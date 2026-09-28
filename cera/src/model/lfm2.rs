@@ -493,10 +493,19 @@ impl Lfm2Model {
         })
     }
 
+    /// Resolve all layer weight references for an LFM2 model from its GGUF tensor index,
+    /// enabling CPU int8 repacking by default.
+    pub fn resolve_all_layer_refs(
+        gguf: &GgufFile,
+        config: &ModelConfig,
+    ) -> Result<Vec<LayerWeightRefs>> {
+        Self::resolve_all_layer_refs_with_repack(gguf, config, true)
+    }
+
     /// Resolve all layer weight references for an LFM2 model from its GGUF tensor index.
     /// When `repack` is false the CPU int8 repacks are skipped (see
-    /// `with_repack_if`) — for loaders that only resolve metadata.
-    pub fn resolve_all_layer_refs(
+    /// `with_repack_if`): for loaders that only resolve metadata.
+    pub fn resolve_all_layer_refs_with_repack(
         gguf: &GgufFile,
         config: &ModelConfig,
         repack: bool,
@@ -719,7 +728,7 @@ impl Lfm2Model {
             }
         }
 
-        let layer_refs = Self::resolve_all_layer_refs(&gguf, &config, repack)?;
+        let layer_refs = Self::resolve_all_layer_refs_with_repack(&gguf, &config, repack)?;
         let embd_ref = Self::resolve_weight(&gguf, "token_embd.weight")?;
 
         let prefix_cache = Mutex::new(KvPrefixCache::for_model(

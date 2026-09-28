@@ -10460,8 +10460,9 @@ mod tests {
     /// (`MmapWeight::dequantize_row`) instead of a pre-dequantized f32 host
     /// copy: the rows must be bit-identical to `to_f32_vec` slices, or every
     /// GPU prefill/decode drifts from the old path. Needs the 230M model
-    /// locally; skips without it. Pure host math — runs without a GPU.
+    /// locally; skips without it. Pure host math: runs without a GPU.
     #[test]
+    #[cfg(feature = "mmap")]
     fn embedding_gather_matches_f32_table() {
         use super::MmapWeight;
         let home = std::env::var("HOME").expect("HOME unset");
@@ -10490,8 +10491,9 @@ mod tests {
     /// Same contract for the untied logit projection: the F16 head upload
     /// converts `output.weight` row by row from the mmap, so those rows must
     /// be bit-identical to `to_f32_vec` slices. Needs the TinyStories model
-    /// locally; skips without it. Pure host math — runs without a GPU.
+    /// locally; skips without it. Pure host math: runs without a GPU.
     #[test]
+    #[cfg(feature = "mmap")]
     fn untied_head_gather_matches_f32_table() {
         use super::MmapWeight;
         let home = std::env::var("HOME").expect("HOME unset");

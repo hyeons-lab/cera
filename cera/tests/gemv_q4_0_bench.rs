@@ -93,7 +93,7 @@ fn bench_shape(shape: &Shape, iters: u32) {
 
     // ── wgpu (WGSL) path ────────────────────────────────────────────────
     // The WGSL tree twin (production wherever SPIR-V passthrough is
-    // unavailable — this bench only runs on macOS, which never takes
+    // unavailable: this bench only runs on macOS, which never takes
     // passthrough), plus the handwritten legacy kernel for coverage.
     // The SPIR-V subgroup twin is pinned by the in-crate dispatch smoke
     // test, which selects passthrough when the backend accepts it.
@@ -170,7 +170,7 @@ fn bench_wgpu(
     let a_buf = ctx.upload_storage(q4_padded, "A_q4");
     let x_buf = ctx.upload_f32(x, "x");
     let y_buf = ctx.create_storage_rw((shape.m as u64) * 4, "y");
-    // gemv_q4_0_fast reads params[0] as uint4 — pad to 4 words so the
+    // gemv_q4_0_fast reads params[0] as uint4; pad to 4 words so the
     // 16-byte read stays in bounds (z/w unused).
     let params = [shape.m, shape.k, 0u32, 0u32];
     let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
@@ -200,7 +200,7 @@ fn bench_wgpu(
     });
 
     // Both Q4_0 kernels use NR=8 rows/workgroup (must match the shader's
-    // `NR` and `gemv_pipeline_rows_label` — see the MUST comment there).
+    // `NR` and `gemv_pipeline_rows_label`; see the MUST comment there).
     let groups = shape.m.div_ceil(8);
 
     // Warmup + correctness check.

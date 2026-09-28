@@ -347,6 +347,33 @@ impl FastRpcDriver {
         Ok(())
     }
 
+    /// Configure CDSP latency QoS to prevent power collapse and clock downscaling during active inference.
+    pub fn set_latency_qos(&self, latency_us: u32) -> Result<(), CeraError> {
+        if let Some(control_fn) = self.remote_session_control {
+            #[repr(C)]
+            struct LatencyControl {
+                enable: u32,
+                latency: u32,
+            }
+            let mut ctrl = LatencyControl {
+                enable: if latency_us > 0 { 1 } else { 0 },
+                latency: latency_us,
+            };
+            let ret = control_fn(
+                1, // FASTRPC_CONTROL_LATENCY
+                &mut ctrl as *mut _ as *mut c_void,
+                std::mem::size_of::<LatencyControl>() as u32,
+            );
+            if ret != 0 {
+                tracing::debug!(
+                    "remote_session_control(latency) returned error 0x{:08x}; continuing without latency vote",
+                    ret
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Open a FastRPC handle to a skeleton library (e.g. `file:///libggml-htp-v75.so?domain=3`).
     pub fn open_skel_handle(&self, uri: &str) -> Result<RemoteHandle64, CeraError> {
         let c_uri = CString::new(uri).map_err(|e| CeraError::Backend(e.to_string()))?;
@@ -517,6 +544,8 @@ impl FastRpcDriver {
                         // Slow batch: stop burning a core and block for the
                         // response like blocking mode does.
                         timeout = DSPQUEUE_TIMEOUT_US;
+                    } else {
+                        std::hint::spin_loop();
                     }
                     // Expiry is checked at the top of the next iteration.
                     continue;
@@ -525,6 +554,9 @@ impl FastRpcDriver {
                 if timeouts < 30 {
                     continue;
                 }
+                return Err(CeraError::Backend(
+                    "dspqueue_read: no DSP response after 30s (timed out)".into(),
+                ));
             }
             return Err(CeraError::Backend(format!(
                 "dspqueue_read failed (error 0x{:08x})",

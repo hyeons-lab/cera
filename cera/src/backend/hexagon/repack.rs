@@ -38,6 +38,11 @@ const TILE_HI_Q6_K: usize = 256;
 /// via `GgufFile::open`, which validates dims with checked math at load;
 /// this is pub-API robustness.)
 fn checked_tiled_size(ne0: usize, ne1: usize, tile: usize, what: &str) -> Result<usize, CeraError> {
+    if ne0 == 0 || ne1 == 0 {
+        return Err(CeraError::Backend(format!(
+            "{what}: zero dimension {ne0}x{ne1}"
+        )));
+    }
     let n_col = ne1
         .checked_next_multiple_of(32)
         .ok_or_else(|| CeraError::Backend(format!("{what}: dim {ne1} overflows")))?
@@ -97,6 +102,11 @@ pub fn repack_q8_0(
     ne1: usize,
     dst: &mut [u8],
 ) -> Result<(), CeraError> {
+    if ne0 == 0 || ne1 == 0 {
+        return Err(CeraError::Backend(format!(
+            "repack_q8_0: dimensions must be non-zero (ne0={ne0}, ne1={ne1})"
+        )));
+    }
     if !ne0.is_multiple_of(32) {
         return Err(CeraError::Backend(format!(
             "repack_q8_0: ne0 ({ne0}) must be a multiple of 32"
@@ -170,6 +180,11 @@ pub fn repack_q4_0(
     ne1: usize,
     dst: &mut [u8],
 ) -> Result<(), CeraError> {
+    if ne0 == 0 || ne1 == 0 {
+        return Err(CeraError::Backend(format!(
+            "repack_q4_0: dimensions must be non-zero (ne0={ne0}, ne1={ne1})"
+        )));
+    }
     if !ne0.is_multiple_of(32) {
         return Err(CeraError::Backend(format!(
             "repack_q4_0: ne0 ({ne0}) must be a multiple of 32"
@@ -248,6 +263,11 @@ pub fn repack_q4_k(
     ne1: usize,
     dst: &mut [u8],
 ) -> Result<(), CeraError> {
+    if ne0 == 0 || ne1 == 0 {
+        return Err(CeraError::Backend(format!(
+            "repack_q4_k: dimensions must be non-zero (ne0={ne0}, ne1={ne1})"
+        )));
+    }
     if !ne0.is_multiple_of(256) {
         return Err(CeraError::Backend(format!(
             "repack_q4_k: K dim {ne0} is not a multiple of 256"
@@ -342,6 +362,11 @@ pub fn repack_q6_k(
     ne1: usize,
     dst: &mut [u8],
 ) -> Result<(), CeraError> {
+    if ne0 == 0 || ne1 == 0 {
+        return Err(CeraError::Backend(format!(
+            "repack_q6_k: dimensions must be non-zero (ne0={ne0}, ne1={ne1})"
+        )));
+    }
     if !ne0.is_multiple_of(256) {
         return Err(CeraError::Backend(format!(
             "repack_q6_k: K dim {ne0} is not a multiple of 256"
@@ -491,6 +516,48 @@ pub fn requant_q5_k_to_q8_0(
                 for (j, &v) in q.quants.iter().enumerate() {
                     out[dst_off + 2 + j] = v as u8;
                 }
+            }
+        }
+    }
+    Ok(out)
+}
+
+/// Quantize an f32 matrix of shape `[rows, cols]` into linear GGUF Q8_0 blocks.
+///
+/// `cols` must be a multiple of 32. Output contains `rows * (cols / 32) * 34` bytes.
+pub fn quantize_f32_to_q8_0(vals: &[f32], cols: usize, rows: usize) -> Result<Vec<u8>, CeraError> {
+    if cols == 0 || rows == 0 {
+        return Err(CeraError::Backend(format!(
+            "quantize_f32_to_q8_0: degenerate dims ({cols}, {rows})"
+        )));
+    }
+    if !cols.is_multiple_of(32) {
+        return Err(CeraError::Backend(format!(
+            "quantize_f32_to_q8_0: cols ({cols}) must be a multiple of 32"
+        )));
+    }
+    let total_vals = cols.checked_mul(rows).ok_or_else(|| {
+        CeraError::Backend(format!(
+            "quantize_f32_to_q8_0: dimensions overflow usize ({cols} * {rows})"
+        ))
+    })?;
+    if vals.len() < total_vals {
+        return Err(CeraError::Backend(format!(
+            "quantize_f32_to_q8_0: vals buffer too short (expected {total_vals}, got {})",
+            vals.len()
+        )));
+    }
+    let blocks_per_row = cols / 32;
+    let out_len = checked_src_bytes(rows, blocks_per_row, 34, "quantize_f32_to_q8_0")?;
+    let mut out = vec![0u8; out_len];
+    for r in 0..rows {
+        let row_vals = &vals[r * cols..(r + 1) * cols];
+        for (b, chunk) in row_vals.as_chunks::<32>().0.iter().enumerate() {
+            let q = quantize_q8_0_block(chunk);
+            let dst_off = (r * blocks_per_row + b) * 34;
+            out[dst_off..dst_off + 2].copy_from_slice(&q.delta.to_le_bytes());
+            for (j, &v) in q.quants.iter().enumerate() {
+                out[dst_off + 2 + j] = v as u8;
             }
         }
     }
@@ -743,8 +810,9 @@ mod tests {
         assert!(repack_q8_0(empty, huge, huge, &mut dst).is_err());
         assert!(repack_q4_0(empty, huge, huge, &mut dst).is_err());
         // Zero in one dim defeats the src-size check (0 times anything is 0)
-        // and used to reach the unchecked tile math and panic.
-        for (ne0, ne1) in [(0, usize::MAX), (usize::MAX, 0)] {
+        // and used to reach the unchecked tile math and panic. Each leg uses
+        // an alignment-passing partner dimension (32) to isolate the zero check.
+        for (ne0, ne1) in [(0, 32), (32, 0), (0, usize::MAX), (usize::MAX, 0)] {
             assert!(repack_q8_0(empty, ne0, ne1, &mut dst).is_err());
             assert!(repack_q4_0(empty, ne0, ne1, &mut dst).is_err());
             assert!(repack_q4_k(empty, ne0, ne1, &mut dst).is_err());
@@ -759,5 +827,38 @@ mod tests {
         assert!(requant_q5_k_to_q8_0(empty, 256, usize::MAX).is_err());
         assert!(requant_q5_k_to_q8_0(empty, 0, 256).is_err());
         assert!(requant_q5_k_to_q8_0(empty, 256, 0).is_err());
+    }
+
+    #[test]
+    fn test_quantize_f32_to_q8_0() {
+        let cols = 64;
+        let rows = 4;
+        let vals: Vec<f32> = (0..cols * rows).map(|i| (i as f32) * 0.1 - 10.0).collect();
+        let q8_bytes = quantize_f32_to_q8_0(&vals, cols, rows).unwrap();
+        assert_eq!(q8_bytes.len(), rows * (cols / 32) * 34);
+
+        // Verify numerical reconstruction fidelity for block 0
+        let d = f16_to_f32(u16::from_le_bytes([q8_bytes[0], q8_bytes[1]]));
+        assert!(d > 0.0, "scale must be positive");
+        for j in 0..32 {
+            let q = q8_bytes[2 + j] as i8;
+            let recon = (q as f32) * d;
+            let orig = vals[j];
+            assert!(
+                (recon - orig).abs() <= d + 1e-3,
+                "reconstruction error exceeds scale"
+            );
+        }
+
+        // Verify validation error handling
+        assert!(quantize_f32_to_q8_0(&vals, 0, rows).is_err());
+        assert!(quantize_f32_to_q8_0(&vals, cols, 0).is_err());
+        assert!(quantize_f32_to_q8_0(&vals, 33, rows).is_err());
+        assert!(quantize_f32_to_q8_0(&vals[..10], cols, rows).is_err());
+
+        let sz = repacked_matrix_size_q8_0(cols, rows).unwrap();
+        let mut repacked = vec![0u8; sz];
+        repack_q8_0(&q8_bytes, cols, rows, &mut repacked).unwrap();
+        assert_eq!(repacked.len(), sz);
     }
 }

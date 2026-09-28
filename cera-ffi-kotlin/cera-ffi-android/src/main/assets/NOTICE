@@ -8,7 +8,7 @@ unmodified llama.cpp sources:
 
   Copyright (c) 2023-2026 The ggml authors
   License: MIT (full text below)
-  Source: https://github.com/ggml-org/llama.cpp at cf302539c,
+  Source: https://github.com/ggml-org/llama.cpp at 00ccd6970,
   ggml/src/ggml-hexagon/htp/
 
 --------------------------------------------------------------------------------

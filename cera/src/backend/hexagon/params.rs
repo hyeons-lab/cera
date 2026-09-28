@@ -494,7 +494,11 @@ pub fn build_flash_attn_kernel_params(
     kparams[11] = 1.0f32.to_bits() as i32;
 
     // offset 48..52: n_head_log2: u32
-    let n_head_log2 = 1u32 << (31 - (n_heads as u32).leading_zeros());
+    let n_head_log2 = if n_heads > 0 {
+        1u32 << (31 - (n_heads as u32).leading_zeros())
+    } else {
+        0
+    };
     kparams[12] = n_head_log2 as i32;
 
     // offset 52..60: src3_div2: FastDivValues (mask)
@@ -547,17 +551,18 @@ pub fn build_flash_attn_kernel_params(
 
 /// HVX weight tile sizes (see `HTP_MM_WEIGHT_*_TILE_SIZE_*`).
 fn mm_tile_sizes(wtype: HtpDataType) -> (u32, u32) {
+    use super::repack::{TILE_SIZE_Q4_0, TILE_SIZE_Q4_K, TILE_SIZE_Q6_K, TILE_SIZE_Q8_0};
     match wtype {
-        HtpDataType::Q4_0 => (576, 640),
+        HtpDataType::Q4_0 => (TILE_SIZE_Q4_0 as u32, 640),
         // Q4_K repacks into the Q4_1 wire layout (640/640).
-        HtpDataType::Q4K => (640, 640),
-        HtpDataType::Q6K => (896, 896),
-        HtpDataType::Q8_0 => (1088, 1152),
+        HtpDataType::Q4K => (TILE_SIZE_Q4_K as u32, 640),
+        HtpDataType::Q6K => (TILE_SIZE_Q6_K as u32, 896),
+        HtpDataType::Q8_0 => (TILE_SIZE_Q8_0 as u32, 1152),
         other => {
             // New weight type without a tile entry: fail loudly in debug
             // rather than silently emitting Q8_0-sized tiles.
             debug_assert!(false, "mm_tile_sizes: no tile entry for {other:?}");
-            (1088, 1152)
+            (TILE_SIZE_Q8_0 as u32, 1152)
         }
     }
 }
@@ -616,7 +621,7 @@ fn mm_hvx_vtcm_layout(
     let src1_bytes = round_up(q_src1_row * src1_nrows, 256);
 
     let (_, aligned_tile) = mm_tile_sizes(wtype);
-    let tile_row = (ne10 / 32) * aligned_tile as usize;
+    let tile_row = ne10.div_ceil(32) * aligned_tile as usize;
     let src0_bytes = round_up(n_prefetch * tile_row, 256) * n_threads;
 
     let quant_scratch = round_up(ne10 * 4, 128 * 4);
@@ -738,7 +743,7 @@ pub fn mm_is_hmx_eligible(wtype: HtpDataType, k: usize, n: usize, m: usize) -> b
         wtype,
         HtpDataType::Q4_0 | HtpDataType::Q8_0 | HtpDataType::Q4K | HtpDataType::Q6K
     ) && k.is_multiple_of(HMX_TILE)
-        && n.next_multiple_of(HMX_TILE).is_multiple_of(HMX_TILE)
+        && n.is_multiple_of(HMX_TILE)
         && m >= HMX_MM_MIN_NROWS
 }
 
@@ -1196,7 +1201,11 @@ pub fn build_hmx_fa_kernel_params(
     // [7] qrows, [8] qrows_per_thread, [9] qrow_start: zero for HMX.
     kparams[10] = 1.0f32.to_bits() as i32;
     kparams[11] = 1.0f32.to_bits() as i32;
-    kparams[12] = (1u32 << (31 - (n_heads as u32).leading_zeros())) as i32;
+    kparams[12] = if n_heads > 0 {
+        (1u32 << (31 - (n_heads as u32).leading_zeros())) as i32
+    } else {
+        0
+    };
     // Mask is [seq, tokens, 1, 1]: src3 divs over unit dims.
     let div_1 = init_fastdiv(1);
     kparams[13] = div_1.mp as i32;
@@ -1439,6 +1448,7 @@ mod tests {
         assert!(!mm_is_hmx_eligible(HtpDataType::Q8_0, 1024, 4608, 7)); // M < 8: HVX
         assert!(!mm_is_hmx_eligible(HtpDataType::Q8_0, 1024, 4608, 4)); // M < 8: HVX
         assert!(!mm_is_hmx_eligible(HtpDataType::Q8_0, 1000, 4608, 32)); // K % 32
+        assert!(!mm_is_hmx_eligible(HtpDataType::Q8_0, 1024, 4600, 32)); // N % 32
         assert!(!mm_is_hmx_eligible(HtpDataType::F32, 1024, 4608, 32)); // dense unhandled
     }
 
@@ -1545,5 +1555,12 @@ mod tests {
 
         let p_custom = build_elu_params(0.5);
         assert_eq!(p_custom[0], 0.5f32.to_bits() as i32);
+    }
+
+    #[test]
+    fn test_build_flash_attn_kernel_params_zero_heads() {
+        let p = build_flash_attn_kernel_params(64, 0, 1, 1, 1, 0.1, 1, false);
+        // Offset 12 corresponds to n_head_log2; must be 0 when n_heads == 0 without underflow
+        assert_eq!(p[12], 0);
     }
 }

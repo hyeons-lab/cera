@@ -207,7 +207,7 @@ pub fn preprocess_image_with_opts(
     // Optional caller cap on the longest side of the encoded target.
     // Applied to the TARGET (not a pre-resize of the input) so the
     // single `resize_exact` below goes straight from native dims to the
-    // final target — one resample, no cascaded downscale-then-upscale.
+    // final target: one resample, no cascaded downscale-then-upscale.
     // Shrinks only (`long > cap`), preserves aspect, re-aligns by
     // flooring, and clamps to at least one aligned block so the patch
     // grid stays valid. Deliberately takes precedence over
@@ -215,7 +215,7 @@ pub fn preprocess_image_with_opts(
     if let Some(cap) = max_long_size.filter(|&c| c > 0).map(|c| c as usize) {
         let long = target_w.max(target_h);
         if long > cap {
-            let beta = cap as f64 / long as f64; // < 1.0 — shrink only
+            let beta = cap as f64 / long as f64; // < 1.0: shrink only
             let floor_align = |x: f64| align.max(((x / align as f64).floor() as usize) * align);
             target_w = floor_align(target_w as f64 * beta);
             target_h = floor_align(target_h as f64 * beta);
@@ -225,8 +225,7 @@ pub fn preprocess_image_with_opts(
     debug_assert_eq!(target_w % cfg.patch_size, 0);
     debug_assert_eq!(target_h % cfg.patch_size, 0);
 
-    // Fast path: use resize_bilinear_rgb directly from decoded DynamicImage
-    // instead of allocating an intermediate full-resolution RGB image.
+    // Fast path: reuse decoded ImageRgb8 raw buffer when dimensions already match target.
     let rgb_bytes = match img {
         image::DynamicImage::ImageRgb8(rgb) => {
             if rgb.width() as usize == target_w && rgb.height() as usize == target_h {
@@ -251,19 +250,15 @@ pub fn preprocess_image_with_opts(
             target_h,
         )?,
         other => {
-            let rgb = other.into_rgb8();
-            if rgb.width() as usize == target_w && rgb.height() as usize == target_h {
-                rgb.into_raw()
-            } else {
-                resize_bilinear_rgb(
-                    rgb.as_raw(),
-                    rgb.width() as usize,
-                    rgb.height() as usize,
-                    PixelFormat::Rgb8,
-                    target_w,
-                    target_h,
-                )?
-            }
+            let rgb = other.to_rgb8();
+            resize_bilinear_rgb(
+                rgb.as_raw(),
+                rgb.width() as usize,
+                rgb.height() as usize,
+                PixelFormat::Rgb8,
+                target_w,
+                target_h,
+            )?
         }
     };
 
@@ -420,27 +415,36 @@ pub fn resize_bilinear_rgb(
     let mut dst = vec![0u8; total_dst];
 
     let x_scale = src_w as f32 / target_w as f32;
-    let max_x = (src_w - 1) as f32;
-    let x_table: Vec<(usize, usize, f32, f32)> = (0..target_w)
-        .map(|dx| {
-            let sx = ((dx as f32 + 0.5) * x_scale - 0.5).clamp(0.0, max_x);
-            let x0 = sx.floor() as usize;
-            let x1 = (x0 + 1).min(src_w - 1);
-            let wx1 = sx - x0 as f32;
-            let wx0 = 1.0 - wx1;
-            (x0, x1, wx0, wx1)
-        })
-        .collect();
+    let max_x = (src_w.saturating_sub(1)) as f32;
+    let x_table: Vec<(usize, usize, f32, f32)> = if src_w == 1 {
+        vec![(0, 0, 1.0, 0.0); target_w]
+    } else {
+        (0..target_w)
+            .map(|dx| {
+                let sx = ((dx as f32 + 0.5) * x_scale - 0.5).clamp(0.0, max_x);
+                let x0 = sx.floor() as usize;
+                let x1 = (x0 + 1).min(src_w.saturating_sub(1));
+                let wx1 = sx - x0 as f32;
+                let wx0 = 1.0 - wx1;
+                (x0, x1, wx0, wx1)
+            })
+            .collect()
+    };
 
     let y_scale = src_h as f32 / target_h as f32;
-    let max_y = (src_h - 1) as f32;
+    let max_y = (src_h.saturating_sub(1)) as f32;
 
     let sample_row = |dy: usize, row_dst: &mut [u8]| {
-        let sy = ((dy as f32 + 0.5) * y_scale - 0.5).clamp(0.0, max_y);
-        let y0 = sy.floor() as usize;
-        let y1 = (y0 + 1).min(src_h - 1);
-        let wy1 = sy - y0 as f32;
-        let wy0 = 1.0 - wy1;
+        let (y0, y1, wy0, wy1) = if src_h == 1 {
+            (0, 0, 1.0, 0.0)
+        } else {
+            let sy = ((dy as f32 + 0.5) * y_scale - 0.5).clamp(0.0, max_y);
+            let y0 = sy.floor() as usize;
+            let y1 = (y0 + 1).min(src_h.saturating_sub(1));
+            let wy1 = sy - y0 as f32;
+            let wy0 = 1.0 - wy1;
+            (y0, y1, wy0, wy1)
+        };
 
         let row0 = &src[y0 * src_stride..(y0 + 1) * src_stride];
         let row1 = &src[y1 * src_stride..(y1 + 1) * src_stride];
@@ -532,7 +536,14 @@ pub fn normalize_rgb8_to_nchw_f32(
     let process_chunk =
         |raw_chunk: &[u8], out_r: &mut [f32], out_g: &mut [f32], out_b: &mut [f32]| {
             let chunk_len = out_r.len();
-            debug_assert_eq!(raw_chunk.len(), chunk_len * 3);
+            assert_eq!(
+                raw_chunk.len(),
+                chunk_len * 3,
+                "raw_chunk length {} does not match required {} (3 * {})",
+                raw_chunk.len(),
+                chunk_len * 3,
+                chunk_len
+            );
 
             #[cfg(target_arch = "aarch64")]
             unsafe {
@@ -905,9 +916,19 @@ mod tests {
         ] {
             let out = resize_bilinear_rgb(data, w, h, fmt, tw, th).expect("resize");
             assert_eq!(out.len(), tw * th * 3);
-            for px in out.chunks_exact(3) {
+            for &px in out.as_chunks::<3>().0 {
                 assert_eq!(px, [r, g, b], "format {fmt:?} channel mismatch");
             }
+        }
+    }
+
+    #[test]
+    fn test_resize_bilinear_rgb_degenerate_1x1() {
+        let src = [100u8, 150u8, 200u8];
+        let out = resize_bilinear_rgb(&src, 1, 1, PixelFormat::Rgb8, 4, 4).expect("resize 1x1");
+        assert_eq!(out.len(), 4 * 4 * 3);
+        for &chunk in out.as_chunks::<3>().0 {
+            assert_eq!(chunk, [100, 150, 200]);
         }
     }
 
@@ -942,6 +963,15 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "does not match required")]
+    fn test_normalize_rgb8_to_nchw_f32_undersized_panics() {
+        let mean = [0.485f32, 0.456, 0.406];
+        let std = [0.229f32, 0.224, 0.225];
+        let short_raw = vec![0u8; 10];
+        normalize_rgb8_to_nchw_f32(&short_raw, 4, 4, &mean, &std);
     }
 
     #[test]

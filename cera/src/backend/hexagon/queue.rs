@@ -183,6 +183,46 @@ impl HexagonQueueSession {
         self.ops.clear();
     }
 
+    /// Number of operations currently enqueued in the pending batch.
+    pub fn ops_len(&self) -> usize {
+        self.ops.len()
+    }
+
+    /// Export the currently pending batch as a reusable template.
+    pub fn export_batch(
+        &self,
+    ) -> (
+        Vec<HtpBufDesc>,
+        HashMap<i32, u16>,
+        Vec<HtpTensor>,
+        Vec<HtpOpDesc>,
+    ) {
+        (
+            self.bufs.clone(),
+            self.buf_map.clone(),
+            self.tens.clone(),
+            self.ops.clone(),
+        )
+    }
+
+    /// Load a previously prepared batch template into the queue session.
+    pub fn load_batch(
+        &mut self,
+        bufs: &[HtpBufDesc],
+        buf_map: &HashMap<i32, u16>,
+        tens: &[HtpTensor],
+        ops: &[HtpOpDesc],
+    ) {
+        self.bufs.clear();
+        self.bufs.extend_from_slice(bufs);
+        self.buf_map.clear();
+        self.buf_map.clone_from(buf_map);
+        self.tens.clear();
+        self.tens.extend_from_slice(tens);
+        self.ops.clear();
+        self.ops.extend_from_slice(ops);
+    }
+
     /// Register a buffer in the batch, returning its index.
     pub fn add_buffer(&mut self, buf: &RpcmemBuffer) -> Result<u16, CeraError> {
         let fd = buf.fd();
@@ -251,10 +291,38 @@ impl HexagonQueueSession {
             dst: [0xffff; 4],
             pad: [0; 2],
         };
-        for (i, &s) in src.iter().enumerate().take(10) {
+        if src.len() > 10 {
+            self.drop_pending_batch();
+            return Err(CeraError::Backend(format!(
+                "enqueue_op opcode {opcode}: too many src operands ({} > 10)",
+                src.len()
+            )));
+        }
+        if dst.len() > 4 {
+            self.drop_pending_batch();
+            return Err(CeraError::Backend(format!(
+                "enqueue_op opcode {opcode}: too many dst operands ({} > 4)",
+                dst.len()
+            )));
+        }
+        for (i, &s) in src.iter().enumerate() {
+            if s != 0xffff && (s as usize) >= self.tens.len() {
+                self.drop_pending_batch();
+                return Err(CeraError::Backend(format!(
+                    "enqueue_op opcode {opcode}: src[{i}] index {s} out of bounds (registered {})",
+                    self.tens.len()
+                )));
+            }
             op.src[i] = s;
         }
-        for (i, &d) in dst.iter().enumerate().take(4) {
+        for (i, &d) in dst.iter().enumerate() {
+            if d != 0xffff && (d as usize) >= self.tens.len() {
+                self.drop_pending_batch();
+                return Err(CeraError::Backend(format!(
+                    "enqueue_op opcode {opcode}: dst[{i}] index {d} out of bounds (registered {})",
+                    self.tens.len()
+                )));
+            }
             op.dst[i] = d;
         }
         self.ops.push(op);
@@ -407,7 +475,14 @@ impl HexagonQueueSession {
                         read_res = Err(e);
                         break;
                     }
-                    Ok(_) => {
+                    Ok(n_read) => {
+                        if (n_read as usize) < std::mem::size_of::<HtpOpBatchRsp>() {
+                            read_res = Err(CeraError::Backend(format!(
+                                "DSP queue response truncated: got {n_read} bytes, expected at least {}",
+                                std::mem::size_of::<HtpOpBatchRsp>()
+                            )));
+                            break;
+                        }
                         match stale_drain_action(rsp.seq, self.seq, stale_drained) {
                             StaleDrainAction::DrainStale => {
                                 stale_drained += 1;
@@ -458,10 +533,7 @@ impl HexagonQueueSession {
         // onto the next forward's flush. And the drain above is correct only
         // if `seq` advances strictly per attempt: reusing a timed-out
         // batch's `seq` would accept its late response as the new batch's.
-        self.bufs.clear();
-        self.buf_map.clear();
-        self.tens.clear();
-        self.ops.clear();
+        self.drop_pending_batch();
         self.seq += 1;
 
         write_res?;
@@ -477,7 +549,8 @@ impl HexagonQueueSession {
             )));
         }
 
-        if std::env::var_os("CERA_HEXAGON_PROFILE").is_some() {
+        static PROFILE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *PROFILE_ENABLED.get_or_init(|| std::env::var_os("CERA_HEXAGON_PROFILE").is_some()) {
             self.record_profile(
                 rsp.seq,
                 n_ops,
@@ -504,7 +577,9 @@ impl HexagonQueueSession {
     ) {
         let prof_size = std::mem::size_of::<HtpProfDesc>();
         let mut dsp_total: u64 = 0;
-        let per_op = std::env::var_os("CERA_HEXAGON_PROFILE_OPS").is_some();
+        static PROFILE_OPS_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let per_op = *PROFILE_OPS_ENABLED
+            .get_or_init(|| std::env::var_os("CERA_HEXAGON_PROFILE_OPS").is_some());
         for i in 0..n_ops {
             let desc = unsafe {
                 (self.staging_buf.as_ptr().add(prof_offset + i * prof_size) as *const HtpProfDesc)
@@ -557,8 +632,11 @@ impl Drop for HexagonQueueSession {
             );
             self.drop_pending_batch();
         }
-        if std::env::var_os("CERA_HEXAGON_PROFILE").is_some() && self.prof_flushes > 0 {
-            let rtt = self.prof_host_us.saturating_sub(self.prof_dsp_us) / self.prof_flushes;
+        if let Some(rtt) = self
+            .prof_host_us
+            .saturating_sub(self.prof_dsp_us)
+            .checked_div(self.prof_flushes)
+        {
             eprintln!(
                 "[cera-hexagon] profile: {} flushes, host_total={}us dsp_total={}us mean_rtt={}us",
                 self.prof_flushes, self.prof_host_us, self.prof_dsp_us, rtt
@@ -593,38 +671,7 @@ impl Drop for HexagonQueueSession {
 /// Short opcode names for profile tables. Discriminants are firmware-ABI
 /// pinned (see `HtpOpCode`); unknown ids print numerically via the `op` column.
 fn htp_opcode_name(opcode: u32) -> &'static str {
-    match opcode {
-        x if x == HtpOpCode::Mul as u32 => "Mul",
-        x if x == HtpOpCode::Add as u32 => "Add",
-        x if x == HtpOpCode::MulMat as u32 => "MulMat",
-        x if x == HtpOpCode::MulMatNx as u32 => "MulMatNx",
-        x if x == HtpOpCode::MulMatAdd as u32 => "MulMatAdd",
-        x if x == HtpOpCode::RmsNorm as u32 => "RmsNorm",
-        x if x == HtpOpCode::RmsNormMul as u32 => "RmsNormMul",
-        x if x == HtpOpCode::GluSwiglu as u32 => "GluSwiglu",
-        x if x == HtpOpCode::Rope as u32 => "Rope",
-        x if x == HtpOpCode::FlashAttnExt as u32 => "FlashAttnExt",
-        x if x == HtpOpCode::SetRows as u32 => "SetRows",
-        x if x == HtpOpCode::GetRows as u32 => "GetRows",
-        x if x == HtpOpCode::Scale as u32 => "Scale",
-        x if x == HtpOpCode::Cpy as u32 => "Cpy",
-        x if x == HtpOpCode::SsmConv as u32 => "SsmConv",
-        x if x == HtpOpCode::Concat as u32 => "Concat",
-        x if x == HtpOpCode::Norm as u32 => "Norm",
-        x if x == HtpOpCode::UnaryGelu as u32 => "UnaryGelu",
-        x if x == HtpOpCode::Clamp as u32 => "Clamp",
-        x if x == HtpOpCode::Conv1D as u32 => "Conv1D",
-        x if x == HtpOpCode::UnarySnake as u32 => "UnarySnake",
-        x if x == HtpOpCode::UnarySin as u32 => "UnarySin",
-        x if x == HtpOpCode::UnaryCos as u32 => "UnaryCos",
-        x if x == HtpOpCode::ConvTranspose1D as u32 => "ConvTranspose1D",
-        x if x == HtpOpCode::UnaryHardSigmoid as u32 => "UnaryHardSigmoid",
-        x if x == HtpOpCode::UnaryHardSwish as u32 => "UnaryHardSwish",
-        x if x == HtpOpCode::UnaryElu as u32 => "UnaryElu",
-        x if x == HtpOpCode::UnaryStep as u32 => "UnaryStep",
-        x if x == HtpOpCode::Sum as u32 => "Sum",
-        _ => "unknown",
-    }
+    HtpOpCode::from_u32(opcode).map_or("unknown", |op| op.name())
 }
 
 #[cfg(test)]

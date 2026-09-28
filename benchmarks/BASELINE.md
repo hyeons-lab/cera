@@ -365,6 +365,46 @@ not host work; similarly decode needs fusion (41 passes/token) plus
 kernel efficiency to close sustained. Documented as follow-ups, not
 attempted here.
 
+### Multimodal UI Benchmarks: Galaxy S25 Ultra (SM-S938U1)
+
+Measured on physical Samsung Galaxy S25 Ultra hardware running inside a resumed
+Android foreground activity (`BenchActivity`) via `MultimodalUiBenchmarkTest` to
+guarantee top-app visible CPU/GPU/NPU scheduling.
+
+#### Audio: LFM2.5-Audio-1.5B-Q4_0 (`weather.wav`, 47 prompt tokens, 64 max tokens)
+
+Back-to-back benchmark comparing Leap CPU, Cera CPU, Cera GPU (Adreno 830 Vulkan/wgpu),
+and Cera Hexagon NPU across 2 measured turns following on-device warmup.
+
+| Engine | Backend | TTFT Prefill (ms) | TTFT Prefill (tok/s) | Kernel Prefill (tok/s) | Decode (tok/s) |
+|---|---|---|---|---|---|
+| Leap | CPU | 592.5 | 86.1 | N/A | 23.02 |
+| Cera | CPU | 382.5 | 122.9 | 241.0 | 15.63 |
+| Cera | GPU (wgpu-vulkan) | 1822.5 | 25.8 | 30.8 | 11.47 |
+| Cera | Hexagon NPU (HTP v79) | 244.5 | 193.1 | 602.7 | 36.67 |
+
+- **Hexagon NPU delivers 1.59x faster decode than Leap CPU:** 36.67 tok/s vs 23.02 tok/s (a 2.82x acceleration over previous CPU-fallback decode of 13.00 tok/s), executing all 8 codebook autoregressive passes directly on Qualcomm Hexagon HTP DSP without host CPU roundtrips.
+- **Hexagon NPU delivers 2.42x faster prefill than Leap CPU:** 244.5 ms vs 592.5 ms (59% latency reduction), with 602.7 tok/s raw backbone kernel prefill.
+- **Full hardware audio pipeline:** Hexagon runs the entire audio decode and vocoder graph (backbone, Depthformer autoregression, detokenizer, and iSTFT) on NPU, completely immune to Android background CPU demotion.
+- **Cera CPU prefill is 35% faster than Leap CPU:** 382.5 ms vs 592.5 ms, achieving 241.0 tok/s kernel prefill.
+- **Full audio synthesis:** Cera synthesized valid audio chunks (1440/1920 PCM samples) through the detokenizer and iSTFT vocoder pipeline across CPU, GPU, and NPU.
+
+#### Vision: LFM2.5-VL-450M-Q4_0 (512x512 image, 291 prompt tokens)
+
+Back-to-back benchmark comparing Leap CPU, Cera CPU, Cera GPU (Adreno 830 Vulkan/wgpu),
+and Cera Hexagon NPU across 2 measured turns following on-device warmup.
+
+| Engine | Backend | TTFT Prefill (ms) | TTFT Prefill (tok/s) | Kernel Prefill (tok/s) | Decode (tok/s) |
+|---|---|---|---|---|---|
+| Leap | CPU | 3740.5 | 77.6 | N/A | 3.40 |
+| Cera | CPU | 2375.5 | 122.7 | 1216.2 | 200.00 |
+| Cera | GPU (wgpu-vulkan) | 6002.5 | 48.5 | 109.9 | 113.92 |
+| Cera | Hexagon NPU (HTP v79) | 3178.0 | 91.6 | 3779.2 | 114.69 |
+
+- **Cera CPU vision TTFT is 36% faster than Leap CPU:** 2375.5 ms vs 3740.5 ms, with 58.8x faster decode (200.00 vs 3.40 tok/s).
+- **Hexagon NPU leads raw vision backbone prefill:** 3779.2 tok/s kernel prefill (77 ms backbone time).
+- **Hexagon NPU generates coherent descriptions without host CPU RoPE dependency:** 114.69 tok/s decode on HTP v79.
+
 ### S25U, `LFM2.5-2.6B-Agent-Q4_0.gguf`: full matrix (2026-09-24)
 
 Same device, bigger model (30 layers, hidden 2048). Protocol: `--prompt

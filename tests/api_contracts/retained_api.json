@@ -28,6 +28,7 @@
         "from_parts": "pub fn from_parts(parts: ModelBytes, cfg: EngineConfig) -> Result<Self, CeraError>",
         "from_path": "pub fn from_path<P: AsRef<Path>>(path: P, cfg: EngineConfig) -> Result<Self, CeraError>",
         "from_reader": "pub fn from_reader<R: Read>(reader: R, cfg: EngineConfig) -> Result<Self, CeraError>",
+        "has_audio_accelerator": "pub fn has_audio_accelerator(&self) -> bool",
         "has_gpu_audio_decoder": "pub fn has_gpu_audio_decoder(&self) -> bool",
         "has_gpu_audio_encoder": "pub fn has_gpu_audio_encoder(&self) -> bool",
         "has_gpu_vision_encoder": "pub fn has_gpu_vision_encoder(&self) -> bool",
@@ -202,6 +203,7 @@
       "expected": {
         "append_audio": "pub fn append_audio(&self, samples: Vec<f32>, sample_rate: u32) -> Result<(), FfiError>",
         "append_image": "pub fn append_image(&self, bytes: Vec<u8>, max_long_size: Option<u32>) -> Result<(), FfiError>",
+        "append_raw_image": "pub fn append_raw_image( &self, pixels: Vec<u8>, width: u32, height: u32, format: PixelFormat, max_long_size: Option<u32>, ) -> Result<(), FfiError>",
         "append_text": "pub fn append_text(&self, text: String) -> Result<(), FfiError>",
         "append_tokens": "pub fn append_tokens(&self, tokens: Vec<u32>) -> Result<(), FfiError>",
         "attach_lora": "pub fn attach_lora(&self, adapters: Arc<LoraAdapters>) -> Result<(), FfiError>",
@@ -222,6 +224,7 @@
         "hidden_states_for_tokens_with_adapters": "pub fn hidden_states_for_tokens_with_adapters( &self, tokens: Vec<u32>, adapters: Vec<LoraAdapterEntry>, ) -> Result<Vec<u8>, FfiError>",
         "hidden_states_mean_pooled": "pub fn hidden_states_mean_pooled(&self, tokens: Vec<u32>) -> Result<Vec<f32>, FfiError>",
         "hidden_states_mean_pooled_with_adapters": "pub fn hidden_states_mean_pooled_with_adapters( &self, tokens: Vec<u32>, adapters: Vec<LoraAdapterEntry>, ) -> Result<Vec<f32>, FfiError>",
+        "image_max_long_size": "pub fn image_max_long_size(&self) -> Result<Option<u32>, FfiError>",
         "import_checkpoint": "pub fn import_checkpoint(&self, data: Vec<u8>) -> Result<(), FfiError>",
         "into_chat": "pub fn into_chat(&self) -> Result<Arc<ChatSession>, FfiError>",
         "load_checkpoint": "pub fn load_checkpoint(&self, path: String) -> Result<(), FfiError>",
@@ -528,6 +531,13 @@
       "owner": "ToolFormat",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
       "expected": "pub enum ToolFormat { Lfm2Pythonic, Hermes, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "PixelFormat",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub enum PixelFormat { Rgb8, Rgba8, Bgr8, Bgra8, }"
     },
     {
       "source": "cera-ffi/src/lib.rs",

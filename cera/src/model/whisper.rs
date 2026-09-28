@@ -1629,6 +1629,27 @@ impl WhisperSpecialTokens {
     }
 }
 
+/// Suppress special control tokens and timestamp tokens in logits during autoregressive generation.
+pub fn suppress_whisper_special_tokens(
+    logits: &mut [f32],
+    special_tokens: &WhisperSpecialTokens,
+    timestamps: bool,
+) {
+    let ctrl_start = special_tokens.sot.min(special_tokens.no_timestamps);
+    let ctrl_end = special_tokens.sot.max(special_tokens.no_timestamps);
+    for tok in ctrl_start..=ctrl_end {
+        if tok != special_tokens.eot && (tok as usize) < logits.len() {
+            logits[tok as usize] = -f32::INFINITY;
+        }
+    }
+    if !timestamps {
+        let ts_start = special_tokens.timestamp_begin as usize;
+        if ts_start < logits.len() {
+            logits[ts_start..].fill(-f32::INFINITY);
+        }
+    }
+}
+
 /// Catalog metadata for a known Whisper model checkpoint.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WhisperModelCatalogEntry {
@@ -2092,22 +2113,9 @@ pub fn transcribe_pcm_with_tokens(
         )?;
 
         // Suppress special control tokens during autoregressive generation
-        let ctrl_start = special_tokens.sot.min(special_tokens.no_timestamps);
-        let ctrl_end = special_tokens.sot.max(special_tokens.no_timestamps);
-        for tok in ctrl_start..=ctrl_end {
-            if tok != special_tokens.eot && (tok as usize) < logits.len() {
-                logits[tok as usize] = -f32::INFINITY;
-            }
-        }
-        if !opts.timestamps {
-            let ts_start = special_tokens.timestamp_begin as usize;
-            if ts_start < logits.len() {
-                logits[ts_start..].fill(-f32::INFINITY);
-            }
-        }
+        suppress_whisper_special_tokens(&mut logits, &special_tokens, opts.timestamps);
 
         let next_token = sampler.sample(&mut logits);
-
         if next_token == special_tokens.eot {
             break;
         }
@@ -2125,6 +2133,8 @@ pub fn transcribe_pcm_with_tokens(
 pub struct WhisperModel {
     pub weights: WhisperWeights,
     pub special_tokens: WhisperSpecialTokens,
+    #[cfg(feature = "hexagon")]
+    hexagon: Option<Arc<crate::model::whisper_hexagon::HexagonWhisperModel>>,
 }
 
 #[allow(dead_code)]
@@ -2137,10 +2147,11 @@ const _: () = {
 };
 
 impl WhisperModel {
-    /// Load Whisper model from GGUF file with optional tokenizer for dynamic special token resolution.
-    pub fn from_gguf(
+    /// Load Whisper model from GGUF file with optional tokenizer and backend preference.
+    pub fn from_gguf_with_backend(
         gguf: &Arc<GgufFile>,
         tokenizer: Option<&crate::tokenizer::BpeTokenizer>,
+        backend: crate::engine::BackendPreference,
     ) -> Result<Self> {
         let weights = WhisperWeights::from_gguf(gguf)?;
         let special_tokens = if let Some(tok) = tokenizer {
@@ -2161,10 +2172,68 @@ impl WhisperModel {
         } else {
             WhisperSpecialTokens::default()
         };
+
+        #[cfg(feature = "hexagon")]
+        let hexagon = match backend {
+            crate::engine::BackendPreference::Cpu => None,
+            crate::engine::BackendPreference::Hexagon => {
+                if let Some(tok) = tokenizer {
+                    match crate::model::whisper_hexagon::init_hexagon_whisper(&weights, tok) {
+                        Ok(hex) => Some(hex),
+                        Err(e) => {
+                            bail!("Hexagon backend requested but initialization failed: {e}");
+                        }
+                    }
+                } else {
+                    bail!("Hexagon backend requires a tokenizer to stage special token tables");
+                }
+            }
+            crate::engine::BackendPreference::Auto => tokenizer
+                .and_then(|tok| crate::model::whisper_hexagon::try_hexagon_whisper(&weights, tok)),
+            other => bail!(
+                "Whisper does not support backend preference {other:?}; only CPU and Hexagon are supported"
+            ),
+        };
+
+        #[cfg(not(feature = "hexagon"))]
+        match backend {
+            crate::engine::BackendPreference::Cpu | crate::engine::BackendPreference::Auto => {}
+            crate::engine::BackendPreference::Hexagon => {
+                bail!("Hexagon backend requested but `hexagon` feature is not enabled");
+            }
+            other => {
+                bail!(
+                    "Whisper does not support backend preference {other:?}; only CPU is supported"
+                );
+            }
+        }
+
         Ok(Self {
             weights,
             special_tokens,
+            #[cfg(feature = "hexagon")]
+            hexagon,
         })
+    }
+
+    /// Load Whisper model from GGUF file with optional tokenizer for dynamic special token resolution.
+    pub fn from_gguf(
+        gguf: &Arc<GgufFile>,
+        tokenizer: Option<&crate::tokenizer::BpeTokenizer>,
+    ) -> Result<Self> {
+        Self::from_gguf_with_backend(gguf, tokenizer, crate::engine::BackendPreference::Auto)
+    }
+
+    /// Load Whisper model and tokenizer from a GGUF file path with backend preference.
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mmap"))]
+    pub fn from_file_with_backend<P: AsRef<std::path::Path>>(
+        path: P,
+        backend: crate::engine::BackendPreference,
+    ) -> Result<(Self, crate::tokenizer::BpeTokenizer)> {
+        let gguf = GgufFile::open_arc(path.as_ref())?;
+        let tokenizer = crate::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
+        let model = Self::from_gguf_with_backend(&gguf, Some(&tokenizer), backend)?;
+        Ok((model, tokenizer))
     }
 
     /// Load Whisper model and tokenizer from a GGUF file path using memory mapping.
@@ -2172,10 +2241,18 @@ impl WhisperModel {
     pub fn from_file<P: AsRef<std::path::Path>>(
         path: P,
     ) -> Result<(Self, crate::tokenizer::BpeTokenizer)> {
-        let gguf = GgufFile::open_arc(path.as_ref())?;
-        let tokenizer = crate::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
-        let model = Self::from_gguf(&gguf, Some(&tokenizer))?;
-        Ok((model, tokenizer))
+        Self::from_file_with_backend(path, crate::engine::BackendPreference::Auto)
+    }
+
+    /// Load Whisper model and tokenizer from a GGUF file path without memory mapping.
+    #[cfg(all(not(target_arch = "wasm32"), not(feature = "mmap")))]
+    pub fn from_file_with_backend<P: AsRef<std::path::Path>>(
+        path: P,
+        backend: crate::engine::BackendPreference,
+    ) -> Result<(Self, crate::tokenizer::BpeTokenizer)> {
+        let bytes = std::fs::read(path.as_ref())
+            .with_context(|| format!("read whisper model {:?}", path.as_ref()))?;
+        Self::from_bytes_with_backend(bytes, backend)
     }
 
     /// Load Whisper model and tokenizer from a GGUF file path without memory mapping.
@@ -2183,19 +2260,47 @@ impl WhisperModel {
     pub fn from_file<P: AsRef<std::path::Path>>(
         path: P,
     ) -> Result<(Self, crate::tokenizer::BpeTokenizer)> {
-        let bytes = std::fs::read(path.as_ref())
-            .with_context(|| format!("read whisper model {:?}", path.as_ref()))?;
-        Self::from_bytes(bytes)
+        Self::from_file_with_backend(path, crate::engine::BackendPreference::Auto)
+    }
+
+    /// Load Whisper model and tokenizer from in-memory GGUF bytes with backend preference.
+    pub fn from_bytes_with_backend(
+        bytes: impl Into<Arc<[u8]>>,
+        backend: crate::engine::BackendPreference,
+    ) -> Result<(Self, crate::tokenizer::BpeTokenizer)> {
+        let gguf = Arc::new(GgufFile::from_bytes(bytes.into())?);
+        let tokenizer = crate::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
+        let model = Self::from_gguf_with_backend(&gguf, Some(&tokenizer), backend)?;
+        Ok((model, tokenizer))
     }
 
     /// Load Whisper model and tokenizer from in-memory GGUF bytes.
     pub fn from_bytes(
         bytes: impl Into<Arc<[u8]>>,
     ) -> Result<(Self, crate::tokenizer::BpeTokenizer)> {
-        let gguf = Arc::new(GgufFile::from_bytes(bytes.into())?);
-        let tokenizer = crate::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
-        let model = Self::from_gguf(&gguf, Some(&tokenizer))?;
-        Ok((model, tokenizer))
+        Self::from_bytes_with_backend(bytes, crate::engine::BackendPreference::Auto)
+    }
+
+    /// Whether Hexagon NPU execution is enabled and active for this model.
+    pub fn is_hexagon(&self) -> bool {
+        #[cfg(feature = "hexagon")]
+        {
+            self.hexagon.is_some()
+        }
+        #[cfg(not(feature = "hexagon"))]
+        {
+            false
+        }
+    }
+
+    /// Set or replace the Hexagon Whisper pipeline instance.
+    #[cfg(feature = "hexagon")]
+    pub fn with_hexagon(
+        mut self,
+        hex: Option<Arc<crate::model::whisper_hexagon::HexagonWhisperModel>>,
+    ) -> Self {
+        self.hexagon = hex;
+        self
     }
 
     /// Transcribe 16 kHz mono PCM audio samples.
@@ -2205,6 +2310,25 @@ impl WhisperModel {
         pcm: &[f32],
         opts: &WhisperTranscribeOpts,
     ) -> Result<String> {
+        #[cfg(feature = "hexagon")]
+        if let Some(ref hex) = self.hexagon {
+            match hex.transcribe(tokenizer, pcm, opts) {
+                Ok(text) => return Ok(text),
+                Err(e) => {
+                    if opts
+                        .cancel
+                        .as_ref()
+                        .is_some_and(|c| c.load(std::sync::atomic::Ordering::Relaxed))
+                    {
+                        return Err(anyhow::anyhow!("transcription cancelled"));
+                    }
+                    tracing::warn!(
+                        "Hexagon Whisper transcription failed: {e}; falling back to CPU"
+                    );
+                }
+            }
+        }
+
         transcribe_pcm_with_tokens(
             &self.weights,
             tokenizer,
@@ -2608,6 +2732,25 @@ mod tests {
             assert!(v.is_finite(), "logit is not finite: {v}");
         }
         assert_eq!(kv_cache.seq_len, 1);
+    }
+
+    #[test]
+    fn test_suppress_whisper_special_tokens() {
+        let special = WhisperSpecialTokens::default();
+        let mut logits = vec![1.0f32; 51865];
+
+        suppress_whisper_special_tokens(&mut logits, &special, false);
+        assert_eq!(logits[special.sot as usize], -f32::INFINITY);
+        assert_eq!(logits[special.transcribe as usize], -f32::INFINITY);
+        assert_eq!(logits[special.no_timestamps as usize], -f32::INFINITY);
+        assert_eq!(logits[special.eot as usize], 1.0f32);
+        assert_eq!(logits[special.timestamp_begin as usize], -f32::INFINITY);
+
+        let mut logits_ts = vec![1.0f32; 51865];
+        suppress_whisper_special_tokens(&mut logits_ts, &special, true);
+        assert_eq!(logits_ts[special.timestamp_begin as usize], 1.0f32);
+        assert_eq!(logits_ts[special.sot as usize], -f32::INFINITY);
+        assert_eq!(logits_ts[special.eot as usize], 1.0f32);
     }
 
     #[test]

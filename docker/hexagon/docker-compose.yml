@@ -14,7 +14,7 @@ services:
       # Mount current repository into container workspace
       - ../..:/workspace
       # Mount llama.cpp for HTP DSP skeleton compilation
-      - /Users/dberrios/development/llama.cpp:/workspace/third_party/llama.cpp
+      - ${LLAMA_CPP_DIR:-../../third_party/llama.cpp}:/workspace/third_party/llama.cpp
       # Persist downloaded Qualcomm SDK and cache across container restarts
       - hexagon-qcom-cache:/opt/qcom
       - hexagon-home-cache:/root

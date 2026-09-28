@@ -644,10 +644,11 @@ pub struct Session {
     /// (and still backs the capability/dimension checks). Attached via
     /// [`Self::attach_gpu_audio_encoder`].
     gpu_audio_encoder: Option<Arc<dyn crate::model::audio_encoder_gpu::AudioGpuEncode>>,
-    /// Optional cached GPU audio decoder. When present, [`Self::generate`]
-    /// passes it to `AudioOutputDecoder` so detokenization and iSTFT run on
-    /// the GPU rather than CPU. Attached via [`Self::attach_gpu_audio_decoder`].
-    gpu_audio_decoder: Option<Arc<dyn crate::model::audio_decoder::AudioGpu>>,
+    /// Optional cached hardware audio accelerator (Qualcomm Hexagon NPU, Apple Metal, WebGPU).
+    /// When present, [`Self::generate`] passes it to `AudioOutputDecoder` so depthformer
+    /// sampling and detokenization run on hardware accelerators rather than CPU.
+    /// Attached via [`Self::attach_audio_accelerator`].
+    audio_accelerator: Option<Arc<dyn crate::model::audio_decoder::AudioAccelerator>>,
     /// Vision encoder weights, if attached. None for non-VL
     /// sessions; populated via [`Self::attach_vision_encoder`]
     /// before [`Self::append_image`] is called. Held by `Arc`
@@ -826,7 +827,7 @@ impl Session {
             audio_decoder: None,
             detok_weights: None,
             gpu_audio_encoder: None,
-            gpu_audio_decoder: None,
+            audio_accelerator: None,
             vision_encoder: None,
             gpu_vision_encoder: None,
             image_max_long_size: None,
@@ -868,20 +869,33 @@ impl Session {
         self.detok_weights = Some(detok);
     }
 
-    /// Attach a GPU audio decoder backend. When present, [`Self::generate`]
-    /// passes it to `AudioOutputDecoder` so detokenization and iSTFT run on
-    /// the GPU. The CPU vocoder weights must still be attached via
-    /// [`Self::attach_vocoder`]. Preserved across `reset()`.
-    pub fn attach_gpu_audio_decoder(
+    /// Attach a hardware audio accelerator backend (Qualcomm Hexagon NPU, Apple Metal, WebGPU).
+    /// When present, [`Self::generate`] passes it to `AudioOutputDecoder` so depthformer
+    /// sampling and detokenization run on hardware accelerators. The CPU vocoder weights
+    /// must still be attached via [`Self::attach_vocoder`]. Preserved across `reset()`.
+    pub fn attach_audio_accelerator(
         &mut self,
-        decoder: Arc<dyn crate::model::audio_decoder::AudioGpu>,
+        accelerator: Arc<dyn crate::model::audio_decoder::AudioAccelerator>,
     ) {
-        self.gpu_audio_decoder = Some(decoder);
+        self.audio_accelerator = Some(accelerator);
     }
 
-    /// Whether a GPU audio decoder backend is attached to this session.
+    /// Backward-compatibility alias for [`Self::attach_audio_accelerator`].
+    pub fn attach_gpu_audio_decoder(
+        &mut self,
+        decoder: Arc<dyn crate::model::audio_decoder::AudioAccelerator>,
+    ) {
+        self.attach_audio_accelerator(decoder);
+    }
+
+    /// Whether a hardware audio accelerator backend is attached to this session.
+    pub fn has_audio_accelerator(&self) -> bool {
+        self.audio_accelerator.is_some()
+    }
+
+    /// Backward-compatibility alias for [`Self::has_audio_accelerator`].
     pub fn has_gpu_audio_decoder(&self) -> bool {
-        self.gpu_audio_decoder.is_some()
+        self.has_audio_accelerator()
     }
 
     /// Attach an audio encoder so [`Self::append_audio`] can encode
@@ -2909,14 +2923,14 @@ impl Session {
         let mut began_step = false;
         let mut decoder =
             if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
-                let gpu_ref = self.gpu_audio_decoder.as_deref();
+                let acc_ref = self.audio_accelerator.as_deref();
                 Some(crate::audio_engine::AudioOutputDecoder::new(
                     dec,
                     detok,
-                    gpu_ref,
+                    acc_ref,
                     0.7,
                     40,
-                    self.config.gpu_depthformer,
+                    acc_ref.is_some_and(|a| a.supports_depthformer()),
                 ))
             } else {
                 None
@@ -3138,6 +3152,7 @@ impl Session {
                             pcm,
                             ..
                         } => {
+                            generated += 1;
                             dec.observe_pcm(&pcm);
                             if !pcm.is_empty() {
                                 sink.on_audio_frames(&pcm, dec.sample_rate());

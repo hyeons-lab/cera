@@ -23,8 +23,10 @@ type CloseSessionFn = unsafe extern "C" fn(*mut c_void);
 fn current_tid() -> Option<i32> {
     #[cfg(any(target_os = "linux", target_os = "android"))]
     {
-        // Raw syscall: no Bionic version dependency (unlike the gettid wrapper).
-        Some(unsafe { libc::syscall(libc::SYS_gettid) as i32 })
+        thread_local! {
+            static CACHED_TID: i32 = unsafe { libc::syscall(libc::SYS_gettid) as i32 };
+        }
+        Some(CACHED_TID.with(|&tid| tid))
     }
     #[cfg(not(any(target_os = "linux", target_os = "android")))]
     {

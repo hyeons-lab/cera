@@ -25,11 +25,11 @@ pub fn embedded_skel(arch: HexagonArch) -> &'static [u8] {
 
 /// All architectures we ship skels for, probe order (most common first).
 pub const PROBE_ARCHS: [HexagonArch; 5] = [
-    HexagonArch::V85,
     HexagonArch::V79,
     HexagonArch::V75,
     HexagonArch::V73,
     HexagonArch::V81,
+    HexagonArch::V85,
 ];
 
 /// Serializes `install_skels`: two concurrent installs must neither
@@ -60,13 +60,9 @@ pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
     let dir_str = dir
         .to_str()
         .ok_or_else(|| CeraError::Backend("skel dir is not UTF-8".into()))?;
-    if dir_str.contains(';') {
-        // Fail fast, before writing anything: a `;` in the dir would
-        // silently become two loader search entries (legal on
-        // Linux/Android filesystems), breaking skel resolution with no
-        // error naming the cause.
+    if dir_str.contains(';') || dir_str.contains('\0') || dir_str.contains('=') {
         return Err(CeraError::Backend(format!(
-            "skel dir {dir_str:?} contains ';', which splits into two loader entries"
+            "skel dir {dir_str:?} contains ';', NUL bytes, or '=', which is invalid for loader search entries"
         )));
     }
     std::fs::create_dir_all(dir)
@@ -286,16 +282,31 @@ mod tests {
         // Env restore is the `_restore` guard's `Drop` (panic-safe).
     }
 
-    /// A staging dir containing `;` fails closed instead of silently
-    /// splitting into two loader search entries.
+    /// A staging dir containing `;`, `=`, or `\0` fails closed instead of
+    /// corrupting the loader path list.
     #[test]
     fn install_rejects_semicolon_dir() {
-        // No restore guard here on purpose: the `;` rejection returns before
+        // No restore guard here on purpose: the rejection returns before
         // any env write, so there is nothing to restore, and a guard's
         // `Drop` would race the idempotent test's phased assertions above
         // (see its NOTE). A second env writer in this binary is forbidden.
-        let err = install_skels(std::path::Path::new("/tmp/skel-test-;")).unwrap_err();
-        assert!(err.to_string().contains("';'"), "unexpected error: {err}");
+        let err_semi = install_skels(std::path::Path::new("/tmp/skel-test-;")).unwrap_err();
+        assert!(
+            err_semi.to_string().contains("';'"),
+            "unexpected error: {err_semi}"
+        );
+
+        let err_eq = install_skels(std::path::Path::new("/tmp/skel-test-=")).unwrap_err();
+        assert!(
+            err_eq.to_string().contains("'='"),
+            "unexpected error: {err_eq}"
+        );
+
+        let err_nul = install_skels(std::path::Path::new("/tmp/skel-test-\0")).unwrap_err();
+        assert!(
+            err_nul.to_string().contains("NUL"),
+            "unexpected error: {err_nul}"
+        );
     }
 }
 

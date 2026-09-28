@@ -5,8 +5,8 @@
 //! loses the device on 2.6B Adreno shapes (empirical kind split, not a
 //! SPIR-V/WGSL one; see `is_adreno_split_label`). Nothing about the
 //! *output* changes when
-//! that grouping regresses — numerics stay identical while the device dies,
-//! on-device only — so the grouping gets a counter assertion: a 129-token
+//! that grouping regresses: numerics stay identical while the device dies,
+//! on-device only; so the grouping gets a counter assertion: a 129-token
 //! prefill must issue strictly more passes than a 128-token one on the same
 //! model. The split is host-side (`chunk_n > 128`), so the count gap holds
 //! on every backend, not just Adreno.
@@ -26,7 +26,7 @@ use cera::gguf::GgufFile;
 use cera::kv_cache::{InferenceState, KvCompression};
 use cera::model::load_model_gpu;
 
-/// The `core` fixture set's LFM2 model — fetched on pull requests, so this has
+/// The `core` fixture set's LFM2 model (fetched on pull requests, so this has
 /// real PR coverage rather than the skip-as-pass an `arch`-tier model gets.
 const FIXTURE: &str = "LFM2.5-230M-Q4_K_M.gguf";
 
@@ -73,13 +73,13 @@ fn prefill_splits_mul_mat_passes_past_128_tokens() {
 
     assert!(
         p128 > 0 && p129 > 0,
-        "counted zero compute passes — `GpuContext::begin_pass` is being \
+        "counted zero compute passes: `GpuContext::begin_pass` is being \
          bypassed, so this grouping check is not measuring anything"
     );
     // Fewer submits than tokens: pins the batched path. Under the per-token
     // fallback each token is its own forward (≥1 submit each), so `p129 >
     // p128` would hold for the wrong reason (token count, not the kind
-    // split) — this floor rules that out.
+    // split), so this floor rules that out.
     assert!(
         s128 < 128 && s129 < 129,
         "submits look per-token (s128={s128}, s129={s129}): the batched path is gone"

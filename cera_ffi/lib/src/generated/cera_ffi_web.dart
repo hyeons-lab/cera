@@ -3055,6 +3055,18 @@ final class KvCompressionTurboQuant extends KvCompression {
   int get hashCode => Object.hash(seed, keys, values);
 }
 
+/// Supported pixel layouts for uncompressed raw image buffers.
+enum PixelFormat {
+  /// 24-bit RGB (3 bytes per pixel: Red, Green, Blue).
+  rgb8,
+  /// 32-bit RGBA (4 bytes per pixel: Red, Green, Blue, Alpha).
+  rgba8,
+  /// 24-bit BGR (3 bytes per pixel: Blue, Green, Red).
+  bgr8,
+  /// 32-bit BGRA (4 bytes per pixel: Blue, Green, Red, Alpha).
+  bgra8,
+}
+
 /// The tool-call wire format a model family uses. Mirrors
 /// [`cera::tools::ToolFormat`]. Get one from
 /// [`CeraEngine::tool_format`] (auto-detected from the model) or set it
@@ -4776,6 +4788,25 @@ KvCompression _decodeKvCompression(String raw) {
   }
 }
 
+String _encodePixelFormat(PixelFormat value) {
+  return switch (value) {
+    PixelFormat.rgb8 => 'rgb8',
+    PixelFormat.rgba8 => 'rgba8',
+    PixelFormat.bgr8 => 'bgr8',
+    PixelFormat.bgra8 => 'bgra8',
+  };
+}
+
+PixelFormat _decodePixelFormat(String raw) {
+  return switch (raw) {
+    'rgb8' => PixelFormat.rgb8,
+    'rgba8' => PixelFormat.rgba8,
+    'bgr8' => PixelFormat.bgr8,
+    'bgra8' => PixelFormat.bgra8,
+    _ => throw StateError('Unknown PixelFormat variant: $raw'),
+  };
+}
+
 String _encodeToolFormat(ToolFormat value) {
   return switch (value) {
     ToolFormat.lfm2Pythonic => 'lfm2Pythonic',
@@ -5698,6 +5729,14 @@ final class KvCompressionFfiCodec {
   static String encode(KvCompression value) => _encodeKvCompression(value);
 
   static KvCompression decode(String raw) => _decodeKvCompression(raw);
+}
+
+final class PixelFormatFfiCodec {
+  const PixelFormatFfiCodec._();
+
+  static String encode(PixelFormat value) => _encodePixelFormat(value);
+
+  static PixelFormat decode(String raw) => _decodePixelFormat(raw);
 }
 
 final class ToolFormatFfiCodec {
@@ -6624,6 +6663,19 @@ final class Session {
   /// as `Backend`, not `Cancelled`).
   void appendImage(Uint8List bytes, int? maxLongSize) => _unsupportedOnWeb('Session.appendImage');
 
+  /// Append an uncompressed raw image buffer to the session context.
+  ///
+  /// `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+  /// `width` and `height` specify the source image dimensions in pixels.
+  /// Automatically applies aspect-preserving resizing and normalization,
+  /// then encodes with the vision encoder and appends image tokens.
+  ///
+  /// # Errors
+  ///
+  /// Returns an error if the image buffer length does not match the dimensions,
+  /// if preprocessing fails, or if vision encoding is unsupported.
+  void appendRawImage(Uint8List pixels, int width, int height, PixelFormat format, int? maxLongSize) => _unsupportedOnWeb('Session.appendRawImage');
+
   /// Append raw text to the context, running a prefill over just
   /// the new tokens. `EmptyInput` error if `text` is empty.
   void appendText(String text) => _unsupportedOnWeb('Session.appendText');
@@ -6834,6 +6886,9 @@ final class Session {
   /// stack of [`Self::hidden_states_for_tokens_with_adapters`].
   List<double> hiddenStatesMeanPooledWithAdapters(List<int> tokens, List<LoraAdapterEntry> adapters) => _unsupportedOnWeb('Session.hiddenStatesMeanPooledWithAdapters');
 
+  /// Read the session-default cap on the longest side of an appended image, if any.
+  int? imageMaxLongSize() => _unsupportedOnWeb('Session.imageMaxLongSize');
+
   /// Import and restore an inference session checkpoint from serialized binary bytes.
   void importCheckpoint(Uint8List data) => _unsupportedOnWeb('Session.importCheckpoint');
 
@@ -6899,13 +6954,7 @@ final class Session {
   GenerateSummary sendMessageStreaming(UserMessage message, GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('Session.sendMessageStreaming');
 
   /// Set a session-default cap on the longest side of an appended
-  /// image, in pixels (`None` = no cap). Unlike the per-call
-  /// `max_long_size` argument to [`Self::append_image`], this default
-  /// is honored by every image-append path the session drives —
-  /// including chat-template flows — so a host can configure the
-  /// image-encode budget once. See [`Self::append_image`] for the cap
-  /// semantics (shrinks the encoded target, never upscales, takes
-  /// precedence over the model's minimum-resolution floor).
+  /// image, in pixels (`None` = no cap).
   void setImageMaxLongSize(int? maxLongSize) => _unsupportedOnWeb('Session.setImageMaxLongSize');
 
   /// Replace the attached adapter set with a runtime-scaled stack: entry
@@ -7049,6 +7098,9 @@ final class ChatSession {
   /// Stream generation output tokens into the specified sink, constrained by a JSON Schema.
   GenerateSummary generateStreamingJson(GenerateOpts opts, String schemaJson, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreamingJson');
 
+  /// Read the longest-side pixel cap configured on the session, if any.
+  int? imageMaxLongSize() => _unsupportedOnWeb('ChatSession.imageMaxLongSize');
+
   /// Import and restore a chat session checkpoint from serialized binary bytes.
   void importCheckpoint(Uint8List data) => _unsupportedOnWeb('ChatSession.importCheckpoint');
 
@@ -7094,6 +7146,9 @@ final class ChatSession {
 
   /// Save current chat session checkpoint to a file.
   void saveCheckpoint(String path) => _unsupportedOnWeb('ChatSession.saveCheckpoint');
+
+  /// Set an optional resolution cap on the longest side of encoded images.
+  void setImageMaxLongSize(int? maxLongSize) => _unsupportedOnWeb('ChatSession.setImageMaxLongSize');
 
   /// Set tool wire format explicitly.
   void setToolFormat(ToolFormat format) => _unsupportedOnWeb('ChatSession.setToolFormat');

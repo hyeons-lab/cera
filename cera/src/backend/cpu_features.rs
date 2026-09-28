@@ -937,8 +937,25 @@ fn cgroup_cpuset_cpu_set(
 ) -> Option<Vec<usize>> {
     let cgroup = std::fs::read_to_string(cpuset_path).ok()?;
     let rel = cgroup.trim().strip_prefix('/').unwrap_or(cgroup.trim());
-    let mountinfo = std::fs::read_to_string(mountinfo_path).ok()?;
-    let (v1, v2) = find_cgroup_mounts(&mountinfo);
+    let (v1, v2) = if mountinfo_path == std::path::Path::new("/proc/self/mountinfo") {
+        static PROCFS_MOUNTS: std::sync::OnceLock<(
+            Option<std::path::PathBuf>,
+            Option<std::path::PathBuf>,
+        )> = std::sync::OnceLock::new();
+        if let Some(cached) = PROCFS_MOUNTS.get() {
+            cached.clone()
+        } else {
+            let mountinfo = std::fs::read_to_string(mountinfo_path).ok()?;
+            let mounts = find_cgroup_mounts(&mountinfo);
+            if mounts.0.is_some() || mounts.1.is_some() {
+                let _ = PROCFS_MOUNTS.set(mounts.clone());
+            }
+            mounts
+        }
+    } else {
+        let mountinfo = std::fs::read_to_string(mountinfo_path).ok()?;
+        find_cgroup_mounts(&mountinfo)
+    };
     // Both v1 filename spellings: plain `cpuset.*` normally, bare
     // `cpus`/`effective_cpus` under the `noprefix` mount option Android
     // uses. Only one spelling exists per mount, so their relative order

@@ -229,9 +229,19 @@ impl MmapWeight {
     /// `y = self · x` where `self` is `[rows × cols]` and `x` is
     /// `[cols]`. Routes through
     /// [`crate::backend::cpu::gemv_dispatch`], which has a per-
-    /// dtype branch (including `gemv_f32` for F32) — no duplicate
+    /// dtype branch (including `gemv_f32` for F32), with no duplicate
     /// scalar path on this side.
     pub fn gemv(&self, x: &[f32], y: &mut [f32]) {
+        self.gemv_scratch(x, y, None);
+    }
+
+    /// `y = self * x` with caller-provided Q8_0 scratch buffers to avoid allocation.
+    pub fn gemv_scratch(
+        &self,
+        x: &[f32],
+        y: &mut [f32],
+        q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
+    ) {
         assert_eq!(x.len(), self.cols);
         assert_eq!(y.len(), self.rows);
         crate::backend::cpu::gemv_dispatch(
@@ -241,7 +251,7 @@ impl MmapWeight {
             y,
             self.rows,
             self.cols,
-            None,
+            q8_scratch,
         );
     }
 
@@ -432,6 +442,18 @@ impl MmapWeight {
     /// `block_size = 1`; quantised callers must ensure `cols`
     /// is a multiple of the block size).
     pub fn gemv_rows(&self, x: &[f32], y: &mut [f32], row_start: usize, n_rows: usize) {
+        self.gemv_rows_scratch(x, y, row_start, n_rows, None);
+    }
+
+    /// `y = self[row_start..row_start+n_rows, :] * x` with caller-provided Q8_0 scratch buffers.
+    pub fn gemv_rows_scratch(
+        &self,
+        x: &[f32],
+        y: &mut [f32],
+        row_start: usize,
+        n_rows: usize,
+        q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
+    ) {
         assert_eq!(x.len(), self.cols);
         assert_eq!(y.len(), n_rows);
         assert!(row_start + n_rows <= self.rows);
@@ -439,7 +461,7 @@ impl MmapWeight {
         let offset = row_start * row_bytes;
         let bytes = self.data();
         let slice = &bytes[offset..offset + n_rows * row_bytes];
-        crate::backend::cpu::gemv_dispatch(self.dtype, slice, x, y, n_rows, self.cols, None);
+        crate::backend::cpu::gemv_dispatch(self.dtype, slice, x, y, n_rows, self.cols, q8_scratch);
     }
 }
 

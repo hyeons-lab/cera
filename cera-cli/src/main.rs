@@ -1194,6 +1194,10 @@ enum Command {
         /// Cache directory for downloaded models (defaults to ~/.cache/cera).
         #[arg(long)]
         cache_dir: Option<String>,
+
+        /// Compute device / backend: `auto`, `cpu`, `hexagon` / `npu`, `metal`, `gpu`.
+        #[arg(long, visible_alias = "backend", default_value = "auto")]
+        device: String,
     },
 
     /// Compare a Cera-converted GGUF (or on-the-fly SafeTensors conversion) against a reference community GGUF.
@@ -3181,7 +3185,7 @@ fn main() -> Result<()> {
                         "cpu"
                     },
                 );
-                let gpu_detok: Option<Box<dyn cera::model::audio_decoder::AudioGpu>> =
+                let gpu_detok: Option<Box<dyn cera::model::audio_decoder::AudioAccelerator>> =
                     match audio_gpu_choice {
                         "cpu" => None,
                         "metal" => {
@@ -3197,7 +3201,9 @@ fn main() -> Result<()> {
                                     Ok(d) => {
                                         eprintln!("Metal detokenizer loaded");
                                         Some(Box::new(d)
-                                            as Box<dyn cera::model::audio_decoder::AudioGpu>)
+                                            as Box<
+                                                dyn cera::model::audio_decoder::AudioAccelerator,
+                                            >)
                                     }
                                     Err(e) => {
                                         eprintln!("Metal detokenizer failed: {e}, using CPU");
@@ -3226,7 +3232,9 @@ fn main() -> Result<()> {
                                     Ok(d) => {
                                         eprintln!("WGPU detokenizer loaded");
                                         Some(Box::new(d)
-                                            as Box<dyn cera::model::audio_decoder::AudioGpu>)
+                                            as Box<
+                                                dyn cera::model::audio_decoder::AudioAccelerator,
+                                            >)
                                     }
                                     Err(e) => {
                                         eprintln!("WGPU detokenizer failed: {e}, using CPU");
@@ -3299,7 +3307,7 @@ fn main() -> Result<()> {
                     gpu_depthformer,
                 };
 
-                let gpu_ref: Option<&dyn cera::model::audio_decoder::AudioGpu> =
+                let gpu_ref: Option<&dyn cera::model::audio_decoder::AudioAccelerator> =
                     gpu_detok.as_deref();
 
                 let result = cera::audio_engine::generate_audio(
@@ -3948,6 +3956,7 @@ fn main() -> Result<()> {
             list_models,
             download_model,
             cache_dir,
+            device,
         } => {
             let cache_path = cache_dir
                 .map(PathBuf::from)
@@ -3975,6 +3984,9 @@ fn main() -> Result<()> {
                     "missing required argument `--audio <PATH_TO_WAV>` (or use `--download-model` to download weights without transcribing)"
                 );
             }
+
+            let backend_pref = BackendPreference::parse_str(&device)
+                .map_err(|e| anyhow::anyhow!("invalid --device `{device}`: {e}"))?;
 
             let progress = Arc::new(CliDownloadProgress::default());
             let repo = cera::bundle::BundleRepo::with_progress(
@@ -4039,7 +4051,11 @@ fn main() -> Result<()> {
                     let tokenizer = BpeTokenizer::from_gguf(&gguf).context(
                         "failed to parse tokenizer from Whisper GGUF; ensure tokenizer.ggml.tokens metadata is present",
                     )?;
-                    let whisper = cera::WhisperModel::from_gguf(&gguf, Some(&tokenizer))?;
+                    let whisper = cera::WhisperModel::from_gguf_with_backend(
+                        &gguf,
+                        Some(&tokenizer),
+                        backend_pref,
+                    )?;
 
                     let opts = cera::WhisperTranscribeOpts {
                         language,
@@ -4054,6 +4070,13 @@ fn main() -> Result<()> {
                     println!("{text}");
                 }
                 AsrResolvedModel::Liquid(engine) => {
+                    if backend_pref != BackendPreference::Cpu
+                        && backend_pref != BackendPreference::Auto
+                    {
+                        eprintln!(
+                            "cera: warning: --device `{device}` is not supported for Liquid ASR models; executing on CPU"
+                        );
+                    }
                     if translate {
                         eprintln!(
                             "cera: warning: --translate is not supported for Liquid ASR models; transcribing as-is"
@@ -6747,6 +6770,7 @@ mod tests {
                 list_models,
                 download_model,
                 cache_dir,
+                device,
             } => {
                 assert_eq!(model.as_deref(), Some("models/whisper_base.gguf"));
                 assert_eq!(audio.as_deref(), Some("test.wav"));
@@ -6758,6 +6782,7 @@ mod tests {
                 assert!(!list_models);
                 assert!(!download_model);
                 assert!(cache_dir.is_none());
+                assert_eq!(device, "auto");
             }
             _ => panic!("expected Transcribe command"),
         }

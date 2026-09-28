@@ -2890,7 +2890,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 2279) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 39958) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
@@ -10983,6 +10983,11 @@ public interface SessionInterface {
      * `width` and `height` specify the source image dimensions in pixels.
      * Automatically applies aspect-preserving resizing and normalization,
      * then encodes with the vision encoder and appends image tokens.
+     *
+     * # Errors
+     *
+     * Returns an error if the image buffer length does not match the dimensions,
+     * if preprocessing fails, or if vision encoding is unsupported.
      */
     fun `appendRawImage`(
         `pixels`: kotlin.ByteArray,
@@ -11635,6 +11640,11 @@ open class Session :
      * `width` and `height` specify the source image dimensions in pixels.
      * Automatically applies aspect-preserving resizing and normalization,
      * then encodes with the vision encoder and appends image tokens.
+     *
+     * # Errors
+     *
+     * Returns an error if the image buffer length does not match the dimensions,
+     * if preprocessing fails, or if vision encoding is unsupported.
      */
     @Throws(FfiException::class)
     override fun `appendRawImage`(

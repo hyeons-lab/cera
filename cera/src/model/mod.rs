@@ -65,6 +65,65 @@ pub mod audio_decoder_hexagon;
 pub mod hexagon_lfm2;
 #[cfg(feature = "hexagon")]
 pub mod vision_encoder_hexagon;
+#[cfg(feature = "hexagon")]
+pub mod whisper_hexagon;
+
+#[allow(
+    clippy::too_many_arguments,
+    clippy::needless_range_loop,
+    clippy::manual_saturating_arithmetic,
+    unused_variables
+)]
+pub mod audio_decoder;
+pub mod audio_encoder;
+pub mod audio_encoder_gpu;
+pub mod audio_preprocessor;
+pub mod vision_encoder;
+pub mod vision_encoder_gpu;
+#[cfg(feature = "vl-preprocess")]
+pub mod vision_preprocessor;
+#[cfg(feature = "vl-preprocess")]
+pub use vision_preprocessor::{
+    PreprocessedImage, calc_size_preserved_ratio, normalize_rgb8_to_nchw_f32, preprocess_image,
+    preprocess_image_with_opts, preprocess_raw_pixels, resize_bilinear_rgb,
+};
+
+/// Supported pixel layouts for uncompressed raw image buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PixelFormat {
+    /// 24-bit RGB (3 bytes per pixel: Red, Green, Blue).
+    Rgb8,
+    /// 32-bit RGBA (4 bytes per pixel: Red, Green, Blue, Alpha).
+    Rgba8,
+    /// 24-bit BGR (3 bytes per pixel: Blue, Green, Red).
+    Bgr8,
+    /// 32-bit BGRA (4 bytes per pixel: Blue, Green, Red, Alpha).
+    Bgra8,
+}
+
+impl PixelFormat {
+    /// Bytes per pixel for this format.
+    #[inline]
+    pub const fn bytes_per_pixel(self) -> usize {
+        match self {
+            Self::Rgb8 | Self::Bgr8 => 3,
+            Self::Rgba8 | Self::Bgra8 => 4,
+        }
+    }
+
+    /// Zero-based byte offsets for (Red, Green, Blue) channels.
+    #[inline]
+    pub const fn channel_offsets(self) -> (usize, usize, usize) {
+        match self {
+            Self::Rgb8 => (0, 1, 2),
+            Self::Rgba8 => (0, 1, 2),
+            Self::Bgr8 => (2, 1, 0),
+            Self::Bgra8 => (2, 1, 0),
+        }
+    }
+}
+
+pub mod weights;
 
 use std::sync::atomic::{AtomicBool, Ordering};
 
@@ -357,97 +416,6 @@ pub(crate) fn take_fault(
     slot.lock()
         .unwrap_or_else(|poison| poison.into_inner())
         .take()
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{record_first_fault, run_chunked_prefill, take_fault};
-    use crate::CeraError;
-    use std::sync::Mutex;
-    use std::sync::atomic::AtomicBool;
-
-    #[test]
-    fn sticky_slot_keeps_first_fault() {
-        let slot = Mutex::new(None);
-        record_first_fault(&slot, CeraError::Backend("root cause".into()));
-        record_first_fault(&slot, CeraError::Backend("downstream symptom".into()));
-        let taken = take_fault(&slot);
-        assert!(matches!(taken, Some(CeraError::Backend(s)) if s == "root cause"));
-        // Drained: a later fault records fresh.
-        record_first_fault(&slot, CeraError::Backend("next".into()));
-        let taken = take_fault(&slot);
-        assert!(matches!(taken, Some(CeraError::Backend(s)) if s == "next"));
-    }
-
-    #[test]
-    fn chunked_prefill_stops_consumed_at_failed_ubatch() {
-        // Three session-ubatch chunks; the scripted forward fails the middle
-        // one after consuming 5 of its 10 tokens (a partial scratch-chunk
-        // run). `consumed` must cover exactly the KV that exists: the full
-        // first chunk plus the 5-token partial prefix, never the failed
-        // suffix the session would otherwise advance over.
-        let tokens: Vec<u32> = (1..=30).collect();
-        let cancel = AtomicBool::new(false);
-        let mut ran: Vec<(usize, usize)> = Vec::new();
-        let (consumed, logits) = run_chunked_prefill(&tokens, 40, 10, &cancel, |chunk, pos| {
-            ran.push((chunk.len(), pos));
-            match ran.len() {
-                1 => (chunk.len(), Some(vec![1.0f32; 4])),
-                2 => (5, Some(vec![2.0f32; 4])),
-                _ => panic!("third chunk ran after the short second chunk"),
-            }
-        });
-        assert_eq!(consumed, 15);
-        assert_eq!(logits, Some(vec![2.0f32; 4]));
-        assert_eq!(ran, vec![(10, 40), (10, 50)]);
-    }
-
-    #[test]
-    fn chunked_prefill_cancel_and_ubatch_zero_match_default() {
-        // Cancel fires between chunks (after at least one ran); `ubatch == 0`
-        // runs the whole input as one chunk. Both mirror the default
-        // `forward_prefill_chunked` exactly.
-        let tokens: Vec<u32> = (1..=30).collect();
-        let cancel = AtomicBool::new(true);
-        let mut ran = 0usize;
-        let (consumed, logits) = run_chunked_prefill(&tokens, 0, 10, &cancel, |chunk, _| {
-            ran += 1;
-            (chunk.len(), Some(vec![ran as f32; 2]))
-        });
-        assert_eq!((consumed, ran), (10, 1));
-        assert_eq!(logits, Some(vec![1.0f32; 2]));
-
-        let cancel = AtomicBool::new(false);
-        let mut ran = 0usize;
-        let (consumed, logits) = run_chunked_prefill(&tokens, 7, 0, &cancel, |chunk, pos| {
-            ran += 1;
-            assert_eq!((chunk.len(), pos), (30, 7));
-            (chunk.len(), Some(vec![9.0f32; 2]))
-        });
-        assert_eq!((consumed, ran), (30, 1));
-        assert_eq!(logits, Some(vec![9.0f32; 2]));
-
-        // Empty input: `(0, None)`, runner never invoked.
-        let (consumed, logits) = run_chunked_prefill(&[], 0, 10, &cancel, |_, _| {
-            panic!("forward invoked for empty tokens")
-        });
-        assert_eq!((consumed, logits), (0, None));
-    }
-
-    #[test]
-    fn chunked_prefill_first_chunk_fault_yields_zero_none() {
-        // Backend fault before anything completes: `(0, None)` without
-        // invoking later chunks, and `logits.or(last_logits)` stays `None`
-        // (no stale logits for the session to stash).
-        let tokens: Vec<u32> = (1..=30).collect();
-        let cancel = AtomicBool::new(false);
-        let mut ran = 0usize;
-        let (consumed, logits) = run_chunked_prefill(&tokens, 0, 10, &cancel, |_, _| {
-            ran += 1;
-            (0, None)
-        });
-        assert_eq!((consumed, logits, ran), (0, None, 1));
-    }
 }
 
 /// Trait for loaded models that can run forward passes.
@@ -1196,62 +1164,6 @@ pub fn load_model_hexagon(
         ),
     }
 }
-#[allow(
-    clippy::too_many_arguments,
-    clippy::needless_range_loop,
-    clippy::manual_saturating_arithmetic,
-    unused_variables
-)]
-pub mod audio_decoder;
-pub mod audio_encoder;
-pub mod audio_encoder_gpu;
-pub mod audio_preprocessor;
-pub mod vision_encoder;
-pub mod vision_encoder_gpu;
-#[cfg(feature = "vl-preprocess")]
-pub mod vision_preprocessor;
-#[cfg(feature = "vl-preprocess")]
-pub use vision_preprocessor::{
-    PreprocessedImage, calc_size_preserved_ratio, normalize_rgb8_to_nchw_f32, preprocess_image,
-    preprocess_image_with_opts, preprocess_raw_pixels, resize_bilinear_rgb,
-};
-
-/// Supported pixel layouts for uncompressed raw image buffers.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PixelFormat {
-    /// 24-bit RGB (3 bytes per pixel: Red, Green, Blue).
-    Rgb8,
-    /// 32-bit RGBA (4 bytes per pixel: Red, Green, Blue, Alpha).
-    Rgba8,
-    /// 24-bit BGR (3 bytes per pixel: Blue, Green, Red).
-    Bgr8,
-    /// 32-bit BGRA (4 bytes per pixel: Blue, Green, Red, Alpha).
-    Bgra8,
-}
-
-impl PixelFormat {
-    /// Bytes per pixel for this format.
-    #[inline]
-    pub const fn bytes_per_pixel(self) -> usize {
-        match self {
-            Self::Rgb8 | Self::Bgr8 => 3,
-            Self::Rgba8 | Self::Bgra8 => 4,
-        }
-    }
-
-    /// Zero-based byte offsets for (Red, Green, Blue) channels.
-    #[inline]
-    pub const fn channel_offsets(self) -> (usize, usize, usize) {
-        match self {
-            Self::Rgb8 => (0, 1, 2),
-            Self::Rgba8 => (0, 1, 2),
-            Self::Bgr8 => (2, 1, 0),
-            Self::Bgra8 => (2, 1, 0),
-        }
-    }
-}
-
-pub mod weights;
 
 // Compile-time proof that `Arc<dyn Model>` is `Send + Sync`. If a new
 // backend impl introduces a non-`Sync` field (e.g. a `RefCell` / `Cell`),
@@ -1278,4 +1190,95 @@ pub(crate) fn reset_cpu_kv(
     fresh.lora = state.lora.clone();
     *state = fresh;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{record_first_fault, run_chunked_prefill, take_fault};
+    use crate::CeraError;
+    use std::sync::Mutex;
+    use std::sync::atomic::AtomicBool;
+
+    #[test]
+    fn sticky_slot_keeps_first_fault() {
+        let slot = Mutex::new(None);
+        record_first_fault(&slot, CeraError::Backend("root cause".into()));
+        record_first_fault(&slot, CeraError::Backend("downstream symptom".into()));
+        let taken = take_fault(&slot);
+        assert!(matches!(taken, Some(CeraError::Backend(s)) if s == "root cause"));
+        // Drained: a later fault records fresh.
+        record_first_fault(&slot, CeraError::Backend("next".into()));
+        let taken = take_fault(&slot);
+        assert!(matches!(taken, Some(CeraError::Backend(s)) if s == "next"));
+    }
+
+    #[test]
+    fn chunked_prefill_stops_consumed_at_failed_ubatch() {
+        // Three session-ubatch chunks; the scripted forward fails the middle
+        // one after consuming 5 of its 10 tokens (a partial scratch-chunk
+        // run). `consumed` must cover exactly the KV that exists: the full
+        // first chunk plus the 5-token partial prefix, never the failed
+        // suffix the session would otherwise advance over.
+        let tokens: Vec<u32> = (1..=30).collect();
+        let cancel = AtomicBool::new(false);
+        let mut ran: Vec<(usize, usize)> = Vec::new();
+        let (consumed, logits) = run_chunked_prefill(&tokens, 40, 10, &cancel, |chunk, pos| {
+            ran.push((chunk.len(), pos));
+            match ran.len() {
+                1 => (chunk.len(), Some(vec![1.0f32; 4])),
+                2 => (5, Some(vec![2.0f32; 4])),
+                _ => panic!("third chunk ran after the short second chunk"),
+            }
+        });
+        assert_eq!(consumed, 15);
+        assert_eq!(logits, Some(vec![2.0f32; 4]));
+        assert_eq!(ran, vec![(10, 40), (10, 50)]);
+    }
+
+    #[test]
+    fn chunked_prefill_cancel_and_ubatch_zero_match_default() {
+        // Cancel fires between chunks (after at least one ran); `ubatch == 0`
+        // runs the whole input as one chunk. Both mirror the default
+        // `forward_prefill_chunked` exactly.
+        let tokens: Vec<u32> = (1..=30).collect();
+        let cancel = AtomicBool::new(true);
+        let mut ran = 0usize;
+        let (consumed, logits) = run_chunked_prefill(&tokens, 0, 10, &cancel, |chunk, _| {
+            ran += 1;
+            (chunk.len(), Some(vec![ran as f32; 2]))
+        });
+        assert_eq!((consumed, ran), (10, 1));
+        assert_eq!(logits, Some(vec![1.0f32; 2]));
+
+        let cancel = AtomicBool::new(false);
+        let mut ran = 0usize;
+        let (consumed, logits) = run_chunked_prefill(&tokens, 7, 0, &cancel, |chunk, pos| {
+            ran += 1;
+            assert_eq!((chunk.len(), pos), (30, 7));
+            (chunk.len(), Some(vec![9.0f32; 2]))
+        });
+        assert_eq!((consumed, ran), (30, 1));
+        assert_eq!(logits, Some(vec![9.0f32; 2]));
+
+        // Empty input: `(0, None)`, runner never invoked.
+        let (consumed, logits) = run_chunked_prefill(&[], 0, 10, &cancel, |_, _| {
+            panic!("forward invoked for empty tokens")
+        });
+        assert_eq!((consumed, logits), (0, None));
+    }
+
+    #[test]
+    fn chunked_prefill_first_chunk_fault_yields_zero_none() {
+        // Backend fault before anything completes: `(0, None)` without
+        // invoking later chunks, and `logits.or(last_logits)` stays `None`
+        // (no stale logits for the session to stash).
+        let tokens: Vec<u32> = (1..=30).collect();
+        let cancel = AtomicBool::new(false);
+        let mut ran = 0usize;
+        let (consumed, logits) = run_chunked_prefill(&tokens, 0, 10, &cancel, |_, _| {
+            ran += 1;
+            (0, None)
+        });
+        assert_eq!((consumed, logits, ran), (0, None, 1));
+    }
 }

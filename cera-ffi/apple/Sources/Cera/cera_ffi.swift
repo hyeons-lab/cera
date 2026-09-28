@@ -5345,6 +5345,11 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * `width` and `height` specify the source image dimensions in pixels.
      * Automatically applies aspect-preserving resizing and normalization,
      * then encodes with the vision encoder and appends image tokens.
+     *
+     * # Errors
+     *
+     * Returns an error if the image buffer length does not match the dimensions,
+     * if preprocessing fails, or if vision encoding is unsupported.
      */
     func appendRawImage(pixels: Data, width: UInt32, height: UInt32, format: PixelFormat, maxLongSize: UInt32?) throws 
     
@@ -5909,6 +5914,11 @@ open func appendImage(bytes: Data, maxLongSize: UInt32?)throws   {try rustCallWi
      * `width` and `height` specify the source image dimensions in pixels.
      * Automatically applies aspect-preserving resizing and normalization,
      * then encodes with the vision encoder and appends image tokens.
+     *
+     * # Errors
+     *
+     * Returns an error if the image buffer length does not match the dimensions,
+     * if preprocessing fails, or if vision encoding is unsupported.
      */
 open func appendRawImage(pixels: Data, width: UInt32, height: UInt32, format: PixelFormat, maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_append_raw_image(
@@ -13033,7 +13043,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_append_image() != 60729) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_append_raw_image() != 2279) {
+    if (uniffi_cera_ffi_checksum_method_session_append_raw_image() != 39958) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {

@@ -1,6 +1,6 @@
 use super::*;
 use crate::model::audio_decoder::{
-    AudioDecoderWeights, AudioGpu, CodebookWeights, DecoderConfig, DepthformerConfig,
+    AudioAccelerator, AudioDecoderWeights, CodebookWeights, DecoderConfig, DepthformerConfig,
     DetokenizerConfig, DetokenizerWeights,
 };
 use crate::model::weights::MmapWeight;
@@ -11,7 +11,7 @@ struct EndAudio {
     releases: AtomicUsize,
 }
 
-impl AudioGpu for EndAudio {
+impl AudioAccelerator for EndAudio {
     fn sample_audio_frame(&self, _: &[f32], _: f32, _: usize) -> [i32; 8] {
         self.frames.fetch_add(1, Ordering::Relaxed);
         [crate::audio_engine::AUDIO_END_CODE; 8]

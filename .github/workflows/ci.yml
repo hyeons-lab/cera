@@ -61,6 +61,9 @@ jobs:
         # The FFI hexagon_probe/install_skels bodies are cfg'd on cera-ffi's
         # own `hexagon` feature; neither leg above compiles them.
         run: cargo clippy -p cera-ffi --features hexagon --all-targets -- -D warnings
+      - name: Clippy (cera-cli hexagon feature)
+        # Verify CLI feature-gated Hexagon code and lints compile cleanly.
+        run: cargo clippy -p cera-cli --features hexagon --all-targets -- -D warnings
       # Host-side compilation checks without default features. Because workspace
       # checks unify features across all crates, `cargo check --workspace` never
       # verifies `cera` with `default-features = false`. Checking `cera-wasm` on
@@ -74,6 +77,8 @@ jobs:
       # Pure unit tests, no GPU needed.
       - name: Test cera-cli (gpu feature)
         run: cargo test -p cera-cli --features gpu
+      - name: Test cera-cli (hexagon feature)
+        run: cargo test -p cera-cli --features hexagon
       - name: Python unit tests
         run: |
           python3 tests/test_format_review_comment.py
@@ -204,7 +209,7 @@ jobs:
       # No "print the resolved tier" step here, unlike the other SIMD legs.
       # `cera-cli` has no passthrough for cera's `avx512` feature, so
       # `cera-cli -- cpu` would build cera with defaults and print the
-      # avx512-enabled tier — a diagnostic for a configuration this job is
+      # avx512-enabled tier: a diagnostic for a configuration this job is
       # specifically not testing. `CERA_REQUIRE_SIMD=avx2` below is the real
       # assertion that the intended tier was reached.
       - name: Test without avx512
@@ -325,7 +330,7 @@ jobs:
             done
             # A committed twin outside the declared targets is never compared
             # above, yet build.rs copies committed output when slangc is
-            # missing — so an undeclared twin would ship unchecked. Fail on it.
+            # missing, so an undeclared twin would ship unchecked. Fail on it.
             for twin in wgsl metal; do
               declared=0
               for target in $targets; do
@@ -493,7 +498,7 @@ jobs:
           COUNT=$(cargo test -p cera --features "gpu metal" --test gemv_q4_0_bench -- --list \
                   | grep -c ': test$' || true)
           if [ "$COUNT" -eq 0 ]; then
-            echo "::error::gemv_q4_0_bench holds zero tests under gpu+metal — did its cfg gate change? Update this step." >&2
+            echo "::error::gemv_q4_0_bench holds zero tests under gpu+metal: did its cfg gate change? Update this step." >&2
             exit 1
           fi
 
@@ -1138,7 +1143,7 @@ jobs:
       - name: Install compileSdk platform + build-tools
         # Pinned to what `cera-ffi-kotlin/gradle/libs.versions.toml` declares
         # (compileSdk 36; build-tools track the SDK major). The unit-test
-        # tasks never invoke aapt2/aidl — only android.jar is read — but AGP
+        # tasks never invoke aapt2/aidl (only android.jar is read), but AGP
         # still requires build-tools present at configuration.
         run: |
           sdkmanager "platforms;android-36" "build-tools;36.0.0" > /dev/null
@@ -1560,7 +1565,7 @@ jobs:
           toolchain: nightly-2026-07-10
           targets: ${{ matrix.rust_target }}
       - uses: Swatinem/rust-cache@v2
-      # Install NDK. Pin to r28c — a validated stable release the
+      # Install NDK. Pin to r28c: a validated stable release the
       # workspace builds against cleanly. r28 is the floor: it is the
       # first NDK whose default ELF alignment is 16KB (Android 15+
       # page-size requirement); r27c and older default to 4KB. Bumping
@@ -1632,7 +1637,7 @@ jobs:
         # requires 16KB-clean binaries. NDK r28+ aligns by default but this
         # job pins r28c, whose default is already 16KB, and
         # `.cargo/config.toml` additionally carries explicit
-        # `-z max-page-size=16384` flags for every Android target — and this
+        # `-z max-page-size=16384` flags for every Android target; and this
         # step enforces the result, because a flag that silently stopped
         # reaching the link would ship a library that crashes on first load
         # for 16KB-page users. Pure-python check (no readelf), shared with

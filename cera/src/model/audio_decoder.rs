@@ -13,9 +13,10 @@ use crate::backend::cpu;
 use crate::gguf::GgufFile;
 use crate::model::weights::MmapWeight;
 
-/// GPU-accelerated audio backend. Implementations provide Metal or WGPU
-/// dispatch for the depthformer (code sampling) and detokenizer (spectrum).
-pub trait AudioGpu: Send + Sync {
+/// Hardware-accelerated audio backend (Qualcomm Hexagon NPU, Apple Metal, WebGPU).
+/// Implementations provide offloaded execution for the depthformer (code sampling)
+/// and detokenizer (spectrum).
+pub trait AudioAccelerator: Send + Sync {
     /// Sample 8 audio codes from an LLM embedding using the depthformer.
     fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8];
 
@@ -126,14 +127,18 @@ pub trait AudioGpu: Send + Sync {
     fn release_session(&self) {}
 }
 
-/// Try to construct a GPU audio decoder backend for the given vocoder GGUF file.
+/// Backward-compatibility sub-trait for [`AudioAccelerator`].
+pub trait AudioGpu: AudioAccelerator {}
+impl<T: ?Sized + AudioAccelerator> AudioGpu for T {}
+
+/// Try to construct an accelerated audio decoder backend for the given vocoder GGUF file.
 ///
 /// Returns `None` for `Cpu`, when the chosen backend's feature is not compiled,
 /// or when the device/context cannot be created.
-pub fn build_gpu_audio_decoder(
+pub fn build_audio_accelerator(
     gguf: &Arc<GgufFile>,
     backend: crate::engine::BackendPreference,
-) -> Option<Arc<dyn AudioGpu>> {
+) -> Option<Arc<dyn AudioAccelerator>> {
     use crate::engine::BackendPreference as BP;
     match backend {
         BP::Cpu => None,
@@ -146,18 +151,27 @@ pub fn build_gpu_audio_decoder(
     }
 }
 
+/// Backward-compatibility alias for [`build_audio_accelerator`].
+pub fn build_gpu_audio_decoder(
+    gguf: &Arc<GgufFile>,
+    backend: crate::engine::BackendPreference,
+) -> Option<Arc<dyn AudioAccelerator>> {
+    build_audio_accelerator(gguf, backend)
+}
+
 #[cfg(feature = "hexagon")]
-fn try_hexagon_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+fn try_hexagon_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAccelerator>> {
     crate::model::audio_decoder_hexagon::try_hexagon_audio_decoder(gguf)
+        .map(|d| d as Arc<dyn AudioAccelerator>)
 }
 
 #[cfg(not(feature = "hexagon"))]
-fn try_hexagon_audio_decoder(_gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+fn try_hexagon_audio_decoder(_gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAccelerator>> {
     None
 }
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-fn try_metal_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+fn try_metal_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAccelerator>> {
     let dummy_path = std::path::Path::new("");
     match crate::model::metal_audio_decoder::MetalAudioDecoder::from_gguf(gguf, dummy_path) {
         Ok(d) => {
@@ -172,12 +186,12 @@ fn try_metal_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
 }
 
 #[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
-fn try_metal_audio_decoder(_gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+fn try_metal_audio_decoder(_gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAccelerator>> {
     None
 }
 
 #[cfg(feature = "gpu")]
-fn try_wgpu_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+fn try_wgpu_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAccelerator>> {
     let dummy_path = std::path::Path::new("");
     match crate::model::wgpu_audio_decoder::WgpuAudioDecoder::from_gguf(gguf, dummy_path) {
         Ok(d) => {
@@ -192,7 +206,7 @@ fn try_wgpu_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
 }
 
 #[cfg(not(feature = "gpu"))]
-fn try_wgpu_audio_decoder(_gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioGpu>> {
+fn try_wgpu_audio_decoder(_gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAccelerator>> {
     None
 }
 
@@ -422,7 +436,8 @@ impl DepthformerState {
         let n_embd = cfg.n_embd;
         let hd = cfg.n_embd_head;
         let qkv_dim = cfg.n_head * hd + 2 * (cfg.n_head_kv * hd);
-        let nb = n_embd / 32;
+        let max_dim = n_embd.max(cfg.ffn_dim).max(2048);
+        let nb = max_dim.div_ceil(32);
         Self {
             kv,
             n_past: 0,
@@ -435,7 +450,7 @@ impl DepthformerState {
             up: vec![0.0; cfg.ffn_dim],
             scores: vec![0.0; cfg.max_seq_len],
             q8_scales: vec![0.0; nb],
-            q8_quants: vec![0; n_embd],
+            q8_quants: vec![0; max_dim],
             depthformer_in: vec![0.0; n_embd],
             emb_row: vec![0.0; n_embd],
             normed: vec![0.0; n_embd],
@@ -610,7 +625,11 @@ fn depthformer_forward_step(weights: &AudioDecoderWeights, state: &mut Depthform
 
         // 7. Out projection + residual (in-place).
         state.proj.iter_mut().for_each(|v| *v = 0.0);
-        lw.wo.gemv(&state.attn_out, &mut state.proj);
+        lw.wo.gemv_scratch(
+            &state.attn_out,
+            &mut state.proj,
+            Some((&mut state.q8_scales, &mut state.q8_quants)),
+        );
         for (c, (r, p)) in state
             .cur
             .iter_mut()
@@ -619,45 +638,30 @@ fn depthformer_forward_step(weights: &AudioDecoderWeights, state: &mut Depthform
             *c = r + p;
         }
 
-        // 8. FFN: RMSnorm → SwiGLU(w1, w3) → w2 → residual.
+        // 8. FFN: RMSnorm -> SwiGLU(w1, w3) -> w2 -> residual.
         state.residual.copy_from_slice(&state.cur);
         cpu::rmsnorm(&mut state.cur, &lw.ffn_norm, cfg.rms_norm_eps);
 
-        let ffn_q8 = if lw.w1.dtype != crate::tensor::DType::F32 {
-            crate::backend::cpu::quantize_f32_to_q8_0_into(
-                &state.cur,
-                &mut state.q8_scales,
-                &mut state.q8_quants,
-            );
-            Some((&mut state.q8_scales, &mut state.q8_quants))
-        } else {
-            None
-        };
-
         state.gate.iter_mut().for_each(|v| *v = 0.0);
         state.up.iter_mut().for_each(|v| *v = 0.0);
-        crate::backend::cpu::gemv_dispatch(
-            lw.w1.dtype,
-            lw.w1.data(),
+        lw.w1.gemv_scratch(
             &state.cur,
             &mut state.gate,
-            lw.w1.rows,
-            lw.w1.cols,
-            ffn_q8,
+            Some((&mut state.q8_scales, &mut state.q8_quants)),
         );
-        crate::backend::cpu::gemv_dispatch(
-            lw.w3.dtype,
-            lw.w3.data(),
+        lw.w3.gemv_scratch(
             &state.cur,
             &mut state.up,
-            lw.w3.rows,
-            lw.w3.cols,
-            None,
+            Some((&mut state.q8_scales, &mut state.q8_quants)),
         );
         cpu::silu_mul_inplace(&mut state.gate, &state.up);
 
         state.proj.iter_mut().for_each(|v| *v = 0.0);
-        lw.w2.gemv(&state.gate, &mut state.proj);
+        lw.w2.gemv_scratch(
+            &state.gate,
+            &mut state.proj,
+            Some((&mut state.q8_scales, &mut state.q8_quants)),
+        );
         for (c, (r, d)) in state
             .cur
             .iter_mut()
@@ -703,9 +707,13 @@ pub fn sample_audio_frame(
         // 1. Project LLM embedding → depthformer input for codebook j.
         state.depthformer_in.fill(0.0);
         let row_start = j * n_embd_d;
-        weights
-            .depth_linear_w
-            .gemv_rows(embedding, &mut state.depthformer_in, row_start, n_embd_d);
+        weights.depth_linear_w.gemv_rows_scratch(
+            embedding,
+            &mut state.depthformer_in,
+            row_start,
+            n_embd_d,
+            Some((&mut state.q8_scales, &mut state.q8_quants)),
+        );
         // Add bias.
         for (r, out) in state.depthformer_in.iter_mut().enumerate() {
             *out += weights.depth_linear_b[row_start + r];
@@ -726,13 +734,17 @@ pub fn sample_audio_frame(
         // 3. Run depthformer in-place.
         depthformer_forward_inplace(weights, state);
 
-        // 4. RMSnorm → to_logits → sample.
+        // 4. RMSnorm -> to_logits -> sample.
         state.normed.copy_from_slice(&state.cur);
         cpu::rmsnorm(&mut state.normed, &cb.norm, cfg.rms_norm_eps);
 
         state.logits.resize(cfg.n_vocab, 0.0);
         state.logits.fill(0.0);
-        cb.to_logits.gemv(&state.normed, &mut state.logits);
+        cb.to_logits.gemv_scratch(
+            &state.normed,
+            &mut state.logits,
+            Some((&mut state.q8_scales, &mut state.q8_quants)),
+        );
 
         // Sample (greedy if temperature <= 0 or top_k <= 1, otherwise top-k).
         let sampled = if state.logits.is_empty() {
@@ -1117,7 +1129,7 @@ pub struct DetokenizerState {
     conv_bufs: Vec<Vec<f32>>,
     /// Per-layer KV cache for attention layers.
     attn_kv: Vec<Option<(Vec<f32>, Vec<f32>)>>,
-    n_past: usize,
+    pub(crate) n_past: usize,
 }
 
 impl DetokenizerState {
@@ -1182,10 +1194,24 @@ pub fn detok_embed_codes(weights: &DetokenizerWeights, codes: &[i32]) -> Vec<f32
     result
 }
 
-/// Linear interpolation upsample: 1 token → n_up tokens.
+/// Linear interpolation upsample: 1 token to n_up tokens.
 pub fn upsample(input: &[f32], n_embd: usize, n_up: usize) -> Vec<f32> {
+    if n_embd == 0 || n_up == 0 || input.is_empty() {
+        return Vec::new();
+    }
     let n_in = input.len() / n_embd;
+    if n_in == 0 {
+        return Vec::new();
+    }
     let n_out = n_in * n_up;
+    if n_in == 1 {
+        let mut output = vec![0.0; n_out * n_embd];
+        let token = &input[..n_embd];
+        for chunk in output.chunks_exact_mut(n_embd) {
+            chunk.copy_from_slice(token);
+        }
+        return output;
+    }
     let mut output = vec![0.0; n_out * n_embd];
     for i in 0..n_out {
         let src_f = i as f32 / n_up as f32;
@@ -1836,7 +1862,7 @@ mod tests {
         active: std::sync::atomic::AtomicBool,
     }
 
-    impl AudioGpu for MockAudioGpu {
+    impl AudioAccelerator for MockAudioGpu {
         fn supports_depthformer(&self) -> bool {
             false
         }
@@ -1885,5 +1911,30 @@ mod tests {
         // Subsequent acquisition succeeds.
         assert!(gpu.try_acquire_session());
         gpu.release_session();
+    }
+
+    #[test]
+    fn test_upsample_single_token() {
+        let input = vec![1.0, 2.0, 3.0, 4.0];
+        let n_embd = 4;
+        let n_up = 6;
+        let output = upsample(&input, n_embd, n_up);
+        assert_eq!(output.len(), 24);
+        for chunk in output.chunks_exact(n_embd) {
+            assert_eq!(chunk, input.as_slice());
+        }
+    }
+
+    #[test]
+    fn test_upsample_multiple_tokens() {
+        let input = vec![0.0, 10.0, 10.0, 20.0];
+        let n_embd = 2;
+        let n_up = 2;
+        let output = upsample(&input, n_embd, n_up);
+        assert_eq!(output.len(), 8);
+        assert_eq!(&output[0..2], &[0.0, 10.0]);
+        assert_eq!(&output[2..4], &[5.0, 15.0]);
+        assert_eq!(&output[4..6], &[10.0, 20.0]);
+        assert_eq!(&output[6..8], &[10.0, 20.0]);
     }
 }

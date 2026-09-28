@@ -2585,7 +2585,7 @@ mod tests {
         let set1 = UsableCpus::Known(vec![0, 1, 2, 3]);
         let set2 = UsableCpus::Known(vec![4, 5, 6, 7]);
         stage_usable(&set1);
-        stage_usable(&set2);
+        assert!(rebuild_pools_for_allowance(&set2));
         assert!(!rebuild_pools_for_allowance(&set2));
     }
 

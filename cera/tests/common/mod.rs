@@ -28,7 +28,7 @@
 //! own).
 //!
 //! [`fixture_or_skip`] resolves one fixture under it (or skips), and
-//! [`prompt_tokens`] tokenizes the shared prefill prompt — one home for
+//! [`prompt_tokens`] tokenizes the shared prefill prompt: one home for
 //! the `gpu_lfm2_*` suites' fixture preamble.
 //!
 //! [`fail_closed_passthrough_skip`] is the fail-closed SPIR-V passthrough
@@ -59,7 +59,7 @@ pub fn models_dir() -> std::path::PathBuf {
 /// `tag`; `CERA_REQUIRE_MODEL` set turns the miss into a hard failure so a
 /// CI leg proves the kernels executed rather than reporting green on
 /// skips. One definition for all suites (a copy per file is how the
-/// copies — and the fail-closed policy — drift).
+/// copies (and the fail-closed policy) drift).
 ///
 /// Callers: the `gpu_lfm2_*` suites.
 pub fn fixture_or_skip(fixture: &str, tag: &str) -> Option<std::path::PathBuf> {

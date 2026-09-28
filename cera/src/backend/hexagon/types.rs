@@ -129,6 +129,182 @@ pub enum HtpOpCode {
     Invalid = 0xFFFF_FFFF,
 }
 
+impl HtpOpCode {
+    /// Return the canonical short name for this opcode.
+    pub const fn name(&self) -> &'static str {
+        match self {
+            Self::Mul => "Mul",
+            Self::Add => "Add",
+            Self::Sub => "Sub",
+            Self::Div => "Div",
+            Self::MulMat => "MulMat",
+            Self::MulMatId => "MulMatId",
+            Self::MulMatNx => "MulMatNx",
+            Self::MulMatIdNx => "MulMatIdNx",
+            Self::MulMatAdd => "MulMatAdd",
+            Self::RmsNorm => "RmsNorm",
+            Self::RmsNormMul => "RmsNormMul",
+            Self::UnarySilu => "UnarySilu",
+            Self::UnaryGelu => "UnaryGelu",
+            Self::UnarySigmoid => "UnarySigmoid",
+            Self::UnaryExp => "UnaryExp",
+            Self::UnaryNeg => "UnaryNeg",
+            Self::UnarySoftplus => "UnarySoftplus",
+            Self::UnaryTanh => "UnaryTanh",
+            Self::UnaryAbs => "UnaryAbs",
+            Self::UnaryLog => "UnaryLog",
+            Self::UnaryRelu => "UnaryRelu",
+            Self::UnaryStep => "UnaryStep",
+            Self::GluSwiglu => "GluSwiglu",
+            Self::GluSwigluOai => "GluSwigluOai",
+            Self::GluGeglu => "GluGeglu",
+            Self::GluGegluQuick => "GluGegluQuick",
+            Self::Softmax => "Softmax",
+            Self::AddId => "AddId",
+            Self::Rope => "Rope",
+            Self::FlashAttnExt => "FlashAttnExt",
+            Self::SetRows => "SetRows",
+            Self::GetRows => "GetRows",
+            Self::Scale => "Scale",
+            Self::Cpy => "Cpy",
+            Self::CpyFence => "CpyFence",
+            Self::Argsort => "Argsort",
+            Self::TopK => "TopK",
+            Self::Sqr => "Sqr",
+            Self::Sqrt => "Sqrt",
+            Self::Sum => "Sum",
+            Self::SumRows => "SumRows",
+            Self::SsmConv => "SsmConv",
+            Self::Repeat => "Repeat",
+            Self::Cumsum => "Cumsum",
+            Self::Fill => "Fill",
+            Self::Diag => "Diag",
+            Self::SolveTri => "SolveTri",
+            Self::L2Norm => "L2Norm",
+            Self::GatedDeltaNet => "GatedDeltaNet",
+            Self::Tri => "Tri",
+            Self::Pad => "Pad",
+            Self::Norm => "Norm",
+            Self::Concat => "Concat",
+            Self::Clamp => "Clamp",
+            Self::LeakyRelu => "LeakyRelu",
+            Self::Im2col => "Im2col",
+            Self::Fence => "Fence",
+            Self::Allreduce => "Allreduce",
+            Self::AllreduceAdd => "AllreduceAdd",
+            Self::GluSwigluClamp => "GluSwigluClamp",
+            Self::MdevGroup => "MdevGroup",
+            Self::Roll => "Roll",
+            Self::Argmax => "Argmax",
+            Self::Conv1D => "Conv1D",
+            Self::UnarySnake => "UnarySnake",
+            Self::UnarySin => "UnarySin",
+            Self::UnaryCos => "UnaryCos",
+            Self::ConvTranspose1D => "ConvTranspose1D",
+            Self::UnaryHardSigmoid => "UnaryHardSigmoid",
+            Self::UnaryHardSwish => "UnaryHardSwish",
+            Self::UnaryElu => "UnaryElu",
+            Self::Invalid => "Invalid",
+        }
+    }
+
+    /// Match an opcode value against pinned firmware-ABI discriminants.
+    pub const fn from_u32(val: u32) -> Option<Self> {
+        match val {
+            0 => Some(Self::Mul),
+            1 => Some(Self::Add),
+            2 => Some(Self::Sub),
+            3 => Some(Self::Div),
+            4 => Some(Self::MulMat),
+            5 => Some(Self::MulMatId),
+            6 => Some(Self::MulMatNx),
+            7 => Some(Self::MulMatIdNx),
+            8 => Some(Self::MulMatAdd),
+            9 => Some(Self::RmsNorm),
+            10 => Some(Self::RmsNormMul),
+            11 => Some(Self::UnarySilu),
+            12 => Some(Self::UnaryGelu),
+            13 => Some(Self::UnarySigmoid),
+            14 => Some(Self::UnaryExp),
+            15 => Some(Self::UnaryNeg),
+            16 => Some(Self::UnarySoftplus),
+            17 => Some(Self::UnaryTanh),
+            18 => Some(Self::UnaryAbs),
+            19 => Some(Self::UnaryLog),
+            20 => Some(Self::UnaryRelu),
+            21 => Some(Self::UnaryStep),
+            22 => Some(Self::GluSwiglu),
+            23 => Some(Self::GluSwigluOai),
+            24 => Some(Self::GluGeglu),
+            25 => Some(Self::GluGegluQuick),
+            26 => Some(Self::Softmax),
+            27 => Some(Self::AddId),
+            28 => Some(Self::Rope),
+            29 => Some(Self::FlashAttnExt),
+            30 => Some(Self::SetRows),
+            31 => Some(Self::GetRows),
+            32 => Some(Self::Scale),
+            33 => Some(Self::Cpy),
+            34 => Some(Self::CpyFence),
+            35 => Some(Self::Argsort),
+            36 => Some(Self::TopK),
+            37 => Some(Self::Sqr),
+            38 => Some(Self::Sqrt),
+            39 => Some(Self::Sum),
+            40 => Some(Self::SumRows),
+            41 => Some(Self::SsmConv),
+            42 => Some(Self::Repeat),
+            43 => Some(Self::Cumsum),
+            44 => Some(Self::Fill),
+            45 => Some(Self::Diag),
+            46 => Some(Self::SolveTri),
+            47 => Some(Self::L2Norm),
+            48 => Some(Self::GatedDeltaNet),
+            49 => Some(Self::Tri),
+            50 => Some(Self::Pad),
+            51 => Some(Self::Norm),
+            52 => Some(Self::Concat),
+            53 => Some(Self::Clamp),
+            54 => Some(Self::LeakyRelu),
+            55 => Some(Self::Im2col),
+            56 => Some(Self::Fence),
+            57 => Some(Self::Allreduce),
+            58 => Some(Self::AllreduceAdd),
+            59 => Some(Self::GluSwigluClamp),
+            60 => Some(Self::MdevGroup),
+            61 => Some(Self::Roll),
+            62 => Some(Self::Argmax),
+            63 => Some(Self::Conv1D),
+            64 => Some(Self::UnarySnake),
+            65 => Some(Self::UnarySin),
+            66 => Some(Self::UnaryCos),
+            67 => Some(Self::ConvTranspose1D),
+            68 => Some(Self::UnaryHardSigmoid),
+            69 => Some(Self::UnaryHardSwish),
+            70 => Some(Self::UnaryElu),
+            0xFFFF_FFFF => Some(Self::Invalid),
+            _ => None,
+        }
+    }
+}
+
+/// Layout format for weight tensors stored in shared rpcmem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HexagonWeightFormat {
+    RepackedQ8_0,
+    RepackedQ4_0,
+}
+
+/// Metadata describing a repacked weight tensor stored in shared rpcmem.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HexagonWeightDesc {
+    pub offset: usize,
+    pub size_bytes: usize,
+    pub format: HexagonWeightFormat,
+    pub rows: usize,
+    pub cols: usize,
+}
+
 /// Compute (non-weight) tensor: flags 0, so the DSP tracks its dirty ranges
 /// and keeps intra-batch producer/consumer edges coherent. Upstream defines
 /// no COMPUTE bit; bit 0 is WEIGHT (read-only, skipped by dirty tracking).
@@ -286,5 +462,14 @@ mod tests {
         assert_eq!(std::mem::size_of::<HtpOpBatchReq>(), 24);
         assert_eq!(std::mem::size_of::<HtpOpBatchRsp>(), 88);
         assert_eq!(std::mem::size_of::<DspQueueBuffer>(), 24);
+    }
+
+    #[test]
+    fn test_htp_opcode_from_u32() {
+        assert_eq!(HtpOpCode::from_u32(0), Some(HtpOpCode::Mul));
+        assert_eq!(HtpOpCode::from_u32(1), Some(HtpOpCode::Add));
+        assert_eq!(HtpOpCode::from_u32(70), Some(HtpOpCode::UnaryElu));
+        assert_eq!(HtpOpCode::from_u32(0xFFFF_FFFF), Some(HtpOpCode::Invalid));
+        assert_eq!(HtpOpCode::from_u32(71), None);
     }
 }

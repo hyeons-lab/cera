@@ -14,7 +14,7 @@ pub mod sys;
 pub mod types;
 
 pub use adpf::AdpfSession;
-pub use device::{HexagonArch, HexagonDevice};
+pub use device::{HexagonArch, HexagonDevice, probe_device};
 pub use params::*;
 pub use queue::HexagonQueueSession;
 pub use repack::*;

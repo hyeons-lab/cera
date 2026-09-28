@@ -25,23 +25,9 @@ use crate::model::weights::MmapWeight;
 use crate::session::CeraError;
 use crate::tensor::DType;
 
-/// Format descriptor for a linear weight inside `weights_buf`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HexagonWeightFormat {
-    RepackedQ8_0,
-    RepackedQ4_0,
-    DenseF32,
-}
+pub use crate::backend::hexagon::HexagonWeightFormat;
 
-/// Metadata describing a stored weight tensor in shared rpcmem.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct HexagonVitWeightDesc {
-    pub offset: usize,
-    pub size_bytes: usize,
-    pub format: HexagonWeightFormat,
-    pub rows: usize,
-    pub cols: usize,
-}
+pub use crate::backend::hexagon::types::HexagonWeightDesc as HexagonVitWeightDesc;
 
 /// Weight offsets for one ViT block in `weights_buf`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -334,11 +320,6 @@ impl HexagonVisionEncoder {
                     repack_q4_0(w.data(), w.cols, w.rows, dst_slice)
                         .map_err(|e| CeraError::Backend(format!("ViT repack Q4_0 failed: {e}")))?;
                 }
-                HexagonWeightFormat::DenseF32 => {
-                    return Err(CeraError::Backend(
-                        "DenseF32 linear weights are not supported on Hexagon ViT".into(),
-                    ));
-                }
             }
             Ok(())
         };
@@ -552,17 +533,12 @@ impl HexagonVisionEncoder {
         let (w_dtype, block_bytes, tile_size) = match w_desc.format {
             HexagonWeightFormat::RepackedQ8_0 => (HtpDataType::Q8_0, 34usize, 32 * 34usize),
             HexagonWeightFormat::RepackedQ4_0 => (HtpDataType::Q4_0, 18usize, 32 * 18usize),
-            HexagonWeightFormat::DenseF32 => {
-                return Err(CeraError::Backend(
-                    "dispatch_linear_m does not support DenseF32 weights on HTP".into(),
-                ));
-            }
         };
 
         let ne0 = w_desc.cols;
         let ne1 = w_desc.rows;
-        let tiled_row_bytes = (ne0 / 32) * tile_size;
-        let w_tot = (ne1 / 32) * tiled_row_bytes;
+        let tiled_row_bytes = ne0.div_ceil(32) * tile_size;
+        let w_tot = ne1.div_ceil(32) * tiled_row_bytes;
         let w_nb = [
             block_bytes as u32,
             tiled_row_bytes as u32,
@@ -638,7 +614,7 @@ impl HexagonVisionEncoder {
         let add_kparams = build_binary_kernel_params(
             w_desc.rows,
             w_desc.rows,
-            n_tokens,
+            1,
             1,
             1,
             4,
@@ -732,7 +708,7 @@ impl HexagonVisionEncoder {
             dim,
             dim,
             n_tokens,
-            n_tokens,
+            1,
             1,
             4,
             8 * 1024 * 1024,
@@ -1234,14 +1210,21 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                     Ok(())
                 })();
 
-                if proj_res.is_ok() {
-                    scratch_guard.invalidate_cpu_cache(so.proj_final_off, out_bytes);
-                    let out_slice: &[f32] = bytemuck::cast_slice(
-                        &scratch_guard.as_slice()[so.proj_final_off..so.proj_final_off + out_bytes],
-                    );
-                    return Ok(out_slice.to_vec());
-                } else {
-                    session.drop_pending_batch();
+                match proj_res {
+                    Ok(()) => {
+                        scratch_guard.invalidate_cpu_cache(so.proj_final_off, out_bytes);
+                        let out_slice: &[f32] = bytemuck::cast_slice(
+                            &scratch_guard.as_slice()
+                                [so.proj_final_off..so.proj_final_off + out_bytes],
+                        );
+                        return Ok(out_slice.to_vec());
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "HexagonVisionEncoder: DSP projector failed ({e}), falling back to CPU"
+                        );
+                        session.drop_pending_batch();
+                    }
                 }
             }
         }
@@ -1268,22 +1251,13 @@ pub fn try_hexagon_vision_encoder(
         .and_then(|s| s.parse::<u32>().ok())
         .and_then(HexagonArch::from_u32);
 
-    let probe_archs: Vec<HexagonArch> = if let Some(arch) = arch_override {
-        vec![arch]
-    } else {
-        crate::backend::hexagon::PROBE_ARCHS.to_vec()
-    };
-
-    let mut device_opt = None;
-    for arch in probe_archs {
-        if let Ok(dev) = HexagonDevice::new(Arc::clone(context.driver()), arch) {
-            tracing::info!(arch = ?arch, "initialized Hexagon NPU device for vision encoder");
-            device_opt = Some(dev);
-            break;
+    let dev = match crate::backend::hexagon::probe_device(context.driver(), arch_override) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::info!("HexagonVisionEncoder: DSP device unavailable ({e}), falling back");
+            return None;
         }
-    }
-
-    let dev = device_opt?;
+    };
     let device = Arc::new(Mutex::new(dev));
 
     match HexagonVisionEncoder::new(Arc::clone(context.driver()), device, weights) {

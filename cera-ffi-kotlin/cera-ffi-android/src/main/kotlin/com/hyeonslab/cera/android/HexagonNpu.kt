@@ -81,8 +81,8 @@ object HexagonNpu {
         // A ';' in the dir would silently become two loader search entries,
         // breaking skel resolution with no error naming the cause (mirrors
         // the Rust-side rejection in `install_skels`).
-        require(!dir.contains(';')) {
-            "skel dir contains ';', which splits into two loader entries: $dir"
+        require(!dir.contains(';') && !dir.contains('\u0000') && !dir.contains('=')) {
+            "skel dir contains invalid characters (';', NUL, or '='): $dir"
         }
         val targetDir = File(dir)
         if (!targetDir.exists()) {
@@ -92,6 +92,7 @@ object HexagonNpu {
             uniffi.cera_ffi.hexagonInstallSkels(dir)
         } catch (e: Exception) {
             checkSkelsPresent(dir, e)
+            throw IllegalStateException("Failed to extract or update Hexagon skels in $dir", e)
         }
         checkSkelsPresent(dir, null)
         // ';' is the separator the FastRPC loader parses (same form the

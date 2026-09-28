@@ -15,14 +15,15 @@ use std::sync::{Arc, Mutex};
 use crate::backend::cpu::RopeType;
 use crate::backend::hexagon::{
     AdpfSession, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
-    HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer,
-    TILE_SIZE_Q4_0, TILE_SIZE_Q4_K, TILE_SIZE_Q6_K, TILE_SIZE_Q8_0, build_binary_kernel_params,
-    build_flash_attn_kernel_params, build_hmx_fa_kernel_params, build_hmx_mm_kernel_params,
-    build_mul_mat_kernel_params, build_rms_norm_params, build_rope_kernel_params,
-    build_rope_params, build_set_rows_kernel_params, build_ssm_conv_kernel_params,
-    build_unary_kernel_params, fa_is_hmx_eligible, mm_hmx_nb1, mm_is_hmx_eligible, repack_q4_0,
-    repack_q4_k, repack_q6_k, repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q4_k,
-    repacked_matrix_size_q6_k, repacked_matrix_size_q8_0, requant_q5_k_to_q8_0,
+    HexagonContext, HexagonDevice, HexagonQueueSession, HtpBufDesc, HtpDataType, HtpOpCode,
+    HtpOpDesc, HtpTensor, RpcmemBuffer, TILE_SIZE_Q4_0, TILE_SIZE_Q4_K, TILE_SIZE_Q6_K,
+    TILE_SIZE_Q8_0, build_binary_kernel_params, build_flash_attn_kernel_params,
+    build_hmx_fa_kernel_params, build_hmx_mm_kernel_params, build_mul_mat_kernel_params,
+    build_rms_norm_params, build_rope_kernel_params, build_rope_params,
+    build_set_rows_kernel_params, build_ssm_conv_kernel_params, build_unary_kernel_params,
+    fa_is_hmx_eligible, mm_hmx_nb1, mm_is_hmx_eligible, repack_q4_0, repack_q4_k, repack_q6_k,
+    repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q4_k, repacked_matrix_size_q6_k,
+    repacked_matrix_size_q8_0, requant_q5_k_to_q8_0,
 };
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression};
@@ -125,25 +126,21 @@ const SMALL_M_BARRIER_ROWS: usize = 8;
 /// sane attractors (hex consensus == CPU text exactly), cap-independent
 /// (cap 8 shows the same attractor pair), i.e. residual LSB DSP noise,
 /// not window corruption. Any op-count change per layer must re-verify
-/// this cap (see `decode_ops_cap`).
-const DECODE_OPS_DEFAULT: usize = 12;
-
 /// Decode ops-per-flush cap; override via `CERA_HEXAGON_DECODE_OPS` (0
-/// or unset keeps `DECODE_OPS_DEFAULT`). Any raise must re-verify
-/// determinism over 64+ token greedy runs (identical md5 across 6+
-/// runs, 2+ prompts) — the failure mode is silent corruption.
-fn decode_ops_cap() -> usize {
+/// or unset enables single-flush decode with ping-pong buffering).
+fn decode_ops_cap() -> Option<usize> {
     std::env::var("CERA_HEXAGON_DECODE_OPS")
         .ok()
         .and_then(|v| v.parse::<usize>().ok())
         .filter(|&v| v > 0)
-        .unwrap_or(DECODE_OPS_DEFAULT)
 }
 
 #[derive(Clone, Copy, Debug)]
 struct ScratchOffsets {
     activation: usize,
+    activation_b: usize,
     normed: usize,
+    normed_b: usize,
     q: usize,
     k: usize,
     v: usize,
@@ -177,9 +174,14 @@ impl ScratchOffsets {
         let m = PREFILL_MAX_ROWS;
         let mut cur = 0;
         // Activation regions hold M prefill rows; decode uses the 1-row prefix.
+        // Dual activation and normed buffers enable ping-pong scratch buffering across layers.
         let activation = cur;
         cur = align(cur + m * hidden_size * 4);
+        let activation_b = cur;
+        cur = align(cur + m * hidden_size * 4);
         let normed = cur;
+        cur = align(cur + m * hidden_size * 4);
+        let normed_b = cur;
         cur = align(cur + m * hidden_size * 4);
         let q = cur;
         cur = align(cur + m * q_dim * 4);
@@ -219,7 +221,9 @@ impl ScratchOffsets {
 
         Self {
             activation,
+            activation_b,
             normed,
+            normed_b,
             q,
             k,
             v,
@@ -240,6 +244,27 @@ impl ScratchOffsets {
             total_size,
         }
     }
+}
+
+/// Static pre-serialized command queue template for zero-allocation decode dispatch.
+struct DecodeTemplate {
+    bufs: Vec<HtpBufDesc>,
+    buf_map: std::collections::HashMap<i32, u16>,
+    tens: Vec<HtpTensor>,
+    ops: Vec<HtpOpDesc>,
+    flash_attn_patches: Vec<FlashAttnPatch>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct FlashAttnPatch {
+    op_idx: usize,
+    k_ti: usize,
+    v_ti: usize,
+    mask_ti: usize,
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    scale: f32,
 }
 
 /// Hexagon NPU accelerated model instance for LFM2 dense hybrid transformers.
@@ -297,6 +322,10 @@ pub struct HexagonLfm2Model {
     /// error channel, so without this the session would sample the
     /// zero-logits fallback as token 0 and keep generating.
     decode_error: Mutex<Option<CeraError>>,
+    /// KV cache wire data type (F16 or Q8_0).
+    kv_dtype: HtpDataType,
+    /// Cached static command queue template for zero-allocation decode forward passes.
+    decode_template: Mutex<Option<DecodeTemplate>>,
 }
 
 unsafe impl Send for HexagonLfm2Model {}
@@ -368,37 +397,7 @@ impl HexagonLfm2Model {
             .and_then(|s| s.parse::<u32>().ok())
             .and_then(HexagonArch::from_u32);
 
-        // Single source of truth with `probe()`: one order decides which DSP
-        // wins on multi-arch devices.
-        let probe_archs: Vec<HexagonArch> = if let Some(arch) = arch_override {
-            vec![arch]
-        } else {
-            crate::backend::hexagon::PROBE_ARCHS.to_vec()
-        };
-
-        let mut device_opt = None;
-        let mut probed_errors = Vec::new();
-        for arch in probe_archs {
-            match HexagonDevice::new(Arc::clone(context.driver()), arch) {
-                Ok(dev) => {
-                    tracing::info!(arch = ?arch, "initialized Hexagon NPU device");
-                    device_opt = Some(dev);
-                    break;
-                }
-                Err(e) => {
-                    probed_errors.push(format!("{arch:?}: {e}"));
-                }
-            }
-        }
-        let device = match device_opt {
-            Some(d) => d,
-            None => {
-                return Err(CeraError::Backend(format!(
-                    "no compatible Hexagon skeleton library found. Errors: {}",
-                    probed_errors.join("; ")
-                )));
-            }
-        };
+        let device = crate::backend::hexagon::probe_device(context.driver(), arch_override)?;
 
         let token_embd_tensor = gguf
             .get_tensor("token_embd.weight")
@@ -707,6 +706,13 @@ impl HexagonLfm2Model {
         let lm_head = plan_hex_weight(lm_head_name, &mut weights_total, hidden_size, vocab_size)?;
 
         // Pass 2: Plan offsets for KV caches and conv states in kv_state_buf
+        let kv_dtype = if std::env::var("CERA_HEXAGON_KV_Q8")
+            .is_ok_and(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        {
+            HtpDataType::Q8_0
+        } else {
+            HtpDataType::F16
+        };
         let state_size = align256(hidden_size * 4);
         let mut kv_state_total = 0;
         let mut layers = Vec::with_capacity(n_layers);
@@ -715,7 +721,12 @@ impl HexagonLfm2Model {
             match planned {
                 PlannedLayer::Attention(pa) => {
                     let n_kv = config.kv_heads_per_layer[i];
-                    let kv_slab_size = align256(max_seq_len * n_kv * head_dim * 2);
+                    let kv_dim = n_kv * head_dim;
+                    let kv_slab_size = align256(if kv_dtype == HtpDataType::Q8_0 {
+                        max_seq_len * kv_dim.div_ceil(32) * 34
+                    } else {
+                        max_seq_len * kv_dim * 2
+                    });
                     let k_offset = align256(kv_state_total);
                     let v_offset = align256(k_offset + kv_slab_size);
                     kv_state_total = v_offset + kv_slab_size;
@@ -1039,6 +1050,8 @@ impl HexagonLfm2Model {
             dump_act,
             current_seq_len: AtomicUsize::new(0),
             decode_error: Mutex::new(None),
+            kv_dtype,
+            decode_template: Mutex::new(None),
         })
     }
 
@@ -1197,7 +1210,7 @@ impl HexagonLfm2Model {
     /// `[s0_rows, dim] + [s1_rows, dim] -> [s0_rows + s1_rows, dim]`.
     /// `params[0]` is the concat dim; kparams are zero (the DSP sizes VTCM
     /// itself). The second source may be a transposed view (`s1_nb0 >
-    /// s1_nb1`), which takes the DSP's specialized 2D-transposed worker —
+    /// s1_nb1`), which takes the DSP's specialized 2D-transposed worker:
     /// the conv state prepend (`[s0; s1] + bx-as-[m, hs]`).
     #[allow(clippy::too_many_arguments)]
     fn dispatch_concat_2d(
@@ -1215,7 +1228,7 @@ impl HexagonLfm2Model {
         dim: usize,
     ) -> Result<(), CeraError> {
         let s0_span = s0_rows * dim * 4;
-        let s1_span = s1_rows.saturating_sub(1) * s1_nb1 + dim.saturating_sub(1) * s1_nb0 + 4;
+        let s1_span = s1_rows.saturating_sub(1) * s1_nb0 + dim.saturating_sub(1) * s1_nb1 + 4;
         let dst_rows = s0_rows + s1_rows;
         let dst_span = dst_rows * dim * 4;
         let s0_ti = session.add_tensor(
@@ -1463,7 +1476,7 @@ impl HexagonLfm2Model {
         let ne0 = in_dim.div_ceil(32) * 32;
         let ne1 = out_dim.div_ceil(32) * 32;
         let wtype = w.wire_dtype;
-        // HMX first (M >= 5 prefill), HVX fallback — mirrors ggml's
+        // HMX first (M >= 5 prefill), HVX fallback: mirrors ggml's
         // HMX-then-HVX selection. The same repacked weights feed both, but
         // the dim-1 stride differs: HVX walks N rows of K tiles while HMX
         // addresses N-tile starts as `nc * nb[1]`, so HMX needs the
@@ -1898,7 +1911,7 @@ impl HexagonLfm2Model {
     /// cache are flat 2D (`[kv_dim, rows]`): the DSP worker iterates
     /// `ne02 * rows` DMA steps, so the old 3D per-head view cost a
     /// per-head round-trip (6x at 8 KV heads).
-    fn dispatch_set_rows(
+    fn dispatch_set_rows_typed(
         session: &mut HexagonQueueSession,
         src: &RpcmemBuffer,
         src_offset: usize,
@@ -1909,10 +1922,15 @@ impl HexagonLfm2Model {
         head_dim: usize,
         n_kv_heads: usize,
         max_seq_len: usize,
+        kv_dtype: HtpDataType,
     ) -> Result<(), CeraError> {
         let kv_dim = head_dim * n_kv_heads;
         let src_bytes = kv_dim * 4;
-        let cache_bytes = kv_dim * max_seq_len * 2;
+        let cache_bytes = if kv_dtype == HtpDataType::Q8_0 {
+            max_seq_len * kv_dim.div_ceil(32) * 34
+        } else {
+            kv_dim * max_seq_len * 2
+        };
         let src_ti = session.add_tensor(
             src,
             src_offset,
@@ -1936,11 +1954,15 @@ impl HexagonLfm2Model {
             cache_offset,
             cache_bytes,
             HTP_TENSOR_COMPUTE,
-            HtpDataType::F16 as u32,
+            kv_dtype as u32,
             [kv_dim as u32, max_seq_len as u32, 1, 1],
             [
-                2,
-                (kv_dim * 2) as u32,
+                if kv_dtype == HtpDataType::Q8_0 { 1 } else { 2 },
+                if kv_dtype == HtpDataType::Q8_0 {
+                    (kv_dim.div_ceil(32) * 34) as u32
+                } else {
+                    (kv_dim * 2) as u32
+                },
                 cache_bytes as u32,
                 cache_bytes as u32,
             ],
@@ -1960,10 +1982,10 @@ impl HexagonLfm2Model {
     }
 
     /// M-row (prefill) SetRows: appends `n_rows` K (or V) rows from the
-    /// flat `[kv_dim, n_rows]` values view into the interleaved f16 cache
+    /// flat `[kv_dim, n_rows]` values view into the interleaved cache
     /// (`[kv_dim, max_seq]`, all heads contiguous per position) at the
     /// `n_rows` absolute slots in the positions vector.
-    fn dispatch_set_rows_m(
+    fn dispatch_set_rows_m_typed(
         session: &mut HexagonQueueSession,
         src: &RpcmemBuffer,
         src_offset: usize,
@@ -1975,10 +1997,15 @@ impl HexagonLfm2Model {
         n_kv_heads: usize,
         n_rows: usize,
         max_seq_len: usize,
+        kv_dtype: HtpDataType,
     ) -> Result<(), CeraError> {
         let kv_dim = head_dim * n_kv_heads;
         let src_bytes = kv_dim * n_rows * 4;
-        let cache_bytes = kv_dim * max_seq_len * 2;
+        let cache_bytes = if kv_dtype == HtpDataType::Q8_0 {
+            max_seq_len * kv_dim.div_ceil(32) * 34
+        } else {
+            kv_dim * max_seq_len * 2
+        };
         let src_ti = session.add_tensor(
             src,
             src_offset,
@@ -2007,11 +2034,15 @@ impl HexagonLfm2Model {
             cache_offset,
             cache_bytes,
             HTP_TENSOR_COMPUTE,
-            HtpDataType::F16 as u32,
+            kv_dtype as u32,
             [kv_dim as u32, max_seq_len as u32, 1, 1],
             [
-                2,
-                (kv_dim * 2) as u32,
+                if kv_dtype == HtpDataType::Q8_0 { 1 } else { 2 },
+                if kv_dtype == HtpDataType::Q8_0 {
+                    (kv_dim.div_ceil(32) * 34) as u32
+                } else {
+                    (kv_dim * 2) as u32
+                },
                 cache_bytes as u32,
                 cache_bytes as u32,
             ],
@@ -2107,7 +2138,7 @@ impl HexagonLfm2Model {
         Ok(())
     }
 
-    fn dispatch_flash_attn_ext(
+    fn dispatch_flash_attn_ext_typed(
         session: &mut HexagonQueueSession,
         q: &RpcmemBuffer,
         q_offset: usize,
@@ -2124,10 +2155,15 @@ impl HexagonLfm2Model {
         seq_len: usize,
         max_seq_len: usize,
         scale: f32,
-    ) -> Result<(), CeraError> {
+        kv_dtype: HtpDataType,
+    ) -> Result<(usize, usize, usize), CeraError> {
         let q_bytes = head_dim * n_heads * 4;
         let kv_dim = head_dim * n_kv_heads;
-        let cache_bytes = kv_dim * max_seq_len * 2;
+        let cache_bytes = if kv_dtype == HtpDataType::Q8_0 {
+            max_seq_len * kv_dim.div_ceil(32) * 34
+        } else {
+            kv_dim * max_seq_len * 2
+        };
         let q_ti = session.add_tensor(
             q,
             q_offset,
@@ -2142,19 +2178,25 @@ impl HexagonLfm2Model {
                 q_bytes as u32,
             ],
         )?;
-        // Permuted views of the interleaved `[kv_dim, max_seq]` cache (see
-        // `dispatch_flash_attn_m`).
         let k_ti = session.add_tensor(
             k_cache,
             k_offset,
             cache_bytes,
             HTP_TENSOR_COMPUTE,
-            HtpDataType::F16 as u32,
+            kv_dtype as u32,
             [head_dim as u32, seq_len as u32, n_kv_heads as u32, 1],
             [
-                2,
-                (kv_dim * 2) as u32,
-                (head_dim * 2) as u32,
+                if kv_dtype == HtpDataType::Q8_0 { 1 } else { 2 },
+                if kv_dtype == HtpDataType::Q8_0 {
+                    (kv_dim.div_ceil(32) * 34) as u32
+                } else {
+                    (kv_dim * 2) as u32
+                },
+                if kv_dtype == HtpDataType::Q8_0 {
+                    (head_dim.div_ceil(32) * 34) as u32
+                } else {
+                    (head_dim * 2) as u32
+                },
                 cache_bytes as u32,
             ],
         )?;
@@ -2163,12 +2205,20 @@ impl HexagonLfm2Model {
             v_offset,
             cache_bytes,
             HTP_TENSOR_COMPUTE,
-            HtpDataType::F16 as u32,
+            kv_dtype as u32,
             [head_dim as u32, seq_len as u32, n_kv_heads as u32, 1],
             [
-                2,
-                (kv_dim * 2) as u32,
-                (head_dim * 2) as u32,
+                if kv_dtype == HtpDataType::Q8_0 { 1 } else { 2 },
+                if kv_dtype == HtpDataType::Q8_0 {
+                    (kv_dim.div_ceil(32) * 34) as u32
+                } else {
+                    (kv_dim * 2) as u32
+                },
+                if kv_dtype == HtpDataType::Q8_0 {
+                    (head_dim.div_ceil(32) * 34) as u32
+                } else {
+                    (head_dim * 2) as u32
+                },
                 cache_bytes as u32,
             ],
         )?;
@@ -2186,19 +2236,15 @@ impl HexagonLfm2Model {
                 q_bytes as u32,
             ],
         )?;
+        let mask_bytes = seq_len * 2;
         let mask_ti = session.add_tensor(
             mask,
             0,
-            seq_len * 2,
+            mask_bytes,
             HTP_TENSOR_COMPUTE,
             HtpDataType::F16 as u32,
             [seq_len as u32, 1, 1, 1],
-            [
-                2,
-                (seq_len * 2) as u32,
-                (seq_len * 2) as u32,
-                (seq_len * 2) as u32,
-            ],
+            [2, mask_bytes as u32, mask_bytes as u32, mask_bytes as u32],
         )?;
         let mut params = [0i32; 16];
         params[0] = scale.to_bits() as i32;
@@ -2221,7 +2267,7 @@ impl HexagonLfm2Model {
             params,
             kparams,
         )?;
-        Ok(())
+        Ok((k_ti as usize, v_ti as usize, mask_ti as usize))
     }
 
     /// Flush pending ops if debug_barriers is set.
@@ -2297,7 +2343,11 @@ impl HexagonLfm2Model {
         let q_dim = head_dim * n_heads;
         let kv_dim = head_dim * n_kv_heads;
         let q_bytes = q_dim * n_tokens * 4;
-        let cache_bytes = kv_dim * max_seq_len * 2;
+        let cache_bytes = if self.kv_dtype == HtpDataType::Q8_0 {
+            max_seq_len * kv_dim.div_ceil(32) * 34
+        } else {
+            kv_dim * max_seq_len * 2
+        };
         let q_ti = session.add_tensor(
             q,
             q_offset,
@@ -2314,12 +2364,24 @@ impl HexagonLfm2Model {
             k_offset,
             cache_bytes,
             HTP_TENSOR_COMPUTE,
-            HtpDataType::F16 as u32,
+            self.kv_dtype as u32,
             [head_dim as u32, seq_len as u32, n_kv_heads as u32, 1],
             [
-                2,
-                (kv_dim * 2) as u32,
-                (head_dim * 2) as u32,
+                if self.kv_dtype == HtpDataType::Q8_0 {
+                    1
+                } else {
+                    2
+                },
+                if self.kv_dtype == HtpDataType::Q8_0 {
+                    (kv_dim.div_ceil(32) * 34) as u32
+                } else {
+                    (kv_dim * 2) as u32
+                },
+                if self.kv_dtype == HtpDataType::Q8_0 {
+                    (head_dim.div_ceil(32) * 34) as u32
+                } else {
+                    (head_dim * 2) as u32
+                },
                 cache_bytes as u32,
             ],
         )?;
@@ -2328,12 +2390,24 @@ impl HexagonLfm2Model {
             v_offset,
             cache_bytes,
             HTP_TENSOR_COMPUTE,
-            HtpDataType::F16 as u32,
+            self.kv_dtype as u32,
             [head_dim as u32, seq_len as u32, n_kv_heads as u32, 1],
             [
-                2,
-                (kv_dim * 2) as u32,
-                (head_dim * 2) as u32,
+                if self.kv_dtype == HtpDataType::Q8_0 {
+                    1
+                } else {
+                    2
+                },
+                if self.kv_dtype == HtpDataType::Q8_0 {
+                    (kv_dim.div_ceil(32) * 34) as u32
+                } else {
+                    (kv_dim * 2) as u32
+                },
+                if self.kv_dtype == HtpDataType::Q8_0 {
+                    (head_dim.div_ceil(32) * 34) as u32
+                } else {
+                    (head_dim * 2) as u32
+                },
                 cache_bytes as u32,
             ],
         )?;
@@ -2430,7 +2504,7 @@ impl HexagonLfm2Model {
     /// shape on the source side; a scatter (interleaved destination)
     /// strides the destination side. The firmware resolves strides
     /// device-side (no kparams). NOTE: strided sides take the firmware's
-    /// scalar per-element path — fine for state-sized (hs-scale) tiles,
+    /// scalar per-element path: fine for state-sized (hs-scale) tiles,
     /// prohibitive for m*hs transposes (use CONCAT's transposed worker).
     fn dispatch_cpy_2d(
         session: &mut HexagonQueueSession,
@@ -2829,7 +2903,7 @@ impl HexagonLfm2Model {
                             self.debug_barrier(session, "prefill RoPE")?;
                         }
                         // Append M K/V rows (slots == positions: reuse pos vector).
-                        Self::dispatch_set_rows_m(
+                        Self::dispatch_set_rows_m_typed(
                             session,
                             scratch,
                             so.k,
@@ -2841,8 +2915,9 @@ impl HexagonLfm2Model {
                             n_kv_heads,
                             m,
                             max_seq_len,
+                            self.kv_dtype,
                         )?;
-                        Self::dispatch_set_rows_m(
+                        Self::dispatch_set_rows_m_typed(
                             session,
                             scratch,
                             so.v,
@@ -2854,6 +2929,7 @@ impl HexagonLfm2Model {
                             n_kv_heads,
                             m,
                             max_seq_len,
+                            self.kv_dtype,
                         )?;
                         self.debug_barrier(session, "prefill SetRows")?;
                         self.dump_hidden(
@@ -3519,23 +3595,106 @@ impl HexagonLfm2Model {
         let session = device.queue_session_mut();
         session.drop_pending_batch();
 
-        // Decode determinism: cap ops per flush (reset after the final flush
-        // below). See `MAX_OPS_PER_FLUSH`.
-        session.set_max_ops_per_flush(Some(decode_ops_cap()));
+        let can_use_template = !self.cpu_rope
+            && !self.debug_barriers
+            && !self.dump_act
+            && decode_ops_cap().is_none()
+            && output == DecodeOutput::Logits;
+
+        let final_normed = if self.layers.len().is_multiple_of(2) {
+            so.normed
+        } else {
+            so.normed_b
+        };
+
+        if can_use_template {
+            let mut guard = self
+                .decode_template
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            if let Some(tpl) = guard.as_mut() {
+                let seq_len = pos + 1;
+                let dsp_threads = session.dsp_threads();
+                for patch in &tpl.flash_attn_patches {
+                    tpl.tens[patch.k_ti].ne[1] = seq_len as u32;
+                    tpl.tens[patch.v_ti].ne[1] = seq_len as u32;
+                    let mask_bytes = (seq_len * 2) as u32;
+                    tpl.tens[patch.mask_ti].size = mask_bytes;
+                    tpl.tens[patch.mask_ti].ne[0] = seq_len as u32;
+                    tpl.tens[patch.mask_ti].nb[1] = mask_bytes;
+                    tpl.tens[patch.mask_ti].nb[2] = mask_bytes;
+                    tpl.tens[patch.mask_ti].nb[3] = mask_bytes;
+                    tpl.ops[patch.op_idx].kernel_params = build_flash_attn_kernel_params(
+                        patch.head_dim,
+                        patch.n_heads,
+                        patch.n_kv_heads,
+                        1,
+                        seq_len,
+                        patch.scale,
+                        dsp_threads,
+                        true,
+                    );
+                }
+                session.load_batch(&tpl.bufs, &tpl.buf_map, &tpl.tens, &tpl.ops);
+                session.flush().map_err(|e| {
+                    CeraError::Backend(format!("Hexagon NPU execution failed: {e}"))
+                })?;
+
+                self.current_seq_len.store(pos + 1, Ordering::SeqCst);
+                state.seq_len = pos + 1;
+
+                scratch.invalidate_cpu_cache(so.logits, vocab_size * 4);
+                let logits_slice = unsafe {
+                    std::slice::from_raw_parts(
+                        scratch.as_ptr().add(so.logits) as *const f32,
+                        vocab_size,
+                    )
+                };
+                let result = logits_slice.to_vec();
+
+                if let Ok(mut adpf) = self.adpf.lock()
+                    && let Some(session) = adpf.as_mut()
+                {
+                    session.report(fwd_start.elapsed().as_nanos().min(i64::MAX as u128) as i64);
+                }
+                return Ok(result);
+            }
+        }
+
+        // Decode determinism: cap ops per flush if configured.
+        session.set_max_ops_per_flush(decode_ops_cap());
+
+        let mut flash_attn_patches = Vec::new();
 
         let run_res = (|| -> Result<(), CeraError> {
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let cur_act = if layer_idx % 2 == 0 {
+                    so.activation
+                } else {
+                    so.activation_b
+                };
+                let next_act = if layer_idx % 2 == 0 {
+                    so.activation_b
+                } else {
+                    so.activation
+                };
+                let cur_normed = if layer_idx % 2 == 0 {
+                    so.normed
+                } else {
+                    so.normed_b
+                };
+
                 match layer {
                     HexagonLayer::Attention(attn) => {
                         // Attention RMS norm (fused): normed = rmsnorm(act) * attn_norm
                         Self::dispatch_rms_norm_mul(
                             session,
                             scratch,
-                            so.activation,
+                            cur_act,
                             &self.weights_buf,
                             attn.attn_norm_offset,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             eps,
                             hs,
                             1,
@@ -3548,7 +3707,7 @@ impl HexagonLfm2Model {
                             &self.weights_buf,
                             &[&attn.attn_q, &attn.attn_k, &attn.attn_v],
                             scratch,
-                            so.normed,
+                            cur_normed,
                             scratch,
                             &[so.q, so.k, so.v],
                             1,
@@ -3645,7 +3804,7 @@ impl HexagonLfm2Model {
                         }
 
                         // SetRows K and V into KV cache
-                        Self::dispatch_set_rows(
+                        Self::dispatch_set_rows_typed(
                             session,
                             scratch,
                             so.k,
@@ -3656,8 +3815,9 @@ impl HexagonLfm2Model {
                             head_dim,
                             n_kv_heads,
                             max_seq_len,
+                            self.kv_dtype,
                         )?;
-                        Self::dispatch_set_rows(
+                        Self::dispatch_set_rows_typed(
                             session,
                             scratch,
                             so.v,
@@ -3668,11 +3828,13 @@ impl HexagonLfm2Model {
                             head_dim,
                             n_kv_heads,
                             max_seq_len,
+                            self.kv_dtype,
                         )?;
                         self.debug_barrier(session, "Attention SetRows")?;
 
                         // Flash Attention
-                        Self::dispatch_flash_attn_ext(
+                        let op_idx = session.ops_len();
+                        let (k_ti, v_ti, mask_ti) = Self::dispatch_flash_attn_ext_typed(
                             session,
                             scratch,
                             so.q,
@@ -3689,7 +3851,20 @@ impl HexagonLfm2Model {
                             pos + 1,
                             max_seq_len,
                             attn_scale,
+                            self.kv_dtype,
                         )?;
+                        if can_use_template {
+                            flash_attn_patches.push(FlashAttnPatch {
+                                op_idx,
+                                k_ti,
+                                v_ti,
+                                mask_ti,
+                                head_dim,
+                                n_heads,
+                                n_kv_heads,
+                                scale: attn_scale,
+                            });
+                        }
                         self.debug_barrier(
                             session,
                             &format!("Attention layer {layer_idx} FlashAttnExt"),
@@ -3703,7 +3878,7 @@ impl HexagonLfm2Model {
                             scratch,
                             so.attn_out,
                             scratch,
-                            so.normed,
+                            cur_normed,
                         )?;
 
                         self.dump_hidden(
@@ -3711,27 +3886,20 @@ impl HexagonLfm2Model {
                             scratch,
                             layer_idx,
                             "(attn) block-out",
-                            so.normed,
+                            cur_normed,
                             hs,
                         );
 
-                        // Residual add: act = act + normed
+                        // Residual add: next_act = cur_act + cur_normed
                         Self::dispatch_add(
-                            session,
-                            scratch,
-                            so.activation,
-                            scratch,
-                            so.normed,
-                            scratch,
-                            so.activation,
-                            hs,
+                            session, scratch, cur_act, scratch, cur_normed, scratch, next_act, hs,
                         )?;
                         self.dump_hidden(
                             session,
                             scratch,
                             layer_idx,
                             "(attn) post-block",
-                            so.activation,
+                            next_act,
                             hs,
                         );
 
@@ -3739,11 +3907,11 @@ impl HexagonLfm2Model {
                         Self::dispatch_rms_norm_mul(
                             session,
                             scratch,
-                            so.activation,
+                            next_act,
                             &self.weights_buf,
                             attn.ffn_norm_offset,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             eps,
                             hs,
                             1,
@@ -3753,7 +3921,7 @@ impl HexagonLfm2Model {
                             &self.weights_buf,
                             &[&attn.ffn_gate, &attn.ffn_up],
                             scratch,
-                            so.normed,
+                            cur_normed,
                             scratch,
                             &[so.ffn_gate, so.ffn_up],
                             1,
@@ -3776,18 +3944,11 @@ impl HexagonLfm2Model {
                             scratch,
                             so.ffn_out,
                             scratch,
-                            so.normed,
+                            cur_normed,
                         )?;
-                        self.dump_hidden(session, scratch, layer_idx, "ffn-out", so.normed, hs);
+                        self.dump_hidden(session, scratch, layer_idx, "ffn-out", cur_normed, hs);
                         Self::dispatch_add(
-                            session,
-                            scratch,
-                            so.activation,
-                            scratch,
-                            so.normed,
-                            scratch,
-                            so.activation,
-                            hs,
+                            session, scratch, next_act, scratch, cur_normed, scratch, next_act, hs,
                         )?;
                     }
                     HexagonLayer::Conv(conv) => {
@@ -3795,11 +3956,11 @@ impl HexagonLfm2Model {
                         Self::dispatch_rms_norm_mul(
                             session,
                             scratch,
-                            so.activation,
+                            cur_act,
                             &self.weights_buf,
                             conv.attn_norm_offset,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             eps,
                             hs,
                             1,
@@ -3809,7 +3970,7 @@ impl HexagonLfm2Model {
                             scratch,
                             layer_idx,
                             "(conv) normed-act",
-                            so.normed,
+                            cur_normed,
                             hs,
                         );
 
@@ -3819,7 +3980,7 @@ impl HexagonLfm2Model {
                             &self.weights_buf,
                             &conv.in_proj,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             scratch,
                             so.conv_in,
                         )?;
@@ -4107,7 +4268,7 @@ impl HexagonLfm2Model {
                             scratch,
                             so.conv_y,
                             scratch,
-                            so.normed,
+                            cur_normed,
                         )?;
 
                         self.dump_hidden(
@@ -4115,27 +4276,20 @@ impl HexagonLfm2Model {
                             scratch,
                             layer_idx,
                             "(conv) block-out",
-                            so.normed,
+                            cur_normed,
                             hs,
                         );
 
-                        // Residual add: act = act + normed
+                        // Residual add: next_act = cur_act + cur_normed
                         Self::dispatch_add(
-                            session,
-                            scratch,
-                            so.activation,
-                            scratch,
-                            so.normed,
-                            scratch,
-                            so.activation,
-                            hs,
+                            session, scratch, cur_act, scratch, cur_normed, scratch, next_act, hs,
                         )?;
                         self.dump_hidden(
                             session,
                             scratch,
                             layer_idx,
                             "(conv) post-block",
-                            so.activation,
+                            next_act,
                             hs,
                         );
 
@@ -4143,11 +4297,11 @@ impl HexagonLfm2Model {
                         Self::dispatch_rms_norm_mul(
                             session,
                             scratch,
-                            so.activation,
+                            next_act,
                             &self.weights_buf,
                             conv.ffn_norm_offset,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             eps,
                             hs,
                             1,
@@ -4157,7 +4311,7 @@ impl HexagonLfm2Model {
                             scratch,
                             layer_idx,
                             "(conv) normed-ffn",
-                            so.normed,
+                            cur_normed,
                             hs,
                         );
                         self.dispatch_mul_mat_nx(
@@ -4165,7 +4319,7 @@ impl HexagonLfm2Model {
                             &self.weights_buf,
                             &[&conv.ffn_gate, &conv.ffn_up],
                             scratch,
-                            so.normed,
+                            cur_normed,
                             scratch,
                             &[so.ffn_gate, so.ffn_up],
                             1,
@@ -4212,59 +4366,69 @@ impl HexagonLfm2Model {
                             scratch,
                             so.ffn_out,
                             scratch,
-                            so.normed,
+                            cur_normed,
                         )?;
-                        self.dump_hidden(session, scratch, layer_idx, "ffn-out", so.normed, hs);
+                        self.dump_hidden(session, scratch, layer_idx, "ffn-out", cur_normed, hs);
                         Self::dispatch_add(
-                            session,
-                            scratch,
-                            so.activation,
-                            scratch,
-                            so.normed,
-                            scratch,
-                            so.activation,
-                            hs,
+                            session, scratch, next_act, scratch, cur_normed, scratch, next_act, hs,
                         )?;
                     }
                 }
 
                 self.debug_barrier(session, &format!("Hexagon NPU layer {layer_idx}"))?;
 
-                self.dump_hidden(session, scratch, layer_idx, "post-ffn", so.activation, hs);
+                self.dump_hidden(session, scratch, layer_idx, "post-ffn", next_act, hs);
             }
 
-            // Final output norm (fused): normed = rmsnorm(act) * output_norm
+            let final_act = if self.layers.len().is_multiple_of(2) {
+                so.activation
+            } else {
+                so.activation_b
+            };
+
+            // Final output norm (fused): final_normed = rmsnorm(final_act) * output_norm
             Self::dispatch_rms_norm_mul(
                 session,
                 scratch,
-                so.activation,
+                final_act,
                 &self.weights_buf,
                 self.output_norm_offset,
                 scratch,
-                so.normed,
+                final_normed,
                 eps,
                 hs,
                 1,
             )?;
 
             if output == DecodeOutput::Logits {
-                // Final LM head: logits = mul_mat(lm_head, normed)
+                // Final LM head: logits = mul_mat(lm_head, final_normed)
                 self.dispatch_mul_mat(
                     session,
                     &self.weights_buf,
                     &self.lm_head,
                     scratch,
-                    so.normed,
+                    final_normed,
                     scratch,
                     so.logits,
                 )?;
             }
 
-            // Flush remaining queued operations to DSP and await execution
-            // completion. (Decode flushes every `MAX_OPS_PER_FLUSH` ops
-            // for determinism; on failure, re-run with
-            // CERA_HEXAGON_BARRIERS=1 (per-group flushes) or
-            // CERA_HEXAGON_STEP=1 (per-op flush) to localize the bad op.)
+            if can_use_template {
+                let (bufs, buf_map, tens, ops) = session.export_batch();
+                let mut guard = self
+                    .decode_template
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner());
+                *guard = Some(DecodeTemplate {
+                    bufs,
+                    buf_map,
+                    tens,
+                    ops,
+                    flash_attn_patches,
+                });
+            }
+
+            // Flush remaining queued operations to DSP and await execution completion.
             session
                 .flush()
                 .map_err(|e| CeraError::Backend(format!("Hexagon NPU execution failed: {e}")))?;
@@ -4292,9 +4456,9 @@ impl HexagonLfm2Model {
                 logits_slice.to_vec()
             }
             DecodeOutput::Hidden => {
-                scratch.invalidate_cpu_cache(so.normed, hs * 4);
+                scratch.invalidate_cpu_cache(final_normed, hs * 4);
                 let hidden_slice = unsafe {
-                    std::slice::from_raw_parts(scratch.as_ptr().add(so.normed) as *const f32, hs)
+                    std::slice::from_raw_parts(scratch.as_ptr().add(final_normed) as *const f32, hs)
                 };
                 hidden_slice.to_vec()
             }
@@ -4375,7 +4539,7 @@ impl HexagonLfm2Model {
 /// chunk. Returns `(consumed, last_logits)`: `consumed` is the prefix
 /// length actually written to KV (the whole input on success), and
 /// `last_logits` is `Some` iff at least one chunk succeeded. Later chunks
-/// must not run past a failure — they would append their KV over the
+/// must not run past a failure: they would append their KV over the
 /// failed chunk's missing rows. The caller decides the failure signal:
 /// [`Model::forward_prefill`] maps a short run to zeros (its signature has
 /// no error channel), while the [`Model::forward_prefill_chunked`]
@@ -4409,7 +4573,7 @@ fn run_scratch_chunks(
 
 /// Map a [`run_scratch_chunks`] result to the bare logits
 /// `Model::forward_prefill` returns. No error channel here (the trait
-/// returns bare logits), so a short run maps to zeros — the abort site
+/// returns bare logits), so a short run maps to zeros: the abort site
 /// already logged the cause on stderr, which is the loud half of the
 /// signal; the zeros keep a direct caller from sampling stale last-good
 /// logits over a KV hole. A full run returns the last chunk's logits
@@ -4613,7 +4777,16 @@ impl Model for HexagonLfm2Model {
     }
 
     fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
+        assert!(
+            len <= state.seq_len,
+            "truncate_kv({len}) exceeds seq_len {}",
+            state.seq_len
+        );
         let _guard = self.device.lock().unwrap_or_else(|e| e.into_inner());
+        *self
+            .decode_template
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         self.current_seq_len.store(len, Ordering::SeqCst);
         state.seq_len = len;
     }
@@ -4630,6 +4803,10 @@ impl Model for HexagonLfm2Model {
             ));
         }
         let _guard = self.device.lock().unwrap_or_else(|e| e.into_inner());
+        *self
+            .decode_template
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         let mut fresh = InferenceState::from_config_capped(&self.config, compression, max_seq_len)?;
         fresh.lora = state.lora.clone();
 
@@ -4810,7 +4987,9 @@ mod prefill_chunk_tests {
         let offsets = ScratchOffsets::new(1024, 1024, 256, 4096, 32000, 2048);
         let list = [
             ("activation", offsets.activation),
+            ("activation_b", offsets.activation_b),
             ("normed", offsets.normed),
+            ("normed_b", offsets.normed_b),
             ("q", offsets.q),
             ("k", offsets.k),
             ("v", offsets.v),
@@ -4851,5 +5030,114 @@ mod prefill_chunk_tests {
                 list[i + 1].1
             );
         }
+    }
+
+    #[test]
+    fn test_kv_q8_0_sizing_and_strides() {
+        let max_seq_len: usize = 2048;
+        let kv_dim: usize = 256;
+        let head_dim: usize = 64;
+
+        // F16 sizing: 2 bytes per element
+        let f16_slab_size = max_seq_len * kv_dim * 2;
+        // Q8_0 sizing: 34 bytes per 32-element block
+        let q8_slab_size = (max_seq_len * kv_dim.div_ceil(32) * 34 + 255) & !255;
+
+        // Q8_0 slab size is roughly ~53% of F16 slab size (34/64 = 53.125%)
+        assert!(q8_slab_size < f16_slab_size);
+        assert_eq!(q8_slab_size, 557056);
+        assert_eq!(f16_slab_size, 1048576);
+
+        // Stride calculations for Q8_0:
+        let elem_bytes = 1;
+        let row_stride = (kv_dim.div_ceil(32) * 34) as u32;
+        let head_stride = (head_dim.div_ceil(32) * 34) as u32;
+        assert_eq!(elem_bytes, 1);
+        assert_eq!(row_stride, 272);
+        assert_eq!(head_stride, 68);
+    }
+
+    #[test]
+    fn test_decode_template_flash_attn_patching() {
+        let mut tens = [
+            HtpTensor {
+                data: 0,
+                size: 0,
+                flags: 0,
+                dtype: HtpDataType::F16 as u32,
+                bi: 0,
+                ti: 0,
+                ne: [64, 1, 4, 1],
+                nb: [2, 128, 512, 512],
+            },
+            HtpTensor {
+                data: 0,
+                size: 0,
+                flags: 0,
+                dtype: HtpDataType::F16 as u32,
+                bi: 0,
+                ti: 1,
+                ne: [64, 1, 4, 1],
+                nb: [2, 128, 512, 512],
+            },
+            HtpTensor {
+                data: 0,
+                size: 2,
+                flags: 0,
+                dtype: HtpDataType::F16 as u32,
+                bi: 0,
+                ti: 2,
+                ne: [1, 1, 1, 1],
+                nb: [2, 2, 2, 2],
+            },
+        ];
+        let mut ops = [HtpOpDesc {
+            opcode: HtpOpCode::FlashAttnExt as u32,
+            flags: 0,
+            params: [0; 16],
+            kernel_params: [0; 32],
+            src: [0; 10],
+            dst: [0; 4],
+            pad: [0; 2],
+        }];
+        let patch = FlashAttnPatch {
+            op_idx: 0,
+            k_ti: 0,
+            v_ti: 1,
+            mask_ti: 2,
+            head_dim: 64,
+            n_heads: 16,
+            n_kv_heads: 4,
+            scale: 0.125,
+        };
+
+        // Simulate token step at pos = 15 (seq_len = 16)
+        let pos = 15;
+        let seq_len = pos + 1;
+        tens[patch.k_ti].ne[1] = seq_len as u32;
+        tens[patch.v_ti].ne[1] = seq_len as u32;
+        let mask_bytes = (seq_len * 2) as u32;
+        tens[patch.mask_ti].size = mask_bytes;
+        tens[patch.mask_ti].ne[0] = seq_len as u32;
+        tens[patch.mask_ti].nb[1] = mask_bytes;
+        tens[patch.mask_ti].nb[2] = mask_bytes;
+        tens[patch.mask_ti].nb[3] = mask_bytes;
+        ops[patch.op_idx].kernel_params = build_flash_attn_kernel_params(
+            patch.head_dim,
+            patch.n_heads,
+            patch.n_kv_heads,
+            1,
+            seq_len,
+            patch.scale,
+            4,
+            true,
+        );
+
+        assert_eq!(tens[0].ne[1], 16);
+        assert_eq!(tens[1].ne[1], 16);
+        assert_eq!(tens[2].ne[0], 16);
+        assert_eq!(tens[2].size, 32);
+        assert_eq!(tens[2].nb[1], 32);
+        assert_ne!(ops[0].kernel_params, [0; 32]);
     }
 }

@@ -357,7 +357,7 @@ sample_cera() { # backend label mask
   local cooldown="${CERA_BENCH_COOLDOWN_SECS:-0}"
   # Fail LOUD on garbage: `[[ $cooldown -gt 0 ]]` below is silently false
   # for non-numeric input, fail-opening a guard against Adreno context loss.
-  # Exits the whole matrix — a silently unguarded run would report numbers
+  # Exits the whole matrix: a silently unguarded run would report numbers
   # from the red regime as if they were green-regime measurements.
   [[ "$cooldown" =~ ^[0-9]+$ ]] || {
     echo "error: non-numeric CERA_BENCH_COOLDOWN_SECS=$cooldown (want seconds)" >&2

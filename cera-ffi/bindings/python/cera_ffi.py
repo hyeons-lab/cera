@@ -779,7 +779,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 2279:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 39958:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -10064,6 +10064,11 @@ class SessionProtocol(typing.Protocol):
         `width` and `height` specify the source image dimensions in pixels.
         Automatically applies aspect-preserving resizing and normalization,
         then encodes with the vision encoder and appends image tokens.
+
+        # Errors
+
+        Returns an error if the image buffer length does not match the dimensions,
+        if preprocessing fails, or if vision encoding is unsupported.
 """
         raise NotImplementedError
     def append_text(self, text: str) -> None:
@@ -10617,6 +10622,11 @@ class Session(SessionProtocol):
         `width` and `height` specify the source image dimensions in pixels.
         Automatically applies aspect-preserving resizing and normalization,
         then encodes with the vision encoder and appends image tokens.
+
+        # Errors
+
+        Returns an error if the image buffer length does not match the dimensions,
+        if preprocessing fails, or if vision encoding is unsupported.
 """
         
         _UniffiFfiConverterBytes.check_lower(pixels)

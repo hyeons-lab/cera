@@ -62,7 +62,7 @@ pub struct HexagonDevice {
     handle: RemoteHandle64,
     arch: HexagonArch,
     hw_info: HtpHwInfo,
-    queue_session: HexagonQueueSession,
+    queue_session: Option<HexagonQueueSession>,
     profiler_on: bool,
 }
 
@@ -90,6 +90,9 @@ impl HexagonDevice {
     pub fn new(driver: Arc<FastRpcDriver>, arch: HexagonArch) -> Result<Self, CeraError> {
         // Enable Unsigned Process Domain (domain 3) for standard Android APK deployment
         driver.enable_unsigned_pd(3)?;
+
+        // Configure CDSP latency QoS to prevent power collapse during active inference
+        let _ = driver.set_latency_qos(100);
 
         // FastRPC URI pointing to the architecture skel library in CDSP Unsigned PD
         let skel_uri = format!(
@@ -216,7 +219,7 @@ impl HexagonDevice {
             handle,
             arch,
             hw_info,
-            queue_session,
+            queue_session: Some(queue_session),
             profiler_on,
         })
     }
@@ -233,12 +236,17 @@ impl HexagonDevice {
 
     /// Mutable reference to the command queue session.
     pub fn queue_session_mut(&mut self) -> &mut HexagonQueueSession {
-        &mut self.queue_session
+        self.queue_session
+            .as_mut()
+            .expect("HexagonDevice: queue_session is active")
     }
 }
 
 impl Drop for HexagonDevice {
     fn drop(&mut self) {
+        // Drop queue session before shutting down DSP hardware session.
+        drop(self.queue_session.take());
+
         if self.profiler_on {
             let payload = HtpProfilerPayload {
                 mode: 0, // HTP_PROF_DISABLED
@@ -258,6 +266,39 @@ impl Drop for HexagonDevice {
         let stop_scalars = remote_scalars_make(3, 0, 0);
         let _ = self.driver.invoke_skel(self.handle, stop_scalars, &mut []);
         self.driver.close_skel_handle(self.handle);
+        let _ = self.driver.set_latency_qos(0);
+    }
+}
+
+/// Probe and initialize a Hexagon device, respecting optional architecture override.
+pub fn probe_device(
+    driver: &Arc<FastRpcDriver>,
+    arch_override: Option<HexagonArch>,
+) -> Result<HexagonDevice, CeraError> {
+    let probe_archs: &[HexagonArch] = match arch_override {
+        Some(ref arch) => std::slice::from_ref(arch),
+        None => &super::skels::PROBE_ARCHS,
+    };
+    let mut device_opt = None;
+    let mut probed_errors = Vec::new();
+    for &arch in probe_archs {
+        match HexagonDevice::new(Arc::clone(driver), arch) {
+            Ok(dev) => {
+                tracing::info!(arch = ?arch, "initialized Hexagon NPU device");
+                device_opt = Some(dev);
+                break;
+            }
+            Err(e) => {
+                probed_errors.push(format!("{arch:?}: {e}"));
+            }
+        }
+    }
+    match device_opt {
+        Some(d) => Ok(d),
+        None => Err(CeraError::Backend(format!(
+            "no compatible Hexagon skeleton library found. Errors: {}",
+            probed_errors.join("; ")
+        ))),
     }
 }
 
@@ -287,11 +328,11 @@ mod tests {
         assert_eq!(
             super::super::skels::PROBE_ARCHS,
             [
-                HexagonArch::V85,
                 HexagonArch::V79,
                 HexagonArch::V75,
                 HexagonArch::V73,
-                HexagonArch::V81
+                HexagonArch::V81,
+                HexagonArch::V85,
             ]
         );
     }

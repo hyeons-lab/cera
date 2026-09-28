@@ -1257,7 +1257,7 @@ fn n_embd_bins(cfg: &DetokenizerConfig) -> usize {
     (cfg.n_fft / 2 + 1) * 2
 }
 
-impl crate::model::audio_decoder::AudioGpu for WgpuAudioDecoder {
+impl crate::model::audio_decoder::AudioAccelerator for WgpuAudioDecoder {
     fn supports_depthformer(&self) -> bool {
         self.depthformer.is_some()
     }
