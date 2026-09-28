@@ -97,6 +97,20 @@ or you can pin one:
 
 `--device auto` prefers native Metal on macOS and iOS, Qualcomm Hexagon NPU on supported Snapdragon devices, and wgpu where a GPU is available, falling back to CPU otherwise.
 
+### Qualcomm Hexagon NPU backend
+
+Cera provides a native backend for Qualcomm Hexagon NPUs and Compute DSPs on Snapdragon 8 Gen 2 (`v73`), Snapdragon 8 Gen 3 (`v75`), Snapdragon 8 Elite (`v79`/`v81`), and next-generation platforms (`v85`). See the [Hexagon NPU Guide](docs/HEXAGON_NPU.md) for full architecture and Android packaging details.
+
+- **FastRPC Unsigned Process Domain**: Runs within Qualcomm's CDSP unsigned user domain (`/dev/fastrpc-cdsp`), enabling third-party Play Store applications to execute on HTP/HVX hardware without root privileges or vendor signing keys.
+- **Zero-Copy Shared Memory**: Allocates model weights, activations, and KV cache buffers in shared `rpcmem` (DMA-BUF / ION) mapped into both CPU and DSP address spaces, eliminating bus copying.
+- **Embedded Skeleton Libraries**: Embeds prebuilt, 16 KB page-aligned DSP worker libraries (`libggml-htp-v{73,75,79,81,85}.so`) into the host binary and extracts them automatically at startup. Skeletons incorporate extended operators (`Conv1D`, `ConvTranspose1D`, `Snake`, `UnaryStep`, `Sum`) aligned with the v85 DSP firmware ABI.
+- **Accelerated Kernels**:
+  - **LLM Text Generation**: 32x32 tiled Q4_0 and Q8_0 matrix repacking for HTP matrix units, single-flush forward decode eliminating ~22 synchronization boundaries per token, ping-pong scratch memory isolation, static batch template caching for zero-allocation dispatch, FastRPC latency QoS (`FASTRPC_CONTROL_LATENCY = 100 µs`), and Q8_0 quantized KV cache (~47% memory reduction over F16).
+  - **Multimodal Vision (ViT)**: Dispatches all 24 Vision Transformer blocks in a single batched submission with on-NPU Flash Attention, F16 KV scratch handling, and quantized MLP projector execution.
+  - **Whisper Speech Recognition**: 64-token chunked Conv1D and LayerNorm dispatches adhering to Snapdragon 8 Elite's 8 MB physical VTCM ceiling, paired with FlashAttnExt autoregressive decode.
+  - **Audio Synthesis & Vocoder**: `HexagonDepthformer` executes all 8 autoregressive passes (48 transformer layers per audio frame) entirely on the NPU using HTP GEMV, RMSNorm, RoPE, and FlashAttnExt, alongside on-DSP audio detokenization (LayerNorm, linear GEMM, SwiGLU, Conv1D).
+
+
 ### Quantization
 
 Weights run in **Q4_0**, **Q4_1**, **Q8_0**, **Q4_K**, **Q5_K**, and **Q6_K**,

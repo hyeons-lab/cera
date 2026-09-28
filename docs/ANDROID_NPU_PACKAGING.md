@@ -1,13 +1,14 @@
 # Android NPU Packaging
 
 How the Hexagon backend ships in published artifacts, which devices it
-runs on, and what blocks the rest.
+runs on, and what blocks the rest. See [HEXAGON_NPU.md](HEXAGON_NPU.md) for
+complete architecture, kernel acceleration, and benchmark details.
 
 ## What ships where
 
 | artifact | NPU content | notes |
 |---|---|---|
-| `cera` (crates.io) | `hexagon` feature (off by default) + 4 embedded DSP skels (~3.2 MB) | `cargo package` includes `src/backend/hexagon/skels/` (no `package.include` filter) |
+| `cera` (crates.io) | `hexagon` feature (off by default) + 5 embedded DSP skels (~4.2 MB) | `cargo package` includes `src/backend/hexagon/skels/` (no `package.include` filter) |
 | `cera-ffi-android` AAR | hexagon on arm64-v8a + x86_64; lean on 32-bit; skels embedded in libcera_ffi.so | FFI surface identical everywhere; `hexagon_probe()` reports unavailable where off |
 | AAR `assets/NOTICE` | MIT attribution for the embedded skels | required: MIT covers binaries too |
 | `cera-ffi-jvm` / xcframework / npm / crates | unchanged (no hexagon) | host platforms have no DSP |
@@ -63,11 +64,12 @@ that route string is the datum to record when validating a new device.
 
 ## Device support matrix
 
-Skels ship for v73/v75/v79/v81 (llama.cpp upstream scope; the probe
-tries all four and uses the first that opens).
+Skels ship for v73/v75/v79/v81/v85 (the probe
+tries all five and uses the first that opens).
 
 | SoC (examples) | arch | status |
 |---|---|---|
+| Next-Gen Snapdragon / Extended HTP | v85 | ✅ skel ships (extended ops, v85 ABI aligned) |
 | 8 Elite, X Elite Gen 2-class | v79/v81 | ✅ validated on-device (S25 Ultra) |
 | 8 Gen 3 / 8s Gen 3 | v75 | ✅ skel ships, same code path (not yet run) |
 | 8 Gen 2 / 8+ Gen 1 / 7+ Gen 2 / X Elite | v73 | ✅ skel ships, same code path (not yet run) |

@@ -23,7 +23,7 @@ cera = "0.7"
 
 ## The 0.7 Release
 
-- **Qualcomm Hexagon NPU Backend (`cera::backend::hexagon`)**: Opt-in `hexagon` feature flag enabling FastRPC Unsigned Process Domain execution on Qualcomm Snapdragon 8 Gen 2 / 8 Gen 3 / 8 Elite hardware. Features rpcmem DMA allocations, 32x32 tiled matrix repacking for Q4_0 and Q8_0 weights, asynchronous DSP command queues (`DspQueue`), and fused HTP operators with CPU fallback.
+- **Qualcomm Hexagon NPU Backend (`cera::backend::hexagon`)**: Opt-in `hexagon` feature flag enabling FastRPC Unsigned Process Domain execution on Qualcomm Snapdragon 8 Gen 2 / 8 Gen 3 / 8 Elite hardware. Features rpcmem DMA zero-copy allocations, 32x32 tiled matrix repacking for Q4_0 and Q8_0 weights, embedded 16 KB page-aligned DSP skeleton libraries with extended ops (Conv1D, ConvTranspose1D, Snake, UnaryStep, Sum), single-flush forward decode, and native acceleration across LLM text, ViT vision, Whisper ASR, and Depthformer vocoders.
 - **Dynamic CPU Topology Discovery & Threadpool Resizing**: Structured CPU set discovery (`UsableCpus::Known`), cgroup cpuset quota and sandbox awareness, set identity comparison across core migrations, and automatic dynamic worker threadpool resizing.
 - **Prompt Tail Prefill Scoping**: Assistant prefill scoping strictly to the rendered prompt tail, preserving state hygiene across conversational turns and session restorations.
 - **Chat coordinator (`cera::session::chat`)**: `Session::into_chat()` transfers execution into `SessionChat`, with delta-only prefill and validated template profiles. Ingest another turn only from `TurnComplete`. Interrupted generation requires reset or replacement before a new user turn; zero-token/no-progress calls can preserve `PromptReady` for retry. Recovery can restore, reset or leave the session unusable. Legacy `Session::append_user_message` is deprecated in favor of this API.
@@ -216,6 +216,30 @@ This synchronous CPU path handles one 30-second chunk. The
 [Swift/Kotlin guide](../docs/internals/API_RESHAPE_WHISPER_EXAMPLES.md) uses the
 standalone FFI object and its background decode method. The unified typed
 Whisper/VAD/hotword loader remains planned separately from the generative API refactor.
+
+## Qualcomm Hexagon NPU Backend (`cera::backend::hexagon`)
+
+The `hexagon` feature flag activates Cera's native Qualcomm Hexagon NPU backend, enabling hardware acceleration on Qualcomm Snapdragon mobile and compute processors (Snapdragon 8 Gen 2, 8 Gen 3, 8 Elite, and next-generation architectures). See the comprehensive [Qualcomm Hexagon NPU Guide](../docs/HEXAGON_NPU.md) for architectural specifications, execution flow, and benchmarks.
+
+### Execution Architecture
+- **FastRPC Unsigned Process Domain**: Executes inside Qualcomm's CDSP unsigned user domain (`/dev/fastrpc-cdsp`), allowing standard non-root Android applications to access HTP matrix coprocessors and HVX vector units.
+- **Zero-Copy Shared Memory**: Allocates all weights, activations, and KV cache slabs in `rpcmem` DMA-BUF buffers shared directly between CPU and CDSP address spaces, bypassing bus copy bottlenecks.
+- **Dynamic Device Probing**: Automatically detects device architecture (`v73`, `v75`, `v79`, `v81`, `v85`) via `HexagonDevice::probe()` and loads the matching embedded skeleton library.
+
+### Embedded Skeleton Libraries & Extended Operators
+The backend embeds prebuilt 16 KB page-aligned Hexagon ELF dynamic libraries (`libggml-htp-v{73,75,79,81,85}.so`) and extracts them to application storage at runtime. Key additions in 0.7.0 include:
+- **Extended Operator Set**:
+  - `Conv1D`: 1D convolution with configurable dilation, stride, and padding for waveform audio encoding and speech processing.
+  - `ConvTranspose1D`: Transposed 1D convolution for speech decoders and vocoder audio reconstruction.
+  - `Snake` / `Snake1D`: Sinusoidal activation function ($\sin^2(\alpha x)$) for neural vocoders.
+  - `UnaryStep` and `Sum`: Element-wise step activations and reductions executing directly on HVX vector units.
+- **ABI Opcode Alignment**: Realigned `HtpOpCode` discriminants with the v85 DSP firmware ABI (`UnaryStep = 21`, `Sum = 39`, `Cpy = 32`, `Scale = 33`, `Conv1d = 40`, `Snake = 41`), preventing opcode displacement.
+
+### Accelerated Kernels & Subsystems
+- **LLM Text Generation (`HexagonLfm2Model`)**: 32x32 tiled Q4_0 and Q8_0 matrix repacking for HTP hardware, single-flush forward decode eliminating ~22 synchronization boundaries per token, ping-pong scratch memory isolation across layers, static batch template caching for zero-allocation dispatch, FastRPC latency QoS (`FASTRPC_CONTROL_LATENCY = 100 µs`), and Q8_0 quantized KV cache (~47% memory reduction over F16).
+- **Multimodal Vision Transformer (`HexagonVisionEncoder`)**: Consolidates all 24 ViT blocks into a single FastRPC batch submission with on-NPU Flash Attention, F16 KV scratch handling, and quantized MLP projector dispatch.
+- **Speech Recognition (`HexagonWhisperModel`)**: Partitions 1,500-token audio sequences into 64-token tiles across all Conv1D, LayerNorm, linear GEMM, and GELU dispatches to satisfy Snapdragon 8 Elite's 8 MB physical VTCM hardware ceiling, paired with FlashAttnExt autoregressive decode.
+- **Vocoder & Audio Synthesis (`HexagonAudioDecoder` / `HexagonDepthformer`)**: `HexagonDepthformer` executes all 8 autoregressive passes (48 transformer layers per audio frame) entirely on the NPU using HTP GEMV, RMSNorm, RoPE, and FlashAttnExt, alongside on-DSP audio detokenization (LayerNorm, linear GEMM, SwiGLU, Conv1D), delivering 36.67 tok/s on Snapdragon 8 Elite (1.59x faster than Leap CPU).
 
 ## API refactor examples
 
