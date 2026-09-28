@@ -2890,7 +2890,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 39958) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 20118) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
@@ -10981,13 +10981,17 @@ public interface SessionInterface {
      *
      * `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
      * `width` and `height` specify the source image dimensions in pixels.
+     * `max_long_size` controls edge resizing: `None` uses the session default,
+     * `Some(0)` disables resizing to keep original dimensions, and `Some(n)`
+     * constrains the longest edge to at most `n` pixels.
      * Automatically applies aspect-preserving resizing and normalization,
      * then encodes with the vision encoder and appends image tokens.
      *
      * # Errors
      *
-     * Returns an error if the image buffer length does not match the dimensions,
-     * if preprocessing fails, or if vision encoding is unsupported.
+     * Returns `FfiError::InvalidInput` if buffer length does not match dimensions
+     * or pixel format, `FfiError::Preprocess` if image normalization fails,
+     * or [`FfiError::UnsupportedModality`] if vision encoding is unsupported.
      */
     fun `appendRawImage`(
         `pixels`: kotlin.ByteArray,
@@ -11638,13 +11642,17 @@ open class Session :
      *
      * `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
      * `width` and `height` specify the source image dimensions in pixels.
+     * `max_long_size` controls edge resizing: `None` uses the session default,
+     * `Some(0)` disables resizing to keep original dimensions, and `Some(n)`
+     * constrains the longest edge to at most `n` pixels.
      * Automatically applies aspect-preserving resizing and normalization,
      * then encodes with the vision encoder and appends image tokens.
      *
      * # Errors
      *
-     * Returns an error if the image buffer length does not match the dimensions,
-     * if preprocessing fails, or if vision encoding is unsupported.
+     * Returns `FfiError::InvalidInput` if buffer length does not match dimensions
+     * or pixel format, `FfiError::Preprocess` if image normalization fails,
+     * or [`FfiError::UnsupportedModality`] if vision encoding is unsupported.
      */
     @Throws(FfiException::class)
     override fun `appendRawImage`(

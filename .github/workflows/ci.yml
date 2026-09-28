@@ -1032,7 +1032,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}-mt
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=4096  # 4.0 MB; PR #445 api reshape and session checkpointing MT
+          BUDGET_KB=4160  # 4.06 MB; PR #449 Hexagon backend and audio depthformer MT
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}

@@ -285,7 +285,7 @@ fn render(session: &mut crate::Session, prefix: &[u32]) -> AudioSink {
             &mut sink,
         )
         .unwrap();
-    assert_eq!(summary.tokens_generated, 18);
+    assert_eq!(summary.tokens_generated, 6);
     assert_eq!(sink.text.len(), 6);
     assert_eq!(sink.done, [crate::FinishReason::MaxTokens]);
     assert!(!sink.pcm.is_empty());

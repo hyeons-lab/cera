@@ -2704,8 +2704,8 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns [`FfiError::InvalidInput`] if buffer length does not match dimensions
-    /// or pixel format, [`FfiError::Preprocess`] if image normalization fails,
+    /// Returns `FfiError::InvalidInput` if buffer length does not match dimensions
+    /// or pixel format, `FfiError::Preprocess` if image normalization fails,
     /// or [`FfiError::UnsupportedModality`] if vision encoding is unsupported.
     pub fn append_raw_image(
         &self,

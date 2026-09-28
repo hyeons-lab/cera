@@ -3139,7 +3139,6 @@ impl Session {
                             pcm,
                             ..
                         } => {
-                            generated += 1;
                             dec.observe_pcm(&pcm);
                             if !pcm.is_empty() {
                                 sink.on_audio_frames(&pcm, dec.sample_rate());
