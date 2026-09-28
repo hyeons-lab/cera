@@ -78,7 +78,7 @@ pub trait AudioAccelerator: Send + Sync {
     /// Reset detokenizer state (conv buffers + KV caches, called per generation).
     fn reset_detokenizer(&self);
 
-    /// Whether [`AudioGpu::sample_audio_frame`] is actually implemented here.
+    /// Whether [`Self::sample_audio_frame`] is actually implemented here.
     fn supports_depthformer(&self) -> bool;
 
     /// Convert the accumulated spectrum `[n_frames × n_fft_bins × 2]` (log-mag,
@@ -127,10 +127,6 @@ pub trait AudioAccelerator: Send + Sync {
     fn release_session(&self) {}
 }
 
-/// Backward-compatibility sub-trait for [`AudioAccelerator`].
-pub trait AudioGpu: AudioAccelerator {}
-impl<T: ?Sized + AudioAccelerator> AudioGpu for T {}
-
 /// Try to construct an accelerated audio decoder backend for the given vocoder GGUF file.
 ///
 /// Returns `None` for `Cpu`, when the chosen backend's feature is not compiled,
@@ -149,14 +145,6 @@ pub fn build_audio_accelerator(
             .or_else(|| try_hexagon_audio_decoder(gguf))
             .or_else(|| try_wgpu_audio_decoder(gguf)),
     }
-}
-
-/// Backward-compatibility alias for [`build_audio_accelerator`].
-pub fn build_gpu_audio_decoder(
-    gguf: &Arc<GgufFile>,
-    backend: crate::engine::BackendPreference,
-) -> Option<Arc<dyn AudioAccelerator>> {
-    build_audio_accelerator(gguf, backend)
 }
 
 #[cfg(feature = "hexagon")]
@@ -1840,7 +1828,7 @@ mod tests {
     }
 
     #[test]
-    fn test_build_gpu_audio_decoder_empty_gguf_graceful_none() {
+    fn test_build_audio_accelerator_empty_gguf_graceful_none() {
         let mut data = Vec::new();
         data.extend_from_slice(b"GGUF");
         data.extend_from_slice(&3u32.to_le_bytes());
@@ -1849,20 +1837,20 @@ mod tests {
         let bytes: Arc<[u8]> = Arc::from(data.into_boxed_slice());
         let gguf = Arc::new(GgufFile::from_bytes(bytes).expect("parse minimal gguf"));
 
-        assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Cpu).is_none());
-        assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Metal).is_none());
-        assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Gpu).is_none());
-        assert!(build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Auto).is_none());
+        assert!(build_audio_accelerator(&gguf, crate::engine::BackendPreference::Cpu).is_none());
+        assert!(build_audio_accelerator(&gguf, crate::engine::BackendPreference::Metal).is_none());
+        assert!(build_audio_accelerator(&gguf, crate::engine::BackendPreference::Gpu).is_none());
+        assert!(build_audio_accelerator(&gguf, crate::engine::BackendPreference::Auto).is_none());
         assert!(
-            build_gpu_audio_decoder(&gguf, crate::engine::BackendPreference::Hexagon).is_none()
+            build_audio_accelerator(&gguf, crate::engine::BackendPreference::Hexagon).is_none()
         );
     }
 
-    struct MockAudioGpu {
+    struct MockAudioAccelerator {
         active: std::sync::atomic::AtomicBool,
     }
 
-    impl AudioAccelerator for MockAudioGpu {
+    impl AudioAccelerator for MockAudioAccelerator {
         fn supports_depthformer(&self) -> bool {
             false
         }
@@ -1900,17 +1888,17 @@ mod tests {
     }
 
     #[test]
-    fn test_audio_gpu_session_lease_lifecycle() {
-        let gpu = MockAudioGpu {
+    fn test_audio_accelerator_session_lease_lifecycle() {
+        let acc = MockAudioAccelerator {
             active: std::sync::atomic::AtomicBool::new(false),
         };
-        assert!(gpu.try_acquire_session());
+        assert!(acc.try_acquire_session());
         // Second concurrent acquisition fails while active.
-        assert!(!gpu.try_acquire_session());
-        gpu.release_session();
+        assert!(!acc.try_acquire_session());
+        acc.release_session();
         // Subsequent acquisition succeeds.
-        assert!(gpu.try_acquire_session());
-        gpu.release_session();
+        assert!(acc.try_acquire_session());
+        acc.release_session();
     }
 
     #[test]

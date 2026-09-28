@@ -406,7 +406,7 @@ fn depthformer_frame_sampling_parity() {
         return;
     };
 
-    use cera::model::audio_decoder::AudioGpu;
+    use cera::model::audio_decoder::AudioAccelerator;
 
     let dec_w = cera::model::audio_decoder::AudioDecoderWeights::from_gguf(&gguf).unwrap();
     let gpu = cera::model::wgpu_audio_decoder::WgpuAudioDecoder::from_gguf(&gguf, &path).unwrap();

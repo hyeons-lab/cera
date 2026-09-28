@@ -38,7 +38,7 @@ remove that operation later without an equivalent replacement.
 | `transcribe` | Same method on `GenerativeModel` | Preserve the one-call LFM2-Audio path and existing errors |
 | `AUDIO_MARKER_CANDIDATES`, `split_tokens_at_marker` | Retain on `CeraEngine` | Existing marker priority and token-split helper stay available |
 | `audio_encoder`, `vision_encoder` | Retain on `CeraEngine` | Borrow optional shared typed weights for raw auxiliary computations |
-| `has_gpu_vision_encoder`, `has_gpu_audio_encoder`, `has_gpu_audio_decoder` | Retain on `CeraEngine` | Report successfully attached GPU components |
+| `has_gpu_vision_encoder`, `has_gpu_audio_encoder`, `has_audio_accelerator` | Retain on `CeraEngine` | Report successfully attached GPU or accelerator components |
 | `vision_encoder_gguf` | Retain on `CeraEngine`, still doc-hidden | Raw GGUF access can succeed while typed projector parsing fails |
 | `detect_pii`, `detect_pii_with_lora` | Retain on `CeraEngine` | Fresh caller state for classifier execution; no invented encoder facade |
 

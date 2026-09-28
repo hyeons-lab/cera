@@ -4230,10 +4230,10 @@ mod webgpu {
             let mut decoder = if has_audio_weights
                 && let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights)
             {
-                let gpu_ref: Option<&dyn cera::model::audio_decoder::AudioGpu> = self
+                let acc_ref: Option<&dyn cera::model::audio_decoder::AudioAccelerator> = self
                     .gpu_audio_decoder
                     .as_deref()
-                    .map(|g| g as &dyn cera::model::audio_decoder::AudioGpu);
+                    .map(|g| g as &dyn cera::model::audio_decoder::AudioAccelerator);
                 let use_gpu_df = self
                     .gpu_audio_decoder
                     .as_ref()
@@ -4246,7 +4246,7 @@ mod webgpu {
                     cera::audio_engine::AudioOutputDecoder::new(
                         dec,
                         detok,
-                        gpu_ref,
+                        acc_ref,
                         audio_temp,
                         audio_top_k,
                         use_gpu_df,

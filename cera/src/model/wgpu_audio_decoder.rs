@@ -148,7 +148,7 @@ pub struct WgpuAudioDecoder {
     /// Sticky record of a failed sync depthformer sample (see
     /// `sample_audio_frame`): the async error has no readback slot to
     /// land in, so the sync wrapper records it here for
-    /// [`crate::model::audio_decoder::AudioGpu::take_audio_error`].
+    /// [`crate::model::audio_decoder::AudioAccelerator::take_audio_error`].
     sample_error: std::sync::Mutex<Option<crate::CeraError>>,
 }
 

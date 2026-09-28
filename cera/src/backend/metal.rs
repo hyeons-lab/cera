@@ -47,7 +47,7 @@ pub struct MetalContext {
     /// session gate allows one live session per model, so the take is
     /// unambiguous. Contexts owned by non-`Model` drivers
     /// (`MetalAudioDecoder`, `MetalDepthformer` own private contexts)
-    /// drain through `AudioGpu::take_audio_error`, which the audio
+    /// drain through `AudioAccelerator::take_audio_error`, which the audio
     /// engine checks after every bare call; do not assume audio faults
     /// surface via `take_decode_error`.
     cmd_error: std::sync::Mutex<Option<CeraError>>,

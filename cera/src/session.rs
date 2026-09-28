@@ -880,22 +880,9 @@ impl Session {
         self.audio_accelerator = Some(accelerator);
     }
 
-    /// Backward-compatibility alias for [`Self::attach_audio_accelerator`].
-    pub fn attach_gpu_audio_decoder(
-        &mut self,
-        decoder: Arc<dyn crate::model::audio_decoder::AudioAccelerator>,
-    ) {
-        self.attach_audio_accelerator(decoder);
-    }
-
     /// Whether a hardware audio accelerator backend is attached to this session.
     pub fn has_audio_accelerator(&self) -> bool {
         self.audio_accelerator.is_some()
-    }
-
-    /// Backward-compatibility alias for [`Self::has_audio_accelerator`].
-    pub fn has_gpu_audio_decoder(&self) -> bool {
-        self.has_audio_accelerator()
     }
 
     /// Attach an audio encoder so [`Self::append_audio`] can encode

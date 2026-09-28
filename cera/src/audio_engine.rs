@@ -178,8 +178,8 @@ pub enum FrameOutcome {
     /// spectrum produced for this frame; caller should return control
     /// to the text modality per its mode's exit convention.
     End,
-    /// The GPU backend faulted mid-frame (see
-    /// `AudioGpu::take_audio_error`) and the stage has no CPU fallback
+    /// The accelerator backend faulted mid-frame (see
+    /// `AudioAccelerator::take_audio_error`) and the stage has no CPU fallback
     /// with coherent state, so the frame produced nothing usable.
     /// Callers must abort generation with the error, not continue over
     /// the hole: detokenize/ISTFT faults already fall back to CPU
@@ -1166,7 +1166,7 @@ mod tests {
         assert!(check_audio_decode_error(&clean).is_ok());
     }
 
-    /// Fault-injecting `AudioGpu` double: scripted `take_audio_error`
+    /// Fault-injecting `AudioAccelerator` double: scripted `take_audio_error`
     /// outcomes (one per take, in order; the script running dry reads as
     /// clean) plus garbage outputs no real computation produces, so a
     /// missed drain is observable.

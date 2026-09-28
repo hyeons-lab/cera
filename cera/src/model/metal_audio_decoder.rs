@@ -1584,7 +1584,7 @@ impl MetalDepthformer {
     }
 }
 
-// ── AudioGpu trait implementation ───────────────────────────────────────────
+// ── AudioAccelerator trait implementation ───────────────────────────────────
 
 impl crate::model::audio_decoder::AudioAccelerator for MetalAudioDecoder {
     // Not a constant `true`: `from_gguf` leaves this `None` on any depthformer

@@ -100,7 +100,7 @@ fn actual_audio_end_path_does_not_claim_a_text_turn_boundary() {
         }),
     );
     let backend = Arc::new(EndAudio::default());
-    active.attach_gpu_audio_decoder(backend.clone());
+    active.attach_audio_accelerator(backend.clone());
     let mut sink = Sink::default();
     let observed = active.generate_observed(&opts(), &mut sink);
     assert_eq!(observed.observation, DecodeObservation::Audio);

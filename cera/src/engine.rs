@@ -1100,11 +1100,6 @@ impl CeraEngine {
         self.audio_accelerator.is_some()
     }
 
-    /// Backward-compatibility alias for [`Self::has_audio_accelerator`].
-    pub fn has_gpu_audio_decoder(&self) -> bool {
-        self.has_audio_accelerator()
-    }
-
     /// Borrow the raw mmapped vision-encoder mmproj GGUF, if any.
     /// `Some` for VL bundles loaded from filesystem paths via
     /// `from_path`, `from_files`, or `from_bundle_id`. Hermetic

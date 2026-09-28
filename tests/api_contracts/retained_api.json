@@ -29,7 +29,6 @@
         "from_path": "pub fn from_path<P: AsRef<Path>>(path: P, cfg: EngineConfig) -> Result<Self, CeraError>",
         "from_reader": "pub fn from_reader<R: Read>(reader: R, cfg: EngineConfig) -> Result<Self, CeraError>",
         "has_audio_accelerator": "pub fn has_audio_accelerator(&self) -> bool",
-        "has_gpu_audio_decoder": "pub fn has_gpu_audio_decoder(&self) -> bool",
         "has_gpu_audio_encoder": "pub fn has_gpu_audio_encoder(&self) -> bool",
         "has_gpu_vision_encoder": "pub fn has_gpu_vision_encoder(&self) -> bool",
         "manifest": "pub fn manifest(&self) -> &Manifest",
