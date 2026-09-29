@@ -375,6 +375,11 @@ impl HexagonQueueSession {
                 base.add(bufs_bytes + tens_bytes),
                 ops_bytes,
             );
+            // Explicitly zero prof_bytes segment to guarantee cleared HtpProfDesc descriptors,
+            // mirroring flush() behavior.
+            if prof_bytes > 0 {
+                std::ptr::write_bytes(base.add(bufs_bytes + tens_bytes + ops_bytes), 0, prof_bytes);
+            }
         }
 
         Ok(StagedBatch {

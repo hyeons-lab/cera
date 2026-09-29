@@ -563,9 +563,10 @@ impl FastRpcDriver {
                 // processing.
                 if self.oppoll {
                     spins += 1;
-                    if spins > 10_000 {
+                    if spins > 500_000 {
                         // Slow batch: stop burning a core and block for the
-                        // response like blocking mode does.
+                        // response like blocking mode does. 500k spins provides
+                        // roughly 1 to 5 ms of low-latency polling before falling back.
                         timeout = DSPQUEUE_TIMEOUT_US;
                     } else {
                         std::hint::spin_loop();

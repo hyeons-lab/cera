@@ -520,6 +520,9 @@ pub fn requant_q5_k_to_q8_0(
         std::mem::size_of::<BlockQ8_0>(),
         "requant_q5_k_to_q8_0",
     )?;
+    // Allocate safe zeroed output buffer. Although par_chunks_mut below exhaustively
+    // populates every byte of out, creating mutable slices over uninitialized memory
+    // would violate Rust's validity invariants.
     let mut out = vec![0u8; out_len];
     let row_bytes = sb_per_row * 8 * 34;
     out.par_chunks_mut(row_bytes)
@@ -577,6 +580,9 @@ pub fn quantize_f32_to_q8_0(vals: &[f32], cols: usize, rows: usize) -> Result<Ve
     }
     let blocks_per_row = cols / 32;
     let out_len = checked_src_bytes(rows, blocks_per_row, 34, "quantize_f32_to_q8_0")?;
+    // Allocate safe zeroed output buffer. Although par_chunks_mut below exhaustively
+    // populates every byte of out, creating mutable slices over uninitialized memory
+    // would violate Rust's validity invariants.
     let mut out = vec![0u8; out_len];
     let row_bytes = blocks_per_row * 34;
     out.par_chunks_mut(row_bytes)

@@ -171,7 +171,7 @@ impl HexagonDevice {
         }
 
         // Start session on DSP via htp_iface_start (Method 2: 1 in, 0 out)
-        let start_payload = HtpStartPayload {
+        let mut start_payload = HtpStartPayload {
             sess_id: 0,
             _pad: 0,
             dsp_queue_id: queue_session.queue_id(),
@@ -182,7 +182,7 @@ impl HexagonDevice {
 
         let mut in_args = [RemoteArg {
             buf: RemoteBuf {
-                buf: &start_payload as *const _ as *mut std::ffi::c_void,
+                buf: &mut start_payload as *mut _ as *mut std::ffi::c_void,
                 len: std::mem::size_of::<HtpStartPayload>(),
             },
         }];
@@ -198,13 +198,13 @@ impl HexagonDevice {
         // when `GGML_HEXAGON_PROFILE` is set). A failed enable is non-fatal:
         // batch totals stay valid either way.
         let profiler_on = if std::env::var_os("CERA_HEXAGON_PROFILE").is_some() {
-            let payload = HtpProfilerPayload {
+            let mut payload = HtpProfilerPayload {
                 mode: 1, // HTP_PROF_BASIC
                 events: [0; 8],
             };
             let mut args = [RemoteArg {
                 buf: RemoteBuf {
-                    buf: &payload as *const _ as *mut std::ffi::c_void,
+                    buf: &mut payload as *mut _ as *mut std::ffi::c_void,
                     len: std::mem::size_of::<HtpProfilerPayload>(),
                 },
             }];
@@ -249,13 +249,13 @@ impl Drop for HexagonDevice {
         drop(self.queue_session.take());
 
         if self.profiler_on {
-            let payload = HtpProfilerPayload {
+            let mut payload = HtpProfilerPayload {
                 mode: 0, // HTP_PROF_DISABLED
                 events: [0; 8],
             };
             let mut args = [RemoteArg {
                 buf: RemoteBuf {
-                    buf: &payload as *const _ as *mut std::ffi::c_void,
+                    buf: &mut payload as *mut _ as *mut std::ffi::c_void,
                     len: std::mem::size_of::<HtpProfilerPayload>(),
                 },
             }];
