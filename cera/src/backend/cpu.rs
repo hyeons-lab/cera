@@ -2470,6 +2470,7 @@ pub(crate) fn q4_k_repack_supported(m: usize, k: usize) -> bool {
 /// this host.
 #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
 pub(crate) fn q6_k_repack_supported(m: usize, k: usize) -> bool {
+    let _ = (m, k);
     #[cfg(target_arch = "aarch64")]
     return m.is_multiple_of(8)
         && k.is_multiple_of(256)
@@ -2842,8 +2843,10 @@ pub(crate) fn gemm_preq_repacked_q6_k_dispatch(
     n: usize,
     k: usize,
 ) -> bool {
-    let nb16 = k / 16;
+    let _ = (packed, scales);
     let nb32 = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    let nb16 = k / 16;
     #[cfg(target_arch = "aarch64")]
     {
         assert!(
@@ -2887,8 +2890,9 @@ pub(crate) fn gemm_preq_repacked_q6_k_smmla_dispatch(
     k: usize,
 ) -> bool {
     let _ = (packed, scales);
-    let nb16 = k / 16;
     let nb32 = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    let nb16 = k / 16;
     #[cfg(target_arch = "aarch64")]
     {
         assert!(
@@ -2931,8 +2935,10 @@ pub(crate) fn gemm_preq_repacked_q6_k_rowmajor_dispatch(
     m: usize,
     k: usize,
 ) -> bool {
-    let nb16 = k / 16;
+    let _ = (packed, scales);
     let nb32 = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    let nb16 = k / 16;
     #[cfg(target_arch = "aarch64")]
     {
         assert!(
@@ -2976,8 +2982,9 @@ pub(crate) fn gemm_preq_repacked_q6_k_smmla_rowmajor_dispatch(
     k: usize,
 ) -> bool {
     let _ = (packed, scales);
-    let nb16 = k / 16;
     let nb32 = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    let nb16 = k / 16;
     #[cfg(target_arch = "aarch64")]
     {
         assert!(

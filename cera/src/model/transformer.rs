@@ -356,23 +356,15 @@ impl WeightRef {
                     kind = Some(Repacked::Q4K { packed, dsc, dmn });
                 }
             }
+            #[cfg(target_arch = "aarch64")]
             if qualifies && self.dtype == DType::Q6K {
-                #[cfg(target_arch = "aarch64")]
+                if crate::backend::cpu_features::cpu_features().tier
+                    == crate::backend::cpu_features::CpuTier::NeonI8mm
                 {
-                    if crate::backend::cpu_features::cpu_features().tier
-                        == crate::backend::cpu_features::CpuTier::NeonI8mm
-                    {
-                        let (packed, scales) =
-                            cpu::repack_q6_k_smmla_8x8(weight_data(gguf, &self), self.m, self.k);
-                        kind = Some(Repacked::Q6KSmmla { packed, scales });
-                    } else {
-                        let (packed, scales) =
-                            cpu::repack_q6_k_8x8(weight_data(gguf, &self), self.m, self.k);
-                        kind = Some(Repacked::Q6K { packed, scales });
-                    }
-                }
-                #[cfg(target_arch = "x86_64")]
-                {
+                    let (packed, scales) =
+                        cpu::repack_q6_k_smmla_8x8(weight_data(gguf, &self), self.m, self.k);
+                    kind = Some(Repacked::Q6KSmmla { packed, scales });
+                } else {
                     let (packed, scales) =
                         cpu::repack_q6_k_8x8(weight_data(gguf, &self), self.m, self.k);
                     kind = Some(Repacked::Q6K { packed, scales });
