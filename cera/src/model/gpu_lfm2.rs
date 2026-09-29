@@ -6918,6 +6918,7 @@ impl GpuLfm2Model {
     /// Streaming fp16 Q4_K_M GEMM (`gemm_stream_q4_k`). Same contract as
     /// `encode_mul_mat_reg_tile` for the Q4KM case: `y[n, m] = x[n, k] @
     /// w[m, k]^T` with token-major strides. Grid `(ceil(m/256), ceil(n/32))`.
+    #[allow(clippy::too_many_arguments)]
     fn encode_gemm_stream_q4_k<'a>(
         &'a self,
         cmds: &mut Vec<PrefillCmd<'a>>,
