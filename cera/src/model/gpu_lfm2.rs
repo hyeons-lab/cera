@@ -10765,8 +10765,8 @@ mod tests {
         );
     }
 
-    /// Resident stream layout eligibility: Q4_0 with `k % 32 == 0` (the
-    /// repack's precondition). There is no size gate — the repack is the
+    /// Resident stream layout eligibility: Q4_0 with `k % 32 == 0` or Q4_K_M
+    /// with `k % 256 == 0`. There is no size gate: the repack is the
     /// same bytes transposed, so small and large models alike qualify.
     #[test]
     fn stream_layout_eligibility() {
@@ -10777,8 +10777,11 @@ mod tests {
         assert!(stream_layout_eligible(DType::Q4_0, 10752));
         assert!(!stream_layout_eligible(DType::Q4_0, 100));
         assert!(!stream_layout_eligible(DType::Q4_0, 2056));
+        assert!(stream_layout_eligible(DType::Q4KM, 256));
+        assert!(stream_layout_eligible(DType::Q4KM, 2048));
+        assert!(!stream_layout_eligible(DType::Q4KM, 100));
+        assert!(!stream_layout_eligible(DType::Q4KM, 2056));
         assert!(!stream_layout_eligible(DType::Q8_0, 2048));
-        assert!(!stream_layout_eligible(DType::Q4KM, 2048));
         assert!(!stream_layout_eligible(DType::F32, 2048));
     }
 

@@ -5351,9 +5351,14 @@ public protocol SessionProtocol: AnyObject, Sendable {
      *
      * # Errors
      *
-     * Returns `FfiError::InvalidInput` if buffer length does not match dimensions
-     * or pixel format, `FfiError::Preprocess` if image normalization fails,
-     * or [`FfiError::UnsupportedModality`] if vision encoding is unsupported.
+     * - `InvalidInput` if buffer length does not match dimensions or pixel format.
+     * - `Preprocess` if image normalization fails.
+     * - `UnsupportedModality` if vision encoding is unsupported on this session.
+     * - `Backend` for missing vision encoder, projection dimension mismatch,
+     * or backend execution failure during encoding or prefill.
+     * - `ContextOverflow` if appending image tokens exceeds context limit.
+     * - `Cancelled` if execution is interrupted.
+     * - `PoisonedSession` if the session lock is poisoned.
      */
     func appendRawImage(pixels: Data, width: UInt32, height: UInt32, format: PixelFormat, maxLongSize: UInt32?) throws 
     
@@ -5934,9 +5939,14 @@ open func appendImage(bytes: Data, maxLongSize: UInt32?)throws   {try rustCallWi
      *
      * # Errors
      *
-     * Returns `FfiError::InvalidInput` if buffer length does not match dimensions
-     * or pixel format, `FfiError::Preprocess` if image normalization fails,
-     * or [`FfiError::UnsupportedModality`] if vision encoding is unsupported.
+     * - `InvalidInput` if buffer length does not match dimensions or pixel format.
+     * - `Preprocess` if image normalization fails.
+     * - `UnsupportedModality` if vision encoding is unsupported on this session.
+     * - `Backend` for missing vision encoder, projection dimension mismatch,
+     * or backend execution failure during encoding or prefill.
+     * - `ContextOverflow` if appending image tokens exceeds context limit.
+     * - `Cancelled` if execution is interrupted.
+     * - `PoisonedSession` if the session lock is poisoned.
      */
 open func appendRawImage(pixels: Data, width: UInt32, height: UInt32, format: PixelFormat, maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_append_raw_image(
@@ -13101,7 +13111,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_append_image() != 60729) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_append_raw_image() != 20118) {
+    if (uniffi_cera_ffi_checksum_method_session_append_raw_image() != 51302) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {

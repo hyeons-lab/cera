@@ -779,7 +779,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 20118:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 51302:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -10102,9 +10102,14 @@ class SessionProtocol(typing.Protocol):
 
         # Errors
 
-        Returns `FfiError::InvalidInput` if buffer length does not match dimensions
-        or pixel format, `FfiError::Preprocess` if image normalization fails,
-        or [`FfiError::UnsupportedModality`] if vision encoding is unsupported.
+        - `InvalidInput` if buffer length does not match dimensions or pixel format.
+        - `Preprocess` if image normalization fails.
+        - `UnsupportedModality` if vision encoding is unsupported on this session.
+        - `Backend` for missing vision encoder, projection dimension mismatch,
+        or backend execution failure during encoding or prefill.
+        - `ContextOverflow` if appending image tokens exceeds context limit.
+        - `Cancelled` if execution is interrupted.
+        - `PoisonedSession` if the session lock is poisoned.
 """
         raise NotImplementedError
     def append_text(self, text: str) -> None:
@@ -10674,9 +10679,14 @@ class Session(SessionProtocol):
 
         # Errors
 
-        Returns `FfiError::InvalidInput` if buffer length does not match dimensions
-        or pixel format, `FfiError::Preprocess` if image normalization fails,
-        or [`FfiError::UnsupportedModality`] if vision encoding is unsupported.
+        - `InvalidInput` if buffer length does not match dimensions or pixel format.
+        - `Preprocess` if image normalization fails.
+        - `UnsupportedModality` if vision encoding is unsupported on this session.
+        - `Backend` for missing vision encoder, projection dimension mismatch,
+        or backend execution failure during encoding or prefill.
+        - `ContextOverflow` if appending image tokens exceeds context limit.
+        - `Cancelled` if execution is interrupted.
+        - `PoisonedSession` if the session lock is poisoned.
 """
         
         _UniffiFfiConverterBytes.check_lower(pixels)

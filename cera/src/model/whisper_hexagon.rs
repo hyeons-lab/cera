@@ -771,11 +771,8 @@ impl HexagonWhisperScratchOffsets {
 
 /// Native Qualcomm Hexagon NPU Whisper speech recognition model.
 pub struct HexagonWhisperModel {
-    #[allow(dead_code)]
-    driver: Arc<FastRpcDriver>,
     device: Arc<Mutex<HexagonDevice>>,
     config: WhisperConfig,
-    #[allow(dead_code)]
     weights_offsets: HexagonWhisperWeightOffsets,
     weights_buf: RpcmemBuffer,
     state_offsets: HexagonWhisperStateOffsets,
@@ -823,7 +820,6 @@ impl HexagonWhisperModel {
         let special_tokens = WhisperSpecialTokens::from_tokenizer(tokenizer);
 
         Ok(Self {
-            driver,
             device,
             config: weights.config.clone(),
             weights_offsets,
@@ -3054,6 +3050,7 @@ mod tests {
         let offsets = HexagonWhisperWeightOffsets::plan(&weights).unwrap();
         let mut short_buf = vec![0u8; offsets.total_bytes - 1];
         let res = stage_whisper_weights(&weights, &offsets, &mut short_buf);
-        assert!(res.is_err());
+        let err = res.unwrap_err().to_string();
+        assert!(err.contains("smaller than required offsets total_bytes"));
     }
 }

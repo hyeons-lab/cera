@@ -9430,8 +9430,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_append_raw_image`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image != 20118) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_raw_image`: expected 20118, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image != 51302) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_raw_image`: expected 51302, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_append_text;
     try {
@@ -31175,9 +31175,14 @@ final class Session {
   ///
   /// # Errors
   ///
-  /// Returns `FfiError::InvalidInput` if buffer length does not match dimensions
-  /// or pixel format, `FfiError::Preprocess` if image normalization fails,
-  /// or [`FfiError::UnsupportedModality`] if vision encoding is unsupported.
+  /// - `InvalidInput` if buffer length does not match dimensions or pixel format.
+  /// - `Preprocess` if image normalization fails.
+  /// - `UnsupportedModality` if vision encoding is unsupported on this session.
+  /// - `Backend` for missing vision encoder, projection dimension mismatch,
+  /// or backend execution failure during encoding or prefill.
+  /// - `ContextOverflow` if appending image tokens exceeds context limit.
+  /// - `Cancelled` if execution is interrupted.
+  /// - `PoisonedSession` if the session lock is poisoned.
   void appendRawImage(Uint8List pixels, int width, int height, PixelFormat format, int? maxLongSize) {
     _ensureOpen();
     _ffi.sessionInvokeAppendRawImage(_handle, pixels, width, height, format, maxLongSize);

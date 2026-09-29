@@ -221,9 +221,7 @@ pub fn build_binary_kernel_params(
     let avail = vtcm_size.saturating_sub(src1_size);
     let denom = spad_row_total * n_threads as usize;
     let rows_per_buffer = avail.checked_div(denom).unwrap_or(0).max(1);
-    let total_vtcm =
-        rows_per_buffer * 2 * (src0_row_size_aligned + dst_row_size_aligned) * n_threads as usize
-            + src1_size;
+    let total_vtcm = rows_per_buffer * spad_row_total * n_threads as usize + src1_size;
 
     kparams[0] = kernel_type as i32;
     kparams[1] = n_threads as i32;

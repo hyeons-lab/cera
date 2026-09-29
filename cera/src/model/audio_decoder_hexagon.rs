@@ -774,7 +774,14 @@ impl HexagonDepthformer {
             match desc.format {
                 HexagonWeightFormat::RepackedQ8_0 => {
                     if w.dtype == DType::F32 {
-                        let f32_slice = bytemuck::cast_slice::<u8, f32>(w.data());
+                        let f32_vec;
+                        let f32_slice = match w.try_as_f32() {
+                            Some(slice) => slice,
+                            None => {
+                                f32_vec = w.to_dense_f32();
+                                &f32_vec[..]
+                            }
+                        };
                         let q8_bytes = crate::backend::hexagon::quantize_f32_to_q8_0(
                             f32_slice, w.cols, w.rows,
                         )?;
@@ -830,7 +837,19 @@ impl HexagonDepthformer {
                 }
                 HexagonWeightFormat::RepackedQ8_0 => {
                     if dl_w.dtype == DType::F32 {
-                        let f32_slice = bytemuck::cast_slice::<u8, f32>(src_slice);
+                        let f32_vec;
+                        let f32_slice = match bytemuck::try_cast_slice::<u8, f32>(src_slice) {
+                            Ok(slice) => slice,
+                            Err(_) => {
+                                f32_vec = src_slice
+                                    .as_chunks::<4>()
+                                    .0
+                                    .iter()
+                                    .map(|chunk| f32::from_ne_bytes(*chunk))
+                                    .collect::<Vec<f32>>();
+                                &f32_vec[..]
+                            }
+                        };
                         let q8_bytes = crate::backend::hexagon::quantize_f32_to_q8_0(
                             f32_slice, dl_cols, n_embd_d,
                         )?;
@@ -3128,7 +3147,8 @@ mod tests {
         };
 
         let plan_res = HexagonDetokWeightOffsets::plan(&weights);
-        assert!(plan_res.is_err());
+        let err = plan_res.unwrap_err().to_string();
+        assert!(err.contains("requires Q8_0 or Q4_0"));
     }
 
     #[test]

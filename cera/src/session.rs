@@ -3128,11 +3128,17 @@ impl Session {
                     let outcome = dec.decode_frame(&emb);
                     let audio_emb = match outcome {
                         // A vocoder sampling fault aborts the turn outright:
-                        // `decode_frame` runs the vocoder, not the LLM, so no
-                        // frontier position was consumed for this frame and
-                        // there is nothing to rewind.
+                        // synchronize the verified frontier and token history
+                        // before returning the backend error.
                         crate::audio_engine::FrameOutcome::Fault(detail) => {
-                            return Err(CeraError::Backend(detail));
+                            return Err(Self::sync_frontier_on_err(
+                                &mut self.current_pos,
+                                &self.position_atomic,
+                                &mut self.token_history,
+                                pos,
+                                history_len,
+                                CeraError::Backend(detail),
+                            ));
                         }
                         crate::audio_engine::FrameOutcome::End => {
                             if is_audio_transition || text_done {

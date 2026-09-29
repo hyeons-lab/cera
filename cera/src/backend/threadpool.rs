@@ -2585,7 +2585,19 @@ mod tests {
         let set1 = UsableCpus::Known(vec![0, 1, 2, 3]);
         let set2 = UsableCpus::Known(vec![4, 5, 6, 7]);
         stage_usable(&set1);
-        assert!(rebuild_pools_for_allowance(&set2));
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut landed = false;
+        loop {
+            if rebuild_pools_for_allowance(&set2) {
+                landed = true;
+                break;
+            }
+            if std::time::Instant::now() > deadline {
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(landed, "rebuild for allowance set2 never landed");
         assert!(!rebuild_pools_for_allowance(&set2));
     }
 

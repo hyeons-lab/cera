@@ -1,6 +1,6 @@
 //! Embedded Hexagon DSP skels + device probe.
 //!
-//! The `skels/` directory vendors the four `libggml-htp-vXX.so` DSP
+//! The `skels/` directory vendors the five `libggml-htp-vXX.so` DSP
 //! libraries (see `skels/SOURCE.md` for provenance). They are embedded
 //! in the binary so apps ship one artifact: at runtime the engine writes
 //! the matching skel next to itself (or into an app-provided directory)

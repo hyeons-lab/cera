@@ -523,7 +523,6 @@ impl FastRpcDriver {
         let mut flags: u32 = 0;
         let mut n_bufs: u32 = 0;
         let mut msg_len: u32 = 0;
-        let mut timeouts = 0;
         // Oppoll: timeout 0 turns the read non-blocking; the retry loop
         // below spins on EWOULDBLOCK until the response lands.
         let mut timeout = if self.oppoll { 0 } else { DSPQUEUE_TIMEOUT_US };
@@ -575,13 +574,8 @@ impl FastRpcDriver {
                     // Expiry is checked at the top of the next iteration.
                     continue;
                 }
-                timeouts += 1;
-                if timeouts < 30 {
-                    continue;
-                }
-                return Err(CeraError::Backend(
-                    "dspqueue_read: no DSP response after 30s (timed out)".into(),
-                ));
+                // Wall-clock deadline check at the top of the loop governs the 30s budget.
+                continue;
             }
             return Err(CeraError::Backend(format!(
                 "dspqueue_read failed (error 0x{:08x})",

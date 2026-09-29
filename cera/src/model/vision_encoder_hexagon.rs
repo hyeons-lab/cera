@@ -1590,7 +1590,8 @@ mod tests {
         };
 
         let plan_res = HexagonVitWeightOffsets::plan(&weights);
-        assert!(plan_res.is_err());
+        let err = plan_res.unwrap_err().to_string();
+        assert!(err.contains("requires Q8_0 or Q4_0"));
     }
 
     #[test]

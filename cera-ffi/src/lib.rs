@@ -2714,9 +2714,14 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// Returns `FfiError::InvalidInput` if buffer length does not match dimensions
-    /// or pixel format, `FfiError::Preprocess` if image normalization fails,
-    /// or [`FfiError::UnsupportedModality`] if vision encoding is unsupported.
+    /// - `InvalidInput` if buffer length does not match dimensions or pixel format.
+    /// - `Preprocess` if image normalization fails.
+    /// - `UnsupportedModality` if vision encoding is unsupported on this session.
+    /// - `Backend` for missing vision encoder, projection dimension mismatch,
+    ///   or backend execution failure during encoding or prefill.
+    /// - `ContextOverflow` if appending image tokens exceeds context limit.
+    /// - `Cancelled` if execution is interrupted.
+    /// - `PoisonedSession` if the session lock is poisoned.
     pub fn append_raw_image(
         &self,
         pixels: Vec<u8>,
