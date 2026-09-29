@@ -103,7 +103,7 @@ after the outer call returns. This guarantee excludes recursive handle access
 and does not apply to every raw Session callback API.
 
 CPU Session and Chat expose `checkpoint()` and `restore(bytes)`. These differ
-from the separate browser `WebGpuSession` API below; native Metal/wgpu Session
+from the separate browser `WebGpuSession` API below; native Metal/Hexagon/wgpu Session
 checkpointing is unsupported. See the [checkpoint matrix](../docs/API_0_6.md#checkpoints-and-compatibility).
 
 ## Install

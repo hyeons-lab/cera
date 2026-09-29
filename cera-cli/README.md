@@ -72,14 +72,14 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 
 | Command | Purpose |
 |---------|---------|
-| `run` | Run inference on a prompt: text, optional grammar/JSON or tool calling (`--tools` / `--constrain-tools`), plus audio input for LFM2-Audio bundles. Optional `--lora` adapter. |
-| `chat` | Interactive multi-turn REPL with `/help`, `/clear`, `/exit` slash commands. Optional `--lora` adapter. Run with no model source at all on a terminal (and without `--no-tui`) to pick one from the published catalog. |
+| `run` | Run inference on a prompt: text, optional grammar/JSON or tool calling (`--tools` / `--constrain-tools`), optional LoRA (`--lora`), and speculative decoding (`--spec` / `--no-spec` / `--draft`), plus image/audio input for multimodal bundles. |
+| `chat` | Interactive multi-turn REPL with `/help`, `/clear`, `/exit` slash commands. Optional `--lora` adapter and speculative decoding (`--spec` / `--no-spec` / `--draft`). Run with no model source at all on a terminal (and without `--no-tui`) to pick one from the published catalog. |
 | `embed` | Extract last-layer hidden-state embeddings for a prompt: mean-pooled by default, `--per-token` for the full matrix, `--json` for array output. |
 | `logits` | Dump the next-token logits over the full vocabulary for a prompt (single prefill): `--top-k` for the K highest `(token_id, logit)` pairs, `--json` for array output. Handy for cross-backend parity checks. |
 | `inspect` | Inspect a GGUF file's metadata and resolved CPU backend tier. |
 | `cpu` | Print the host's CPU backend tier + detected SIMD features (no model needed). |
 | `tokenize` | Tokenize text and print token IDs (e.g. to compare against HuggingFace). |
-| `bench` | Measure decode throughput (tok/s) with p10/p50/p90/mean/stddev over N runs. `--spec` (plus `--spec-ngram` / `--spec-k`) measures greedy speculative decoding; `--gpu-io` reports wgpu submits, compute passes, and readbacks per token. |
+| `bench` | Measure decode throughput (tok/s) with p10/p50/p90/mean/stddev over N runs. `--spec` (plus `--spec-ngram` / `--spec-k`) measures greedy speculative decoding; `--no-spec` disables speculative decoding; `--gpu-io` reports wgpu submits, compute passes, and readbacks per token. |
 | `list-bundles` | List bundles on `LiquidAI/LeapBundles` (add `--quants` for per-bundle quants). |
 | `list-hf` | Discover and list GGUF model files in a Hugging Face repository. |
 | `download-bundles` | Download bundle manifests + model files without loading them. |
@@ -120,6 +120,13 @@ to every forward pass, generation and hidden-state extraction alike. For a PEFT
 `.safetensors` adapter whose `alpha` differs from its rank, pass
 `--lora-alpha <ALPHA>` (`scale = alpha / rank`; `.gguf` adapters carry alpha in
 their metadata).
+
+`run`, `chat`, and `bench` accept speculative decoding flags: `--spec` enables
+prompt-lookup drafting, `--no-spec` disables speculative decoding even when a
+draft sidecar is present, `--draft <PATH>` attaches a neural draft model, and
+`--spec-ngram <N>` / `--spec-k <K>` configure drafting parameters. For audio models
+with an external vocoder, `--vocoder <PATH>` routes audio accelerator loading
+through the resolved `--device` backend (or `CERA_AUDIO_GPU` override).
 
 ### CPU tuning
 

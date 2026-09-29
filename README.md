@@ -105,7 +105,9 @@ Cera provides a native backend for Qualcomm Hexagon NPUs and Compute DSPs on Sna
 - **Zero-Copy Shared Memory**: Allocates model weights, activations, and KV cache buffers in shared `rpcmem` (DMA-BUF / ION) mapped into both CPU and DSP address spaces, eliminating bus copying.
 - **Embedded Skeleton Libraries**: Embeds prebuilt, 16 KB page-aligned DSP worker libraries (`libggml-htp-v{73,75,79,81,85}.so`) into the host binary and extracts them automatically at startup. Skeletons incorporate extended operators (`Conv1D`, `ConvTranspose1D`, `Snake`, `UnaryStep`, `Sum`) aligned with the v85 DSP firmware ABI.
 - **Accelerated Kernels**:
-  - **LLM Text Generation**: 32x32 tiled Q4_0 and Q8_0 matrix repacking for HTP matrix units, single-flush forward decode eliminating ~22 synchronization boundaries per token, ping-pong scratch memory isolation, static batch template caching for zero-allocation dispatch, FastRPC latency QoS (`FASTRPC_CONTROL_LATENCY = 100 µs`), and Q8_0 quantized KV cache (~47% memory reduction over F16).
+  - **LLM Text Generation**: 32x32 tiled Q4_0 and Q8_0 matrix repacking for HTP matrix units, single-flush forward decode eliminating ~22 synchronization boundaries per token, ping-pong scratch memory isolation, static batch template caching for zero-allocation dispatch, FastRPC latency QoS (`FASTRPC_CONTROL_LATENCY = 100 µs`), FastRPC driver wakelock (`FASTRPC_CONTROL_WAKELOCK`), and Q8_0 quantized KV cache (~47% memory reduction over F16).
+  - **On-DSP Argmax**: Offloads greedy token argmax reduction directly to Hexagon HTP (`HtpOpCode::Argmax`, opcode 62), reading only 4 bytes of token ID from rpcmem rather than copying or invalidating 128 to 256 KB of float32 logits, eliminating host CPU allocations and memory traffic during greedy decode.
+  - **Speculative Decoding Verification**: Batches LM-head projections across all draft token rows via parallel HTP matrix dispatch (`forward_prefill_logits_all`). When paired with prompt-lookup drafting (`ngram=2`, `k=4`), speculative decoding lifts 350M decode throughput from 164.0 tok/s to 259.5 tok/s (peak 260.2 tok/s) and 2.6B decode from 26.7 tok/s to 47.7 tok/s (peak 48.5 tok/s) on Snapdragon 8 Elite.
   - **Multimodal Vision (ViT)**: Dispatches all 24 Vision Transformer blocks in a single batched submission with on-NPU Flash Attention, F16 KV scratch handling, and quantized MLP projector execution.
   - **Whisper Speech Recognition**: 64-token chunked Conv1D and LayerNorm dispatches adhering to Snapdragon 8 Elite's 8 MB physical VTCM ceiling, paired with FlashAttnExt autoregressive decode.
   - **Audio Synthesis & Vocoder**: `HexagonDepthformer` executes all 8 autoregressive passes (48 transformer layers per audio frame) entirely on the NPU using HTP GEMV, RMSNorm, RoPE, and FlashAttnExt, alongside on-DSP audio detokenization (LayerNorm, linear GEMM, SwiGLU, Conv1D).
@@ -666,10 +668,13 @@ enough to invent a trend that isn't there.
   argmax (a poor draft costs acceptance rate, never
   correctness), though a near-tie can land differently than a sequential greedy
   run, since the verifier forwards a different batch shape. It engages on
-  eligible CPU and native GPU models with all-position logits, plain greedy
-  decoding, uncompressed KV and no audio decoder. See
+  eligible CPU, native Metal, Qualcomm Hexagon NPU, and wgpu models with
+  all-position logits, plain greedy decoding, uncompressed KV and no audio decoder.
+  Speculative decoding defaults to disabled (off) unless explicitly configured or
+  when a draft sidecar model is present. See
   [speculative decoding](cera/README.md#speculative-decoding) for backend and
-  execution limits. The CLI exposes prompt-lookup knobs on `bench` (`--spec`).
+  execution limits. The CLI exposes speculative decoding knobs on `run`, `chat`,
+  and `bench` (`--spec` and `--no-spec`).
 - **Streaming & cancellation**: tokens (and audio frames) arrive through a
   `ModalitySink` as they decode; `Session::cancel()` interrupts long prompts
   responsively via chunked prefill.

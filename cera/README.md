@@ -438,14 +438,17 @@ batch where a sequential loop forwards one token at a time, and the two
 reduction orders can pick opposite sides of a near-tie. It engages only on the
 plain greedy path (`temperature <= 0` or `top_k == 1`, no grammar), with a model
 that reports `supports_all_logits()`, an uncompressed (f32/f16) KV cache, and no
-audio decoder. CPU dense transformers and LFM2, native Metal models, and wgpu
-models with batched prefill and compatible matrix weights advertise this
-capability. Configurations excluded by these gates use normal decode. Backend
-rewind support and the draft size still constrain execution; benchmark with the
-intended model/backend rather than assuming a speedup.
+audio decoder. CPU dense transformers and LFM2, native Metal models, Qualcomm Hexagon
+NPU (`HexagonLfm2Model`), and wgpu models with batched prefill advertise this
+capability. Speculative decoding defaults to disabled (off) unless explicitly configured
+via `opts.spec` or when a draft sidecar model is present. Setting `opts.no_spec = true`,
+configuring `SessionConfig::disable_spec`, or calling `session.disable_spec()` disables
+speculative decoding across all execution paths. Configurations excluded by these gates
+use normal decode. Backend rewind support and the draft size still constrain execution;
+benchmark with the intended model/backend rather than assuming a speedup.
 
-The CLI exposes prompt-lookup knobs on `bench` (`--spec`, `--spec-ngram`,
-`--spec-k`). `run` and `chat` expose separate draft-model options.
+The CLI exposes speculative decoding knobs across `run`, `chat`, and `bench`
+(`--spec`, `--no-spec`, `--spec-ngram`, `--spec-k`, and `--draft`).
 
 ## Tool calling
 
@@ -558,6 +561,7 @@ shrink the crate for `wasm32-unknown-unknown` or embedded targets
 | `avx512` | ✅ | x86-64 AVX-512 Q8_0/Q4_0 tier (needs Rust 1.89+) |
 | `gpu` | - | wgpu compute backend |
 | `metal` | - | Apple Metal backend (⇒ `mmap`) |
+| `hexagon` | - | Qualcomm Hexagon NPU backend on Snapdragon (FastRPC offload to HTP, ⇒ `std-fs`) |
 | `blas` | - | Opt-in GEMM accelerator |
 | `remote` | - | `BundleRepo` HTTP download + SHA-256 (⇒ `std-fs`) |
 

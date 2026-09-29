@@ -111,6 +111,23 @@ The DSP-side worker libraries (`libggml-htp-v{73,75,79,81,85}.so`) are precompil
 - **On-DSP Audio Detokenizer**: Runs LayerNorm, linear GEMM, SwiGLU, and Conv1D operations directly from rpcmem buffers to generate spectrograms.
 - **Throughput & Thermals**: Audio decode throughput reaches 36.67 tok/s on Snapdragon 8 Elite (1.59x faster than Leap CPU at 23.02 tok/s, and 2.82x faster than previous NPU decode of 13.00 tok/s). Offloading audio synthesis to the NPU protects real-time speech generation from Android CPU frequency throttling.
 
+### 4.5 On-DSP Argmax (`HtpOpCode::Argmax`)
+- **Direct DSP Reduction**: Offloads greedy token selection directly to the Hexagon HTP execution engine using `HtpOpCode::Argmax` (opcode 62).
+- **Zero-Copy Host Retrieval**: The host CPU reads only 4 bytes containing the winning token ID from rpcmem rather than transferring or cache-invalidating 128 to 256 KB of float32 logits. This eliminates memory bandwidth bottlenecks and host vector allocations during greedy token generation.
+
+### 4.6 Training-Free Speculative Decoding (`forward_prefill_logits_all`)
+- **Batched LM-Head Verification**: Evaluates all candidate draft tokens in a single forward pass by batching LM-head projections across M rows via `dispatch_mul_mat_m`.
+- **KV State Coherency**: Implements `check_kv_rewind` and `try_truncate_kv` with boundary validation, allowing non-fatal verification rejects or prompt tail rollbacks without context wipeouts.
+- **Hardware Acceleration Uplift**: Pairing Hexagon NPU verification with Cera's prompt-lookup drafter (`ngram=2`, `k=4`) elevates 350M decode throughput from 164.0 tok/s to 259.5 tok/s (peak 260.2 tok/s) and 2.6B decode throughput from 26.7 tok/s to 47.7 tok/s (peak 48.5 tok/s) on Snapdragon 8 Elite without requiring fine-tuning or neural drafter sidecars.
+
+### 4.7 FastRPC Power Management & Wakelock
+- **Device Node Preservation**: Acquires a FastRPC driver wakelock (`FASTRPC_CONTROL_WAKELOCK`) during `HexagonDevice::new()` to prevent Android power management from suspending the FastRPC device node during active sessions. The wakelock is released upon session drop.
+- **Latency QoS Scaling**: Combines the wakelock with `FASTRPC_CONTROL_LATENCY = 100 µs` session votes, ensuring the CDSP frequency governor remains locked in peak performance corners during active inference.
+
+### 4.8 Centralized Audio Accelerator Factory Integration
+- **Unified Backend Resolution**: Vocoder detokenizer and depthformer acceleration routes through `cera::model::audio_decoder::build_audio_accelerator`, providing immediate parity with `--device hexagon` and honoring `CERA_AUDIO_GPU` environment overrides.
+- **Automatic Depthformer Activation**: When targeting Hexagon NPU, hardware-accelerated depthformer codebook sampling executes automatically without requiring auxiliary experimental flags.
+
 ---
 
 ## 5. Mobile & Android Integration
@@ -190,6 +207,8 @@ Measurements taken on a retail Samsung Galaxy S25 Ultra (Snapdragon 8 Elite, SM-
 | Workload | Model Architecture | Metric | Cera Hexagon NPU | Baseline / Comparison |
 |----------|-------------------|--------|-------------------|-----------------------|
 | **Text Generation** | LFM2.5-1.2B (Q4_0) | Decode Throughput | **154.91 tok/s** | llama.cpp: 157.8 tok/s |
+| **Speculative Text (350M)** | LFM2.5-350M (Q4_0) | Decode (Prompt Lookup) | **259.50 tok/s** | Sequential: 164.0 tok/s (1.58x uplift) |
+| **Speculative Text (2.6B)** | LFM2.5-2.6B (Q4_0) | Decode (Prompt Lookup) | **47.70 tok/s** | Sequential: 26.7 tok/s, llama CPU: 34.2 tok/s |
 | **Vision Ingestion** | LFM2.5-VL-450M (Q4_0) | Backbone Prefill | **3,805.38 tok/s** | CPU: 1,295.0 tok/s |
 | **Vision Generation** | LFM2.5-VL-450M (Q4_0) | Decode Throughput | **146.35 tok/s** | CPU: 140.97 tok/s |
 | **Audio Time-To-First-Token** | LFM2-Audio-1.5B (Q4_0) | Audio TTFT | **238.5 ms** | Leap CPU: 600.0 ms (2.52x faster) |

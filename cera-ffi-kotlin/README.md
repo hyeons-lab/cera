@@ -96,12 +96,15 @@ AndroidBundleRepo.download(context, "LFM2-1.2B-GGUF", "Q4_0").collect { ... }
 ## Hexagon NPU (Android)
 
 `cera-ffi-android` can run inference on Qualcomm Hexagon NPUs from a
-normally installed app (no root/setup). The AAR ships the DSP skels in
-`jniLibs/arm64-v8a` plus the manifest entries the NPU needs
-(`extractNativeLibs`, `<uses-native-library>`), which merge into
-consumers automatically: do not override `extractNativeLibs` to
-`false` (the FastRPC loader opens the skels by path, so they must be
-extracted files, not entries inside the APK).
+normally installed app (no root/setup). `libcera_ffi.so` embeds the
+prebuilt DSP skeletons directly; at startup, `HexagonNpu.setup(context)`
+extracts them into `context.noBackupFilesDir/cera_skels` and sets
+`ADSP_LIBRARY_PATH`. Because skeletons are extracted at runtime rather
+than packaged as host shared libraries in `jniLibs/`, all libraries
+in the published AAR remain 16KB-page-aligned (`0x4000`) and apps do
+not require `android:extractNativeLibs="true"`. The AAR manifest merges
+`<uses-native-library android:name="libcdsprpc.so" android:required="false"/>`
+into consumers automatically.
 
 ```kotlin
 import com.hyeonslab.cera.android.HexagonNpu
