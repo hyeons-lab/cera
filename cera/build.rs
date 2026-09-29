@@ -79,11 +79,14 @@ const SLANG_KERNELS: &[&str] = &[
     "mul_mat_reg_tile_q6_k",
     "gemm_stream_q4_0",
     "gemm_stream_q4_0_k64",
+    "gemm_stream_q4_k",
     "transpose_cast_f16",
     "gemv_q4_0_fast",
     "gemv_q6_k",
     "gemv_q6_k_flat",
     "gemv_q4_0_stream",
+    "gemv_q4_k",
+    "gemv_q4_k_stream",
     "mul_mat_reg_tile_q4_0_stream",
 ];
 

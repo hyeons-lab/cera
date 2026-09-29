@@ -1702,6 +1702,9 @@ pub struct GenerateOpts {
     /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
     #[uniffi(default = None)]
     pub spec: Option<SpecDecodeConfig>,
+    /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+    #[uniffi(default = false)]
+    pub no_spec: bool,
 }
 
 impl From<&cera::GenerateOpts> for GenerateOpts {
@@ -1723,6 +1726,7 @@ impl From<&cera::GenerateOpts> for GenerateOpts {
             flush_every_tokens: core.flush_every_tokens,
             flush_every_ms: core.flush_every_ms,
             spec: core.spec.map(SpecDecodeConfig::from),
+            no_spec: core.no_spec,
         }
     }
 }
@@ -1769,6 +1773,7 @@ impl TryFrom<GenerateOpts> for cera::GenerateOpts {
             flush_every_tokens: o.flush_every_tokens,
             flush_every_ms: o.flush_every_ms,
             spec: o.spec.map(cera::SpecDecode::from),
+            no_spec: o.no_spec,
         })
     }
 }
@@ -3048,6 +3053,18 @@ impl Session {
     pub fn import_checkpoint(&self, data: Vec<u8>) -> Result<(), FfiError> {
         let cp = cera::session::SessionCheckpoint::from_bytes(&data)?;
         self.lock_inner()?.restore(&cp)?;
+        Ok(())
+    }
+
+    /// Explicitly disable speculative decoding for this session.
+    pub fn disable_spec(&self) -> Result<(), FfiError> {
+        self.lock_inner()?.disable_spec();
+        Ok(())
+    }
+
+    /// Re-enable speculative decoding for this session (if previously disabled).
+    pub fn enable_spec(&self) -> Result<(), FfiError> {
+        self.lock_inner()?.enable_spec();
         Ok(())
     }
 

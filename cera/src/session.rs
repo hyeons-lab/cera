@@ -143,18 +143,20 @@ pub struct GenerateOpts {
     pub flush_every_tokens: u32,
     /// Emit `on_text_tokens` at least every N milliseconds. `0` disables time-based flushing.
     pub flush_every_ms: u32,
-    /// Speculative decoding. `None` disables it (default). When set, decode uses
-    /// speculative verification **only** on the plain greedy path (`temperature
-    /// <= 0` or `top_k == 1`, no grammar) with a dense model that supports
-    /// all-position logits and an uncompressed (f32/f16) KV cache; any other
-    /// configuration falls back to the normal decode path transparently. Every
-    /// emitted token is the target's own argmax, so this is a throughput
-    /// optimization rather than a behavior change — but it is not guaranteed
-    /// bit-identical to a *sequential* greedy run: the verifier forwards a
+    /// Speculative decoding. When `None`, speculative decoding defaults to on:
+    /// using an attached drafter if present (sidecar/embedded), or prompt lookup
+    /// if not. When set to `Some(SpecDecode { .. })`, custom n-gram or k are used.
+    /// Only engages on the plain greedy path (`temperature <= 0` or `top_k == 1`, no grammar)
+    /// with a dense model that supports all-position logits and an uncompressed KV cache.
+    /// Every emitted token is the target's own argmax, so this is a throughput
+    /// optimization rather than a behavior change, but it is not guaranteed
+    /// bit-identical to a sequential greedy run: the verifier forwards a
     /// batch where a sequential loop forwards one token at a time, and the two
     /// reduction orders can pick opposite sides of a near-tie. See
     /// [`SpecDecode`] and [`crate::spec`].
     pub spec: Option<SpecDecode>,
+    /// Explicitly disable speculative decoding for this request.
+    pub no_spec: bool,
 }
 
 impl Default for GenerateOpts {
@@ -174,6 +176,7 @@ impl Default for GenerateOpts {
             flush_every_tokens: 16,
             flush_every_ms: 50,
             spec: None,
+            no_spec: false,
         }
     }
 }
@@ -691,6 +694,8 @@ pub struct Session {
     /// hidden-states scratch) so the CPU projection helpers pick it up.
     /// Preserved across [`Self::reset`], like the vision/audio encoders.
     lora: Option<Arc<crate::lora::LoraAdapterWeights>>,
+    /// Whether speculative decoding is explicitly disabled for this session.
+    spec_disabled: bool,
     usable: bool,
     ingest_mutation: Option<recovery::Mutation>,
     last_ingest_recovery: Option<IngestRecovery>,
@@ -836,6 +841,7 @@ impl Session {
             hs_scratch: None,
             hs_scratch_cap: 0,
             lora: None,
+            spec_disabled: false,
             usable: true,
             ingest_mutation: None,
             last_ingest_recovery: None,
@@ -855,7 +861,24 @@ impl Session {
 
     /// Attach a speculative decoding drafter (e.g. DSpark sidecar model).
     pub fn attach_drafter(&mut self, drafter: &dyn crate::spec::Drafter) {
+        self.spec_disabled = false;
         self.drafter = Some(drafter.clone_drafter());
+    }
+
+    /// Detach any attached speculative decoding drafter.
+    pub fn detach_drafter(&mut self) {
+        self.drafter = None;
+    }
+
+    /// Explicitly disable speculative decoding for this session.
+    pub fn disable_spec(&mut self) {
+        self.spec_disabled = true;
+        self.drafter = None;
+    }
+
+    /// Enable speculative decoding for this session.
+    pub fn enable_spec(&mut self) {
+        self.spec_disabled = false;
     }
 
     /// Attach vocoder weights so [`Self::generate`] can synthesize PCM audio
@@ -2785,7 +2808,7 @@ impl Session {
         // Trade-off for the lazy tool-call trigger: with a trigger token the grammar
         // is inactive during the pre-trigger free-text phase, so that span *could*
         // run on `forward_greedy` and only switch to the logits path once armed.
-        // We keep it on the single logits path for the whole generation instead —
+        // We keep it on the single logits path for the whole generation instead:
         // switching kernels mid-loop would complicate the reproducibility-critical
         // decode body (see the RNG-step note below) for a path that is typically
         // short. Revisit if pre-trigger prose dominates a real workload.
@@ -2795,16 +2818,30 @@ impl Session {
         // Speculative-decoding fast path. Engages only on the plain greedy path
         // (implied by `greedy`, which already excludes grammar) with a dense
         // model that can return all-position logits and an uncompressed KV
-        // cache — verifying K drafted tokens in one forward amortizes the single
+        // cache: verifying K drafted tokens in one forward amortizes the single
         // weight-read a bandwidth-bound decode is limited by. Output is a valid
-        // greedy decode; see `generate_greedy_spec` and `crate::spec`. Any other
-        // configuration falls through to the normal decode loop below.
-        let spec_opt = opts.spec.or_else(|| {
-            self.drafter.as_ref().map(|d| SpecDecode {
-                ngram: 2,
-                k: d.suggested_k().unwrap_or(6),
+        // greedy decode; see `generate_greedy_spec` and `crate::spec`.
+        // Speculative decoding defaults to on:
+        // - When an attached drafter is present (sidecar/embedded), it defaults to on with that drafter.
+        // - When no drafter is attached, it defaults to on using prompt lookup (the new method).
+        // - It is disabled only when explicitly opted out via `opts.no_spec` or `session.disable_spec()`.
+        let spec_opt = if opts.no_spec || self.spec_disabled {
+            None
+        } else {
+            opts.spec.or_else(|| {
+                if let Some(d) = &self.drafter {
+                    Some(SpecDecode {
+                        ngram: 2,
+                        k: d.suggested_k().unwrap_or(6),
+                    })
+                } else {
+                    Some(SpecDecode {
+                        ngram: 2,
+                        k: 4,
+                    })
+                }
             })
-        });
+        };
         if let Some(sd) = spec_opt
             && greedy
             && self.audio_decoder.is_none()
@@ -4585,6 +4622,57 @@ mod tests {
         // Every round rejected: two verify batches (the final token takes
         // the plain final-step forward, not a batch).
         assert_eq!(model.batches_seen.load(Ordering::Relaxed), 2);
+    }
+
+    #[test]
+    fn attached_drafter_defaults_spec_on() {
+        // Sidecar default: an attached drafter engages the spec path with no
+        // explicit `opts.spec`: one verify batch covers all three tokens.
+        let (model, mut session) = spec_test_session(vec![vec![0, 0]]);
+        let mut sink = RecordingSink::default();
+        let opts = GenerateOpts {
+            temperature: 0.0,
+            max_tokens: 3,
+            ..GenerateOpts::default()
+        };
+        let summary = session.generate(&opts, &mut sink).unwrap();
+        assert_eq!(summary.tokens_generated, 3);
+        assert_eq!(sink.tokens, vec![0, 0, 0]);
+        assert_eq!(model.batches_seen.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn no_spec_opt_out_beats_attached_drafter() {
+        // `--no-spec`: same tokens out of the plain loop, zero verify batches.
+        let (model, mut session) = spec_test_session(vec![vec![0, 0]]);
+        let mut sink = RecordingSink::default();
+        let opts = GenerateOpts {
+            temperature: 0.0,
+            max_tokens: 3,
+            no_spec: true,
+            ..GenerateOpts::default()
+        };
+        let summary = session.generate(&opts, &mut sink).unwrap();
+        assert_eq!(summary.tokens_generated, 3);
+        assert_eq!(sink.tokens, vec![0, 0, 0]);
+        assert_eq!(model.batches_seen.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn disable_spec_beats_attached_drafter() {
+        // Session-level switch for call sites that reuse one opts value.
+        let (model, mut session) = spec_test_session(vec![vec![0, 0]]);
+        session.disable_spec();
+        let mut sink = RecordingSink::default();
+        let opts = GenerateOpts {
+            temperature: 0.0,
+            max_tokens: 3,
+            ..GenerateOpts::default()
+        };
+        let summary = session.generate(&opts, &mut sink).unwrap();
+        assert_eq!(summary.tokens_generated, 3);
+        assert_eq!(sink.tokens, vec![0, 0, 0]);
+        assert_eq!(model.batches_seen.load(Ordering::Relaxed), 0);
     }
 
     #[test]

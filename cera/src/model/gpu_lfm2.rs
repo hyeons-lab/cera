@@ -247,10 +247,11 @@ fn use_stream_layout(ctx: &GpuContext) -> bool {
 }
 
 /// Whether one weight qualifies for the resident stream layout: Q4_0 with
-/// `k % 32 == 0` (the repack's precondition). Ineligible weights upload
+/// `k % 32 == 0` or Q4_K_M with `k % 256 == 0`. Ineligible weights upload
 /// raw and ride the raw kernels in both phases.
 fn stream_layout_eligible(dtype: DType, k: usize) -> bool {
-    dtype == DType::Q4_0 && k.is_multiple_of(32)
+    (dtype == DType::Q4_0 && k.is_multiple_of(32))
+        || (dtype == DType::Q4KM && k.is_multiple_of(256))
 }
 
 /// Whether the k-slice-64 streaming GEMM twin is enabled: on by default
@@ -308,6 +309,75 @@ fn repack_q4_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
                     q[qi * m + row] = v as u32;
                 } else {
                     q[qi * m + row] |= (v as u32) << 16;
+                }
+            }
+        }
+    }
+    (q, d)
+}
+
+/// Repack Q4_K_M weights from GGUF block order to the resident stream layout:
+/// row-consecutive nibbles in `q`, row-consecutive split (scale, min) in `d`.
+///
+/// Layout:
+/// - `q[(k/8)*m]`: 4 words per 32-element sub-block per row, each word holding 8 nibbles
+/// - `d[(k/32)*m]`: 1 word per 32-element sub-block per row, holding half(scale) in low 16
+///   and half(min) in high 16
+fn repack_q4_k_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
+    assert_eq!(k % 256, 0, "streaming repack needs k % 256 == 0, got k={k}");
+    let blocks_256 = k / 256;
+    let block_size = 144usize; // BlockQ4KM
+    debug_assert_eq!(data.len(), m * blocks_256 * block_size);
+
+    let n_kb = k / 32; // 8 sub-blocks per 256-block
+    let mut q = vec![0u32; m * (k / 8)];
+    let mut d = vec![0u32; m * n_kb];
+
+    for row in 0..m {
+        for b in 0..blocks_256 {
+            let base = (row * blocks_256 + b) * block_size;
+            let block_bytes = &data[base..base + block_size];
+            let d_val = half::f16::from_bits(u16::from_le_bytes([block_bytes[0], block_bytes[1]])).to_f32();
+            let dmin_val = half::f16::from_bits(u16::from_le_bytes([block_bytes[2], block_bytes[3]])).to_f32();
+
+            let mut scales = [0u8; 12];
+            scales.copy_from_slice(&block_bytes[4..16]);
+            let (sc, mn) = crate::quant::decode_q4km_scales(&scales);
+            let qs = &block_bytes[16..144]; // 128 bytes
+
+            // 4 pairs of sub-blocks (j = 0..4)
+            for j in 0..4 {
+                // Sub-block 0: 2 * j
+                let kb0 = b * 8 + 2 * j;
+                let sc0 = d_val * sc[2 * j] as f32;
+                let mn0 = dmin_val * mn[2 * j] as f32;
+                let sc0_f16 = half::f16::from_f32(sc0).to_bits() as u32;
+                let mn0_f16 = half::f16::from_f32(mn0).to_bits() as u32;
+                d[kb0 * m + row] = sc0_f16 | (mn0_f16 << 16);
+
+                // Sub-block 1: 2 * j + 1
+                let kb1 = b * 8 + 2 * j + 1;
+                let sc1 = d_val * sc[2 * j + 1] as f32;
+                let mn1 = dmin_val * mn[2 * j + 1] as f32;
+                let sc1_f16 = half::f16::from_f32(sc1).to_bits() as u32;
+                let mn1_f16 = half::f16::from_f32(mn1).to_bits() as u32;
+                d[kb1 * m + row] = sc1_f16 | (mn1_f16 << 16);
+
+                // 32 nibbles for sub-block 0 are the low nibbles of qs[j*32 .. j*32 + 32]
+                // 32 nibbles for sub-block 1 are the high nibbles of qs[j*32 .. j*32 + 32]
+                // 4 u32 words per sub-block (p = 0..4, 8 nibbles each)
+                for p in 0..4 {
+                    let mut v0 = 0u32;
+                    let mut v1 = 0u32;
+                    for t in 0..8 {
+                        let byte = qs[j * 32 + p * 8 + t];
+                        let nib0 = (byte & 0x0F) as u32;
+                        let nib1 = (byte >> 4) as u32;
+                        v0 |= nib0 << (t * 4);
+                        v1 |= nib1 << (t * 4);
+                    }
+                    q[(kb0 * 4 + p) * m + row] = v0;
+                    q[(kb1 * 4 + p) * m + row] = v1;
                 }
             }
         }
@@ -1268,6 +1338,9 @@ struct GpuPipelines {
     /// `use_stream_layout` (passthrough-only; SPIR-V has no WGSL twin).
     gemv_q4_0_stream: Option<wgpu::ComputePipeline>,
     gemv_q4_k: wgpu::ComputePipeline,
+    /// Q4_K decode GEMV over the resident stream layout. None unless
+    /// `use_stream_layout` (passthrough-only; SPIR-V has no WGSL twin).
+    gemv_q4_k_stream: Option<wgpu::ComputePipeline>,
     gemv_q5_k: wgpu::ComputePipeline,
     gemv_q6_k: wgpu::ComputePipeline,
     /// Q6_K decode GEMV over the flat-planes LM-head twin. `None` unless
@@ -1332,6 +1405,8 @@ struct GpuPipelines {
     /// k-slice covers 64 k. Dispatched when k % 64 == 0 (see `use_gemm_k64`).
     /// Same `None`-unless-streaming convention as `gemm_stream_q4_0`.
     gemm_stream_q4_0_k64: Option<wgpu::ComputePipeline>,
+    /// Streaming fp16 Q4_K prefill GEMM. None unless `use_stream_layout`.
+    gemm_stream_q4_k: Option<wgpu::ComputePipeline>,
     /// Transpose + f32->f16 cast feeding the streaming GEMM's B16 scratch.
     /// Same `None`-unless-streaming convention as `gemm_stream_q4_0`.
     transpose_cast_f16: Option<wgpu::ComputePipeline>,
@@ -2032,7 +2107,17 @@ impl GpuLfm2Model {
             } else {
                 None
             },
-            gemv_q4_k: ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k", "gemv_q4_k"),
+            gemv_q4_k: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
+                ctx.gemv_q4_k_passthrough()
+            } else {
+                ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k", "gemv_q4_k")
+            },
+            gemv_q4_k_stream: if stream_layout {
+                tracing::debug!("gemv_q4_k_stream: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q4_k_stream_passthrough())
+            } else {
+                None
+            },
             gemv_q5_k: ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k", "gemv_q5_k"),
             gemv_q6_k: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
                 // Vulkan: 64-thread subgroup twin via passthrough. Same
@@ -2134,6 +2219,12 @@ impl GpuLfm2Model {
             } else {
                 None
             },
+            gemm_stream_q4_k: if stream_layout {
+                tracing::debug!("gemm_stream_q4_k: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_k_passthrough())
+            } else {
+                None
+            },
             transpose_cast_f16: if stream_layout {
                 tracing::debug!("transpose_cast_f16: SPIR-V passthrough (slang)");
                 Some(ctx.transpose_cast_f16_passthrough())
@@ -2208,18 +2299,26 @@ impl GpuLfm2Model {
             Some(wref) => (wref.dtype, src.weight_bytes(wref)),
             None => (emb_table.dtype, src.embedding_tensor_data()?),
         };
-        // Resident stream layout for the logit projection (Q4_0 only): the
+        // Resident stream layout for the logit projection (Q4_0, Q4_K_M): the
         // vocab projection is ~19% of prefill FLOPs, so it gets the repack
         // like every other eligible weight. Repacked on the host here; the
         // GPU upload happens inside the Quantized arm below so the F16
         // fallback never pays for buffers it drops.
         let lm_head_repack =
             if stream_layout && stream_layout_eligible(lm_head_dtype, config.hidden_size) {
-                Some(repack_q4_0_stream(
-                    &lm_head_bytes,
-                    config.vocab_size,
-                    config.hidden_size,
-                ))
+                if lm_head_dtype == DType::Q4KM {
+                    Some(repack_q4_k_stream(
+                        &lm_head_bytes,
+                        config.vocab_size,
+                        config.hidden_size,
+                    ))
+                } else {
+                    Some(repack_q4_0_stream(
+                        &lm_head_bytes,
+                        config.vocab_size,
+                        config.hidden_size,
+                    ))
+                }
             } else {
                 None
             };
@@ -2360,13 +2459,17 @@ impl GpuLfm2Model {
                 // (18 B/block), and Q8_0 (34 B/block) are not, and rely on that
                 // round-up guarantee.
                 let data = src.weight_bytes(wref);
-                // Resident stream layout: eligible Q4_0 uploads the (q, d)
+                // Resident stream layout: eligible Q4_0 and Q4_K_M upload the (q, d)
                 // repack INSTEAD of raw (same bytes, transposed) and both
-                // phases read it directly — no second copy, no per-GEMM
+                // phases read it directly: no second copy, no per-GEMM
                 // repack. `tensor.buffer` is the q half (see `GpuWeight`).
                 let resident = stream_layout && stream_layout_eligible(wref.dtype, wref.k);
                 if resident {
-                    let (q, d) = repack_q4_0_stream(&data, wref.m, wref.k);
+                    let (q, d) = if wref.dtype == DType::Q4KM {
+                        repack_q4_k_stream(&data, wref.m, wref.k)
+                    } else {
+                        repack_q4_0_stream(&data, wref.m, wref.k)
+                    };
                     let qb =
                         ctx.upload_storage(bytemuck::cast_slice(&q), &format!("{name}.stream_q"));
                     let db =
@@ -3363,10 +3466,10 @@ impl GpuLfm2Model {
         w: &GpuWeight,
     ) -> (&wgpu::ComputePipeline, u32, &'static str) {
         // rows-per-workgroup MUST match each shader's `NR`/`ROWS_PER_WG`
-        // constant: gemv_q4_0_fast=8, gemv_q4_0_stream=16, gemv_q8_0=8,
-        // gemv_q4_k=2, gemv_q5_k=2, gemv_q6_k=1 on the SPIR-V passthrough
-        // (2 on the WGSL fallback — gated below), gemv_q6_k_flat=8,
-        // gemv_f32=8. Too large and
+        // constant: gemv_q4_0_fast=8, gemv_q4_0_stream=16, gemv_q4_k_stream=16,
+        // gemv_q8_0=8, gemv_q4_k=4 on passthrough (2 on WGSL), gemv_q5_k=2,
+        // gemv_q6_k=1 on the SPIR-V passthrough (2 on the WGSL fallback: gated below),
+        // gemv_q6_k_flat=8, gemv_f32=8. Too large and
         // rows are silently dropped, in every kernel here. Too small
         // over-dispatches, and what that costs is per kernel:
         // `gemv_q4_0_fast` is the one that reads past the weight buffer,
@@ -3376,17 +3479,33 @@ impl GpuLfm2Model {
         if w.resident_stream {
             // Resident layout implies passthrough implies the pipeline
             // exists (same `stream_layout` gate at load).
-            let pipe = self
-                .pipelines
-                .gemv_q4_0_stream
-                .as_ref()
-                .expect("resident-stream weight without a gemv_q4_0_stream pipeline");
-            return (pipe, 16, "gemv_q4s");
+            if w.tensor.dtype == DType::Q4KM {
+                let pipe = self
+                    .pipelines
+                    .gemv_q4_k_stream
+                    .as_ref()
+                    .expect("resident-stream weight without a gemv_q4_k_stream pipeline");
+                return (pipe, 16, "gemv_q4ks");
+            } else {
+                let pipe = self
+                    .pipelines
+                    .gemv_q4_0_stream
+                    .as_ref()
+                    .expect("resident-stream weight without a gemv_q4_0_stream pipeline");
+                return (pipe, 16, "gemv_q4s");
+            }
         }
         match w.tensor.dtype {
             DType::Q4_0 => (&self.pipelines.gemv_q4_0_fast, 8, "gemv_q4"),
             DType::Q8_0 => (&self.pipelines.gemv_q8_0, 8, "gemv_q8"),
-            DType::Q4KM => (&self.pipelines.gemv_q4_k, 2, "gemv_q4k"),
+            DType::Q4KM => {
+                let rows = if self.ctx.supports_spirv_passthrough() && self.ctx.has_subgroup {
+                    4
+                } else {
+                    2
+                };
+                (&self.pipelines.gemv_q4_k, rows, "gemv_q4k")
+            }
             // The Q6_K SPIR-V twin runs NR=1 while the WGSL fallback runs
             // NR=2; the pipeline was picked under this same condition at
             // construction, so mirror it here. Flat-planes twins (LM head
@@ -6775,9 +6894,143 @@ impl GpuLfm2Model {
         };
 
         // Both recorded in order; the emitter groups them into the layer's
-        // shared pass (transpose-then-GEMM RAW on B16 needs no boundary —
+        // shared pass (transpose-then-GEMM RAW on B16 needs no boundary:
         // same guarantee as the decode `ffn` span). Profile mode keeps one
         // pass per dispatch, labeled as below.
+        Self::push_prefill_dispatch(
+            cmds,
+            transpose,
+            t_bg,
+            (n_pad / 32, k.div_ceil(32), 1),
+            "transpose_cast_f16",
+        );
+        Self::push_prefill_dispatch(
+            cmds,
+            gemm,
+            bg,
+            (m.div_ceil(256), n.div_ceil(32), 1),
+            gemm_label,
+        );
+    }
+
+    /// Streaming fp16 Q4_K_M GEMM (`gemm_stream_q4_k`). Same contract as
+    /// `encode_mul_mat_reg_tile` for the Q4KM case: `y[n, m] = x[n, k] @
+    /// w[m, k]^T` with token-major strides. Grid `(ceil(m/256), ceil(n/32))`.
+    fn encode_gemm_stream_q4_k<'a>(
+        &'a self,
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        w: &GpuWeight,
+        x: &wgpu::Buffer,
+        y: &wgpu::Buffer,
+        n: u32,
+        k: u32,
+        y_stride: u32,
+        all_logits: bool,
+    ) {
+        let m = w.tensor.shape[0] as u32;
+        let gemm = self
+            .pipelines
+            .gemm_stream_q4_k
+            .as_ref()
+            .expect("streaming Q4_K GEMM dispatched without a pipeline");
+        let gemm_label = "gemm_stream_q4_k";
+        let transpose = self
+            .pipelines
+            .transpose_cast_f16
+            .as_ref()
+            .expect("streaming GEMM dispatched without a transpose pipeline");
+        let b16 = self
+            .stream_b16_buf
+            .as_ref()
+            .expect("streaming GEMM dispatched without B16 scratch");
+        let (sq, sd) = match (&w.stream_q, &w.stream_d) {
+            (Some(q), Some(d)) => (q, d),
+            _ => panic!("streaming GEMM dispatched without resident (q, d) buffers"),
+        };
+        debug_assert_eq!(k % 32, 0);
+        let nq = m.checked_mul(k / 8).expect("repack q count exceeds u32");
+        let nd = m.checked_mul(k / 32).expect("repack d count exceeds u32");
+        debug_assert!(u64::from(nq) * 4 <= sq.size());
+        debug_assert!(u64::from(nd) * 4 <= sd.size());
+        let n_pad = n.next_multiple_of(32);
+        let t_params: [u32; 4] = [n, n_pad, k, 0];
+        let t_buf = self.next_prefill_params(bytemuck::cast_slice(&t_params));
+        let params: [u32; 5] = [m, k, n, n_pad, y_stride];
+        let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
+
+        let (t_bg, bg) = {
+            let mut cache = self
+                .stream_gemm_bg_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (key_n, key_al, cursor, slots) = &mut *cache;
+            if (*key_n, *key_al) != (n, all_logits) {
+                *key_n = n;
+                *key_al = all_logits;
+                *cursor = 0;
+                slots.clear();
+            }
+            let idx = *cursor;
+            *cursor += 1;
+            if slots.len() <= idx {
+                slots.resize_with(idx + 1, || None);
+            }
+            if slots[idx].is_none() {
+                let fresh_t = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &transpose.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: x.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: b16.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: t_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                let fresh_bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &gemm.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: sq.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: sd.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: b16.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 3,
+                                resource: y.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 4,
+                                resource: p_buf.as_entire_binding(),
+                            },
+                        ],
+                    });
+                slots[idx] = Some((fresh_t, fresh_bg));
+            }
+            slots[idx].as_ref().unwrap().clone()
+        };
+
         Self::push_prefill_dispatch(
             cmds,
             transpose,
@@ -6807,21 +7060,26 @@ impl GpuLfm2Model {
         y_stride: u32,
         all_logits: bool,
     ) {
-        // Streaming fp16 fast path (Q4_0, n >= 32, k % 32 == 0, packed B):
-        // ~10x the reg-tile kernel on Adreno. Anything it declines — other
-        // dtypes, short rows, strided B, missing repack — falls through to
+        // Streaming fp16 fast path (Q4_0, Q4_K_M, n >= 32, k % 32 == 0, packed B):
+        // ~10x the reg-tile kernel on Adreno. Anything it declines: other
+        // dtypes, short rows, strided B, missing repack: falls through to
         // reg-tile below.
-        if w.tensor.dtype == DType::Q4_0
+        if (w.tensor.dtype == DType::Q4_0 || w.tensor.dtype == DType::Q4KM)
             && n >= 32
             && k.is_multiple_of(32)
             && x_stride == k
-            && self.pipelines.gemm_stream_q4_0.is_some()
             && self.pipelines.transpose_cast_f16.is_some()
             && w.stream_q.is_some()
             && w.stream_d.is_some()
         {
-            self.encode_gemm_stream_q4_0(cmds, w, x, y, n, k, y_stride, all_logits);
-            return;
+            if w.tensor.dtype == DType::Q4KM && self.pipelines.gemm_stream_q4_k.is_some() {
+                self.encode_gemm_stream_q4_k(cmds, w, x, y, n, k, y_stride, all_logits);
+                return;
+            }
+            if w.tensor.dtype == DType::Q4_0 && self.pipelines.gemm_stream_q4_0.is_some() {
+                self.encode_gemm_stream_q4_0(cmds, w, x, y, n, k, y_stride, all_logits);
+                return;
+            }
         }
         debug_assert!(
             matches!(
@@ -10070,6 +10328,7 @@ mod tests {
         for label in [
             "gemm_stream_q4_0",
             "gemm_stream_q4_0_k64",
+            "gemm_stream_q4_k",
             "transpose_cast_f16",
             "rmsnorm_batch",
             "attention_prefill",
@@ -10259,6 +10518,70 @@ mod tests {
                             let want = ((row * 64 + w) % 16) as u32;
                             assert_eq!(got, want, "row {row} kb {kb} p {p} s {s} j {j} (w={w})");
                         }
+                    }
+                }
+            }
+        }
+    }
+
+    /// `repack_q4_k_stream` must place every nibble, scale, and min where the
+    /// streaming kernels index them, and match CPU dequantize_q4_k_m_block.
+    #[test]
+    fn stream_repack_q4_k_layout() {
+        use super::repack_q4_k_stream;
+        use crate::quant::{dequantize_q4_k_m_block, BlockQ4KM};
+        let (m, k) = (2usize, 256usize);
+        let mut data = vec![0u8; m * 144];
+
+        for row in 0..m {
+            let base = row * 144;
+            // Super-scale and min as f16 bits
+            let d_f16 = 0x3C00u16; // 1.0 in f16
+            let dmin_f16 = 0x3800u16; // 0.5 in f16
+            data[base..base + 2].copy_from_slice(&d_f16.to_le_bytes());
+            data[base + 2..base + 4].copy_from_slice(&dmin_f16.to_le_bytes());
+
+            // 12 bytes of packed scales and mins
+            for i in 0..12 {
+                data[base + 4 + i] = ((row * 12 + i) % 64) as u8;
+            }
+
+            // 128 bytes of nibbles
+            for i in 0..128 {
+                let lo = ((row + i) % 16) as u8;
+                let hi = ((row * 2 + i * 3) % 16) as u8;
+                data[base + 16 + i] = lo | (hi << 4);
+            }
+        }
+
+        let (q, d) = repack_q4_k_stream(&data, m, k);
+        assert_eq!(q.len(), m * (k / 8));
+        assert_eq!(d.len(), m * (k / 32));
+
+        // Verify against dequantize_q4_k_m_block for each row
+        for row in 0..m {
+            let base = row * 144;
+            let block = unsafe { &*(data[base..base + 144].as_ptr() as *const BlockQ4KM) };
+            let ref_weights = dequantize_q4_k_m_block(block);
+
+            // Reconstruct weights from repacked (q, d) through the kernel's formula:
+            // weight = nibble * scale - min
+            for kb in 0..8 {
+                let pd = d[kb * m + row];
+                let scale = half::f16::from_bits((pd & 0xFFFF) as u16).to_f32();
+                let minv = half::f16::from_bits((pd >> 16) as u16).to_f32();
+
+                for p in 0..4 {
+                    let pq = q[(kb * 4 + p) * m + row];
+                    for t in 0..8 {
+                        let nib = ((pq >> (t * 4)) & 0xF) as f32;
+                        let got = nib * scale - minv;
+                        let elem_idx = kb * 32 + p * 8 + t;
+                        let exp = ref_weights[elem_idx];
+                        assert!(
+                            (got - exp).abs() < 1e-3,
+                            "row {row} elem {elem_idx}: got {got}, exp {exp}"
+                        );
                     }
                 }
             }

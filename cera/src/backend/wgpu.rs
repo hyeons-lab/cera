@@ -1840,6 +1840,200 @@ impl GpuContext {
             })
     }
 
+    /// Streaming fp16 Q4_K prefill GEMM (`gemm_stream_q4_k.slang`).
+    /// Five bindings (0 = src_q, 1 = src_d, 2 = src_b (f16), 3 = dst (f32), 4 = paramsBuf).
+    ///
+    /// # Safety
+    /// The module must be spirv-val-clean with the binding interface above
+    /// (our slangc-compiled `gemm_stream_q4_k.slang`). Only call when
+    /// `supports_spirv_passthrough()` is true.
+    pub fn gemm_stream_q4_k_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gemm_stream_q4_k_passthrough_bgl"),
+                entries: &[
+                    storage(0, true),
+                    storage(1, true),
+                    storage(2, true),
+                    storage(3, false),
+                    storage(4, true),
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gemm_stream_q4_k_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: slangc-compiled from gemm_stream_q4_k.slang, spirv-val clean.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemm_stream_q4_k.spv"
+                )))
+        };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("gemm_stream_q4_k_passthrough"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
+    /// Q4_K decode GEMV over the resident stream layout (`spirv/gemv_q4_k_stream.slang`, entry `main`).
+    /// 5-binding interface (q, d, x, y, params), ROWS_PER_WG=16 dispatch.
+    ///
+    /// # Safety
+    /// The module must be spirv-val-clean with the binding interface above
+    /// (our slangc-compiled `gemv_q4_k_stream.slang`). Only call when
+    /// `supports_spirv_passthrough()` is true.
+    pub fn gemv_q4_k_stream_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gemv_q4_k_stream_passthrough_bgl"),
+                entries: &[
+                    storage(0, true),
+                    storage(1, true),
+                    storage(2, true),
+                    storage(3, false),
+                    storage(4, true),
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gemv_q4_k_stream_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: slangc-compiled from gemv_q4_k_stream.slang, spirv-val clean.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemv_q4_k_stream.spv"
+                )))
+        };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("gemv_q4_k_stream_passthrough"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
+    /// Fast Q4_K decode GEMV for raw weights with subgroup reduction (`spirv/gemv_q4_k.slang`).
+    /// 4-binding interface (w, x, y, params), NR=4 rows per workgroup.
+    ///
+    /// # Safety
+    /// The module must be spirv-val-clean with the binding interface above
+    /// (our slangc-compiled `gemv_q4_k.slang`). Only call when
+    /// `supports_spirv_passthrough()` is true.
+    pub fn gemv_q4_k_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gemv_q4_k_passthrough_bgl"),
+                entries: &[
+                    storage(0, true),
+                    storage(1, true),
+                    storage(2, false),
+                    storage(3, true),
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gemv_q4_k_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: slangc-compiled from gemv_q4_k.slang, spirv-val clean.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemv_q4_k.spv"
+                )))
+        };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("gemv_q4_k_passthrough"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
     // NOTE: no `repack_q4_0_stream` GPU kernel. The (q, d) repack is
     // load-time only now (host `repack_q4_0_stream` in gpu_lfm2.rs): the
     // resident stream layout deleted the per-GEMM on-GPU transpose along

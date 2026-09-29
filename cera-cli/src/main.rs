@@ -517,12 +517,24 @@ enum Command {
         #[arg(long, value_name = "ALPHA", requires = "lora")]
         lora_alpha: Option<f32>,
 
+        /// Enable speculative decoding (default: off).
+        #[arg(long)]
+        spec: bool,
+
+        /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+        #[arg(long, conflicts_with = "spec")]
+        no_spec: bool,
+
+        /// Trailing n-gram length for prompt-lookup speculative decoding.
+        #[arg(long = "spec-ngram", default_value_t = 2, value_name = "N")]
+        spec_ngram: usize,
+
         /// Path to a draft model GGUF for speculative decoding (e.g. DSpark draft sidecar).
         #[arg(short = 'd', long = "draft-model", value_name = "PATH")]
         draft_model: Option<String>,
 
-        /// Speculative decoding proposal length (default: 8).
-        #[arg(long = "spec-k", default_value_t = 8, value_name = "K")]
+        /// Speculative decoding proposal length (default: 6).
+        #[arg(long = "spec-k", default_value_t = 6, value_name = "K")]
         spec_k: usize,
     },
 
@@ -679,12 +691,24 @@ enum Command {
         #[arg(long, value_name = "ALPHA", requires = "lora")]
         lora_alpha: Option<f32>,
 
+        /// Enable speculative decoding (default: off).
+        #[arg(long)]
+        spec: bool,
+
+        /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+        #[arg(long, conflicts_with = "spec")]
+        no_spec: bool,
+
+        /// Trailing n-gram length for prompt-lookup speculative decoding.
+        #[arg(long = "spec-ngram", default_value_t = 2, value_name = "N")]
+        spec_ngram: usize,
+
         /// Path to a draft model GGUF for speculative decoding (e.g. DSpark draft sidecar).
         #[arg(short = 'd', long = "draft-model", value_name = "PATH")]
         draft_model: Option<String>,
 
-        /// Speculative decoding proposal length (default: 8).
-        #[arg(long = "spec-k", default_value_t = 8, value_name = "K")]
+        /// Speculative decoding proposal length (default: 6).
+        #[arg(long = "spec-k", default_value_t = 6, value_name = "K")]
         spec_k: usize,
     },
 
@@ -986,13 +1010,17 @@ enum Command {
         /// Enable greedy speculative decoding (prompt-lookup drafting) for the
         /// decode phase. Verifies K drafted tokens per forward, so a
         /// bandwidth-bound decode amortizes its single weight-read over the
-        /// accepted run — the win shows on repetitive / long-context prompts.
+        /// accepted run: the win shows on repetitive / long-context prompts.
         /// Every emitted token is the target's argmax, so this is a valid
         /// greedy decode (a near-tie may land differently than a sequential
         /// one). Only engages on CPU dense models with an uncompressed
         /// (f32/f16) KV cache; otherwise it's a no-op.
         #[arg(long)]
         spec: bool,
+
+        /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+        #[arg(long, conflicts_with = "spec")]
+        no_spec: bool,
 
         /// Trailing n-gram length the prompt-lookup drafter matches. Only used
         /// with `--spec`.
@@ -2686,6 +2714,9 @@ fn main() -> Result<()> {
             n_keep,
             lora,
             lora_alpha,
+            spec,
+            no_spec,
+            spec_ngram,
             draft_model,
             spec_k,
         } => {
@@ -2805,9 +2836,12 @@ fn main() -> Result<()> {
                               triggers: Vec<u32>|
              -> cera::GenerateOpts {
                 let mut opts = sampling_args.build_generate_opts(engine, grammar, triggers);
-                if draft_model.is_some() || engine.manifest().files.draft_model.is_some() {
+                if no_spec {
+                    opts.no_spec = true;
+                    opts.spec = None;
+                } else if spec || spec_ngram != 2 || spec_k != 4 {
                     opts.spec = Some(cera::SpecDecode {
-                        ngram: 2,
+                        ngram: spec_ngram,
                         k: spec_k,
                     });
                 }
@@ -2838,6 +2872,9 @@ fn main() -> Result<()> {
                     n_keep,
                     ..Default::default()
                 })?;
+                if no_spec {
+                    session.disable_spec();
+                }
                 attach_lora(&mut session, &lora, lora_alpha)?;
                 // Honored by `append_chat_with_images` below (and any
                 // later append) — bounds each image's encoded long side.
@@ -2971,6 +3008,9 @@ fn main() -> Result<()> {
                     n_keep,
                     ..Default::default()
                 })?;
+                if no_spec {
+                    session.disable_spec();
+                }
                 attach_lora(&mut session, &lora, lora_alpha)?;
 
                 let prefill_start = std::time::Instant::now();
@@ -4238,6 +4278,9 @@ fn main() -> Result<()> {
             no_tui,
             lora,
             lora_alpha,
+            spec,
+            no_spec,
+            spec_ngram,
             draft_model,
             spec_k,
         } => {
@@ -4298,6 +4341,9 @@ fn main() -> Result<()> {
                 seed,
                 ..Default::default()
             })?;
+            if no_spec {
+                session.disable_spec();
+            }
             attach_lora(&mut session, &lora, lora_alpha)?;
 
             let mut history: Vec<cera::tokenizer::ChatMessage> = Vec::new();
@@ -4338,9 +4384,12 @@ fn main() -> Result<()> {
             };
             sampling_args.validate()?;
             let mut opts = sampling_args.build_generate_opts(&engine, None, Vec::new());
-            if draft_model.is_some() || engine.manifest().files.draft_model.is_some() {
+            if no_spec {
+                opts.no_spec = true;
+                opts.spec = None;
+            } else if spec || spec_ngram != 2 || spec_k != 4 {
                 opts.spec = Some(cera::SpecDecode {
-                    ngram: 2,
+                    ngram: spec_ngram,
                     k: spec_k,
                 });
             }
@@ -5057,13 +5106,14 @@ fn main() -> Result<()> {
             kv_cache_keys,
             ubatch_size,
             gpu_io,
-            spec,
+            spec: _,
+            no_spec,
             spec_ngram,
             spec_k,
             draft_model,
         } => {
             anyhow::ensure!(runs >= 1, "--runs must be >= 1");
-            if spec {
+            if !no_spec {
                 anyhow::ensure!(spec_ngram >= 1, "--spec-ngram must be >= 1");
                 anyhow::ensure!(spec_k >= 1, "--spec-k must be >= 1");
             }
@@ -5154,12 +5204,13 @@ fn main() -> Result<()> {
                 runs
             );
             let has_draft = draft_model.is_some() || engine.manifest().files.draft_model.is_some();
-            if spec || has_draft {
+            let spec_enabled = !no_spec;
+            if spec_enabled {
                 // Speculative decode only engages on a dense model with an
                 // uncompressed KV cache; flag when it will silently no-op so the
                 // measured number isn't mistaken for a spec result. Test against
                 // the resolved `kv_compression` (which already reflects any
-                // unsupported-mode fallback to f32), not the raw flag string —
+                // unsupported-mode fallback to f32), not the raw flag string:
                 // every TurboQuant variant is compressed, only f32/f16 are not.
                 let compressed = matches!(
                     kv_compression,
@@ -5169,7 +5220,7 @@ fn main() -> Result<()> {
                 let drafter_desc = if has_draft {
                     format!("neural draft model, k={spec_k}")
                 } else {
-                    format!("ngram={spec_ngram}, k={spec_k}")
+                    format!("prompt lookup (ngram={spec_ngram}, k={spec_k})")
                 };
                 eprintln!(
                     "Speculative decode: ON ({drafter_desc}){}",
@@ -5179,6 +5230,8 @@ fn main() -> Result<()> {
                         " - NOTE: model/KV not eligible, decode falls back to non-spec".to_string()
                     }
                 );
+            } else {
+                eprintln!("Speculative decode: OFF");
             }
 
             // Greedy (temp=0): deterministic, bench-friendly. NoopSink swallows tokens.
@@ -5189,7 +5242,11 @@ fn main() -> Result<()> {
                     ubatch_size,
                     ..Default::default()
                 })?;
-                // Prefill is one batched pass in principle — if it turns out to
+                if no_spec {
+                    session.disable_spec();
+                    session.detach_drafter();
+                }
+                // Prefill is one batched pass in principle: if it turns out to
                 // issue a submit per prompt token, that alone explains a prefill
                 // rate that never exceeds decode.
                 let io_prefill_before = gpu_io_snapshot();
@@ -5202,10 +5259,11 @@ fn main() -> Result<()> {
                     max_tokens: max_tokens as u32,
                     temperature: 0.0,
                     // llama-bench semantics: every run must decode exactly
-                    // `max_tokens`, not stop early at EOS — otherwise short
+                    // `max_tokens`, not stop early at EOS: otherwise short
                     // completions silently shrink the measured sample.
                     ignore_eos: true,
-                    spec: (spec || has_draft).then_some(cera::SpecDecode {
+                    no_spec,
+                    spec: spec_enabled.then_some(cera::SpecDecode {
                         ngram: spec_ngram,
                         k: spec_k,
                     }),
@@ -5214,7 +5272,7 @@ fn main() -> Result<()> {
                 let mut sink = NoopSink;
                 // Scope these counters to decode only, so the decode rates are
                 // per decoded token and not diluted by prefill (measured
-                // separately above — its submit count varies wildly depending
+                // separately above: its submit count varies wildly depending
                 // on whether the batched path was taken).
                 let io_before = gpu_io_snapshot();
                 let summary = session.generate(&opts, &mut sink)?;
@@ -5815,6 +5873,56 @@ mod tests {
             panic!("expected `bench -d` to parse, got: {:?}", bench.err());
         };
         assert_eq!(draft_model.as_deref(), Some("/tmp/draft.gguf"));
+    }
+
+    /// `--spec` / `--no-spec` parse on run/chat/bench, default off, and
+    /// conflict with each other.
+    #[test]
+    fn spec_flags_parse_on_run_chat_bench() {
+        fn spec_pair(cmd: &Command) -> (bool, bool) {
+            match cmd {
+                Command::Run { spec, no_spec, .. } => (*spec, *no_spec),
+                Command::Chat { spec, no_spec, .. } => (*spec, *no_spec),
+                Command::Bench { spec, no_spec, .. } => (*spec, *no_spec),
+                _ => panic!("expected run/chat/bench"),
+            }
+        }
+        // `run` requires a prompt; chat/bench take a bare model.
+        let extra: &[(&str, &[&str])] = &[
+            ("run", &["-p", "hello"]),
+            ("chat", &[]),
+            ("bench", &[]),
+        ];
+        for (sub, rest) in extra {
+            let mut base: Vec<&str> = vec!["cera", sub, "-m", "/tmp/base.gguf"];
+            base.extend_from_slice(rest);
+            let plain = Cli::try_parse_from(base.clone());
+            let Ok(Cli { command }) = plain else {
+                panic!("expected bare `{sub}` to parse, got: {:?}", plain.err());
+            };
+            assert_eq!(spec_pair(&command), (false, false), "{sub} defaults");
+
+            let mut on = base.clone();
+            on.push("--spec");
+            let Ok(Cli { command }) = Cli::try_parse_from(on) else {
+                panic!("expected `{sub} --spec` to parse");
+            };
+            assert_eq!(spec_pair(&command), (true, false), "{sub} --spec");
+
+            let mut off = base.clone();
+            off.push("--no-spec");
+            let Ok(Cli { command }) = Cli::try_parse_from(off) else {
+                panic!("expected `{sub} --no-spec` to parse");
+            };
+            assert_eq!(spec_pair(&command), (false, true), "{sub} --no-spec");
+
+            let mut both = base.clone();
+            both.extend_from_slice(&["--spec", "--no-spec"]);
+            assert!(
+                Cli::try_parse_from(both).is_err(),
+                "expected `{sub} --spec --no-spec` to conflict"
+            );
+        }
     }
 
     /// `embed` requires `--prompt`, accepts a model source, and exposes
