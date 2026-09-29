@@ -108,6 +108,18 @@ pub enum Repacked {
         dsc: Vec<f32>,
         dmn: Vec<f32>,
     },
+    Q6K {
+        packed: Vec<u8>,
+        scales: Vec<f32>,
+    },
+    /// Smmla (i8mm) twin of [`Repacked::Q6K`]: same shapes
+    /// (`m*k` packed bytes, `(m/8)*nb16*8` f32 scales) but the
+    /// [`crate::backend::cpu::repack_q6_k_smmla_8x8`] layout. Built instead of
+    /// `Q6K` when the process tier is `NeonI8mm` on aarch64.
+    Q6KSmmla {
+        packed: Vec<u8>,
+        scales: Vec<f32>,
+    },
 }
 
 /// A weight's `m x k` body repacked into the layout the prefill GEMM
@@ -132,6 +144,8 @@ impl std::fmt::Debug for RepackedWeight {
             Repacked::Q40Smmla { packed, .. } => ("Q4_0+smmla", packed.len()),
             Repacked::Q4K { packed, .. } => ("Q4_K", packed.len()),
             Repacked::Q4KSmmla { packed, .. } => ("Q4_K+smmla", packed.len()),
+            Repacked::Q6K { packed, .. } => ("Q6_K", packed.len()),
+            Repacked::Q6KSmmla { packed, .. } => ("Q6_K+smmla", packed.len()),
         };
         f.debug_struct("RepackedWeight")
             .field("kind", &tag)
@@ -294,7 +308,8 @@ impl WeightRef {
             // (a weight that qualified for one can never take the other).
             let qualifies = (self.dtype == DType::Q4_0
                 && cpu::q4_0_repack_supported(self.m, self.k))
-                || (self.dtype == DType::Q4KM && cpu::q4_k_repack_supported(self.m, self.k));
+                || (self.dtype == DType::Q4KM && cpu::q4_k_repack_supported(self.m, self.k))
+                || (self.dtype == DType::Q6K && cpu::q6_k_repack_supported(self.m, self.k));
             if !do_repack {
                 self.repacked = None;
                 self.repack_loader_skipped = qualifies;
@@ -339,6 +354,28 @@ impl WeightRef {
                     let (packed, dsc, dmn) =
                         cpu::repack_q4_k_8x8(weight_data(gguf, &self), self.m, self.k);
                     kind = Some(Repacked::Q4K { packed, dsc, dmn });
+                }
+            }
+            if qualifies && self.dtype == DType::Q6K {
+                #[cfg(target_arch = "aarch64")]
+                {
+                    if crate::backend::cpu_features::cpu_features().tier
+                        == crate::backend::cpu_features::CpuTier::NeonI8mm
+                    {
+                        let (packed, scales) =
+                            cpu::repack_q6_k_smmla_8x8(weight_data(gguf, &self), self.m, self.k);
+                        kind = Some(Repacked::Q6KSmmla { packed, scales });
+                    } else {
+                        let (packed, scales) =
+                            cpu::repack_q6_k_8x8(weight_data(gguf, &self), self.m, self.k);
+                        kind = Some(Repacked::Q6K { packed, scales });
+                    }
+                }
+                #[cfg(target_arch = "x86_64")]
+                {
+                    let (packed, scales) =
+                        cpu::repack_q6_k_8x8(weight_data(gguf, &self), self.m, self.k);
+                    kind = Some(Repacked::Q6K { packed, scales });
                 }
             }
             self.repacked = kind.map(|k| {
@@ -1092,6 +1129,14 @@ pub(crate) fn try_repacked_gemm_rowmajor(
                     packed, dsc, dmn, b_scales, b_quants, out, n, m, k,
                 )
             }
+            Repacked::Q6K { packed, scales } => cpu::gemm_preq_repacked_q6_k_rowmajor_dispatch(
+                packed, scales, b_scales, b_quants, out, n, m, k,
+            ),
+            Repacked::Q6KSmmla { packed, scales } => {
+                cpu::gemm_preq_repacked_q6_k_smmla_rowmajor_dispatch(
+                    packed, scales, b_scales, b_quants, out, n, m, k,
+                )
+            }
         };
         if ran {
             return true;
@@ -1292,6 +1337,12 @@ pub(crate) fn gemm_preq(
             ),
             Repacked::Q4KSmmla { packed, dsc, dmn } => cpu::gemm_preq_repacked_q4_k_smmla_dispatch(
                 packed, dsc, dmn, b_scales, b_quants, out, m, n, k,
+            ),
+            Repacked::Q6K { packed, scales } => cpu::gemm_preq_repacked_q6_k_dispatch(
+                packed, scales, b_scales, b_quants, out, m, n, k,
+            ),
+            Repacked::Q6KSmmla { packed, scales } => cpu::gemm_preq_repacked_q6_k_smmla_dispatch(
+                packed, scales, b_scales, b_quants, out, m, n, k,
             ),
         };
         if ran {

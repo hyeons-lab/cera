@@ -8694,6 +8694,641 @@ pub(crate) mod neon {
         }
     }
 
+    /// Load 4 consecutive Q8_0 activations and duplicate across 128-bit vector.
+    #[inline]
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn load_act_4_q6(bq: *const i8, tok: usize, k: usize, s: usize, g: usize) -> int8x16_t {
+        unsafe {
+            let a4 = (bq.add(tok * k + s * 16 + g * 4) as *const i32).read_unaligned();
+            vreinterpretq_s8_s32(vdupq_n_s32(a4))
+        }
+    }
+
+    /// Single-tile kernel: super-row `sr`, token quad `[j, j+3]`, full k into `t[8][4]`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    unsafe fn smmla_q6_k_tile_8x4(
+        p_ptr: *const i8,
+        scales_ptr: *const f32,
+        bq_ptr: *const i8,
+        bs_ptr: *const f32,
+        sr: usize,
+        j: usize,
+        nb16: usize,
+        k: usize,
+        t: &mut [[f32; 4]; 8],
+    ) {
+        unsafe {
+            let nb32 = k / 32;
+            let mut facc = [[vdupq_n_f32(0.0); 2]; 4];
+            for s in 0..nb16 {
+                let b = s / 2;
+                let mut acc = [[vdupq_n_s32(0); 2]; 4];
+                let w_base = p_ptr.add((sr * nb16 + s) * 128);
+                for c in 0..2usize {
+                    let k_off = s * 16 + c * 8;
+                    let t0 = bq_ptr.add(j * k + k_off);
+                    let t1 = bq_ptr.add((j + 1) * k + k_off);
+                    let t2 = bq_ptr.add((j + 2) * k + k_off);
+                    let t3 = bq_ptr.add((j + 3) * k + k_off);
+                    let rhs0 = vcombine_s8(vld1_s8(t0), vld1_s8(t1));
+                    let rhs1 = vcombine_s8(vld1_s8(t2), vld1_s8(t3));
+                    for p in 0..4usize {
+                        let lhs = vld1q_s8(w_base.add(c * 64 + p * 16));
+                        acc[p][0] = vmmlaq_s32(acc[p][0], lhs, rhs0);
+                        acc[p][1] = vmmlaq_s32(acc[p][1], lhs, rhs1);
+                    }
+                }
+
+                let s_off = (sr * nb16 + s) * 8;
+                let d0 = vld1q_f32(scales_ptr.add(s_off));
+                let d1 = vld1q_f32(scales_ptr.add(s_off + 4));
+
+                let db0 = *bs_ptr.add(j * nb32 + b);
+                let db1 = *bs_ptr.add((j + 1) * nb32 + b);
+                let db2 = *bs_ptr.add((j + 2) * nb32 + b);
+                let db3 = *bs_ptr.add((j + 3) * nb32 + b);
+                let dbv0 = vld1q_f32([db0, db1, db0, db1].as_ptr());
+                let dbv1 = vld1q_f32([db2, db3, db2, db3].as_ptr());
+
+                let dw_p0 = vzip1q_f32(d0, d0);
+                let scale0_0 = vmulq_f32(dw_p0, dbv0);
+                let scale0_1 = vmulq_f32(dw_p0, dbv1);
+                facc[0][0] = vfmaq_f32(facc[0][0], scale0_0, vcvtq_f32_s32(acc[0][0]));
+                facc[0][1] = vfmaq_f32(facc[0][1], scale0_1, vcvtq_f32_s32(acc[0][1]));
+
+                let dw_p1 = vzip2q_f32(d0, d0);
+                let scale1_0 = vmulq_f32(dw_p1, dbv0);
+                let scale1_1 = vmulq_f32(dw_p1, dbv1);
+                facc[1][0] = vfmaq_f32(facc[1][0], scale1_0, vcvtq_f32_s32(acc[1][0]));
+                facc[1][1] = vfmaq_f32(facc[1][1], scale1_1, vcvtq_f32_s32(acc[1][1]));
+
+                let dw_p2 = vzip1q_f32(d1, d1);
+                let scale2_0 = vmulq_f32(dw_p2, dbv0);
+                let scale2_1 = vmulq_f32(dw_p2, dbv1);
+                facc[2][0] = vfmaq_f32(facc[2][0], scale2_0, vcvtq_f32_s32(acc[2][0]));
+                facc[2][1] = vfmaq_f32(facc[2][1], scale2_1, vcvtq_f32_s32(acc[2][1]));
+
+                let dw_p3 = vzip2q_f32(d1, d1);
+                let scale3_0 = vmulq_f32(dw_p3, dbv0);
+                let scale3_1 = vmulq_f32(dw_p3, dbv1);
+                facc[3][0] = vfmaq_f32(facc[3][0], scale3_0, vcvtq_f32_s32(acc[3][0]));
+                facc[3][1] = vfmaq_f32(facc[3][1], scale3_1, vcvtq_f32_s32(acc[3][1]));
+            }
+
+            let mut tmp = [[0.0f32; 4]; 8];
+            for p in 0..4 {
+                vst1q_f32(tmp[p * 2].as_mut_ptr(), facc[p][0]);
+                vst1q_f32(tmp[p * 2 + 1].as_mut_ptr(), facc[p][1]);
+            }
+            for p in 0..4 {
+                for rr in 0..2 {
+                    let r = 2 * p + rr;
+                    t[r][0] = tmp[p * 2][rr * 2];
+                    t[r][1] = tmp[p * 2][rr * 2 + 1];
+                    t[r][2] = tmp[p * 2 + 1][rr * 2];
+                    t[r][3] = tmp[p * 2 + 1][rr * 2 + 1];
+                }
+            }
+        }
+    }
+
+    /// Single-token twin of [`smmla_q6_k_tile_8x4`]: super-row `sr`, token `j`,
+    /// full k into `t[8]`. Runs token pair `(j, j)` and retains the even lanes.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    unsafe fn smmla_q6_k_tile_8x1(
+        p_ptr: *const i8,
+        scales_ptr: *const f32,
+        bq_ptr: *const i8,
+        bs_ptr: *const f32,
+        sr: usize,
+        j: usize,
+        nb16: usize,
+        k: usize,
+        t: &mut [f32; 8],
+    ) {
+        unsafe {
+            let nb32 = k / 32;
+            let mut facc = [vdupq_n_f32(0.0); 4];
+            for s in 0..nb16 {
+                let b = s / 2;
+                let mut acc = [vdupq_n_s32(0); 4];
+                let w_base = p_ptr.add((sr * nb16 + s) * 128);
+                for c in 0..2usize {
+                    let k_off = s * 16 + c * 8;
+                    let b8 = vld1_s8(bq_ptr.add(j * k + k_off));
+                    let rhs = vcombine_s8(b8, b8);
+                    for p in 0..4usize {
+                        let lhs = vld1q_s8(w_base.add(c * 64 + p * 16));
+                        acc[p] = vmmlaq_s32(acc[p], lhs, rhs);
+                    }
+                }
+
+                let s_off = (sr * nb16 + s) * 8;
+                let d0 = vld1q_f32(scales_ptr.add(s_off));
+                let d1 = vld1q_f32(scales_ptr.add(s_off + 4));
+
+                let db = *bs_ptr.add(j * nb32 + b);
+                let dbv = vdupq_n_f32(db);
+
+                let dw_p0 = vzip1q_f32(d0, d0);
+                facc[0] = vfmaq_f32(facc[0], vmulq_f32(dw_p0, dbv), vcvtq_f32_s32(acc[0]));
+
+                let dw_p1 = vzip2q_f32(d0, d0);
+                facc[1] = vfmaq_f32(facc[1], vmulq_f32(dw_p1, dbv), vcvtq_f32_s32(acc[1]));
+
+                let dw_p2 = vzip1q_f32(d1, d1);
+                facc[2] = vfmaq_f32(facc[2], vmulq_f32(dw_p2, dbv), vcvtq_f32_s32(acc[2]));
+
+                let dw_p3 = vzip2q_f32(d1, d1);
+                facc[3] = vfmaq_f32(facc[3], vmulq_f32(dw_p3, dbv), vcvtq_f32_s32(acc[3]));
+            }
+
+            let mut tmp = [[0.0f32; 4]; 4];
+            for p in 0..4 {
+                vst1q_f32(tmp[p].as_mut_ptr(), facc[p]);
+            }
+            for p in 0..4 {
+                t[2 * p] = tmp[p][0];
+                t[2 * p + 1] = tmp[p][2];
+            }
+        }
+    }
+
+    /// Smmla (i8mm) repacked Q6_K x Q8_0 batched GEMM writing column-major `out[m, n]`.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    pub unsafe fn gemm_q6_k_smmla_8x4_q8_0(
+        packed: &[u8],
+        scales: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(m % 8, 0, "smmla Q6_K GEMM: m must be a multiple of 8");
+        debug_assert_eq!(k % 256, 0, "smmla Q6_K GEMM: k must be divisible by 256");
+        let nb16 = k / 16;
+        let nb32 = k / 32;
+        debug_assert_eq!(out.len(), m * n);
+        debug_assert_eq!(packed.len(), (m / 8) * nb16 * 128);
+        debug_assert_eq!(scales.len(), (m / 8) * nb16 * 8);
+        debug_assert_eq!(b_quants.len(), n * k);
+        debug_assert_eq!(b_scales.len(), n * nb32);
+
+        let p_base = packed.as_ptr() as usize;
+        let scales_base = scales.as_ptr() as usize;
+        let bq_base = b_quants.as_ptr() as usize;
+        let bs_base = b_scales.as_ptr() as usize;
+
+        let compute_super_row = move |(sr, chunk): (usize, &mut [f32])| unsafe {
+            let p_ptr = p_base as *const i8;
+            let scales_ptr = scales_base as *const f32;
+            let bq_ptr = bq_base as *const i8;
+            let bs_ptr = bs_base as *const f32;
+
+            let mut j = 0;
+            while j + 4 <= n {
+                let mut t = [[0.0f32; 4]; 8];
+                smmla_q6_k_tile_8x4(p_ptr, scales_ptr, bq_ptr, bs_ptr, sr, j, nb16, k, &mut t);
+
+                for r in 0..8 {
+                    chunk[r * n + j..r * n + j + 4].copy_from_slice(&t[r]);
+                }
+
+                j += 4;
+            }
+
+            while j < n {
+                let mut t = [0.0f32; 8];
+                smmla_q6_k_tile_8x1(p_ptr, scales_ptr, bq_ptr, bs_ptr, sr, j, nb16, k, &mut t);
+
+                for r in 0..8 {
+                    chunk[r * n + j] = t[r];
+                }
+
+                j += 1;
+            }
+        };
+
+        let sr_count = m / 8;
+        if sr_count >= 2 {
+            let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+            crate::backend::cpu::par_rows_n_active(out, 8 * n, 1, max_active, compute_super_row);
+        } else {
+            out.chunks_mut(8 * n)
+                .enumerate()
+                .for_each(compute_super_row);
+        }
+    }
+
+    /// Smmla (i8mm) repacked Q6_K x Q8_0 batched GEMM writing row-major `out[n, m]`.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    pub unsafe fn gemm_q6_k_smmla_8x4_q8_0_rowmajor(
+        packed: &[u8],
+        scales: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        n: usize,
+        m: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(m % 8, 0, "smmla Q6_K GEMM: m must be a multiple of 8");
+        debug_assert_eq!(k % 256, 0, "smmla Q6_K GEMM: k must be divisible by 256");
+        let nb16 = k / 16;
+        let nb32 = k / 32;
+        debug_assert_eq!(out.len(), m * n);
+        debug_assert_eq!(packed.len(), (m / 8) * nb16 * 128);
+        debug_assert_eq!(scales.len(), (m / 8) * nb16 * 8);
+        debug_assert_eq!(b_quants.len(), n * k);
+        debug_assert_eq!(b_scales.len(), n * nb32);
+
+        let p_base = packed.as_ptr() as usize;
+        let scales_base = scales.as_ptr() as usize;
+        let bq_base = b_quants.as_ptr() as usize;
+        let bs_base = b_scales.as_ptr() as usize;
+        let out_base = out.as_mut_ptr() as usize;
+
+        let compute_super_row = move |sr: usize| unsafe {
+            let p_ptr = p_base as *const i8;
+            let scales_ptr = scales_base as *const f32;
+            let bq_ptr = bq_base as *const i8;
+            let bs_ptr = bs_base as *const f32;
+            let out_ptr = out_base as *mut f32;
+
+            let mut j = 0;
+            while j + 4 <= n {
+                let mut t = [[0.0f32; 4]; 8];
+                smmla_q6_k_tile_8x4(p_ptr, scales_ptr, bq_ptr, bs_ptr, sr, j, nb16, k, &mut t);
+
+                let base_row = 8 * sr;
+                for c in 0..4 {
+                    for r in 0..8 {
+                        *out_ptr.add((j + c) * m + base_row + r) = t[r][c];
+                    }
+                }
+
+                j += 4;
+            }
+
+            while j < n {
+                let mut t = [0.0f32; 8];
+                smmla_q6_k_tile_8x1(p_ptr, scales_ptr, bq_ptr, bs_ptr, sr, j, nb16, k, &mut t);
+
+                let base_row = 8 * sr;
+                for r in 0..8 {
+                    *out_ptr.add(j * m + base_row + r) = t[r];
+                }
+
+                j += 1;
+            }
+        };
+
+        let sr_count = m / 8;
+        if sr_count >= 2 {
+            if n == 1 {
+                crate::backend::cpu::par_range(sr_count, 1, |start_sr, count| {
+                    for sr in start_sr..start_sr + count {
+                        compute_super_row(sr);
+                    }
+                });
+            } else {
+                let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                crate::backend::cpu::par_range_prefill_active(
+                    sr_count,
+                    1,
+                    max_active,
+                    |start_sr, count| {
+                        for sr in start_sr..start_sr + count {
+                            compute_super_row(sr);
+                        }
+                    },
+                );
+            }
+        } else {
+            (0..sr_count).for_each(compute_super_row);
+        }
+    }
+
+    /// Single-tile kernel: super-row `sr`, token quad `[j, j+3]`, full k into `t[8][4]`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn vdot_q6_k_tile_8x4(
+        p_ptr: *const i8,
+        scales_ptr: *const f32,
+        bq_ptr: *const i8,
+        bs_ptr: *const f32,
+        sr: usize,
+        j: usize,
+        nb16: usize,
+        k: usize,
+        t: &mut [[f32; 4]; 8],
+    ) {
+        unsafe {
+            let nb32 = k / 32;
+            let mut facc0_0 = vdupq_n_f32(0.0);
+            let mut facc0_1 = vdupq_n_f32(0.0);
+            let mut facc1_0 = vdupq_n_f32(0.0);
+            let mut facc1_1 = vdupq_n_f32(0.0);
+            let mut facc2_0 = vdupq_n_f32(0.0);
+            let mut facc2_1 = vdupq_n_f32(0.0);
+            let mut facc3_0 = vdupq_n_f32(0.0);
+            let mut facc3_1 = vdupq_n_f32(0.0);
+
+            for s in 0..nb16 {
+                let b = s / 2;
+                let mut acc0_0 = vdupq_n_s32(0);
+                let mut acc0_1 = vdupq_n_s32(0);
+                let mut acc1_0 = vdupq_n_s32(0);
+                let mut acc1_1 = vdupq_n_s32(0);
+                let mut acc2_0 = vdupq_n_s32(0);
+                let mut acc2_1 = vdupq_n_s32(0);
+                let mut acc3_0 = vdupq_n_s32(0);
+                let mut acc3_1 = vdupq_n_s32(0);
+
+                let pbase = (sr * nb16 + s) * 128;
+                for g in 0..4usize {
+                    let w0 = vld1q_s8(p_ptr.add(pbase + g * 32));
+                    let w1 = vld1q_s8(p_ptr.add(pbase + g * 32 + 16));
+
+                    let act0 = load_act_4_q6(bq_ptr, j, k, s, g);
+                    let act1 = load_act_4_q6(bq_ptr, j + 1, k, s, g);
+                    let act2 = load_act_4_q6(bq_ptr, j + 2, k, s, g);
+                    let act3 = load_act_4_q6(bq_ptr, j + 3, k, s, g);
+
+                    acc0_0 = vdotq_s32(acc0_0, w0, act0);
+                    acc0_1 = vdotq_s32(acc0_1, w1, act0);
+
+                    acc1_0 = vdotq_s32(acc1_0, w0, act1);
+                    acc1_1 = vdotq_s32(acc1_1, w1, act1);
+
+                    acc2_0 = vdotq_s32(acc2_0, w0, act2);
+                    acc2_1 = vdotq_s32(acc2_1, w1, act2);
+
+                    acc3_0 = vdotq_s32(acc3_0, w0, act3);
+                    acc3_1 = vdotq_s32(acc3_1, w1, act3);
+                }
+
+                let d0 = vld1q_f32(scales_ptr.add((sr * nb16 + s) * 8));
+                let d1 = vld1q_f32(scales_ptr.add((sr * nb16 + s) * 8 + 4));
+
+                let d_a0 = *bs_ptr.add(j * nb32 + b);
+                let d_a1 = *bs_ptr.add((j + 1) * nb32 + b);
+                let d_a2 = *bs_ptr.add((j + 2) * nb32 + b);
+                let d_a3 = *bs_ptr.add((j + 3) * nb32 + b);
+
+                facc0_0 = vfmaq_f32(facc0_0, vmulq_n_f32(d0, d_a0), vcvtq_f32_s32(acc0_0));
+                facc0_1 = vfmaq_f32(facc0_1, vmulq_n_f32(d1, d_a0), vcvtq_f32_s32(acc0_1));
+
+                facc1_0 = vfmaq_f32(facc1_0, vmulq_n_f32(d0, d_a1), vcvtq_f32_s32(acc1_0));
+                facc1_1 = vfmaq_f32(facc1_1, vmulq_n_f32(d1, d_a1), vcvtq_f32_s32(acc1_1));
+
+                facc2_0 = vfmaq_f32(facc2_0, vmulq_n_f32(d0, d_a2), vcvtq_f32_s32(acc2_0));
+                facc2_1 = vfmaq_f32(facc2_1, vmulq_n_f32(d1, d_a2), vcvtq_f32_s32(acc2_1));
+
+                facc3_0 = vfmaq_f32(facc3_0, vmulq_n_f32(d0, d_a3), vcvtq_f32_s32(acc3_0));
+                facc3_1 = vfmaq_f32(facc3_1, vmulq_n_f32(d1, d_a3), vcvtq_f32_s32(acc3_1));
+            }
+
+            let mut tmp = [[0.0f32; 4]; 8];
+            vst1q_f32(tmp[0].as_mut_ptr(), facc0_0);
+            vst1q_f32(tmp[1].as_mut_ptr(), facc0_1);
+            vst1q_f32(tmp[2].as_mut_ptr(), facc1_0);
+            vst1q_f32(tmp[3].as_mut_ptr(), facc1_1);
+            vst1q_f32(tmp[4].as_mut_ptr(), facc2_0);
+            vst1q_f32(tmp[5].as_mut_ptr(), facc2_1);
+            vst1q_f32(tmp[6].as_mut_ptr(), facc3_0);
+            vst1q_f32(tmp[7].as_mut_ptr(), facc3_1);
+
+            for r in 0..8 {
+                t[r][0] = tmp[r / 4][r % 4];
+                t[r][1] = tmp[2 + r / 4][r % 4];
+                t[r][2] = tmp[4 + r / 4][r % 4];
+                t[r][3] = tmp[6 + r / 4][r % 4];
+            }
+        }
+    }
+
+    /// Single-token twin of [`vdot_q6_k_tile_8x4`]: super-row `sr`, token `j`, full k into `t[8]`.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,dotprod")]
+    unsafe fn vdot_q6_k_tile_8x1(
+        p_ptr: *const i8,
+        scales_ptr: *const f32,
+        bq_ptr: *const i8,
+        bs_ptr: *const f32,
+        sr: usize,
+        j: usize,
+        nb16: usize,
+        k: usize,
+        t: &mut [f32; 8],
+    ) {
+        unsafe {
+            let nb32 = k / 32;
+            let mut facc0 = vdupq_n_f32(0.0);
+            let mut facc1 = vdupq_n_f32(0.0);
+
+            for s in 0..nb16 {
+                let b = s / 2;
+                let mut acc0 = vdupq_n_s32(0);
+                let mut acc1 = vdupq_n_s32(0);
+
+                let pbase = (sr * nb16 + s) * 128;
+                for g in 0..4usize {
+                    let w0 = vld1q_s8(p_ptr.add(pbase + g * 32));
+                    let w1 = vld1q_s8(p_ptr.add(pbase + g * 32 + 16));
+
+                    let act = load_act_4_q6(bq_ptr, j, k, s, g);
+
+                    acc0 = vdotq_s32(acc0, w0, act);
+                    acc1 = vdotq_s32(acc1, w1, act);
+                }
+
+                let d0 = vld1q_f32(scales_ptr.add((sr * nb16 + s) * 8));
+                let d1 = vld1q_f32(scales_ptr.add((sr * nb16 + s) * 8 + 4));
+
+                let d_a = *bs_ptr.add(j * nb32 + b);
+                facc0 = vfmaq_f32(facc0, vmulq_n_f32(d0, d_a), vcvtq_f32_s32(acc0));
+                facc1 = vfmaq_f32(facc1, vmulq_n_f32(d1, d_a), vcvtq_f32_s32(acc1));
+            }
+
+            vst1q_f32(t.as_mut_ptr(), facc0);
+            vst1q_f32(t.as_mut_ptr().add(4), facc1);
+        }
+    }
+
+    /// Dotprod repacked Q6_K x Q8_0 batched GEMM writing column-major `out[m, n]`.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemm_q6_k_8x8_q8_0(
+        packed: &[u8],
+        scales: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(m % 8, 0, "repacked Q6_K GEMM: m must be a multiple of 8");
+        debug_assert_eq!(k % 256, 0, "repacked Q6_K GEMM: k must be divisible by 256");
+        let nb16 = k / 16;
+        let nb32 = k / 32;
+        debug_assert_eq!(out.len(), m * n);
+        debug_assert_eq!(packed.len(), (m / 8) * nb16 * 128);
+        debug_assert_eq!(scales.len(), (m / 8) * nb16 * 8);
+        debug_assert_eq!(b_quants.len(), n * k);
+        debug_assert_eq!(b_scales.len(), n * nb32);
+
+        let p_base = packed.as_ptr() as usize;
+        let scales_base = scales.as_ptr() as usize;
+        let bq_base = b_quants.as_ptr() as usize;
+        let bs_base = b_scales.as_ptr() as usize;
+
+        let compute_super_row = move |(sr, chunk): (usize, &mut [f32])| unsafe {
+            let p_ptr = p_base as *const i8;
+            let scales_ptr = scales_base as *const f32;
+            let bq_ptr = bq_base as *const i8;
+            let bs_ptr = bs_base as *const f32;
+
+            let mut j = 0;
+            while j + 4 <= n {
+                let mut t = [[0.0f32; 4]; 8];
+                vdot_q6_k_tile_8x4(p_ptr, scales_ptr, bq_ptr, bs_ptr, sr, j, nb16, k, &mut t);
+
+                for r in 0..8 {
+                    chunk[r * n + j..r * n + j + 4].copy_from_slice(&t[r]);
+                }
+
+                j += 4;
+            }
+
+            while j < n {
+                let mut t = [0.0f32; 8];
+                vdot_q6_k_tile_8x1(p_ptr, scales_ptr, bq_ptr, bs_ptr, sr, j, nb16, k, &mut t);
+
+                for r in 0..8 {
+                    chunk[r * n + j] = t[r];
+                }
+
+                j += 1;
+            }
+        };
+
+        let sr_count = m / 8;
+        if sr_count >= 2 {
+            let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+            crate::backend::cpu::par_rows_n_active(out, 8 * n, 1, max_active, compute_super_row);
+        } else {
+            out.chunks_mut(8 * n)
+                .enumerate()
+                .for_each(compute_super_row);
+        }
+    }
+
+    /// Dotprod repacked Q6_K x Q8_0 batched GEMM writing row-major `out[n, m]`.
+    #[allow(dead_code)]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn gemm_q6_k_8x8_q8_0_rowmajor(
+        packed: &[u8],
+        scales: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        n: usize,
+        m: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(m % 8, 0, "repacked Q6_K GEMM: m must be a multiple of 8");
+        debug_assert_eq!(k % 256, 0, "repacked Q6_K GEMM: k must be divisible by 256");
+        let nb16 = k / 16;
+        let nb32 = k / 32;
+        debug_assert_eq!(out.len(), m * n);
+        debug_assert_eq!(packed.len(), (m / 8) * nb16 * 128);
+        debug_assert_eq!(scales.len(), (m / 8) * nb16 * 8);
+        debug_assert_eq!(b_quants.len(), n * k);
+        debug_assert_eq!(b_scales.len(), n * nb32);
+
+        let p_base = packed.as_ptr() as usize;
+        let scales_base = scales.as_ptr() as usize;
+        let bq_base = b_quants.as_ptr() as usize;
+        let bs_base = b_scales.as_ptr() as usize;
+        let out_base = out.as_mut_ptr() as usize;
+
+        let compute_super_row = move |sr: usize| unsafe {
+            let p_ptr = p_base as *const i8;
+            let scales_ptr = scales_base as *const f32;
+            let bq_ptr = bq_base as *const i8;
+            let bs_ptr = bs_base as *const f32;
+            let out_ptr = out_base as *mut f32;
+
+            let mut j = 0;
+            while j + 4 <= n {
+                let mut t = [[0.0f32; 4]; 8];
+                vdot_q6_k_tile_8x4(p_ptr, scales_ptr, bq_ptr, bs_ptr, sr, j, nb16, k, &mut t);
+
+                let base_row = 8 * sr;
+                for c in 0..4 {
+                    for r in 0..8 {
+                        *out_ptr.add((j + c) * m + base_row + r) = t[r][c];
+                    }
+                }
+
+                j += 4;
+            }
+
+            while j < n {
+                let mut t = [0.0f32; 8];
+                vdot_q6_k_tile_8x1(p_ptr, scales_ptr, bq_ptr, bs_ptr, sr, j, nb16, k, &mut t);
+
+                let base_row = 8 * sr;
+                for r in 0..8 {
+                    *out_ptr.add(j * m + base_row + r) = t[r];
+                }
+
+                j += 1;
+            }
+        };
+
+        let sr_count = m / 8;
+        if sr_count >= 2 {
+            if n == 1 {
+                crate::backend::cpu::par_range(sr_count, 1, |start_sr, count| {
+                    for sr in start_sr..start_sr + count {
+                        compute_super_row(sr);
+                    }
+                });
+            } else {
+                let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                crate::backend::cpu::par_range_prefill_active(
+                    sr_count,
+                    1,
+                    max_active,
+                    |start_sr, count| {
+                        for sr in start_sr..start_sr + count {
+                            compute_super_row(sr);
+                        }
+                    },
+                );
+            }
+        } else {
+            (0..sr_count).for_each(compute_super_row);
+        }
+    }
+
     /// Q4_1 × Q8_0 integer GEMV dispatcher with pre-quantized input.
     pub unsafe fn gemv_q4_1_q8_0_neon(
         a_quant: &[u8],
@@ -10572,6 +11207,188 @@ pub(crate) mod neon {
                     }
                 }
                 assert_close(&out_fused, &want);
+            }
+        }
+
+        fn random_q6_k_prefill_case(
+            st: &mut u64,
+            m: usize,
+            n: usize,
+            k: usize,
+        ) -> (Vec<u8>, Vec<f32>, Vec<i8>) {
+            let sb = k / 256;
+            let nb = k / 32;
+            let blocks: Vec<BlockQ6K> = (0..m * sb).map(|_| random_q6k(st)).collect();
+            let a = blocks_to_bytes(&blocks);
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            for j in 0..n {
+                let col: Vec<f32> = (0..k).map(|_| lcg(st)).collect();
+                let (s, q) = quantize_col(&col);
+                b_scales[j * nb..(j + 1) * nb].copy_from_slice(&s);
+                b_quants[j * k..(j + 1) * k].copy_from_slice(&q);
+            }
+            (a, b_scales, b_quants)
+        }
+
+        #[test]
+        fn q6_k_vdot_repacked_matches_dotprod_standard() {
+            if !cpu_features().dotprod {
+                return;
+            }
+            for (m, n, k) in [
+                (16usize, 1usize, 256usize),
+                (16, 3, 256),
+                (16, 4, 256),
+                (16, 5, 256),
+                (16, 13, 256),
+                (32, 5, 512),
+            ] {
+                let mut st = 0x6b6b_0001u64 ^ (m as u64) ^ ((n as u64) << 20) ^ (k as u64);
+                let (a, b_scales, b_quants) = random_q6_k_prefill_case(&mut st, m, n, k);
+                let (packed, scales) = crate::backend::cpu::repack_q6_k_8x8(&a, m, k);
+                let mut got = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q6_k_8x8_q8_0(&packed, &scales, &b_scales, &b_quants, &mut got, m, n, k);
+                }
+                let mut want = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q6_k_q8_0_neon_dotprod(&a, &b_scales, &b_quants, &mut want, m, n, k);
+                }
+                assert_close(&got, &want);
+            }
+        }
+
+        #[test]
+        fn q6_k_vdot_rowmajor_matches_colmajor() {
+            if !cpu_features().dotprod {
+                return;
+            }
+            for (m, n, k) in [
+                (16usize, 1usize, 256usize),
+                (16, 3, 256),
+                (16, 4, 256),
+                (16, 5, 256),
+                (16, 13, 256),
+                (32, 5, 512),
+            ] {
+                let mut st = 0x6b6b_0003u64 ^ (m as u64) ^ ((n as u64) << 20) ^ (k as u64);
+                let (a, b_scales, b_quants) = random_q6_k_prefill_case(&mut st, m, n, k);
+                let (packed, scales) = crate::backend::cpu::repack_q6_k_8x8(&a, m, k);
+                let mut out_rm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q6_k_8x8_q8_0_rowmajor(
+                        &packed,
+                        &scales,
+                        &b_scales,
+                        &b_quants,
+                        &mut out_rm,
+                        n,
+                        m,
+                        k,
+                    )
+                };
+                let mut out_cm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q6_k_8x8_q8_0(&packed, &scales, &b_scales, &b_quants, &mut out_cm, m, n, k)
+                };
+                let mut out_rm_t = vec![0.0f32; m * n];
+                for j in 0..n {
+                    for i in 0..m {
+                        out_rm_t[i * n + j] = out_rm[j * m + i];
+                    }
+                }
+                assert_close(&out_rm_t, &out_cm);
+            }
+        }
+
+        #[test]
+        fn q6_k_smmla_repacked_matches_vdot() {
+            if !require_i8mm_kernel_or_skip() {
+                return;
+            }
+            for (m, n, k) in [
+                (16usize, 1usize, 256usize),
+                (16, 3, 256),
+                (16, 4, 256),
+                (16, 5, 256),
+                (16, 13, 256),
+                (32, 5, 512),
+            ] {
+                let mut st = 0x6bb1_8823u64 ^ (m as u64) ^ ((n as u64) << 20) ^ (k as u64);
+                let (a, b_scales, b_quants) = random_q6_k_prefill_case(&mut st, m, n, k);
+                let (packed, scales) = crate::backend::cpu::repack_q6_k_smmla_8x8(&a, m, k);
+                let mut got = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q6_k_smmla_8x4_q8_0(
+                        &packed, &scales, &b_scales, &b_quants, &mut got, m, n, k,
+                    )
+                };
+                let (v_packed, v_scales) = crate::backend::cpu::repack_q6_k_8x8(&a, m, k);
+                let mut want = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q6_k_8x8_q8_0(
+                        &v_packed, &v_scales, &b_scales, &b_quants, &mut want, m, n, k,
+                    )
+                };
+                assert_close(&got, &want);
+            }
+        }
+
+        #[test]
+        fn q6_k_smmla_rowmajor_matches_colmajor() {
+            if !require_i8mm_kernel_or_skip() {
+                return;
+            }
+            for (m, n, k) in [
+                (16usize, 1usize, 256usize),
+                (16, 3, 256),
+                (16, 4, 256),
+                (16, 5, 256),
+                (16, 13, 256),
+                (32, 5, 512),
+            ] {
+                let mut st = 0x6aa1_04e5u64 ^ (m as u64) ^ ((n as u64) << 20) ^ (k as u64);
+                let (a, _, _) = random_q6_k_prefill_case(&mut st, m, n, k);
+                let bmat: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+                let nb = k / 32;
+                let mut b_scales = vec![0.0f32; n * nb];
+                let mut b_quants = vec![0i8; n * k];
+                crate::model::transformer::quantize_rows(&bmat, k, n, &mut b_scales, &mut b_quants);
+                let (packed, scales) = crate::backend::cpu::repack_q6_k_smmla_8x8(&a, m, k);
+                let mut out_rm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q6_k_smmla_8x4_q8_0_rowmajor(
+                        &packed,
+                        &scales,
+                        &b_scales,
+                        &b_quants,
+                        &mut out_rm,
+                        n,
+                        m,
+                        k,
+                    )
+                };
+                let mut out_cm = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q6_k_smmla_8x4_q8_0(
+                        &packed,
+                        &scales,
+                        &b_scales,
+                        &b_quants,
+                        &mut out_cm,
+                        m,
+                        n,
+                        k,
+                    )
+                };
+                let mut out_rm_t = vec![0.0f32; m * n];
+                for j in 0..n {
+                    for i in 0..m {
+                        out_rm_t[i * n + j] = out_rm[j * m + i];
+                    }
+                }
+                assert_close(&out_rm_t, &out_cm);
             }
         }
 

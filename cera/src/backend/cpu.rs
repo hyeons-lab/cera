@@ -2283,6 +2283,176 @@ pub(crate) fn repack_q4_k_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f
     (packed, dsc, dmn)
 }
 
+/// Repack `m x k` Q6_K weights into 8-row-interleaved layout for aarch64 dotprod prefill.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(has_blas, allow(dead_code))]
+pub(crate) fn repack_q6_k_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
+    assert!(
+        m.is_multiple_of(8),
+        "repack_q6_k_8x8: m must be a multiple of 8"
+    );
+    assert!(
+        k.is_multiple_of(256),
+        "repack_q6_k_8x8: k must be a multiple of 256"
+    );
+    let sb = k / 256;
+    let nb16 = k / 16;
+    let bsz = size_of::<crate::quant::BlockQ6K>();
+    assert_eq!(
+        src.len(),
+        m * sb * bsz,
+        "repack_q6_k_8x8: src is {} bytes, need {} for {m}x{k}",
+        src.len(),
+        m * sb * bsz,
+    );
+    let sr_count = m / 8;
+    let mut packed = vec![0u8; sr_count * nb16 * 128];
+    let mut scales = vec![0.0f32; sr_count * nb16 * 8];
+    const QL_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ6K, ql);
+    const QH_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ6K, qh);
+    const SC_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ6K, scales);
+    const D_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ6K, d);
+
+    let quant_val = |row: usize, sub: usize, e: usize| -> i8 {
+        let bi = sub / 16;
+        let s = sub % 16;
+        let off = (row * sb + bi) * bsz;
+        let pass = s / 8;
+        let in_pass_s = s % 8;
+        let group = in_pass_s / 2;
+        let is = in_pass_s % 2;
+        let l = is * 16 + e;
+        let ql = &src[off + QL_OFF..off + QL_OFF + 128];
+        let qh = &src[off + QH_OFF..off + QH_OFF + 64];
+        let ql_base = pass * 64;
+        let qh_base = pass * 32;
+        let q = match group {
+            0 => (ql[ql_base + l] & 0x0F) | ((qh[qh_base + l] & 3) << 4),
+            1 => (ql[ql_base + l + 32] & 0x0F) | (((qh[qh_base + l] >> 2) & 3) << 4),
+            2 => (ql[ql_base + l] >> 4) | (((qh[qh_base + l] >> 4) & 3) << 4),
+            3 => (ql[ql_base + l + 32] >> 4) | (((qh[qh_base + l] >> 6) & 3) << 4),
+            _ => unreachable!(),
+        };
+        (q as i8).wrapping_sub(32)
+    };
+
+    for sr in 0..sr_count {
+        for bi in 0..sb {
+            for r in 0..8 {
+                let off = ((8 * sr + r) * sb + bi) * bsz;
+                let d = f16_to_f32(u16::from_le_bytes([src[off + D_OFF], src[off + D_OFF + 1]]));
+                for s in 0..16 {
+                    let sc = src[off + SC_OFF + s] as i8;
+                    let sub = bi * 16 + s;
+                    scales[(sr * nb16 + sub) * 8 + r] = d * sc as f32;
+                }
+            }
+            for s in 0..16usize {
+                let sub = bi * 16 + s;
+                let base = (sr * nb16 + sub) * 128;
+                for g in 0..4usize {
+                    for chunk in 0..2usize {
+                        for r in 0..4usize {
+                            for c in 0..4usize {
+                                let e = 4 * g + c;
+                                let row = 8 * sr + chunk * 4 + r;
+                                let val = quant_val(row, sub, e) as u8;
+                                packed[base + g * 32 + chunk * 16 + r * 4 + c] = val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (packed, scales)
+}
+
+/// Repack `m x k` Q6_K weights into smmla-ready row-pair x 8-wide layout for aarch64.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(has_blas, allow(dead_code))]
+pub(crate) fn repack_q6_k_smmla_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
+    assert!(
+        m.is_multiple_of(8),
+        "repack_q6_k_smmla_8x8: m must be a multiple of 8"
+    );
+    assert!(
+        k.is_multiple_of(256),
+        "repack_q6_k_smmla_8x8: k must be a multiple of 256"
+    );
+    let sb = k / 256;
+    let nb16 = k / 16;
+    let bsz = size_of::<crate::quant::BlockQ6K>();
+    assert_eq!(
+        src.len(),
+        m * sb * bsz,
+        "repack_q6_k_smmla_8x8: src is {} bytes, need {} for {m}x{k}",
+        src.len(),
+        m * sb * bsz,
+    );
+    let sr_count = m / 8;
+    let mut packed = vec![0u8; sr_count * nb16 * 128];
+    let mut scales = vec![0.0f32; sr_count * nb16 * 8];
+    const QL_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ6K, ql);
+    const QH_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ6K, qh);
+    const SC_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ6K, scales);
+    const D_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ6K, d);
+
+    let quant_val = |row: usize, sub: usize, e: usize| -> i8 {
+        let bi = sub / 16;
+        let s = sub % 16;
+        let off = (row * sb + bi) * bsz;
+        let pass = s / 8;
+        let in_pass_s = s % 8;
+        let group = in_pass_s / 2;
+        let is = in_pass_s % 2;
+        let l = is * 16 + e;
+        let ql = &src[off + QL_OFF..off + QL_OFF + 128];
+        let qh = &src[off + QH_OFF..off + QH_OFF + 64];
+        let ql_base = pass * 64;
+        let qh_base = pass * 32;
+        let q = match group {
+            0 => (ql[ql_base + l] & 0x0F) | ((qh[qh_base + l] & 3) << 4),
+            1 => (ql[ql_base + l + 32] & 0x0F) | (((qh[qh_base + l] >> 2) & 3) << 4),
+            2 => (ql[ql_base + l] >> 4) | (((qh[qh_base + l] >> 4) & 3) << 4),
+            3 => (ql[ql_base + l + 32] >> 4) | (((qh[qh_base + l] >> 6) & 3) << 4),
+            _ => unreachable!(),
+        };
+        (q as i8).wrapping_sub(32)
+    };
+
+    for sr in 0..sr_count {
+        for bi in 0..sb {
+            for r in 0..8 {
+                let off = ((8 * sr + r) * sb + bi) * bsz;
+                let d = f16_to_f32(u16::from_le_bytes([src[off + D_OFF], src[off + D_OFF + 1]]));
+                for s in 0..16 {
+                    let sc = src[off + SC_OFF + s] as i8;
+                    let sub = bi * 16 + s;
+                    scales[(sr * nb16 + sub) * 8 + r] = d * sc as f32;
+                }
+            }
+            for s in 0..16usize {
+                let sub = bi * 16 + s;
+                let base = (sr * nb16 + sub) * 128;
+                for c in 0..2usize {
+                    for p in 0..4usize {
+                        for rr in 0..2usize {
+                            for e in 0..8usize {
+                                let elem = 8 * c + e;
+                                let row = 8 * sr + 2 * p + rr;
+                                let val = quant_val(row, sub, elem) as u8;
+                                packed[base + c * 64 + p * 16 + rr * 8 + e] = val;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+    (packed, scales)
+}
+
 /// Whether a Q4_K_M weight of shape `m x k` should be repacked for prefill on
 /// this host. Like [`q4_0_repack_supported`], but K-quants need whole
 /// super-blocks (`k % 256 == 0`).
@@ -2294,6 +2464,18 @@ pub(crate) fn q4_k_repack_supported(m: usize, k: usize) -> bool {
         && crate::backend::simd::neon::k_quant_gemm_available();
     #[cfg(target_arch = "x86_64")]
     return m.is_multiple_of(8) && k.is_multiple_of(256) && int8_gemm_available();
+}
+
+/// Whether a Q6_K weight of shape `m x k` should be repacked for prefill on
+/// this host.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+pub(crate) fn q6_k_repack_supported(m: usize, k: usize) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    return m.is_multiple_of(8)
+        && k.is_multiple_of(256)
+        && crate::backend::simd::neon::k_quant_gemm_available();
+    #[cfg(target_arch = "x86_64")]
+    return false;
 }
 
 /// Run the repacked-Q4_K prefill GEMM on whichever int8 tier this host has.
@@ -2639,6 +2821,184 @@ pub(crate) fn gemm_preq_repacked_q4_k_smmla_gate_up_silu_dispatch(
                 n,
                 m,
                 k,
+            );
+        }
+        return true;
+    }
+
+    false
+}
+
+/// Run the repacked-Q6_K prefill GEMM on whichever int8 tier this host has.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q6_k_dispatch(
+    packed: &[u8],
+    scales: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    let nb16 = k / 16;
+    let nb32 = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            k.is_multiple_of(256) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q6_k_dispatch: need k%256==0 and m%8==0, got m={m} k={k}"
+        );
+        assert!(
+            packed.len() >= (m / 8) * nb16 * 128 && scales.len() >= (m / 8) * nb16 * 8,
+            "gemm_preq_repacked_q6_k_dispatch: repacked weights too small for {m}x{k}"
+        );
+    }
+    assert!(
+        b_quants.len() >= n * k && b_scales.len() >= n * nb32 && out.len() == m * n,
+        "gemm_preq_repacked_q6_k_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    if crate::backend::simd::neon::k_quant_gemm_available() {
+        unsafe {
+            crate::backend::simd::neon::gemm_q6_k_8x8_q8_0(
+                packed, scales, b_scales, b_quants, out, m, n, k,
+            );
+        }
+        return true;
+    }
+
+    false
+}
+
+/// Run the smmla-repacked-Q6_K prefill GEMM (column-major `out[m, n]`).
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q6_k_smmla_dispatch(
+    packed: &[u8],
+    scales: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    let _ = (packed, scales);
+    let nb16 = k / 16;
+    let nb32 = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            k.is_multiple_of(256) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q6_k_smmla_dispatch: need k%256==0 and m%8==0, got m={m} k={k}"
+        );
+        assert!(
+            packed.len() >= (m / 8) * nb16 * 128 && scales.len() >= (m / 8) * nb16 * 8,
+            "gemm_preq_repacked_q6_k_smmla_dispatch: repacked weights too small for {m}x{k}"
+        );
+    }
+    assert!(
+        b_quants.len() >= n * k && b_scales.len() >= n * nb32 && out.len() == m * n,
+        "gemm_preq_repacked_q6_k_smmla_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        unsafe {
+            crate::backend::simd::neon::gemm_q6_k_smmla_8x4_q8_0(
+                packed, scales, b_scales, b_quants, out, m, n, k,
+            );
+        }
+        return true;
+    }
+
+    false
+}
+
+/// Run the repacked-Q6_K prefill GEMM writing directly in row-major `out[n, m]` layout.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q6_k_rowmajor_dispatch(
+    packed: &[u8],
+    scales: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    let nb16 = k / 16;
+    let nb32 = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            k.is_multiple_of(256) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q6_k_rowmajor_dispatch: need k%256==0 and m%8==0, got m={m} k={k}"
+        );
+        assert!(
+            packed.len() >= (m / 8) * nb16 * 128 && scales.len() >= (m / 8) * nb16 * 8,
+            "gemm_preq_repacked_q6_k_rowmajor_dispatch: repacked weights too small for {m}x{k}"
+        );
+    }
+    assert!(
+        b_quants.len() >= n * k && b_scales.len() >= n * nb32 && out.len() == m * n,
+        "gemm_preq_repacked_q6_k_rowmajor_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    if crate::backend::simd::neon::k_quant_gemm_available() {
+        unsafe {
+            crate::backend::simd::neon::gemm_q6_k_8x8_q8_0_rowmajor(
+                packed, scales, b_scales, b_quants, out, n, m, k,
+            );
+        }
+        return true;
+    }
+
+    false
+}
+
+/// Run the smmla-repacked-Q6_K prefill GEMM writing directly in row-major `out[n, m]` layout.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q6_k_smmla_rowmajor_dispatch(
+    packed: &[u8],
+    scales: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    let _ = (packed, scales);
+    let nb16 = k / 16;
+    let nb32 = k / 32;
+    #[cfg(target_arch = "aarch64")]
+    {
+        assert!(
+            k.is_multiple_of(256) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q6_k_smmla_rowmajor_dispatch: need k%256==0 and m%8==0, got m={m} k={k}"
+        );
+        assert!(
+            packed.len() >= (m / 8) * nb16 * 128 && scales.len() >= (m / 8) * nb16 * 8,
+            "gemm_preq_repacked_q6_k_smmla_rowmajor_dispatch: repacked weights too small for {m}x{k}"
+        );
+    }
+    assert!(
+        b_quants.len() >= n * k && b_scales.len() >= n * nb32 && out.len() == m * n,
+        "gemm_preq_repacked_q6_k_smmla_rowmajor_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
+    );
+
+    #[cfg(target_arch = "aarch64")]
+    if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
+        unsafe {
+            crate::backend::simd::neon::gemm_q6_k_smmla_8x4_q8_0_rowmajor(
+                packed, scales, b_scales, b_quants, out, n, m, k,
             );
         }
         return true;
@@ -6913,6 +7273,89 @@ unsafe fn transpose4_f32(
     ]
 }
 
+/// Transpose row-major `src[rows, cols]` into row-major `dst[cols, rows]` using
+/// tiled 4x4 vector operations and multi-threaded parallel dispatch across output rows.
+pub fn transpose_matrix_f32_parallel(
+    src: &[f32],
+    dst: &mut [f32],
+    rows: usize,
+    cols: usize,
+    max_active: usize,
+) {
+    assert_eq!(src.len(), rows * cols);
+    assert_eq!(dst.len(), cols * rows);
+    if rows == 0 || cols == 0 {
+        return;
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    {
+        let src_ptr = src.as_ptr() as usize;
+        let dst_ptr = dst.as_mut_ptr() as usize;
+        let cols_quad = cols / 4;
+
+        if cols_quad > 0 {
+            par_range_prefill_active(cols_quad, 1, max_active, move |q_start, q_count| {
+                let s_ptr = src_ptr as *const f32;
+                let d_ptr = dst_ptr as *mut f32;
+                for q in q_start..q_start + q_count {
+                    let c = q * 4;
+                    let mut r = 0;
+                    while r + 4 <= rows {
+                        unsafe {
+                            let r0 = std::arch::aarch64::vld1q_f32(s_ptr.add(r * cols + c));
+                            let r1 = std::arch::aarch64::vld1q_f32(s_ptr.add((r + 1) * cols + c));
+                            let r2 = std::arch::aarch64::vld1q_f32(s_ptr.add((r + 2) * cols + c));
+                            let r3 = std::arch::aarch64::vld1q_f32(s_ptr.add((r + 3) * cols + c));
+                            let [t0, t1, t2, t3] = transpose4_f32(r0, r1, r2, r3);
+                            std::arch::aarch64::vst1q_f32(d_ptr.add(c * rows + r), t0);
+                            std::arch::aarch64::vst1q_f32(d_ptr.add((c + 1) * rows + r), t1);
+                            std::arch::aarch64::vst1q_f32(d_ptr.add((c + 2) * rows + r), t2);
+                            std::arch::aarch64::vst1q_f32(d_ptr.add((c + 3) * rows + r), t3);
+                        }
+                        r += 4;
+                    }
+                    while r < rows {
+                        unsafe {
+                            *d_ptr.add(c * rows + r) = *s_ptr.add(r * cols + c);
+                            *d_ptr.add((c + 1) * rows + r) = *s_ptr.add(r * cols + c + 1);
+                            *d_ptr.add((c + 2) * rows + r) = *s_ptr.add(r * cols + c + 2);
+                            *d_ptr.add((c + 3) * rows + r) = *s_ptr.add(r * cols + c + 3);
+                        }
+                        r += 1;
+                    }
+                }
+            });
+        }
+
+        let tail_cols = cols_quad * 4;
+        if tail_cols < cols {
+            for c in tail_cols..cols {
+                for r in 0..rows {
+                    dst[c * rows + r] = src[r * cols + c];
+                }
+            }
+        }
+    }
+
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let src_ptr = src.as_ptr() as usize;
+        let dst_ptr = dst.as_mut_ptr() as usize;
+        par_range_prefill_active(cols, 16, max_active, move |c_start, c_count| {
+            let s_ptr = src_ptr as *const f32;
+            let d_ptr = dst_ptr as *mut f32;
+            for c in c_start..c_start + c_count {
+                for r in 0..rows {
+                    unsafe {
+                        *d_ptr.add(c * rows + r) = *s_ptr.add(r * cols + c);
+                    }
+                }
+            }
+        });
+    }
+}
+
 /// One dim of an 8-key QK outer product: `s[kt][q] += tq[q] * k[kt]`, where
 /// `a`/`b` are two transposed key-quads' shared dim and `tq` the 4 queries'
 /// dim values. Lanes are literal (const) so the accumulators stay in
@@ -7210,11 +7653,19 @@ unsafe fn flash_attention_gqa_neon_opt(
                                 continue;
                             }
                             let tile_len = lens[q];
-                            let mut tile_max = f32::NEG_INFINITY;
-                            for ti in 0..tile_len {
+                            let mut max4 = vdupq_n_f32(f32::NEG_INFINITY);
+                            let mut ti = 0;
+                            while ti + 4 <= tile_len {
+                                let sv = vld1q_f32(st[q].as_ptr().add(ti));
+                                max4 = vmaxq_f32(max4, sv);
+                                ti += 4;
+                            }
+                            let mut tile_max = vmaxvq_f32(max4);
+                            while ti < tile_len {
                                 if st[q][ti] > tile_max {
                                     tile_max = st[q][ti];
                                 }
+                                ti += 1;
                             }
                             let running_max = running_max_b[jq];
                             let new_max = running_max.max(tile_max);
@@ -12148,6 +12599,31 @@ mod f16_gemv_tests {
 
         for val in &y {
             assert!(val.is_finite());
+        }
+    }
+
+    #[test]
+    fn test_transpose_matrix_f32_parallel() {
+        for (rows, cols) in [(32, 64), (17, 35), (7, 9), (64, 128), (128, 64)] {
+            let mut src = vec![0.0f32; rows * cols];
+            for r in 0..rows {
+                for c in 0..cols {
+                    src[r * cols + c] = (r * 1000 + c) as f32;
+                }
+            }
+            let mut dst = vec![0.0f32; cols * rows];
+            transpose_matrix_f32_parallel(&src, &mut dst, rows, cols, 4);
+
+            for r in 0..rows {
+                for c in 0..cols {
+                    let expected = src[r * cols + c];
+                    let actual = dst[c * rows + r];
+                    assert_eq!(
+                        actual, expected,
+                        "mismatch at r={r}, c={c} for shape ({rows}, {cols})"
+                    );
+                }
+            }
         }
     }
 }

@@ -127,6 +127,42 @@ impl FfnRefs {
     }
 }
 
+#[derive(Debug, Clone)]
+pub enum FusedAttnProjections {
+    Q40All {
+        packed: Vec<u8>,
+        scales: Vec<f32>,
+        smmla: bool,
+    },
+    Q40QkOnly {
+        packed: Vec<u8>,
+        scales: Vec<f32>,
+        smmla: bool,
+    },
+    Q4KAll {
+        packed: Vec<u8>,
+        dsc: Vec<f32>,
+        dmn: Vec<f32>,
+        smmla: bool,
+    },
+    Q4KQkOnly {
+        packed: Vec<u8>,
+        dsc: Vec<f32>,
+        dmn: Vec<f32>,
+        smmla: bool,
+    },
+    Q6KAll {
+        packed: Vec<u8>,
+        scales: Vec<f32>,
+        smmla: bool,
+    },
+    Q6KQkOnly {
+        packed: Vec<u8>,
+        scales: Vec<f32>,
+        smmla: bool,
+    },
+}
+
 /// Per-layer weight references for quantized tensors.
 #[derive(Debug, Clone)]
 pub struct LayerWeightRefs {
@@ -140,7 +176,7 @@ pub struct LayerWeightRefs {
     #[allow(dead_code)]
     pub qkv_f32: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
     #[allow(dead_code, clippy::type_complexity)]
-    pub qkv_repacked: std::sync::Arc<std::sync::OnceLock<Option<(Vec<u8>, Vec<f32>, bool)>>>,
+    pub qkv_repacked: std::sync::Arc<std::sync::OnceLock<Option<FusedAttnProjections>>>,
 }
 
 // ── LFM2 Model ─────────────────────────────────────────────────────────────
@@ -2876,103 +2912,681 @@ impl Lfm2Model {
                             // layout all three shards share.
                             let qkv_repacked = refs.qkv_repacked.get_or_init(|| {
                                 #[allow(clippy::collapsible_if)]
-                                if let (Some(q_rp), Some(k_rp), Some(v_rp)) = (
-                                    &attn_q_ref.repacked,
-                                    &attn_k_ref.repacked,
-                                    &attn_v_ref.repacked,
-                                ) {
-                                    for smmla in [false, true] {
-                                        let shards = if smmla {
-                                            match (&q_rp.kind, &k_rp.kind, &v_rp.kind) {
-                                                (
-                                                    transformer::Repacked::Q40Smmla {
-                                                        packed: q_p,
-                                                        scales: q_s,
-                                                    },
-                                                    transformer::Repacked::Q40Smmla {
-                                                        packed: k_p,
-                                                        scales: k_s,
-                                                    },
-                                                    transformer::Repacked::Q40Smmla {
-                                                        packed: v_p,
-                                                        scales: v_s,
-                                                    },
-                                                ) => Some((q_p, q_s, k_p, k_s, v_p, v_s)),
-                                                _ => None,
+                                if let (Some(q_rp), Some(k_rp)) =
+                                    (&attn_q_ref.repacked, &attn_k_ref.repacked)
+                                {
+                                    // Check for 3-way fusion if V is also available with repacked weights
+                                    if let Some(v_rp) = &attn_v_ref.repacked {
+                                        match (&q_rp.kind, &k_rp.kind, &v_rp.kind) {
+                                            (
+                                                transformer::Repacked::Q40Smmla {
+                                                    packed: q_p,
+                                                    scales: q_s,
+                                                },
+                                                transformer::Repacked::Q40Smmla {
+                                                    packed: k_p,
+                                                    scales: k_s,
+                                                },
+                                                transformer::Repacked::Q40Smmla {
+                                                    packed: v_p,
+                                                    scales: v_s,
+                                                },
+                                            ) => {
+                                                let mut p = Vec::with_capacity(
+                                                    q_p.len() + k_p.len() + v_p.len(),
+                                                );
+                                                p.extend_from_slice(q_p);
+                                                p.extend_from_slice(k_p);
+                                                p.extend_from_slice(v_p);
+
+                                                let mut s = Vec::with_capacity(
+                                                    q_s.len() + k_s.len() + v_s.len(),
+                                                );
+                                                s.extend_from_slice(q_s);
+                                                s.extend_from_slice(k_s);
+                                                s.extend_from_slice(v_s);
+                                                return Some(FusedAttnProjections::Q40All {
+                                                    packed: p,
+                                                    scales: s,
+                                                    smmla: true,
+                                                });
                                             }
-                                        } else {
-                                            match (&q_rp.kind, &k_rp.kind, &v_rp.kind) {
-                                                (
-                                                    transformer::Repacked::Q40 {
-                                                        packed: q_p,
-                                                        scales: q_s,
-                                                    },
-                                                    transformer::Repacked::Q40 {
-                                                        packed: k_p,
-                                                        scales: k_s,
-                                                    },
-                                                    transformer::Repacked::Q40 {
-                                                        packed: v_p,
-                                                        scales: v_s,
-                                                    },
-                                                ) => Some((q_p, q_s, k_p, k_s, v_p, v_s)),
-                                                _ => None,
+                                            (
+                                                transformer::Repacked::Q40 {
+                                                    packed: q_p,
+                                                    scales: q_s,
+                                                },
+                                                transformer::Repacked::Q40 {
+                                                    packed: k_p,
+                                                    scales: k_s,
+                                                },
+                                                transformer::Repacked::Q40 {
+                                                    packed: v_p,
+                                                    scales: v_s,
+                                                },
+                                            ) => {
+                                                let mut p = Vec::with_capacity(
+                                                    q_p.len() + k_p.len() + v_p.len(),
+                                                );
+                                                p.extend_from_slice(q_p);
+                                                p.extend_from_slice(k_p);
+                                                p.extend_from_slice(v_p);
+
+                                                let mut s = Vec::with_capacity(
+                                                    q_s.len() + k_s.len() + v_s.len(),
+                                                );
+                                                s.extend_from_slice(q_s);
+                                                s.extend_from_slice(k_s);
+                                                s.extend_from_slice(v_s);
+                                                return Some(FusedAttnProjections::Q40All {
+                                                    packed: p,
+                                                    scales: s,
+                                                    smmla: false,
+                                                });
                                             }
-                                        };
-                                        if let Some((q_p, q_s, k_p, k_s, v_p, v_s)) = shards {
-                                            let mut p = Vec::with_capacity(
-                                                q_p.len() + k_p.len() + v_p.len(),
-                                            );
+                                            (
+                                                transformer::Repacked::Q4KSmmla {
+                                                    packed: q_p,
+                                                    dsc: q_dsc,
+                                                    dmn: q_dmn,
+                                                },
+                                                transformer::Repacked::Q4KSmmla {
+                                                    packed: k_p,
+                                                    dsc: k_dsc,
+                                                    dmn: k_dmn,
+                                                },
+                                                transformer::Repacked::Q4KSmmla {
+                                                    packed: v_p,
+                                                    dsc: v_dsc,
+                                                    dmn: v_dmn,
+                                                },
+                                            ) => {
+                                                let mut p = Vec::with_capacity(
+                                                    q_p.len() + k_p.len() + v_p.len(),
+                                                );
+                                                p.extend_from_slice(q_p);
+                                                p.extend_from_slice(k_p);
+                                                p.extend_from_slice(v_p);
+
+                                                let mut dsc = Vec::with_capacity(
+                                                    q_dsc.len() + k_dsc.len() + v_dsc.len(),
+                                                );
+                                                dsc.extend_from_slice(q_dsc);
+                                                dsc.extend_from_slice(k_dsc);
+                                                dsc.extend_from_slice(v_dsc);
+
+                                                let mut dmn = Vec::with_capacity(
+                                                    q_dmn.len() + k_dmn.len() + v_dmn.len(),
+                                                );
+                                                dmn.extend_from_slice(q_dmn);
+                                                dmn.extend_from_slice(k_dmn);
+                                                dmn.extend_from_slice(v_dmn);
+                                                return Some(FusedAttnProjections::Q4KAll {
+                                                    packed: p,
+                                                    dsc,
+                                                    dmn,
+                                                    smmla: true,
+                                                });
+                                            }
+                                            (
+                                                transformer::Repacked::Q4K {
+                                                    packed: q_p,
+                                                    dsc: q_dsc,
+                                                    dmn: q_dmn,
+                                                },
+                                                transformer::Repacked::Q4K {
+                                                    packed: k_p,
+                                                    dsc: k_dsc,
+                                                    dmn: k_dmn,
+                                                },
+                                                transformer::Repacked::Q4K {
+                                                    packed: v_p,
+                                                    dsc: v_dsc,
+                                                    dmn: v_dmn,
+                                                },
+                                            ) => {
+                                                let mut p = Vec::with_capacity(
+                                                    q_p.len() + k_p.len() + v_p.len(),
+                                                );
+                                                p.extend_from_slice(q_p);
+                                                p.extend_from_slice(k_p);
+                                                p.extend_from_slice(v_p);
+
+                                                let mut dsc = Vec::with_capacity(
+                                                    q_dsc.len() + k_dsc.len() + v_dsc.len(),
+                                                );
+                                                dsc.extend_from_slice(q_dsc);
+                                                dsc.extend_from_slice(k_dsc);
+                                                dsc.extend_from_slice(v_dsc);
+
+                                                let mut dmn = Vec::with_capacity(
+                                                    q_dmn.len() + k_dmn.len() + v_dmn.len(),
+                                                );
+                                                dmn.extend_from_slice(q_dmn);
+                                                dmn.extend_from_slice(k_dmn);
+                                                dmn.extend_from_slice(v_dmn);
+                                                return Some(FusedAttnProjections::Q4KAll {
+                                                    packed: p,
+                                                    dsc,
+                                                    dmn,
+                                                    smmla: false,
+                                                });
+                                            }
+                                            (
+                                                transformer::Repacked::Q6KSmmla {
+                                                    packed: q_p,
+                                                    scales: q_s,
+                                                },
+                                                transformer::Repacked::Q6KSmmla {
+                                                    packed: k_p,
+                                                    scales: k_s,
+                                                },
+                                                transformer::Repacked::Q6KSmmla {
+                                                    packed: v_p,
+                                                    scales: v_s,
+                                                },
+                                            ) => {
+                                                let mut p = Vec::with_capacity(
+                                                    q_p.len() + k_p.len() + v_p.len(),
+                                                );
+                                                p.extend_from_slice(q_p);
+                                                p.extend_from_slice(k_p);
+                                                p.extend_from_slice(v_p);
+
+                                                let mut s = Vec::with_capacity(
+                                                    q_s.len() + k_s.len() + v_s.len(),
+                                                );
+                                                s.extend_from_slice(q_s);
+                                                s.extend_from_slice(k_s);
+                                                s.extend_from_slice(v_s);
+                                                return Some(FusedAttnProjections::Q6KAll {
+                                                    packed: p,
+                                                    scales: s,
+                                                    smmla: true,
+                                                });
+                                            }
+                                            (
+                                                transformer::Repacked::Q6K {
+                                                    packed: q_p,
+                                                    scales: q_s,
+                                                },
+                                                transformer::Repacked::Q6K {
+                                                    packed: k_p,
+                                                    scales: k_s,
+                                                },
+                                                transformer::Repacked::Q6K {
+                                                    packed: v_p,
+                                                    scales: v_s,
+                                                },
+                                            ) => {
+                                                let mut p = Vec::with_capacity(
+                                                    q_p.len() + k_p.len() + v_p.len(),
+                                                );
+                                                p.extend_from_slice(q_p);
+                                                p.extend_from_slice(k_p);
+                                                p.extend_from_slice(v_p);
+
+                                                let mut s = Vec::with_capacity(
+                                                    q_s.len() + k_s.len() + v_s.len(),
+                                                );
+                                                s.extend_from_slice(q_s);
+                                                s.extend_from_slice(k_s);
+                                                s.extend_from_slice(v_s);
+                                                return Some(FusedAttnProjections::Q6KAll {
+                                                    packed: p,
+                                                    scales: s,
+                                                    smmla: false,
+                                                });
+                                            }
+                                            _ => {}
+                                        }
+                                    }
+
+                                    // Fall back to 2-way QK fusion if Q and K share the same repack format
+                                    match (&q_rp.kind, &k_rp.kind) {
+                                        (
+                                            transformer::Repacked::Q4KSmmla {
+                                                packed: q_p,
+                                                dsc: q_dsc,
+                                                dmn: q_dmn,
+                                            },
+                                            transformer::Repacked::Q4KSmmla {
+                                                packed: k_p,
+                                                dsc: k_dsc,
+                                                dmn: k_dmn,
+                                            },
+                                        ) => {
+                                            let mut p = Vec::with_capacity(q_p.len() + k_p.len());
                                             p.extend_from_slice(q_p);
                                             p.extend_from_slice(k_p);
-                                            p.extend_from_slice(v_p);
 
-                                            let mut s = Vec::with_capacity(
-                                                q_s.len() + k_s.len() + v_s.len(),
-                                            );
+                                            let mut dsc =
+                                                Vec::with_capacity(q_dsc.len() + k_dsc.len());
+                                            dsc.extend_from_slice(q_dsc);
+                                            dsc.extend_from_slice(k_dsc);
+
+                                            let mut dmn =
+                                                Vec::with_capacity(q_dmn.len() + k_dmn.len());
+                                            dmn.extend_from_slice(q_dmn);
+                                            dmn.extend_from_slice(k_dmn);
+                                            return Some(FusedAttnProjections::Q4KQkOnly {
+                                                packed: p,
+                                                dsc,
+                                                dmn,
+                                                smmla: true,
+                                            });
+                                        }
+                                        (
+                                            transformer::Repacked::Q4K {
+                                                packed: q_p,
+                                                dsc: q_dsc,
+                                                dmn: q_dmn,
+                                            },
+                                            transformer::Repacked::Q4K {
+                                                packed: k_p,
+                                                dsc: k_dsc,
+                                                dmn: k_dmn,
+                                            },
+                                        ) => {
+                                            let mut p = Vec::with_capacity(q_p.len() + k_p.len());
+                                            p.extend_from_slice(q_p);
+                                            p.extend_from_slice(k_p);
+
+                                            let mut dsc =
+                                                Vec::with_capacity(q_dsc.len() + k_dsc.len());
+                                            dsc.extend_from_slice(q_dsc);
+                                            dsc.extend_from_slice(k_dsc);
+
+                                            let mut dmn =
+                                                Vec::with_capacity(q_dmn.len() + k_dmn.len());
+                                            dmn.extend_from_slice(q_dmn);
+                                            dmn.extend_from_slice(k_dmn);
+                                            return Some(FusedAttnProjections::Q4KQkOnly {
+                                                packed: p,
+                                                dsc,
+                                                dmn,
+                                                smmla: false,
+                                            });
+                                        }
+                                        (
+                                            transformer::Repacked::Q40Smmla {
+                                                packed: q_p,
+                                                scales: q_s,
+                                            },
+                                            transformer::Repacked::Q40Smmla {
+                                                packed: k_p,
+                                                scales: k_s,
+                                            },
+                                        ) => {
+                                            let mut p = Vec::with_capacity(q_p.len() + k_p.len());
+                                            p.extend_from_slice(q_p);
+                                            p.extend_from_slice(k_p);
+
+                                            let mut s = Vec::with_capacity(q_s.len() + k_s.len());
                                             s.extend_from_slice(q_s);
                                             s.extend_from_slice(k_s);
-                                            s.extend_from_slice(v_s);
-                                            return Some((p, s, smmla));
+                                            return Some(FusedAttnProjections::Q40QkOnly {
+                                                packed: p,
+                                                scales: s,
+                                                smmla: true,
+                                            });
                                         }
+                                        (
+                                            transformer::Repacked::Q40 {
+                                                packed: q_p,
+                                                scales: q_s,
+                                            },
+                                            transformer::Repacked::Q40 {
+                                                packed: k_p,
+                                                scales: k_s,
+                                            },
+                                        ) => {
+                                            let mut p = Vec::with_capacity(q_p.len() + k_p.len());
+                                            p.extend_from_slice(q_p);
+                                            p.extend_from_slice(k_p);
+
+                                            let mut s = Vec::with_capacity(q_s.len() + k_s.len());
+                                            s.extend_from_slice(q_s);
+                                            s.extend_from_slice(k_s);
+                                            return Some(FusedAttnProjections::Q40QkOnly {
+                                                packed: p,
+                                                scales: s,
+                                                smmla: false,
+                                            });
+                                        }
+                                        (
+                                            transformer::Repacked::Q6KSmmla {
+                                                packed: q_p,
+                                                scales: q_s,
+                                            },
+                                            transformer::Repacked::Q6KSmmla {
+                                                packed: k_p,
+                                                scales: k_s,
+                                            },
+                                        ) => {
+                                            let mut p = Vec::with_capacity(q_p.len() + k_p.len());
+                                            p.extend_from_slice(q_p);
+                                            p.extend_from_slice(k_p);
+
+                                            let mut s = Vec::with_capacity(q_s.len() + k_s.len());
+                                            s.extend_from_slice(q_s);
+                                            s.extend_from_slice(k_s);
+                                            return Some(FusedAttnProjections::Q6KQkOnly {
+                                                packed: p,
+                                                scales: s,
+                                                smmla: true,
+                                            });
+                                        }
+                                        (
+                                            transformer::Repacked::Q6K {
+                                                packed: q_p,
+                                                scales: q_s,
+                                            },
+                                            transformer::Repacked::Q6K {
+                                                packed: k_p,
+                                                scales: k_s,
+                                            },
+                                        ) => {
+                                            let mut p = Vec::with_capacity(q_p.len() + k_p.len());
+                                            p.extend_from_slice(q_p);
+                                            p.extend_from_slice(k_p);
+
+                                            let mut s = Vec::with_capacity(q_s.len() + k_s.len());
+                                            s.extend_from_slice(q_s);
+                                            s.extend_from_slice(k_s);
+                                            return Some(FusedAttnProjections::Q6KQkOnly {
+                                                packed: p,
+                                                scales: s,
+                                                smmla: false,
+                                            });
+                                        }
+                                        _ => {}
                                     }
                                 }
                                 None
                             });
 
                             let mut ran_fused = false;
-                            if let Some((p, s, smmla)) = qkv_repacked.as_ref() {
-                                ran_fused = if *smmla {
-                                    crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
-                                        p,
-                                        s,
-                                        bq_scales,
-                                        bq_quants,
-                                        &mut proj_mat[..qkv_dim * n],
-                                        n,
-                                        qkv_dim,
-                                        hs,
-                                    )
-                                } else {
-                                    crate::backend::cpu::gemm_preq_repacked_q4_0_rowmajor_dispatch(
-                                        p,
-                                        s,
-                                        bq_scales,
-                                        bq_quants,
-                                        &mut proj_mat[..qkv_dim * n],
-                                        n,
-                                        qkv_dim,
-                                        hs,
-                                    )
-                                };
-                                if ran_fused {
-                                    for j in 0..n {
-                                        let row = &proj_mat[j * qkv_dim..(j + 1) * qkv_dim];
-                                        q_mat[j * hs..(j + 1) * hs].copy_from_slice(&row[..hs]);
-                                        k_mat[j * kv_dim..(j + 1) * kv_dim]
-                                            .copy_from_slice(&row[hs..hs + kv_dim]);
-                                        v_mat[j * kv_dim..(j + 1) * kv_dim]
-                                            .copy_from_slice(&row[hs + kv_dim..qkv_dim]);
+                            if let Some(fused) = qkv_repacked.as_ref() {
+                                match fused {
+                                    FusedAttnProjections::Q40All {
+                                        packed,
+                                        scales,
+                                        smmla,
+                                    } => {
+                                        let ok = if *smmla {
+                                            crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
+                                                packed,
+                                                scales,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut proj_mat[..qkv_dim * n],
+                                                n,
+                                                qkv_dim,
+                                                hs,
+                                            )
+                                        } else {
+                                            crate::backend::cpu::gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                                                packed,
+                                                scales,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut proj_mat[..qkv_dim * n],
+                                                n,
+                                                qkv_dim,
+                                                hs,
+                                            )
+                                        };
+                                        if ok {
+                                            ran_fused = true;
+                                            for j in 0..n {
+                                                let row = &proj_mat[j * qkv_dim..(j + 1) * qkv_dim];
+                                                q_mat[j * hs..(j + 1) * hs]
+                                                    .copy_from_slice(&row[..hs]);
+                                                k_mat[j * kv_dim..(j + 1) * kv_dim]
+                                                    .copy_from_slice(&row[hs..hs + kv_dim]);
+                                                v_mat[j * kv_dim..(j + 1) * kv_dim]
+                                                    .copy_from_slice(&row[hs + kv_dim..qkv_dim]);
+                                            }
+                                        }
+                                    }
+                                    FusedAttnProjections::Q4KAll {
+                                        packed,
+                                        dsc,
+                                        dmn,
+                                        smmla,
+                                    } => {
+                                        let ok = if *smmla {
+                                            crate::backend::cpu::gemm_preq_repacked_q4_k_smmla_rowmajor_dispatch(
+                                                packed,
+                                                dsc,
+                                                dmn,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut proj_mat[..qkv_dim * n],
+                                                n,
+                                                qkv_dim,
+                                                hs,
+                                            )
+                                        } else {
+                                            crate::backend::cpu::gemm_preq_repacked_q4_k_rowmajor_dispatch(
+                                                packed,
+                                                dsc,
+                                                dmn,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut proj_mat[..qkv_dim * n],
+                                                n,
+                                                qkv_dim,
+                                                hs,
+                                            )
+                                        };
+                                        if ok {
+                                            ran_fused = true;
+                                            for j in 0..n {
+                                                let row = &proj_mat[j * qkv_dim..(j + 1) * qkv_dim];
+                                                q_mat[j * hs..(j + 1) * hs]
+                                                    .copy_from_slice(&row[..hs]);
+                                                k_mat[j * kv_dim..(j + 1) * kv_dim]
+                                                    .copy_from_slice(&row[hs..hs + kv_dim]);
+                                                v_mat[j * kv_dim..(j + 1) * kv_dim]
+                                                    .copy_from_slice(&row[hs + kv_dim..qkv_dim]);
+                                            }
+                                        }
+                                    }
+                                    FusedAttnProjections::Q6KAll {
+                                        packed,
+                                        scales,
+                                        smmla,
+                                    } => {
+                                        let ok = if *smmla {
+                                            crate::backend::cpu::gemm_preq_repacked_q6_k_smmla_rowmajor_dispatch(
+                                                packed,
+                                                scales,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut proj_mat[..qkv_dim * n],
+                                                n,
+                                                qkv_dim,
+                                                hs,
+                                            )
+                                        } else {
+                                            crate::backend::cpu::gemm_preq_repacked_q6_k_rowmajor_dispatch(
+                                                packed,
+                                                scales,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut proj_mat[..qkv_dim * n],
+                                                n,
+                                                qkv_dim,
+                                                hs,
+                                            )
+                                        };
+                                        if ok {
+                                            ran_fused = true;
+                                            for j in 0..n {
+                                                let row = &proj_mat[j * qkv_dim..(j + 1) * qkv_dim];
+                                                q_mat[j * hs..(j + 1) * hs]
+                                                    .copy_from_slice(&row[..hs]);
+                                                k_mat[j * kv_dim..(j + 1) * kv_dim]
+                                                    .copy_from_slice(&row[hs..hs + kv_dim]);
+                                                v_mat[j * kv_dim..(j + 1) * kv_dim]
+                                                    .copy_from_slice(&row[hs + kv_dim..qkv_dim]);
+                                            }
+                                        }
+                                    }
+                                    FusedAttnProjections::Q4KQkOnly {
+                                        packed,
+                                        dsc,
+                                        dmn,
+                                        smmla,
+                                    } => {
+                                        let qk_dim = hs + kv_dim;
+                                        let ok = if *smmla {
+                                            crate::backend::cpu::gemm_preq_repacked_q4_k_smmla_rowmajor_dispatch(
+                                                packed,
+                                                dsc,
+                                                dmn,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut proj_mat[..qk_dim * n],
+                                                n,
+                                                qk_dim,
+                                                hs,
+                                            )
+                                        } else {
+                                            crate::backend::cpu::gemm_preq_repacked_q4_k_rowmajor_dispatch(
+                                                packed,
+                                                dsc,
+                                                dmn,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut proj_mat[..qk_dim * n],
+                                                n,
+                                                qk_dim,
+                                                hs,
+                                            )
+                                        };
+                                        if ok {
+                                            ran_fused = true;
+                                            for j in 0..n {
+                                                let row = &proj_mat[j * qk_dim..(j + 1) * qk_dim];
+                                                q_mat[j * hs..(j + 1) * hs]
+                                                    .copy_from_slice(&row[..hs]);
+                                                k_mat[j * kv_dim..(j + 1) * kv_dim]
+                                                    .copy_from_slice(&row[hs..qk_dim]);
+                                            }
+                                            transformer::gemm_preq_rowmajor(
+                                                &self.gguf,
+                                                attn_v_ref,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut v_mat[..kv_dim * n],
+                                                n,
+                                                kv_dim,
+                                                hs,
+                                            );
+                                        }
+                                    }
+                                    FusedAttnProjections::Q40QkOnly {
+                                        packed,
+                                        scales,
+                                        smmla,
+                                    } => {
+                                        let qk_dim = hs + kv_dim;
+                                        let ok = if *smmla {
+                                            crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
+                                                packed,
+                                                scales,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut proj_mat[..qk_dim * n],
+                                                n,
+                                                qk_dim,
+                                                hs,
+                                            )
+                                        } else {
+                                            crate::backend::cpu::gemm_preq_repacked_q4_0_rowmajor_dispatch(
+                                                packed,
+                                                scales,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut proj_mat[..qk_dim * n],
+                                                n,
+                                                qk_dim,
+                                                hs,
+                                            )
+                                        };
+                                        if ok {
+                                            ran_fused = true;
+                                            for j in 0..n {
+                                                let row = &proj_mat[j * qk_dim..(j + 1) * qk_dim];
+                                                q_mat[j * hs..(j + 1) * hs]
+                                                    .copy_from_slice(&row[..hs]);
+                                                k_mat[j * kv_dim..(j + 1) * kv_dim]
+                                                    .copy_from_slice(&row[hs..qk_dim]);
+                                            }
+                                            transformer::gemm_preq_rowmajor(
+                                                &self.gguf,
+                                                attn_v_ref,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut v_mat[..kv_dim * n],
+                                                n,
+                                                kv_dim,
+                                                hs,
+                                            );
+                                        }
+                                    }
+                                    FusedAttnProjections::Q6KQkOnly {
+                                        packed,
+                                        scales,
+                                        smmla,
+                                    } => {
+                                        let qk_dim = hs + kv_dim;
+                                        let ok = if *smmla {
+                                            crate::backend::cpu::gemm_preq_repacked_q6_k_smmla_rowmajor_dispatch(
+                                                packed,
+                                                scales,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut proj_mat[..qk_dim * n],
+                                                n,
+                                                qk_dim,
+                                                hs,
+                                            )
+                                        } else {
+                                            crate::backend::cpu::gemm_preq_repacked_q6_k_rowmajor_dispatch(
+                                                packed,
+                                                scales,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut proj_mat[..qk_dim * n],
+                                                n,
+                                                qk_dim,
+                                                hs,
+                                            )
+                                        };
+                                        if ok {
+                                            ran_fused = true;
+                                            for j in 0..n {
+                                                let row = &proj_mat[j * qk_dim..(j + 1) * qk_dim];
+                                                q_mat[j * hs..(j + 1) * hs]
+                                                    .copy_from_slice(&row[..hs]);
+                                                k_mat[j * kv_dim..(j + 1) * kv_dim]
+                                                    .copy_from_slice(&row[hs..qk_dim]);
+                                            }
+                                            transformer::gemm_preq_rowmajor(
+                                                &self.gguf,
+                                                attn_v_ref,
+                                                bq_scales,
+                                                bq_quants,
+                                                &mut v_mat[..kv_dim * n],
+                                                n,
+                                                kv_dim,
+                                                hs,
+                                            );
+                                        }
                                     }
                                 }
                             }
@@ -3294,24 +3908,14 @@ impl Lfm2Model {
                             let head_chunk = n * head_dim;
                             let flash_buf = &mut flash_out[..n_heads * head_chunk];
                             let t_scores = Instant::now();
-                            // Q transpose to head-major columns, row-parallel: 2MB
-                            // of strided writes per layer is ~1ms serial.
-                            let q_mat_ptr = q_mat.as_ptr() as usize;
+                            // Q transpose to head-major columns, row-parallel using 4x4 vector tiles.
                             let max_active = cpu::prefill_threads_for_tokens(n);
-                            cpu::par_rows_n_active(
+                            cpu::transpose_matrix_f32_parallel(
+                                &q_mat[..n * hs],
                                 &mut q_col[..hs * n],
                                 n,
-                                64,
+                                hs,
                                 max_active,
-                                move |(r, row)| unsafe {
-                                    let src = core::slice::from_raw_parts(
-                                        q_mat_ptr as *const f32,
-                                        n * hs,
-                                    );
-                                    for j in 0..n {
-                                        row[j] = src[j * hs + r];
-                                    }
-                                },
                             );
                             let q_ref = &q_col[..hs * n];
 
