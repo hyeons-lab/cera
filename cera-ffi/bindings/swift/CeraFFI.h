@@ -859,6 +859,16 @@ void uniffi_cera_ffi_fn_method_session_clear_cancel(uint64_t ptr, RustCallStatus
 RustBuffer uniffi_cera_ffi_fn_method_session_default_generate_opts(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_DISABLE_SPEC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_DISABLE_SPEC
+void uniffi_cera_ffi_fn_method_session_disable_spec(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_ENABLE_SPEC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_ENABLE_SPEC
+void uniffi_cera_ffi_fn_method_session_enable_spec(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_EXPORT_CHECKPOINT
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_SESSION_EXPORT_CHECKPOINT
 RustBuffer uniffi_cera_ffi_fn_method_session_export_checkpoint(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -2179,6 +2189,18 @@ uint16_t uniffi_cera_ffi_checksum_method_session_clear_cancel(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_DEFAULT_GENERATE_OPTS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_DEFAULT_GENERATE_OPTS
 uint16_t uniffi_cera_ffi_checksum_method_session_default_generate_opts(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_DISABLE_SPEC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_DISABLE_SPEC
+uint16_t uniffi_cera_ffi_checksum_method_session_disable_spec(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_ENABLE_SPEC
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_SESSION_ENABLE_SPEC
+uint16_t uniffi_cera_ffi_checksum_method_session_enable_spec(void
     
 );
 #endif

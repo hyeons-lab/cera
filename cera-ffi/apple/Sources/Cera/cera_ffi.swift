@@ -5433,6 +5433,16 @@ public protocol SessionProtocol: AnyObject, Sendable {
     func defaultGenerateOpts() throws  -> GenerateOpts
     
     /**
+     * Explicitly disable speculative decoding for this session.
+     */
+    func disableSpec() throws 
+    
+    /**
+     * Re-enable speculative decoding for this session (if previously disabled).
+     */
+    func enableSpec() throws 
+    
+    /**
      * Export current inference session checkpoint as serialized binary bytes.
      */
     func exportCheckpoint() throws  -> Data
@@ -6053,6 +6063,26 @@ open func defaultGenerateOpts()throws  -> GenerateOpts  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Explicitly disable speculative decoding for this session.
+     */
+open func disableSpec()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_disable_spec(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Re-enable speculative decoding for this session (if previously disabled).
+     */
+open func enableSpec()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_enable_spec(
+            self.uniffiCloneHandle(),$0
+    )
+}
 }
     
     /**
@@ -7666,6 +7696,10 @@ public struct GenerateOpts: Equatable, Hashable {
      * When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
      */
     public var spec: SpecDecodeConfig?
+    /**
+     * Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+     */
+    public var noSpec: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -7714,7 +7748,10 @@ public struct GenerateOpts: Equatable, Hashable {
         /**
          * Optional speculative decoding configuration (prompt-lookup drafting).
          * When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
-         */spec: SpecDecodeConfig? = nil) {
+         */spec: SpecDecodeConfig? = nil, 
+        /**
+         * Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+         */noSpec: Bool = false) {
         self.maxTokens = maxTokens
         self.seed = seed
         self.temperature = temperature
@@ -7729,6 +7766,7 @@ public struct GenerateOpts: Equatable, Hashable {
         self.flushEveryTokens = flushEveryTokens
         self.flushEveryMs = flushEveryMs
         self.spec = spec
+        self.noSpec = noSpec
     }
 
     
@@ -7760,7 +7798,8 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
                 grammarTriggerTokens: FfiConverterSequenceUInt32.read(from: &buf), 
                 flushEveryTokens: FfiConverterUInt32.read(from: &buf), 
                 flushEveryMs: FfiConverterUInt32.read(from: &buf), 
-                spec: FfiConverterOptionTypeSpecDecodeConfig.read(from: &buf)
+                spec: FfiConverterOptionTypeSpecDecodeConfig.read(from: &buf), 
+                noSpec: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -7779,6 +7818,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.flushEveryTokens, into: &buf)
         FfiConverterUInt32.write(value.flushEveryMs, into: &buf)
         FfiConverterOptionTypeSpecDecodeConfig.write(value.spec, into: &buf)
+        FfiConverterBool.write(value.noSpec, into: &buf)
     }
 }
 
@@ -8832,6 +8872,10 @@ public struct SessionConfig: Equatable, Hashable {
      * Whether to prefer GPU depthformer for audio decoder generation.
      */
     public var gpuDepthformer: Bool
+    /**
+     * Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+     */
+    public var disableSpec: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -8855,13 +8899,17 @@ public struct SessionConfig: Equatable, Hashable {
          */ubatchSize: UInt32 = UInt32(512), 
         /**
          * Whether to prefer GPU depthformer for audio decoder generation.
-         */gpuDepthformer: Bool = false) {
+         */gpuDepthformer: Bool = false, 
+        /**
+         * Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+         */disableSpec: Bool = false) {
         self.maxSeqLen = maxSeqLen
         self.kvCompression = kvCompression
         self.nKeep = nKeep
         self.seed = seed
         self.ubatchSize = ubatchSize
         self.gpuDepthformer = gpuDepthformer
+        self.disableSpec = disableSpec
     }
 
     
@@ -8885,7 +8933,8 @@ public struct FfiConverterTypeSessionConfig: FfiConverterRustBuffer {
                 nKeep: FfiConverterUInt32.read(from: &buf), 
                 seed: FfiConverterOptionUInt64.read(from: &buf), 
                 ubatchSize: FfiConverterUInt32.read(from: &buf), 
-                gpuDepthformer: FfiConverterBool.read(from: &buf)
+                gpuDepthformer: FfiConverterBool.read(from: &buf), 
+                disableSpec: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -8896,6 +8945,7 @@ public struct FfiConverterTypeSessionConfig: FfiConverterRustBuffer {
         FfiConverterOptionUInt64.write(value.seed, into: &buf)
         FfiConverterUInt32.write(value.ubatchSize, into: &buf)
         FfiConverterBool.write(value.gpuDepthformer, into: &buf)
+        FfiConverterBool.write(value.disableSpec, into: &buf)
     }
 }
 
@@ -13073,6 +13123,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_disable_spec() != 3153) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_enable_spec() != 9506) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819) {

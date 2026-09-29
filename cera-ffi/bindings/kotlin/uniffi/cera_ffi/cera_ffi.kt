@@ -1014,6 +1014,10 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_default_generate_opts(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_disable_spec(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_enable_spec(): Int
+
     external fun uniffi_cera_ffi_checksum_method_session_export_checkpoint(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_generate(): Int
@@ -1861,6 +1865,16 @@ internal object UniffiLib {
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_session_disable_spec(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_session_enable_spec(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
 
     external fun uniffi_cera_ffi_fn_method_session_export_checkpoint(
         `ptr`: Long,
@@ -2912,6 +2926,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_disable_spec() != 3153) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_enable_spec() != 9506) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819) {
@@ -11077,6 +11097,16 @@ public interface SessionInterface {
     fun `defaultGenerateOpts`(): GenerateOpts
 
     /**
+     * Explicitly disable speculative decoding for this session.
+     */
+    fun `disableSpec`()
+
+    /**
+     * Re-enable speculative decoding for this session (if previously disabled).
+     */
+    fun `enableSpec`()
+
+    /**
      * Export current inference session checkpoint as serialized binary bytes.
      */
     fun `exportCheckpoint`(): kotlin.ByteArray
@@ -11816,6 +11846,34 @@ open class Session :
                 }
             },
         )
+
+    /**
+     * Explicitly disable speculative decoding for this session.
+     */
+    @Throws(FfiException::class)
+    override fun `disableSpec`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_disable_spec(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Re-enable speculative decoding for this session (if previously disabled).
+     */
+    @Throws(FfiException::class)
+    override fun `enableSpec`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_enable_spec(
+                    it,
+                    _status,
+                )
+            }
+        }
 
     /**
      * Export current inference session checkpoint as serialized binary bytes.
@@ -13203,6 +13261,10 @@ data class GenerateOpts(
      * When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
      */
     var `spec`: SpecDecodeConfig? = null,
+    /**
+     * Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+     */
+    var `noSpec`: kotlin.Boolean = false,
 ) {
     companion object
 }
@@ -13227,6 +13289,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterOptionalTypeSpecDecodeConfig.read(buf),
+            FfiConverterBoolean.read(buf),
         )
 
     override fun allocationSize(value: GenerateOpts) =
@@ -13244,7 +13307,8 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
                 FfiConverterSequenceUInt.allocationSize(value.`grammarTriggerTokens`) +
                 FfiConverterUInt.allocationSize(value.`flushEveryTokens`) +
                 FfiConverterUInt.allocationSize(value.`flushEveryMs`) +
-                FfiConverterOptionalTypeSpecDecodeConfig.allocationSize(value.`spec`)
+                FfiConverterOptionalTypeSpecDecodeConfig.allocationSize(value.`spec`) +
+                FfiConverterBoolean.allocationSize(value.`noSpec`)
         )
 
     override fun write(
@@ -13265,6 +13329,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
         FfiConverterUInt.write(value.`flushEveryTokens`, buf)
         FfiConverterUInt.write(value.`flushEveryMs`, buf)
         FfiConverterOptionalTypeSpecDecodeConfig.write(value.`spec`, buf)
+        FfiConverterBoolean.write(value.`noSpec`, buf)
     }
 }
 
@@ -13975,6 +14040,10 @@ data class SessionConfig(
      * Whether to prefer GPU depthformer for audio decoder generation.
      */
     var `gpuDepthformer`: kotlin.Boolean = false,
+    /**
+     * Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+     */
+    var `disableSpec`: kotlin.Boolean = false,
 ) {
     companion object
 }
@@ -13991,6 +14060,7 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
             FfiConverterOptionalULong.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
         )
 
     override fun allocationSize(value: SessionConfig) =
@@ -14000,7 +14070,8 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
                 FfiConverterUInt.allocationSize(value.`nKeep`) +
                 FfiConverterOptionalULong.allocationSize(value.`seed`) +
                 FfiConverterUInt.allocationSize(value.`ubatchSize`) +
-                FfiConverterBoolean.allocationSize(value.`gpuDepthformer`)
+                FfiConverterBoolean.allocationSize(value.`gpuDepthformer`) +
+                FfiConverterBoolean.allocationSize(value.`disableSpec`)
         )
 
     override fun write(
@@ -14013,6 +14084,7 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
         FfiConverterOptionalULong.write(value.`seed`, buf)
         FfiConverterUInt.write(value.`ubatchSize`, buf)
         FfiConverterBoolean.write(value.`gpuDepthformer`, buf)
+        FfiConverterBoolean.write(value.`disableSpec`, buf)
     }
 }
 

@@ -795,6 +795,10 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_disable_spec() != 3153:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_enable_spec() != 9506:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_generate() != 20338:
@@ -2221,6 +2225,16 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_default_generate_opts.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_default_generate_opts.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_session_disable_spec.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_disable_spec.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_session_enable_spec.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_enable_spec.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_session_export_checkpoint.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2863,6 +2877,12 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_clear_cancel.restype = ctypes
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_default_generate_opts.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_default_generate_opts.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_disable_spec.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_disable_spec.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_enable_spec.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_enable_spec.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_export_checkpoint.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_export_checkpoint.restype = ctypes.c_uint16
@@ -5550,7 +5570,7 @@ class GenerateOpts:
     in a follow-up PR. Including them in the record now keeps the FFI
     surface stable across that transition.
 """
-    def __init__(self, *, max_tokens:int = 256, seed:typing.Optional[int] = _DEFAULT, temperature:float = 0.7, top_p:float = 0.9, top_k:int = 40, min_p:float = 0.05, repetition_penalty:float = 1.1, stop_tokens:typing.List[int] = _DEFAULT, ignore_eos:bool = False, grammar:typing.Optional[str] = _DEFAULT, grammar_trigger_tokens:typing.List[int] = _DEFAULT, flush_every_tokens:int = 16, flush_every_ms:int = 50, spec:typing.Optional[SpecDecodeConfig] = _DEFAULT):
+    def __init__(self, *, max_tokens:int = 256, seed:typing.Optional[int] = _DEFAULT, temperature:float = 0.7, top_p:float = 0.9, top_k:int = 40, min_p:float = 0.05, repetition_penalty:float = 1.1, stop_tokens:typing.List[int] = _DEFAULT, ignore_eos:bool = False, grammar:typing.Optional[str] = _DEFAULT, grammar_trigger_tokens:typing.List[int] = _DEFAULT, flush_every_tokens:int = 16, flush_every_ms:int = 50, spec:typing.Optional[SpecDecodeConfig] = _DEFAULT, no_spec:bool = False):
         self.max_tokens = max_tokens
         if seed is _DEFAULT:
             self.seed = None
@@ -5580,12 +5600,13 @@ class GenerateOpts:
             self.spec = None
         else:
             self.spec = spec
+        self.no_spec = no_spec
         
         
 
     
     def __str__(self):
-        return "GenerateOpts(max_tokens={}, seed={}, temperature={}, top_p={}, top_k={}, min_p={}, repetition_penalty={}, stop_tokens={}, ignore_eos={}, grammar={}, grammar_trigger_tokens={}, flush_every_tokens={}, flush_every_ms={}, spec={})".format(self.max_tokens, self.seed, self.temperature, self.top_p, self.top_k, self.min_p, self.repetition_penalty, self.stop_tokens, self.ignore_eos, self.grammar, self.grammar_trigger_tokens, self.flush_every_tokens, self.flush_every_ms, self.spec)
+        return "GenerateOpts(max_tokens={}, seed={}, temperature={}, top_p={}, top_k={}, min_p={}, repetition_penalty={}, stop_tokens={}, ignore_eos={}, grammar={}, grammar_trigger_tokens={}, flush_every_tokens={}, flush_every_ms={}, spec={}, no_spec={})".format(self.max_tokens, self.seed, self.temperature, self.top_p, self.top_k, self.min_p, self.repetition_penalty, self.stop_tokens, self.ignore_eos, self.grammar, self.grammar_trigger_tokens, self.flush_every_tokens, self.flush_every_ms, self.spec, self.no_spec)
     def __eq__(self, other):
         if self.max_tokens != other.max_tokens:
             return False
@@ -5615,6 +5636,8 @@ class GenerateOpts:
             return False
         if self.spec != other.spec:
             return False
+        if self.no_spec != other.no_spec:
+            return False
         return True
 
 class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
@@ -5635,6 +5658,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
             flush_every_tokens=_UniffiFfiConverterUInt32.read(buf),
             flush_every_ms=_UniffiFfiConverterUInt32.read(buf),
             spec=_UniffiFfiConverterOptionalTypeSpecDecodeConfig.read(buf),
+            no_spec=_UniffiFfiConverterBoolean.read(buf),
         )
 
     @staticmethod
@@ -5653,6 +5677,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.check_lower(value.flush_every_tokens)
         _UniffiFfiConverterUInt32.check_lower(value.flush_every_ms)
         _UniffiFfiConverterOptionalTypeSpecDecodeConfig.check_lower(value.spec)
+        _UniffiFfiConverterBoolean.check_lower(value.no_spec)
 
     @staticmethod
     def write(value, buf):
@@ -5670,6 +5695,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.write(value.flush_every_tokens, buf)
         _UniffiFfiConverterUInt32.write(value.flush_every_ms, buf)
         _UniffiFfiConverterOptionalTypeSpecDecodeConfig.write(value.spec, buf)
+        _UniffiFfiConverterBoolean.write(value.no_spec, buf)
 
 class _UniffiFfiConverterFloat64(_UniffiConverterPrimitiveFloat):
     @staticmethod
@@ -7855,7 +7881,7 @@ class SessionConfig:
     """
     Per-session configuration. Mirrors [`cera::SessionConfig`].
 """
-    def __init__(self, *, max_seq_len:typing.Optional[int] = _DEFAULT, kv_compression:typing.Optional[KvCompression] = _DEFAULT, n_keep:int = 0, seed:typing.Optional[int] = _DEFAULT, ubatch_size:int = 512, gpu_depthformer:bool = False):
+    def __init__(self, *, max_seq_len:typing.Optional[int] = _DEFAULT, kv_compression:typing.Optional[KvCompression] = _DEFAULT, n_keep:int = 0, seed:typing.Optional[int] = _DEFAULT, ubatch_size:int = 512, gpu_depthformer:bool = False, disable_spec:bool = False):
         if max_seq_len is _DEFAULT:
             self.max_seq_len = None
         else:
@@ -7871,12 +7897,13 @@ class SessionConfig:
             self.seed = seed
         self.ubatch_size = ubatch_size
         self.gpu_depthformer = gpu_depthformer
+        self.disable_spec = disable_spec
         
         
 
     
     def __str__(self):
-        return "SessionConfig(max_seq_len={}, kv_compression={}, n_keep={}, seed={}, ubatch_size={}, gpu_depthformer={})".format(self.max_seq_len, self.kv_compression, self.n_keep, self.seed, self.ubatch_size, self.gpu_depthformer)
+        return "SessionConfig(max_seq_len={}, kv_compression={}, n_keep={}, seed={}, ubatch_size={}, gpu_depthformer={}, disable_spec={})".format(self.max_seq_len, self.kv_compression, self.n_keep, self.seed, self.ubatch_size, self.gpu_depthformer, self.disable_spec)
     def __eq__(self, other):
         if self.max_seq_len != other.max_seq_len:
             return False
@@ -7890,6 +7917,8 @@ class SessionConfig:
             return False
         if self.gpu_depthformer != other.gpu_depthformer:
             return False
+        if self.disable_spec != other.disable_spec:
+            return False
         return True
 
 class _UniffiFfiConverterTypeSessionConfig(_UniffiConverterRustBuffer):
@@ -7902,6 +7931,7 @@ class _UniffiFfiConverterTypeSessionConfig(_UniffiConverterRustBuffer):
             seed=_UniffiFfiConverterOptionalUInt64.read(buf),
             ubatch_size=_UniffiFfiConverterUInt32.read(buf),
             gpu_depthformer=_UniffiFfiConverterBoolean.read(buf),
+            disable_spec=_UniffiFfiConverterBoolean.read(buf),
         )
 
     @staticmethod
@@ -7912,6 +7942,7 @@ class _UniffiFfiConverterTypeSessionConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalUInt64.check_lower(value.seed)
         _UniffiFfiConverterUInt32.check_lower(value.ubatch_size)
         _UniffiFfiConverterBoolean.check_lower(value.gpu_depthformer)
+        _UniffiFfiConverterBoolean.check_lower(value.disable_spec)
 
     @staticmethod
     def write(value, buf):
@@ -7921,6 +7952,7 @@ class _UniffiFfiConverterTypeSessionConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalUInt64.write(value.seed, buf)
         _UniffiFfiConverterUInt32.write(value.ubatch_size, buf)
         _UniffiFfiConverterBoolean.write(value.gpu_depthformer, buf)
+        _UniffiFfiConverterBoolean.write(value.disable_spec, buf)
 
 class _UniffiFfiConverterOptionalTypeIngestRecovery(_UniffiConverterRustBuffer):
     @classmethod
@@ -10150,6 +10182,16 @@ class SessionProtocol(typing.Protocol):
         advisory sampling defaults from the bundle manifest (if any) or standard defaults.
 """
         raise NotImplementedError
+    def disable_spec(self, ) -> None:
+        """
+        Explicitly disable speculative decoding for this session.
+"""
+        raise NotImplementedError
+    def enable_spec(self, ) -> None:
+        """
+        Re-enable speculative decoding for this session (if previously disabled).
+"""
+        raise NotImplementedError
     def export_checkpoint(self, ) -> bytes:
         """
         Export current inference session checkpoint as serialized binary bytes.
@@ -10813,6 +10855,36 @@ class Session(SessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_session_default_generate_opts,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def disable_spec(self, ) -> None:
+        """
+        Explicitly disable speculative decoding for this session.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_disable_spec,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def enable_spec(self, ) -> None:
+        """
+        Re-enable speculative decoding for this session (if previously disabled).
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_enable_spec,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)

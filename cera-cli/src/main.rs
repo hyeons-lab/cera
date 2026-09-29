@@ -5218,7 +5218,7 @@ fn main() -> Result<()> {
                     if spec {
                         format!("neural draft model, k={spec_k}")
                     } else {
-                        format!("neural draft model")
+                        "neural draft model".to_string()
                     }
                 } else {
                     format!("prompt lookup (ngram={spec_ngram}, k={spec_k})")

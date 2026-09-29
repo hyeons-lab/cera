@@ -791,6 +791,8 @@ class GenerateOpts {
     /// Optional speculative decoding configuration (prompt-lookup drafting).
     /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
     this.spec = null,
+    /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+    this.noSpec = false,
   });
 
   final int maxTokens;
@@ -832,6 +834,8 @@ class GenerateOpts {
   /// Optional speculative decoding configuration (prompt-lookup drafting).
   /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
   final SpecDecodeConfig? spec;
+  /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+  final bool noSpec;
 
   Map<String, dynamic> toJson() {
     return {
@@ -849,6 +853,7 @@ class GenerateOpts {
       'flushEveryTokens': this.flushEveryTokens,
       'flushEveryMs': this.flushEveryMs,
       'spec': this.spec == null ? null : (() { final __tmp = this.spec!; return __tmp.toJson(); })(),
+      'noSpec': this.noSpec,
     };
   }
 
@@ -868,6 +873,7 @@ class GenerateOpts {
       flushEveryTokens: json.containsKey('flushEveryTokens') ? (json['flushEveryTokens'] as num).toInt() : 16,
       flushEveryMs: json.containsKey('flushEveryMs') ? (json['flushEveryMs'] as num).toInt() : 50,
       spec: json.containsKey('spec') ? json['spec'] == null ? null : (() { final __tmp = json['spec']; return SpecDecodeConfig.fromJson(__tmp as Map<String, dynamic>); })() : null,
+      noSpec: json.containsKey('noSpec') ? json['noSpec'] as bool : false,
     );
   }
 
@@ -886,6 +892,7 @@ class GenerateOpts {
     int? flushEveryTokens,
     int? flushEveryMs,
     Object? spec = _sentinel,
+    bool? noSpec,
   }) {
     return GenerateOpts(
       maxTokens: maxTokens ?? this.maxTokens,
@@ -902,21 +909,22 @@ class GenerateOpts {
       flushEveryTokens: flushEveryTokens ?? this.flushEveryTokens,
       flushEveryMs: flushEveryMs ?? this.flushEveryMs,
       spec: spec == _sentinel ? this.spec : spec as SpecDecodeConfig?,
+      noSpec: noSpec ?? this.noSpec,
     );
   }
 
   @override
   String toString() {
-    return 'GenerateOpts(maxTokens: $maxTokens, seed: $seed, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, ignoreEos: $ignoreEos, grammar: $grammar, grammarTriggerTokens: $grammarTriggerTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs, spec: $spec)';
+    return 'GenerateOpts(maxTokens: $maxTokens, seed: $seed, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, ignoreEos: $ignoreEos, grammar: $grammar, grammarTriggerTokens: $grammarTriggerTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs, spec: $spec, noSpec: $noSpec)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is GenerateOpts && maxTokens == other.maxTokens && seed == other.seed && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && ignoreEos == other.ignoreEos && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs && spec == other.spec;
+      other is GenerateOpts && maxTokens == other.maxTokens && seed == other.seed && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && ignoreEos == other.ignoreEos && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs && spec == other.spec && noSpec == other.noSpec;
 
   @override
-  int get hashCode => Object.hash(maxTokens, seed, temperature, topP, topK, minP, repetitionPenalty, stopTokens, ignoreEos, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs, spec);
+  int get hashCode => Object.hash(maxTokens, seed, temperature, topP, topK, minP, repetitionPenalty, stopTokens, ignoreEos, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs, spec, noSpec);
 }
 
 /// Bundle of everything a synchronous `generate` call produces:
@@ -1428,6 +1436,8 @@ class SessionConfig {
     this.ubatchSize = 512,
     /// Whether to prefer GPU depthformer for audio decoder generation.
     this.gpuDepthformer = false,
+    /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+    this.disableSpec = false,
   });
 
   /// Cap on total tokens held in KV. `None` → model's default
@@ -1444,6 +1454,8 @@ class SessionConfig {
   final int ubatchSize;
   /// Whether to prefer GPU depthformer for audio decoder generation.
   final bool gpuDepthformer;
+  /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+  final bool disableSpec;
 
   Map<String, dynamic> toJson() {
     return {
@@ -1453,6 +1465,7 @@ class SessionConfig {
       'seed': this.seed,
       'ubatchSize': this.ubatchSize,
       'gpuDepthformer': this.gpuDepthformer,
+      'disableSpec': this.disableSpec,
     };
   }
 
@@ -1464,6 +1477,7 @@ class SessionConfig {
       seed: json.containsKey('seed') ? json['seed'] == null ? null : (json['seed'] as num).toInt() : null,
       ubatchSize: json.containsKey('ubatchSize') ? (json['ubatchSize'] as num).toInt() : 512,
       gpuDepthformer: json.containsKey('gpuDepthformer') ? json['gpuDepthformer'] as bool : false,
+      disableSpec: json.containsKey('disableSpec') ? json['disableSpec'] as bool : false,
     );
   }
 
@@ -1474,6 +1488,7 @@ class SessionConfig {
     Object? seed = _sentinel,
     int? ubatchSize,
     bool? gpuDepthformer,
+    bool? disableSpec,
   }) {
     return SessionConfig(
       maxSeqLen: maxSeqLen == _sentinel ? this.maxSeqLen : maxSeqLen as int?,
@@ -1482,21 +1497,22 @@ class SessionConfig {
       seed: seed == _sentinel ? this.seed : seed as int?,
       ubatchSize: ubatchSize ?? this.ubatchSize,
       gpuDepthformer: gpuDepthformer ?? this.gpuDepthformer,
+      disableSpec: disableSpec ?? this.disableSpec,
     );
   }
 
   @override
   String toString() {
-    return 'SessionConfig(maxSeqLen: $maxSeqLen, kvCompression: $kvCompression, nKeep: $nKeep, seed: $seed, ubatchSize: $ubatchSize, gpuDepthformer: $gpuDepthformer)';
+    return 'SessionConfig(maxSeqLen: $maxSeqLen, kvCompression: $kvCompression, nKeep: $nKeep, seed: $seed, ubatchSize: $ubatchSize, gpuDepthformer: $gpuDepthformer, disableSpec: $disableSpec)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is SessionConfig && maxSeqLen == other.maxSeqLen && kvCompression == other.kvCompression && nKeep == other.nKeep && seed == other.seed && ubatchSize == other.ubatchSize && gpuDepthformer == other.gpuDepthformer;
+      other is SessionConfig && maxSeqLen == other.maxSeqLen && kvCompression == other.kvCompression && nKeep == other.nKeep && seed == other.seed && ubatchSize == other.ubatchSize && gpuDepthformer == other.gpuDepthformer && disableSpec == other.disableSpec;
 
   @override
-  int get hashCode => Object.hash(maxSeqLen, kvCompression, nKeep, seed, ubatchSize, gpuDepthformer);
+  int get hashCode => Object.hash(maxSeqLen, kvCompression, nKeep, seed, ubatchSize, gpuDepthformer, disableSpec);
 }
 
 /// Speculative decoding configuration for prompt-lookup drafting. Mirrors [`cera::SpecDecode`].
@@ -6740,6 +6756,12 @@ final class Session {
   /// Returns default `GenerateOpts` for this session, pre-populated with
   /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
   GenerateOpts defaultGenerateOpts() => _unsupportedOnWeb('Session.defaultGenerateOpts');
+
+  /// Explicitly disable speculative decoding for this session.
+  void disableSpec() => _unsupportedOnWeb('Session.disableSpec');
+
+  /// Re-enable speculative decoding for this session (if previously disabled).
+  void enableSpec() => _unsupportedOnWeb('Session.enableSpec');
 
   /// Export current inference session checkpoint as serialized binary bytes.
   Uint8List exportCheckpoint() => _unsupportedOnWeb('Session.exportCheckpoint');

@@ -859,6 +859,8 @@ class GenerateOpts {
     /// Optional speculative decoding configuration (prompt-lookup drafting).
     /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
     this.spec = null,
+    /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+    this.noSpec = false,
   });
 
   final int maxTokens;
@@ -900,6 +902,8 @@ class GenerateOpts {
   /// Optional speculative decoding configuration (prompt-lookup drafting).
   /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
   final SpecDecodeConfig? spec;
+  /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+  final bool noSpec;
 
   Map<String, dynamic> toJson() {
     return {
@@ -917,6 +921,7 @@ class GenerateOpts {
       'flushEveryTokens': this.flushEveryTokens,
       'flushEveryMs': this.flushEveryMs,
       'spec': this.spec == null ? null : (() { final __tmp = this.spec!; return __tmp.toJson(); })(),
+      'noSpec': this.noSpec,
     };
   }
 
@@ -936,6 +941,7 @@ class GenerateOpts {
       flushEveryTokens: json.containsKey('flushEveryTokens') ? (json['flushEveryTokens'] as num).toInt() : 16,
       flushEveryMs: json.containsKey('flushEveryMs') ? (json['flushEveryMs'] as num).toInt() : 50,
       spec: json.containsKey('spec') ? json['spec'] == null ? null : (() { final __tmp = json['spec']; return SpecDecodeConfig.fromJson(__tmp as Map<String, dynamic>); })() : null,
+      noSpec: json.containsKey('noSpec') ? json['noSpec'] as bool : false,
     );
   }
 
@@ -954,6 +960,7 @@ class GenerateOpts {
     int? flushEveryTokens,
     int? flushEveryMs,
     Object? spec = _sentinel,
+    bool? noSpec,
   }) {
     return GenerateOpts(
       maxTokens: maxTokens ?? this.maxTokens,
@@ -970,21 +977,22 @@ class GenerateOpts {
       flushEveryTokens: flushEveryTokens ?? this.flushEveryTokens,
       flushEveryMs: flushEveryMs ?? this.flushEveryMs,
       spec: spec == _sentinel ? this.spec : spec as SpecDecodeConfig?,
+      noSpec: noSpec ?? this.noSpec,
     );
   }
 
   @override
   String toString() {
-    return 'GenerateOpts(maxTokens: $maxTokens, seed: $seed, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, ignoreEos: $ignoreEos, grammar: $grammar, grammarTriggerTokens: $grammarTriggerTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs, spec: $spec)';
+    return 'GenerateOpts(maxTokens: $maxTokens, seed: $seed, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, ignoreEos: $ignoreEos, grammar: $grammar, grammarTriggerTokens: $grammarTriggerTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs, spec: $spec, noSpec: $noSpec)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is GenerateOpts && maxTokens == other.maxTokens && seed == other.seed && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && ignoreEos == other.ignoreEos && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs && spec == other.spec;
+      other is GenerateOpts && maxTokens == other.maxTokens && seed == other.seed && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && ignoreEos == other.ignoreEos && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs && spec == other.spec && noSpec == other.noSpec;
 
   @override
-  int get hashCode => Object.hash(maxTokens, seed, temperature, topP, topK, minP, repetitionPenalty, stopTokens, ignoreEos, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs, spec);
+  int get hashCode => Object.hash(maxTokens, seed, temperature, topP, topK, minP, repetitionPenalty, stopTokens, ignoreEos, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs, spec, noSpec);
 }
 
 /// Bundle of everything a synchronous `generate` call produces:
@@ -1496,6 +1504,8 @@ class SessionConfig {
     this.ubatchSize = 512,
     /// Whether to prefer GPU depthformer for audio decoder generation.
     this.gpuDepthformer = false,
+    /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+    this.disableSpec = false,
   });
 
   /// Cap on total tokens held in KV. `None` → model's default
@@ -1512,6 +1522,8 @@ class SessionConfig {
   final int ubatchSize;
   /// Whether to prefer GPU depthformer for audio decoder generation.
   final bool gpuDepthformer;
+  /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+  final bool disableSpec;
 
   Map<String, dynamic> toJson() {
     return {
@@ -1521,6 +1533,7 @@ class SessionConfig {
       'seed': this.seed,
       'ubatchSize': this.ubatchSize,
       'gpuDepthformer': this.gpuDepthformer,
+      'disableSpec': this.disableSpec,
     };
   }
 
@@ -1532,6 +1545,7 @@ class SessionConfig {
       seed: json.containsKey('seed') ? json['seed'] == null ? null : (json['seed'] as num).toInt() : null,
       ubatchSize: json.containsKey('ubatchSize') ? (json['ubatchSize'] as num).toInt() : 512,
       gpuDepthformer: json.containsKey('gpuDepthformer') ? json['gpuDepthformer'] as bool : false,
+      disableSpec: json.containsKey('disableSpec') ? json['disableSpec'] as bool : false,
     );
   }
 
@@ -1542,6 +1556,7 @@ class SessionConfig {
     Object? seed = _sentinel,
     int? ubatchSize,
     bool? gpuDepthformer,
+    bool? disableSpec,
   }) {
     return SessionConfig(
       maxSeqLen: maxSeqLen == _sentinel ? this.maxSeqLen : maxSeqLen as int?,
@@ -1550,21 +1565,22 @@ class SessionConfig {
       seed: seed == _sentinel ? this.seed : seed as int?,
       ubatchSize: ubatchSize ?? this.ubatchSize,
       gpuDepthformer: gpuDepthformer ?? this.gpuDepthformer,
+      disableSpec: disableSpec ?? this.disableSpec,
     );
   }
 
   @override
   String toString() {
-    return 'SessionConfig(maxSeqLen: $maxSeqLen, kvCompression: $kvCompression, nKeep: $nKeep, seed: $seed, ubatchSize: $ubatchSize, gpuDepthformer: $gpuDepthformer)';
+    return 'SessionConfig(maxSeqLen: $maxSeqLen, kvCompression: $kvCompression, nKeep: $nKeep, seed: $seed, ubatchSize: $ubatchSize, gpuDepthformer: $gpuDepthformer, disableSpec: $disableSpec)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is SessionConfig && maxSeqLen == other.maxSeqLen && kvCompression == other.kvCompression && nKeep == other.nKeep && seed == other.seed && ubatchSize == other.ubatchSize && gpuDepthformer == other.gpuDepthformer;
+      other is SessionConfig && maxSeqLen == other.maxSeqLen && kvCompression == other.kvCompression && nKeep == other.nKeep && seed == other.seed && ubatchSize == other.ubatchSize && gpuDepthformer == other.gpuDepthformer && disableSpec == other.disableSpec;
 
   @override
-  int get hashCode => Object.hash(maxSeqLen, kvCompression, nKeep, seed, ubatchSize, gpuDepthformer);
+  int get hashCode => Object.hash(maxSeqLen, kvCompression, nKeep, seed, ubatchSize, gpuDepthformer, disableSpec);
 }
 
 /// Speculative decoding configuration for prompt-lookup drafting. Mirrors [`cera::SpecDecode`].
@@ -6514,6 +6530,7 @@ void _uniffiWriteGenerateOpts(GenerateOpts value, _UniFfiBinaryWriter writer) {
     writer.writeI8(1);
     _uniffiWriteSpecDecodeConfig(value.spec!, writer);
   }
+  writer.writeBool(value.noSpec);
 }
 
 Uint8List _uniffiEncodeGenerateOpts(GenerateOpts value) {
@@ -6538,6 +6555,7 @@ GenerateOpts _uniffiReadGenerateOpts(_UniFfiBinaryReader reader) {
     flushEveryTokens: reader.readU32(),
     flushEveryMs: reader.readU32(),
     spec: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return _uniffiReadSpecDecodeConfig(reader); })(),
+    noSpec: reader.readBool(),
   );
 }
 
@@ -6812,6 +6830,7 @@ void _uniffiWriteSessionConfig(SessionConfig value, _UniFfiBinaryWriter writer) 
   }
   writer.writeU32(value.ubatchSize);
   writer.writeBool(value.gpuDepthformer);
+  writer.writeBool(value.disableSpec);
 }
 
 Uint8List _uniffiEncodeSessionConfig(SessionConfig value) {
@@ -6828,6 +6847,7 @@ SessionConfig _uniffiReadSessionConfig(_UniFfiBinaryReader reader) {
     seed: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readU64(); })(),
     ubatchSize: reader.readU32(),
     gpuDepthformer: reader.readBool(),
+    disableSpec: reader.readBool(),
   );
 }
 
@@ -9482,6 +9502,26 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_method_session_default_generate_opts != 61826) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_default_generate_opts`: expected 61826, got $_checksum_uniffi_cera_ffi_checksum_method_session_default_generate_opts');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_session_disable_spec;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_session_disable_spec');
+      _checksum_uniffi_cera_ffi_checksum_method_session_disable_spec = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_disable_spec`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_disable_spec != 3153) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_disable_spec`: expected 3153, got $_checksum_uniffi_cera_ffi_checksum_method_session_disable_spec');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_session_enable_spec;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_session_enable_spec');
+      _checksum_uniffi_cera_ffi_checksum_method_session_enable_spec = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_enable_spec`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_enable_spec != 9506) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_enable_spec`: expected 9506, got $_checksum_uniffi_cera_ffi_checksum_method_session_enable_spec');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_export_checkpoint;
     try {
@@ -21143,6 +21183,140 @@ class CeraFfiFfi {
     }
   }
 
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionDisableSpecFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_disable_spec');
+
+  void sessionInvokeDisableSpec(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _sessionClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _sessionDisableSpecFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 0).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 1).ref.u64
+          ..len = (returnBuf + 2).ref.u64
+          ..data = (returnBuf + 3).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionEnableSpecFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_enable_spec');
+
+  void sessionInvokeEnableSpec(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _sessionClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _sessionEnableSpecFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 0).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 1).ref.u64
+          ..len = (returnBuf + 2).ref.u64
+          ..data = (returnBuf + 3).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _sessionExportCheckpointFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_session_export_checkpoint');
 
   Uint8List sessionInvokeExportCheckpoint(int handle) {
@@ -31089,6 +31263,18 @@ final class Session {
   GenerateOpts defaultGenerateOpts() {
     _ensureOpen();
     return _ffi.sessionInvokeDefaultGenerateOpts(_handle);
+  }
+
+  /// Explicitly disable speculative decoding for this session.
+  void disableSpec() {
+    _ensureOpen();
+    _ffi.sessionInvokeDisableSpec(_handle);
+  }
+
+  /// Re-enable speculative decoding for this session (if previously disabled).
+  void enableSpec() {
+    _ensureOpen();
+    _ffi.sessionInvokeEnableSpec(_handle);
   }
 
   /// Export current inference session checkpoint as serialized binary bytes.
