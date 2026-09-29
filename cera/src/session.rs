@@ -1701,7 +1701,7 @@ impl Session {
     /// mid-flight. Returns `CeraError::Cancelled` when cancel fires
     /// before the full slice is consumed, or `CeraError::InvalidToken`
     /// if any token ID is `>= vocab_size`. A short prefill with no
-    /// cancel armed — or a backend failure recorded mid-prefill —
+    /// cancel armed, or a backend failure recorded mid-prefill,
     /// returns `CeraError::Backend`: a fault, not user cancellation
     /// (a `Cancelled` here would read as resumable at the FFI boundary).
     ///
@@ -1821,7 +1821,7 @@ impl Session {
         // out-of-band while `consumed` still counts every chunk (only the
         // Hexagon override returns a short prefix). Draining after the
         // advance would position the session over unverified KV, then
-        // return Err — the next op would continue past the hole. A
+        // return Err: the next op would continue past the hole. A
         // faulted append advances nothing and clears `last_logits` like
         // the short path below: without this, logits from a previous
         // successful append would survive and seed the next `generate()`
@@ -1864,7 +1864,7 @@ impl Session {
     ///
     /// GPU/NPU backends surface *asynchronous* failures (lost device,
     /// kernel errors, NPU faults) out-of-band: the forward call returns
-    /// normally — possibly with stale or zeroed outputs — and records
+    /// normally (possibly with stale or zeroed outputs) and records
     /// the real error where [`Model::take_decode_error`] drains it.
     /// Every forward on the session's prefill/decode/spec paths is
     /// followed by this check so a poisoned backend surfaces as `Err`
@@ -1874,7 +1874,7 @@ impl Session {
     /// Entry points (`append_tokens`, `append_embeddings`,
     /// `generate_inner`, `hidden_states_for_tokens_inner`) *discard* a
     /// stale slot before doing work, so only errors recorded *during*
-    /// the current call are reported — a previous call's failure can't
+    /// the current call are reported: a previous call's failure can't
     /// fail a fresh one.
     fn check_decode_error(&self) -> Result<(), CeraError> {
         if let Some(err) = self.model.take_decode_error() {
@@ -3535,7 +3535,7 @@ impl Session {
                 &mut rewinds_proven,
             );
             // Verify ran target forwards through the shared model handle;
-            // drain any failure it recorded before trusting `vr` — an
+            // drain any failure it recorded before trusting `vr`: an
             // accepted draft decided from poisoned logits is a silent
             // corruption, not a speedup.
             if let Err(e) = self.check_decode_error() {

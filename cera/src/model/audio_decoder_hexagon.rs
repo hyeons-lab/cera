@@ -898,7 +898,7 @@ impl HexagonDepthformer {
         embedding: &[f32],
         temperature: f32,
         top_k: usize,
-    ) -> [i32; 8] {
+    ) -> Result<[i32; 8], CeraError> {
         let dec = &self.weights.decoder_config;
         let cfg = &self.weights.depthformer_config;
         let n_embd = cfg.n_embd;
@@ -920,22 +920,26 @@ impl HexagonDepthformer {
         let mut dev_guard = match device.lock() {
             Ok(g) => g,
             Err(e) => {
-                tracing::warn!("HexagonDepthformer device lock failed: {e}");
-                return [0; 8];
+                let err = CeraError::Backend(format!("HexagonDepthformer device lock failed: {e}"));
+                tracing::warn!("{err}");
+                return Err(err);
             }
         };
         let mut scratch_guard = match self.scratch_buf.lock() {
             Ok(g) => g,
             Err(e) => {
-                tracing::warn!("HexagonDepthformer scratch lock failed: {e}");
-                return [0; 8];
+                let err =
+                    CeraError::Backend(format!("HexagonDepthformer scratch lock failed: {e}"));
+                tracing::warn!("{err}");
+                return Err(err);
             }
         };
         let state_buf_guard = match self.state_buf.lock() {
             Ok(g) => g,
             Err(e) => {
-                tracing::warn!("HexagonDepthformer state lock failed: {e}");
-                return [0; 8];
+                let err = CeraError::Backend(format!("HexagonDepthformer state lock failed: {e}"));
+                tracing::warn!("{err}");
+                return Err(err);
             }
         };
 
@@ -964,7 +968,7 @@ impl HexagonDepthformer {
             .lock()
             .unwrap_or_else(|e| e.into_inner());
 
-        for j in 0..dec.n_codebook {
+        for (j, code_slot) in codes.iter_mut().enumerate().take(dec.n_codebook) {
             let pos = self.n_past.load(std::sync::atomic::Ordering::Relaxed);
 
             // 2. Stage previous codebook embedding if j > 0
@@ -1286,7 +1290,7 @@ impl HexagonDepthformer {
             if let Err(e) = res {
                 tracing::warn!("HexagonDepthformer NPU execution failed at codebook {j}: {e}");
                 session.drop_pending_batch();
-                return codes;
+                return Err(e);
             }
 
             // Invalidate cache for logits
@@ -1331,13 +1335,13 @@ impl HexagonDepthformer {
                 picked as i32
             };
 
-            codes[j] = sampled;
+            *code_slot = sampled;
             prev_token = sampled;
             self.n_past
                 .store(pos + 1, std::sync::atomic::Ordering::Relaxed);
         }
 
-        codes
+        Ok(codes)
     }
 }
 
@@ -2883,7 +2887,13 @@ impl HexagonAudioDecoder {
 impl AudioAccelerator for HexagonAudioDecoder {
     fn sample_audio_frame(&self, embedding: &[f32], temperature: f32, top_k: usize) -> [i32; 8] {
         if let Some(ref df) = self.depthformer {
-            df.sample_frame(&self.device, embedding, temperature, top_k)
+            match df.sample_frame(&self.device, embedding, temperature, top_k) {
+                Ok(codes) => codes,
+                Err(e) => {
+                    self.record_error(e);
+                    [0; 8]
+                }
+            }
         } else {
             [0; 8]
         }
@@ -3297,5 +3307,29 @@ mod tests {
         assert_eq!(plan.cb_to_logits.len(), 2);
         assert_eq!(plan.total_bytes % 128, 0);
         assert!(plan.total_bytes > 0);
+    }
+
+    #[test]
+    fn test_hexagon_audio_decoder_error_recording() {
+        let last_error = Mutex::new(None);
+        let record = |err: CeraError| {
+            let mut guard = last_error.lock().unwrap_or_else(|e| e.into_inner());
+            if guard.is_none() {
+                *guard = Some(err);
+            }
+        };
+
+        // Record first error
+        record(CeraError::Backend("dsp failure 1".into()));
+        // Record second error (must be discarded by sticky contract)
+        record(CeraError::Backend("dsp failure 2".into()));
+
+        let drained = last_error.lock().unwrap_or_else(|e| e.into_inner()).take();
+        assert!(drained.is_some());
+        assert_eq!(drained.unwrap().to_string(), "backend: dsp failure 1");
+
+        // Subsequent drain is empty
+        let drained_again = last_error.lock().unwrap_or_else(|e| e.into_inner()).take();
+        assert!(drained_again.is_none());
     }
 }

@@ -112,7 +112,6 @@ pub struct FastRpcDriver {
     remote_handle64_open: RemoteHandle64OpenFn,
     remote_handle64_invoke: RemoteHandle64InvokeFn,
     remote_handle64_close: RemoteHandle64CloseFn,
-    #[allow(dead_code)]
     remote_session_control: Option<RemoteSessionControlFn>,
 
     // DSP queue

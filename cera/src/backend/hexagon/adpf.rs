@@ -171,8 +171,7 @@ mod tests {
         // platform provides ADPF (API 33+ with power-HAL support).
         #[cfg(target_os = "android")]
         if let Some(mut session) = AdpfSession::try_open(10_000_000) {
-            session.set_target(12_000_000);
-            session.report_actual(11_000_000);
+            session.report(11_000_000);
         }
     }
 }
