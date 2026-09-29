@@ -335,8 +335,10 @@ pub fn repack_q4_k(
                         let q1 = (b[qs_base + 2 * cp + 1] >> shift) & 0x0f;
                         tile_quants[cp * 32 + row] = (q1 << 4) | q0;
                     }
-                    tile_scales[row * 4..row * 4 + 2].copy_from_slice(&f32_to_f16(dd).to_le_bytes());
-                    tile_scales[row * 4 + 2..row * 4 + 4].copy_from_slice(&f32_to_f16(mm).to_le_bytes());
+                    tile_scales[row * 4..row * 4 + 2]
+                        .copy_from_slice(&f32_to_f16(dd).to_le_bytes());
+                    tile_scales[row * 4 + 2..row * 4 + 4]
+                        .copy_from_slice(&f32_to_f16(mm).to_le_bytes());
                 }
             }
         });

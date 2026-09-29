@@ -15,14 +15,14 @@ use std::sync::{Arc, Mutex};
 use crate::backend::cpu::RopeType;
 use crate::backend::hexagon::{
     AdpfSession, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
-    HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode,
-    RpcmemBuffer, StagedBatch, TILE_SIZE_Q4_0, TILE_SIZE_Q4_K, TILE_SIZE_Q6_K,
-    TILE_SIZE_Q8_0, build_binary_kernel_params, build_flash_attn_kernel_params,
-    build_hmx_fa_kernel_params, build_hmx_mm_kernel_params, build_mul_mat_kernel_params,
-    build_rms_norm_params, build_rope_kernel_params, build_rope_params,
-    build_set_rows_kernel_params, build_ssm_conv_kernel_params, build_unary_kernel_params,
-    fa_is_hmx_eligible, mm_hmx_nb1, mm_is_hmx_eligible, repack_q4_0, repack_q4_k, repack_q6_k,
-    repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q4_k, repacked_matrix_size_q6_k,
+    HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer,
+    StagedBatch, TILE_SIZE_Q4_0, TILE_SIZE_Q4_K, TILE_SIZE_Q6_K, TILE_SIZE_Q8_0,
+    build_binary_kernel_params, build_flash_attn_kernel_params, build_hmx_fa_kernel_params,
+    build_hmx_mm_kernel_params, build_mul_mat_kernel_params, build_rms_norm_params,
+    build_rope_kernel_params, build_rope_params, build_set_rows_kernel_params,
+    build_ssm_conv_kernel_params, build_unary_kernel_params, fa_is_hmx_eligible, mm_hmx_nb1,
+    mm_is_hmx_eligible, repack_q4_0, repack_q4_k, repack_q6_k, repack_q8_0,
+    repacked_matrix_size_q4_0, repacked_matrix_size_q4_k, repacked_matrix_size_q6_k,
     repacked_matrix_size_q8_0, requant_q5_k_to_q8_0,
 };
 use crate::gguf::GgufFile;
@@ -131,6 +131,8 @@ fn decode_ops_cap() -> Option<usize> {
         .filter(|&v| v > 0)
 }
 
+pub const MAX_ALL_LOGITS_TOKENS: usize = 64;
+
 #[derive(Clone, Copy, Debug)]
 struct ScratchOffsets {
     activation: usize,
@@ -152,6 +154,7 @@ struct ScratchOffsets {
     ffn_up: usize,
     ffn_out: usize,
     logits: usize,
+    argmax: usize,
     pos: usize,
     mask: usize,
     total_size: usize,
@@ -208,7 +211,9 @@ impl ScratchOffsets {
         let ffn_out = cur;
         cur = align(cur + m * intermediate_size * 4);
         let logits = cur;
-        cur = align(cur + vocab_size * 4);
+        cur = align(cur + MAX_ALL_LOGITS_TOKENS * vocab_size * 4);
+        let argmax = cur;
+        cur = align(cur + MAX_ALL_LOGITS_TOKENS * 4);
         let pos = cur;
         cur = align(cur + m * 4);
         let mask = cur;
@@ -235,6 +240,7 @@ impl ScratchOffsets {
             ffn_up,
             ffn_out,
             logits,
+            argmax,
             pos,
             mask,
             total_size,
@@ -316,6 +322,8 @@ pub struct HexagonLfm2Model {
     kv_dtype: HtpDataType,
     /// Cached static command queue template for zero-allocation decode forward passes.
     decode_template: Mutex<Option<DecodeTemplate>>,
+    /// Cached static command queue template for zero-allocation greedy (on-DSP argmax) decode forward passes.
+    greedy_decode_template: Mutex<Option<DecodeTemplate>>,
 }
 
 unsafe impl Send for HexagonLfm2Model {}
@@ -336,6 +344,13 @@ enum DecodeInput<'a> {
 enum DecodeOutput {
     Logits,
     Hidden,
+    Greedy,
+}
+
+enum DecodeResult {
+    Logits(Vec<f32>),
+    Hidden(Vec<f32>),
+    Greedy(u32),
 }
 
 impl HexagonLfm2Model {
@@ -1042,6 +1057,7 @@ impl HexagonLfm2Model {
             decode_error: Mutex::new(None),
             kv_dtype,
             decode_template: Mutex::new(None),
+            greedy_decode_template: Mutex::new(None),
         })
     }
 
@@ -1079,6 +1095,55 @@ impl HexagonLfm2Model {
         session
             .enqueue_op(opcode, src, dst, params, kernel_params)
             .map_err(|e| CeraError::Backend(format!("{label}: {e}")))
+    }
+
+    fn dispatch_argmax(
+        session: &mut HexagonQueueSession,
+        in_act: &RpcmemBuffer,
+        in_offset: usize,
+        out_act: &RpcmemBuffer,
+        out_offset: usize,
+        vocab_size: usize,
+        n_rows: usize,
+    ) -> Result<(), CeraError> {
+        let in_ti = session.add_tensor(
+            in_act,
+            in_offset,
+            n_rows * vocab_size * 4,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            [vocab_size as u32, n_rows as u32, 1, 1],
+            [
+                4,
+                (vocab_size * 4) as u32,
+                (n_rows * vocab_size * 4) as u32,
+                (n_rows * vocab_size * 4) as u32,
+            ],
+        )?;
+        let out_ti = session.add_tensor(
+            out_act,
+            out_offset,
+            n_rows * 4,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::I32 as u32,
+            [n_rows as u32, 1, 1, 1],
+            [
+                4,
+                (n_rows * 4) as u32,
+                (n_rows * 4) as u32,
+                (n_rows * 4) as u32,
+            ],
+        )?;
+        Self::enqueue_labeled(
+            session,
+            "dispatch_argmax",
+            HtpOpCode::Argmax as u32,
+            &[in_ti],
+            &[out_ti],
+            [0i32; 16],
+            [0i32; 32],
+        )?;
+        Ok(())
     }
 
     fn dispatch_mul(
@@ -2649,6 +2714,7 @@ impl HexagonLfm2Model {
         input: PrefillInput<'_>,
         start_pos: usize,
         state: &mut InferenceState,
+        all_logits: bool,
     ) -> Result<Vec<f32>, CeraError> {
         let hs = self.config.hidden_size;
         let m = match input {
@@ -2678,6 +2744,11 @@ impl HexagonLfm2Model {
         if m > PREFILL_MAX_ROWS {
             return Err(CeraError::Backend(format!(
                 "prefill chunk size ({m}) exceeds maximum ({PREFILL_MAX_ROWS})"
+            )));
+        }
+        if all_logits && m > MAX_ALL_LOGITS_TOKENS {
+            return Err(CeraError::Backend(format!(
+                "all_logits prefill chunk size ({m}) exceeds MAX_ALL_LOGITS_TOKENS ({MAX_ALL_LOGITS_TOKENS})"
             )));
         }
         let fwd_start = std::time::Instant::now();
@@ -2996,14 +3067,7 @@ impl HexagonLfm2Model {
                             hs,
                         );
                         Self::dispatch_add_m(
-                            session,
-                            scratch,
-                            cur_act,
-                            scratch,
-                            cur_normed,
-                            scratch,
-                            next_act,
-                            hs,
+                            session, scratch, cur_act, scratch, cur_normed, scratch, next_act, hs,
                             m,
                         )?;
                         self.dump_hidden(
@@ -3059,14 +3123,7 @@ impl HexagonLfm2Model {
                             m,
                         )?;
                         Self::dispatch_add_m(
-                            session,
-                            scratch,
-                            next_act,
-                            scratch,
-                            cur_normed,
-                            scratch,
-                            next_act,
-                            hs,
+                            session, scratch, next_act, scratch, cur_normed, scratch, next_act, hs,
                             m,
                         )?;
                         self.dump_hidden(
@@ -3297,14 +3354,7 @@ impl HexagonLfm2Model {
                             );
                         }
                         Self::dispatch_add_m(
-                            session,
-                            scratch,
-                            cur_act,
-                            scratch,
-                            cur_normed,
-                            scratch,
-                            next_act,
-                            hs,
+                            session, scratch, cur_act, scratch, cur_normed, scratch, next_act, hs,
                             m,
                         )?;
                         self.dump_hidden(
@@ -3377,14 +3427,7 @@ impl HexagonLfm2Model {
                             m,
                         )?;
                         Self::dispatch_add_m(
-                            session,
-                            scratch,
-                            next_act,
-                            scratch,
-                            cur_normed,
-                            scratch,
-                            next_act,
-                            hs,
+                            session, scratch, next_act, scratch, cur_normed, scratch, next_act, hs,
                             m,
                         )?;
                         self.dump_hidden(
@@ -3417,7 +3460,7 @@ impl HexagonLfm2Model {
                 so.normed_b
             };
 
-            // Final norm + LM head on the last row only.
+            // Final norm + LM head
             Self::dispatch_rms_norm_mul(
                 session,
                 scratch,
@@ -3430,15 +3473,38 @@ impl HexagonLfm2Model {
                 hs,
                 m,
             )?;
-            self.dispatch_mul_mat(
-                session,
-                &self.weights_buf,
-                &self.lm_head,
-                scratch,
-                final_normed + (m - 1) * hs * 4,
-                scratch,
-                so.logits,
-            )?;
+            if all_logits && m > 1 {
+                self.dispatch_mul_mat_m(
+                    session,
+                    &self.weights_buf,
+                    &self.lm_head,
+                    scratch,
+                    final_normed,
+                    scratch,
+                    so.logits,
+                    m,
+                )?;
+            } else if all_logits {
+                self.dispatch_mul_mat(
+                    session,
+                    &self.weights_buf,
+                    &self.lm_head,
+                    scratch,
+                    final_normed,
+                    scratch,
+                    so.logits,
+                )?;
+            } else {
+                self.dispatch_mul_mat(
+                    session,
+                    &self.weights_buf,
+                    &self.lm_head,
+                    scratch,
+                    final_normed + (m - 1) * hs * 4,
+                    scratch,
+                    so.logits,
+                )?;
+            }
 
             session.flush().map_err(|e| {
                 CeraError::Backend(format!("Hexagon NPU prefill execution failed: {e}"))
@@ -3455,9 +3521,13 @@ impl HexagonLfm2Model {
         self.current_seq_len.store(start_pos + m, Ordering::SeqCst);
         state.seq_len = start_pos + m;
 
-        scratch.invalidate_cpu_cache(so.logits, vocab_size * 4);
+        let n_out_tokens = if all_logits { m } else { 1 };
+        scratch.invalidate_cpu_cache(so.logits, n_out_tokens * vocab_size * 4);
         let logits_slice = unsafe {
-            std::slice::from_raw_parts(scratch.as_ptr().add(so.logits) as *const f32, vocab_size)
+            std::slice::from_raw_parts(
+                scratch.as_ptr().add(so.logits) as *const f32,
+                n_out_tokens * vocab_size,
+            )
         };
         if let Ok(mut adpf) = self.adpf.lock()
             && let Some(session) = adpf.as_mut()
@@ -3475,7 +3545,7 @@ impl HexagonLfm2Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Result<Vec<f32>, CeraError> {
-        self.try_forward_prefill_chunk_input(PrefillInput::Tokens(tokens), start_pos, state)
+        self.try_forward_prefill_chunk_input(PrefillInput::Tokens(tokens), start_pos, state, false)
     }
 
     fn try_forward_prefill_chunk_from_embeddings(
@@ -3484,7 +3554,21 @@ impl HexagonLfm2Model {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Result<Vec<f32>, CeraError> {
-        self.try_forward_prefill_chunk_input(PrefillInput::Embeddings(embeddings), start_pos, state)
+        self.try_forward_prefill_chunk_input(
+            PrefillInput::Embeddings(embeddings),
+            start_pos,
+            state,
+            false,
+        )
+    }
+
+    fn try_forward_prefill_logits_all(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<Vec<f32>, CeraError> {
+        self.try_forward_prefill_chunk_input(PrefillInput::Tokens(tokens), start_pos, state, true)
     }
 
     /// Run one prefill chunk, or `None` when the chunk failed. A failed
@@ -3538,7 +3622,7 @@ impl HexagonLfm2Model {
         output: DecodeOutput,
         pos: usize,
         state: &mut InferenceState,
-    ) -> Result<Vec<f32>, CeraError> {
+    ) -> Result<DecodeResult, CeraError> {
         let fwd_start = std::time::Instant::now();
         let vocab_size = self.config.vocab_size;
         let hs = self.config.hidden_size;
@@ -3616,7 +3700,7 @@ impl HexagonLfm2Model {
             && !self.debug_barriers
             && !self.dump_act
             && decode_ops_cap().is_none()
-            && output == DecodeOutput::Logits;
+            && (output == DecodeOutput::Logits || output == DecodeOutput::Greedy);
 
         let final_normed = if self.layers.len().is_multiple_of(2) {
             so.normed
@@ -3625,10 +3709,12 @@ impl HexagonLfm2Model {
         };
 
         if can_use_template {
-            let mut guard = self
-                .decode_template
-                .lock()
-                .unwrap_or_else(|e| e.into_inner());
+            let template_slot = if output == DecodeOutput::Greedy {
+                &self.greedy_decode_template
+            } else {
+                &self.decode_template
+            };
+            let mut guard = template_slot.lock().unwrap_or_else(|e| e.into_inner());
             if let Some(tpl) = guard.as_mut() {
                 let seq_len = pos + 1;
                 let n_kv_blocks = seq_len.div_ceil(64).max(1) as u32;
@@ -3657,21 +3743,30 @@ impl HexagonLfm2Model {
                 self.current_seq_len.store(pos + 1, Ordering::SeqCst);
                 state.seq_len = pos + 1;
 
-                scratch.invalidate_cpu_cache(so.logits, vocab_size * 4);
-                let logits_slice = unsafe {
-                    std::slice::from_raw_parts(
-                        scratch.as_ptr().add(so.logits) as *const f32,
-                        vocab_size,
-                    )
-                };
-                let result = logits_slice.to_vec();
-
                 if let Ok(mut adpf) = self.adpf.lock()
                     && let Some(session) = adpf.as_mut()
                 {
                     session.report(fwd_start.elapsed().as_nanos().min(i64::MAX as u128) as i64);
                 }
-                return Ok(result);
+
+                return match output {
+                    DecodeOutput::Greedy => {
+                        scratch.invalidate_cpu_cache(so.argmax, 4);
+                        let token = unsafe { *(scratch.as_ptr().add(so.argmax) as *const u32) };
+                        Ok(DecodeResult::Greedy(token))
+                    }
+                    DecodeOutput::Logits => {
+                        scratch.invalidate_cpu_cache(so.logits, vocab_size * 4);
+                        let logits_slice = unsafe {
+                            std::slice::from_raw_parts(
+                                scratch.as_ptr().add(so.logits) as *const f32,
+                                vocab_size,
+                            )
+                        };
+                        Ok(DecodeResult::Logits(logits_slice.to_vec()))
+                    }
+                    DecodeOutput::Hidden => unreachable!(),
+                };
             }
         }
 
@@ -4411,7 +4506,7 @@ impl HexagonLfm2Model {
                 1,
             )?;
 
-            if output == DecodeOutput::Logits {
+            if output == DecodeOutput::Logits || output == DecodeOutput::Greedy {
                 // Final LM head: logits = mul_mat(lm_head, final_normed)
                 self.dispatch_mul_mat(
                     session,
@@ -4422,14 +4517,21 @@ impl HexagonLfm2Model {
                     scratch,
                     so.logits,
                 )?;
+                if output == DecodeOutput::Greedy {
+                    Self::dispatch_argmax(
+                        session, scratch, so.logits, scratch, so.argmax, vocab_size, 1,
+                    )?;
+                }
             }
 
             if can_use_template {
                 let staged = session.export_staged_batch()?;
-                let mut guard = self
-                    .decode_template
-                    .lock()
-                    .unwrap_or_else(|e| e.into_inner());
+                let template_slot = if output == DecodeOutput::Greedy {
+                    &self.greedy_decode_template
+                } else {
+                    &self.decode_template
+                };
+                let mut guard = template_slot.lock().unwrap_or_else(|e| e.into_inner());
                 *guard = Some(DecodeTemplate {
                     staged,
                     flash_attn_patches,
@@ -4453,6 +4555,11 @@ impl HexagonLfm2Model {
         state.seq_len = pos + 1;
 
         let result = match output {
+            DecodeOutput::Greedy => {
+                scratch.invalidate_cpu_cache(so.argmax, 4);
+                let token = unsafe { *(scratch.as_ptr().add(so.argmax) as *const u32) };
+                DecodeResult::Greedy(token)
+            }
             DecodeOutput::Logits => {
                 scratch.invalidate_cpu_cache(so.logits, vocab_size * 4);
                 let logits_slice = unsafe {
@@ -4461,14 +4568,14 @@ impl HexagonLfm2Model {
                         vocab_size,
                     )
                 };
-                logits_slice.to_vec()
+                DecodeResult::Logits(logits_slice.to_vec())
             }
             DecodeOutput::Hidden => {
                 scratch.invalidate_cpu_cache(final_normed, hs * 4);
                 let hidden_slice = unsafe {
                     std::slice::from_raw_parts(scratch.as_ptr().add(final_normed) as *const f32, hs)
                 };
-                hidden_slice.to_vec()
+                DecodeResult::Hidden(hidden_slice.to_vec())
             }
         };
 
@@ -4489,12 +4596,47 @@ impl HexagonLfm2Model {
         if tokens.is_empty() {
             return Ok(Vec::new());
         }
-        self.try_forward_input(
+        if tokens.len() > 1 {
+            self.forward_prefill(&tokens[..tokens.len() - 1], pos, state);
+            return self.try_forward(&tokens[tokens.len() - 1..], pos + tokens.len() - 1, state);
+        }
+        match self.try_forward_input(
             DecodeInput::Token(tokens[0]),
             DecodeOutput::Logits,
             pos,
             state,
-        )
+        )? {
+            DecodeResult::Logits(logits) => Ok(logits),
+            _ => unreachable!(),
+        }
+    }
+
+    fn try_forward_greedy(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<u32, CeraError> {
+        if tokens.is_empty() {
+            return Ok(0);
+        }
+        if tokens.len() > 1 {
+            self.forward_prefill(&tokens[..tokens.len() - 1], pos, state);
+            return self.try_forward_greedy(
+                &tokens[tokens.len() - 1..],
+                pos + tokens.len() - 1,
+                state,
+            );
+        }
+        match self.try_forward_input(
+            DecodeInput::Token(tokens[0]),
+            DecodeOutput::Greedy,
+            pos,
+            state,
+        )? {
+            DecodeResult::Greedy(token) => Ok(token),
+            _ => unreachable!(),
+        }
     }
 
     fn try_forward_from_embedding(
@@ -4503,12 +4645,15 @@ impl HexagonLfm2Model {
         pos: usize,
         state: &mut InferenceState,
     ) -> Result<Vec<f32>, CeraError> {
-        self.try_forward_input(
+        match self.try_forward_input(
             DecodeInput::Embedding(embedding),
             DecodeOutput::Logits,
             pos,
             state,
-        )
+        )? {
+            DecodeResult::Logits(logits) => Ok(logits),
+            _ => unreachable!(),
+        }
     }
 
     fn try_forward_embedding(
@@ -4520,12 +4665,15 @@ impl HexagonLfm2Model {
         if tokens.is_empty() {
             return Err(CeraError::EmptyInput);
         }
-        self.try_forward_input(
+        match self.try_forward_input(
             DecodeInput::Token(tokens[0]),
             DecodeOutput::Hidden,
             pos,
             state,
-        )
+        )? {
+            DecodeResult::Hidden(hidden) => Ok(hidden),
+            _ => unreachable!(),
+        }
     }
 
     fn try_forward_hidden_from_embedding(
@@ -4534,12 +4682,15 @@ impl HexagonLfm2Model {
         pos: usize,
         state: &mut InferenceState,
     ) -> Result<Vec<f32>, CeraError> {
-        self.try_forward_input(
+        match self.try_forward_input(
             DecodeInput::Embedding(embedding),
             DecodeOutput::Hidden,
             pos,
             state,
-        )
+        )? {
+            DecodeResult::Hidden(hidden) => Ok(hidden),
+            _ => unreachable!(),
+        }
     }
 }
 
@@ -4744,6 +4895,18 @@ impl Model for HexagonLfm2Model {
         }
     }
 
+    fn forward_greedy(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> u32 {
+        match self.try_forward_greedy(tokens, pos, state) {
+            Ok(token) => token,
+            Err(e) => {
+                tracing::error!("Hexagon NPU greedy decode failed: {e}");
+                eprintln!("[cera-hexagon] greedy decode failed, returning token 0: {e}");
+                record_first_fault(&self.decode_error, e);
+                0
+            }
+        }
+    }
+
     fn take_decode_error(&self) -> Option<CeraError> {
         take_fault(&self.decode_error)
     }
@@ -4780,8 +4943,47 @@ impl Model for HexagonLfm2Model {
         })
     }
 
+    fn forward_prefill_logits_all(
+        &self,
+        tokens: &[u32],
+        start_pos: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        if tokens.is_empty() {
+            return Vec::new();
+        }
+        assert!(
+            tokens.len() <= MAX_ALL_LOGITS_TOKENS,
+            "forward_prefill_logits_all token count ({}) exceeds MAX_ALL_LOGITS_TOKENS ({MAX_ALL_LOGITS_TOKENS})",
+            tokens.len()
+        );
+        match self.try_forward_prefill_logits_all(tokens, start_pos, state) {
+            Ok(logits) => logits,
+            Err(e) => {
+                tracing::error!("Hexagon NPU forward_prefill_logits_all failed: {e}");
+                eprintln!("[cera-hexagon] forward_prefill_logits_all failed: {e}");
+                record_first_fault(&self.decode_error, e);
+                vec![0.0f32; tokens.len() * self.config.vocab_size]
+            }
+        }
+    }
+
     fn supports_all_logits(&self) -> bool {
-        false
+        true
+    }
+
+    fn check_kv_rewind(
+        &self,
+        state: &InferenceState,
+        len: usize,
+    ) -> Result<(), crate::kv_cache::KvRewindError> {
+        if len > state.seq_len {
+            return Err(crate::kv_cache::KvRewindError::OutOfBounds {
+                requested: len,
+                current: state.seq_len,
+            });
+        }
+        Ok(())
     }
 
     fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
@@ -4793,6 +4995,10 @@ impl Model for HexagonLfm2Model {
         let _guard = self.device.lock().unwrap_or_else(|e| e.into_inner());
         *self
             .decode_template
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .greedy_decode_template
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         self.current_seq_len.store(len, Ordering::SeqCst);
@@ -4813,6 +5019,10 @@ impl Model for HexagonLfm2Model {
         let _guard = self.device.lock().unwrap_or_else(|e| e.into_inner());
         *self
             .decode_template
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        *self
+            .greedy_decode_template
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = None;
         let mut fresh = InferenceState::from_config_capped(&self.config, compression, max_seq_len)?;
@@ -5014,6 +5224,7 @@ mod prefill_chunk_tests {
             ("ffn_up", offsets.ffn_up),
             ("ffn_out", offsets.ffn_out),
             ("logits", offsets.logits),
+            ("argmax", offsets.argmax),
             ("pos", offsets.pos),
             ("mask", offsets.mask),
             ("total_size", offsets.total_size),
@@ -5109,16 +5320,7 @@ mod prefill_chunk_tests {
             dst: [0; 4],
             pad: [0; 2],
         }];
-        ops[0].kernel_params = build_flash_attn_kernel_params(
-            64,
-            16,
-            4,
-            1,
-            1,
-            0.125,
-            4,
-            true,
-        );
+        ops[0].kernel_params = build_flash_attn_kernel_params(64, 16, 4, 1, 1, 0.125, 4, true);
         let patch = FlashAttnPatch {
             op_idx: 0,
             k_ti: 0,
@@ -5143,16 +5345,8 @@ mod prefill_chunk_tests {
         let b2 = (n_kv_blocks & 0xffff) | ((patch.g as u32 & 0xffff) << 16);
         ops[patch.op_idx].kernel_params[2] = b2 as i32;
 
-        let expected_kparams = build_flash_attn_kernel_params(
-            64,
-            16,
-            4,
-            1,
-            seq_len,
-            0.125,
-            4,
-            true,
-        );
+        let expected_kparams =
+            build_flash_attn_kernel_params(64, 16, 4, 1, seq_len, 0.125, 4, true);
 
         assert_eq!(tens[0].ne[1], 16);
         assert_eq!(tens[1].ne[1], 16);

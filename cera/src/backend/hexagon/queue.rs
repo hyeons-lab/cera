@@ -124,9 +124,8 @@ impl BufferIndexMap {
     }
 
     pub fn to_hash_map(&self) -> HashMap<i32, u16> {
-        let mut map = HashMap::with_capacity(
-            self.count + self.overflow.as_ref().map_or(0, |m| m.len()),
-        );
+        let mut map =
+            HashMap::with_capacity(self.count + self.overflow.as_ref().map_or(0, |m| m.len()));
         for i in 0..self.count {
             map.insert(self.inline[i].0, self.inline[i].1);
         }
