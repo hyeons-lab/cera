@@ -53,6 +53,8 @@ pub struct SessionConfig {
     pub ubatch_size: u32,
     /// Whether to prefer GPU depthformer for audio decoder generation.
     pub gpu_depthformer: bool,
+    /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+    pub disable_spec: bool,
 }
 
 impl Default for SessionConfig {
@@ -64,6 +66,7 @@ impl Default for SessionConfig {
             seed: None,
             ubatch_size: 512,
             gpu_depthformer: false,
+            disable_spec: false,
         }
     }
 }
@@ -811,6 +814,7 @@ impl Session {
             ..SamplerConfig::default()
         };
         let sampler = Sampler::new(sampler_cfg);
+        let spec_disabled = config.disable_spec;
 
         Ok(Self {
             model,
@@ -841,7 +845,7 @@ impl Session {
             hs_scratch: None,
             hs_scratch_cap: 0,
             lora: None,
-            spec_disabled: false,
+            spec_disabled,
             usable: true,
             ingest_mutation: None,
             last_ingest_recovery: None,
@@ -2821,26 +2825,22 @@ impl Session {
         // cache: verifying K drafted tokens in one forward amortizes the single
         // weight-read a bandwidth-bound decode is limited by. Output is a valid
         // greedy decode; see `generate_greedy_spec` and `crate::spec`.
-        // Speculative decoding defaults to on:
-        // - When an attached drafter is present (sidecar/embedded), it defaults to on with that drafter.
-        // - When no drafter is attached, it defaults to on using prompt lookup (the new method).
-        // - It is disabled only when explicitly opted out via `opts.no_spec` or `session.disable_spec()`.
+        // Speculative decoding policy:
+        // - Disabled if explicitly opted out via `opts.no_spec` or `session.spec_disabled` (via `SessionConfig::disable_spec` or `Session::disable_spec()`).
+        // - If explicit `opts.spec` is configured, honors that configuration.
+        // - If a draft sidecar model is present (separate or embedded), defaults to ON with that drafter.
+        // - If no draft sidecar model is present, defaults to DISABLED (off).
         let spec_opt = if opts.no_spec || self.spec_disabled {
             None
-        } else {
-            opts.spec.or_else(|| {
-                if let Some(d) = &self.drafter {
-                    Some(SpecDecode {
-                        ngram: 2,
-                        k: d.suggested_k().unwrap_or(6),
-                    })
-                } else {
-                    Some(SpecDecode {
-                        ngram: 2,
-                        k: 4,
-                    })
-                }
+        } else if opts.spec.is_some() {
+            opts.spec
+        } else if let Some(d) = &self.drafter {
+            Some(SpecDecode {
+                ngram: 2,
+                k: d.suggested_k().unwrap_or(6),
             })
+        } else {
+            None
         };
         if let Some(sd) = spec_opt
             && greedy
@@ -4663,6 +4663,65 @@ mod tests {
         // Session-level switch for call sites that reuse one opts value.
         let (model, mut session) = spec_test_session(vec![vec![0, 0]]);
         session.disable_spec();
+        let mut sink = RecordingSink::default();
+        let opts = GenerateOpts {
+            temperature: 0.0,
+            max_tokens: 3,
+            ..GenerateOpts::default()
+        };
+        let summary = session.generate(&opts, &mut sink).unwrap();
+        assert_eq!(summary.tokens_generated, 3);
+        assert_eq!(sink.tokens, vec![0, 0, 0]);
+        assert_eq!(model.batches_seen.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn no_drafter_defaults_spec_off() {
+        // Without an attached drafter, spec defaults to OFF when not explicitly configured.
+        let (model, mut session) = poison_test_session();
+        session.append_tokens(&[1, 2, 3]).unwrap();
+        let mut sink = RecordingSink::default();
+        let opts = GenerateOpts {
+            temperature: 0.0,
+            max_tokens: 3,
+            ..GenerateOpts::default()
+        };
+        let summary = session.generate(&opts, &mut sink).unwrap();
+        assert_eq!(summary.tokens_generated, 3);
+        assert_eq!(model.batches_seen.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn no_drafter_explicit_spec_turns_on() {
+        // Without an attached drafter, explicitly configuring `opts.spec` turns spec ON (prompt lookup).
+        let (model, mut session) = poison_test_session();
+        session.append_tokens(&[1, 2, 0, 1, 2]).unwrap();
+        let mut sink = RecordingSink::default();
+        let opts = GenerateOpts {
+            temperature: 0.0,
+            max_tokens: 3,
+            spec: Some(SpecDecode { ngram: 2, k: 2 }),
+            ..GenerateOpts::default()
+        };
+        let summary = session.generate(&opts, &mut sink).unwrap();
+        assert_eq!(summary.tokens_generated, 3);
+        assert!(model.batches_seen.load(Ordering::Relaxed) >= 1);
+    }
+
+    #[test]
+    fn session_config_disable_spec_beats_attached_drafter() {
+        // SessionConfig::disable_spec configures the session to disable spec even with an attached drafter.
+        let (model, session_raw) = spec_test_session(vec![vec![0, 0]]);
+        let mut config = session_raw.config.clone();
+        config.disable_spec = true;
+        let mut session = Session::new(
+            session_raw.model.clone(),
+            session_raw.tokenizer.clone(),
+            session_raw.capabilities,
+            config,
+        ).unwrap();
+        session.append_tokens(&[1, 2, 3]).unwrap();
+        session.drafter = Some(Box::new(CannedDrafter { script: vec![vec![0, 0]], calls: 0 }));
         let mut sink = RecordingSink::default();
         let opts = GenerateOpts {
             temperature: 0.0,

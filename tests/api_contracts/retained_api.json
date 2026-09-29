@@ -210,6 +210,8 @@
         "capabilities": "pub fn capabilities(&self) -> ModalityCapabilities",
         "clear_cancel": "pub fn clear_cancel(&self)",
         "default_generate_opts": "pub fn default_generate_opts(&self) -> Result<GenerateOpts, FfiError>",
+        "disable_spec": "pub fn disable_spec(&self) -> Result<(), FfiError>",
+        "enable_spec": "pub fn enable_spec(&self) -> Result<(), FfiError>",
         "export_checkpoint": "pub fn export_checkpoint(&self) -> Result<Vec<u8>, FfiError>",
         "generate": "pub fn generate(&self, opts: GenerateOpts) -> Result<GenerateOutput, FfiError>",
         "generate_async": "pub async fn generate_async( self: Arc<Self>, opts: GenerateOpts, ) -> Result<GenerateOutput, FfiError>",
@@ -403,7 +405,7 @@
       "kind": "record",
       "owner": "SessionConfig",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
-      "expected": "pub struct SessionConfig { #[uniffi(default = None)] pub max_seq_len: Option<u32>, #[uniffi(default = None)] pub kv_compression: Option<KvCompression>, #[uniffi(default = 0)] pub n_keep: u32, #[uniffi(default = None)] pub seed: Option<u64>, #[uniffi(default = 512)] pub ubatch_size: u32, #[uniffi(default = false)] pub gpu_depthformer: bool, }"
+      "expected": "pub struct SessionConfig { #[uniffi(default = None)] pub max_seq_len: Option<u32>, #[uniffi(default = None)] pub kv_compression: Option<KvCompression>, #[uniffi(default = 0)] pub n_keep: u32, #[uniffi(default = None)] pub seed: Option<u64>, #[uniffi(default = 512)] pub ubatch_size: u32, #[uniffi(default = false)] pub gpu_depthformer: bool, #[uniffi(default = false)] pub disable_spec: bool, }"
     },
     {
       "source": "cera-ffi/src/lib.rs",
@@ -417,7 +419,7 @@
       "kind": "record",
       "owner": "GenerateOpts",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
-      "expected": "pub struct GenerateOpts { #[uniffi(default = 256)] pub max_tokens: u32, #[uniffi(default = None)] pub seed: Option<u64>, #[uniffi(default = 0.7)] pub temperature: f32, #[uniffi(default = 0.9)] pub top_p: f32, #[uniffi(default = 40)] pub top_k: u32, #[uniffi(default = 0.05)] pub min_p: f32, #[uniffi(default = 1.1)] pub repetition_penalty: f32, #[uniffi(default = [])] pub stop_tokens: Vec<u32>, #[uniffi(default = false)] pub ignore_eos: bool, #[uniffi(default = None)] pub grammar: Option<String>, #[uniffi(default = [])] pub grammar_trigger_tokens: Vec<u32>, #[uniffi(default = 16)] pub flush_every_tokens: u32, #[uniffi(default = 50)] pub flush_every_ms: u32, #[uniffi(default = None)] pub spec: Option<SpecDecodeConfig>, }"
+      "expected": "pub struct GenerateOpts { #[uniffi(default = 256)] pub max_tokens: u32, #[uniffi(default = None)] pub seed: Option<u64>, #[uniffi(default = 0.7)] pub temperature: f32, #[uniffi(default = 0.9)] pub top_p: f32, #[uniffi(default = 40)] pub top_k: u32, #[uniffi(default = 0.05)] pub min_p: f32, #[uniffi(default = 1.1)] pub repetition_penalty: f32, #[uniffi(default = [])] pub stop_tokens: Vec<u32>, #[uniffi(default = false)] pub ignore_eos: bool, #[uniffi(default = None)] pub grammar: Option<String>, #[uniffi(default = [])] pub grammar_trigger_tokens: Vec<u32>, #[uniffi(default = 16)] pub flush_every_tokens: u32, #[uniffi(default = 50)] pub flush_every_ms: u32, #[uniffi(default = None)] pub spec: Option<SpecDecodeConfig>, #[uniffi(default = false)] pub no_spec: bool, }"
     },
     {
       "source": "cera-ffi/src/lib.rs",

@@ -1564,6 +1564,9 @@ pub struct SessionConfig {
     /// Whether to prefer GPU depthformer for audio decoder generation.
     #[uniffi(default = false)]
     pub gpu_depthformer: bool,
+    /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+    #[uniffi(default = false)]
+    pub disable_spec: bool,
 }
 
 impl Default for SessionConfig {
@@ -1582,6 +1585,7 @@ impl Default for SessionConfig {
             seed: core.seed,
             ubatch_size: core.ubatch_size,
             gpu_depthformer: core.gpu_depthformer,
+            disable_spec: core.disable_spec,
         }
     }
 }
@@ -1597,6 +1601,7 @@ impl From<SessionConfig> for cera::SessionConfig {
             seed: c.seed,
             ubatch_size: c.ubatch_size,
             gpu_depthformer: c.gpu_depthformer,
+            disable_spec: c.disable_spec,
         }
     }
 }
@@ -4813,6 +4818,7 @@ mod tests {
         assert_eq!(core.seed, default_core.seed);
         assert_eq!(core.ubatch_size, default_core.ubatch_size);
         assert_eq!(core.gpu_depthformer, default_core.gpu_depthformer);
+        assert_eq!(core.disable_spec, default_core.disable_spec);
     }
 
     #[test]

@@ -517,11 +517,11 @@ enum Command {
         #[arg(long, value_name = "ALPHA", requires = "lora")]
         lora_alpha: Option<f32>,
 
-        /// Enable speculative decoding (default: off).
+        /// Enable speculative decoding (defaults to ON when a draft sidecar model is present, OFF otherwise).
         #[arg(long)]
         spec: bool,
 
-        /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+        /// Disable speculative decoding (even when a draft sidecar model is present).
         #[arg(long, conflicts_with = "spec")]
         no_spec: bool,
 
@@ -691,11 +691,11 @@ enum Command {
         #[arg(long, value_name = "ALPHA", requires = "lora")]
         lora_alpha: Option<f32>,
 
-        /// Enable speculative decoding (default: off).
+        /// Enable speculative decoding (defaults to ON when a draft sidecar model is present, OFF otherwise).
         #[arg(long)]
         spec: bool,
 
-        /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+        /// Disable speculative decoding (even when a draft sidecar model is present).
         #[arg(long, conflicts_with = "spec")]
         no_spec: bool,
 
@@ -1007,18 +1007,11 @@ enum Command {
         #[arg(long)]
         gpu_io: bool,
 
-        /// Enable greedy speculative decoding (prompt-lookup drafting) for the
-        /// decode phase. Verifies K drafted tokens per forward, so a
-        /// bandwidth-bound decode amortizes its single weight-read over the
-        /// accepted run: the win shows on repetitive / long-context prompts.
-        /// Every emitted token is the target's argmax, so this is a valid
-        /// greedy decode (a near-tie may land differently than a sequential
-        /// one). Only engages on CPU dense models with an uncompressed
-        /// (f32/f16) KV cache; otherwise it's a no-op.
+        /// Enable speculative decoding (defaults to ON when a draft sidecar model is present, OFF otherwise).
         #[arg(long)]
         spec: bool,
 
-        /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+        /// Disable speculative decoding (even when a draft sidecar model is present).
         #[arg(long, conflicts_with = "spec")]
         no_spec: bool,
 
@@ -2839,7 +2832,7 @@ fn main() -> Result<()> {
                 if no_spec {
                     opts.no_spec = true;
                     opts.spec = None;
-                } else if spec || spec_ngram != 2 || spec_k != 4 {
+                } else if spec {
                     opts.spec = Some(cera::SpecDecode {
                         ngram: spec_ngram,
                         k: spec_k,
@@ -3414,8 +3407,12 @@ fn main() -> Result<()> {
                     seed: None,
                     ubatch_size,
                     n_keep,
+                    disable_spec: no_spec,
                     ..Default::default()
                 })?;
+                if no_spec {
+                    session.disable_spec();
+                }
                 attach_lora(&mut session, &lora, lora_alpha)?;
 
                 let prefill_start = std::time::Instant::now();
@@ -4387,7 +4384,7 @@ fn main() -> Result<()> {
             if no_spec {
                 opts.no_spec = true;
                 opts.spec = None;
-            } else if spec || spec_ngram != 2 || spec_k != 4 {
+            } else if spec {
                 opts.spec = Some(cera::SpecDecode {
                     ngram: spec_ngram,
                     k: spec_k,
@@ -5106,14 +5103,14 @@ fn main() -> Result<()> {
             kv_cache_keys,
             ubatch_size,
             gpu_io,
-            spec: _,
+            spec,
             no_spec,
             spec_ngram,
             spec_k,
             draft_model,
         } => {
             anyhow::ensure!(runs >= 1, "--runs must be >= 1");
-            if !no_spec {
+            if spec || draft_model.is_some() {
                 anyhow::ensure!(spec_ngram >= 1, "--spec-ngram must be >= 1");
                 anyhow::ensure!(spec_k >= 1, "--spec-k must be >= 1");
             }
@@ -5204,7 +5201,7 @@ fn main() -> Result<()> {
                 runs
             );
             let has_draft = draft_model.is_some() || engine.manifest().files.draft_model.is_some();
-            let spec_enabled = !no_spec;
+            let spec_enabled = !no_spec && (spec || has_draft);
             if spec_enabled {
                 // Speculative decode only engages on a dense model with an
                 // uncompressed KV cache; flag when it will silently no-op so the
@@ -5218,7 +5215,11 @@ fn main() -> Result<()> {
                 );
                 let engages = engine.model().supports_all_logits() && !compressed;
                 let drafter_desc = if has_draft {
-                    format!("neural draft model, k={spec_k}")
+                    if spec {
+                        format!("neural draft model, k={spec_k}")
+                    } else {
+                        format!("neural draft model")
+                    }
                 } else {
                     format!("prompt lookup (ngram={spec_ngram}, k={spec_k})")
                 };
@@ -5240,6 +5241,7 @@ fn main() -> Result<()> {
                     kv_compression: kv_compression.clone(),
                     seed: None,
                     ubatch_size,
+                    disable_spec: no_spec,
                     ..Default::default()
                 })?;
                 if no_spec {
@@ -5263,10 +5265,14 @@ fn main() -> Result<()> {
                     // completions silently shrink the measured sample.
                     ignore_eos: true,
                     no_spec,
-                    spec: spec_enabled.then_some(cera::SpecDecode {
-                        ngram: spec_ngram,
-                        k: spec_k,
-                    }),
+                    spec: if !no_spec && spec {
+                        Some(cera::SpecDecode {
+                            ngram: spec_ngram,
+                            k: spec_k,
+                        })
+                    } else {
+                        None
+                    },
                     ..Default::default()
                 };
                 let mut sink = NoopSink;
