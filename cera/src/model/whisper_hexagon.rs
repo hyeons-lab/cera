@@ -1405,38 +1405,30 @@ impl HexagonWhisperModel {
         dim: usize,
         n_tokens: usize,
     ) -> Result<(), CeraError> {
-        let chunk_size = 64;
-        let mut t_start = 0;
-        while t_start < n_tokens {
-            let chunk = (n_tokens - t_start).min(chunk_size);
-            let src_bytes = dim * chunk * 4;
-            let dst_bytes = dim * chunk * 2;
-            let cur_src_off = src_offset + t_start * dim * 4;
-            let cur_dst_off = dst_offset + t_start * dim * 2;
+        let src_bytes = dim * n_tokens * 4;
+        let dst_bytes = dim * n_tokens * 2;
 
-            let src_ti = session.add_tensor(
-                src,
-                cur_src_off,
-                src_bytes,
-                HTP_TENSOR_COMPUTE,
-                HtpDataType::F32 as u32,
-                [dim as u32, chunk as u32, 1, 1],
-                [4, (dim * 4) as u32, src_bytes as u32, src_bytes as u32],
-            )?;
-            let dst_ti = session.add_tensor(
-                dst,
-                cur_dst_off,
-                dst_bytes,
-                HTP_TENSOR_COMPUTE,
-                HtpDataType::F16 as u32,
-                [dim as u32, chunk as u32, 1, 1],
-                [2, (dim * 2) as u32, dst_bytes as u32, dst_bytes as u32],
-            )?;
-            let params = [0i32; 16];
-            let kparams = [0i32; 32];
-            session.enqueue_op(HtpOpCode::Cpy as u32, &[src_ti], &[dst_ti], params, kparams)?;
-            t_start += chunk;
-        }
+        let src_ti = session.add_tensor(
+            src,
+            src_offset,
+            src_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            [dim as u32, n_tokens as u32, 1, 1],
+            [4, (dim * 4) as u32, src_bytes as u32, src_bytes as u32],
+        )?;
+        let dst_ti = session.add_tensor(
+            dst,
+            dst_offset,
+            dst_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F16 as u32,
+            [dim as u32, n_tokens as u32, 1, 1],
+            [2, (dim * 2) as u32, dst_bytes as u32, dst_bytes as u32],
+        )?;
+        let params = [0i32; 16];
+        let kparams = [0i32; 32];
+        session.enqueue_op(HtpOpCode::Cpy as u32, &[src_ti], &[dst_ti], params, kparams)?;
         Ok(())
     }
 

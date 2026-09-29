@@ -8,6 +8,7 @@
 //! `repack_q4_K_tiled` / `repack_q6_K_tiled`. Q5_K has no DSP wire format and
 //! is requanted to Q8_0 on the host ([`requant_q5_k_to_q8_0`]) before repack.
 
+use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
 use crate::quant::{
     BlockQ4_0, BlockQ4KM, BlockQ5K, BlockQ6K, BlockQ8_0, decode_q4km_scales, dequantize_q5_k_block,
     f16_to_f32, f32_to_f16,
@@ -127,7 +128,6 @@ pub fn repack_q8_0(
     // (which would panic on overflow), and the surviving plain-arithmetic
     // uses are then provably in-range.
     let matrix_size = checked_tiled_size(ne0, ne1, TILE_SIZE_Q8_0, "repack_q8_0")?;
-    let n_col_tiles = ne1.div_ceil(32);
     let n_k_tiles = ne0.div_ceil(32);
     if dst.len() < matrix_size {
         return Err(CeraError::Backend(format!(
@@ -139,31 +139,35 @@ pub fn repack_q8_0(
     // Zero the tail so padded rows/cols read back as zero weights.
     dst[..matrix_size].fill(0);
 
-    for ct in 0..n_col_tiles {
-        for kt in 0..n_k_tiles {
-            let tile_dst = &mut dst[(ct * n_k_tiles + kt) * TILE_SIZE_Q8_0..][..TILE_SIZE_Q8_0];
-            let (tile_quants, tile_scales) = tile_dst.split_at_mut(TILE_QUANTS_Q8_0);
-            for cp in 0..16 {
+    let col_tile_bytes = n_k_tiles * TILE_SIZE_Q8_0;
+    dst[..matrix_size]
+        .par_chunks_mut(col_tile_bytes)
+        .enumerate()
+        .for_each(|(ct, ct_dst)| {
+            for kt in 0..n_k_tiles {
+                let tile_dst = &mut ct_dst[kt * TILE_SIZE_Q8_0..][..TILE_SIZE_Q8_0];
+                let (tile_quants, tile_scales) = tile_dst.split_at_mut(TILE_QUANTS_Q8_0);
+                for cp in 0..16 {
+                    for row in 0..32 {
+                        let r = ct * 32 + row;
+                        if r < ne1 && kt < ne0 / 32 {
+                            let blk_off = (r * blocks_per_row + kt) * block_size;
+                            let quants = &src_bytes[blk_off + 2..blk_off + 34];
+                            tile_quants[cp * 64 + 2 * row] = quants[2 * cp];
+                            tile_quants[cp * 64 + 2 * row + 1] = quants[2 * cp + 1];
+                        }
+                    }
+                }
                 for row in 0..32 {
                     let r = ct * 32 + row;
                     if r < ne1 && kt < ne0 / 32 {
                         let blk_off = (r * blocks_per_row + kt) * block_size;
-                        let quants = &src_bytes[blk_off + 2..blk_off + 34];
-                        tile_quants[cp * 64 + 2 * row] = quants[2 * cp];
-                        tile_quants[cp * 64 + 2 * row + 1] = quants[2 * cp + 1];
+                        tile_scales[row * 2..row * 2 + 2]
+                            .copy_from_slice(&src_bytes[blk_off..blk_off + 2]);
                     }
                 }
             }
-            for row in 0..32 {
-                let r = ct * 32 + row;
-                if r < ne1 && kt < ne0 / 32 {
-                    let blk_off = (r * blocks_per_row + kt) * block_size;
-                    tile_scales[row * 2..row * 2 + 2]
-                        .copy_from_slice(&src_bytes[blk_off..blk_off + 2]);
-                }
-            }
-        }
-    }
+        });
 
     Ok(())
 }
@@ -205,7 +209,6 @@ pub fn repack_q4_0(
     // (which would panic on overflow), and the surviving plain-arithmetic
     // uses are then provably in-range.
     let matrix_size = checked_tiled_size(ne0, ne1, TILE_SIZE_Q4_0, "repack_q4_0")?;
-    let n_col_tiles = ne1.div_ceil(32);
     let n_k_tiles = ne0.div_ceil(32);
     if dst.len() < matrix_size {
         return Err(CeraError::Backend(format!(
@@ -216,36 +219,40 @@ pub fn repack_q4_0(
     }
     dst[..matrix_size].fill(0);
 
-    for ct in 0..n_col_tiles {
-        for kt in 0..n_k_tiles {
-            let tile_dst = &mut dst[(ct * n_k_tiles + kt) * TILE_SIZE_Q4_0..][..TILE_SIZE_Q4_0];
-            let (tile_quants, tile_scales) = tile_dst.split_at_mut(TILE_QUANTS_Q4_0);
+    let col_tile_bytes = n_k_tiles * TILE_SIZE_Q4_0;
+    dst[..matrix_size]
+        .par_chunks_mut(col_tile_bytes)
+        .enumerate()
+        .for_each(|(ct, ct_dst)| {
+            for kt in 0..n_k_tiles {
+                let tile_dst = &mut ct_dst[kt * TILE_SIZE_Q4_0..][..TILE_SIZE_Q4_0];
+                let (tile_quants, tile_scales) = tile_dst.split_at_mut(TILE_QUANTS_Q4_0);
 
-            let mut quants = [[8u8; 32]; 32];
-            for row in 0..32 {
-                let r = ct * 32 + row;
-                if r < ne1 && kt < ne0 / 32 {
-                    let blk_off = (r * blocks_per_row + kt) * block_size;
-                    let packed = &src_bytes[blk_off + 2..blk_off + 18];
-                    for (i, q) in quants[row].iter_mut().enumerate() {
-                        *q = if i < 16 {
-                            packed[i] & 0x0f
-                        } else {
-                            packed[i - 16] >> 4
-                        };
-                    }
-                    tile_scales[row * 2..row * 2 + 2]
-                        .copy_from_slice(&src_bytes[blk_off..blk_off + 2]);
-                }
-            }
-            for cp in 0..16 {
+                let mut quants = [[8u8; 32]; 32];
                 for row in 0..32 {
-                    tile_quants[cp * 32 + row] =
-                        (quants[row][2 * cp + 1] << 4) | quants[row][2 * cp];
+                    let r = ct * 32 + row;
+                    if r < ne1 && kt < ne0 / 32 {
+                        let blk_off = (r * blocks_per_row + kt) * block_size;
+                        let packed = &src_bytes[blk_off + 2..blk_off + 18];
+                        for (i, q) in quants[row].iter_mut().enumerate() {
+                            *q = if i < 16 {
+                                packed[i] & 0x0f
+                            } else {
+                                packed[i - 16] >> 4
+                            };
+                        }
+                        tile_scales[row * 2..row * 2 + 2]
+                            .copy_from_slice(&src_bytes[blk_off..blk_off + 2]);
+                    }
+                }
+                for cp in 0..16 {
+                    for row in 0..32 {
+                        tile_quants[cp * 32 + row] =
+                            (quants[row][2 * cp + 1] << 4) | quants[row][2 * cp];
+                    }
                 }
             }
-        }
-    }
+        });
 
     Ok(())
 }
@@ -298,33 +305,41 @@ pub fn repack_q4_k(
     }
     dst[..matrix_size].fill(0);
 
-    for r in 0..ne1 {
-        let ct = r / 32;
-        let row = r % 32;
-        for kt in 0..n_k_tiles {
-            let kt_local = kt % 8;
-            let blk_off = (r * sb_per_row + kt / 8) * block_size;
-            let b = &src_bytes[blk_off..blk_off + block_size];
-            let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
-            let dmin = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
-            let scales: &[u8; 12] = b[4..16].try_into().unwrap();
-            let (sc, mn) = decode_q4km_scales(scales);
-            let dd = d * f32::from(sc[kt_local]);
-            let mm = -dmin * f32::from(mn[kt_local]);
+    let col_tile_bytes = n_k_tiles * TILE_SIZE_Q4_K;
+    dst[..matrix_size]
+        .par_chunks_mut(col_tile_bytes)
+        .enumerate()
+        .for_each(|(ct, ct_dst)| {
+            for row in 0..32 {
+                let r = ct * 32 + row;
+                if r >= ne1 {
+                    break;
+                }
+                for kt in 0..n_k_tiles {
+                    let kt_local = kt % 8;
+                    let blk_off = (r * sb_per_row + kt / 8) * block_size;
+                    let b = &src_bytes[blk_off..blk_off + block_size];
+                    let d = f16_to_f32(u16::from_le_bytes([b[0], b[1]]));
+                    let dmin = f16_to_f32(u16::from_le_bytes([b[2], b[3]]));
+                    let scales: &[u8; 12] = b[4..16].try_into().unwrap();
+                    let (sc, mn) = decode_q4km_scales(scales);
+                    let dd = d * f32::from(sc[kt_local]);
+                    let mm = -dmin * f32::from(mn[kt_local]);
 
-            let tile_dst = &mut dst[(ct * n_k_tiles + kt) * TILE_SIZE_Q4_K..][..TILE_SIZE_Q4_K];
-            let (tile_quants, tile_scales) = tile_dst.split_at_mut(TILE_QUANTS_Q4_K);
-            let qs_base = 16 + (kt_local / 2) * 32;
-            let shift = (kt_local & 1) * 4;
-            for cp in 0..16 {
-                let q0 = (b[qs_base + 2 * cp] >> shift) & 0x0f;
-                let q1 = (b[qs_base + 2 * cp + 1] >> shift) & 0x0f;
-                tile_quants[cp * 32 + row] = (q1 << 4) | q0;
+                    let tile_dst = &mut ct_dst[kt * TILE_SIZE_Q4_K..][..TILE_SIZE_Q4_K];
+                    let (tile_quants, tile_scales) = tile_dst.split_at_mut(TILE_QUANTS_Q4_K);
+                    let qs_base = 16 + (kt_local / 2) * 32;
+                    let shift = (kt_local & 1) * 4;
+                    for cp in 0..16 {
+                        let q0 = (b[qs_base + 2 * cp] >> shift) & 0x0f;
+                        let q1 = (b[qs_base + 2 * cp + 1] >> shift) & 0x0f;
+                        tile_quants[cp * 32 + row] = (q1 << 4) | q0;
+                    }
+                    tile_scales[row * 4..row * 4 + 2].copy_from_slice(&f32_to_f16(dd).to_le_bytes());
+                    tile_scales[row * 4 + 2..row * 4 + 4].copy_from_slice(&f32_to_f16(mm).to_le_bytes());
+                }
             }
-            tile_scales[row * 4..row * 4 + 2].copy_from_slice(&f32_to_f16(dd).to_le_bytes());
-            tile_scales[row * 4 + 2..row * 4 + 4].copy_from_slice(&f32_to_f16(mm).to_le_bytes());
-        }
-    }
+        });
 
     Ok(())
 }
@@ -397,32 +412,40 @@ pub fn repack_q6_k(
     }
     dst[..matrix_size].fill(0);
 
-    for r in 0..ne1 {
-        let ct = r / 32;
-        let row = r % 32;
-        for kt in 0..n_k_tiles {
-            let kt_local = kt % 8;
-            let blk_off = (r * sb_per_row + kt / 8) * block_size;
-            let b = &src_bytes[blk_off..blk_off + block_size];
-            let d = f16_to_f32(u16::from_le_bytes([b[208], b[209]]));
+    let col_tile_bytes = n_k_tiles * TILE_SIZE_Q6_K;
+    dst[..matrix_size]
+        .par_chunks_mut(col_tile_bytes)
+        .enumerate()
+        .for_each(|(ct, ct_dst)| {
+            for row in 0..32 {
+                let r = ct * 32 + row;
+                if r >= ne1 {
+                    break;
+                }
+                for kt in 0..n_k_tiles {
+                    let kt_local = kt % 8;
+                    let blk_off = (r * sb_per_row + kt / 8) * block_size;
+                    let b = &src_bytes[blk_off..blk_off + block_size];
+                    let d = f16_to_f32(u16::from_le_bytes([b[208], b[209]]));
 
-            let tile = &mut dst[(ct * n_k_tiles + kt) * TILE_SIZE_Q6_K..][..TILE_SIZE_Q6_K];
-            let (lo_pl, rest) = tile.split_at_mut(TILE_LO_Q6_K);
-            let (hi_pl, sc_pl) = rest.split_at_mut(TILE_HI_Q6_K);
-            for lk in 0..32 {
-                let q6 = q6_k_get_quant(b, kt_local * 32 + lk);
-                let g = lk >> 2;
-                let pos = row * 4 + (lk & 3);
-                lo_pl[(g >> 1) * 128 + pos] |= (q6 & 0x0f) << ((g & 1) * 4);
-                hi_pl[(g >> 2) * 128 + pos] |= (q6 >> 4) << ((g & 3) * 2);
+                    let tile = &mut ct_dst[kt * TILE_SIZE_Q6_K..][..TILE_SIZE_Q6_K];
+                    let (lo_pl, rest) = tile.split_at_mut(TILE_LO_Q6_K);
+                    let (hi_pl, sc_pl) = rest.split_at_mut(TILE_HI_Q6_K);
+                    for lk in 0..32 {
+                        let q6 = q6_k_get_quant(b, kt_local * 32 + lk);
+                        let g = lk >> 2;
+                        let pos = row * 4 + (lk & 3);
+                        lo_pl[(g >> 1) * 128 + pos] |= (q6 & 0x0f) << ((g & 1) * 4);
+                        hi_pl[(g >> 2) * 128 + pos] |= (q6 >> 4) << ((g & 3) * 2);
+                    }
+                    for sub in 0..2 {
+                        let s = d * f32::from(b[192 + kt_local * 2 + sub] as i8);
+                        let off = sub * 64 + row * 2;
+                        sc_pl[off..off + 2].copy_from_slice(&f32_to_f16(s).to_le_bytes());
+                    }
+                }
             }
-            for sub in 0..2 {
-                let s = d * f32::from(b[192 + kt_local * 2 + sub] as i8);
-                let off = sub * 64 + row * 2;
-                sc_pl[off..off + 2].copy_from_slice(&f32_to_f16(s).to_le_bytes());
-            }
-        }
-    }
+        });
 
     Ok(())
 }
@@ -496,29 +519,32 @@ pub fn requant_q5_k_to_q8_0(
         "requant_q5_k_to_q8_0",
     )?;
     let mut out = vec![0u8; out_len];
-    for r in 0..ne1 {
-        for sb in 0..sb_per_row {
-            let blk_off = (r * sb_per_row + sb) * block_size;
-            let b = &src_bytes[blk_off..blk_off + block_size];
-            // Reinterpret through the packed struct (little-endian, packed).
-            let block = BlockQ5K {
-                d: u16::from_le_bytes([b[0], b[1]]),
-                dmin: u16::from_le_bytes([b[2], b[3]]),
-                scales: b[4..16].try_into().unwrap(),
-                qh: b[16..48].try_into().unwrap(),
-                qs: b[48..176].try_into().unwrap(),
-            };
-            let vals = dequantize_q5_k_block(&block);
-            for (i, chunk) in vals.as_chunks::<32>().0.iter().enumerate() {
-                let q = quantize_q8_0_block(chunk);
-                let dst_off = (r * sb_per_row * 8 + sb * 8 + i) * 34;
-                out[dst_off..dst_off + 2].copy_from_slice(&q.delta.to_le_bytes());
-                for (j, &v) in q.quants.iter().enumerate() {
-                    out[dst_off + 2 + j] = v as u8;
+    let row_bytes = sb_per_row * 8 * 34;
+    out.par_chunks_mut(row_bytes)
+        .enumerate()
+        .for_each(|(r, row_out)| {
+            for sb in 0..sb_per_row {
+                let blk_off = (r * sb_per_row + sb) * block_size;
+                let b = &src_bytes[blk_off..blk_off + block_size];
+                // Reinterpret through the packed struct (little-endian, packed).
+                let block = BlockQ5K {
+                    d: u16::from_le_bytes([b[0], b[1]]),
+                    dmin: u16::from_le_bytes([b[2], b[3]]),
+                    scales: b[4..16].try_into().unwrap(),
+                    qh: b[16..48].try_into().unwrap(),
+                    qs: b[48..176].try_into().unwrap(),
+                };
+                let vals = dequantize_q5_k_block(&block);
+                for (i, chunk) in vals.as_chunks::<32>().0.iter().enumerate() {
+                    let q = quantize_q8_0_block(chunk);
+                    let dst_off = (sb * 8 + i) * 34;
+                    row_out[dst_off..dst_off + 2].copy_from_slice(&q.delta.to_le_bytes());
+                    for (j, &v) in q.quants.iter().enumerate() {
+                        row_out[dst_off + 2 + j] = v as u8;
+                    }
                 }
             }
-        }
-    }
+        });
     Ok(out)
 }
 
@@ -550,17 +576,20 @@ pub fn quantize_f32_to_q8_0(vals: &[f32], cols: usize, rows: usize) -> Result<Ve
     let blocks_per_row = cols / 32;
     let out_len = checked_src_bytes(rows, blocks_per_row, 34, "quantize_f32_to_q8_0")?;
     let mut out = vec![0u8; out_len];
-    for r in 0..rows {
-        let row_vals = &vals[r * cols..(r + 1) * cols];
-        for (b, chunk) in row_vals.as_chunks::<32>().0.iter().enumerate() {
-            let q = quantize_q8_0_block(chunk);
-            let dst_off = (r * blocks_per_row + b) * 34;
-            out[dst_off..dst_off + 2].copy_from_slice(&q.delta.to_le_bytes());
-            for (j, &v) in q.quants.iter().enumerate() {
-                out[dst_off + 2 + j] = v as u8;
+    let row_bytes = blocks_per_row * 34;
+    out.par_chunks_mut(row_bytes)
+        .enumerate()
+        .for_each(|(r, row_out)| {
+            let row_vals = &vals[r * cols..(r + 1) * cols];
+            for (b, chunk) in row_vals.as_chunks::<32>().0.iter().enumerate() {
+                let q = quantize_q8_0_block(chunk);
+                let dst_off = b * 34;
+                row_out[dst_off..dst_off + 2].copy_from_slice(&q.delta.to_le_bytes());
+                for (j, &v) in q.quants.iter().enumerate() {
+                    row_out[dst_off + 2 + j] = v as u8;
+                }
             }
-        }
-    }
+        });
     Ok(out)
 }
 

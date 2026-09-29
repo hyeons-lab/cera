@@ -15,8 +15,8 @@ use std::sync::{Arc, Mutex};
 use crate::backend::cpu::RopeType;
 use crate::backend::hexagon::{
     AdpfSession, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
-    HexagonContext, HexagonDevice, HexagonQueueSession, HtpBufDesc, HtpDataType, HtpOpCode,
-    HtpOpDesc, HtpTensor, RpcmemBuffer, TILE_SIZE_Q4_0, TILE_SIZE_Q4_K, TILE_SIZE_Q6_K,
+    HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode,
+    RpcmemBuffer, StagedBatch, TILE_SIZE_Q4_0, TILE_SIZE_Q4_K, TILE_SIZE_Q6_K,
     TILE_SIZE_Q8_0, build_binary_kernel_params, build_flash_attn_kernel_params,
     build_hmx_fa_kernel_params, build_hmx_mm_kernel_params, build_mul_mat_kernel_params,
     build_rms_norm_params, build_rope_kernel_params, build_rope_params,
@@ -111,12 +111,8 @@ const SMALL_M_FLUSH_CAP_ROWS: usize = 32;
 /// Ops-per-flush cap for small-M prefill chunks (see above).
 const MAX_OPS_PER_FLUSH: usize = 24;
 
-/// Prefill chunks below this many rows flush after every layer. The
-/// cap-24 window still races at tiny M (m = 2,4,6,7 nondeterministic
-/// run-to-run; m >= 8 bit-clean): per-layer flushes pin the window
-/// phase and restore determinism. Independent of the HMX M gate above
-/// (different mechanism: the race persists with HMX fully disabled).
-const SMALL_M_BARRIER_ROWS: usize = 8;
+// Dual activation and normed ping-pong buffers isolate adjacent layers,
+// preventing read-after-write collisions across layer boundaries.
 
 /// Default decode ops-per-flush cap. The cap is phase-sensitive, not a
 /// safety threshold: cap 20 was clean, then adding conv state-copy ops
@@ -248,10 +244,7 @@ impl ScratchOffsets {
 
 /// Static pre-serialized command queue template for zero-allocation decode dispatch.
 struct DecodeTemplate {
-    bufs: Vec<HtpBufDesc>,
-    buf_map: std::collections::HashMap<i32, u16>,
-    tens: Vec<HtpTensor>,
-    ops: Vec<HtpOpDesc>,
+    staged: StagedBatch,
     flash_attn_patches: Vec<FlashAttnPatch>,
 }
 
@@ -261,10 +254,7 @@ struct FlashAttnPatch {
     k_ti: usize,
     v_ti: usize,
     mask_ti: usize,
-    head_dim: usize,
-    n_heads: usize,
-    n_kv_heads: usize,
-    scale: f32,
+    g: usize,
 }
 
 /// Hexagon NPU accelerated model instance for LFM2 dense hybrid transformers.
@@ -2781,6 +2771,22 @@ impl HexagonLfm2Model {
 
         let run_res = (|| -> Result<(), CeraError> {
             for (layer_idx, layer) in self.layers.iter().enumerate() {
+                let cur_act = if layer_idx % 2 == 0 {
+                    so.activation
+                } else {
+                    so.activation_b
+                };
+                let next_act = if layer_idx % 2 == 0 {
+                    so.activation_b
+                } else {
+                    so.activation
+                };
+                let cur_normed = if layer_idx % 2 == 0 {
+                    so.normed
+                } else {
+                    so.normed_b
+                };
+
                 match layer {
                     HexagonLayer::Attention(attn) => {
                         let n_kv_heads = attn.kv_dim / head_dim;
@@ -2790,11 +2796,11 @@ impl HexagonLfm2Model {
                         Self::dispatch_rms_norm_mul(
                             session,
                             scratch,
-                            so.activation,
+                            cur_act,
                             &self.weights_buf,
                             attn.attn_norm_offset,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             eps,
                             hs,
                             m,
@@ -2806,7 +2812,7 @@ impl HexagonLfm2Model {
                             &self.weights_buf,
                             &[&attn.attn_q, &attn.attn_k, &attn.attn_v],
                             scratch,
-                            so.normed,
+                            cur_normed,
                             scratch,
                             &[so.q, so.k, so.v],
                             m,
@@ -2978,7 +2984,7 @@ impl HexagonLfm2Model {
                             scratch,
                             so.attn_out,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             m,
                         )?;
                         self.dump_hidden(
@@ -2986,17 +2992,17 @@ impl HexagonLfm2Model {
                             scratch,
                             layer_idx,
                             "(attn) prefill attn-out",
-                            so.normed + (m - 1) * hs * 4,
+                            cur_normed + (m - 1) * hs * 4,
                             hs,
                         );
                         Self::dispatch_add_m(
                             session,
                             scratch,
-                            so.activation,
+                            cur_act,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             scratch,
-                            so.activation,
+                            next_act,
                             hs,
                             m,
                         )?;
@@ -3005,18 +3011,18 @@ impl HexagonLfm2Model {
                             scratch,
                             layer_idx,
                             "(attn) prefill block-out",
-                            so.activation + (m - 1) * hs * 4,
+                            next_act + (m - 1) * hs * 4,
                             hs,
                         );
                         // FFN.
                         Self::dispatch_rms_norm_mul(
                             session,
                             scratch,
-                            so.activation,
+                            next_act,
                             &self.weights_buf,
                             attn.ffn_norm_offset,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             eps,
                             hs,
                             m,
@@ -3026,7 +3032,7 @@ impl HexagonLfm2Model {
                             &self.weights_buf,
                             &[&attn.ffn_gate, &attn.ffn_up],
                             scratch,
-                            so.normed,
+                            cur_normed,
                             scratch,
                             &[so.ffn_gate, so.ffn_up],
                             m,
@@ -3049,17 +3055,17 @@ impl HexagonLfm2Model {
                             scratch,
                             so.ffn_out,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             m,
                         )?;
                         Self::dispatch_add_m(
                             session,
                             scratch,
-                            so.activation,
+                            next_act,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             scratch,
-                            so.activation,
+                            next_act,
                             hs,
                             m,
                         )?;
@@ -3068,7 +3074,7 @@ impl HexagonLfm2Model {
                             scratch,
                             layer_idx,
                             "(attn) prefill post-ffn",
-                            so.activation + (m - 1) * hs * 4,
+                            next_act + (m - 1) * hs * 4,
                             hs,
                         );
                     }
@@ -3077,11 +3083,11 @@ impl HexagonLfm2Model {
                         Self::dispatch_rms_norm_mul(
                             session,
                             scratch,
-                            so.activation,
+                            cur_act,
                             &self.weights_buf,
                             conv.attn_norm_offset,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             eps,
                             hs,
                             m,
@@ -3091,7 +3097,7 @@ impl HexagonLfm2Model {
                             &self.weights_buf,
                             &conv.in_proj,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             scratch,
                             so.conv_in,
                             m,
@@ -3269,7 +3275,7 @@ impl HexagonLfm2Model {
                             scratch,
                             so.conv_ssm_y,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             m,
                         )?;
                         self.dump_hidden(
@@ -3277,7 +3283,7 @@ impl HexagonLfm2Model {
                             scratch,
                             layer_idx,
                             "(conv) prefill conv_out r0",
-                            so.normed,
+                            cur_normed,
                             hs,
                         );
                         if m > 1 {
@@ -3286,18 +3292,18 @@ impl HexagonLfm2Model {
                                 scratch,
                                 layer_idx,
                                 "(conv) prefill conv_out r1",
-                                so.normed + hs * 4,
+                                cur_normed + hs * 4,
                                 hs,
                             );
                         }
                         Self::dispatch_add_m(
                             session,
                             scratch,
-                            so.activation,
+                            cur_act,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             scratch,
-                            so.activation,
+                            next_act,
                             hs,
                             m,
                         )?;
@@ -3306,7 +3312,7 @@ impl HexagonLfm2Model {
                             scratch,
                             layer_idx,
                             "(conv) prefill block-out",
-                            so.activation + (m - 1) * hs * 4,
+                            next_act + (m - 1) * hs * 4,
                             hs,
                         );
                         self.debug_barrier(session, "prefill conv/out-proj")?;
@@ -3314,11 +3320,11 @@ impl HexagonLfm2Model {
                         Self::dispatch_rms_norm_mul(
                             session,
                             scratch,
-                            so.activation,
+                            next_act,
                             &self.weights_buf,
                             conv.ffn_norm_offset,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             eps,
                             hs,
                             m,
@@ -3328,7 +3334,7 @@ impl HexagonLfm2Model {
                             &self.weights_buf,
                             &[&conv.ffn_gate, &conv.ffn_up],
                             scratch,
-                            so.normed,
+                            cur_normed,
                             scratch,
                             &[so.ffn_gate, so.ffn_up],
                             m,
@@ -3367,17 +3373,17 @@ impl HexagonLfm2Model {
                             scratch,
                             so.ffn_out,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             m,
                         )?;
                         Self::dispatch_add_m(
                             session,
                             scratch,
-                            so.activation,
+                            next_act,
                             scratch,
-                            so.normed,
+                            cur_normed,
                             scratch,
-                            so.activation,
+                            next_act,
                             hs,
                             m,
                         )?;
@@ -3386,12 +3392,12 @@ impl HexagonLfm2Model {
                             scratch,
                             layer_idx,
                             "prefill post-ffn",
-                            so.activation + (m - 1) * hs * 4,
+                            next_act + (m - 1) * hs * 4,
                             hs,
                         );
                     }
                 }
-                if (self.debug_barriers || m < SMALL_M_BARRIER_ROWS)
+                if self.debug_barriers
                     && let Err(e) = session.flush()
                 {
                     return Err(CeraError::Backend(format!(
@@ -3400,15 +3406,26 @@ impl HexagonLfm2Model {
                 }
             }
 
+            let final_act = if self.layers.len().is_multiple_of(2) {
+                so.activation
+            } else {
+                so.activation_b
+            };
+            let final_normed = if self.layers.len().is_multiple_of(2) {
+                so.normed
+            } else {
+                so.normed_b
+            };
+
             // Final norm + LM head on the last row only.
             Self::dispatch_rms_norm_mul(
                 session,
                 scratch,
-                so.activation,
+                final_act,
                 &self.weights_buf,
                 self.output_norm_offset,
                 scratch,
-                so.normed,
+                final_normed,
                 eps,
                 hs,
                 m,
@@ -3418,7 +3435,7 @@ impl HexagonLfm2Model {
                 &self.weights_buf,
                 &self.lm_head,
                 scratch,
-                so.normed + (m - 1) * hs * 4,
+                final_normed + (m - 1) * hs * 4,
                 scratch,
                 so.logits,
             )?;
@@ -3614,29 +3631,26 @@ impl HexagonLfm2Model {
                 .unwrap_or_else(|e| e.into_inner());
             if let Some(tpl) = guard.as_mut() {
                 let seq_len = pos + 1;
-                let dsp_threads = session.dsp_threads();
+                let n_kv_blocks = seq_len.div_ceil(64).max(1) as u32;
+                let mask_bytes = (seq_len * 2) as u32;
                 for patch in &tpl.flash_attn_patches {
-                    tpl.tens[patch.k_ti].ne[1] = seq_len as u32;
-                    tpl.tens[patch.v_ti].ne[1] = seq_len as u32;
-                    let mask_bytes = (seq_len * 2) as u32;
-                    tpl.tens[patch.mask_ti].size = mask_bytes;
-                    tpl.tens[patch.mask_ti].ne[0] = seq_len as u32;
-                    tpl.tens[patch.mask_ti].nb[1] = mask_bytes;
-                    tpl.tens[patch.mask_ti].nb[2] = mask_bytes;
-                    tpl.tens[patch.mask_ti].nb[3] = mask_bytes;
-                    tpl.ops[patch.op_idx].kernel_params = build_flash_attn_kernel_params(
-                        patch.head_dim,
-                        patch.n_heads,
-                        patch.n_kv_heads,
-                        1,
-                        seq_len,
-                        patch.scale,
-                        dsp_threads,
-                        true,
-                    );
+                    let k_ten = tpl.staged.tensor_mut(patch.k_ti);
+                    k_ten.ne[1] = seq_len as u32;
+
+                    let v_ten = tpl.staged.tensor_mut(patch.v_ti);
+                    v_ten.ne[1] = seq_len as u32;
+
+                    let mask_ten = tpl.staged.tensor_mut(patch.mask_ti);
+                    mask_ten.size = mask_bytes;
+                    mask_ten.ne[0] = seq_len as u32;
+                    mask_ten.nb[1] = mask_bytes;
+                    mask_ten.nb[2] = mask_bytes;
+                    mask_ten.nb[3] = mask_bytes;
+
+                    let b2 = (n_kv_blocks & 0xffff) | ((patch.g as u32 & 0xffff) << 16);
+                    tpl.staged.op_mut(patch.op_idx).kernel_params[2] = b2 as i32;
                 }
-                session.load_batch(&tpl.bufs, &tpl.buf_map, &tpl.tens, &tpl.ops);
-                session.flush().map_err(|e| {
+                session.flush_staged(&tpl.staged).map_err(|e| {
                     CeraError::Backend(format!("Hexagon NPU execution failed: {e}"))
                 })?;
 
@@ -3859,10 +3873,7 @@ impl HexagonLfm2Model {
                                 k_ti,
                                 v_ti,
                                 mask_ti,
-                                head_dim,
-                                n_heads,
-                                n_kv_heads,
-                                scale: attn_scale,
+                                g: (n_heads / n_kv_heads.max(1)).max(1),
                             });
                         }
                         self.debug_barrier(
@@ -4414,16 +4425,13 @@ impl HexagonLfm2Model {
             }
 
             if can_use_template {
-                let (bufs, buf_map, tens, ops) = session.export_batch();
+                let staged = session.export_staged_batch()?;
                 let mut guard = self
                     .decode_template
                     .lock()
                     .unwrap_or_else(|e| e.into_inner());
                 *guard = Some(DecodeTemplate {
-                    bufs,
-                    buf_map,
-                    tens,
-                    ops,
+                    staged,
                     flash_attn_patches,
                 });
             }
@@ -4826,6 +4834,7 @@ impl Model for HexagonLfm2Model {
 #[cfg(test)]
 mod prefill_chunk_tests {
     use super::*;
+    use crate::backend::hexagon::{HtpOpDesc, HtpTensor};
     use crate::model::{ModelConfig, ScalarMultipliers};
 
     fn tiny_config() -> ModelConfig {
@@ -5100,19 +5109,26 @@ mod prefill_chunk_tests {
             dst: [0; 4],
             pad: [0; 2],
         }];
+        ops[0].kernel_params = build_flash_attn_kernel_params(
+            64,
+            16,
+            4,
+            1,
+            1,
+            0.125,
+            4,
+            true,
+        );
         let patch = FlashAttnPatch {
             op_idx: 0,
             k_ti: 0,
             v_ti: 1,
             mask_ti: 2,
-            head_dim: 64,
-            n_heads: 16,
-            n_kv_heads: 4,
-            scale: 0.125,
+            g: 16 / 4,
         };
 
         // Simulate token step at pos = 15 (seq_len = 16)
-        let pos = 15;
+        let pos: usize = 15;
         let seq_len = pos + 1;
         tens[patch.k_ti].ne[1] = seq_len as u32;
         tens[patch.v_ti].ne[1] = seq_len as u32;
@@ -5122,13 +5138,18 @@ mod prefill_chunk_tests {
         tens[patch.mask_ti].nb[1] = mask_bytes;
         tens[patch.mask_ti].nb[2] = mask_bytes;
         tens[patch.mask_ti].nb[3] = mask_bytes;
-        ops[patch.op_idx].kernel_params = build_flash_attn_kernel_params(
-            patch.head_dim,
-            patch.n_heads,
-            patch.n_kv_heads,
+
+        let n_kv_blocks = seq_len.div_ceil(64).max(1) as u32;
+        let b2 = (n_kv_blocks & 0xffff) | ((patch.g as u32 & 0xffff) << 16);
+        ops[patch.op_idx].kernel_params[2] = b2 as i32;
+
+        let expected_kparams = build_flash_attn_kernel_params(
+            64,
+            16,
+            4,
             1,
             seq_len,
-            patch.scale,
+            0.125,
             4,
             true,
         );
@@ -5138,6 +5159,6 @@ mod prefill_chunk_tests {
         assert_eq!(tens[2].ne[0], 16);
         assert_eq!(tens[2].size, 32);
         assert_eq!(tens[2].nb[1], 32);
-        assert_ne!(ops[0].kernel_params, [0; 32]);
+        assert_eq!(ops[patch.op_idx].kernel_params, expected_kparams);
     }
 }

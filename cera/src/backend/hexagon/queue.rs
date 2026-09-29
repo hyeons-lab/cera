@@ -66,6 +66,120 @@ fn stale_drain_action(rsp_seq: u64, expected: u64, drained: u32) -> StaleDrainAc
     }
 }
 
+/// Inline flat-array buffer map avoiding heap allocations on the hot path.
+#[derive(Clone, Debug, Default)]
+pub struct BufferIndexMap {
+    inline: [(i32, u16); 16],
+    count: usize,
+    overflow: Option<HashMap<i32, u16>>,
+}
+
+impl BufferIndexMap {
+    #[inline]
+    pub fn new() -> Self {
+        Self {
+            inline: [(0, 0); 16],
+            count: 0,
+            overflow: None,
+        }
+    }
+
+    #[inline]
+    pub fn clear(&mut self) {
+        self.count = 0;
+        if let Some(m) = &mut self.overflow {
+            m.clear();
+        }
+    }
+
+    #[inline]
+    pub fn get(&self, fd: i32) -> Option<u16> {
+        for i in 0..self.count {
+            if self.inline[i].0 == fd {
+                return Some(self.inline[i].1);
+            }
+        }
+        if let Some(m) = &self.overflow {
+            return m.get(&fd).copied();
+        }
+        None
+    }
+
+    #[inline]
+    pub fn insert(&mut self, fd: i32, idx: u16) {
+        for i in 0..self.count {
+            if self.inline[i].0 == fd {
+                self.inline[i].1 = idx;
+                return;
+            }
+        }
+        if self.count < 16 {
+            self.inline[self.count] = (fd, idx);
+            self.count += 1;
+        } else {
+            self.overflow
+                .get_or_insert_with(HashMap::new)
+                .insert(fd, idx);
+        }
+    }
+
+    pub fn to_hash_map(&self) -> HashMap<i32, u16> {
+        let mut map = HashMap::with_capacity(
+            self.count + self.overflow.as_ref().map_or(0, |m| m.len()),
+        );
+        for i in 0..self.count {
+            map.insert(self.inline[i].0, self.inline[i].1);
+        }
+        if let Some(overflow) = &self.overflow {
+            map.extend(overflow.iter().map(|(&k, &v)| (k, v)));
+        }
+        map
+    }
+}
+
+/// Pre-serialized and reusable batch representation in contiguous host memory.
+///
+/// Holds serialized buffer descriptors, tensor descriptors, op descriptors,
+/// and profiling descriptors ready for single-memcpy transfer to `staging_buf`.
+#[derive(Clone, Debug)]
+pub struct StagedBatch {
+    pub raw_bytes: Vec<u8>,
+    pub n_bufs: u32,
+    pub n_tensors: u32,
+    pub n_ops: u32,
+    pub bufs_bytes: usize,
+    pub tens_bytes: usize,
+    pub ops_bytes: usize,
+    pub prof_bytes: usize,
+    pub total_bytes: usize,
+}
+
+impl StagedBatch {
+    /// Mutably access a tensor descriptor in the staged command buffer.
+    #[inline]
+    pub fn tensor_mut(&mut self, ti: usize) -> &mut HtpTensor {
+        assert!(
+            ti < self.n_tensors as usize,
+            "tensor index {ti} out of bounds ({})",
+            self.n_tensors
+        );
+        let offset = self.bufs_bytes + ti * std::mem::size_of::<HtpTensor>();
+        unsafe { &mut *(self.raw_bytes.as_mut_ptr().add(offset) as *mut HtpTensor) }
+    }
+
+    /// Mutably access an operation descriptor in the staged command buffer.
+    #[inline]
+    pub fn op_mut(&mut self, op_idx: usize) -> &mut HtpOpDesc {
+        assert!(
+            op_idx < self.n_ops as usize,
+            "op index {op_idx} out of bounds ({})",
+            self.n_ops
+        );
+        let offset = self.bufs_bytes + self.tens_bytes + op_idx * std::mem::size_of::<HtpOpDesc>();
+        unsafe { &mut *(self.raw_bytes.as_mut_ptr().add(offset) as *mut HtpOpDesc) }
+    }
+}
+
 /// An active DSP command queue session managing batched request and response dispatch.
 pub struct HexagonQueueSession {
     driver: Arc<FastRpcDriver>,
@@ -73,7 +187,7 @@ pub struct HexagonQueueSession {
     queue_id: u64,
     staging_buf: RpcmemBuffer,
     bufs: Vec<HtpBufDesc>,
-    buf_map: HashMap<i32, u16>,
+    buf_map: BufferIndexMap,
     tens: Vec<HtpTensor>,
     ops: Vec<HtpOpDesc>,
     /// Auto-flush once this many ops are queued (`None` = unbounded).
@@ -122,7 +236,7 @@ impl HexagonQueueSession {
             queue_id,
             staging_buf,
             bufs: Vec::with_capacity(32),
-            buf_map: HashMap::new(),
+            buf_map: BufferIndexMap::new(),
             tens: Vec::with_capacity(256),
             ops: Vec::with_capacity(128),
             max_ops_per_flush: None,
@@ -199,7 +313,7 @@ impl HexagonQueueSession {
     ) {
         (
             self.bufs.clone(),
-            self.buf_map.clone(),
+            self.buf_map.to_hash_map(),
             self.tens.clone(),
             self.ops.clone(),
         )
@@ -216,17 +330,91 @@ impl HexagonQueueSession {
         self.bufs.clear();
         self.bufs.extend_from_slice(bufs);
         self.buf_map.clear();
-        self.buf_map.clone_from(buf_map);
+        for (&fd, &idx) in buf_map {
+            self.buf_map.insert(fd, idx);
+        }
         self.tens.clear();
         self.tens.extend_from_slice(tens);
         self.ops.clear();
         self.ops.extend_from_slice(ops);
     }
 
+    /// Export the currently pending batch as a pre-serialized staged template.
+    pub fn export_staged_batch(&self) -> Result<StagedBatch, CeraError> {
+        let bufs_bytes = self.bufs.len() * std::mem::size_of::<HtpBufDesc>();
+        let tens_bytes = self.tens.len() * std::mem::size_of::<HtpTensor>();
+        let ops_bytes = self.ops.len() * std::mem::size_of::<HtpOpDesc>();
+        let prof_bytes = self.ops.len() * std::mem::size_of::<HtpProfDesc>();
+        let total_bytes = bufs_bytes + tens_bytes + ops_bytes + prof_bytes;
+
+        if total_bytes > self.staging_buf.size() {
+            return Err(CeraError::Backend(format!(
+                "HTP batch size ({total_bytes} bytes) exceeds staging buffer ({})",
+                self.staging_buf.size()
+            )));
+        }
+
+        let mut raw_bytes = vec![0u8; total_bytes];
+        unsafe {
+            let base = raw_bytes.as_mut_ptr();
+            std::ptr::copy_nonoverlapping(self.bufs.as_ptr() as *const u8, base, bufs_bytes);
+            std::ptr::copy_nonoverlapping(
+                self.tens.as_ptr() as *const u8,
+                base.add(bufs_bytes),
+                tens_bytes,
+            );
+            std::ptr::copy_nonoverlapping(
+                self.ops.as_ptr() as *const u8,
+                base.add(bufs_bytes + tens_bytes),
+                ops_bytes,
+            );
+        }
+
+        Ok(StagedBatch {
+            raw_bytes,
+            n_bufs: self.bufs.len() as u32,
+            n_tensors: self.tens.len() as u32,
+            n_ops: self.ops.len() as u32,
+            bufs_bytes,
+            tens_bytes,
+            ops_bytes,
+            prof_bytes,
+            total_bytes,
+        })
+    }
+
+    /// Dispatch a pre-staged command batch without rebuilding or re-serializing descriptors.
+    pub fn flush_staged(&mut self, staged: &StagedBatch) -> Result<(), CeraError> {
+        let total_bytes = staged.total_bytes;
+        if total_bytes > self.staging_buf.size() {
+            return Err(CeraError::Backend(format!(
+                "HTP batch size ({total_bytes} bytes) exceeds staging buffer ({})",
+                self.staging_buf.size()
+            )));
+        }
+
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                staged.raw_bytes.as_ptr(),
+                self.staging_buf.as_mut_ptr(),
+                total_bytes,
+            );
+        }
+
+        let prof_offset = staged.bufs_bytes + staged.tens_bytes + staged.ops_bytes;
+        self.dispatch_batch_buffer(
+            total_bytes,
+            staged.n_bufs,
+            staged.n_tensors,
+            staged.n_ops,
+            prof_offset,
+        )
+    }
+
     /// Register a buffer in the batch, returning its index.
     pub fn add_buffer(&mut self, buf: &RpcmemBuffer) -> Result<u16, CeraError> {
         let fd = buf.fd();
-        if let Some(&idx) = self.buf_map.get(&fd) {
+        if let Some(idx) = self.buf_map.get(fd) {
             return Ok(idx);
         }
         let idx = Self::batch_index(self.bufs.len(), "buffers")
@@ -419,6 +607,27 @@ impl HexagonQueueSession {
             std::ptr::write_bytes(base.add(bufs_bytes + tens_bytes + ops_bytes), 0, prof_bytes);
         }
 
+        let n_bufs = self.bufs.len() as u32;
+        let n_tensors = self.tens.len() as u32;
+        let n_ops = self.ops.len() as u32;
+        let prof_offset = bufs_bytes + tens_bytes + ops_bytes;
+
+        // Attempts are single-shot: drop the pending batch whether dispatch
+        // succeeded or failed.
+        self.drop_pending_batch();
+
+        self.dispatch_batch_buffer(total_bytes, n_bufs, n_tensors, n_ops, prof_offset)
+    }
+
+    /// Internal batch submission and response polling helper shared by `flush` and `flush_staged`.
+    fn dispatch_batch_buffer(
+        &mut self,
+        total_bytes: usize,
+        n_bufs: u32,
+        n_tensors: u32,
+        n_ops: u32,
+        prof_offset: usize,
+    ) -> Result<(), CeraError> {
         self.staging_buf.flush_cpu_cache(0, total_bytes);
 
         let dbuf = DspQueueBuffer {
@@ -431,9 +640,9 @@ impl HexagonQueueSession {
 
         let req = HtpOpBatchReq {
             seq: self.seq,
-            n_bufs: self.bufs.len() as u32,
-            n_tensors: self.tens.len() as u32,
-            n_ops: self.ops.len() as u32,
+            n_bufs,
+            n_tensors,
+            n_ops,
             n_traces: 0,
         };
 
@@ -444,7 +653,6 @@ impl HexagonQueueSession {
             )
         };
 
-        let n_ops = self.ops.len();
         let host_start = std::time::Instant::now();
         let write_res = self.driver.write_dsp_queue(self.queue, &[dbuf], req_bytes);
 
@@ -526,14 +734,8 @@ impl HexagonQueueSession {
 
         self.staging_buf.invalidate_cpu_cache(0, total_bytes);
 
-        // Attempts are single-shot: drop the batch and advance `seq` whether
-        // this attempt succeeded or failed. Nothing ever retries (every
-        // flush-error path aborts its forward), while the session outlives
-        // the forward, retaining a failed batch would piggyback stale ops
-        // onto the next forward's flush. And the drain above is correct only
-        // if `seq` advances strictly per attempt: reusing a timed-out
-        // batch's `seq` would accept its late response as the new batch's.
-        self.drop_pending_batch();
+        // Attempts are single-shot: advance `seq` whether
+        // this attempt succeeded or failed.
         self.seq += 1;
 
         write_res?;
@@ -553,11 +755,11 @@ impl HexagonQueueSession {
         if *PROFILE_ENABLED.get_or_init(|| std::env::var_os("CERA_HEXAGON_PROFILE").is_some()) {
             self.record_profile(
                 rsp.seq,
-                n_ops,
+                n_ops as usize,
                 rsp.usecs,
                 rsp.cycles_stop.saturating_sub(rsp.cycles_start),
                 host_start.elapsed(),
-                bufs_bytes + tens_bytes + ops_bytes,
+                prof_offset,
             );
         }
 

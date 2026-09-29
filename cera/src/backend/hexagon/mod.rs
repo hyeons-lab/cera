@@ -16,7 +16,7 @@ pub mod types;
 pub use adpf::AdpfSession;
 pub use device::{HexagonArch, HexagonDevice, probe_device};
 pub use params::*;
-pub use queue::HexagonQueueSession;
+pub use queue::{BufferIndexMap, HexagonQueueSession, StagedBatch};
 pub use repack::*;
 pub use rpcmem::RpcmemBuffer;
 pub use skels::{HexagonProbe, PROBE_ARCHS, embedded_skel, install_skels, probe};

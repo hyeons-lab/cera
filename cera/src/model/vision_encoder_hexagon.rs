@@ -597,8 +597,19 @@ impl HexagonVisionEncoder {
             .map_err(|e| CeraError::Backend(format!("dispatch_linear_m: {e}")))?;
 
         // Broadcast bias add
-        let b_bytes = w_desc.rows * 4;
-        let b_ne = [w_desc.rows as u32, 1, 1, 1];
+        Self::dispatch_bias_add(session, dst_ti, weights, b_offset, w_desc.rows)
+    }
+
+    /// Dispatch broadcast bias add: `dst[i] += bias[i]`.
+    fn dispatch_bias_add(
+        session: &mut HexagonQueueSession,
+        dst_ti: u16,
+        weights: &RpcmemBuffer,
+        b_offset: usize,
+        rows: usize,
+    ) -> Result<(), CeraError> {
+        let b_bytes = rows * 4;
+        let b_ne = [rows as u32, 1, 1, 1];
         let b_nb = [4, b_bytes as u32, b_bytes as u32, b_bytes as u32];
         let b_ti = session.add_tensor(
             weights,
@@ -612,8 +623,8 @@ impl HexagonVisionEncoder {
 
         let add_params = [0i32; 16];
         let add_kparams = build_binary_kernel_params(
-            w_desc.rows,
-            w_desc.rows,
+            rows,
+            rows,
             1,
             1,
             1,
@@ -630,6 +641,165 @@ impl HexagonVisionEncoder {
                 add_kparams,
             )
             .map_err(|e| CeraError::Backend(format!("linear_bias_add: {e}")))?;
+
+        Ok(())
+    }
+
+    /// Dispatch fused linear QKV matmuls via MulMatNx followed by bias additions.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_linear_qkv_m(
+        session: &mut HexagonQueueSession,
+        x: &RpcmemBuffer,
+        x_offset: usize,
+        weights: &RpcmemBuffer,
+        q_w: HexagonVitWeightDesc,
+        q_b_off: usize,
+        k_w: HexagonVitWeightDesc,
+        k_b_off: usize,
+        v_w: HexagonVitWeightDesc,
+        v_b_off: usize,
+        dst: &RpcmemBuffer,
+        q_dst_off: usize,
+        k_dst_off: usize,
+        v_dst_off: usize,
+        n_tokens: usize,
+    ) -> Result<(), CeraError> {
+        if !(q_w.cols == k_w.cols
+            && k_w.cols == v_w.cols
+            && q_w.rows == k_w.rows
+            && k_w.rows == v_w.rows
+            && q_w.format == k_w.format
+            && k_w.format == v_w.format)
+        {
+            Self::dispatch_linear_m(
+                session, x, x_offset, weights, q_w, q_b_off, dst, q_dst_off, n_tokens,
+            )?;
+            Self::dispatch_linear_m(
+                session, x, x_offset, weights, k_w, k_b_off, dst, k_dst_off, n_tokens,
+            )?;
+            Self::dispatch_linear_m(
+                session, x, x_offset, weights, v_w, v_b_off, dst, v_dst_off, n_tokens,
+            )?;
+            return Ok(());
+        }
+
+        let (w_dtype, block_bytes, tile_size) = match q_w.format {
+            HexagonWeightFormat::RepackedQ8_0 => (HtpDataType::Q8_0, 34usize, 32 * 34usize),
+            HexagonWeightFormat::RepackedQ4_0 => (HtpDataType::Q4_0, 18usize, 32 * 18usize),
+        };
+
+        let ne0 = q_w.cols;
+        let ne1 = q_w.rows;
+        let tiled_row_bytes = ne0.div_ceil(32) * tile_size;
+        let w_tot = ne1.div_ceil(32) * tiled_row_bytes;
+        let w_nb = [
+            block_bytes as u32,
+            tiled_row_bytes as u32,
+            w_tot as u32,
+            w_tot as u32,
+        ];
+        let w_ne = [ne0 as u32, ne1 as u32, 1, 1];
+
+        let q_w_ti = session.add_tensor(
+            weights,
+            q_w.offset,
+            q_w.size_bytes,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            w_dtype as u32,
+            w_ne,
+            w_nb,
+        )?;
+        let k_w_ti = session.add_tensor(
+            weights,
+            k_w.offset,
+            k_w.size_bytes,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            w_dtype as u32,
+            w_ne,
+            w_nb,
+        )?;
+        let v_w_ti = session.add_tensor(
+            weights,
+            v_w.offset,
+            v_w.size_bytes,
+            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+            w_dtype as u32,
+            w_ne,
+            w_nb,
+        )?;
+
+        let x_bytes = n_tokens * ne0 * 4;
+        let x_ne = [ne0 as u32, n_tokens as u32, 1, 1];
+        let x_nb = [4, (ne0 * 4) as u32, x_bytes as u32, x_bytes as u32];
+        let x_ti = session.add_tensor(
+            x,
+            x_offset,
+            x_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            x_ne,
+            x_nb,
+        )?;
+
+        let dst_bytes = n_tokens * ne1 * 4;
+        let dst_ne = [ne1 as u32, n_tokens as u32, 1, 1];
+        let dst_nb = [4, (ne1 * 4) as u32, dst_bytes as u32, dst_bytes as u32];
+
+        let q_dst_ti = session.add_tensor(
+            dst,
+            q_dst_off,
+            dst_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            dst_ne,
+            dst_nb,
+        )?;
+        let k_dst_ti = session.add_tensor(
+            dst,
+            k_dst_off,
+            dst_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            dst_ne,
+            dst_nb,
+        )?;
+        let v_dst_ti = session.add_tensor(
+            dst,
+            v_dst_off,
+            dst_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            dst_ne,
+            dst_nb,
+        )?;
+
+        let mut kparams = crate::backend::hexagon::build_mul_mat_kernel_params(
+            w_dtype,
+            ne0,
+            n_tokens as u32,
+            1,
+            ne1 * 4,
+            session.dsp_threads(),
+            8 * 1024 * 1024,
+        );
+        kparams[0] = 5; // HTP_MM_KERNEL_HVX_QUANT_ROW
+        kparams[17] = 3; // n_weights
+
+        let params = [0i32; 16];
+        session
+            .enqueue_op(
+                HtpOpCode::MulMatNx as u32,
+                &[q_w_ti, k_w_ti, v_w_ti, x_ti],
+                &[q_dst_ti, k_dst_ti, v_dst_ti],
+                params,
+                kparams,
+            )
+            .map_err(|e| CeraError::Backend(format!("dispatch_linear_qkv_m: {e}")))?;
+
+        // Broadcast bias adds
+        Self::dispatch_bias_add(session, q_dst_ti, weights, q_b_off, ne1)?;
+        Self::dispatch_bias_add(session, k_dst_ti, weights, k_b_off, ne1)?;
+        Self::dispatch_bias_add(session, v_dst_ti, weights, v_b_off, ne1)?;
 
         Ok(())
     }
@@ -972,37 +1142,21 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                     n_embd,
                 )?;
 
-                // Q, K, V linear projections
-                Self::dispatch_linear_m(
+                // Fused Q, K, V linear projections via MulMatNx
+                Self::dispatch_linear_qkv_m(
                     session,
                     scratch_guard,
                     so.pre_norm_off,
                     &self.weights_buf,
                     blk.q_w,
                     blk.q_b_off,
-                    scratch_guard,
-                    so.q_off,
-                    n_patches,
-                )?;
-                Self::dispatch_linear_m(
-                    session,
-                    scratch_guard,
-                    so.pre_norm_off,
-                    &self.weights_buf,
                     blk.k_w,
                     blk.k_b_off,
-                    scratch_guard,
-                    so.k_off,
-                    n_patches,
-                )?;
-                Self::dispatch_linear_m(
-                    session,
-                    scratch_guard,
-                    so.pre_norm_off,
-                    &self.weights_buf,
                     blk.v_w,
                     blk.v_b_off,
                     scratch_guard,
+                    so.q_off,
+                    so.k_off,
                     so.v_off,
                     n_patches,
                 )?;
