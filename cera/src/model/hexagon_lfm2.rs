@@ -267,8 +267,6 @@ struct FlashAttnPatch {
 
 /// Hexagon NPU accelerated model instance for LFM2 dense hybrid transformers.
 pub struct HexagonLfm2Model {
-    #[allow(dead_code)]
-    context: Arc<HexagonContext>,
     device: Mutex<HexagonDevice>,
     config: ModelConfig,
     session_gate: ModelSessionGate,
@@ -1034,7 +1032,6 @@ impl HexagonLfm2Model {
         let vtcm_budget = device.hw_info().vtcm_size as usize;
 
         Ok(Self {
-            context,
             device: Mutex::new(device),
             config,
             session_gate: ModelSessionGate::default(),

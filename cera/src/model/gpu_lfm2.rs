@@ -7063,27 +7063,36 @@ impl GpuLfm2Model {
         y_stride: u32,
         all_logits: bool,
     ) {
-        // Streaming fp16 fast path (Q4_0, Q4_K_M, n >= 32, k % 32 == 0, packed B):
-        // ~10x the reg-tile kernel on Adreno. Anything it declines: other
-        // dtypes, short rows, strided B, missing repack: falls through to
-        // reg-tile below.
-        if (w.tensor.dtype == DType::Q4_0 || w.tensor.dtype == DType::Q4KM)
-            && n >= 32
+        // Streaming fp16 fast path:
+        // - Q4_K_M: gemm_stream_q4_k handles any n (bounds-checked per column)
+        // - Q4_0: gemm_stream_q4_0 handles n >= 32; n < 32 rides mul_mat_reg_tile_q4_0_stream
+        if w.tensor.dtype == DType::Q4KM
             && k.is_multiple_of(32)
             && x_stride == k
+            && self.pipelines.gemm_stream_q4_k.is_some()
             && self.pipelines.transpose_cast_f16.is_some()
             && w.stream_q.is_some()
             && w.stream_d.is_some()
         {
-            if w.tensor.dtype == DType::Q4KM && self.pipelines.gemm_stream_q4_k.is_some() {
-                self.encode_gemm_stream_q4_k(cmds, w, x, y, n, k, y_stride, all_logits);
-                return;
-            }
-            if w.tensor.dtype == DType::Q4_0 && self.pipelines.gemm_stream_q4_0.is_some() {
-                self.encode_gemm_stream_q4_0(cmds, w, x, y, n, k, y_stride, all_logits);
-                return;
-            }
+            self.encode_gemm_stream_q4_k(cmds, w, x, y, n, k, y_stride, all_logits);
+            return;
         }
+        if w.tensor.dtype == DType::Q4_0
+            && n >= 32
+            && k.is_multiple_of(32)
+            && x_stride == k
+            && self.pipelines.gemm_stream_q4_0.is_some()
+            && self.pipelines.transpose_cast_f16.is_some()
+            && w.stream_q.is_some()
+            && w.stream_d.is_some()
+        {
+            self.encode_gemm_stream_q4_0(cmds, w, x, y, n, k, y_stride, all_logits);
+            return;
+        }
+        debug_assert!(
+            !w.resident_stream || w.tensor.dtype == DType::Q4_0,
+            "resident-stream reg-tile fallback is only valid for Q4_0; Q4KM must ride gemm_stream_q4_k"
+        );
         debug_assert!(
             matches!(
                 w.tensor.dtype,

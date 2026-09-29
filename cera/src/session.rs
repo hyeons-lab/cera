@@ -3152,7 +3152,7 @@ impl Session {
                             // `decode_frame` runs the vocoder, not the LLM: it
                             // takes no `Model` handle, so it cannot poison the
                             // slot between the `forward_embedding` check above
-                            // and this one — this drain covers exactly the
+                            // and this one: this drain covers exactly the
                             // `TOKEN_TEXT_END` forward. (The vocoder's own
                             // failures, if any, don't flow through this slot;
                             // the standalone driver's drains live in
