@@ -791,7 +791,7 @@ class GenerateOpts {
     /// Optional speculative decoding configuration (prompt-lookup drafting).
     /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
     this.spec = null,
-    /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+    /// Disable speculative decoding (even when a draft sidecar model is present).
     this.noSpec = false,
   });
 
@@ -834,7 +834,7 @@ class GenerateOpts {
   /// Optional speculative decoding configuration (prompt-lookup drafting).
   /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
   final SpecDecodeConfig? spec;
-  /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+  /// Disable speculative decoding (even when a draft sidecar model is present).
   final bool noSpec;
 
   Map<String, dynamic> toJson() {

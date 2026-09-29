@@ -1707,7 +1707,7 @@ pub struct GenerateOpts {
     /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
     #[uniffi(default = None)]
     pub spec: Option<SpecDecodeConfig>,
-    /// Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+    /// Disable speculative decoding (even when a draft sidecar model is present).
     #[uniffi(default = false)]
     pub no_spec: bool,
 }

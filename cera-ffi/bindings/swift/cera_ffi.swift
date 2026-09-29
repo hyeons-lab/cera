@@ -7707,7 +7707,7 @@ public struct GenerateOpts: Equatable, Hashable {
      */
     public var spec: SpecDecodeConfig?
     /**
-     * Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+     * Disable speculative decoding (even when a draft sidecar model is present).
      */
     public var noSpec: Bool
 
@@ -7760,7 +7760,7 @@ public struct GenerateOpts: Equatable, Hashable {
          * When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
          */spec: SpecDecodeConfig? = nil, 
         /**
-         * Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+         * Disable speculative decoding (even when a draft sidecar model is present).
          */noSpec: Bool = false) {
         self.maxTokens = maxTokens
         self.seed = seed

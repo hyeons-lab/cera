@@ -3204,107 +3204,58 @@ fn main() -> Result<()> {
                 }
                 let gpu_df_requested = std::env::var("CERA_GPU_DF").as_deref() == Ok("1");
 
-                // Select the audio GPU backend for the detokenizer (and, under
-                // CERA_GPU_DF, the depthformer): CERA_AUDIO_GPU in
-                // {metal, wgpu, cpu}. Default: metal on macOS+metal, else cpu.
-                let audio_gpu_choice = std::env::var("CERA_AUDIO_GPU").ok();
-                let audio_gpu_choice = audio_gpu_choice.as_deref().unwrap_or(
-                    if cfg!(all(
-                        feature = "metal",
-                        any(target_os = "macos", target_os = "ios")
-                    )) {
-                        "metal"
-                    } else {
-                        "cpu"
-                    },
-                );
-                let gpu_detok: Option<Box<dyn cera::model::audio_decoder::AudioAccelerator>> =
-                    match audio_gpu_choice {
-                        "cpu" => None,
-                        "metal" => {
-                            #[cfg(all(
-                                feature = "metal",
-                                any(target_os = "macos", target_os = "ios")
-                            ))]
-                            {
-                                match cera::model::metal_audio_decoder::MetalAudioDecoder::from_gguf(
-                                    &voc_gguf,
-                                    Path::new(vocoder_path),
-                                ) {
-                                    Ok(d) => {
-                                        eprintln!("Metal detokenizer loaded");
-                                        Some(Box::new(d)
-                                            as Box<
-                                                dyn cera::model::audio_decoder::AudioAccelerator,
-                                            >)
-                                    }
-                                    Err(e) => {
-                                        eprintln!("Metal detokenizer failed: {e}, using CPU");
-                                        None
-                                    }
-                                }
-                            }
-                            #[cfg(not(all(
-                                feature = "metal",
-                                any(target_os = "macos", target_os = "ios")
-                            )))]
-                            {
-                                eprintln!(
-                                    "CERA_AUDIO_GPU=metal but the metal backend is not built; using CPU"
-                                );
-                                None
-                            }
-                        }
-                        "wgpu" => {
-                            #[cfg(feature = "gpu")]
-                            {
-                                match cera::model::wgpu_audio_decoder::WgpuAudioDecoder::from_gguf(
-                                    &voc_gguf,
-                                    Path::new(vocoder_path),
-                                ) {
-                                    Ok(d) => {
-                                        eprintln!("WGPU detokenizer loaded");
-                                        Some(Box::new(d)
-                                            as Box<
-                                                dyn cera::model::audio_decoder::AudioAccelerator,
-                                            >)
-                                    }
-                                    Err(e) => {
-                                        eprintln!("WGPU detokenizer failed: {e}, using CPU");
-                                        None
-                                    }
-                                }
-                            }
-                            #[cfg(not(feature = "gpu"))]
-                            {
-                                eprintln!(
-                                    "CERA_AUDIO_GPU=wgpu but the gpu feature is not built; using CPU"
-                                );
-                                None
-                            }
-                        }
+                // Select the audio accelerator backend for the detokenizer and depthformer.
+                // Priority: explicit CERA_AUDIO_GPU override if present, else parsed --device backend.
+                let backend_pref = if let Ok(env_override) = std::env::var("CERA_AUDIO_GPU") {
+                    match env_override.to_ascii_lowercase().as_str() {
+                        "cpu" => BackendPreference::Cpu,
+                        "metal" => BackendPreference::Metal,
+                        "wgpu" | "gpu" => BackendPreference::Gpu,
+                        "hexagon" | "npu" => BackendPreference::Hexagon,
+                        "auto" => BackendPreference::Auto,
                         other => {
                             eprintln!("unknown CERA_AUDIO_GPU={other}; using CPU");
-                            None
+                            BackendPreference::Cpu
                         }
-                    };
+                    }
+                } else {
+                    BackendPreference::parse_str(&device).unwrap_or(BackendPreference::Auto)
+                };
 
-                // `CERA_GPU_DF=1` asks for the depthformer on the GPU, but only
-                // some backends have one: WGPU ships the detokenizer alone and
-                // its `sample_audio_frame` panics, and even Metal leaves the
-                // depthformer `None` if those weights failed to load. Honouring
-                // the flag on either would crash generation instead of falling
-                // back, so it is resolved against the backend that was actually
-                // built, not against the environment variable alone.
-                let gpu_depthformer = gpu_df_requested
-                    && gpu_detok.as_ref().is_some_and(|d| d.supports_depthformer());
+                let gpu_detok =
+                    cera::model::audio_decoder::build_audio_accelerator(&voc_gguf, backend_pref);
+                if gpu_detok.is_some() {
+                    eprintln!("Audio accelerator loaded ({backend_pref:?})");
+                } else if backend_pref != BackendPreference::Cpu {
+                    eprintln!("Audio accelerator ({backend_pref:?}) unavailable; using CPU");
+                }
+
+                // Depthformer execution:
+                // Hardware-accelerated depthformers (e.g. Hexagon NPU) run automatically when supported.
+                // Metal depthformer remains experimental and requires explicit CERA_GPU_DF=1.
+                let gpu_depthformer = gpu_detok.as_ref().is_some_and(|d| {
+                    if d.supports_depthformer() {
+                        if cfg!(all(
+                            feature = "metal",
+                            any(target_os = "macos", target_os = "ios")
+                        )) && backend_pref == BackendPreference::Metal
+                        {
+                            gpu_df_requested
+                        } else {
+                            true
+                        }
+                    } else {
+                        false
+                    }
+                });
+
                 if gpu_df_requested && !gpu_depthformer && gpu_detok.is_some() {
                     eprintln!(
-                        "CERA_GPU_DF=1 ignored: the selected audio GPU backend has no \
+                        "CERA_GPU_DF=1 ignored: the selected audio accelerator backend has no \
                          depthformer; sampling codes on the CPU"
                     );
                 }
-                if gpu_depthformer {
+                if gpu_depthformer && backend_pref == BackendPreference::Metal {
                     eprintln!(
                         "warning: CERA_GPU_DF=1 enables an experimental Metal depthformer that \
                          currently produces incorrect codes (frame-1 immediate-end with \

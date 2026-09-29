@@ -13272,7 +13272,7 @@ data class GenerateOpts(
      */
     var `spec`: SpecDecodeConfig? = null,
     /**
-     * Disable speculative decoding (defaults to ON using draft sidecar if present, or prompt lookup).
+     * Disable speculative decoding (even when a draft sidecar model is present).
      */
     var `noSpec`: kotlin.Boolean = false,
 ) {
