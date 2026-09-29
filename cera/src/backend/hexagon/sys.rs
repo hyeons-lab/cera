@@ -374,6 +374,31 @@ impl FastRpcDriver {
         Ok(())
     }
 
+    /// Configure FastRPC driver wakelock to prevent Android power management from suspending the device during active inference.
+    pub fn set_wakelock(&self, enable: bool) -> Result<(), CeraError> {
+        if let Some(control_fn) = self.remote_session_control {
+            #[repr(C)]
+            struct WakelockControl {
+                enable: u32,
+            }
+            let mut ctrl = WakelockControl {
+                enable: if enable { 1 } else { 0 },
+            };
+            let ret = control_fn(
+                4, // FASTRPC_CONTROL_WAKELOCK
+                &mut ctrl as *mut _ as *mut c_void,
+                std::mem::size_of::<WakelockControl>() as u32,
+            );
+            if ret != 0 {
+                tracing::debug!(
+                    "remote_session_control(wakelock) returned error 0x{:08x}; continuing without wakelock vote",
+                    ret
+                );
+            }
+        }
+        Ok(())
+    }
+
     /// Open a FastRPC handle to a skeleton library (e.g. `file:///libggml-htp-v75.so?domain=3`).
     pub fn open_skel_handle(&self, uri: &str) -> Result<RemoteHandle64, CeraError> {
         let c_uri = CString::new(uri).map_err(|e| CeraError::Backend(e.to_string()))?;

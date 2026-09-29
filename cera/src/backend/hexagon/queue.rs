@@ -34,6 +34,11 @@ fn debug_enabled() -> bool {
     *DEBUG.get_or_init(|| std::env::var_os("CERA_HEXAGON_DEBUG").is_some())
 }
 
+fn profile_enabled() -> bool {
+    static PROFILE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *PROFILE.get_or_init(|| std::env::var_os("CERA_HEXAGON_PROFILE").is_some())
+}
+
 /// One stale-drain decision: what the drain loop does with a freshly-read
 /// `rsp_seq` when `expected` was awaited and `drained` stale responses
 /// have already been consumed this flush. Pure so the seq/cap boundary is
@@ -203,6 +208,7 @@ pub struct HexagonQueueSession {
     /// kparams thread counts derive from this; the default is llama's
     /// hwinfo-failure fallback until `HexagonDevice` overwrites it.
     dsp_threads: u32,
+    resident_staged_id: Option<u64>,
 }
 
 // Queue session operations are Send across threads when guarded by model session locks.
@@ -245,6 +251,7 @@ impl HexagonQueueSession {
             prof_dsp_us: 0,
             prof_flushes: 0,
             dsp_threads: 8,
+            resident_staged_id: None,
         })
     }
 
@@ -294,6 +301,7 @@ impl HexagonQueueSession {
         self.buf_map.clear();
         self.tens.clear();
         self.ops.clear();
+        self.resident_staged_id = None;
     }
 
     /// Number of operations currently enqueued in the pending batch.
@@ -384,6 +392,7 @@ impl HexagonQueueSession {
 
     /// Dispatch a pre-staged command batch without rebuilding or re-serializing descriptors.
     pub fn flush_staged(&mut self, staged: &StagedBatch) -> Result<(), CeraError> {
+        self.resident_staged_id = None;
         let total_bytes = staged.total_bytes;
         if total_bytes > self.staging_buf.size() {
             return Err(CeraError::Backend(format!(
@@ -398,6 +407,58 @@ impl HexagonQueueSession {
                 self.staging_buf.as_mut_ptr(),
                 total_bytes,
             );
+        }
+
+        let prof_offset = staged.bufs_bytes + staged.tens_bytes + staged.ops_bytes;
+        self.dispatch_batch_buffer(
+            total_bytes,
+            staged.n_bufs,
+            staged.n_tensors,
+            staged.n_ops,
+            prof_offset,
+        )
+    }
+
+    /// Dispatch a pre-staged command batch, retaining resident descriptor memory in `staging_buf`.
+    /// When `resident_id` matches the currently resident batch, only the memory slices in
+    /// `patch_ranges` are copied from `staged.raw_bytes` to `staging_buf`, eliminating full-buffer copies.
+    pub fn flush_staged_resident(
+        &mut self,
+        resident_id: u64,
+        staged: &StagedBatch,
+        patch_ranges: &[std::ops::Range<usize>],
+    ) -> Result<(), CeraError> {
+        let total_bytes = staged.total_bytes;
+        if total_bytes > self.staging_buf.size() {
+            return Err(CeraError::Backend(format!(
+                "HTP batch size ({total_bytes} bytes) exceeds staging buffer ({})",
+                self.staging_buf.size()
+            )));
+        }
+
+        if self.resident_staged_id != Some(resident_id) {
+            unsafe {
+                std::ptr::copy_nonoverlapping(
+                    staged.raw_bytes.as_ptr(),
+                    self.staging_buf.as_mut_ptr(),
+                    total_bytes,
+                );
+            }
+            self.resident_staged_id = Some(resident_id);
+        } else {
+            for range in patch_ranges {
+                let start = range.start;
+                let end = range.end.min(total_bytes);
+                if start < end {
+                    unsafe {
+                        std::ptr::copy_nonoverlapping(
+                            staged.raw_bytes.as_ptr().add(start),
+                            self.staging_buf.as_mut_ptr().add(start),
+                            end - start,
+                        );
+                    }
+                }
+            }
         }
 
         let prof_offset = staged.bufs_bytes + staged.tens_bytes + staged.ops_bytes;
@@ -532,6 +593,7 @@ impl HexagonQueueSession {
 
     /// Flush all queued operations in a single atomic batch execution.
     pub fn flush(&mut self) -> Result<(), CeraError> {
+        self.resident_staged_id = None;
         if self.ops.is_empty() {
             return Ok(());
         }
@@ -731,7 +793,10 @@ impl HexagonQueueSession {
             }
         }
 
-        self.staging_buf.invalidate_cpu_cache(0, total_bytes);
+        if profile_enabled() && total_bytes > prof_offset {
+            self.staging_buf
+                .invalidate_cpu_cache(prof_offset, total_bytes - prof_offset);
+        }
 
         // Attempts are single-shot: advance `seq` whether
         // this attempt succeeded or failed.
@@ -750,8 +815,7 @@ impl HexagonQueueSession {
             )));
         }
 
-        static PROFILE_ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *PROFILE_ENABLED.get_or_init(|| std::env::var_os("CERA_HEXAGON_PROFILE").is_some()) {
+        if profile_enabled() {
             self.record_profile(
                 rsp.seq,
                 n_ops as usize,

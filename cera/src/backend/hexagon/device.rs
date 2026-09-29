@@ -93,6 +93,7 @@ impl HexagonDevice {
 
         // Configure CDSP latency QoS to prevent power collapse during active inference
         let _ = driver.set_latency_qos(100);
+        let _ = driver.set_wakelock(true);
 
         // FastRPC URI pointing to the architecture skel library in CDSP Unsigned PD
         let skel_uri = format!(
@@ -266,6 +267,7 @@ impl Drop for HexagonDevice {
         let stop_scalars = remote_scalars_make(3, 0, 0);
         let _ = self.driver.invoke_skel(self.handle, stop_scalars, &mut []);
         self.driver.close_skel_handle(self.handle);
+        let _ = self.driver.set_wakelock(false);
         let _ = self.driver.set_latency_qos(0);
     }
 }

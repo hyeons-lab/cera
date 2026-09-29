@@ -5894,11 +5894,7 @@ mod tests {
             }
         }
         // `run` requires a prompt; chat/bench take a bare model.
-        let extra: &[(&str, &[&str])] = &[
-            ("run", &["-p", "hello"]),
-            ("chat", &[]),
-            ("bench", &[]),
-        ];
+        let extra: &[(&str, &[&str])] = &[("run", &["-p", "hello"]), ("chat", &[]), ("bench", &[])];
         for (sub, rest) in extra {
             let mut base: Vec<&str> = vec!["cera", sub, "-m", "/tmp/base.gguf"];
             base.extend_from_slice(rest);

@@ -337,8 +337,10 @@ fn repack_q4_k_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
         for b in 0..blocks_256 {
             let base = (row * blocks_256 + b) * block_size;
             let block_bytes = &data[base..base + block_size];
-            let d_val = half::f16::from_bits(u16::from_le_bytes([block_bytes[0], block_bytes[1]])).to_f32();
-            let dmin_val = half::f16::from_bits(u16::from_le_bytes([block_bytes[2], block_bytes[3]])).to_f32();
+            let d_val =
+                half::f16::from_bits(u16::from_le_bytes([block_bytes[0], block_bytes[1]])).to_f32();
+            let dmin_val =
+                half::f16::from_bits(u16::from_le_bytes([block_bytes[2], block_bytes[3]])).to_f32();
 
             let mut scales = [0u8; 12];
             scales.copy_from_slice(&block_bytes[4..16]);
@@ -10529,7 +10531,7 @@ mod tests {
     #[test]
     fn stream_repack_q4_k_layout() {
         use super::repack_q4_k_stream;
-        use crate::quant::{dequantize_q4_k_m_block, BlockQ4KM};
+        use crate::quant::{BlockQ4KM, dequantize_q4_k_m_block};
         let (m, k) = (2usize, 256usize);
         let mut data = vec![0u8; m * 144];
 

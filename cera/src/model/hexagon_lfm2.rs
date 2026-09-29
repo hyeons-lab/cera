@@ -250,8 +250,10 @@ impl ScratchOffsets {
 
 /// Static pre-serialized command queue template for zero-allocation decode dispatch.
 struct DecodeTemplate {
+    resident_id: u64,
     staged: StagedBatch,
     flash_attn_patches: Vec<FlashAttnPatch>,
+    patch_ranges: Vec<std::ops::Range<usize>>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -2808,9 +2810,10 @@ impl HexagonLfm2Model {
                 kv_len * m,
             );
             for (mm, row) in mask.chunks_mut(kv_len).enumerate() {
-                let allowed = start_pos + mm + 1;
-                for (kv, slot) in row.iter_mut().enumerate() {
-                    *slot = if kv < allowed { 0x0000 } else { 0xFC00 };
+                let allowed = (start_pos + mm + 1).min(kv_len);
+                row[..allowed].fill(0x0000);
+                if allowed < kv_len {
+                    row[allowed..].fill(0xFC00);
                 }
             }
         }
@@ -3736,9 +3739,11 @@ impl HexagonLfm2Model {
                     let b2 = (n_kv_blocks & 0xffff) | ((patch.g as u32 & 0xffff) << 16);
                     tpl.staged.op_mut(patch.op_idx).kernel_params[2] = b2 as i32;
                 }
-                session.flush_staged(&tpl.staged).map_err(|e| {
-                    CeraError::Backend(format!("Hexagon NPU execution failed: {e}"))
-                })?;
+                session
+                    .flush_staged_resident(tpl.resident_id, &tpl.staged, &tpl.patch_ranges)
+                    .map_err(|e| {
+                        CeraError::Backend(format!("Hexagon NPU execution failed: {e}"))
+                    })?;
 
                 self.current_seq_len.store(pos + 1, Ordering::SeqCst);
                 state.seq_len = pos + 1;
@@ -4526,15 +4531,30 @@ impl HexagonLfm2Model {
 
             if can_use_template {
                 let staged = session.export_staged_batch()?;
-                let template_slot = if output == DecodeOutput::Greedy {
-                    &self.greedy_decode_template
+                let (template_slot, resident_id) = if output == DecodeOutput::Greedy {
+                    (&self.greedy_decode_template, 2u64)
                 } else {
-                    &self.decode_template
+                    (&self.decode_template, 1u64)
                 };
+                let tensor_sz = std::mem::size_of::<crate::backend::hexagon::HtpTensor>();
+                let op_sz = std::mem::size_of::<crate::backend::hexagon::HtpOpDesc>();
+                let mut patch_ranges = Vec::with_capacity(flash_attn_patches.len() * 4);
+                for patch in &flash_attn_patches {
+                    let k_off = staged.bufs_bytes + patch.k_ti * tensor_sz;
+                    patch_ranges.push(k_off..k_off + tensor_sz);
+                    let v_off = staged.bufs_bytes + patch.v_ti * tensor_sz;
+                    patch_ranges.push(v_off..v_off + tensor_sz);
+                    let m_off = staged.bufs_bytes + patch.mask_ti * tensor_sz;
+                    patch_ranges.push(m_off..m_off + tensor_sz);
+                    let op_off = staged.bufs_bytes + staged.tens_bytes + patch.op_idx * op_sz;
+                    patch_ranges.push(op_off..op_off + op_sz);
+                }
                 let mut guard = template_slot.lock().unwrap_or_else(|e| e.into_inner());
                 *guard = Some(DecodeTemplate {
+                    resident_id,
                     staged,
                     flash_attn_patches,
+                    patch_ranges,
                 });
             }
 

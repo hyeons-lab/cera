@@ -2834,13 +2834,11 @@ impl Session {
             None
         } else if opts.spec.is_some() {
             opts.spec
-        } else if let Some(d) = &self.drafter {
-            Some(SpecDecode {
+        } else {
+            self.drafter.as_ref().map(|d| SpecDecode {
                 ngram: 2,
                 k: d.suggested_k().unwrap_or(6),
             })
-        } else {
-            None
         };
         if let Some(sd) = spec_opt
             && greedy
@@ -4719,9 +4717,13 @@ mod tests {
             session_raw.tokenizer.clone(),
             session_raw.capabilities,
             config,
-        ).unwrap();
+        )
+        .unwrap();
         session.append_tokens(&[1, 2, 3]).unwrap();
-        session.drafter = Some(Box::new(CannedDrafter { script: vec![vec![0, 0]], calls: 0 }));
+        session.drafter = Some(Box::new(CannedDrafter {
+            script: vec![vec![0, 0]],
+            calls: 0,
+        }));
         let mut sink = RecordingSink::default();
         let opts = GenerateOpts {
             temperature: 0.0,
