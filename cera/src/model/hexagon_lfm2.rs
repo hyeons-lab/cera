@@ -5003,6 +5003,16 @@ impl Model for HexagonLfm2Model {
         Ok(())
     }
 
+    fn try_truncate_kv(
+        &self,
+        state: &mut InferenceState,
+        len: usize,
+    ) -> Result<(), crate::kv_cache::KvRewindError> {
+        self.check_kv_rewind(state, len)?;
+        self.truncate_kv(state, len);
+        Ok(())
+    }
+
     fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
         assert!(
             len <= state.seq_len,

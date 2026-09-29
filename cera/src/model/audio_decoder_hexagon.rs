@@ -1439,10 +1439,7 @@ impl HexagonAudioDecoder {
 
     /// Record the first fault into the sticky error slot.
     fn record_error(&self, err: CeraError) {
-        let mut guard = self.last_error.lock().unwrap_or_else(|e| e.into_inner());
-        if guard.is_none() {
-            *guard = Some(err);
-        }
+        crate::model::record_first_fault(&self.last_error, err);
     }
 
     /// Stage weights into contiguous rpcmem buffer.
@@ -2962,10 +2959,7 @@ impl AudioAccelerator for HexagonAudioDecoder {
     }
 
     fn take_audio_error(&self) -> Option<CeraError> {
-        self.last_error
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .take()
+        crate::model::take_fault(&self.last_error)
     }
 
     fn try_acquire_session(&self) -> bool {
@@ -3312,24 +3306,18 @@ mod tests {
     #[test]
     fn test_hexagon_audio_decoder_error_recording() {
         let last_error = Mutex::new(None);
-        let record = |err: CeraError| {
-            let mut guard = last_error.lock().unwrap_or_else(|e| e.into_inner());
-            if guard.is_none() {
-                *guard = Some(err);
-            }
-        };
 
         // Record first error
-        record(CeraError::Backend("dsp failure 1".into()));
+        crate::model::record_first_fault(&last_error, CeraError::Backend("dsp failure 1".into()));
         // Record second error (must be discarded by sticky contract)
-        record(CeraError::Backend("dsp failure 2".into()));
+        crate::model::record_first_fault(&last_error, CeraError::Backend("dsp failure 2".into()));
 
-        let drained = last_error.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let drained = crate::model::take_fault(&last_error);
         assert!(drained.is_some());
         assert_eq!(drained.unwrap().to_string(), "backend: dsp failure 1");
 
         // Subsequent drain is empty
-        let drained_again = last_error.lock().unwrap_or_else(|e| e.into_inner()).take();
+        let drained_again = crate::model::take_fault(&last_error);
         assert!(drained_again.is_none());
     }
 }

@@ -37,7 +37,7 @@ pub fn build_rms_norm_params(eps: f32) -> [i32; 16] {
     params
 }
 
-/// Host-computed parameters for Layer norm (opcode 49 `Norm`).
+/// Host-computed parameters for Layer norm (opcode 51 `Norm`).
 pub fn build_layer_norm_params(eps: f32) -> [i32; 16] {
     let mut params = [0i32; 16];
     params[0] = eps.to_bits() as i32;
