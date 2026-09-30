@@ -94,6 +94,29 @@ enum CeraKvCompression {
   turboQuant,
 }
 
+/// How a model with audio output answers during one [Cera.generate] call.
+///
+/// Audio models are driven by their system prompt, and generation has to match
+/// it. The runtime, not the model, decides when to switch between text and
+/// audio in an interleaved turn; doing that on a text turn splices audio into
+/// the answer's context and corrupts the rest of it.
+///
+/// Only matters on a model with audio output, and only natively: the web
+/// runtime interleaves exactly when [Cera.generate] is given an `onAudio`
+/// callback.
+enum CeraAudioMode {
+  /// Never generate audio: `Perform ASR.` and ordinary chat.
+  textOnly,
+
+  /// Text, then audio once the model itself starts it: `Perform TTS.` The
+  /// default. Never forces a switch, so it is safe on a text turn.
+  sequential,
+
+  /// Alternate text tokens and audio frames at the model's own cadence:
+  /// `Respond with interleaved text and audio.`
+  interleaved,
+}
+
 /// Speculative decoding options for prompt-lookup drafting.
 ///
 /// Prompt-lookup drafting matches trailing n-grams in history to propose draft candidates
@@ -494,6 +517,12 @@ abstract interface class Cera {
   /// web's GPU one. Greedy decoding is `temperature: 0` or `topK: 1`, the
   /// same rule everywhere.
   ///
+  /// `audioMode` says how a model with audio output should answer, and must
+  /// match the system prompt in play (see [CeraAudioMode]). When omitted, a
+  /// conversation started through [appendAudio] follows the system prompt that
+  /// call applied; anything else is [CeraAudioMode.sequential]. Ignored on the
+  /// web, where `onAudio` selects interleaving.
+  ///
   /// Sampling does cost more on the web's GPU backend than greedy decoding
   /// does: greedy takes the argmax on the GPU and reads back a token id, while
   /// sampling has to read the whole logits row back for the sampler to see it,
@@ -516,6 +545,7 @@ abstract interface class Cera {
     int? topK,
     int? seed,
     CeraSpecDecode? spec,
+    CeraAudioMode? audioMode,
     void Function(String thought)? onThought,
     void Function(List<double> pcm, int sampleRate)? onAudio,
   });

@@ -2907,7 +2907,10 @@ fn main() -> Result<()> {
                     prefill_elapsed.as_secs_f64() * 1000.0
                 );
 
-                let opts = build_opts(&engine, grammar_compiled.clone(), Vec::new());
+                // `--audio-in` answers in text (there is no audio sink here), so never let
+                // a bundle's vocoder cut the answer into audio rounds.
+                let mut opts = build_opts(&engine, grammar_compiled.clone(), Vec::new());
+                opts.audio_mode = cera::AudioOutputMode::TextOnly;
                 let mut sink = StdoutSink::new(tokenizer, session.cancel_handle());
                 let summary = session.generate(&opts, &mut sink)?;
 
@@ -3177,7 +3180,9 @@ fn main() -> Result<()> {
                 // GGUF alive — see `cera::model::weights::MmapWeight`);
                 // `open_arc` is the convenience opener that wraps in
                 // `Arc` for us.
-                let voc_gguf = cera::gguf::GgufFile::open_arc(Path::new(vocoder_path))?;
+                // A llama.cpp vocoder keeps its detokenizer in the sibling
+                // `tokenizer-*.gguf`; `open_vocoder` merges the two.
+                let voc_gguf = cera::model::split_vocoder::open_vocoder(Path::new(vocoder_path))?;
                 let decoder_weights =
                     cera::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_gguf)?;
                 {

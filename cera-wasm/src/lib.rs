@@ -3405,6 +3405,11 @@ mod webgpu {
                 None
             };
 
+            // A llama.cpp-style vocoder keeps its detokenizer backbone in the
+            // tokenizer sidecar; fold the two into the layout the loaders read.
+            let voc_arc =
+                voc_arc.map(|vg| cera::model::split_vocoder::resolve_vocoder(vg, tok_arc.as_ref()));
+
             let llm_hidden = cera::model::Model::config(&self.model).hidden_size;
 
             let mut decoder_weights = None;
@@ -4268,8 +4273,15 @@ mod webgpu {
             let mut time_vocoder_finish_ms = 0.0;
             let mut llm_hidden_passes = 0usize;
             let mut text_tokens_count = 0usize;
+            // The vocoder may declare its own interleave cadence (the Japanese
+            // model runs 6 text tokens / 9 audio frames).
+            let cadence = self
+                .audio_decoder
+                .as_ref()
+                .map(|d| d.interleave)
+                .unwrap_or_default();
             let mut modality_budget = if is_interleaved {
-                cera::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET
+                cadence.text
             } else {
                 usize::MAX
             };
@@ -4441,7 +4453,7 @@ mod webgpu {
                     time_llm_audio_ms += js_sys::Date::now() - t_emb0;
                     pos += 1;
 
-                    let mut audio_budget = cera::audio_engine::DEFAULT_INTERLEAVED_AUDIO_BUDGET;
+                    let mut audio_budget = cadence.audio;
                     let can_use_gpu_buf = dec.supports_gpu_depthformer();
                     let mut use_gpu_buf = false;
                     loop {
@@ -4498,8 +4510,7 @@ mod webgpu {
                                 token_history.push(next);
                                 time_llm_text_ms += js_sys::Date::now() - t_trans0;
                                 pos += 1;
-                                modality_budget =
-                                    cera::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET;
+                                modality_budget = cadence.text;
                                 break;
                             }
                             cera::audio_engine::FrameOutcome::Codes {
@@ -4556,7 +4567,7 @@ mod webgpu {
                             token_history.push(next);
                             time_llm_text_ms += js_sys::Date::now() - t_trans0;
                             pos += 1;
-                            modality_budget = cera::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET;
+                            modality_budget = cadence.text;
                             break;
                         }
 

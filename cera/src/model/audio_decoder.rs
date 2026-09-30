@@ -277,6 +277,8 @@ pub struct AudioDecoderWeights {
     pub depth_linear_b: Vec<f32>,
     pub depth_embeddings: Vec<CodebookWeights>,
     pub audio_embedding: CodebookWeights,
+    /// Text/audio alternation this vocoder asks for in interleaved turns.
+    pub interleave: crate::audio_engine::InterleaveCadence,
 }
 
 impl AudioDecoderWeights {
@@ -396,6 +398,7 @@ impl AudioDecoderWeights {
             depth_linear_b,
             depth_embeddings,
             audio_embedding,
+            interleave: crate::audio_engine::InterleaveCadence::from_gguf(gguf),
         })
     }
 }

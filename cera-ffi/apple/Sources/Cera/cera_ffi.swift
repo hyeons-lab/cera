@@ -7722,6 +7722,14 @@ public struct GenerateOpts: Equatable, Hashable {
      * Disable speculative decoding (even when a draft sidecar model is present).
      */
     public var noSpec: Bool
+    /**
+     * How to produce output when the loaded bundle has an audio decoder. Must
+     * match the system prompt: `TextOnly` for ASR and plain chat, `Sequential`
+     * for `Perform TTS.`, `Interleaved` for `Respond with interleaved text and
+     * audio.`. `None` (the default) is `Sequential`. Ignored for bundles
+     * without a vocoder.
+     */
+    public var audioMode: AudioOutputMode?
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -7773,7 +7781,14 @@ public struct GenerateOpts: Equatable, Hashable {
          */spec: SpecDecodeConfig? = nil, 
         /**
          * Disable speculative decoding (even when a draft sidecar model is present).
-         */noSpec: Bool = false) {
+         */noSpec: Bool = false, 
+        /**
+         * How to produce output when the loaded bundle has an audio decoder. Must
+         * match the system prompt: `TextOnly` for ASR and plain chat, `Sequential`
+         * for `Perform TTS.`, `Interleaved` for `Respond with interleaved text and
+         * audio.`. `None` (the default) is `Sequential`. Ignored for bundles
+         * without a vocoder.
+         */audioMode: AudioOutputMode? = nil) {
         self.maxTokens = maxTokens
         self.seed = seed
         self.temperature = temperature
@@ -7789,6 +7804,7 @@ public struct GenerateOpts: Equatable, Hashable {
         self.flushEveryMs = flushEveryMs
         self.spec = spec
         self.noSpec = noSpec
+        self.audioMode = audioMode
     }
 
     
@@ -7821,7 +7837,8 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
                 flushEveryTokens: FfiConverterUInt32.read(from: &buf), 
                 flushEveryMs: FfiConverterUInt32.read(from: &buf), 
                 spec: FfiConverterOptionTypeSpecDecodeConfig.read(from: &buf), 
-                noSpec: FfiConverterBool.read(from: &buf)
+                noSpec: FfiConverterBool.read(from: &buf), 
+                audioMode: FfiConverterOptionTypeAudioOutputMode.read(from: &buf)
         )
     }
 
@@ -7841,6 +7858,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.flushEveryMs, into: &buf)
         FfiConverterOptionTypeSpecDecodeConfig.write(value.spec, into: &buf)
         FfiConverterBool.write(value.noSpec, into: &buf)
+        FfiConverterOptionTypeAudioOutputMode.write(value.audioMode, into: &buf)
     }
 }
 
@@ -9434,6 +9452,95 @@ public func FfiConverterTypeUserMessage_lift(_ buf: RustBuffer) throws -> UserMe
 public func FfiConverterTypeUserMessage_lower(_ value: UserMessage) -> RustBuffer {
     return FfiConverterTypeUserMessage.lower(value)
 }
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * How a session with an audio decoder produces output. Mirrors
+ * [`cera::AudioOutputMode`].
+ */
+
+public enum AudioOutputMode: Equatable, Hashable {
+    
+    /**
+     * Never generate audio (ASR, plain chat).
+     */
+    case textOnly
+    /**
+     * Text until the model itself emits `<|audio_start|>`, then audio
+     * (`Perform TTS.`). Never forces a switch, so it is safe on text turns.
+     */
+    case sequential
+    /**
+     * Alternate text tokens and audio frames at the vocoder's cadence
+     * (`Respond with interleaved text and audio.`).
+     */
+    case interleaved
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension AudioOutputMode: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAudioOutputMode: FfiConverterRustBuffer {
+    typealias SwiftType = AudioOutputMode
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AudioOutputMode {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .textOnly
+        
+        case 2: return .sequential
+        
+        case 3: return .interleaved
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: AudioOutputMode, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .textOnly:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .sequential:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .interleaved:
+            writeInt(&buf, Int32(3))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAudioOutputMode_lift(_ buf: RustBuffer) throws -> AudioOutputMode {
+    return try FfiConverterTypeAudioOutputMode.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAudioOutputMode_lower(_ value: AudioOutputMode) -> RustBuffer {
+    return FfiConverterTypeAudioOutputMode.lower(value)
+}
+
 
 // Note that we don't yet support `indirect` for enums.
 // See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
@@ -12028,6 +12135,30 @@ fileprivate struct FfiConverterOptionTypeSpecDecodeConfig: FfiConverterRustBuffe
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterTypeSpecDecodeConfig.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeAudioOutputMode: FfiConverterRustBuffer {
+    typealias SwiftType = AudioOutputMode?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeAudioOutputMode.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeAudioOutputMode.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }

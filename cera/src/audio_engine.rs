@@ -56,6 +56,53 @@ pub const TOKEN_TEXT_END: u32 = 130;
 pub const AUDIO_END_CODE: i32 = 2048;
 pub const DEFAULT_INTERLEAVED_TEXT_BUDGET: usize = 6;
 pub const DEFAULT_INTERLEAVED_AUDIO_BUDGET: usize = 12;
+
+/// How many text tokens and audio frames an interleaved turn alternates
+/// between. A vocoder GGUF may declare its own cadence
+/// (`interleaved_n_text` / `interleaved_n_audio`; the Japanese LFM2.5-Audio
+/// declares 6 and 9), and the llama.cpp reference honors it. A vocoder without
+/// those keys, such as the merged LEAP English one, gets the 6/12 defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct InterleaveCadence {
+    /// Text tokens per interleave round.
+    pub text: usize,
+    /// Audio frames per interleave round.
+    pub audio: usize,
+}
+
+impl Default for InterleaveCadence {
+    fn default() -> Self {
+        Self {
+            text: DEFAULT_INTERLEAVED_TEXT_BUDGET,
+            audio: DEFAULT_INTERLEAVED_AUDIO_BUDGET,
+        }
+    }
+}
+
+impl InterleaveCadence {
+    /// Read the cadence from a vocoder GGUF's metadata. A missing key keeps its
+    /// default; a zero (which would spin the interleave loop) is rejected with
+    /// a warning and also keeps the default.
+    pub fn from_gguf(gguf: &crate::gguf::GgufFile) -> Self {
+        let read = |key: &str, default: usize| match gguf.get_u32(key) {
+            Some(0) => {
+                tracing::warn!(
+                    target: "cera::audio",
+                    key,
+                    "vocoder declares a zero interleave budget; using {default}"
+                );
+                default
+            }
+            Some(v) => v as usize,
+            None => default,
+        };
+        let d = Self::default();
+        Self {
+            text: read("interleaved_n_text", d.text),
+            audio: read("interleaved_n_audio", d.audio),
+        }
+    }
+}
 pub const AUDIO_SAFETY_FRAME_LIMIT: usize = 4096;
 
 /// Standard silence detection watchdog for voice synthesis across native and WebAssembly engines.
@@ -805,8 +852,9 @@ pub fn generate_audio(
     let mut pos = consumed;
 
     // Interleaved mode counters.
+    let cadence = decoder_weights.interleave;
     let mut modality_budget = match config.mode {
-        AudioMode::Interleaved => DEFAULT_INTERLEAVED_TEXT_BUDGET, // start with default text tokens
+        AudioMode::Interleaved => cadence.text, // start with the vocoder's text budget
         AudioMode::Sequential => usize::MAX,
     };
     let mut text_done = false;
@@ -828,7 +876,7 @@ pub fn generate_audio(
             if next_token == TOKEN_AUDIO_START {
                 modality = Modality::Audio;
                 modality_budget = match config.mode {
-                    AudioMode::Interleaved => DEFAULT_INTERLEAVED_AUDIO_BUDGET,
+                    AudioMode::Interleaved => cadence.audio,
                     AudioMode::Sequential => usize::MAX,
                 };
                 continue;
@@ -863,7 +911,7 @@ pub fn generate_audio(
                 pos += 1;
 
                 modality = Modality::Audio;
-                modality_budget = DEFAULT_INTERLEAVED_AUDIO_BUDGET;
+                modality_budget = cadence.audio;
 
                 // Run audio loop with this embedding.
                 loop {
@@ -929,7 +977,7 @@ pub fn generate_audio(
 
                 // Switch back to text.
                 modality = Modality::Text;
-                modality_budget = DEFAULT_INTERLEAVED_TEXT_BUDGET;
+                modality_budget = cadence.text;
                 continue;
             }
 
@@ -973,7 +1021,7 @@ pub fn generate_audio(
                             // runaway cycles.
                             modality = Modality::Text;
                             text_done = true;
-                            modality_budget = DEFAULT_INTERLEAVED_TEXT_BUDGET;
+                            modality_budget = cadence.text;
                             logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
                             check_audio_decode_error(model)?;
                             next_token = sampler.sample(&mut logits);
@@ -1008,7 +1056,7 @@ pub fn generate_audio(
                     && !text_done
                 {
                     modality = Modality::Text;
-                    modality_budget = DEFAULT_INTERLEAVED_TEXT_BUDGET;
+                    modality_budget = cadence.text;
                     logits = model.forward_from_embedding(&audio_emb, pos, &mut state);
                     check_audio_decode_error(model)?;
                     next_token = sampler.sample(&mut logits);
@@ -1458,6 +1506,7 @@ mod tests {
                 norm: Vec::new(),
                 to_logits: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
             },
+            interleave: InterleaveCadence::default(),
         };
         let detok = DetokenizerWeights {
             config: DetokenizerConfig {
@@ -1559,5 +1608,51 @@ mod tests {
         )
         .unwrap_err();
         assert!(err.to_string().contains("produced no logits"), "{err:?}");
+    }
+
+    fn cadence_gguf(meta: &[(&str, u32)]) -> crate::gguf::GgufFile {
+        let mut w = crate::convert::writer::GgufWriter::new();
+        for (k, v) in meta {
+            w.add_u32(*k, *v);
+        }
+        let mut bytes = Vec::new();
+        w.write_header_and_tensor_info(&mut bytes).unwrap();
+        crate::gguf::GgufFile::from_bytes(bytes.into()).unwrap()
+    }
+
+    #[test]
+    fn interleave_cadence_reads_the_vocoders_declared_values() {
+        let g = cadence_gguf(&[("interleaved_n_text", 6), ("interleaved_n_audio", 9)]);
+        assert_eq!(
+            InterleaveCadence::from_gguf(&g),
+            InterleaveCadence { text: 6, audio: 9 }
+        );
+    }
+
+    #[test]
+    fn interleave_cadence_defaults_when_absent_and_per_key() {
+        assert_eq!(
+            InterleaveCadence::from_gguf(&cadence_gguf(&[])),
+            InterleaveCadence::default()
+        );
+        assert_eq!(
+            InterleaveCadence::default(),
+            InterleaveCadence { text: 6, audio: 12 }
+        );
+        // One key present keeps the other's default.
+        assert_eq!(
+            InterleaveCadence::from_gguf(&cadence_gguf(&[("interleaved_n_audio", 9)])),
+            InterleaveCadence { text: 6, audio: 9 }
+        );
+    }
+
+    #[test]
+    fn interleave_cadence_rejects_zero_budgets() {
+        // A zero budget would switch modality on every token forever.
+        let g = cadence_gguf(&[("interleaved_n_text", 0), ("interleaved_n_audio", 0)]);
+        assert_eq!(
+            InterleaveCadence::from_gguf(&g),
+            InterleaveCadence::default()
+        );
     }
 }

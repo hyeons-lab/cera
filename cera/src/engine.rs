@@ -459,6 +459,9 @@ impl CeraEngine {
                 .and_then(|b| GgufFile::from_bytes(b).ok())
                 .map(Arc::new);
 
+            let voc_arc = voc_arc
+                .map(|vg| crate::model::split_vocoder::resolve_vocoder(vg, tok_arc.as_ref()));
+
             let dec = if let Some(ref vg) = voc_arc {
                 crate::model::audio_decoder::AudioDecoderWeights::from_gguf(vg)
                     .map_err(|e| {
@@ -1053,6 +1056,10 @@ impl CeraEngine {
         // a low hard cap (was 64) silently truncated longer transcriptions.
         let opts = GenerateOpts {
             temperature: 0.0,
+            // ASR answers in text. Without this, a session that carries the
+            // bundle's vocoder would switch to audio after a few tokens and
+            // corrupt the transcript.
+            audio_mode: crate::session::AudioOutputMode::TextOnly,
             ..GenerateOpts::default()
         };
         session.generate(&opts, &mut sink)?;
@@ -1535,6 +1542,7 @@ fn resolve_all_manifest_files(
     manifest.files.model = resolve_url_or_path(&manifest.files.model, manifest_dir, cfg)?
         .to_string_lossy()
         .into_owned();
+    let decoder_ref = manifest.files.audio_decoder.clone();
 
     for slot in [
         &mut manifest.files.multimodal_projector,
@@ -1554,7 +1562,58 @@ fn resolve_all_manifest_files(
             .into_owned();
     }
 
+    if let Some(decoder_ref) = decoder_ref {
+        attach_split_vocoder_sidecar(manifest, &decoder_ref, manifest_dir, cfg);
+    }
+
     Ok(())
+}
+
+/// A llama.cpp-style LFM2-Audio vocoder keeps its detokenizer backbone in the
+/// sibling `tokenizer-*.gguf`, but LeapBundles manifests for these bundles leave
+/// `audio_tokenizer` empty. When the resolved vocoder turns out to be the split
+/// half, fetch (or locate) that sibling so `split_vocoder` can merge them.
+///
+/// Best-effort: a missing sibling or a failed download only warns, and the audio
+/// loaders then report the missing detokenizer themselves.
+#[cfg(feature = "mmap")]
+fn attach_split_vocoder_sidecar(
+    manifest: &mut Manifest,
+    decoder_ref: &str,
+    manifest_dir: Option<&Path>,
+    cfg: &EngineConfig,
+) {
+    if manifest.files.audio_tokenizer.is_some() {
+        return;
+    }
+    let Some(local) = manifest.files.audio_decoder.as_deref() else {
+        return;
+    };
+    let Ok(vocoder) = GgufFile::open(Path::new(local)) else {
+        return;
+    };
+    if !crate::model::split_vocoder::is_split_vocoder(&vocoder) {
+        return;
+    }
+    let Some(sibling) = crate::model::split_vocoder::sibling_tokenizer_ref(decoder_ref) else {
+        return;
+    };
+    match resolve_url_or_path(&sibling, manifest_dir, cfg) {
+        Ok(path) if path.exists() => {
+            manifest.files.audio_tokenizer = Some(path.to_string_lossy().into_owned());
+        }
+        Ok(path) => tracing::warn!(
+            target: "cera::engine",
+            path = %path.display(),
+            "audio vocoder needs its `tokenizer-*` sidecar but none exists beside it"
+        ),
+        Err(e) => tracing::warn!(
+            target: "cera::engine",
+            sidecar = %sibling,
+            error = %e,
+            "audio vocoder needs its `tokenizer-*` sidecar but it could not be fetched"
+        ),
+    }
 }
 
 #[cfg(feature = "mmap")]
@@ -1875,8 +1934,28 @@ fn try_load_audio_decoder_and_detok(
         }
     });
 
+    // The llama.cpp release splits the detokenizer backbone into the tokenizer
+    // sidecar; fold it into one vocoder so every backend loader sees the merged
+    // layout.
+    let voc_gguf = voc_gguf.map(|vg| {
+        crate::model::split_vocoder::resolve_vocoder_cached(
+            voc_path.unwrap_or(Path::new("")),
+            vg,
+            tok_path,
+            tok_gguf.as_ref(),
+        )
+    });
+
     let dec = if let Some(ref vg) = voc_gguf {
         crate::model::audio_decoder::AudioDecoderWeights::from_gguf(vg)
+            .map_err(|e| {
+                tracing::warn!(
+                    target: "cera::engine",
+                    error = %format!("{e:#}"),
+                    "audio decoder (depthformer) failed to load from the vocoder"
+                );
+                e
+            })
             .ok()
             .map(Arc::new)
     } else {
