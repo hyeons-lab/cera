@@ -88,6 +88,114 @@ fn test_forward_from_embedding_applies_output_rmsnorm() {
     );
 }
 
+/// Both embedding-input entry points must return/consume the hidden state
+/// normalised exactly once. `Lfm2Model::run_layers` already ends with the output
+/// RMSNorm; #397 added a second one to `forward_embedding`,
+/// `forward_hidden_from_embedding` and `forward_from_embedding`, so the CPU
+/// depthformer was fed a hidden state ~7x too large and TTS never reached its end
+/// code (Metal and wgpu normalise once, so only CPU regressed). The looser
+/// `..._applies_output_rmsnorm` bounds above (±100) let it through, and the
+/// CPU-vs-GPU parity tests only print their cosine.
+///
+/// Invariant, independent of any magnitude: decode logits for a token are the
+/// tied-embedding projection of the hidden state `forward_embedding` returns for
+/// the same token in the same state.
+#[test]
+fn forward_embedding_hidden_projects_to_the_decode_logits() {
+    let Some((model_gguf, _)) = load_models() else {
+        return;
+    };
+    let model =
+        Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load LFM2 model");
+    let embd = cera::model::weights::MmapWeight::from_gguf(&model_gguf, "token_embd.weight")
+        .expect("tied embedding");
+    let prefix = [1u32, 6, 6423, 708];
+    let token = 128u32;
+
+    let replay = || {
+        let mut state = InferenceState::from_config(model.config()).unwrap();
+        for (i, &t) in prefix.iter().enumerate() {
+            model.forward(&[t], i, &mut state);
+        }
+        state
+    };
+
+    let mut decode_state = replay();
+    let logits = model.forward(&[token], prefix.len(), &mut decode_state);
+    let best = logits
+        .iter()
+        .enumerate()
+        .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+        .unwrap()
+        .0;
+
+    let mut embed_state = replay();
+    let hidden = model.forward_embedding(&[token], prefix.len(), &mut embed_state);
+    let mut row = vec![0.0f32; hidden.len()];
+    embd.dequantize_row(best, &mut row);
+    let projected: f32 = row.iter().zip(&hidden).map(|(a, b)| a * b).sum();
+
+    let rel = ((projected - logits[best]) / logits[best]).abs();
+    assert!(
+        rel < 0.05,
+        "forward_embedding hidden projects to {projected} but decode logit is {} (rel {rel}); \
+         the hidden state is normalised the wrong number of times",
+        logits[best]
+    );
+}
+
+/// `forward_from_embedding` fed a token's own embedding must reproduce the
+/// decode logits for that token (same state, same math, one output norm).
+#[test]
+fn forward_from_embedding_matches_decode_logits() {
+    let Some((model_gguf, _)) = load_models() else {
+        return;
+    };
+    let model =
+        Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load LFM2 model");
+    let embd = cera::model::weights::MmapWeight::from_gguf(&model_gguf, "token_embd.weight")
+        .expect("tied embedding");
+    let prefix = [1u32, 6, 6423, 708];
+    let token = 1234u32;
+
+    let replay = || {
+        let mut state = InferenceState::from_config(model.config()).unwrap();
+        for (i, &t) in prefix.iter().enumerate() {
+            model.forward(&[t], i, &mut state);
+        }
+        state
+    };
+    let mut a = replay();
+    let decode = model.forward(&[token], prefix.len(), &mut a);
+
+    let mut emb = vec![0.0f32; model.config().hidden_size];
+    embd.dequantize_row(token as usize, &mut emb);
+    let mut b = replay();
+    let from_emb = model.forward_from_embedding(&emb, prefix.len(), &mut b);
+
+    let dot: f64 = decode
+        .iter()
+        .zip(&from_emb)
+        .map(|(x, y)| (*x as f64) * (*y as f64))
+        .sum();
+    let na: f64 = decode
+        .iter()
+        .map(|x| (*x as f64).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let nb: f64 = from_emb
+        .iter()
+        .map(|x| (*x as f64).powi(2))
+        .sum::<f64>()
+        .sqrt();
+    let cos = dot / (na * nb);
+    let scale = nb / na;
+    assert!(
+        cos > 0.999 && (scale - 1.0).abs() < 0.02,
+        "forward_from_embedding diverges from decode: cosine {cos}, logit-norm ratio {scale}"
+    );
+}
+
 #[test]
 fn test_acoustic_spectrum_energy_distribution() {
     let Some((_, vocoder_gguf)) = load_models() else {

@@ -4522,11 +4522,6 @@ impl Model for Lfm2Model {
         let mut hidden = embedding.to_vec();
         let pos = state.seq_len;
         self.run_layers(&mut hidden, pos, state);
-        cpu::rmsnorm(
-            &mut hidden,
-            &self.output_norm_weight,
-            self.config.rms_norm_eps,
-        );
 
         // Output projection (tied embeddings)
         let mut logits = vec![0.0f32; cfg.vocab_size];
@@ -4558,11 +4553,6 @@ impl Model for Lfm2Model {
         let mut hidden = self.dequantize_row(&self.embd_ref, token_id);
         let pos = state.seq_len;
         self.run_layers(&mut hidden, pos, state);
-        cpu::rmsnorm(
-            &mut hidden,
-            &self.output_norm_weight,
-            self.config.rms_norm_eps,
-        );
         hidden
     }
 
@@ -4575,11 +4565,6 @@ impl Model for Lfm2Model {
         let mut hidden = embedding.to_vec();
         let pos = state.seq_len;
         self.run_layers(&mut hidden, pos, state);
-        cpu::rmsnorm(
-            &mut hidden,
-            &self.output_norm_weight,
-            self.config.rms_norm_eps,
-        );
         hidden
     }
 
