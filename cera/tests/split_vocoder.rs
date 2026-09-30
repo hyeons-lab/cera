@@ -5,6 +5,8 @@
 //! A missing fixture skips with a message, which is a *pass*: run with
 //! `CERA_REQUIRE_SPLIT_VOCODER_FIXTURES=1` to make absence a failure.
 
+#![cfg(feature = "mmap")]
+
 use std::path::PathBuf;
 use std::sync::Arc;
 
