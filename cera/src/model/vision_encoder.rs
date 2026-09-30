@@ -213,6 +213,7 @@ impl VisionEncoderConfig {
 /// for `B` (the function does standard `C = A · B`, NOT `A · B^T`),
 /// so the forward pass calls it directly with no per-image
 /// transpose.
+#[derive(Clone)]
 pub struct PatchEmbedWeights {
     /// Row-major `[in_dim × n_embd]` kernel ready for matmul. Built
     /// from `v.patch_embd.weight` once at load time.
@@ -247,11 +248,55 @@ pub struct VitBlockWeights {
 /// into the LLM embedding dim. `mm.1` is `[n_embd·scale_factor² →
 /// projection_dim·2]`, GELU, `mm.2` is `[projection_dim·2 →
 /// projection_dim]` per llama.cpp's LFM2 projector layout.
+#[derive(Clone)]
 pub struct ProjectorWeights {
     pub mm1_w: MmapWeight,
     pub mm1_b: Vec<f32>,
     pub mm2_w: MmapWeight,
     pub mm2_b: Vec<f32>,
+}
+
+impl ProjectorWeights {
+    pub(crate) fn forward(&self, pooled: &[f32], projection_dim: usize) -> Vec<f32> {
+        let in_dim = self.mm1_w.cols;
+        let mid_dim = self.mm1_w.rows;
+        let out_dim = projection_dim;
+        if in_dim == 0 || pooled.is_empty() || !pooled.len().is_multiple_of(in_dim) {
+            return Vec::new();
+        }
+        let n_tokens = pooled.len() / in_dim;
+
+        let mut mid = vec![0f32; n_tokens * mid_dim];
+        let mut out = vec![0f32; n_tokens * out_dim];
+
+        self.mm1_w.batched_matmul(pooled, &mut mid, n_tokens);
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            mid.par_chunks_mut(mid_dim).for_each(|mid_row| {
+                crate::backend::cpu::add_inplace(mid_row, &self.mm1_b);
+                crate::backend::cpu::gelu_inplace(mid_row);
+            });
+            self.mm2_w.batched_matmul(&mid, &mut out, n_tokens);
+            out.par_chunks_mut(out_dim).for_each(|out_row| {
+                crate::backend::cpu::add_inplace(out_row, &self.mm2_b);
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for t in 0..n_tokens {
+                let mid_row = &mut mid[t * mid_dim..(t + 1) * mid_dim];
+                crate::backend::cpu::add_inplace(mid_row, &self.mm1_b);
+                crate::backend::cpu::gelu_inplace(mid_row);
+            }
+            self.mm2_w.batched_matmul(&mid, &mut out, n_tokens);
+            for t in 0..n_tokens {
+                let out_row = &mut out[t * out_dim..(t + 1) * out_dim];
+                crate::backend::cpu::add_inplace(out_row, &self.mm2_b);
+            }
+        }
+        out
+    }
 }
 
 /// All vision-encoder weights, loaded from a multimodal_projector
@@ -530,9 +575,29 @@ impl VisionEncoderWeights {
         }
 
         // 4. post_ln (per token).
-        for t in 0..n_patches {
-            let row = &mut tokens[t * cfg.n_embd..(t + 1) * cfg.n_embd];
-            crate::backend::cpu::layer_norm_inplace(row, &self.post_ln_w, &self.post_ln_b, cfg.eps);
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            tokens.par_chunks_mut(cfg.n_embd).for_each(|row| {
+                crate::backend::cpu::layer_norm_inplace(
+                    row,
+                    &self.post_ln_w,
+                    &self.post_ln_b,
+                    cfg.eps,
+                );
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for t in 0..n_patches {
+                let row = &mut tokens[t * cfg.n_embd..(t + 1) * cfg.n_embd];
+                crate::backend::cpu::layer_norm_inplace(
+                    row,
+                    &self.post_ln_w,
+                    &self.post_ln_b,
+                    cfg.eps,
+                );
+            }
         }
 
         // 5. Pixel-shuffle scale_factor² over the dynamic grid →
@@ -600,9 +665,19 @@ impl VisionEncoderWeights {
         // Copy tokens into `pre_norm` so we can LN it without
         // clobbering the residual.
         scratch.pre_norm.copy_from_slice(tokens);
-        for t in 0..n_tokens {
-            let row = &mut scratch.pre_norm[t * n_embd..(t + 1) * n_embd];
-            crate::backend::cpu::layer_norm_inplace(row, &block.ln1_w, &block.ln1_b, cfg.eps);
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            scratch.pre_norm.par_chunks_mut(n_embd).for_each(|row| {
+                crate::backend::cpu::layer_norm_inplace(row, &block.ln1_w, &block.ln1_b, cfg.eps);
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for t in 0..n_tokens {
+                let row = &mut scratch.pre_norm[t * n_embd..(t + 1) * n_embd];
+                crate::backend::cpu::layer_norm_inplace(row, &block.ln1_w, &block.ln1_b, cfg.eps);
+            }
         }
 
         // Q/K/V projections batched across all tokens: weight rows dequantized once into reusable scratch
@@ -625,45 +700,94 @@ impl VisionEncoderWeights {
             Some(&mut scratch.dequant_scratch),
         );
 
-        for t in 0..n_tokens {
-            let q_row = &mut scratch.q[t * n_embd..(t + 1) * n_embd];
-            let k_row = &mut scratch.k[t * n_embd..(t + 1) * n_embd];
-            let v_row = &mut scratch.v[t * n_embd..(t + 1) * n_embd];
-            crate::backend::cpu::add_inplace(q_row, &block.q_b);
-            crate::backend::cpu::add_inplace(k_row, &block.k_b);
-            crate::backend::cpu::add_inplace(v_row, &block.v_b);
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            scratch
+                .q
+                .par_chunks_mut(n_embd)
+                .zip(scratch.k.par_chunks_mut(n_embd))
+                .zip(scratch.v.par_chunks_mut(n_embd))
+                .for_each(|((q_row, k_row), v_row)| {
+                    crate::backend::cpu::add_inplace(q_row, &block.q_b);
+                    crate::backend::cpu::add_inplace(k_row, &block.k_b);
+                    crate::backend::cpu::add_inplace(v_row, &block.v_b);
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for t in 0..n_tokens {
+                let q_row = &mut scratch.q[t * n_embd..(t + 1) * n_embd];
+                let k_row = &mut scratch.k[t * n_embd..(t + 1) * n_embd];
+                let v_row = &mut scratch.v[t * n_embd..(t + 1) * n_embd];
+                crate::backend::cpu::add_inplace(q_row, &block.q_b);
+                crate::backend::cpu::add_inplace(k_row, &block.k_b);
+                crate::backend::cpu::add_inplace(v_row, &block.v_b);
+            }
         }
 
         // Multi-head scaled dot-product attention.
         // Q/K/V are [n_tokens × (n_head·head_dim)]; we view them
         // as [n_head, n_tokens, head_dim] by indexing into the
-        // contiguous buffer. `attn_out` and `scores` live in
-        // `VitScratch` so they're allocated once per
-        // `encode_image` call instead of per block.
-        for h in 0..n_head {
-            for q_idx in 0..n_tokens {
-                let q_off = q_idx * n_embd + h * head_dim;
-                let q = &scratch.q[q_off..q_off + head_dim];
-                // Compute attention scores for this query against
-                // every key in this head.
-                for (k_idx, score) in scratch.scores.iter_mut().enumerate() {
-                    let k_off = k_idx * n_embd + h * head_dim;
-                    let k = &scratch.k[k_off..k_off + head_dim];
-                    let dot = crate::backend::cpu::dot_f32(q, k);
-                    *score = dot * scale;
-                }
-                // Softmax over the n_tokens scores.
-                crate::backend::cpu::softmax_inplace(&mut scratch.scores);
-                // Weighted sum of V: `attn_out[q_idx, h, :] =
-                // Σ_k scores[k] * v[k, h, :]`.
-                let out_off = q_idx * n_embd + h * head_dim;
-                let out_slice = &mut scratch.attn_out[out_off..out_off + head_dim];
-                out_slice.iter_mut().for_each(|v| *v = 0.0);
-                for (k_idx, &s) in scratch.scores.iter().enumerate() {
-                    let v_off = k_idx * n_embd + h * head_dim;
-                    let v = &scratch.v[v_off..v_off + head_dim];
-                    for (o, vv) in out_slice.iter_mut().zip(v) {
-                        *o += s * vv;
+        // contiguous buffer.
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            let q_slice = scratch.q.as_slice();
+            let k_slice = scratch.k.as_slice();
+            let v_slice = scratch.v.as_slice();
+            scratch
+                .attn_out
+                .par_chunks_mut(n_embd)
+                .enumerate()
+                .for_each_init(
+                    || vec![0.0f32; n_tokens],
+                    |scores, (q_idx, out_row)| {
+                        for h in 0..n_head {
+                            let q_off = q_idx * n_embd + h * head_dim;
+                            let q = &q_slice[q_off..q_off + head_dim];
+                            for (k_idx, score) in scores.iter_mut().enumerate() {
+                                let k_off = k_idx * n_embd + h * head_dim;
+                                let k = &k_slice[k_off..k_off + head_dim];
+                                let dot = crate::backend::cpu::dot_f32(q, k);
+                                *score = dot * scale;
+                            }
+                            crate::backend::cpu::softmax_inplace(scores);
+                            let out_head = &mut out_row[h * head_dim..(h + 1) * head_dim];
+                            out_head.iter_mut().for_each(|v| *v = 0.0);
+                            for (k_idx, &s) in scores.iter().enumerate() {
+                                let v_off = k_idx * n_embd + h * head_dim;
+                                let v = &v_slice[v_off..v_off + head_dim];
+                                for (o, vv) in out_head.iter_mut().zip(v) {
+                                    *o += s * vv;
+                                }
+                            }
+                        }
+                    },
+                );
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for h in 0..n_head {
+                for q_idx in 0..n_tokens {
+                    let q_off = q_idx * n_embd + h * head_dim;
+                    let q = &scratch.q[q_off..q_off + head_dim];
+                    for (k_idx, score) in scratch.scores.iter_mut().enumerate() {
+                        let k_off = k_idx * n_embd + h * head_dim;
+                        let k = &scratch.k[k_off..k_off + head_dim];
+                        let dot = crate::backend::cpu::dot_f32(q, k);
+                        *score = dot * scale;
+                    }
+                    crate::backend::cpu::softmax_inplace(&mut scratch.scores);
+                    let out_off = q_idx * n_embd + h * head_dim;
+                    let out_slice = &mut scratch.attn_out[out_off..out_off + head_dim];
+                    out_slice.iter_mut().for_each(|v| *v = 0.0);
+                    for (k_idx, &s) in scratch.scores.iter().enumerate() {
+                        let v_off = k_idx * n_embd + h * head_dim;
+                        let v = &scratch.v[v_off..v_off + head_dim];
+                        for (o, vv) in out_slice.iter_mut().zip(v) {
+                            *o += s * vv;
+                        }
                     }
                 }
             }
@@ -676,20 +800,44 @@ impl VisionEncoderWeights {
             n_tokens,
             Some(&mut scratch.dequant_scratch),
         );
-        for t in 0..n_tokens {
-            let proj_row = &mut scratch.attn_proj[t * n_embd..(t + 1) * n_embd];
-            crate::backend::cpu::add_inplace(proj_row, &block.o_b);
-            // Residual: tokens += proj.
-            let tok_row = &mut tokens[t * n_embd..(t + 1) * n_embd];
-            crate::backend::cpu::add_inplace(tok_row, proj_row);
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            tokens
+                .par_chunks_mut(n_embd)
+                .zip(scratch.attn_proj.par_chunks_mut(n_embd))
+                .for_each(|(tok_row, proj_row)| {
+                    crate::backend::cpu::add_inplace(proj_row, &block.o_b);
+                    crate::backend::cpu::add_inplace(tok_row, proj_row);
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for t in 0..n_tokens {
+                let proj_row = &mut scratch.attn_proj[t * n_embd..(t + 1) * n_embd];
+                crate::backend::cpu::add_inplace(proj_row, &block.o_b);
+                let tok_row = &mut tokens[t * n_embd..(t + 1) * n_embd];
+                crate::backend::cpu::add_inplace(tok_row, proj_row);
+            }
         }
 
         // ── MLP ──
         scratch.pre_norm.copy_from_slice(tokens);
-        for t in 0..n_tokens {
-            let row = &mut scratch.pre_norm[t * n_embd..(t + 1) * n_embd];
-            crate::backend::cpu::layer_norm_inplace(row, &block.ln2_w, &block.ln2_b, cfg.eps);
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            scratch.pre_norm.par_chunks_mut(n_embd).for_each(|row| {
+                crate::backend::cpu::layer_norm_inplace(row, &block.ln2_w, &block.ln2_b, cfg.eps);
+            });
         }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for t in 0..n_tokens {
+                let row = &mut scratch.pre_norm[t * n_embd..(t + 1) * n_embd];
+                crate::backend::cpu::layer_norm_inplace(row, &block.ln2_w, &block.ln2_b, cfg.eps);
+            }
+        }
+
         let n_ff = cfg.n_ff;
         block.ffn_up_w.batched_matmul_with_scratch(
             &scratch.pre_norm,
@@ -697,10 +845,21 @@ impl VisionEncoderWeights {
             n_tokens,
             Some(&mut scratch.dequant_scratch),
         );
-        for t in 0..n_tokens {
-            let ff_row = &mut scratch.ffn_mid[t * n_ff..(t + 1) * n_ff];
-            crate::backend::cpu::add_inplace(ff_row, &block.ffn_up_b);
-            crate::backend::cpu::gelu_inplace(ff_row);
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            scratch.ffn_mid.par_chunks_mut(n_ff).for_each(|ff_row| {
+                crate::backend::cpu::add_inplace(ff_row, &block.ffn_up_b);
+                crate::backend::cpu::gelu_inplace(ff_row);
+            });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for t in 0..n_tokens {
+                let ff_row = &mut scratch.ffn_mid[t * n_ff..(t + 1) * n_ff];
+                crate::backend::cpu::add_inplace(ff_row, &block.ffn_up_b);
+                crate::backend::cpu::gelu_inplace(ff_row);
+            }
         }
 
         block.ffn_down_w.batched_matmul_with_scratch(
@@ -709,12 +868,25 @@ impl VisionEncoderWeights {
             n_tokens,
             Some(&mut scratch.dequant_scratch),
         );
-        for t in 0..n_tokens {
-            let down_row = &mut scratch.ffn_out[t * n_embd..(t + 1) * n_embd];
-            crate::backend::cpu::add_inplace(down_row, &block.ffn_down_b);
-            // Residual.
-            let tok_row = &mut tokens[t * n_embd..(t + 1) * n_embd];
-            crate::backend::cpu::add_inplace(tok_row, down_row);
+        #[cfg(feature = "parallel")]
+        {
+            use rayon::prelude::*;
+            tokens
+                .par_chunks_mut(n_embd)
+                .zip(scratch.ffn_out.par_chunks_mut(n_embd))
+                .for_each(|(tok_row, down_row)| {
+                    crate::backend::cpu::add_inplace(down_row, &block.ffn_down_b);
+                    crate::backend::cpu::add_inplace(tok_row, down_row);
+                });
+        }
+        #[cfg(not(feature = "parallel"))]
+        {
+            for t in 0..n_tokens {
+                let down_row = &mut scratch.ffn_out[t * n_embd..(t + 1) * n_embd];
+                crate::backend::cpu::add_inplace(down_row, &block.ffn_down_b);
+                let tok_row = &mut tokens[t * n_embd..(t + 1) * n_embd];
+                crate::backend::cpu::add_inplace(tok_row, down_row);
+            }
         }
     }
 
@@ -722,31 +894,7 @@ impl VisionEncoderWeights {
     /// (3072 → 2048) + GELU → `mm.2` (2048 → 1024). Output:
     /// `[64, 1024]` flattened.
     fn projector_forward(&self, pooled: &[f32], cfg: &VisionEncoderConfig) -> Vec<f32> {
-        let p = &self.projector;
-        let in_dim = p.mm1_w.cols;
-        let mid_dim = p.mm1_w.rows; // intermediate (e.g., 2048)
-        let out_dim = cfg.projection_dim;
-        if in_dim == 0 || pooled.is_empty() || !pooled.len().is_multiple_of(in_dim) {
-            return Vec::new();
-        }
-        let n_tokens = pooled.len() / in_dim;
-
-        let mut mid = vec![0f32; n_tokens * mid_dim];
-        let mut out = vec![0f32; n_tokens * out_dim];
-
-        p.mm1_w.batched_matmul(pooled, &mut mid, n_tokens);
-        for t in 0..n_tokens {
-            let mid_row = &mut mid[t * mid_dim..(t + 1) * mid_dim];
-            crate::backend::cpu::add_inplace(mid_row, &p.mm1_b);
-            crate::backend::cpu::gelu_inplace(mid_row);
-        }
-
-        p.mm2_w.batched_matmul(&mid, &mut out, n_tokens);
-        for t in 0..n_tokens {
-            let out_row = &mut out[t * out_dim..(t + 1) * out_dim];
-            crate::backend::cpu::add_inplace(out_row, &p.mm2_b);
-        }
-        out
+        self.projector.forward(pooled, cfg.projection_dim)
     }
 }
 
@@ -762,8 +910,8 @@ struct VitScratch {
     /// Attention output `[n_tokens × n_embd]` — reused across all
     /// 12 blocks (was previously allocated per block).
     attn_out: Vec<f32>,
-    /// Per-query attention scores `[n_tokens]` — softmax target
-    /// reused for every (head, query) pair.
+    /// Per-query attention scores `[n_tokens]` used in serial attention.
+    #[allow(dead_code)]
     scores: Vec<f32>,
     attn_proj: Vec<f32>,
     ffn_mid: Vec<f32>,
@@ -806,7 +954,7 @@ impl VitScratch {
 /// 8-core M-class CPU. Without the feature, falls through to the
 /// scalar single-thread path so embedded targets that disable
 /// `parallel` still build.
-fn patch_embed_compute(
+pub(crate) fn patch_embed_compute(
     image: &[f32],
     patch_embed: &PatchEmbedWeights,
     cfg: &VisionEncoderConfig,

@@ -852,6 +852,10 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_func_detect_tool_format(): Int
 
+    external fun uniffi_cera_ffi_checksum_func_hexagon_install_skels(): Int
+
+    external fun uniffi_cera_ffi_checksum_func_hexagon_probe(): Int
+
     external fun uniffi_cera_ffi_checksum_func_hotword_default_config(): Int
 
     external fun uniffi_cera_ffi_checksum_func_list_leap_bundles(): Int
@@ -899,6 +903,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_ceraengine_capabilities(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_context_size(): Int
 
@@ -992,6 +998,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_append_image(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_session_append_raw_image(): Int
+
     external fun uniffi_cera_ffi_checksum_method_session_append_text(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_append_tokens(): Int
@@ -1005,6 +1013,10 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_session_clear_cancel(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_default_generate_opts(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_disable_spec(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_enable_spec(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_export_checkpoint(): Int
 
@@ -1031,6 +1043,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_session_image_max_long_size(): Int
 
     external fun uniffi_cera_ffi_checksum_method_session_import_checkpoint(): Int
 
@@ -1108,6 +1122,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size(): Int
+
     external fun uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_ingest(): Int
@@ -1131,6 +1147,8 @@ internal object IntegrityCheckingUniffiLib {
     external fun uniffi_cera_ffi_checksum_method_chatsession_reset(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_set_tool_format(): Int
 
@@ -1349,6 +1367,13 @@ internal object UniffiLib {
 
     external fun uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache(
         `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache(
+        `ptr`: Long,
+        `cacheDir`: RustBuffer.ByValue,
+        `maxWarmEntries`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -1793,6 +1818,16 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
+    external fun uniffi_cera_ffi_fn_method_session_append_raw_image(
+        `ptr`: Long,
+        `pixels`: RustBuffer.ByValue,
+        `width`: Int,
+        `height`: Int,
+        `format`: RustBuffer.ByValue,
+        `maxLongSize`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
     external fun uniffi_cera_ffi_fn_method_session_append_text(
         `ptr`: Long,
         `text`: RustBuffer.ByValue,
@@ -1830,6 +1865,16 @@ internal object UniffiLib {
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_session_disable_spec(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_session_enable_spec(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
 
     external fun uniffi_cera_ffi_fn_method_session_export_checkpoint(
         `ptr`: Long,
@@ -1906,6 +1951,11 @@ internal object UniffiLib {
         `ptr`: Long,
         `tokens`: RustBuffer.ByValue,
         `adapters`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_session_image_max_long_size(
+        `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
@@ -2166,6 +2216,11 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_chatsession_image_max_long_size(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_method_chatsession_import_checkpoint(
         `ptr`: Long,
         `data`: RustBuffer.ByValue,
@@ -2231,6 +2286,12 @@ internal object UniffiLib {
     external fun uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(
         `ptr`: Long,
         `path`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Unit
+
+    external fun uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size(
+        `ptr`: Long,
+        `maxLongSize`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Unit
 
@@ -2331,6 +2392,13 @@ internal object UniffiLib {
         `architecture`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_func_hexagon_install_skels(
+        `dir`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Int
+
+    external fun uniffi_cera_ffi_fn_func_hexagon_probe(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
 
     external fun uniffi_cera_ffi_fn_func_hotword_default_config(uniffi_out_err: UniffiRustCallStatus): RustBuffer.ByValue
 
@@ -2617,6 +2685,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 55417) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -2687,6 +2761,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() != 5238) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache() != 49295) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 47091) {
@@ -2821,10 +2898,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 10087) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 51530) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 65327) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 13190) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 38950) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
@@ -2846,6 +2926,12 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_disable_spec() != 57) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_enable_spec() != 2995) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819) {
@@ -2875,7 +2961,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 42869) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 60330) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 34852) {
@@ -2885,6 +2971,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 61117) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_session_image_max_long_size() != 8402) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224) {
@@ -2917,7 +3006,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 26929) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 64571) {
@@ -3001,6 +3090,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size() != 39566) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -3035,6 +3127,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size() != 55203) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586) {
@@ -4155,6 +4250,17 @@ public interface CeraEngineInterface {
     fun `clearPrefixCache`()
 
     /**
+     * Configure the model's KV prefix cache.
+     *
+     * When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+     * When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+     */
+    fun `configurePrefixCache`(
+        `cacheDir`: kotlin.String?,
+        `maxWarmEntries`: kotlin.UInt?,
+    )
+
+    /**
      * Resolved context-window size (KV cache cap) the engine was
      * configured with. Mirrors the `context_size` field of the
      * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
@@ -4519,6 +4625,26 @@ open class CeraEngine :
                 )
             }
         }
+
+    /**
+     * Configure the model's KV prefix cache.
+     *
+     * When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+     * When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+     */
+    override fun `configurePrefixCache`(
+        `cacheDir`: kotlin.String?,
+        `maxWarmEntries`: kotlin.UInt?,
+    ) = callWithHandle {
+        uniffiRustCall { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache(
+                it,
+                FfiConverterOptionalString.lower(`cacheDir`),
+                FfiConverterOptionalUInt.lower(`maxWarmEntries`),
+                _status,
+            )
+        }
+    }
 
     /**
      * Resolved context-window size (KV cache cap) the engine was
@@ -5383,6 +5509,11 @@ public interface ChatSessionInterface {
     ): GenerateSummary
 
     /**
+     * Read the longest-side pixel cap configured on the session, if any.
+     */
+    fun `imageMaxLongSize`(): kotlin.UInt?
+
+    /**
      * Import and restore a chat session checkpoint from serialized binary bytes.
      */
     fun `importCheckpoint`(`data`: kotlin.ByteArray)
@@ -5454,6 +5585,11 @@ public interface ChatSessionInterface {
      * Save current chat session checkpoint to a file.
      */
     fun `saveCheckpoint`(`path`: kotlin.String)
+
+    /**
+     * Set an optional resolution cap on the longest side of encoded images.
+     */
+    fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?)
 
     /**
      * Set tool wire format explicitly.
@@ -5811,6 +5947,22 @@ open class ChatSession :
         )
 
     /**
+     * Read the longest-side pixel cap configured on the session, if any.
+     */
+    @Throws(FfiException::class)
+    override fun `imageMaxLongSize`(): kotlin.UInt? =
+        FfiConverterOptionalUInt.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_chatsession_image_max_long_size(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Import and restore a chat session checkpoint from serialized binary bytes.
      */
     @Throws(FfiException::class)
@@ -6010,6 +6162,21 @@ open class ChatSession :
                 UniffiLib.uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(
                     it,
                     FfiConverterString.lower(`path`),
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Set an optional resolution cap on the longest side of encoded images.
+     */
+    @Throws(FfiException::class)
+    override fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?) =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size(
+                    it,
+                    FfiConverterOptionalUInt.lower(`maxLongSize`),
                     _status,
                 )
             }
@@ -10762,8 +10929,9 @@ public interface SessionInterface {
      * includes both "manifest didn't list a mmproj" (no warn
      * logged) and "mmproj listed but failed to open/parse"
      * (warn logged at `CeraEngine::from_path`).
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     fun `appendAudio`(
         `samples`: List<kotlin.Float>,
@@ -10819,11 +10987,44 @@ public interface SessionInterface {
      * - `Backend(...)` for image decode failure, missing vision
      * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
      * mismatch.
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     fun `appendImage`(
         `bytes`: kotlin.ByteArray,
+        `maxLongSize`: kotlin.UInt?,
+    )
+
+    /**
+     * Append an uncompressed raw image buffer to the session context.
+     *
+     * `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+     * `width` and `height` specify the source image dimensions in pixels.
+     * `max_long_size` controls edge resizing: `None` uses the session default,
+     * `Some(0)` disables resizing to keep original dimensions, and `Some(n)`
+     * constrains the longest edge to at most `n` pixels.
+     * Automatically applies aspect-preserving resizing and normalization,
+     * then encodes with the vision encoder and appends image tokens.
+     *
+     * # Errors
+     *
+     * - `EmptyInput` if the buffer is empty or a dimension is 0.
+     * - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+     * (extra trailing bytes are ignored).
+     * - `Preprocess` if image normalization fails.
+     * - `UnsupportedModality` if vision encoding is unsupported on this session.
+     * - `Backend` for missing vision encoder, projection dimension mismatch,
+     * or backend execution failure during encoding or prefill.
+     * - `ContextOverflow` if appending image tokens exceeds context limit.
+     * - `Cancelled` if execution is interrupted.
+     * - `PoisonedSession` if the session lock is poisoned.
+     */
+    fun `appendRawImage`(
+        `pixels`: kotlin.ByteArray,
+        `width`: kotlin.UInt,
+        `height`: kotlin.UInt,
+        `format`: PixelFormat,
         `maxLongSize`: kotlin.UInt?,
     )
 
@@ -10901,6 +11102,18 @@ public interface SessionInterface {
      * advisory sampling defaults from the bundle manifest (if any) or standard defaults.
      */
     fun `defaultGenerateOpts`(): GenerateOpts
+
+    /**
+     * Explicitly disable speculative decoding for this session. An attached
+     * drafter is kept, so [`Self::enable_spec`] restores it.
+     */
+    fun `disableSpec`()
+
+    /**
+     * Re-enable speculative decoding for this session (if previously
+     * disabled), using the attached drafter if there is one.
+     */
+    fun `enableSpec`()
 
     /**
      * Export current inference session checkpoint as serialized binary bytes.
@@ -11056,7 +11269,7 @@ public interface SessionInterface {
      *
      * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
      * doesn't implement hidden-state extraction; `InvalidToken` if any id is
-     * `>= vocab_size`.
+     * `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
      */
     fun `hiddenStatesForTokens`(`tokens`: List<kotlin.UInt>): kotlin.ByteArray
 
@@ -11091,6 +11304,11 @@ public interface SessionInterface {
         `tokens`: List<kotlin.UInt>,
         `adapters`: List<LoraAdapterEntry>,
     ): List<kotlin.Float>
+
+    /**
+     * Read the session-default cap on the longest side of an appended image, if any.
+     */
+    fun `imageMaxLongSize`(): kotlin.UInt?
 
     /**
      * Import and restore an inference session checkpoint from serialized binary bytes.
@@ -11174,13 +11392,7 @@ public interface SessionInterface {
 
     /**
      * Set a session-default cap on the longest side of an appended
-     * image, in pixels (`None` = no cap). Unlike the per-call
-     * `max_long_size` argument to [`Self::append_image`], this default
-     * is honored by every image-append path the session drives —
-     * including chat-template flows — so a host can configure the
-     * image-encode budget once. See [`Self::append_image`] for the cap
-     * semantics (shrinks the encoded target, never upscales, takes
-     * precedence over the model's minimum-resolution floor).
+     * image, in pixels (`None` = no cap).
      */
     fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?)
 
@@ -11377,8 +11589,9 @@ open class Session :
      * includes both "manifest didn't list a mmproj" (no warn
      * logged) and "mmproj listed but failed to open/parse"
      * (warn logged at `CeraEngine::from_path`).
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     @Throws(FfiException::class)
     override fun `appendAudio`(
@@ -11444,8 +11657,9 @@ open class Session :
      * - `Backend(...)` for image decode failure, missing vision
      * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
      * mismatch.
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     @Throws(FfiException::class)
     override fun `appendImage`(
@@ -11456,6 +11670,51 @@ open class Session :
             UniffiLib.uniffi_cera_ffi_fn_method_session_append_image(
                 it,
                 FfiConverterByteArray.lower(`bytes`),
+                FfiConverterOptionalUInt.lower(`maxLongSize`),
+                _status,
+            )
+        }
+    }
+
+    /**
+     * Append an uncompressed raw image buffer to the session context.
+     *
+     * `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+     * `width` and `height` specify the source image dimensions in pixels.
+     * `max_long_size` controls edge resizing: `None` uses the session default,
+     * `Some(0)` disables resizing to keep original dimensions, and `Some(n)`
+     * constrains the longest edge to at most `n` pixels.
+     * Automatically applies aspect-preserving resizing and normalization,
+     * then encodes with the vision encoder and appends image tokens.
+     *
+     * # Errors
+     *
+     * - `EmptyInput` if the buffer is empty or a dimension is 0.
+     * - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+     * (extra trailing bytes are ignored).
+     * - `Preprocess` if image normalization fails.
+     * - `UnsupportedModality` if vision encoding is unsupported on this session.
+     * - `Backend` for missing vision encoder, projection dimension mismatch,
+     * or backend execution failure during encoding or prefill.
+     * - `ContextOverflow` if appending image tokens exceeds context limit.
+     * - `Cancelled` if execution is interrupted.
+     * - `PoisonedSession` if the session lock is poisoned.
+     */
+    @Throws(FfiException::class)
+    override fun `appendRawImage`(
+        `pixels`: kotlin.ByteArray,
+        `width`: kotlin.UInt,
+        `height`: kotlin.UInt,
+        `format`: PixelFormat,
+        `maxLongSize`: kotlin.UInt?,
+    ) = callWithHandle {
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_method_session_append_raw_image(
+                it,
+                FfiConverterByteArray.lower(`pixels`),
+                FfiConverterUInt.lower(`width`),
+                FfiConverterUInt.lower(`height`),
+                FfiConverterTypePixelFormat.lower(`format`),
                 FfiConverterOptionalUInt.lower(`maxLongSize`),
                 _status,
             )
@@ -11603,6 +11862,36 @@ open class Session :
                 }
             },
         )
+
+    /**
+     * Explicitly disable speculative decoding for this session. An attached
+     * drafter is kept, so [`Self::enable_spec`] restores it.
+     */
+    @Throws(FfiException::class)
+    override fun `disableSpec`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_disable_spec(
+                    it,
+                    _status,
+                )
+            }
+        }
+
+    /**
+     * Re-enable speculative decoding for this session (if previously
+     * disabled), using the attached drafter if there is one.
+     */
+    @Throws(FfiException::class)
+    override fun `enableSpec`() =
+        callWithHandle {
+            uniffiRustCallWithError(FfiException) { _status ->
+                UniffiLib.uniffi_cera_ffi_fn_method_session_enable_spec(
+                    it,
+                    _status,
+                )
+            }
+        }
 
     /**
      * Export current inference session checkpoint as serialized binary bytes.
@@ -11875,7 +12164,7 @@ open class Session :
      *
      * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
      * doesn't implement hidden-state extraction; `InvalidToken` if any id is
-     * `>= vocab_size`.
+     * `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
      */
     @Throws(FfiException::class)
     override fun `hiddenStatesForTokens`(`tokens`: List<kotlin.UInt>): kotlin.ByteArray =
@@ -11955,6 +12244,22 @@ open class Session :
                         it,
                         FfiConverterSequenceUInt.lower(`tokens`),
                         FfiConverterSequenceTypeLoraAdapterEntry.lower(`adapters`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Read the session-default cap on the longest side of an appended image, if any.
+     */
+    @Throws(FfiException::class)
+    override fun `imageMaxLongSize`(): kotlin.UInt? =
+        FfiConverterOptionalUInt.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_session_image_max_long_size(
+                        it,
                         _status,
                     )
                 }
@@ -12149,13 +12454,7 @@ open class Session :
 
     /**
      * Set a session-default cap on the longest side of an appended
-     * image, in pixels (`None` = no cap). Unlike the per-call
-     * `max_long_size` argument to [`Self::append_image`], this default
-     * is honored by every image-append path the session drives —
-     * including chat-template flows — so a host can configure the
-     * image-encode budget once. See [`Self::append_image`] for the cap
-     * semantics (shrinks the encoded target, never upscales, takes
-     * precedence over the model's minimum-resolution floor).
+     * image, in pixels (`None` = no cap).
      */
     @Throws(FfiException::class)
     override fun `setImageMaxLongSize`(`maxLongSize`: kotlin.UInt?) =
@@ -12377,7 +12676,9 @@ data class EngineConfig(
      */
     var `draftModel`: kotlin.String? = null,
     /**
-     * Whether to prefer GPU depthformer for audio decoder generation.
+     * Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+     * `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+     * depthformer regardless of this flag.
      */
     var `gpuDepthformer`: kotlin.Boolean = false,
 ) : Disposable {
@@ -12980,6 +13281,10 @@ data class GenerateOpts(
      * When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
      */
     var `spec`: SpecDecodeConfig? = null,
+    /**
+     * Disable speculative decoding (even when a draft sidecar model is present).
+     */
+    var `noSpec`: kotlin.Boolean = false,
 ) {
     companion object
 }
@@ -13004,6 +13309,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
             FfiConverterUInt.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterOptionalTypeSpecDecodeConfig.read(buf),
+            FfiConverterBoolean.read(buf),
         )
 
     override fun allocationSize(value: GenerateOpts) =
@@ -13021,7 +13327,8 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
                 FfiConverterSequenceUInt.allocationSize(value.`grammarTriggerTokens`) +
                 FfiConverterUInt.allocationSize(value.`flushEveryTokens`) +
                 FfiConverterUInt.allocationSize(value.`flushEveryMs`) +
-                FfiConverterOptionalTypeSpecDecodeConfig.allocationSize(value.`spec`)
+                FfiConverterOptionalTypeSpecDecodeConfig.allocationSize(value.`spec`) +
+                FfiConverterBoolean.allocationSize(value.`noSpec`)
         )
 
     override fun write(
@@ -13042,6 +13349,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
         FfiConverterUInt.write(value.`flushEveryTokens`, buf)
         FfiConverterUInt.write(value.`flushEveryMs`, buf)
         FfiConverterOptionalTypeSpecDecodeConfig.write(value.`spec`, buf)
+        FfiConverterBoolean.write(value.`noSpec`, buf)
     }
 }
 
@@ -13147,6 +13455,57 @@ public object FfiConverterTypeGenerateSummary : FfiConverterRustBuffer<GenerateS
         FfiConverterDouble.write(value.`decodeTokPerSec`, buf)
         FfiConverterDouble.write(value.`promptEvalTokPerSec`, buf)
         FfiConverterTypeFinishReason.write(value.`finishReason`, buf)
+    }
+}
+
+/**
+ * Successful Hexagon NPU probe: the working DSP architecture plus
+ * hardware capabilities. See [`hexagon_probe`].
+ */
+data class HexagonProbeInfo(
+    /**
+     * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`, `"V85"`).
+     */
+    var `arch`: kotlin.String,
+    var `threads`: kotlin.UInt,
+    var `hvxUnits`: kotlin.UInt,
+    var `hmxUnits`: kotlin.UInt,
+    var `vtcmBytes`: kotlin.ULong,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeHexagonProbeInfo : FfiConverterRustBuffer<HexagonProbeInfo> {
+    override fun read(buf: ByteBuffer): HexagonProbeInfo =
+        HexagonProbeInfo(
+            FfiConverterString.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterUInt.read(buf),
+            FfiConverterULong.read(buf),
+        )
+
+    override fun allocationSize(value: HexagonProbeInfo) =
+        (
+            FfiConverterString.allocationSize(value.`arch`) +
+                FfiConverterUInt.allocationSize(value.`threads`) +
+                FfiConverterUInt.allocationSize(value.`hvxUnits`) +
+                FfiConverterUInt.allocationSize(value.`hmxUnits`) +
+                FfiConverterULong.allocationSize(value.`vtcmBytes`)
+        )
+
+    override fun write(
+        value: HexagonProbeInfo,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`arch`, buf)
+        FfiConverterUInt.write(value.`threads`, buf)
+        FfiConverterUInt.write(value.`hvxUnits`, buf)
+        FfiConverterUInt.write(value.`hmxUnits`, buf)
+        FfiConverterULong.write(value.`vtcmBytes`, buf)
     }
 }
 
@@ -13698,9 +14057,15 @@ data class SessionConfig(
      */
     var `ubatchSize`: kotlin.UInt = 512u,
     /**
-     * Whether to prefer GPU depthformer for audio decoder generation.
+     * Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+     * `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+     * depthformer regardless of this flag.
      */
     var `gpuDepthformer`: kotlin.Boolean = false,
+    /**
+     * Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+     */
+    var `disableSpec`: kotlin.Boolean = false,
 ) {
     companion object
 }
@@ -13717,6 +14082,7 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
             FfiConverterOptionalULong.read(buf),
             FfiConverterUInt.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterBoolean.read(buf),
         )
 
     override fun allocationSize(value: SessionConfig) =
@@ -13726,7 +14092,8 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
                 FfiConverterUInt.allocationSize(value.`nKeep`) +
                 FfiConverterOptionalULong.allocationSize(value.`seed`) +
                 FfiConverterUInt.allocationSize(value.`ubatchSize`) +
-                FfiConverterBoolean.allocationSize(value.`gpuDepthformer`)
+                FfiConverterBoolean.allocationSize(value.`gpuDepthformer`) +
+                FfiConverterBoolean.allocationSize(value.`disableSpec`)
         )
 
     override fun write(
@@ -13739,6 +14106,7 @@ public object FfiConverterTypeSessionConfig : FfiConverterRustBuffer<SessionConf
         FfiConverterOptionalULong.write(value.`seed`, buf)
         FfiConverterUInt.write(value.`ubatchSize`, buf)
         FfiConverterBoolean.write(value.`gpuDepthformer`, buf)
+        FfiConverterBoolean.write(value.`disableSpec`, buf)
     }
 }
 
@@ -14026,7 +14394,7 @@ public object FfiConverterTypeUserMessage : FfiConverterRustBuffer<UserMessage> 
 
 enum class BackendPreference {
     /**
-     * Probe Metal → GPU → CPU at load time.
+     * Probe Metal / Hexagon / GPU / CPU at load time.
      */
     AUTO,
     CPU,
@@ -14040,6 +14408,11 @@ enum class BackendPreference {
      * Native Metal. Requires the `metal` feature + macOS.
      */
     METAL,
+
+    /**
+     * Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
+     */
+    HEXAGON,
 
     ;
 
@@ -16049,6 +16422,57 @@ public object FfiConverterTypeModelSource : FfiConverterRustBuffer<ModelSource> 
 }
 
 /**
+ * Supported pixel layouts for uncompressed raw image buffers.
+ */
+
+enum class PixelFormat {
+    /**
+     * 24-bit RGB (3 bytes per pixel: Red, Green, Blue).
+     */
+    RGB8,
+
+    /**
+     * 32-bit RGBA (4 bytes per pixel: Red, Green, Blue, Alpha).
+     */
+    RGBA8,
+
+    /**
+     * 24-bit BGR (3 bytes per pixel: Blue, Green, Red).
+     */
+    BGR8,
+
+    /**
+     * 32-bit BGRA (4 bytes per pixel: Blue, Green, Red, Alpha).
+     */
+    BGRA8,
+
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypePixelFormat : FfiConverterRustBuffer<PixelFormat> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            PixelFormat.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: PixelFormat) = 4UL
+
+    override fun write(
+        value: PixelFormat,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
+    }
+}
+
+/**
  * Execution state after a failed whole-message append.
  */
 
@@ -17775,6 +18199,46 @@ fun `detectToolFormat`(`architecture`: kotlin.String): ToolFormat? =
     FfiConverterOptionalTypeToolFormat.lift(
         uniffiRustCall { _status ->
             UniffiLib.uniffi_cera_ffi_fn_func_detect_tool_format(FfiConverterString.lower(`architecture`), _status)
+        },
+    )
+
+/**
+ * Write the embedded DSP skels into `dir` (created private, mode 0700, if
+ * missing) and point FastRPC's loader at it. An existing `dir` that another
+ * user owns, or that is writable by "other", is refused with `Backend`, since
+ * the loader executes what is in it. Caller stages a private writable directory;
+ * on Android, the `HexagonNpu.setup` helper invokes this function to extract
+ * skels into the application's internal files directory (`cera_skels`) and
+ * configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
+ * or loading a model with [`BackendPreference::Hexagon`]. Returns the
+ * number of skels written (0 when all were already present and fresh).
+ * Re-running is cheap and idempotent (files are only rewritten when
+ * their bytes differ, and the loader path is not duplicated). A `dir`
+ * containing `;`, `=` or NUL is rejected: it would silently split or corrupt
+ * the loader's search path.
+ */
+@Throws(FfiException::class)
+fun `hexagonInstallSkels`(`dir`: kotlin.String): kotlin.UInt =
+    FfiConverterUInt.lift(
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_hexagon_install_skels(FfiConverterString.lower(`dir`), _status)
+        },
+    )
+
+/**
+ * Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
+ * tries each bundled DSP skel, and returns the first working device's
+ * capabilities (then closes it). Fails when the `hexagon` feature is
+ * off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
+ * unavailable to this process. On Android, call the AAR's
+ * `HexagonNpu.setup` first so the loader can find the skel files
+ * (JVM/desktop flows use [`hexagon_install_skels`] instead).
+ */
+@Throws(FfiException::class)
+fun `hexagonProbe`(): HexagonProbeInfo =
+    FfiConverterTypeHexagonProbeInfo.lift(
+        uniffiRustCallWithError(FfiException) { _status ->
+            UniffiLib.uniffi_cera_ffi_fn_func_hexagon_probe(_status)
         },
     )
 

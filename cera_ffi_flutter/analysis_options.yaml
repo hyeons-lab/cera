@@ -1,5 +1,13 @@
 include: package:lints/recommended.yaml
 
-# No `analyzer.exclude` here any more: the generated UniFFI bindings moved to the
-# `cera_ffi` package along with the rest of the Dart API, and this package's
-# `lib/` is a single re-export file.
+analyzer:
+  exclude:
+    # Exclude build outputs and platform scaffold directories so that transient
+    # or generated files are ignored by 'dart analyze' under Flutter 3.47 conventions.
+    # Note that generated UniFFI bindings reside in `cera_ffi` rather than here.
+    - build/**
+    - android/**
+    - ios/**
+    - windows/**
+    - macos/**
+    - linux/**

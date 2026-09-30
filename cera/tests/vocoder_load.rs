@@ -178,6 +178,9 @@ fn test_audio_output_decoder_sequential_step() {
         cera::audio_engine::FrameOutcome::End => {
             panic!("unexpected immediate End outcome for dummy embedding");
         }
+        cera::audio_engine::FrameOutcome::Fault(detail) => {
+            panic!("unexpected GPU fault on the CPU-only path: {detail}");
+        }
         cera::audio_engine::FrameOutcome::Codes {
             audio_embedding,
             pcm,
@@ -258,6 +261,9 @@ fn test_end_to_end_tts_synthesis() {
             cera::audio_engine::FrameOutcome::End => {
                 eprintln!("Frame {frame_idx}: End");
                 break;
+            }
+            cera::audio_engine::FrameOutcome::Fault(detail) => {
+                panic!("unexpected GPU fault on the CPU-only path: {detail}");
             }
             cera::audio_engine::FrameOutcome::Codes {
                 audio_embedding,

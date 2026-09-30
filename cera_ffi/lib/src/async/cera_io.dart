@@ -30,6 +30,7 @@ BackendPreference _backendOf(CeraBackend backend) => switch (backend) {
     (Platform.isMacOS || Platform.isIOS)
         ? BackendPreference.metal
         : BackendPreference.auto,
+  CeraBackend.hexagon => BackendPreference.hexagon,
   CeraBackend.auto => BackendPreference.auto,
 };
 

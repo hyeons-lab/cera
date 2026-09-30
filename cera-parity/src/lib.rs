@@ -187,10 +187,11 @@ fn greedy_opts(max_tokens: u32) -> cera::GenerateOpts {
         // and cera-ffi produce identical output, and its sister `greedy_opts_ffi`
         // has no such knob to mirror. Turning it on would put one side on a
         // different code path for no coverage gain, which is the opposite of
-        // what a parity harness is for — and because the batched verify forward
+        // what a parity harness is for, and because the batched verify forward
         // can flip a near-tie (see `cera::spec`), it could also inject drift
         // this harness would report as a parity failure.
         spec: None,
+        no_spec: true,
     }
 }
 
@@ -213,6 +214,7 @@ fn greedy_opts_ffi(max_tokens: u32) -> cera_ffi::GenerateOpts {
         flush_every_tokens: settings::FLUSH_EVERY_TOKENS,
         flush_every_ms: settings::FLUSH_EVERY_MS,
         spec: None,
+        no_spec: true,
     }
 }
 

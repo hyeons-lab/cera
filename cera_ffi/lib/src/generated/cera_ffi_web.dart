@@ -155,7 +155,9 @@ class EngineConfig {
     this.bundleRepo = null,
     /// Optional path to a DSpark speculative draft model GGUF file.
     this.draftModel = null,
-    /// Whether to prefer GPU depthformer for audio decoder generation.
+    /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+    /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+    /// depthformer regardless of this flag.
     this.gpuDepthformer = false,
   });
 
@@ -174,7 +176,9 @@ class EngineConfig {
   final BundleRepo? bundleRepo;
   /// Optional path to a DSpark speculative draft model GGUF file.
   final String? draftModel;
-  /// Whether to prefer GPU depthformer for audio decoder generation.
+  /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+  /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+  /// depthformer regardless of this flag.
   final bool gpuDepthformer;
 
   Map<String, dynamic> toJson() {
@@ -791,6 +795,8 @@ class GenerateOpts {
     /// Optional speculative decoding configuration (prompt-lookup drafting).
     /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
     this.spec = null,
+    /// Disable speculative decoding (even when a draft sidecar model is present).
+    this.noSpec = false,
   });
 
   final int maxTokens;
@@ -832,6 +838,8 @@ class GenerateOpts {
   /// Optional speculative decoding configuration (prompt-lookup drafting).
   /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
   final SpecDecodeConfig? spec;
+  /// Disable speculative decoding (even when a draft sidecar model is present).
+  final bool noSpec;
 
   Map<String, dynamic> toJson() {
     return {
@@ -849,6 +857,7 @@ class GenerateOpts {
       'flushEveryTokens': this.flushEveryTokens,
       'flushEveryMs': this.flushEveryMs,
       'spec': this.spec == null ? null : (() { final __tmp = this.spec!; return __tmp.toJson(); })(),
+      'noSpec': this.noSpec,
     };
   }
 
@@ -868,6 +877,7 @@ class GenerateOpts {
       flushEveryTokens: json.containsKey('flushEveryTokens') ? (json['flushEveryTokens'] as num).toInt() : 16,
       flushEveryMs: json.containsKey('flushEveryMs') ? (json['flushEveryMs'] as num).toInt() : 50,
       spec: json.containsKey('spec') ? json['spec'] == null ? null : (() { final __tmp = json['spec']; return SpecDecodeConfig.fromJson(__tmp as Map<String, dynamic>); })() : null,
+      noSpec: json.containsKey('noSpec') ? json['noSpec'] as bool : false,
     );
   }
 
@@ -886,6 +896,7 @@ class GenerateOpts {
     int? flushEveryTokens,
     int? flushEveryMs,
     Object? spec = _sentinel,
+    bool? noSpec,
   }) {
     return GenerateOpts(
       maxTokens: maxTokens ?? this.maxTokens,
@@ -902,21 +913,22 @@ class GenerateOpts {
       flushEveryTokens: flushEveryTokens ?? this.flushEveryTokens,
       flushEveryMs: flushEveryMs ?? this.flushEveryMs,
       spec: spec == _sentinel ? this.spec : spec as SpecDecodeConfig?,
+      noSpec: noSpec ?? this.noSpec,
     );
   }
 
   @override
   String toString() {
-    return 'GenerateOpts(maxTokens: $maxTokens, seed: $seed, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, ignoreEos: $ignoreEos, grammar: $grammar, grammarTriggerTokens: $grammarTriggerTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs, spec: $spec)';
+    return 'GenerateOpts(maxTokens: $maxTokens, seed: $seed, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, ignoreEos: $ignoreEos, grammar: $grammar, grammarTriggerTokens: $grammarTriggerTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs, spec: $spec, noSpec: $noSpec)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is GenerateOpts && maxTokens == other.maxTokens && seed == other.seed && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && ignoreEos == other.ignoreEos && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs && spec == other.spec;
+      other is GenerateOpts && maxTokens == other.maxTokens && seed == other.seed && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && ignoreEos == other.ignoreEos && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs && spec == other.spec && noSpec == other.noSpec;
 
   @override
-  int get hashCode => Object.hash(maxTokens, seed, temperature, topP, topK, minP, repetitionPenalty, stopTokens, ignoreEos, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs, spec);
+  int get hashCode => Object.hash(maxTokens, seed, temperature, topP, topK, minP, repetitionPenalty, stopTokens, ignoreEos, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs, spec, noSpec);
 }
 
 /// Bundle of everything a synchronous `generate` call produces:
@@ -1060,6 +1072,75 @@ class GenerateSummary {
 
   @override
   int get hashCode => Object.hash(tokensGenerated, promptEvalTokens, promptEvalMs, decodeMs, totalDurationMs, decodeTokPerSec, promptEvalTokPerSec, finishReason);
+}
+
+/// Successful Hexagon NPU probe: the working DSP architecture plus
+/// hardware capabilities. See [`hexagon_probe`].
+class HexagonProbeInfo {
+  const HexagonProbeInfo({
+    /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`, `"V85"`).
+    required this.arch,
+    required this.threads,
+    required this.hvxUnits,
+    required this.hmxUnits,
+    required this.vtcmBytes,
+  });
+
+  /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`, `"V85"`).
+  final String arch;
+  final int threads;
+  final int hvxUnits;
+  final int hmxUnits;
+  final int vtcmBytes;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'arch': this.arch,
+      'threads': this.threads,
+      'hvxUnits': this.hvxUnits,
+      'hmxUnits': this.hmxUnits,
+      'vtcmBytes': this.vtcmBytes,
+    };
+  }
+
+  factory HexagonProbeInfo.fromJson(Map<String, dynamic> json) {
+    return HexagonProbeInfo(
+      arch: json['arch'] as String,
+      threads: (json['threads'] as num).toInt(),
+      hvxUnits: (json['hvxUnits'] as num).toInt(),
+      hmxUnits: (json['hmxUnits'] as num).toInt(),
+      vtcmBytes: (json['vtcmBytes'] as num).toInt(),
+    );
+  }
+
+  HexagonProbeInfo copyWith({
+    String? arch,
+    int? threads,
+    int? hvxUnits,
+    int? hmxUnits,
+    int? vtcmBytes,
+  }) {
+    return HexagonProbeInfo(
+      arch: arch ?? this.arch,
+      threads: threads ?? this.threads,
+      hvxUnits: hvxUnits ?? this.hvxUnits,
+      hmxUnits: hmxUnits ?? this.hmxUnits,
+      vtcmBytes: vtcmBytes ?? this.vtcmBytes,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'HexagonProbeInfo(arch: $arch, threads: $threads, hvxUnits: $hvxUnits, hmxUnits: $hmxUnits, vtcmBytes: $vtcmBytes)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is HexagonProbeInfo && arch == other.arch && threads == other.threads && hvxUnits == other.hvxUnits && hmxUnits == other.hmxUnits && vtcmBytes == other.vtcmBytes;
+
+  @override
+  int get hashCode => Object.hash(arch, threads, hvxUnits, hmxUnits, vtcmBytes);
 }
 
 /// One bundle published on `huggingface.co/LiquidAI/LeapBundles`: the
@@ -1357,8 +1438,12 @@ class SessionConfig {
     this.seed = null,
     /// Chunked-prefill ubatch size. `0` = monolithic prefill.
     this.ubatchSize = 512,
-    /// Whether to prefer GPU depthformer for audio decoder generation.
+    /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+    /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+    /// depthformer regardless of this flag.
     this.gpuDepthformer = false,
+    /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+    this.disableSpec = false,
   });
 
   /// Cap on total tokens held in KV. `None` → model's default
@@ -1373,8 +1458,12 @@ class SessionConfig {
   final int? seed;
   /// Chunked-prefill ubatch size. `0` = monolithic prefill.
   final int ubatchSize;
-  /// Whether to prefer GPU depthformer for audio decoder generation.
+  /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+  /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+  /// depthformer regardless of this flag.
   final bool gpuDepthformer;
+  /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+  final bool disableSpec;
 
   Map<String, dynamic> toJson() {
     return {
@@ -1384,6 +1473,7 @@ class SessionConfig {
       'seed': this.seed,
       'ubatchSize': this.ubatchSize,
       'gpuDepthformer': this.gpuDepthformer,
+      'disableSpec': this.disableSpec,
     };
   }
 
@@ -1395,6 +1485,7 @@ class SessionConfig {
       seed: json.containsKey('seed') ? json['seed'] == null ? null : (json['seed'] as num).toInt() : null,
       ubatchSize: json.containsKey('ubatchSize') ? (json['ubatchSize'] as num).toInt() : 512,
       gpuDepthformer: json.containsKey('gpuDepthformer') ? json['gpuDepthformer'] as bool : false,
+      disableSpec: json.containsKey('disableSpec') ? json['disableSpec'] as bool : false,
     );
   }
 
@@ -1405,6 +1496,7 @@ class SessionConfig {
     Object? seed = _sentinel,
     int? ubatchSize,
     bool? gpuDepthformer,
+    bool? disableSpec,
   }) {
     return SessionConfig(
       maxSeqLen: maxSeqLen == _sentinel ? this.maxSeqLen : maxSeqLen as int?,
@@ -1413,21 +1505,22 @@ class SessionConfig {
       seed: seed == _sentinel ? this.seed : seed as int?,
       ubatchSize: ubatchSize ?? this.ubatchSize,
       gpuDepthformer: gpuDepthformer ?? this.gpuDepthformer,
+      disableSpec: disableSpec ?? this.disableSpec,
     );
   }
 
   @override
   String toString() {
-    return 'SessionConfig(maxSeqLen: $maxSeqLen, kvCompression: $kvCompression, nKeep: $nKeep, seed: $seed, ubatchSize: $ubatchSize, gpuDepthformer: $gpuDepthformer)';
+    return 'SessionConfig(maxSeqLen: $maxSeqLen, kvCompression: $kvCompression, nKeep: $nKeep, seed: $seed, ubatchSize: $ubatchSize, gpuDepthformer: $gpuDepthformer, disableSpec: $disableSpec)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is SessionConfig && maxSeqLen == other.maxSeqLen && kvCompression == other.kvCompression && nKeep == other.nKeep && seed == other.seed && ubatchSize == other.ubatchSize && gpuDepthformer == other.gpuDepthformer;
+      other is SessionConfig && maxSeqLen == other.maxSeqLen && kvCompression == other.kvCompression && nKeep == other.nKeep && seed == other.seed && ubatchSize == other.ubatchSize && gpuDepthformer == other.gpuDepthformer && disableSpec == other.disableSpec;
 
   @override
-  int get hashCode => Object.hash(maxSeqLen, kvCompression, nKeep, seed, ubatchSize, gpuDepthformer);
+  int get hashCode => Object.hash(maxSeqLen, kvCompression, nKeep, seed, ubatchSize, gpuDepthformer, disableSpec);
 }
 
 /// Speculative decoding configuration for prompt-lookup drafting. Mirrors [`cera::SpecDecode`].
@@ -2306,13 +2399,15 @@ class SessionRecoveryStatus {
 /// kept as a separate type so the `cera` crate doesn't carry UniFFI
 /// annotations.
 enum BackendPreference {
-  /// Probe Metal → GPU → CPU at load time.
+  /// Probe Metal / Hexagon / GPU / CPU at load time.
   auto,
   cpu,
   /// `wgpu` (Vulkan / Metal / DX12). Requires the `gpu` feature.
   gpu,
   /// Native Metal. Requires the `metal` feature + macOS.
   metal,
+  /// Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
+  hexagon,
 }
 
 /// Typed error surface for `cera-ffi`. Mirrors [`cera::CeraError`] one-
@@ -2982,6 +3077,18 @@ final class KvCompressionTurboQuant extends KvCompression {
 
   @override
   int get hashCode => Object.hash(seed, keys, values);
+}
+
+/// Supported pixel layouts for uncompressed raw image buffers.
+enum PixelFormat {
+  /// 24-bit RGB (3 bytes per pixel: Red, Green, Blue).
+  rgb8,
+  /// 32-bit RGBA (4 bytes per pixel: Red, Green, Blue, Alpha).
+  rgba8,
+  /// 24-bit BGR (3 bytes per pixel: Blue, Green, Red).
+  bgr8,
+  /// 32-bit BGRA (4 bytes per pixel: Blue, Green, Red, Alpha).
+  bgra8,
 }
 
 /// The tool-call wire format a model family uses. Mirrors
@@ -4367,6 +4474,7 @@ String _encodeBackendPreference(BackendPreference value) {
     BackendPreference.cpu => 'cpu',
     BackendPreference.gpu => 'gpu',
     BackendPreference.metal => 'metal',
+    BackendPreference.hexagon => 'hexagon',
   };
 }
 
@@ -4376,6 +4484,7 @@ BackendPreference _decodeBackendPreference(String raw) {
     'cpu' => BackendPreference.cpu,
     'gpu' => BackendPreference.gpu,
     'metal' => BackendPreference.metal,
+    'hexagon' => BackendPreference.hexagon,
     _ => throw StateError('Unknown BackendPreference variant: $raw'),
   };
 }
@@ -4701,6 +4810,25 @@ KvCompression _decodeKvCompression(String raw) {
     default:
       throw StateError('Unknown KvCompression variant tag: $tag');
   }
+}
+
+String _encodePixelFormat(PixelFormat value) {
+  return switch (value) {
+    PixelFormat.rgb8 => 'rgb8',
+    PixelFormat.rgba8 => 'rgba8',
+    PixelFormat.bgr8 => 'bgr8',
+    PixelFormat.bgra8 => 'bgra8',
+  };
+}
+
+PixelFormat _decodePixelFormat(String raw) {
+  return switch (raw) {
+    'rgb8' => PixelFormat.rgb8,
+    'rgba8' => PixelFormat.rgba8,
+    'bgr8' => PixelFormat.bgr8,
+    'bgra8' => PixelFormat.bgra8,
+    _ => throw StateError('Unknown PixelFormat variant: $raw'),
+  };
 }
 
 String _encodeToolFormat(ToolFormat value) {
@@ -5627,6 +5755,14 @@ final class KvCompressionFfiCodec {
   static KvCompression decode(String raw) => _decodeKvCompression(raw);
 }
 
+final class PixelFormatFfiCodec {
+  const PixelFormatFfiCodec._();
+
+  static String encode(PixelFormat value) => _encodePixelFormat(value);
+
+  static PixelFormat decode(String raw) => _decodePixelFormat(raw);
+}
+
 final class ToolFormatFfiCodec {
   const ToolFormatFfiCodec._();
 
@@ -6017,6 +6153,12 @@ final class CeraEngine {
   /// Call this from host OS memory pressure warnings (e.g. iOS `applicationDidReceiveMemoryWarning`
   /// or Android `onTrimMemory`) to immediately free RAM without losing persistent cached prefixes.
   void clearPrefixCache() => _unsupportedOnWeb('CeraEngine.clearPrefixCache');
+
+  /// Configure the model's KV prefix cache.
+  ///
+  /// When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+  /// When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+  void configurePrefixCache(String? cacheDir, int? maxWarmEntries) => _unsupportedOnWeb('CeraEngine.configurePrefixCache');
 
   /// Resolved context-window size (KV cache cap) the engine was
   /// configured with. Mirrors the `context_size` field of the
@@ -6487,8 +6629,9 @@ final class Session {
   /// includes both "manifest didn't list a mmproj" (no warn
   /// logged) and "mmproj listed but failed to open/parse"
   /// (warn logged at `CeraEngine::from_path`).
-  /// - `ContextOverflow` / `Cancelled` propagate from the
-  /// underlying prefill.
+  /// - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+  /// underlying prefill (a backend fault recorded mid-prefill surfaces
+  /// as `Backend`, not `Cancelled`).
   void appendAudio(List<double> samples, int sampleRate) => _unsupportedOnWeb('Session.appendAudio');
 
   /// Append an encoded image (PNG / JPEG bytes, auto-detected) to the
@@ -6539,9 +6682,34 @@ final class Session {
   /// - `Backend(...)` for image decode failure, missing vision
   /// encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
   /// mismatch.
-  /// - `ContextOverflow` / `Cancelled` propagate from the
-  /// underlying prefill.
+  /// - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+  /// underlying prefill (a backend fault recorded mid-prefill surfaces
+  /// as `Backend`, not `Cancelled`).
   void appendImage(Uint8List bytes, int? maxLongSize) => _unsupportedOnWeb('Session.appendImage');
+
+  /// Append an uncompressed raw image buffer to the session context.
+  ///
+  /// `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+  /// `width` and `height` specify the source image dimensions in pixels.
+  /// `max_long_size` controls edge resizing: `None` uses the session default,
+  /// `Some(0)` disables resizing to keep original dimensions, and `Some(n)`
+  /// constrains the longest edge to at most `n` pixels.
+  /// Automatically applies aspect-preserving resizing and normalization,
+  /// then encodes with the vision encoder and appends image tokens.
+  ///
+  /// # Errors
+  ///
+  /// - `EmptyInput` if the buffer is empty or a dimension is 0.
+  /// - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+  /// (extra trailing bytes are ignored).
+  /// - `Preprocess` if image normalization fails.
+  /// - `UnsupportedModality` if vision encoding is unsupported on this session.
+  /// - `Backend` for missing vision encoder, projection dimension mismatch,
+  /// or backend execution failure during encoding or prefill.
+  /// - `ContextOverflow` if appending image tokens exceeds context limit.
+  /// - `Cancelled` if execution is interrupted.
+  /// - `PoisonedSession` if the session lock is poisoned.
+  void appendRawImage(Uint8List pixels, int width, int height, PixelFormat format, int? maxLongSize) => _unsupportedOnWeb('Session.appendRawImage');
 
   /// Append raw text to the context, running a prefill over just
   /// the new tokens. `EmptyInput` error if `text` is empty.
@@ -6603,6 +6771,14 @@ final class Session {
   /// Returns default `GenerateOpts` for this session, pre-populated with
   /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
   GenerateOpts defaultGenerateOpts() => _unsupportedOnWeb('Session.defaultGenerateOpts');
+
+  /// Explicitly disable speculative decoding for this session. An attached
+  /// drafter is kept, so [`Self::enable_spec`] restores it.
+  void disableSpec() => _unsupportedOnWeb('Session.disableSpec');
+
+  /// Re-enable speculative decoding for this session (if previously
+  /// disabled), using the attached drafter if there is one.
+  void enableSpec() => _unsupportedOnWeb('Session.enableSpec');
 
   /// Export current inference session checkpoint as serialized binary bytes.
   Uint8List exportCheckpoint() => _unsupportedOnWeb('Session.exportCheckpoint');
@@ -6730,7 +6906,7 @@ final class Session {
   ///
   /// Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
   /// doesn't implement hidden-state extraction; `InvalidToken` if any id is
-  /// `>= vocab_size`.
+  /// `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
   Uint8List hiddenStatesForTokens(List<int> tokens) => _unsupportedOnWeb('Session.hiddenStatesForTokens');
 
   /// Like [`Self::hidden_states_for_tokens`] but with an explicit per-call
@@ -6752,6 +6928,9 @@ final class Session {
   /// Like [`Self::hidden_states_mean_pooled`] with the per-call adapter
   /// stack of [`Self::hidden_states_for_tokens_with_adapters`].
   List<double> hiddenStatesMeanPooledWithAdapters(List<int> tokens, List<LoraAdapterEntry> adapters) => _unsupportedOnWeb('Session.hiddenStatesMeanPooledWithAdapters');
+
+  /// Read the session-default cap on the longest side of an appended image, if any.
+  int? imageMaxLongSize() => _unsupportedOnWeb('Session.imageMaxLongSize');
 
   /// Import and restore an inference session checkpoint from serialized binary bytes.
   void importCheckpoint(Uint8List data) => _unsupportedOnWeb('Session.importCheckpoint');
@@ -6818,13 +6997,7 @@ final class Session {
   GenerateSummary sendMessageStreaming(UserMessage message, GenerateOpts opts, ModalitySink sink) => _unsupportedOnWeb('Session.sendMessageStreaming');
 
   /// Set a session-default cap on the longest side of an appended
-  /// image, in pixels (`None` = no cap). Unlike the per-call
-  /// `max_long_size` argument to [`Self::append_image`], this default
-  /// is honored by every image-append path the session drives —
-  /// including chat-template flows — so a host can configure the
-  /// image-encode budget once. See [`Self::append_image`] for the cap
-  /// semantics (shrinks the encoded target, never upscales, takes
-  /// precedence over the model's minimum-resolution floor).
+  /// image, in pixels (`None` = no cap).
   void setImageMaxLongSize(int? maxLongSize) => _unsupportedOnWeb('Session.setImageMaxLongSize');
 
   /// Replace the attached adapter set with a runtime-scaled stack: entry
@@ -6968,6 +7141,9 @@ final class ChatSession {
   /// Stream generation output tokens into the specified sink, constrained by a JSON Schema.
   GenerateSummary generateStreamingJson(GenerateOpts opts, String schemaJson, ModalitySink sink) => _unsupportedOnWeb('ChatSession.generateStreamingJson');
 
+  /// Read the longest-side pixel cap configured on the session, if any.
+  int? imageMaxLongSize() => _unsupportedOnWeb('ChatSession.imageMaxLongSize');
+
   /// Import and restore a chat session checkpoint from serialized binary bytes.
   void importCheckpoint(Uint8List data) => _unsupportedOnWeb('ChatSession.importCheckpoint');
 
@@ -7013,6 +7189,9 @@ final class ChatSession {
 
   /// Save current chat session checkpoint to a file.
   void saveCheckpoint(String path) => _unsupportedOnWeb('ChatSession.saveCheckpoint');
+
+  /// Set an optional resolution cap on the longest side of encoded images.
+  void setImageMaxLongSize(int? maxLongSize) => _unsupportedOnWeb('ChatSession.setImageMaxLongSize');
 
   /// Set tool wire format explicitly.
   void setToolFormat(ToolFormat format) => _unsupportedOnWeb('ChatSession.setToolFormat');
@@ -7125,6 +7304,30 @@ String cpuBackendReport() => _unsupportedOnWeb('cpuBackendReport');
 /// `"lfm2"`, `"qwen3"`). Returns `None` for architectures with no known
 /// convention — the caller may still choose a format explicitly.
 ToolFormat? detectToolFormat(String architecture) => _unsupportedOnWeb('detectToolFormat');
+
+/// Write the embedded DSP skels into `dir` (created private, mode 0700, if
+/// missing) and point FastRPC's loader at it. An existing `dir` that another
+/// user owns, or that is writable by "other", is refused with `Backend`, since
+/// the loader executes what is in it. Caller stages a private writable directory;
+/// on Android, the `HexagonNpu.setup` helper invokes this function to extract
+/// skels into the application's internal files directory (`cera_skels`) and
+/// configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
+/// or loading a model with [`BackendPreference::Hexagon`]. Returns the
+/// number of skels written (0 when all were already present and fresh).
+/// Re-running is cheap and idempotent (files are only rewritten when
+/// their bytes differ, and the loader path is not duplicated). A `dir`
+/// containing `;`, `=` or NUL is rejected: it would silently split or corrupt
+/// the loader's search path.
+int hexagonInstallSkels(String dir) => _unsupportedOnWeb('hexagonInstallSkels');
+
+/// Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
+/// tries each bundled DSP skel, and returns the first working device's
+/// capabilities (then closes it). Fails when the `hexagon` feature is
+/// off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
+/// unavailable to this process. On Android, call the AAR's
+/// `HexagonNpu.setup` first so the loader can find the skel files
+/// (JVM/desktop flows use [`hexagon_install_skels`] instead).
+HexagonProbeInfo hexagonProbe() => _unsupportedOnWeb('hexagonProbe');
 
 /// Default KWS configuration parameters.
 FfiHotwordConfig hotwordDefaultConfig() => _unsupportedOnWeb('hotwordDefaultConfig');

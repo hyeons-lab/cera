@@ -16,6 +16,8 @@
 //! or a wrong base index cannot cancel out against the reference.
 #![cfg(feature = "gpu")]
 
+mod common;
+
 use cera::backend::wgpu::{DevicePollExt, GpuContext, shaders};
 use cera::quant::{
     BlockQ5K, dequantize_q4_0_matrix, dequantize_q4_k_m_matrix, dequantize_q5_k_block,
@@ -306,20 +308,7 @@ fn check_k_quants(ctx: &GpuContext, m: u32, k: u32, n: u32) {
         let pt6 = ctx.mul_mat_reg_tile_q6_k_passthrough();
         dispatch_and_check(ctx, &pt6, &raw6, &w6, m, k, n, "Q6_K passthrough");
     } else {
-        // Mirror CERA_REQUIRE_GPU: on a Vulkan CI leg (lavapipe) this must not
-        // silently skip, or the passthrough kernels would report green untested.
-        assert!(
-            std::env::var("CERA_REQUIRE_PASSTHROUGH")
-                .unwrap_or_default()
-                .is_empty(),
-            "CERA_REQUIRE_PASSTHROUGH is set but the backend ({}) does not take \
-             SPIR-V passthrough",
-            ctx.backend
-        );
-        eprintln!(
-            "[wgpu-mul-mat-parity] SKIP K-quant passthrough on non-Vulkan backend ({})",
-            ctx.backend
-        );
+        common::fail_closed_passthrough_skip(ctx, "K-quant");
     }
 }
 
@@ -386,20 +375,7 @@ fn check_q4_0_q8_0(ctx: &GpuContext, m: u32, k: u32, n: u32) {
         let pt8 = ctx.mul_mat_reg_tile_q8_0_passthrough();
         dispatch_and_check(ctx, &pt8, &raw8, &w8, m, k, n, "Q8_0 passthrough");
     } else {
-        // Mirror CERA_REQUIRE_GPU: on a Vulkan CI leg (lavapipe) this must not
-        // silently skip, or the passthrough kernels would report green untested.
-        assert!(
-            std::env::var("CERA_REQUIRE_PASSTHROUGH")
-                .unwrap_or_default()
-                .is_empty(),
-            "CERA_REQUIRE_PASSTHROUGH is set but the backend ({}) does not take \
-             SPIR-V passthrough",
-            ctx.backend
-        );
-        eprintln!(
-            "[wgpu-mul-mat-parity] SKIP passthrough on non-Vulkan backend ({})",
-            ctx.backend
-        );
+        common::fail_closed_passthrough_skip(ctx, "Q4_0/Q8_0");
     }
 }
 

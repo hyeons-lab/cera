@@ -72,7 +72,7 @@ fun runProduction(
         buffer.flip()
         check(FfiConverterTypeBackendPreference.read(buffer) == backend && !buffer.hasRemaining())
     }
-    for (tag in listOf(0, 5, -1, Int.MAX_VALUE)) {
+    for (tag in listOf(0, 6, -1, Int.MAX_VALUE)) {
         val buffer = ByteBuffer.allocate(4).putInt(tag).flip()
         try {
             FfiConverterTypeBackendPreference.read(buffer)

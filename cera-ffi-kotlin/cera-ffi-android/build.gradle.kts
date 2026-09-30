@@ -43,6 +43,7 @@ dependencies {
     // Android needs JNA's `@aar` artifact (bundles the per-ABI JNI dispatch libs).
     api("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
     api(libs.kotlinx.coroutines.core)
+    testImplementation(libs.junit)
 }
 
 mavenPublishing {
@@ -54,7 +55,8 @@ mavenPublishing {
         name.set("cera-ffi (Android)")
         description.set(
             "UniFFI/JNA Kotlin bindings for the cera inference engine: Android AAR with " +
-                "jniLibs for arm64-v8a, armeabi-v7a, x86_64, and x86."
+                "jniLibs for arm64-v8a, armeabi-v7a, x86_64, and x86 " +
+                "(Hexagon NPU backend + DSP skels on the 64-bit ABIs)."
         )
         // Dual-licensed Apache-2.0 OR MIT, matching the Cargo workspace.
         licenses {

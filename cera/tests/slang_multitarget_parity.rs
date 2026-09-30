@@ -3813,14 +3813,22 @@ fn generated_gemm_wgsl_needs_no_f16() {
     }
 }
 
-/// The generated WGSL must **not** contain subgroup ops: cera never requests
-/// `wgpu::Features::SUBGROUP`, so a wave intrinsic leaking into this target
-/// fails pipeline creation on every device. Text-level because the failure
-/// would otherwise surface as an opaque validation error far from its cause.
+/// The generated WGSL for the kernels listed below must **not** contain
+/// subgroup ops: every one of them is dispatched on devices without
+/// `wgpu::Features::SUBGROUP` (cera requests SUBGROUP only opportunistically),
+/// and a wave intrinsic leaking into them fails pipeline creation there.
+/// Text-level because the failure would otherwise surface as an opaque
+/// validation error far from its cause. Note `gemv_q4_0_fast` IS in this
+/// list: only its SPIR-V *variant* is gated on `has_subgroup`; the WGSL twin
+/// below runs exactly on the no-SUBGROUP devices, so it must stay wave-free.
 #[cfg(feature = "gpu")]
 #[test]
 fn generated_wgsl_has_no_subgroup_ops() {
     for (name, src) in [
+        (
+            "gemv_q4_0_fast",
+            cera::backend::wgpu::shaders::GEMV_Q4_0_FAST,
+        ),
         ("softmax", cera::backend::wgpu::shaders::SOFTMAX),
         ("gemm_q8_0", cera::backend::wgpu::shaders::GEMM_Q8_0_SLANG),
         (
@@ -3843,7 +3851,7 @@ fn generated_wgsl_has_no_subgroup_ops() {
     ] {
         assert!(
             !src.contains("subgroup"),
-            "generated WGSL for {name} uses a subgroup op, but cera does not enable Features::SUBGROUP"
+            "generated WGSL for {name} uses a subgroup op, but {name} is dispatched on devices without Features::SUBGROUP"
         );
     }
     // The audio tier goes through the shared lookup rather than a fourth copy of
@@ -3857,7 +3865,7 @@ fn generated_wgsl_has_no_subgroup_ops() {
         };
         assert!(
             !src.contains("subgroup"),
-            "generated WGSL for {name} uses a subgroup op, but cera does not enable Features::SUBGROUP"
+            "generated WGSL for {name} uses a subgroup op, but {name} is dispatched on devices without Features::SUBGROUP"
         );
     }
 }

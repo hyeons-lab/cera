@@ -1015,7 +1015,14 @@ impl VitGpuOps for WgpuVitOps {
     type Weight = WgpuVitWeight;
 
     fn upload(&self, data: &[f32]) -> Self::Buf {
-        self.ctx.upload_f32(data, "vit")
+        let pad_len = data.len().next_multiple_of(32);
+        if pad_len == data.len() {
+            self.ctx.upload_f32(data, "vit")
+        } else {
+            let mut padded = data.to_vec();
+            padded.resize(pad_len, 0.0);
+            self.ctx.upload_f32(&padded, "vit")
+        }
     }
 
     fn download(&self, buf: &Self::Buf, len: usize) -> Vec<f32> {
@@ -1047,9 +1054,11 @@ impl VitGpuOps for WgpuVitOps {
         out_dim: usize,
         in_dim: usize,
     ) -> Self::Buf {
+        let pad_tokens = tokens.next_multiple_of(32);
+        let pad_out = out_dim.next_multiple_of(32);
         let y = self
             .ctx
-            .create_storage_rw((tokens * out_dim * 4) as u64, "vit_linear_out");
+            .create_storage_rw((pad_tokens * pad_out * 4) as u64, "vit_linear_out");
         match w {
             WgpuVitWeight::Quant { buf, dtype } => {
                 // `upload_weight` only builds `Quant` for Q8_0/Q4_0, so those
@@ -1107,9 +1116,11 @@ impl VitGpuOps for WgpuVitOps {
         rows: usize,
         dim: usize,
     ) -> Self::Buf {
+        let pad_rows = rows.next_multiple_of(32);
+        let pad_dim = dim.next_multiple_of(32);
         let dst = self
             .ctx
-            .create_storage_rw((rows * dim * 4) as u64, "vit_ln_out");
+            .create_storage_rw((pad_rows * pad_dim * 4) as u64, "vit_ln_out");
         let params: [u32; 4] = [dim as u32, eps.to_bits(), dim as u32, dim as u32];
         let p_buf = self
             .ctx
@@ -1144,9 +1155,11 @@ impl VitGpuOps for WgpuVitOps {
         head_dim: usize,
     ) -> Self::Buf {
         let dim = n_head * head_dim;
+        let pad_tokens = tokens.next_multiple_of(32);
+        let pad_dim = dim.next_multiple_of(32);
         let out = self
             .ctx
-            .create_storage_rw((tokens * dim * 4) as u64, "vit_attn_out");
+            .create_storage_rw((pad_tokens * pad_dim * 4) as u64, "vit_attn_out");
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let params: [u32; 4] = [
             tokens as u32,
@@ -1160,9 +1173,14 @@ impl VitGpuOps for WgpuVitOps {
         // Query-tiled flash attention (one workgroup per Q_TILE=256 queries,
         // reusing K/V tiles in shared memory) when head_dim fits its shared/
         // register sizing; else the scalar per-query kernel.
+        // On Android / Vulkan (Adreno, Mali), vit_attention_tiled.wgsl allocates
+        // 128 dynamic registers per thread across 256 threads that spill to DRAM,
+        // hanging the Qualcomm driver watchdog. vit_attention.wgsl uses workgroup
+        // shared memory (spill-free) and executes safely on mobile GPUs.
         const VIT_ATTN_TILED_Q: u32 = 256;
         const VIT_ATTN_TILED_MAX_HEAD_DIM: usize = 64;
-        if head_dim <= VIT_ATTN_TILED_MAX_HEAD_DIM {
+        let use_tiled = cfg!(not(target_os = "android")) && head_dim <= VIT_ATTN_TILED_MAX_HEAD_DIM;
+        if use_tiled {
             self.dispatch(
                 &self.p_attn_tiled,
                 &[q, k, v, &out, &p_buf],
@@ -1459,7 +1477,17 @@ struct WgpuVisionEncoder {
 #[cfg(feature = "gpu")]
 impl VisionGpuEncode for WgpuVisionEncoder {
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
-        encode_image_gpu(&self.ops, &self.weights, pixels, grid_w, grid_h)
+        // Drain the readback slot around the encode (mirrors Session's
+        // discard-at-entry/drain-after-work discipline): a map/range fault
+        // mid-encode otherwise returns Ok(zero embeddings) that the
+        // session prefills as valid, while the Err arm's CPU fallback
+        // (built for exactly this fault class) never fires.
+        let _ = self.ops.ctx.take_readback_fault();
+        let out = encode_image_gpu(&self.ops, &self.weights, pixels, grid_w, grid_h)?;
+        if let Some(e) = self.ops.ctx.take_readback_fault() {
+            return Err(e.into());
+        }
+        Ok(out)
     }
 
     fn encode_image_async<'a>(
@@ -1487,14 +1515,24 @@ struct MetalVisionEncoder {
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 impl VisionGpuEncode for MetalVisionEncoder {
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
-        encode_image_gpu(&self.ops, &self.weights, pixels, grid_w, grid_h)
+        // Drain the command-error slot around the encode (mirrors
+        // Session's discard-at-entry/drain-after-work discipline): a
+        // commit fault mid-encode otherwise returns Ok(stale embeddings)
+        // that the session prefills as valid, while the Err arm's CPU fallback (built for
+        // exactly this fault class) never fires.
+        let _ = self.ops.ctx.take_cmd_error();
+        let out = encode_image_gpu(&self.ops, &self.weights, pixels, grid_w, grid_h)?;
+        if let Some(e) = self.ops.ctx.take_cmd_error() {
+            return Err(e.into());
+        }
+        Ok(out)
     }
 }
 
 /// Build a cached GPU vision encoder for `weights`, honoring `backend`.
 /// Returns `None` for `Cpu`, when the chosen backend's feature isn't compiled,
-/// or when the device/context can't be created — the caller then falls back to
-/// the CPU encoder. `Auto` prefers Metal, then wgpu.
+/// or when the device/context can't be created: the caller then falls back to
+/// the CPU encoder. `Auto` prefers Metal, then Hexagon, then wgpu.
 pub fn build_gpu_vision_encoder(
     weights: &VisionEncoderWeights,
     backend: crate::engine::BackendPreference,
@@ -1502,9 +1540,30 @@ pub fn build_gpu_vision_encoder(
     use crate::engine::BackendPreference as BP;
     match backend {
         BP::Cpu => None,
+        BP::Hexagon => {
+            #[cfg(feature = "hexagon")]
+            {
+                crate::model::vision_encoder_hexagon::try_hexagon_vision_encoder(weights)
+            }
+            #[cfg(not(feature = "hexagon"))]
+            {
+                None
+            }
+        }
         BP::Metal => try_metal_vision_encoder(weights),
         BP::Gpu => try_wgpu_vision_encoder(weights),
-        BP::Auto => try_metal_vision_encoder(weights).or_else(|| try_wgpu_vision_encoder(weights)),
+        BP::Auto => try_metal_vision_encoder(weights)
+            .or_else(|| {
+                #[cfg(feature = "hexagon")]
+                {
+                    crate::model::vision_encoder_hexagon::try_hexagon_vision_encoder(weights)
+                }
+                #[cfg(not(feature = "hexagon"))]
+                {
+                    None
+                }
+            })
+            .or_else(|| try_wgpu_vision_encoder(weights)),
     }
 }
 
@@ -1797,6 +1856,49 @@ mod tests {
         run_parity(&MetalVitOps::new(ctx).unwrap(), &synth_encoder(), 2e-3, 0.0);
     }
 
+    /// Encode through the `VisionGpuEncode` impl (not the inner
+    /// `encode_image_gpu` the parity tests call): pins that the
+    /// discard/drain wrapper neither breaks normal encodes nor reports a
+    /// stray fault. The fault-conversion half (mid-encode fault becomes
+    /// `Err` so the session's CPU fallback fires) needs a real device
+    /// fault and is not injectable here; there is no poison seam for the
+    /// readback/command slots.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_wgpu_encode_wrapper_happy_path() {
+        use crate::engine::BackendPreference as BP;
+        let enc = synth_encoder();
+        let encoder = match build_gpu_vision_encoder(&enc, BP::Gpu) {
+            Some(e) => e,
+            None => return, // no GPU (CI)
+        };
+        let cfg = &enc.config;
+        let pixels = rnd(3 * 8 * cfg.patch_size * 8 * cfg.patch_size, 999);
+        let cpu_out = enc.encode_image(&pixels, 8, 8).unwrap();
+        let gpu_out = encoder.encode_image(&pixels, 8, 8).unwrap();
+        assert_eq!(gpu_out.len(), cpu_out.len());
+        assert!(!gpu_out.iter().all(|&x| x == 0.0));
+    }
+
+    /// Metal twin of `test_wgpu_encode_wrapper_happy_path` (same
+    /// discard/drain wrapper shape over `take_cmd_error`).
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn test_metal_encode_wrapper_happy_path() {
+        use crate::engine::BackendPreference as BP;
+        let enc = synth_encoder();
+        let encoder = match build_gpu_vision_encoder(&enc, BP::Metal) {
+            Some(e) => e,
+            None => return, // no Metal device (CI)
+        };
+        let cfg = &enc.config;
+        let pixels = rnd(3 * 8 * cfg.patch_size * 8 * cfg.patch_size, 999);
+        let cpu_out = enc.encode_image(&pixels, 8, 8).unwrap();
+        let gpu_out = encoder.encode_image(&pixels, 8, 8).unwrap();
+        assert_eq!(gpu_out.len(), cpu_out.len());
+        assert!(!gpu_out.iter().all(|&x| x == 0.0));
+    }
+
     /// Q8_0 linear weights → exercises the Metal simdgroup `gemm_q8_0` path.
     /// The GEMM stores dequantized weights as f16, so its error scales with the
     /// output magnitude — hence the relative tolerance (see `run_parity`). A
@@ -1850,5 +1952,14 @@ mod tests {
             2e-1,
             4e-2, // 4-bit GEMM noise scales with magnitude (see run_parity)
         );
+    }
+
+    #[test]
+    fn test_build_gpu_vision_encoder_hexagon_preference_fallback() {
+        let enc = synth_encoder();
+        let result = build_gpu_vision_encoder(&enc, crate::engine::BackendPreference::Hexagon);
+        #[cfg(not(target_os = "android"))]
+        assert!(result.is_none());
+        let _ = result;
     }
 }

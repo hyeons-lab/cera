@@ -4230,10 +4230,14 @@ mod webgpu {
             let mut decoder = if has_audio_weights
                 && let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights)
             {
-                let gpu_ref: Option<&dyn cera::model::audio_decoder::AudioGpu> = self
+                let acc_ref: Option<&dyn cera::model::audio_decoder::AudioAccelerator> = self
                     .gpu_audio_decoder
                     .as_deref()
-                    .map(|g| g as &dyn cera::model::audio_decoder::AudioGpu);
+                    .map(|g| g as &dyn cera::model::audio_decoder::AudioAccelerator);
+                // The browser has no `CERA_GPU_DF`, and the WebGPU depthformer is
+                // the only fast path there (it always ran by default), so this
+                // caller requests it whenever it is available: an intentional
+                // exception to the opt-in in `accelerated_depthformer_enabled`.
                 let use_gpu_df = self
                     .gpu_audio_decoder
                     .as_ref()
@@ -4246,7 +4250,7 @@ mod webgpu {
                     cera::audio_engine::AudioOutputDecoder::new(
                         dec,
                         detok,
-                        gpu_ref,
+                        acc_ref,
                         audio_temp,
                         audio_top_k,
                         use_gpu_df,
@@ -4338,6 +4342,11 @@ mod webgpu {
                             time_depthformer_ms += js_sys::Date::now() - t_df0;
 
                             let audio_emb = match outcome {
+                                cera::audio_engine::FrameOutcome::Fault(detail) => {
+                                    return Err(JsError::new(&format!(
+                                        "audio decoder fault: {detail}"
+                                    )));
+                                }
                                 cera::audio_engine::FrameOutcome::End => {
                                     console_info(&format!(
                                         "[cera-wasm] WebGpuSession vocoder emitted End code after {} frames",
@@ -4453,6 +4462,11 @@ mod webgpu {
                         time_depthformer_ms += js_sys::Date::now() - t_df0;
 
                         let audio_emb = match outcome {
+                            cera::audio_engine::FrameOutcome::Fault(detail) => {
+                                return Err(JsError::new(&format!(
+                                    "audio decoder fault: {detail}"
+                                )));
+                            }
                             cera::audio_engine::FrameOutcome::End => {
                                 if text_done {
                                     break;

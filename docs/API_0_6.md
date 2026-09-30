@@ -1,8 +1,8 @@
-# Cera 0.6 API guide
+# Cera API guide
 
-This guide describes the 0.6.2 source API, including the corrections to chat,
-checkpoint validation, structured output and audio processing. Build generated
-bindings and the native library from the same revision. Package installation
+This guide describes the 0.6+ and 0.7.0 source API, including the contracts for chat,
+checkpoint validation, structured output, audio processing, and hardware backend dispatch.
+Build generated bindings and the native library from the same revision. Package installation
 commands select published artifacts; a local version bump does not publish them.
 
 ## Choose an API
@@ -151,7 +151,7 @@ before executing it.
 | Surface | Supported checkpoint behavior |
 | --- | --- |
 | Rust/native CPU Session and Chat | Snapshot host KV/recurrent state, token history, logits and execution counters; Chat also stores phase, tool configuration and terminal bookkeeping. |
-| Native Metal/wgpu Session and Chat | Checkpoint and restore are rejected because the model owns device state that a host snapshot cannot represent. |
+| Native Metal/Hexagon/wgpu Session and Chat | Checkpoint and restore are rejected because the model owns device state that a host snapshot cannot represent. |
 | Browser/Node CPU Session and Chat | Binary `checkpoint()` / `restore(bytes)` APIs. |
 | Browser `WebGpuSession` | Async device-buffer checkpoint/export; synchronous restore/import into a compatible GPU session. |
 

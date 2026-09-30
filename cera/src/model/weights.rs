@@ -229,9 +229,19 @@ impl MmapWeight {
     /// `y = self · x` where `self` is `[rows × cols]` and `x` is
     /// `[cols]`. Routes through
     /// [`crate::backend::cpu::gemv_dispatch`], which has a per-
-    /// dtype branch (including `gemv_f32` for F32) — no duplicate
+    /// dtype branch (including `gemv_f32` for F32), with no duplicate
     /// scalar path on this side.
     pub fn gemv(&self, x: &[f32], y: &mut [f32]) {
+        self.gemv_scratch(x, y, None);
+    }
+
+    /// `y = self * x` with caller-provided Q8_0 scratch buffers to avoid allocation.
+    pub fn gemv_scratch(
+        &self,
+        x: &[f32],
+        y: &mut [f32],
+        q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
+    ) {
         assert_eq!(x.len(), self.cols);
         assert_eq!(y.len(), self.rows);
         crate::backend::cpu::gemv_dispatch(
@@ -241,7 +251,7 @@ impl MmapWeight {
             y,
             self.rows,
             self.cols,
-            None,
+            q8_scratch,
         );
     }
 
@@ -269,6 +279,57 @@ impl MmapWeight {
         assert_eq!(y.len(), n_tokens * self.rows);
         if n_tokens == 0 || self.rows == 0 || self.cols == 0 {
             return;
+        }
+
+        #[cfg(feature = "parallel")]
+        {
+            let num_threads = crate::par::current_num_threads();
+            let min_chunk = 16;
+            if num_threads > 1 && n_tokens >= min_chunk {
+                use rayon::prelude::*;
+                let chunk_tokens = (n_tokens / num_threads).max(min_chunk);
+                let chunk_y_size = chunk_tokens * self.rows;
+
+                if self.dtype == DType::F32
+                    && let Some(w_f32) = self.try_as_f32()
+                {
+                    y.par_chunks_mut(chunk_y_size)
+                        .enumerate()
+                        .for_each(|(chunk_idx, y_chunk)| {
+                            let t_start = chunk_idx * chunk_tokens;
+                            let chunk_len = y_chunk.len() / self.rows;
+                            let x_chunk =
+                                &x[t_start * self.cols..(t_start + chunk_len) * self.cols];
+                            for r in 0..self.rows {
+                                let w_row = &w_f32[r * self.cols..(r + 1) * self.cols];
+                                for t in 0..chunk_len {
+                                    let x_row = &x_chunk[t * self.cols..(t + 1) * self.cols];
+                                    y_chunk[t * self.rows + r] =
+                                        crate::backend::cpu::dot_f32(x_row, w_row);
+                                }
+                            }
+                        });
+                    return;
+                }
+
+                y.par_chunks_mut(chunk_y_size).enumerate().for_each_init(
+                    || vec![0.0f32; self.cols],
+                    |row_buf, (chunk_idx, y_chunk)| {
+                        let t_start = chunk_idx * chunk_tokens;
+                        let chunk_len = y_chunk.len() / self.rows;
+                        let x_chunk = &x[t_start * self.cols..(t_start + chunk_len) * self.cols];
+                        for r in 0..self.rows {
+                            self.dequantize_row(r, row_buf);
+                            for t in 0..chunk_len {
+                                let x_row = &x_chunk[t * self.cols..(t + 1) * self.cols];
+                                y_chunk[t * self.rows + r] =
+                                    crate::backend::cpu::dot_f32(x_row, row_buf);
+                            }
+                        }
+                    },
+                );
+                return;
+            }
         }
 
         // Fast path if already contiguous and properly aligned F32
@@ -381,6 +442,18 @@ impl MmapWeight {
     /// `block_size = 1`; quantised callers must ensure `cols`
     /// is a multiple of the block size).
     pub fn gemv_rows(&self, x: &[f32], y: &mut [f32], row_start: usize, n_rows: usize) {
+        self.gemv_rows_scratch(x, y, row_start, n_rows, None);
+    }
+
+    /// `y = self[row_start..row_start+n_rows, :] * x` with caller-provided Q8_0 scratch buffers.
+    pub fn gemv_rows_scratch(
+        &self,
+        x: &[f32],
+        y: &mut [f32],
+        row_start: usize,
+        n_rows: usize,
+        q8_scratch: Option<(&mut Vec<f32>, &mut Vec<i8>)>,
+    ) {
         assert_eq!(x.len(), self.cols);
         assert_eq!(y.len(), n_rows);
         assert!(row_start + n_rows <= self.rows);
@@ -388,7 +461,7 @@ impl MmapWeight {
         let offset = row_start * row_bytes;
         let bytes = self.data();
         let slice = &bytes[offset..offset + n_rows * row_bytes];
-        crate::backend::cpu::gemv_dispatch(self.dtype, slice, x, y, n_rows, self.cols, None);
+        crate::backend::cpu::gemv_dispatch(self.dtype, slice, x, y, n_rows, self.cols, q8_scratch);
     }
 }
 

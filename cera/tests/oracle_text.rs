@@ -33,6 +33,7 @@
 
 #![cfg(feature = "mmap")]
 
+mod common;
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 
@@ -65,13 +66,6 @@ const SUM_MAG_FLOOR: f64 = 10.0;
 
 fn fixtures_root() -> PathBuf {
     PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/oracle")
-}
-
-fn models_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
-        return PathBuf::from(d);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/oracle/models")
 }
 
 /// Encode a prompt the same way the oracle did: byte-level BPE, with a leading
@@ -130,7 +124,7 @@ fn check_model(fixture_dir: &std::path::Path) -> ModelOutcome {
     )
     .unwrap_or_else(|e| panic!("parse {}: {e}", index_path.display()));
     let model_file = index["model_file"].as_str().unwrap();
-    let mp = models_dir().join(model_file);
+    let mp = common::models_dir().join(model_file);
     if !mp.exists() {
         return ModelOutcome::Absent { path: mp };
     }
@@ -411,7 +405,7 @@ fn text_models_match_llama_cpp_oracle() {
                 .map(|p| p.display().to_string())
                 .collect::<Vec<_>>()
                 .join("\n  "),
-            models_dir().display(),
+            common::models_dir().display(),
         ));
     }
     if !all_failures.is_empty() {
