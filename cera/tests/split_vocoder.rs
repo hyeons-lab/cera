@@ -14,7 +14,10 @@ use cera::model::audio_decoder::{AudioDecoderWeights, DetokenizerWeights};
 use cera::model::split_vocoder::{is_split_vocoder, merge_split_vocoder};
 
 fn fixture(lang: &str, file: &str) -> Option<PathBuf> {
-    let p = PathBuf::from(std::env::var("HOME").expect("HOME"))
+    let home = std::env::var("HOME")
+        .or_else(|_| std::env::var("USERPROFILE"))
+        .expect("HOME or USERPROFILE must be set");
+    let p = PathBuf::from(home)
         .join(".leap/models/split-vocoder-fixtures")
         .join(lang)
         .join(file);

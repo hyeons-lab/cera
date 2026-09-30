@@ -287,16 +287,28 @@ pub fn resolve_vocoder_cached(
         return g;
     }
 
+    // Merge once: the bytes serve the cached file and, when the cache cannot be
+    // written, the in-memory fallback, so an I/O failure never repeats the merge.
+    let bytes = match merge_split_vocoder(&vocoder, sidecar) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(
+                target: "cera::engine",
+                error = %format!("{e:#}"),
+                "failed to merge split vocoder and tokenizer sidecar"
+            );
+            return vocoder;
+        }
+    };
     let write = || -> Result<Arc<GgufFile>> {
-        let bytes = merge_split_vocoder(&vocoder, sidecar)?;
         std::fs::create_dir_all(&dir)?;
-        let tmp = dir.join(format!(
-            ".{}.{}.tmp",
-            name.to_string_lossy(),
-            std::process::id()
-        ));
-        std::fs::write(&tmp, &bytes)?;
-        std::fs::rename(&tmp, &merged_path)?;
+        let tmp = unique_tmp_path(&dir, name);
+        if let Err(e) =
+            std::fs::write(&tmp, &bytes).and_then(|()| std::fs::rename(&tmp, &merged_path))
+        {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e.into());
+        }
         GgufFile::open_arc(&merged_path)
     };
     match write() {
@@ -306,11 +318,37 @@ pub fn resolve_vocoder_cached(
                 target: "cera::engine",
                 path = %merged_path.display(),
                 error = %format!("{e:#}"),
-                "could not cache merged vocoder on disk; merging in memory"
+                "could not cache merged vocoder on disk; using the in-memory merge"
             );
-            resolve_vocoder(vocoder, Some(sidecar))
+            match GgufFile::from_bytes(bytes.into()) {
+                Ok(g) => Arc::new(g),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cera::engine",
+                        error = %format!("{e:#}"),
+                        "merged split vocoder does not parse"
+                    );
+                    vocoder
+                }
+            }
         }
     }
+}
+
+/// A scratch path beside the cache target that no other writer shares. The pid
+/// separates processes; the counter separates concurrent loads of the same
+/// model inside one process, which would otherwise truncate and interleave
+/// writes to a single file before the rename.
+#[cfg(feature = "mmap")]
+fn unique_tmp_path(dir: &std::path::Path, name: &std::ffi::OsStr) -> std::path::PathBuf {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    static NEXT: AtomicUsize = AtomicUsize::new(0);
+    dir.join(format!(
+        ".{}.{}.{}.tmp",
+        name.to_string_lossy(),
+        std::process::id(),
+        NEXT.fetch_add(1, Ordering::Relaxed)
+    ))
 }
 
 #[cfg(test)]
@@ -498,5 +536,109 @@ mod tests {
 
         let voc = Arc::new(gguf(&[("emb.emb.weight", vec![4, 2], f(8, 0.0))], &[]));
         assert!(Arc::ptr_eq(&resolve_vocoder(voc.clone(), None), &voc));
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn tmp_paths_are_unique_per_call() {
+        let dir = std::path::Path::new("/d");
+        let name = std::ffi::OsStr::new("vocoder-X.gguf");
+        assert_ne!(unique_tmp_path(dir, name), unique_tmp_path(dir, name));
+    }
+
+    #[cfg(feature = "mmap")]
+    fn write_split_pair(dir: &std::path::Path) -> (std::path::PathBuf, std::path::PathBuf) {
+        let save = |path: &std::path::Path, tensors: &[(&str, Vec<u64>, Vec<f32>)]| {
+            let mut w = GgufWriter::new();
+            for (name, dims, data) in tensors {
+                w.add_tensor(*name, dims.clone(), GGML_TYPE_F32, data.len() * 4);
+            }
+            let mut out = Vec::new();
+            w.write_header_and_tensor_info(&mut out).unwrap();
+            for (_, _, data) in tensors {
+                let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+                w.write_tensor_data(&mut out, &bytes).unwrap();
+            }
+            std::fs::write(path, out).unwrap();
+        };
+        let voc = dir.join("vocoder-X.gguf");
+        let side = dir.join("tokenizer-X.gguf");
+        save(&voc, &[("emb.emb.weight", vec![4, 2], f(8, 0.0))]);
+        save(
+            &side,
+            &[("blk.0.shortconv.in_proj.weight", vec![4, 3], f(12, 100.0))],
+        );
+        (voc, side)
+    }
+
+    #[cfg(feature = "mmap")]
+    fn resolve_pair(voc: &std::path::Path, side: &std::path::Path) -> Arc<GgufFile> {
+        let v = GgufFile::open_arc(voc).unwrap();
+        let s = GgufFile::open_arc(side).unwrap();
+        resolve_vocoder_cached(voc, v, Some(side), Some(&s))
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn cached_resolve_writes_then_reuses_the_merged_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let (voc, side) = write_split_pair(dir.path());
+        let first = resolve_pair(&voc, &side);
+        assert!(!is_split_vocoder(&first));
+        let cached = dir.path().join(".cera-merged/vocoder-X.gguf");
+        assert!(cached.is_file());
+        // No scratch file is left behind.
+        let leftovers = std::fs::read_dir(dir.path().join(".cera-merged"))
+            .unwrap()
+            .filter(|e| {
+                e.as_ref()
+                    .unwrap()
+                    .file_name()
+                    .to_string_lossy()
+                    .ends_with(".tmp")
+            })
+            .count();
+        assert_eq!(leftovers, 0);
+        assert!(!is_split_vocoder(&resolve_pair(&voc, &side)));
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn cached_resolve_falls_back_to_the_in_memory_merge_when_the_cache_is_unwritable() {
+        let dir = tempfile::tempdir().unwrap();
+        let (voc, side) = write_split_pair(dir.path());
+        // A file where the cache directory should be makes create_dir_all fail.
+        std::fs::write(dir.path().join(".cera-merged"), b"blocked").unwrap();
+        let merged = resolve_pair(&voc, &side);
+        assert!(!is_split_vocoder(&merged));
+        assert_eq!(
+            merged
+                .get_tensor("lfm.layers.0.conv.in_proj.weight")
+                .unwrap()
+                .to_f32_vec(),
+            f(12, 100.0)
+        );
+    }
+
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn concurrent_cached_resolves_all_see_a_valid_merge() {
+        let dir = tempfile::tempdir().unwrap();
+        let (voc, side) = write_split_pair(dir.path());
+        std::thread::scope(|s| {
+            let handles: Vec<_> = (0..8)
+                .map(|_| s.spawn(|| resolve_pair(&voc, &side)))
+                .collect();
+            for h in handles {
+                let g = h.join().unwrap();
+                assert!(!is_split_vocoder(&g));
+                assert_eq!(
+                    g.get_tensor("lfm.layers.0.conv.in_proj.weight")
+                        .unwrap()
+                        .to_f32_vec(),
+                    f(12, 100.0)
+                );
+            }
+        });
     }
 }
