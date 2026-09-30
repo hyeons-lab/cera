@@ -223,7 +223,9 @@ class EngineConfig {
     this.bundleRepo = null,
     /// Optional path to a DSpark speculative draft model GGUF file.
     this.draftModel = null,
-    /// Whether to prefer GPU depthformer for audio decoder generation.
+    /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+    /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+    /// depthformer regardless of this flag.
     this.gpuDepthformer = false,
   });
 
@@ -242,7 +244,9 @@ class EngineConfig {
   final BundleRepo? bundleRepo;
   /// Optional path to a DSpark speculative draft model GGUF file.
   final String? draftModel;
-  /// Whether to prefer GPU depthformer for audio decoder generation.
+  /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+  /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+  /// depthformer regardless of this flag.
   final bool gpuDepthformer;
 
   Map<String, dynamic> toJson() {
@@ -1502,7 +1506,9 @@ class SessionConfig {
     this.seed = null,
     /// Chunked-prefill ubatch size. `0` = monolithic prefill.
     this.ubatchSize = 512,
-    /// Whether to prefer GPU depthformer for audio decoder generation.
+    /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+    /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+    /// depthformer regardless of this flag.
     this.gpuDepthformer = false,
     /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
     this.disableSpec = false,
@@ -1520,7 +1526,9 @@ class SessionConfig {
   final int? seed;
   /// Chunked-prefill ubatch size. `0` = monolithic prefill.
   final int ubatchSize;
-  /// Whether to prefer GPU depthformer for audio decoder generation.
+  /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+  /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+  /// depthformer regardless of this flag.
   final bool gpuDepthformer;
   /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
   final bool disableSpec;
@@ -8700,8 +8708,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_hexagon_install_skels`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels != 41114) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_hexagon_install_skels`: expected 41114, got $_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels');
+    if (_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels != 55417) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_hexagon_install_skels`: expected 55417, got $_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_hexagon_probe;
     try {
@@ -9430,8 +9438,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_append_raw_image`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image != 51302) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_raw_image`: expected 51302, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image != 38950) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_raw_image`: expected 38950, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_append_text;
     try {
@@ -9510,8 +9518,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_disable_spec`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_disable_spec != 3153) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_disable_spec`: expected 3153, got $_checksum_uniffi_cera_ffi_checksum_method_session_disable_spec');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_disable_spec != 57) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_disable_spec`: expected 57, got $_checksum_uniffi_cera_ffi_checksum_method_session_disable_spec');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_enable_spec;
     try {
@@ -9520,8 +9528,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_enable_spec`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_enable_spec != 9506) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_enable_spec`: expected 9506, got $_checksum_uniffi_cera_ffi_checksum_method_session_enable_spec');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_enable_spec != 2995) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_enable_spec`: expected 2995, got $_checksum_uniffi_cera_ffi_checksum_method_session_enable_spec');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_export_checkpoint;
     try {
@@ -31175,7 +31183,9 @@ final class Session {
   ///
   /// # Errors
   ///
-  /// - `InvalidInput` if buffer length does not match dimensions or pixel format.
+  /// - `EmptyInput` if the buffer is empty or a dimension is 0.
+  /// - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+  /// (extra trailing bytes are ignored).
   /// - `Preprocess` if image normalization fails.
   /// - `UnsupportedModality` if vision encoding is unsupported on this session.
   /// - `Backend` for missing vision encoder, projection dimension mismatch,
@@ -31270,13 +31280,15 @@ final class Session {
     return _ffi.sessionInvokeDefaultGenerateOpts(_handle);
   }
 
-  /// Explicitly disable speculative decoding for this session.
+  /// Explicitly disable speculative decoding for this session. An attached
+  /// drafter is kept, so [`Self::enable_spec`] restores it.
   void disableSpec() {
     _ensureOpen();
     _ffi.sessionInvokeDisableSpec(_handle);
   }
 
-  /// Re-enable speculative decoding for this session (if previously disabled).
+  /// Re-enable speculative decoding for this session (if previously
+  /// disabled), using the attached drafter if there is one.
   void enableSpec() {
     _ensureOpen();
     _ffi.sessionInvokeEnableSpec(_handle);
@@ -32219,8 +32231,10 @@ ToolFormat? detectToolFormat(String architecture) {
   return _bindings().detectToolFormat(architecture);
 }
 
-/// Write the embedded DSP skels into `dir` (created if missing) and
-/// point FastRPC's loader at it. Caller stages a private writable directory;
+/// Write the embedded DSP skels into `dir` (created private, mode 0700, if
+/// missing) and point FastRPC's loader at it. An existing `dir` that another
+/// user owns, or that is writable by "other", is refused with `Backend`, since
+/// the loader executes what is in it. Caller stages a private writable directory;
 /// on Android, the `HexagonNpu.setup` helper invokes this function to extract
 /// skels into the application's internal files directory (`cera_skels`) and
 /// configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
@@ -32228,8 +32242,8 @@ ToolFormat? detectToolFormat(String architecture) {
 /// number of skels written (0 when all were already present and fresh).
 /// Re-running is cheap and idempotent (files are only rewritten when
 /// their bytes differ, and the loader path is not duplicated). A `dir`
-/// containing `;` is rejected: it would silently split into two loader
-/// search entries.
+/// containing `;`, `=` or NUL is rejected: it would silently split or corrupt
+/// the loader's search path.
 int hexagonInstallSkels(String dir) {
   return _bindings().hexagonInstallSkels(dir);
 }

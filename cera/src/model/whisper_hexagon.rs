@@ -10,29 +10,24 @@
 //! convolutions, LayerNorm, linear GEMM, unmasked FlashAttention, and token
 //! sampling on the NPU for background execution on Android.
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
     HexagonContext, HexagonDevice, HexagonQueueSession, HexagonWeightFormat, HtpDataType,
-    HtpOpCode, RpcmemBuffer, build_binary_kernel_params, build_flash_attn_kernel_params,
+    HtpOpCode, RpcmemBuffer, align128, build_binary_kernel_params, build_flash_attn_kernel_params,
     build_layer_norm_params, build_mul_mat_kernel_params, build_unary_kernel_params,
     quantize_f32_to_q8_0, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0,
     repacked_matrix_size_q8_0,
 };
+use crate::backend::hexagon::{LockOrRecover, lock_reporting_poison, report_poison};
 use crate::model::weights::MmapWeight;
 use crate::model::whisper::{
     Conv1dWeights, WhisperConfig, WhisperSpecialTokens, WhisperTranscribeOpts, WhisperWeights,
 };
 use crate::session::CeraError;
 use crate::tensor::DType;
-
-/// Alignment for DMA buffer offsets in rpcmem (128-byte HVX vector alignment).
-const ALIGN_128: usize = 128;
-
-fn align128(sz: usize) -> usize {
-    (sz + ALIGN_128 - 1) & !(ALIGN_128 - 1)
-}
 
 fn plan_vec_f32(cur_off: &mut usize, len: usize) -> usize {
     let off = *cur_off;
@@ -453,48 +448,9 @@ pub fn stage_whisper_weights(
             Ok(())
         };
 
-    let stage_conv = |dst: &mut [u8],
-                      conv: &Conv1dWeights,
-                      desc: &HexagonWhisperConvWeights|
-     -> Result<(), CeraError> {
-        let in_ch = conv.in_channels;
-        let padded_in_ch = in_ch.next_multiple_of(32);
-        let out_ch = conv.out_channels;
-
-        if conv.kernel_size != 3 {
-            return Err(CeraError::Backend(format!(
-                "conv kernel_size {} is not 3 for 3-tap decomposition",
-                conv.kernel_size
-            )));
-        }
-        let expected_weight_len = out_ch * in_ch * 3;
-        if conv.weight.len() != expected_weight_len {
-            return Err(CeraError::Backend(format!(
-                "conv weight length {} does not match expected {}",
-                conv.weight.len(),
-                expected_weight_len
-            )));
-        }
-
-        for (k, w_desc) in [desc.w0, desc.w1, desc.w2].iter().enumerate() {
-            let mut tap_vals = vec![0.0f32; out_ch * padded_in_ch];
-            for r in 0..out_ch {
-                for c in 0..in_ch {
-                    tap_vals[r * padded_in_ch + c] = conv.weight[r * in_ch * 3 + c * 3 + k];
-                }
-            }
-            let q8_bytes = quantize_f32_to_q8_0(&tap_vals, padded_in_ch, out_ch)?;
-            let dst_slice = &mut dst[w_desc.offset..w_desc.offset + w_desc.size_bytes];
-            repack_q8_0(&q8_bytes, padded_in_ch, out_ch, dst_slice)
-                .map_err(|e| CeraError::Backend(format!("conv tap {k} repack Q8_0 failed: {e}")))?;
-        }
-        copy_vec_f32(dst, desc.bias_off, &conv.bias);
-        Ok(())
-    };
-
     // Stage Conv1 & Conv2
-    stage_conv(dst, &weights.encoder.conv1, &offsets.conv1)?;
-    stage_conv(dst, &weights.encoder.conv2, &offsets.conv2)?;
+    stage_conv_taps(dst, &weights.encoder.conv1, &offsets.conv1)?;
+    stage_conv_taps(dst, &weights.encoder.conv2, &offsets.conv2)?;
 
     // Positional embeddings
     copy_vec_f32(
@@ -783,6 +739,8 @@ pub struct HexagonWhisperModel {
     token_embeddings: MmapWeight,
     positional_embedding: Vec<f32>,
     session_lock: Mutex<()>,
+    /// True once `encode_audio` has fully rewritten `state_buf`.
+    encoded_ok: AtomicBool,
 }
 
 unsafe impl Send for HexagonWhisperModel {}
@@ -832,6 +790,7 @@ impl HexagonWhisperModel {
             token_embeddings: weights.decoder.token_embeddings.clone(),
             positional_embedding: weights.decoder.positional_embedding.clone(),
             session_lock: Mutex::new(()),
+            encoded_ok: AtomicBool::new(false),
         })
     }
 
@@ -1755,6 +1714,9 @@ impl HexagonWhisperModel {
     }
 
     /// Execute audio encoder and precompute static cross-attention on Qualcomm Hexagon NPU.
+    ///
+    /// A failed or panicked encode leaves the model needing a fresh one:
+    /// `decode_step` fails closed until this succeeds.
     pub fn encode_audio(&self, mel: &[f32]) -> Result<(), CeraError> {
         let n_mels = self.config.n_audio_mel_bins;
         if mel.len() != n_mels * 3000 {
@@ -1771,12 +1733,20 @@ impl HexagonWhisperModel {
         let n_heads = self.config.n_audio_head;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let mut scratch = self.scratch_buf.lock().map_err(|e| {
-            CeraError::Backend(format!("scratch_buf lock poisoned in encode_audio: {e}"))
-        })?;
-        let state = self.state_buf.lock().map_err(|e| {
-            CeraError::Backend(format!("state_buf lock poisoned in encode_audio: {e}"))
-        })?;
+        let mut scratch = self.scratch_buf.lock_or_recover();
+        // The whole buffer is rewritten below, so a poisoned lock is recovered
+        // (once: the flag is cleared under the lock, so concurrent callers
+        // cannot miss it).
+        let (state, poisoned) = lock_reporting_poison(&self.state_buf);
+        if poisoned {
+            report_poison("whisper state", "rewriting it with a fresh encode");
+        }
+        // `state_buf` is torn from here until the encode completes: an error
+        // or panic part-way leaves `encoded_ok` false, so `decode_step` fails
+        // closed instead of decoding over half-written K/V. Both stores happen
+        // under the state lock, so overlapping encodes cannot leave it true
+        // over a half-written buffer.
+        self.encoded_ok.store(false, Ordering::SeqCst);
 
         // 1. Stage mel spectrogram into scratch_buf.mel_in_off (padded from 80 to 96)
         let scratch_slice = scratch.as_mut_slice();
@@ -1809,9 +1779,7 @@ impl HexagonWhisperModel {
         scratch.flush_cpu_cache(conv1_last_off, d_model * 4);
 
         // 2. Build DSP command queue
-        let mut dev_guard = self.device.lock().map_err(|e| {
-            CeraError::Backend(format!("device lock poisoned in encode_audio: {e}"))
-        })?;
+        let mut dev_guard = self.device.lock_or_recover();
         let session = dev_guard.queue_session_mut();
         session.drop_pending_batch();
 
@@ -2089,10 +2057,16 @@ impl HexagonWhisperModel {
 
         // Submit DSP batch queue
         session.flush()?;
+        self.encoded_ok.store(true, Ordering::SeqCst);
         Ok(())
     }
 
     /// Execute one autoregressive decoding step on Qualcomm Hexagon NPU.
+    ///
+    /// # Errors
+    ///
+    /// `Backend` if `encode_audio` has not completed successfully since the
+    /// last failure or panic (the state it fills would be torn).
     pub fn decode_step(
         &self,
         token_id: u32,
@@ -2124,12 +2098,21 @@ impl HexagonWhisperModel {
         let n_heads = self.config.n_text_head;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
-        let mut scratch = self.scratch_buf.lock().map_err(|e| {
-            CeraError::Backend(format!("scratch_buf lock poisoned in decode_step: {e}"))
-        })?;
-        let state = self.state_buf.lock().map_err(|e| {
-            CeraError::Backend(format!("state_buf lock poisoned in decode_step: {e}"))
-        })?;
+        let mut scratch = self.scratch_buf.lock_or_recover();
+        // `state_buf` carries the encoder output and cross-attention K/V. Refuse
+        // to decode over a torn one: a panic here (poison) or an encode that
+        // failed part-way (`encoded_ok` false) both need a fresh `encode_audio`.
+        let state = self
+            .state_buf
+            .lock()
+            .ok()
+            .filter(|_| self.encoded_ok.load(Ordering::SeqCst));
+        let Some(state) = state else {
+            return Err(CeraError::Backend(
+                "Hexagon whisper state is not valid (poisoned or encode incomplete); re-run encode_audio"
+                    .into(),
+            ));
+        };
 
         // 1. Stage input embedding + positional embedding into scratch.dec_x_off
         let scratch_slice = scratch.as_mut_slice();
@@ -2154,10 +2137,7 @@ impl HexagonWhisperModel {
         scratch.flush_cpu_cache(pos_off, 4);
 
         // 2. Build DSP command queue
-        let mut dev_guard = self
-            .device
-            .lock()
-            .map_err(|e| CeraError::Backend(format!("device lock poisoned in decode_step: {e}")))?;
+        let mut dev_guard = self.device.lock_or_recover();
         let session = dev_guard.queue_session_mut();
         session.drop_pending_batch();
 
@@ -2451,10 +2431,7 @@ impl HexagonWhisperModel {
         pcm: &[f32],
         opts: &WhisperTranscribeOpts,
     ) -> Result<String, CeraError> {
-        let _session_guard = self
-            .session_lock
-            .lock()
-            .map_err(|e| CeraError::Backend(format!("session lock poison: {e}")))?;
+        let _session_guard = self.session_lock.lock_or_recover();
 
         if opts
             .cancel
@@ -2668,18 +2645,64 @@ pub fn try_hexagon_whisper(
     }
 }
 
+/// Stage one 3-tap Conv1d into `dst`: tap `k` goes to the descriptor `w{k}`
+/// (input offsets -1, 0, +1), each as a repacked Q8_0 matrix, then the bias.
+fn stage_conv_taps(
+    dst: &mut [u8],
+    conv: &Conv1dWeights,
+    desc: &HexagonWhisperConvWeights,
+) -> Result<(), CeraError> {
+    let in_ch = conv.in_channels;
+    let padded_in_ch = in_ch.next_multiple_of(32);
+    let out_ch = conv.out_channels;
+
+    if conv.kernel_size != 3 {
+        return Err(CeraError::Backend(format!(
+            "conv kernel_size {} is not 3 for 3-tap decomposition",
+            conv.kernel_size
+        )));
+    }
+    let expected_weight_len = out_ch * in_ch * 3;
+    if conv.weight.len() != expected_weight_len {
+        return Err(CeraError::Backend(format!(
+            "conv weight length {} does not match expected {}",
+            conv.weight.len(),
+            expected_weight_len
+        )));
+    }
+
+    for (k, w_desc) in [desc.w0, desc.w1, desc.w2].iter().enumerate() {
+        let tap_vals = conv_tap_matrix(conv, k, padded_in_ch);
+        let q8_bytes = quantize_f32_to_q8_0(&tap_vals, padded_in_ch, out_ch)?;
+        let dst_slice = &mut dst[w_desc.offset..w_desc.offset + w_desc.size_bytes];
+        repack_q8_0(&q8_bytes, padded_in_ch, out_ch, dst_slice)
+            .map_err(|e| CeraError::Backend(format!("conv tap {k} repack Q8_0 failed: {e}")))?;
+    }
+    let bias_bytes: &[u8] = bytemuck::cast_slice(&conv.bias);
+    dst[desc.bias_off..desc.bias_off + bias_bytes.len()].copy_from_slice(bias_bytes);
+    Ok(())
+}
+
+/// Tap `k` (0, 1, 2 = input offsets -1, 0, +1) of a 3-tap Conv1d as a row-major
+/// `[out_channels, padded_in_ch]` matrix, zero-padded past `in_channels`. The
+/// weights are `[out, in, 3]`, so tap `k` is every third element from `k`.
+/// Shared by staging and the tests; the decomposition test pins the tap
+/// order against a direct convolution.
+fn conv_tap_matrix(conv: &Conv1dWeights, k: usize, padded_in_ch: usize) -> Vec<f32> {
+    let (in_ch, out_ch) = (conv.in_channels, conv.out_channels);
+    let mut tap = vec![0.0f32; out_ch * padded_in_ch];
+    for r in 0..out_ch {
+        for c in 0..in_ch {
+            tap[r * padded_in_ch + c] = conv.weight[r * in_ch * 3 + c * 3 + k];
+        }
+    }
+    tap
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::model::whisper::*;
-
-    #[test]
-    fn test_align128() {
-        assert_eq!(align128(0), 0);
-        assert_eq!(align128(1), 128);
-        assert_eq!(align128(128), 128);
-        assert_eq!(align128(129), 256);
-    }
 
     #[test]
     fn test_state_offsets_plan_tiny() {
@@ -2764,19 +2787,11 @@ mod tests {
             *v = ((i % 23) as f32 - 11.0) * 0.1;
         }
 
-        // 3-tap matrix decomposition:
-        // Extract taps W0, W1, W2 of shape [out_channels, in_channels]
-        let mut w0 = vec![0.0f32; out_channels * in_channels];
-        let mut w1 = vec![0.0f32; out_channels * in_channels];
-        let mut w2 = vec![0.0f32; out_channels * in_channels];
-
-        for r in 0..out_channels {
-            for c in 0..in_channels {
-                w0[r * in_channels + c] = weight[r * in_channels * 3 + c * 3];
-                w1[r * in_channels + c] = weight[r * in_channels * 3 + c * 3 + 1];
-                w2[r * in_channels + c] = weight[r * in_channels * 3 + c * 3 + 2];
-            }
-        }
+        // Taps W0, W1, W2 of shape [out_channels, in_channels], from the same
+        // helper the Hexagon weight staging uses.
+        let w0 = conv_tap_matrix(&conv, 0, in_channels);
+        let w1 = conv_tap_matrix(&conv, 1, in_channels);
+        let w2 = conv_tap_matrix(&conv, 2, in_channels);
 
         for stride in [1, 2] {
             let t_out = t_in / stride;
@@ -3052,5 +3067,54 @@ mod tests {
         let res = stage_whisper_weights(&weights, &offsets, &mut short_buf);
         let err = res.unwrap_err().to_string();
         assert!(err.contains("smaller than required offsets total_bytes"));
+    }
+
+    /// Tap `k` must land in descriptor `w{k}`: stage a small conv, then compare
+    /// each descriptor's bytes with the repack of the matching tap matrix.
+    #[test]
+    fn stage_conv_taps_maps_each_tap_to_its_descriptor() {
+        let (in_ch, out_ch) = (32usize, 32usize);
+        let padded = in_ch.next_multiple_of(32);
+        let weight: Vec<f32> = (0..out_ch * in_ch * 3)
+            .map(|i| ((i * 31 % 97) as f32 - 48.0) * 0.03)
+            .collect();
+        let conv = Conv1dWeights {
+            weight,
+            bias: vec![0.5; out_ch],
+            out_channels: out_ch,
+            in_channels: in_ch,
+            kernel_size: 3,
+        };
+        let tap_size = repacked_matrix_size_q8_0(padded, out_ch).unwrap();
+        let desc_at = |i: usize| HexagonWhisperWeightDesc {
+            offset: i * align128(tap_size),
+            size_bytes: tap_size,
+            format: HexagonWeightFormat::RepackedQ8_0,
+            rows: out_ch,
+            cols: padded,
+        };
+        let desc = HexagonWhisperConvWeights {
+            w0: desc_at(0),
+            w1: desc_at(1),
+            w2: desc_at(2),
+            bias_off: 3 * align128(tap_size),
+        };
+        let mut dst = vec![0u8; desc.bias_off + align128(out_ch * 4)];
+        stage_conv_taps(&mut dst, &conv, &desc).unwrap();
+        for (k, d) in [desc.w0, desc.w1, desc.w2].iter().enumerate() {
+            let tap = conv_tap_matrix(&conv, k, padded);
+            let q8 = quantize_f32_to_q8_0(&tap, padded, out_ch).unwrap();
+            let mut want = vec![0u8; tap_size];
+            repack_q8_0(&q8, padded, out_ch, &mut want).unwrap();
+            assert_eq!(
+                &dst[d.offset..d.offset + d.size_bytes],
+                &want[..],
+                "tap {k}"
+            );
+        }
+        assert_eq!(
+            &dst[desc.bias_off..desc.bias_off + 4],
+            &0.5f32.to_ne_bytes()
+        );
     }
 }

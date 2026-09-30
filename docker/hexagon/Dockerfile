@@ -67,11 +67,15 @@ RUN if [ "${UBUNTU_VERSION}" = "22.04" ]; then \
 # Optional: Install Android NDK (r30 LTS) for FastRPC Android host cross-compilation
 ARG INSTALL_NDK=true
 ARG NDK_VERSION=r30
+# sha1 of android-ndk-${NDK_VERSION}-linux.zip from Google's repository2-3.xml;
+# override together with NDK_VERSION.
+ARG NDK_SHA1=5107f898313790e449e87eee2183d9a20602dee9
 ENV ANDROID_NDK_ROOT=/opt/android-ndk
 ENV ANDROID_NDK_HOME=/opt/android-ndk
 RUN if [ "${INSTALL_NDK}" = "true" ]; then \
         mkdir -p /opt/android-ndk && \
         wget -q --show-progress https://dl.google.com/android/repository/android-ndk-${NDK_VERSION}-linux.zip -O /tmp/ndk.zip && \
+        echo "${NDK_SHA1}  /tmp/ndk.zip" | sha1sum -c - && \
         unzip -q /tmp/ndk.zip -d /tmp && \
         mv /tmp/android-ndk-${NDK_VERSION}/* /opt/android-ndk/ && \
         rm -rf /tmp/android-ndk-${NDK_VERSION} /tmp/ndk.zip; \

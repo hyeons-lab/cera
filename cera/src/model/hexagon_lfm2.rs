@@ -15,15 +15,16 @@ use std::sync::{Arc, Mutex};
 use crate::backend::cpu::RopeType;
 use crate::backend::hexagon::{
     AdpfSession, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
-    HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer,
-    StagedBatch, TILE_SIZE_Q4_0, TILE_SIZE_Q4_K, TILE_SIZE_Q6_K, TILE_SIZE_Q8_0,
-    build_binary_kernel_params, build_flash_attn_kernel_params, build_hmx_fa_kernel_params,
-    build_hmx_mm_kernel_params, build_mul_mat_kernel_params, build_rms_norm_params,
-    build_rope_kernel_params, build_rope_params, build_set_rows_kernel_params,
-    build_ssm_conv_kernel_params, build_unary_kernel_params, fa_is_hmx_eligible, mm_hmx_nb1,
-    mm_is_hmx_eligible, repack_q4_0, repack_q4_k, repack_q6_k, repack_q8_0,
-    repacked_matrix_size_q4_0, repacked_matrix_size_q4_k, repacked_matrix_size_q6_k,
-    repacked_matrix_size_q8_0, requant_q5_k_to_q8_0,
+    HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, LockOrRecover,
+    RpcmemBuffer, StagedBatch, TILE_SIZE_Q4_0, TILE_SIZE_Q4_K, TILE_SIZE_Q6_K, TILE_SIZE_Q8_0,
+    align256, build_binary_kernel_params, build_flash_attn_kernel_params,
+    build_hmx_fa_kernel_params, build_hmx_mm_kernel_params, build_mul_mat_kernel_params,
+    build_rms_norm_params, build_rope_kernel_params, build_rope_params,
+    build_set_rows_kernel_params, build_ssm_conv_kernel_params, build_unary_kernel_params,
+    fa_is_hmx_eligible, lock_keeping_poison, lock_or_discard, mm_hmx_nb1, mm_is_hmx_eligible,
+    repack_q4_0, repack_q4_k, repack_q6_k, repack_q8_0, repacked_matrix_size_q4_0,
+    repacked_matrix_size_q4_k, repacked_matrix_size_q6_k, repacked_matrix_size_q8_0,
+    requant_q5_k_to_q8_0,
 };
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression};
@@ -89,7 +90,7 @@ enum HexagonLayer {
 
 /// Reserve `size` bytes in a 256-aligned running total, returning the offset.
 fn plan_offset(total: &mut usize, size: usize) -> usize {
-    let offset = (*total + 255) & !255;
+    let offset = align256(*total);
     *total = offset + size;
     offset
 }
@@ -169,7 +170,7 @@ impl ScratchOffsets {
         vocab_size: usize,
         max_seq_len: usize,
     ) -> Self {
-        let align = |x: usize| (x + 4095) & !4095;
+        let align = |x: usize| x.next_multiple_of(4096);
         let m = PREFILL_MAX_ROWS;
         let mut cur = 0;
         // Activation regions hold M prefill rows; decode uses the 1-row prefix.
@@ -256,6 +257,97 @@ struct DecodeTemplate {
     patch_ranges: Vec<std::ops::Range<usize>>,
 }
 
+/// Byte size of one K or V cache slab holding `max_seq_len` rows of `dim`
+/// elements. The single source of the KV layout: every slab allocation and
+/// every DSP tensor stride below derives from these three helpers, so a
+/// layout change cannot land in one dispatch only.
+fn kv_cache_bytes(kv_dtype: HtpDataType, dim: usize, max_seq_len: usize) -> usize {
+    max_seq_len * kv_row_stride(kv_dtype, dim)
+}
+
+/// Bytes between consecutive rows of `dim` elements (`nb[1]` of a KV tensor).
+fn kv_row_stride(kv_dtype: HtpDataType, dim: usize) -> usize {
+    if kv_dtype == HtpDataType::Q8_0 {
+        dim.div_ceil(crate::tensor::DType::Q8_0.block_size())
+            * crate::tensor::DType::Q8_0.block_bytes()
+    } else {
+        dim * 2
+    }
+}
+
+/// Bytes per element step (`nb[0]`): 1 for block-quantized Q8_0, else f16.
+fn kv_elem_nb0(kv_dtype: HtpDataType) -> u32 {
+    if kv_dtype == HtpDataType::Q8_0 { 1 } else { 2 }
+}
+
+/// Re-point every flash-attention op of a resident decode template at the
+/// current `seq_len`: K/V tensor row counts, the mask tensor size and strides,
+/// and the packed KV-block count in `kernel_params[2]`. Shared by decode and
+/// its test so the DSP-visible patch cannot drift from what is pinned.
+fn apply_flash_attn_patches(staged: &mut StagedBatch, patches: &[FlashAttnPatch], seq_len: usize) {
+    let n_kv_blocks = seq_len.div_ceil(64).max(1) as u32;
+    let mask_bytes = (seq_len * 2) as u32;
+    for patch in patches {
+        staged.update_tensor(patch.k_ti, |t| t.ne[1] = seq_len as u32);
+        staged.update_tensor(patch.v_ti, |t| t.ne[1] = seq_len as u32);
+        staged.update_tensor(patch.mask_ti, |t| {
+            t.size = mask_bytes;
+            t.ne[0] = seq_len as u32;
+            t.nb[1] = mask_bytes;
+            t.nb[2] = mask_bytes;
+            t.nb[3] = mask_bytes;
+        });
+
+        let b2 = (n_kv_blocks & 0xffff) | ((patch.g as u32 & 0xffff) << 16);
+        staged.update_op(patch.op_idx, |o| o.kernel_params[2] = b2 as i32);
+    }
+}
+
+/// Split an all-logits verification batch at `max` tokens per chunk. Causal
+/// attention makes chunked evaluation identical to one batch: each chunk
+/// continues at `start_pos + tokens already run`, and the rows concatenate in
+/// order. The first chunk error aborts and propagates.
+fn chunked_all_logits(
+    tokens: &[u32],
+    start_pos: usize,
+    max: usize,
+    vocab_size: usize,
+    mut run: impl FnMut(&[u32], usize) -> Result<Vec<f32>, CeraError>,
+) -> Result<Vec<f32>, CeraError> {
+    let mut all = Vec::with_capacity(tokens.len() * vocab_size);
+    for (i, chunk) in tokens.chunks(max).enumerate() {
+        all.extend(run(chunk, start_pos + i * max)?);
+    }
+    Ok(all)
+}
+
+/// Whether any layer keeps recurrent short-conv state (LFM2 hybrids).
+fn has_conv_layers(layers: &[HexagonLayer]) -> bool {
+    layers.iter().any(|l| matches!(l, HexagonLayer::Conv(_)))
+}
+
+/// Whether a rewind to `len` from `seq_len` can be called proven. The conv
+/// layers' recurrent state lives on the DSP and is not checkpointed, so any
+/// real rewind (`len < seq_len`) of a model with a conv layer is refused;
+/// `len == seq_len` moves nothing and stays free.
+fn rewind_ok(
+    has_conv: bool,
+    len: usize,
+    seq_len: usize,
+) -> Result<(), crate::kv_cache::KvRewindError> {
+    use crate::kv_cache::KvRewindError;
+    if len > seq_len {
+        return Err(KvRewindError::OutOfBounds {
+            requested: len,
+            current: seq_len,
+        });
+    }
+    if has_conv && len < seq_len {
+        return Err(KvRewindError::BackendUnsupported);
+    }
+    Ok(())
+}
+
 #[derive(Clone, Copy, Debug)]
 struct FlashAttnPatch {
     op_idx: usize,
@@ -265,14 +357,90 @@ struct FlashAttnPatch {
     g: usize,
 }
 
+/// The `token_embd.weight` table in its GGUF dtype with row-wise dequantization.
+struct TokenEmbd {
+    tensor: crate::tensor::Tensor,
+    hidden_size: usize,
+    vocab_size: usize,
+    row_bytes: usize,
+}
+
+impl TokenEmbd {
+    /// Validate `tensor` as a `[vocab, hidden]` embedding table. Rejects dtypes
+    /// without a row dequantizer and block-misaligned rows up front, so
+    /// [`Self::row_into`] cannot panic on a supported load.
+    fn new(
+        tensor: crate::tensor::Tensor,
+        hidden_size: usize,
+        vocab_size: usize,
+    ) -> Result<Self, CeraError> {
+        let dt = tensor.dtype();
+        if !crate::model::transformer::supports_row_dequant(dt) {
+            return Err(CeraError::Backend(format!(
+                "token_embd.weight dtype {dt:?} has no row dequantizer"
+            )));
+        }
+        if hidden_size == 0 || !hidden_size.is_multiple_of(dt.block_size()) {
+            return Err(CeraError::Backend(format!(
+                "token_embd.weight hidden size {hidden_size} is not a multiple of the {dt:?} block size {}",
+                dt.block_size()
+            )));
+        }
+        let expected = vocab_size
+            .checked_mul(hidden_size)
+            .ok_or_else(|| CeraError::Backend("vocab_size * hidden_size overflows usize".into()))?;
+        if tensor.numel() < expected {
+            return Err(CeraError::Backend(format!(
+                "token_embd.weight has {} elements, expected at least {expected}",
+                tensor.numel()
+            )));
+        }
+        let row_bytes = hidden_size / dt.block_size() * dt.block_bytes();
+        let needed = row_bytes
+            .checked_mul(vocab_size)
+            .ok_or_else(|| CeraError::Backend("token_embd.weight byte size overflows".into()))?;
+        if tensor.data().len() < needed {
+            return Err(CeraError::Backend(format!(
+                "token_embd.weight has {} bytes, expected at least {needed}",
+                tensor.data().len()
+            )));
+        }
+        Ok(Self {
+            tensor,
+            hidden_size,
+            vocab_size,
+            row_bytes,
+        })
+    }
+
+    /// Dequantize the row for `token` into `dst` (`hidden_size` floats).
+    fn row_into(&self, token: usize, dst: &mut [f32]) -> Result<(), CeraError> {
+        if token >= self.vocab_size {
+            return Err(CeraError::Backend(format!(
+                "token ID {token} exceeds model vocab size {}",
+                self.vocab_size
+            )));
+        }
+        debug_assert_eq!(dst.len(), self.hidden_size);
+        let start = token * self.row_bytes;
+        crate::model::transformer::dequantize_row_slice(
+            self.tensor.dtype(),
+            &self.tensor.data()[start..start + self.row_bytes],
+            dst,
+        );
+        Ok(())
+    }
+}
+
 /// Hexagon NPU accelerated model instance for LFM2 dense hybrid transformers.
 pub struct HexagonLfm2Model {
     device: Mutex<HexagonDevice>,
     config: ModelConfig,
     session_gate: ModelSessionGate,
 
-    // Token embedding on CPU
-    token_embd: Vec<f32>,
+    // Token embedding on CPU, kept in its file dtype and dequantized one row
+    // per token (a wholesale f32 copy is ~5x the file size for Q6_K).
+    token_embd: TokenEmbd,
 
     // Unified weights buffer in rpcmem (all static weights across all layers)
     weights_buf: RpcmemBuffer,
@@ -354,6 +522,19 @@ enum DecodeResult {
 }
 
 impl HexagonLfm2Model {
+    /// Take the device lock for a forward pass. The DSP-resident conv state
+    /// and `current_seq_len` persist across calls, so after a panic under the
+    /// lock they may be torn: fail closed until `try_reset_kv` rewrites them
+    /// (it recovers the lock, which clears the poison).
+    fn lock_device_checked(&self) -> Result<std::sync::MutexGuard<'_, HexagonDevice>, CeraError> {
+        self.device.lock().map_err(|_| {
+            CeraError::Backend(
+                "Hexagon device state was poisoned by a panic; reset the KV cache and re-prefill"
+                    .into(),
+            )
+        })
+    }
+
     /// Load an LFM2 model onto the Hexagon NPU from GGUF.
     pub fn from_gguf(
         gguf: GgufFile,
@@ -407,16 +588,7 @@ impl HexagonLfm2Model {
         let token_embd_tensor = gguf
             .get_tensor("token_embd.weight")
             .map_err(|e| CeraError::Backend(format!("missing token_embd.weight: {e}")))?;
-        let expected_elements = vocab_size
-            .checked_mul(hidden_size)
-            .ok_or_else(|| CeraError::Backend("vocab_size * hidden_size overflows usize".into()))?;
-        let token_embd = token_embd_tensor.to_f32_vec();
-        if token_embd.len() < expected_elements {
-            return Err(CeraError::Backend(format!(
-                "token_embd.weight has {} elements, expected at least {expected_elements}",
-                token_embd.len()
-            )));
-        }
+        let token_embd = TokenEmbd::new(token_embd_tensor, hidden_size, vocab_size)?;
 
         let driver = context.driver();
 
@@ -468,8 +640,6 @@ impl HexagonLfm2Model {
                 has_attn_k_norm.push(false);
             }
         }
-
-        let align256 = |x: usize| (x + 255) & !255;
 
         // Pass 1: Plan offsets for all weights in weights_buf
         let mut weights_total = 0;
@@ -727,11 +897,7 @@ impl HexagonLfm2Model {
                 PlannedLayer::Attention(pa) => {
                     let n_kv = config.kv_heads_per_layer[i];
                     let kv_dim = n_kv * head_dim;
-                    let kv_slab_size = align256(if kv_dtype == HtpDataType::Q8_0 {
-                        max_seq_len * kv_dim.div_ceil(32) * 34
-                    } else {
-                        max_seq_len * kv_dim * 2
-                    });
+                    let kv_slab_size = align256(kv_cache_bytes(kv_dtype, kv_dim, max_seq_len));
                     let k_offset = align256(kv_state_total);
                     let v_offset = align256(k_offset + kv_slab_size);
                     kv_state_total = v_offset + kv_slab_size;
@@ -1980,11 +2146,7 @@ impl HexagonLfm2Model {
     ) -> Result<(), CeraError> {
         let kv_dim = head_dim * n_kv_heads;
         let src_bytes = kv_dim * 4;
-        let cache_bytes = if kv_dtype == HtpDataType::Q8_0 {
-            max_seq_len * kv_dim.div_ceil(32) * 34
-        } else {
-            kv_dim * max_seq_len * 2
-        };
+        let cache_bytes = kv_cache_bytes(kv_dtype, kv_dim, max_seq_len);
         let src_ti = session.add_tensor(
             src,
             src_offset,
@@ -2011,12 +2173,8 @@ impl HexagonLfm2Model {
             kv_dtype as u32,
             [kv_dim as u32, max_seq_len as u32, 1, 1],
             [
-                if kv_dtype == HtpDataType::Q8_0 { 1 } else { 2 },
-                if kv_dtype == HtpDataType::Q8_0 {
-                    (kv_dim.div_ceil(32) * 34) as u32
-                } else {
-                    (kv_dim * 2) as u32
-                },
+                kv_elem_nb0(kv_dtype),
+                kv_row_stride(kv_dtype, kv_dim) as u32,
                 cache_bytes as u32,
                 cache_bytes as u32,
             ],
@@ -2055,11 +2213,7 @@ impl HexagonLfm2Model {
     ) -> Result<(), CeraError> {
         let kv_dim = head_dim * n_kv_heads;
         let src_bytes = kv_dim * n_rows * 4;
-        let cache_bytes = if kv_dtype == HtpDataType::Q8_0 {
-            max_seq_len * kv_dim.div_ceil(32) * 34
-        } else {
-            kv_dim * max_seq_len * 2
-        };
+        let cache_bytes = kv_cache_bytes(kv_dtype, kv_dim, max_seq_len);
         let src_ti = session.add_tensor(
             src,
             src_offset,
@@ -2091,12 +2245,8 @@ impl HexagonLfm2Model {
             kv_dtype as u32,
             [kv_dim as u32, max_seq_len as u32, 1, 1],
             [
-                if kv_dtype == HtpDataType::Q8_0 { 1 } else { 2 },
-                if kv_dtype == HtpDataType::Q8_0 {
-                    (kv_dim.div_ceil(32) * 34) as u32
-                } else {
-                    (kv_dim * 2) as u32
-                },
+                kv_elem_nb0(kv_dtype),
+                kv_row_stride(kv_dtype, kv_dim) as u32,
                 cache_bytes as u32,
                 cache_bytes as u32,
             ],
@@ -2213,11 +2363,7 @@ impl HexagonLfm2Model {
     ) -> Result<(usize, usize, usize), CeraError> {
         let q_bytes = head_dim * n_heads * 4;
         let kv_dim = head_dim * n_kv_heads;
-        let cache_bytes = if kv_dtype == HtpDataType::Q8_0 {
-            max_seq_len * kv_dim.div_ceil(32) * 34
-        } else {
-            kv_dim * max_seq_len * 2
-        };
+        let cache_bytes = kv_cache_bytes(kv_dtype, kv_dim, max_seq_len);
         let q_ti = session.add_tensor(
             q,
             q_offset,
@@ -2240,17 +2386,9 @@ impl HexagonLfm2Model {
             kv_dtype as u32,
             [head_dim as u32, seq_len as u32, n_kv_heads as u32, 1],
             [
-                if kv_dtype == HtpDataType::Q8_0 { 1 } else { 2 },
-                if kv_dtype == HtpDataType::Q8_0 {
-                    (kv_dim.div_ceil(32) * 34) as u32
-                } else {
-                    (kv_dim * 2) as u32
-                },
-                if kv_dtype == HtpDataType::Q8_0 {
-                    (head_dim.div_ceil(32) * 34) as u32
-                } else {
-                    (head_dim * 2) as u32
-                },
+                kv_elem_nb0(kv_dtype),
+                kv_row_stride(kv_dtype, kv_dim) as u32,
+                kv_row_stride(kv_dtype, head_dim) as u32,
                 cache_bytes as u32,
             ],
         )?;
@@ -2262,17 +2400,9 @@ impl HexagonLfm2Model {
             kv_dtype as u32,
             [head_dim as u32, seq_len as u32, n_kv_heads as u32, 1],
             [
-                if kv_dtype == HtpDataType::Q8_0 { 1 } else { 2 },
-                if kv_dtype == HtpDataType::Q8_0 {
-                    (kv_dim.div_ceil(32) * 34) as u32
-                } else {
-                    (kv_dim * 2) as u32
-                },
-                if kv_dtype == HtpDataType::Q8_0 {
-                    (head_dim.div_ceil(32) * 34) as u32
-                } else {
-                    (head_dim * 2) as u32
-                },
+                kv_elem_nb0(kv_dtype),
+                kv_row_stride(kv_dtype, kv_dim) as u32,
+                kv_row_stride(kv_dtype, head_dim) as u32,
                 cache_bytes as u32,
             ],
         )?;
@@ -2397,11 +2527,7 @@ impl HexagonLfm2Model {
         let q_dim = head_dim * n_heads;
         let kv_dim = head_dim * n_kv_heads;
         let q_bytes = q_dim * n_tokens * 4;
-        let cache_bytes = if self.kv_dtype == HtpDataType::Q8_0 {
-            max_seq_len * kv_dim.div_ceil(32) * 34
-        } else {
-            kv_dim * max_seq_len * 2
-        };
+        let cache_bytes = kv_cache_bytes(self.kv_dtype, kv_dim, max_seq_len);
         let q_ti = session.add_tensor(
             q,
             q_offset,
@@ -2421,21 +2547,9 @@ impl HexagonLfm2Model {
             self.kv_dtype as u32,
             [head_dim as u32, seq_len as u32, n_kv_heads as u32, 1],
             [
-                if self.kv_dtype == HtpDataType::Q8_0 {
-                    1
-                } else {
-                    2
-                },
-                if self.kv_dtype == HtpDataType::Q8_0 {
-                    (kv_dim.div_ceil(32) * 34) as u32
-                } else {
-                    (kv_dim * 2) as u32
-                },
-                if self.kv_dtype == HtpDataType::Q8_0 {
-                    (head_dim.div_ceil(32) * 34) as u32
-                } else {
-                    (head_dim * 2) as u32
-                },
+                kv_elem_nb0(self.kv_dtype),
+                kv_row_stride(self.kv_dtype, kv_dim) as u32,
+                kv_row_stride(self.kv_dtype, head_dim) as u32,
                 cache_bytes as u32,
             ],
         )?;
@@ -2447,21 +2561,9 @@ impl HexagonLfm2Model {
             self.kv_dtype as u32,
             [head_dim as u32, seq_len as u32, n_kv_heads as u32, 1],
             [
-                if self.kv_dtype == HtpDataType::Q8_0 {
-                    1
-                } else {
-                    2
-                },
-                if self.kv_dtype == HtpDataType::Q8_0 {
-                    (kv_dim.div_ceil(32) * 34) as u32
-                } else {
-                    (kv_dim * 2) as u32
-                },
-                if self.kv_dtype == HtpDataType::Q8_0 {
-                    (head_dim.div_ceil(32) * 34) as u32
-                } else {
-                    (head_dim * 2) as u32
-                },
+                kv_elem_nb0(self.kv_dtype),
+                kv_row_stride(self.kv_dtype, kv_dim) as u32,
+                kv_row_stride(self.kv_dtype, head_dim) as u32,
                 cache_bytes as u32,
             ],
         )?;
@@ -2771,7 +2873,7 @@ impl HexagonLfm2Model {
             });
         }
 
-        let mut device = self.device.lock().unwrap_or_else(|e| e.into_inner());
+        let mut device = self.lock_device_checked()?;
 
         let so = self.scratch_offsets;
         let scratch = &self.scratch_buf;
@@ -2781,11 +2883,11 @@ impl HexagonLfm2Model {
             match input {
                 PrefillInput::Tokens(tokens) => {
                     for (i, &t) in tokens.iter().enumerate() {
-                        std::ptr::copy_nonoverlapping(
-                            self.token_embd.as_ptr().add(t as usize * hs),
+                        let dst = std::slice::from_raw_parts_mut(
                             scratch.as_mut_ptr().add(so.activation + i * hs * 4) as *mut f32,
                             hs,
                         );
+                        self.token_embd.row_into(t as usize, dst)?;
                     }
                 }
                 PrefillInput::Embeddings(embeddings) => {
@@ -3529,9 +3631,9 @@ impl HexagonLfm2Model {
                 n_out_tokens * vocab_size,
             )
         };
-        if let Ok(mut adpf) = self.adpf.lock()
-            && let Some(session) = adpf.as_mut()
-        {
+        // Advisory power-hint state: safe to keep after a poison.
+        let mut adpf = self.adpf.lock_or_recover();
+        if let Some(session) = adpf.as_mut() {
             let per_token_ns =
                 (fwd_start.elapsed().as_nanos() / m.max(1) as u128).min(i64::MAX as u128) as i64;
             session.report(per_token_ns);
@@ -3635,7 +3737,7 @@ impl HexagonLfm2Model {
             });
         }
 
-        let mut device = self.device.lock().unwrap_or_else(|e| e.into_inner());
+        let mut device = self.lock_device_checked()?;
 
         let so = self.scratch_offsets;
         let scratch = &self.scratch_buf;
@@ -3648,14 +3750,12 @@ impl HexagonLfm2Model {
                         "token ID {token} exceeds model vocab size {vocab_size}"
                     )));
                 }
-                let embd_start = token * hs;
-                let embd_slice = &self.token_embd[embd_start..embd_start + hs];
                 unsafe {
-                    std::ptr::copy_nonoverlapping(
-                        embd_slice.as_ptr() as *const u8,
-                        scratch.as_mut_ptr().add(so.activation),
-                        hs * 4,
+                    let dst = std::slice::from_raw_parts_mut(
+                        scratch.as_mut_ptr().add(so.activation) as *mut f32,
+                        hs,
                     );
+                    self.token_embd.row_into(token, dst)?;
                 }
             }
             DecodeInput::Embedding(embedding) => {
@@ -3714,28 +3814,11 @@ impl HexagonLfm2Model {
             } else {
                 &self.decode_template
             };
-            let mut guard = template_slot.lock().unwrap_or_else(|e| e.into_inner());
+            // The patched template is mutated in place, so a panic mid-patch
+            // may leave it half-updated: drop it and take the rebuild path.
+            let mut guard = lock_or_discard(template_slot);
             if let Some(tpl) = guard.as_mut() {
-                let seq_len = pos + 1;
-                let n_kv_blocks = seq_len.div_ceil(64).max(1) as u32;
-                let mask_bytes = (seq_len * 2) as u32;
-                for patch in &tpl.flash_attn_patches {
-                    let k_ten = tpl.staged.tensor_mut(patch.k_ti);
-                    k_ten.ne[1] = seq_len as u32;
-
-                    let v_ten = tpl.staged.tensor_mut(patch.v_ti);
-                    v_ten.ne[1] = seq_len as u32;
-
-                    let mask_ten = tpl.staged.tensor_mut(patch.mask_ti);
-                    mask_ten.size = mask_bytes;
-                    mask_ten.ne[0] = seq_len as u32;
-                    mask_ten.nb[1] = mask_bytes;
-                    mask_ten.nb[2] = mask_bytes;
-                    mask_ten.nb[3] = mask_bytes;
-
-                    let b2 = (n_kv_blocks & 0xffff) | ((patch.g as u32 & 0xffff) << 16);
-                    tpl.staged.op_mut(patch.op_idx).kernel_params[2] = b2 as i32;
-                }
+                apply_flash_attn_patches(&mut tpl.staged, &tpl.flash_attn_patches, pos + 1);
                 session
                     .flush_staged_resident(tpl.resident_id, &tpl.staged, &tpl.patch_ranges)
                     .map_err(|e| {
@@ -3745,9 +3828,8 @@ impl HexagonLfm2Model {
                 self.current_seq_len.store(pos + 1, Ordering::SeqCst);
                 state.seq_len = pos + 1;
 
-                if let Ok(mut adpf) = self.adpf.lock()
-                    && let Some(session) = adpf.as_mut()
-                {
+                let mut adpf = self.adpf.lock_or_recover();
+                if let Some(session) = adpf.as_mut() {
                     session.report(fwd_start.elapsed().as_nanos().min(i64::MAX as u128) as i64);
                 }
 
@@ -4546,7 +4628,7 @@ impl HexagonLfm2Model {
                     let op_off = staged.bufs_bytes + staged.tens_bytes + patch.op_idx * op_sz;
                     patch_ranges.push(op_off..op_off + op_sz);
                 }
-                let mut guard = template_slot.lock().unwrap_or_else(|e| e.into_inner());
+                let mut guard = template_slot.lock_or_recover();
                 *guard = Some(DecodeTemplate {
                     resident_id,
                     staged,
@@ -4596,12 +4678,32 @@ impl HexagonLfm2Model {
             }
         };
 
-        if let Ok(mut adpf) = self.adpf.lock()
-            && let Some(session) = adpf.as_mut()
-        {
+        let mut adpf = self.adpf.lock_or_recover();
+        if let Some(session) = adpf.as_mut() {
             session.report(fwd_start.elapsed().as_nanos().min(i64::MAX as u128) as i64);
         }
         Ok(result)
+    }
+
+    /// Prefill every token but the last. A failed chunk aborts with an error
+    /// instead of decoding the last token over the KV hole it left behind.
+    fn prefill_head(
+        &self,
+        tokens: &[u32],
+        pos: usize,
+        state: &mut InferenceState,
+    ) -> Result<(), CeraError> {
+        let head = &tokens[..tokens.len() - 1];
+        let (consumed, _) = run_scratch_chunks(head, pos, state, |c, p, s| {
+            self.forward_prefill_chunk(c, p, s)
+        });
+        if consumed != head.len() {
+            return Err(CeraError::Backend(format!(
+                "Hexagon prefill aborted after {consumed} of {} tokens",
+                head.len()
+            )));
+        }
+        Ok(())
     }
 
     fn try_forward(
@@ -4614,7 +4716,7 @@ impl HexagonLfm2Model {
             return Ok(Vec::new());
         }
         if tokens.len() > 1 {
-            self.forward_prefill(&tokens[..tokens.len() - 1], pos, state);
+            self.prefill_head(tokens, pos, state)?;
             return self.try_forward(&tokens[tokens.len() - 1..], pos + tokens.len() - 1, state);
         }
         match self.try_forward_input(
@@ -4638,7 +4740,7 @@ impl HexagonLfm2Model {
             return Ok(0);
         }
         if tokens.len() > 1 {
-            self.forward_prefill(&tokens[..tokens.len() - 1], pos, state);
+            self.prefill_head(tokens, pos, state)?;
             return self.try_forward_greedy(
                 &tokens[tokens.len() - 1..],
                 pos + tokens.len() - 1,
@@ -4768,6 +4870,10 @@ fn prefill_tail_logits(
     }
 }
 
+/// Embedding-input twin of [`run_scratch_chunks`]: same abort-at-first-failure
+/// policy, chunking `embeddings` (`n_tokens * hidden_size` floats) by scratch
+/// capacity. `n_tokens` only gates the empty case; the per-chunk token count
+/// comes from the slice length.
 fn run_scratch_chunks_embeddings(
     embeddings: &[f32],
     n_tokens: usize,
@@ -4871,16 +4977,19 @@ impl Model for HexagonLfm2Model {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         let hs = self.config.hidden_size;
-        assert!(
-            n_tokens > 0,
-            "forward_prefill_from_embeddings requires at least one frame"
-        );
-        assert_eq!(
-            embeddings.len(),
-            n_tokens * hs,
-            "embeddings.len() ({}) != n_tokens ({n_tokens}) * hidden_size ({hs})",
-            embeddings.len(),
-        );
+        // A bad shape is a caller bug, but a panic here would cross the FFI
+        // boundary and abort the host: record a fault and return zeros, like
+        // the other prefill failures.
+        if n_tokens == 0 || embeddings.len() != n_tokens * hs {
+            let e = CeraError::Backend(format!(
+                "forward_prefill_from_embeddings needs n_tokens > 0 and \
+                 embeddings.len() ({}) == n_tokens ({n_tokens}) * hidden_size ({hs})",
+                embeddings.len(),
+            ));
+            eprintln!("[cera-hexagon] {e}");
+            record_first_fault(&self.decode_error, e);
+            return vec![0.0f32; self.config.vocab_size];
+        }
         let (consumed, logits) = run_scratch_chunks_embeddings(
             embeddings,
             n_tokens,
@@ -4969,12 +5078,16 @@ impl Model for HexagonLfm2Model {
         if tokens.is_empty() {
             return Vec::new();
         }
-        assert!(
-            tokens.len() <= MAX_ALL_LOGITS_TOKENS,
-            "forward_prefill_logits_all token count ({}) exceeds MAX_ALL_LOGITS_TOKENS ({MAX_ALL_LOGITS_TOKENS})",
-            tokens.len()
+        // Speculative verification batches `1 + k` tokens and `k` can be 64, so
+        // split at the scratch capacity instead of panicking.
+        let result = chunked_all_logits(
+            tokens,
+            start_pos,
+            MAX_ALL_LOGITS_TOKENS,
+            self.config.vocab_size,
+            |chunk, chunk_start| self.try_forward_prefill_logits_all(chunk, chunk_start, state),
         );
-        match self.try_forward_prefill_logits_all(tokens, start_pos, state) {
+        match result {
             Ok(logits) => logits,
             Err(e) => {
                 tracing::error!("Hexagon NPU forward_prefill_logits_all failed: {e}");
@@ -4994,13 +5107,17 @@ impl Model for HexagonLfm2Model {
         state: &InferenceState,
         len: usize,
     ) -> Result<(), crate::kv_cache::KvRewindError> {
-        if len > state.seq_len {
-            return Err(crate::kv_cache::KvRewindError::OutOfBounds {
-                requested: len,
-                current: state.seq_len,
-            });
+        // A poisoned device may hold torn conv state that even a no-op
+        // truncate must not paper over; only `try_reset_kv` recovers it.
+        // `BackendUnsupported` is reused deliberately: callers fall through
+        // to a checked reset, which is exactly the recovery needed.
+        if self.device.is_poisoned() {
+            return Err(crate::kv_cache::KvRewindError::BackendUnsupported);
         }
-        Ok(())
+        // The recurrent short-conv state lives on the DSP and is not
+        // checkpointed (see `rewind_ok`); `truncate_kv` stays the counter-only
+        // legacy path, as on the GPU backends.
+        rewind_ok(has_conv_layers(&self.layers), len, state.seq_len)
     }
 
     fn try_truncate_kv(
@@ -5019,15 +5136,11 @@ impl Model for HexagonLfm2Model {
             "truncate_kv({len}) exceeds seq_len {}",
             state.seq_len
         );
-        let _guard = self.device.lock().unwrap_or_else(|e| e.into_inner());
-        *self
-            .decode_template
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-        *self
-            .greedy_decode_template
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        // Keep any poison: this rewrites counters only, so it must not turn a
+        // failed-closed device back into a usable one.
+        let _guard = lock_keeping_poison(&self.device);
+        *self.decode_template.lock_or_recover() = None;
+        *self.greedy_decode_template.lock_or_recover() = None;
         self.current_seq_len.store(len, Ordering::SeqCst);
         state.seq_len = len;
     }
@@ -5043,17 +5156,13 @@ impl Model for HexagonLfm2Model {
                 "TurboQuant KV compression is not supported by the Hexagon backend".into(),
             ));
         }
-        let _guard = self.device.lock().unwrap_or_else(|e| e.into_inner());
-        *self
-            .decode_template
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
-        *self
-            .greedy_decode_template
-            .lock()
-            .unwrap_or_else(|e| e.into_inner()) = None;
+        // Fallible work first: nothing may fail between clearing the poison
+        // (below) and rewriting the state it guards.
         let mut fresh = InferenceState::from_config_capped(&self.config, compression, max_seq_len)?;
         fresh.lora = state.lora.clone();
+        let _guard = self.device.lock_or_recover();
+        *self.decode_template.lock_or_recover() = None;
+        *self.greedy_decode_template.lock_or_recover() = None;
 
         // Clear unified KV cache and convolution state buffer
         unsafe {
@@ -5281,64 +5390,43 @@ mod prefill_chunk_tests {
 
     #[test]
     fn test_kv_q8_0_sizing_and_strides() {
-        let max_seq_len: usize = 2048;
-        let kv_dim: usize = 256;
-        let head_dim: usize = 64;
-
-        // F16 sizing: 2 bytes per element
-        let f16_slab_size = max_seq_len * kv_dim * 2;
-        // Q8_0 sizing: 34 bytes per 32-element block
-        let q8_slab_size = (max_seq_len * kv_dim.div_ceil(32) * 34 + 255) & !255;
-
-        // Q8_0 slab size is roughly ~53% of F16 slab size (34/64 = 53.125%)
-        assert!(q8_slab_size < f16_slab_size);
-        assert_eq!(q8_slab_size, 557056);
-        assert_eq!(f16_slab_size, 1048576);
-
-        // Stride calculations for Q8_0:
-        let elem_bytes = 1;
-        let row_stride = (kv_dim.div_ceil(32) * 34) as u32;
-        let head_stride = (head_dim.div_ceil(32) * 34) as u32;
-        assert_eq!(elem_bytes, 1);
-        assert_eq!(row_stride, 272);
-        assert_eq!(head_stride, 68);
+        let (max_seq_len, kv_dim, head_dim) = (2048usize, 256usize, 64usize);
+        let f16_slab = kv_cache_bytes(HtpDataType::F16, kv_dim, max_seq_len);
+        let q8_slab = kv_cache_bytes(HtpDataType::Q8_0, kv_dim, max_seq_len);
+        // 34 bytes per 32-element block against 64 for f16: ~53%.
+        assert_eq!(f16_slab, 1_048_576);
+        assert_eq!(q8_slab, 557_056);
+        assert!(q8_slab < f16_slab);
+        assert_eq!(kv_row_stride(HtpDataType::Q8_0, kv_dim), 272);
+        assert_eq!(kv_row_stride(HtpDataType::Q8_0, head_dim), 68);
+        assert_eq!(kv_row_stride(HtpDataType::F16, kv_dim), 512);
+        assert_eq!(kv_elem_nb0(HtpDataType::Q8_0), 1);
+        assert_eq!(kv_elem_nb0(HtpDataType::F16), 2);
+        // A dim that is not a whole number of blocks rounds up to a block.
+        assert_eq!(
+            kv_row_stride(HtpDataType::Q8_0, 33),
+            2 * crate::tensor::DType::Q8_0.block_bytes()
+        );
     }
 
     #[test]
     fn test_decode_template_flash_attn_patching() {
-        let mut tens = [
-            HtpTensor {
-                data: 0,
-                size: 0,
-                flags: 0,
-                dtype: HtpDataType::F16 as u32,
-                bi: 0,
-                ti: 0,
-                ne: [64, 1, 4, 1],
-                nb: [2, 128, 512, 512],
-            },
-            HtpTensor {
-                data: 0,
-                size: 0,
-                flags: 0,
-                dtype: HtpDataType::F16 as u32,
-                bi: 0,
-                ti: 1,
-                ne: [64, 1, 4, 1],
-                nb: [2, 128, 512, 512],
-            },
-            HtpTensor {
-                data: 0,
-                size: 2,
-                flags: 0,
-                dtype: HtpDataType::F16 as u32,
-                bi: 0,
-                ti: 2,
-                ne: [1, 1, 1, 1],
-                nb: [2, 2, 2, 2],
-            },
+        let tensor = |ti: u16, size: u32, ne: [u32; 4], nb: [u32; 4]| HtpTensor {
+            data: 0,
+            size,
+            flags: 0,
+            dtype: HtpDataType::F16 as u32,
+            bi: 0,
+            ti,
+            ne,
+            nb,
+        };
+        let tens = [
+            tensor(0, 0, [64, 1, 4, 1], [2, 128, 512, 512]),
+            tensor(1, 0, [64, 1, 4, 1], [2, 128, 512, 512]),
+            tensor(2, 2, [1, 1, 1, 1], [2, 2, 2, 2]),
         ];
-        let mut ops = [HtpOpDesc {
+        let mut op = HtpOpDesc {
             opcode: HtpOpCode::FlashAttnExt as u32,
             flags: 0,
             params: [0; 16],
@@ -5346,8 +5434,29 @@ mod prefill_chunk_tests {
             src: [0; 10],
             dst: [0; 4],
             pad: [0; 2],
-        }];
-        ops[0].kernel_params = build_flash_attn_kernel_params(64, 16, 4, 1, 1, 0.125, 4, true);
+        };
+        op.kernel_params = build_flash_attn_kernel_params(64, 16, 4, 1, 1, 0.125, 4, true);
+
+        // Serialize into the same layout `export_staged_batch` produces
+        // (tensors, then ops), so the descriptor accessors address real bytes.
+        let (tens_bytes, ops_bytes) = (
+            tens.len() * std::mem::size_of::<HtpTensor>(),
+            std::mem::size_of::<HtpOpDesc>(),
+        );
+        let mut raw_bytes = Vec::with_capacity(tens_bytes + ops_bytes);
+        raw_bytes.extend_from_slice(descriptor_bytes(&tens));
+        raw_bytes.extend_from_slice(descriptor_bytes(std::slice::from_ref(&op)));
+        let mut staged = StagedBatch {
+            raw_bytes,
+            n_bufs: 0,
+            n_tensors: tens.len() as u32,
+            n_ops: 1,
+            bufs_bytes: 0,
+            tens_bytes,
+            ops_bytes,
+            prof_bytes: 0,
+            total_bytes: tens_bytes + ops_bytes,
+        };
         let patch = FlashAttnPatch {
             op_idx: 0,
             k_ti: 0,
@@ -5356,30 +5465,147 @@ mod prefill_chunk_tests {
             g: 16 / 4,
         };
 
-        // Simulate token step at pos = 15 (seq_len = 16)
-        let pos: usize = 15;
-        let seq_len = pos + 1;
-        tens[patch.k_ti].ne[1] = seq_len as u32;
-        tens[patch.v_ti].ne[1] = seq_len as u32;
-        let mask_bytes = (seq_len * 2) as u32;
-        tens[patch.mask_ti].size = mask_bytes;
-        tens[patch.mask_ti].ne[0] = seq_len as u32;
-        tens[patch.mask_ti].nb[1] = mask_bytes;
-        tens[patch.mask_ti].nb[2] = mask_bytes;
-        tens[patch.mask_ti].nb[3] = mask_bytes;
+        // Decode step at pos = 15 (seq_len = 16), then pos = 64 (seq_len 65:
+        // a second KV block).
+        for seq_len in [16usize, 65] {
+            apply_flash_attn_patches(&mut staged, &[patch], seq_len);
+            let mask_bytes = (seq_len * 2) as u32;
+            assert_eq!(staged.tensor(0).ne[1], seq_len as u32);
+            assert_eq!(staged.tensor(1).ne[1], seq_len as u32);
+            let mask = staged.tensor(2);
+            assert_eq!(mask.ne[0], seq_len as u32);
+            assert_eq!(mask.size, mask_bytes);
+            assert_eq!(mask.nb[1..], [mask_bytes; 3]);
+            assert_eq!(
+                staged.op(0).kernel_params,
+                build_flash_attn_kernel_params(64, 16, 4, 1, seq_len, 0.125, 4, true),
+                "seq_len {seq_len}"
+            );
+        }
+    }
 
-        let n_kv_blocks = seq_len.div_ceil(64).max(1) as u32;
-        let b2 = (n_kv_blocks & 0xffff) | ((patch.g as u32 & 0xffff) << 16);
-        ops[patch.op_idx].kernel_params[2] = b2 as i32;
+    #[test]
+    fn chunked_all_logits_splits_offsets_and_orders_rows() {
+        let vocab = 2;
+        let max = 4;
+        let tokens: Vec<u32> = (0..(2 * max + 1) as u32).collect();
+        let mut calls = Vec::new();
+        let out = chunked_all_logits(&tokens, 10, max, vocab, |chunk, start| {
+            calls.push((start, chunk.len()));
+            Ok(chunk
+                .iter()
+                .flat_map(|&t| [t as f32, -(t as f32)])
+                .collect())
+        })
+        .unwrap();
+        assert_eq!(calls, vec![(10, 4), (14, 4), (18, 1)]);
+        assert_eq!(out.len(), tokens.len() * vocab);
+        for (i, row) in out.chunks(vocab).enumerate() {
+            assert_eq!(row, [i as f32, -(i as f32)], "row {i} out of order");
+        }
+    }
 
-        let expected_kparams =
-            build_flash_attn_kernel_params(64, 16, 4, 1, seq_len, 0.125, 4, true);
+    #[test]
+    fn chunked_all_logits_aborts_on_first_chunk_error() {
+        let mut ran = 0;
+        let r = chunked_all_logits(&[1, 2, 3, 4, 5], 0, 2, 1, |_, _| {
+            ran += 1;
+            if ran == 2 {
+                Err(CeraError::Backend("boom".into()))
+            } else {
+                Ok(vec![0.0; 2])
+            }
+        });
+        assert!(r.is_err());
+        assert_eq!(ran, 2, "chunks after the failed one must not run");
+    }
 
-        assert_eq!(tens[0].ne[1], 16);
-        assert_eq!(tens[1].ne[1], 16);
-        assert_eq!(tens[2].ne[0], 16);
-        assert_eq!(tens[2].size, 32);
-        assert_eq!(tens[2].nb[1], 32);
-        assert_eq!(ops[patch.op_idx].kernel_params, expected_kparams);
+    #[test]
+    fn rewind_ok_refuses_unproven_conv_rewinds() {
+        use crate::kv_cache::KvRewindError;
+        assert_eq!(
+            rewind_ok(true, 9, 8),
+            Err(KvRewindError::OutOfBounds {
+                requested: 9,
+                current: 8
+            })
+        );
+        assert_eq!(rewind_ok(true, 8, 8), Ok(()), "no-op rewind stays free");
+        assert_eq!(
+            rewind_ok(true, 5, 8),
+            Err(KvRewindError::BackendUnsupported)
+        );
+        assert_eq!(rewind_ok(false, 5, 8), Ok(()), "attention-only can rewind");
+    }
+
+    /// `row_into` must equal the reference full dequantization for every
+    /// dtype a token table can be stored in, including the row offset.
+    #[test]
+    fn token_embd_rows_match_full_dequantization() {
+        use crate::tensor::{DType, Tensor};
+        let (vocab, hidden) = (5usize, 256usize);
+        for dt in [
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::Q4_0,
+            DType::Q4_1,
+            DType::Q8_0,
+            DType::Q6K,
+            DType::Q4KM,
+            DType::Q5KM,
+        ] {
+            let row_bytes = hidden / dt.block_size() * dt.block_bytes();
+            // Distinct, small-magnitude bytes per row so a wrong offset shows.
+            let data: Vec<u8> = (0..vocab * row_bytes)
+                .map(|i| ((i * 7 + i / row_bytes * 13) % 61) as u8)
+                .collect();
+            let tensor = Tensor::new(data.clone(), vec![vocab, hidden], dt);
+            let reference = tensor.to_f32_vec();
+            let emb = TokenEmbd::new(Tensor::new(data, vec![vocab, hidden], dt), hidden, vocab)
+                .unwrap_or_else(|e| panic!("{dt:?}: {e}"));
+            let mut row = vec![0.0f32; hidden];
+            for tok in 0..vocab {
+                emb.row_into(tok, &mut row).unwrap();
+                let want = &reference[tok * hidden..(tok + 1) * hidden];
+                assert!(
+                    row.iter()
+                        .zip(want)
+                        .all(|(a, b)| a.to_bits() == b.to_bits() || (a.is_nan() && b.is_nan())),
+                    "{dt:?} token {tok}"
+                );
+            }
+            assert!(emb.row_into(vocab, &mut row).is_err(), "{dt:?} oob token");
+        }
+    }
+
+    #[test]
+    fn token_embd_rejects_bad_tables() {
+        use crate::tensor::{DType, Tensor};
+        let t = |dt: DType, n: usize| Tensor::new(vec![0u8; n], vec![n], dt);
+        // Block-misaligned hidden size for a 32-element-block dtype.
+        assert!(TokenEmbd::new(t(DType::Q8_0, 34 * 2), 48, 1).is_err());
+        assert!(TokenEmbd::new(t(DType::F32, 16), 0, 1).is_err(), "hidden 0");
+        assert!(
+            TokenEmbd::new(t(DType::F32, 4 * 3), 4, 4).is_err(),
+            "table shorter than vocab * hidden"
+        );
+        assert!(TokenEmbd::new(t(DType::I32, 16), 4, 1).is_err(), "dtype");
+        // Each size check must fire on its own: shape short with plenty of
+        // bytes, and shape fine with too few bytes.
+        let short_shape = Tensor::new(vec![0u8; 4 * 4 * 4], vec![4 * 3], DType::F32);
+        assert!(TokenEmbd::new(short_shape, 4, 4).is_err(), "numel short");
+        let short_bytes = Tensor::new(vec![0u8; 4 * 3 * 4], vec![4 * 4], DType::F32);
+        assert!(TokenEmbd::new(short_bytes, 4, 4).is_err(), "bytes short");
+        assert!(
+            TokenEmbd::new(t(DType::F32, 16), usize::MAX, 2).is_err(),
+            "overflow"
+        );
+    }
+
+    /// Raw bytes of a slice of plain `repr(C)` descriptors.
+    fn descriptor_bytes<T>(v: &[T]) -> &[u8] {
+        // SAFETY: descriptors are `repr(C)` plain data; only read here.
+        unsafe { std::slice::from_raw_parts(v.as_ptr() as *const u8, std::mem::size_of_val(v)) }
     }
 }

@@ -64,18 +64,9 @@ impl AdpfSession {
         {
             return None;
         }
-        #[cfg(unix)]
-        {
-            Self::open_unix(target_nanos)
-        }
-        #[cfg(not(unix))]
-        {
-            let _ = target_nanos;
-            None
-        }
+        Self::open_unix(target_nanos)
     }
 
-    #[cfg(unix)]
     fn open_unix(target_nanos: i64) -> Option<Self> {
         let tid = current_tid()?;
         unsafe {

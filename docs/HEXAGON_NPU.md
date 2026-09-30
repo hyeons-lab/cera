@@ -121,12 +121,12 @@ The DSP-side worker libraries (`libggml-htp-v{73,75,79,81,85}.so`) are precompil
 - **Hardware Acceleration Uplift**: Pairing Hexagon NPU verification with Cera's prompt-lookup drafter (`ngram=2`, `k=4`) elevates 350M decode throughput from 164.0 tok/s to 259.5 tok/s (peak 260.2 tok/s) and 2.6B decode throughput from 26.7 tok/s to 47.7 tok/s (peak 48.5 tok/s) on Snapdragon 8 Elite without requiring fine-tuning or neural drafter sidecars.
 
 ### 4.7 FastRPC Power Management & Wakelock
-- **Device Node Preservation**: Acquires a FastRPC driver wakelock (`FASTRPC_CONTROL_WAKELOCK`) during `HexagonDevice::new()` to prevent Android power management from suspending the FastRPC device node during active sessions. The wakelock is released upon session drop.
+- **Device Node Preservation**: Acquires a FastRPC driver wakelock (`FASTRPC_CONTROL_WAKELOCK`) during `HexagonDevice::new()` to prevent Android power management from suspending the FastRPC device node during active sessions. The votes are process-wide, so they are refcounted: the first live device takes them, the last one to drop releases them, and a failed device open (for example an unsupported arch during probing) never leaves them on.
 - **Latency QoS Scaling**: Combines the wakelock with `FASTRPC_CONTROL_LATENCY = 100 µs` session votes, ensuring the CDSP frequency governor remains locked in peak performance corners during active inference.
 
 ### 4.8 Centralized Audio Accelerator Factory Integration
 - **Unified Backend Resolution**: Vocoder detokenizer and depthformer acceleration routes through `cera::model::audio_decoder::build_audio_accelerator`, providing immediate parity with `--device hexagon` and honoring `CERA_AUDIO_GPU` environment overrides.
-- **Automatic Depthformer Activation**: When targeting Hexagon NPU, hardware-accelerated depthformer codebook sampling executes automatically without requiring auxiliary experimental flags.
+- **Automatic Depthformer Activation**: When targeting Hexagon NPU, hardware-accelerated depthformer codebook sampling executes automatically without requiring auxiliary experimental flags. The Metal and wgpu depthformers stay opt-in (`CERA_GPU_DF=1`); an accelerator opts in to the default through `AudioAccelerator::depthformer_default_on`.
 
 ---
 

@@ -486,8 +486,10 @@ pub fn hexagon_probe() -> Result<HexagonProbeInfo, FfiError> {
     }
 }
 
-/// Write the embedded DSP skels into `dir` (created if missing) and
-/// point FastRPC's loader at it. Caller stages a private writable directory;
+/// Write the embedded DSP skels into `dir` (created private, mode 0700, if
+/// missing) and point FastRPC's loader at it. An existing `dir` that another
+/// user owns, or that is writable by "other", is refused with `Backend`, since
+/// the loader executes what is in it. Caller stages a private writable directory;
 /// on Android, the `HexagonNpu.setup` helper invokes this function to extract
 /// skels into the application's internal files directory (`cera_skels`) and
 /// configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
@@ -495,8 +497,8 @@ pub fn hexagon_probe() -> Result<HexagonProbeInfo, FfiError> {
 /// number of skels written (0 when all were already present and fresh).
 /// Re-running is cheap and idempotent (files are only rewritten when
 /// their bytes differ, and the loader path is not duplicated). A `dir`
-/// containing `;` is rejected: it would silently split into two loader
-/// search entries.
+/// containing `;`, `=` or NUL is rejected: it would silently split or corrupt
+/// the loader's search path.
 #[uniffi::export]
 pub fn hexagon_install_skels(dir: String) -> Result<u32, FfiError> {
     #[cfg(feature = "hexagon")]
@@ -535,7 +537,9 @@ pub struct EngineConfig {
     /// Optional path to a DSpark speculative draft model GGUF file.
     #[uniffi(default = None)]
     pub draft_model: Option<String>,
-    /// Whether to prefer GPU depthformer for audio decoder generation.
+    /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+    /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+    /// depthformer regardless of this flag.
     #[uniffi(default = false)]
     pub gpu_depthformer: bool,
 }
@@ -1561,7 +1565,9 @@ pub struct SessionConfig {
     /// Chunked-prefill ubatch size. `0` = monolithic prefill.
     #[uniffi(default = 512)]
     pub ubatch_size: u32,
-    /// Whether to prefer GPU depthformer for audio decoder generation.
+    /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+    /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+    /// depthformer regardless of this flag.
     #[uniffi(default = false)]
     pub gpu_depthformer: bool,
     /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
@@ -2714,7 +2720,9 @@ impl Session {
     ///
     /// # Errors
     ///
-    /// - `InvalidInput` if buffer length does not match dimensions or pixel format.
+    /// - `EmptyInput` if the buffer is empty or a dimension is 0.
+    /// - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+    ///   (extra trailing bytes are ignored).
     /// - `Preprocess` if image normalization fails.
     /// - `UnsupportedModality` if vision encoding is unsupported on this session.
     /// - `Backend` for missing vision encoder, projection dimension mismatch,
@@ -3066,13 +3074,15 @@ impl Session {
         Ok(())
     }
 
-    /// Explicitly disable speculative decoding for this session.
+    /// Explicitly disable speculative decoding for this session. An attached
+    /// drafter is kept, so [`Self::enable_spec`] restores it.
     pub fn disable_spec(&self) -> Result<(), FfiError> {
         self.lock_inner()?.disable_spec();
         Ok(())
     }
 
-    /// Re-enable speculative decoding for this session (if previously disabled).
+    /// Re-enable speculative decoding for this session (if previously
+    /// disabled), using the attached drafter if there is one.
     pub fn enable_spec(&self) -> Result<(), FfiError> {
         self.lock_inner()?.enable_spec();
         Ok(())

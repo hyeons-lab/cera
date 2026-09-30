@@ -26,7 +26,7 @@ rustflags = ["-C", "target-cpu=x86-64-v3"]
 # Android: force 16KB ELF alignment. Devices with 16KB pages (Android 15+)
 # refuse to load native libraries whose LOAD segments are 4KB-aligned, and
 # Google Play requires 16KB-clean binaries. CI and the release pipeline pin
-# NDK r28c, whose default is already 16KB; the explicit flags below (Google's
+# NDK r30, whose default is already 16KB; the explicit flags below (Google's
 # documented recipe for r27 and older) stay so the requirement holds even if
 # the pin ever moves to an NDK with a 4KB default:
 # https://developer.android.com/guide/practices/page-sizes

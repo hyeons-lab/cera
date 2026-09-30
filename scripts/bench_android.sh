@@ -17,7 +17,8 @@
 # Usage:
 #   scripts/bench_android.sh --model <name.gguf> [--serial <adb-serial>]
 #                            [--llama-bench <path-on-device>]
-#                            [--prompt 512] [--decode 128] [--runs 5]
+#                            [--prompt 512] [--decode 512] [--runs 5]
+#                            [--warmup N] [--force]
 #                            [--decode-prompt 128] [--passes 5] [--equil-warm 2]
 #                            [--min-battery 30]
 #

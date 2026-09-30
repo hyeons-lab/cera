@@ -168,7 +168,9 @@ class CeraOptions {
   /// Micro-batch size for prompt prefill chunking. Defaults to 512.
   final int ubatchSize;
 
-  /// Whether to prefer GPU depthformer for audio generation when available.
+  /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+  /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+  /// depthformer regardless of this flag.
   final bool gpuDepthformer;
 
   /// Web asset locations. Ignored on native targets.

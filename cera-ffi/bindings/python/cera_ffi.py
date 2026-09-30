@@ -499,7 +499,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 41114:
+    if lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 55417:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -779,7 +779,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 51302:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 38950:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -795,9 +795,9 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_disable_spec() != 3153:
+    if lib.uniffi_cera_ffi_checksum_method_session_disable_spec() != 57:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_enable_spec() != 9506:
+    if lib.uniffi_cera_ffi_checksum_method_session_enable_spec() != 2995:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -10102,7 +10102,9 @@ class SessionProtocol(typing.Protocol):
 
         # Errors
 
-        - `InvalidInput` if buffer length does not match dimensions or pixel format.
+        - `EmptyInput` if the buffer is empty or a dimension is 0.
+        - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+        (extra trailing bytes are ignored).
         - `Preprocess` if image normalization fails.
         - `UnsupportedModality` if vision encoding is unsupported on this session.
         - `Backend` for missing vision encoder, projection dimension mismatch,
@@ -10189,12 +10191,14 @@ class SessionProtocol(typing.Protocol):
         raise NotImplementedError
     def disable_spec(self, ) -> None:
         """
-        Explicitly disable speculative decoding for this session.
+        Explicitly disable speculative decoding for this session. An attached
+        drafter is kept, so [`Self::enable_spec`] restores it.
 """
         raise NotImplementedError
     def enable_spec(self, ) -> None:
         """
-        Re-enable speculative decoding for this session (if previously disabled).
+        Re-enable speculative decoding for this session (if previously
+        disabled), using the attached drafter if there is one.
 """
         raise NotImplementedError
     def export_checkpoint(self, ) -> bytes:
@@ -10679,7 +10683,9 @@ class Session(SessionProtocol):
 
         # Errors
 
-        - `InvalidInput` if buffer length does not match dimensions or pixel format.
+        - `EmptyInput` if the buffer is empty or a dimension is 0.
+        - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+        (extra trailing bytes are ignored).
         - `Preprocess` if image normalization fails.
         - `UnsupportedModality` if vision encoding is unsupported on this session.
         - `Backend` for missing vision encoder, projection dimension mismatch,
@@ -10870,7 +10876,8 @@ class Session(SessionProtocol):
         return _uniffi_lift_return(_uniffi_ffi_result)
     def disable_spec(self, ) -> None:
         """
-        Explicitly disable speculative decoding for this session.
+        Explicitly disable speculative decoding for this session. An attached
+        drafter is kept, so [`Self::enable_spec`] restores it.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
@@ -10885,7 +10892,8 @@ class Session(SessionProtocol):
         return _uniffi_lift_return(_uniffi_ffi_result)
     def enable_spec(self, ) -> None:
         """
-        Re-enable speculative decoding for this session (if previously disabled).
+        Re-enable speculative decoding for this session (if previously
+        disabled), using the attached drafter if there is one.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
@@ -15854,8 +15862,10 @@ def detect_tool_format(architecture: str) -> typing.Optional[ToolFormat]:
     return _uniffi_lift_return(_uniffi_ffi_result)
 def hexagon_install_skels(dir: str) -> int:
     """
-    Write the embedded DSP skels into `dir` (created if missing) and
-    point FastRPC's loader at it. Caller stages a private writable directory;
+    Write the embedded DSP skels into `dir` (created private, mode 0700, if
+    missing) and point FastRPC's loader at it. An existing `dir` that another
+    user owns, or that is writable by "other", is refused with `Backend`, since
+    the loader executes what is in it. Caller stages a private writable directory;
     on Android, the `HexagonNpu.setup` helper invokes this function to extract
     skels into the application's internal files directory (`cera_skels`) and
     configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
@@ -15863,8 +15873,8 @@ def hexagon_install_skels(dir: str) -> int:
     number of skels written (0 when all were already present and fresh).
     Re-running is cheap and idempotent (files are only rewritten when
     their bytes differ, and the loader path is not duplicated). A `dir`
-    containing `;` is rejected: it would silently split into two loader
-    search entries.
+    containing `;`, `=` or NUL is rejected: it would silently split or corrupt
+    the loader's search path.
 """
     
     _UniffiFfiConverterString.check_lower(dir)

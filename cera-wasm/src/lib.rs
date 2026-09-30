@@ -4234,6 +4234,10 @@ mod webgpu {
                     .gpu_audio_decoder
                     .as_deref()
                     .map(|g| g as &dyn cera::model::audio_decoder::AudioAccelerator);
+                // The browser has no `CERA_GPU_DF`, and the WebGPU depthformer is
+                // the only fast path there (it always ran by default), so this
+                // caller requests it whenever it is available: an intentional
+                // exception to the opt-in in `accelerated_depthformer_enabled`.
                 let use_gpu_df = self
                     .gpu_audio_decoder
                     .as_ref()

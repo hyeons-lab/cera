@@ -3,8 +3,9 @@
 //! Handles device lifecycle, Unsigned PD session initiation, and
 //! hardware resource registration via FastRPC.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use super::LockOrRecover;
 use super::queue::HexagonQueueSession;
 use super::sys::{FastRpcDriver, RemoteArg, RemoteBuf, RemoteHandle64, remote_scalars_make};
 use super::types::HtpHwInfo;
@@ -56,6 +57,69 @@ impl HexagonArch {
     }
 }
 
+/// Process-wide count of live [`PowerVote`] holders. The FastRPC latency QoS
+/// and wakelock are process-wide and not counted by the driver, so the votes
+/// are taken on the 0 to 1 transition and released on 1 to 0; one device
+/// dropping must not cancel the votes another still decoding relies on.
+struct VoteCounter(Mutex<usize>);
+
+impl VoteCounter {
+    const fn new() -> Self {
+        Self(Mutex::new(0))
+    }
+
+    /// Register a holder, running `on_first` under the lock when it is the
+    /// first (so the vote calls of concurrent enter/leave cannot interleave).
+    fn enter(&self, on_first: impl FnOnce()) {
+        let mut n = self.0.lock_or_recover();
+        if *n == 0 {
+            on_first();
+        }
+        *n += 1;
+    }
+
+    /// Unregister a holder, running `on_last` under the lock when it was the
+    /// last. Saturates at zero rather than underflowing.
+    fn leave(&self, on_last: impl FnOnce()) {
+        let mut n = self.0.lock_or_recover();
+        *n = n.saturating_sub(1);
+        if *n == 0 {
+            on_last();
+        }
+    }
+}
+
+static POWER_VOTES: VoteCounter = VoteCounter::new();
+
+/// RAII holder of the CDSP latency QoS and wakelock votes. Held from the top
+/// of [`HexagonDevice::new`], so every early-return path releases its share.
+struct PowerVote(Arc<FastRpcDriver>);
+
+impl PowerVote {
+    fn acquire(driver: &Arc<FastRpcDriver>) -> Self {
+        POWER_VOTES.enter(|| {
+            // Prevent DSP power collapse during active inference. Best
+            // effort: a refused vote costs performance, not correctness.
+            if let Err(e) = driver.set_latency_qos(100) {
+                tracing::warn!("Hexagon latency QoS vote failed: {e}");
+            }
+            if let Err(e) = driver.set_wakelock(true) {
+                tracing::warn!("Hexagon wakelock vote failed: {e}");
+            }
+        });
+        Self(Arc::clone(driver))
+    }
+}
+
+impl Drop for PowerVote {
+    fn drop(&mut self) {
+        POWER_VOTES.leave(|| {
+            let _ = self.0.set_wakelock(false);
+            let _ = self.0.set_latency_qos(0);
+        });
+    }
+}
+
 /// Represents an active connection to a Hexagon NPU execution domain.
 pub struct HexagonDevice {
     driver: Arc<FastRpcDriver>,
@@ -64,6 +128,8 @@ pub struct HexagonDevice {
     hw_info: HtpHwInfo,
     queue_session: Option<HexagonQueueSession>,
     profiler_on: bool,
+    /// Declared last so the votes outlive the skel handle close in `Drop`.
+    _power_vote: PowerVote,
 }
 
 #[repr(C)]
@@ -91,9 +157,9 @@ impl HexagonDevice {
         // Enable Unsigned Process Domain (domain 3) for standard Android APK deployment
         driver.enable_unsigned_pd(3)?;
 
-        // Configure CDSP latency QoS to prevent power collapse during active inference
-        let _ = driver.set_latency_qos(100);
-        let _ = driver.set_wakelock(true);
+        // Held across every early return below, so a failed arch probe never
+        // leaves the process-wide votes on.
+        let power_vote = PowerVote::acquire(&driver);
 
         // FastRPC URI pointing to the architecture skel library in CDSP Unsigned PD
         let skel_uri = format!(
@@ -189,6 +255,7 @@ impl HexagonDevice {
 
         let start_scalars = remote_scalars_make(2, 1, 0);
         if let Err(e) = driver.invoke_skel(handle, start_scalars, &mut in_args) {
+            drop(queue_session);
             driver.close_skel_handle(handle);
             return Err(e);
         }
@@ -222,6 +289,7 @@ impl HexagonDevice {
             hw_info,
             queue_session: Some(queue_session),
             profiler_on,
+            _power_vote: power_vote,
         })
     }
 
@@ -267,8 +335,6 @@ impl Drop for HexagonDevice {
         let stop_scalars = remote_scalars_make(3, 0, 0);
         let _ = self.driver.invoke_skel(self.handle, stop_scalars, &mut []);
         self.driver.close_skel_handle(self.handle);
-        let _ = self.driver.set_wakelock(false);
-        let _ = self.driver.set_latency_qos(0);
     }
 }
 
@@ -350,5 +416,45 @@ mod tests {
         assert_eq!(HexagonArch::from_u32(72), None);
         assert_eq!(HexagonArch::from_u32(74), None);
         assert_eq!(HexagonArch::from_u32(100), None);
+    }
+}
+
+#[cfg(test)]
+mod vote_tests {
+    use super::VoteCounter;
+    use std::cell::Cell;
+
+    #[test]
+    fn votes_toggle_only_on_first_enter_and_last_leave() {
+        let c = VoteCounter::new();
+        let (on, off) = (Cell::new(0), Cell::new(0));
+        c.enter(|| on.set(on.get() + 1));
+        c.enter(|| on.set(on.get() + 1));
+        assert_eq!(on.get(), 1, "second holder must not re-vote");
+        c.leave(|| off.set(off.get() + 1));
+        assert_eq!(off.get(), 0, "one holder still live: votes must stay on");
+        c.leave(|| off.set(off.get() + 1));
+        assert_eq!(off.get(), 1);
+        // Re-entering after a full release votes again.
+        c.enter(|| on.set(on.get() + 1));
+        assert_eq!(on.get(), 2);
+    }
+
+    #[test]
+    fn leave_at_zero_saturates_and_survives_poison() {
+        let c = std::sync::Arc::new(VoteCounter::new());
+        let off = Cell::new(0);
+        c.leave(|| off.set(off.get() + 1));
+        c.leave(|| off.set(off.get() + 1));
+        // Saturating: each leave at zero reports "last" but never underflows.
+        assert_eq!(off.get(), 2);
+        let c2 = std::sync::Arc::clone(&c);
+        let _ = std::thread::spawn(move || {
+            c2.enter(|| panic!("poison the counter mutex"));
+        })
+        .join();
+        let on = Cell::new(0);
+        c.enter(|| on.set(1));
+        assert_eq!(on.get(), 1, "a poisoned counter still counts");
     }
 }

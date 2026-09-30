@@ -13,6 +13,17 @@ use crate::backend::cpu;
 use crate::gguf::GgufFile;
 use crate::model::weights::MmapWeight;
 
+/// Whether an accelerator's depthformer should run: it must exist
+/// (`supports`), and either be trusted by default (`default_on`, see
+/// [`AudioAccelerator::depthformer_default_on`]) or be explicitly requested
+/// (`SessionConfig::gpu_depthformer` / `CERA_GPU_DF=1`). One definition for the
+/// engine and the CLI. (The wasm/WebGPU path requests it unconditionally by
+/// design: the browser has no `CERA_GPU_DF`, and it always ran the WebGPU
+/// depthformer.)
+pub fn accelerated_depthformer_enabled(supports: bool, default_on: bool, requested: bool) -> bool {
+    supports && (default_on || requested)
+}
+
 /// Hardware-accelerated audio backend (Qualcomm Hexagon NPU, Apple Metal, WebGPU).
 /// Implementations provide offloaded execution for the depthformer (code sampling)
 /// and detokenizer (spectrum).
@@ -80,6 +91,13 @@ pub trait AudioAccelerator: Send + Sync {
 
     /// Whether [`Self::sample_audio_frame`] is actually implemented here.
     fn supports_depthformer(&self) -> bool;
+
+    /// Whether the accelerator's depthformer is trusted enough to run without
+    /// an explicit opt-in. Defaults to `false` (the GPU depthformers stay
+    /// opt-in); a backend overrides this once its codes match the CPU path.
+    fn depthformer_default_on(&self) -> bool {
+        false
+    }
 
     /// Convert the accumulated spectrum `[n_frames × n_fft_bins × 2]` (log-mag,
     /// angle) to PCM via ISTFT. Defaults to the CPU `istft_to_pcm`; GPU backends
@@ -1794,6 +1812,32 @@ impl IstftStreamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn accelerated_depthformer_needs_support_and_trust_or_opt_in() {
+        // (supports, default_on, requested) -> enabled
+        for (s, d, r, want) in [
+            (false, true, true, false),
+            (true, false, false, false),
+            (true, false, true, true),
+            (true, true, false, true),
+            (true, true, true, true),
+        ] {
+            assert_eq!(
+                accelerated_depthformer_enabled(s, d, r),
+                want,
+                "{s} {d} {r}"
+            );
+        }
+    }
+
+    #[test]
+    fn depthformer_is_opt_in_by_default() {
+        let mock = MockAudioAccelerator {
+            active: std::sync::atomic::AtomicBool::new(false),
+        };
+        assert!(!mock.depthformer_default_on());
+    }
 
     #[test]
     fn test_istft_streamer_exact_parity_with_batch() {

@@ -10,11 +10,12 @@
 use anyhow::{Result, anyhow, ensure};
 use std::sync::{Arc, Mutex};
 
+use crate::backend::hexagon::LockOrRecover;
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
     HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer,
-    build_binary_kernel_params, build_layer_norm_params, build_unary_kernel_params, repack_q4_0,
-    repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+    align128, build_binary_kernel_params, build_layer_norm_params, build_unary_kernel_params,
+    repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::model::vision_encoder::{
     PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionEncoderWeights,
@@ -73,7 +74,6 @@ impl HexagonVitWeightOffsets {
     /// Compute memory layout and byte offsets for all ViT weights in shared rpcmem.
     pub fn plan(weights: &VisionEncoderWeights) -> Result<Self, CeraError> {
         let mut cur_off = 0;
-        let align128 = |sz: usize| (sz + 127) & !127;
 
         let plan_vec_f32 = |cur_off: &mut usize, len: usize| -> usize {
             let off = *cur_off;
@@ -202,8 +202,6 @@ pub struct HexagonVitScratchOffsets {
 impl HexagonVitScratchOffsets {
     /// Compute scratch allocation sized for up to `MAX_VIT_TOKENS` patches.
     pub fn new(n_embd: usize, n_ff: usize) -> Self {
-        let align128 = |sz: usize| (sz + 127) & !127;
-
         let token_bytes = align128(MAX_VIT_TOKENS * n_embd * 4);
         let token_f16_bytes = align128(MAX_VIT_TOKENS * n_embd * 2);
         let ffn_mid_bytes = align128(MAX_VIT_TOKENS * n_ff * 4);
@@ -1100,14 +1098,8 @@ impl VisionGpuEncode for HexagonVisionEncoder {
         let head_dim = n_embd / n_head;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
-        let mut dev_guard = self
-            .device
-            .lock()
-            .map_err(|_| anyhow!("Hexagon device mutex poisoned"))?;
-        let mut scratch_guard = self
-            .scratch_buf
-            .lock()
-            .map_err(|_| anyhow!("Hexagon scratch mutex poisoned"))?;
+        let mut dev_guard = self.device.lock_or_recover();
+        let mut scratch_guard = self.scratch_buf.lock_or_recover();
 
         let so = self.scratch_offsets;
         let tokens_bytes = n_patches * n_embd * 4;
@@ -1480,7 +1472,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_hexagon_vision_encoder_on_host_without_dsp() {
+    fn test_try_hexagon_vision_encoder_returns_none_for_unloadable_weights() {
         let cfg = VisionEncoderConfig {
             n_layer: 1,
             n_embd: 64,

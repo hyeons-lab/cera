@@ -2685,7 +2685,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 41114) {
+    if (lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 55417) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471) {
@@ -2904,7 +2904,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 51302) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 38950) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
@@ -2928,10 +2928,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_disable_spec() != 3153) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_disable_spec() != 57) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_enable_spec() != 9506) {
+    if (lib.uniffi_cera_ffi_checksum_method_session_enable_spec() != 2995) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819) {
@@ -11009,7 +11009,9 @@ public interface SessionInterface {
      *
      * # Errors
      *
-     * - `InvalidInput` if buffer length does not match dimensions or pixel format.
+     * - `EmptyInput` if the buffer is empty or a dimension is 0.
+     * - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+     * (extra trailing bytes are ignored).
      * - `Preprocess` if image normalization fails.
      * - `UnsupportedModality` if vision encoding is unsupported on this session.
      * - `Backend` for missing vision encoder, projection dimension mismatch,
@@ -11102,12 +11104,14 @@ public interface SessionInterface {
     fun `defaultGenerateOpts`(): GenerateOpts
 
     /**
-     * Explicitly disable speculative decoding for this session.
+     * Explicitly disable speculative decoding for this session. An attached
+     * drafter is kept, so [`Self::enable_spec`] restores it.
      */
     fun `disableSpec`()
 
     /**
-     * Re-enable speculative decoding for this session (if previously disabled).
+     * Re-enable speculative decoding for this session (if previously
+     * disabled), using the attached drafter if there is one.
      */
     fun `enableSpec`()
 
@@ -11685,7 +11689,9 @@ open class Session :
      *
      * # Errors
      *
-     * - `InvalidInput` if buffer length does not match dimensions or pixel format.
+     * - `EmptyInput` if the buffer is empty or a dimension is 0.
+     * - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+     * (extra trailing bytes are ignored).
      * - `Preprocess` if image normalization fails.
      * - `UnsupportedModality` if vision encoding is unsupported on this session.
      * - `Backend` for missing vision encoder, projection dimension mismatch,
@@ -11858,7 +11864,8 @@ open class Session :
         )
 
     /**
-     * Explicitly disable speculative decoding for this session.
+     * Explicitly disable speculative decoding for this session. An attached
+     * drafter is kept, so [`Self::enable_spec`] restores it.
      */
     @Throws(FfiException::class)
     override fun `disableSpec`() =
@@ -11872,7 +11879,8 @@ open class Session :
         }
 
     /**
-     * Re-enable speculative decoding for this session (if previously disabled).
+     * Re-enable speculative decoding for this session (if previously
+     * disabled), using the attached drafter if there is one.
      */
     @Throws(FfiException::class)
     override fun `enableSpec`() =
@@ -12668,7 +12676,9 @@ data class EngineConfig(
      */
     var `draftModel`: kotlin.String? = null,
     /**
-     * Whether to prefer GPU depthformer for audio decoder generation.
+     * Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+     * `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+     * depthformer regardless of this flag.
      */
     var `gpuDepthformer`: kotlin.Boolean = false,
 ) : Disposable {
@@ -14047,7 +14057,9 @@ data class SessionConfig(
      */
     var `ubatchSize`: kotlin.UInt = 512u,
     /**
-     * Whether to prefer GPU depthformer for audio decoder generation.
+     * Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+     * `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+     * depthformer regardless of this flag.
      */
     var `gpuDepthformer`: kotlin.Boolean = false,
     /**
@@ -18191,8 +18203,10 @@ fun `detectToolFormat`(`architecture`: kotlin.String): ToolFormat? =
     )
 
 /**
- * Write the embedded DSP skels into `dir` (created if missing) and
- * point FastRPC's loader at it. Caller stages a private writable directory;
+ * Write the embedded DSP skels into `dir` (created private, mode 0700, if
+ * missing) and point FastRPC's loader at it. An existing `dir` that another
+ * user owns, or that is writable by "other", is refused with `Backend`, since
+ * the loader executes what is in it. Caller stages a private writable directory;
  * on Android, the `HexagonNpu.setup` helper invokes this function to extract
  * skels into the application's internal files directory (`cera_skels`) and
  * configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
@@ -18200,8 +18214,8 @@ fun `detectToolFormat`(`architecture`: kotlin.String): ToolFormat? =
  * number of skels written (0 when all were already present and fresh).
  * Re-running is cheap and idempotent (files are only rewritten when
  * their bytes differ, and the loader path is not duplicated). A `dir`
- * containing `;` is rejected: it would silently split into two loader
- * search entries.
+ * containing `;`, `=` or NUL is rejected: it would silently split or corrupt
+ * the loader's search path.
  */
 @Throws(FfiException::class)
 fun `hexagonInstallSkels`(`dir`: kotlin.String): kotlin.UInt =

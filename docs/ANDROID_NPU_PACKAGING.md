@@ -56,7 +56,8 @@ a retail S25 Ultra, SELinux enforcing, via a normally installed APK):
 
 `hexagonInstallSkels` (write embedded skels into a caller-staged dir)
 underlies `HexagonNpu.setup` and remains available for JVM/desktop/shell
-flows. The `probe-app` module is a runnable reference and the on-device
+flows; it creates the directory private (mode 0700) and refuses an existing
+one owned by another user or writable by "other". The `probe-app` module is a runnable reference and the on-device
 gate: `./gradlew :probe-app:installDebug`, launch from the launcher,
 `adb logcat -s CeraProbe`. It also reports the access route (`direct` vs
 `hal-fallback`, see below), since DSP policy varies per OEM/SoC/firmware;

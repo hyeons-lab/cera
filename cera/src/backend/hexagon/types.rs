@@ -449,6 +449,18 @@ pub struct HtpHwInfo {
     pub vtcm_size: u64,
 }
 
+/// Round `sz` up to the 128-byte HVX vector / DMA alignment every rpcmem
+/// offset and DSP row stride must honor. The single definition: layout code
+/// that must agree with DSP offsets should never carry its own copy.
+pub(crate) const fn align128(sz: usize) -> usize {
+    sz.next_multiple_of(128)
+}
+
+/// Round `sz` up to 256 bytes (the KV/state slab and theta-row alignment).
+pub(crate) const fn align256(sz: usize) -> usize {
+    sz.next_multiple_of(256)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -471,5 +483,17 @@ mod tests {
         assert_eq!(HtpOpCode::from_u32(70), Some(HtpOpCode::UnaryElu));
         assert_eq!(HtpOpCode::from_u32(0xFFFF_FFFF), Some(HtpOpCode::Invalid));
         assert_eq!(HtpOpCode::from_u32(71), None);
+    }
+
+    #[test]
+    fn align128_rounds_up_to_vector_width() {
+        assert_eq!(align128(0), 0);
+        assert_eq!(align128(1), 128);
+        assert_eq!(align128(128), 128);
+        assert_eq!(align128(129), 256);
+        assert_eq!(align256(0), 0);
+        assert_eq!(align256(1), 256);
+        assert_eq!(align256(256), 256);
+        assert_eq!(align256(257), 512);
     }
 }

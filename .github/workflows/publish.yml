@@ -473,7 +473,7 @@ jobs:
         with:
           # r28 floor: first NDK with 16KB ELF alignment by default (see
           # the android-abis job in ci.yml). Keep in sync with it.
-          ndk-version: r28c
+          ndk-version: r30
       - name: Build Android jniLibs
         if: ${{ matrix.android }}
         env:

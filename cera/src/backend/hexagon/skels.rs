@@ -8,6 +8,7 @@
 
 use std::sync::Arc;
 
+use super::LockOrRecover;
 use super::device::{HexagonArch, HexagonDevice};
 use super::sys::FastRpcDriver;
 use crate::session::CeraError;
@@ -37,9 +38,56 @@ pub const PROBE_ARCHS: [HexagonArch; 5] = [
 /// path mid-write.
 static SKEL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
-/// Write the embedded skels into `dir` (created if missing) and point
-/// FastRPC's loader at it via `ADSP_LIBRARY_PATH`. Prepends to an
-/// existing value instead of replacing it (no-op when `dir` is already
+/// Whether a skel directory owned by `uid` with `mode` cannot be trusted by a
+/// process running as `euid`: owned by someone else, or writable by "other".
+/// Group-write is tolerated on purpose: Android app-private dirs are
+/// `rwxrwx--x` with the app's own uid as group.
+fn skel_dir_unsafe(uid: u32, euid: u32, mode: u32) -> bool {
+    uid != euid || mode & 0o002 != 0
+}
+
+/// Create `dir` (mode 0700 when newly created) and refuse one the loader
+/// would execute code from but another local user could tamper with: an
+/// existing directory owned by someone else, or writable by "other". App-private
+/// Android dirs (owned by the app uid, at most `rwxrwx--x`) pass.
+fn ensure_private_skel_dir(dir: &std::path::Path) -> Result<(), CeraError> {
+    use std::os::unix::fs::{DirBuilderExt, MetadataExt};
+    std::fs::DirBuilder::new()
+        .recursive(true)
+        .mode(0o700)
+        .create(dir)
+        .map_err(|e| CeraError::Backend(format!("skel dir {}: {e}", dir.display())))?;
+    let meta = std::fs::metadata(dir)
+        .map_err(|e| CeraError::Backend(format!("skel dir {}: {e}", dir.display())))?;
+    // SAFETY: `geteuid` has no preconditions and cannot fail.
+    let euid = unsafe { libc::geteuid() };
+    if skel_dir_unsafe(meta.uid(), euid, meta.mode()) {
+        return Err(CeraError::Backend(format!(
+            "skel dir {} must be owned by the current user and not world-writable \
+             (uid {} vs {euid}, mode {:o})",
+            dir.display(),
+            meta.uid(),
+            meta.mode() & 0o7777
+        )));
+    }
+    Ok(())
+}
+
+/// Exclusively create `path` (mode 0644) and write `bytes`.
+fn write_new_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
+    use std::io::Write;
+    use std::os::unix::fs::OpenOptionsExt;
+    let mut f = std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .mode(0o644)
+        .open(path)?;
+    f.write_all(bytes)
+}
+
+/// Write the embedded skels into `dir` (created private, mode 0700, if
+/// missing) and point FastRPC's loader at it via `ADSP_LIBRARY_PATH`.
+/// Prepends to an existing value instead of replacing it (no-op when `dir` is already
 /// listed). Returns the number of skels written; files are only rewritten
 /// when their bytes differ, so repeated calls are cheap and idempotent.
 ///
@@ -53,10 +101,13 @@ static SKEL_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// *different* monitors, so they may compose only sequentially, on one
 /// thread, during single-threaded startup. Concurrent composition can
 /// lost-update `ADSP_LIBRARY_PATH` and drop a skel dir.
+///
+/// Refuses an existing `dir` that another user owns or that is writable by
+/// "other" (the loader executes what is in it), before touching anything.
 pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
     // Held for the whole install: serializes the file writes (shared
     // `.so.tmp` names) as well as the `ADSP_LIBRARY_PATH` update below.
-    let _env_guard = SKEL_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+    let _env_guard = SKEL_ENV_LOCK.lock_or_recover();
     let dir_str = dir
         .to_str()
         .ok_or_else(|| CeraError::Backend("skel dir is not UTF-8".into()))?;
@@ -65,8 +116,7 @@ pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
             "skel dir {dir_str:?} contains ';', NUL bytes, or '=', which is invalid for loader search entries"
         )));
     }
-    std::fs::create_dir_all(dir)
-        .map_err(|e| CeraError::Backend(format!("skel dir {}: {e}", dir.display())))?;
+    ensure_private_skel_dir(dir)?;
     let mut count = 0;
     for arch in PROBE_ARCHS {
         let bytes = embedded_skel(arch);
@@ -93,10 +143,18 @@ pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
             // never loader-visible and safe to delete.
             let tmp = path.with_extension(format!("so.tmp.{}", std::process::id()));
             let _ = std::fs::remove_file(&tmp);
-            std::fs::write(&tmp, bytes)
-                .map_err(|e| CeraError::Backend(format!("write {}: {e}", tmp.display())))?;
-            std::fs::rename(&tmp, &path)
-                .map_err(|e| CeraError::Backend(format!("rename {}: {e}", path.display())))?;
+            // Remove the staging file on any failure (ENOSPC, interrupted
+            // write): its pid-suffixed name differs per launch, so leaks add up.
+            // `create_new` (O_EXCL) never follows a pre-placed symlink.
+            write_new_file(&tmp, bytes)
+                .map_err(|e| CeraError::Backend(format!("write {}: {e}", tmp.display())))
+                .and_then(|()| {
+                    std::fs::rename(&tmp, &path)
+                        .map_err(|e| CeraError::Backend(format!("rename {}: {e}", path.display())))
+                })
+                .inspect_err(|_| {
+                    let _ = std::fs::remove_file(&tmp);
+                })?;
             count += 1;
         }
     }
@@ -155,6 +213,57 @@ fn merge_adsp_paths_os(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn skel_dir_is_created_private_and_world_writable_is_refused() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("a/b/skels");
+        ensure_private_skel_dir(&dir).unwrap();
+        let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o700, "newly created dir must be owner-only");
+        // Android's app files dir is 0771: group access is fine.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o771)).unwrap();
+        assert!(ensure_private_skel_dir(&dir).is_ok());
+        // "Other" write access lets another local user swap a loaded skel.
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        assert!(ensure_private_skel_dir(&dir).is_err());
+    }
+
+    #[test]
+    fn install_skels_refuses_a_world_writable_dir_before_writing() {
+        use std::os::unix::fs::PermissionsExt;
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path().join("skels");
+        std::fs::create_dir(&dir).unwrap();
+        std::fs::set_permissions(&dir, std::fs::Permissions::from_mode(0o777)).unwrap();
+        // The public entry, not just the helper: swapping the directory check
+        // for a plain `create_dir_all` must fail this test.
+        assert!(install_skels(&dir).is_err());
+        assert_eq!(
+            std::fs::read_dir(&dir).unwrap().count(),
+            0,
+            "nothing may be written into a refused dir"
+        );
+    }
+
+    #[test]
+    fn write_new_file_refuses_an_existing_path_or_symlink() {
+        let root = tempfile::tempdir().unwrap();
+        let file = root.path().join("x.so");
+        write_new_file(&file, b"one").unwrap();
+        assert!(
+            write_new_file(&file, b"two").is_err(),
+            "O_EXCL: no overwrite"
+        );
+        let link = root.path().join("y.so");
+        std::os::unix::fs::symlink(&file, &link).unwrap();
+        assert!(
+            write_new_file(&link, b"three").is_err(),
+            "never follows a link"
+        );
+        assert_eq!(std::fs::read(&file).unwrap(), b"one");
+    }
 
     /// Restores `ADSP_LIBRARY_PATH` on drop, so a mid-test panic cannot
     /// leak a dirty loader var into the rest of the suite (the manual
@@ -307,6 +416,15 @@ mod tests {
             err_nul.to_string().contains("NUL"),
             "unexpected error: {err_nul}"
         );
+    }
+
+    #[test]
+    fn skel_dir_unsafe_checks_owner_and_other_write() {
+        assert!(!skel_dir_unsafe(1000, 1000, 0o700));
+        assert!(!skel_dir_unsafe(1000, 1000, 0o771));
+        assert!(skel_dir_unsafe(0, 1000, 0o700), "foreign owner");
+        assert!(skel_dir_unsafe(1000, 1000, 0o777), "world-writable");
+        assert!(skel_dir_unsafe(1000, 1000, 0o702));
     }
 }
 

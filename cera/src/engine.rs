@@ -101,7 +101,9 @@ pub struct EngineConfig {
     pub backend: BackendPreference,
     /// Optional speculative decoding draft model GGUF path (e.g. DSpark sidecar).
     pub draft_model: Option<PathBuf>,
-    /// Whether to prefer GPU depthformer for audio decoder generation.
+    /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+    /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+    /// depthformer regardless of this flag.
     pub gpu_depthformer: bool,
     /// Optional repository used to resolve `http(s)://` URLs found in a
     /// manifest's `files` entries. When `None`, remote URLs fail with a

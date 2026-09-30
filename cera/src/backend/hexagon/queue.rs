@@ -159,28 +159,106 @@ pub struct StagedBatch {
 }
 
 impl StagedBatch {
-    /// Mutably access a tensor descriptor in the staged command buffer.
+    /// Reject a batch whose byte accounting disagrees with `raw_bytes`, since
+    /// the flush paths copy `total_bytes` out of it into DSP-visible memory
+    /// and every field is public.
+    fn validate(&self) -> Result<(), CeraError> {
+        let parts = self
+            .bufs_bytes
+            .checked_add(self.tens_bytes)
+            .and_then(|n| n.checked_add(self.ops_bytes))
+            .and_then(|n| n.checked_add(self.prof_bytes));
+        // Each section's byte count must match its descriptor count: the DSP
+        // walks `n_*` descriptors, so a lying count reads past the section.
+        let counted = |n: u32, size: usize| (n as usize).checked_mul(size);
+        let counts_match = counted(self.n_bufs, std::mem::size_of::<HtpBufDesc>())
+            == Some(self.bufs_bytes)
+            && counted(self.n_tensors, std::mem::size_of::<HtpTensor>()) == Some(self.tens_bytes)
+            && counted(self.n_ops, std::mem::size_of::<HtpOpDesc>()) == Some(self.ops_bytes)
+            && counted(self.n_ops, std::mem::size_of::<HtpProfDesc>()) == Some(self.prof_bytes);
+        if !counts_match
+            || parts != Some(self.total_bytes)
+            || self.raw_bytes.len() < self.total_bytes
+        {
+            return Err(CeraError::Backend(format!(
+                "inconsistent StagedBatch: total {} vs parts {parts:?} vs raw {}",
+                self.total_bytes,
+                self.raw_bytes.len()
+            )));
+        }
+        Ok(())
+    }
+
+    /// Read tensor descriptor `ti` from the staged command buffer.
+    pub fn tensor(&self, ti: usize) -> HtpTensor {
+        self.read_desc(self.tensor_offset(ti))
+    }
+
+    /// Read-modify-write tensor descriptor `ti` in the staged command buffer.
     #[inline]
-    pub fn tensor_mut(&mut self, ti: usize) -> &mut HtpTensor {
+    pub fn update_tensor(&mut self, ti: usize, f: impl FnOnce(&mut HtpTensor)) {
+        let offset = self.tensor_offset(ti);
+        self.update_desc(offset, f);
+    }
+
+    /// Read operation descriptor `op_idx` from the staged command buffer.
+    pub fn op(&self, op_idx: usize) -> HtpOpDesc {
+        self.read_desc(self.op_offset(op_idx))
+    }
+
+    /// Read-modify-write operation descriptor `op_idx`.
+    #[inline]
+    pub fn update_op(&mut self, op_idx: usize, f: impl FnOnce(&mut HtpOpDesc)) {
+        let offset = self.op_offset(op_idx);
+        self.update_desc(offset, f);
+    }
+
+    fn tensor_offset(&self, ti: usize) -> usize {
         assert!(
             ti < self.n_tensors as usize,
             "tensor index {ti} out of bounds ({})",
             self.n_tensors
         );
-        let offset = self.bufs_bytes + ti * std::mem::size_of::<HtpTensor>();
-        unsafe { &mut *(self.raw_bytes.as_mut_ptr().add(offset) as *mut HtpTensor) }
+        self.bufs_bytes + ti * std::mem::size_of::<HtpTensor>()
     }
 
-    /// Mutably access an operation descriptor in the staged command buffer.
-    #[inline]
-    pub fn op_mut(&mut self, op_idx: usize) -> &mut HtpOpDesc {
+    fn op_offset(&self, op_idx: usize) -> usize {
         assert!(
             op_idx < self.n_ops as usize,
             "op index {op_idx} out of bounds ({})",
             self.n_ops
         );
-        let offset = self.bufs_bytes + self.tens_bytes + op_idx * std::mem::size_of::<HtpOpDesc>();
-        unsafe { &mut *(self.raw_bytes.as_mut_ptr().add(offset) as *mut HtpOpDesc) }
+        self.bufs_bytes + self.tens_bytes + op_idx * std::mem::size_of::<HtpOpDesc>()
+    }
+
+    /// Range-check `size_of::<T>()` bytes at `offset`. `raw_bytes` is a
+    /// `Vec<u8>` (align 1) and descriptors need align 8, so descriptors are
+    /// accessed by value with unaligned reads and writes: nothing depends on
+    /// what alignment the allocator happened to return.
+    #[inline]
+    fn check_desc_range<T>(&self, offset: usize) {
+        let end = offset.checked_add(std::mem::size_of::<T>());
+        assert!(
+            end.is_some_and(|e| e <= self.raw_bytes.len()),
+            "descriptor at {offset} overruns staged batch ({} bytes)",
+            self.raw_bytes.len()
+        );
+    }
+
+    fn read_desc<T: Copy>(&self, offset: usize) -> T {
+        self.check_desc_range::<T>(offset);
+        // SAFETY: in bounds (checked above); `T` is a plain `repr(C)`
+        // descriptor valid for any bit pattern.
+        unsafe { (self.raw_bytes.as_ptr().add(offset) as *const T).read_unaligned() }
+    }
+
+    fn update_desc<T: Copy>(&mut self, offset: usize, f: impl FnOnce(&mut T)) {
+        let mut value: T = self.read_desc(offset);
+        f(&mut value);
+        // SAFETY: in bounds (checked by `read_desc`); the pointer derives
+        // from `as_mut_ptr`, so writing through it is permitted, and the
+        // write is unaligned for a plain descriptor.
+        unsafe { (self.raw_bytes.as_mut_ptr().add(offset) as *mut T).write_unaligned(value) }
     }
 }
 
@@ -398,6 +476,7 @@ impl HexagonQueueSession {
     /// Dispatch a pre-staged command batch without rebuilding or re-serializing descriptors.
     pub fn flush_staged(&mut self, staged: &StagedBatch) -> Result<(), CeraError> {
         self.resident_staged_id = None;
+        staged.validate()?;
         let total_bytes = staged.total_bytes;
         if total_bytes > self.staging_buf.size() {
             return Err(CeraError::Backend(format!(
@@ -433,6 +512,7 @@ impl HexagonQueueSession {
         staged: &StagedBatch,
         patch_ranges: &[std::ops::Range<usize>],
     ) -> Result<(), CeraError> {
+        staged.validate()?;
         let total_bytes = staged.total_bytes;
         if total_bytes > self.staging_buf.size() {
             return Err(CeraError::Backend(format!(
@@ -510,9 +590,17 @@ impl HexagonQueueSession {
         let bi = self.add_buffer(buf)?;
         let ti = Self::batch_index(self.tens.len(), "tensors")
             .inspect_err(|_| self.drop_pending_batch())?;
+        // The DSP descriptor carries a u32 size; a wrapped size would reach the
+        // DSP as a small tensor with no error.
+        let size = u32::try_from(size).map_err(|_| {
+            self.drop_pending_batch();
+            CeraError::Backend(format!(
+                "tensor size {size} exceeds the u32 descriptor limit"
+            ))
+        })?;
         self.tens.push(HtpTensor {
             data: offset as u64,
-            size: size as u32,
+            size,
             flags,
             dtype,
             bi,
@@ -947,6 +1035,99 @@ fn htp_opcode_name(opcode: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A batch shaped like `export_staged_batch` output: `n_tensors`
+    /// tensors and `n_ops` ops, no buffers.
+    fn staged(n_tensors: u32, n_ops: u32) -> StagedBatch {
+        let tens_bytes = n_tensors as usize * std::mem::size_of::<HtpTensor>();
+        let ops_bytes = n_ops as usize * std::mem::size_of::<HtpOpDesc>();
+        let prof_bytes = n_ops as usize * std::mem::size_of::<HtpProfDesc>();
+        let total_bytes = tens_bytes + ops_bytes + prof_bytes;
+        StagedBatch {
+            raw_bytes: vec![0u8; total_bytes],
+            n_bufs: 0,
+            n_tensors,
+            n_ops,
+            bufs_bytes: 0,
+            tens_bytes,
+            ops_bytes,
+            prof_bytes,
+            total_bytes,
+        }
+    }
+
+    #[test]
+    fn staged_batch_validate_accepts_consistent_and_rejects_lies() {
+        assert!(staged(3, 2).validate().is_ok());
+        let mut b = staged(3, 2);
+        b.total_bytes += 1;
+        assert!(b.validate().is_err(), "total disagrees with the sections");
+        let mut b = staged(3, 2);
+        b.raw_bytes.pop();
+        assert!(b.validate().is_err(), "raw_bytes shorter than total");
+        let mut b = staged(3, 2);
+        b.total_bytes -= 1;
+        assert!(
+            b.validate().is_err(),
+            "total below the sections (raw stays longer)"
+        );
+        let mut b = staged(3, 2);
+        b.n_tensors = 1000;
+        assert!(b.validate().is_err(), "count larger than its section");
+        let mut b = staged(3, 2);
+        b.n_ops = 5;
+        assert!(
+            b.validate().is_err(),
+            "op count disagrees with ops and prof bytes"
+        );
+        let mut b = staged(3, 2);
+        b.n_bufs = 1;
+        assert!(b.validate().is_err(), "buffer count with no buffer bytes");
+        let mut b = staged(3, 2);
+        b.tens_bytes = usize::MAX;
+        assert!(b.validate().is_err(), "overflowing section size");
+    }
+
+    #[test]
+    fn staged_descriptor_access_is_bounds_checked() {
+        let mut b = staged(2, 1);
+        b.update_tensor(1, |t| t.ne[0] = 7);
+        assert_eq!(b.tensor(1).ne[0], 7);
+        assert_eq!(b.tensor(0).ne[0], 0, "neighbouring descriptor untouched");
+        b.update_op(0, |o| o.kernel_params[2] = 9);
+        assert_eq!(b.op(0).kernel_params[2], 9);
+    }
+
+    /// A section that claims more descriptors than the bytes hold trips the
+    /// range check instead of reading past `raw_bytes`.
+    #[test]
+    #[should_panic(expected = "overruns staged batch")]
+    fn staged_descriptor_overrun_panics() {
+        let mut short = staged(2, 1);
+        short.raw_bytes.truncate(std::mem::size_of::<HtpTensor>());
+        short.update_tensor(1, |t| t.ne[0] = 1);
+    }
+
+    /// Descriptors sit at a deliberately odd offset (1-byte buffer section),
+    /// so a regression to aligned `&mut T` access would be misaligned UB.
+    #[test]
+    fn staged_descriptor_access_is_unaligned_safe() {
+        let mut b = staged(2, 1);
+        b.raw_bytes.insert(0, 0);
+        b.bufs_bytes = 1;
+        b.total_bytes += 1;
+        let addr = b.raw_bytes.as_ptr() as usize + b.tensor_offset(1);
+        assert_ne!(
+            addr % std::mem::align_of::<HtpTensor>(),
+            0,
+            "fixture must place the descriptor at a misaligned address"
+        );
+        b.update_tensor(1, |t| t.ne[0] = 11);
+        b.update_op(0, |o| o.kernel_params[1] = 13);
+        assert_eq!(b.tensor(1).ne[0], 11);
+        assert_eq!(b.tensor(0).ne[0], 0);
+        assert_eq!(b.op(0).kernel_params[1], 13);
+    }
 
     /// The DSP reads `u16` indices and `0xffff` is the absent-operand
     /// marker, so the top usable index is 65534 and one past it is `Err`,

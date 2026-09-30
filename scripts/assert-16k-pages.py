@@ -6,9 +6,10 @@ Why this exists
 Android 15+ devices can use 16KB pages, and the dynamic linker refuses to
 load native libraries whose LOAD segments are only 4KB-aligned. Google Play
 requires 16KB-clean binaries for updates. NDK r28+ aligns to 16KB by
-default, but this repo pins r27c (whose default is still 4KB), so every
-Android target carries explicit `-z max-page-size=16384` linker flags (see
-`.cargo/config.toml`), and this script enforces the result, because a flag
+default (this repo pins r30), but the 32-bit ABIs and any toolchain drift
+still need it, so every Android target carries explicit
+`-z max-page-size=16384` linker flags (see `.cargo/config.toml`), and this
+script enforces the result, because a flag
 that silently stops reaching the link would ship a library that crashes on
 first load for 16KB-page users, caught only by running on that hardware.
 
@@ -73,10 +74,8 @@ def load_alignments(path):
             if len(raw) < ph_size:
                 raise ValueError("truncated program header table")
             fields = struct.unpack(ph_fmt, raw)
-            if is64:
-                p_type, _, _, _, _, _, _, p_align = fields
-            else:
-                p_type, _, _, _, _, _, _, p_align = fields
+            # p_type is first and p_align last in both ELF32 and ELF64 layouts.
+            p_type, p_align = fields[0], fields[-1]
             if p_type == PT_LOAD:
                 loads.append((i, p_align))
     if not loads:

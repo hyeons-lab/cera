@@ -4,7 +4,7 @@ use std::sync::atomic::AtomicBool;
 
 use anyhow::Result;
 
-use crate::kv_cache::InferenceState;
+use crate::kv_cache::{InferenceState, KvCompression};
 use crate::model::Model;
 use crate::model::audio_decoder::{
     AudioAccelerator, AudioDecoderWeights, DepthformerState, DetokenizerState, DetokenizerWeights,
@@ -25,8 +25,9 @@ pub struct AudioGenerateConfig {
     pub audio_top_k: usize,
     /// Generation mode.
     pub mode: AudioMode,
-    /// Use GPU for depthformer (code sampling). Disabled by default because
-    /// GEMV accumulation order differences can produce different codes.
+    /// Opt in to an experimental accelerated depthformer (Metal, wgpu): off by
+    /// default because GEMV accumulation order differences can produce
+    /// different codes. Accelerators trusted by default (Hexagon) ignore it.
     pub gpu_depthformer: bool,
 }
 
@@ -288,7 +289,7 @@ impl<'a> AudioOutputDecoder<'a> {
         accelerator: Option<&'a dyn AudioAccelerator>,
         audio_temperature: f32,
         audio_top_k: usize,
-        _gpu_depthformer: bool,
+        gpu_depthformer: bool,
     ) -> Self {
         let active_accelerator = match accelerator {
             Some(a) if a.try_acquire_session() => {
@@ -324,7 +325,13 @@ impl<'a> AudioOutputDecoder<'a> {
             time_detokenizer: Duration::ZERO,
             audio_temperature,
             audio_top_k,
-            use_accelerated_df: active_accelerator.is_some_and(|a| a.supports_depthformer()),
+            use_accelerated_df: active_accelerator.is_some_and(|a| {
+                crate::model::audio_decoder::accelerated_depthformer_enabled(
+                    a.supports_depthformer(),
+                    a.depthformer_default_on(),
+                    gpu_depthformer,
+                )
+            }),
             streaming: true,
             all_codes: Vec::new(),
             watchdog: AudioSilenceWatchdog::new(),
@@ -751,6 +758,12 @@ pub fn generate_audio(
 
     let model_config = model.config();
     let mut state = InferenceState::from_config(model_config)?;
+    // A fresh state starts at position 0, but backends that keep KV or
+    // recurrent state on the model or device (Hexagon) would carry the last
+    // generation's, or stay failed-closed after a panic. Reset them to match.
+    // Best effort: backends without a checked reset return `Err` and are
+    // unaffected; a real failure resurfaces on the first forward pass.
+    let _ = model.try_reset_kv(&mut state, &KvCompression::None, model_config.max_seq_len);
     let mut sampler = Sampler::new(config.sampler.clone());
     let mut decoder = AudioOutputDecoder::new(
         decoder_weights,
@@ -1172,12 +1185,16 @@ mod tests {
     /// missed drain is observable.
     struct ScriptedFaultGpu {
         takes: std::sync::Mutex<std::collections::VecDeque<Option<crate::CeraError>>>,
+        /// What `depthformer_default_on` reports (an opt-in accelerator by
+        /// default, like Metal and wgpu).
+        default_on: bool,
     }
 
     impl ScriptedFaultGpu {
         fn with_script(outcomes: Vec<Option<crate::CeraError>>) -> Self {
             Self {
                 takes: std::sync::Mutex::new(outcomes.into()),
+                default_on: false,
             }
         }
 
@@ -1215,6 +1232,10 @@ mod tests {
             true
         }
 
+        fn depthformer_default_on(&self) -> bool {
+            self.default_on
+        }
+
         fn take_audio_error(&self) -> Option<crate::CeraError> {
             self.takes.lock().unwrap().pop_front().flatten()
         }
@@ -1229,6 +1250,29 @@ mod tests {
         let mut decoder = AudioOutputDecoder::new(&dec, &detok, Some(&gpu), 1.0, 1, true);
         let outcome = decoder.decode_frame(&[0.0; 4]);
         assert_eq!(outcome, FrameOutcome::Fault("injected audio fault".into()));
+    }
+
+    /// The accelerated depthformer needs support and either default trust or
+    /// an explicit request: an opt-in accelerator (Metal, wgpu) must not run
+    /// it without `gpu_depthformer`, a trusted one (Hexagon) always does.
+    #[test]
+    fn accelerated_depthformer_is_opt_in_unless_trusted() {
+        let (dec, detok) = empty_vocoder_weights();
+        let built = |gpu: &ScriptedFaultGpu, requested: bool| {
+            AudioOutputDecoder::new(&dec, &detok, Some(gpu), 1.0, 1, requested)
+                .supports_accelerated_depthformer()
+        };
+        let opt_in = ScriptedFaultGpu::with_script(vec![]);
+        assert!(
+            !built(&opt_in, false),
+            "opt-in accelerator without the flag"
+        );
+        assert!(built(&opt_in, true), "opt-in accelerator with the flag");
+        let trusted = ScriptedFaultGpu {
+            default_on: true,
+            ..ScriptedFaultGpu::with_script(vec![])
+        };
+        assert!(built(&trusted, false), "trusted accelerator needs no flag");
     }
 
     #[test]
@@ -1314,6 +1358,8 @@ mod tests {
         config: crate::model::ModelConfig,
         consumed: usize,
         logits: Option<Vec<f32>>,
+        /// How many times `generate_audio` asked for a checked KV reset.
+        resets: std::sync::atomic::AtomicUsize,
     }
 
     impl Model for ScriptedPrefillModel {
@@ -1333,6 +1379,16 @@ mod tests {
             _cancel: &AtomicBool,
         ) -> (usize, Option<Vec<f32>>) {
             (self.consumed, self.logits.clone())
+        }
+        fn try_reset_kv(
+            &self,
+            _state: &mut InferenceState,
+            _compression: &crate::kv_cache::KvCompression,
+            _max_seq_len: usize,
+        ) -> Result<(), crate::CeraError> {
+            self.resets
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
         }
     }
 
@@ -1361,6 +1417,7 @@ mod tests {
             },
             consumed,
             logits,
+            resets: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1461,6 +1518,27 @@ mod tests {
             err.to_string().contains("prefill fault after 1/3"),
             "{err:?}"
         );
+    }
+
+    /// A fresh generation must reset device-resident model state (Hexagon
+    /// conv state, or a fail-closed poisoned device) before its first pass.
+    #[test]
+    fn generate_audio_resets_model_state_first() {
+        let model = scripted_model(3, None);
+        let (dec_w, detok_w) = empty_vocoder_weights();
+        let tokenizer = BpeTokenizer::empty_for_test();
+        let _ = generate_audio(
+            &model,
+            &dec_w,
+            &detok_w,
+            &tokenizer,
+            &[1, 2, 3],
+            &audio_test_config(),
+            None,
+            |_| {},
+            |_, _| {},
+        );
+        assert_eq!(model.resets.load(std::sync::atomic::Ordering::SeqCst), 1);
     }
 
     #[test]

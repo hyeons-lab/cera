@@ -51,7 +51,9 @@ pub struct SessionConfig {
     pub seed: Option<u64>,
     /// Micro-batch size for chunked prompt prefill.
     pub ubatch_size: u32,
-    /// Whether to prefer GPU depthformer for audio decoder generation.
+    /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+    /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+    /// depthformer regardless of this flag.
     pub gpu_depthformer: bool,
     /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
     pub disable_spec: bool,
@@ -146,9 +148,10 @@ pub struct GenerateOpts {
     pub flush_every_tokens: u32,
     /// Emit `on_text_tokens` at least every N milliseconds. `0` disables time-based flushing.
     pub flush_every_ms: u32,
-    /// Speculative decoding. When `None`, speculative decoding defaults to on:
-    /// using an attached drafter if present (sidecar/embedded), or prompt lookup
-    /// if not. When set to `Some(SpecDecode { .. })`, custom n-gram or k are used.
+    /// Speculative decoding. When `None`, it is on only if a drafter
+    /// (sidecar/embedded) is attached, and stays off otherwise. When set to
+    /// `Some(SpecDecode { .. })`, that n-gram and k are used (prompt lookup if
+    /// no drafter is attached).
     /// Only engages on the plain greedy path (`temperature <= 0` or `top_k == 1`, no grammar)
     /// with a dense model that supports all-position logits and an uncompressed KV cache.
     /// Every emitted token is the target's own argmax, so this is a throughput
@@ -864,8 +867,10 @@ impl Session {
     }
 
     /// Attach a speculative decoding drafter (e.g. DSpark sidecar model).
+    ///
+    /// Leaves the disable flag alone, so `SessionConfig::disable_spec` still
+    /// wins when the engine attaches a sidecar during session creation.
     pub fn attach_drafter(&mut self, drafter: &dyn crate::spec::Drafter) {
-        self.spec_disabled = false;
         self.drafter = Some(drafter.clone_drafter());
     }
 
@@ -874,10 +879,10 @@ impl Session {
         self.drafter = None;
     }
 
-    /// Explicitly disable speculative decoding for this session.
+    /// Explicitly disable speculative decoding for this session. An attached
+    /// drafter is kept so [`Self::enable_spec`] can restore it.
     pub fn disable_spec(&mut self) {
         self.spec_disabled = true;
-        self.drafter = None;
     }
 
     /// Enable speculative decoding for this session.
@@ -2952,7 +2957,7 @@ impl Session {
                     acc_ref,
                     0.7,
                     40,
-                    acc_ref.is_some_and(|a| a.supports_depthformer()),
+                    self.config.gpu_depthformer,
                 ))
             } else {
                 None
@@ -4726,10 +4731,12 @@ mod tests {
         )
         .unwrap();
         session.append_tokens(&[1, 2, 3]).unwrap();
-        session.drafter = Some(Box::new(CannedDrafter {
+        // Through `attach_drafter`, as `CeraEngine::create_session` does: it
+        // must not clear the config's opt-out.
+        session.attach_drafter(&CannedDrafter {
             script: vec![vec![0, 0]],
             calls: 0,
-        }));
+        });
         let mut sink = RecordingSink::default();
         let opts = GenerateOpts {
             temperature: 0.0,
@@ -4740,6 +4747,31 @@ mod tests {
         assert_eq!(summary.tokens_generated, 3);
         assert_eq!(sink.tokens, vec![0, 0, 0]);
         assert_eq!(model.batches_seen.load(Ordering::Relaxed), 0);
+    }
+
+    #[test]
+    fn disable_then_enable_spec_restores_the_drafter() {
+        let (model, mut session) = spec_test_session(vec![vec![0, 0]]);
+        session.disable_spec();
+        assert!(
+            session.drafter.is_some(),
+            "disable_spec dropped the drafter"
+        );
+        session.enable_spec();
+        // Default opts (`spec: None`): only an attached drafter can engage
+        // the spec path, unlike `spec_opts`, which forces prompt lookup.
+        let mut sink = RecordingSink::default();
+        let opts = GenerateOpts {
+            temperature: 0.0,
+            max_tokens: 3,
+            ..GenerateOpts::default()
+        };
+        session.generate(&opts, &mut sink).unwrap();
+        assert_eq!(
+            model.batches_seen.load(Ordering::Relaxed),
+            1,
+            "enable_spec did not restore the drafter"
+        );
     }
 
     #[test]

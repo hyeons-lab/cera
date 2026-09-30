@@ -70,7 +70,7 @@ filesystem tree manually" workaround.
 | 26+ | CPU Session/Chat checkpoint export/import and file persistence; native Metal/Hexagon/wgpu checkpoints are rejected |
 | 27+ | Unified Audio Pipeline: `FfiAudioPipeline` uniting Silero VAD v5, Keyword Spotting, and Whisper ASR |
 | 28+ | Per-request seeds: `GenerateOpts.seed` (restarts the RNG for one call, KV-safe, session default untouched), `Session::set_seed` (persistent default, survives `reset()`) |
-| 29+ | Qualcomm Hexagon NPU: `BackendPreference.HEXAGON`, Android FastRPC skel integration, Unsigned PD runtime, dynamic CPU topology discovery and worker threadpool resizing |
+| 29+ | Qualcomm Hexagon NPU: `BackendPreference.HEXAGON`, Android FastRPC skel integration, Unsigned PD runtime, dynamic CPU topology discovery and worker threadpool resizing; the 64-bit Android AAR also ships wgpu, so `Auto` probes Hexagon, then wgpu, then CPU |
 
 Don't add FFI exposure to `cera` directly. The `cera` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -319,8 +319,9 @@ app's `jniLibs/` as needed.
 
 ### NDK version
 
-CI pins NDK **r28c**, a stable release the workspace is validated
-against. The workflow installs it through `nttld/setup-ndk@v1` by
+CI and the release pipeline pin NDK **r30**, the same release the
+`docker/hexagon` image installs, so CI, local and release toolchains
+agree. The workflow installs it through `nttld/setup-ndk@v1` by
 version string (no checksum; the action fetches from Google's CDN
 which serves signed artifacts). Bumping is a one-line change: update
 the `ndk-version:` value in `.github/workflows/ci.yml`'s
@@ -334,7 +335,7 @@ and `i686-linux-android` sysroots should drop in cleanly.
 
 Every published Android `.so` is 16KB-page clean: LOAD segments aligned
 to 16KB, as Android 15+ hardware and Google Play require. CI pins NDK
-r28c, whose default is already 16KB, and `.cargo/config.toml`
+r30, whose default is already 16KB, and `.cargo/config.toml`
 additionally carries explicit `-z max-page-size=16384` /
 `-z common-page-size=16384` linker flags for all four Android targets
 (Google's documented recipe, kept so the requirement holds regardless
@@ -1179,8 +1180,8 @@ see [Sharing a loaded GPU model](#sharing-a-loaded-gpu-model) for foreign lifeti
 | `session.position()` | `() -> u32` | Tokens currently in the KV cache. Atomic-backed (no mutex), safe to poll from any thread. |
 | `session.cancel()` | `() -> ()` | Flip the cancel atomic. Safe from any thread. Decode loop checks it at every flush boundary. |
 | `session.clearCancel()` | `() -> ()` | Clear the cancel flag without dropping any session state. |
-| `session.disableSpec()` | `() -> ()` | Disable speculative decoding for the session, detaching any active drafter. |
-| `session.enableSpec()` | `() -> ()` | Re-enable speculative decoding for the session. |
+| `session.disableSpec()` | `() -> ()` | Disable speculative decoding for the session. An attached drafter is kept, so `enableSpec()` restores it. |
+| `session.enableSpec()` | `() -> ()` | Re-enable speculative decoding for the session, using the attached drafter if any. |
 | `session.reset()` | `() -> Result<(), FfiError>` | Reset KV + position + last logits + re-seed sampler from the session default (`SessionConfig.seed` as passed to `newSession`, or the `set_seed` value when one was set). Retains device context ownership. |
 | `session.capabilities()` | `() -> ModalityCapabilities` | The same flags `engine.capabilities()` reports; exposed on `Session` too so a caller holding only the session handle can probe. |
 

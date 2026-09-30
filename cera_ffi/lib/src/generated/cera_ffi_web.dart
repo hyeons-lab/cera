@@ -155,7 +155,9 @@ class EngineConfig {
     this.bundleRepo = null,
     /// Optional path to a DSpark speculative draft model GGUF file.
     this.draftModel = null,
-    /// Whether to prefer GPU depthformer for audio decoder generation.
+    /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+    /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+    /// depthformer regardless of this flag.
     this.gpuDepthformer = false,
   });
 
@@ -174,7 +176,9 @@ class EngineConfig {
   final BundleRepo? bundleRepo;
   /// Optional path to a DSpark speculative draft model GGUF file.
   final String? draftModel;
-  /// Whether to prefer GPU depthformer for audio decoder generation.
+  /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+  /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+  /// depthformer regardless of this flag.
   final bool gpuDepthformer;
 
   Map<String, dynamic> toJson() {
@@ -1434,7 +1438,9 @@ class SessionConfig {
     this.seed = null,
     /// Chunked-prefill ubatch size. `0` = monolithic prefill.
     this.ubatchSize = 512,
-    /// Whether to prefer GPU depthformer for audio decoder generation.
+    /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+    /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+    /// depthformer regardless of this flag.
     this.gpuDepthformer = false,
     /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
     this.disableSpec = false,
@@ -1452,7 +1458,9 @@ class SessionConfig {
   final int? seed;
   /// Chunked-prefill ubatch size. `0` = monolithic prefill.
   final int ubatchSize;
-  /// Whether to prefer GPU depthformer for audio decoder generation.
+  /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+  /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+  /// depthformer regardless of this flag.
   final bool gpuDepthformer;
   /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
   final bool disableSpec;
@@ -6691,7 +6699,9 @@ final class Session {
   ///
   /// # Errors
   ///
-  /// - `InvalidInput` if buffer length does not match dimensions or pixel format.
+  /// - `EmptyInput` if the buffer is empty or a dimension is 0.
+  /// - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+  /// (extra trailing bytes are ignored).
   /// - `Preprocess` if image normalization fails.
   /// - `UnsupportedModality` if vision encoding is unsupported on this session.
   /// - `Backend` for missing vision encoder, projection dimension mismatch,
@@ -6762,10 +6772,12 @@ final class Session {
   /// advisory sampling defaults from the bundle manifest (if any) or standard defaults.
   GenerateOpts defaultGenerateOpts() => _unsupportedOnWeb('Session.defaultGenerateOpts');
 
-  /// Explicitly disable speculative decoding for this session.
+  /// Explicitly disable speculative decoding for this session. An attached
+  /// drafter is kept, so [`Self::enable_spec`] restores it.
   void disableSpec() => _unsupportedOnWeb('Session.disableSpec');
 
-  /// Re-enable speculative decoding for this session (if previously disabled).
+  /// Re-enable speculative decoding for this session (if previously
+  /// disabled), using the attached drafter if there is one.
   void enableSpec() => _unsupportedOnWeb('Session.enableSpec');
 
   /// Export current inference session checkpoint as serialized binary bytes.
@@ -7293,8 +7305,10 @@ String cpuBackendReport() => _unsupportedOnWeb('cpuBackendReport');
 /// convention — the caller may still choose a format explicitly.
 ToolFormat? detectToolFormat(String architecture) => _unsupportedOnWeb('detectToolFormat');
 
-/// Write the embedded DSP skels into `dir` (created if missing) and
-/// point FastRPC's loader at it. Caller stages a private writable directory;
+/// Write the embedded DSP skels into `dir` (created private, mode 0700, if
+/// missing) and point FastRPC's loader at it. An existing `dir` that another
+/// user owns, or that is writable by "other", is refused with `Backend`, since
+/// the loader executes what is in it. Caller stages a private writable directory;
 /// on Android, the `HexagonNpu.setup` helper invokes this function to extract
 /// skels into the application's internal files directory (`cera_skels`) and
 /// configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
@@ -7302,8 +7316,8 @@ ToolFormat? detectToolFormat(String architecture) => _unsupportedOnWeb('detectTo
 /// number of skels written (0 when all were already present and fresh).
 /// Re-running is cheap and idempotent (files are only rewritten when
 /// their bytes differ, and the loader path is not duplicated). A `dir`
-/// containing `;` is rejected: it would silently split into two loader
-/// search entries.
+/// containing `;`, `=` or NUL is rejected: it would silently split or corrupt
+/// the loader's search path.
 int hexagonInstallSkels(String dir) => _unsupportedOnWeb('hexagonInstallSkels');
 
 /// Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,

@@ -108,6 +108,7 @@ use std::sync::atomic::AtomicI64;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
+use std::time::Instant;
 
 /// Bounded spin iterations before a waiting worker parks. Sized to comfortably
 /// cover the between-GEMV gap (the caller's serial work between matmuls, ~µs)
@@ -1116,7 +1117,8 @@ fn swap_rebuilt_pool(
 /// sized (cpuset/cgroup migration, e.g. Android background to foreground, or core
 /// reallocations at constant width), so workers are re-seated onto valid cores and
 /// performance is never stuck at a departed cpuset's shape. Cheap no-op when
-/// unchanged: one three-tier probe (cgroup filesystem reads, falling back to
+/// unchanged: rate-limited to one probe per 250 ms, and each probe is one three-tier
+/// check (cgroup filesystem reads, falling back to
 /// affinity syscalls and online CPUs only when earlier tiers miss) plus set
 /// identity comparisons against each slot. On change it rebuilds only idle pools;
 /// a mid-dispatch pool defers to the next boundary instead of blocking it. Returns
@@ -1124,7 +1126,9 @@ fn swap_rebuilt_pool(
 ///
 /// Called at generation boundaries (append/generate entry, each decode
 /// token, each prefill chunk): between dispatches, never within one.
-/// In-flight dispatches hold their own `Arc` and finish on the old width.
+/// In-flight dispatches hold their own `Arc` and finish on the old width;
+/// a rebuild deferred that way retries at the next boundary after the probe
+/// window reopens (at most `CPUSET_PROBE_INTERVAL_MS` later).
 ///
 /// Scope is the RowPools' sizing (width plus pins). The rayon global pool
 /// (vision preprocessing) is build-once and has no public resize API; the
@@ -1132,7 +1136,50 @@ fn swap_rebuilt_pool(
 /// its pins with the live usable set, so a cpuset move re-seats pins as well
 /// as width instead of stranding workers on departed cores.
 pub(crate) fn resize_pools_for_cpuset() -> bool {
-    rebuild_pools_for_allowance(&super::cpu_features::cpu_usable_cpus())
+    resize_when_due(cpuset_probe_due(), || {
+        rebuild_pools_for_allowance(&super::cpu_features::cpu_usable_cpus())
+    })
+}
+
+/// Run the (expensive) probe-and-rebuild only when the limiter says it is
+/// due. Separate so tests can pin that a not-due call never probes.
+fn resize_when_due(due: bool, probe_and_rebuild: impl FnOnce() -> bool) -> bool {
+    due && probe_and_rebuild()
+}
+
+/// Minimum spacing between usable-CPU probes. The probe is tens of cgroup
+/// file reads (plus a mountinfo re-parse when no mount is cached) and this is
+/// called per decode token and prefill chunk; a cpuset migration only needs to
+/// be noticed within a fraction of a second, so most boundary calls cost one
+/// atomic load.
+const CPUSET_PROBE_INTERVAL_MS: u64 = 250;
+
+/// Milliseconds (on a process-local monotonic clock) of the last probe;
+/// `u64::MAX` = never probed, so the first boundary always probes.
+static LAST_CPUSET_PROBE_MS: AtomicU64 = AtomicU64::new(u64::MAX);
+
+/// Claim the right to probe now. At most one concurrent caller wins a window;
+/// the losers skip, since the winner is already re-checking for everyone.
+fn cpuset_probe_due() -> bool {
+    static EPOCH: OnceLock<Instant> = OnceLock::new();
+    let now = EPOCH.get_or_init(Instant::now).elapsed().as_millis() as u64;
+    probe_window_open(now, &LAST_CPUSET_PROBE_MS)
+}
+
+/// The limiter's clock-free core: `now_ms` against the `last` probe stamp.
+fn probe_window_open(now_ms: u64, last: &AtomicU64) -> bool {
+    let prev = last.load(Ordering::Relaxed);
+    if prev != u64::MAX && now_ms.saturating_sub(prev) < CPUSET_PROBE_INTERVAL_MS {
+        return false;
+    }
+    claim_probe_window(last, prev, now_ms)
+}
+
+/// Take the window if nobody else did since `prev` was read: the stamp only
+/// moves from the value this caller saw, so one concurrent caller wins.
+fn claim_probe_window(last: &AtomicU64, prev: u64, now_ms: u64) -> bool {
+    last.compare_exchange(prev, now_ms, Ordering::Relaxed, Ordering::Relaxed)
+        .is_ok()
 }
 
 #[cfg(any(target_os = "macos", target_os = "ios"))]
@@ -2565,12 +2612,70 @@ mod tests {
             RowPool::prefill().num_threads(),
             RowPool::decode().num_threads(),
         );
-        assert!(!resize_pools_for_cpuset());
+        // Not `resize_pools_for_cpuset()`: its 250 ms limiter can return false
+        // without probing (another test or session took the window), which
+        // would pass this test without exercising the unchanged comparison.
+        assert!(!rebuild_pools_for_allowance(&ambient));
         let after = (
             RowPool::prefill().num_threads(),
             RowPool::decode().num_threads(),
         );
         assert_eq!(before, after);
+    }
+
+    #[test]
+    fn probe_window_first_call_and_interval() {
+        let last = AtomicU64::new(u64::MAX);
+        assert!(
+            probe_window_open(1_000, &last),
+            "never probed: first call probes"
+        );
+        assert!(!probe_window_open(
+            1_000 + CPUSET_PROBE_INTERVAL_MS - 1,
+            &last
+        ));
+        assert!(probe_window_open(1_000 + CPUSET_PROBE_INTERVAL_MS, &last));
+        // The stamp advanced to the last winner, not the skipped attempts.
+        assert!(!probe_window_open(
+            1_000 + CPUSET_PROBE_INTERVAL_MS + 1,
+            &last
+        ));
+    }
+
+    #[test]
+    fn claim_fails_when_another_caller_moved_the_stamp() {
+        let last = AtomicU64::new(u64::MAX);
+        // Two callers both read `u64::MAX`; the first claim wins, and the
+        // second must lose deterministically (no thread scheduling involved).
+        assert!(claim_probe_window(&last, u64::MAX, 100));
+        assert!(!claim_probe_window(&last, u64::MAX, 101));
+        assert_eq!(last.load(Ordering::Relaxed), 100);
+    }
+
+    #[test]
+    fn not_due_resize_never_probes() {
+        assert!(!resize_when_due(false, || panic!("probed while not due")));
+        assert!(resize_when_due(true, || true));
+        assert!(!resize_when_due(true, || false));
+    }
+
+    #[test]
+    fn probe_window_has_one_winner_per_window() {
+        let last = Arc::new(AtomicU64::new(u64::MAX));
+        let barrier = Arc::new(std::sync::Barrier::new(8));
+        let winners: usize = (0..8)
+            .map(|_| {
+                let (last, barrier) = (Arc::clone(&last), Arc::clone(&barrier));
+                thread::spawn(move || {
+                    barrier.wait();
+                    probe_window_open(5_000, &last)
+                })
+            })
+            .collect::<Vec<_>>()
+            .into_iter()
+            .map(|h| usize::from(h.join().unwrap()))
+            .sum();
+        assert_eq!(winners, 1);
     }
 
     /// A cpuset migration that moves to a different set of cores with the same

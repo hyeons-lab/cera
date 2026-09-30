@@ -1598,6 +1598,25 @@ pub(crate) fn dequantize_row_into(
     dequantize_row_slice(wref.dtype, row_data, out);
 }
 
+/// Whether [`dequantize_row_slice`] has an arm for `dtype`. Loaders that
+/// accept an embedding dtype must check this, since the function panics on an
+/// unsupported one; keep it in step with the match below.
+#[cfg(feature = "hexagon")]
+pub(crate) fn supports_row_dequant(dtype: DType) -> bool {
+    matches!(
+        dtype,
+        DType::Q6K
+            | DType::Q8_0
+            | DType::Q4_0
+            | DType::Q4_1
+            | DType::Q4KM
+            | DType::Q5KM
+            | DType::F32
+            | DType::F16
+            | DType::BF16
+    )
+}
+
 /// Dequantize raw row bytes of `dtype` into `out`.
 pub fn dequantize_row_slice(dtype: DType, row_data: &[u8], out: &mut [f32]) {
     match dtype {

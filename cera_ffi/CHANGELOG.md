@@ -5,6 +5,10 @@
 - Add Qualcomm Hexagon NPU backend and FastRPC runtime integration.
 - Add structured CPU topology discovery and dynamic worker threadpool resizing.
 - Align package and native artifact versions at 0.7.0.
+- **Breaking (Rust API, `cera` crate):** the audio accelerator surface is renamed with no deprecated aliases: trait `AudioGpu` is now `AudioAccelerator`, `build_gpu_audio_decoder` is `build_audio_accelerator`, `Session::attach_gpu_audio_decoder` is `attach_audio_accelerator`, and `has_gpu_audio_decoder` is `has_audio_accelerator` (on both `Session` and `CeraEngine`). `FrameOutcome::Fault` and `BackendPreference::Hexagon` are new variants on public enums, so exhaustive matches need an arm.
+- **Behavior change:** the Android 64-bit AAR now ships the Hexagon NPU and wgpu backends (`hexagon`, `gpu` features), so `BackendPreference.AUTO` probes Hexagon, then wgpu, then CPU there. The 32-bit ABIs stay CPU-only.
+- Add FFI methods `Session.disableSpec()` / `enableSpec()`, `appendRawImage` and `configurePrefixCache`.
+- Fix `SessionConfig.disableSpec` being overridden when the engine attaches a draft sidecar, and let `enableSpec` restore the drafter.
 
 ## 0.6.3
 

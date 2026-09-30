@@ -107,8 +107,23 @@ python-test:
     python3 tests/api_contracts/check.py
     python3 -m unittest discover -s tests/api_contracts
 
+# Clippy and tests for the non-default `hexagon` feature, mirroring the
+# hexagon legs of `.github/workflows/ci.yml`. `clippy` and `test` above never
+# compile it, so without these a green `just ci` can still fail CI.
+clippy-hexagon:
+    cargo clippy -p cera --features hexagon --all-targets -- -D warnings
+    cargo clippy -p cera-ffi --features hexagon --all-targets -- -D warnings
+    cargo clippy -p cera-ffi --features hexagon,gpu --all-targets -- -D warnings
+    cargo clippy -p cera-cli --features hexagon --all-targets -- -D warnings
+
+# Tests for the non-default `hexagon` feature (the hexagon test legs of CI).
+test-hexagon:
+    cargo test -p cera --features hexagon --lib
+    cargo test -p cera-ffi --features hexagon --lib
+    cargo test -p cera-cli --features hexagon
+
 # Run all CI checks locally (mirrors GitHub Actions)
-ci: fmt clippy test python-test
+ci: fmt clippy test python-test clippy-hexagon test-hexagon
 
 # Print the host's resolved SIMD tier, then run the tier-specific kernel tests.
 # Each test self-skips unless the host has the feature it covers, so the useful
@@ -345,13 +360,15 @@ jvm-libs-host:
 # AAR backs the Flutter plugin, whose Dart bindings call `uniffi_ffibuffer_*`.
 # See scripts/assert-ffibuffer.sh.
 #
-# `hexagon` (Hexagon NPU backend + embedded DSP skels, ~3.2 MB) ships on the
-# 64-bit ABIs only: no shipping NPU phone is 32-bit, and the Play store has
-# required 64-bit since 2019. The two invocations build into scratch dirs and
-# merge (cargo-ndk owns its `-o` root per invocation). The FFI surface is
-# identical on all ABIs: without the feature, `hexagon_probe()` simply
+# `hexagon` (Hexagon NPU backend + embedded DSP skels, ~3.2 MB) and `gpu`
+# (wgpu) ship on the 64-bit ABIs only: no shipping NPU phone is 32-bit, and
+# the Play store has required 64-bit since 2019. The two invocations build
+# into scratch dirs and merge (cargo-ndk owns its `-o` root per invocation).
+# The FFI surface is identical on all ABIs: without the feature, `hexagon_probe()` simply
 # reports unavailable, only `Auto` falls back to CPU, and explicit
 # `BackendPreference::Hexagon` reports `Backend/Hexagon backend not available`.
+# Because `gpu` rides along, `BackendPreference::Auto` on a 64-bit Android build
+# probes Hexagon, then wgpu, then CPU; the 32-bit ABIs stay CPU-only.
 # The DSP skels are embedded directly inside `libcera_ffi.so` on 64-bit
 # ABIs (via include_bytes!) and extracted to app storage at runtime by
 # `HexagonNpu.setup(context)` (or `hexagonInstallSkels`). They are not

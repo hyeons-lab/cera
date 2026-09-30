@@ -27,7 +27,7 @@ use cera::kv_cache::{InferenceState, KvCompression};
 use cera::model::load_model_gpu;
 
 /// The `core` fixture set's LFM2 model (fetched on pull requests, so this has
-/// real PR coverage rather than the skip-as-pass an `arch`-tier model gets.
+/// real PR coverage rather than the skip-as-pass an `arch`-tier model gets).
 const FIXTURE: &str = "LFM2.5-230M-Q4_K_M.gguf";
 
 /// A fresh model instance per measurement: the two prompts share a

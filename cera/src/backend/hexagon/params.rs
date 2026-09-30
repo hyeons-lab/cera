@@ -4,12 +4,12 @@
 //! by consuming precomputed integer division constants (Granlund and Montgomery FastDiv)
 //! and layout descriptors generated on the host.
 
+use super::types::{HtpDataType, align128, align256};
+
 /// Precomputed integer division constants using Granlund and Montgomery's algorithm.
 ///
 /// Permits the DSP to calculate `n / d` without hardware division via:
 /// `((mulhi(n, mp) + n) >> l)`.
-use super::types::HtpDataType;
-
 #[repr(C)]
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct FastDivValues {
@@ -195,9 +195,9 @@ pub fn build_binary_kernel_params(
     let src1_row_size = ne10 * elem_size;
     let dst_row_size = ne00 * elem_size;
 
-    let src0_row_size_aligned = (src0_row_size + 127) & !127;
-    let src1_row_size_aligned = (src1_row_size + 127) & !127;
-    let dst_row_size_aligned = (dst_row_size + 127) & !127;
+    let src0_row_size_aligned = align128(src0_row_size);
+    let src1_row_size_aligned = align128(src1_row_size);
+    let dst_row_size_aligned = align128(dst_row_size);
 
     let is_row_bcast = ne11 == 1 && ne12 == 1 && ne13 == 1 && ne10 == ne00;
     // Single-row same-shape vectors take the ROW_BCAST path (kernel 1),
@@ -270,8 +270,8 @@ pub fn build_rope_kernel_params(
     let mut kparams = [0i32; 32];
     let n_threads = n_threads.max(1) as usize;
     let row_size = n_dims * 4;
-    let row_aligned = (row_size + 127) & !127;
-    let theta_aligned = (row_size + 255) & !255;
+    let row_aligned = align128(row_size);
+    let theta_aligned = align256(row_size);
     // HTP_ROPE_SPAD_NROWS = HTP_ROPE_SPAD_BLOCK(8) * HTP_ROPE_SPAD_NSLOTS(4)
     let bytes_per_thread = theta_aligned + 32 * row_aligned;
     let total = bytes_per_thread * n_threads;
@@ -360,24 +360,23 @@ pub fn build_ssm_conv_kernel_params(
     kparams[4] = n_s as i32;
     let d_inner_per_thread = d_inner.div_ceil(n_threads).next_multiple_of(32);
     kparams[5] = d_inner_per_thread as i32;
-    let round128 = |n: usize| n.next_multiple_of(128);
-    kparams[7] = round128(ncs * 4) as i32;
-    kparams[8] = round128(d_conv * 4) as i32;
-    kparams[9] = round128(d_inner * 4) as i32;
+    kparams[7] = align128(ncs * 4) as i32;
+    kparams[8] = align128(d_conv * 4) as i32;
+    kparams[9] = align128(d_inner * 4) as i32;
 
     // Weight-side VTCM is identical in both branches: raw rows plus the
     // transposed tile the HVX kernel multiplies from.
-    let src1_raw = round128(d_inner_per_thread * d_conv * 4) + 128;
-    let src1_t = round128(d_conv * d_inner_per_thread * 4);
+    let src1_raw = align128(d_inner_per_thread * d_conv * 4) + 128;
+    let src1_t = align128(d_conv * d_inner_per_thread * 4);
     let vtcm_src1_per_thread = src1_raw + src1_t;
     kparams[11] = vtcm_src1_per_thread as i32;
 
     let (vtcm_src0_per_thread, vtcm_dst_per_thread) = if n_t == 1 {
         // Scalar path: one position, full per-thread channel range.
         kparams[6] = d_inner_per_thread as i32;
-        let src0_raw = round128(d_inner_per_thread * d_conv * 4) + 128;
-        let src0_t = round128(d_conv * d_inner_per_thread * 4);
-        (src0_raw + src0_t, round128(d_inner_per_thread * 4))
+        let src0_raw = align128(d_inner_per_thread * d_conv * 4) + 128;
+        let src0_t = align128(d_conv * d_inner_per_thread * 4);
+        (src0_raw + src0_t, align128(d_inner_per_thread * 4))
     } else {
         // Chunk path: tile channels to fit per-thread VTCM budget.
         let budget_per_thread = if vtcm_budget > 0 {
@@ -395,9 +394,9 @@ pub fn build_ssm_conv_kernel_params(
         }
         let tile = tile.min(d_inner_per_thread);
         kparams[6] = tile as i32;
-        let src0_raw = round128(tile * ncs * 4) + 128;
-        let src0_t = round128(ncs * tile * 4);
-        (src0_raw + src0_t, round128(tile * n_t * 4))
+        let src0_raw = align128(tile * ncs * 4) + 128;
+        let src0_t = align128(ncs * tile * 4);
+        (src0_raw + src0_t, align128(tile * n_t * 4))
     };
     kparams[10] = vtcm_src0_per_thread as i32;
     kparams[12] = vtcm_dst_per_thread as i32;
@@ -459,14 +458,14 @@ pub fn build_flash_attn_kernel_params(
     kparams[5] = 0;
 
     // offset 24..28: vtcm_size: u32
-    let size_q_row_padded = (head_dim * 4 + 127) & !127;
-    let size_k_row_padded = (head_dim * 2 + 127) & !127;
-    let size_v_row_padded = (head_dim * 2 + 127) & !127;
+    let size_q_row_padded = align128(head_dim * 4);
+    let size_k_row_padded = align128(head_dim * 2);
+    let size_v_row_padded = align128(head_dim * 2);
     let size_q_block = size_q_row_padded;
     let size_k_block = size_k_row_padded * 64;
     let size_v_block = size_v_row_padded * 64;
-    let size_m_block = (64 * 2 + 127) & !127;
-    let size_vkq_acc = (head_dim * 4 + 127) & !127;
+    let size_m_block = align128(64 * 2);
+    let size_vkq_acc = align128(head_dim * 4);
     let size_per_thread = size_q_block
         + size_k_block * 2
         + size_v_block * 2

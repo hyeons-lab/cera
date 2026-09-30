@@ -95,7 +95,6 @@ type DspqueueReadFn = extern "C" fn(
 
 /// Dynamically loaded FastRPC library handle and dispatch table.
 pub struct FastRpcDriver {
-    #[cfg(unix)]
     handle: *mut c_void,
 
     // Memory allocation
@@ -138,7 +137,6 @@ unsafe impl Sync for FastRpcDriver {}
 impl FastRpcDriver {
     /// Attempt to dynamically load `libcdsprpc.so` (or system driver on Linux/Android).
     pub fn load() -> Result<Arc<Self>, CeraError> {
-        #[cfg(unix)]
         {
             // Soname first: inside an APK the app linker namespace resolves
             // `libcdsprpc.so` once the manifest declares it (see the AAR
@@ -154,6 +152,10 @@ impl FastRpcDriver {
                 "/vendor/lib64/libadsprpc.so",
             ];
             let mut lib_handle = std::ptr::null_mut();
+            // Keep each candidate's `dlerror()` text: "not found" and a linker
+            // namespace denial (the common Android failure) look identical
+            // otherwise, and only the loader knows which it was.
+            let mut load_errors = Vec::new();
 
             for name in &lib_names {
                 let c_name = CString::new(*name).unwrap();
@@ -162,12 +164,24 @@ impl FastRpcDriver {
                     lib_handle = h;
                     break;
                 }
+                // SAFETY: `dlerror` returns null or a NUL-terminated string
+                // valid until the next dl* call on this thread; copied at once.
+                let detail = unsafe {
+                    let e = libc::dlerror();
+                    if e.is_null() {
+                        "no dlerror".to_string()
+                    } else {
+                        std::ffi::CStr::from_ptr(e).to_string_lossy().into_owned()
+                    }
+                };
+                load_errors.push(format!("{name}: {detail}"));
             }
 
             if lib_handle.is_null() {
-                return Err(CeraError::Backend(
-                    "Qualcomm FastRPC driver (libcdsprpc.so) not found on this system".into(),
-                ));
+                return Err(CeraError::Backend(format!(
+                    "Qualcomm FastRPC driver (libcdsprpc.so) could not be loaded ({})",
+                    load_errors.join("; ")
+                )));
             }
 
             unsafe {
@@ -231,13 +245,6 @@ impl FastRpcDriver {
 
                 Ok(Arc::new(driver))
             }
-        }
-
-        #[cfg(not(unix))]
-        {
-            Err(CeraError::Backend(
-                "Qualcomm Hexagon backend is only supported on Unix/Android targets".into(),
-            ))
         }
     }
 
@@ -587,7 +594,6 @@ impl FastRpcDriver {
 
 impl Drop for FastRpcDriver {
     fn drop(&mut self) {
-        #[cfg(unix)]
         if !self.handle.is_null() {
             unsafe {
                 libc::dlclose(self.handle);

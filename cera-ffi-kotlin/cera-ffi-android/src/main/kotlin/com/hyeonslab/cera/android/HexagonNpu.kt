@@ -48,9 +48,12 @@ object HexagonNpu {
 
     /**
      * Extract embedded DSP skels into `context.noBackupFilesDir/cera_skels`
-     * and point the FastRPC loader there. Idempotent (repeats are no-ops);
-     * the process environment is set exactly once because `setenv` is not
-     * thread-safe.
+     * and point the FastRPC loader there. Idempotent: once a setup has
+     * succeeded, later calls (even with a different directory) return
+     * without doing anything. `ADSP_LIBRARY_PATH` is written twice on the
+     * first call, by the Rust install (the skel dir) and then here (the
+     * deduplicated union with the vendor paths); `setenv` is not
+     * thread-safe, so call this once during single-threaded startup.
      *
      * @param context Application or activity context.
      * @return Absolute path to the directory where skels were installed.

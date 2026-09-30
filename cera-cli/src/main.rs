@@ -3231,22 +3231,15 @@ fn main() -> Result<()> {
                 }
 
                 // Depthformer execution:
-                // Hardware-accelerated depthformers (e.g. Hexagon NPU) run automatically when supported.
-                // Metal depthformer remains experimental and requires explicit CERA_GPU_DF=1.
+                // Accelerators that opt in (Hexagon NPU) run their depthformer
+                // automatically; the others (Metal, wgpu) remain experimental
+                // and require explicit CERA_GPU_DF=1.
                 let gpu_depthformer = gpu_detok.as_ref().is_some_and(|d| {
-                    if d.supports_depthformer() {
-                        if cfg!(all(
-                            feature = "metal",
-                            any(target_os = "macos", target_os = "ios")
-                        )) && backend_pref == BackendPreference::Metal
-                        {
-                            gpu_df_requested
-                        } else {
-                            true
-                        }
-                    } else {
-                        false
-                    }
+                    cera::model::audio_decoder::accelerated_depthformer_enabled(
+                        d.supports_depthformer(),
+                        d.depthformer_default_on(),
+                        gpu_df_requested,
+                    )
                 });
 
                 if gpu_df_requested && !gpu_depthformer && gpu_detok.is_some() {
@@ -3255,12 +3248,19 @@ fn main() -> Result<()> {
                          depthformer; sampling codes on the CPU"
                     );
                 }
-                if gpu_depthformer && backend_pref == BackendPreference::Metal {
+                // Any opt-in depthformer (Metal, wgpu) is experimental, whichever
+                // preference selected it, so `--device auto` warns too.
+                if gpu_depthformer
+                    && gpu_df_requested
+                    && gpu_detok
+                        .as_ref()
+                        .is_some_and(|d| !d.depthformer_default_on())
+                {
                     eprintln!(
-                        "warning: CERA_GPU_DF=1 enables an experimental Metal depthformer that \
-                         currently produces incorrect codes (frame-1 immediate-end with \
-                         --audio-temperature 0; NaN-logit panic with default sampling). \
-                         The CPU depthformer is the supported path."
+                        "warning: CERA_GPU_DF=1 enables an experimental GPU depthformer that \
+                         may produce incorrect codes (observed on Metal: frame-1 \
+                         immediate-end with --audio-temperature 0; NaN-logit panic with \
+                         default sampling). The CPU depthformer is the supported path."
                     );
                 }
 

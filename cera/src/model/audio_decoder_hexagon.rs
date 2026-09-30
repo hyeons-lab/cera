@@ -15,10 +15,12 @@ pub use crate::backend::hexagon::HexagonWeightFormat;
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
     HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer,
-    build_binary_kernel_params, build_flash_attn_kernel_params, build_mul_mat_kernel_params,
-    build_rms_norm_params, build_rope_kernel_params, build_rope_params, build_unary_kernel_params,
-    repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+    align128, build_binary_kernel_params, build_flash_attn_kernel_params,
+    build_mul_mat_kernel_params, build_rms_norm_params, build_rope_kernel_params,
+    build_rope_params, build_unary_kernel_params, repack_q4_0, repack_q8_0,
+    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
+use crate::backend::hexagon::{LockOrRecover, lock_reporting_poison, report_poison};
 use crate::gguf::GgufFile;
 use crate::model::audio_decoder::{
     AudioAccelerator, AudioDecoderWeights, DepthformerConfig, DetokenizerConfig, DetokenizerState,
@@ -67,7 +69,6 @@ impl HexagonDetokWeightOffsets {
     /// Compute memory layout and byte offsets for all detokenizer weights in shared rpcmem.
     pub fn plan(weights: &DetokenizerWeights) -> Result<Self, CeraError> {
         let mut cur_off = 0;
-        let align128 = |sz: usize| (sz + 127) & !127;
 
         let plan_vec_f32 = |cur_off: &mut usize, len: usize| -> usize {
             let off = *cur_off;
@@ -229,7 +230,6 @@ impl HexagonDepthformerWeightOffsets {
     /// Compute memory layout and byte offsets for all depthformer weights in shared rpcmem.
     pub fn plan(weights: &AudioDecoderWeights) -> Result<Self, CeraError> {
         let mut cur_off = 0;
-        let align128 = |sz: usize| (sz + 127) & !127;
 
         let plan_vec_f32 = |cur_off: &mut usize, len: usize| -> usize {
             let off = *cur_off;
@@ -356,7 +356,6 @@ pub struct HexagonDetokStateOffsets {
 impl HexagonDetokStateOffsets {
     /// Plan state memory allocation for Conv rolling states and attention KV caches.
     pub fn plan(cfg: &DetokenizerConfig) -> Self {
-        let align128 = |sz: usize| (sz + 127) & !127;
         let mut cur_off = 0;
         let n_embd = cfg.n_embd;
         let kv_dim = cfg.n_head_kv * cfg.n_embd_head;
@@ -426,7 +425,6 @@ pub struct HexagonDetokScratchOffsets {
 
 impl HexagonDetokScratchOffsets {
     pub fn new(n_embd: usize, ffn_dim: usize, n_fft_bins: usize, max_seq_len: usize) -> Self {
-        let align128 = |sz: usize| (sz + 127) & !127;
         const MAX_AUDIO_TOKENS: usize = 16;
         let n_head = 8;
         let n_kv = 2;
@@ -561,7 +559,6 @@ impl HexagonDepthformerScratchOffsets {
         n_head_kv: usize,
         hd: usize,
     ) -> Self {
-        let align128 = |sz: usize| (sz + 127) & !127;
         let mut off = 0;
 
         let llm_emb_off = off;
@@ -639,7 +636,6 @@ pub struct HexagonDepthformerStateOffsets {
 
 impl HexagonDepthformerStateOffsets {
     pub fn plan(cfg: &DepthformerConfig) -> Self {
-        let align128 = |sz: usize| (sz + 127) & !127;
         let mut cur_off = 0;
         let kv_dim = cfg.n_head_kv * cfg.n_embd_head;
         let max_seq = cfg.max_seq_len.max(8);
@@ -742,7 +738,10 @@ impl HexagonDepthformer {
     }
 
     pub fn reset(&self) {
-        if let Ok(sb_guard) = self.state_buf.lock() {
+        // The buffer is fully overwritten with zeros, so a poisoned lock is
+        // recoverable; skipping it would reset the counters over stale state.
+        {
+            let sb_guard = self.state_buf.lock_or_recover();
             unsafe {
                 std::ptr::write_bytes(sb_guard.as_mut_ptr(), 0, sb_guard.size());
             }
@@ -917,31 +916,13 @@ impl HexagonDepthformer {
         let mut codes = [0i32; 8];
         let mut prev_token: i32 = -1;
 
-        let mut dev_guard = match device.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                let err = CeraError::Backend(format!("HexagonDepthformer device lock failed: {e}"));
-                tracing::warn!("{err}");
-                return Err(err);
-            }
-        };
-        let mut scratch_guard = match self.scratch_buf.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                let err =
-                    CeraError::Backend(format!("HexagonDepthformer scratch lock failed: {e}"));
-                tracing::warn!("{err}");
-                return Err(err);
-            }
-        };
-        let state_buf_guard = match self.state_buf.lock() {
-            Ok(g) => g,
-            Err(e) => {
-                let err = CeraError::Backend(format!("HexagonDepthformer state lock failed: {e}"));
-                tracing::warn!("{err}");
-                return Err(err);
-            }
-        };
+        let mut dev_guard = device.lock_or_recover();
+        let mut scratch_guard = self.scratch_buf.lock_or_recover();
+        let state_buf_guard = self.state_buf.lock_or_recover();
+        // `reset()` above rewrote the state; a panic mid-dispatch in an
+        // earlier frame can still have left a half-built batch queued, which
+        // the next flush would run together with this frame's ops.
+        dev_guard.queue_session_mut().drop_pending_batch();
 
         // 1. Stage LLM embedding into scratch buffer at llm_emb_off
         {
@@ -958,15 +939,9 @@ impl HexagonDepthformer {
             scratch_guard.flush_cpu_cache(so.llm_emb_off, dec.n_embd * 4);
         }
 
-        let mut emb_scratch = self.emb_scratch.lock().unwrap_or_else(|e| e.into_inner());
-        let mut logits_scratch = self
-            .logits_scratch
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let mut indices_scratch = self
-            .indices_scratch
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
+        let mut emb_scratch = self.emb_scratch.lock_or_recover();
+        let mut logits_scratch = self.logits_scratch.lock_or_recover();
+        let mut indices_scratch = self.indices_scratch.lock_or_recover();
 
         for (j, code_slot) in codes.iter_mut().enumerate().take(dec.n_codebook) {
             let pos = self.n_past.load(std::sync::atomic::Ordering::Relaxed);
@@ -2271,22 +2246,22 @@ impl HexagonAudioDecoder {
             )));
         }
 
-        let mut dev_guard = self
-            .device
-            .lock()
-            .map_err(|e| CeraError::Backend(format!("device lock poison: {e}")))?;
-        let mut scratch_guard = self
-            .scratch_buf
-            .lock()
-            .map_err(|e| CeraError::Backend(format!("scratch lock poison: {e}")))?;
-        let state_buf_guard = self
-            .state_buf
-            .lock()
-            .map_err(|e| CeraError::Backend(format!("state_buf lock poison: {e}")))?;
-        let mut state_guard = self
-            .state
-            .lock()
-            .map_err(|e| CeraError::Backend(format!("state lock poison: {e}")))?;
+        let mut dev_guard = self.device.lock_or_recover();
+        let mut scratch_guard = self.scratch_buf.lock_or_recover();
+        // Unlike the scratch buffers, the recurrent state persists across
+        // calls and `n_past` only advances after the dispatches, so after a
+        // poisoning panic the pair may be torn. Recover the locks, then start
+        // the stream over rather than continue over half-advanced state.
+        let (state_buf_guard, sb_poisoned) = lock_reporting_poison(&self.state_buf);
+        let (mut state_guard, st_poisoned) = lock_reporting_poison(&self.state);
+        if sb_poisoned || st_poisoned {
+            report_poison("audio detokenizer state", "resetting the stream");
+            unsafe {
+                std::ptr::write_bytes(state_buf_guard.as_mut_ptr(), 0, state_buf_guard.size());
+            }
+            state_buf_guard.flush_cpu_cache(0, state_buf_guard.size());
+            state_guard.reset();
+        }
 
         // 1. Stage tokens into scratch buffer
         let tokens_bytes = tokens.len() * 4;
@@ -2914,7 +2889,8 @@ impl AudioAccelerator for HexagonAudioDecoder {
             Ok(spec) if spec.len() == expected_spec_len => spec,
             Err(e) => {
                 tracing::warn!(error = %e, "Hexagon audio detokenizer NPU execution failed");
-                if let Ok(mut dev) = self.device.lock() {
+                {
+                    let mut dev = self.device.lock_or_recover();
                     dev.queue_session_mut().drop_pending_batch();
                 }
                 self.record_error(e);
@@ -2940,18 +2916,25 @@ impl AudioAccelerator for HexagonAudioDecoder {
     }
 
     fn reset_detokenizer(&self) {
-        if let Ok(sb_guard) = self.state_buf.lock() {
+        // The buffer is fully overwritten with zeros, so a poisoned lock is
+        // recoverable; skipping it would reset the counters over stale state.
+        {
+            let sb_guard = self.state_buf.lock_or_recover();
             unsafe {
                 std::ptr::write_bytes(sb_guard.as_mut_ptr(), 0, sb_guard.size());
             }
             sb_guard.flush_cpu_cache(0, sb_guard.size());
         }
-        let mut state_guard = self.state.lock().unwrap_or_else(|e| e.into_inner());
+        let mut state_guard = self.state.lock_or_recover();
         state_guard.reset();
     }
 
     fn supports_depthformer(&self) -> bool {
         self.depthformer.is_some()
+    }
+
+    fn depthformer_default_on(&self) -> bool {
+        true
     }
 
     fn istft_to_pcm(&self, spectrum: &[f32], n_fft: usize, hop_length: usize) -> Vec<f32> {
@@ -3094,7 +3077,7 @@ mod tests {
     }
 
     #[test]
-    fn test_try_hexagon_audio_decoder_on_host_without_dsp() {
+    fn test_try_hexagon_audio_decoder_returns_none_for_unloadable_weights() {
         let mut data = Vec::new();
         data.extend_from_slice(b"GGUF");
         data.extend_from_slice(&3u32.to_le_bytes());
