@@ -4,7 +4,7 @@ UniFFI bindings for [`cera`](../cera/): exposes the core inference
 engine to Kotlin, Swift, Python, and every other language
 [`uniffi-rs`](https://mozilla.github.io/uniffi-rs/) supports.
 
-> The 0.6.2 bindings include chat ownership/cancellation, streaming, checkpoint validation, schema and audio corrections. See the [0.6 API guide](../docs/API_0_6.md) for contracts and migration limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
+> The 0.7.0 bindings include Qualcomm Hexagon NPU support, chat ownership/cancellation, streaming, checkpoint validation, schema and audio corrections. See the [API guide](../docs/API_0_6.md) for contracts and migration limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 Concrete [Swift/Kotlin GPU lifetime examples](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md#swift-and-kotlin-conversation-lifetimes)
 and an [executable native ownership probe](../tests/gpu_session_ffi/README.md)
@@ -67,9 +67,10 @@ filesystem tree manually" workaround.
 | 23+ | Reactive Streaming: `AsyncThrowingStream` (Swift), `Flow` (Kotlin), `Iterator` generator (Python), and `Stream` (Dart) |
 | 24+ | Structured Outputs: JSON Schema compilation to GBNF, `GenerateOpts.withJsonSchema`, and `completeJson` |
 | 25+ | First-Class Tool Calling: `ChatSession.setTools`, `ingestToolResponse`, and automatic grammar triggers |
-| 26+ | CPU Session/Chat checkpoint export/import and file persistence; native Metal/wgpu checkpoints are rejected |
+| 26+ | CPU Session/Chat checkpoint export/import and file persistence; native Metal/Hexagon/wgpu checkpoints are rejected |
 | 27+ | Unified Audio Pipeline: `FfiAudioPipeline` uniting Silero VAD v5, Keyword Spotting, and Whisper ASR |
 | 28+ | Per-request seeds: `GenerateOpts.seed` (restarts the RNG for one call, KV-safe, session default untouched), `Session::set_seed` (persistent default, survives `reset()`) |
+| 29+ | Qualcomm Hexagon NPU: `BackendPreference.HEXAGON`, Android FastRPC skel integration, Unsigned PD runtime, dynamic CPU topology discovery and worker threadpool resizing; the 64-bit Android AAR also ships wgpu, so `Auto` probes Hexagon, then wgpu, then CPU |
 
 Don't add FFI exposure to `cera` directly. The `cera` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.
@@ -318,8 +319,9 @@ app's `jniLibs/` as needed.
 
 ### NDK version
 
-CI pins NDK **r27c**, a stable release the workspace is validated
-against. The workflow installs it through `nttld/setup-ndk@v1` by
+CI and the release pipeline pin NDK **r30**, the same release the
+`docker/hexagon` image installs, so CI, local and release toolchains
+agree. The workflow installs it through `nttld/setup-ndk@v1` by
 version string (no checksum; the action fetches from Google's CDN
 which serves signed artifacts). Bumping is a one-line change: update
 the `ndk-version:` value in `.github/workflows/ci.yml`'s
@@ -328,6 +330,23 @@ The `cargo ndk` flag shape is compatible across recent NDK majors so
 the pin is mostly about toolchain + sysroot stability across runs,
 not a hard constraint; later NDKs that keep the `armv7-linux-androideabi`
 and `i686-linux-android` sysroots should drop in cleanly.
+
+### 16KB page size
+
+Every published Android `.so` is 16KB-page clean: LOAD segments aligned
+to 16KB, as Android 15+ hardware and Google Play require. CI pins NDK
+r30, whose default is already 16KB, and `.cargo/config.toml`
+additionally carries explicit `-z max-page-size=16384` /
+`-z common-page-size=16384` linker flags for all four Android targets
+(Google's documented recipe, kept so the requirement holds regardless
+of NDK default). Two checks enforce it:
+`scripts/assert-16k-pages.py` runs in the `android-abis` CI job on each
+built `.so`, and `just android-libs` (what the release pipeline stages
+into the AAR's `jniLibs/`) runs it on the staged set. Larger alignment is backward compatible: 16KB-aligned libraries load
+fine on 4KB-page devices. Hexagon DSP skel binaries are embedded directly
+in `libcera_ffi.so` and extracted to app storage at runtime by
+`HexagonNpu.setup(context)`, so all binaries packaged in `jniLibs/` are
+16KB-page-aligned.
 
 ## Apple platforms
 
@@ -1127,7 +1146,7 @@ copy rather than mutating the original `GenerateOpts`.
 
 Session and Chat expose `exportCheckpoint` / `importCheckpoint` and
 `saveCheckpoint` / `loadCheckpoint` (snake_case in Python). CPU snapshots validate
-layer geometry, KV precision and compression/seed identity. Native Metal/wgpu
+layer geometry, KV precision and compression/seed identity. Native Metal/Hexagon/wgpu
 calls fail explicitly because these snapshots omit backend-owned device state.
 Recreate older f16/TurboQuant snapshots with fingerprints that lack compression
 identity. See [checkpoint compatibility](../docs/API_0_6.md#checkpoints-and-compatibility).
@@ -1137,31 +1156,33 @@ identity. See [checkpoint compatibility](../docs/API_0_6.md#checkpoints-and-comp
 `engine.newSession(config)` produces an `Arc<Session>` that retains the
 engine's model and tokenizer, plus its own sampler, cancel atomic, and
 `Mutex` over the inner `cera::Session`. CPU sessions own their live KV state
-and can run concurrently against the same engine. Metal/wgpu models own one
-live GPU context: a second session on the same loaded model returns
+and can run concurrently against the same engine. Metal/Hexagon/wgpu models own one
+live device context: a second session on the same loaded model returns
 `FfiError::Busy` until the first session is released. Resetting or cancelling
-keeps that reservation. Load separate models for simultaneous GPU conversations;
+keeps that reservation. Load separate models for simultaneous GPU or NPU conversations;
 see [Sharing a loaded GPU model](#sharing-a-loaded-gpu-model) for foreign lifetimes.
 
 ### Surface
 
 | Method | Signature | Notes |
 |---|---|---|
-| `engine.newSession(config)` | `(SessionConfig) -> Result<Arc<Session>, FfiError>` | Per-session knobs (`seed`, `nKeep`, `ubatchSize`, `maxSeqLen`, `kvCompression`). Returns `Busy` if another session owns the model's GPU context, or `OutOfMemory` when the KV cache can't be allocated. |
+| `engine.newSession(config)` | `(SessionConfig) -> Result<Arc<Session>, FfiError>` | Per-session knobs (`seed`, `nKeep`, `ubatchSize`, `maxSeqLen`, `kvCompression`, `disableSpec`). Returns `Busy` if another session owns the model's device context, or `OutOfMemory` when the KV cache can't be allocated. |
 | `session.intoChat()` | `() -> Result<Arc<ChatSession>, FfiError>` | Transition the raw session into a transactional chat coordinator. Moves ownership out of Session. |
 | `session.appendText(text)` | `(String) -> Result<(), FfiError>` | Tokenize + push into KV. Convenience over `appendTokens(encodeText(text))`. |
 | `session.appendTokens(tokens)` | `(Vec<u32>) -> Result<(), FfiError>` | Push pre-tokenized IDs. Use when you need explicit BOS/EOS framing. |
 | `session.sendMessage(message)` | `(UserMessage) -> Result<(), FfiError>` | **Deprecated**: use `ChatSession` via `intoChat()` instead. Append a multimodal envelope (`UserMessage` with optional `text`, `images`, `audio`) enforcing model-canonical ordering and automatic 16 kHz resampling. |
 | `session.sendMessageAndGenerate(message, opts)` | `(UserMessage, GenerateOpts) -> Result<GenerateOutput, FfiError>` | **Deprecated**: use `ChatSession` via `intoChat()` instead. |
 | `session.sendMessageStreaming(message, opts, sink)` | `(UserMessage, GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | **Deprecated**: use `ChatSession` via `intoChat()` instead. |
-| `session.generate(opts)` | `(GenerateOpts) -> Result<GenerateOutput, FfiError>` | Sync decode; returns the full text + token list + summary in one shot. |
+| `session.generate(opts)` | `(GenerateOpts) -> Result<GenerateOutput, FfiError>` | Sync decode; returns the full text + token list + summary in one shot. Accepts `opts.spec` (prompt-lookup config) and `opts.noSpec` (explicit disable). |
 | `session.generateStreaming(opts, sink)` | `(GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Sync decode with a foreign-trait callback per flush boundary (text chunks or audio frames per the model's modality). Returns the summary only; text chunks flow through the sink. |
 | `session.generateAsync(opts)` | `async (GenerateOpts) -> Result<GenerateOutput, FfiError>` | `spawn_blocking`-backed async twin of `generate`. Dropping the Rust future requests cancellation; raw Swift callers must call `session.cancel()` explicitly. |
 | `session.generateStreamingAsync(opts, sink)` | `async (GenerateOpts, Arc<dyn ModalitySink>) -> Result<GenerateSummary, FfiError>` | Async + streaming with the same cancellation rules as `generateAsync`. |
 | `session.position()` | `() -> u32` | Tokens currently in the KV cache. Atomic-backed (no mutex), safe to poll from any thread. |
 | `session.cancel()` | `() -> ()` | Flip the cancel atomic. Safe from any thread. Decode loop checks it at every flush boundary. |
 | `session.clearCancel()` | `() -> ()` | Clear the cancel flag without dropping any session state. |
-| `session.reset()` | `() -> Result<(), FfiError>` | Reset KV + position + last logits + re-seed sampler from the session default (`SessionConfig.seed` as passed to `newSession`, or the `set_seed` value when one was set). Retains GPU context ownership. |
+| `session.disableSpec()` | `() -> ()` | Disable speculative decoding for the session. An attached drafter is kept, so `enableSpec()` restores it. |
+| `session.enableSpec()` | `() -> ()` | Re-enable speculative decoding for the session, using the attached drafter if any. |
+| `session.reset()` | `() -> Result<(), FfiError>` | Reset KV + position + last logits + re-seed sampler from the session default (`SessionConfig.seed` as passed to `newSession`, or the `set_seed` value when one was set). Retains device context ownership. |
 | `session.capabilities()` | `() -> ModalityCapabilities` | The same flags `engine.capabilities()` reports; exposed on `Session` too so a caller holding only the session handle can probe. |
 
 ### Lifecycle (Kotlin)

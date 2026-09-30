@@ -77,6 +77,7 @@ pub use engine::{
 pub use hotword::{
     HotwordConfig, HotwordDetector, HotwordEvent, HotwordIterator, HotwordScore, LogMelFrontEnd,
 };
+pub use model::PixelFormat;
 pub use model::whisper::{
     Conv1dWeights, WHISPER_CATALOG, WHISPER_LANGUAGES, WhisperConfig, WhisperDecoderBlockWeights,
     WhisperDecoderWeights, WhisperEncoderBlockWeights, WhisperEncoderWeights, WhisperModel,

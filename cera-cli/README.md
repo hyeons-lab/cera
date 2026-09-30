@@ -4,7 +4,7 @@ Command-line interface for the [`cera`](https://github.com/hyeons-lab/cera/tree/
 a `cera` binary for running, chatting with, inspecting, and benchmarking GGUF /
 LeapBundles models locally.
 
-> This checkout uses the 0.6.2 core. The CLI commands below are distinct from the library's Session/Chat APIs; see the [0.6 API guide](../docs/API_0_6.md) for those contracts and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
+> This checkout uses the 0.7.0 core. The CLI commands below are distinct from the library's Session/Chat APIs; see the [API guide](../docs/API_0_6.md) for those contracts and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 > **Note:** Part of a learning-experiment project exploring LLM inference
 > internals in Rust, see the [project README](https://github.com/hyeons-lab/cera).
@@ -16,10 +16,10 @@ LeapBundles models locally.
 cargo install cera-cli
 ```
 
-This builds the `cera` binary. For an Apple Metal or wgpu GPU build:
+This builds the `cera` binary. For an Apple Metal, wgpu GPU, or Qualcomm Hexagon NPU build:
 
 ```sh
-cargo install cera-cli --features metal   # or gpu
+cargo install cera-cli --features metal   # or gpu, or hexagon
 ```
 
 ## Usage
@@ -72,14 +72,14 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 
 | Command | Purpose |
 |---------|---------|
-| `run` | Run inference on a prompt: text, optional grammar/JSON or tool calling (`--tools` / `--constrain-tools`), plus audio input for LFM2-Audio bundles. Optional `--lora` adapter. |
-| `chat` | Interactive multi-turn REPL with `/help`, `/clear`, `/exit` slash commands. Optional `--lora` adapter. Run with no model source at all on a terminal (and without `--no-tui`) to pick one from the published catalog. |
+| `run` | Run inference on a prompt: text, optional grammar/JSON or tool calling (`--tools` / `--constrain-tools`), optional LoRA (`--lora`), and speculative decoding (`--spec` / `--no-spec` / `--draft`), plus image/audio input for multimodal bundles. |
+| `chat` | Interactive multi-turn REPL with `/help`, `/clear`, `/exit` slash commands. Optional `--lora` adapter and speculative decoding (`--spec` / `--no-spec` / `--draft`). Run with no model source at all on a terminal (and without `--no-tui`) to pick one from the published catalog. |
 | `embed` | Extract last-layer hidden-state embeddings for a prompt: mean-pooled by default, `--per-token` for the full matrix, `--json` for array output. |
 | `logits` | Dump the next-token logits over the full vocabulary for a prompt (single prefill): `--top-k` for the K highest `(token_id, logit)` pairs, `--json` for array output. Handy for cross-backend parity checks. |
 | `inspect` | Inspect a GGUF file's metadata and resolved CPU backend tier. |
 | `cpu` | Print the host's CPU backend tier + detected SIMD features (no model needed). |
 | `tokenize` | Tokenize text and print token IDs (e.g. to compare against HuggingFace). |
-| `bench` | Measure decode throughput (tok/s) with p10/p50/p90/mean/stddev over N runs. `--spec` (plus `--spec-ngram` / `--spec-k`) measures greedy speculative decoding; `--gpu-io` reports wgpu submits, compute passes, and readbacks per token. |
+| `bench` | Measure decode throughput (tok/s) with p10/p50/p90/mean/stddev over N runs. `--spec` (plus `--spec-ngram` / `--spec-k`) measures greedy speculative decoding; `--no-spec` disables speculative decoding; `--gpu-io` reports wgpu submits, compute passes, and readbacks per token. |
 | `list-bundles` | List bundles on `LiquidAI/LeapBundles` (add `--quants` for per-bundle quants). |
 | `list-hf` | Discover and list GGUF model files in a Hugging Face repository. |
 | `download-bundles` | Download bundle manifests + model files without loading them. |
@@ -106,7 +106,7 @@ cera compare-quants --cera-gguf ./cera.gguf --reference ./upstream.gguf --json
 
 Run `cera <command> --help` for the full flag list. Common `run` flags:
 `--max-tokens` (default 256), `--temperature` (default 0.7), `--device`
-(`cpu` / `gpu` / `metal` / `auto`, default `auto`), `--grammar` / `--json`, and
+(`cpu` / `gpu` / `metal` / `hexagon` / `auto`, default `auto`), `--grammar` / `--json`, and
 `--lora` to attach a LoRA adapter. For tool calling, `--tools <JSON|@file>`
 passes an array of OpenAI-style function schemas (rendered into the chat
 template; the reply's tool calls are parsed to a JSON array on stdout), and
@@ -121,9 +121,16 @@ to every forward pass, generation and hidden-state extraction alike. For a PEFT
 `--lora-alpha <ALPHA>` (`scale = alpha / rank`; `.gguf` adapters carry alpha in
 their metadata).
 
+`run`, `chat`, and `bench` accept speculative decoding flags: `--spec` enables
+prompt-lookup drafting, `--no-spec` disables speculative decoding even when a
+draft sidecar is present, `--draft <PATH>` attaches a neural draft model, and
+`--spec-ngram <N>` / `--spec-k <K>` configure drafting parameters. For audio models
+with an external vocoder, `--vocoder <PATH>` routes audio accelerator loading
+through the resolved `--device` backend (or `CERA_AUDIO_GPU` override).
+
 ### CPU tuning
 
-The CPU backend auto-detects thread count and core affinity per device. To pin
+The CPU backend auto-detects thread count, cgroup cpuset quota, and core affinity per device. To pin
 them for benchmarking or tuning, set `CERA_DECODE_THREADS=<n>` (fixed decode
 width), `CERA_PREFILL_THREADS=<n>` (prefill width on its own, so the two can be
 swept independently), `CERA_THREADS=<n>` (override the detected perf-core

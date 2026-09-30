@@ -651,7 +651,9 @@ impl MetalLfm2Model {
         path: Option<&std::path::Path>,
         context_size: usize,
     ) -> Result<Self> {
-        let cpu = super::lfm2::Lfm2Model::from_gguf(gguf, context_size)?;
+        // No CPU repacks: the Metal loader only resolves metadata from this
+        // model (see `with_repack_if`).
+        let cpu = super::lfm2::Lfm2Model::from_gguf_no_repack(gguf, context_size)?;
         Self::from_weight_source(&cpu, path, context_size)
     }
 
@@ -668,7 +670,10 @@ impl MetalLfm2Model {
         let model_id = path
             .map(|p| p.to_string_lossy().into_owned())
             .unwrap_or_default();
-        let cpu = super::llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?;
+        // No CPU repacks: the Metal loader only resolves metadata from this
+        // model (see `with_repack_if`).
+        let cpu =
+            super::llama::LlamaModel::from_gguf_with_id_no_repack(gguf, context_size, model_id)?;
         if let Some(sw) = cpu.sliding_window() {
             tracing::warn!(
                 "Model specifies sliding window attention ({sw} tokens), which is not accelerated on Metal; full dense attention will be applied"
@@ -3842,8 +3847,7 @@ impl MetalLfm2Model {
                 self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
                 self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
             });
-            cb.commit();
-            cb.wait_until_completed();
+            self.ctx.commit_and_wait(cb, "forward_inner(gpu-timed)");
             self.gpu_timer_resolve(timer);
             timer.bump_token();
             if timer.tokens.load(Ordering::Relaxed) % 32 == 0 {
@@ -3856,8 +3860,7 @@ impl MetalLfm2Model {
             self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
             self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
             enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
+            self.ctx.commit_and_wait(cb, "forward_inner");
         }
 
         // Update state + read back logits (unified memory zero-copy)
@@ -3978,8 +3981,7 @@ impl Model for MetalLfm2Model {
             self.encode_layers(enc, pos);
             self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
             enc.end_encoding();
-            cb.commit();
-            cb.wait_until_completed();
+            self.ctx.commit_and_wait(cb, "hidden_states");
             out.extend_from_slice(&self.ctx.read_f32(&self.normed_buf, hs));
         }
         // `_scratch_guard` clears `use_hs_scratch` here on the way out.
@@ -4036,14 +4038,22 @@ impl Model for MetalLfm2Model {
         enc.set_buffer(2, Some(&self.argmax_params_buf), 0);
         enc.dispatch_thread_groups(sz1d(1), sz1d(256));
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        self.ctx.commit_and_wait(cb, "forward_greedy");
 
         self.state.seq_len.fetch_add(1, Ordering::Relaxed);
         state.seq_len += 1;
 
         // Read only 4 bytes instead of vocab_size × 4.
         unsafe { *(self.argmax_token_buf.contents() as *const u32) }
+    }
+
+    fn take_decode_error(&self) -> Option<CeraError> {
+        // Every submit goes through `MetalContext::commit_and_wait`, which
+        // records a non-`Completed` status sticky-until-taken; drain it so
+        // the session fails the generation instead of sampling a dead
+        // buffer's stale contents. Also covers prefill faults still pending
+        // at the next session check.
+        self.ctx.take_cmd_error()
     }
 
     fn forward_embedding(
@@ -4081,8 +4091,7 @@ impl Model for MetalLfm2Model {
         let enc = cb.new_compute_command_encoder();
         self.encode_layers(enc, pos);
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        self.ctx.commit_and_wait(cb, "forward_embedding");
 
         self.state.seq_len.fetch_add(1, Ordering::Relaxed);
         state.seq_len += 1;
@@ -4092,8 +4101,7 @@ impl Model for MetalLfm2Model {
         let enc2 = cb2.new_compute_command_encoder();
         self.encode_rmsnorm(enc2, &self.hidden_buf, &self.normed_buf, &self.output_norm);
         enc2.end_encoding();
-        cb2.commit();
-        cb2.wait_until_completed();
+        self.ctx.commit_and_wait(cb2, "forward_embedding(norm)");
 
         self.ctx.read_f32(&self.normed_buf, hs)
     }
@@ -4123,8 +4131,8 @@ impl Model for MetalLfm2Model {
         self.encode_layers(enc, pos);
         self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        self.ctx
+            .commit_and_wait(cb, "forward_hidden_from_embedding");
 
         self.state.seq_len.fetch_add(1, Ordering::Relaxed);
         state.seq_len += 1;
@@ -4162,8 +4170,7 @@ impl Model for MetalLfm2Model {
         self.encode_rmsnorm(enc, &self.hidden_buf, &self.normed_buf, &self.output_norm);
         self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        self.ctx.commit_and_wait(cb, "forward_from_embedding");
 
         self.state.seq_len.fetch_add(1, Ordering::Relaxed);
         state.seq_len += 1;
@@ -4394,10 +4401,7 @@ impl Model for MetalLfm2Model {
                     state.seq_len = use_len;
 
                     let logits = self.forward_prefill_inner(&tokens[use_len..], use_len, state);
-                    self.prefix_cache
-                        .lock()
-                        .unwrap_or_else(|e| e.into_inner())
-                        .insert(tokens, self.snapshot_state_locked());
+                    self.maybe_snapshot_prefix_locked(tokens);
                     return logits;
                 }
             }
@@ -4412,10 +4416,7 @@ impl Model for MetalLfm2Model {
         let logits = self.forward_prefill_inner(tokens, start_pos, state);
         // Only cache base-model KV — an adapted run's KV must never be reused.
         if start_pos == 0 && !lora_active {
-            self.prefix_cache
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .insert(tokens, self.snapshot_state_locked());
+            self.maybe_snapshot_prefix_locked(tokens);
         }
         logits
     }
@@ -4556,6 +4557,18 @@ impl MetalLfm2Model {
     /// cache write step) call this directly to avoid a recursive
     /// `Mutex::lock()` deadlock — `std::sync::Mutex` is not
     /// reentrant.
+    /// Snapshot GPU state into the prefix cache, skipping the snapshot
+    /// entirely when the cache is disabled. Mirrors the wgpu backend: building
+    /// it unconditionally costs a blocking readback per layer just to have
+    /// `insert` throw it away.
+    fn maybe_snapshot_prefix_locked(&self, tokens: &[u32]) {
+        let mut cache = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.stores_entries() {
+            let snap = self.snapshot_state_locked();
+            cache.insert(tokens, snap);
+        }
+    }
+
     fn snapshot_state_locked(&self) -> crate::kv_cache::StateSnapshot {
         use crate::kv_cache::{LayerSnapshot, StateSnapshot};
         let seq_len = self.state.seq_len.load(Ordering::Relaxed);
@@ -4811,8 +4824,7 @@ impl MetalLfm2Model {
             );
         }
 
-        cmd_buf.commit();
-        cmd_buf.wait_until_completed();
+        self.ctx.commit_and_wait(cmd_buf, "encode_kv_shift_layers");
     }
 
     /// Element-wise f16 copy via the `memcpy_f16_offsets` kernel.
@@ -5714,8 +5726,9 @@ impl MetalLfm2Model {
         }
 
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        // Shared by plain prefill and the all-logits verifier path.
+        self.ctx
+            .commit_and_wait(cb, "prefill_layers_and_logits_mode");
 
         self.state.seq_len.store(start_pos + n, Ordering::Relaxed);
         state.seq_len = start_pos + n;
@@ -6291,8 +6304,7 @@ impl MetalLfm2Model {
             f(enc);
             enc.end_encoding();
             let t0 = Instant::now();
-            cb.commit();
-            cb.wait_until_completed();
+            self.ctx.commit_and_wait(cb, &name);
             let us = t0.elapsed().as_secs_f64() * 1e6;
             timings.push((name, us));
         });
@@ -6348,8 +6360,8 @@ impl MetalLfm2Model {
             next_idx = idx + 2;
         });
 
-        cb.commit();
-        cb.wait_until_completed();
+        self.ctx
+            .commit_and_wait(cb, "forward_prefill_profiled(gpu)");
 
         let range = metal::NSRange {
             location: 0,
@@ -6597,8 +6609,7 @@ impl MetalLfm2Model {
         let t0 = std::time::Instant::now();
         f(enc);
         enc.end_encoding();
-        cb.commit();
-        cb.wait_until_completed();
+        self.ctx.commit_and_wait(cb, cat);
         let ms = t0.elapsed().as_secs_f64() * 1000.0;
         timer.record(cat, ms);
     }

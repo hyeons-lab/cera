@@ -50,11 +50,9 @@ cblas-sys = { workspace = true, optional = true }
 [target.'cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android")))'.dependencies]
 sha2 = { workspace = true, optional = true, features = ["asm"] }
 
-# `sched_setaffinity` + `cpu_set_t` for pinning the compute thread pool's
-# workers to performance cores. Linux + Android only (Darwin ignores affinity
-# masks, uses QoS); used solely by `backend::threadpool` under the `parallel`
-# feature. Already in the tree transitively, so this adds no new build cost.
-[target.'cfg(any(target_os = "linux", target_os = "android"))'.dependencies]
+# FastRPC dynamic loader on Android/Linux, threadpool core pinning on Linux/Android.
+# Already in the tree transitively, so this adds no new build cost.
+[target.'cfg(unix)'.dependencies]
 libc = "0.2"
 
 # wasm32 portability deps, scoped by sub-target.
@@ -173,6 +171,10 @@ name = "gpu_lfm2_prefill_equivalence"
 required-features = ["mmap"]
 
 [[test]]
+name = "gpu_lfm2_prefill_pass_split"
+required-features = ["mmap"]
+
+[[test]]
 name = "gpu_transformer_parity"
 required-features = ["mmap"]
 
@@ -191,6 +193,11 @@ required-features = ["mmap"]
 [[test]]
 name = "wgpu_moe_prefill_dispatch"
 required-features = ["mmap"]
+
+[[test]]
+name = "wgpu_mul_mat_parity"
+required-features = ["mmap"]
+
 
 [dev-dependencies]
 tempfile.workspace = true
@@ -259,4 +266,6 @@ vl-preprocess = ["dep:image"]
 # (below the crate's current 1.94 MSRV), so this gate is purely about hardware
 # coverage, not toolchain support. No-op on non-x86.
 avx512 = []
+# Qualcomm Hexagon NPU backend (Snapdragon 8 Gen 2 / SM8550+). FastRPC offload to HTP.
+hexagon = ["std-fs"]
 default = ["parallel", "mmap", "std-fs", "disk-cache", "vl-preprocess", "avx512"]

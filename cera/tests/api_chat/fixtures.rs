@@ -61,6 +61,13 @@ pub fn lfm2_5_tokenizer() -> Arc<BpeTokenizer> {
     make_fixture_tokenizer(LFM2_5_TEMPLATE)
 }
 
+/// Small ASCII vocabulary with a thinking-model template: static text plus a
+/// `<think>` prefill on the generation prompt, mirroring what LFM2.5 2.6B-class
+/// templates append after the assistant header.
+pub fn think_prefill_tokenizer() -> Arc<BpeTokenizer> {
+    make_fixture_tokenizer("{{bos_token}}hi{% if add_generation_prompt %}<think>{% endif %}")
+}
+
 #[derive(Default)]
 pub struct Sink {
     pub tokens: Vec<u32>,

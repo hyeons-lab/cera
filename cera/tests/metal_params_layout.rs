@@ -287,11 +287,13 @@ fn slang_params_bytes(src: &str) -> Option<usize> {
     // actually needs it.
     //
     // A `__target_switch` source can declare one params binding per target, as
-    // `rmsnorm.slang` does with `p_wgsl` and `p_metal`, because the two branches
-    // want different layouts. This is the Metal layout test, so take the
-    // `_metal` one; refusing outright (as an earlier revision did) left every
-    // such kernel uncovered, which is worse than the ambiguity it avoided.
-    // Anything else with more than one binding is still ambiguous.
+    // `rmsnorm.slang` does with `p_wgsl` and `p_oop`, because the two branches
+    // want different binding sets. This is the Metal layout test, so take the
+    // metal-side one: the binding whose name carries `_metal`, or `_oop`
+    // since the out-of-place rename. Refusing outright (as an earlier
+    // revision did) left every such kernel uncovered, which is worse than
+    // the ambiguity it avoided. Anything else with more than one binding is
+    // still ambiguous.
     //
     // Before falling back to that, prefer a `uintN` binding when exactly one
     // candidate is vector-typed. A kernel that reads *data* as `uint` (any
@@ -322,7 +324,7 @@ fn slang_params_bytes(src: &str) -> Option<usize> {
         ([only], _) => only,
         (many, _) => *many
             .iter()
-            .find(|l| l.contains("_metal") || l.contains("metal_"))?,
+            .find(|l| l.contains("_metal") || l.contains("metal_") || l.contains("_oop"))?,
     };
     let after = decl.split("StructuredBuffer<uint").nth(1)?;
     let (comp_txt, rest) = after.split_once('>')?;
@@ -844,6 +846,18 @@ fn slang_parser_refuses_to_guess() {
             "[[vk::binding(0)]] StructuredBuffer<uint4> p_wgsl : register(t0);\n\
              [[vk::binding(1)]] StructuredBuffer<uint4> p_metal : register(t1);\n\
              x = p_wgsl[7]; y = p_metal[0];"
+        ),
+        Some(4 * 4)
+    );
+
+    // Same fallback for the out-of-place rename: `rmsnorm.slang` now
+    // declares `p_wgsl` and `p_oop`, both `uint4`, and the metal side is the
+    // `_oop` one.
+    assert_eq!(
+        slang_params_bytes(
+            "[[vk::binding(0)]] StructuredBuffer<uint4> p_wgsl : register(t0);\n\
+             [[vk::binding(1)]] StructuredBuffer<uint4> p_oop : register(t1);\n\
+             x = p_wgsl[7]; y = p_oop[0];"
         ),
         Some(4 * 4)
     );

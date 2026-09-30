@@ -6,7 +6,16 @@
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
+    <!-- The entry below merges into consuming apps (manifest merger):
+         an app's own values win on conflict.
+         - uses-native-library: grants the app linker namespace access to
+           the vendor FastRPC client (on the vendor public list).
+           required=false so devices without it still install; the NPU
+           probe then reports unavailable and callers fall back. -->
     <application>
+        <uses-native-library
+            android:name="libcdsprpc.so"
+            android:required="false" />
         <service
             android:name="com.hyeonslab.cera.android.download.CeraDownloadService"
             android:exported="false"

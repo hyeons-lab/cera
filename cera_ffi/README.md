@@ -3,7 +3,7 @@
 Dart bindings for the [Cera](https://github.com/hyeons-lab/cera) on-device
 inference engine. Runs GGUF language models locally through `dart:ffi`.
 
-> The 0.6.2 API includes chat lifecycle, streaming, checkpoint validation, schema and audio corrections. See the [0.6 API guide](../docs/API_0_6.md) for contracts and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
+> The 0.7.0 API includes chat lifecycle, streaming, checkpoint validation, schema, audio corrections, and Qualcomm Hexagon NPU preference support. See the [API guide](../docs/API_0_6.md) for contracts and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 **Building a Flutter app? Use
 [`cera_ffi_flutter`](https://pub.dev/packages/cera_ffi_flutter) instead.** It
@@ -65,12 +65,12 @@ CERA_FFI_LIB=/absolute/path/to/libcera_ffi.dylib \
 ```
 
 This synchronous path belongs on a worker in UI applications. Use matching
-bindings and native libraries from this checkout when testing 0.6.2; a local
+bindings and native libraries from this checkout when testing 0.7.0; a local
 version bump does not publish a package. The portable async `Cera` facade retains
 its existing API. The native loader's web stubs do not load models in a browser.
 
 Native CPU Session and Chat provide `exportCheckpoint` / `importCheckpoint` and
-file save/load methods. Native Metal/wgpu checkpoints are rejected; the separate
+file save/load methods. Native Metal/Hexagon/wgpu checkpoints are rejected; the separate
 browser WebGPU API owns its own device snapshot path. Older f16/TurboQuant
 snapshots need recreation after the compression fingerprint change. See
 [checkpoint compatibility](../docs/API_0_6.md#checkpoints-and-compatibility).
@@ -201,7 +201,7 @@ print(reply.text);
 
 See [`example/chat.dart`](example/chat.dart) for the complete multi-turn conversational chat workflow.
 
-Native Metal/wgpu models permit one live session per loaded model. Close a raw
+Native Metal/Hexagon/wgpu models permit one live session per loaded model. Close a raw
 session before creating another on that model; reset and cancellation retain
 ownership. CPU sessions can share a model. The portable `Cera` adapter handles
 replacement when applying a seed to an empty conversation and keeps the current
@@ -214,6 +214,37 @@ extra model memory and first-use setup. See the
 [GPU ownership guide](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md)
 and [native consumer](example/gpu_ownership_probe.dart) for runnable fixtures and
 seeded generation, transcription, recovery and continuation checks.
+
+### Qualcomm Hexagon NPU (Android & Linux aarch64)
+
+The native Qualcomm Hexagon NPU backend accelerates inference on Snapdragon chipsets (SM8550+ / v73+) through FastRPC Unsigned PD.
+
+```dart
+// Probe hardware support and capabilities (DSP arch, threads, HVX/HMX units, VTCM):
+try {
+  final probe = hexagonProbe();
+  print('Hexagon NPU available: ${probe.arch} (${probe.threads} threads, ${probe.hvxUnits} HVX units)');
+} catch (e) {
+  print('Hexagon NPU not available: $e');
+}
+
+// Request Hexagon with the portable async API:
+final cera = await Cera.openPath(
+  '/path/to/model.gguf',
+  options: const CeraOptions(backend: CeraBackend.hexagon),
+);
+
+// Or via low-level synchronous EngineConfig:
+final engine = CeraEngine.fromPath(
+  '/path/to/model.gguf',
+  const EngineConfig(
+    contextSize: 2048,
+    backend: BackendPreference.hexagon,
+  ),
+);
+```
+
+For Android apps built with `cera_ffi_flutter`, DSP skeleton libraries are embedded in `libcera_ffi.so` and extracted directly to app storage via `HexagonNpu.setup(context)`. Standalone Dart environments on Linux or Android aarch64 can extract embedded skeletons by calling `hexagonInstallSkels(skelDir)` before probing or model loading.
 
 ### Voice Activity Detection (Silero VAD v5)
 

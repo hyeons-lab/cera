@@ -34,6 +34,6 @@ still get type-checked.
 `chat.dart` continues only after `SessionPhase.turnComplete`. If its token budget
 leaves the turn `interrupted`, it reclaims Session and exits rather than ingesting
 another user message into an incomplete turn. Reset or replace messages to start
-again. See the [0.6 API guide](../../docs/API_0_6.md) for lifecycle, streaming,
+again. See the [API guide](../../docs/API_0_6.md) for lifecycle, streaming,
 schema and checkpoint limits. These native examples require a matching library
 built with `ffi-buffer`; their generated bindings do not run on the web.

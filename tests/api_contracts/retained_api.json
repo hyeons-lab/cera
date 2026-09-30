@@ -28,7 +28,7 @@
         "from_parts": "pub fn from_parts(parts: ModelBytes, cfg: EngineConfig) -> Result<Self, CeraError>",
         "from_path": "pub fn from_path<P: AsRef<Path>>(path: P, cfg: EngineConfig) -> Result<Self, CeraError>",
         "from_reader": "pub fn from_reader<R: Read>(reader: R, cfg: EngineConfig) -> Result<Self, CeraError>",
-        "has_gpu_audio_decoder": "pub fn has_gpu_audio_decoder(&self) -> bool",
+        "has_audio_accelerator": "pub fn has_audio_accelerator(&self) -> bool",
         "has_gpu_audio_encoder": "pub fn has_gpu_audio_encoder(&self) -> bool",
         "has_gpu_vision_encoder": "pub fn has_gpu_vision_encoder(&self) -> bool",
         "manifest": "pub fn manifest(&self) -> &Manifest",
@@ -76,7 +76,7 @@
       "kind": "record",
       "owner": "BackendPreference",
       "retained_home": "Rust core; retain existing engine and raw helpers",
-      "expected": "pub enum BackendPreference { #[default] Auto, Cpu, Gpu, Metal, }"
+      "expected": "pub enum BackendPreference { #[default] Auto, Cpu, Gpu, Metal, Hexagon, }"
     },
     {
       "source": "cera/src/engine.rs",
@@ -151,6 +151,7 @@
         "bos_token": "pub fn bos_token(&self) -> Option<u32>",
         "capabilities": "pub fn capabilities(&self) -> ModalityCapabilities",
         "clear_prefix_cache": "pub fn clear_prefix_cache(&self)",
+        "configure_prefix_cache": "pub fn configure_prefix_cache(&self, cache_dir: Option<String>, max_warm_entries: Option<u32>)",
         "context_size": "pub fn context_size(&self) -> u64",
         "decode_tokens": "pub fn decode_tokens(&self, tokens: Vec<u32>) -> String",
         "default_generate_opts": "pub fn default_generate_opts(&self) -> GenerateOpts",
@@ -201,6 +202,7 @@
       "expected": {
         "append_audio": "pub fn append_audio(&self, samples: Vec<f32>, sample_rate: u32) -> Result<(), FfiError>",
         "append_image": "pub fn append_image(&self, bytes: Vec<u8>, max_long_size: Option<u32>) -> Result<(), FfiError>",
+        "append_raw_image": "pub fn append_raw_image( &self, pixels: Vec<u8>, width: u32, height: u32, format: PixelFormat, max_long_size: Option<u32>, ) -> Result<(), FfiError>",
         "append_text": "pub fn append_text(&self, text: String) -> Result<(), FfiError>",
         "append_tokens": "pub fn append_tokens(&self, tokens: Vec<u32>) -> Result<(), FfiError>",
         "attach_lora": "pub fn attach_lora(&self, adapters: Arc<LoraAdapters>) -> Result<(), FfiError>",
@@ -208,6 +210,8 @@
         "capabilities": "pub fn capabilities(&self) -> ModalityCapabilities",
         "clear_cancel": "pub fn clear_cancel(&self)",
         "default_generate_opts": "pub fn default_generate_opts(&self) -> Result<GenerateOpts, FfiError>",
+        "disable_spec": "pub fn disable_spec(&self) -> Result<(), FfiError>",
+        "enable_spec": "pub fn enable_spec(&self) -> Result<(), FfiError>",
         "export_checkpoint": "pub fn export_checkpoint(&self) -> Result<Vec<u8>, FfiError>",
         "generate": "pub fn generate(&self, opts: GenerateOpts) -> Result<GenerateOutput, FfiError>",
         "generate_async": "pub async fn generate_async( self: Arc<Self>, opts: GenerateOpts, ) -> Result<GenerateOutput, FfiError>",
@@ -221,6 +225,7 @@
         "hidden_states_for_tokens_with_adapters": "pub fn hidden_states_for_tokens_with_adapters( &self, tokens: Vec<u32>, adapters: Vec<LoraAdapterEntry>, ) -> Result<Vec<u8>, FfiError>",
         "hidden_states_mean_pooled": "pub fn hidden_states_mean_pooled(&self, tokens: Vec<u32>) -> Result<Vec<f32>, FfiError>",
         "hidden_states_mean_pooled_with_adapters": "pub fn hidden_states_mean_pooled_with_adapters( &self, tokens: Vec<u32>, adapters: Vec<LoraAdapterEntry>, ) -> Result<Vec<f32>, FfiError>",
+        "image_max_long_size": "pub fn image_max_long_size(&self) -> Result<Option<u32>, FfiError>",
         "import_checkpoint": "pub fn import_checkpoint(&self, data: Vec<u8>) -> Result<(), FfiError>",
         "into_chat": "pub fn into_chat(&self) -> Result<Arc<ChatSession>, FfiError>",
         "load_checkpoint": "pub fn load_checkpoint(&self, path: String) -> Result<(), FfiError>",
@@ -337,7 +342,7 @@
       "kind": "record",
       "owner": "BackendPreference",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
-      "expected": "pub enum BackendPreference { Auto, Cpu, Gpu, Metal, }"
+      "expected": "pub enum BackendPreference { Auto, Cpu, Gpu, Metal, Hexagon, }"
     },
     {
       "source": "cera-ffi/src/lib.rs",
@@ -400,7 +405,7 @@
       "kind": "record",
       "owner": "SessionConfig",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
-      "expected": "pub struct SessionConfig { #[uniffi(default = None)] pub max_seq_len: Option<u32>, #[uniffi(default = None)] pub kv_compression: Option<KvCompression>, #[uniffi(default = 0)] pub n_keep: u32, #[uniffi(default = None)] pub seed: Option<u64>, #[uniffi(default = 512)] pub ubatch_size: u32, #[uniffi(default = false)] pub gpu_depthformer: bool, }"
+      "expected": "pub struct SessionConfig { #[uniffi(default = None)] pub max_seq_len: Option<u32>, #[uniffi(default = None)] pub kv_compression: Option<KvCompression>, #[uniffi(default = 0)] pub n_keep: u32, #[uniffi(default = None)] pub seed: Option<u64>, #[uniffi(default = 512)] pub ubatch_size: u32, #[uniffi(default = false)] pub gpu_depthformer: bool, #[uniffi(default = false)] pub disable_spec: bool, }"
     },
     {
       "source": "cera-ffi/src/lib.rs",
@@ -414,7 +419,7 @@
       "kind": "record",
       "owner": "GenerateOpts",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
-      "expected": "pub struct GenerateOpts { #[uniffi(default = 256)] pub max_tokens: u32, #[uniffi(default = None)] pub seed: Option<u64>, #[uniffi(default = 0.7)] pub temperature: f32, #[uniffi(default = 0.9)] pub top_p: f32, #[uniffi(default = 40)] pub top_k: u32, #[uniffi(default = 0.05)] pub min_p: f32, #[uniffi(default = 1.1)] pub repetition_penalty: f32, #[uniffi(default = [])] pub stop_tokens: Vec<u32>, #[uniffi(default = false)] pub ignore_eos: bool, #[uniffi(default = None)] pub grammar: Option<String>, #[uniffi(default = [])] pub grammar_trigger_tokens: Vec<u32>, #[uniffi(default = 16)] pub flush_every_tokens: u32, #[uniffi(default = 50)] pub flush_every_ms: u32, #[uniffi(default = None)] pub spec: Option<SpecDecodeConfig>, }"
+      "expected": "pub struct GenerateOpts { #[uniffi(default = 256)] pub max_tokens: u32, #[uniffi(default = None)] pub seed: Option<u64>, #[uniffi(default = 0.7)] pub temperature: f32, #[uniffi(default = 0.9)] pub top_p: f32, #[uniffi(default = 40)] pub top_k: u32, #[uniffi(default = 0.05)] pub min_p: f32, #[uniffi(default = 1.1)] pub repetition_penalty: f32, #[uniffi(default = [])] pub stop_tokens: Vec<u32>, #[uniffi(default = false)] pub ignore_eos: bool, #[uniffi(default = None)] pub grammar: Option<String>, #[uniffi(default = [])] pub grammar_trigger_tokens: Vec<u32>, #[uniffi(default = 16)] pub flush_every_tokens: u32, #[uniffi(default = 50)] pub flush_every_ms: u32, #[uniffi(default = None)] pub spec: Option<SpecDecodeConfig>, #[uniffi(default = false)] pub no_spec: bool, }"
     },
     {
       "source": "cera-ffi/src/lib.rs",
@@ -530,6 +535,20 @@
     },
     {
       "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "PixelFormat",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub enum PixelFormat { Rgb8, Rgba8, Bgr8, Bgra8, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "HexagonProbeInfo",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct HexagonProbeInfo { pub arch: String, pub threads: u32, pub hvx_units: u32, pub hmx_units: u32, pub vtcm_bytes: u64, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
       "kind": "functions",
       "owner": "<module>",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
@@ -537,6 +556,8 @@
         "cera_ffi_version": "pub fn cera_ffi_version() -> String",
         "cpu_backend_report": "pub fn cpu_backend_report() -> String",
         "detect_tool_format": "pub fn detect_tool_format(architecture: String) -> Option<ToolFormat>",
+        "hexagon_install_skels": "pub fn hexagon_install_skels(dir: String) -> Result<u32, FfiError>",
+        "hexagon_probe": "pub fn hexagon_probe() -> Result<HexagonProbeInfo, FfiError>",
         "hotword_default_config": "pub fn hotword_default_config() -> FfiHotwordConfig",
         "list_leap_bundles": "pub fn list_leap_bundles() -> Result<Vec<LeapBundleEntry>, FfiError>",
         "list_leap_bundles_async": "pub async fn list_leap_bundles_async() -> Result<Vec<LeapBundleEntry>, FfiError>",

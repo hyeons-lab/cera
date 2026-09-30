@@ -2,13 +2,13 @@
 
 Rust-native LLM inference engine. Load a GGUF, generate text, make it fast.
 
-> The 0.6.2 API corrects chat lifecycle, streaming, checkpoint validation, structured output and audio processing. See the [0.6 API guide](../docs/API_0_6.md) for migration and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
+> The 0.7.0 release adds the native Qualcomm Hexagon NPU backend, dynamic CPU topology discovery and worker threadpool resizing, and core lifecycle enhancements. See the [API guide](../docs/API_0_6.md) for migration and compatibility limits, and [Releases](https://github.com/hyeons-lab/cera/releases) for published builds.
 
 > See the [project README](https://github.com/hyeons-lab/cera) for
 > benchmarks and design notes.
 
 `cera` is the core library: GGUF loading, a quantized CPU kernel stack
-(AVX2/AVX-512, NEON dotprod/i8mm) with optional wgpu GPU and BLAS backends, a
+(AVX2/AVX-512, NEON dotprod/i8mm) with optional wgpu GPU, Qualcomm Hexagon NPU, and BLAS backends, a
 stateful session API with prefix caching, and a streaming token sink. It powers
 the [`cera-cli`](https://github.com/hyeons-lab/cera/tree/main/cera-cli) CLI, the
 [`cera-ffi`](https://github.com/hyeons-lab/cera/tree/main/cera-ffi) mobile
@@ -18,16 +18,19 @@ bindings, and [`cera-wasm`](https://github.com/hyeons-lab/cera/tree/main/cera-wa
 
 ```toml
 [dependencies]
-cera = "0.6"
+cera = "0.7"
 ```
 
-## The 0.6 API
+## The 0.7 Release
 
+- **Qualcomm Hexagon NPU Backend (`cera::backend::hexagon`)**: Opt-in `hexagon` feature flag enabling FastRPC Unsigned Process Domain execution on Qualcomm Snapdragon 8 Gen 2 / 8 Gen 3 / 8 Elite hardware. Features rpcmem DMA zero-copy allocations, 32x32 tiled matrix repacking for Q4_0 and Q8_0 weights, embedded 16 KB page-aligned DSP skeleton libraries with extended ops (Conv1D, ConvTranspose1D, Snake, UnaryStep, Sum), single-flush forward decode, and native acceleration across LLM text, ViT vision, Whisper ASR, and Depthformer vocoders.
+- **Dynamic CPU Topology Discovery & Threadpool Resizing**: Structured CPU set discovery (`UsableCpus::Known`), cgroup cpuset quota and sandbox awareness, set identity comparison across core migrations, and automatic dynamic worker threadpool resizing.
+- **Prompt Tail Prefill Scoping**: Assistant prefill scoping strictly to the rendered prompt tail, preserving state hygiene across conversational turns and session restorations.
 - **Chat coordinator (`cera::session::chat`)**: `Session::into_chat()` transfers execution into `SessionChat`, with delta-only prefill and validated template profiles. Ingest another turn only from `TurnComplete`. Interrupted generation requires reset or replacement before a new user turn; zero-token/no-progress calls can preserve `PromptReady` for retry. Recovery can restore, reset or leave the session unusable. Legacy `Session::append_user_message` is deprecated in favor of this API.
 - **Language-Native Reactive Streaming**: Real-time token and text streaming via `SessionChat::stream_text` in Rust, `AsyncThrowingStream` in Swift, `Flow` in Kotlin, `Iterator[str]` in Python, and `Stream<String>` in Dart, with cancellation isolation across conversation turns.
 - **JSON Schema compiler (`cera::grammar::json_schema_to_gbnf`)**: Compiles a [documented subset](../docs/API_0_6.md#json-schema-constraints) with required/optional properties, bounded arrays, local refs and restricted `allOf` composition. Use `GenerateOpts::with_json_schema`; still check for truncated output and validate constraints outside the supported subset.
 - **First-Class Tool Calling**: Tool definition, schema validation, format detection (LFM2 Pythonic, Hermes/Qwen JSON), `chat.set_tools()`, and `chat.ingest_tool_response()`.
-- **Session checkpoints (`cera::session::checkpoint`)**: CPU Session/Chat snapshots (`CERASCHK` / `CERACHAT`) validate structural identity, KV geometry and compression including the TurboQuant seed. Native Metal/wgpu checkpoints are rejected; browser WebGPU has a separate snapshot path. Recreate pre-0.6.2 f16/TurboQuant checkpoints with old fingerprints. File persistence uses atomic rename.
+- **Session checkpoints (`cera::session::checkpoint`)**: CPU Session/Chat snapshots (`CERASCHK` / `CERACHAT`) validate structural identity, KV geometry and compression including the TurboQuant seed. Native Metal/Hexagon/wgpu checkpoints are rejected; browser WebGPU has a separate snapshot path. Recreate pre-0.6.2 f16/TurboQuant checkpoints with old fingerprints. File persistence uses atomic rename.
 - **Unified Stateful Audio Pipeline (`cera::audio_pipeline::AudioPipeline`)**: Stateful streaming pipeline uniting Silero VAD v5, streaming hotword detection, and Whisper speech-to-text transcription. Features pre-roll ring buffering, max utterance duration chunking that preserves active VAD hidden states across continuation segments, automatic transcription, and wait-free cancellation across FFI boundaries.
 - **Expanded Model Architectures**: Native support for Mamba-2 SSM and hybrid architectures, Gemma 2, Olmo 2, Gemma 4 (PLE and cross-layer KV sharing), Olmo 3 (sliding window and YaRN RoPE), MiniCPM, Nanbeige 4.2, Qwen 3.5 / Ornith 1.0, Ministral 3, Phi-3 / Phi-4-mini, and Ling 3.0 Tiny.
 - **Prefix cache anchors (`cera::kv_cache::KvPrefixCache`)**: Warm memory and optional disk caching with caller-supplied anchor metadata. FlatBuffers v2 persistence retains existing snapshot precision; the engine does not automatically extract anchors or recompress cold entries.
@@ -178,14 +181,14 @@ mmproj encoder for VL bundles, and `Session::append_image` (or
 Verified against LFM2.5-VL-450M. The ViT encode runs on the GPU (native Metal or
 wgpu, selected by `BackendPreference`) with a CPU fallback.
 
-## Sharing a loaded GPU model
+## Sharing a loaded GPU or NPU model
 
-Metal and wgpu permit one live `Session` per loaded model. A second session
-returns `Busy` until the first is dropped; reset and cancellation keep ownership.
+Metal, Hexagon, and wgpu permit one live `Session` per loaded model. A second session
+returns `Busy` until the first is dropped (enforced via `ModelSessionGate`); reset and cancellation keep ownership.
 CPU models continue to support shared weights across concurrent sessions. Load
-separate GPU models for simultaneous conversations. The
+separate GPU or NPU models for simultaneous conversations. The
 [session ownership walkthrough](../docs/internals/API_RESHAPE_GPU_SESSION_EXAMPLES.md) shows the public API, cleanup behavior
-and executable CPU/Metal/wgpu checks.
+and executable checks.
 
 LFM2-Audio transcription during a live GPU conversation uses a cached secondary
 model built from retained weights. This preserves conversation KV and costs
@@ -213,6 +216,30 @@ This synchronous CPU path handles one 30-second chunk. The
 [Swift/Kotlin guide](../docs/internals/API_RESHAPE_WHISPER_EXAMPLES.md) uses the
 standalone FFI object and its background decode method. The unified typed
 Whisper/VAD/hotword loader remains planned separately from the generative API refactor.
+
+## Qualcomm Hexagon NPU Backend (`cera::backend::hexagon`)
+
+The `hexagon` feature flag activates Cera's native Qualcomm Hexagon NPU backend, enabling hardware acceleration on Qualcomm Snapdragon mobile and compute processors (Snapdragon 8 Gen 2, 8 Gen 3, 8 Elite, and next-generation architectures). See the comprehensive [Qualcomm Hexagon NPU Guide](../docs/HEXAGON_NPU.md) for architectural specifications, execution flow, and benchmarks.
+
+### Execution Architecture
+- **FastRPC Unsigned Process Domain**: Executes inside Qualcomm's CDSP unsigned user domain (`/dev/fastrpc-cdsp`), allowing standard non-root Android applications to access HTP matrix coprocessors and HVX vector units.
+- **Zero-Copy Shared Memory**: Allocates all weights, activations, and KV cache slabs in `rpcmem` DMA-BUF buffers shared directly between CPU and CDSP address spaces, bypassing bus copy bottlenecks.
+- **Dynamic Device Probing**: Automatically detects device architecture (`v73`, `v75`, `v79`, `v81`, `v85`) via `HexagonDevice::probe()` and loads the matching embedded skeleton library.
+
+### Embedded Skeleton Libraries & Extended Operators
+The backend embeds prebuilt 16 KB page-aligned Hexagon ELF dynamic libraries (`libggml-htp-v{73,75,79,81,85}.so`) and extracts them to application storage at runtime. Key additions in 0.7.0 include:
+- **Extended Operator Set**:
+  - `Conv1D`: 1D convolution with configurable dilation, stride, and padding for waveform audio encoding and speech processing.
+  - `ConvTranspose1D`: Transposed 1D convolution for speech decoders and vocoder audio reconstruction.
+  - `Snake` / `Snake1D`: Sinusoidal activation function ($\sin^2(\alpha x)$) for neural vocoders.
+  - `UnaryStep` and `Sum`: Element-wise step activations and reductions executing directly on HVX vector units.
+- **ABI Opcode Alignment**: Realigned `HtpOpCode` discriminants with the v85 DSP firmware ABI (`UnaryStep = 21`, `Sum = 39`, `Cpy = 32`, `Scale = 33`, `Conv1d = 40`, `Snake = 41`), preventing opcode displacement.
+
+### Accelerated Kernels & Subsystems
+- **LLM Text Generation (`HexagonLfm2Model`)**: 32x32 tiled Q4_0 and Q8_0 matrix repacking for HTP hardware, single-flush forward decode eliminating ~22 synchronization boundaries per token, ping-pong scratch memory isolation across layers, static batch template caching for zero-allocation dispatch, FastRPC latency QoS (`FASTRPC_CONTROL_LATENCY = 100 µs`), and Q8_0 quantized KV cache (~47% memory reduction over F16).
+- **Multimodal Vision Transformer (`HexagonVisionEncoder`)**: Consolidates all 24 ViT blocks into a single FastRPC batch submission with on-NPU Flash Attention, F16 KV scratch handling, and quantized MLP projector dispatch.
+- **Speech Recognition (`HexagonWhisperModel`)**: Partitions 1,500-token audio sequences into 64-token tiles across all Conv1D, LayerNorm, linear GEMM, and GELU dispatches to satisfy Snapdragon 8 Elite's 8 MB physical VTCM hardware ceiling, paired with FlashAttnExt autoregressive decode.
+- **Vocoder & Audio Synthesis (`HexagonAudioDecoder` / `HexagonDepthformer`)**: `HexagonDepthformer` executes all 8 autoregressive passes (48 transformer layers per audio frame) entirely on the NPU using HTP GEMV, RMSNorm, RoPE, and FlashAttnExt, alongside on-DSP audio detokenization (LayerNorm, linear GEMM, SwiGLU, Conv1D), delivering 36.67 tok/s on Snapdragon 8 Elite (1.59x faster than Leap CPU).
 
 ## API refactor examples
 
@@ -411,14 +438,17 @@ batch where a sequential loop forwards one token at a time, and the two
 reduction orders can pick opposite sides of a near-tie. It engages only on the
 plain greedy path (`temperature <= 0` or `top_k == 1`, no grammar), with a model
 that reports `supports_all_logits()`, an uncompressed (f32/f16) KV cache, and no
-audio decoder. CPU dense transformers and LFM2, native Metal models, and wgpu
-models with batched prefill and compatible matrix weights advertise this
-capability. Configurations excluded by these gates use normal decode. Backend
-rewind support and the draft size still constrain execution; benchmark with the
-intended model/backend rather than assuming a speedup.
+audio decoder. CPU dense transformers and LFM2, native Metal models, Qualcomm Hexagon
+NPU (`HexagonLfm2Model`), and wgpu models with batched prefill advertise this
+capability. Speculative decoding defaults to disabled (off) unless explicitly configured
+via `opts.spec` or when a draft sidecar model is present. Setting `opts.no_spec = true`,
+configuring `SessionConfig::disable_spec`, or calling `session.disable_spec()` disables
+speculative decoding across all execution paths. Configurations excluded by these gates
+use normal decode. Backend rewind support and the draft size still constrain execution;
+benchmark with the intended model/backend rather than assuming a speedup.
 
-The CLI exposes prompt-lookup knobs on `bench` (`--spec`, `--spec-ngram`,
-`--spec-k`). `run` and `chat` expose separate draft-model options.
+The CLI exposes speculative decoding knobs across `run`, `chat`, and `bench`
+(`--spec`, `--no-spec`, `--spec-ngram`, `--spec-k`, and `--draft`).
 
 ## Tool calling
 
@@ -531,6 +561,7 @@ shrink the crate for `wasm32-unknown-unknown` or embedded targets
 | `avx512` | ✅ | x86-64 AVX-512 Q8_0/Q4_0 tier (needs Rust 1.89+) |
 | `gpu` | - | wgpu compute backend |
 | `metal` | - | Apple Metal backend (⇒ `mmap`) |
+| `hexagon` | - | Qualcomm Hexagon NPU backend on Snapdragon (FastRPC offload to HTP, ⇒ `std-fs`) |
 | `blas` | - | Opt-in GEMM accelerator |
 | `remote` | - | `BundleRepo` HTTP download + SHA-256 (⇒ `std-fs`) |
 

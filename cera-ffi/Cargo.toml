@@ -51,6 +51,9 @@ blas = ["cera/blas"]
 # Light up cera's wgpu GPU backend in the built cdylib/staticlib.
 gpu = ["cera/gpu"]
 
+# Light up Qualcomm Hexagon NPU backend in the built cdylib/staticlib.
+hexagon = ["cera/hexagon"]
+
 # Opt-in feature for the Dart/Flutter bindings (cera_ffi_flutter). The Dart
 # generator (uniffi-bindgen-dart) calls `uniffi_ffibuffer_*` trampolines —
 # extra scaffolding functions that pass args/returns through an FfiBuffer —
@@ -82,7 +85,7 @@ tokio = { version = "1", default-features = false, features = ["rt", "rt-multi-t
 # `sha2` + `std-fs` — the downloader + per-file SHA-256 verifier.
 # Default features (`parallel`, `mmap`, `std-fs`, `disk-cache`) stay
 # on; `CeraEngine::from_bundle_id` requires both `remote` and `mmap`.
-cera = { path = "../cera", version = "0.6.3", features = ["remote"] }
+cera = { path = "../cera", version = "0.7.0", features = ["remote"] }
 # Tool-calling FFI marshals JSON Schemas / tool-call arguments as JSON strings
 # across the boundary (UniFFI has no `serde_json::Value` type).
 serde_json.workspace = true

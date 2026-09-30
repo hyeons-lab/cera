@@ -179,7 +179,7 @@ final class ChatViewModel: ObservableObject {
 
         do {
             // Render the whole conversation, then feed it as one prefill. We
-            // reset first so the KV cache doesn't double-count earlier turns —
+            // reset first so the KV cache doesn't double-count earlier turns:
             // simplest correct approach for an example (re-prefills each turn).
             let prompt = try engine.applyChatTemplate(messages: history,
                                                       addGenerationPrompt: true)
@@ -226,31 +226,30 @@ final class ChatViewModel: ObservableObject {
     }
 }
 
-/// `ModalitySink` that turns streamed token IDs into display text on the fly.
+/// `ModalitySink` that turns streamed text chunks into display text on the fly.
 ///
 /// The FFI calls these methods on the decode worker thread. We accumulate the
-/// raw token IDs here (single-threaded within one generate call, so no locking
-/// needed), decode the full run each time — `decodeTokens` reassembles
-/// multi-byte UTF-8 / BPE merges correctly, which per-token decoding can split
-/// — and forward the text to the main actor via `onDisplay`.
+/// streamed text chunks here (single-threaded within one generate call, so no locking
+/// needed) and forward the cumulative text to the main actor via `onDisplay`.
 final class StreamingTextSink: ModalitySink, @unchecked Sendable {
     /// Exposed so the view model can `cancel()` an in-flight decode.
     let session: Session?
-    private let engine: CeraEngine
     private let onDisplay: (String) -> Void
-    private var tokens: [UInt32] = []
+    private var accumulatedText: String = ""
 
-    init(engine: CeraEngine, session: Session, onDisplay: @escaping (String) -> Void) {
-        self.engine = engine
+    init(engine: CeraEngine? = nil, session: Session? = nil, onDisplay: @escaping (String) -> Void) {
+        _ = engine
         self.session = session
         self.onDisplay = onDisplay
     }
 
-    func onTextTokens(tokens newTokens: [UInt32]) {
-        tokens.append(contentsOf: newTokens)
-        // Drop special/control tokens (e.g. <|im_end|>) from the visible text.
-        let visible = tokens.filter { !engine.isSpecialToken(id: $0) }
-        onDisplay(engine.decodeTokens(tokens: visible))
+    func onThoughtChunk(text: String) {
+        // Reasoning tokens can be handled separately; ignored for standard chat display.
+    }
+
+    func onTextChunk(text: String) {
+        accumulatedText.append(text)
+        onDisplay(accumulatedText)
     }
 
     func onAudioFrames(pcm: [Float], sampleRate: UInt32) {

@@ -91,6 +91,10 @@
 
 use std::sync::Arc;
 
+use cera::session::chat::{
+    THINK_CLOSE_TAGS as CLOSE_THOUGHT_TAGS, THINK_OPEN_TAGS as OPEN_THOUGHT_TAGS,
+};
+
 uniffi::setup_scaffolding!();
 
 mod audio_pipeline;
@@ -365,13 +369,15 @@ impl From<&cera::CeraError> for FfiError {
 /// annotations.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
 pub enum BackendPreference {
-    /// Probe Metal → GPU → CPU at load time.
+    /// Probe Metal / Hexagon / GPU / CPU at load time.
     Auto,
     Cpu,
     /// `wgpu` (Vulkan / Metal / DX12). Requires the `gpu` feature.
     Gpu,
     /// Native Metal. Requires the `metal` feature + macOS.
     Metal,
+    /// Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
+    Hexagon,
 }
 
 impl From<BackendPreference> for cera::BackendPreference {
@@ -381,6 +387,7 @@ impl From<BackendPreference> for cera::BackendPreference {
             BackendPreference::Cpu => cera::BackendPreference::Cpu,
             BackendPreference::Gpu => cera::BackendPreference::Gpu,
             BackendPreference::Metal => cera::BackendPreference::Metal,
+            BackendPreference::Hexagon => cera::BackendPreference::Hexagon,
         }
     }
 }
@@ -392,7 +399,119 @@ impl From<cera::BackendPreference> for BackendPreference {
             cera::BackendPreference::Cpu => BackendPreference::Cpu,
             cera::BackendPreference::Gpu => BackendPreference::Gpu,
             cera::BackendPreference::Metal => BackendPreference::Metal,
+            cera::BackendPreference::Hexagon => BackendPreference::Hexagon,
         }
+    }
+}
+
+/// Supported pixel layouts for uncompressed raw image buffers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Enum)]
+pub enum PixelFormat {
+    /// 24-bit RGB (3 bytes per pixel: Red, Green, Blue).
+    Rgb8,
+    /// 32-bit RGBA (4 bytes per pixel: Red, Green, Blue, Alpha).
+    Rgba8,
+    /// 24-bit BGR (3 bytes per pixel: Blue, Green, Red).
+    Bgr8,
+    /// 32-bit BGRA (4 bytes per pixel: Blue, Green, Red, Alpha).
+    Bgra8,
+}
+
+impl From<PixelFormat> for cera::PixelFormat {
+    fn from(f: PixelFormat) -> Self {
+        match f {
+            PixelFormat::Rgb8 => Self::Rgb8,
+            PixelFormat::Rgba8 => Self::Rgba8,
+            PixelFormat::Bgr8 => Self::Bgr8,
+            PixelFormat::Bgra8 => Self::Bgra8,
+        }
+    }
+}
+
+impl From<cera::PixelFormat> for PixelFormat {
+    fn from(f: cera::PixelFormat) -> Self {
+        match f {
+            cera::PixelFormat::Rgb8 => Self::Rgb8,
+            cera::PixelFormat::Rgba8 => Self::Rgba8,
+            cera::PixelFormat::Bgr8 => Self::Bgr8,
+            cera::PixelFormat::Bgra8 => Self::Bgra8,
+        }
+    }
+}
+
+/// Successful Hexagon NPU probe: the working DSP architecture plus
+/// hardware capabilities. See [`hexagon_probe`].
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct HexagonProbeInfo {
+    /// DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`, `"V85"`).
+    pub arch: String,
+    pub threads: u32,
+    pub hvx_units: u32,
+    pub hmx_units: u32,
+    pub vtcm_bytes: u64,
+}
+
+/// Map a core probe result onto the FFI record. Factored out of
+/// [`hexagon_probe`] so the wire mapping (especially `arch`) is testable
+/// without FastRPC hardware.
+#[cfg(feature = "hexagon")]
+fn probe_info_from(p: &cera::backend::hexagon::HexagonProbe) -> HexagonProbeInfo {
+    HexagonProbeInfo {
+        arch: p.arch.short_name().to_string(),
+        threads: p.n_threads,
+        hvx_units: p.n_hvx,
+        hmx_units: p.n_hmx,
+        vtcm_bytes: p.vtcm_bytes,
+    }
+}
+
+/// Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
+/// tries each bundled DSP skel, and returns the first working device's
+/// capabilities (then closes it). Fails when the `hexagon` feature is
+/// off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
+/// unavailable to this process. On Android, call the AAR's
+/// `HexagonNpu.setup` first so the loader can find the skel files
+/// (JVM/desktop flows use [`hexagon_install_skels`] instead).
+#[uniffi::export]
+pub fn hexagon_probe() -> Result<HexagonProbeInfo, FfiError> {
+    #[cfg(feature = "hexagon")]
+    {
+        Ok(probe_info_from(&cera::backend::hexagon::probe()?))
+    }
+    #[cfg(not(feature = "hexagon"))]
+    {
+        Err(FfiError::Backend {
+            detail: "Hexagon backend not available (built without the hexagon feature)".into(),
+        })
+    }
+}
+
+/// Write the embedded DSP skels into `dir` (created private, mode 0700, if
+/// missing) and point FastRPC's loader at it. An existing `dir` that another
+/// user owns, or that is writable by "other", is refused with `Backend`, since
+/// the loader executes what is in it. Caller stages a private writable directory;
+/// on Android, the `HexagonNpu.setup` helper invokes this function to extract
+/// skels into the application's internal files directory (`cera_skels`) and
+/// configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
+/// or loading a model with [`BackendPreference::Hexagon`]. Returns the
+/// number of skels written (0 when all were already present and fresh).
+/// Re-running is cheap and idempotent (files are only rewritten when
+/// their bytes differ, and the loader path is not duplicated). A `dir`
+/// containing `;`, `=` or NUL is rejected: it would silently split or corrupt
+/// the loader's search path.
+#[uniffi::export]
+pub fn hexagon_install_skels(dir: String) -> Result<u32, FfiError> {
+    #[cfg(feature = "hexagon")]
+    {
+        let n = cera::backend::hexagon::install_skels(std::path::Path::new(&dir))?;
+        Ok(n as u32)
+    }
+    #[cfg(not(feature = "hexagon"))]
+    {
+        let _ = dir;
+        Err(FfiError::Backend {
+            detail: "Hexagon backend not available (built without the hexagon feature)".into(),
+        })
     }
 }
 
@@ -418,7 +537,9 @@ pub struct EngineConfig {
     /// Optional path to a DSpark speculative draft model GGUF file.
     #[uniffi(default = None)]
     pub draft_model: Option<String>,
-    /// Whether to prefer GPU depthformer for audio decoder generation.
+    /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+    /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+    /// depthformer regardless of this flag.
     #[uniffi(default = false)]
     pub gpu_depthformer: bool,
 }
@@ -1351,6 +1472,21 @@ impl CeraEngine {
         self.inner.clear_cache();
     }
 
+    /// Configure the model's KV prefix cache.
+    ///
+    /// When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+    /// When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+    pub fn configure_prefix_cache(&self, cache_dir: Option<String>, max_warm_entries: Option<u32>) {
+        let mut cfg = cera::kv_cache::KvCacheConfig {
+            cache_dir: cache_dir.map(std::path::PathBuf::from),
+            ..Default::default()
+        };
+        if let Some(warm) = max_warm_entries {
+            cfg.max_warm_entries = warm as usize;
+        }
+        self.inner.configure_cache(cfg);
+    }
+
     /// Detect PII entity spans in text using the loaded token classification model.
     pub fn detect_pii(&self, text: String) -> Result<Vec<FfiEntitySpan>, FfiError> {
         let spans = self.inner.detect_pii(&text)?;
@@ -1429,9 +1565,14 @@ pub struct SessionConfig {
     /// Chunked-prefill ubatch size. `0` = monolithic prefill.
     #[uniffi(default = 512)]
     pub ubatch_size: u32,
-    /// Whether to prefer GPU depthformer for audio decoder generation.
+    /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+    /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+    /// depthformer regardless of this flag.
     #[uniffi(default = false)]
     pub gpu_depthformer: bool,
+    /// Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+    #[uniffi(default = false)]
+    pub disable_spec: bool,
 }
 
 impl Default for SessionConfig {
@@ -1450,6 +1591,7 @@ impl Default for SessionConfig {
             seed: core.seed,
             ubatch_size: core.ubatch_size,
             gpu_depthformer: core.gpu_depthformer,
+            disable_spec: core.disable_spec,
         }
     }
 }
@@ -1465,6 +1607,7 @@ impl From<SessionConfig> for cera::SessionConfig {
             seed: c.seed,
             ubatch_size: c.ubatch_size,
             gpu_depthformer: c.gpu_depthformer,
+            disable_spec: c.disable_spec,
         }
     }
 }
@@ -1570,6 +1713,9 @@ pub struct GenerateOpts {
     /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
     #[uniffi(default = None)]
     pub spec: Option<SpecDecodeConfig>,
+    /// Disable speculative decoding (even when a draft sidecar model is present).
+    #[uniffi(default = false)]
+    pub no_spec: bool,
 }
 
 impl From<&cera::GenerateOpts> for GenerateOpts {
@@ -1591,6 +1737,7 @@ impl From<&cera::GenerateOpts> for GenerateOpts {
             flush_every_tokens: core.flush_every_tokens,
             flush_every_ms: core.flush_every_ms,
             spec: core.spec.map(SpecDecodeConfig::from),
+            no_spec: core.no_spec,
         }
     }
 }
@@ -1637,6 +1784,7 @@ impl TryFrom<GenerateOpts> for cera::GenerateOpts {
             flush_every_tokens: o.flush_every_tokens,
             flush_every_ms: o.flush_every_ms,
             spec: o.spec.map(cera::SpecDecode::from),
+            no_spec: o.no_spec,
         })
     }
 }
@@ -1794,9 +1942,6 @@ pub trait ModalitySink: Send + Sync {
     fn on_done(&self, reason: FinishReason);
 }
 
-const OPEN_THOUGHT_TAGS: &[&str] = &["<think>", "<thought>", "<|thought_start|>"];
-const CLOSE_THOUGHT_TAGS: &[&str] = &["</think>", "</thought>", "<|thought_end|>"];
-
 fn find_thought_tag<'a>(text: &str, tags: &[&'a str]) -> Option<(usize, &'a str)> {
     tags.iter()
         .filter_map(|&tag| text.find(tag).map(|pos| (pos, tag)))
@@ -1837,35 +1982,77 @@ impl StreamingThinkingParser {
         }
     }
 
+    /// Parser starting inside a thinking block, for prompts that prefill
+    /// the opener (see `cera::session::chat::prompt_prefills_think`): the
+    /// first generated tokens are reasoning with no opener in the stream.
+    fn new_thinking() -> Self {
+        Self {
+            state: ThinkingState::Thinking,
+            buffer: String::new(),
+        }
+    }
+
     fn feed(&mut self, chunk: &str) -> Vec<(bool, String)> {
         self.buffer.push_str(chunk);
         let mut emissions = Vec::new();
 
         loop {
-            let (tags, is_thought, next_state) = match self.state {
-                ThinkingState::Content => (OPEN_THOUGHT_TAGS, false, ThinkingState::Thinking),
-                ThinkingState::Thinking => (CLOSE_THOUGHT_TAGS, true, ThinkingState::Content),
-            };
-
-            if let Some((pos, tag)) = find_thought_tag(&self.buffer, tags) {
-                if pos > 0 {
-                    let text = self.buffer[..pos].to_string();
-                    emissions.push((is_thought, text));
+            match self.state {
+                ThinkingState::Thinking => {
+                    if let Some((pos, tag)) = find_thought_tag(&self.buffer, CLOSE_THOUGHT_TAGS) {
+                        if pos > 0 {
+                            emissions.push((true, self.buffer[..pos].to_string()));
+                        }
+                        self.buffer.drain(..pos + tag.len());
+                        self.state = ThinkingState::Content;
+                        continue;
+                    }
+                    let hold = thought_partial_suffix_len(&self.buffer, CLOSE_THOUGHT_TAGS);
+                    let safe_len = self.buffer.len() - hold;
+                    if safe_len > 0 {
+                        emissions.push((true, self.buffer[..safe_len].to_string()));
+                        self.buffer.drain(..safe_len);
+                    }
+                    break;
                 }
-                let tag_len = tag.len();
-                self.buffer.drain(..pos + tag_len);
-                self.state = next_state;
-                continue;
-            }
+                ThinkingState::Content => {
+                    // In content state, a close tag before any opener is stray (the
+                    // opener was prefilled and consumed at ingest, or the model
+                    // emitted a bare closer): drop it rather than leaking markup
+                    // into the answer.
+                    let open = find_thought_tag(&self.buffer, OPEN_THOUGHT_TAGS);
+                    let close = find_thought_tag(&self.buffer, CLOSE_THOUGHT_TAGS);
+                    let open_pos = open.map(|(pos, _)| pos);
 
-            let hold = thought_partial_suffix_len(&self.buffer, tags);
-            let safe_len = self.buffer.len() - hold;
-            if safe_len > 0 {
-                let text = self.buffer[..safe_len].to_string();
-                self.buffer.drain(..safe_len);
-                emissions.push((is_thought, text));
+                    if let Some((close_pos, close_tag)) = close
+                        && open_pos.is_none_or(|open_idx| close_pos < open_idx)
+                    {
+                        if close_pos > 0 {
+                            emissions.push((false, self.buffer[..close_pos].to_string()));
+                        }
+                        self.buffer.drain(..close_pos + close_tag.len());
+                        continue;
+                    }
+
+                    if let Some((pos, tag)) = open {
+                        if pos > 0 {
+                            emissions.push((false, self.buffer[..pos].to_string()));
+                        }
+                        self.buffer.drain(..pos + tag.len());
+                        self.state = ThinkingState::Thinking;
+                        continue;
+                    }
+
+                    let hold = thought_partial_suffix_len(&self.buffer, OPEN_THOUGHT_TAGS)
+                        .max(thought_partial_suffix_len(&self.buffer, CLOSE_THOUGHT_TAGS));
+                    let safe_len = self.buffer.len() - hold;
+                    if safe_len > 0 {
+                        emissions.push((false, self.buffer[..safe_len].to_string()));
+                        self.buffer.drain(..safe_len);
+                    }
+                    break;
+                }
             }
-            break;
         }
 
         emissions
@@ -1900,11 +2087,27 @@ impl ForeignSinkAdapter {
         inner: Arc<dyn ModalitySink>,
         tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
     ) -> Self {
+        Self::new_with_initial_thinking(inner, tokenizer, false)
+    }
+
+    /// Adapter whose thinking parser starts inside a thinking block when
+    /// `thinking` is set. Chat callers pass the session's
+    /// [`cera::session::chat::Chat::prefilled_think`]; raw sessions have no
+    /// prompt introspection and keep the content default.
+    pub(crate) fn new_with_initial_thinking(
+        inner: Arc<dyn ModalitySink>,
+        tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
+        thinking: bool,
+    ) -> Self {
         Self {
             inner,
             tokenizer,
             pending_bytes: Vec::new(),
-            parser: StreamingThinkingParser::new(),
+            parser: if thinking {
+                StreamingThinkingParser::new_thinking()
+            } else {
+                StreamingThinkingParser::new()
+            },
             done_called: false,
             done_reason: None,
         }
@@ -2272,8 +2475,9 @@ impl Session {
     ///   includes both "manifest didn't list a mmproj" (no warn
     ///   logged) and "mmproj listed but failed to open/parse"
     ///   (warn logged at `CeraEngine::from_path`).
-    /// - `ContextOverflow` / `Cancelled` propagate from the
-    ///   underlying prefill.
+    /// - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+    ///   underlying prefill (a backend fault recorded mid-prefill surfaces
+    ///   as `Backend`, not `Cancelled`).
     pub fn append_audio(&self, samples: Vec<f32>, sample_rate: u32) -> Result<(), FfiError> {
         if samples.is_empty() {
             return Err(FfiError::EmptyInput);
@@ -2307,7 +2511,7 @@ impl Session {
     ///
     /// Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
     /// doesn't implement hidden-state extraction; `InvalidToken` if any id is
-    /// `>= vocab_size`.
+    /// `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
     pub fn hidden_states_for_tokens(&self, tokens: Vec<u32>) -> Result<Vec<u8>, FfiError> {
         let hs = self.lock_inner()?.hidden_states_for_tokens(&tokens)?;
         Ok(f32_vec_to_le_bytes(&hs))
@@ -2483,8 +2687,9 @@ impl Session {
     /// - `Backend(...)` for image decode failure, missing vision
     ///   encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
     ///   mismatch.
-    /// - `ContextOverflow` / `Cancelled` propagate from the
-    ///   underlying prefill.
+    /// - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+    ///   underlying prefill (a backend fault recorded mid-prefill surfaces
+    ///   as `Backend`, not `Cancelled`).
     pub fn append_image(&self, bytes: Vec<u8>, max_long_size: Option<u32>) -> Result<(), FfiError> {
         // Delegate to the core methods (rather than always calling
         // `append_image_with_opts`) so the session default stays
@@ -2503,17 +2708,59 @@ impl Session {
         Ok(())
     }
 
+    /// Append an uncompressed raw image buffer to the session context.
+    ///
+    /// `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+    /// `width` and `height` specify the source image dimensions in pixels.
+    /// `max_long_size` controls edge resizing: `None` uses the session default,
+    /// `Some(0)` disables resizing to keep original dimensions, and `Some(n)`
+    /// constrains the longest edge to at most `n` pixels.
+    /// Automatically applies aspect-preserving resizing and normalization,
+    /// then encodes with the vision encoder and appends image tokens.
+    ///
+    /// # Errors
+    ///
+    /// - `EmptyInput` if the buffer is empty or a dimension is 0.
+    /// - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+    ///   (extra trailing bytes are ignored).
+    /// - `Preprocess` if image normalization fails.
+    /// - `UnsupportedModality` if vision encoding is unsupported on this session.
+    /// - `Backend` for missing vision encoder, projection dimension mismatch,
+    ///   or backend execution failure during encoding or prefill.
+    /// - `ContextOverflow` if appending image tokens exceeds context limit.
+    /// - `Cancelled` if execution is interrupted.
+    /// - `PoisonedSession` if the session lock is poisoned.
+    pub fn append_raw_image(
+        &self,
+        pixels: Vec<u8>,
+        width: u32,
+        height: u32,
+        format: PixelFormat,
+        max_long_size: Option<u32>,
+    ) -> Result<(), FfiError> {
+        let mut inner = self.lock_inner()?;
+        match max_long_size {
+            None => inner.append_raw_image(&pixels, width, height, format.into()),
+            Some(0) => {
+                inner.append_raw_image_with_opts(&pixels, width, height, format.into(), None)
+            }
+            Some(n) => {
+                inner.append_raw_image_with_opts(&pixels, width, height, format.into(), Some(n))
+            }
+        }?;
+        Ok(())
+    }
+
     /// Set a session-default cap on the longest side of an appended
-    /// image, in pixels (`None` = no cap). Unlike the per-call
-    /// `max_long_size` argument to [`Self::append_image`], this default
-    /// is honored by every image-append path the session drives —
-    /// including chat-template flows — so a host can configure the
-    /// image-encode budget once. See [`Self::append_image`] for the cap
-    /// semantics (shrinks the encoded target, never upscales, takes
-    /// precedence over the model's minimum-resolution floor).
+    /// image, in pixels (`None` = no cap).
     pub fn set_image_max_long_size(&self, max_long_size: Option<u32>) -> Result<(), FfiError> {
         self.lock_inner()?.set_image_max_long_size(max_long_size);
         Ok(())
+    }
+
+    /// Read the session-default cap on the longest side of an appended image, if any.
+    pub fn image_max_long_size(&self) -> Result<Option<u32>, FfiError> {
+        Ok(self.lock_inner()?.image_max_long_size())
     }
 
     /// Returns default `GenerateOpts` for this session, pre-populated with
@@ -2824,6 +3071,20 @@ impl Session {
     pub fn import_checkpoint(&self, data: Vec<u8>) -> Result<(), FfiError> {
         let cp = cera::session::SessionCheckpoint::from_bytes(&data)?;
         self.lock_inner()?.restore(&cp)?;
+        Ok(())
+    }
+
+    /// Explicitly disable speculative decoding for this session. An attached
+    /// drafter is kept, so [`Self::enable_spec`] restores it.
+    pub fn disable_spec(&self) -> Result<(), FfiError> {
+        self.lock_inner()?.disable_spec();
+        Ok(())
+    }
+
+    /// Re-enable speculative decoding for this session (if previously
+    /// disabled), using the attached drafter if there is one.
+    pub fn enable_spec(&self) -> Result<(), FfiError> {
+        self.lock_inner()?.enable_spec();
         Ok(())
     }
 
@@ -4092,6 +4353,44 @@ impl PiiClassifier {
 mod tests {
     use super::*;
 
+    /// Pins the FFI `arch` wire strings end to end: the literals plus the
+    /// field mapping in `probe_info_from` (a hardcoded `arch` or swapped
+    /// field fails here). NOTE: a revert to `format!("{:?}", …)` passes
+    /// this test (derived `Debug` of these unit variants is value-equal to
+    /// `short_name()`), so the mapping line itself is guarded by review,
+    /// not by this assertion. Constructing `HexagonProbe` directly needs
+    /// no FastRPC hardware (all fields are pub).
+    #[cfg(feature = "hexagon")]
+    #[test]
+    fn probe_arch_wire_names_pinned() {
+        use cera::backend::hexagon::{HexagonArch, HexagonProbe};
+        for (arch, want) in [
+            (HexagonArch::V73, "V73"),
+            (HexagonArch::V75, "V75"),
+            (HexagonArch::V79, "V79"),
+            (HexagonArch::V81, "V81"),
+            (HexagonArch::V85, "V85"),
+        ] {
+            let info = probe_info_from(&HexagonProbe {
+                arch,
+                n_threads: 4,
+                n_hvx: 2,
+                n_hmx: 1,
+                vtcm_bytes: 1024,
+            });
+            assert_eq!(info.arch, want);
+            assert_eq!(
+                (
+                    info.threads,
+                    info.hvx_units,
+                    info.hmx_units,
+                    info.vtcm_bytes
+                ),
+                (4, 2, 1, 1024)
+            );
+        }
+    }
+
     #[test]
     fn version_is_non_empty() {
         // Smoke test: proves the proc-macro expanded and the export is
@@ -4334,6 +4633,7 @@ mod tests {
             BackendPreference::Cpu,
             BackendPreference::Gpu,
             BackendPreference::Metal,
+            BackendPreference::Hexagon,
         ] {
             let core: cera::BackendPreference = ffi.into();
             let back: BackendPreference = core.into();
@@ -4533,6 +4833,7 @@ mod tests {
         assert_eq!(core.seed, default_core.seed);
         assert_eq!(core.ubatch_size, default_core.ubatch_size);
         assert_eq!(core.gpu_depthformer, default_core.gpu_depthformer);
+        assert_eq!(core.disable_spec, default_core.disable_spec);
     }
 
     #[test]
@@ -4766,6 +5067,102 @@ mod tests {
 
         let flushed = parser.flush();
         assert!(flushed.is_none());
+    }
+
+    #[test]
+    fn thinking_parser_prefilled_start_routes_to_thought() {
+        // Prefilled `<think>` (consumed at ingest, never in the stream):
+        // reasoning arrives with no opener and must still route to thought.
+        let mut parser = StreamingThinkingParser::new_thinking();
+        let out = parser.feed("Reasoning step 1. ");
+        assert_eq!(out, vec![(true, "Reasoning step 1. ".to_string())]);
+        let out = parser.feed("done.</think>Final answer.");
+        assert_eq!(
+            out,
+            vec![
+                (true, "done.".to_string()),
+                (false, "Final answer.".to_string()),
+            ]
+        );
+        assert!(parser.flush().is_none());
+    }
+
+    #[test]
+    fn thinking_parser_drops_stray_closer_in_content() {
+        // Bare `</think>` with no opener (untemplated spill, or the tail of
+        // a prefilled block the session did not flag): dropped, never
+        // leaked into the answer.
+        let mut parser = StreamingThinkingParser::new();
+        let out = parser.feed("Answer.</think> More.");
+        assert_eq!(
+            out,
+            vec![
+                (false, "Answer.".to_string()),
+                (false, " More.".to_string()),
+            ]
+        );
+        assert!(parser.flush().is_none());
+
+        // Split across feeds: the partial closer is held, then dropped whole.
+        let mut parser = StreamingThinkingParser::new();
+        let out = parser.feed("Answer.</th");
+        assert_eq!(out, vec![(false, "Answer.".to_string())]);
+        let out = parser.feed("ink> More.");
+        assert_eq!(out, vec![(false, " More.".to_string())]);
+        assert!(parser.flush().is_none());
+    }
+
+    #[test]
+    fn adapter_prefilled_thinking_routes_tokens_to_thought() {
+        use cera::ModalitySink as CoreSink;
+        use std::sync::Mutex;
+
+        #[derive(Default)]
+        struct Recorder {
+            thought: Mutex<Vec<String>>,
+            text: Mutex<Vec<String>>,
+        }
+
+        impl ModalitySink for Recorder {
+            fn on_thought_chunk(&self, text: String) {
+                self.thought.lock().unwrap().push(text);
+            }
+            fn on_text_chunk(&self, text: String) {
+                self.text.lock().unwrap().push(text);
+            }
+            fn on_audio_frames(&self, _pcm: Vec<f32>, _sample_rate: u32) {}
+            fn on_done(&self, _reason: FinishReason) {}
+        }
+
+        let vocab = vec![
+            b"thought".to_vec(),  // 0
+            b"</think>".to_vec(), // 1
+            b"answer".to_vec(),   // 2
+        ];
+        let tokenizer = Arc::new(cera::tokenizer::BpeTokenizer::from_vocab(vocab));
+        let recorder: Arc<Recorder> = Arc::new(Recorder::default());
+
+        // Prefilled session: the opener never appears in the stream, so the
+        // leading text must still route to thought, then flip on the closer.
+        let mut adapter = ForeignSinkAdapter::new_with_initial_thinking(
+            recorder.clone() as Arc<dyn ModalitySink>,
+            tokenizer.clone(),
+            true,
+        );
+        adapter.on_text_tokens(&[0, 1, 2]);
+        adapter.flush_pending();
+        assert_eq!(&*recorder.thought.lock().unwrap(), &["thought"]);
+        assert_eq!(&*recorder.text.lock().unwrap(), &["answer"]);
+
+        // Default session: same stream is plain content with the stray
+        // closer dropped.
+        let recorder: Arc<Recorder> = Arc::new(Recorder::default());
+        let mut adapter =
+            ForeignSinkAdapter::new(recorder.clone() as Arc<dyn ModalitySink>, tokenizer);
+        adapter.on_text_tokens(&[0, 1, 2]);
+        adapter.flush_pending();
+        assert!(recorder.thought.lock().unwrap().is_empty());
+        assert_eq!(recorder.text.lock().unwrap().join(""), "thoughtanswer");
     }
 
     #[test]
@@ -5152,5 +5549,20 @@ mod tests {
 
         let roundtrip: FfiWhisperTranscribeOpts = core_opts.into();
         assert_eq!(roundtrip, custom);
+    }
+
+    #[test]
+    fn pixel_format_ffi_conversions() {
+        for (ffi_fmt, core_fmt) in [
+            (PixelFormat::Rgb8, cera::PixelFormat::Rgb8),
+            (PixelFormat::Rgba8, cera::PixelFormat::Rgba8),
+            (PixelFormat::Bgr8, cera::PixelFormat::Bgr8),
+            (PixelFormat::Bgra8, cera::PixelFormat::Bgra8),
+        ] {
+            let to_core: cera::PixelFormat = ffi_fmt.into();
+            assert_eq!(to_core, core_fmt);
+            let back: PixelFormat = core_fmt.into();
+            assert_eq!(back, ffi_fmt);
+        }
     }
 }

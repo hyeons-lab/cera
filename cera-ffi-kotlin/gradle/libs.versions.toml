@@ -12,10 +12,13 @@ kotlinxCoroutines = "1.10.2"
 
 [libraries]
 jna = { module = "net.java.dev.jna:jna", version.ref = "jna" }
+# Plain JVM unit tests only (mergeAdspPaths); no Robolectric, no device.
+junit = "junit:junit:4.13.2"
 kotlinx-coroutines-core = { module = "org.jetbrains.kotlinx:kotlinx-coroutines-core", version.ref = "kotlinxCoroutines" }
 
 [plugins]
 # AGP 9+ has built-in Kotlin, so the android module needs no kotlin-android plugin.
 kotlin-jvm = { id = "org.jetbrains.kotlin.jvm", version.ref = "kotlin" }
 android-library = { id = "com.android.library", version.ref = "agp" }
+android-application = { id = "com.android.application" }
 maven-publish = { id = "com.vanniktech.maven.publish", version.ref = "mavenPublish" }

@@ -913,6 +913,14 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
     func clearPrefixCache() 
     
     /**
+     * Configure the model's KV prefix cache.
+     *
+     * When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+     * When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+     */
+    func configurePrefixCache(cacheDir: String?, maxWarmEntries: UInt32?) 
+    
+    /**
      * Resolved context-window size (KV cache cap) the engine was
      * configured with. Mirrors the `context_size` field of the
      * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
@@ -1457,6 +1465,21 @@ open func clearPrefixCache()  {try! rustCall() {
 }
     
     /**
+     * Configure the model's KV prefix cache.
+     *
+     * When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+     * When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+     */
+open func configurePrefixCache(cacheDir: String?, maxWarmEntries: UInt32?)  {try! rustCall() {
+    uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionString.lower(cacheDir),
+        FfiConverterOptionUInt32.lower(maxWarmEntries),$0
+    )
+}
+}
+    
+    /**
      * Resolved context-window size (KV cache cap) the engine was
      * configured with. Mirrors the `context_size` field of the
      * [`EngineConfig`] passed to `from_path` / `from_bundle_id`,
@@ -1839,6 +1862,11 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
     func generateStreamingJson(opts: GenerateOpts, schemaJson: String, sink: ModalitySink) throws  -> GenerateSummary
     
     /**
+     * Read the longest-side pixel cap configured on the session, if any.
+     */
+    func imageMaxLongSize() throws  -> UInt32?
+    
+    /**
      * Import and restore a chat session checkpoint from serialized binary bytes.
      */
     func importCheckpoint(data: Data) throws 
@@ -1907,6 +1935,11 @@ public protocol ChatSessionProtocol: AnyObject, Sendable {
      * Save current chat session checkpoint to a file.
      */
     func saveCheckpoint(path: String) throws 
+    
+    /**
+     * Set an optional resolution cap on the longest side of encoded images.
+     */
+    func setImageMaxLongSize(maxLongSize: UInt32?) throws 
     
     /**
      * Set tool wire format explicitly.
@@ -2165,6 +2198,17 @@ open func generateStreamingJson(opts: GenerateOpts, schemaJson: String, sink: Mo
 }
     
     /**
+     * Read the longest-side pixel cap configured on the session, if any.
+     */
+open func imageMaxLongSize()throws  -> UInt32?  {
+    return try  FfiConverterOptionUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_image_max_long_size(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
      * Import and restore a chat session checkpoint from serialized binary bytes.
      */
 open func importCheckpoint(data: Data)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -2306,6 +2350,17 @@ open func saveCheckpoint(path: String)throws   {try rustCallWithError(FfiConvert
     uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(path),$0
+    )
+}
+}
+    
+    /**
+     * Set an optional resolution cap on the longest side of encoded images.
+     */
+open func setImageMaxLongSize(maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionUInt32.lower(maxLongSize),$0
     )
 }
 }
@@ -5222,8 +5277,9 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * includes both "manifest didn't list a mmproj" (no warn
      * logged) and "mmproj listed but failed to open/parse"
      * (warn logged at `CeraEngine::from_path`).
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     func appendAudio(samples: [Float], sampleRate: UInt32) throws 
     
@@ -5276,10 +5332,37 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * - `Backend(...)` for image decode failure, missing vision
      * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
      * mismatch.
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
     func appendImage(bytes: Data, maxLongSize: UInt32?) throws 
+    
+    /**
+     * Append an uncompressed raw image buffer to the session context.
+     *
+     * `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+     * `width` and `height` specify the source image dimensions in pixels.
+     * `max_long_size` controls edge resizing: `None` uses the session default,
+     * `Some(0)` disables resizing to keep original dimensions, and `Some(n)`
+     * constrains the longest edge to at most `n` pixels.
+     * Automatically applies aspect-preserving resizing and normalization,
+     * then encodes with the vision encoder and appends image tokens.
+     *
+     * # Errors
+     *
+     * - `EmptyInput` if the buffer is empty or a dimension is 0.
+     * - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+     * (extra trailing bytes are ignored).
+     * - `Preprocess` if image normalization fails.
+     * - `UnsupportedModality` if vision encoding is unsupported on this session.
+     * - `Backend` for missing vision encoder, projection dimension mismatch,
+     * or backend execution failure during encoding or prefill.
+     * - `ContextOverflow` if appending image tokens exceeds context limit.
+     * - `Cancelled` if execution is interrupted.
+     * - `PoisonedSession` if the session lock is poisoned.
+     */
+    func appendRawImage(pixels: Data, width: UInt32, height: UInt32, format: PixelFormat, maxLongSize: UInt32?) throws 
     
     /**
      * Append raw text to the context, running a prefill over just
@@ -5355,6 +5438,18 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * advisory sampling defaults from the bundle manifest (if any) or standard defaults.
      */
     func defaultGenerateOpts() throws  -> GenerateOpts
+    
+    /**
+     * Explicitly disable speculative decoding for this session. An attached
+     * drafter is kept, so [`Self::enable_spec`] restores it.
+     */
+    func disableSpec() throws 
+    
+    /**
+     * Re-enable speculative decoding for this session (if previously
+     * disabled), using the attached drafter if there is one.
+     */
+    func enableSpec() throws 
     
     /**
      * Export current inference session checkpoint as serialized binary bytes.
@@ -5501,7 +5596,7 @@ public protocol SessionProtocol: AnyObject, Sendable {
      *
      * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
      * doesn't implement hidden-state extraction; `InvalidToken` if any id is
-     * `>= vocab_size`.
+     * `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
      */
     func hiddenStatesForTokens(tokens: [UInt32]) throws  -> Data
     
@@ -5530,6 +5625,11 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * stack of [`Self::hidden_states_for_tokens_with_adapters`].
      */
     func hiddenStatesMeanPooledWithAdapters(tokens: [UInt32], adapters: [LoraAdapterEntry]) throws  -> [Float]
+    
+    /**
+     * Read the session-default cap on the longest side of an appended image, if any.
+     */
+    func imageMaxLongSize() throws  -> UInt32?
     
     /**
      * Import and restore an inference session checkpoint from serialized binary bytes.
@@ -5606,13 +5706,7 @@ public protocol SessionProtocol: AnyObject, Sendable {
     
     /**
      * Set a session-default cap on the longest side of an appended
-     * image, in pixels (`None` = no cap). Unlike the per-call
-     * `max_long_size` argument to [`Self::append_image`], this default
-     * is honored by every image-append path the session drives —
-     * including chat-template flows — so a host can configure the
-     * image-encode budget once. See [`Self::append_image`] for the cap
-     * semantics (shrinks the encoded target, never upscales, takes
-     * precedence over the model's minimum-resolution floor).
+     * image, in pixels (`None` = no cap).
      */
     func setImageMaxLongSize(maxLongSize: UInt32?) throws 
     
@@ -5761,8 +5855,9 @@ open class Session: SessionProtocol, @unchecked Sendable {
      * includes both "manifest didn't list a mmproj" (no warn
      * logged) and "mmproj listed but failed to open/parse"
      * (warn logged at `CeraEngine::from_path`).
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
 open func appendAudio(samples: [Float], sampleRate: UInt32)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_append_audio(
@@ -5822,13 +5917,50 @@ open func appendAudio(samples: [Float], sampleRate: UInt32)throws   {try rustCal
      * - `Backend(...)` for image decode failure, missing vision
      * encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
      * mismatch.
-     * - `ContextOverflow` / `Cancelled` propagate from the
-     * underlying prefill.
+     * - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+     * underlying prefill (a backend fault recorded mid-prefill surfaces
+     * as `Backend`, not `Cancelled`).
      */
 open func appendImage(bytes: Data, maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_append_image(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(bytes),
+        FfiConverterOptionUInt32.lower(maxLongSize),$0
+    )
+}
+}
+    
+    /**
+     * Append an uncompressed raw image buffer to the session context.
+     *
+     * `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+     * `width` and `height` specify the source image dimensions in pixels.
+     * `max_long_size` controls edge resizing: `None` uses the session default,
+     * `Some(0)` disables resizing to keep original dimensions, and `Some(n)`
+     * constrains the longest edge to at most `n` pixels.
+     * Automatically applies aspect-preserving resizing and normalization,
+     * then encodes with the vision encoder and appends image tokens.
+     *
+     * # Errors
+     *
+     * - `EmptyInput` if the buffer is empty or a dimension is 0.
+     * - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+     * (extra trailing bytes are ignored).
+     * - `Preprocess` if image normalization fails.
+     * - `UnsupportedModality` if vision encoding is unsupported on this session.
+     * - `Backend` for missing vision encoder, projection dimension mismatch,
+     * or backend execution failure during encoding or prefill.
+     * - `ContextOverflow` if appending image tokens exceeds context limit.
+     * - `Cancelled` if execution is interrupted.
+     * - `PoisonedSession` if the session lock is poisoned.
+     */
+open func appendRawImage(pixels: Data, width: UInt32, height: UInt32, format: PixelFormat, maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_append_raw_image(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(pixels),
+        FfiConverterUInt32.lower(width),
+        FfiConverterUInt32.lower(height),
+        FfiConverterTypePixelFormat_lower(format),
         FfiConverterOptionUInt32.lower(maxLongSize),$0
     )
 }
@@ -5947,6 +6079,28 @@ open func defaultGenerateOpts()throws  -> GenerateOpts  {
             self.uniffiCloneHandle(),$0
     )
 })
+}
+    
+    /**
+     * Explicitly disable speculative decoding for this session. An attached
+     * drafter is kept, so [`Self::enable_spec`] restores it.
+     */
+open func disableSpec()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_disable_spec(
+            self.uniffiCloneHandle(),$0
+    )
+}
+}
+    
+    /**
+     * Re-enable speculative decoding for this session (if previously
+     * disabled), using the attached drafter if there is one.
+     */
+open func enableSpec()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_enable_spec(
+            self.uniffiCloneHandle(),$0
+    )
+}
 }
     
     /**
@@ -6172,7 +6326,7 @@ open func hiddenStatesForTextWithAdapters(text: String, adapters: [LoraAdapterEn
      *
      * Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
      * doesn't implement hidden-state extraction; `InvalidToken` if any id is
-     * `>= vocab_size`.
+     * `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
      */
 open func hiddenStatesForTokens(tokens: [UInt32])throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -6228,6 +6382,17 @@ open func hiddenStatesMeanPooledWithAdapters(tokens: [UInt32], adapters: [LoraAd
             self.uniffiCloneHandle(),
         FfiConverterSequenceUInt32.lower(tokens),
         FfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),$0
+    )
+})
+}
+    
+    /**
+     * Read the session-default cap on the longest side of an appended image, if any.
+     */
+open func imageMaxLongSize()throws  -> UInt32?  {
+    return try  FfiConverterOptionUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_session_image_max_long_size(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -6370,13 +6535,7 @@ open func sendMessageStreaming(message: UserMessage, opts: GenerateOpts, sink: M
     
     /**
      * Set a session-default cap on the longest side of an appended
-     * image, in pixels (`None` = no cap). Unlike the per-call
-     * `max_long_size` argument to [`Self::append_image`], this default
-     * is honored by every image-append path the session drives —
-     * including chat-template flows — so a host can configure the
-     * image-encode budget once. See [`Self::append_image`] for the cap
-     * semantics (shrinks the encoded target, never upscales, takes
-     * precedence over the model's minimum-resolution floor).
+     * image, in pixels (`None` = no cap).
      */
 open func setImageMaxLongSize(maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_set_image_max_long_size(
@@ -6647,7 +6806,9 @@ public struct EngineConfig {
      */
     public var draftModel: String?
     /**
-     * Whether to prefer GPU depthformer for audio decoder generation.
+     * Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+     * `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+     * depthformer regardless of this flag.
      */
     public var gpuDepthformer: Bool
 
@@ -6672,7 +6833,9 @@ public struct EngineConfig {
          * Optional path to a DSpark speculative draft model GGUF file.
          */draftModel: String? = nil, 
         /**
-         * Whether to prefer GPU depthformer for audio decoder generation.
+         * Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+         * `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+         * depthformer regardless of this flag.
          */gpuDepthformer: Bool = false) {
         self.contextSize = contextSize
         self.backend = backend
@@ -7555,6 +7718,10 @@ public struct GenerateOpts: Equatable, Hashable {
      * When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
      */
     public var spec: SpecDecodeConfig?
+    /**
+     * Disable speculative decoding (even when a draft sidecar model is present).
+     */
+    public var noSpec: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -7603,7 +7770,10 @@ public struct GenerateOpts: Equatable, Hashable {
         /**
          * Optional speculative decoding configuration (prompt-lookup drafting).
          * When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
-         */spec: SpecDecodeConfig? = nil) {
+         */spec: SpecDecodeConfig? = nil, 
+        /**
+         * Disable speculative decoding (even when a draft sidecar model is present).
+         */noSpec: Bool = false) {
         self.maxTokens = maxTokens
         self.seed = seed
         self.temperature = temperature
@@ -7618,6 +7788,7 @@ public struct GenerateOpts: Equatable, Hashable {
         self.flushEveryTokens = flushEveryTokens
         self.flushEveryMs = flushEveryMs
         self.spec = spec
+        self.noSpec = noSpec
     }
 
     
@@ -7649,7 +7820,8 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
                 grammarTriggerTokens: FfiConverterSequenceUInt32.read(from: &buf), 
                 flushEveryTokens: FfiConverterUInt32.read(from: &buf), 
                 flushEveryMs: FfiConverterUInt32.read(from: &buf), 
-                spec: FfiConverterOptionTypeSpecDecodeConfig.read(from: &buf)
+                spec: FfiConverterOptionTypeSpecDecodeConfig.read(from: &buf), 
+                noSpec: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -7668,6 +7840,7 @@ public struct FfiConverterTypeGenerateOpts: FfiConverterRustBuffer {
         FfiConverterUInt32.write(value.flushEveryTokens, into: &buf)
         FfiConverterUInt32.write(value.flushEveryMs, into: &buf)
         FfiConverterOptionTypeSpecDecodeConfig.write(value.spec, into: &buf)
+        FfiConverterBool.write(value.noSpec, into: &buf)
     }
 }
 
@@ -7839,6 +8012,82 @@ public func FfiConverterTypeGenerateSummary_lift(_ buf: RustBuffer) throws -> Ge
 #endif
 public func FfiConverterTypeGenerateSummary_lower(_ value: GenerateSummary) -> RustBuffer {
     return FfiConverterTypeGenerateSummary.lower(value)
+}
+
+
+/**
+ * Successful Hexagon NPU probe: the working DSP architecture plus
+ * hardware capabilities. See [`hexagon_probe`].
+ */
+public struct HexagonProbeInfo: Equatable, Hashable {
+    /**
+     * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`, `"V85"`).
+     */
+    public var arch: String
+    public var threads: UInt32
+    public var hvxUnits: UInt32
+    public var hmxUnits: UInt32
+    public var vtcmBytes: UInt64
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * DSP architecture that opened (`"V73"`, `"V75"`, `"V79"`, `"V81"`, `"V85"`).
+         */arch: String, threads: UInt32, hvxUnits: UInt32, hmxUnits: UInt32, vtcmBytes: UInt64) {
+        self.arch = arch
+        self.threads = threads
+        self.hvxUnits = hvxUnits
+        self.hmxUnits = hmxUnits
+        self.vtcmBytes = vtcmBytes
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension HexagonProbeInfo: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeHexagonProbeInfo: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> HexagonProbeInfo {
+        return
+            try HexagonProbeInfo(
+                arch: FfiConverterString.read(from: &buf), 
+                threads: FfiConverterUInt32.read(from: &buf), 
+                hvxUnits: FfiConverterUInt32.read(from: &buf), 
+                hmxUnits: FfiConverterUInt32.read(from: &buf), 
+                vtcmBytes: FfiConverterUInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: HexagonProbeInfo, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.arch, into: &buf)
+        FfiConverterUInt32.write(value.threads, into: &buf)
+        FfiConverterUInt32.write(value.hvxUnits, into: &buf)
+        FfiConverterUInt32.write(value.hmxUnits, into: &buf)
+        FfiConverterUInt64.write(value.vtcmBytes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHexagonProbeInfo_lift(_ buf: RustBuffer) throws -> HexagonProbeInfo {
+    return try FfiConverterTypeHexagonProbeInfo.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeHexagonProbeInfo_lower(_ value: HexagonProbeInfo) -> RustBuffer {
+    return FfiConverterTypeHexagonProbeInfo.lower(value)
 }
 
 
@@ -8642,9 +8891,15 @@ public struct SessionConfig: Equatable, Hashable {
      */
     public var ubatchSize: UInt32
     /**
-     * Whether to prefer GPU depthformer for audio decoder generation.
+     * Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+     * `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+     * depthformer regardless of this flag.
      */
     public var gpuDepthformer: Bool
+    /**
+     * Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+     */
+    public var disableSpec: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -8667,14 +8922,20 @@ public struct SessionConfig: Equatable, Hashable {
          * Chunked-prefill ubatch size. `0` = monolithic prefill.
          */ubatchSize: UInt32 = UInt32(512), 
         /**
-         * Whether to prefer GPU depthformer for audio decoder generation.
-         */gpuDepthformer: Bool = false) {
+         * Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+         * `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+         * depthformer regardless of this flag.
+         */gpuDepthformer: Bool = false, 
+        /**
+         * Whether to disable speculative decoding for this session (even if a draft sidecar model is present).
+         */disableSpec: Bool = false) {
         self.maxSeqLen = maxSeqLen
         self.kvCompression = kvCompression
         self.nKeep = nKeep
         self.seed = seed
         self.ubatchSize = ubatchSize
         self.gpuDepthformer = gpuDepthformer
+        self.disableSpec = disableSpec
     }
 
     
@@ -8698,7 +8959,8 @@ public struct FfiConverterTypeSessionConfig: FfiConverterRustBuffer {
                 nKeep: FfiConverterUInt32.read(from: &buf), 
                 seed: FfiConverterOptionUInt64.read(from: &buf), 
                 ubatchSize: FfiConverterUInt32.read(from: &buf), 
-                gpuDepthformer: FfiConverterBool.read(from: &buf)
+                gpuDepthformer: FfiConverterBool.read(from: &buf), 
+                disableSpec: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -8709,6 +8971,7 @@ public struct FfiConverterTypeSessionConfig: FfiConverterRustBuffer {
         FfiConverterOptionUInt64.write(value.seed, into: &buf)
         FfiConverterUInt32.write(value.ubatchSize, into: &buf)
         FfiConverterBool.write(value.gpuDepthformer, into: &buf)
+        FfiConverterBool.write(value.disableSpec, into: &buf)
     }
 }
 
@@ -9183,7 +9446,7 @@ public func FfiConverterTypeUserMessage_lower(_ value: UserMessage) -> RustBuffe
 public enum BackendPreference: Equatable, Hashable {
     
     /**
-     * Probe Metal → GPU → CPU at load time.
+     * Probe Metal / Hexagon / GPU / CPU at load time.
      */
     case auto
     case cpu
@@ -9195,6 +9458,10 @@ public enum BackendPreference: Equatable, Hashable {
      * Native Metal. Requires the `metal` feature + macOS.
      */
     case metal
+    /**
+     * Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
+     */
+    case hexagon
 
 
 
@@ -9224,6 +9491,8 @@ public struct FfiConverterTypeBackendPreference: FfiConverterRustBuffer {
         
         case 4: return .metal
         
+        case 5: return .hexagon
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -9246,6 +9515,10 @@ public struct FfiConverterTypeBackendPreference: FfiConverterRustBuffer {
         
         case .metal:
             writeInt(&buf, Int32(4))
+        
+        
+        case .hexagon:
+            writeInt(&buf, Int32(5))
         
         }
     }
@@ -10712,6 +10985,102 @@ public func FfiConverterTypeModelSource_lift(_ buf: RustBuffer) throws -> ModelS
 #endif
 public func FfiConverterTypeModelSource_lower(_ value: ModelSource) -> RustBuffer {
     return FfiConverterTypeModelSource.lower(value)
+}
+
+
+// Note that we don't yet support `indirect` for enums.
+// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+/**
+ * Supported pixel layouts for uncompressed raw image buffers.
+ */
+
+public enum PixelFormat: Equatable, Hashable {
+    
+    /**
+     * 24-bit RGB (3 bytes per pixel: Red, Green, Blue).
+     */
+    case rgb8
+    /**
+     * 32-bit RGBA (4 bytes per pixel: Red, Green, Blue, Alpha).
+     */
+    case rgba8
+    /**
+     * 24-bit BGR (3 bytes per pixel: Blue, Green, Red).
+     */
+    case bgr8
+    /**
+     * 32-bit BGRA (4 bytes per pixel: Blue, Green, Red, Alpha).
+     */
+    case bgra8
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PixelFormat: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePixelFormat: FfiConverterRustBuffer {
+    typealias SwiftType = PixelFormat
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PixelFormat {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+        
+        case 1: return .rgb8
+        
+        case 2: return .rgba8
+        
+        case 3: return .bgr8
+        
+        case 4: return .bgra8
+        
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PixelFormat, into buf: inout [UInt8]) {
+        switch value {
+        
+        
+        case .rgb8:
+            writeInt(&buf, Int32(1))
+        
+        
+        case .rgba8:
+            writeInt(&buf, Int32(2))
+        
+        
+        case .bgr8:
+            writeInt(&buf, Int32(3))
+        
+        
+        case .bgra8:
+            writeInt(&buf, Int32(4))
+        
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePixelFormat_lift(_ buf: RustBuffer) throws -> PixelFormat {
+    return try FfiConverterTypePixelFormat.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePixelFormat_lower(_ value: PixelFormat) -> RustBuffer {
+    return FfiConverterTypePixelFormat.lower(value)
 }
 
 
@@ -12290,6 +12659,43 @@ public func detectToolFormat(architecture: String) -> ToolFormat?  {
 })
 }
 /**
+ * Write the embedded DSP skels into `dir` (created private, mode 0700, if
+ * missing) and point FastRPC's loader at it. An existing `dir` that another
+ * user owns, or that is writable by "other", is refused with `Backend`, since
+ * the loader executes what is in it. Caller stages a private writable directory;
+ * on Android, the `HexagonNpu.setup` helper invokes this function to extract
+ * skels into the application's internal files directory (`cera_skels`) and
+ * configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
+ * or loading a model with [`BackendPreference::Hexagon`]. Returns the
+ * number of skels written (0 when all were already present and fresh).
+ * Re-running is cheap and idempotent (files are only rewritten when
+ * their bytes differ, and the loader path is not duplicated). A `dir`
+ * containing `;`, `=` or NUL is rejected: it would silently split or corrupt
+ * the loader's search path.
+ */
+public func hexagonInstallSkels(dir: String)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_func_hexagon_install_skels(
+        FfiConverterString.lower(dir),$0
+    )
+})
+}
+/**
+ * Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
+ * tries each bundled DSP skel, and returns the first working device's
+ * capabilities (then closes it). Fails when the `hexagon` feature is
+ * off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
+ * unavailable to this process. On Android, call the AAR's
+ * `HexagonNpu.setup` first so the loader can find the skel files
+ * (JVM/desktop flows use [`hexagon_install_skels`] instead).
+ */
+public func hexagonProbe()throws  -> HexagonProbeInfo  {
+    return try  FfiConverterTypeHexagonProbeInfo_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_func_hexagon_probe($0
+    )
+})
+}
+/**
  * Default KWS configuration parameters.
  */
 public func hotwordDefaultConfig() -> FfiHotwordConfig  {
@@ -12504,6 +12910,12 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 55417) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12574,6 +12986,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() != 5238) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache() != 49295) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 47091) {
@@ -12708,10 +13123,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 10087) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_append_audio() != 51530) {
+    if (uniffi_cera_ffi_checksum_method_session_append_audio() != 65327) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_append_image() != 13190) {
+    if (uniffi_cera_ffi_checksum_method_session_append_image() != 60729) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_append_raw_image() != 38950) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
@@ -12733,6 +13151,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_disable_spec() != 57) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_enable_spec() != 2995) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819) {
@@ -12762,7 +13186,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 42869) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100) {
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 60330) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 34852) {
@@ -12772,6 +13196,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 61117) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_session_image_max_long_size() != 8402) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224) {
@@ -12804,7 +13231,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283) {
+    if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 26929) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 64571) {
@@ -12888,6 +13315,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size() != 39566) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -12922,6 +13352,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size() != 55203) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586) {

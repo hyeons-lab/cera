@@ -51,11 +51,11 @@ fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
         let tile_k = i % TILE_K;
         let global_m = offset_m + tile_m;
         let global_k = k_outer + tile_k;
-        store_sa(tile_m, tile_k, select(
-            0.0,
-            src0[global_m * params.k + global_k],
-            global_m < params.m && global_k < params.k,
-        ));
+        var val: f32 = 0.0;
+        if (global_m < params.m && global_k < params.k) {
+            val = src0[global_m * params.k + global_k];
+        }
+        store_sa(tile_m, tile_k, val);
     }
 }
 #endif
@@ -83,29 +83,23 @@ fn init_shmem_src0(thread_id: u32, offset_m: u32, k_outer: u32) {
         let global_m = offset_m + tile_m;
         let global_k = k_outer + tile_k;
 
-        // Position of `global_k` within its 32-element block. `i` steps by 8 and
-        // TILE_K is a multiple of 8 (checked host-side), so `w` is a multiple of
-        // 8 and the 8 weights are one nibble-half of bytes [w % 16, w % 16 + 8),
-        // never straddling a block.
-        let w = global_k % Q4_0_BLOCK_SIZE;
-        let base = (global_m * blocks_k + global_k / Q4_0_BLOCK_SIZE) * Q4_0_BLOCK_BYTES;
-        let d = select(0.0, load_src0_f32_at(base), global_m < params.m && global_k < params.k);
-        let q_lo = load_src0_u32_at(base + 2u + (w % 16u));
-        let q_hi = load_src0_u32_at(base + 6u + (w % 16u));
+        if (global_m < params.m && global_k < params.k) {
+            let w = global_k % Q4_0_BLOCK_SIZE;
+            let base = (global_m * blocks_k + global_k / Q4_0_BLOCK_SIZE) * Q4_0_BLOCK_BYTES;
+            let d = load_src0_f32_at(base);
+            let q_lo = load_src0_u32_at(base + 2u + (w % 16u));
+            let q_hi = load_src0_u32_at(base + 6u + (w % 16u));
 
-        for (var j = 0u; j < Q4_0_PER_THREAD; j++) {
-            // `j & 3u` is `j` for j < 4 and `j - 4` for j >= 4 — the byte index
-            // within whichever u32 the select picks. Spelled this way rather
-            // than `j - 4u` so the unused arm never evaluates an out-of-range
-            // shift (WGSL leaves shifts >= 32 indeterminate).
-            let byte = select(get_byte(q_lo, j & 3u), get_byte(q_hi, j & 3u), j >= 4u);
-            let nib = select(byte & 0xFu, byte >> 4u, w >= 16u);
-            // Zero past the edge per element, not per 8-run: `d` is gated on the
-            // run's FIRST k, so with a `params.k` that is not a multiple of 8 the
-            // trailing lanes would otherwise stage decoded garbage. The k loop
-            // runs a full TILE_K with no tail check and relies on this.
-            let live = global_m < params.m && global_k + j < params.k;
-            store_sa(tile_m, tile_k + j, select(0.0, (f32(nib) - 8.0) * d, live));
+            for (var j = 0u; j < Q4_0_PER_THREAD; j++) {
+                let byte = select(get_byte(q_lo, j & 3u), get_byte(q_hi, j & 3u), j >= 4u);
+                let nib = select(byte & 0xFu, byte >> 4u, w >= 16u);
+                let live = global_k + j < params.k;
+                store_sa(tile_m, tile_k + j, select(0.0, (f32(nib) - 8.0) * d, live));
+            }
+        } else {
+            for (var j = 0u; j < Q4_0_PER_THREAD; j++) {
+                store_sa(tile_m, tile_k + j, 0.0);
+            }
         }
     }
 }

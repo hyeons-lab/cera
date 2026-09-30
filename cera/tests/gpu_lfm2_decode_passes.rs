@@ -19,7 +19,7 @@
 //! the count meaningful. Do not add tests here.
 #![cfg(feature = "gpu")]
 
-use std::path::PathBuf;
+mod common;
 
 use cera::backend::wgpu::io_stats;
 use cera::gguf::GgufFile;
@@ -39,27 +39,11 @@ const FIXTURE: &str = "LFM2.5-230M-Q4_K_M.gguf";
 /// per-layer structure changes.
 const MAX_PASSES_PER_TOKEN: u64 = 50;
 
-fn models_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
-        return PathBuf::from(d);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/oracle/models")
-}
-
 #[test]
 fn decode_stays_within_its_compute_pass_budget() {
-    let path = models_dir().join(FIXTURE);
-    if !path.exists() {
-        assert!(
-            std::env::var("CERA_REQUIRE_MODEL")
-                .unwrap_or_default()
-                .is_empty(),
-            "CERA_REQUIRE_MODEL is set but {FIXTURE} is absent at {}",
-            path.display()
-        );
-        eprintln!("[gpu-lfm2] SKIP (absent): {}", path.display());
+    let Some(path) = common::fixture_or_skip(FIXTURE, "gpu-lfm2") else {
         return;
-    }
+    };
 
     let model = match load_model_gpu(
         GgufFile::open(&path).expect("open gguf"),

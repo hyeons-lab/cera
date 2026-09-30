@@ -499,6 +499,10 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 55417:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 32979:
@@ -552,6 +556,8 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities() != 65060:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() != 5238:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache() != 49295:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 47091:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -613,6 +619,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size() != 39566:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502:
@@ -636,6 +644,8 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size() != 55203:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -765,9 +775,11 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 10087:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 51530:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 65327:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_image() != 13190:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 38950:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -782,6 +794,10 @@ def _uniffi_check_api_checksums(lib):
     if lib.uniffi_cera_ffi_checksum_method_session_clear_cancel() != 11168:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_disable_spec() != 57:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_enable_spec() != 2995:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -801,13 +817,15 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 42869:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 65100:
+    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 60330:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 34852:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 61117:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_session_image_max_long_size() != 8402:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -831,7 +849,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 36283:
+    if lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 26929:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 64571:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1366,6 +1384,15 @@ _UniffiLib.uniffi_cera_ffi_fn_func_detect_tool_format.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_func_detect_tool_format.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_func_hexagon_install_skels.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_hexagon_install_skels.restype = ctypes.c_uint32
+_UniffiLib.uniffi_cera_ffi_fn_func_hexagon_probe.argtypes = (
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_func_hexagon_probe.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_func_hotword_default_config.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
@@ -1515,6 +1542,13 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_context_size.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1689,6 +1723,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json.argtype
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_image_max_long_size.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_image_max_long_size.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_import_checkpoint.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1757,6 +1796,12 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_save_checkpoint.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_save_checkpoint.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_tool_format.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2132,6 +2177,16 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_append_image.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_append_image.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_session_append_raw_image.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.c_uint32,
+    ctypes.c_uint32,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_append_raw_image.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_session_append_text.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2170,6 +2225,16 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_default_generate_opts.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_default_generate_opts.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_session_disable_spec.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_disable_spec.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_method_session_enable_spec.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_enable_spec.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_method_session_export_checkpoint.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2248,6 +2313,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled_with_adap
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled_with_adapters.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_session_image_max_long_size.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_session_image_max_long_size.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_session_import_checkpoint.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2363,6 +2433,12 @@ _UniffiLib.uniffi_cera_ffi_checksum_func_cpu_backend_report.restype = ctypes.c_u
 _UniffiLib.uniffi_cera_ffi_checksum_func_detect_tool_format.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_detect_tool_format.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_install_skels.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_install_skels.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_probe.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_probe.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_func_hotword_default_config.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_func_hotword_default_config.restype = ctypes.c_uint16
@@ -2444,6 +2520,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities.restype = cty
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_context_size.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_context_size.restype = ctypes.c_uint16
@@ -2534,6 +2613,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint.restype = ctypes.c_uint16
@@ -2570,6 +2652,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_reset.restype = ctypes.c_
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format.restype = ctypes.c_uint16
@@ -2768,6 +2853,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_append_audio.restype = ctypes
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_append_image.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_append_image.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_raw_image.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_raw_image.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_append_text.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_append_text.restype = ctypes.c_uint16
@@ -2789,6 +2877,12 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_clear_cancel.restype = ctypes
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_default_generate_opts.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_default_generate_opts.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_disable_spec.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_disable_spec.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_enable_spec.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_enable_spec.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_export_checkpoint.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_export_checkpoint.restype = ctypes.c_uint16
@@ -2828,6 +2922,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled.res
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_image_max_long_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_image_max_long_size.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_import_checkpoint.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_session_import_checkpoint.restype = ctypes.c_uint16
@@ -3136,7 +3233,7 @@ class BackendPreference(enum.Enum):
     
     AUTO = 0
     """
-    Probe Metal → GPU → CPU at load time.
+    Probe Metal / Hexagon / GPU / CPU at load time.
 """
     
     CPU = 1
@@ -3149,6 +3246,11 @@ class BackendPreference(enum.Enum):
     METAL = 3
     """
     Native Metal. Requires the `metal` feature + macOS.
+"""
+    
+    HEXAGON = 4
+    """
+    Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
 """
     
 
@@ -3165,6 +3267,8 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
             return BackendPreference.GPU
         if variant == 4:
             return BackendPreference.METAL
+        if variant == 5:
+            return BackendPreference.HEXAGON
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -3176,6 +3280,8 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
         if value == BackendPreference.GPU:
             return
         if value == BackendPreference.METAL:
+            return
+        if value == BackendPreference.HEXAGON:
             return
         raise ValueError(value)
 
@@ -3189,6 +3295,8 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
             buf.write_i32(3)
         if value == BackendPreference.METAL:
             buf.write_i32(4)
+        if value == BackendPreference.HEXAGON:
+            buf.write_i32(5)
 
 
 
@@ -5462,7 +5570,7 @@ class GenerateOpts:
     in a follow-up PR. Including them in the record now keeps the FFI
     surface stable across that transition.
 """
-    def __init__(self, *, max_tokens:int = 256, seed:typing.Optional[int] = _DEFAULT, temperature:float = 0.7, top_p:float = 0.9, top_k:int = 40, min_p:float = 0.05, repetition_penalty:float = 1.1, stop_tokens:typing.List[int] = _DEFAULT, ignore_eos:bool = False, grammar:typing.Optional[str] = _DEFAULT, grammar_trigger_tokens:typing.List[int] = _DEFAULT, flush_every_tokens:int = 16, flush_every_ms:int = 50, spec:typing.Optional[SpecDecodeConfig] = _DEFAULT):
+    def __init__(self, *, max_tokens:int = 256, seed:typing.Optional[int] = _DEFAULT, temperature:float = 0.7, top_p:float = 0.9, top_k:int = 40, min_p:float = 0.05, repetition_penalty:float = 1.1, stop_tokens:typing.List[int] = _DEFAULT, ignore_eos:bool = False, grammar:typing.Optional[str] = _DEFAULT, grammar_trigger_tokens:typing.List[int] = _DEFAULT, flush_every_tokens:int = 16, flush_every_ms:int = 50, spec:typing.Optional[SpecDecodeConfig] = _DEFAULT, no_spec:bool = False):
         self.max_tokens = max_tokens
         if seed is _DEFAULT:
             self.seed = None
@@ -5492,12 +5600,13 @@ class GenerateOpts:
             self.spec = None
         else:
             self.spec = spec
+        self.no_spec = no_spec
         
         
 
     
     def __str__(self):
-        return "GenerateOpts(max_tokens={}, seed={}, temperature={}, top_p={}, top_k={}, min_p={}, repetition_penalty={}, stop_tokens={}, ignore_eos={}, grammar={}, grammar_trigger_tokens={}, flush_every_tokens={}, flush_every_ms={}, spec={})".format(self.max_tokens, self.seed, self.temperature, self.top_p, self.top_k, self.min_p, self.repetition_penalty, self.stop_tokens, self.ignore_eos, self.grammar, self.grammar_trigger_tokens, self.flush_every_tokens, self.flush_every_ms, self.spec)
+        return "GenerateOpts(max_tokens={}, seed={}, temperature={}, top_p={}, top_k={}, min_p={}, repetition_penalty={}, stop_tokens={}, ignore_eos={}, grammar={}, grammar_trigger_tokens={}, flush_every_tokens={}, flush_every_ms={}, spec={}, no_spec={})".format(self.max_tokens, self.seed, self.temperature, self.top_p, self.top_k, self.min_p, self.repetition_penalty, self.stop_tokens, self.ignore_eos, self.grammar, self.grammar_trigger_tokens, self.flush_every_tokens, self.flush_every_ms, self.spec, self.no_spec)
     def __eq__(self, other):
         if self.max_tokens != other.max_tokens:
             return False
@@ -5527,6 +5636,8 @@ class GenerateOpts:
             return False
         if self.spec != other.spec:
             return False
+        if self.no_spec != other.no_spec:
+            return False
         return True
 
 class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
@@ -5547,6 +5658,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
             flush_every_tokens=_UniffiFfiConverterUInt32.read(buf),
             flush_every_ms=_UniffiFfiConverterUInt32.read(buf),
             spec=_UniffiFfiConverterOptionalTypeSpecDecodeConfig.read(buf),
+            no_spec=_UniffiFfiConverterBoolean.read(buf),
         )
 
     @staticmethod
@@ -5565,6 +5677,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.check_lower(value.flush_every_tokens)
         _UniffiFfiConverterUInt32.check_lower(value.flush_every_ms)
         _UniffiFfiConverterOptionalTypeSpecDecodeConfig.check_lower(value.spec)
+        _UniffiFfiConverterBoolean.check_lower(value.no_spec)
 
     @staticmethod
     def write(value, buf):
@@ -5582,6 +5695,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.write(value.flush_every_tokens, buf)
         _UniffiFfiConverterUInt32.write(value.flush_every_ms, buf)
         _UniffiFfiConverterOptionalTypeSpecDecodeConfig.write(value.spec, buf)
+        _UniffiFfiConverterBoolean.write(value.no_spec, buf)
 
 class _UniffiFfiConverterFloat64(_UniffiConverterPrimitiveFloat):
     @staticmethod
@@ -5952,6 +6066,64 @@ class _UniffiFfiConverterTypeGenerateOutput(_UniffiConverterRustBuffer):
         _UniffiFfiConverterString.write(value.text, buf)
         _UniffiFfiConverterSequenceUInt32.write(value.tokens, buf)
         _UniffiFfiConverterTypeGenerateSummary.write(value.summary, buf)
+
+@dataclass
+class HexagonProbeInfo:
+    """
+    Successful Hexagon NPU probe: the working DSP architecture plus
+    hardware capabilities. See [`hexagon_probe`].
+"""
+    def __init__(self, *, arch:str, threads:int, hvx_units:int, hmx_units:int, vtcm_bytes:int):
+        self.arch = arch
+        self.threads = threads
+        self.hvx_units = hvx_units
+        self.hmx_units = hmx_units
+        self.vtcm_bytes = vtcm_bytes
+        
+        
+
+    
+    def __str__(self):
+        return "HexagonProbeInfo(arch={}, threads={}, hvx_units={}, hmx_units={}, vtcm_bytes={})".format(self.arch, self.threads, self.hvx_units, self.hmx_units, self.vtcm_bytes)
+    def __eq__(self, other):
+        if self.arch != other.arch:
+            return False
+        if self.threads != other.threads:
+            return False
+        if self.hvx_units != other.hvx_units:
+            return False
+        if self.hmx_units != other.hmx_units:
+            return False
+        if self.vtcm_bytes != other.vtcm_bytes:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeHexagonProbeInfo(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return HexagonProbeInfo(
+            arch=_UniffiFfiConverterString.read(buf),
+            threads=_UniffiFfiConverterUInt32.read(buf),
+            hvx_units=_UniffiFfiConverterUInt32.read(buf),
+            hmx_units=_UniffiFfiConverterUInt32.read(buf),
+            vtcm_bytes=_UniffiFfiConverterUInt64.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.arch)
+        _UniffiFfiConverterUInt32.check_lower(value.threads)
+        _UniffiFfiConverterUInt32.check_lower(value.hvx_units)
+        _UniffiFfiConverterUInt32.check_lower(value.hmx_units)
+        _UniffiFfiConverterUInt64.check_lower(value.vtcm_bytes)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.arch, buf)
+        _UniffiFfiConverterUInt32.write(value.threads, buf)
+        _UniffiFfiConverterUInt32.write(value.hvx_units, buf)
+        _UniffiFfiConverterUInt32.write(value.hmx_units, buf)
+        _UniffiFfiConverterUInt64.write(value.vtcm_bytes, buf)
 
 
 
@@ -7709,7 +7881,7 @@ class SessionConfig:
     """
     Per-session configuration. Mirrors [`cera::SessionConfig`].
 """
-    def __init__(self, *, max_seq_len:typing.Optional[int] = _DEFAULT, kv_compression:typing.Optional[KvCompression] = _DEFAULT, n_keep:int = 0, seed:typing.Optional[int] = _DEFAULT, ubatch_size:int = 512, gpu_depthformer:bool = False):
+    def __init__(self, *, max_seq_len:typing.Optional[int] = _DEFAULT, kv_compression:typing.Optional[KvCompression] = _DEFAULT, n_keep:int = 0, seed:typing.Optional[int] = _DEFAULT, ubatch_size:int = 512, gpu_depthformer:bool = False, disable_spec:bool = False):
         if max_seq_len is _DEFAULT:
             self.max_seq_len = None
         else:
@@ -7725,12 +7897,13 @@ class SessionConfig:
             self.seed = seed
         self.ubatch_size = ubatch_size
         self.gpu_depthformer = gpu_depthformer
+        self.disable_spec = disable_spec
         
         
 
     
     def __str__(self):
-        return "SessionConfig(max_seq_len={}, kv_compression={}, n_keep={}, seed={}, ubatch_size={}, gpu_depthformer={})".format(self.max_seq_len, self.kv_compression, self.n_keep, self.seed, self.ubatch_size, self.gpu_depthformer)
+        return "SessionConfig(max_seq_len={}, kv_compression={}, n_keep={}, seed={}, ubatch_size={}, gpu_depthformer={}, disable_spec={})".format(self.max_seq_len, self.kv_compression, self.n_keep, self.seed, self.ubatch_size, self.gpu_depthformer, self.disable_spec)
     def __eq__(self, other):
         if self.max_seq_len != other.max_seq_len:
             return False
@@ -7744,6 +7917,8 @@ class SessionConfig:
             return False
         if self.gpu_depthformer != other.gpu_depthformer:
             return False
+        if self.disable_spec != other.disable_spec:
+            return False
         return True
 
 class _UniffiFfiConverterTypeSessionConfig(_UniffiConverterRustBuffer):
@@ -7756,6 +7931,7 @@ class _UniffiFfiConverterTypeSessionConfig(_UniffiConverterRustBuffer):
             seed=_UniffiFfiConverterOptionalUInt64.read(buf),
             ubatch_size=_UniffiFfiConverterUInt32.read(buf),
             gpu_depthformer=_UniffiFfiConverterBoolean.read(buf),
+            disable_spec=_UniffiFfiConverterBoolean.read(buf),
         )
 
     @staticmethod
@@ -7766,6 +7942,7 @@ class _UniffiFfiConverterTypeSessionConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalUInt64.check_lower(value.seed)
         _UniffiFfiConverterUInt32.check_lower(value.ubatch_size)
         _UniffiFfiConverterBoolean.check_lower(value.gpu_depthformer)
+        _UniffiFfiConverterBoolean.check_lower(value.disable_spec)
 
     @staticmethod
     def write(value, buf):
@@ -7775,6 +7952,7 @@ class _UniffiFfiConverterTypeSessionConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalUInt64.write(value.seed, buf)
         _UniffiFfiConverterUInt32.write(value.ubatch_size, buf)
         _UniffiFfiConverterBoolean.write(value.gpu_depthformer, buf)
+        _UniffiFfiConverterBoolean.write(value.disable_spec, buf)
 
 class _UniffiFfiConverterOptionalTypeIngestRecovery(_UniffiConverterRustBuffer):
     @classmethod
@@ -9240,6 +9418,77 @@ class _UniffiFfiConverterTypeModelSource(_UniffiConverterRustBuffer):
 
 
 
+class PixelFormat(enum.Enum):
+    """
+    Supported pixel layouts for uncompressed raw image buffers.
+"""
+    
+    RGB8 = 0
+    """
+    24-bit RGB (3 bytes per pixel: Red, Green, Blue).
+"""
+    
+    RGBA8 = 1
+    """
+    32-bit RGBA (4 bytes per pixel: Red, Green, Blue, Alpha).
+"""
+    
+    BGR8 = 2
+    """
+    24-bit BGR (3 bytes per pixel: Blue, Green, Red).
+"""
+    
+    BGRA8 = 3
+    """
+    32-bit BGRA (4 bytes per pixel: Blue, Green, Red, Alpha).
+"""
+    
+
+
+class _UniffiFfiConverterTypePixelFormat(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return PixelFormat.RGB8
+        if variant == 2:
+            return PixelFormat.RGBA8
+        if variant == 3:
+            return PixelFormat.BGR8
+        if variant == 4:
+            return PixelFormat.BGRA8
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == PixelFormat.RGB8:
+            return
+        if value == PixelFormat.RGBA8:
+            return
+        if value == PixelFormat.BGR8:
+            return
+        if value == PixelFormat.BGRA8:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == PixelFormat.RGB8:
+            buf.write_i32(1)
+        if value == PixelFormat.RGBA8:
+            buf.write_i32(2)
+        if value == PixelFormat.BGR8:
+            buf.write_i32(3)
+        if value == PixelFormat.BGRA8:
+            buf.write_i32(4)
+
+
+
+
+
+
+
+
 class ToolFormat(enum.Enum):
     """
     The tool-call wire format a model family uses. Mirrors
@@ -9779,8 +10028,9 @@ class SessionProtocol(typing.Protocol):
         includes both "manifest didn't list a mmproj" (no warn
         logged) and "mmproj listed but failed to open/parse"
         (warn logged at `CeraEngine::from_path`).
-        - `ContextOverflow` / `Cancelled` propagate from the
-        underlying prefill.
+        - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+        underlying prefill (a backend fault recorded mid-prefill surfaces
+        as `Backend`, not `Cancelled`).
 """
         raise NotImplementedError
     def append_image(self, bytes: bytes,max_long_size: typing.Optional[int]) -> None:
@@ -9833,8 +10083,35 @@ class SessionProtocol(typing.Protocol):
         - `Backend(...)` for image decode failure, missing vision
         encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
         mismatch.
-        - `ContextOverflow` / `Cancelled` propagate from the
-        underlying prefill.
+        - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+        underlying prefill (a backend fault recorded mid-prefill surfaces
+        as `Backend`, not `Cancelled`).
+"""
+        raise NotImplementedError
+    def append_raw_image(self, pixels: bytes,width: int,height: int,format: PixelFormat,max_long_size: typing.Optional[int]) -> None:
+        """
+        Append an uncompressed raw image buffer to the session context.
+
+        `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+        `width` and `height` specify the source image dimensions in pixels.
+        `max_long_size` controls edge resizing: `None` uses the session default,
+        `Some(0)` disables resizing to keep original dimensions, and `Some(n)`
+        constrains the longest edge to at most `n` pixels.
+        Automatically applies aspect-preserving resizing and normalization,
+        then encodes with the vision encoder and appends image tokens.
+
+        # Errors
+
+        - `EmptyInput` if the buffer is empty or a dimension is 0.
+        - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+        (extra trailing bytes are ignored).
+        - `Preprocess` if image normalization fails.
+        - `UnsupportedModality` if vision encoding is unsupported on this session.
+        - `Backend` for missing vision encoder, projection dimension mismatch,
+        or backend execution failure during encoding or prefill.
+        - `ContextOverflow` if appending image tokens exceeds context limit.
+        - `Cancelled` if execution is interrupted.
+        - `PoisonedSession` if the session lock is poisoned.
 """
         raise NotImplementedError
     def append_text(self, text: str) -> None:
@@ -9910,6 +10187,18 @@ class SessionProtocol(typing.Protocol):
         """
         Returns default `GenerateOpts` for this session, pre-populated with
         advisory sampling defaults from the bundle manifest (if any) or standard defaults.
+"""
+        raise NotImplementedError
+    def disable_spec(self, ) -> None:
+        """
+        Explicitly disable speculative decoding for this session. An attached
+        drafter is kept, so [`Self::enable_spec`] restores it.
+"""
+        raise NotImplementedError
+    def enable_spec(self, ) -> None:
+        """
+        Re-enable speculative decoding for this session (if previously
+        disabled), using the attached drafter if there is one.
 """
         raise NotImplementedError
     def export_checkpoint(self, ) -> bytes:
@@ -10058,7 +10347,7 @@ class SessionProtocol(typing.Protocol):
 
         Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
         doesn't implement hidden-state extraction; `InvalidToken` if any id is
-        `>= vocab_size`.
+        `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
 """
         raise NotImplementedError
     def hidden_states_for_tokens_with_adapters(self, tokens: typing.List[int],adapters: typing.List[LoraAdapterEntry]) -> bytes:
@@ -10085,6 +10374,11 @@ class SessionProtocol(typing.Protocol):
         """
         Like [`Self::hidden_states_mean_pooled`] with the per-call adapter
         stack of [`Self::hidden_states_for_tokens_with_adapters`].
+"""
+        raise NotImplementedError
+    def image_max_long_size(self, ) -> typing.Optional[int]:
+        """
+        Read the session-default cap on the longest side of an appended image, if any.
 """
         raise NotImplementedError
     def import_checkpoint(self, data: bytes) -> None:
@@ -10176,13 +10470,7 @@ class SessionProtocol(typing.Protocol):
     def set_image_max_long_size(self, max_long_size: typing.Optional[int]) -> None:
         """
         Set a session-default cap on the longest side of an appended
-        image, in pixels (`None` = no cap). Unlike the per-call
-        `max_long_size` argument to [`Self::append_image`], this default
-        is honored by every image-append path the session drives —
-        including chat-template flows — so a host can configure the
-        image-encode budget once. See [`Self::append_image`] for the cap
-        semantics (shrinks the encoded target, never upscales, takes
-        precedence over the model's minimum-resolution floor).
+        image, in pixels (`None` = no cap).
 """
         raise NotImplementedError
     def set_lora_adapters(self, adapters: typing.List[LoraAdapterEntry]) -> None:
@@ -10289,8 +10577,9 @@ class Session(SessionProtocol):
         includes both "manifest didn't list a mmproj" (no warn
         logged) and "mmproj listed but failed to open/parse"
         (warn logged at `CeraEngine::from_path`).
-        - `ContextOverflow` / `Cancelled` propagate from the
-        underlying prefill.
+        - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+        underlying prefill (a backend fault recorded mid-prefill surfaces
+        as `Backend`, not `Cancelled`).
 """
         
         _UniffiFfiConverterSequenceFloat32.check_lower(samples)
@@ -10359,8 +10648,9 @@ class Session(SessionProtocol):
         - `Backend(...)` for image decode failure, missing vision
         encoder, or encoder/LLM `projection_dim` ≠ `hidden_size`
         mismatch.
-        - `ContextOverflow` / `Cancelled` propagate from the
-        underlying prefill.
+        - `ContextOverflow` / `Cancelled` / `Backend` propagate from the
+        underlying prefill (a backend fault recorded mid-prefill surfaces
+        as `Backend`, not `Cancelled`).
 """
         
         _UniffiFfiConverterBytes.check_lower(bytes)
@@ -10376,6 +10666,57 @@ class Session(SessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_session_append_image,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def append_raw_image(self, pixels: bytes,width: int,height: int,format: PixelFormat,max_long_size: typing.Optional[int]) -> None:
+        """
+        Append an uncompressed raw image buffer to the session context.
+
+        `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
+        `width` and `height` specify the source image dimensions in pixels.
+        `max_long_size` controls edge resizing: `None` uses the session default,
+        `Some(0)` disables resizing to keep original dimensions, and `Some(n)`
+        constrains the longest edge to at most `n` pixels.
+        Automatically applies aspect-preserving resizing and normalization,
+        then encodes with the vision encoder and appends image tokens.
+
+        # Errors
+
+        - `EmptyInput` if the buffer is empty or a dimension is 0.
+        - `Backend` if the buffer is shorter than `width * height * bytes_per_pixel`
+        (extra trailing bytes are ignored).
+        - `Preprocess` if image normalization fails.
+        - `UnsupportedModality` if vision encoding is unsupported on this session.
+        - `Backend` for missing vision encoder, projection dimension mismatch,
+        or backend execution failure during encoding or prefill.
+        - `ContextOverflow` if appending image tokens exceeds context limit.
+        - `Cancelled` if execution is interrupted.
+        - `PoisonedSession` if the session lock is poisoned.
+"""
+        
+        _UniffiFfiConverterBytes.check_lower(pixels)
+
+        _UniffiFfiConverterUInt32.check_lower(width)
+
+        _UniffiFfiConverterUInt32.check_lower(height)
+
+        _UniffiFfiConverterTypePixelFormat.check_lower(format)
+
+        _UniffiFfiConverterOptionalUInt32.check_lower(max_long_size)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterBytes.lower(pixels),
+            _UniffiFfiConverterUInt32.lower(width),
+            _UniffiFfiConverterUInt32.lower(height),
+            _UniffiFfiConverterTypePixelFormat.lower(format),
+            _UniffiFfiConverterOptionalUInt32.lower(max_long_size),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_append_raw_image,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -10530,6 +10871,38 @@ class Session(SessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_session_default_generate_opts,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def disable_spec(self, ) -> None:
+        """
+        Explicitly disable speculative decoding for this session. An attached
+        drafter is kept, so [`Self::enable_spec`] restores it.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_disable_spec,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def enable_spec(self, ) -> None:
+        """
+        Re-enable speculative decoding for this session (if previously
+        disabled), using the attached drafter if there is one.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_enable_spec,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -10800,7 +11173,7 @@ class Session(SessionProtocol):
 
         Errors: `EmptyInput` on empty input; `UnsupportedModality` if the backend
         doesn't implement hidden-state extraction; `InvalidToken` if any id is
-        `>= vocab_size`.
+        `>= vocab_size`; `Backend` if a backend fault was recorded during extraction.
 """
         
         _UniffiFfiConverterSequenceUInt32.check_lower(tokens)
@@ -10884,6 +11257,21 @@ class Session(SessionProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled_with_adapters,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def image_max_long_size(self, ) -> typing.Optional[int]:
+        """
+        Read the session-default cap on the longest side of an appended image, if any.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterOptionalUInt32.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_session_image_max_long_size,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -11113,13 +11501,7 @@ class Session(SessionProtocol):
     def set_image_max_long_size(self, max_long_size: typing.Optional[int]) -> None:
         """
         Set a session-default cap on the longest side of an appended
-        image, in pixels (`None` = no cap). Unlike the per-call
-        `max_long_size` argument to [`Self::append_image`], this default
-        is honored by every image-append path the session drives —
-        including chat-template flows — so a host can configure the
-        image-encode budget once. See [`Self::append_image`] for the cap
-        semantics (shrinks the encoded target, never upscales, takes
-        precedence over the model's minimum-resolution floor).
+        image, in pixels (`None` = no cap).
 """
         
         _UniffiFfiConverterOptionalUInt32.check_lower(max_long_size)
@@ -11283,6 +11665,11 @@ class ChatSessionProtocol(typing.Protocol):
         Stream generation output tokens into the specified sink, constrained by a JSON Schema.
 """
         raise NotImplementedError
+    def image_max_long_size(self, ) -> typing.Optional[int]:
+        """
+        Read the longest-side pixel cap configured on the session, if any.
+"""
+        raise NotImplementedError
     def import_checkpoint(self, data: bytes) -> None:
         """
         Import and restore a chat session checkpoint from serialized binary bytes.
@@ -11351,6 +11738,11 @@ class ChatSessionProtocol(typing.Protocol):
     def save_checkpoint(self, path: str) -> None:
         """
         Save current chat session checkpoint to a file.
+"""
+        raise NotImplementedError
+    def set_image_max_long_size(self, max_long_size: typing.Optional[int]) -> None:
+        """
+        Set an optional resolution cap on the longest side of encoded images.
 """
         raise NotImplementedError
     def set_tool_format(self, format: ToolFormat) -> None:
@@ -11645,6 +12037,21 @@ class ChatSession(ChatSessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def image_max_long_size(self, ) -> typing.Optional[int]:
+        """
+        Read the longest-side pixel cap configured on the session, if any.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterOptionalUInt32.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_image_max_long_size,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def import_checkpoint(self, data: bytes) -> None:
         """
         Import and restore a chat session checkpoint from serialized binary bytes.
@@ -11859,6 +12266,24 @@ class ChatSession(ChatSessionProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def set_image_max_long_size(self, max_long_size: typing.Optional[int]) -> None:
+        """
+        Set an optional resolution cap on the longest side of encoded images.
+"""
+        
+        _UniffiFfiConverterOptionalUInt32.check_lower(max_long_size)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterOptionalUInt32.lower(max_long_size),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def set_tool_format(self, format: ToolFormat) -> None:
         """
         Set tool wire format explicitly.
@@ -12027,6 +12452,14 @@ class CeraEngineProtocol(typing.Protocol):
         Clear the engine's in-memory warm KV prefix cache, preserving on-disk cold cache.
         Call this from host OS memory pressure warnings (e.g. iOS `applicationDidReceiveMemoryWarning`
         or Android `onTrimMemory`) to immediately free RAM without losing persistent cached prefixes.
+"""
+        raise NotImplementedError
+    def configure_prefix_cache(self, cache_dir: typing.Optional[str],max_warm_entries: typing.Optional[int]) -> None:
+        """
+        Configure the model's KV prefix cache.
+
+        When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+        When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
 """
         raise NotImplementedError
     def context_size(self, ) -> int:
@@ -12643,6 +13076,30 @@ class CeraEngine(CeraEngineProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def configure_prefix_cache(self, cache_dir: typing.Optional[str],max_warm_entries: typing.Optional[int]) -> None:
+        """
+        Configure the model's KV prefix cache.
+
+        When `cache_dir` is Some, enables on-disk persistent prefix caching in that directory.
+        When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
+"""
+        
+        _UniffiFfiConverterOptionalString.check_lower(cache_dir)
+
+        _UniffiFfiConverterOptionalUInt32.check_lower(max_warm_entries)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterOptionalString.lower(cache_dir),
+            _UniffiFfiConverterOptionalUInt32.lower(max_warm_entries),
+        )
+        _uniffi_lift_return = lambda val: None
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -15403,6 +15860,55 @@ def detect_tool_format(architecture: str) -> typing.Optional[ToolFormat]:
         *_uniffi_lowered_args,
     )
     return _uniffi_lift_return(_uniffi_ffi_result)
+def hexagon_install_skels(dir: str) -> int:
+    """
+    Write the embedded DSP skels into `dir` (created private, mode 0700, if
+    missing) and point FastRPC's loader at it. An existing `dir` that another
+    user owns, or that is writable by "other", is refused with `Backend`, since
+    the loader executes what is in it. Caller stages a private writable directory;
+    on Android, the `HexagonNpu.setup` helper invokes this function to extract
+    skels into the application's internal files directory (`cera_skels`) and
+    configures `ADSP_LIBRARY_PATH`. Call once at startup, before [`hexagon_probe`]
+    or loading a model with [`BackendPreference::Hexagon`]. Returns the
+    number of skels written (0 when all were already present and fresh).
+    Re-running is cheap and idempotent (files are only rewritten when
+    their bytes differ, and the loader path is not duplicated). A `dir`
+    containing `;`, `=` or NUL is rejected: it would silently split or corrupt
+    the loader's search path.
+"""
+    
+    _UniffiFfiConverterString.check_lower(dir)
+    _uniffi_lowered_args = (
+        _UniffiFfiConverterString.lower(dir),
+    )
+    _uniffi_lift_return = _UniffiFfiConverterUInt32.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_hexagon_install_skels,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
+def hexagon_probe() -> HexagonProbeInfo:
+    """
+    Probe for a usable Qualcomm Hexagon NPU: opens the FastRPC driver,
+    tries each bundled DSP skel, and returns the first working device's
+    capabilities (then closes it). Fails when the `hexagon` feature is
+    off, on non-Qualcomm hardware, or when FastRPC/unsigned-PD is
+    unavailable to this process. On Android, call the AAR's
+    `HexagonNpu.setup` first so the loader can find the skel files
+    (JVM/desktop flows use [`hexagon_install_skels`] instead).
+"""
+    _uniffi_lowered_args = (
+    )
+    _uniffi_lift_return = _UniffiFfiConverterTypeHexagonProbeInfo.lift
+    _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+    _uniffi_ffi_result = _uniffi_rust_call_with_error(
+        _uniffi_error_converter,
+        _UniffiLib.uniffi_cera_ffi_fn_func_hexagon_probe,
+        *_uniffi_lowered_args,
+    )
+    return _uniffi_lift_return(_uniffi_ffi_result)
 def hotword_default_config() -> FfiHotwordConfig:
     """
     Default KWS configuration parameters.
@@ -15584,6 +16090,7 @@ __all__ = [
     "FfiVadSampleRate",
     "LoadError",
     "ModelSource",
+    "PixelFormat",
     "ToolFormat",
     "AudioInput",
     "ChatMessage",
@@ -15600,6 +16107,7 @@ __all__ = [
     "GenerateOpts",
     "GenerateSummary",
     "GenerateOutput",
+    "HexagonProbeInfo",
     "IngestRecovery",
     "IngestSummary",
     "LeapBundleEntry",
@@ -15626,6 +16134,8 @@ __all__ = [
     "chat_message_user_image",
     "cpu_backend_report",
     "detect_tool_format",
+    "hexagon_install_skels",
+    "hexagon_probe",
     "hotword_default_config",
     "json_schema_to_grammar",
     "list_leap_bundles",

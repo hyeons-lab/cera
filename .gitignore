@@ -57,4 +57,10 @@ cera_time.txt
 llama_time.txt
 bench_results.csv
 bench_log.txt
+bench_*.csv
+bench_*.log
 __pycache__/
+
+# Package archives
+*.deb
+

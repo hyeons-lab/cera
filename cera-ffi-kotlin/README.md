@@ -92,3 +92,41 @@ downloader.download("LFM2-1.2B-GGUF", "Q4_0").collect { state ->
 // 3. Or trigger via AndroidBundleRepo convenience functions:
 AndroidBundleRepo.download(context, "LFM2-1.2B-GGUF", "Q4_0").collect { ... }
 ```
+
+## Hexagon NPU (Android)
+
+`cera-ffi-android` can run inference on Qualcomm Hexagon NPUs from a
+normally installed app (no root/setup). `libcera_ffi.so` embeds the
+prebuilt DSP skeletons directly; at startup, `HexagonNpu.setup(context)`
+extracts them into `context.noBackupFilesDir/cera_skels` and sets
+`ADSP_LIBRARY_PATH`. Because skeletons are extracted at runtime rather
+than packaged as host shared libraries in `jniLibs/`, all libraries
+in the published AAR remain 16KB-page-aligned (`0x4000`) and apps do
+not require `android:extractNativeLibs="true"`. The AAR manifest merges
+`<uses-native-library android:name="libcdsprpc.so" android:required="false"/>`
+into consumers automatically.
+
+```kotlin
+import com.hyeonslab.cera.android.HexagonNpu
+import uniffi.cera_ffi.*
+
+// Once at startup, on the main thread:
+HexagonNpu.setup(context) // verifies skels, sets ADSP_LIBRARY_PATH
+
+// Gate NPU use on a live probe:
+val backend = try {
+    val p = hexagonProbe()
+    Log.i("npu", "Hexagon ${p.arch} hmx=${p.hmxUnits}")
+    BackendPreference.HEXAGON
+} catch (e: Exception) {
+    BackendPreference.CPU // no NPU in this process
+}
+```
+
+`HexagonNpu.setup` fails fast when the skels are missing (packaging
+bug on arm64-v8a) or the ABI ships none (x86_64 Android has no Hexagon
+DSP; treat the NPU as unavailable). DSP policy varies per
+OEM/SoC/firmware; `HexagonNpu.hasDirectNodeAccess()` reports which
+access route the device uses. Details, the support matrix, and the
+release gates live in `docs/ANDROID_NPU_PACKAGING.md`; the `probe-app`
+module is the runnable on-device reference.

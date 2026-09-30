@@ -42,6 +42,7 @@ void main() {
 
     test('enums keep their variants', () {
       expect(BackendPreference.values, contains(BackendPreference.metal));
+      expect(BackendPreference.values, contains(BackendPreference.hexagon));
     });
 
     test('sealed error types can be constructed and matched', () {

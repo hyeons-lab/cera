@@ -1,11 +1,13 @@
 //! Audio-aware generation loop with text ↔ audio modality switching.
 
+use std::sync::atomic::AtomicBool;
+
 use anyhow::Result;
 
-use crate::kv_cache::InferenceState;
+use crate::kv_cache::{InferenceState, KvCompression};
 use crate::model::Model;
 use crate::model::audio_decoder::{
-    AudioDecoderWeights, AudioGpu, DepthformerState, DetokenizerState, DetokenizerWeights,
+    AudioAccelerator, AudioDecoderWeights, DepthformerState, DetokenizerState, DetokenizerWeights,
     detokenize_to_spectrum, embed_audio_token, istft_to_pcm, sample_audio_frame,
 };
 use crate::sampler::{Sampler, SamplerConfig};
@@ -23,8 +25,9 @@ pub struct AudioGenerateConfig {
     pub audio_top_k: usize,
     /// Generation mode.
     pub mode: AudioMode,
-    /// Use GPU for depthformer (code sampling). Disabled by default because
-    /// GEMV accumulation order differences can produce different codes.
+    /// Opt in to an experimental accelerated depthformer (Metal, wgpu): off by
+    /// default because GEMV accumulation order differences can produce
+    /// different codes. Accelerators trusted by default (Hexagon) ignore it.
     pub gpu_depthformer: bool,
 }
 
@@ -176,6 +179,16 @@ pub enum FrameOutcome {
     /// spectrum produced for this frame; caller should return control
     /// to the text modality per its mode's exit convention.
     End,
+    /// The accelerator backend faulted mid-frame (see
+    /// `AudioAccelerator::take_audio_error`) and the stage has no CPU fallback
+    /// with coherent state, so the frame produced nothing usable.
+    /// Callers must abort generation with the error, not continue over
+    /// the hole: detokenize/ISTFT faults already fall back to CPU
+    /// inside `decode_frame`/`finish`, so only sampling faults arrive
+    /// here. Carries the fault detail string (`CeraError` is neither
+    /// `Clone` nor `PartialEq`, which this enum derives); callers
+    /// re-wrap with `CeraError::Backend`.
+    Fault(String),
 }
 
 /// Owns the audio output-decoder state and exposes per-frame operations.
@@ -184,7 +197,7 @@ pub enum FrameOutcome {
 pub struct AudioOutputDecoder<'a> {
     weights: &'a AudioDecoderWeights,
     detok_weights: &'a DetokenizerWeights,
-    gpu: Option<&'a dyn AudioGpu>,
+    accelerator: Option<&'a dyn AudioAccelerator>,
     df_state: DepthformerState,
     detok_state: DetokenizerState,
     streamer: crate::model::audio_decoder::IstftStreamer,
@@ -196,8 +209,8 @@ pub struct AudioOutputDecoder<'a> {
     time_detokenizer: Duration,
     audio_temperature: f32,
     audio_top_k: usize,
-    /// Precomputed: `gpu.is_some() && config.gpu_depthformer`.
-    use_gpu_df: bool,
+    /// Precomputed: hardware depthformer acceleration is active.
+    use_accelerated_df: bool,
     /// Whether to detokenize and stream audio incrementally per frame,
     /// or buffer sampled codes and perform a single fused detokenization + iSTFT pass at finish.
     streaming: bool,
@@ -209,8 +222,8 @@ pub struct AudioOutputDecoder<'a> {
 
 impl<'a> Drop for AudioOutputDecoder<'a> {
     fn drop(&mut self) {
-        if let Some(g) = self.gpu {
-            g.release_session();
+        if let Some(acc) = self.accelerator {
+            acc.release_session();
         }
     }
 }
@@ -273,20 +286,20 @@ impl<'a> AudioOutputDecoder<'a> {
     pub fn new(
         weights: &'a AudioDecoderWeights,
         detok_weights: &'a DetokenizerWeights,
-        gpu: Option<&'a dyn AudioGpu>,
+        accelerator: Option<&'a dyn AudioAccelerator>,
         audio_temperature: f32,
         audio_top_k: usize,
         gpu_depthformer: bool,
     ) -> Self {
-        let active_gpu = match gpu {
-            Some(g) if g.try_acquire_session() => {
-                g.reset_detokenizer();
-                g.reset_depthformer();
-                Some(g)
+        let active_accelerator = match accelerator {
+            Some(a) if a.try_acquire_session() => {
+                a.reset_detokenizer();
+                a.reset_depthformer();
+                Some(a)
             }
             Some(_) => {
                 tracing::warn!(
-                    "GPU audio decoder busy with another session, falling back to CPU detokenization"
+                    "Audio accelerator busy with another session, falling back to CPU detokenization"
                 );
                 None
             }
@@ -301,7 +314,7 @@ impl<'a> AudioOutputDecoder<'a> {
         Self {
             weights,
             detok_weights,
-            gpu: active_gpu,
+            accelerator: active_accelerator,
             df_state,
             detok_state,
             streamer,
@@ -312,16 +325,27 @@ impl<'a> AudioOutputDecoder<'a> {
             time_detokenizer: Duration::ZERO,
             audio_temperature,
             audio_top_k,
-            use_gpu_df: gpu_depthformer && active_gpu.is_some_and(|g| g.supports_depthformer()),
+            use_accelerated_df: active_accelerator.is_some_and(|a| {
+                crate::model::audio_decoder::accelerated_depthformer_enabled(
+                    a.supports_depthformer(),
+                    a.depthformer_default_on(),
+                    gpu_depthformer,
+                )
+            }),
             streaming: true,
             all_codes: Vec::new(),
             watchdog: AudioSilenceWatchdog::new(),
         }
     }
 
-    /// Whether this decoder is using the GPU depthformer.
+    /// Whether this decoder is using hardware-accelerated depthformer.
+    pub fn supports_accelerated_depthformer(&self) -> bool {
+        self.use_accelerated_df
+    }
+
+    /// Backward-compatibility alias for [`Self::supports_accelerated_depthformer`].
     pub fn supports_gpu_depthformer(&self) -> bool {
-        self.use_gpu_df
+        self.supports_accelerated_depthformer()
     }
 
     /// Sample one audio frame via depthformer, detect end-of-stream,
@@ -333,9 +357,24 @@ impl<'a> AudioOutputDecoder<'a> {
     /// frame, or the prior frame's feedback embedding afterward).
     pub fn decode_frame(&mut self, embed: &[f32]) -> FrameOutcome {
         let t0 = Instant::now();
-        let codes = match (self.use_gpu_df, self.gpu) {
-            (true, Some(g)) => {
-                g.sample_audio_frame(embed, self.audio_temperature, self.audio_top_k)
+        let codes = match (self.use_accelerated_df, self.accelerator) {
+            (true, Some(a)) => {
+                // Drain the backend fault slot around the bare sample:
+                // a fault here must abort (the async path `?`s it), since
+                // CPU state went cold while the accelerator drove sampling.
+                let _ = a.take_audio_error();
+                let codes = a.sample_audio_frame(embed, self.audio_temperature, self.audio_top_k);
+                if let Some(e) = a.take_audio_error() {
+                    // Backend details round-trip exactly; anything else
+                    // degrades to its display text (audio faults are
+                    // `Backend` by construction: every recorder passes it).
+                    let detail = match e {
+                        crate::CeraError::Backend(detail) => detail,
+                        other => other.to_string(),
+                    };
+                    return FrameOutcome::Fault(detail);
+                }
+                codes
             }
             _ => sample_audio_frame(
                 self.weights,
@@ -364,8 +403,21 @@ impl<'a> AudioOutputDecoder<'a> {
         }
 
         let t1 = Instant::now();
-        let spectrum = if let Some(g) = self.gpu {
-            g.detokenize_to_spectrum(self.detok_weights, &codes)
+        let spectrum = if let Some(a) = self.accelerator {
+            // Drain around the bare call; on a fault recompute on CPU,
+            // mirroring the async path's `Err(_) =>` arm below.
+            let _ = a.take_audio_error();
+            let spectrum = a.detokenize_to_spectrum(self.detok_weights, &codes);
+            if a.take_audio_error().is_some() {
+                detokenize_to_spectrum(
+                    self.detok_weights,
+                    self.weights,
+                    &mut self.detok_state,
+                    &codes,
+                )
+            } else {
+                spectrum
+            }
         } else {
             detokenize_to_spectrum(
                 self.detok_weights,
@@ -389,9 +441,9 @@ impl<'a> AudioOutputDecoder<'a> {
     /// Async version of [`Self::decode_frame`] for WebGPU / browser wasm.
     pub async fn decode_frame_async(&mut self, embed: &[f32]) -> anyhow::Result<FrameOutcome> {
         let t0 = Instant::now();
-        let codes = match (self.use_gpu_df, self.gpu) {
-            (true, Some(g)) => {
-                g.sample_audio_frame_async(embed, self.audio_temperature, self.audio_top_k)
+        let codes = match (self.use_accelerated_df, self.accelerator) {
+            (true, Some(a)) => {
+                a.sample_audio_frame_async(embed, self.audio_temperature, self.audio_top_k)
                     .await?
             }
             _ => sample_audio_frame(
@@ -421,8 +473,8 @@ impl<'a> AudioOutputDecoder<'a> {
         }
 
         let t1 = Instant::now();
-        let spectrum = if let Some(g) = self.gpu {
-            match g
+        let spectrum = if let Some(a) = self.accelerator {
+            match a
                 .detokenize_to_spectrum_async(self.detok_weights, &codes)
                 .await
             {
@@ -461,8 +513,8 @@ impl<'a> AudioOutputDecoder<'a> {
         hidden_buf: &wgpu::Buffer,
     ) -> anyhow::Result<FrameOutcome> {
         let t0 = Instant::now();
-        let codes = if let (true, Some(g)) = (self.use_gpu_df, self.gpu) {
-            g.sample_audio_frame_from_gpu_hidden_async(
+        let codes = if let (true, Some(a)) = (self.use_accelerated_df, self.accelerator) {
+            a.sample_audio_frame_from_gpu_hidden_async(
                 hidden_buf,
                 self.audio_temperature,
                 self.audio_top_k,
@@ -490,8 +542,8 @@ impl<'a> AudioOutputDecoder<'a> {
         }
 
         let t1 = Instant::now();
-        let spectrum = if let Some(g) = self.gpu {
-            match g
+        let spectrum = if let Some(a) = self.accelerator {
+            match a
                 .detokenize_to_spectrum_async(self.detok_weights, &codes)
                 .await
             {
@@ -542,8 +594,21 @@ impl<'a> AudioOutputDecoder<'a> {
             let chunks = self.all_codes.chunks_exact(8);
             let remainder = chunks.remainder();
             for codes in chunks {
-                let spectrum = if let Some(g) = self.gpu {
-                    g.detokenize_to_spectrum(self.detok_weights, codes)
+                let spectrum = if let Some(a) = self.accelerator {
+                    // Drain around the bare call; on a fault recompute
+                    // on CPU rather than extending zeros.
+                    let _ = a.take_audio_error();
+                    let spectrum = a.detokenize_to_spectrum(self.detok_weights, codes);
+                    if a.take_audio_error().is_some() {
+                        detokenize_to_spectrum(
+                            self.detok_weights,
+                            self.weights,
+                            &mut self.detok_state,
+                            codes,
+                        )
+                    } else {
+                        spectrum
+                    }
                 } else {
                     detokenize_to_spectrum(
                         self.detok_weights,
@@ -568,8 +633,18 @@ impl<'a> AudioOutputDecoder<'a> {
         }
         let n_fft = self.detok_weights.config.n_fft;
         let hop = self.detok_weights.config.hop_length;
-        let pcm = match self.gpu {
-            Some(g) => g.istft_to_pcm(&self.all_spectrum, n_fft, hop),
+        let pcm = match self.accelerator {
+            Some(a) => {
+                // ISTFT is stateless, so a faulted accelerator run recomputes
+                // on CPU with identical output instead of failing.
+                let _ = a.take_audio_error();
+                let pcm = a.istft_to_pcm(&self.all_spectrum, n_fft, hop);
+                if a.take_audio_error().is_some() {
+                    istft_to_pcm(&self.all_spectrum, n_fft, hop)
+                } else {
+                    pcm
+                }
+            }
             None => istft_to_pcm(&self.all_spectrum, n_fft, hop),
         };
         self.all_spectrum.clear();
@@ -603,8 +678,8 @@ impl<'a> AudioOutputDecoder<'a> {
             let chunks = self.all_codes.chunks_exact(8);
             let remainder = chunks.remainder();
             for codes in chunks {
-                let spectrum = if let Some(g) = self.gpu {
-                    g.detokenize_to_spectrum_async(self.detok_weights, codes)
+                let spectrum = if let Some(a) = self.accelerator {
+                    a.detokenize_to_spectrum_async(self.detok_weights, codes)
                         .await?
                 } else {
                     detokenize_to_spectrum(
@@ -630,8 +705,8 @@ impl<'a> AudioOutputDecoder<'a> {
         }
         let n_fft = self.detok_weights.config.n_fft;
         let hop = self.detok_weights.config.hop_length;
-        let pcm = match self.gpu {
-            Some(g) => g.istft_to_pcm_async(&self.all_spectrum, n_fft, hop).await?,
+        let pcm = match self.accelerator {
+            Some(a) => a.istft_to_pcm_async(&self.all_spectrum, n_fft, hop).await?,
             None => istft_to_pcm(&self.all_spectrum, n_fft, hop),
         };
         self.all_spectrum.clear();
@@ -650,9 +725,20 @@ impl<'a> AudioOutputDecoder<'a> {
 // generate_audio
 // ---------------------------------------------------------------------------
 
+/// Fail `generate_audio` on a recorded backend fault: the `Session`
+/// `check_decode_error` equivalent for this standalone driver, which feeds
+/// `&dyn Model` straight in and would otherwise sample zero logits as real
+/// output and advance `pos` over the hole.
+fn check_audio_decode_error(model: &dyn Model) -> Result<()> {
+    if let Some(e) = model.take_decode_error() {
+        return Err(e.into());
+    }
+    Ok(())
+}
+
 /// Generate text + audio from a model with vocoder.
 ///
-/// `gpu`: optional GPU backend for depthformer + detokenizer acceleration.
+/// `accelerator`: optional hardware accelerator backend for depthformer + detokenizer acceleration.
 #[allow(unused_assignments, clippy::too_many_arguments)]
 pub fn generate_audio(
     model: &dyn Model,
@@ -661,19 +747,28 @@ pub fn generate_audio(
     tokenizer: &BpeTokenizer,
     prompt_tokens: &[u32],
     config: &AudioGenerateConfig,
-    gpu: Option<&dyn AudioGpu>,
+    accelerator: Option<&dyn AudioAccelerator>,
     mut text_callback: impl FnMut(&str),
     mut audio_callback: impl FnMut(&[f32], u32),
 ) -> Result<AudioGenerateResult> {
     anyhow::ensure!(!prompt_tokens.is_empty(), "prompt_tokens must not be empty");
+    // Discard any stale decode error (mirrors `Session`): only this
+    // attempt's own faults may fail it at the checks below.
+    let _ = model.take_decode_error();
 
     let model_config = model.config();
     let mut state = InferenceState::from_config(model_config)?;
+    // A fresh state starts at position 0, but backends that keep KV or
+    // recurrent state on the model or device (Hexagon) would carry the last
+    // generation's, or stay failed-closed after a panic. Reset them to match.
+    // Best effort: backends without a checked reset return `Err` and are
+    // unaffected; a real failure resurfaces on the first forward pass.
+    let _ = model.try_reset_kv(&mut state, &KvCompression::None, model_config.max_seq_len);
     let mut sampler = Sampler::new(config.sampler.clone());
     let mut decoder = AudioOutputDecoder::new(
         decoder_weights,
         detok_weights,
-        gpu,
+        accelerator,
         config.audio_temperature,
         config.audio_top_k,
         config.gpu_depthformer,
@@ -681,13 +776,33 @@ pub fn generate_audio(
 
     let start = Instant::now();
 
-    // Prefill.
-    let mut logits = model.forward_prefill(prompt_tokens, 0, &mut state);
+    // Prefill through the chunked entry point (one chunk: `ubatch == 0`
+    // disables session-level chunking) so a backend fault stops `consumed`
+    // at the KV prefix that exists instead of advancing `pos` over a hole:
+    // the `Session::append_tokens` accounting, minus cancellation (this
+    // standalone driver has no cancel flag to poll).
+    let no_cancel = AtomicBool::new(false);
+    let (consumed, prefill_logits) =
+        model.forward_prefill_chunked(prompt_tokens, 0, &mut state, 0, &no_cancel);
+    check_audio_decode_error(model)?;
+    if consumed < prompt_tokens.len() {
+        anyhow::bail!(
+            "prefill fault after {consumed}/{} tokens",
+            prompt_tokens.len()
+        );
+    }
+    let mut logits = match prefill_logits {
+        Some(logits) => logits,
+        None => anyhow::bail!(
+            "prefill produced no logits for {} tokens",
+            prompt_tokens.len()
+        ),
+    };
 
     let mut modality = Modality::Text;
     let mut generated = 0usize;
     let mut text_tokens = 0usize;
-    let mut pos = prompt_tokens.len();
+    let mut pos = consumed;
 
     // Interleaved mode counters.
     let mut modality_budget = match config.mode {
@@ -744,6 +859,7 @@ pub fn generate_audio(
             if matches!(config.mode, AudioMode::Interleaved) && (modality_budget == 0 || text_done)
             {
                 let mut emb = model.forward_embedding(&[next_token], pos, &mut state);
+                check_audio_decode_error(model)?;
                 pos += 1;
 
                 modality = Modality::Audio;
@@ -756,11 +872,17 @@ pub fn generate_audio(
                     }
                     let outcome = decoder.decode_frame(&emb);
                     let audio_emb = match outcome {
+                        // A sampling fault aborts generation: no codes, no
+                        // feedback embedding, nothing to continue with.
+                        FrameOutcome::Fault(detail) => {
+                            return Err(crate::CeraError::Backend(detail).into());
+                        }
                         FrameOutcome::End => {
                             if text_done {
                                 break;
                             }
                             logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
+                            check_audio_decode_error(model)?;
                             next_token = sampler.sample(&mut logits);
                             pos += 1;
                             break;
@@ -790,12 +912,14 @@ pub fn generate_audio(
                         // decoding the last audio code embedding and sampling
                         // text from those logits (not by injecting TEXT_END).
                         logits = model.forward_from_embedding(&audio_emb, pos, &mut state);
+                        check_audio_decode_error(model)?;
                         next_token = sampler.sample(&mut logits);
                         pos += 1;
                         break;
                     }
 
                     emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
+                    check_audio_decode_error(model)?;
                     pos += 1;
                 }
 
@@ -811,11 +935,13 @@ pub fn generate_audio(
 
             // Normal text: forward and sample next token.
             logits = model.forward(&[next_token], pos, &mut state);
+            check_audio_decode_error(model)?;
             next_token = sampler.sample(&mut logits);
             pos += 1;
         } else {
             // Sequential audio mode: embedding from the audio_start token.
             let mut emb = model.forward_embedding(&[next_token], pos, &mut state);
+            check_audio_decode_error(model)?;
             // The output norm naturally produces the right scale (~0.14 RMS)
             // when the hidden state has the activation outlier at channel 1455.
             pos += 1;
@@ -827,6 +953,11 @@ pub fn generate_audio(
                 }
                 let outcome = decoder.decode_frame(&emb);
                 let audio_emb = match outcome {
+                    // A sampling fault aborts generation: no codes, no
+                    // feedback embedding, nothing to continue with.
+                    FrameOutcome::Fault(detail) => {
+                        return Err(crate::CeraError::Backend(detail).into());
+                    }
                     FrameOutcome::End => match config.mode {
                         AudioMode::Sequential => {
                             // Sequential TTS: audio is the final output.
@@ -844,6 +975,7 @@ pub fn generate_audio(
                             text_done = true;
                             modality_budget = DEFAULT_INTERLEAVED_TEXT_BUDGET;
                             logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
+                            check_audio_decode_error(model)?;
                             next_token = sampler.sample(&mut logits);
                             pos += 1;
                             break;
@@ -878,6 +1010,7 @@ pub fn generate_audio(
                     modality = Modality::Text;
                     modality_budget = DEFAULT_INTERLEAVED_TEXT_BUDGET;
                     logits = model.forward_from_embedding(&audio_emb, pos, &mut state);
+                    check_audio_decode_error(model)?;
                     next_token = sampler.sample(&mut logits);
                     pos += 1;
                     break;
@@ -885,6 +1018,7 @@ pub fn generate_audio(
 
                 // Feed codes back as embedding → next hidden state.
                 emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
+                check_audio_decode_error(model)?;
                 pos += 1;
             }
         }
@@ -1002,5 +1136,428 @@ mod tests {
         assert!(rms_mixed > 0.04 && rms_mixed < 0.06);
         assert_eq!(watchdog.total_voiced_frames, 1);
         assert_eq!(watchdog.consecutive_silent_frames, 0);
+    }
+
+    /// Minimal `Model` with a poisonable decode-error slot, for pinning
+    /// `check_audio_decode_error` without audio weight fixtures.
+    struct PoisonableModel {
+        slot: std::sync::Mutex<Option<crate::CeraError>>,
+    }
+
+    impl PoisonableModel {
+        fn with_slot(err: Option<crate::CeraError>) -> Self {
+            Self {
+                slot: std::sync::Mutex::new(err),
+            }
+        }
+    }
+
+    impl Model for PoisonableModel {
+        fn forward(&self, _tokens: &[u32], _pos: usize, _state: &mut InferenceState) -> Vec<f32> {
+            Vec::new()
+        }
+        fn config(&self) -> &crate::model::ModelConfig {
+            // Never read by the drain under test; the mock exists only to
+            // carry the slot.
+            unimplemented!("PoisonableModel carries no config")
+        }
+        fn take_decode_error(&self) -> Option<crate::CeraError> {
+            crate::model::take_fault(&self.slot)
+        }
+    }
+
+    #[test]
+    fn audio_decode_error_drains_sticky_slot() {
+        // Poisoned drains to Err once, then is clean (sticky until taken).
+        let poisoned = PoisonableModel::with_slot(Some(crate::CeraError::Backend(
+            "injected audio fault".into(),
+        )));
+        assert!(check_audio_decode_error(&poisoned).is_err());
+        assert!(check_audio_decode_error(&poisoned).is_ok());
+        // A clean model never trips the drain.
+        let clean = PoisonableModel::with_slot(None);
+        assert!(check_audio_decode_error(&clean).is_ok());
+    }
+
+    /// Fault-injecting `AudioAccelerator` double: scripted `take_audio_error`
+    /// outcomes (one per take, in order; the script running dry reads as
+    /// clean) plus garbage outputs no real computation produces, so a
+    /// missed drain is observable.
+    struct ScriptedFaultGpu {
+        takes: std::sync::Mutex<std::collections::VecDeque<Option<crate::CeraError>>>,
+        /// What `depthformer_default_on` reports (an opt-in accelerator by
+        /// default, like Metal and wgpu).
+        default_on: bool,
+    }
+
+    impl ScriptedFaultGpu {
+        fn with_script(outcomes: Vec<Option<crate::CeraError>>) -> Self {
+            Self {
+                takes: std::sync::Mutex::new(outcomes.into()),
+                default_on: false,
+            }
+        }
+
+        /// One fault on the first drain (covers a discard-then-drain pair).
+        fn fault_once() -> Self {
+            Self::with_script(vec![
+                None,
+                Some(crate::CeraError::Backend("injected audio fault".into())),
+            ])
+        }
+    }
+
+    impl crate::model::audio_decoder::AudioAccelerator for ScriptedFaultGpu {
+        fn sample_audio_frame(&self, _: &[f32], _: f32, _: usize) -> [i32; 8] {
+            [1; 8]
+        }
+
+        fn detokenize_to_spectrum(
+            &self,
+            _: &crate::model::audio_decoder::DetokenizerWeights,
+            _: &[i32],
+        ) -> Vec<f32> {
+            vec![7.0; 3]
+        }
+
+        fn istft_to_pcm(&self, _: &[f32], _: usize, _: usize) -> Vec<f32> {
+            vec![999.0; 5]
+        }
+
+        fn reset_depthformer(&self) {}
+
+        fn reset_detokenizer(&self) {}
+
+        fn supports_depthformer(&self) -> bool {
+            true
+        }
+
+        fn depthformer_default_on(&self) -> bool {
+            self.default_on
+        }
+
+        fn take_audio_error(&self) -> Option<crate::CeraError> {
+            self.takes.lock().unwrap().pop_front().flatten()
+        }
+    }
+
+    #[test]
+    fn gpu_sample_fault_is_frame_fault_not_codes() {
+        // A sampling fault aborts the frame: no codes are trusted, and no
+        // weight or streamer state is touched before the `Fault` return.
+        let (dec, detok) = empty_vocoder_weights();
+        let gpu = ScriptedFaultGpu::fault_once();
+        let mut decoder = AudioOutputDecoder::new(&dec, &detok, Some(&gpu), 1.0, 1, true);
+        let outcome = decoder.decode_frame(&[0.0; 4]);
+        assert_eq!(outcome, FrameOutcome::Fault("injected audio fault".into()));
+    }
+
+    /// The accelerated depthformer needs support and either default trust or
+    /// an explicit request: an opt-in accelerator (Metal, wgpu) must not run
+    /// it without `gpu_depthformer`, a trusted one (Hexagon) always does.
+    #[test]
+    fn accelerated_depthformer_is_opt_in_unless_trusted() {
+        let (dec, detok) = empty_vocoder_weights();
+        let built = |gpu: &ScriptedFaultGpu, requested: bool| {
+            AudioOutputDecoder::new(&dec, &detok, Some(gpu), 1.0, 1, requested)
+                .supports_accelerated_depthformer()
+        };
+        let opt_in = ScriptedFaultGpu::with_script(vec![]);
+        assert!(
+            !built(&opt_in, false),
+            "opt-in accelerator without the flag"
+        );
+        assert!(built(&opt_in, true), "opt-in accelerator with the flag");
+        let trusted = ScriptedFaultGpu {
+            default_on: true,
+            ..ScriptedFaultGpu::with_script(vec![])
+        };
+        assert!(built(&trusted, false), "trusted accelerator needs no flag");
+    }
+
+    #[test]
+    fn gpu_detok_fault_falls_back_to_cpu() {
+        // Minimal head so the CPU fallback runs: 1-row zero codebook (all
+        // codes embed to zero), unit output norm, zero 10-wide head
+        // (matches the n_fft=8 streamer's 10-float frames).
+        let (dec, mut detok) = empty_vocoder_weights();
+        detok.output_norm = vec![1.0; 4];
+        detok.emb_weight = crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 4], 1, 4);
+        detok.lin_w = crate::model::weights::MmapWeight::from_owned_f32(vec![0.0; 40], 10, 4);
+        detok.lin_b = vec![0.0; 10];
+        // Sample clean (discard + drain), detokenize faults (discard + drain).
+        let gpu = ScriptedFaultGpu::with_script(vec![
+            None,
+            None,
+            None,
+            Some(crate::CeraError::Backend("injected audio fault".into())),
+        ]);
+        let mut decoder = AudioOutputDecoder::new(&dec, &detok, Some(&gpu), 1.0, 1, true);
+        let outcome = decoder.decode_frame(&[0.0; 4]);
+        let FrameOutcome::Codes { pcm, codes, .. } = outcome else {
+            panic!("detok fault must fall back, not abort: {outcome:?}");
+        };
+        assert_eq!(codes, [1; 8]);
+        // Only the CPU recompute (all-zero spectrum) yields framed zero
+        // PCM; the double's 3-float garbage cannot produce this shape.
+        assert!(!pcm.is_empty() && pcm.iter().all(|&x| x == 0.0));
+    }
+
+    #[test]
+    fn gpu_istft_fault_recomputes_on_cpu() {
+        let (dec, detok) = empty_vocoder_weights();
+        let gpu = ScriptedFaultGpu::fault_once();
+        let mut decoder =
+            AudioOutputDecoder::new(&dec, &detok, Some(&gpu), 1.0, 1, true).with_streaming(false);
+        // Preset spectrum with empty codes skips the detokenize loop, so
+        // only the ISTFT drain runs.
+        let spectrum = vec![0.5; 40];
+        decoder.all_spectrum = spectrum.clone();
+        let expected = crate::model::audio_decoder::istft_to_pcm(
+            &spectrum,
+            detok.config.n_fft,
+            detok.config.hop_length,
+        );
+        let mut got = Vec::new();
+        let n = decoder.finish(|pcm, _| got.extend_from_slice(pcm));
+        assert_eq!(got, expected);
+        assert_eq!(n, expected.len());
+        assert!(!expected.is_empty());
+    }
+
+    /// Poll a future that never pends (straight-line test bodies only).
+    fn block_on_ready<F: std::future::Future>(mut fut: F) -> F::Output {
+        use std::task::{Context, Poll};
+        let waker = std::task::Waker::noop();
+        let mut cx = Context::from_waker(waker);
+        // SAFETY: the future is never moved after pinning.
+        let mut pinned = unsafe { std::pin::Pin::new_unchecked(&mut fut) };
+        match pinned.as_mut().poll(&mut cx) {
+            Poll::Ready(out) => out,
+            Poll::Pending => panic!("test future pended unexpectedly"),
+        }
+    }
+
+    #[test]
+    fn async_default_detok_drain_fails_loud() {
+        // The trait's async defaults drain before `Ok`: a recorded fault
+        // (the Metal path, which has no explicit async override) must
+        // surface as `Err`, and a clean run passes the output through.
+        let (_dec, detok) = empty_vocoder_weights();
+        let gpu = ScriptedFaultGpu::fault_once();
+        let out = block_on_ready(gpu.detokenize_to_spectrum_async(&detok, &[0; 8]));
+        assert!(out.is_err());
+        let clean = ScriptedFaultGpu::with_script(vec![None, None]);
+        let out = block_on_ready(clean.detokenize_to_spectrum_async(&detok, &[0; 8]));
+        assert_eq!(out.unwrap(), vec![7.0; 3]);
+    }
+
+    /// `Model` with a real config and a scripted `forward_prefill_chunked`,
+    /// for driving `generate_audio`'s prefill-fault branches without silicon.
+    struct ScriptedPrefillModel {
+        config: crate::model::ModelConfig,
+        consumed: usize,
+        logits: Option<Vec<f32>>,
+        /// How many times `generate_audio` asked for a checked KV reset.
+        resets: std::sync::atomic::AtomicUsize,
+    }
+
+    impl Model for ScriptedPrefillModel {
+        fn forward(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> Vec<f32> {
+            state.seq_len += tokens.len();
+            vec![0.0; self.config.vocab_size]
+        }
+        fn config(&self) -> &crate::model::ModelConfig {
+            &self.config
+        }
+        fn forward_prefill_chunked(
+            &self,
+            _tokens: &[u32],
+            _start_pos: usize,
+            _state: &mut InferenceState,
+            _ubatch: usize,
+            _cancel: &AtomicBool,
+        ) -> (usize, Option<Vec<f32>>) {
+            (self.consumed, self.logits.clone())
+        }
+        fn try_reset_kv(
+            &self,
+            _state: &mut InferenceState,
+            _compression: &crate::kv_cache::KvCompression,
+            _max_seq_len: usize,
+        ) -> Result<(), crate::CeraError> {
+            self.resets
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            Ok(())
+        }
+    }
+
+    fn scripted_model(consumed: usize, logits: Option<Vec<f32>>) -> ScriptedPrefillModel {
+        ScriptedPrefillModel {
+            config: crate::model::ModelConfig {
+                architecture: "mock".into(),
+                n_layers: 0,
+                hidden_size: 0,
+                intermediate_size: 0,
+                n_heads: 0,
+                n_kv_heads: 0,
+                head_dim: 0,
+                vocab_size: 100,
+                max_seq_len: 1024,
+                rope_theta: 0.0,
+                rms_norm_eps: 0.0,
+                block_types: Vec::new(),
+                conv_kernel_size: None,
+                ssm: None,
+                kv_heads_per_layer: Vec::new(),
+                scalars: crate::model::ScalarMultipliers::default(),
+                moe: None,
+                is_causal: true,
+                class_labels: Vec::new(),
+            },
+            consumed,
+            logits,
+            resets: std::sync::atomic::AtomicUsize::new(0),
+        }
+    }
+
+    /// Vocoder weights with real (tiny) configs and empty owned tensors:
+    /// `generate_audio`'s prefill bails fire before any decode, so only
+    /// `AudioOutputDecoder::new` must construct (it reads configs only).
+    /// `n_fft`/`hop_length` are nonzero because `IstftStreamer::new`
+    /// plans a real FFT.
+    fn empty_vocoder_weights() -> (AudioDecoderWeights, DetokenizerWeights) {
+        use crate::model::audio_decoder::{
+            CodebookWeights, DecoderConfig, DepthformerConfig, DetokenizerConfig,
+        };
+        use crate::model::weights::MmapWeight;
+        let dec = AudioDecoderWeights {
+            depthformer_config: DepthformerConfig {
+                n_layer: 0,
+                n_embd: 4,
+                n_head: 1,
+                n_head_kv: 1,
+                n_embd_head: 4,
+                ffn_dim: 4,
+                rms_norm_eps: 1e-5,
+                rope_freq_base: 10000.0,
+                max_seq_len: 8,
+            },
+            decoder_config: DecoderConfig {
+                n_codebook: 1,
+                n_vocab: 4,
+                n_embd: 4,
+                rms_norm_eps: 1e-5,
+            },
+            depthformer_layers: Vec::new(),
+            depth_linear_w: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+            depth_linear_b: Vec::new(),
+            depth_embeddings: Vec::new(),
+            audio_embedding: CodebookWeights {
+                embedding: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+                norm: Vec::new(),
+                to_logits: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+            },
+        };
+        let detok = DetokenizerWeights {
+            config: DetokenizerConfig {
+                n_layer: 0,
+                n_embd: 4,
+                n_head: 1,
+                n_head_kv: 1,
+                n_embd_head: 4,
+                ffn_dim: 4,
+                d_conv: 0,
+                rms_norm_eps: 1e-5,
+                rope_freq_base: 10000.0,
+                swa_window_size: 0,
+                n_codes: 1,
+                n_fft: 8,
+                hop_length: 2,
+                sample_rate: 24000,
+                layer_is_conv: Vec::new(),
+            },
+            output_norm: Vec::new(),
+            emb_weight: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+            lin_w: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+            lin_b: Vec::new(),
+            layers: Vec::new(),
+        };
+        (dec, detok)
+    }
+
+    fn audio_test_config() -> AudioGenerateConfig {
+        AudioGenerateConfig {
+            max_tokens: 4,
+            sampler: SamplerConfig::default(),
+            audio_temperature: 0.0,
+            audio_top_k: 1,
+            mode: AudioMode::Sequential,
+            gpu_depthformer: false,
+        }
+    }
+
+    #[test]
+    fn generate_audio_short_prefill_is_fault_not_silent() {
+        let model = scripted_model(1, Some(vec![0.0; 100]));
+        let (dec_w, detok_w) = empty_vocoder_weights();
+        let tokenizer = BpeTokenizer::empty_for_test();
+        let err = generate_audio(
+            &model,
+            &dec_w,
+            &detok_w,
+            &tokenizer,
+            &[1, 2, 3],
+            &audio_test_config(),
+            None,
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("prefill fault after 1/3"),
+            "{err:?}"
+        );
+    }
+
+    /// A fresh generation must reset device-resident model state (Hexagon
+    /// conv state, or a fail-closed poisoned device) before its first pass.
+    #[test]
+    fn generate_audio_resets_model_state_first() {
+        let model = scripted_model(3, None);
+        let (dec_w, detok_w) = empty_vocoder_weights();
+        let tokenizer = BpeTokenizer::empty_for_test();
+        let _ = generate_audio(
+            &model,
+            &dec_w,
+            &detok_w,
+            &tokenizer,
+            &[1, 2, 3],
+            &audio_test_config(),
+            None,
+            |_| {},
+            |_, _| {},
+        );
+        assert_eq!(model.resets.load(std::sync::atomic::Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn generate_audio_missing_logits_bails() {
+        let model = scripted_model(3, None);
+        let (dec_w, detok_w) = empty_vocoder_weights();
+        let tokenizer = BpeTokenizer::empty_for_test();
+        let err = generate_audio(
+            &model,
+            &dec_w,
+            &detok_w,
+            &tokenizer,
+            &[1, 2, 3],
+            &audio_test_config(),
+            None,
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap_err();
+        assert!(err.to_string().contains("produced no logits"), "{err:?}");
     }
 }

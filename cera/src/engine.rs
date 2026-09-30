@@ -70,10 +70,12 @@ pub enum BackendPreference {
     Gpu,
     /// Native Metal. Requires the `metal` feature + macOS.
     Metal,
+    /// Qualcomm Hexagon NPU. Requires the `hexagon` feature.
+    Hexagon,
 }
 
 impl BackendPreference {
-    /// Parse a case-insensitive string (`"auto"`, `"cpu"`, `"gpu"`, `"wgpu"`, `"metal"`).
+    /// Parse a case-insensitive string (`"auto"`, `"cpu"`, `"gpu"`, `"wgpu"`, `"metal"`, `"hexagon"`).
     /// Returns `Err` on an unknown label.
     pub fn parse_str(s: &str) -> Result<Self, CeraError> {
         match s.to_ascii_lowercase().as_str() {
@@ -81,8 +83,9 @@ impl BackendPreference {
             "cpu" => Ok(Self::Cpu),
             "gpu" | "wgpu" => Ok(Self::Gpu),
             "metal" => Ok(Self::Metal),
+            "hexagon" | "npu" | "htp" => Ok(Self::Hexagon),
             other => Err(CeraError::Backend(format!(
-                "unknown backend preference `{other}` (use auto, cpu, gpu, or metal)"
+                "unknown backend preference `{other}` (use auto, cpu, gpu, metal, or hexagon)"
             ))),
         }
     }
@@ -98,7 +101,9 @@ pub struct EngineConfig {
     pub backend: BackendPreference,
     /// Optional speculative decoding draft model GGUF path (e.g. DSpark sidecar).
     pub draft_model: Option<PathBuf>,
-    /// Whether to prefer GPU depthformer for audio decoder generation.
+    /// Opt in to the experimental accelerated depthformers (Metal, wgpu; also
+    /// `CERA_GPU_DF=1`). Accelerators trusted by default (Hexagon NPU) run their
+    /// depthformer regardless of this flag.
     pub gpu_depthformer: bool,
     /// Optional repository used to resolve `http(s)://` URLs found in a
     /// manifest's `files` entries. When `None`, remote URLs fail with a
@@ -229,8 +234,8 @@ struct AuxWeights {
     audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
     /// Parsed detokenizer, for audio-out bundles.
     detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
-    /// Parsed GPU audio decoder backend, for audio-out bundles.
-    gpu_audio_decoder: Option<Arc<dyn crate::model::audio_decoder::AudioGpu>>,
+    /// Parsed hardware audio accelerator backend, for audio-out bundles.
+    audio_accelerator: Option<Arc<dyn crate::model::audio_decoder::AudioAccelerator>>,
     /// Pre-parsed speculative decoding drafter (e.g. from in-memory bytes).
     drafter: Option<Arc<dyn crate::spec::Drafter>>,
 }
@@ -312,11 +317,11 @@ pub struct CeraEngine {
     audio_decoder: Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
     /// Detokenizer weights for audio output generation.
     detok_weights: Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
-    /// Cached GPU audio decoder backend, built at construction when vocoder
-    /// weights are present and `cfg.backend` selects a GPU backend (and the device
+    /// Cached hardware audio accelerator backend, built at construction when vocoder
+    /// weights are present and `cfg.backend` selects an accelerated backend (and the device
     /// is available). Shared into every session via `create_session`; sessions
     /// fall back to CPU detokenization when this is `None`.
-    gpu_audio_decoder: Option<Arc<dyn crate::model::audio_decoder::AudioGpu>>,
+    audio_accelerator: Option<Arc<dyn crate::model::audio_decoder::AudioAccelerator>>,
     /// Optional speculative decoding drafter (e.g. DSpark sidecar draft model).
     drafter: Option<Arc<dyn crate::spec::Drafter>>,
 }
@@ -444,7 +449,7 @@ impl CeraEngine {
         //
         // A text type ignores the mmproj entirely, which is what makes the
         // documented opt-out ("text plus an ignored sidecar") mean something.
-        let (audio_decoder, detok_weights, gpu_audio_decoder) = {
+        let (audio_decoder, detok_weights, audio_accelerator) = {
             let voc_arc = parts
                 .audio_decoder
                 .and_then(|b| GgufFile::from_bytes(b).ok())
@@ -500,15 +505,15 @@ impl CeraEngine {
                         .map(Arc::new)
                 });
 
-            let gpu_dec = if dec.is_some() && detok.is_some() {
+            let acc = if dec.is_some() && detok.is_some() {
                 voc_arc.as_ref().and_then(|g| {
-                    crate::model::audio_decoder::build_gpu_audio_decoder(g, cfg.backend)
+                    crate::model::audio_decoder::build_audio_accelerator(g, cfg.backend)
                 })
             } else {
                 None
             };
 
-            (dec, detok, gpu_dec)
+            (dec, detok, acc)
         };
 
         let mut aux = match (&inference_type, mmproj) {
@@ -517,7 +522,7 @@ impl CeraEngine {
                 audio_encoder: None,
                 audio_decoder: None,
                 detok_weights: None,
-                gpu_audio_decoder: None,
+                audio_accelerator: None,
                 drafter: None,
             },
             (InferenceType::LlamaCppLfm2AudioV1, Some(g)) => AuxWeights {
@@ -525,14 +530,14 @@ impl CeraEngine {
                 audio_encoder: try_parse_audio_encoder(&g, None),
                 audio_decoder: None,
                 detok_weights: None,
-                gpu_audio_decoder: None,
+                audio_accelerator: None,
                 drafter: None,
             },
             _ => AuxWeights::default(),
         };
         aux.audio_decoder = audio_decoder;
         aux.detok_weights = detok_weights;
-        aux.gpu_audio_decoder = gpu_audio_decoder;
+        aux.audio_accelerator = audio_accelerator;
         aux.drafter = parts
             .draft_model
             .as_ref()
@@ -768,11 +773,11 @@ impl CeraEngine {
         let gpu_audio_encoder = audio_encoder
             .as_ref()
             .and_then(|w| crate::model::audio_encoder_gpu::build_gpu_audio_encoder(w, cfg.backend));
-        let (eager_audio_decoder, eager_detok_weights, eager_gpu_audio_decoder) =
+        let (eager_audio_decoder, eager_detok_weights, eager_audio_accelerator) =
             if path.is_some() && aux.audio_decoder.is_none() {
                 try_load_audio_decoder_and_detok(&manifest, cfg.backend)
             } else {
-                (aux.audio_decoder, aux.detok_weights, aux.gpu_audio_decoder)
+                (aux.audio_decoder, aux.detok_weights, aux.audio_accelerator)
             };
 
         let audio_decoder = eager_audio_decoder.filter(|dec| {
@@ -787,8 +792,8 @@ impl CeraEngine {
                 true
             }
         });
-        let (detok_weights, gpu_audio_decoder) = if audio_decoder.is_some() {
-            (eager_detok_weights, eager_gpu_audio_decoder)
+        let (detok_weights, audio_accelerator) = if audio_decoder.is_some() {
+            (eager_detok_weights, eager_audio_accelerator)
         } else {
             (None, None)
         };
@@ -807,7 +812,7 @@ impl CeraEngine {
             vision_encoder,
             gpu_vision_encoder,
             gpu_audio_encoder,
-            gpu_audio_decoder,
+            audio_accelerator,
             drafter,
         })
     }
@@ -884,9 +889,9 @@ impl CeraEngine {
         if let (Some(decoder), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
             session.attach_vocoder(Arc::clone(decoder), Arc::clone(detok));
         }
-        // GPU audio decoder (if one was built); the session prefers it over CPU detokenization.
-        if let Some(gpu) = &self.gpu_audio_decoder {
-            session.attach_gpu_audio_decoder(Arc::clone(gpu));
+        // Hardware audio accelerator (if one was built); the session prefers it over CPU detokenization.
+        if let Some(acc) = &self.audio_accelerator {
+            session.attach_audio_accelerator(Arc::clone(acc));
         }
         // Auto-attach speculative decoding drafter when present.
         if let Some(drafter) = &self.drafter {
@@ -1091,13 +1096,10 @@ impl CeraEngine {
         self.gpu_audio_encoder.is_some()
     }
 
-    /// Whether a GPU audio decoder was built at construction (true when vocoder
-    /// weights loaded, `cfg.backend` selected a supported GPU backend, and the
-    /// device was available). When false, audio synthesis falls back to the CPU
-    /// detokenizer. Primarily for tests/diagnostics; sessions auto-select the GPU
-    /// path.
-    pub fn has_gpu_audio_decoder(&self) -> bool {
-        self.gpu_audio_decoder.is_some()
+    /// Whether a hardware audio accelerator backend is attached (vocoder
+    /// weights loaded, backend was available and supported).
+    pub fn has_audio_accelerator(&self) -> bool {
+        self.audio_accelerator.is_some()
     }
 
     /// Borrow the raw mmapped vision-encoder mmproj GGUF, if any.
@@ -1839,7 +1841,7 @@ fn parse_aux_gguf(bytes: &Arc<[u8]>, kind: &str) -> Option<Arc<GgufFile>> {
 type LoadedAudioDecoderParts = (
     Option<Arc<crate::model::audio_decoder::AudioDecoderWeights>>,
     Option<Arc<crate::model::audio_decoder::DetokenizerWeights>>,
-    Option<Arc<dyn crate::model::audio_decoder::AudioGpu>>,
+    Option<Arc<dyn crate::model::audio_decoder::AudioAccelerator>>,
 );
 
 /// Eager audio decoder & detokenizer GGUF loader for audio-out bundles.
@@ -1894,15 +1896,15 @@ fn try_load_audio_decoder_and_detok(
                 .map(Arc::new)
         });
 
-    let gpu_dec = if dec.is_some() && detok.is_some() {
+    let acc = if dec.is_some() && detok.is_some() {
         voc_gguf
             .as_ref()
-            .and_then(|g| crate::model::audio_decoder::build_gpu_audio_decoder(g, backend))
+            .and_then(|g| crate::model::audio_decoder::build_audio_accelerator(g, backend))
     } else {
         None
     };
 
-    (dec, detok, gpu_dec)
+    (dec, detok, acc)
 }
 
 #[cfg(not(feature = "mmap"))]
@@ -2166,6 +2168,13 @@ fn load_text_model(
         BackendPreference::Metal => Err(CeraError::Backend(
             "Metal backend not available (compile with --features metal on macOS or iOS)".into(),
         )),
+        #[cfg(feature = "hexagon")]
+        BackendPreference::Hexagon => model::load_model_hexagon(gguf, path, cfg.context_size)
+            .map_err(|e| CeraError::Backend(format!("Hexagon model load failed: {e}"))),
+        #[cfg(not(feature = "hexagon"))]
+        BackendPreference::Hexagon => Err(CeraError::Backend(
+            "Hexagon backend not available (compile with --features hexagon)".into(),
+        )),
     }
 }
 
@@ -2174,7 +2183,7 @@ fn load_text_model_auto(
     path: Option<&Path>,
     context_size: usize,
 ) -> Result<Box<dyn Model>, CeraError> {
-    // Metal -> wgpu -> CPU. Mirrors the CLI's previous `load_model_auto`.
+    // Metal -> Hexagon -> wgpu -> CPU.
     #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
     {
         let gguf_for_metal = gguf.clone();
@@ -2185,6 +2194,20 @@ fn load_text_model_auto(
             }
             Err(e) => {
                 tracing::debug!("cera::engine: Metal unavailable ({e}); trying next backend");
+            }
+        }
+    }
+
+    #[cfg(feature = "hexagon")]
+    {
+        let gguf_for_hex = gguf.clone();
+        match model::load_model_hexagon(gguf_for_hex, path, context_size) {
+            Ok(m) => {
+                tracing::debug!("cera::engine: using Qualcomm Hexagon NPU backend (auto)");
+                return Ok(m);
+            }
+            Err(e) => {
+                tracing::debug!("cera::engine: Hexagon unavailable ({e}); trying next backend");
             }
         }
     }
@@ -2322,7 +2345,20 @@ mod tests {
             BackendPreference::parse_str("Metal").unwrap(),
             BackendPreference::Metal
         );
-        assert!(BackendPreference::parse_str("nvidia").is_err());
+        assert_eq!(
+            BackendPreference::parse_str("Hexagon").unwrap(),
+            BackendPreference::Hexagon
+        );
+        assert_eq!(
+            BackendPreference::parse_str("npu").unwrap(),
+            BackendPreference::Hexagon
+        );
+        assert_eq!(
+            BackendPreference::parse_str("htp").unwrap(),
+            BackendPreference::Hexagon
+        );
+        let err = BackendPreference::parse_str("nvidia").unwrap_err();
+        assert!(err.to_string().contains("metal, or hexagon"));
     }
 
     #[test]

@@ -20,7 +20,7 @@ fn check(
 ) {
     assert_eq!(engine.audio_decoder.is_some(), expected_decoder.is_some());
     assert_eq!(engine.detok_weights.is_some(), expected_detok.is_some());
-    assert!(!engine.has_gpu_audio_decoder());
+    assert!(!engine.has_audio_accelerator());
     if let Some(bytes) = expected_decoder {
         let expected = decoder(bytes.clone());
         let actual = engine.audio_decoder.as_ref().unwrap();

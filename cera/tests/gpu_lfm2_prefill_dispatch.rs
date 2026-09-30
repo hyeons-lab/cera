@@ -27,7 +27,7 @@
 //! `gpu_lfm2_prefill_equivalence.rs`.
 #![cfg(feature = "gpu")]
 
-use std::path::PathBuf;
+mod common;
 use std::sync::atomic::AtomicBool;
 
 use cera::backend::wgpu::io_stats;
@@ -42,27 +42,11 @@ const FIXTURE: &str = "LFM2.5-230M-Q4_K_M.gguf";
 const N: usize = 256;
 const UBATCH: usize = 64;
 
-fn models_dir() -> PathBuf {
-    if let Ok(d) = std::env::var("CERA_ORACLE_MODELS_DIR") {
-        return PathBuf::from(d);
-    }
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/oracle/models")
-}
-
 #[test]
 fn chunked_prefill_batches_every_chunk() {
-    let path = models_dir().join(FIXTURE);
-    if !path.exists() {
-        assert!(
-            std::env::var("CERA_REQUIRE_MODEL")
-                .unwrap_or_default()
-                .is_empty(),
-            "CERA_REQUIRE_MODEL is set but {FIXTURE} is absent at {}",
-            path.display()
-        );
-        eprintln!("[gpu-lfm2] SKIP (absent): {}", path.display());
+    let Some(path) = common::fixture_or_skip(FIXTURE, "gpu-lfm2") else {
         return;
-    }
+    };
 
     let model = match load_model_gpu(
         GgufFile::open(&path).expect("open gguf"),

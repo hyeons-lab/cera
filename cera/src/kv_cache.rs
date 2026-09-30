@@ -445,11 +445,129 @@ pub struct ScratchBuffers {
     pub hidden_in: Vec<f32>,
 }
 
+/// Pre-allocated scratch buffers reused across prefill layers and turns.
+#[derive(Clone, Debug, Default)]
+pub struct PrefillScratch {
+    /// Scratch for the normed hidden state (n * hidden_size).
+    pub normed: Vec<f32>,
+    /// Scratch for layer block output before residual addition (n * hidden_size).
+    pub block_out: Vec<f32>,
+    /// Scratch for FFN input (n * hidden_size).
+    pub ffn_input: Vec<f32>,
+    /// Scratch for FFN output (n * hidden_size).
+    pub ffn_out: Vec<f32>,
+    /// Single column scratch (hidden_size).
+    pub col: Vec<f32>,
+    /// Single column gate scratch (intermediate_size).
+    pub gate_col: Vec<f32>,
+    /// Single column up scratch (intermediate_size).
+    pub up_col: Vec<f32>,
+    /// Single column output scratch (hidden_size).
+    pub out_col: Vec<f32>,
+    /// Batched projection buffer for conv/attn (proj_rows * n).
+    pub proj_mat: Vec<f32>,
+    /// Batched output projection input (n * hidden_size).
+    pub out_proj_input: Vec<f32>,
+    /// Batched Q matrix (n * hidden_size).
+    pub q_mat: Vec<f32>,
+    /// Batched K matrix (n * max_kv_dim).
+    pub k_mat: Vec<f32>,
+    /// Batched V matrix (n * max_kv_dim).
+    pub v_mat: Vec<f32>,
+    /// Quantized scales for activation GEMM (n * nb_hs).
+    pub bq_scales: Vec<f32>,
+    /// Quantized int8 activations (n * hidden_size).
+    pub bq_quants: Vec<i8>,
+    /// FFN gate matrix (n * intermediate_size).
+    pub gate_mat: Vec<f32>,
+    /// FFN up matrix (n * intermediate_size).
+    pub up_mat: Vec<f32>,
+    /// Fused gate and up matrix for BLAS SGEMM (2 * n * intermediate_size).
+    pub gate_up_mat: Vec<f32>,
+    /// Down projection quantized scales (n * nb_is).
+    pub dq_scales: Vec<f32>,
+    /// Down projection quantized int8 activations (n * intermediate_size).
+    pub dq_quants: Vec<i8>,
+    /// Flash attention output scratch (n * hidden_size).
+    pub flash_out: Vec<f32>,
+    /// Transposed Q column scratch (n * hidden_size).
+    pub q_col: Vec<f32>,
+    /// Temporary f32 cache widening scratch for half-precision K cache.
+    pub kv_widen_k: Vec<f32>,
+    /// Temporary f32 cache widening scratch for half-precision V cache.
+    pub kv_widen_v: Vec<f32>,
+}
+
+impl PrefillScratch {
+    /// Ensure all prefill scratch buffers have sufficient capacity for `n` tokens.
+    /// Resizes buffers only when their length differs, preserving allocated capacity.
+    pub fn ensure(&mut self, n: usize, config: &ModelConfig) {
+        let hs = config.hidden_size;
+        let is = config.intermediate_size;
+        let head_dim = if config.head_dim > 0 {
+            config.head_dim
+        } else {
+            hs.checked_div(config.n_heads).unwrap_or(64)
+        };
+        let max_kv_heads = config
+            .kv_heads_per_layer
+            .iter()
+            .copied()
+            .max()
+            .unwrap_or(config.n_kv_heads);
+        let max_kv_dim = max_kv_heads * head_dim;
+        let proj_rows = (3 * hs).max(hs + 2 * max_kv_dim);
+        let nb_hs = hs.div_ceil(32);
+        let nb_is = is.div_ceil(32);
+
+        Self::resize_f32(&mut self.normed, hs * n);
+        Self::resize_f32(&mut self.block_out, hs * n);
+        Self::resize_f32(&mut self.ffn_input, hs * n);
+        Self::resize_f32(&mut self.ffn_out, hs * n);
+        Self::resize_f32(&mut self.col, hs);
+        Self::resize_f32(&mut self.gate_col, is);
+        Self::resize_f32(&mut self.up_col, is);
+        Self::resize_f32(&mut self.out_col, hs);
+        Self::resize_f32(&mut self.proj_mat, proj_rows * n);
+        Self::resize_f32(&mut self.out_proj_input, hs * n);
+        Self::resize_f32(&mut self.q_mat, hs * n);
+        Self::resize_f32(&mut self.k_mat, max_kv_dim * n);
+        Self::resize_f32(&mut self.v_mat, max_kv_dim * n);
+        Self::resize_f32(&mut self.bq_scales, n * nb_hs);
+        Self::resize_i8(&mut self.bq_quants, n * hs);
+        Self::resize_f32(&mut self.gate_mat, is * n);
+        Self::resize_f32(&mut self.up_mat, is * n);
+        Self::resize_f32(&mut self.gate_up_mat, 2 * is * n);
+        Self::resize_f32(&mut self.dq_scales, n * nb_is);
+        Self::resize_i8(&mut self.dq_quants, n * is);
+        Self::resize_f32(&mut self.flash_out, hs * n);
+        Self::resize_f32(&mut self.q_col, hs * n);
+        self.kv_widen_k.clear();
+        self.kv_widen_v.clear();
+    }
+
+    #[inline]
+    fn resize_f32(vec: &mut Vec<f32>, len: usize) {
+        if vec.len() != len {
+            vec.resize(len, 0.0);
+        }
+    }
+
+    #[inline]
+    fn resize_i8(vec: &mut Vec<i8>, len: usize) {
+        if vec.len() != len {
+            vec.resize(len, 0);
+        }
+    }
+}
+
 /// Inference state across all layers.
 pub struct InferenceState {
     pub layers: Vec<LayerState>,
     pub seq_len: usize,
     pub scratch: ScratchBuffers,
+    /// Scratch buffers reused across prefill layers and turns.
+    pub prefill_scratch: PrefillScratch,
     /// Active LoRA adapter for this pass, if any. The Session copies its
     /// attached adapter here before each forward; the CPU projection helpers
     /// read `lora.get(layer, target)` and add `scale·B·(A·x)` after each base
@@ -521,6 +639,7 @@ impl InferenceState {
             tq_query_scratch: None,
             tq_rotations: Vec::new(),
             tq_config: None,
+            prefill_scratch: PrefillScratch::default(),
             lora: None,
             kv_f16: false,
         }
@@ -949,6 +1068,7 @@ impl InferenceState {
             },
             tq_rotations,
             tq_config,
+            prefill_scratch: PrefillScratch::default(),
             lora: None,
             kv_f16: use_f16,
         })
@@ -2772,10 +2892,19 @@ impl KvPrefixCache {
             .count()
     }
 
+    /// Whether `insert` would store anything. Backends must check this BEFORE
+    /// building the snapshot: constructing one from GPU state costs a blocking
+    /// readback per layer, and building it just to have `insert` throw it away
+    /// stalls every prefill when the cache is disabled. Keep in sync with the
+    /// early-return in `insert`.
+    pub fn stores_entries(&self) -> bool {
+        !(self.config.max_warm_entries == 0 && self.config.cache_dir.is_none())
+    }
+
     /// Cache a prefix's state. Stores in warm tier; optionally persists to cold.
     pub fn insert(&mut self, tokens: &[u32], snapshot: StateSnapshot) {
         // Skip if cache is disabled (max_warm_entries == 0 and no disk).
-        if self.config.max_warm_entries == 0 && self.config.cache_dir.is_none() {
+        if !self.stores_entries() {
             return;
         }
         let hash = hash_tokens(tokens);
