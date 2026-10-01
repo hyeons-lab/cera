@@ -309,6 +309,15 @@ class CeraAudioProfile {
     this.sampleTexts = const [],
   });
 
+  /// What any LFM2-Audio model accepts and no model was described: plain
+  /// `Perform TTS.`, no voices. Mirrors cera's own generic profile; used when a
+  /// runtime older than this API cannot report one.
+  const CeraAudioProfile.plain()
+    : this(
+        ttsSystemPrompt: 'Perform TTS.',
+        interleavedSystemPrompt: 'Respond with interleaved text and audio.',
+      );
+
   /// System prompt for text-to-speech when no voice was chosen: the first
   /// voice's, or the bare prompt when the model has no voices.
   final String ttsSystemPrompt;
@@ -347,7 +356,42 @@ class CeraAudioProfile {
   /// The interleaved-reply system prompt for a saved voice choice.
   String interleavedSystemPromptFor(String? saved) =>
       voiceFor(saved)?.interleavedSystemPrompt ?? interleavedSystemPrompt;
+
+  /// The system prompt [Cera.appendAudio] applies when its caller gives none:
+  /// the interleaved one on a model with audio output (the first voice's, when
+  /// the model has voices), plain text-only on any other.
+  String defaultSystemPromptFor({required bool audioOut}) =>
+      audioOut ? interleavedSystemPrompt : ceraTextOnlySystemPrompt;
+
+  /// The audio mode a system prompt asks for.
+  ///
+  /// A prompt this profile supplied names its own mode by which one it is, not
+  /// by its words, so a manifest prompt such as `Speak.` still selects
+  /// text-to-speech (if the two prompts are identical the interleaved one
+  /// wins). Any other text is a caller's own and is read the way the models
+  /// read it: `interleaved` asks for interleaved output, `tts` for
+  /// text-to-speech, anything else answers in text.
+  CeraAudioMode audioModeOf(String systemPrompt) {
+    final p = systemPrompt.trim();
+    if (p == interleavedSystemPrompt.trim() ||
+        voices.any((v) => p == v.interleavedSystemPrompt.trim())) {
+      return CeraAudioMode.interleaved;
+    }
+    if (p == ttsSystemPrompt.trim() ||
+        voices.any((v) => p == v.ttsSystemPrompt.trim())) {
+      return CeraAudioMode.sequential;
+    }
+    final lower = p.toLowerCase();
+    if (lower.contains('interleaved')) return CeraAudioMode.interleaved;
+    if (lower.contains('tts')) return CeraAudioMode.sequential;
+    return CeraAudioMode.textOnly;
+  }
 }
+
+/// The system prompt for a model that should answer in text only: what
+/// [Cera.appendAudio] applies on a model without audio output, and what an app
+/// sends for a voice note it wants answered in text.
+const ceraTextOnlySystemPrompt = 'Respond to the user.';
 
 /// One model published on `LiquidAI/LeapBundles`, with the quantizations it
 /// offers.
@@ -582,6 +626,10 @@ abstract interface class Cera {
   /// output. Fixed for the engine's lifetime. Meaningful when
   /// [CeraCapabilities.audioOut] is true; a plain `Perform TTS.` profile with no
   /// voices otherwise.
+  ///
+  /// Resolved from the model's bundle manifest or file names, so a model opened
+  /// from raw bytes (the `Parts` source, which has no file names) reports the
+  /// plain profile.
   CeraAudioProfile get audioProfile;
 
   /// Generates a continuation of `prompt`, streaming decoded text as it is
@@ -693,6 +741,12 @@ abstract interface class Cera {
   ///
   /// `pcm` is normalized to roughly [-1.0, 1.0]. Non-16 kHz inputs are
   /// automatically resampled by the engine to the model's required rate.
+  ///
+  /// `systemPrompt` applies only at the start of a conversation. Omitted, a
+  /// model with audio output gets [CeraAudioProfile.interleavedSystemPrompt]
+  /// (the first voice's, so on a model with voices it includes that voice) and
+  /// any other model gets [ceraTextOnlySystemPrompt]. Pass
+  /// [ceraTextOnlySystemPrompt] to have an audio-out model answer in text.
   ///
   /// Throws if this model has no audio encoder, i.e. whenever [capabilities]
   /// reports `audioIn: false`. Serialized against [generate] the same way

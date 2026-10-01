@@ -5,6 +5,7 @@
 - Add Qualcomm Hexagon NPU backend preference support.
 - The 64-bit Android AAR now bundles the Hexagon and wgpu backends, so `BackendPreference.auto` probes Hexagon, then wgpu, then CPU there.
 - Align platform manifests and the dependency on `cera_ffi` at 0.7.0.
+- Add `Cera.audioProfile` (re-exported from `cera_ffi`): per-model TTS and interleaved system prompts, voices and sample texts resolved by cera. The example app reads it, so TTS Studio and Voice Chat work with models such as LFM2.5-Audio-1.5B-JP without hardcoded personas. Custom `Cera` implementations must add the getter. `Cera.appendAudio` with no `systemPrompt` now uses the profile's interleaved prompt, which includes the first voice on models that have voices.
 
 ## 0.6.3
 

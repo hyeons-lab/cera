@@ -775,67 +775,6 @@ void main() {
       },
     );
 
-    test(
-      'ChatController.systemPromptFor constructs systemPrompt incorporating voice persona',
-      () {
-        const settingsWithPersona = ChatSettings(
-          audioChatMode: AudioChatMode.interleaved,
-          chatVoice: 'Use the British male voice.',
-        );
-
-        final promptInterleaved = ChatController.systemPromptFor(
-          settings: settingsWithPersona,
-          uiMode: AppUIMode.chat,
-        );
-        expect(
-          promptInterleaved,
-          'Respond with interleaved text and audio. Use the British male voice.',
-        );
-
-        // When persona is empty, trimmed cleanly without trailing whitespace
-        const settingsEmptyPersona = ChatSettings(
-          audioChatMode: AudioChatMode.interleaved,
-          chatVoice: '',
-        );
-        final promptEmpty = ChatController.systemPromptFor(
-          settings: settingsEmptyPersona,
-          uiMode: AppUIMode.chat,
-        );
-        expect(promptEmpty, 'Respond with interleaved text and audio.');
-
-        // When persona is whitespace only, trimmed cleanly without trailing whitespace
-        const settingsWhitespacePersona = ChatSettings(
-          audioChatMode: AudioChatMode.interleaved,
-          chatVoice: '   ',
-        );
-        final promptWhitespace = ChatController.systemPromptFor(
-          settings: settingsWhitespacePersona,
-          uiMode: AppUIMode.chat,
-        );
-        expect(promptWhitespace, 'Respond with interleaved text and audio.');
-
-        // TTS mode for text prompt
-        const settingsTts = ChatSettings(
-          audioChatMode: AudioChatMode.textToSpeech,
-          chatVoice: 'Warm storyteller voice.',
-        );
-        final promptTts = ChatController.systemPromptFor(
-          settings: settingsTts,
-          uiMode: AppUIMode.chat,
-          isAudioPrompt: false,
-        );
-        expect(promptTts, 'Perform TTS. Warm storyteller voice.');
-
-        // TTS mode for audio prompt returns null
-        final promptTtsAudio = ChatController.systemPromptFor(
-          settings: settingsTts,
-          uiMode: AppUIMode.chat,
-          isAudioPrompt: true,
-        );
-        expect(promptTtsAudio, isNull);
-      },
-    );
-
     test('systemPromptFor takes the prompt and voice from the model profile', () {
       const english = CeraAudioProfile(
         ttsSystemPrompt: 'Perform TTS. Use the US female voice.',
@@ -878,6 +817,20 @@ void main() {
       // never sent: that model would answer in text and never speak.
       expect(prompt(japanese), 'Perform TTS in japanese.');
       expect(prompt(english, audio: true), isNull);
+      // An empty or blank saved persona is the model's own default voice.
+      for (final blank in ['', '   ']) {
+        expect(
+          ChatController.systemPromptFor(
+            settings: ChatSettings(
+              audioChatMode: AudioChatMode.interleaved,
+              chatVoice: blank,
+            ),
+            uiMode: AppUIMode.chat,
+            profile: english,
+          ),
+          'Respond with interleaved text and audio. Use the US female voice.',
+        );
+      }
       expect(
         ChatController.systemPromptFor(
           settings: settings.copyWith(audioChatMode: AudioChatMode.interleaved),
@@ -896,26 +849,24 @@ void main() {
         interleavedSystemPrompt: 'Respond with interleaved text and audio.',
       );
       const settings = ChatSettings(audioChatMode: AudioChatMode.textOnly);
-      for (final CeraAudioProfile? p in [profile, null]) {
-        expect(
-          ChatController.systemPromptFor(
-            settings: settings,
-            uiMode: AppUIMode.chat,
-            isAudioPrompt: true,
-            profile: p,
-          ),
-          'Respond to the user.',
-        );
-        expect(
-          ChatController.systemPromptFor(
-            settings: settings,
-            uiMode: AppUIMode.chat,
-            profile: p,
-          ),
-          isNull,
-          reason: 'a typed message needs no system prompt',
-        );
-      }
+      expect(
+        ChatController.systemPromptFor(
+          settings: settings,
+          uiMode: AppUIMode.chat,
+          isAudioPrompt: true,
+          profile: profile,
+        ),
+        ceraTextOnlySystemPrompt,
+      );
+      expect(
+        ChatController.systemPromptFor(
+          settings: settings,
+          uiMode: AppUIMode.chat,
+          profile: profile,
+        ),
+        isNull,
+        reason: 'a typed message needs no system prompt',
+      );
     });
 
     test('voiceTagFor maps capabilities to descriptive status labels', () {

@@ -101,6 +101,20 @@
       "expected": "pub struct ModelBytes { pub model: Arc<[u8]>, pub multimodal_projector: Option<Arc<[u8]>>, pub audio_decoder: Option<Arc<[u8]>>, pub audio_tokenizer: Option<Arc<[u8]>>, pub draft_model: Option<Arc<[u8]>>, pub inference_type: Option<InferenceType>, pub chat_template: Option<String>, pub generation_defaults: Option<crate::manifest::GenerationDefaults>, pub audio_profile: Option<crate::audio_profile::AudioProfile>, }"
     },
     {
+      "source": "cera/src/audio_profile.rs",
+      "kind": "record",
+      "owner": "TtsVoice",
+      "retained_home": "Rust core; retain existing engine and raw helpers",
+      "expected": "pub struct TtsVoice { pub label: String, pub prompt: String, pub tts_system_prompt: String, pub interleaved_system_prompt: String, }"
+    },
+    {
+      "source": "cera/src/audio_profile.rs",
+      "kind": "record",
+      "owner": "AudioProfile",
+      "retained_home": "Rust core; retain existing engine and raw helpers",
+      "expected": "pub struct AudioProfile { pub tts_system_prompt: String, pub interleaved_system_prompt: String, pub voices: Vec<TtsVoice>, pub sample_texts: Vec<String>, }"
+    },
+    {
       "source": "cera/src/engine.rs",
       "kind": "record",
       "owner": "ModelMetadata",
@@ -149,8 +163,8 @@
       "expected": {
         "apply_chat_template": "pub fn apply_chat_template( &self, messages: Vec<ChatMessage>, add_generation_prompt: bool, ) -> Result<String, FfiError>",
         "apply_chat_template_with_tools": "pub fn apply_chat_template_with_tools( &self, messages: Vec<ChatMessage>, tools: Vec<ToolDef>, add_generation_prompt: bool, ) -> Result<String, FfiError>",
-        "bos_token": "pub fn bos_token(&self) -> Option<u32>",
         "audio_profile": "pub fn audio_profile(&self) -> AudioProfile",
+        "bos_token": "pub fn bos_token(&self) -> Option<u32>",
         "capabilities": "pub fn capabilities(&self) -> ModalityCapabilities",
         "clear_prefix_cache": "pub fn clear_prefix_cache(&self)",
         "configure_prefix_cache": "pub fn configure_prefix_cache(&self, cache_dir: Option<String>, max_warm_entries: Option<u32>)",
@@ -366,6 +380,20 @@
       "owner": "ModalityCapabilities",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
       "expected": "pub struct ModalityCapabilities { pub text_in: bool, pub text_out: bool, pub image_in: bool, pub audio_in: bool, pub audio_out: bool, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "TtsVoice",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct TtsVoice { pub label: String, pub prompt: String, pub tts_system_prompt: String, pub interleaved_system_prompt: String, }"
+    },
+    {
+      "source": "cera-ffi/src/lib.rs",
+      "kind": "record",
+      "owner": "AudioProfile",
+      "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
+      "expected": "pub struct AudioProfile { pub tts_system_prompt: String, pub interleaved_system_prompt: String, pub voices: Vec<TtsVoice>, pub sample_texts: Vec<String>, }"
     },
     {
       "source": "cera-ffi/src/lib.rs",
@@ -792,9 +820,9 @@
         "append_tokens": "pub fn append_tokens(&mut self, ids: Vec<u32>) -> Result<(), JsError>",
         "audio_in": "pub fn audio_in(&self) -> bool",
         "audio_out": "pub fn audio_out(&self) -> bool",
+        "audio_profile": "pub fn audio_profile(&self) -> AudioProfileJs",
         "cancel": "pub fn cancel(&self)",
         "cancel_handle": "pub fn cancel_handle(&self) -> WebGpuCancelHandle",
-        "audio_profile": "pub fn audio_profile(&self) -> AudioProfileJs",
         "capabilities": "pub fn capabilities(&self) -> Capabilities",
         "checkpoint": "pub async fn checkpoint(&self) -> Result<js_sys::Uint8Array, JsError>",
         "clear_cancel": "pub fn clear_cancel(&self)",

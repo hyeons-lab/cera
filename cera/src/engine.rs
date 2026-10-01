@@ -278,9 +278,11 @@ pub struct ModelMetadata {
 /// why the FFI story requires this).
 pub struct CeraEngine {
     manifest: Manifest,
-    /// The speech-output profile a bytes loader resolved from the manifest it
-    /// read. Wins over what the (synthetic) manifest here can say.
-    audio_profile_override: Option<crate::audio_profile::AudioProfile>,
+    /// The speech-output profile, fixed for the engine's lifetime. A bytes
+    /// loader sets it from the manifest it read (which wins over what the
+    /// synthetic manifest here can say); otherwise it is resolved from the
+    /// manifest on first use, once, since resolving can log a warning.
+    audio_profile: std::sync::OnceLock<crate::audio_profile::AudioProfile>,
     model: Arc<dyn Model>,
     /// Retained only with an audio encoder, for transcription without reopening files.
     primary_gguf: Option<Arc<GgufFile>>,
@@ -588,8 +590,10 @@ impl CeraEngine {
             manifest.generation_defaults = defaults;
         }
         let audio_profile = parts.audio_profile;
-        let mut engine = Self::from_gguf(gguf, manifest, cfg, None, aux)?;
-        engine.audio_profile_override = audio_profile;
+        let engine = Self::from_gguf(gguf, manifest, cfg, None, aux)?;
+        if let Some(profile) = audio_profile {
+            let _ = engine.audio_profile.set(profile);
+        }
         Ok(engine)
     }
 
@@ -829,7 +833,7 @@ impl CeraEngine {
             (None, None)
         };
         Ok(Self {
-            audio_profile_override: None,
+            audio_profile: std::sync::OnceLock::new(),
             manifest,
             model,
             primary_gguf,
@@ -1176,9 +1180,9 @@ impl CeraEngine {
     /// [`crate::audio_profile`]). Meaningful when
     /// [`ModalityCapabilities::audio_out`] is set; harmless otherwise.
     pub fn audio_profile(&self) -> crate::audio_profile::AudioProfile {
-        self.audio_profile_override
+        self.audio_profile
+            .get_or_init(|| crate::audio_profile::AudioProfile::for_manifest(&self.manifest))
             .clone()
-            .unwrap_or_else(|| crate::audio_profile::AudioProfile::for_manifest(&self.manifest))
     }
 
     /// Borrow the loaded model. Used by the audio pipeline today;

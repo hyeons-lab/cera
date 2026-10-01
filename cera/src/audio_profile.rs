@@ -137,17 +137,58 @@ impl AudioProfile {
 
     /// The profile for a loaded bundle: its own `audio_profile` if the manifest
     /// carries one, else the registry entry for its model and vocoder files.
+    ///
+    /// Anything ignored in a malformed `audio_profile` is logged with
+    /// `tracing::warn!`. A host with no subscriber (the browser, UniFFI
+    /// embedders) never sees that; [`AudioProfile::for_manifest_noted`] returns
+    /// the same messages for it to surface.
     pub fn for_manifest(manifest: &Manifest) -> Self {
-        if let Some(profile) = manifest.raw.get("audio_profile").and_then(parse_profile) {
-            return profile;
+        let (profile, notes) = Self::for_manifest_noted(manifest);
+        for note in &notes {
+            tracing::warn!("{note}");
         }
-        let mut identity = manifest.files.model.clone();
+        profile
+    }
+
+    /// [`AudioProfile::for_manifest`] that returns, rather than logs, what it
+    /// ignored in the manifest's `audio_profile`: one message per problem.
+    pub fn for_manifest_noted(manifest: &Manifest) -> (Self, Vec<String>) {
+        let mut notes = Vec::new();
+        if let Some(block) = manifest.raw.get("audio_profile") {
+            match parse_profile(block, &mut notes) {
+                Some(profile) => return (profile, notes),
+                None => notes.push(
+                    "ignoring the manifest's audio_profile: it needs a non-empty string \
+                     `tts_system_prompt`; using the built-in registry"
+                        .to_string(),
+                ),
+            }
+        }
+        // File names only: by now these are resolved paths or URLs, and a
+        // directory, host or app id (`/Users/jp/`, `example.jp`) must not
+        // decide which release a model is.
+        let mut identity = file_name_of(&manifest.files.model).to_string();
         if let Some(decoder) = &manifest.files.audio_decoder {
             identity.push(' ');
-            identity.push_str(decoder);
+            identity.push_str(file_name_of(decoder));
         }
-        Self::for_model(&identity)
+        (Self::for_model(&identity), notes)
     }
+}
+
+/// The file name of a path or URL: its last segment, ignoring a trailing
+/// separator and, for a URL, its query and fragment (a local directory may
+/// legitimately contain `?` or `#`).
+fn file_name_of(path: &str) -> &str {
+    let path = if path.contains("://") {
+        path.split(['?', '#']).next().unwrap_or(path)
+    } else {
+        path
+    };
+    path.trim_end_matches(['/', '\\'])
+        .rsplit(['/', '\\'])
+        .next()
+        .unwrap_or(path)
 }
 
 /// Lowercased alphabetic runs of `identity`: `LFM2.5-Audio-1.5B-JP-Q8_0.gguf`
@@ -204,63 +245,179 @@ fn parse_entry(v: &serde_json::Value) -> Option<RegistryEntry> {
     if any_token.is_empty() && all_tokens.is_empty() {
         return None;
     }
+    // `tokens_of` yields only runs of ASCII letters, so a token with a digit or
+    // a separator could never match and the entry would be dead.
+    let is_token = |t: &String| !t.is_empty() && t.bytes().all(|b| b.is_ascii_lowercase());
+    if !any_token.iter().chain(&all_tokens).all(is_token) {
+        return None;
+    }
     Some(RegistryEntry {
         any_token,
         all_tokens,
-        profile: parse_profile(v)?,
+        profile: parse_profile(v, &mut Vec::new())?,
     })
 }
 
 /// Parse `{ tts_system_prompt, interleaved_system_prompt?, voices?, sample_texts? }`.
 /// `None` when the required prompt is missing, so a malformed manifest block
-/// falls back to the registry instead of silencing the model.
-fn parse_profile(v: &serde_json::Value) -> Option<AudioProfile> {
+/// falls back to the registry instead of silencing the model. Everything
+/// optional that is the wrong type or unusable is dropped, and each kind of
+/// drop adds a message to `notes`.
+fn parse_profile(v: &serde_json::Value, notes: &mut Vec<String>) -> Option<AudioProfile> {
     let tts = v.get("tts_system_prompt")?.as_str()?.trim();
     if tts.is_empty() {
         return None;
     }
-    let interleaved = v
-        .get("interleaved_system_prompt")
-        .and_then(|s| s.as_str())
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or(INTERLEAVED_SYSTEM_PROMPT);
-    let voices: Vec<(String, String)> = v
-        .get("voices")
-        .and_then(|a| a.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|voice| {
-                    let prompt = voice.get("prompt")?.as_str()?.trim();
-                    let label = voice
-                        .get("label")
-                        .and_then(|l| l.as_str())
-                        .unwrap_or(prompt);
-                    (!prompt.is_empty()).then(|| (label.to_string(), prompt.to_string()))
-                })
-                .collect()
-        })
-        .unwrap_or_default();
+    let interleaved = match v.get("interleaved_system_prompt") {
+        None => INTERLEAVED_SYSTEM_PROMPT,
+        Some(p) => match p.as_str().map(str::trim).filter(|s| !s.is_empty()) {
+            Some(p) => p,
+            None => {
+                notes.push(
+                    "audio_profile `interleaved_system_prompt` is not a non-empty string; \
+                     using the standard prompt"
+                        .to_string(),
+                );
+                INTERLEAVED_SYSTEM_PROMPT
+            }
+        },
+    };
+    let mut voices: Vec<(String, String)> = Vec::new();
+    let mut dropped = 0usize;
+    for voice in array_of(v, "voices", notes) {
+        let prompt = voice
+            .get("prompt")
+            .and_then(|p| p.as_str())
+            .map(str::trim)
+            .unwrap_or_default();
+        // A voice is chosen by its prompt, so a repeat would make two entries
+        // indistinguishable to a picker.
+        if prompt.is_empty() || voices.iter().any(|(_, p)| p == prompt) {
+            dropped += 1;
+            continue;
+        }
+        let label = voice
+            .get("label")
+            .and_then(|l| l.as_str())
+            .map(str::trim)
+            .filter(|l| !l.is_empty())
+            .unwrap_or(prompt);
+        voices.push((label.to_string(), prompt.to_string()));
+    }
+    if dropped > 0 {
+        notes.push(format!(
+            "audio_profile: {dropped} voice(s) without a distinct string `prompt` were ignored"
+        ));
+    }
     let voice_refs: Vec<(&str, &str)> = voices
         .iter()
         .map(|(l, p)| (l.as_str(), p.as_str()))
         .collect();
-    let samples = v
-        .get("sample_texts")
-        .and_then(|a| a.as_array())
-        .map(|a| {
-            a.iter()
-                .filter_map(|s| s.as_str().map(str::to_string))
-                .collect()
-        })
-        .unwrap_or_default();
+    let mut samples = Vec::new();
+    let mut unusable = 0usize;
+    for text in array_of(v, "sample_texts", notes) {
+        match text.as_str().filter(|s| !s.trim().is_empty()) {
+            Some(text) => samples.push(text.to_string()),
+            None => unusable += 1,
+        }
+    }
+    if unusable > 0 {
+        notes.push(format!(
+            "audio_profile: {unusable} sample text(s) that are not non-empty strings were ignored"
+        ));
+    }
     Some(AudioProfile::new(tts, interleaved, &voice_refs, samples))
 }
 
+/// The elements of `v[key]`; empty when the key is absent, and empty with a
+/// note when it is present but not an array.
+fn array_of<'a>(
+    v: &'a serde_json::Value,
+    key: &str,
+    notes: &mut Vec<String>,
+) -> &'a [serde_json::Value] {
+    match v.get(key) {
+        None => &[],
+        Some(serde_json::Value::Array(items)) => items,
+        Some(_) => {
+            notes.push(format!("audio_profile `{key}` is not an array; ignored"));
+            &[]
+        }
+    }
+}
+
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::manifest::Manifest;
+    use std::sync::{Arc, Mutex};
+    use tracing_subscriber::layer::SubscriberExt;
+
+    /// Every `WARN` event `f` emits on this thread, as its fields.
+    ///
+    /// One process-wide capture layer tags each event with its thread, and each
+    /// caller reads back only its own. A per-thread `set_default` subscriber
+    /// would race the callsites' cached interest when tests run in parallel and
+    /// intermittently lose events.
+    pub(crate) fn warnings_of(f: impl FnOnce()) -> Vec<String> {
+        use std::sync::OnceLock;
+        use std::thread::ThreadId;
+        use tracing_subscriber::Layer as _;
+        type Events = Arc<Mutex<Vec<(ThreadId, String)>>>;
+
+        #[derive(Clone)]
+        struct Capture(Events);
+        impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for Capture {
+            fn on_event(
+                &self,
+                event: &tracing::Event<'_>,
+                _: tracing_subscriber::layer::Context<'_, S>,
+            ) {
+                if *event.metadata().level() != tracing::Level::WARN {
+                    return;
+                }
+                struct Fields<'a>(&'a mut String);
+                impl tracing::field::Visit for Fields<'_> {
+                    fn record_debug(
+                        &mut self,
+                        field: &tracing::field::Field,
+                        value: &dyn std::fmt::Debug,
+                    ) {
+                        self.0.push_str(&format!("{}={value:?} ", field.name()));
+                    }
+                }
+                let mut line = String::new();
+                event.record(&mut Fields(&mut line));
+                self.0
+                    .lock()
+                    .unwrap()
+                    .push((std::thread::current().id(), line));
+            }
+        }
+
+        static EVENTS: OnceLock<Events> = OnceLock::new();
+        let events = EVENTS.get_or_init(|| {
+            let events = Events::default();
+            // Only warnings are read back, so keep every other level's callsites
+            // disabled for the rest of the test process.
+            tracing::subscriber::set_global_default(tracing_subscriber::registry().with(
+                Capture(events.clone()).with_filter(tracing_subscriber::filter::LevelFilter::WARN),
+            ))
+            .expect("no other test installs a global tracing subscriber");
+            events
+        });
+        let me = std::thread::current().id();
+        events.lock().unwrap().retain(|(t, _)| *t != me);
+        f();
+        let mut mine = Vec::new();
+        events.lock().unwrap().retain(|(t, line)| {
+            if *t == me {
+                mine.push(line.clone());
+            }
+            *t != me
+        });
+        mine
+    }
 
     fn manifest(model: &str, decoder: Option<&str>, extra: &str) -> Manifest {
         let decoder = decoder
@@ -282,11 +439,20 @@ mod tests {
     }
 
     #[test]
+    fn a_japanese_text_model_is_not_an_audio_release() {
+        // The Japanese prompt is for the audio release only: a model that is
+        // merely Japanese keeps the plain profile.
+        for id in ["japanese-llama-7b.gguf", "JP-Instruct-1B-Q4_0.gguf"] {
+            assert_eq!(AudioProfile::for_model(id), AudioProfile::generic(), "{id}");
+        }
+    }
+
+    #[test]
     fn the_japanese_release_gets_its_model_card_prompt_and_no_voices() {
         for id in [
             "LFM2.5-Audio-1.5B-JP-GGUF",
             "LFM2.5-Audio-1.5B-JP-Q8_0.gguf vocoder-LFM2.5-Audio-1.5B-JP-Q8_0.gguf",
-            "some-japanese-voice-model",
+            "some-japanese-audio-model",
         ] {
             let p = AudioProfile::for_model(id);
             assert_eq!(p.tts_system_prompt, "Perform TTS in japanese.", "{id}");
@@ -421,7 +587,7 @@ mod tests {
                 "tts_system_prompt":"Speak.",
                 "interleaved_system_prompt":42,
                 "voices":[{"prompt":7},{"label":"No prompt"},"x",{"prompt":"Voice: ana."}],
-                "sample_texts":[42,"Hi.",null]}"#,
+                "sample_texts":[42,"Hi.",null,""," "]}"#,
         );
         let p = AudioProfile::for_manifest(&m);
         assert_eq!(p.tts_system_prompt, "Speak. Voice: ana.");
@@ -432,6 +598,162 @@ mod tests {
             "Respond with interleaved text and audio. Voice: ana.",
             "a non-string interleaved prompt falls back to the default"
         );
+    }
+
+    #[test]
+    fn directories_and_hosts_never_pick_the_release() {
+        // By load time the manifest holds resolved paths and URLs, so a `jp`
+        // directory, host or app id must not make an English model Japanese.
+        for model in [
+            "/Users/jp/models/LFM2.5-Audio-1.5B-Q4_0.gguf",
+            "/Users/me/Japanese/LFM2.5-Audio-1.5B-Q4_0.gguf",
+            "/data/user/0/jp.co.app/files/LFM2.5-Audio-1.5B-Q4_0.gguf",
+            "https://example.jp/models/LFM2.5-Audio-1.5B-Q4_0.gguf",
+            "https://host/m/LFM2.5-Audio-1.5B-Q4_0.gguf?lang=jp",
+            "https://host/m/LFM2.5-Audio-1.5B-Q4_0.gguf#jp/x",
+            "/Users/me/Projects #1/LFM2.5-Audio-1.5B-Q4_0.gguf",
+            "/Users/me/what?/LFM2.5-Audio-1.5B-Q4_0.gguf",
+            "C:\\\\Users\\\\jp\\\\LFM2.5-Audio-1.5B-Q4_0.gguf",
+        ] {
+            let p = AudioProfile::for_manifest(&manifest(model, None, ""));
+            assert_eq!(
+                p.tts_system_prompt, "Perform TTS. Use the US female voice.",
+                "{model}"
+            );
+            assert_eq!(p.voices.len(), 4, "{model}");
+        }
+        // The release is still read from the file's own name, however the URL
+        // around it ends.
+        for model in [
+            "/x/LFM2.5-Audio-1.5B-JP-Q8_0.gguf",
+            "https://host/m/LFM2.5-Audio-1.5B-JP-Q8_0.gguf?next=a/b",
+            "https://host/m/LFM2.5-Audio-1.5B-JP-Q8_0.gguf#frag/x",
+            "https://host/LFM2.5-Audio-1.5B-JP-GGUF/",
+            "/Users/me/Projects #1/LFM2.5-Audio-1.5B-JP-Q8_0.gguf",
+            "/Users/me/what?/LFM2.5-Audio-1.5B-JP-Q8_0.gguf",
+        ] {
+            let jp = manifest(model, None, "");
+            assert_eq!(
+                AudioProfile::for_manifest(&jp).tts_system_prompt,
+                "Perform TTS in japanese.",
+                "{model}"
+            );
+        }
+    }
+
+    #[test]
+    fn repeated_voices_collapse_and_a_blank_label_reads_as_the_prompt() {
+        let m = manifest(
+            "SomeNewAudioModel-2B-Q4_0.gguf",
+            None,
+            r#","audio_profile":{
+                "tts_system_prompt":"Speak.",
+                "voices":[{"label":"A","prompt":"Voice: a."},
+                          {"label":"B","prompt":" Voice: a. "},
+                          {"label":"  ","prompt":"Voice: x."}]}"#,
+        );
+        let p = AudioProfile::for_manifest(&m);
+        let seen: Vec<_> = p
+            .voices
+            .iter()
+            .map(|v| (v.label.as_str(), v.prompt.as_str()))
+            .collect();
+        assert_eq!(seen, [("A", "Voice: a."), ("Voice: x.", "Voice: x.")]);
+    }
+
+    #[test]
+    fn a_registry_entry_with_a_token_that_can_never_match_is_rejected() {
+        // `tokens_of` splits on digits, so "lfm2" would never be seen.
+        for bad in [
+            r#"{"any_token":["lfm2"],"tts_system_prompt":"x"}"#,
+            r#"{"all_tokens":["lfm","au-dio"],"tts_system_prompt":"x"}"#,
+            r#"{"any_token":[""],"tts_system_prompt":"x"}"#,
+        ] {
+            let v: serde_json::Value = serde_json::from_str(bad).unwrap();
+            assert!(parse_entry(&v).is_none(), "{bad}");
+        }
+        let ok: serde_json::Value =
+            serde_json::from_str(r#"{"any_token":["lfm"],"tts_system_prompt":"x"}"#).unwrap();
+        assert!(parse_entry(&ok).is_some());
+    }
+
+    #[test]
+    fn an_ignored_manifest_block_warns_and_a_good_one_does_not() {
+        let file = "SomeNewAudioModel-2B-Q4_0.gguf";
+        let bad = manifest(file, None, r#","audio_profile":{"tts_system_prompt":5}"#);
+        let warned = warnings_of(|| {
+            AudioProfile::for_manifest(&bad);
+        });
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains("audio_profile"), "{warned:?}");
+
+        let good = manifest(
+            file,
+            None,
+            r#","audio_profile":{"tts_system_prompt":"Speak."}"#,
+        );
+        let none = manifest(file, None, "");
+        let warned = warnings_of(|| {
+            AudioProfile::for_manifest(&good);
+            AudioProfile::for_manifest(&none);
+        });
+        assert!(warned.is_empty(), "{warned:?}");
+    }
+
+    #[test]
+    fn dropped_voices_are_counted_in_one_warning() {
+        let m = manifest(
+            "SomeNewAudioModel-2B-Q4_0.gguf",
+            None,
+            r#","audio_profile":{
+                "tts_system_prompt":"Speak.",
+                "voices":[{"prompt":"Voice: a."},{"prompt":"Voice: a."},{"label":"none"},{"prompt":"Voice: b."}]}"#,
+        );
+        let warned = warnings_of(|| {
+            AudioProfile::for_manifest(&m);
+        });
+        assert_eq!(warned.len(), 1, "{warned:?}");
+        assert!(warned[0].contains("2 voice(s)"), "{warned:?}");
+    }
+
+    #[test]
+    fn every_wrong_typed_field_is_reported() {
+        let m = manifest(
+            "SomeNewAudioModel-2B-Q4_0.gguf",
+            None,
+            r#","audio_profile":{
+                "tts_system_prompt":"Speak.",
+                "interleaved_system_prompt":42,
+                "voices":{"prompt":"Voice: a."},
+                "sample_texts":"Hello"}"#,
+        );
+        let (profile, notes) = AudioProfile::for_manifest_noted(&m);
+        assert_eq!(profile.tts_system_prompt, "Speak.");
+        assert!(profile.voices.is_empty() && profile.sample_texts.is_empty());
+        assert_eq!(notes.len(), 3, "{notes:?}");
+        for field in ["interleaved_system_prompt", "voices", "sample_texts"] {
+            assert!(
+                notes.iter().any(|n| n.contains(field)),
+                "{field}: {notes:?}"
+            );
+        }
+        // The logged form reports the same problems.
+        let warned = warnings_of(|| {
+            AudioProfile::for_manifest(&m);
+        });
+        assert_eq!(warned.len(), 3, "{warned:?}");
+    }
+
+    #[test]
+    fn a_good_or_absent_block_has_no_notes() {
+        let file = "SomeNewAudioModel-2B-Q4_0.gguf";
+        for extra in [
+            "",
+            r#","audio_profile":{"tts_system_prompt":"Speak.","voices":[{"prompt":"Voice: a."}],"sample_texts":["Hi."]}"#,
+        ] {
+            let (_, notes) = AudioProfile::for_manifest_noted(&manifest(file, None, extra));
+            assert!(notes.is_empty(), "{notes:?}");
+        }
     }
 
     #[test]

@@ -4476,6 +4476,7 @@ mod tests {
             core.interleaved_system_prompt
         );
         assert_eq!(ffi.voices.len(), 4);
+        assert_eq!(ffi.voices[1].label, core.voices[1].label);
         assert_eq!(ffi.voices[1].prompt, "Use the US male voice.");
         assert_eq!(
             ffi.voices[1].tts_system_prompt,

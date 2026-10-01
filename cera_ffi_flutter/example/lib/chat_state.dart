@@ -156,9 +156,6 @@ class ChatSettings {
   /// Voice persona description for dedicated TTS Studio.
   final String ttsStudioVoice;
 
-  /// Backwards compatibility getter for ttsVoice.
-  String get ttsVoice => chatVoice;
-
   /// Converts settings to engine open options.
   CeraOptions get ceraOptions => CeraOptions(
     backend: backend,
@@ -178,7 +175,6 @@ class ChatSettings {
     AudioChatMode? audioChatMode,
     String? chatVoice,
     String? ttsStudioVoice,
-    String? ttsVoice,
   }) {
     return ChatSettings(
       backend: backend ?? this.backend,
@@ -187,7 +183,7 @@ class ChatSettings {
           ? maxImageLongSize()
           : this.maxImageLongSize,
       audioChatMode: audioChatMode ?? this.audioChatMode,
-      chatVoice: chatVoice ?? ttsVoice ?? this.chatVoice,
+      chatVoice: chatVoice ?? this.chatVoice,
       ttsStudioVoice: ttsStudioVoice ?? this.ttsStudioVoice,
     );
   }

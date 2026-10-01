@@ -24,6 +24,7 @@ import 'widgets/bundle_picker_dialog.dart';
 import 'widgets/message_composer.dart';
 import 'widgets/message_list.dart';
 import 'widgets/tts_studio_view.dart';
+import 'widgets/voice_persona_picker.dart';
 
 void main() => runApp(const CeraExampleApp());
 
@@ -503,48 +504,17 @@ class _ChatPageState extends State<ChatPage> {
                               currentSettings.audioChatMode ==
                                   AudioChatMode.textToSpeech)) ...[
                         const SizedBox(height: 8),
-                        ListTile(
-                          contentPadding: EdgeInsets.zero,
-                          title: const Text('Voice Persona'),
-                          subtitle: Text(
-                            'Select speaker timbre and accent for synthesized speech responses.',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: theme.colorScheme.onSurfaceVariant,
-                            ),
-                          ),
-                          trailing: DropdownButton<String?>(
-                            value:
-                                (currentState.audioProfile?.voices.any(
-                                      (v) =>
-                                          v.prompt == currentSettings.chatVoice,
-                                    ) ??
-                                    false)
-                                ? currentSettings.chatVoice
-                                : null,
-                            dropdownColor: theme.colorScheme.surface,
-                            underline: const SizedBox.shrink(),
-                            items: [
-                              const DropdownMenuItem(
-                                value: null,
-                                child: Text('Default Voice'),
+                        VoicePersonaPicker(
+                          profile: currentState.audioProfile,
+                          saved: currentSettings.chatVoice,
+                          onChanged: (val) {
+                            _controller.dispatch(
+                              UpdateSettingsIntent(
+                                chatVoice: val,
+                                clearChatVoice: val == null,
                               ),
-                              for (final voice
-                                  in currentState.audioProfile!.voices)
-                                DropdownMenuItem(
-                                  value: voice.prompt,
-                                  child: Text(voice.label),
-                                ),
-                            ],
-                            onChanged: (val) {
-                              _controller.dispatch(
-                                UpdateSettingsIntent(
-                                  chatVoice: val,
-                                  clearChatVoice: val == null,
-                                ),
-                              );
-                            },
-                          ),
+                            );
+                          },
                         ),
                       ],
                       if (currentState.hasModel) ...[

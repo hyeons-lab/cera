@@ -3371,7 +3371,7 @@ mod webgpu {
                     image_max_long_size: None,
                     drafter: None,
                     model_label: format!("{bundle_id} ({quant})"),
-                    audio_profile: cera::AudioProfile::for_manifest(&manifest),
+                    audio_profile: crate::bundle::profile_of(&manifest),
                     generation_defaults: Some(manifest.generation_defaults.clone()),
                     cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     sampler: None,

@@ -1314,12 +1314,20 @@ do {
   means the model has none, so send the profile's `ttsSystemPrompt`. Save the
   user's choice as the voice's `prompt`; a saved voice the loaded model does not
   list must not be sent to it. Meaningful when `capabilities.audioOut` is true.
+  The registry matches the model's and vocoder's **file names** (not directories
+  or hosts), so a model loaded from raw bytes with `ModelSource.Parts`, which has
+  no file names, reports the plain profile; load it from a bundle or path to get
+  the model's own.
 - **`GenerateOpts.audioMode`** (`AudioOutputMode`: `TextOnly`, `Sequential`,
   `Interleaved`; `null` is `Sequential`) says how a bundle **with a vocoder**
   answers, and must match the system prompt in play: `TextOnly` for
   `"Perform ASR."` and plain chat, `Sequential` for `"Perform TTS."` (audio starts
   when the model emits `<|audio_start|>`), `Interleaved` for
-  `"Respond with interleaved text and audio."`. The runtime, not the model,
+  `"Respond with interleaved text and audio."`. When the prompt comes from
+  `audioProfile()` (a manifest may word its prompts any way), choose the mode by
+  which field it came from, not by its words: `ttsSystemPrompt` (also a voice's)
+  means `Sequential`, `interleavedSystemPrompt` (also a voice's) means
+  `Interleaved`. The runtime, not the model,
   forces the text/audio alternation in an interleaved turn, at the cadence the
   vocoder declares (`interleaved_n_text` / `interleaved_n_audio`, default 6/12).
   Interleaving on a text turn corrupts the rest of the answer, which is why it is

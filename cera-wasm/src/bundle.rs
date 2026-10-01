@@ -1605,8 +1605,19 @@ pub(crate) async fn load_manifest_struct(
         inference_type: Some(manifest.inference_type.clone()),
         chat_template: manifest.chat_template.clone(),
         generation_defaults: Some(manifest.generation_defaults.clone()),
-        audio_profile: Some(cera::AudioProfile::for_manifest(manifest)),
+        audio_profile: Some(profile_of(manifest)),
     })
+}
+
+/// The manifest's audio profile, with anything it ignored in a malformed
+/// `audio_profile` reported to the browser console (there is no `tracing`
+/// subscriber here for `AudioProfile::for_manifest` to log to).
+pub(crate) fn profile_of(manifest: &cera::manifest::Manifest) -> cera::AudioProfile {
+    let (profile, notes) = cera::AudioProfile::for_manifest_noted(manifest);
+    for note in &notes {
+        console_warn(note);
+    }
+    profile
 }
 
 /// Load the bundle described by the manifest at `manifest_url`.

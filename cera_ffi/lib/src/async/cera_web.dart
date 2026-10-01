@@ -105,7 +105,9 @@ extension type _Reply._(JSObject _) implements JSObject {
 extension type _OpenResult._(JSObject _) implements JSObject {
   external String get backend;
   external _Capabilities get capabilities;
-  external _AudioProfile get audioProfile;
+  // Absent when the page still serves a worker copied before cera reported
+  // profiles (`dart run cera_ffi:install_web` was not re-run after an upgrade).
+  external _AudioProfile? get audioProfile;
   external JSAny? get cancelBuffer;
 }
 
@@ -247,7 +249,7 @@ extension type _AudioProfile._(JSObject _) implements JSObject {
 CeraAudioProfile _audioProfileOf(_AudioProfile p) => CeraAudioProfile(
   ttsSystemPrompt: p.ttsSystemPrompt,
   interleavedSystemPrompt: p.interleavedSystemPrompt,
-  voices: [
+  voices: List.unmodifiable([
     for (final v in p.voices.toDart)
       CeraTtsVoice(
         label: v.label,
@@ -255,8 +257,10 @@ CeraAudioProfile _audioProfileOf(_AudioProfile p) => CeraAudioProfile(
         ttsSystemPrompt: v.ttsSystemPrompt,
         interleavedSystemPrompt: v.interleavedSystemPrompt,
       ),
-  ],
-  sampleTexts: [for (final s in p.sampleTexts.toDart) s.toDart],
+  ]),
+  sampleTexts: List.unmodifiable([
+    for (final s in p.sampleTexts.toDart) s.toDart,
+  ]),
 );
 
 CeraCapabilities _capabilitiesOf(_Capabilities caps) => CeraCapabilities(
@@ -322,7 +326,7 @@ class _WorkerCera implements Cera {
   @override
   CeraCapabilities get capabilities => _capabilities;
 
-  late CeraAudioProfile _audioProfile;
+  late final CeraAudioProfile _audioProfile;
 
   @override
   CeraAudioProfile get audioProfile => _audioProfile;
@@ -464,7 +468,11 @@ class _WorkerCera implements Cera {
     final opened = result as _OpenResult;
     _backend = opened.backend;
     _capabilities = _capabilitiesOf(opened.capabilities);
-    _audioProfile = _audioProfileOf(opened.audioProfile);
+    final profile = opened.audioProfile;
+    _audioProfile =
+        profile == null
+            ? const CeraAudioProfile.plain()
+            : _audioProfileOf(profile);
     final buf = opened.cancelBuffer;
     if (buf != null) {
       try {

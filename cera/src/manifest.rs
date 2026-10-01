@@ -36,7 +36,10 @@
 //!
 //! Only `tts_system_prompt` is required; `interleaved_system_prompt`, `voices`
 //! and `sample_texts` default to the standard prompt, none, and the client's
-//! own samples. A block without `tts_system_prompt` is ignored.
+//! own samples. A block without `tts_system_prompt` is ignored (with a warning),
+//! as is a voice without a distinct string `prompt`. A client that has to tell
+//! a text-to-speech prompt from an interleaved one should do so by which field
+//! it came from, not by the words in it (a prompt need not say "TTS").
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
