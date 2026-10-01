@@ -13,6 +13,8 @@ pub type DspQueueHandle = *mut c_void;
 pub type DspQueueCallback = extern "C" fn(context: *mut c_void);
 
 pub const DOMAIN_CDSP: i32 = 3;
+/// Mapping size from which a `fastrpc_mmap` failure is blamed on the DSP address space.
+const GIB: usize = 1 << 30;
 pub const FASTRPC_MAP_FD: u32 = 2;
 pub const FASTRPC_MAP_FD_DELAYED: u32 = 3;
 pub const DSPQUEUE_TIMEOUT_US: u32 = 1_000_000;
@@ -309,8 +311,18 @@ impl FastRpcDriver {
             FASTRPC_MAP_FD,
         );
         if ret != 0 {
+            // The CDSP unsigned PD has a 32-bit address space shared by every
+            // mapping. Measured on an S25 Ultra: one buffer maps up to about
+            // 3.9 GiB when nothing else is mapped, but the total across buffers
+            // stops near 3 GiB, so splitting a large model does not help.
+            let hint = if length >= GIB {
+                " (the DSP address space is about 3 to 4 GiB in total; models whose weights \
+                 exceed it cannot run on the NPU)"
+            } else {
+                ""
+            };
             Err(CeraError::Backend(format!(
-                "fastrpc_mmap failed for fd {} length {} (error {})",
+                "fastrpc_mmap failed for fd {} length {} (error {}){hint}",
                 fd, length, ret
             )))
         } else {
