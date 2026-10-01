@@ -5889,7 +5889,7 @@ mod no_repack_tests {
 ///
 /// Loaded without the CPU repacks (their prefill GEMMs reorder sums on purpose).
 /// Not run under BLAS, whose expert GEMMs are f32 SGEMMs.
-#[cfg(all(test, not(has_blas)))]
+#[cfg(all(test, not(has_blas), feature = "mmap"))]
 mod moe_prefill_identity_tests {
     use super::*;
 
