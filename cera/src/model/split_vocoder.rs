@@ -663,7 +663,7 @@ mod tests {
         });
     }
 
-    const LEAP_URL: &str = "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP-GGUF/resolve/main/vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf";
+    const JP_VOCODER_URL: &str = "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP-GGUF/resolve/main/vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf";
 
     fn gguf_bytes(tensors: &[(&str, Vec<u64>, Vec<f32>)]) -> Vec<u8> {
         let mut w = GgufWriter::new();
@@ -683,7 +683,7 @@ mod tests {
     fn sidecar_ref_is_the_sibling_for_a_split_vocoder() {
         let split = gguf_bytes(&[("emb.emb.weight", vec![4, 2], f(8, 0.0))]);
         assert_eq!(
-            sidecar_ref_for(LEAP_URL, &split).as_deref(),
+            sidecar_ref_for(JP_VOCODER_URL, &split).as_deref(),
             Some(
                 "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP-GGUF/resolve/main/tokenizer-LFM2.5-Audio-1.5B-JP-Q4_0.gguf"
             )
@@ -695,15 +695,15 @@ mod tests {
         let split = gguf_bytes(&[("emb.emb.weight", vec![4, 2], f(8, 0.0))]);
         let merged = gguf_bytes(&[(MERGED_PROBE, vec![4, 3], f(12, 0.0))]);
         // Already merged (the LEAP EN vocoder): nothing to fetch.
-        assert_eq!(sidecar_ref_for(LEAP_URL, &merged), None);
+        assert_eq!(sidecar_ref_for(JP_VOCODER_URL, &merged), None);
         // Not named like a llama.cpp vocoder: no sibling to derive.
         assert_eq!(
             sidecar_ref_for("https://h/x/audio_decoder-Q4_0.gguf", &split),
             None
         );
         // Not a GGUF at all.
-        assert_eq!(sidecar_ref_for(LEAP_URL, b"not a gguf"), None);
-        assert_eq!(sidecar_ref_for(LEAP_URL, &[]), None);
+        assert_eq!(sidecar_ref_for(JP_VOCODER_URL, b"not a gguf"), None);
+        assert_eq!(sidecar_ref_for(JP_VOCODER_URL, &[]), None);
     }
 
     #[test]
@@ -712,6 +712,6 @@ mod tests {
         // payload well past the probe size and the result is unchanged.
         let mut split = gguf_bytes(&[("emb.emb.weight", vec![4, 2], f(8, 0.0))]);
         split.resize(split.len() + 2 * HEADER_PROBE_BYTES, 0);
-        assert!(sidecar_ref_for(LEAP_URL, &split).is_some());
+        assert!(sidecar_ref_for(JP_VOCODER_URL, &split).is_some());
     }
 }
