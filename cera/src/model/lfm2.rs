@@ -4378,6 +4378,30 @@ impl Lfm2Model {
                             &mut gate_up_mat[..2 * is * n],
                         );
 
+                        // LoRA on gate/up. The fused GEMM leaves each token's gate then up
+                        // in one `2 * is` row, so the deltas go on the two halves.
+                        if let Some(lora) = &lora {
+                            [
+                                (crate::lora::LoraTarget::FfnGate, 0),
+                                (crate::lora::LoraTarget::FfnUp, is),
+                            ]
+                            .into_iter()
+                            .filter_map(|(target, off)| lora.get(layer, target).map(|t| (t, off)))
+                            .for_each(|(t, off)| {
+                                ffn_input[..n * hs]
+                                    .chunks_exact(hs)
+                                    .zip(gate_up_mat[..2 * is * n].chunks_exact_mut(2 * is))
+                                    .for_each(|(x, row)| {
+                                        crate::lora::apply_decode(
+                                            t,
+                                            x,
+                                            &mut row[off..off + is],
+                                            &mut state.scratch.lora_tmp,
+                                        )
+                                    });
+                            });
+                        }
+
                         for j in 0..n {
                             let (g_slice, u_slice) =
                                 gate_up_mat[j * 2 * is..(j + 1) * 2 * is].split_at_mut(is);
@@ -4510,10 +4534,12 @@ impl Lfm2Model {
                     }
 
                     // LoRA on the down projection: applied to `ffn_out` BEFORE the
-                    // residual add; input is the SiLU⊙up product in `gate_mat` `[is×n]`.
+                    // residual add; input is the SiLU⊙up product, in `gate_mat` `[n×is]`
+                    // (or, under BLAS, the gate half of each `gate_up_mat` row).
                     if let Some(lora) = &lora
                         && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
                     {
+                        #[cfg(not(has_blas))]
                         crate::lora::apply_prefill_rowmajor(
                             t,
                             &gate_mat[..is * n],
@@ -4521,6 +4547,18 @@ impl Lfm2Model {
                             n,
                             &mut state.scratch.lora_tmp,
                         );
+                        #[cfg(has_blas)]
+                        gate_up_mat[..2 * is * n]
+                            .chunks_exact(2 * is)
+                            .zip(ffn_out[..hs * n].chunks_exact_mut(hs))
+                            .for_each(|(row, y)| {
+                                crate::lora::apply_decode(
+                                    t,
+                                    &row[..is],
+                                    y,
+                                    &mut state.scratch.lora_tmp,
+                                )
+                            });
                     }
                     true
                 } else {
