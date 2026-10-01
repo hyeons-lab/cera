@@ -572,6 +572,62 @@ impl HexagonLfmModel {
         Ok(())
     }
 
+    /// [`Self::dispatch_unary`] over `[dim, n_rows]`: one row per token, so the
+    /// DSP streams rows through VTCM instead of holding a flat `dim * n_rows`
+    /// vector, which fails with `VtcmTooSmall` once a prefill chunk is a few
+    /// hundred rows wide.
+    pub(super) fn dispatch_unary_rows(
+        session: &mut HexagonQueueSession,
+        in_buf: &RpcmemBuffer,
+        in_offset: usize,
+        out_buf: &RpcmemBuffer,
+        out_offset: usize,
+        dim: usize,
+        n_rows: usize,
+        opcode: HtpOpCode,
+    ) -> Result<(), CeraError> {
+        let bytes = dim * n_rows * 4;
+        let ne = [dim as u32, n_rows as u32, 1, 1];
+        let nb = [4, (dim * 4) as u32, bytes as u32, bytes as u32];
+        let in_ti = session.add_tensor(
+            in_buf,
+            in_offset,
+            bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            ne,
+            nb,
+        )?;
+        let out_ti = session.add_tensor(
+            out_buf,
+            out_offset,
+            bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            ne,
+            nb,
+        )?;
+        let params = [0i32; 16];
+        let kparams = build_unary_kernel_params(
+            dim,
+            n_rows,
+            0,
+            8 * 1024 * 1024,
+            session.dsp_threads(),
+            false,
+        );
+        Self::enqueue_labeled(
+            session,
+            "dispatch_unary_rows",
+            opcode as u32,
+            &[in_ti],
+            &[out_ti],
+            params,
+            kparams,
+        )?;
+        Ok(())
+    }
+
     fn dispatch_argsort(
         session: &mut HexagonQueueSession,
         src: &RpcmemBuffer,

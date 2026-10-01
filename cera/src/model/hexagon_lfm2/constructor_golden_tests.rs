@@ -444,7 +444,7 @@ fn constructors_build_pinned_models() {
     assert_model(
         "ctor_qwen35",
         &qwen35,
-        (2939268980605172228, 4143789478177102514),
+        (2939268980605172228, 7392097742996743327),
     );
 }
 

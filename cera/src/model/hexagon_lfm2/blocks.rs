@@ -573,16 +573,20 @@ impl HexagonLfmModel {
         }
 
         if attn.has_q_gate {
-            Self::dispatch_unary(
+            Self::dispatch_unary_rows(
                 session,
                 scratch,
                 so.conv_bx,
                 scratch,
                 so.conv_bx,
-                rows * q_dim,
+                q_dim,
+                rows,
                 HtpOpCode::UnarySigmoid,
             )?;
-            Self::dispatch_mul(
+            // One row per token, not one flat `rows * q_dim` vector: the Mul
+            // worker keeps a whole row in VTCM, so the flat form fails with
+            // `VtcmTooSmall` once a Qwen 3.5 prefill chunk reaches 64 rows.
+            Self::dispatch_mul_m_strided(
                 session,
                 scratch,
                 so.attn_out,
@@ -592,7 +596,10 @@ impl HexagonLfmModel {
                 HTP_TENSOR_COMPUTE,
                 scratch,
                 so.attn_out,
-                rows * q_dim,
+                q_dim,
+                rows,
+                q_dim * 4,
+                q_dim * 4,
             )?;
         }
 

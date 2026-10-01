@@ -497,7 +497,7 @@ fn forward_op_sequences_are_pinned() {
             "deltanet",
             deltanet_spec,
             (32, 15798833645049647584),
-            (94, 13774925117970349302),
+            (94, 18402825899250430365),
         ),
         (
             "extras_dsp",
@@ -520,6 +520,30 @@ fn forward_op_sequences_are_pinned() {
     }
     let greedy = decode_capture(dense_spec(), DecodeOutput::Greedy);
     assert_pinned("fwd_dense_greedy", &greedy, (33, 17315577994383314263));
+}
+
+/// The Qwen 3.5 attention gate (`attn_out * sigmoid(gate)`) must see one row
+/// per token. As a flat `rows * q_dim` vector the DSP holds the whole vector in
+/// VTCM and fails with `VtcmTooSmall` once a chunk reaches ~64 rows (found on
+/// an S25 Ultra); the pinned digest changes if it is flattened again, but only
+/// this test says why.
+#[test]
+fn deltanet_prefill_gate_ops_run_one_row_per_token() {
+    let p = prefill_capture(deltanet_spec());
+    let ops: Vec<&str> = p
+        .batches
+        .iter()
+        .flat_map(|b| b.lines())
+        .filter(|l| l.starts_with("UnarySigmoid ") || l.starts_with("Mul "))
+        .collect();
+    assert_eq!(ops.len(), 2, "expected one sigmoid and one mul");
+    let rows = format!("ne=[64, {PREFILL_M}, 1, 1]");
+    for op in ops {
+        assert!(
+            op.matches(&rows).count() >= 2,
+            "gate op is not one row per token ({rows}): {op}"
+        );
+    }
 }
 
 /// Small-M prefill (fewer than `SMALL_M_FLUSH_CAP_ROWS` rows) caps ops per
