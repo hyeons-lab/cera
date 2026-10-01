@@ -1,7 +1,9 @@
 //! LFM2 batched prefill must leave exactly the state, and exactly the logits,
 //! that token-by-token decode does, with and without a LoRA adapter.
 //!
-//! The model is a tiny synthetic Q8_0 LFM2 (`scripts/oracle/create_lfm2_test_model.py`):
+//! The models are tiny synthetic LFM2s (`scripts/oracle/create_lfm2_test_model.py`): a Q8_0
+//! dense one and, with `--moe`, a routed `lfm2moe` (4 of 8 experts, Q4_0).
+//! The dense one is Q8_0:
 //! Q8_0 is the batched path whose arithmetic is meant to be identical to decode
 //! (repacked Q4_0/Q4_K prefill GEMMs are an accepted reorder, so they are not
 //! bit-exact and are not checked here).
@@ -13,7 +15,13 @@
 //!     That one is invisible to the base model, because the next Q8_0 quantization
 //!     absorbs a 1-ulp difference, and only an f32 consumer of the conv output,
 //!     the LoRA `out_proj` hook, exposes it: hence the adapter case;
-//!   * the LoRA hooks in batched prefill read token-major buffers.
+//!   * the LoRA hooks in batched prefill read token-major buffers;
+//!   * the routed-MoE prefill sums a token's experts the way decode does. That is
+//!     pinned directly by `moe_prefill_identity_tests` in `model/lfm2.rs`, which
+//!     compares the FFN output bits; the end-to-end MoE test here is a coarser
+//!     consistency check, because on a tiny model the next quantization absorbs
+//!     a last-bit difference. The MoE model is loaded without the CPU repacks,
+//!     whose prefill GEMMs reorder sums on purpose.
 //!
 //! Exactness is asserted on aarch64 without BLAS (the arithmetic this was written
 //! against); elsewhere the test only checks the paths agree closely. It skips when
@@ -44,7 +52,7 @@ impl Drop for TempModel {
     }
 }
 
-fn synthetic_model() -> Option<TempModel> {
+fn synthetic_model(moe: bool) -> Option<TempModel> {
     let strict = std::env::var("CERA_REQUIRE_ORACLE").as_deref() == Ok("1");
     let script = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("../scripts/oracle/create_lfm2_test_model.py");
@@ -66,11 +74,12 @@ fn synthetic_model() -> Option<TempModel> {
         std::process::id(),
         NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed)
     ));
-    let status = std::process::Command::new("python3")
-        .arg(&script)
-        .arg(&out)
-        .status()
-        .expect("run python3");
+    let mut cmd = std::process::Command::new("python3");
+    cmd.arg(&script).arg(&out);
+    if moe {
+        cmd.arg("--moe");
+    }
+    let status = cmd.status().expect("run python3");
     assert!(
         status.success(),
         "generating the synthetic lfm2 model failed"
@@ -148,73 +157,97 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, |m, (x, y)| m.max((x - y).abs()))
 }
 
+/// Run `tokens` through batched prefill and token-by-token decode on fresh state
+/// and check they agree: bit for bit where exactness applies, closely elsewhere.
+fn assert_prefill_matches_decode(
+    model: &Lfm2Model,
+    tokens: &[u32],
+    lora: Option<Arc<LoraAdapterWeights>>,
+    label: &str,
+) {
+    let cfg = model.config();
+    let exact = cfg!(all(target_arch = "aarch64", not(has_blas)));
+
+    let mut decode = InferenceState::for_prefill(cfg, tokens.len()).expect("state");
+    decode.lora = lora.clone();
+    let decode_logits = tokens
+        .iter()
+        .map(|&t| model.forward(&[t], decode.seq_len, &mut decode))
+        .last()
+        .expect("tokens");
+
+    let mut prefill = InferenceState::for_prefill(cfg, tokens.len()).expect("state");
+    prefill.lora = lora;
+    let prefill_logits = model.forward_prefill(tokens, 0, &mut prefill);
+
+    if !exact {
+        let scale = decode_logits.iter().fold(1.0f32, |m, x| m.max(x.abs()));
+        assert!(
+            max_abs_diff(&prefill_logits, &decode_logits) < 1e-2 * scale,
+            "{label}: prefill and decode logits differ"
+        );
+        return;
+    }
+    assert!(
+        bits(&prefill_logits) == bits(&decode_logits),
+        "{label}: logits differ by {}",
+        max_abs_diff(&prefill_logits, &decode_logits)
+    );
+    decode
+        .layers
+        .iter()
+        .zip(&prefill.layers)
+        .enumerate()
+        .for_each(|(i, pair)| match pair {
+            (LayerState::Conv { buffer: d, .. }, LayerState::Conv { buffer: p, .. }) => {
+                assert!(bits(p) == bits(d), "{label}: layer {i} conv state");
+            }
+            (
+                LayerState::Attention {
+                    key_cache: dk,
+                    value_cache: dv,
+                    ..
+                },
+                LayerState::Attention {
+                    key_cache: pk,
+                    value_cache: pv,
+                    ..
+                },
+            ) => {
+                assert!(bits(pk) == bits(dk), "{label}: layer {i} keys");
+                assert!(bits(pv) == bits(dv), "{label}: layer {i} values");
+            }
+            _ => panic!("{label}: layer {i} kinds differ"),
+        });
+}
+
+/// Below the 16-token flash-attention threshold: flash attention is a legitimate
+/// reorder of the per-token softmax and would not be bit-exact.
+const TOKENS: [u32; 12] = [76, 105, 112, 112, 115, 123, 115, 118, 112, 104, 53, 54];
+
 #[test]
 fn lfm2_batched_prefill_matches_decode() {
-    let Some(model_file) = synthetic_model() else {
+    let Some(model_file) = synthetic_model(false) else {
         return;
     };
     let model = Lfm2Model::from_gguf(GgufFile::open(&model_file.0).expect("open gguf"), 512)
         .expect("load synthetic lfm2");
-    let cfg = model.config();
-    // Below the 16-token flash-attention threshold: flash attention is a legitimate
-    // reorder of the per-token softmax and would not be bit-exact.
-    let tokens: Vec<u32> = vec![76, 105, 112, 112, 115, 123, 115, 118, 112, 104, 53, 54];
+    assert_prefill_matches_decode(&model, &TOKENS, None, "base");
+    assert_prefill_matches_decode(&model, &TOKENS, Some(full_adapter()), "adapter");
+}
 
-    let exact = cfg!(all(target_arch = "aarch64", not(has_blas)));
-    let cases: [(&str, Option<Arc<LoraAdapterWeights>>); 2] =
-        [("base", None), ("adapter", Some(full_adapter()))];
-
-    for (label, lora) in cases {
-        let mut decode = InferenceState::for_prefill(cfg, tokens.len()).expect("state");
-        decode.lora = lora.clone();
-        let decode_logits = tokens
-            .iter()
-            .map(|&t| model.forward(&[t], decode.seq_len, &mut decode))
-            .last()
-            .expect("tokens");
-
-        let mut prefill = InferenceState::for_prefill(cfg, tokens.len()).expect("state");
-        prefill.lora = lora;
-        let prefill_logits = model.forward_prefill(&tokens, 0, &mut prefill);
-
-        if exact {
-            assert!(
-                bits(&prefill_logits) == bits(&decode_logits),
-                "{label}: logits differ by {}",
-                max_abs_diff(&prefill_logits, &decode_logits)
-            );
-            decode
-                .layers
-                .iter()
-                .zip(&prefill.layers)
-                .enumerate()
-                .for_each(|(i, pair)| match pair {
-                    (LayerState::Conv { buffer: d, .. }, LayerState::Conv { buffer: p, .. }) => {
-                        assert!(bits(p) == bits(d), "{label}: layer {i} conv state");
-                    }
-                    (
-                        LayerState::Attention {
-                            key_cache: dk,
-                            value_cache: dv,
-                            ..
-                        },
-                        LayerState::Attention {
-                            key_cache: pk,
-                            value_cache: pv,
-                            ..
-                        },
-                    ) => {
-                        assert!(bits(pk) == bits(dk), "{label}: layer {i} keys");
-                        assert!(bits(pv) == bits(dv), "{label}: layer {i} values");
-                    }
-                    _ => panic!("{label}: layer {i} kinds differ"),
-                });
-        } else {
-            let scale = decode_logits.iter().fold(1.0f32, |m, x| m.max(x.abs()));
-            assert!(
-                max_abs_diff(&prefill_logits, &decode_logits) < 1e-2 * scale,
-                "{label}: prefill and decode logits differ"
-            );
-        }
-    }
+#[test]
+fn lfm2moe_batched_prefill_matches_decode() {
+    let Some(model_file) = synthetic_model(true) else {
+        return;
+    };
+    // No CPU repacks: see the module docs.
+    let model =
+        Lfm2Model::from_gguf_no_repack(GgufFile::open(&model_file.0).expect("open gguf"), 512)
+            .expect("load synthetic lfm2moe");
+    assert!(
+        model.config().moe.is_some(),
+        "the synthetic model must be routed"
+    );
+    assert_prefill_matches_decode(&model, &TOKENS, None, "moe base");
 }

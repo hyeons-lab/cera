@@ -1119,6 +1119,10 @@ impl Lfm2Model {
 
         let mut selected = Vec::with_capacity(n_used);
         let mut expert_assignments: Vec<Vec<(usize, f32)>> = vec![Vec::new(); n_expert];
+        // Each token's picks in router-rank order, which is the order decode
+        // accumulates its experts in.
+        #[cfg(not(has_blas))]
+        let mut token_picks: Vec<Vec<(usize, f32)>> = Vec::with_capacity(n);
 
         for j in 0..n {
             let router_probs = &mut all_router_logits[j * n_expert..(j + 1) * n_expert];
@@ -1127,6 +1131,8 @@ impl Lfm2Model {
                 .for_each(|p| *p = 1.0 / (1.0 + (-*p).exp()));
 
             select_experts(router_probs, &moe.exp_probs_b, n_used, &mut selected);
+            #[cfg(not(has_blas))]
+            token_picks.push(selected.clone());
 
             for &(e, weight) in &selected {
                 if weight > 0.0 {
@@ -1280,6 +1286,12 @@ impl Lfm2Model {
             }
         }
 
+        // Token by token, each token's experts in router-rank order, accumulating
+        // `acc += weight * v` exactly as `forward_moe_ffn` does. This path reads each
+        // expert's weights once per routed token either way, so walking tokens
+        // costs nothing, and a different order (or a fused multiply-add) rounds the
+        // combined output differently from decode. Expert routing is discrete, so
+        // that last-bit difference grows into different experts a few layers on.
         #[cfg(not(has_blas))]
         {
             let mut exp_gate = vec![0.0f32; ff];
@@ -1291,17 +1303,14 @@ impl Lfm2Model {
             #[cfg(target_arch = "aarch64")]
             let mut q8_quants_down = vec![0i8; ff];
 
-            for (e, assigned) in expert_assignments.iter().enumerate().take(n_expert) {
-                if assigned.is_empty() {
-                    continue;
-                }
+            for (token_j, picks) in token_picks.iter().enumerate() {
+                let tok_in = &ffn_input[token_j * hs..(token_j + 1) * hs];
+                #[cfg(target_arch = "aarch64")]
+                Self::quantize_to_scratch(tok_in, state);
 
-                for &(token_j, weight) in assigned {
-                    let tok_in = &ffn_input[token_j * hs..(token_j + 1) * hs];
-
+                for &(e, weight) in picks {
                     #[cfg(target_arch = "aarch64")]
                     {
-                        Self::quantize_to_scratch(tok_in, state);
                         let gate_data = self.weight_data(&moe.gate[e]);
                         let up_data = self.weight_data(&moe.up[e]);
                         cpu::gemv_q4_0_fused2_with_q8(
@@ -1345,30 +1354,10 @@ impl Lfm2Model {
                     #[cfg(not(target_arch = "aarch64"))]
                     self.gemv(&moe.down[e], &exp_gate[..ff], &mut exp_down[..hs]);
 
-                    let out_tok = &mut ffn_out[token_j * hs..(token_j + 1) * hs];
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        unsafe {
-                            use core::arch::aarch64::*;
-                            let n_chunks = hs / 4;
-                            let ed_ptr = exp_down.as_ptr();
-                            let out_ptr = out_tok.as_mut_ptr();
-                            let w_vec = vdupq_n_f32(weight);
-                            for i in 0..n_chunks {
-                                let ed_v = vld1q_f32(ed_ptr.add(i * 4));
-                                let out_v = vld1q_f32(out_ptr.add(i * 4));
-                                let res_v = vfmaq_f32(out_v, ed_v, w_vec);
-                                vst1q_f32(out_ptr.add(i * 4), res_v);
-                            }
-                        }
-                        for i in (hs / 4 * 4)..hs {
-                            out_tok[i] += weight * exp_down[i];
-                        }
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    for i in 0..hs {
-                        out_tok[i] += weight * exp_down[i];
-                    }
+                    ffn_out[token_j * hs..(token_j + 1) * hs]
+                        .iter_mut()
+                        .zip(&exp_down[..hs])
+                        .for_each(|(acc, &v)| *acc += weight * v);
                 }
             }
         }
@@ -5885,5 +5874,118 @@ mod no_repack_tests {
                 "no-repack load still repacked weights"
             );
         }
+    }
+}
+
+/// The routed-MoE prefill must produce, bit for bit, what running each token
+/// through the decode FFN produces.
+///
+/// It used to walk experts by index and accumulate with a fused multiply-add, while
+/// decode accumulates in router-rank order with an unfused `acc += weight * v`, so
+/// the combined output differed in the last bits. A logits comparison on a tiny model
+/// hides that (the next quantization absorbs it), but the real model amplifies it
+/// through discrete expert choice: cosine 0.97 on LFM2.5-8B-A1B-Q4_0. Comparing the FFN
+/// output itself over many tokens does not hide it.
+///
+/// Loaded without the CPU repacks (their prefill GEMMs reorder sums on purpose).
+/// Not run under BLAS, whose expert GEMMs are f32 SGEMMs.
+#[cfg(all(test, not(has_blas)))]
+mod moe_prefill_identity_tests {
+    use super::*;
+
+    fn generate_model() -> Option<std::path::PathBuf> {
+        let strict = std::env::var("CERA_REQUIRE_ORACLE").as_deref() == Ok("1");
+        let has_deps = std::process::Command::new("python3")
+            .args(["-c", "import numpy, gguf"])
+            .output()
+            .is_ok_and(|o| o.status.success());
+        if !has_deps {
+            assert!(
+                !strict,
+                "python3 lacks numpy/gguf and CERA_REQUIRE_ORACLE=1"
+            );
+            eprintln!("skipping: python3 lacks numpy/gguf for the synthetic lfm2moe model");
+            return None;
+        }
+        let script = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../scripts/oracle/create_lfm2_test_model.py");
+        let out =
+            std::env::temp_dir().join(format!("test_lfm2moe_unit_{}.gguf", std::process::id()));
+        let status = std::process::Command::new("python3")
+            .arg(&script)
+            .arg(&out)
+            .arg("--moe")
+            .status()
+            .expect("run python3");
+        assert!(
+            status.success(),
+            "generating the synthetic lfm2moe model failed"
+        );
+        Some(out)
+    }
+
+    #[test]
+    fn prefill_moe_ffn_equals_per_token_decode_bit_for_bit() {
+        let Some(path) = generate_model() else {
+            return;
+        };
+        let model = Lfm2Model::from_gguf_no_repack(GgufFile::open(&path).unwrap(), 128).unwrap();
+        let _ = std::fs::remove_file(&path);
+
+        let (hs, n) = (model.config.hidden_size, 64usize);
+        let mut state = InferenceState::for_prefill(&model.config, n).unwrap();
+        state.scratch.q8_scales.resize(hs / 32, 0.0);
+        state.scratch.q8_quants.resize(hs, 0);
+
+        // Deterministic inputs of a normalized-activation size.
+        let mut seed = 0x9e37_79b9_7f4a_7c15u64;
+        let ffn_input: Vec<f32> = (0..n * hs)
+            .map(|_| {
+                seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((seed >> 33) as f32 / (1u64 << 31) as f32) * 2.0 - 1.0
+            })
+            .collect();
+
+        let routed: Vec<_> = model
+            .layer_refs
+            .iter()
+            .enumerate()
+            .filter_map(|(layer, refs)| match &refs.ffn {
+                FfnRefs::Moe(moe) => Some((layer, moe)),
+                FfnRefs::Dense(_) => None,
+            })
+            .collect();
+        assert!(
+            routed.len() >= 3,
+            "the synthetic model must have routed layers"
+        );
+
+        routed.into_iter().for_each(|(layer, moe)| {
+            let mut col = vec![0.0f32; hs];
+            let mut want = vec![0.0f32; n * hs];
+            (0..n).for_each(|j| {
+                col.copy_from_slice(&ffn_input[j * hs..(j + 1) * hs]);
+                #[cfg(target_arch = "aarch64")]
+                Lfm2Model::quantize_to_scratch(&col, &mut state);
+                model.forward_moe_ffn(layer, moe, hs, &col, &mut state);
+                want[j * hs..(j + 1) * hs].copy_from_slice(&state.scratch.out[..hs]);
+            });
+
+            let mut got = vec![0.0f32; n * hs];
+            model.prefill_moe_ffn(layer, moe, hs, n, &ffn_input, &mut got, &mut col, &mut state);
+
+            let mismatches = got
+                .iter()
+                .zip(&want)
+                .filter(|(g, w)| g.to_bits() != w.to_bits())
+                .count();
+            assert_eq!(
+                mismatches, 0,
+                "layer {layer}: {mismatches} of {} MoE FFN outputs differ between prefill and decode",
+                n * hs
+            );
+        });
     }
 }
