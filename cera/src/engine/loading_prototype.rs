@@ -23,6 +23,10 @@ pub type LoadConfig = EngineConfig;
 /// Filesystem forms require `mmap`; remote forms additionally require `remote`.
 /// A reader may borrow data and need not implement `Send`, `Seek`, or `Clone`.
 /// There is no implicit string conversion between a path and a remote repository.
+// `Parts` is the large variant on builds without `mmap` (`ModelBytes` carries a
+// profile); boxing it would change a public variant, and a source is built once
+// per load.
+#[allow(clippy::large_enum_variant)]
 pub enum ModelSource<'a> {
     /// A Leap bundle ID and quantization, resolved using the configured repository.
     #[cfg(all(feature = "remote", feature = "mmap"))]

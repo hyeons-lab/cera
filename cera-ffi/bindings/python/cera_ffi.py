@@ -551,6 +551,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools() != 46076:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_audio_profile() != 17834:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token() != 30744:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities() != 65060:
@@ -1527,6 +1529,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template_with_tools.a
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template_with_tools.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_audio_profile.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_audio_profile.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_bos_token.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2511,6 +2518,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template.restyp
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_audio_profile.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_audio_profile.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token.restype = ctypes.c_uint16
@@ -3153,6 +3163,169 @@ class _UniffiFfiConverterString:
         with _UniffiRustBuffer.alloc_with_builder() as builder:
             builder.write(value.encode("utf-8"))
             return builder.finalize()
+
+@dataclass
+class TtsVoice:
+    """
+    One speaker an audio model understands. Mirrors [`cera::TtsVoice`].
+
+    `prompt` is the phrase that selects the voice and doubles as its stable
+    identifier (save it as the user's choice). The two `*_system_prompt` fields
+    are complete: pass one as the system message as-is, never assemble a prompt
+    from parts.
+"""
+    def __init__(self, *, label:str, prompt:str, tts_system_prompt:str, interleaved_system_prompt:str):
+        self.label = label
+        self.prompt = prompt
+        self.tts_system_prompt = tts_system_prompt
+        self.interleaved_system_prompt = interleaved_system_prompt
+        
+        
+
+    
+    def __str__(self):
+        return "TtsVoice(label={}, prompt={}, tts_system_prompt={}, interleaved_system_prompt={})".format(self.label, self.prompt, self.tts_system_prompt, self.interleaved_system_prompt)
+    def __eq__(self, other):
+        if self.label != other.label:
+            return False
+        if self.prompt != other.prompt:
+            return False
+        if self.tts_system_prompt != other.tts_system_prompt:
+            return False
+        if self.interleaved_system_prompt != other.interleaved_system_prompt:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeTtsVoice(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return TtsVoice(
+            label=_UniffiFfiConverterString.read(buf),
+            prompt=_UniffiFfiConverterString.read(buf),
+            tts_system_prompt=_UniffiFfiConverterString.read(buf),
+            interleaved_system_prompt=_UniffiFfiConverterString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.label)
+        _UniffiFfiConverterString.check_lower(value.prompt)
+        _UniffiFfiConverterString.check_lower(value.tts_system_prompt)
+        _UniffiFfiConverterString.check_lower(value.interleaved_system_prompt)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.label, buf)
+        _UniffiFfiConverterString.write(value.prompt, buf)
+        _UniffiFfiConverterString.write(value.tts_system_prompt, buf)
+        _UniffiFfiConverterString.write(value.interleaved_system_prompt, buf)
+
+class _UniffiFfiConverterSequenceTypeTtsVoice(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterTypeTtsVoice.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterTypeTtsVoice.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterTypeTtsVoice.read(buf) for i in range(count)
+        ]
+
+class _UniffiFfiConverterSequenceString(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        for item in value:
+            _UniffiFfiConverterString.check_lower(item)
+
+    @classmethod
+    def write(cls, value, buf):
+        items = len(value)
+        buf.write_i32(items)
+        for item in value:
+            _UniffiFfiConverterString.write(item, buf)
+
+    @classmethod
+    def read(cls, buf):
+        count = buf.read_i32()
+        if count < 0:
+            raise InternalError("Unexpected negative sequence length")
+
+        return [
+            _UniffiFfiConverterString.read(buf) for i in range(count)
+        ]
+
+@dataclass
+class AudioProfile:
+    """
+    What an audio model needs to be told to speak. Mirrors [`cera::AudioProfile`].
+
+    The system prompt that selects text-to-speech or interleaved output differs
+    per model, and a voice the model was not trained on makes it answer in text
+    with no audio. So the prompts and the voices a model accepts come from cera,
+    not from the app: the bundle manifest's own `audio_profile`, else cera's
+    built-in registry, else plain `Perform TTS.` with no voices.
+
+    `voices` empty means the model has no voices: send `tts_system_prompt` as-is.
+    `sample_texts` carry `{model}` where the model's display name goes, and are
+    empty when the app should use its own generic samples.
+"""
+    def __init__(self, *, tts_system_prompt:str, interleaved_system_prompt:str, voices:typing.List[TtsVoice], sample_texts:typing.List[str]):
+        self.tts_system_prompt = tts_system_prompt
+        self.interleaved_system_prompt = interleaved_system_prompt
+        self.voices = voices
+        self.sample_texts = sample_texts
+        
+        
+
+    
+    def __str__(self):
+        return "AudioProfile(tts_system_prompt={}, interleaved_system_prompt={}, voices={}, sample_texts={})".format(self.tts_system_prompt, self.interleaved_system_prompt, self.voices, self.sample_texts)
+    def __eq__(self, other):
+        if self.tts_system_prompt != other.tts_system_prompt:
+            return False
+        if self.interleaved_system_prompt != other.interleaved_system_prompt:
+            return False
+        if self.voices != other.voices:
+            return False
+        if self.sample_texts != other.sample_texts:
+            return False
+        return True
+
+class _UniffiFfiConverterTypeAudioProfile(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        return AudioProfile(
+            tts_system_prompt=_UniffiFfiConverterString.read(buf),
+            interleaved_system_prompt=_UniffiFfiConverterString.read(buf),
+            voices=_UniffiFfiConverterSequenceTypeTtsVoice.read(buf),
+            sample_texts=_UniffiFfiConverterSequenceString.read(buf),
+        )
+
+    @staticmethod
+    def check_lower(value):
+        _UniffiFfiConverterString.check_lower(value.tts_system_prompt)
+        _UniffiFfiConverterString.check_lower(value.interleaved_system_prompt)
+        _UniffiFfiConverterSequenceTypeTtsVoice.check_lower(value.voices)
+        _UniffiFfiConverterSequenceString.check_lower(value.sample_texts)
+
+    @staticmethod
+    def write(value, buf):
+        _UniffiFfiConverterString.write(value.tts_system_prompt, buf)
+        _UniffiFfiConverterString.write(value.interleaved_system_prompt, buf)
+        _UniffiFfiConverterSequenceTypeTtsVoice.write(value.voices, buf)
+        _UniffiFfiConverterSequenceString.write(value.sample_texts, buf)
 
 @dataclass
 class ChatMessage:
@@ -6747,29 +6920,6 @@ class _UniffiFfiConverterTypeIngestSummary(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.write(value.input_tokens, buf)
         _UniffiFfiConverterUInt32.write(value.position_before, buf)
         _UniffiFfiConverterUInt32.write(value.position_after, buf)
-
-class _UniffiFfiConverterSequenceString(_UniffiConverterRustBuffer):
-    @classmethod
-    def check_lower(cls, value):
-        for item in value:
-            _UniffiFfiConverterString.check_lower(item)
-
-    @classmethod
-    def write(cls, value, buf):
-        items = len(value)
-        buf.write_i32(items)
-        for item in value:
-            _UniffiFfiConverterString.write(item, buf)
-
-    @classmethod
-    def read(cls, buf):
-        count = buf.read_i32()
-        if count < 0:
-            raise InternalError("Unexpected negative sequence length")
-
-        return [
-            _UniffiFfiConverterString.read(buf) for i in range(count)
-        ]
 
 @dataclass
 class LeapBundleEntry:
@@ -12530,6 +12680,13 @@ class CeraEngineProtocol(typing.Protocol):
         empty `tools` for identical behavior to the plain call.
 """
         raise NotImplementedError
+    def audio_profile(self, ) -> AudioProfile:
+        """
+        The system prompts, voices and sample text this model needs for speech
+        output (see [`AudioProfile`]). Meaningful when
+        [`ModalityCapabilities::audio_out`] is set; a generic profile otherwise.
+"""
+        raise NotImplementedError
     def bos_token(self, ) -> typing.Optional[int]:
         """
         Beginning-of-sequence token ID, if the model has one.
@@ -13122,6 +13279,23 @@ class CeraEngine(CeraEngineProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template_with_tools,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def audio_profile(self, ) -> AudioProfile:
+        """
+        The system prompts, voices and sample text this model needs for speech
+        output (see [`AudioProfile`]). Meaningful when
+        [`ModalityCapabilities::audio_out`] is set; a generic profile otherwise.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeAudioProfile.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_audio_profile,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
@@ -16191,6 +16365,8 @@ __all__ = [
     "PixelFormat",
     "ToolFormat",
     "AudioInput",
+    "TtsVoice",
+    "AudioProfile",
     "ChatMessage",
     "EngineConfig",
     "FfiVadConfig",

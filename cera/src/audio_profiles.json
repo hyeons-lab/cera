@@ -1,0 +1,26 @@
+[
+  {
+    "name": "lfm2.5-audio-jp",
+    "all_tokens": ["audio"],
+    "any_token": ["jp", "japanese"],
+    "tts_system_prompt": "Perform TTS in japanese.",
+    "voices": [],
+    "sample_texts": [
+      "こんにちは、このデバイス上で{model}モデルを使って音声を合成しています。",
+      "今日はとても良い天気ですね。散歩に出かけて、公園で桜の花を見ながら、ゆっくりとお茶を飲みたいと思います。",
+      "Ceraは、Apple Silicon、WebGPU、CPUの上で高性能なマルチモーダルAIを動かします。",
+      "オンデバイスのAIなら、プライバシーは完全に守られ、クラウドの遅延もありません。"
+    ]
+  },
+  {
+    "name": "lfm2.5-audio",
+    "all_tokens": ["lfm", "audio"],
+    "tts_system_prompt": "Perform TTS.",
+    "voices": [
+      { "label": "👩 US Female", "prompt": "Use the US female voice." },
+      { "label": "👨 US Male", "prompt": "Use the US male voice." },
+      { "label": "👩 UK Female", "prompt": "Use the UK female voice." },
+      { "label": "👨 UK Male", "prompt": "Use the UK male voice." }
+    ]
+  }
+]

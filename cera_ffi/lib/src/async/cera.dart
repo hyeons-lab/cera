@@ -263,6 +263,136 @@ class CeraCapabilities {
       'imageIn: $imageIn, audioIn: $audioIn, audioOut: $audioOut)';
 }
 
+/// One speaker an audio model understands.
+///
+/// [prompt] is the phrase that selects the voice and doubles as its stable
+/// identifier: save it as the user's choice. The two system prompts are
+/// complete, so pass one as the system message as-is and never assemble a
+/// prompt from parts.
+class CeraTtsVoice {
+  /// Creates a voice.
+  const CeraTtsVoice({
+    required this.label,
+    required this.prompt,
+    required this.ttsSystemPrompt,
+    required this.interleavedSystemPrompt,
+  });
+
+  /// Human-readable name for a picker.
+  final String label;
+
+  /// The phrase that selects this voice, e.g. `Use the US female voice.`
+  final String prompt;
+
+  /// The complete system prompt for text-to-speech in this voice.
+  final String ttsSystemPrompt;
+
+  /// The complete system prompt for interleaved text-and-audio replies in this
+  /// voice.
+  final String interleavedSystemPrompt;
+}
+
+/// What an audio model needs to be told to speak.
+///
+/// The system prompt that selects text-to-speech or interleaved output differs
+/// per model, and a voice the model was not trained on makes it answer in text
+/// with no audio. So the prompts, the voices a model accepts and its sample
+/// text come from cera (the bundle manifest's own `audio_profile`, else cera's
+/// built-in registry, else plain `Perform TTS.` with no voices), and an app
+/// never hardcodes one model's strings. Fixed for the engine's lifetime.
+class CeraAudioProfile {
+  /// Creates a profile.
+  const CeraAudioProfile({
+    required this.ttsSystemPrompt,
+    required this.interleavedSystemPrompt,
+    this.voices = const [],
+    this.sampleTexts = const [],
+  });
+
+  /// What any LFM2-Audio model accepts and no model was described: plain
+  /// `Perform TTS.`, no voices. Mirrors cera's own generic profile; used when a
+  /// runtime older than this API cannot report one.
+  const CeraAudioProfile.plain()
+    : this(
+        ttsSystemPrompt: 'Perform TTS.',
+        interleavedSystemPrompt: 'Respond with interleaved text and audio.',
+      );
+
+  /// System prompt for text-to-speech when no voice was chosen: the first
+  /// voice's, or the bare prompt when the model has no voices.
+  final String ttsSystemPrompt;
+
+  /// The same for interleaved text-and-audio replies.
+  final String interleavedSystemPrompt;
+
+  /// Voices the model understands. Empty means it has none, so send
+  /// [ttsSystemPrompt] as-is.
+  final List<CeraTtsVoice> voices;
+
+  /// Sample sentences for a demo, with `{model}` where the model's display name
+  /// goes. Empty means the app's own generic samples.
+  final List<String> sampleTexts;
+
+  /// Whether the model offers voice personas.
+  bool get hasVoices => voices.isNotEmpty;
+
+  /// The voice a saved choice resolves to: the one whose [CeraTtsVoice.prompt]
+  /// is [saved], else the model's first, else null. A voice saved under another
+  /// model is therefore never sent to this one.
+  CeraTtsVoice? voiceFor(String? saved) {
+    final wanted = saved?.trim();
+    if (wanted != null && wanted.isNotEmpty) {
+      for (final v in voices) {
+        if (v.prompt == wanted) return v;
+      }
+    }
+    return voices.isEmpty ? null : voices.first;
+  }
+
+  /// The text-to-speech system prompt for a saved voice choice.
+  String ttsSystemPromptFor(String? saved) =>
+      voiceFor(saved)?.ttsSystemPrompt ?? ttsSystemPrompt;
+
+  /// The interleaved-reply system prompt for a saved voice choice.
+  String interleavedSystemPromptFor(String? saved) =>
+      voiceFor(saved)?.interleavedSystemPrompt ?? interleavedSystemPrompt;
+
+  /// The system prompt [Cera.appendAudio] applies when its caller gives none:
+  /// the interleaved one on a model with audio output (the first voice's, when
+  /// the model has voices), plain text-only on any other.
+  String defaultSystemPromptFor({required bool audioOut}) =>
+      audioOut ? interleavedSystemPrompt : ceraTextOnlySystemPrompt;
+
+  /// The audio mode a system prompt asks for.
+  ///
+  /// A prompt this profile supplied names its own mode by which one it is, not
+  /// by its words, so a manifest prompt such as `Speak.` still selects
+  /// text-to-speech (if the two prompts are identical the interleaved one
+  /// wins). Any other text is a caller's own and is read the way the models
+  /// read it: `interleaved` asks for interleaved output, `tts` for
+  /// text-to-speech, anything else answers in text.
+  CeraAudioMode audioModeOf(String systemPrompt) {
+    final p = systemPrompt.trim();
+    if (p == interleavedSystemPrompt.trim() ||
+        voices.any((v) => p == v.interleavedSystemPrompt.trim())) {
+      return CeraAudioMode.interleaved;
+    }
+    if (p == ttsSystemPrompt.trim() ||
+        voices.any((v) => p == v.ttsSystemPrompt.trim())) {
+      return CeraAudioMode.sequential;
+    }
+    final lower = p.toLowerCase();
+    if (lower.contains('interleaved')) return CeraAudioMode.interleaved;
+    if (lower.contains('tts')) return CeraAudioMode.sequential;
+    return CeraAudioMode.textOnly;
+  }
+}
+
+/// The system prompt for a model that should answer in text only: what
+/// [Cera.appendAudio] applies on a model without audio output, and what an app
+/// sends for a voice note it wants answered in text.
+const ceraTextOnlySystemPrompt = 'Respond to the user.';
+
 /// One model published on `LiquidAI/LeapBundles`, with the quantizations it
 /// offers.
 ///
@@ -492,6 +622,16 @@ abstract interface class Cera {
   /// throw, and by then a user has already picked a file.
   CeraCapabilities get capabilities;
 
+  /// The system prompts, voices and sample text this model needs for speech
+  /// output. Fixed for the engine's lifetime. Meaningful when
+  /// [CeraCapabilities.audioOut] is true; a plain `Perform TTS.` profile with no
+  /// voices otherwise.
+  ///
+  /// Resolved from the model's bundle manifest or file names, so a model opened
+  /// from raw bytes (the `Parts` source, which has no file names) reports the
+  /// plain profile.
+  CeraAudioProfile get audioProfile;
+
   /// Generates a continuation of `prompt`, streaming decoded text as it is
   /// produced.
   ///
@@ -601,6 +741,12 @@ abstract interface class Cera {
   ///
   /// `pcm` is normalized to roughly [-1.0, 1.0]. Non-16 kHz inputs are
   /// automatically resampled by the engine to the model's required rate.
+  ///
+  /// `systemPrompt` applies only at the start of a conversation. Omitted, a
+  /// model with audio output gets [CeraAudioProfile.interleavedSystemPrompt]
+  /// (the first voice's, so on a model with voices it includes that voice) and
+  /// any other model gets [ceraTextOnlySystemPrompt]. Pass
+  /// [ceraTextOnlySystemPrompt] to have an audio-out model answer in text.
   ///
   /// Throws if this model has no audio encoder, i.e. whenever [capabilities]
   /// reports `audioIn: false`. Serialized against [generate] the same way

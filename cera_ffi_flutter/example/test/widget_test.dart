@@ -4,6 +4,8 @@
 // seconds. This only asserts the app builds and reaches its empty state, which
 // is enough to catch a broken widget tree in CI.
 
+import 'package:cera_ffi_flutter/cera_ffi_flutter.dart'
+    show CeraAudioProfile, CeraTtsVoice;
 import 'package:cera_ffi_flutter_example/chat_controller.dart';
 import 'package:cera_ffi_flutter_example/chat_state.dart';
 import 'package:cera_ffi_flutter_example/main.dart';
@@ -12,6 +14,7 @@ import 'package:cera_ffi_flutter_example/widgets/audio_waveform.dart';
 import 'package:cera_ffi_flutter_example/widgets/bundle_picker_dialog.dart';
 import 'package:cera_ffi_flutter_example/widgets/message_list.dart';
 import 'package:cera_ffi_flutter_example/widgets/tts_studio_view.dart';
+import 'package:cera_ffi_flutter_example/widgets/voice_persona_picker.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_test/flutter_test.dart';
 import 'package:shared_preferences/shared_preferences.dart';
@@ -183,6 +186,316 @@ void main() {
         findsOneWidget,
       );
       expect(find.textContaining('· Q4_0'), findsNothing);
+    },
+  );
+
+  const englishProfile = CeraAudioProfile(
+    ttsSystemPrompt: 'Perform TTS. Use the US female voice.',
+    interleavedSystemPrompt:
+        'Respond with interleaved text and audio. Use the US female voice.',
+    voices: [
+      CeraTtsVoice(
+        label: 'Narrator',
+        prompt: 'Use the US female voice.',
+        ttsSystemPrompt: 'Perform TTS. Use the US female voice.',
+        interleavedSystemPrompt:
+            'Respond with interleaved text and audio. Use the US female voice.',
+      ),
+      CeraTtsVoice(
+        label: 'Studio Warm',
+        prompt: 'Use the UK male voice.',
+        ttsSystemPrompt: 'Perform TTS. Use the UK male voice.',
+        interleavedSystemPrompt:
+            'Respond with interleaved text and audio. Use the UK male voice.',
+      ),
+    ],
+  );
+  const japaneseProfile = CeraAudioProfile(
+    ttsSystemPrompt: 'Perform TTS in japanese.',
+    interleavedSystemPrompt: 'Respond with interleaved text and audio.',
+    sampleTexts: ['こんにちは、このデバイス上で{model}モデルを使って音声を合成しています。'],
+  );
+  const plainProfile = CeraAudioProfile(
+    ttsSystemPrompt: 'Perform TTS.',
+    interleavedSystemPrompt: 'Respond with interleaved text and audio.',
+  );
+
+  Future<void> pumpStudio(
+    WidgetTester tester,
+    BundleModelSource bundle,
+    CeraAudioProfile profile, {
+    ChatController? controller,
+    ChatSettings settings = const ChatSettings(),
+  }) async {
+    final state = const ChatState().copyWith(
+      loadedModel: () => bundle,
+      audioProfile: () => profile,
+      settings: settings,
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TtsStudioView(
+            state: state,
+            controller: controller ?? ChatController(),
+            onOpenCatalog: () {},
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+  }
+
+  testWidgets('tts studio lists the voices the model profile offers', (
+    WidgetTester tester,
+  ) async {
+    await pumpStudio(
+      tester,
+      const BundleModelSource(
+        name: 'LFM2.5-Audio-1.5B · Q4_0',
+        bundleName: 'LFM2.5-Audio-1.5B-GGUF',
+        quant: 'Q4_0',
+        displayName: 'LFM2.5-Audio-1.5B',
+      ),
+      englishProfile,
+    );
+    expect(find.text('VOICE PERSONA'), findsOneWidget);
+    expect(find.text('Narrator'), findsOneWidget);
+    expect(find.text('Studio Warm'), findsOneWidget);
+  });
+
+  testWidgets(
+    'tapping a studio voice saves the voice\'s prompt, not its label',
+    (WidgetTester tester) async {
+      final controller = ChatController();
+      await pumpStudio(
+        tester,
+        const BundleModelSource(
+          name: 'LFM2.5-Audio-1.5B · Q4_0',
+          bundleName: 'LFM2.5-Audio-1.5B-GGUF',
+          quant: 'Q4_0',
+          displayName: 'LFM2.5-Audio-1.5B',
+        ),
+        englishProfile,
+        controller: controller,
+      );
+      await tester.tap(find.text('Studio Warm'));
+      await tester.pumpAndSettle();
+      expect(
+        controller.value.settings.ttsStudioVoice,
+        'Use the UK male voice.',
+      );
+    },
+  );
+
+  bool chipSelected(WidgetTester tester, String label) => tester
+      .widget<ChoiceChip>(find.widgetWithText(ChoiceChip, label))
+      .selected;
+
+  testWidgets(
+    'the studio highlights the saved voice, else the model\'s first',
+    (WidgetTester tester) async {
+      const bundle = BundleModelSource(
+        name: 'LFM2.5-Audio-1.5B · Q4_0',
+        bundleName: 'LFM2.5-Audio-1.5B-GGUF',
+        quant: 'Q4_0',
+        displayName: 'LFM2.5-Audio-1.5B',
+      );
+      // Nothing saved, and a voice saved under another model: the model's
+      // first voice is the one that will be sent, so it reads as selected.
+      for (final saved in ['', 'Use the Martian voice.']) {
+        await pumpStudio(
+          tester,
+          bundle,
+          englishProfile,
+          settings: ChatSettings(ttsStudioVoice: saved),
+        );
+        expect(chipSelected(tester, 'Narrator'), isTrue, reason: saved);
+        expect(chipSelected(tester, 'Studio Warm'), isFalse, reason: saved);
+      }
+      await pumpStudio(
+        tester,
+        bundle,
+        englishProfile,
+        settings: const ChatSettings(ttsStudioVoice: 'Use the UK male voice.'),
+      );
+      expect(chipSelected(tester, 'Narrator'), isFalse);
+      expect(chipSelected(tester, 'Studio Warm'), isTrue);
+    },
+  );
+
+  testWidgets(
+    'the studio text follows a model switch unless the user edited it',
+    (WidgetTester tester) async {
+      const english = BundleModelSource(
+        name: 'LFM2.5-Audio-1.5B · Q4_0',
+        bundleName: 'LFM2.5-Audio-1.5B-GGUF',
+        quant: 'Q4_0',
+        displayName: 'LFM2.5-Audio-1.5B',
+      );
+      const japanese = BundleModelSource(
+        name: 'LFM2.5-Audio-1.5B-JP · Q4_0',
+        bundleName: 'LFM2.5-Audio-1.5B-JP-GGUF',
+        quant: 'Q4_0',
+        displayName: 'LFM2.5-Audio-1.5B-JP',
+      );
+      const jpSample = 'こんにちは、このデバイス上でLFM2.5-Audio-1.5B-JPモデルを使って音声を合成しています。';
+      final controller = ChatController();
+      Future<void> show(BundleModelSource b, CeraAudioProfile p) async {
+        await tester.pumpWidget(
+          MaterialApp(
+            home: Scaffold(
+              body: TtsStudioView(
+                state: const ChatState().copyWith(
+                  loadedModel: () => b,
+                  audioProfile: () => p,
+                ),
+                controller: controller,
+                onOpenCatalog: () {},
+              ),
+            ),
+          ),
+        );
+        await tester.pumpAndSettle();
+      }
+
+      String text() => tester
+          .widget<TextField>(find.byType(TextField).first)
+          .controller!
+          .text;
+
+      await show(english, englishProfile);
+      expect(text(), startsWith('Hello, this voice was synthesized'));
+      // An untouched default follows the model: speaking English text with the
+      // Japanese model would not be what its profile is for.
+      await show(japanese, japaneseProfile);
+      expect(text(), jpSample);
+
+      // Typed text is the user's, and survives another switch.
+      await tester.enterText(find.byType(TextField).first, 'my own words');
+      await show(english, englishProfile);
+      expect(text(), 'my own words');
+    },
+  );
+
+  Future<void> pumpPicker(
+    WidgetTester tester, {
+    required CeraAudioProfile? profile,
+    String saved = '',
+    ValueChanged<String?>? onChanged,
+  }) async {
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: VoicePersonaPicker(
+            profile: profile,
+            saved: saved,
+            onChanged: onChanged ?? (_) {},
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+  }
+
+  testWidgets('the voice persona picker is absent for a model without voices', (
+    WidgetTester tester,
+  ) async {
+    await pumpPicker(tester, profile: japaneseProfile);
+    expect(find.text('Voice Persona'), findsNothing);
+    await pumpPicker(tester, profile: null);
+    expect(find.text('Voice Persona'), findsNothing);
+  });
+
+  testWidgets(
+    'a voice saved under another model reads as the default voice, without throwing',
+    (WidgetTester tester) async {
+      await pumpPicker(
+        tester,
+        profile: englishProfile,
+        saved: 'Use the Martian voice.',
+      );
+      expect(find.text('Voice Persona'), findsOneWidget);
+      expect(find.text('Default Voice'), findsOneWidget);
+      expect(tester.takeException(), isNull);
+    },
+  );
+
+  testWidgets(
+    'picking a persona reports its prompt, and Default reports null',
+    (WidgetTester tester) async {
+      final picked = <String?>[];
+      await pumpPicker(
+        tester,
+        profile: englishProfile,
+        saved: 'Use the US female voice.',
+        onChanged: picked.add,
+      );
+      expect(
+        find.text('Narrator'),
+        findsOneWidget,
+        reason: 'the saved voice shows',
+      );
+
+      await tester.tap(find.byType(DropdownButton<String?>));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Studio Warm').last);
+      await tester.pumpAndSettle();
+      expect(picked, ['Use the UK male voice.']);
+
+      await tester.tap(find.byType(DropdownButton<String?>));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Default Voice').last);
+      await tester.pumpAndSettle();
+      expect(picked, ['Use the UK male voice.', null]);
+    },
+  );
+
+  testWidgets(
+    'tts studio for a model whose profile has no voices hides the picker and uses its sample text',
+    (WidgetTester tester) async {
+      await pumpStudio(
+        tester,
+        const BundleModelSource(
+          name: 'LFM2.5-Audio-1.5B-JP · Q4_0',
+          bundleName: 'LFM2.5-Audio-1.5B-JP-GGUF',
+          quant: 'Q4_0',
+          displayName: 'LFM2.5-Audio-1.5B-JP',
+        ),
+        japaneseProfile,
+      );
+      // A voice the model was not trained on makes it answer in text and never
+      // speak, so a model without voices offers no picker.
+      expect(find.text('VOICE PERSONA'), findsNothing);
+      expect(find.text('Narrator'), findsNothing);
+      expect(find.text('👩 US Female'), findsNothing);
+      expect(
+        find.text('こんにちは、このデバイス上でLFM2.5-Audio-1.5B-JPモデルを使って音声を合成しています。'),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets(
+    'tts studio falls back to the generic English text when the profile has none',
+    (WidgetTester tester) async {
+      await pumpStudio(
+        tester,
+        const BundleModelSource(
+          name: 'SomeNewAudioModel-2B · Q4_0',
+          bundleName: 'SomeNewAudioModel-2B-GGUF',
+          quant: 'Q4_0',
+          displayName: 'SomeNewAudioModel-2B',
+        ),
+        plainProfile,
+      );
+      expect(find.text('VOICE PERSONA'), findsNothing);
+      expect(
+        find.text(
+          'Hello, this voice was synthesized entirely on-device with the SomeNewAudioModel-2B model powered by Cera.',
+        ),
+        findsOneWidget,
+      );
     },
   );
 }

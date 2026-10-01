@@ -143,6 +143,82 @@ class AudioInput {
   int get hashCode => Object.hash(pcm, sampleRate);
 }
 
+/// What an audio model needs to be told to speak. Mirrors [`cera::AudioProfile`].
+///
+/// The system prompt that selects text-to-speech or interleaved output differs
+/// per model, and a voice the model was not trained on makes it answer in text
+/// with no audio. So the prompts and the voices a model accepts come from cera,
+/// not from the app: the bundle manifest's own `audio_profile`, else cera's
+/// built-in registry, else plain `Perform TTS.` with no voices.
+///
+/// `voices` empty means the model has no voices: send `tts_system_prompt` as-is.
+/// `sample_texts` carry `{model}` where the model's display name goes, and are
+/// empty when the app should use its own generic samples.
+class AudioProfile {
+  const AudioProfile({
+    /// System prompt for text-to-speech with no voice chosen (the first voice's,
+    /// or the bare prompt when there are no voices).
+    required this.ttsSystemPrompt,
+    /// The same for interleaved text-and-audio replies.
+    required this.interleavedSystemPrompt,
+    required this.voices,
+    required this.sampleTexts,
+  });
+
+  /// System prompt for text-to-speech with no voice chosen (the first voice's,
+  /// or the bare prompt when there are no voices).
+  final String ttsSystemPrompt;
+  /// The same for interleaved text-and-audio replies.
+  final String interleavedSystemPrompt;
+  final List<TtsVoice> voices;
+  final List<String> sampleTexts;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'ttsSystemPrompt': this.ttsSystemPrompt,
+      'interleavedSystemPrompt': this.interleavedSystemPrompt,
+      'voices': this.voices.map((item) => item.toJson()).toList(),
+      'sampleTexts': this.sampleTexts,
+    };
+  }
+
+  factory AudioProfile.fromJson(Map<String, dynamic> json) {
+    return AudioProfile(
+      ttsSystemPrompt: json['ttsSystemPrompt'] as String,
+      interleavedSystemPrompt: json['interleavedSystemPrompt'] as String,
+      voices: (json['voices'] as List).map((item) => TtsVoice.fromJson(item as Map<String, dynamic>)).toList(),
+      sampleTexts: (json['sampleTexts'] as List).map((item) => item as String).toList(),
+    );
+  }
+
+  AudioProfile copyWith({
+    String? ttsSystemPrompt,
+    String? interleavedSystemPrompt,
+    List<TtsVoice>? voices,
+    List<String>? sampleTexts,
+  }) {
+    return AudioProfile(
+      ttsSystemPrompt: ttsSystemPrompt ?? this.ttsSystemPrompt,
+      interleavedSystemPrompt: interleavedSystemPrompt ?? this.interleavedSystemPrompt,
+      voices: voices ?? this.voices,
+      sampleTexts: sampleTexts ?? this.sampleTexts,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'AudioProfile(ttsSystemPrompt: $ttsSystemPrompt, interleavedSystemPrompt: $interleavedSystemPrompt, voices: $voices, sampleTexts: $sampleTexts)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is AudioProfile && ttsSystemPrompt == other.ttsSystemPrompt && interleavedSystemPrompt == other.interleavedSystemPrompt && voices == other.voices && sampleTexts == other.sampleTexts;
+
+  @override
+  int get hashCode => Object.hash(ttsSystemPrompt, interleavedSystemPrompt, voices, sampleTexts);
+}
+
 /// One message in a chat-template conversation. Mirrors
 /// [`cera::tokenizer::ChatMessage`]. Pass a `Vec<ChatMessage>` to
 /// [`CeraEngine::apply_chat_template`] to render the model's
@@ -1777,6 +1853,71 @@ class ToolDef {
 
   @override
   int get hashCode => Object.hash(name, description, parametersJson);
+}
+
+/// One speaker an audio model understands. Mirrors [`cera::TtsVoice`].
+///
+/// `prompt` is the phrase that selects the voice and doubles as its stable
+/// identifier (save it as the user's choice). The two `*_system_prompt` fields
+/// are complete: pass one as the system message as-is, never assemble a prompt
+/// from parts.
+class TtsVoice {
+  const TtsVoice({
+    required this.label,
+    required this.prompt,
+    required this.ttsSystemPrompt,
+    required this.interleavedSystemPrompt,
+  });
+
+  final String label;
+  final String prompt;
+  final String ttsSystemPrompt;
+  final String interleavedSystemPrompt;
+
+  Map<String, dynamic> toJson() {
+    return {
+      'label': this.label,
+      'prompt': this.prompt,
+      'ttsSystemPrompt': this.ttsSystemPrompt,
+      'interleavedSystemPrompt': this.interleavedSystemPrompt,
+    };
+  }
+
+  factory TtsVoice.fromJson(Map<String, dynamic> json) {
+    return TtsVoice(
+      label: json['label'] as String,
+      prompt: json['prompt'] as String,
+      ttsSystemPrompt: json['ttsSystemPrompt'] as String,
+      interleavedSystemPrompt: json['interleavedSystemPrompt'] as String,
+    );
+  }
+
+  TtsVoice copyWith({
+    String? label,
+    String? prompt,
+    String? ttsSystemPrompt,
+    String? interleavedSystemPrompt,
+  }) {
+    return TtsVoice(
+      label: label ?? this.label,
+      prompt: prompt ?? this.prompt,
+      ttsSystemPrompt: ttsSystemPrompt ?? this.ttsSystemPrompt,
+      interleavedSystemPrompt: interleavedSystemPrompt ?? this.interleavedSystemPrompt,
+    );
+  }
+
+  @override
+  String toString() {
+    return 'TtsVoice(label: $label, prompt: $prompt, ttsSystemPrompt: $ttsSystemPrompt, interleavedSystemPrompt: $interleavedSystemPrompt)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is TtsVoice && label == other.label && prompt == other.prompt && ttsSystemPrompt == other.ttsSystemPrompt && interleavedSystemPrompt == other.interleavedSystemPrompt;
+
+  @override
+  int get hashCode => Object.hash(label, prompt, ttsSystemPrompt, interleavedSystemPrompt);
 }
 
 /// User-facing multimodal input envelope.
@@ -6231,6 +6372,43 @@ AudioInput _uniffiDecodeAudioInput(Uint8List bytes) {
   return value;
 }
 
+void _uniffiWriteAudioProfile(AudioProfile value, _UniFfiBinaryWriter writer) {
+  writer.writeString(value.ttsSystemPrompt);
+  writer.writeString(value.interleavedSystemPrompt);
+  writer.writeI32(value.voices.length);
+  for (final item in value.voices) {
+    _uniffiWriteTtsVoice(item, writer);
+  }
+  writer.writeI32(value.sampleTexts.length);
+  for (final item in value.sampleTexts) {
+    writer.writeString(item);
+  }
+}
+
+Uint8List _uniffiEncodeAudioProfile(AudioProfile value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteAudioProfile(value, writer);
+  return writer.toBytes();
+}
+
+AudioProfile _uniffiReadAudioProfile(_UniFfiBinaryReader reader) {
+  return AudioProfile(
+    ttsSystemPrompt: reader.readString(),
+    interleavedSystemPrompt: reader.readString(),
+    voices: (() { final int __len = reader.readI32(); final out = <TtsVoice>[]; for (var i = 0; i < __len; i++) { out.add(_uniffiReadTtsVoice(reader)); } return out; })(),
+    sampleTexts: (() { final int __len = reader.readI32(); final out = <String>[]; for (var i = 0; i < __len; i++) { out.add(reader.readString()); } return out; })(),
+  );
+}
+
+AudioProfile _uniffiDecodeAudioProfile(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadAudioProfile(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding AudioProfile');
+  }
+  return value;
+}
+
 void _uniffiWriteChatMessage(ChatMessage value, _UniFfiBinaryWriter writer) {
   writer.writeString(value.role);
   writer.writeString(value.content);
@@ -7013,6 +7191,37 @@ ToolDef _uniffiDecodeToolDef(Uint8List bytes) {
   final value = _uniffiReadToolDef(reader);
   if (!reader.isDone) {
     throw StateError('extra bytes remaining while decoding ToolDef');
+  }
+  return value;
+}
+
+void _uniffiWriteTtsVoice(TtsVoice value, _UniFfiBinaryWriter writer) {
+  writer.writeString(value.label);
+  writer.writeString(value.prompt);
+  writer.writeString(value.ttsSystemPrompt);
+  writer.writeString(value.interleavedSystemPrompt);
+}
+
+Uint8List _uniffiEncodeTtsVoice(TtsVoice value) {
+  final writer = _UniFfiBinaryWriter();
+  _uniffiWriteTtsVoice(value, writer);
+  return writer.toBytes();
+}
+
+TtsVoice _uniffiReadTtsVoice(_UniFfiBinaryReader reader) {
+  return TtsVoice(
+    label: reader.readString(),
+    prompt: reader.readString(),
+    ttsSystemPrompt: reader.readString(),
+    interleavedSystemPrompt: reader.readString(),
+  );
+}
+
+TtsVoice _uniffiDecodeTtsVoice(Uint8List bytes) {
+  final reader = _UniFfiBinaryReader(bytes);
+  final value = _uniffiReadTtsVoice(reader);
+  if (!reader.isDone) {
+    throw StateError('extra bytes remaining while decoding TtsVoice');
   }
   return value;
 }
@@ -9029,6 +9238,16 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools != 46076) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools`: expected 46076, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_audio_profile;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ceraengine_audio_profile');
+      _checksum_uniffi_cera_ffi_checksum_method_ceraengine_audio_profile = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_audio_profile`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_audio_profile != 17834) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_audio_profile`: expected 17834, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_audio_profile');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_bos_token;
     try {
@@ -14439,6 +14658,77 @@ class CeraFfiFfi {
       rustRetBufferPtrs.add(retBufPtr);
       final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
       final decodedValue = utf8.decode(retBytes);
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ceraEngineAudioProfileFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ceraengine_audio_profile');
+
+  AudioProfile ceraEngineInvokeAudioProfile(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _ceraEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _ceraEngineAudioProfileFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = _uniffiDecodeAudioProfile(retBytes);
       return decodedValue;
     } finally {
       for (final ptr in foreignArgPtrs) {
@@ -29897,6 +30187,14 @@ final class CeraEngine {
   String applyChatTemplateWithTools(List<ChatMessage> messages, List<ToolDef> tools, bool addGenerationPrompt) {
     _ensureOpen();
     return _ffi.ceraEngineInvokeApplyChatTemplateWithTools(_handle, messages, tools, addGenerationPrompt);
+  }
+
+  /// The system prompts, voices and sample text this model needs for speech
+  /// output (see [`AudioProfile`]). Meaningful when
+  /// [`ModalityCapabilities::audio_out`] is set; a generic profile otherwise.
+  AudioProfile audioProfile() {
+    _ensureOpen();
+    return _ffi.ceraEngineInvokeAudioProfile(_handle);
   }
 
   /// Beginning-of-sequence token ID, if the model has one.

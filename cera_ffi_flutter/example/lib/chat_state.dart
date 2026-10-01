@@ -132,8 +132,8 @@ class ChatSettings {
     this.turboQuant = false,
     this.maxImageLongSize = 256,
     this.audioChatMode = AudioChatMode.interleaved,
-    this.chatVoice = 'Use the US female voice.',
-    this.ttsStudioVoice = 'Use the US female voice.',
+    this.chatVoice = '',
+    this.ttsStudioVoice = '',
   });
 
   /// Which compute backend to run on.
@@ -156,9 +156,6 @@ class ChatSettings {
   /// Voice persona description for dedicated TTS Studio.
   final String ttsStudioVoice;
 
-  /// Backwards compatibility getter for ttsVoice.
-  String get ttsVoice => chatVoice;
-
   /// Converts settings to engine open options.
   CeraOptions get ceraOptions => CeraOptions(
     backend: backend,
@@ -178,7 +175,6 @@ class ChatSettings {
     AudioChatMode? audioChatMode,
     String? chatVoice,
     String? ttsStudioVoice,
-    String? ttsVoice,
   }) {
     return ChatSettings(
       backend: backend ?? this.backend,
@@ -187,7 +183,7 @@ class ChatSettings {
           ? maxImageLongSize()
           : this.maxImageLongSize,
       audioChatMode: audioChatMode ?? this.audioChatMode,
-      chatVoice: chatVoice ?? ttsVoice ?? this.chatVoice,
+      chatVoice: chatVoice ?? this.chatVoice,
       ttsStudioVoice: ttsStudioVoice ?? this.ttsStudioVoice,
     );
   }
@@ -214,6 +210,7 @@ class ChatState {
     this.pendingImageBytes,
     this.pendingImageName,
     this.capabilities,
+    this.audioProfile,
     this.backend,
     this.downloadedModels = const [],
     this.settings = const ChatSettings(),
@@ -229,12 +226,17 @@ class ChatState {
   final Uint8List? pendingImageBytes;
   final String? pendingImageName;
   final CeraCapabilities? capabilities;
+
+  /// What the loaded model needs to be told to speak (system prompts, voices,
+  /// sample text), resolved by cera. Null until a model is loaded.
+  final CeraAudioProfile? audioProfile;
   final String? backend;
   final List<DownloadedModelRecord> downloadedModels;
   final ChatSettings settings;
   final AppUIMode uiMode;
 
   bool get hasModel => loadedModel != null;
+
   bool get isBusy => isLoading || isGenerating;
   bool get canAttachImage =>
       hasModel && (capabilities?.imageIn ?? false) && !isBusy;
@@ -251,6 +253,7 @@ class ChatState {
     Uint8List? Function()? pendingImageBytes,
     String? Function()? pendingImageName,
     CeraCapabilities? Function()? capabilities,
+    CeraAudioProfile? Function()? audioProfile,
     String? Function()? backend,
     List<DownloadedModelRecord>? downloadedModels,
     ChatSettings? settings,
@@ -272,6 +275,7 @@ class ChatState {
           ? pendingImageName()
           : this.pendingImageName,
       capabilities: capabilities != null ? capabilities() : this.capabilities,
+      audioProfile: audioProfile != null ? audioProfile() : this.audioProfile,
       backend: backend != null ? backend() : this.backend,
       downloadedModels: downloadedModels ?? this.downloadedModels,
       settings: settings ?? this.settings,

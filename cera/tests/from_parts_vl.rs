@@ -103,6 +103,7 @@ fn from_parts_loads_a_vl_bundle_from_bytes_alone() {
             inference_type: None,
             chat_template: None,
             generation_defaults: None,
+            audio_profile: None,
         },
         cfg(),
     )
@@ -158,6 +159,7 @@ fn explicit_text_type_suppresses_the_upgrade() {
             inference_type: Some(InferenceType::LlamaCppTextToText),
             chat_template: None,
             generation_defaults: None,
+            audio_profile: None,
         },
         cfg(),
     )
@@ -188,6 +190,7 @@ fn a_corrupt_mmproj_degrades_to_text_instead_of_failing() {
             inference_type: None,
             chat_template: None,
             generation_defaults: None,
+            audio_profile: None,
         },
         cfg(),
     )
@@ -223,6 +226,7 @@ fn append_image_advances_the_kv_cache() {
             inference_type: None,
             chat_template: None,
             generation_defaults: None,
+            audio_profile: None,
         },
         cfg(),
     )

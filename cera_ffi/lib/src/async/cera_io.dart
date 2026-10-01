@@ -55,6 +55,21 @@ CeraCapabilities _capabilitiesOf(ModalityCapabilities caps) => CeraCapabilities(
   audioOut: caps.audioOut,
 );
 
+CeraAudioProfile _audioProfileOf(AudioProfile p) => CeraAudioProfile(
+  ttsSystemPrompt: p.ttsSystemPrompt,
+  interleavedSystemPrompt: p.interleavedSystemPrompt,
+  voices: List.unmodifiable([
+    for (final v in p.voices)
+      CeraTtsVoice(
+        label: v.label,
+        prompt: v.prompt,
+        ttsSystemPrompt: v.ttsSystemPrompt,
+        interleavedSystemPrompt: v.interleavedSystemPrompt,
+      ),
+  ]),
+  sampleTexts: List.unmodifiable(p.sampleTexts),
+);
+
 /// This platform has a filesystem, so [Cera.openPath] works. See
 /// [Cera.supportsPaths].
 const bool supportsPaths = true;
@@ -224,7 +239,8 @@ class _NativeCera implements Cera {
       _bosToken = _engine.metadata().addBosToken ? _engine.bosToken() : null,
       // Fixed by the bundle at load time, so reading it per query would cross
       // the FFI boundary for a record that cannot change.
-      _capabilities = _capabilitiesOf(_engine.capabilities());
+      _capabilities = _capabilitiesOf(_engine.capabilities()),
+      _audioProfile = _audioProfileOf(_engine.audioProfile());
 
   final CeraEngine _engine;
   final CeraOptions _options;
@@ -234,8 +250,13 @@ class _NativeCera implements Cera {
 
   final CeraCapabilities _capabilities;
 
+  final CeraAudioProfile _audioProfile;
+
   @override
   CeraCapabilities get capabilities => _capabilities;
+
+  @override
+  CeraAudioProfile get audioProfile => _audioProfile;
 
   Session? _sessionHandle;
 
@@ -535,16 +556,15 @@ class _NativeCera implements Cera {
               ? '${prompt.trim()}\n$markerName'
               : markerName;
 
-      final defaultSystemPrompt =
-          _capabilities.audioOut
-              ? 'Respond with interleaved text and audio.'
-              : 'Respond to the user.';
+      final defaultSystemPrompt = _audioProfile.defaultSystemPromptFor(
+        audioOut: _capabilities.audioOut,
+      );
       final effectiveSystemPrompt =
           systemPrompt != null ? systemPrompt.trim() : defaultSystemPrompt;
       // The system prompt only takes effect at the start of a conversation, so
       // that is also when it fixes the mode the following turns run in.
       if (_session.position() == 0 && effectiveSystemPrompt.isNotEmpty) {
-        _conversationAudioMode = _audioModeForSystemPrompt(
+        _conversationAudioMode = _audioProfile.audioModeOf(
           effectiveSystemPrompt,
         );
       }
@@ -765,17 +785,6 @@ class _StreamingSink implements ModalitySink {
     _finished = true;
     done(error);
   }
-}
-
-/// The audio mode a system prompt asks for. LFM2-Audio models are trained on
-/// exact prompts (`Respond with interleaved text and audio.`, `Perform TTS.`,
-/// `Perform ASR.`), so a substring match is the same signal the model reads.
-/// Anything else answers in text.
-CeraAudioMode _audioModeForSystemPrompt(String systemPrompt) {
-  final p = systemPrompt.toLowerCase();
-  if (p.contains('interleaved')) return CeraAudioMode.interleaved;
-  if (p.contains('tts')) return CeraAudioMode.sequential;
-  return CeraAudioMode.textOnly;
 }
 
 AudioOutputMode _ffiAudioMode(CeraAudioMode mode) => switch (mode) {

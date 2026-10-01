@@ -385,6 +385,51 @@ function capabilitiesOf() {
   };
 }
 
+// The profile is fixed for a model's lifetime, so it is read from wasm once per
+// live engine or session; the warning for a stale wasm then fires once per open.
+let audioProfileFor = null;
+let audioProfileCache = null;
+
+/**
+ * What the live model needs to be told to speak: the system prompts, voices and
+ * sample text, resolved by cera from the bundle manifest. Copied into plain
+ * objects so it crosses `postMessage` regardless of what wasm hands back.
+ */
+function audioProfileOf() {
+  const live = gpu ? gpu.session : cpu.engine;
+  if (audioProfileFor === live) return audioProfileCache;
+  const p = live.audioProfile;
+  let profile;
+  // A wasm built before cera reported profiles has no `audioProfile`: serve the
+  // plain one every LFM2-Audio model accepts rather than failing the open.
+  if (!p) {
+    console.warn(
+      'cera: the wasm module has no audioProfile (a build older than this worker); using the plain TTS profile',
+    );
+    profile = {
+      ttsSystemPrompt: 'Perform TTS.',
+      interleavedSystemPrompt: 'Respond with interleaved text and audio.',
+      voices: [],
+      sampleTexts: [],
+    };
+  } else {
+    profile = {
+      ttsSystemPrompt: p.ttsSystemPrompt,
+      interleavedSystemPrompt: p.interleavedSystemPrompt,
+      voices: Array.from(p.voices, (v) => ({
+        label: v.label,
+        prompt: v.prompt,
+        ttsSystemPrompt: v.ttsSystemPrompt,
+        interleavedSystemPrompt: v.interleavedSystemPrompt,
+      })),
+      sampleTexts: Array.from(p.sampleTexts),
+    };
+  }
+  audioProfileFor = live;
+  audioProfileCache = profile;
+  return profile;
+}
+
 const OPS = {
   /**
    * Import the module, then open a model. `backend` is 'auto' | 'gpu' | 'cpu'.
@@ -419,6 +464,7 @@ const OPS = {
     return {
       backend: backendLabel,
       capabilities: capabilitiesOf(),
+      audioProfile: audioProfileOf(),
       cancelBuffer: cancelSharedBuffer,
     };
   },
@@ -471,6 +517,7 @@ const OPS = {
         return {
           backend: backendLabel,
           capabilities: capabilitiesOf(),
+          audioProfile: audioProfileOf(),
           cancelBuffer: cancelSharedBuffer,
         };
       }
@@ -479,6 +526,7 @@ const OPS = {
         return {
           backend: backendLabel,
           capabilities: capabilitiesOf(),
+          audioProfile: audioProfileOf(),
           cancelBuffer: cancelSharedBuffer,
         };
       }
@@ -488,6 +536,7 @@ const OPS = {
         return {
           backend: backendLabel,
           capabilities: capabilitiesOf(),
+          audioProfile: audioProfileOf(),
           cancelBuffer: cancelSharedBuffer,
         };
       }
@@ -506,6 +555,7 @@ const OPS = {
       return {
         backend: backendLabel,
         capabilities: capabilitiesOf(),
+        audioProfile: audioProfileOf(),
         cancelBuffer: cancelSharedBuffer,
       };
     } finally {
@@ -569,7 +619,7 @@ const OPS = {
     const messages = [];
     if (currentPos === 0) {
       const defaultSystemPrompt = capabilitiesOf().audioOut
-        ? 'Respond with interleaved text and audio.'
+        ? audioProfileOf().interleavedSystemPrompt
         : 'Respond to the user.';
       const effectiveSystemPrompt =
         systemPrompt !== undefined && systemPrompt !== null
@@ -1130,6 +1180,8 @@ const OPS = {
     warnedSpecWebGpu = false;
     pendingAudioSuffixTokens = null;
     pendingImage = null;
+    audioProfileFor = null;
+    audioProfileCache = null;
     // The tokenizer handles are separate wasm-bindgen objects holding their own
     // `Arc<BpeTokenizer>` clone, so freeing the engine does not reclaim them.
     // Terminating the worker would, but this protocol is documented as usable

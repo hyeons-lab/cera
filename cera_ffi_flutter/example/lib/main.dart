@@ -24,6 +24,7 @@ import 'widgets/bundle_picker_dialog.dart';
 import 'widgets/message_composer.dart';
 import 'widgets/message_list.dart';
 import 'widgets/tts_studio_view.dart';
+import 'widgets/voice_persona_picker.dart';
 
 void main() => runApp(const CeraExampleApp());
 
@@ -497,56 +498,23 @@ class _ChatPageState extends State<ChatPage> {
                           },
                         ),
                       ),
-                      if (currentSettings.audioChatMode ==
-                              AudioChatMode.interleaved ||
-                          currentSettings.audioChatMode ==
-                              AudioChatMode.textToSpeech) ...[
+                      if ((currentState.audioProfile?.hasVoices ?? false) &&
+                          (currentSettings.audioChatMode ==
+                                  AudioChatMode.interleaved ||
+                              currentSettings.audioChatMode ==
+                                  AudioChatMode.textToSpeech)) ...[
                         const SizedBox(height: 8),
-                        ListTile(
-                          contentPadding: EdgeInsets.zero,
-                          title: const Text('Voice Persona'),
-                          subtitle: Text(
-                            'Select speaker timbre and accent for synthesized speech responses.',
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: theme.colorScheme.onSurfaceVariant,
-                            ),
-                          ),
-                          trailing: DropdownButton<String?>(
-                            value: currentSettings.chatVoice,
-                            dropdownColor: theme.colorScheme.surface,
-                            underline: const SizedBox.shrink(),
-                            items: const [
-                              DropdownMenuItem(
-                                value: null,
-                                child: Text('Default Voice'),
+                        VoicePersonaPicker(
+                          profile: currentState.audioProfile,
+                          saved: currentSettings.chatVoice,
+                          onChanged: (val) {
+                            _controller.dispatch(
+                              UpdateSettingsIntent(
+                                chatVoice: val,
+                                clearChatVoice: val == null,
                               ),
-                              DropdownMenuItem(
-                                value: 'Use the US female voice.',
-                                child: Text('👩 US Female'),
-                              ),
-                              DropdownMenuItem(
-                                value: 'Use the US male voice.',
-                                child: Text('👨 US Male'),
-                              ),
-                              DropdownMenuItem(
-                                value: 'Use the UK female voice.',
-                                child: Text('👩 UK Female'),
-                              ),
-                              DropdownMenuItem(
-                                value: 'Use the UK male voice.',
-                                child: Text('👨 UK Male'),
-                              ),
-                            ],
-                            onChanged: (val) {
-                              _controller.dispatch(
-                                UpdateSettingsIntent(
-                                  chatVoice: val,
-                                  clearChatVoice: val == null,
-                                ),
-                              );
-                            },
-                          ),
+                            );
+                          },
                         ),
                       ],
                       if (currentState.hasModel) ...[
