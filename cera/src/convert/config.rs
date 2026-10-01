@@ -57,12 +57,109 @@ impl HfModelConfig {
         let mut cfg: Self = serde_json::from_slice(bytes)
             .map_err(|e| CeraError::Backend(format!("failed to parse model config.json: {e}")))?;
         cfg.resolve_nested_text_config();
+        cfg.resolve_alternate_spellings();
         Ok(cfg)
     }
 
     /// Parse from JSON string.
     pub fn from_json_str(json_str: &str) -> Result<Self, CeraError> {
         Self::parse_from_bytes(json_str.as_bytes())
+    }
+
+    /// Which of the `layers` blocks are attention (the rest are gated convolutions):
+    /// `layer_types` when the config has it, else the `full_attn_idxs` list of the
+    /// first LFM2 checkpoints. `None` when it has neither, rather than guessing.
+    pub(crate) fn lfm2_attention_layers(&self, layers: usize) -> Option<Vec<bool>> {
+        if let Some(types) = self.hparam("layer_types").and_then(Value::as_array) {
+            return Some(
+                types
+                    .iter()
+                    .map(|t| t.as_str().is_some_and(|t| t != "conv"))
+                    .collect(),
+            );
+        }
+        let idxs = self.hparam("full_attn_idxs").and_then(Value::as_array)?;
+        let attention: Vec<usize> = idxs
+            .iter()
+            .filter_map(Value::as_u64)
+            .map(|i| i as usize)
+            .collect();
+        Some((0..layers).map(|i| attention.contains(&i)).collect())
+    }
+
+    /// The SwiGLU width the LFM2 MLP really has. `intermediate_size` (`block_ff_dim`)
+    /// is the pre-adjustment value: with `block_auto_adjust_ff_dim` the model takes
+    /// two thirds of it, scales it and rounds up to a multiple of `block_multiple_of`
+    /// (Transformers' `Lfm2MLP`, and llama.cpp's converter).
+    pub(crate) fn lfm2_feed_forward_length(&self) -> Option<usize> {
+        let base = self
+            .hparam("block_ff_dim")
+            .and_then(|v| v.as_u64().or_else(|| v.as_f64().map(|f| f as u64)))
+            .map(|v| v as usize)
+            .or(self.intermediate_size)?;
+        let auto_adjust = self
+            .hparam("block_auto_adjust_ff_dim")
+            .and_then(Value::as_bool)
+            .unwrap_or(true);
+        if !auto_adjust {
+            return Some(base);
+        }
+        let mut width = 2 * base / 3;
+        if let Some(multiplier) = self
+            .hparam("block_ffn_dim_multiplier")
+            .and_then(Value::as_f64)
+        {
+            width = (multiplier * width as f64) as usize;
+        }
+        let multiple_of = self
+            .hparam("block_multiple_of")
+            .and_then(Value::as_u64)
+            .unwrap_or(256)
+            .max(1) as usize;
+        Some(width.div_ceil(multiple_of) * multiple_of)
+    }
+
+    /// A hyperparameter that has no typed field: the top level of `config.json`, else
+    /// the nested `text_config` of a multimodal checkpoint.
+    fn hparam(&self, key: &str) -> Option<&Value> {
+        self.extra
+            .get(key)
+            .or_else(|| self.extra.get("text_config")?.get(key))
+    }
+
+    fn is_lfm_family(&self) -> bool {
+        matches!(self.gguf_architecture(), "lfm2" | "lfm2moe")
+    }
+
+    /// For the LFM family, fill the RMSNorm epsilon and RoPE base from the spellings
+    /// its configs use: `norm_eps` / `block_norm_eps` and `rope_parameters.rope_theta`
+    /// (Transformers 5, where the base moved out of the top level). A top-level
+    /// `rms_norm_eps` / `rope_theta` still wins.
+    fn resolve_alternate_spellings(&mut self) {
+        // checked against llama.cpp's converter for the LFM family only
+        if !self.is_lfm_family() {
+            return;
+        }
+        if self.rms_norm_eps.is_none() {
+            self.rms_norm_eps = ["norm_eps", "block_norm_eps"]
+                .iter()
+                .find_map(|k| self.hparam(k).and_then(Value::as_f64))
+                .map(|v| v as f32);
+        }
+        if self.rope_theta.is_none() {
+            self.rope_theta = self.rope_parameter_theta("full_attention");
+        }
+    }
+
+    /// `rope_parameters.rope_theta`, or the one nested under `layer_type` when the
+    /// parameters are keyed by attention type.
+    fn rope_parameter_theta(&self, layer_type: &str) -> Option<f32> {
+        let params = self.hparam("rope_parameters")?;
+        params
+            .get("rope_theta")
+            .or_else(|| params.get(layer_type)?.get("rope_theta"))
+            .and_then(Value::as_f64)
+            .map(|v| v as f32)
     }
 
     fn resolve_nested_text_config(&mut self) {
@@ -174,12 +271,15 @@ impl HfModelConfig {
             "mamba" => "mamba",
             "phi3" | "phi" | "phi-3" | "phi4" | "phi-4" => "phi3",
             "lfm" | "lfm2" | "lfm2.5" | "liquid" => "lfm2",
+            "lfm2_moe" | "lfm2moe" => "lfm2moe",
             "whisper" => "whisper",
             _ => {
                 if let Some(first_arch) = self.architectures.first() {
                     let arch_lower = first_arch.to_ascii_lowercase();
                     if arch_lower.contains("whisper") {
                         "whisper"
+                    } else if arch_lower.contains("lfm2moe") {
+                        "lfm2moe"
                     } else if arch_lower.contains("lfm") || arch_lower.contains("liquid") {
                         "lfm2"
                     } else if arch_lower.contains("qwen35")
@@ -234,6 +334,27 @@ impl HfModelConfig {
                 }
             }
         }
+    }
+
+    /// Refuse a checkpoint this converter would write a wrong GGUF for.
+    pub fn ensure_convertible(&self) -> Result<(), CeraError> {
+        if self.gguf_architecture() == "lfm2moe" {
+            // The routed experts must be stacked into per-layer `ffn_*_exps` tensors,
+            // which this converter does not do; without that the file would carry
+            // the dense architecture name over expert tensors it cannot load.
+            return Err(CeraError::Backend(
+                "converting LFM2-MoE checkpoints is not supported; convert them with \
+                 llama.cpp's convert_hf_to_gguf.py"
+                    .into(),
+            ));
+        }
+        Ok(())
+    }
+
+    /// Whether the vocabulary should be laid out the way llama.cpp's converter does
+    /// (see [`crate::convert::tokenizer::VocabOptions`]). Verified for the LFM family only.
+    pub fn uses_llama_cpp_vocab_layout(&self) -> bool {
+        self.gguf_architecture() == "lfm2"
     }
 
     /// Apply architecture metadata keys to a [`GgufWriter`].
@@ -347,13 +468,29 @@ impl HfModelConfig {
         }
         if let Some(kv_heads) = self.num_key_value_heads.or(self.num_attention_heads) {
             if arch == "lfm2" {
-                let kv_array = vec![kv_heads as i32; layers.max(1)];
+                // Per layer, and 0 on the conv layers: that is how llama.cpp tells the
+                // two block kinds apart, so a uniform array reads as all-attention there.
+                let kv_array = match self.lfm2_attention_layers(layers) {
+                    Some(attention) => attention
+                        .iter()
+                        .map(|&is_attention| if is_attention { kv_heads as i32 } else { 0 })
+                        .collect(),
+                    // no layer layout to read: keep the uniform array older output had
+                    None => vec![kv_heads as i32; layers.max(1)],
+                };
                 writer.add_i32_array(format!("{arch}.attention.head_count_kv"), kv_array);
             } else {
                 writer.add_u32(format!("{arch}.attention.head_count_kv"), kv_heads as u32);
             }
         }
-        if let Some(ffn) = self.intermediate_size {
+        if arch == "lfm2" {
+            if let Some(ffn) = self.lfm2_feed_forward_length() {
+                writer.add_u32(format!("{arch}.feed_forward_length"), ffn as u32);
+            }
+            if let Some(l_cache) = self.hparam("conv_L_cache").and_then(Value::as_u64) {
+                writer.add_u32(format!("{arch}.shortconv.l_cache"), l_cache as u32);
+            }
+        } else if let Some(ffn) = self.intermediate_size {
             writer.add_u32(format!("{arch}.feed_forward_length"), ffn as u32);
         }
         if let Some(dim) = self.head_dim {
@@ -1189,5 +1326,139 @@ mod tests {
         }"#;
         let cfg_phi2 = HfModelConfig::from_json_str(json_phi2).unwrap();
         assert_ne!(cfg_phi2.gguf_architecture(), "phi3");
+    }
+
+    fn lfm2_config(extra: &str) -> HfModelConfig {
+        HfModelConfig::from_json_str(&format!(
+            r#"{{"model_type": "lfm2", "hidden_size": 1024, "num_hidden_layers": 4,
+                "num_attention_heads": 16, "num_key_value_heads": 8,
+                "intermediate_size": 6656, "vocab_size": 65536 {extra}}}"#
+        ))
+        .unwrap()
+    }
+
+    #[test]
+    fn lfm2_feed_forward_length_follows_the_auto_adjust_rule() {
+        // LFM2.5-350M: int(2 * 6656 / 3) = 4437, rounded up to a multiple of 256
+        let cfg = lfm2_config(
+            r#", "block_ff_dim": 6656, "block_auto_adjust_ff_dim": true,
+                 "block_ffn_dim_multiplier": 1.0, "block_multiple_of": 256"#,
+        );
+        assert_eq!(cfg.lfm2_feed_forward_length(), Some(4608));
+        // the multiplier applies before the rounding
+        let cfg = lfm2_config(
+            r#", "block_ff_dim": 6656, "block_auto_adjust_ff_dim": true,
+                 "block_ffn_dim_multiplier": 1.5, "block_multiple_of": 256"#,
+        );
+        assert_eq!(cfg.lfm2_feed_forward_length(), Some(6656));
+        // without auto-adjust the stated width is the width
+        let cfg = lfm2_config(r#", "block_ff_dim": 6656, "block_auto_adjust_ff_dim": false"#);
+        assert_eq!(cfg.lfm2_feed_forward_length(), Some(6656));
+        // a config with no block_* keys takes the Transformers defaults (adjust, 256)
+        assert_eq!(lfm2_config("").lfm2_feed_forward_length(), Some(4608));
+    }
+
+    #[test]
+    fn lfm2_attention_layers_come_from_layer_types_or_full_attn_idxs() {
+        let cfg =
+            lfm2_config(r#", "layer_types": ["conv", "full_attention", "conv", "full_attention"]"#);
+        assert_eq!(
+            cfg.lfm2_attention_layers(4),
+            Some(vec![false, true, false, true])
+        );
+        // the first LFM2 checkpoints list the attention layers instead
+        let cfg = lfm2_config(r#", "full_attn_idxs": [2]"#);
+        assert_eq!(
+            cfg.lfm2_attention_layers(4),
+            Some(vec![false, false, true, false])
+        );
+        // neither: no guess
+        assert_eq!(lfm2_config("").lfm2_attention_layers(4), None);
+    }
+
+    #[test]
+    fn lfm2_metadata_marks_conv_layers_with_zero_kv_heads() {
+        let cfg = lfm2_config(
+            r#", "layer_types": ["conv", "full_attention", "conv", "full_attention"],
+                 "conv_L_cache": 3, "norm_eps": 1e-5,
+                 "rope_parameters": {"rope_theta": 1000000.0, "rope_type": "default"}"#,
+        );
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "t");
+        assert_eq!(
+            writer.get_metadata("lfm2.attention.head_count_kv"),
+            Some(&MetadataValue::Int32Array(vec![0, 8, 0, 8]))
+        );
+        assert_eq!(
+            writer.get_metadata("lfm2.shortconv.l_cache"),
+            Some(&MetadataValue::Uint32(3))
+        );
+        assert_eq!(
+            writer.get_metadata("lfm2.rope.freq_base"),
+            Some(&MetadataValue::Float32(1_000_000.0))
+        );
+        assert_eq!(
+            writer.get_metadata("lfm2.attention.layer_norm_rms_epsilon"),
+            Some(&MetadataValue::Float32(1e-5))
+        );
+    }
+
+    #[test]
+    fn rope_base_and_epsilon_fall_back_to_the_newer_spellings() {
+        // a top-level value still wins
+        let cfg = lfm2_config(
+            r#", "rope_theta": 10000.0, "rms_norm_eps": 1e-6,
+                 "rope_parameters": {"rope_theta": 5.0}, "norm_eps": 1e-5"#,
+        );
+        assert_eq!(cfg.rope_theta, Some(10000.0));
+        assert_eq!(cfg.rms_norm_eps, Some(1e-6));
+        // keyed by attention type, the full-attention base is the model's base
+        let cfg = lfm2_config(
+            r#", "block_norm_eps": 2e-5,
+                 "rope_parameters": {"full_attention": {"rope_theta": 1000000.0},
+                                     "sliding_attention": {"rope_theta": 10000.0}}"#,
+        );
+        assert_eq!(cfg.rope_theta, Some(1_000_000.0));
+        assert_eq!(cfg.rms_norm_eps, Some(2e-5));
+    }
+
+    #[test]
+    fn lfm2_moe_is_its_own_architecture_and_is_not_convertible() {
+        let cfg = HfModelConfig::from_json_str(
+            r#"{"model_type": "lfm2_moe", "architectures": ["Lfm2MoeForCausalLM"]}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.gguf_architecture(), "lfm2moe");
+        assert!(cfg.ensure_convertible().is_err());
+        assert!(lfm2_config("").ensure_convertible().is_ok());
+    }
+
+    #[test]
+    fn other_architectures_do_not_pick_up_the_lfm_spellings() {
+        let cfg = HfModelConfig::from_json_str(
+            r#"{"model_type": "llama", "hidden_size": 64, "num_hidden_layers": 2,
+                "norm_eps": 1e-5, "rope_parameters": {"rope_theta": 500000.0}}"#,
+        )
+        .unwrap();
+        assert_eq!(cfg.rope_theta, None);
+        assert_eq!(cfg.rms_norm_eps, None);
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "t");
+        assert_eq!(writer.get_metadata("llama.rope.freq_base"), None);
+        assert_eq!(
+            writer.get_metadata("llama.attention.layer_norm_rms_epsilon"),
+            None
+        );
+    }
+
+    #[test]
+    fn lfm2_without_a_layer_layout_keeps_uniform_kv_heads() {
+        let cfg = lfm2_config("");
+        let mut writer = GgufWriter::new();
+        cfg.apply_to_gguf_writer(&mut writer, "t");
+        assert_eq!(
+            writer.get_metadata("lfm2.attention.head_count_kv"),
+            Some(&MetadataValue::Int32Array(vec![8, 8, 8, 8]))
+        );
     }
 }

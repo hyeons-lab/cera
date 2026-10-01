@@ -155,6 +155,19 @@ fn map_whisper_block_sub(sub: &str) -> &str {
     }
 }
 
+/// GGUF dimensions (fastest-varying first) for a tensor of row-major `shape`.
+///
+/// Identical to the reversed shape except for the LFM2 short-convolution kernel:
+/// Hugging Face stores it as `[channels, 1, taps]`, llama.cpp's loader wants the 2-D
+/// `[taps, channels]`. The singleton axis holds no data, so only the dimensions change.
+pub fn gguf_tensor_dims(gguf_name: &str, shape: &[usize]) -> Vec<u64> {
+    let mut dims: Vec<u64> = shape.iter().rev().map(|&d| d as u64).collect();
+    if gguf_name.ends_with("shortconv.conv.weight") && shape.len() == 3 && shape[1] == 1 {
+        dims.remove(1);
+    }
+    dims
+}
+
 /// Translate Hugging Face standard tensor names to standard GGUF tensor names.
 pub fn translate_hf_to_gguf_tensor_name(hf_name: &str) -> String {
     translate_hf_to_gguf_tensor_name_with_arch(hf_name, "llama")
@@ -170,7 +183,9 @@ pub fn translate_hf_to_gguf_tensor_name_with_arch(hf_name: &str, arch: &str) -> 
     {
         return "token_embd.weight".to_string();
     }
-    if hf_name == "lfm2.embedding_norm.weight" {
+    if hf_name == "lfm2.embedding_norm.weight"
+        || (arch == "lfm2" && hf_name == "model.embedding_norm.weight")
+    {
         return "token_embd_norm.weight".to_string();
     }
     if hf_name == "model.norm.weight"

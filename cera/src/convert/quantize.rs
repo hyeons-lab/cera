@@ -107,18 +107,25 @@ impl TargetQuant {
 
     /// Select the appropriate GGML type for a tensor given its name and rank.
     pub fn select_ggml_type(&self, tensor_name: &str, num_dims: usize, num_elements: usize) -> u32 {
+        // llama.cpp's graph multiplies activations by norm weights in F32 and aborts on
+        // an F16 norm, so a 1-D tensor (and the short-conv kernel) is never narrowed.
+        let keep_f32 = num_dims <= 1
+            || tensor_name.contains("shortconv.conv")
+            || tensor_name.contains("conv.conv");
         match self {
             Self::F32 => return GGML_TYPE_F32,
-            Self::F16 => return GGML_TYPE_F16,
+            Self::F16 => {
+                return if keep_f32 {
+                    GGML_TYPE_F32
+                } else {
+                    GGML_TYPE_F16
+                };
+            }
             _ => {}
         }
 
         // 1D tensors (layer norms, bias vectors) and shortconv 3-token kernels are kept in F32.
-        if num_dims <= 1
-            || num_elements < 256
-            || tensor_name.contains("shortconv.conv")
-            || tensor_name.contains("conv.conv")
-        {
+        if keep_f32 || num_elements < 256 {
             return GGML_TYPE_F32;
         }
 
@@ -1447,5 +1454,32 @@ mod tests {
         let v2 = vec![1.0f32, 2.0];
         assert_eq!(compute_cosine_similarity(&v1, &v2), 0.0);
         assert_eq!(compute_cosine_similarity(&[], &[]), 0.0);
+    }
+
+    #[test]
+    fn f16_target_keeps_norms_and_the_conv_kernel_in_f32() {
+        let f16 = TargetQuant::F16;
+        // 1-D tensors: llama.cpp aborts on an F16 norm weight
+        assert_eq!(
+            f16.select_ggml_type("blk.0.attn_norm.weight", 1, 2048),
+            GGML_TYPE_F32
+        );
+        assert_eq!(
+            f16.select_ggml_type("blk.0.ffn_gate.bias", 1, 4096),
+            GGML_TYPE_F32
+        );
+        assert_eq!(
+            f16.select_ggml_type("blk.0.shortconv.conv.weight", 2, 6144),
+            GGML_TYPE_F32
+        );
+        // matrices still narrow
+        assert_eq!(
+            f16.select_ggml_type("blk.0.ffn_gate.weight", 2, 1 << 20),
+            GGML_TYPE_F16
+        );
+        assert_eq!(
+            f16.select_ggml_type("token_embd.weight", 2, 1 << 20),
+            GGML_TYPE_F16
+        );
     }
 }
