@@ -2252,6 +2252,16 @@ pub mod shaders {
     /// Weighted sum of a token's expert outputs, generated from
     /// `shaders/slang/moe_combine.slang`. See [`MOE_ROUTE`].
     pub const MOE_COMBINE: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_combine.wgsl"));
+    /// Single-token Gated Delta Net recurrence step for Qwen 3.5 / Ornith 1.0,
+    /// generated from `shaders/slang/deltanet_recurrence.slang` by build.rs and
+    /// shared with the Metal backend.
+    ///
+    /// Validated against a CPU reference by `tests/slang_multitarget_parity.rs`
+    /// (including `head_k_dim > 128`), but not yet dispatched by any model: GPU
+    /// decode for Qwen 3.5 still rejects DeltaNet layers.
+    #[doc(hidden)]
+    pub const DELTANET_RECURRENCE: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/deltanet_recurrence.wgsl"));
     /// Two kernels (`rmsnorm_batch` + `add_rmsnorm_batch`), generated from
     /// `shaders/slang/rmsnorm_batch.slang` by build.rs and shared with the Metal
     /// backend's `metal::shaders::RMSNORM_BATCH`. A

@@ -1005,6 +1005,106 @@ fn moe_gemv_params(n_entries: usize, x_by_entry: bool) -> [u32; 8] {
     ]
 }
 
+/// `(q, k, v, alpha, beta, state)` for one DeltaNet step.
+type DeltanetInputs = (Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>, Vec<f32>);
+
+/// `(num_v_heads, num_k_heads, head_k_dim, head_v_dim)` cases shared by the
+/// wgsl and msl DeltaNet checks. The last one has `head_k_dim > 128`, which is
+/// the only way to reach the shader's `else` arm past the 128-entry
+/// `s_col` register column (state re-read from the buffer), and a
+/// `head_v_dim` that spans two 128-wide workgroup columns with a ragged tail.
+const DELTANET_CASES: [(usize, usize, usize, usize); 3] =
+    [(4, 2, 64, 64), (16, 4, 128, 128), (2, 1, 192, 192)];
+
+/// Synthetic inputs for DeltaNet recurrent linear attention step.
+fn deltanet_inputs(
+    num_v_heads: usize,
+    num_k_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+) -> DeltanetInputs {
+    let q: Vec<f32> = (0..num_k_heads * head_k_dim)
+        .map(|i| (i as f32 * 0.031).sin() * 0.5)
+        .collect();
+    let k: Vec<f32> = (0..num_k_heads * head_k_dim)
+        .map(|i| (i as f32 * 0.047).cos() * 0.5)
+        .collect();
+    let v: Vec<f32> = (0..num_v_heads * head_v_dim)
+        .map(|i| (i as f32 * 0.019).sin() * 0.8)
+        .collect();
+    let alpha: Vec<f32> = (0..num_v_heads).map(|h| 0.95 - (h as f32 * 0.02)).collect();
+    let beta: Vec<f32> = (0..num_v_heads).map(|h| 0.6 + (h as f32 * 0.03)).collect();
+    let state: Vec<f32> = (0..num_v_heads * head_k_dim * head_v_dim)
+        .map(|i| (i as f32 * 0.013).sin() * 0.1)
+        .collect();
+    (q, k, v, alpha, beta, state)
+}
+
+/// Reference DeltaNet recurrence step: S = S * dec + k * d, o = S * q.
+#[allow(clippy::too_many_arguments)]
+fn deltanet_recurrence_ref(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    alpha: &[f32],
+    beta: &[f32],
+    state: &mut [f32],
+    num_v_heads: usize,
+    num_k_heads: usize,
+    head_k_dim: usize,
+    head_v_dim: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; num_v_heads * head_v_dim];
+    let heads_per_group = (num_v_heads / num_k_heads.max(1)).max(1);
+
+    for h in 0..num_v_heads {
+        let kh = (h / heads_per_group).min(num_k_heads.saturating_sub(1));
+        let q_head = &q[kh * head_k_dim..(kh + 1) * head_k_dim];
+        let k_head = &k[kh * head_k_dim..(kh + 1) * head_k_dim];
+        let v_head = &v[h * head_v_dim..(h + 1) * head_v_dim];
+        let dec = alpha[h];
+        let b = beta[h];
+
+        let state_offset = h * head_k_dim * head_v_dim;
+        let s_mat = &mut state[state_offset..state_offset + head_k_dim * head_v_dim];
+
+        if dec <= 0.0 {
+            s_mat.fill(0.0);
+        } else if (dec - 1.0).abs() > 1e-7 {
+            for x in s_mat.iter_mut() {
+                *x *= dec;
+            }
+        }
+
+        let mut sk = vec![0.0f32; head_v_dim];
+        for i in 0..head_k_dim {
+            let ki = k_head[i];
+            let row = &s_mat[i * head_v_dim..(i + 1) * head_v_dim];
+            for j in 0..head_v_dim {
+                sk[j] += row[j] * ki;
+            }
+        }
+
+        let mut d = vec![0.0f32; head_v_dim];
+        for j in 0..head_v_dim {
+            d[j] = b * (v_head[j] - sk[j]);
+        }
+
+        let o_head = &mut out[h * head_v_dim..(h + 1) * head_v_dim];
+        for i in 0..head_k_dim {
+            let ki = k_head[i];
+            let qi = q_head[i];
+            let row = &mut s_mat[i * head_v_dim..(i + 1) * head_v_dim];
+            for j in 0..head_v_dim {
+                let updated = row[j] + ki * d[j];
+                row[j] = updated;
+                o_head[j] += updated * qi;
+            }
+        }
+    }
+    out
+}
+
 #[cfg(feature = "gpu")]
 mod wgsl {
     use super::*;
@@ -2302,6 +2402,109 @@ mod wgsl {
                 );
             }
         }
+    }
+
+    fn check_deltanet_recurrence(ctx: &GpuContext, tag: &str, shader: &str) {
+        for (num_v_heads, num_k_heads, head_k_dim, head_v_dim) in DELTANET_CASES {
+            let (q, k, v, alpha, beta, mut state_ref) =
+                deltanet_inputs(num_v_heads, num_k_heads, head_k_dim, head_v_dim);
+            let state_gpu = state_ref.clone();
+            let want_out = deltanet_recurrence_ref(
+                &q,
+                &k,
+                &v,
+                &alpha,
+                &beta,
+                &mut state_ref,
+                num_v_heads,
+                num_k_heads,
+                head_k_dim,
+                head_v_dim,
+            );
+
+            let pipeline =
+                ctx.create_pipeline(shader, "deltanet_recurrence", "deltanet_recurrence");
+            let q_buf = ctx.upload_f32(&q, "dn_q");
+            let k_buf = ctx.upload_f32(&k, "dn_k");
+            let v_buf = ctx.upload_f32(&v, "dn_v");
+            let a_buf = ctx.upload_f32(&alpha, "dn_a");
+            let b_buf = ctx.upload_f32(&beta, "dn_b");
+            let s_buf = ctx.upload_f32(&state_gpu, "dn_state");
+            let o_buf = ctx.upload_f32(&vec![0.0f32; num_v_heads * head_v_dim], "dn_out");
+            let params = [
+                num_v_heads as u32,
+                num_k_heads as u32,
+                head_k_dim as u32,
+                head_v_dim as u32,
+            ];
+            let par_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "dn_par");
+
+            let bind_group_layout = pipeline.get_bind_group_layout(0);
+            let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("deltanet_bg"),
+                layout: &bind_group_layout,
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: q_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: k_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: v_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: a_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: b_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: s_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 6,
+                        resource: o_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 7,
+                        resource: par_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                let grid_y = head_v_dim.div_ceil(128);
+                pass.dispatch_workgroups(num_v_heads as u32, grid_y as u32, 1);
+            }
+            ctx.queue.submit(Some(enc.finish()));
+            ctx.device.poll_wait();
+
+            let got_out = ctx.download_f32(&o_buf, num_v_heads * head_v_dim);
+            let got_state = ctx.download_f32(&s_buf, num_v_heads * head_k_dim * head_v_dim);
+
+            let label = format!(
+                "wgsl {tag} deltanet v_heads={num_v_heads} k_heads={num_k_heads} kd={head_k_dim} vd={head_v_dim}"
+            );
+            assert_close(&label, &got_out, &want_out, 1e-4);
+            assert_close(&format!("{label} state"), &got_state, &state_ref, 1e-4);
+        }
+    }
+
+    #[test]
+    fn deltanet_recurrence_slang_matches_reference() {
+        let Some(ctx) = setup() else { return };
+        check_deltanet_recurrence(&ctx, "generated", shaders::DELTANET_RECURRENCE);
     }
 }
 
@@ -3725,6 +3928,88 @@ mod msl {
             }
         }
     }
+
+    fn check_deltanet_recurrence(ctx: &MetalContext, tag: &str, shader: &'static str) {
+        for (num_v_heads, num_k_heads, head_k_dim, head_v_dim) in DELTANET_CASES {
+            let (q, k, v, alpha, beta, mut state_ref) =
+                deltanet_inputs(num_v_heads, num_k_heads, head_k_dim, head_v_dim);
+            let state_gpu = state_ref.clone();
+            let want_out = deltanet_recurrence_ref(
+                &q,
+                &k,
+                &v,
+                &alpha,
+                &beta,
+                &mut state_ref,
+                num_v_heads,
+                num_k_heads,
+                head_k_dim,
+                head_v_dim,
+            );
+
+            let pipeline = ctx.create_pipeline(shader, "deltanet_recurrence").unwrap();
+            let q_buf = ctx.upload_f32(&q);
+            let k_buf = ctx.upload_f32(&k);
+            let v_buf = ctx.upload_f32(&v);
+            let a_buf = ctx.upload_f32(&alpha);
+            let b_buf = ctx.upload_f32(&beta);
+            let s_buf = ctx.upload_f32(&state_gpu);
+            let o_buf = ctx.upload_f32(&vec![0.0f32; num_v_heads * head_v_dim]);
+            let params = [
+                num_v_heads as u32,
+                num_k_heads as u32,
+                head_k_dim as u32,
+                head_v_dim as u32,
+            ];
+            let par_buf = ctx.upload_bytes(bytemuck::cast_slice(&params));
+
+            let cb = ctx.queue.new_command_buffer();
+            let enc = cb.new_compute_command_encoder();
+            enc.set_compute_pipeline_state(&pipeline);
+            enc.set_buffer(0, Some(&q_buf), 0);
+            enc.set_buffer(1, Some(&k_buf), 0);
+            enc.set_buffer(2, Some(&v_buf), 0);
+            enc.set_buffer(3, Some(&a_buf), 0);
+            enc.set_buffer(4, Some(&b_buf), 0);
+            enc.set_buffer(5, Some(&s_buf), 0);
+            enc.set_buffer(6, Some(&o_buf), 0);
+            enc.set_buffer(7, Some(&par_buf), 0);
+
+            let grid_y = head_v_dim.div_ceil(128);
+            enc.dispatch_thread_groups(
+                metal::MTLSize {
+                    width: num_v_heads as u64,
+                    height: grid_y as u64,
+                    depth: 1,
+                },
+                metal::MTLSize {
+                    width: 128,
+                    height: 1,
+                    depth: 1,
+                },
+            );
+            enc.end_encoding();
+            cb.commit();
+            cb.wait_until_completed();
+
+            let got_out = ctx.read_f32(&o_buf, num_v_heads * head_v_dim);
+            let got_state = ctx.read_f32(&s_buf, num_v_heads * head_k_dim * head_v_dim);
+
+            let label = format!(
+                "msl {tag} deltanet v_heads={num_v_heads} k_heads={num_k_heads} kd={head_k_dim} vd={head_v_dim}"
+            );
+            assert_close(&label, &got_out, &want_out, 1e-4);
+            assert_close(&format!("{label} state"), &got_state, &state_ref, 1e-4);
+        }
+    }
+
+    #[test]
+    fn deltanet_recurrence_slang_matches_reference() {
+        let Some(ctx) = common::metal_context() else {
+            return;
+        };
+        check_deltanet_recurrence(&ctx, "generated", shaders::DELTANET_RECURRENCE);
+    }
 }
 
 /// Slang reaches Metal's `simdgroup_matrix` hardware through `linalg::CoopMat`.
@@ -3847,6 +4132,10 @@ fn generated_wgsl_has_no_subgroup_ops() {
         (
             "conv1d_fused_batch",
             cera::backend::wgpu::shaders::CONV1D_FUSED_BATCH,
+        ),
+        (
+            "deltanet_recurrence",
+            cera::backend::wgpu::shaders::DELTANET_RECURRENCE,
         ),
     ] {
         assert!(
@@ -4114,6 +4403,40 @@ fn generated_conv_wgsl_binds_five_slots() {
             "generated WGSL for {name} binds more than the five conv slots"
         );
     }
+}
+
+/// The DeltaNet recurrence kernel binds 8 buffers: q, k, v, alpha, beta, state, out, params.
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+#[test]
+fn generated_deltanet_msl_binds_eight_buffers() {
+    let src = cera::backend::metal::shaders::DELTANET_RECURRENCE;
+    for i in 0..8 {
+        assert!(
+            src.contains(&format!("[[buffer({i})]]")),
+            "generated MSL for deltanet_recurrence is missing buffer({i})"
+        );
+    }
+    assert!(
+        !src.contains("[[buffer(8)]]"),
+        "generated MSL for deltanet_recurrence binds more than eight slots"
+    );
+}
+
+/// WGSL half of generated_deltanet_msl_binds_eight_buffers.
+#[cfg(feature = "gpu")]
+#[test]
+fn generated_deltanet_wgsl_binds_eight_slots() {
+    let src = cera::backend::wgpu::shaders::DELTANET_RECURRENCE;
+    for i in 0..8 {
+        assert!(
+            src.contains(&format!("@binding({i})")),
+            "generated WGSL for deltanet_recurrence is missing binding {i}"
+        );
+    }
+    assert!(
+        !src.contains("@binding(8)"),
+        "generated WGSL for deltanet_recurrence binds more than eight slots"
+    );
 }
 
 /// `conv1d_fused_batch` gets its speed from having all five loops over its

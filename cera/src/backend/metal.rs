@@ -585,6 +585,16 @@ pub mod shaders {
     /// `tests/slang_multitarget_parity.rs` pins it against the CPU reference.
     pub const CONV1D_FUSED_BATCH: &str =
         include_str!(concat!(env!("OUT_DIR"), "/conv1d_fused_batch.metal"));
+    /// Single-token Gated Delta Net recurrence step for Qwen 3.5 / Ornith 1.0,
+    /// generated from `shaders/slang/deltanet_recurrence.slang` by build.rs and
+    /// shared with the wgpu backend.
+    ///
+    /// Validated against a CPU reference by `tests/slang_multitarget_parity.rs`
+    /// (including `head_k_dim > 128`), but not yet dispatched by any model: GPU
+    /// decode for Qwen 3.5 still rejects DeltaNet layers.
+    #[doc(hidden)]
+    pub const DELTANET_RECURRENCE: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/deltanet_recurrence.metal"));
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.metal");
     /// TurboQuant KV compression: `tq_encode_keys`, `tq_encode_values`,
     /// `tq_rotate_q` (three kernels in one source).

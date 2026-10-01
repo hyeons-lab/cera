@@ -176,6 +176,7 @@ const SLANG_MULTI_KERNELS: &[&str] = &[
     "ffn_swiglu_q4_0",
     "gemv_q4_0_fast",
     "bert_flash_attention",
+    "deltanet_recurrence",
 ];
 
 /// Compile each multi-target kernel to the shader languages the enabled
