@@ -1579,6 +1579,34 @@ pub fn apply_prefill(
     }
 }
 
+/// Prefill-path apply for **token-major** buffers: `Y += scale · B·(A·X)` for `n`
+/// tokens, where `x` is `[n × k]` and `y` is `[n × d]` (row `j` is token `j`).
+///
+/// The LFM2 CPU prefill runs its projections through the row-major GEMMs, so its
+/// activations and outputs are token rows. [`apply_prefill`] reads `[k × n]` /
+/// `[d × n]`, the layout of the column-major GEMMs the dense transformers use;
+/// handing it token rows applies the adapter to transposed data.
+///
+/// Each token goes through [`apply_decode`], so the result is bit-identical to the
+/// decode path by construction. The rank is small, so the loop costs little next
+/// to the base GEMM it follows.
+pub fn apply_prefill_rowmajor(
+    t: &LoraTargetWeights,
+    x: &[f32],
+    y: &mut [f32],
+    n: usize,
+    tmp: &mut Vec<f32>,
+) {
+    debug_assert_eq!(x.len(), t.k * n);
+    debug_assert_eq!(y.len(), t.d * n);
+    if n == 0 || t.scale == 0.0 {
+        return;
+    }
+    x.chunks_exact(t.k)
+        .zip(y.chunks_exact_mut(t.d))
+        .for_each(|(x_row, y_row)| apply_decode(t, x_row, y_row, tmp));
+}
+
 /// Apply the Q/K/V attention-projection LoRAs for one layer: `q/k/v` are the
 /// base projection outputs (share input `x`), each gets `+= scale·B·(A·x)` if the
 /// adapter targets it. Shared by both `forward_attn_block` implementations
@@ -1951,6 +1979,56 @@ mod tests {
                 "element {i}: batched {a} != per-column {b}"
             );
         }
+    }
+
+    /// The token-major variant must equal `apply_decode` per token bit for bit, and
+    /// must agree with the channel-major `apply_prefill` on the transposed data.
+    #[test]
+    fn apply_prefill_rowmajor_matches_decode_and_channel_major() {
+        let (rank, k, d, n) = (3, 4, 5, 3);
+        let buf = synth_safetensors(rank, k, d, 0.5, 0.25);
+        let adapter = LoraAdapterWeights::from_safetensors_bytes(&buf, Some(6.0)).unwrap();
+        let t = adapter.get(0, LoraTarget::AttnQ).unwrap();
+
+        let x_rows: Vec<f32> = (0..n * k)
+            .map(|i| ((i / k) as f32 + 1.0) * ((i % k) as f32 + 1.0) * 0.1)
+            .collect();
+        let y0: Vec<f32> = (0..n * d).map(|i| i as f32 * 0.01).collect();
+        let mut tmp = Vec::new();
+
+        let mut y_rows = y0.clone();
+        apply_prefill_rowmajor(t, &x_rows, &mut y_rows, n, &mut tmp);
+
+        // per-token decode
+        let mut y_ref = y0.clone();
+        x_rows
+            .chunks_exact(k)
+            .zip(y_ref.chunks_exact_mut(d))
+            .for_each(|(x, y)| apply_decode(t, x, y, &mut tmp));
+        assert_eq!(
+            y_rows.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+            y_ref.iter().map(|v| v.to_bits()).collect::<Vec<_>>()
+        );
+
+        // channel-major equivalent on the transposed buffers
+        let transpose = |m: &[f32], cols: usize| -> Vec<f32> {
+            (0..cols)
+                .flat_map(|c| (0..n).map(move |j| (c, j)))
+                .map(|(c, j)| m[j * cols + c])
+                .collect()
+        };
+        let x_cols = transpose(&x_rows, k);
+        let mut y_cols = transpose(&y0, d);
+        apply_prefill(t, &x_cols, &mut y_cols, n, &mut tmp);
+        assert_eq!(transpose_back(&y_cols, d, n), y_rows);
+    }
+
+    /// `[d × n]` channel-major back to `[n × d]` token rows.
+    fn transpose_back(m: &[f32], d: usize, n: usize) -> Vec<f32> {
+        (0..n)
+            .flat_map(|j| (0..d).map(move |o| (o, j)))
+            .map(|(o, j)| m[o * n + j])
+            .collect()
     }
 
     #[test]

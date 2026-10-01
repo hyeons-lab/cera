@@ -2509,7 +2509,7 @@ impl Lfm2Model {
                             && let Some(t) =
                                 lora.get(layer, crate::lora::LoraTarget::ShortconvInProj)
                         {
-                            crate::lora::apply_prefill(
+                            crate::lora::apply_prefill_rowmajor(
                                 t,
                                 normed,
                                 &mut proj_mat[..3 * hs * n],
@@ -2810,7 +2810,7 @@ impl Lfm2Model {
                             && let Some(t) =
                                 lora.get(layer, crate::lora::LoraTarget::ShortconvOutProj)
                         {
-                            crate::lora::apply_prefill(
+                            crate::lora::apply_prefill_rowmajor(
                                 t,
                                 out_proj_input,
                                 block_out,
@@ -3632,7 +3632,7 @@ impl Lfm2Model {
                         // QK-norm/RoPE, input is the normed hidden `[hs×n]`.
                         if let Some(lora) = &lora {
                             if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnQ) {
-                                crate::lora::apply_prefill(
+                                crate::lora::apply_prefill_rowmajor(
                                     t,
                                     normed,
                                     &mut q_mat[..hs * n],
@@ -3641,7 +3641,7 @@ impl Lfm2Model {
                                 );
                             }
                             if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnK) {
-                                crate::lora::apply_prefill(
+                                crate::lora::apply_prefill_rowmajor(
                                     t,
                                     normed,
                                     &mut k_mat[..kv_dim * n],
@@ -3650,7 +3650,7 @@ impl Lfm2Model {
                                 );
                             }
                             if let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnV) {
-                                crate::lora::apply_prefill(
+                                crate::lora::apply_prefill_rowmajor(
                                     t,
                                     normed,
                                     &mut v_mat[..kv_dim * n],
@@ -4195,7 +4195,7 @@ impl Lfm2Model {
                         if let Some(lora) = &lora
                             && let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnOutput)
                         {
-                            crate::lora::apply_prefill(
+                            crate::lora::apply_prefill_rowmajor(
                                 t,
                                 out_proj_input,
                                 block_out,
@@ -4425,7 +4425,7 @@ impl Lfm2Model {
                             );
                             if let Some(lora) = &lora {
                                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnGate) {
-                                    crate::lora::apply_prefill(
+                                    crate::lora::apply_prefill_rowmajor(
                                         t,
                                         ffn_input,
                                         &mut gate_mat[..is * n],
@@ -4434,7 +4434,7 @@ impl Lfm2Model {
                                     );
                                 }
                                 if let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnUp) {
-                                    crate::lora::apply_prefill(
+                                    crate::lora::apply_prefill_rowmajor(
                                         t,
                                         ffn_input,
                                         &mut up_mat[..is * n],
@@ -4514,7 +4514,7 @@ impl Lfm2Model {
                     if let Some(lora) = &lora
                         && let Some(t) = lora.get(layer, crate::lora::LoraTarget::FfnDown)
                     {
-                        crate::lora::apply_prefill(
+                        crate::lora::apply_prefill_rowmajor(
                             t,
                             &gate_mat[..is * n],
                             ffn_out,
