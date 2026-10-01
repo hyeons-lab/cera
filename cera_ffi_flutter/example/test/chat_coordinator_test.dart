@@ -231,6 +231,12 @@ class FakeCera implements Cera {
   );
 
   @override
+  CeraAudioProfile get audioProfile => const CeraAudioProfile(
+    ttsSystemPrompt: 'Perform TTS.',
+    interleavedSystemPrompt: 'Respond with interleaved text and audio.',
+  );
+
+  @override
   String get backend => 'gpu';
 
   @override

@@ -165,6 +165,7 @@ fn source(source: ModelSource) -> Result<core::ModelSource<'static>, LoadError> 
                 .generation_defaults
                 .map(crate::GenerationDefaults::into_core)
                 .transpose()?,
+            audio_profile: None,
         }),
 
         ModelSource::Path { path } => core::ModelSource::path(path),

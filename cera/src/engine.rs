@@ -185,6 +185,12 @@ pub struct ModelBytes {
     pub chat_template: Option<String>,
     /// Generation defaults from the bundle manifest (if loaded from a bundle).
     pub generation_defaults: Option<crate::manifest::GenerationDefaults>,
+    /// The speech-output profile resolved from the bundle manifest (see
+    /// [`crate::audio_profile`]), for a loader that read one. A bytes load has
+    /// no file names for the engine to resolve it from, so without this the
+    /// engine reports the generic profile. `None` is correct for a model that
+    /// was not loaded from a bundle.
+    pub audio_profile: Option<crate::audio_profile::AudioProfile>,
 }
 
 impl ModelBytes {
@@ -199,6 +205,7 @@ impl ModelBytes {
             inference_type: Some(InferenceType::LlamaCppTextToText),
             chat_template: None,
             generation_defaults: None,
+            audio_profile: None,
         }
     }
 }
@@ -271,6 +278,9 @@ pub struct ModelMetadata {
 /// why the FFI story requires this).
 pub struct CeraEngine {
     manifest: Manifest,
+    /// The speech-output profile a bytes loader resolved from the manifest it
+    /// read. Wins over what the (synthetic) manifest here can say.
+    audio_profile_override: Option<crate::audio_profile::AudioProfile>,
     model: Arc<dyn Model>,
     /// Retained only with an audio encoder, for transcription without reopening files.
     primary_gguf: Option<Arc<GgufFile>>,
@@ -577,7 +587,10 @@ impl CeraEngine {
         if let Some(defaults) = parts.generation_defaults {
             manifest.generation_defaults = defaults;
         }
-        Self::from_gguf(gguf, manifest, cfg, None, aux)
+        let audio_profile = parts.audio_profile;
+        let mut engine = Self::from_gguf(gguf, manifest, cfg, None, aux)?;
+        engine.audio_profile_override = audio_profile;
+        Ok(engine)
     }
 
     /// Load from any `std::io::Read`. Streams the full GGUF into an
@@ -816,6 +829,7 @@ impl CeraEngine {
             (None, None)
         };
         Ok(Self {
+            audio_profile_override: None,
             manifest,
             model,
             primary_gguf,
@@ -1153,6 +1167,18 @@ impl CeraEngine {
     /// without constructing a [`Session`].
     pub fn capabilities(&self) -> ModalityCapabilities {
         ModalityCapabilities::from_inference_type(&self.manifest.inference_type)
+    }
+
+    /// What this model needs to be told to speak: the system prompts, voices
+    /// and sample text for text-to-speech and interleaved output. Resolved from
+    /// the manifest's own `audio_profile`, else the built-in registry for its
+    /// model and vocoder files, else plain `Perform TTS.` (see
+    /// [`crate::audio_profile`]). Meaningful when
+    /// [`ModalityCapabilities::audio_out`] is set; harmless otherwise.
+    pub fn audio_profile(&self) -> crate::audio_profile::AudioProfile {
+        self.audio_profile_override
+            .clone()
+            .unwrap_or_else(|| crate::audio_profile::AudioProfile::for_manifest(&self.manifest))
     }
 
     /// Borrow the loaded model. Used by the audio pipeline today;

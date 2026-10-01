@@ -892,6 +892,13 @@ public protocol CeraEngineProtocol: AnyObject, Sendable {
     func applyChatTemplateWithTools(messages: [ChatMessage], tools: [ToolDef], addGenerationPrompt: Bool) throws  -> String
     
     /**
+     * The system prompts, voices and sample text this model needs for speech
+     * output (see [`AudioProfile`]). Meaningful when
+     * [`ModalityCapabilities::audio_out`] is set; a generic profile otherwise.
+     */
+    func audioProfile()  -> AudioProfile
+    
+    /**
      * Beginning-of-sequence token ID, if the model has one.
      * LLaMA-family models typically do; some don't. Honor
      * [`ModelMetadata::add_bos_token`] when deciding whether to
@@ -1422,6 +1429,19 @@ open func applyChatTemplateWithTools(messages: [ChatMessage], tools: [ToolDef], 
         FfiConverterSequenceTypeChatMessage.lower(messages),
         FfiConverterSequenceTypeToolDef.lower(tools),
         FfiConverterBool.lower(addGenerationPrompt),$0
+    )
+})
+}
+    
+    /**
+     * The system prompts, voices and sample text this model needs for speech
+     * output (see [`AudioProfile`]). Meaningful when
+     * [`ModalityCapabilities::audio_out`] is set; a generic profile otherwise.
+     */
+open func audioProfile() -> AudioProfile  {
+    return try!  FfiConverterTypeAudioProfile_lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ceraengine_audio_profile(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -6710,6 +6730,95 @@ public func FfiConverterTypeAudioInput_lower(_ value: AudioInput) -> RustBuffer 
 
 
 /**
+ * What an audio model needs to be told to speak. Mirrors [`cera::AudioProfile`].
+ *
+ * The system prompt that selects text-to-speech or interleaved output differs
+ * per model, and a voice the model was not trained on makes it answer in text
+ * with no audio. So the prompts and the voices a model accepts come from cera,
+ * not from the app: the bundle manifest's own `audio_profile`, else cera's
+ * built-in registry, else plain `Perform TTS.` with no voices.
+ *
+ * `voices` empty means the model has no voices: send `tts_system_prompt` as-is.
+ * `sample_texts` carry `{model}` where the model's display name goes, and are
+ * empty when the app should use its own generic samples.
+ */
+public struct AudioProfile: Equatable, Hashable {
+    /**
+     * System prompt for text-to-speech with no voice chosen (the first voice's,
+     * or the bare prompt when there are no voices).
+     */
+    public var ttsSystemPrompt: String
+    /**
+     * The same for interleaved text-and-audio replies.
+     */
+    public var interleavedSystemPrompt: String
+    public var voices: [TtsVoice]
+    public var sampleTexts: [String]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * System prompt for text-to-speech with no voice chosen (the first voice's,
+         * or the bare prompt when there are no voices).
+         */ttsSystemPrompt: String, 
+        /**
+         * The same for interleaved text-and-audio replies.
+         */interleavedSystemPrompt: String, voices: [TtsVoice], sampleTexts: [String]) {
+        self.ttsSystemPrompt = ttsSystemPrompt
+        self.interleavedSystemPrompt = interleavedSystemPrompt
+        self.voices = voices
+        self.sampleTexts = sampleTexts
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension AudioProfile: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAudioProfile: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AudioProfile {
+        return
+            try AudioProfile(
+                ttsSystemPrompt: FfiConverterString.read(from: &buf), 
+                interleavedSystemPrompt: FfiConverterString.read(from: &buf), 
+                voices: FfiConverterSequenceTypeTtsVoice.read(from: &buf), 
+                sampleTexts: FfiConverterSequenceString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AudioProfile, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.ttsSystemPrompt, into: &buf)
+        FfiConverterString.write(value.interleavedSystemPrompt, into: &buf)
+        FfiConverterSequenceTypeTtsVoice.write(value.voices, into: &buf)
+        FfiConverterSequenceString.write(value.sampleTexts, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAudioProfile_lift(_ buf: RustBuffer) throws -> AudioProfile {
+    return try FfiConverterTypeAudioProfile.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAudioProfile_lower(_ value: AudioProfile) -> RustBuffer {
+    return FfiConverterTypeAudioProfile.lower(value)
+}
+
+
+/**
  * One message in a chat-template conversation. Mirrors
  * [`cera::tokenizer::ChatMessage`]. Pass a `Vec<ChatMessage>` to
  * [`CeraEngine::apply_chat_template`] to render the model's
@@ -9301,6 +9410,76 @@ public func FfiConverterTypeToolDef_lift(_ buf: RustBuffer) throws -> ToolDef {
 #endif
 public func FfiConverterTypeToolDef_lower(_ value: ToolDef) -> RustBuffer {
     return FfiConverterTypeToolDef.lower(value)
+}
+
+
+/**
+ * One speaker an audio model understands. Mirrors [`cera::TtsVoice`].
+ *
+ * `prompt` is the phrase that selects the voice and doubles as its stable
+ * identifier (save it as the user's choice). The two `*_system_prompt` fields
+ * are complete: pass one as the system message as-is, never assemble a prompt
+ * from parts.
+ */
+public struct TtsVoice: Equatable, Hashable {
+    public var label: String
+    public var prompt: String
+    public var ttsSystemPrompt: String
+    public var interleavedSystemPrompt: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(label: String, prompt: String, ttsSystemPrompt: String, interleavedSystemPrompt: String) {
+        self.label = label
+        self.prompt = prompt
+        self.ttsSystemPrompt = ttsSystemPrompt
+        self.interleavedSystemPrompt = interleavedSystemPrompt
+    }
+
+    
+
+    
+}
+
+#if compiler(>=6)
+extension TtsVoice: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTtsVoice: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TtsVoice {
+        return
+            try TtsVoice(
+                label: FfiConverterString.read(from: &buf), 
+                prompt: FfiConverterString.read(from: &buf), 
+                ttsSystemPrompt: FfiConverterString.read(from: &buf), 
+                interleavedSystemPrompt: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TtsVoice, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.label, into: &buf)
+        FfiConverterString.write(value.prompt, into: &buf)
+        FfiConverterString.write(value.ttsSystemPrompt, into: &buf)
+        FfiConverterString.write(value.interleavedSystemPrompt, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTtsVoice_lift(_ buf: RustBuffer) throws -> TtsVoice {
+    return try FfiConverterTypeTtsVoice.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTtsVoice_lower(_ value: TtsVoice) -> RustBuffer {
+    return FfiConverterTypeTtsVoice.lower(value)
 }
 
 
@@ -12659,6 +12838,31 @@ fileprivate struct FfiConverterSequenceTypeToolDef: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeTtsVoice: FfiConverterRustBuffer {
+    typealias SwiftType = [TtsVoice]
+
+    public static func write(_ value: [TtsVoice], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeTtsVoice.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [TtsVoice] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [TtsVoice]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeTtsVoice.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeFfiAudioPipelineEvent: FfiConverterRustBuffer {
     typealias SwiftType = [FfiAudioPipelineEvent]
 
@@ -13108,6 +13312,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools() != 46076) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ceraengine_audio_profile() != 17834) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ceraengine_bos_token() != 30744) {

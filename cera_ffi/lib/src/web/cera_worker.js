@@ -385,6 +385,36 @@ function capabilitiesOf() {
   };
 }
 
+/**
+ * What the live model needs to be told to speak: the system prompts, voices and
+ * sample text, resolved by cera from the bundle manifest. Copied into plain
+ * objects so it crosses `postMessage` regardless of what wasm hands back.
+ */
+function audioProfileOf() {
+  const p = gpu ? gpu.session.audioProfile : cpu.engine.audioProfile;
+  // A wasm built before cera reported profiles has no `audioProfile`: serve the
+  // plain one every LFM2-Audio model accepts rather than failing the open.
+  if (!p) {
+    return {
+      ttsSystemPrompt: 'Perform TTS.',
+      interleavedSystemPrompt: 'Respond with interleaved text and audio.',
+      voices: [],
+      sampleTexts: [],
+    };
+  }
+  return {
+    ttsSystemPrompt: p.ttsSystemPrompt,
+    interleavedSystemPrompt: p.interleavedSystemPrompt,
+    voices: Array.from(p.voices, (v) => ({
+      label: v.label,
+      prompt: v.prompt,
+      ttsSystemPrompt: v.ttsSystemPrompt,
+      interleavedSystemPrompt: v.interleavedSystemPrompt,
+    })),
+    sampleTexts: Array.from(p.sampleTexts),
+  };
+}
+
 const OPS = {
   /**
    * Import the module, then open a model. `backend` is 'auto' | 'gpu' | 'cpu'.
@@ -419,6 +449,7 @@ const OPS = {
     return {
       backend: backendLabel,
       capabilities: capabilitiesOf(),
+      audioProfile: audioProfileOf(),
       cancelBuffer: cancelSharedBuffer,
     };
   },
@@ -471,6 +502,7 @@ const OPS = {
         return {
           backend: backendLabel,
           capabilities: capabilitiesOf(),
+          audioProfile: audioProfileOf(),
           cancelBuffer: cancelSharedBuffer,
         };
       }
@@ -479,6 +511,7 @@ const OPS = {
         return {
           backend: backendLabel,
           capabilities: capabilitiesOf(),
+          audioProfile: audioProfileOf(),
           cancelBuffer: cancelSharedBuffer,
         };
       }
@@ -488,6 +521,7 @@ const OPS = {
         return {
           backend: backendLabel,
           capabilities: capabilitiesOf(),
+          audioProfile: audioProfileOf(),
           cancelBuffer: cancelSharedBuffer,
         };
       }
@@ -506,6 +540,7 @@ const OPS = {
       return {
         backend: backendLabel,
         capabilities: capabilitiesOf(),
+        audioProfile: audioProfileOf(),
         cancelBuffer: cancelSharedBuffer,
       };
     } finally {
@@ -569,7 +604,7 @@ const OPS = {
     const messages = [];
     if (currentPos === 0) {
       const defaultSystemPrompt = capabilitiesOf().audioOut
-        ? 'Respond with interleaved text and audio.'
+        ? audioProfileOf().interleavedSystemPrompt
         : 'Respond to the user.';
       const effectiveSystemPrompt =
         systemPrompt !== undefined && systemPrompt !== null

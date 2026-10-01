@@ -497,10 +497,11 @@ class _ChatPageState extends State<ChatPage> {
                           },
                         ),
                       ),
-                      if (currentSettings.audioChatMode ==
-                              AudioChatMode.interleaved ||
-                          currentSettings.audioChatMode ==
-                              AudioChatMode.textToSpeech) ...[
+                      if ((currentState.audioProfile?.hasVoices ?? false) &&
+                          (currentSettings.audioChatMode ==
+                                  AudioChatMode.interleaved ||
+                              currentSettings.audioChatMode ==
+                                  AudioChatMode.textToSpeech)) ...[
                         const SizedBox(height: 8),
                         ListTile(
                           contentPadding: EdgeInsets.zero,
@@ -513,30 +514,27 @@ class _ChatPageState extends State<ChatPage> {
                             ),
                           ),
                           trailing: DropdownButton<String?>(
-                            value: currentSettings.chatVoice,
+                            value:
+                                (currentState.audioProfile?.voices.any(
+                                      (v) =>
+                                          v.prompt == currentSettings.chatVoice,
+                                    ) ??
+                                    false)
+                                ? currentSettings.chatVoice
+                                : null,
                             dropdownColor: theme.colorScheme.surface,
                             underline: const SizedBox.shrink(),
-                            items: const [
-                              DropdownMenuItem(
+                            items: [
+                              const DropdownMenuItem(
                                 value: null,
                                 child: Text('Default Voice'),
                               ),
-                              DropdownMenuItem(
-                                value: 'Use the US female voice.',
-                                child: Text('👩 US Female'),
-                              ),
-                              DropdownMenuItem(
-                                value: 'Use the US male voice.',
-                                child: Text('👨 US Male'),
-                              ),
-                              DropdownMenuItem(
-                                value: 'Use the UK female voice.',
-                                child: Text('👩 UK Female'),
-                              ),
-                              DropdownMenuItem(
-                                value: 'Use the UK male voice.',
-                                child: Text('👨 UK Male'),
-                              ),
+                              for (final voice
+                                  in currentState.audioProfile!.voices)
+                                DropdownMenuItem(
+                                  value: voice.prompt,
+                                  child: Text(voice.label),
+                                ),
                             ],
                             onChanged: (val) {
                               _controller.dispatch(

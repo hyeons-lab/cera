@@ -11,6 +11,7 @@
       "expected": {
         "AUDIO_MARKER_CANDIDATES": "pub const AUDIO_MARKER_CANDIDATES: [&'static str; 4]",
         "audio_encoder": "pub fn audio_encoder(&self) -> Option<&Arc<AudioEncoderWeights>>",
+        "audio_profile": "pub fn audio_profile(&self) -> crate::audio_profile::AudioProfile",
         "capabilities": "pub fn capabilities(&self) -> ModalityCapabilities",
         "clear_cache": "pub fn clear_cache(&self)",
         "clear_warm_cache": "pub fn clear_warm_cache(&self)",
@@ -97,7 +98,7 @@
       "kind": "record",
       "owner": "ModelBytes",
       "retained_home": "Rust core; retain existing engine and raw helpers",
-      "expected": "pub struct ModelBytes { pub model: Arc<[u8]>, pub multimodal_projector: Option<Arc<[u8]>>, pub audio_decoder: Option<Arc<[u8]>>, pub audio_tokenizer: Option<Arc<[u8]>>, pub draft_model: Option<Arc<[u8]>>, pub inference_type: Option<InferenceType>, pub chat_template: Option<String>, pub generation_defaults: Option<crate::manifest::GenerationDefaults>, }"
+      "expected": "pub struct ModelBytes { pub model: Arc<[u8]>, pub multimodal_projector: Option<Arc<[u8]>>, pub audio_decoder: Option<Arc<[u8]>>, pub audio_tokenizer: Option<Arc<[u8]>>, pub draft_model: Option<Arc<[u8]>>, pub inference_type: Option<InferenceType>, pub chat_template: Option<String>, pub generation_defaults: Option<crate::manifest::GenerationDefaults>, pub audio_profile: Option<crate::audio_profile::AudioProfile>, }"
     },
     {
       "source": "cera/src/engine.rs",
@@ -149,6 +150,7 @@
         "apply_chat_template": "pub fn apply_chat_template( &self, messages: Vec<ChatMessage>, add_generation_prompt: bool, ) -> Result<String, FfiError>",
         "apply_chat_template_with_tools": "pub fn apply_chat_template_with_tools( &self, messages: Vec<ChatMessage>, tools: Vec<ToolDef>, add_generation_prompt: bool, ) -> Result<String, FfiError>",
         "bos_token": "pub fn bos_token(&self) -> Option<u32>",
+        "audio_profile": "pub fn audio_profile(&self) -> AudioProfile",
         "capabilities": "pub fn capabilities(&self) -> ModalityCapabilities",
         "clear_prefix_cache": "pub fn clear_prefix_cache(&self)",
         "configure_prefix_cache": "pub fn configure_prefix_cache(&self, cache_dir: Option<String>, max_warm_entries: Option<u32>)",
@@ -593,6 +595,7 @@
         "add_bos_token": "pub fn add_bos_token(&self) -> bool",
         "add_eos_token": "pub fn add_eos_token(&self) -> bool",
         "architecture": "pub fn architecture(&self) -> String",
+        "audio_profile": "pub fn audio_profile(&self) -> AudioProfileJs",
         "capabilities": "pub fn capabilities(&self) -> Capabilities",
         "context_size": "pub fn context_size(&self) -> u32",
         "default_generate_opts": "pub fn default_generate_opts(&self) -> GenerateOpts",
@@ -791,6 +794,7 @@
         "audio_out": "pub fn audio_out(&self) -> bool",
         "cancel": "pub fn cancel(&self)",
         "cancel_handle": "pub fn cancel_handle(&self) -> WebGpuCancelHandle",
+        "audio_profile": "pub fn audio_profile(&self) -> AudioProfileJs",
         "capabilities": "pub fn capabilities(&self) -> Capabilities",
         "checkpoint": "pub async fn checkpoint(&self) -> Result<js_sys::Uint8Array, JsError>",
         "clear_cancel": "pub fn clear_cancel(&self)",

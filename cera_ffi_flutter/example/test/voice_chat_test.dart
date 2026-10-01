@@ -836,6 +836,58 @@ void main() {
       },
     );
 
+    test('systemPromptFor takes the prompt and voice from the model profile', () {
+      const english = CeraAudioProfile(
+        ttsSystemPrompt: 'Perform TTS. Use the US female voice.',
+        interleavedSystemPrompt:
+            'Respond with interleaved text and audio. Use the US female voice.',
+        voices: [
+          CeraTtsVoice(
+            label: 'US Female',
+            prompt: 'Use the US female voice.',
+            ttsSystemPrompt: 'Perform TTS. Use the US female voice.',
+            interleavedSystemPrompt:
+                'Respond with interleaved text and audio. Use the US female voice.',
+          ),
+          CeraTtsVoice(
+            label: 'UK Male',
+            prompt: 'Use the UK male voice.',
+            ttsSystemPrompt: 'Perform TTS. Use the UK male voice.',
+            interleavedSystemPrompt:
+                'Respond with interleaved text and audio. Use the UK male voice.',
+          ),
+        ],
+      );
+      const japanese = CeraAudioProfile(
+        ttsSystemPrompt: 'Perform TTS in japanese.',
+        interleavedSystemPrompt: 'Respond with interleaved text and audio.',
+      );
+      const settings = ChatSettings(
+        audioChatMode: AudioChatMode.textToSpeech,
+        ttsStudioVoice: 'Use the UK male voice.',
+      );
+      String? prompt(CeraAudioProfile p, {bool audio = false}) =>
+          ChatController.systemPromptFor(
+            settings: settings,
+            uiMode: AppUIMode.ttsStudio,
+            isAudioPrompt: audio,
+            profile: p,
+          );
+      expect(prompt(english), 'Perform TTS. Use the UK male voice.');
+      // The saved English voice is not one the Japanese model accepts, so it is
+      // never sent: that model would answer in text and never speak.
+      expect(prompt(japanese), 'Perform TTS in japanese.');
+      expect(prompt(english, audio: true), isNull);
+      expect(
+        ChatController.systemPromptFor(
+          settings: settings.copyWith(audioChatMode: AudioChatMode.interleaved),
+          uiMode: AppUIMode.ttsStudio,
+          profile: english,
+        ),
+        'Respond with interleaved text and audio. Use the UK male voice.',
+      );
+    });
+
     test('voiceTagFor maps capabilities to descriptive status labels', () {
       expect(
         ChatController.voiceTagFor(

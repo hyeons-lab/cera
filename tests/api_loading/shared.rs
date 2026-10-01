@@ -217,6 +217,7 @@ pub fn source(source: Source) -> Result<core::ModelSource<'static>, LoadError> {
                 .generation_defaults
                 .map(crate::GenerationDefaults::into_core)
                 .transpose()?,
+            audio_profile: None,
         }),
         #[cfg(feature = "native")]
         Source::Path { path } => core::ModelSource::path(path),

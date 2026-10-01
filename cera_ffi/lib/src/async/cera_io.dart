@@ -55,6 +55,21 @@ CeraCapabilities _capabilitiesOf(ModalityCapabilities caps) => CeraCapabilities(
   audioOut: caps.audioOut,
 );
 
+CeraAudioProfile _audioProfileOf(AudioProfile p) => CeraAudioProfile(
+  ttsSystemPrompt: p.ttsSystemPrompt,
+  interleavedSystemPrompt: p.interleavedSystemPrompt,
+  voices: [
+    for (final v in p.voices)
+      CeraTtsVoice(
+        label: v.label,
+        prompt: v.prompt,
+        ttsSystemPrompt: v.ttsSystemPrompt,
+        interleavedSystemPrompt: v.interleavedSystemPrompt,
+      ),
+  ],
+  sampleTexts: List.unmodifiable(p.sampleTexts),
+);
+
 /// This platform has a filesystem, so [Cera.openPath] works. See
 /// [Cera.supportsPaths].
 const bool supportsPaths = true;
@@ -224,7 +239,8 @@ class _NativeCera implements Cera {
       _bosToken = _engine.metadata().addBosToken ? _engine.bosToken() : null,
       // Fixed by the bundle at load time, so reading it per query would cross
       // the FFI boundary for a record that cannot change.
-      _capabilities = _capabilitiesOf(_engine.capabilities());
+      _capabilities = _capabilitiesOf(_engine.capabilities()),
+      _audioProfile = _audioProfileOf(_engine.audioProfile());
 
   final CeraEngine _engine;
   final CeraOptions _options;
@@ -234,8 +250,13 @@ class _NativeCera implements Cera {
 
   final CeraCapabilities _capabilities;
 
+  final CeraAudioProfile _audioProfile;
+
   @override
   CeraCapabilities get capabilities => _capabilities;
+
+  @override
+  CeraAudioProfile get audioProfile => _audioProfile;
 
   Session? _sessionHandle;
 
@@ -537,7 +558,7 @@ class _NativeCera implements Cera {
 
       final defaultSystemPrompt =
           _capabilities.audioOut
-              ? 'Respond with interleaved text and audio.'
+              ? _audioProfile.interleavedSystemPrompt
               : 'Respond to the user.';
       final effectiveSystemPrompt =
           systemPrompt != null ? systemPrompt.trim() : defaultSystemPrompt;

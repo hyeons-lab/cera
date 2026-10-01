@@ -1605,6 +1605,7 @@ pub(crate) async fn load_manifest_struct(
         inference_type: Some(manifest.inference_type.clone()),
         chat_template: manifest.chat_template.clone(),
         generation_defaults: Some(manifest.generation_defaults.clone()),
+        audio_profile: Some(cera::AudioProfile::for_manifest(manifest)),
     })
 }
 

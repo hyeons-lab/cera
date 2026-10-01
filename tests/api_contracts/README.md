@@ -11,7 +11,7 @@ uvx --offline ruff format --check tests/api_contracts
 
 The [reviewed baseline](retained_api.json) lists 73 declaration groups in five
 Rust source files: core engine/repository, native UniFFI and CPU/WebGPU/browser
-WASM. It records 345 methods/functions/constants and 37 records/enums and three callback traits. The
+WASM. It records 349 methods/functions/constants and 37 records/enums and three callback traits. The
 [target retention map](../../docs/internals/API_RESHAPE_TARGET_RETENTION.md)
 explains their supported homes and the selected additive loading signatures.
 This inventory supplements the [generated loading runtime](../api_loading/README.md).

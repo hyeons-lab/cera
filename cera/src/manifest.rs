@@ -17,6 +17,26 @@
 //! and `llama.cpp/lfm2-audio-v1`. Anything else falls into
 //! `InferenceType::Unknown(raw)`, letting consumers display a
 //! diagnostic error without the parser panicking.
+//!
+//! # `audio_profile` (cera extension)
+//!
+//! An optional top-level object that lets an audio bundle describe the system
+//! prompts and voices it needs, so no client hardcodes them (see
+//! [`crate::audio_profile`]). It is read from [`Manifest::raw`], so the typed
+//! parser needs no knowledge of it:
+//!
+//! ```json
+//! "audio_profile": {
+//!   "tts_system_prompt": "Perform TTS in japanese.",
+//!   "interleaved_system_prompt": "Respond with interleaved text and audio.",
+//!   "voices": [{ "label": "Female", "prompt": "Use the female voice." }],
+//!   "sample_texts": ["こんにちは、{model}です。"]
+//! }
+//! ```
+//!
+//! Only `tts_system_prompt` is required; `interleaved_system_prompt`, `voices`
+//! and `sample_texts` default to the standard prompt, none, and the client's
+//! own samples. A block without `tts_system_prompt` is ignored.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};

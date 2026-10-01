@@ -4,6 +4,8 @@
 // seconds. This only asserts the app builds and reaches its empty state, which
 // is enough to catch a broken widget tree in CI.
 
+import 'package:cera_ffi_flutter/cera_ffi_flutter.dart'
+    show CeraAudioProfile, CeraTtsVoice;
 import 'package:cera_ffi_flutter_example/chat_controller.dart';
 import 'package:cera_ffi_flutter_example/chat_state.dart';
 import 'package:cera_ffi_flutter_example/main.dart';
@@ -183,6 +185,125 @@ void main() {
         findsOneWidget,
       );
       expect(find.textContaining('· Q4_0'), findsNothing);
+    },
+  );
+
+  const englishProfile = CeraAudioProfile(
+    ttsSystemPrompt: 'Perform TTS. Use the US female voice.',
+    interleavedSystemPrompt:
+        'Respond with interleaved text and audio. Use the US female voice.',
+    voices: [
+      CeraTtsVoice(
+        label: '👩 US Female',
+        prompt: 'Use the US female voice.',
+        ttsSystemPrompt: 'Perform TTS. Use the US female voice.',
+        interleavedSystemPrompt:
+            'Respond with interleaved text and audio. Use the US female voice.',
+      ),
+      CeraTtsVoice(
+        label: '👨 UK Male',
+        prompt: 'Use the UK male voice.',
+        ttsSystemPrompt: 'Perform TTS. Use the UK male voice.',
+        interleavedSystemPrompt:
+            'Respond with interleaved text and audio. Use the UK male voice.',
+      ),
+    ],
+  );
+  const japaneseProfile = CeraAudioProfile(
+    ttsSystemPrompt: 'Perform TTS in japanese.',
+    interleavedSystemPrompt: 'Respond with interleaved text and audio.',
+    sampleTexts: ['こんにちは、このデバイス上で{model}モデルを使って音声を合成しています。'],
+  );
+  const plainProfile = CeraAudioProfile(
+    ttsSystemPrompt: 'Perform TTS.',
+    interleavedSystemPrompt: 'Respond with interleaved text and audio.',
+  );
+
+  Future<void> pumpStudio(
+    WidgetTester tester,
+    BundleModelSource bundle,
+    CeraAudioProfile profile,
+  ) async {
+    final state = const ChatState().copyWith(
+      loadedModel: () => bundle,
+      audioProfile: () => profile,
+    );
+    await tester.pumpWidget(
+      MaterialApp(
+        home: Scaffold(
+          body: TtsStudioView(
+            state: state,
+            controller: ChatController(),
+            onOpenCatalog: () {},
+          ),
+        ),
+      ),
+    );
+    await tester.pumpAndSettle();
+  }
+
+  testWidgets('tts studio lists the voices the model profile offers', (
+    WidgetTester tester,
+  ) async {
+    await pumpStudio(
+      tester,
+      const BundleModelSource(
+        name: 'LFM2.5-Audio-1.5B · Q4_0',
+        bundleName: 'LFM2.5-Audio-1.5B-GGUF',
+        quant: 'Q4_0',
+        displayName: 'LFM2.5-Audio-1.5B',
+      ),
+      englishProfile,
+    );
+    expect(find.text('VOICE PERSONA'), findsOneWidget);
+    expect(find.text('👩 US Female'), findsOneWidget);
+    expect(find.text('👨 UK Male'), findsOneWidget);
+  });
+
+  testWidgets(
+    'tts studio for a model whose profile has no voices hides the picker and uses its sample text',
+    (WidgetTester tester) async {
+      await pumpStudio(
+        tester,
+        const BundleModelSource(
+          name: 'LFM2.5-Audio-1.5B-JP · Q4_0',
+          bundleName: 'LFM2.5-Audio-1.5B-JP-GGUF',
+          quant: 'Q4_0',
+          displayName: 'LFM2.5-Audio-1.5B-JP',
+        ),
+        japaneseProfile,
+      );
+      // A voice the model was not trained on makes it answer in text and never
+      // speak, so a model without voices offers no picker.
+      expect(find.text('VOICE PERSONA'), findsNothing);
+      expect(find.text('👩 US Female'), findsNothing);
+      expect(
+        find.text('こんにちは、このデバイス上でLFM2.5-Audio-1.5B-JPモデルを使って音声を合成しています。'),
+        findsOneWidget,
+      );
+    },
+  );
+
+  testWidgets(
+    'tts studio falls back to the generic English text when the profile has none',
+    (WidgetTester tester) async {
+      await pumpStudio(
+        tester,
+        const BundleModelSource(
+          name: 'SomeNewAudioModel-2B · Q4_0',
+          bundleName: 'SomeNewAudioModel-2B-GGUF',
+          quant: 'Q4_0',
+          displayName: 'SomeNewAudioModel-2B',
+        ),
+        plainProfile,
+      );
+      expect(find.text('VOICE PERSONA'), findsNothing);
+      expect(
+        find.text(
+          'Hello, this voice was synthesized entirely on-device with the SomeNewAudioModel-2B model powered by Cera.',
+        ),
+        findsOneWidget,
+      );
     },
   );
 }
