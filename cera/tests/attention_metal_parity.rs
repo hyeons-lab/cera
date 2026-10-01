@@ -36,7 +36,7 @@ fn find_model(name: &str) -> Option<PathBuf> {
 fn generate_greedy(model_path: &Path, prompt: &str, max_tokens: usize) -> Vec<u32> {
     use cera::kv_cache::KvCompression;
     use cera::model::Model;
-    use cera::model::metal_lfm2::MetalLfm2Model;
+    use cera::model::metal_lfm2::MetalLfmModel;
     use cera::{
         FinishReason, GenerateOpts, ModalityCapabilities, ModalitySink, Session, SessionConfig,
     };
@@ -45,7 +45,7 @@ fn generate_greedy(model_path: &Path, prompt: &str, max_tokens: usize) -> Vec<u3
     let gguf = cera::gguf::GgufFile::open(model_path).unwrap();
     let tokenizer = Arc::new(cera::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap());
     let model: Arc<dyn Model> =
-        Arc::new(MetalLfm2Model::from_gguf(gguf, Some(model_path), 4096).unwrap());
+        Arc::new(MetalLfmModel::from_gguf(gguf, Some(model_path), 4096).unwrap());
     let prompt_toks = tokenizer.encode(prompt);
 
     struct CollectSink(Vec<u32>);

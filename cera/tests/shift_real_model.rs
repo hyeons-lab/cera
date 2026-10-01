@@ -226,7 +226,7 @@ fn shift_runs_through_real_model() {
 }
 
 /// Metal variant of `shift_runs_through_real_model` — the GPU `shift_kv`
-/// override on `MetalLfm2Model` is exercised end-to-end. The follow-up
+/// override on `MetalLfmModel` is exercised end-to-end. The follow-up
 /// prefill reads the shifted (re-rotated) K cache on the GPU; a sign
 /// or layout bug in `kv_shift.metal` would surface as either a
 /// numerical issue here or a downstream panic.
@@ -238,7 +238,7 @@ fn shift_runs_through_real_model_metal() {
 }
 
 /// wgpu variant of `shift_runs_through_real_model` — the GPU `shift_kv` override
-/// on `GpuLfm2Model` is exercised end-to-end. The follow-up prefill reads the
+/// on `GpuLfmModel` is exercised end-to-end. The follow-up prefill reads the
 /// shifted (re-rotated) K cache on the GPU; a sign or layout bug in
 /// `kv_shift.wgsl`, or a bookkeeping bug in the scratch copy-back / V move,
 /// would surface as a numerical issue here or a downstream panic.

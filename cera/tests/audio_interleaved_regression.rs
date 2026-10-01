@@ -12,7 +12,7 @@ use cera::model::Model;
 #[cfg(feature = "gpu")]
 use cera::model::audio_decoder::AudioAccelerator;
 use cera::model::audio_decoder::{AudioDecoderWeights, DetokenizerWeights, embed_audio_token};
-use cera::model::lfm2::Lfm2Model;
+use cera::model::lfm2::LfmModel;
 use std::path::PathBuf;
 use std::sync::Arc;
 
@@ -62,8 +62,7 @@ fn test_forward_from_embedding_applies_output_rmsnorm() {
     let Some((model_gguf, vocoder_gguf)) = load_models() else {
         return;
     };
-    let model =
-        Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load LFM2 model");
+    let model = LfmModel::from_gguf((*model_gguf).clone(), 512).expect("Failed to load LFM2 model");
     let dec_w = AudioDecoderWeights::from_gguf(&vocoder_gguf).expect("Failed to load vocoder");
     let mut state = InferenceState::from_config(model.config()).expect("Failed to init state");
 
@@ -89,7 +88,7 @@ fn test_forward_from_embedding_applies_output_rmsnorm() {
 }
 
 /// Both embedding-input entry points must return/consume the hidden state
-/// normalised exactly once. `Lfm2Model::run_layers` already ends with the output
+/// normalised exactly once. `LfmModel::run_layers` already ends with the output
 /// RMSNorm; #397 added a second one to `forward_embedding`,
 /// `forward_hidden_from_embedding` and `forward_from_embedding`, so the CPU
 /// depthformer was fed a hidden state ~7x too large and TTS never reached its end
@@ -105,8 +104,7 @@ fn forward_embedding_hidden_projects_to_the_decode_logits() {
     let Some((model_gguf, _)) = load_models() else {
         return;
     };
-    let model =
-        Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load LFM2 model");
+    let model = LfmModel::from_gguf((*model_gguf).clone(), 512).expect("Failed to load LFM2 model");
     let embd = cera::model::weights::MmapWeight::from_gguf(&model_gguf, "token_embd.weight")
         .expect("tied embedding");
     let prefix = [1u32, 6, 6423, 708];
@@ -151,8 +149,7 @@ fn forward_from_embedding_matches_decode_logits() {
     let Some((model_gguf, _)) = load_models() else {
         return;
     };
-    let model =
-        Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load LFM2 model");
+    let model = LfmModel::from_gguf((*model_gguf).clone(), 512).expect("Failed to load LFM2 model");
     let embd = cera::model::weights::MmapWeight::from_gguf(&model_gguf, "token_embd.weight")
         .expect("tied embedding");
     let prefix = [1u32, 6, 6423, 708];
@@ -243,8 +240,7 @@ fn test_tts_prompt_token_prediction() {
     let Some((model_gguf, vocoder_gguf)) = load_models() else {
         return;
     };
-    let model =
-        Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load LFM2 model");
+    let model = LfmModel::from_gguf((*model_gguf).clone(), 512).expect("Failed to load LFM2 model");
     let tokenizer =
         cera::tokenizer::BpeTokenizer::from_gguf(&model_gguf).expect("Failed to load tokenizer");
     let mut state = InferenceState::from_config(model.config()).expect("Failed to init state");
@@ -320,7 +316,7 @@ fn test_gpu_tts_prompt_token_prediction() {
     let Some((model_gguf, vocoder_gguf)) = load_models() else {
         return;
     };
-    let gpu_model = cera::model::gpu_lfm2::GpuLfm2Model::from_gguf_with_id(
+    let gpu_model = cera::model::gpu_lfm2::GpuLfmModel::from_gguf_with_id(
         (*model_gguf).clone(),
         2048,
         "test_gpu".to_string(),
@@ -366,7 +362,7 @@ fn test_gpu_tts_prompt_token_prediction() {
     pos += 1;
 
     let cpu_model =
-        Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load LFM2 model");
+        LfmModel::from_gguf((*model_gguf).clone(), 512).expect("Failed to load LFM2 model");
     let mut cpu_state =
         InferenceState::from_config(cpu_model.config()).expect("Failed to init state");
     for (i, &tok) in tokens.iter().enumerate() {
@@ -434,7 +430,7 @@ fn test_gpu_depthformer_exact_layer_parity() {
     let Some((model_gguf, vocoder_gguf)) = load_models() else {
         return;
     };
-    let gpu_model = cera::model::gpu_lfm2::GpuLfm2Model::from_gguf_with_id(
+    let gpu_model = cera::model::gpu_lfm2::GpuLfmModel::from_gguf_with_id(
         (*model_gguf).clone(),
         2048,
         "test_gpu_parity".to_string(),
@@ -487,8 +483,8 @@ fn test_cpu_vs_gpu_llm_prefill_and_decode_parity() {
     let tokens = tokenizer.encode(&formatted);
 
     let cpu_model =
-        Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load CPU model");
-    let gpu_model = cera::model::gpu_lfm2::GpuLfm2Model::from_gguf_with_id(
+        LfmModel::from_gguf((*model_gguf).clone(), 512).expect("Failed to load CPU model");
+    let gpu_model = cera::model::gpu_lfm2::GpuLfmModel::from_gguf_with_id(
         (*model_gguf).clone(),
         2048,
         "test_prefill_parity".to_string(),
@@ -554,8 +550,8 @@ fn test_cpu_vs_gpu_audio_loop_parity() {
     let tokens = tokenizer.encode(&formatted);
 
     let cpu_model =
-        Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load CPU model");
-    let gpu_model = cera::model::gpu_lfm2::GpuLfm2Model::from_gguf_with_id(
+        LfmModel::from_gguf((*model_gguf).clone(), 512).expect("Failed to load CPU model");
+    let gpu_model = cera::model::gpu_lfm2::GpuLfmModel::from_gguf_with_id(
         (*model_gguf).clone(),
         2048,
         "test_loop_parity".to_string(),
@@ -627,8 +623,8 @@ fn test_layer_by_layer_parity_token_0() {
         return;
     };
     let cpu_model =
-        Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load CPU model");
-    let gpu_model = cera::model::gpu_lfm2::GpuLfm2Model::from_gguf_with_id(
+        LfmModel::from_gguf((*model_gguf).clone(), 512).expect("Failed to load CPU model");
+    let gpu_model = cera::model::gpu_lfm2::GpuLfmModel::from_gguf_with_id(
         (*model_gguf).clone(),
         2048,
         "test_l0_parity".to_string(),
@@ -664,7 +660,7 @@ fn test_tts_studio_default_sample_text_synthesis() {
     };
     let tokenizer =
         cera::tokenizer::BpeTokenizer::from_gguf(&model_gguf).expect("Failed to load tokenizer");
-    let model = Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load CPU model");
+    let model = LfmModel::from_gguf((*model_gguf).clone(), 512).expect("Failed to load CPU model");
     let mut state = InferenceState::from_config(model.config()).expect("Failed to init state");
 
     let sample_text = "Hello, this voice was synthesized entirely on-device with the LFM2.5-Audio-1.5B model powered by Cera.";
@@ -738,7 +734,7 @@ fn test_tts_studio_default_sample_text_synthesis_us_male_voice() {
     };
     let tokenizer =
         cera::tokenizer::BpeTokenizer::from_gguf(&model_gguf).expect("Failed to load tokenizer");
-    let model = Lfm2Model::from_gguf((*model_gguf).clone(), 512).expect("Failed to load CPU model");
+    let model = LfmModel::from_gguf((*model_gguf).clone(), 512).expect("Failed to load CPU model");
     let mut state = InferenceState::from_config(model.config()).expect("Failed to init state");
 
     let sample_text = "Hello, this voice was synthesized entirely on-device with the LFM2.5-Audio-1.5B model powered by Cera.";
@@ -817,7 +813,7 @@ fn test_tts_studio_default_sample_text_synthesis_gpu() {
     };
     let tokenizer =
         cera::tokenizer::BpeTokenizer::from_gguf(&model_gguf).expect("Failed to load tokenizer");
-    let model = cera::model::gpu_lfm2::GpuLfm2Model::from_gguf_with_id(
+    let model = cera::model::gpu_lfm2::GpuLfmModel::from_gguf_with_id(
         (*model_gguf).clone(),
         2048,
         "test_tts_gpu".to_string(),

@@ -903,7 +903,7 @@ struct GpuDenseFfn {
     down: GpuWeight,
 }
 
-/// Borrowed inputs to [`GpuLfm2Model::encode_attn_pre_into`]: the decode attn
+/// Borrowed inputs to [`GpuLfmModel::encode_attn_pre_into`]: the decode attn
 /// pre-chain (norm + QKV + bias + QK-norm + RoPE) runs identically in the
 /// merged `layer_attn` pass and the TurboQuant `attn_pre` split, so it takes
 /// one struct instead of fifteen parameters. Per-head-norm, bias, and rope
@@ -1548,12 +1548,12 @@ struct GpuState {
     /// Per attention layer: (key_cache, value_cache) packed-f16 buffers.
     ///
     /// Allocated **lazily**, on the first `active_kv` (see
-    /// [`GpuLfm2Model::f16_kv`]). A model is loaded before the session that
+    /// [`GpuLfmModel::f16_kv`]). A model is loaded before the session that
     /// configures its KV compression exists, so allocating the full
     /// `max_seq_len × kv_dim` slabs up front and freeing them once a
     /// TurboQuant session arrives would create exactly the transient memory peak
     /// compression exists to avoid. Under TurboQuant this `OnceLock` is never
-    /// initialized and the packed buffers in `GpuLfm2Model::tq` hold the cache
+    /// initialized and the packed buffers in `GpuLfmModel::tq` hold the cache
     /// instead.
     kv_caches: OnceLock<Vec<Option<(wgpu::Buffer, wgpu::Buffer)>>>,
     /// Per conv layer: rolling buffer.
@@ -1569,7 +1569,7 @@ struct GpuState {
     embedding: MmapWeight,
 }
 
-/// Scratch KV/conv caches for [`GpuLfm2Model::hidden_states`], mirroring the
+/// Scratch KV/conv caches for [`GpuLfmModel::hidden_states`], mirroring the
 /// generation caches' shapes. Allocated **lazily** on first `hidden_states` call
 /// (via `OnceLock`) so a generation-only load never pays the extra VRAM.
 /// Selected over the generation caches by `use_hs_scratch`.
@@ -1578,7 +1578,7 @@ struct HsScratch {
     conv: Vec<Option<wgpu::Buffer>>,
 }
 
-/// Clears `GpuLfm2Model::active_lora` when dropped, so a leaked `Some` can't
+/// Clears `GpuLfmModel::active_lora` when dropped, so a leaked `Some` can't
 /// send a later base-model forward through the adapter. Mirrors the Metal
 /// `LoraGuard`.
 struct LoraGuard<'a>(&'a Mutex<Option<Arc<WgpuLoraAdapter>>>);
@@ -1596,7 +1596,7 @@ impl Drop for LoraGuard<'_> {
 /// The per-call `infer_lock` still protects scratch and raw-call bookkeeping.
 /// Use independently loaded models for concurrent GPU conversations. Direct raw
 /// methods remain caller-managed and must not interfere with a live Session.
-pub struct GpuLfm2Model {
+pub struct GpuLfmModel {
     ctx: GpuContext,
     config: ModelConfig,
     pipelines: GpuPipelines,
@@ -1697,7 +1697,7 @@ pub struct GpuLfm2Model {
     conv_proj_buf: wgpu::Buffer, // [3 × hidden_size]
     conv_gate_buf: wgpu::Buffer, // [hidden_size] — fused conv writes here, out_proj reads
     // ── Batched-prefill scratch (sized to MAX_PREFILL_TOKENS rows) ────────
-    // Mirrors MetalLfm2Model's prefill_*_buf set. Used only by the batched
+    // Mirrors MetalLfmModel's prefill_*_buf set. Used only by the batched
     // prefill path; the per-token forward path keeps using the scalar
     // scratch buffers above.
     /// `[MAX_PREFILL_TOKENS × hidden_size]` — running residual-stream
@@ -1878,7 +1878,7 @@ enum DecodeTail {
     LogitsUnsubmitted(TailArgmax),
 }
 
-impl GpuLfm2Model {
+impl GpuLfmModel {
     /// Construct without a model identifier. Equivalent to
     /// `from_gguf_with_id(gguf, context_size, "")`. Warm prefix caching works;
     /// cold caching is disabled even when a directory is configured.
@@ -1938,7 +1938,7 @@ impl GpuLfm2Model {
             "lfm2" | "lfm2moe" => {
                 // No CPU repacks: the GPU loader only resolves metadata from
                 // this model (see `with_repack_if`).
-                let cpu_model = super::lfm2::Lfm2Model::from_gguf_with_id_no_repack(
+                let cpu_model = super::lfm2::LfmModel::from_gguf_with_id_no_repack(
                     gguf,
                     context_size,
                     model_id.clone(),
@@ -1957,7 +1957,7 @@ impl GpuLfm2Model {
     /// Construct a GPU model for a dense transformer (Qwen2/Qwen3/LLaMA/
     /// Mistral/Granite/MiniCPM): the `LlamaModel` family. Mirrors `from_gguf_with_id`
     /// but feeds the shared loader a `LlamaModel` weight source instead of
-    /// `Lfm2Model`. The GPU forward path is arch-generic; per-arch behavior
+    /// `LfmModel`. The GPU forward path is arch-generic; per-arch behavior
     /// (NEOX/NORM rope, QK-norm, QKV bias, untied output, Granite/MiniCPM scalars) is
     /// driven by the `GpuWeightSource` accessors + `config`.
     pub fn from_llama_with_id(
@@ -1987,7 +1987,7 @@ impl GpuLfm2Model {
 
     /// Generalized GPU loader over any [`GpuWeightSource`]. Uploads weights,
     /// builds pipelines + scratch, and wires the arch-specific knobs. The
-    /// concrete CPU model (`Lfm2Model` / `LlamaModel`) is only borrowed here
+    /// concrete CPU model (`LfmModel` / `LlamaModel`) is only borrowed here
     /// for its weights/metadata; it is dropped on return.
     fn from_weight_source(
         src: &dyn GpuWeightSource,
@@ -5124,7 +5124,7 @@ impl GpuLfm2Model {
     }
 }
 
-impl GpuLfm2Model {
+impl GpuLfmModel {
     /// Lock-free body of [`Model::forward`]. Callers must already hold
     /// `infer_lock` — enter via the trait's `forward()` for a single
     /// token, or `forward_prefill` for the hot prefill loop. The
@@ -6477,7 +6477,7 @@ impl GpuLfm2Model {
 
 // === Batched prefill — encode helpers + main method ========================
 //
-// Mirror `MetalLfm2Model::prefill_layers_and_logits` (metal_lfm2.rs:2906).
+// Mirror `MetalLfmModel::prefill_layers_and_logits` (metal_lfm2.rs:2906).
 // Uses the five batched shaders landed in PRs #154 + #156:
 //   rmsnorm_batch / add_rmsnorm_batch (PR #154)
 //   qk_norm_rope_batch                (PR #154)
@@ -6515,7 +6515,7 @@ impl GpuLfm2Model {
 // contiguous K/V cache (`max_seq × kv_dim`); contexts long enough that *it*
 // overflows the storage-binding limit need key-tiled / paged KV, a follow-up.
 
-impl GpuLfm2Model {
+impl GpuLfmModel {
     /// The first matmul weight that has no batched prefill kernel, as
     /// `(layer, tensor name, dtype)` — or `None` when every weight has one, which
     /// is the precondition for `forward_prefill_batched_locked` to take the batched
@@ -7578,7 +7578,7 @@ impl GpuLfm2Model {
     /// naturally. Do NOT re-add a `start_pos == 0` gate on the caller side — it
     /// silently dropped every chunk after the first onto the per-token loop.
     ///
-    /// Mirrors `MetalLfm2Model::prefill_layers_and_logits`
+    /// Mirrors `MetalLfmModel::prefill_layers_and_logits`
     /// (metal_lfm2.rs:2906); the Metal version is the canonical
     /// reference for the dispatch order + buffer assignment.
     fn encode_prefill_batched_locked(
@@ -8555,7 +8555,7 @@ impl GpuLfm2Model {
     }
 }
 
-impl GpuLfm2Model {
+impl GpuLfmModel {
     /// Lock-free body of `Model::snapshot_state`. Callers that already
     /// hold `infer_lock` (e.g. `forward_prefill`'s prefix-cache write
     /// step) call this directly to avoid a recursive `Mutex::lock()`
@@ -8713,7 +8713,7 @@ impl GpuLfm2Model {
                     // kernels reading whatever was in the packed cache before.
                     let tq = self.tq_cache().unwrap_or_else(|| {
                         panic!(
-                            "GpuLfm2Model::restore_state_locked received a \
+                            "GpuLfmModel::restore_state_locked received a \
                              TurboQuant-compressed snapshot at layer {i} but this \
                              model is not TurboQuant-configured; callers must gate \
                              on `StateSnapshot::is_compressed`"
@@ -8764,8 +8764,8 @@ impl GpuLfm2Model {
                 | LayerSnapshot::ParallelAttentionMamba2 { .. }
                 | LayerSnapshot::DeltaNet { .. } => {
                     panic!(
-                        "GpuLfm2Model::restore_state_locked received an unsupported recurrent snapshot at layer {i}; \
-                         Mamba2 and DeltaNet are not supported on GpuLfm2Model."
+                        "GpuLfmModel::restore_state_locked received an unsupported recurrent snapshot at layer {i}; \
+                         Mamba2 and DeltaNet are not supported on GpuLfmModel."
                     );
                 }
             }
@@ -8780,12 +8780,12 @@ impl GpuLfm2Model {
     /// from a prior generation can't leak into the new run. Cache
     /// HITs go through `restore_state_locked` which overwrites the
     /// buffers from the snapshot, so this only fires on the cold
-    /// path. Mirrors `MetalLfm2Model::zero_conv_buffers_locked`.
+    /// path. Mirrors `MetalLfmModel::zero_conv_buffers_locked`.
     ///
     /// Conv layers always read the entire rolling buffer regardless
     /// of `seq_len`, so the seq_len atomic reset alone isn't enough
     /// to fence stale state. Without this an FFI / long-lived
-    /// process that reuses the same `GpuLfm2Model` across multiple
+    /// process that reuses the same `GpuLfmModel` across multiple
     /// `Session`s would drift on conv state.
     ///
     /// Uses wgpu's native `clear_buffer` so the zero fill happens
@@ -8916,7 +8916,7 @@ impl GpuLfm2Model {
 #[cfg(not(target_arch = "wasm32"))]
 mod recovery;
 
-impl Model for GpuLfm2Model {
+impl Model for GpuLfmModel {
     #[cfg(not(target_arch = "wasm32"))]
     fn try_reset_kv(
         &self,
@@ -9426,7 +9426,7 @@ impl Model for GpuLfm2Model {
     /// Public Model trait surface for `_locked` snapshot/restore so
     /// external state-management callers (FFI / parity harness)
     /// can drive the prefix cache directly without going through
-    /// `forward_prefill`. Mirrors `MetalLfm2Model`'s overrides.
+    /// `forward_prefill`. Mirrors `MetalLfmModel`'s overrides.
     fn snapshot_state(&self) -> StateSnapshot {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         self.snapshot_state_locked()
@@ -9546,7 +9546,7 @@ impl Model for GpuLfm2Model {
     }
 
     fn supports_kv_shift(&self) -> bool {
-        // Mirror of CPU `Lfm2Model` / Metal `MetalLfm2Model` — the wgpu backend
+        // Mirror of CPU `LfmModel` / Metal `MetalLfmModel` — the wgpu backend
         // implements the GPU-side shift via the `kv_shift` WGSL kernel +
         // `copy_buffer_to_buffer`. See `Self::shift_kv`.
         //
@@ -10322,7 +10322,7 @@ mod tests {
     /// reclassify without the 2.6B n>128 Adreno soak.
     #[test]
     fn adreno_split_label_table() {
-        use super::GpuLfm2Model;
+        use super::GpuLfmModel;
         for label in [
             "mul_mat_tile",
             "mul_mat_tile_stream",
@@ -10333,7 +10333,7 @@ mod tests {
             "mul_mat_f32",
         ] {
             assert!(
-                GpuLfm2Model::is_adreno_split_label(label),
+                GpuLfmModel::is_adreno_split_label(label),
                 "{label} must stay in the Adreno-split kind"
             );
         }
@@ -10347,7 +10347,7 @@ mod tests {
             "kv_append",
         ] {
             assert!(
-                !GpuLfm2Model::is_adreno_split_label(label),
+                !GpuLfmModel::is_adreno_split_label(label),
                 "{label} must stay out of the Adreno-split kind"
             );
         }
@@ -10761,7 +10761,7 @@ mod tests {
             .device
             .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
         // Copy 4 floats from src[2..6] to dst[5..9] using FLOAT offsets.
-        super::GpuLfm2Model::encode_copy(&mut enc, &src_buf, 2, &dst_buf, 5, 4);
+        super::GpuLfmModel::encode_copy(&mut enc, &src_buf, 2, &dst_buf, 5, 4);
         ctx.queue.submit(Some(enc.finish()));
 
         let got = ctx.download_f32(&dst_buf, 16);

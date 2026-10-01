@@ -1,10 +1,10 @@
-use super::GpuLfm2Model;
+use super::GpuLfmModel;
 use crate::kv_cache::{InferenceState, KvCompression};
 use crate::model::Model;
 use crate::session::CeraError;
 use std::sync::atomic::Ordering;
 
-impl GpuLfm2Model {
+impl GpuLfmModel {
     pub(super) fn reset_kv_checked(
         &self,
         state: &mut InferenceState,

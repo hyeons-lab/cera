@@ -66,7 +66,7 @@ CLI perf must be reproducible in-app. Risks, in order:
 
 ### 3. Admission + lifecycle (required for good citizenship)
 
-- Before `HexagonLfm2Model::load_weights`: `canLoadModel()` with the
+- Before `HexagonLfmModel::load_weights`: `canLoadModel()` with the
   GGUF size bucket (`LESS_THAN_1GB` for 350M; 8B-A1B is
   `BETWEEN_1GB_AND_2GB`). `WAIT_FOR_UNLOAD` → surface "waiting for
   NPU" to the app (do not spin); `NOT_PRIORITIZED` → fall back to

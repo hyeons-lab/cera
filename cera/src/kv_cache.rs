@@ -120,8 +120,8 @@ fn deltanet_conv_dim(ssm: &crate::model::SsmConfig) -> Result<usize, CeraError> 
 /// caches, and the scratch buffers. **No separate `enable_turboquant` call on
 /// the model is required.**
 ///
-/// TurboQuant is honored by the CPU backend (`Lfm2Model`) and by both GPU
-/// backends (`GpuLfm2Model` and `MetalLfm2Model`). The GPU paths additionally
+/// TurboQuant is honored by the CPU backend (`LfmModel`) and by both GPU
+/// backends (`GpuLfmModel` and `MetalLfmModel`). The GPU paths additionally
 /// need [`crate::model::Model::configure_kv_compression`] — which `Session`
 /// calls — to build their GPU-resident compressed caches, and they only
 /// implement the both-sides mode: a single-sided (debug) request, or a
@@ -224,7 +224,7 @@ impl KvCompression {
     /// `head_dim`, or a single-sided request on GPU) must use the uncompressed
     /// tag so it shares the namespace it is now writing into. Metal's
     /// uncompressed cache is f16 but still takes `None`'s tag; see the note in
-    /// `MetalLfm2Model::configure_kv_compression`.
+    /// `MetalLfmModel::configure_kv_compression`.
     pub fn cache_tag(&self) -> String {
         match self {
             Self::None => String::new(),
@@ -2643,7 +2643,7 @@ impl StateSnapshot {
     }
 
     /// `true` iff any attention layer in this snapshot is
-    /// compressed. Used by `Lfm2Model::forward_prefill` to skip
+    /// compressed. Used by `LfmModel::forward_prefill` to skip
     /// snapshots whose compression mode doesn't match the live
     /// state — treat as cache miss instead of panicking on
     /// `restore`.
@@ -2652,7 +2652,7 @@ impl StateSnapshot {
     }
 
     /// `true` iff any attention layer in this snapshot is f16
-    /// (`AttentionF16`). Used by `Lfm2Model::forward_prefill`'s
+    /// (`AttentionF16`). Used by `LfmModel::forward_prefill`'s
     /// cross-mode gate to reject an f16 snapshot against an f32
     /// (or compressed) live state — their byte widths differ, so a
     /// cross-mode restore would corrupt the cache.
@@ -2756,7 +2756,7 @@ impl KvPrefixCache {
     /// enforces: a full-length hit would leave `use_len == tokens.len()`, and the
     /// restored state already reflects "after all tokens", so re-running the last
     /// token would advance the conv rolling buffer one position past where it
-    /// belongs (conv layers don't gate on `seq_len`). `Lfm2Model::forward_prefill`
+    /// belongs (conv layers don't gate on `seq_len`). `LfmModel::forward_prefill`
     /// and both GPU backends therefore skip full hits.
     ///
     /// Returning them anyway made the cache **effectively single-use per token

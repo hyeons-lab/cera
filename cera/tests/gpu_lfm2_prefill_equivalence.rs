@@ -14,7 +14,7 @@
 //!
 //! ## These models are stateful — reuse contaminates
 //!
-//! `GpuLfm2Model` keeps the KV cache, the conv rolling buffers and the prefix
+//! `GpuLfmModel` keeps the KV cache, the conv rolling buffers and the prefix
 //! cache in `GpuState`, on the **model**, not in `InferenceState`. A fresh
 //! `InferenceState` does not reset any of it, and the two entry points differ:
 //! `forward_prefill(start_pos = 0)` zeroes the conv buffers and writes the

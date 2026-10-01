@@ -1,7 +1,7 @@
 //! GPU-resident TurboQuant KV cache for the wgpu backend.
 //!
 //! Holds everything the compressed path needs that isn't already on
-//! [`GpuLfm2Model`](super::gpu_lfm2::GpuLfm2Model): the packed per-layer key and
+//! [`GpuLfmModel`](super::gpu_lfm2::GpuLfmModel): the packed per-layer key and
 //! value buffers, the per-layer randomized-Hadamard sign flips, the rotated-query
 //! scratch, the shader params slab, and the four pipelines. Built lazily by
 //! `Model::configure_kv_compression` so a session that never asks for TurboQuant

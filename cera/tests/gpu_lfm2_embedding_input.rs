@@ -1,6 +1,6 @@
 //! wgpu LFM2 `forward_from_embedding` oracle, pinned to the CPU model.
 //!
-//! `GpuLfm2Model` used the trait's default `supports_embedding_input()`
+//! `GpuLfmModel` used the trait's default `supports_embedding_input()`
 //! (`false`) and a `forward_from_embedding` that panicked, so image input
 //! could not reach the WebGPU backend at all: an image arrives from the
 //! mmproj's projector as hidden-size vectors with no token id behind them,
@@ -104,7 +104,7 @@ fn gpu_model_advertises_embedding_input() {
     let Some(gpu) = load_gpu(&path) else { return };
     assert!(
         gpu.supports_embedding_input(),
-        "GpuLfm2Model must advertise embedding input, or Session::append_embeddings \
+        "GpuLfmModel must advertise embedding input, or Session::append_embeddings \
          refuses images on the WebGPU backend before calling forward_from_embedding"
     );
 }

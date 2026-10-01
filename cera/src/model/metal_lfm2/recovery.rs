@@ -1,10 +1,10 @@
-use super::MetalLfm2Model;
+use super::MetalLfmModel;
 use crate::kv_cache::{InferenceState, KvCompression};
 use crate::model::Model;
 use crate::session::CeraError;
 use std::sync::atomic::Ordering;
 
-impl MetalLfm2Model {
+impl MetalLfmModel {
     pub(super) fn reset_kv_checked(
         &self,
         state: &mut InferenceState,

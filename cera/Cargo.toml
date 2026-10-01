@@ -92,7 +92,7 @@ getrandom = { workspace = true, features = ["js"] }
 # runtime UB.
 #
 # Without this feature, our `Model: Send + Sync` bound rejects
-# `GpuLfm2Model` on wasm. We always-on it for wasm32; threaded wasm
+# `GpuLfmModel` on wasm. We always-on it for wasm32; threaded wasm
 # builds (which set `atomics` via the `wasm-web-mt` / `wasm-node-mt`
 # justfile recipes' RUSTFLAGS) will still fail to satisfy the bound,
 # which is the right outcome — multi-threaded wgpu wasm needs wgpu

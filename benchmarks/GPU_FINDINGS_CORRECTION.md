@@ -30,7 +30,7 @@ three inferences were false, closed T6 as "already done", and declared the
 kernels, not the plumbing, to be the problem.
 
 **The counters were lying.** They incremented only inside
-`GpuContext::submit_encoder`, but `GpuLfm2Model` submitted its work through direct
+`GpuContext::submit_encoder`, but `GpuLfmModel` submitted its work through direct
 `self.ctx.queue.submit(...)` calls that bypassed the choke point entirely. The
 counter saw only the final 4-byte logits download. The tell was sitting in the
 data and I walked past it: prefill's "23 submits" was *exactly* the readback count.
@@ -39,7 +39,7 @@ Caught in review by the `github-actions` bot on #255. It was right.
 
 ## What the counters say now that every submit is counted
 
-`GpuLfm2Model` and `WgpuVitOps` now route every submit through `submit_encoder`,
+`GpuLfmModel` and `WgpuVitOps` now route every submit through `submit_encoder`,
 so the count is real. Prompt 512, greedy decode:
 
 | | LFM2-VL-450M **Q4_0** (Mac) | LFM2.5-350M **Q4_K_M** (Mac) | LFM2.5-350M **Q4_K_M** (Adreno) |

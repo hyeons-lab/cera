@@ -560,7 +560,7 @@ fn append_embeddings_advances_position_and_sets_logits() {
 
 /// Parity test: the batched
 /// `Model::forward_prefill_from_embeddings` override on
-/// `Lfm2Model` must produce the same final-frame logits as the
+/// `LfmModel` must produce the same final-frame logits as the
 /// per-frame `forward_from_embedding` loop the trait default
 /// performs. Reduction-order differences between GEMV and GEMM
 /// allow a small epsilon, but the two paths must agree on every
@@ -630,7 +630,7 @@ fn forward_prefill_from_embeddings_matches_per_frame_loop() {
 
 /// Metal counterpart of
 /// [`forward_prefill_from_embeddings_matches_per_frame_loop`]. The
-/// Metal `MetalLfm2Model` override (this PR) and the trait-default
+/// Metal `MetalLfmModel` override (this PR) and the trait-default
 /// per-frame `forward_from_embedding` loop must produce the same
 /// final-frame logits — modulo the f16-K-cache rounding that the
 /// production Metal forward path already absorbs in
@@ -664,12 +664,12 @@ fn metal_forward_prefill_from_embeddings_matches_per_frame_loop() {
         return;
     };
 
-    use cera::model::metal_lfm2::MetalLfm2Model;
+    use cera::model::metal_lfm2::MetalLfmModel;
 
     let gguf_a = cera::gguf::GgufFile::open(&model_path).unwrap();
     let gguf_b = cera::gguf::GgufFile::open(&model_path).unwrap();
-    let model_a = MetalLfm2Model::from_gguf(gguf_a, Some(&model_path), 4096).unwrap();
-    let model_b = MetalLfm2Model::from_gguf(gguf_b, Some(&model_path), 4096).unwrap();
+    let model_a = MetalLfmModel::from_gguf(gguf_a, Some(&model_path), 4096).unwrap();
+    let model_b = MetalLfmModel::from_gguf(gguf_b, Some(&model_path), 4096).unwrap();
     let cfg = model_a.config().clone();
     let hidden_size = cfg.hidden_size;
 
@@ -713,7 +713,7 @@ fn metal_forward_prefill_from_embeddings_matches_per_frame_loop() {
 }
 
 /// Concurrency safety regression: two threads sharing the same
-/// `Arc<MetalLfm2Model>` and running `forward_prefill` simultaneously
+/// `Arc<MetalLfmModel>` and running `forward_prefill` simultaneously
 /// must not corrupt each other's output.
 ///
 /// Before the `infer_lock` was added, the `prefill_batch_buf` /
@@ -755,12 +755,12 @@ fn metal_concurrent_forward_prefill_does_not_corrupt() {
         return;
     };
 
-    use cera::model::metal_lfm2::MetalLfm2Model;
+    use cera::model::metal_lfm2::MetalLfmModel;
 
     // One shared model for the parallel run.
     let gguf = cera::gguf::GgufFile::open(&model_path).unwrap();
-    let shared_model: Arc<MetalLfm2Model> =
-        Arc::new(MetalLfm2Model::from_gguf(gguf, Some(&model_path), 4096).unwrap());
+    let shared_model: Arc<MetalLfmModel> =
+        Arc::new(MetalLfmModel::from_gguf(gguf, Some(&model_path), 4096).unwrap());
     let cfg = shared_model.config().clone();
 
     // Two distinct prompts so we can verify outputs aren't crossed.
@@ -828,7 +828,7 @@ fn metal_in_memory_loading_matches_mmap_parity() {
         return;
     };
 
-    use cera::model::metal_lfm2::MetalLfm2Model;
+    use cera::model::metal_lfm2::MetalLfmModel;
 
     let bytes = std::fs::read(&model_path).unwrap();
     let arc_bytes: Arc<[u8]> = Arc::from(bytes.into_boxed_slice());
@@ -836,8 +836,8 @@ fn metal_in_memory_loading_matches_mmap_parity() {
     let gguf_mmap = cera::gguf::GgufFile::open(&model_path).unwrap();
     let gguf_mem = cera::gguf::GgufFile::from_bytes(Arc::clone(&arc_bytes)).unwrap();
 
-    let model_mmap = MetalLfm2Model::from_gguf(gguf_mmap, Some(&model_path), 2048).unwrap();
-    let model_mem = MetalLfm2Model::from_gguf(gguf_mem, None, 2048).unwrap();
+    let model_mmap = MetalLfmModel::from_gguf(gguf_mmap, Some(&model_path), 2048).unwrap();
+    let model_mem = MetalLfmModel::from_gguf(gguf_mem, None, 2048).unwrap();
 
     let prompt: Vec<u32> = vec![1, 15, 32, 105, 400];
     let mut state_mmap = cera::kv_cache::InferenceState::from_config(model_mmap.config()).unwrap();

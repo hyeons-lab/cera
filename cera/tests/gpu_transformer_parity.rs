@@ -412,7 +412,7 @@ fn check_metal_matches_cpu(
 /// (decoupled head_dim, QKV bias, NORM rope + Granite residual all exercised).
 #[cfg(all(feature = "metal", target_os = "macos"))]
 fn check_metal_profiled_prefill(model_file: &str, prompt: &str) -> Option<Result<(), String>> {
-    use cera::model::metal_lfm2::MetalLfm2Model;
+    use cera::model::metal_lfm2::MetalLfmModel;
 
     let mp = common::models_dir().join(model_file);
     if !mp.exists() {
@@ -431,7 +431,7 @@ fn check_metal_profiled_prefill(model_file: &str, prompt: &str) -> Option<Result
 
     // Separate model instances so the second prefill can't restore the first's
     // prefix cache instead of recomputing.
-    let prod = match MetalLfm2Model::from_llama(GgufFile::open(&mp).expect("open"), Some(&mp), 8192)
+    let prod = match MetalLfmModel::from_llama(GgufFile::open(&mp).expect("open"), Some(&mp), 8192)
     {
         Ok(m) => m,
         Err(e) => {
@@ -439,7 +439,7 @@ fn check_metal_profiled_prefill(model_file: &str, prompt: &str) -> Option<Result
             return None;
         }
     };
-    let prof = MetalLfm2Model::from_llama(GgufFile::open(&mp).expect("open"), Some(&mp), 8192)
+    let prof = MetalLfmModel::from_llama(GgufFile::open(&mp).expect("open"), Some(&mp), 8192)
         .expect("metal load (profiled)");
 
     let cfg = prod.config();

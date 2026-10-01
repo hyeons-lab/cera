@@ -55,7 +55,7 @@ architecture aliases and backend admission rules.
 
 Metal and wgpu support `lfm2`, `lfm2moe`, `llama`, `qwen2`, `qwen3`, `granite`,
 `minicpm`, `minicpm5`, `nanbeige`, `phi3` and `phi`. Qualcomm Hexagon NPU supports
-`lfm2` (`HexagonLfm2Model`). The listed `qwen35`, `mistral3` and `bailingmoe3` families
+`lfm2` (`HexagonLfmModel`). The listed `qwen35`, `mistral3` and `bailingmoe3` families
 use CPU; requesting an unsupported GPU or NPU backend explicitly returns an error.
 Auto selection can fall back to CPU.
 The LFM2 and supported dense-transformer paths use batched-GEMM prefill,

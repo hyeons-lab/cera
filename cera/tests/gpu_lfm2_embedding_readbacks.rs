@@ -1,6 +1,6 @@
 //! An image must cost one GPU readback, not one per patch token.
 //!
-//! `GpuLfm2Model` used to inherit the default `forward_prefill_from_embeddings`
+//! `GpuLfmModel` used to inherit the default `forward_prefill_from_embeddings`
 //! from `model/mod.rs`, which loops `forward_from_embedding` and so ends every
 //! frame in a blocking `download_f32` of a full vocab-sized logits vector. All
 //! but the last were discarded.

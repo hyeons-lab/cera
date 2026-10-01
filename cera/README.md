@@ -236,7 +236,7 @@ The backend embeds prebuilt 16 KB page-aligned Hexagon ELF dynamic libraries (`l
 - **ABI Opcode Alignment**: Realigned `HtpOpCode` discriminants with the upstream DSP firmware ABI (`UnaryStep = 21`, `Sum = 39`, `Cpy = 32`, `Scale = 33`, `Conv1d = 40`, `Snake = 41`), preventing opcode displacement.
 
 ### Accelerated Kernels & Subsystems
-- **LLM Text Generation (`HexagonLfm2Model`)**: 32x32 tiled Q4_0 and Q8_0 matrix repacking for HTP hardware, single-flush forward decode eliminating ~22 synchronization boundaries per token, ping-pong scratch memory isolation across layers, static batch template caching for zero-allocation dispatch, FastRPC latency QoS (`FASTRPC_CONTROL_LATENCY = 100 µs`), and Q8_0 quantized KV cache (~47% memory reduction over F16).
+- **LLM Text Generation (`HexagonLfmModel`)**: 32x32 tiled Q4_0 and Q8_0 matrix repacking for HTP hardware, single-flush forward decode eliminating ~22 synchronization boundaries per token, ping-pong scratch memory isolation across layers, static batch template caching for zero-allocation dispatch, FastRPC latency QoS (`FASTRPC_CONTROL_LATENCY = 100 µs`), and Q8_0 quantized KV cache (~47% memory reduction over F16).
 - **Multimodal Vision Transformer (`HexagonVisionEncoder`)**: Consolidates all 24 ViT blocks into a single FastRPC batch submission with on-NPU Flash Attention, F16 KV scratch handling, and quantized MLP projector dispatch.
 - **Speech Recognition (`HexagonWhisperModel`)**: Partitions 1,500-token audio sequences into 64-token tiles across all Conv1D, LayerNorm, linear GEMM, and GELU dispatches to satisfy Snapdragon 8 Elite's 8 MB physical VTCM hardware ceiling, paired with FlashAttnExt autoregressive decode.
 - **Vocoder & Audio Synthesis (`HexagonAudioDecoder` / `HexagonDepthformer`)**: `HexagonDepthformer` executes all 8 autoregressive passes (48 transformer layers per audio frame) entirely on the NPU using HTP GEMV, RMSNorm, RoPE, and FlashAttnExt, alongside on-DSP audio detokenization (LayerNorm, linear GEMM, SwiGLU, Conv1D), delivering 36.67 tok/s on Snapdragon 8 Elite (1.59x faster than Leap CPU).
@@ -439,7 +439,7 @@ reduction orders can pick opposite sides of a near-tie. It engages only on the
 plain greedy path (`temperature <= 0` or `top_k == 1`, no grammar), with a model
 that reports `supports_all_logits()`, an uncompressed (f32/f16) KV cache, and no
 audio decoder. CPU dense transformers and LFM2, native Metal models, Qualcomm Hexagon
-NPU (`HexagonLfm2Model`), and wgpu models with batched prefill advertise this
+NPU (`HexagonLfmModel`), and wgpu models with batched prefill advertise this
 capability. Speculative decoding defaults to disabled (off) unless explicitly configured
 via `opts.spec` or when a draft sidecar model is present. Setting `opts.no_spec = true`,
 configuring `SessionConfig::disable_spec`, or calling `session.disable_spec()` disables
