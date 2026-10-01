@@ -1651,6 +1651,41 @@ impl From<SpecDecodeConfig> for cera::SpecDecode {
     }
 }
 
+/// How a session with an audio decoder produces output. Mirrors
+/// [`cera::AudioOutputMode`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, uniffi::Enum)]
+pub enum AudioOutputMode {
+    /// Never generate audio (ASR, plain chat).
+    TextOnly,
+    /// Text until the model itself emits `<|audio_start|>`, then audio
+    /// (`Perform TTS.`). Never forces a switch, so it is safe on text turns.
+    #[default]
+    Sequential,
+    /// Alternate text tokens and audio frames at the vocoder's cadence
+    /// (`Respond with interleaved text and audio.`).
+    Interleaved,
+}
+
+impl From<cera::AudioOutputMode> for AudioOutputMode {
+    fn from(m: cera::AudioOutputMode) -> Self {
+        match m {
+            cera::AudioOutputMode::TextOnly => Self::TextOnly,
+            cera::AudioOutputMode::Sequential => Self::Sequential,
+            cera::AudioOutputMode::Interleaved => Self::Interleaved,
+        }
+    }
+}
+
+impl From<AudioOutputMode> for cera::AudioOutputMode {
+    fn from(m: AudioOutputMode) -> Self {
+        match m {
+            AudioOutputMode::TextOnly => Self::TextOnly,
+            AudioOutputMode::Sequential => Self::Sequential,
+            AudioOutputMode::Interleaved => Self::Interleaved,
+        }
+    }
+}
+
 /// Per-call decode options. Mirrors [`cera::GenerateOpts`].
 ///
 /// `flush_every_tokens` / `flush_every_ms` are accepted but have no
@@ -1716,6 +1751,13 @@ pub struct GenerateOpts {
     /// Disable speculative decoding (even when a draft sidecar model is present).
     #[uniffi(default = false)]
     pub no_spec: bool,
+    /// How to produce output when the loaded bundle has an audio decoder. Must
+    /// match the system prompt: `TextOnly` for ASR and plain chat, `Sequential`
+    /// for `Perform TTS.`, `Interleaved` for `Respond with interleaved text and
+    /// audio.`. `None` (the default) is `Sequential`. Ignored for bundles
+    /// without a vocoder.
+    #[uniffi(default = None)]
+    pub audio_mode: Option<AudioOutputMode>,
 }
 
 impl From<&cera::GenerateOpts> for GenerateOpts {
@@ -1738,6 +1780,7 @@ impl From<&cera::GenerateOpts> for GenerateOpts {
             flush_every_ms: core.flush_every_ms,
             spec: core.spec.map(SpecDecodeConfig::from),
             no_spec: core.no_spec,
+            audio_mode: Some(core.audio_mode.into()),
         }
     }
 }
@@ -1785,6 +1828,9 @@ impl TryFrom<GenerateOpts> for cera::GenerateOpts {
             flush_every_ms: o.flush_every_ms,
             spec: o.spec.map(cera::SpecDecode::from),
             no_spec: o.no_spec,
+            audio_mode: o
+                .audio_mode
+                .map_or_else(cera::AudioOutputMode::default, Into::into),
         })
     }
 }

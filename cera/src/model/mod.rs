@@ -78,6 +78,7 @@ pub mod audio_decoder;
 pub mod audio_encoder;
 pub mod audio_encoder_gpu;
 pub mod audio_preprocessor;
+pub mod split_vocoder;
 pub mod vision_encoder;
 pub mod vision_encoder_gpu;
 #[cfg(feature = "vl-preprocess")]

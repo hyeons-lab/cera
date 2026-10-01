@@ -99,6 +99,36 @@ impl Default for SpecDecode {
     }
 }
 
+/// How a session with an audio decoder attached produces output during one
+/// [`Session::generate`] call.
+///
+/// LFM2-Audio models are driven by their system prompt (`Perform ASR.`,
+/// `Perform TTS.`, `Respond with interleaved text and audio.`), and the runtime
+/// has to match it: the model does not signal an interleave switch itself, the
+/// runtime forces "N text tokens, then M audio frames" (see
+/// [`crate::audio_engine::InterleaveCadence`]). A session that interleaves on a
+/// text-only turn corrupts its own context: it injects audio embeddings into the
+/// KV cache mid-answer and resumes text from that.
+///
+/// Has no effect on a session without a vocoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum AudioOutputMode {
+    /// Never generate audio. ASR, plain chat, and anything else that answers in
+    /// text. The decoder is not touched, and a stray `<|audio_start|>` is just a
+    /// token.
+    TextOnly,
+    /// Text until the model itself emits `<|audio_start|>`, then audio until it
+    /// ends. This is how `Perform TTS.` turns run, and a text turn that never
+    /// emits the token behaves exactly like [`Self::TextOnly`]. The default: it
+    /// never forces a switch, so it cannot corrupt a text answer.
+    #[default]
+    Sequential,
+    /// Alternate the vocoder's cadence of text tokens and audio frames
+    /// (`Respond with interleaved text and audio.`). Only correct when the
+    /// prompt asked for interleaved output.
+    Interleaved,
+}
+
 /// Per-call generation options.
 #[derive(Debug, Clone)]
 pub struct GenerateOpts {
@@ -163,6 +193,9 @@ pub struct GenerateOpts {
     pub spec: Option<SpecDecode>,
     /// Explicitly disable speculative decoding for this request.
     pub no_spec: bool,
+    /// How to produce output when the session has an audio decoder attached.
+    /// See [`AudioOutputMode`]. Ignored without a vocoder.
+    pub audio_mode: AudioOutputMode,
 }
 
 impl Default for GenerateOpts {
@@ -183,6 +216,7 @@ impl Default for GenerateOpts {
             flush_every_ms: 50,
             spec: None,
             no_spec: false,
+            audio_mode: AudioOutputMode::default(),
         }
     }
 }
@@ -2948,21 +2982,35 @@ impl Session {
         let mut stopped_token = None;
         let mut used_audio = false;
         let mut began_step = false;
-        let mut decoder =
-            if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
-                let acc_ref = self.audio_accelerator.as_deref();
-                Some(crate::audio_engine::AudioOutputDecoder::new(
-                    dec,
-                    detok,
-                    acc_ref,
-                    0.7,
-                    40,
-                    self.config.gpu_depthformer,
-                ))
-            } else {
-                None
-            };
-        let mut modality_budget = crate::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET;
+        let mut decoder = if opts.audio_mode == AudioOutputMode::TextOnly {
+            None
+        } else if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
+            let acc_ref = self.audio_accelerator.as_deref();
+            Some(crate::audio_engine::AudioOutputDecoder::new(
+                dec,
+                detok,
+                acc_ref,
+                0.7,
+                40,
+                self.config.gpu_depthformer,
+            ))
+        } else {
+            None
+        };
+        let cadence = self
+            .audio_decoder
+            .as_ref()
+            .map(|d| d.interleave)
+            .unwrap_or_default();
+        // Only an interleaved turn forces the text -> audio switch. Every other
+        // mode leaves the text budget unbounded, so the switch happens only when
+        // the model itself emits `<|audio_start|>`.
+        let text_budget = if opts.audio_mode == AudioOutputMode::Interleaved {
+            cadence.text
+        } else {
+            usize::MAX
+        };
+        let mut modality_budget = text_budget;
         let mut text_done = false;
 
         loop {
@@ -3115,7 +3163,7 @@ impl Session {
                     if token == crate::audio_engine::TOKEN_AUDIO_START || text_done {
                         usize::MAX
                     } else {
-                        crate::audio_engine::DEFAULT_INTERLEAVED_AUDIO_BUDGET
+                        cadence.audio
                     };
                 loop {
                     if self.cancel.load(Ordering::Relaxed) {
@@ -3177,7 +3225,7 @@ impl Session {
                             }
                             logits = text_end_logits;
                             pos += 1;
-                            modality_budget = crate::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET;
+                            modality_budget = text_budget;
                             break;
                         }
                         crate::audio_engine::FrameOutcome::Codes {
@@ -3216,7 +3264,7 @@ impl Session {
                             greedy_next = crate::sampler::argmax(&logits);
                         }
                         pos += 1;
-                        modality_budget = crate::audio_engine::DEFAULT_INTERLEAVED_TEXT_BUDGET;
+                        modality_budget = text_budget;
                         break;
                     }
 

@@ -192,6 +192,9 @@ fn greedy_opts(max_tokens: u32) -> cera::GenerateOpts {
         // this harness would report as a parity failure.
         spec: None,
         no_spec: true,
+        // Parity bundles have no vocoder, so the mode is inert; pinned to the
+        // default on both sides so an audio bundle could not diverge them.
+        audio_mode: cera::AudioOutputMode::Sequential,
     }
 }
 
@@ -215,6 +218,7 @@ fn greedy_opts_ffi(max_tokens: u32) -> cera_ffi::GenerateOpts {
         flush_every_ms: settings::FLUSH_EVERY_MS,
         spec: None,
         no_spec: true,
+        audio_mode: Some(cera_ffi::AudioOutputMode::Sequential),
     }
 }
 

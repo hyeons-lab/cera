@@ -260,6 +260,7 @@ class FakeCera implements Cera {
     int? topK,
     int? seed,
     CeraSpecDecode? spec,
+    CeraAudioMode? audioMode,
     void Function(String thought)? onThought,
     void Function(List<double> pcm, int sampleRate)? onAudio,
   }) async* {

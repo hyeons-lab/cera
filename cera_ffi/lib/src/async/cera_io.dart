@@ -247,6 +247,13 @@ class _NativeCera implements Cera {
   bool _closed = false;
   List<int>? _pendingAudioSuffixTokens;
 
+  /// The audio mode implied by the system prompt [appendAudio] last applied, or
+  /// null when none has been. Used by [generate] when the caller passes no
+  /// `audioMode`, so a conversation opened with the default interleaved prompt
+  /// keeps interleaving. Cleared by [reset], which drops that prompt with the
+  /// rest of the conversation.
+  CeraAudioMode? _conversationAudioMode;
+
   /// Completes when the generation currently queued or running has finished.
   ///
   /// Generations are serialized rather than run concurrently or refused. They
@@ -313,6 +320,7 @@ class _NativeCera implements Cera {
     int? topK,
     int? seed,
     CeraSpecDecode? spec,
+    CeraAudioMode? audioMode,
     void Function(String thought)? onThought,
     void Function(List<double> pcm, int sampleRate)? onAudio,
   }) {
@@ -402,6 +410,8 @@ class _NativeCera implements Cera {
         if (topP != null) opts = opts.copyWith(topP: topP);
         if (topK != null) opts = opts.copyWith(topK: topK);
         opts = opts.copyWith(seed: seed);
+        final mode = audioMode ?? _conversationAudioMode;
+        if (mode != null) opts = opts.copyWith(audioMode: _ffiAudioMode(mode));
         if (spec != null) {
           opts = opts.copyWith(
             spec: SpecDecodeConfig(
@@ -531,6 +541,13 @@ class _NativeCera implements Cera {
               : 'Respond to the user.';
       final effectiveSystemPrompt =
           systemPrompt != null ? systemPrompt.trim() : defaultSystemPrompt;
+      // The system prompt only takes effect at the start of a conversation, so
+      // that is also when it fixes the mode the following turns run in.
+      if (_session.position() == 0 && effectiveSystemPrompt.isNotEmpty) {
+        _conversationAudioMode = _audioModeForSystemPrompt(
+          effectiveSystemPrompt,
+        );
+      }
 
       final messages = <ChatMessage>[
         if (_session.position() == 0 && effectiveSystemPrompt.isNotEmpty)
@@ -614,6 +631,7 @@ class _NativeCera implements Cera {
         await ahead;
       } catch (_) {}
       _pendingAudioSuffixTokens = null;
+      _conversationAudioMode = null;
       // Re-checked: `close()` can land during the await above, and reset would
       // then run on a disposed handle and surface the binding's raw error
       // instead of this one.
@@ -748,3 +766,20 @@ class _StreamingSink implements ModalitySink {
     done(error);
   }
 }
+
+/// The audio mode a system prompt asks for. LFM2-Audio models are trained on
+/// exact prompts (`Respond with interleaved text and audio.`, `Perform TTS.`,
+/// `Perform ASR.`), so a substring match is the same signal the model reads.
+/// Anything else answers in text.
+CeraAudioMode _audioModeForSystemPrompt(String systemPrompt) {
+  final p = systemPrompt.toLowerCase();
+  if (p.contains('interleaved')) return CeraAudioMode.interleaved;
+  if (p.contains('tts')) return CeraAudioMode.sequential;
+  return CeraAudioMode.textOnly;
+}
+
+AudioOutputMode _ffiAudioMode(CeraAudioMode mode) => switch (mode) {
+  CeraAudioMode.textOnly => AudioOutputMode.textOnly,
+  CeraAudioMode.sequential => AudioOutputMode.sequential,
+  CeraAudioMode.interleaved => AudioOutputMode.interleaved,
+};

@@ -1301,6 +1301,17 @@ do {
   missing prerequisites return an error. Accepts `sampleRate` from 1000 through
   192000 Hz and resamples to 16 kHz before encoding. Blocking; wrap it in
   `spawn_blocking` / `Task.detached` from an async context.
+- **`GenerateOpts.audioMode`** (`AudioOutputMode`: `TextOnly`, `Sequential`,
+  `Interleaved`; `null` is `Sequential`) says how a bundle **with a vocoder**
+  answers, and must match the system prompt in play: `TextOnly` for
+  `"Perform ASR."` and plain chat, `Sequential` for `"Perform TTS."` (audio starts
+  when the model emits `<|audio_start|>`), `Interleaved` for
+  `"Respond with interleaved text and audio."`. The runtime, not the model,
+  forces the text/audio alternation in an interleaved turn, at the cadence the
+  vocoder declares (`interleaved_n_text` / `interleaved_n_audio`, default 6/12).
+  Interleaving on a text turn corrupts the rest of the answer, which is why it is
+  never the default. Ignored for bundles without a vocoder. `transcribe` pins
+  `TextOnly`.
 
 ## Keyword Spotting & Whisper ASR
 
