@@ -1,4 +1,4 @@
-//! BLAS-path correctness oracle for `Lfm2Model::forward_prefill`.
+//! BLAS-path correctness oracle for `LfmModel::forward_prefill`.
 //!
 //! In the follow-up to PR #61 (this PR), the BLAS arm of
 //! `forward_prefill` was lifted from `cfg(target_arch = "aarch64")`

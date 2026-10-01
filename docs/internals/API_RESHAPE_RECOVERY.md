@@ -180,7 +180,7 @@ whole-message/chat facade. Browser WebGPU recovery still requires an async API.
 | `spec::greedy_generate_spec` in the same file | Drop accepted tokens beyond a stop/budget | Preserve output/position accounting on refusal or recovery |
 | [DSparkSessionDrafter::prepare_draft_step](../../cera/src/model/dspark.rs) | Reset a divergent draft prefix or rewind to synchronized context | Include drafter state and synced token history in session recovery inventory |
 | `DSparkSessionDrafter::draft` in the same file | Restore its local draft prefix | Validate target/context continuity without claiming target-model restoration |
-| [GpuLfm2Model::truncate_kv_direct](../../cera/src/model/gpu_lfm2.rs) | Public direct counter rewind; no in-tree call sites | Retain signature; classify external callers before changing its behavior |
+| [GpuLfmModel::truncate_kv_direct](../../cera/src/model/gpu_lfm2.rs) | Public direct counter rewind; no in-tree call sites | Retain signature; classify external callers before changing its behavior |
 | `Model::truncate_kv` defaults and CPU state `truncate_to` | Existing raw/speculative extension points | Keep available; use checked methods for new recovery guarantees |
 
 Plan37 migrates only user-message rollback. Speculative and drafter failure

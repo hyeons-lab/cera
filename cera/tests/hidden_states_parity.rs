@@ -1,6 +1,6 @@
 //! GPU-vs-CPU parity for per-token hidden-states extraction (`Model::hidden_states`).
 //!
-//! cera's CPU `Lfm2Model::hidden_states` mirrors the llama.cpp `--pooling none`
+//! cera's CPU `LfmModel::hidden_states` mirrors the llama.cpp `--pooling none`
 //! semantics (post-final-RMSNorm last-layer state); the GPU backends (Metal +
 //! wgpu) are verified against that CPU path rather than a separate GPU oracle.
 //! GPU and CPU float accumulation differ, so we compare per-token **cosine

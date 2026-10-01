@@ -433,7 +433,7 @@ impl TokenEmbd {
 }
 
 /// Hexagon NPU accelerated model instance for LFM2 dense hybrid transformers.
-pub struct HexagonLfm2Model {
+pub struct HexagonLfmModel {
     device: Mutex<HexagonDevice>,
     config: ModelConfig,
     session_gate: ModelSessionGate,
@@ -494,8 +494,8 @@ pub struct HexagonLfm2Model {
     greedy_decode_template: Mutex<Option<DecodeTemplate>>,
 }
 
-unsafe impl Send for HexagonLfm2Model {}
-unsafe impl Sync for HexagonLfm2Model {}
+unsafe impl Send for HexagonLfmModel {}
+unsafe impl Sync for HexagonLfmModel {}
 
 enum PrefillInput<'a> {
     Tokens(&'a [u32]),
@@ -521,7 +521,7 @@ enum DecodeResult {
     Greedy(u32),
 }
 
-impl HexagonLfm2Model {
+impl HexagonLfmModel {
     /// Take the device lock for a forward pass. The DSP-resident conv state
     /// and `current_seq_len` persist across calls, so after a panic under the
     /// lock they may be torn: fail closed until `try_reset_kv` rewrites them
@@ -541,7 +541,7 @@ impl HexagonLfm2Model {
         _path: Option<&Path>,
         context_size: usize,
     ) -> Result<Self, CeraError> {
-        let config = crate::model::lfm2::Lfm2Model::parse_config(&gguf, context_size)
+        let config = crate::model::lfm2::LfmModel::parse_config(&gguf, context_size)
             .map_err(|e| CeraError::Backend(e.to_string()))?;
         let hidden_size = config.hidden_size;
         let intermediate_size = config.intermediate_size;
@@ -4901,7 +4901,7 @@ fn run_scratch_chunks_embeddings(
     (consumed, logits)
 }
 
-impl Model for HexagonLfm2Model {
+impl Model for HexagonLfmModel {
     fn config(&self) -> &ModelConfig {
         &self.config
     }

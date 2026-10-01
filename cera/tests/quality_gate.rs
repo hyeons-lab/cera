@@ -21,7 +21,7 @@
 use cera::gguf::GgufFile;
 use cera::kv_cache::{InferenceState, KvCompression};
 use cera::model::Model;
-use cera::model::lfm2::Lfm2Model;
+use cera::model::lfm2::LfmModel;
 use cera::tokenizer::BpeTokenizer;
 
 fn find_lfm2_model() -> Option<std::path::PathBuf> {
@@ -91,7 +91,7 @@ fn test_kv_compression_quality_gate() {
     // One model instance is enough — TurboQuant state now lives entirely on
     // the InferenceState, so the same model can be reused across modes.
     let gguf = GgufFile::open(&model_path).expect("open gguf");
-    let model = Lfm2Model::from_gguf(gguf, 8192).expect("load model");
+    let model = LfmModel::from_gguf(gguf, 8192).expect("load model");
     assert!(model.turboquant_supported(), "TurboQuant not supported");
 
     // Deterministic prompt.

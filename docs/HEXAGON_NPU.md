@@ -88,7 +88,7 @@ The DSP-side worker libraries (`libggml-htp-v{73,75,79,81,85}.so`) are precompil
 
 ## 4. Accelerated Kernels & Subsystems
 
-### 4.1 LLM Text Generation (`HexagonLfm2Model`)
+### 4.1 LLM Text Generation (`HexagonLfmModel`)
 - **32x32 Tiled Weight Repacking**: Weights quantized in Q4_0 and Q8_0 formats are repacked into 32x32 tiles. This layout maps directly to HTP matrix multiplier hardware blocks, maximizing SIMD register utilization and eliminating runtime unpacking overhead.
 - **Single-Flush Forward Decode**: The full forward decode pass (attention projections, multi-head attention, RMSNorm, SwiGLU feed-forward, and residual adds) across all layers is staged into a single contiguous FastRPC batch submission. This removes approximately 22 host-to-DSP synchronization roundtrips per token.
 - **Ping-Pong Scratch Buffering**: Alternating layer buffers (`activation` and `activation_b`, `normed` and `normed_b`) isolate memory access between consecutive layers, preventing data races in the asynchronous DSP execution pipeline.

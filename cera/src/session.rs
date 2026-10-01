@@ -1998,7 +1998,7 @@ impl Session {
     /// Dispatches to [`Model::forward_prefill_from_embeddings`]
     /// in `ubatch`-sized chunks, mirroring
     /// [`Model::forward_prefill_chunked`] for tokens. Backends
-    /// with a true batched embedding-prefill path (CPU `Lfm2Model`)
+    /// with a true batched embedding-prefill path (CPU `LfmModel`)
     /// process a whole chunk per call and amortize per-layer GEMM
     /// dispatch across frames; the trait default falls back to a
     /// per-frame `forward_from_embedding` loop, preserving

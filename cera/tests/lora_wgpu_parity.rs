@@ -1,5 +1,5 @@
-//! wgpu LoRA apply parity: the WGSL LoRA epilogue on `GpuLfm2Model` must match
-//! the CPU `Lfm2Model` LoRA apply, and stay a true no-op when the delta is zero.
+//! wgpu LoRA apply parity: the WGSL LoRA epilogue on `GpuLfmModel` must match
+//! the CPU `LfmModel` LoRA apply, and stay a true no-op when the delta is zero.
 //!
 //! Two properties are pinned:
 //!  1. **Effect parity** — with a non-zero synthetic adapter set on both the CPU
@@ -304,9 +304,9 @@ fn synth_adapter_io_varied(
     LoraAdapterWeights::from_safetensors_bytes(&buf, Some(alpha)).expect("load varied adapter")
 }
 
-/// Batched-prefill LoRA parity: with an adapter active, `GpuLfm2Model`'s
+/// Batched-prefill LoRA parity: with an adapter active, `GpuLfmModel`'s
 /// batched-GEMM `forward_prefill` (in-batch LoRA across all N tokens, two NT
-/// GEMMs per target) must match the CPU `Lfm2Model`'s batched prefill at last-
+/// GEMMs per target) must match the CPU `LfmModel`'s batched prefill at last-
 /// token-logit cosine above 0.99. A wrong GEMM layout (token- vs channel-major),
 /// a transposed/mis-scaled B, a dropped hook, or a conv-layer QKV hook collapses
 /// this well below 0.99. Mirrors Metal's `metal_batched_lora_matches_cpu_prefill`.

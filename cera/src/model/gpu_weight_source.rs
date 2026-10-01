@@ -1,9 +1,9 @@
 //! Backend-agnostic weight accessor surface for the wgpu loader.
 //!
 //! The wgpu transformer model (`gpu_lfm2.rs`) was originally written against
-//! the concrete `Lfm2Model`. To serve the plain dense transformers
+//! the concrete `LfmModel`. To serve the plain dense transformers
 //! (Qwen2/Qwen3/LLaMA/Mistral/Granite) on the same GPU code path, the loader
-//! takes a `&dyn GpuWeightSource` instead, and both `Lfm2Model` and
+//! takes a `&dyn GpuWeightSource` instead, and both `LfmModel` and
 //! `LlamaModel` implement it.
 //!
 //! Everything here is host-side metadata + small F32 weights + `WeightRef`

@@ -1,5 +1,5 @@
-//! Metal LoRA apply parity: the MSL LoRA epilogue on `MetalLfm2Model` must match
-//! the CPU `Lfm2Model` LoRA apply, and stay a true no-op when the delta is zero.
+//! Metal LoRA apply parity: the MSL LoRA epilogue on `MetalLfmModel` must match
+//! the CPU `LfmModel` LoRA apply, and stay a true no-op when the delta is zero.
 //!
 //! Two properties are pinned:
 //!  1. **Effect parity** — with a non-zero synthetic adapter set on both the CPU
@@ -227,9 +227,9 @@ fn prefill_logits(
     model.forward_prefill(tokens, 0, &mut state)
 }
 
-/// Batched-prefill LoRA parity: with an adapter active, `MetalLfm2Model`'s
+/// Batched-prefill LoRA parity: with an adapter active, `MetalLfmModel`'s
 /// batched-GEMM `forward_prefill` (in-batch LoRA, all N tokens) must match the
-/// CPU `Lfm2Model`'s batched prefill at cosine > 0.99 on the last-token logits.
+/// CPU `LfmModel`'s batched prefill at cosine > 0.99 on the last-token logits.
 /// A wrong GEMM layout (token- vs channel-major), a transposed/mis-scaled B, a
 /// dropped hook, or a conv-layer QKV hook collapses this well below 0.99.
 #[test]

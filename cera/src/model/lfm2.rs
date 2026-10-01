@@ -179,9 +179,11 @@ pub struct LayerWeightRefs {
     pub qkv_repacked: std::sync::Arc<std::sync::OnceLock<Option<FusedAttnProjections>>>,
 }
 
-// ── LFM2 Model ─────────────────────────────────────────────────────────────
+// ── LFM Model ──────────────────────────────────────────────────────────────
 
-pub struct Lfm2Model {
+/// The CPU model of the LFM family: `lfm2`, the routed `lfm2moe`, and any later
+/// architecture that shares the hybrid attention + gated-convolution block layout.
+pub struct LfmModel {
     gguf: GgufFile,
     config: ModelConfig,
     // Pre-dequantized small F32 weights
@@ -229,7 +231,7 @@ pub struct Lfm2Model {
 /// *weighted* by `probs` alone, then renormalized to sum to 1. This is the DeepSeek-V3
 /// convention llama.cpp implements in `build_moe_ffn`.
 ///
-/// Split out of [`Lfm2Model::route_experts`] as a pure function purely so this
+/// Split out of [`LfmModel::route_experts`] as a pure function purely so this
 /// rule is directly testable: the bias affects rank only, which means the
 /// returned weights are *not* necessarily descending, and a version that
 /// weights by the biased score produces plausible text while being wrong.
@@ -317,7 +319,7 @@ fn validate_conv_kernel_size(v: Option<usize>) -> anyhow::Result<Option<usize>> 
     Ok(v)
 }
 
-impl Lfm2Model {
+impl LfmModel {
     fn check_rewind_mode(
         &self,
         state: &InferenceState,
@@ -364,7 +366,7 @@ impl Lfm2Model {
             .to_string();
         ensure!(
             arch == "lfm2" || arch == "lfm2moe",
-            "Lfm2Model: unsupported architecture {arch}"
+            "LfmModel: unsupported architecture {arch}"
         );
         let prefix = arch.as_str();
 
@@ -4864,7 +4866,7 @@ impl Lfm2Model {
     }
 }
 
-impl Model for Lfm2Model {
+impl Model for LfmModel {
     fn try_reset_kv(
         &self,
         state: &mut InferenceState,
@@ -5524,7 +5526,7 @@ impl Model for Lfm2Model {
     feature = "gpu",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
-impl crate::model::gpu_weight_source::GpuWeightSource for Lfm2Model {
+impl crate::model::gpu_weight_source::GpuWeightSource for LfmModel {
     fn cache_identity_sources(&self) -> Option<Vec<&GgufFile>> {
         Some(vec![&self.gguf])
     }
@@ -5545,13 +5547,13 @@ impl crate::model::gpu_weight_source::GpuWeightSource for Lfm2Model {
         &self.ffn_norm_weights[layer]
     }
     fn attn_q_norm_weight(&self, layer: usize) -> Option<&[f32]> {
-        Lfm2Model::attn_q_norm_weight(self, layer)
+        LfmModel::attn_q_norm_weight(self, layer)
     }
     fn attn_k_norm_weight(&self, layer: usize) -> Option<&[f32]> {
-        Lfm2Model::attn_k_norm_weight(self, layer)
+        LfmModel::attn_k_norm_weight(self, layer)
     }
     fn conv_weight(&self, layer: usize) -> Option<&[f32]> {
-        Lfm2Model::conv_weight(self, layer)
+        LfmModel::conv_weight(self, layer)
     }
     fn attn_q_bias(&self, _layer: usize) -> Option<&[f32]> {
         None
@@ -5757,7 +5759,7 @@ mod moe_routing_tests {
 
 #[cfg(test)]
 mod loader_tests {
-    use super::Lfm2Model;
+    use super::LfmModel;
     use crate::gguf::GgufFile;
 
     #[test]
@@ -5771,7 +5773,7 @@ mod loader_tests {
         let mut bytes = Vec::new();
         writer.write_header_and_tensor_info(&mut bytes).unwrap();
         let gguf = GgufFile::from_bytes(bytes.into()).unwrap();
-        let err = Lfm2Model::parse_config(&gguf, 32).unwrap_err();
+        let err = LfmModel::parse_config(&gguf, 32).unwrap_err();
         assert!(
             err.to_string()
                 .contains("lfm2.embedding_length must be > 0"),
@@ -5796,8 +5798,8 @@ mod no_repack_tests {
             eprintln!("skipping: {} not present", path.display());
             return;
         }
-        let full = Lfm2Model::from_gguf(GgufFile::open(&path).unwrap(), 64).unwrap();
-        let lite = Lfm2Model::from_gguf_no_repack(GgufFile::open(&path).unwrap(), 64).unwrap();
+        let full = LfmModel::from_gguf(GgufFile::open(&path).unwrap(), 64).unwrap();
+        let lite = LfmModel::from_gguf_no_repack(GgufFile::open(&path).unwrap(), 64).unwrap();
         assert_eq!(full.config.n_layers, lite.config.n_layers);
         assert_eq!(full.config.hidden_size, lite.config.hidden_size);
         assert_eq!(full.layer_refs.len(), lite.layer_refs.len());

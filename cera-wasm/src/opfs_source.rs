@@ -6,7 +6,7 @@ use web_sys::{FileSystemReadWriteOptions, FileSystemSyncAccessHandle};
 
 use cera::gguf::GgufFile;
 use cera::model::gpu_weight_source::{GpuWeightSource, RopeType};
-use cera::model::lfm2::{LayerWeightRefs, Lfm2Model, MoeFfnRefs};
+use cera::model::lfm2::{LayerWeightRefs, LfmModel, MoeFfnRefs};
 use cera::model::transformer::WeightRef;
 use cera::model::{BlockType, ModelConfig};
 use cera::tensor::{DType, Tensor};
@@ -42,11 +42,11 @@ impl OpfsGpuWeightSource {
         gguf: Arc<GgufFile>,
         context_size: usize,
     ) -> Result<Self, JsError> {
-        let config = Lfm2Model::parse_config(&gguf, context_size)
+        let config = LfmModel::parse_config(&gguf, context_size)
             .map_err(|e| JsError::new(&format!("parsing LFM2 config: {e:#}")))?;
         // No CPU repacks: this source only resolves metadata for GPU upload
         // (see `with_repack_if`).
-        let layer_refs = Lfm2Model::resolve_all_layer_refs_with_repack(&gguf, &config, false)
+        let layer_refs = LfmModel::resolve_all_layer_refs_with_repack(&gguf, &config, false)
             .map_err(|e| JsError::new(&format!("resolving layer refs: {e:#}")))?;
         let output_ref = cera::model::transformer::resolve_weight(&gguf, "output.weight").ok();
 
