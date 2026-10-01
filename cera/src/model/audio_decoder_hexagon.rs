@@ -3273,6 +3273,7 @@ mod tests {
                     64,
                 ),
             },
+            interleave: crate::audio_engine::InterleaveCadence::default(),
         };
 
         let plan =

@@ -903,6 +903,13 @@ class ChatController extends ValueNotifier<ChatState> {
         formattedPrompt,
         maxTokens: 512,
         temperature: isTts ? 0.0 : null,
+        // Must match the system prompt for this mode. Interleaving on an ASR or
+        // plain-text turn corrupts the answer.
+        audioMode: switch (mode) {
+          AudioChatMode.interleaved => CeraAudioMode.interleaved,
+          AudioChatMode.textToSpeech => CeraAudioMode.sequential,
+          _ => CeraAudioMode.textOnly,
+        },
         onAudio: shouldStreamAudio
             ? (pcm, rate) {
                 if (rate <= 0 || _disposed || _generationId != generationId) {

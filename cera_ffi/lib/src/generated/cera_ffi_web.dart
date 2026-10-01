@@ -797,6 +797,12 @@ class GenerateOpts {
     this.spec = null,
     /// Disable speculative decoding (even when a draft sidecar model is present).
     this.noSpec = false,
+    /// How to produce output when the loaded bundle has an audio decoder. Must
+    /// match the system prompt: `TextOnly` for ASR and plain chat, `Sequential`
+    /// for `Perform TTS.`, `Interleaved` for `Respond with interleaved text and
+    /// audio.`. `None` (the default) is `Sequential`. Ignored for bundles
+    /// without a vocoder.
+    this.audioMode = null,
   });
 
   final int maxTokens;
@@ -840,6 +846,12 @@ class GenerateOpts {
   final SpecDecodeConfig? spec;
   /// Disable speculative decoding (even when a draft sidecar model is present).
   final bool noSpec;
+  /// How to produce output when the loaded bundle has an audio decoder. Must
+  /// match the system prompt: `TextOnly` for ASR and plain chat, `Sequential`
+  /// for `Perform TTS.`, `Interleaved` for `Respond with interleaved text and
+  /// audio.`. `None` (the default) is `Sequential`. Ignored for bundles
+  /// without a vocoder.
+  final AudioOutputMode? audioMode;
 
   Map<String, dynamic> toJson() {
     return {
@@ -858,6 +870,7 @@ class GenerateOpts {
       'flushEveryMs': this.flushEveryMs,
       'spec': this.spec == null ? null : (() { final __tmp = this.spec!; return __tmp.toJson(); })(),
       'noSpec': this.noSpec,
+      'audioMode': this.audioMode == null ? null : (() { final __tmp = this.audioMode!; return AudioOutputModeFfiCodec.encode(__tmp); })(),
     };
   }
 
@@ -878,6 +891,7 @@ class GenerateOpts {
       flushEveryMs: json.containsKey('flushEveryMs') ? (json['flushEveryMs'] as num).toInt() : 50,
       spec: json.containsKey('spec') ? json['spec'] == null ? null : (() { final __tmp = json['spec']; return SpecDecodeConfig.fromJson(__tmp as Map<String, dynamic>); })() : null,
       noSpec: json.containsKey('noSpec') ? json['noSpec'] as bool : false,
+      audioMode: json.containsKey('audioMode') ? json['audioMode'] == null ? null : (() { final __tmp = json['audioMode']; return AudioOutputModeFfiCodec.decode(__tmp as String); })() : null,
     );
   }
 
@@ -897,6 +911,7 @@ class GenerateOpts {
     int? flushEveryMs,
     Object? spec = _sentinel,
     bool? noSpec,
+    Object? audioMode = _sentinel,
   }) {
     return GenerateOpts(
       maxTokens: maxTokens ?? this.maxTokens,
@@ -914,21 +929,22 @@ class GenerateOpts {
       flushEveryMs: flushEveryMs ?? this.flushEveryMs,
       spec: spec == _sentinel ? this.spec : spec as SpecDecodeConfig?,
       noSpec: noSpec ?? this.noSpec,
+      audioMode: audioMode == _sentinel ? this.audioMode : audioMode as AudioOutputMode?,
     );
   }
 
   @override
   String toString() {
-    return 'GenerateOpts(maxTokens: $maxTokens, seed: $seed, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, ignoreEos: $ignoreEos, grammar: $grammar, grammarTriggerTokens: $grammarTriggerTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs, spec: $spec, noSpec: $noSpec)';
+    return 'GenerateOpts(maxTokens: $maxTokens, seed: $seed, temperature: $temperature, topP: $topP, topK: $topK, minP: $minP, repetitionPenalty: $repetitionPenalty, stopTokens: $stopTokens, ignoreEos: $ignoreEos, grammar: $grammar, grammarTriggerTokens: $grammarTriggerTokens, flushEveryTokens: $flushEveryTokens, flushEveryMs: $flushEveryMs, spec: $spec, noSpec: $noSpec, audioMode: $audioMode)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is GenerateOpts && maxTokens == other.maxTokens && seed == other.seed && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && ignoreEos == other.ignoreEos && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs && spec == other.spec && noSpec == other.noSpec;
+      other is GenerateOpts && maxTokens == other.maxTokens && seed == other.seed && temperature == other.temperature && topP == other.topP && topK == other.topK && minP == other.minP && repetitionPenalty == other.repetitionPenalty && stopTokens == other.stopTokens && ignoreEos == other.ignoreEos && grammar == other.grammar && grammarTriggerTokens == other.grammarTriggerTokens && flushEveryTokens == other.flushEveryTokens && flushEveryMs == other.flushEveryMs && spec == other.spec && noSpec == other.noSpec && audioMode == other.audioMode;
 
   @override
-  int get hashCode => Object.hash(maxTokens, seed, temperature, topP, topK, minP, repetitionPenalty, stopTokens, ignoreEos, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs, spec, noSpec);
+  int get hashCode => Object.hash(maxTokens, seed, temperature, topP, topK, minP, repetitionPenalty, stopTokens, ignoreEos, grammar, grammarTriggerTokens, flushEveryTokens, flushEveryMs, spec, noSpec, audioMode);
 }
 
 /// Bundle of everything a synchronous `generate` call produces:
@@ -2393,6 +2409,19 @@ class SessionRecoveryStatus {
 
   @override
   int get hashCode => Object.hash(usable, position, lastIngestRecovery);
+}
+
+/// How a session with an audio decoder produces output. Mirrors
+/// [`cera::AudioOutputMode`].
+enum AudioOutputMode {
+  /// Never generate audio (ASR, plain chat).
+  textOnly,
+  /// Text until the model itself emits `<|audio_start|>`, then audio
+  /// (`Perform TTS.`). Never forces a switch, so it is safe on text turns.
+  sequential,
+  /// Alternate text tokens and audio frames at the vocoder's cadence
+  /// (`Respond with interleaved text and audio.`).
+  interleaved,
 }
 
 /// Compute-backend selector. Mirrors [`cera::BackendPreference`];
@@ -4468,6 +4497,23 @@ final class LoadErrorExceptionConsumed extends LoadErrorException {
   }
 }
 
+String _encodeAudioOutputMode(AudioOutputMode value) {
+  return switch (value) {
+    AudioOutputMode.textOnly => 'textOnly',
+    AudioOutputMode.sequential => 'sequential',
+    AudioOutputMode.interleaved => 'interleaved',
+  };
+}
+
+AudioOutputMode _decodeAudioOutputMode(String raw) {
+  return switch (raw) {
+    'textOnly' => AudioOutputMode.textOnly,
+    'sequential' => AudioOutputMode.sequential,
+    'interleaved' => AudioOutputMode.interleaved,
+    _ => throw StateError('Unknown AudioOutputMode variant: $raw'),
+  };
+}
+
 String _encodeBackendPreference(BackendPreference value) {
   return switch (value) {
     BackendPreference.auto => 'auto',
@@ -5705,6 +5751,14 @@ LoadErrorException _decodeLoadErrorException(Object? raw) {
     default:
       throw StateError('Unknown LoadErrorException exception tag: $tag');
   }
+}
+
+final class AudioOutputModeFfiCodec {
+  const AudioOutputModeFfiCodec._();
+
+  static String encode(AudioOutputMode value) => _encodeAudioOutputMode(value);
+
+  static AudioOutputMode decode(String raw) => _decodeAudioOutputMode(raw);
 }
 
 final class BackendPreferenceFfiCodec {

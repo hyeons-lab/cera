@@ -13285,6 +13285,14 @@ data class GenerateOpts(
      * Disable speculative decoding (even when a draft sidecar model is present).
      */
     var `noSpec`: kotlin.Boolean = false,
+    /**
+     * How to produce output when the loaded bundle has an audio decoder. Must
+     * match the system prompt: `TextOnly` for ASR and plain chat, `Sequential`
+     * for `Perform TTS.`, `Interleaved` for `Respond with interleaved text and
+     * audio.`. `None` (the default) is `Sequential`. Ignored for bundles
+     * without a vocoder.
+     */
+    var `audioMode`: AudioOutputMode? = null,
 ) {
     companion object
 }
@@ -13310,6 +13318,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
             FfiConverterUInt.read(buf),
             FfiConverterOptionalTypeSpecDecodeConfig.read(buf),
             FfiConverterBoolean.read(buf),
+            FfiConverterOptionalTypeAudioOutputMode.read(buf),
         )
 
     override fun allocationSize(value: GenerateOpts) =
@@ -13328,7 +13337,8 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
                 FfiConverterUInt.allocationSize(value.`flushEveryTokens`) +
                 FfiConverterUInt.allocationSize(value.`flushEveryMs`) +
                 FfiConverterOptionalTypeSpecDecodeConfig.allocationSize(value.`spec`) +
-                FfiConverterBoolean.allocationSize(value.`noSpec`)
+                FfiConverterBoolean.allocationSize(value.`noSpec`) +
+                FfiConverterOptionalTypeAudioOutputMode.allocationSize(value.`audioMode`)
         )
 
     override fun write(
@@ -13350,6 +13360,7 @@ public object FfiConverterTypeGenerateOpts : FfiConverterRustBuffer<GenerateOpts
         FfiConverterUInt.write(value.`flushEveryMs`, buf)
         FfiConverterOptionalTypeSpecDecodeConfig.write(value.`spec`, buf)
         FfiConverterBoolean.write(value.`noSpec`, buf)
+        FfiConverterOptionalTypeAudioOutputMode.write(value.`audioMode`, buf)
     }
 }
 
@@ -14383,6 +14394,55 @@ public object FfiConverterTypeUserMessage : FfiConverterRustBuffer<UserMessage> 
         FfiConverterOptionalString.write(value.`text`, buf)
         FfiConverterSequenceByteArray.write(value.`images`, buf)
         FfiConverterOptionalTypeAudioInput.write(value.`audio`, buf)
+    }
+}
+
+/**
+ * How a session with an audio decoder produces output. Mirrors
+ * [`cera::AudioOutputMode`].
+ */
+
+enum class AudioOutputMode {
+    /**
+     * Never generate audio (ASR, plain chat).
+     */
+    TEXT_ONLY,
+
+    /**
+     * Text until the model itself emits `<|audio_start|>`, then audio
+     * (`Perform TTS.`). Never forces a switch, so it is safe on text turns.
+     */
+    SEQUENTIAL,
+
+    /**
+     * Alternate text tokens and audio frames at the vocoder's cadence
+     * (`Respond with interleaved text and audio.`).
+     */
+    INTERLEAVED,
+
+    ;
+
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeAudioOutputMode : FfiConverterRustBuffer<AudioOutputMode> {
+    override fun read(buf: ByteBuffer) =
+        try {
+            AudioOutputMode.values()[buf.getInt() - 1]
+        } catch (e: IndexOutOfBoundsException) {
+            throw RuntimeException("invalid enum value, something is very wrong!!", e)
+        }
+
+    override fun allocationSize(value: AudioOutputMode) = 4UL
+
+    override fun write(
+        value: AudioOutputMode,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.ordinal + 1)
     }
 }
 
@@ -17500,6 +17560,38 @@ public object FfiConverterOptionalTypeSpecDecodeConfig : FfiConverterRustBuffer<
         } else {
             buf.put(1)
             FfiConverterTypeSpecDecodeConfig.write(value, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterOptionalTypeAudioOutputMode : FfiConverterRustBuffer<AudioOutputMode?> {
+    override fun read(buf: ByteBuffer): AudioOutputMode? {
+        if (buf.get().toInt() == 0) {
+            return null
+        }
+        return FfiConverterTypeAudioOutputMode.read(buf)
+    }
+
+    override fun allocationSize(value: AudioOutputMode?): ULong {
+        if (value == null) {
+            return 1UL
+        } else {
+            return 1UL + FfiConverterTypeAudioOutputMode.allocationSize(value)
+        }
+    }
+
+    override fun write(
+        value: AudioOutputMode?,
+        buf: ByteBuffer,
+    ) {
+        if (value == null) {
+            buf.put(0)
+        } else {
+            buf.put(1)
+            FfiConverterTypeAudioOutputMode.write(value, buf)
         }
     }
 }

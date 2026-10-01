@@ -5559,6 +5559,94 @@ class _UniffiFfiConverterOptionalTypeSpecDecodeConfig(_UniffiConverterRustBuffer
         else:
             raise InternalError("Unexpected flag byte for optional type")
 
+
+
+
+
+
+class AudioOutputMode(enum.Enum):
+    """
+    How a session with an audio decoder produces output. Mirrors
+    [`cera::AudioOutputMode`].
+"""
+    
+    TEXT_ONLY = 0
+    """
+    Never generate audio (ASR, plain chat).
+"""
+    
+    SEQUENTIAL = 1
+    """
+    Text until the model itself emits `<|audio_start|>`, then audio
+    (`Perform TTS.`). Never forces a switch, so it is safe on text turns.
+"""
+    
+    INTERLEAVED = 2
+    """
+    Alternate text tokens and audio frames at the vocoder's cadence
+    (`Respond with interleaved text and audio.`).
+"""
+    
+
+
+class _UniffiFfiConverterTypeAudioOutputMode(_UniffiConverterRustBuffer):
+    @staticmethod
+    def read(buf):
+        variant = buf.read_i32()
+        if variant == 1:
+            return AudioOutputMode.TEXT_ONLY
+        if variant == 2:
+            return AudioOutputMode.SEQUENTIAL
+        if variant == 3:
+            return AudioOutputMode.INTERLEAVED
+        raise InternalError("Raw enum value doesn't match any cases")
+
+    @staticmethod
+    def check_lower(value):
+        if value == AudioOutputMode.TEXT_ONLY:
+            return
+        if value == AudioOutputMode.SEQUENTIAL:
+            return
+        if value == AudioOutputMode.INTERLEAVED:
+            return
+        raise ValueError(value)
+
+    @staticmethod
+    def write(value, buf):
+        if value == AudioOutputMode.TEXT_ONLY:
+            buf.write_i32(1)
+        if value == AudioOutputMode.SEQUENTIAL:
+            buf.write_i32(2)
+        if value == AudioOutputMode.INTERLEAVED:
+            buf.write_i32(3)
+
+
+
+class _UniffiFfiConverterOptionalTypeAudioOutputMode(_UniffiConverterRustBuffer):
+    @classmethod
+    def check_lower(cls, value):
+        if value is not None:
+            _UniffiFfiConverterTypeAudioOutputMode.check_lower(value)
+
+    @classmethod
+    def write(cls, value, buf):
+        if value is None:
+            buf.write_u8(0)
+            return
+
+        buf.write_u8(1)
+        _UniffiFfiConverterTypeAudioOutputMode.write(value, buf)
+
+    @classmethod
+    def read(cls, buf):
+        flag = buf.read_u8()
+        if flag == 0:
+            return None
+        elif flag == 1:
+            return _UniffiFfiConverterTypeAudioOutputMode.read(buf)
+        else:
+            raise InternalError("Unexpected flag byte for optional type")
+
 @dataclass
 class GenerateOpts:
     """
@@ -5570,7 +5658,7 @@ class GenerateOpts:
     in a follow-up PR. Including them in the record now keeps the FFI
     surface stable across that transition.
 """
-    def __init__(self, *, max_tokens:int = 256, seed:typing.Optional[int] = _DEFAULT, temperature:float = 0.7, top_p:float = 0.9, top_k:int = 40, min_p:float = 0.05, repetition_penalty:float = 1.1, stop_tokens:typing.List[int] = _DEFAULT, ignore_eos:bool = False, grammar:typing.Optional[str] = _DEFAULT, grammar_trigger_tokens:typing.List[int] = _DEFAULT, flush_every_tokens:int = 16, flush_every_ms:int = 50, spec:typing.Optional[SpecDecodeConfig] = _DEFAULT, no_spec:bool = False):
+    def __init__(self, *, max_tokens:int = 256, seed:typing.Optional[int] = _DEFAULT, temperature:float = 0.7, top_p:float = 0.9, top_k:int = 40, min_p:float = 0.05, repetition_penalty:float = 1.1, stop_tokens:typing.List[int] = _DEFAULT, ignore_eos:bool = False, grammar:typing.Optional[str] = _DEFAULT, grammar_trigger_tokens:typing.List[int] = _DEFAULT, flush_every_tokens:int = 16, flush_every_ms:int = 50, spec:typing.Optional[SpecDecodeConfig] = _DEFAULT, no_spec:bool = False, audio_mode:typing.Optional[AudioOutputMode] = _DEFAULT):
         self.max_tokens = max_tokens
         if seed is _DEFAULT:
             self.seed = None
@@ -5601,12 +5689,16 @@ class GenerateOpts:
         else:
             self.spec = spec
         self.no_spec = no_spec
+        if audio_mode is _DEFAULT:
+            self.audio_mode = None
+        else:
+            self.audio_mode = audio_mode
         
         
 
     
     def __str__(self):
-        return "GenerateOpts(max_tokens={}, seed={}, temperature={}, top_p={}, top_k={}, min_p={}, repetition_penalty={}, stop_tokens={}, ignore_eos={}, grammar={}, grammar_trigger_tokens={}, flush_every_tokens={}, flush_every_ms={}, spec={}, no_spec={})".format(self.max_tokens, self.seed, self.temperature, self.top_p, self.top_k, self.min_p, self.repetition_penalty, self.stop_tokens, self.ignore_eos, self.grammar, self.grammar_trigger_tokens, self.flush_every_tokens, self.flush_every_ms, self.spec, self.no_spec)
+        return "GenerateOpts(max_tokens={}, seed={}, temperature={}, top_p={}, top_k={}, min_p={}, repetition_penalty={}, stop_tokens={}, ignore_eos={}, grammar={}, grammar_trigger_tokens={}, flush_every_tokens={}, flush_every_ms={}, spec={}, no_spec={}, audio_mode={})".format(self.max_tokens, self.seed, self.temperature, self.top_p, self.top_k, self.min_p, self.repetition_penalty, self.stop_tokens, self.ignore_eos, self.grammar, self.grammar_trigger_tokens, self.flush_every_tokens, self.flush_every_ms, self.spec, self.no_spec, self.audio_mode)
     def __eq__(self, other):
         if self.max_tokens != other.max_tokens:
             return False
@@ -5638,6 +5730,8 @@ class GenerateOpts:
             return False
         if self.no_spec != other.no_spec:
             return False
+        if self.audio_mode != other.audio_mode:
+            return False
         return True
 
 class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
@@ -5659,6 +5753,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
             flush_every_ms=_UniffiFfiConverterUInt32.read(buf),
             spec=_UniffiFfiConverterOptionalTypeSpecDecodeConfig.read(buf),
             no_spec=_UniffiFfiConverterBoolean.read(buf),
+            audio_mode=_UniffiFfiConverterOptionalTypeAudioOutputMode.read(buf),
         )
 
     @staticmethod
@@ -5678,6 +5773,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.check_lower(value.flush_every_ms)
         _UniffiFfiConverterOptionalTypeSpecDecodeConfig.check_lower(value.spec)
         _UniffiFfiConverterBoolean.check_lower(value.no_spec)
+        _UniffiFfiConverterOptionalTypeAudioOutputMode.check_lower(value.audio_mode)
 
     @staticmethod
     def write(value, buf):
@@ -5696,6 +5792,7 @@ class _UniffiFfiConverterTypeGenerateOpts(_UniffiConverterRustBuffer):
         _UniffiFfiConverterUInt32.write(value.flush_every_ms, buf)
         _UniffiFfiConverterOptionalTypeSpecDecodeConfig.write(value.spec, buf)
         _UniffiFfiConverterBoolean.write(value.no_spec, buf)
+        _UniffiFfiConverterOptionalTypeAudioOutputMode.write(value.audio_mode, buf)
 
 class _UniffiFfiConverterFloat64(_UniffiConverterPrimitiveFloat):
     @staticmethod
@@ -16078,6 +16175,7 @@ __all__ = [
     "SessionPhase",
     "ValidationError",
     "FfiError",
+    "AudioOutputMode",
     "FinishReason",
     "RecoveryOutcome",
     "KvRewindFailure",

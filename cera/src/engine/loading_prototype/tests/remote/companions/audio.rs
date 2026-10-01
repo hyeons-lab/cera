@@ -31,6 +31,9 @@ fn render(session: &mut Session) -> Sink {
                 temperature: 0.0,
                 max_tokens: 6,
                 ignore_eos: true,
+                // The turn ends on the interleave switch after 6 text tokens;
+                // a vocoder only runs when the caller asks for audio output.
+                audio_mode: crate::AudioOutputMode::Interleaved,
                 ..GenerateOpts::default()
             },
             &mut sink,

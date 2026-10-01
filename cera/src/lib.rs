@@ -91,8 +91,8 @@ pub use session::chat::{
 };
 pub use session::checkpoint::{ChatCheckpoint, SessionCheckpoint};
 pub use session::{
-    CeraError, FinishReason, GenerateOpts, GenerateSummary, ModalityCapabilities, ModalitySink,
-    Session, SessionConfig, SpecDecode,
+    AudioOutputMode, CeraError, FinishReason, GenerateOpts, GenerateSummary, ModalityCapabilities,
+    ModalitySink, Session, SessionConfig, SpecDecode,
 };
 pub use sysmem::{available_memory_bytes, fits_in_available_memory};
 pub use vad::{SileroVad, SpeechTimestamp, VadConfig, VadEvent, VadIterator, VadSampleRate};

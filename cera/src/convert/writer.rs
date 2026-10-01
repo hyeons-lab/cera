@@ -121,6 +121,11 @@ impl GgufWriter {
         self.metadata.get(key)
     }
 
+    /// Add a pre-typed metadata key-value pair.
+    pub fn add_metadata(&mut self, key: impl Into<String>, val: MetadataValue) {
+        self.metadata.insert(key.into(), val);
+    }
+
     /// Add a string metadata key-value pair.
     pub fn add_string(&mut self, key: impl Into<String>, val: impl Into<String>) {
         self.metadata
