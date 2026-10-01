@@ -130,6 +130,41 @@ export interface Capabilities {
 }
 "#;
 
+#[wasm_bindgen(typescript_custom_section)]
+const TS_AUDIO_PROFILE: &'static str = r#"
+/**
+ * One speaker an audio model understands. `prompt` is the phrase that selects
+ * the voice and doubles as its stable identifier (save it as the user's
+ * choice). The two `*SystemPrompt` fields are complete: pass one as the system
+ * message as-is, never assemble a prompt from parts.
+ */
+export interface TtsVoice {
+    readonly label: string;
+    readonly prompt: string;
+    readonly ttsSystemPrompt: string;
+    readonly interleavedSystemPrompt: string;
+}
+
+/**
+ * What an audio model needs to be told to speak, returned by
+ * `CeraEngine.audioProfile` and `WebGpuSession.audioProfile`. Mirrors the
+ * `AudioProfile` record of the JVM/Apple bindings (cera-ffi).
+ *
+ * The system prompt that selects text-to-speech or interleaved output differs
+ * per model, and a voice the model was not trained on makes it answer in text
+ * with no audio, so the prompts and voices come from cera, not the app.
+ * `voices` empty means the model has none: send `ttsSystemPrompt` as-is.
+ * `sampleTexts` carry `{model}` where the model's display name goes, and are
+ * empty when the app should use its own generic samples.
+ */
+export interface AudioProfile {
+    readonly ttsSystemPrompt: string;
+    readonly interleavedSystemPrompt: string;
+    readonly voices: readonly TtsVoice[];
+    readonly sampleTexts: readonly string[];
+}
+"#;
+
 /// TS declaration for the `ModelMetadata` record. See `TS_CAPABILITIES`
 /// for why these interfaces are hand-declared rather than derived.
 #[wasm_bindgen(typescript_custom_section)]
@@ -165,6 +200,11 @@ extern "C" {
     /// destructuring (`const { audioIn } = engine.capabilities`).
     #[wasm_bindgen(typescript_type = "Capabilities")]
     pub type Capabilities;
+
+    /// Opaque type-label wrapper for the `AudioProfile` record: a plain JS
+    /// object whose shape the `.d.ts` declares (see `TS_AUDIO_PROFILE`).
+    #[wasm_bindgen(typescript_type = "AudioProfile")]
+    pub type AudioProfileJs;
 
     /// Opaque type-label wrapper for the `ModelMetadata` interface above,
     /// same arrangement as `Capabilities`.
@@ -220,6 +260,52 @@ fn capabilities_to_js(caps: cera::ModalityCapabilities) -> Capabilities {
     set_bool("imageIn", caps.image_in);
     set_bool("audioIn", caps.audio_in);
     set_bool("audioOut", caps.audio_out);
+    JsValue::from(obj).unchecked_into()
+}
+
+/// Build a JS-side `AudioProfile` from a cera core `AudioProfile`. Used by both
+/// `CeraEngine.audioProfile` and `WebGpuSession.audioProfile` so the field set
+/// and naming stay in lock-step.
+fn audio_profile_to_js(profile: &cera::AudioProfile) -> AudioProfileJs {
+    // `Reflect::set` only fails when the target isn't an object, and every
+    // target here is one we just made.
+    let set = |obj: &js_sys::Object, key: &str, value: JsValue| {
+        let _ = js_sys::Reflect::set(obj, &JsValue::from_str(key), &value);
+    };
+    let voices = js_sys::Array::new();
+    for v in &profile.voices {
+        let voice = js_sys::Object::new();
+        set(&voice, "label", JsValue::from_str(&v.label));
+        set(&voice, "prompt", JsValue::from_str(&v.prompt));
+        set(
+            &voice,
+            "ttsSystemPrompt",
+            JsValue::from_str(&v.tts_system_prompt),
+        );
+        set(
+            &voice,
+            "interleavedSystemPrompt",
+            JsValue::from_str(&v.interleaved_system_prompt),
+        );
+        voices.push(&voice);
+    }
+    let samples = js_sys::Array::new();
+    for s in &profile.sample_texts {
+        samples.push(&JsValue::from_str(s));
+    }
+    let obj = js_sys::Object::new();
+    set(
+        &obj,
+        "ttsSystemPrompt",
+        JsValue::from_str(&profile.tts_system_prompt),
+    );
+    set(
+        &obj,
+        "interleavedSystemPrompt",
+        JsValue::from_str(&profile.interleaved_system_prompt),
+    );
+    set(&obj, "voices", voices.into());
+    set(&obj, "sampleTexts", samples.into());
     JsValue::from(obj).unchecked_into()
 }
 
@@ -460,6 +546,7 @@ impl CeraEngine {
                 .map(cera::manifest::InferenceType::parse_str),
             chat_template: None,
             generation_defaults: None,
+            audio_profile: None,
         };
         cera::CeraEngine::from_parts(parts, cfg)
             .map(|inner| CeraEngine {
@@ -604,6 +691,16 @@ impl CeraEngine {
     #[wasm_bindgen(getter)]
     pub fn capabilities(&self) -> Capabilities {
         capabilities_to_js(self.inner.capabilities())
+    }
+
+    /// What this model needs to be told to speak: the system prompts, voices
+    /// and sample text for text-to-speech and interleaved output (see
+    /// `AudioProfile`). Resolved by cera from the bundle manifest, so an app
+    /// never hardcodes one model's prompt or voices. Meaningful when
+    /// `capabilities.audioOut` is true; a generic profile otherwise.
+    #[wasm_bindgen(getter, js_name = audioProfile)]
+    pub fn audio_profile(&self) -> AudioProfileJs {
+        audio_profile_to_js(&self.inner.audio_profile())
     }
 
     /// Requested context-window size (KV cache cap) the engine was
@@ -2831,8 +2928,9 @@ pub(crate) fn validate_webgpu_checkpoint(
 #[cfg(feature = "wgpu")]
 mod webgpu {
     use super::{
-        Capabilities, Tokenizer, capabilities_to_js, compression_fingerprint_tag, console_info,
-        console_warn, effective_compression, map_err, validate_webgpu_checkpoint,
+        AudioProfileJs, Capabilities, Tokenizer, audio_profile_to_js, capabilities_to_js,
+        compression_fingerprint_tag, console_info, console_warn, effective_compression, map_err,
+        validate_webgpu_checkpoint,
     };
     use cera::model::Model;
     use cera::time::Instant;
@@ -2884,6 +2982,8 @@ mod webgpu {
         drafter: Option<Box<dyn cera::spec::Drafter>>,
         /// Human-readable model and quantization label.
         model_label: String,
+        /// Speech-output prompts, voices and sample text for this model.
+        audio_profile: cera::AudioProfile,
         /// Generation defaults from the bundle manifest.
         generation_defaults: Option<cera::manifest::GenerationDefaults>,
         cancel: Arc<std::sync::atomic::AtomicBool>,
@@ -3124,6 +3224,7 @@ mod webgpu {
                 image_max_long_size: None,
                 drafter: None,
                 model_label: "custom GGUF".to_string(),
+                audio_profile: cera::AudioProfile::generic(),
                 generation_defaults: None,
                 cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                 sampler: None,
@@ -3270,6 +3371,7 @@ mod webgpu {
                     image_max_long_size: None,
                     drafter: None,
                     model_label: format!("{bundle_id} ({quant})"),
+                    audio_profile: crate::bundle::profile_of(&manifest),
                     generation_defaults: Some(manifest.generation_defaults.clone()),
                     cancel: Arc::new(std::sync::atomic::AtomicBool::new(false)),
                     sampler: None,
@@ -3385,6 +3487,9 @@ mod webgpu {
                     .await?;
                     session.model_label = format!("{bundle_id} ({quant})");
                     session.generation_defaults = parts.generation_defaults;
+                    if let Some(profile) = parts.audio_profile {
+                        session.audio_profile = profile;
+                    }
                     if let Some(mmproj) = parts.multimodal_projector {
                         session.attach_projector(mmproj)?;
                     }
@@ -3664,6 +3769,13 @@ mod webgpu {
         #[wasm_bindgen(getter, js_name = audioOut)]
         pub fn audio_out(&self) -> bool {
             self.audio_decoder.is_some() && self.detok_weights.is_some()
+        }
+
+        /// Speech-output prompts, voices and sample text for this model, same
+        /// shape as `CeraEngine.audioProfile` on the CPU path.
+        #[wasm_bindgen(getter, js_name = audioProfile)]
+        pub fn audio_profile(&self) -> AudioProfileJs {
+            audio_profile_to_js(&self.audio_profile)
         }
 
         /// Modality capability flags for this session, same shape as
@@ -4994,6 +5106,40 @@ mod tests {
             inner: Some(inner),
             hidden_size,
         }
+    }
+
+    /// The worker copies these fields by name, so a rename here breaks it silently.
+    #[wasm_bindgen_test]
+    fn the_audio_profile_reaches_js_with_the_fields_the_worker_reads() {
+        let get =
+            |obj: &JsValue, key: &str| js_sys::Reflect::get(obj, &JsValue::from_str(key)).unwrap();
+        let en: JsValue =
+            audio_profile_to_js(&cera::AudioProfile::for_model("LFM2.5-Audio-1.5B-GGUF")).into();
+        assert_eq!(
+            get(&en, "ttsSystemPrompt").as_string().unwrap(),
+            "Perform TTS. Use the US female voice."
+        );
+        let voices: js_sys::Array = get(&en, "voices").into();
+        assert_eq!(voices.length(), 4);
+        let first = voices.get(0);
+        assert_eq!(
+            get(&first, "prompt").as_string().unwrap(),
+            "Use the US female voice."
+        );
+        assert_eq!(
+            get(&first, "interleavedSystemPrompt").as_string().unwrap(),
+            "Respond with interleaved text and audio. Use the US female voice."
+        );
+
+        // The Japanese release has no voices: the picker must have nothing to offer.
+        let jp: JsValue =
+            audio_profile_to_js(&cera::AudioProfile::for_model("LFM2.5-Audio-1.5B-JP-GGUF")).into();
+        assert_eq!(
+            get(&jp, "ttsSystemPrompt").as_string().unwrap(),
+            "Perform TTS in japanese."
+        );
+        assert_eq!(js_sys::Array::from(&get(&jp, "voices")).length(), 0);
+        assert_eq!(js_sys::Array::from(&get(&jp, "sampleTexts")).length(), 4);
     }
 
     #[wasm_bindgen_test]

@@ -2703,7 +2703,22 @@ mod tests {
             std::thread::yield_now();
         }
         assert!(landed, "rebuild for allowance set2 never landed");
-        assert!(!rebuild_pools_for_allowance(&set2));
+        // Probing the same set again is a no-op once the pools track it. Not a
+        // bare assert: `set2` is off-ambient, so an ambient resize from a
+        // session or engine test (they run outside the serial lock) can pull a
+        // pool back between the two calls, and one pool that was mid-dispatch
+        // during the landing is still owed its swap. Each `true` is progress
+        // toward tracking, so retry like the staging helpers do.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+        let mut settled = false;
+        while std::time::Instant::now() <= deadline {
+            if !rebuild_pools_for_allowance(&set2) {
+                settled = true;
+                break;
+            }
+            std::thread::yield_now();
+        }
+        assert!(settled, "probing allowance set2 again never became a no-op");
     }
 
     #[test]

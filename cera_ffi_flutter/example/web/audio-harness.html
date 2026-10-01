@@ -115,7 +115,12 @@ document.getElementById('run').onclick = async () => {
     const tk = session.tokenizer;
     const promptText = document.getElementById('prompt').value;
     const messages = [
-      { role: 'system', content: 'Respond with interleaved text and audio.' },
+      {
+        role: 'system',
+        content:
+          session.audioProfile?.interleavedSystemPrompt ??
+          'Respond with interleaved text and audio.',
+      },
       { role: 'user', content: promptText },
     ];
     let formatted;

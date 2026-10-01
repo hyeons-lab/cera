@@ -665,6 +665,62 @@ impl From<cera::ModalityCapabilities> for ModalityCapabilities {
     }
 }
 
+/// One speaker an audio model understands. Mirrors [`cera::TtsVoice`].
+///
+/// `prompt` is the phrase that selects the voice and doubles as its stable
+/// identifier (save it as the user's choice). The two `*_system_prompt` fields
+/// are complete: pass one as the system message as-is, never assemble a prompt
+/// from parts.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TtsVoice {
+    pub label: String,
+    pub prompt: String,
+    pub tts_system_prompt: String,
+    pub interleaved_system_prompt: String,
+}
+
+/// What an audio model needs to be told to speak. Mirrors [`cera::AudioProfile`].
+///
+/// The system prompt that selects text-to-speech or interleaved output differs
+/// per model, and a voice the model was not trained on makes it answer in text
+/// with no audio. So the prompts and the voices a model accepts come from cera,
+/// not from the app: the bundle manifest's own `audio_profile`, else cera's
+/// built-in registry, else plain `Perform TTS.` with no voices.
+///
+/// `voices` empty means the model has no voices: send `tts_system_prompt` as-is.
+/// `sample_texts` carry `{model}` where the model's display name goes, and are
+/// empty when the app should use its own generic samples.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AudioProfile {
+    /// System prompt for text-to-speech with no voice chosen (the first voice's,
+    /// or the bare prompt when there are no voices).
+    pub tts_system_prompt: String,
+    /// The same for interleaved text-and-audio replies.
+    pub interleaved_system_prompt: String,
+    pub voices: Vec<TtsVoice>,
+    pub sample_texts: Vec<String>,
+}
+
+impl From<cera::AudioProfile> for AudioProfile {
+    fn from(p: cera::AudioProfile) -> Self {
+        AudioProfile {
+            tts_system_prompt: p.tts_system_prompt,
+            interleaved_system_prompt: p.interleaved_system_prompt,
+            voices: p
+                .voices
+                .into_iter()
+                .map(|v| TtsVoice {
+                    label: v.label,
+                    prompt: v.prompt,
+                    tts_system_prompt: v.tts_system_prompt,
+                    interleaved_system_prompt: v.interleaved_system_prompt,
+                })
+                .collect(),
+            sample_texts: p.sample_texts,
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // ChatMessage (PR 13 — chat template input)
 // ---------------------------------------------------------------------------
@@ -1210,6 +1266,7 @@ impl CeraEngine {
                 .map(cera::manifest::InferenceType::parse_str),
             chat_template: None,
             generation_defaults: None,
+            audio_profile: None,
         };
         let inner = cera::CeraEngine::from_parts(parts, config.try_into()?)?;
         Ok(Arc::new(Self {
@@ -1255,6 +1312,13 @@ impl CeraEngine {
     /// load time from the manifest's `inference_type`.
     pub fn capabilities(&self) -> ModalityCapabilities {
         self.inner.capabilities().into()
+    }
+
+    /// The system prompts, voices and sample text this model needs for speech
+    /// output (see [`AudioProfile`]). Meaningful when
+    /// [`ModalityCapabilities::audio_out`] is set; a generic profile otherwise.
+    pub fn audio_profile(&self) -> AudioProfile {
+        self.inner.audio_profile().into()
     }
 
     /// Transcribe mono `f32` PCM audio (normalized to roughly `[-1.0, 1.0]`) to text using the
@@ -3538,6 +3602,7 @@ impl CeraEngine {
                     .map(cera::manifest::InferenceType::parse_str),
                 chat_template: None,
                 generation_defaults: None,
+                audio_profile: None,
             };
             cera::CeraEngine::from_parts(parts, cera_config)
         })
@@ -4398,6 +4463,35 @@ impl PiiClassifier {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The record carries cera's resolved profile field for field: every voice
+    /// keeps the complete prompts cera built, so a client never assembles one.
+    #[test]
+    fn audio_profile_record_mirrors_the_core_profile() {
+        let core = cera::AudioProfile::for_model("LFM2.5-Audio-1.5B-GGUF");
+        let ffi = AudioProfile::from(core.clone());
+        assert_eq!(ffi.tts_system_prompt, core.tts_system_prompt);
+        assert_eq!(
+            ffi.interleaved_system_prompt,
+            core.interleaved_system_prompt
+        );
+        assert_eq!(ffi.voices.len(), 4);
+        assert_eq!(ffi.voices[1].label, core.voices[1].label);
+        assert_eq!(ffi.voices[1].prompt, "Use the US male voice.");
+        assert_eq!(
+            ffi.voices[1].tts_system_prompt,
+            "Perform TTS. Use the US male voice."
+        );
+        assert_eq!(
+            ffi.voices[1].interleaved_system_prompt,
+            "Respond with interleaved text and audio. Use the US male voice."
+        );
+
+        let jp = AudioProfile::from(cera::AudioProfile::for_model("LFM2.5-Audio-1.5B-JP-GGUF"));
+        assert_eq!(jp.tts_system_prompt, "Perform TTS in japanese.");
+        assert!(jp.voices.is_empty());
+        assert_eq!(jp.sample_texts.len(), 4);
+    }
 
     /// Pins the FFI `arch` wire strings end to end: the literals plus the
     /// field mapping in `probe_info_from` (a hardcoded `arch` or swapped

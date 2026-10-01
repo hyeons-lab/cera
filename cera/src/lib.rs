@@ -30,6 +30,7 @@ pub fn build_info() -> String {
 }
 
 pub mod audio_engine;
+pub mod audio_profile;
 pub mod backend;
 pub mod bundle;
 pub mod classifier;
@@ -69,6 +70,7 @@ pub use audio_pipeline::{
     AudioPipeline, AudioPipelineBuilder, AudioPipelineConfig, AudioPipelineEvent,
     AudioPipelineState,
 };
+pub use audio_profile::{AudioProfile, TtsVoice};
 pub use backend::cpu_features::{CpuFeatures, CpuTier, cpu_features, cpu_tier};
 pub use classifier::{
     BioesPrefix, EntitySpan, detect_pii, extract_spans, parse_bioes, viterbi_decode,

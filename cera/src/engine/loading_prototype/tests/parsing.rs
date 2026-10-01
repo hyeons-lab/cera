@@ -125,6 +125,57 @@ fn non_utf8_primary_preserves_bare_path_failure_and_explicit_files_success() {
     .unwrap();
 }
 
+/// A bytes load has no manifest to read, so the loader hands the engine the
+/// profile it resolved (the browser's bundle path does exactly this). Model-free,
+/// so it runs on every PR.
+#[test]
+fn a_profile_handed_to_a_bytes_load_is_what_the_engine_reports() {
+    let bytes = tiny_llama();
+    let jp = crate::AudioProfile::for_model("LFM2.5-Audio-1.5B-JP-GGUF");
+    assert_ne!(
+        jp,
+        crate::AudioProfile::generic(),
+        "the control must differ"
+    );
+
+    let mut parts = ModelBytes::text(bytes.clone());
+    parts.audio_profile = Some(jp.clone());
+    let engine = CeraEngine::from_parts(parts, cpu_config()).unwrap();
+    assert_eq!(engine.audio_profile(), jp);
+
+    let engine = CeraEngine::from_parts(ModelBytes::text(bytes), cpu_config()).unwrap();
+    assert_eq!(engine.audio_profile(), crate::AudioProfile::generic());
+}
+
+/// The manifest-resolved path through a real load: the engine reads its profile
+/// from the model's file name (resolved to an absolute path by then, in a
+/// directory that says nothing about the release) and from a malformed
+/// `audio_profile` falls back to the registry, warning once however often the
+/// profile is read.
+#[cfg(feature = "mmap")]
+#[test]
+fn the_engine_resolves_its_profile_once_from_the_loaded_manifest() {
+    let directory = tempfile::tempdir().unwrap();
+    let name = "LFM2.5-Audio-1.5B-JP-Q8_0.gguf";
+    std::fs::write(directory.path().join(name), tiny_llama()).unwrap();
+    let mut manifest = filesystem::manifest(name);
+    manifest["audio_profile"] = serde_json::json!({"tts_system_prompt": 5});
+    let manifest = filesystem::write_manifest(directory.path(), &manifest);
+    let engine = CeraEngine::from_path(&manifest, cpu_config()).unwrap();
+
+    let mut seen = Vec::new();
+    let warned = crate::audio_profile::tests::warnings_of(|| {
+        for _ in 0..3 {
+            seen.push(engine.audio_profile());
+        }
+    });
+    assert!(
+        seen.iter()
+            .all(|p| p.tts_system_prompt == "Perform TTS in japanese.")
+    );
+    assert_eq!(warned.len(), 1, "{warned:?}");
+}
+
 #[test]
 fn memory_primary_is_parsed_once() {
     let bytes = tiny_llama();

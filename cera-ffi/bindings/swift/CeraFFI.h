@@ -399,6 +399,11 @@ RustBuffer uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template(uint64_t ptr
 RustBuffer uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template_with_tools(uint64_t ptr, RustBuffer messages, RustBuffer tools, int8_t add_generation_prompt, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_AUDIO_PROFILE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_AUDIO_PROFILE
+RustBuffer uniffi_cera_ffi_fn_method_ceraengine_audio_profile(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_BOS_TOKEN
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_CERAENGINE_BOS_TOKEN
 RustBuffer uniffi_cera_ffi_fn_method_ceraengine_bos_token(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -1841,6 +1846,12 @@ uint16_t uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_APPLY_CHAT_TEMPLATE_WITH_TOOLS
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_APPLY_CHAT_TEMPLATE_WITH_TOOLS
 uint16_t uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_AUDIO_PROFILE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_CERAENGINE_AUDIO_PROFILE
+uint16_t uniffi_cera_ffi_checksum_method_ceraengine_audio_profile(void
     
 );
 #endif

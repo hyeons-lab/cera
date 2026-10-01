@@ -132,6 +132,7 @@ class ChatController extends ValueNotifier<ChatState> {
     value = value.copyWith(
       loadedModel: () => null,
       capabilities: () => null,
+      audioProfile: () => null,
       backend: () => null,
       status: 'Model unloaded.',
       isLoading: false,
@@ -164,13 +165,13 @@ class ChatController extends ValueNotifier<ChatState> {
         'textOnly' => AudioChatMode.textOnly,
         _ => AudioChatMode.interleaved,
       };
+      // Empty means "the loaded model's own default voice": which voices exist
+      // is the model's business (see `CeraAudioProfile`), not the app's.
       final chatVoice =
           prefs.getString('cera_chat_voice') ??
           prefs.getString('cera_tts_voice') ??
-          'Use the US female voice.';
-      final ttsStudioVoice =
-          prefs.getString('cera_tts_studio_voice') ??
-          'Use the US female voice.';
+          '';
+      final ttsStudioVoice = prefs.getString('cera_tts_studio_voice') ?? '';
       final restoredSettings = ChatSettings(
         backend: backend,
         turboQuant: turboQuant,
@@ -228,7 +229,7 @@ class ChatController extends ValueNotifier<ChatState> {
         : (intent.maxImageLongSize ?? current.maxImageLongSize);
     final newAudioMode = intent.audioChatMode ?? current.audioChatMode;
     final newChatVoice = intent.clearChatVoice
-        ? 'Use the US female voice.'
+        ? ''
         : (intent.chatVoice ?? current.chatVoice);
     final newTtsStudioVoice = intent.ttsStudioVoice ?? current.ttsStudioVoice;
 
@@ -464,6 +465,7 @@ class ChatController extends ValueNotifier<ChatState> {
       value = value.copyWith(
         loadedModel: () => modelSource,
         capabilities: () => cera.capabilities,
+        audioProfile: () => cera.audioProfile,
         backend: () => cera.backend,
         status: '${modelSource.name} · ${cera.backend}$visionTag$voiceTag',
         isLoading: false,
@@ -495,6 +497,7 @@ class ChatController extends ValueNotifier<ChatState> {
           loadedModel: () => null,
           backend: () => null,
           capabilities: () => null,
+          audioProfile: () => null,
           downloadFraction: () => null,
           status: 'Failed to load: $err',
         );
@@ -609,6 +612,7 @@ class ChatController extends ValueNotifier<ChatState> {
         settings: value.settings,
         uiMode: value.uiMode,
         isAudioPrompt: false,
+        profile: cera.audioProfile,
       );
       final messages = <CeraMessage>[
         if (systemPrompt != null) CeraMessage.system(systemPrompt),
@@ -800,6 +804,7 @@ class ChatController extends ValueNotifier<ChatState> {
       settings: value.settings,
       uiMode: value.uiMode,
       isAudioPrompt: true,
+      profile: cera.audioProfile,
     );
 
     try {
@@ -1185,25 +1190,34 @@ class ChatController extends ValueNotifier<ChatState> {
     return settings;
   }
 
+  /// The system prompt for the current audio mode, or `null` when it needs none.
+  ///
+  /// The prompt and the voice persona come from the loaded model's [profile]:
+  /// a persona the model does not list is dropped, because an unknown one makes
+  /// it answer in text and never speak.
   @visibleForTesting
   static String? systemPromptFor({
     required ChatSettings settings,
     required AppUIMode uiMode,
+    required CeraAudioProfile profile,
     bool isAudioPrompt = false,
   }) {
     final rawPersona = uiMode == AppUIMode.ttsStudio
         ? settings.ttsStudioVoice
         : settings.chatVoice;
     final voicePersona = rawPersona.trim();
-    final personaSuffix = voicePersona.isNotEmpty ? ' $voicePersona' : '';
-    final mode = settings.audioChatMode;
-    if (mode == AudioChatMode.interleaved) {
-      return 'Respond with interleaved text and audio.$personaSuffix'.trim();
+    switch (settings.audioChatMode) {
+      case AudioChatMode.interleaved:
+        return profile.interleavedSystemPromptFor(voicePersona);
+      case AudioChatMode.textToSpeech when !isAudioPrompt:
+        return profile.ttsSystemPromptFor(voicePersona);
+      // A voice note with no system prompt falls back to the model's
+      // interleaved one and would be answered with speech.
+      case AudioChatMode.textOnly when isAudioPrompt:
+        return ceraTextOnlySystemPrompt;
+      default:
+        return null;
     }
-    if (mode == AudioChatMode.textToSpeech && !isAudioPrompt) {
-      return 'Perform TTS.$personaSuffix'.trim();
-    }
-    return null;
   }
 
   @override

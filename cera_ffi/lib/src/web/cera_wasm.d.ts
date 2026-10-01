@@ -66,6 +66,40 @@ export interface ToolCall {
 
 
 /**
+ * One speaker an audio model understands. `prompt` is the phrase that selects
+ * the voice and doubles as its stable identifier (save it as the user's
+ * choice). The two `*SystemPrompt` fields are complete: pass one as the system
+ * message as-is, never assemble a prompt from parts.
+ */
+export interface TtsVoice {
+    readonly label: string;
+    readonly prompt: string;
+    readonly ttsSystemPrompt: string;
+    readonly interleavedSystemPrompt: string;
+}
+
+/**
+ * What an audio model needs to be told to speak, returned by
+ * `CeraEngine.audioProfile` and `WebGpuSession.audioProfile`. Mirrors the
+ * `AudioProfile` record of the JVM/Apple bindings (cera-ffi).
+ *
+ * The system prompt that selects text-to-speech or interleaved output differs
+ * per model, and a voice the model was not trained on makes it answer in text
+ * with no audio, so the prompts and voices come from cera, not the app.
+ * `voices` empty means the model has none: send `ttsSystemPrompt` as-is.
+ * `sampleTexts` carry `{model}` where the model's display name goes, and are
+ * empty when the app should use its own generic samples.
+ */
+export interface AudioProfile {
+    readonly ttsSystemPrompt: string;
+    readonly interleavedSystemPrompt: string;
+    readonly voices: readonly TtsVoice[];
+    readonly sampleTexts: readonly string[];
+}
+
+
+
+/**
  * Summary of a loaded model, returned by `CeraEngine.metadata`.
  * Mirrors the `ModelMetadata` record the JVM/Apple bindings
  * (cera-ffi) expose, so cross-platform consumers read the same
@@ -194,14 +228,14 @@ export class BundleRepo {
 }
 
 /**
- * Loaded inference engine - wraps `cera::CeraEngine` with sync access
+ * Loaded inference engine — wraps `cera::CeraEngine` with sync access
  * to model metadata and the tokenizer.
  *
  * JS callers fetch the GGUF (e.g. via `fetch().arrayBuffer()`), pass
  * the bytes to `CeraEngine.fromGgufBytes`, and use the returned
  * handle to read model info or pull a `Tokenizer`. Session-based
  * inference (`generate`, streaming) is intentionally not exposed yet
- * - that shape needs an async/streaming design that lives in a
+ * — that shape needs an async/streaming design that lives in a
  * follow-up PR.
  *
  * **Memory:** the loaded GGUF stays resident in wasm linear memory
@@ -242,7 +276,7 @@ export class CeraEngine {
      * to 4096 if omitted; the actual KV-cache cap is the smaller of
      * the requested size and the model's own `max_seq_len`.
      *
-     * The backend is forced to CPU - wasm has no native GPU/Metal
+     * The backend is forced to CPU — wasm has no native GPU/Metal
      * backend. Throws on parse failure, unsupported quantization,
      * or unrecognized architecture.
      */
@@ -291,7 +325,7 @@ export class CeraEngine {
     newChatSession(config: SessionConfig): ChatSession;
     /**
      * Construct a new `Session` for this engine. The `config`
-     * freezes per-session knobs - sampler `seed`, `nKeep`
+     * freezes per-session knobs — sampler `seed`, `nKeep`
      * pinned-prefix size, `ubatchSize` chunked-prefill batch,
      * `maxSeqLen` KV cap. For the cera defaults
      * (`maxSeqLen = null` → engine's effective cap, i.e.
@@ -299,7 +333,7 @@ export class CeraEngine {
      * `seed = null`, `ubatchSize = 512`), pass a freshly-
      * constructed `new SessionConfig()`.
      *
-     * `config` is **borrowed**, not consumed - JS callers can
+     * `config` is **borrowed**, not consumed — JS callers can
      * reuse the same `SessionConfig` across multiple `newSession`
      * calls. Inner state is cloned per-session at the boundary.
      * This mirrors how `Session.generate` borrows `GenerateOpts`.
@@ -348,7 +382,7 @@ export class CeraEngine {
      * `true` when the GGUF declares `tokenizer.ggml.add_bos_token`.
      * Callers that hand-build a token sequence from `Tokenizer.encode`
      * should prepend `Tokenizer.bosToken` when this is `true` (and
-     * the model has a BOS) - cera's encoder returns the raw tokens
+     * the model has a BOS) — cera's encoder returns the raw tokens
      * without that prefix.
      */
     readonly addBosToken: boolean;
@@ -362,6 +396,14 @@ export class CeraEngine {
      * (e.g. `"lfm2"`, `"llama"`).
      */
     readonly architecture: string;
+    /**
+     * What this model needs to be told to speak: the system prompts, voices
+     * and sample text for text-to-speech and interleaved output (see
+     * `AudioProfile`). Resolved by cera from the bundle manifest, so an app
+     * never hardcodes one model's prompt or voices. Meaningful when
+     * `capabilities.audioOut` is true; a generic profile otherwise.
+     */
+    readonly audioProfile: AudioProfile;
     /**
      * Modality capability flags reported by the loaded model.
      * See the `Capabilities` interface in the generated `.d.ts`
@@ -381,7 +423,7 @@ export class CeraEngine {
     /**
      * Requested context-window size (KV cache cap) the engine was
      * configured with. Mirrors what `fromGgufBytes(bytes,
-     * contextSize)` resolved to - i.e. the value of `contextSize`
+     * contextSize)` resolved to — i.e. the value of `contextSize`
      * you passed in, or `4096` if you omitted it. Unlike
      * `cera-ffi`'s `EngineConfig::try_from`, the wasm load path
      * has no `0` → `maxSeqLen` translation: a `contextSize` of `0`
@@ -392,7 +434,7 @@ export class CeraEngine {
      * per-session ceiling. cera core clamps the model's
      * `maxSeqLen` at load time to `min(contextSize,
      * gguf_max_seq_len)`, so `engine.maxSeqLen` is already the
-     * effective ceiling - `contextSize` is informational ("what
+     * effective ceiling — `contextSize` is informational ("what
      * cap did I load with?") rather than a value to `Math.min`
      * against `maxSeqLen` at call sites.
      */
@@ -406,7 +448,7 @@ export class CeraEngine {
     readonly hasChatTemplate: boolean;
     /**
      * Maximum sequence length the model was trained for. Independent
-     * of the engine's `contextSize` config - that one is the KV
+     * of the engine's `contextSize` config — that one is the KV
      * cache cap, this is the model's positional encoding ceiling.
      */
     readonly maxSeqLen: number;
@@ -424,7 +466,7 @@ export class CeraEngine {
     /**
      * Returns a `Tokenizer` handle bound to this engine's vocab.
      * Each call allocates a fresh JS object but the underlying
-     * tokenizer state is shared via `Arc` - cheap to call, JS
+     * tokenizer state is shared via `Arc` — cheap to call, JS
      * callers can cache the result if they prefer one handle.
      */
     readonly tokenizer: Tokenizer;
@@ -655,7 +697,7 @@ export class GenerateSummary {
     readonly decodeMs: number;
     /**
      * Why decode ended. One of `"MaxTokens"`, `"Stop"`,
-     * `"Cancelled"`, `"ContextFull"`, or `"Error(<message>)"` -
+     * `"Cancelled"`, `"ContextFull"`, or `"Error(<message>)"` —
      * the `Error(...)` form preserves the inner string verbatim
      * (no surrounding quotes), so JS callers can log it directly.
      */
@@ -729,7 +771,7 @@ export class LoadConfig {
 
 /**
  * A loaded LoRA adapter, ready to attach to a [`Session`] via `attachLora`.
- * Load it once (from bytes - the browser has no filesystem) and reuse the
+ * Load it once (from bytes — the browser has no filesystem) and reuse the
  * handle across sessions; the factors are reference-counted internally.
  */
 export class LoraAdapters {
@@ -795,7 +837,7 @@ export class LoraStack {
  * and pass them to `Manifest.parse`. The wrapper exposes the typed
  * fields cera already understands; the raw `serde_json::Value`
  * retained on the inner `cera::manifest::Manifest` is intentionally
- * **not** exposed here - JS callers can re-parse the JSON themselves
+ * **not** exposed here — JS callers can re-parse the JSON themselves
  * for forward-compat fields, and we don't want to commit to a
  * `serde-wasm-bindgen` round-trip on every getter.
  */
@@ -807,7 +849,7 @@ export class Manifest {
      * Parse a JSON manifest from raw bytes. Throws a `JsError` on
      * malformed JSON or when required fields are missing or wrongly
      * typed (e.g. no `load_time_parameters.model`). Unknown
-     * `inference_type` values are **not** an error - they round-trip
+     * `inference_type` values are **not** an error — they round-trip
      * through `cera::manifest::InferenceType::Unknown(String)` and
      * surface verbatim via the `inferenceType` getter, so JS callers
      * can decide how to react instead of catching here.
@@ -819,6 +861,11 @@ export class Manifest {
     readonly audioDecoderUrl: string | undefined;
     /**
      * URL of the audio-tokenizer checkpoint (typically `.safetensors`).
+     *
+     * `undefined` when the manifest does not name one, as for a llama.cpp
+     * split-layout vocoder (`vocoder-*.gguf`): its detokenizer lives in the
+     * sibling `tokenizer-*.gguf`, and callers assembling their own `ModelParts`
+     * must fetch that file.
      */
     readonly audioTokenizerUrl: string | undefined;
     /**
@@ -834,7 +881,7 @@ export class Manifest {
     /**
      * Raw `inference_type` string (e.g. `llama.cpp/text-to-text`).
      * Round-trips through cera's enum, so unknown variants come back
-     * as their original string - no information loss.
+     * as their original string — no information loss.
      */
     readonly inferenceType: string;
     /**
@@ -885,7 +932,19 @@ export class ModelParts {
     constructor(model: Uint8Array);
     get audio_decoder(): Uint8Array | undefined;
     set audio_decoder(value: Uint8Array | null | undefined);
+    /**
+     * The audio detokenizer backbone. A llama.cpp split-layout vocoder
+     * (`vocoder-*.gguf`) does not carry it: fetch its sibling `tokenizer-*.gguf`
+     * and pass it here, or the model loads without audio output. The bundle
+     * loaders do this for you.
+     */
     get audio_tokenizer(): Uint8Array | undefined;
+    /**
+     * The audio detokenizer backbone. A llama.cpp split-layout vocoder
+     * (`vocoder-*.gguf`) does not carry it: fetch its sibling `tokenizer-*.gguf`
+     * and pass it here, or the model loads without audio output. The bundle
+     * loaders do this for you.
+     */
     set audio_tokenizer(value: Uint8Array | null | undefined);
     get chat_template(): string | undefined;
     set chat_template(value: string | null | undefined);
@@ -935,7 +994,7 @@ export class SamplingDefaults {
  *
  * **Worker note:** `generate` is synchronous and will block the
  * thread it runs on for the duration of decode (potentially
- * seconds). On the browser main thread that freezes the page -
+ * seconds). On the browser main thread that freezes the page —
  * always call from a Web Worker. On Node it also blocks the JS
  * event loop (libuv's background I/O thread pool keeps running,
  * but JS callbacks queue): use `worker_threads` for server
@@ -943,7 +1002,7 @@ export class SamplingDefaults {
  * one-off scripts are fine to run sync.
  *
  * **Cancellation:** since the worker thread is blocked inside
- * `generate`, the worker's own `onmessage` handler can't run -
+ * `generate`, the worker's own `onmessage` handler can't run —
  * incoming `postMessage({kind:'cancel'})` queues but doesn't
  * dispatch until `generate` returns, so a flag set by that
  * handler can't be updated mid-decode. Do not call `session.cancel()` or
@@ -1219,9 +1278,9 @@ export class SessionConfig {
     constructor();
     /**
      * KV cache compression configuration. `null` (default) stores
-     * keys and values as f32 - best fidelity, biggest memory
+     * keys and values as f32 — best fidelity, biggest memory
      * footprint. Set to a `TurboQuantConfig` to **request**
-     * TurboQuant compression - keys to ~3 bits/elem, values to
+     * TurboQuant compression — keys to ~3 bits/elem, values to
      * ~2 bits/elem (plus a norm word per vector); the same `seed`
      * reproduces the same per-layer Hadamard rotations
      * deterministically.
@@ -1231,14 +1290,14 @@ export class SessionConfig {
      *   attention `head_dim` is a power of two (a constraint of
      *   the Hadamard rotation). If it isn't, cera logs a warning
      *   and falls back to the uncompressed f32 path even with
-     *   this set - there's no JS-visible error, just no
+     *   this set — there's no JS-visible error, just no
      *   compression.
      * - `nKeep` (context-shift) is incompatible with TurboQuant.
      *   Setting both gets a warning at session creation and the
      *   `nKeep` value is ignored on KV overflow (the cache
      *   overflows hard instead of shifting). Pick one.
      * - This config drives the CPU session. `WebGpuSession` takes
-     *   no `SessionConfig` - it accepts its own `kvCompression`
+     *   no `SessionConfig` — it accepts its own `kvCompression`
      *   argument on `create` instead, and its `kvCompression`
      *   getter reports the mode that actually took effect. Its
      *   `head_dim` constraint is stricter than the CPU's: a power
@@ -1248,8 +1307,8 @@ export class SessionConfig {
      *
      * Setting this consumes the JS-side `TurboQuantConfig`
      * handle (wasm-bindgen's `Option<T>` parameter shape). Read
-     * back via the getter - which returns a fresh handle that's
-     * a snapshot, not a live link - if you need to inspect the
+     * back via the getter — which returns a fresh handle that's
+     * a snapshot, not a live link — if you need to inspect the
      * current config without affecting it.
      *
      * Assign a fresh config per session. Reusing an already-
@@ -1257,13 +1316,13 @@ export class SessionConfig {
      * wasm-bindgen lowers it to pointer 0, which arrives as
      * `None`, so the second session silently gets uncompressed
      * KV. (A `--dev` build does throw "Attempt to use a moved
-     * value" - so this is a bug that only appears in release.)
+     * value" — so this is a bug that only appears in release.)
      */
     get kvCompression(): TurboQuantConfig | undefined;
     set kvCompression(value: TurboQuantConfig | null | undefined);
     /**
      * Cap on total tokens held in KV. `null` (the common case)
-     * defers to the engine's effective max - i.e.
+     * defers to the engine's effective max — i.e.
      * `min(engine.contextSize, model.maxSeqLen)`. Set to a
      * smaller value here to further lower the cap; values larger
      * than the engine's effective max are still capped at it.
@@ -1271,14 +1330,14 @@ export class SessionConfig {
     get maxSeqLen(): number | undefined;
     set maxSeqLen(value: number | null | undefined);
     /**
-     * Number of leading tokens pinned in KV across context shifts -
+     * Number of leading tokens pinned in KV across context shifts —
      * a system prompt or persistent prefix that should survive
      * when the cache fills. `0` (default) disables the pin.
      */
     nKeep: number;
     /**
      * Deterministic sampler seed. `null` (default) uses a fresh
-     * random seed per session - set this to make a session's
+     * random seed per session — set this to make a session's
      * outputs reproducible across runs (useful for testing /
      * demos / regression checks).
      */
@@ -1300,7 +1359,7 @@ export class SessionConfig {
  *
  * Round-trip note: `decode(encode(text))` is **not** guaranteed to
  * be byte-identical to `text` for inputs containing tokens that
- * don't survive BPE merge replay (rare in practice - BOS/EOS,
+ * don't survive BPE merge replay (rare in practice — BOS/EOS,
  * some byte-level edge cases). When you need exact reproduction,
  * keep the original string around.
  */
@@ -1336,19 +1395,19 @@ export class Tokenizer {
     applyChatTemplateWithTools(messages: ChatMessage[], tools_json: string, add_generation_prompt?: boolean | null): string;
     /**
      * Detokenize back to a UTF-8 string. Lossy for tokens whose
-     * byte sequences don't decode to valid UTF-8 - those are
+     * byte sequences don't decode to valid UTF-8 — those are
      * replaced with U+FFFD per `String::from_utf8_lossy`.
      */
     decode(tokens: Uint32Array): string;
     /**
      * Tokenize a UTF-8 string. Returns the token IDs as a
-     * `Uint32Array`. No BOS/EOS prefix - callers that want them
+     * `Uint32Array`. No BOS/EOS prefix — callers that want them
      * should prepend `bosToken` / append `eosToken` manually, or use
      * `encodeSpecial`.
      */
     encode(text: string): Uint32Array;
     /**
-     * Encode with optional special markers - the analog of llama.cpp's
+     * Encode with optional special markers — the analog of llama.cpp's
      * `llama_tokenize(..., add_special)`. When `addSpecial` is true, BOS is
      * prepended iff the GGUF declares `tokenizer.ggml.add_bos_token` and EOS
      * appended iff it declares `tokenizer.ggml.add_eos_token`, so token counts
@@ -1359,9 +1418,9 @@ export class Tokenizer {
      * `true` when `id` is registered as a control or user-defined
      * special token in the model's GGUF metadata
      * (`tokenizer.ggml.token_type` types `3` / `4`). Useful for
-     * output filtering - e.g. dropping `<|im_end|>` from a
+     * output filtering — e.g. dropping `<|im_end|>` from a
      * `Session.generate` token-callback batch before joining the
-     * IDs into UI-rendered text - and for token-class
+     * IDs into UI-rendered text — and for token-class
      * classification in analysis tools.
      *
      * Out-of-range IDs (>= vocab size) and regular vocab tokens
@@ -1413,7 +1472,7 @@ export class Tokenizer {
     /**
      * Raw embedded Jinja chat template from the GGUF metadata, if
      * any. Most callers should use [`Self::apply_chat_template`]
-     * (`applyChatTemplate` in JS) instead - this getter is for
+     * (`applyChatTemplate` in JS) instead — this getter is for
      * inspection or for callers who want to render with a
      * different Jinja runtime.
      */
@@ -1452,7 +1511,7 @@ export enum ToolFormat {
  * - **Values**: 2-bit PolarQuant only (2 bits/elem + a packed
  *   norm word per vector).
  *
- * `seed` drives the per-layer randomized Hadamard rotations -
+ * `seed` drives the per-layer randomized Hadamard rotations —
  * the same seed produces the same rotations deterministically,
  * so a seeded session with TurboQuant on stays bitwise-
  * reproducible across runs.
@@ -1620,8 +1679,8 @@ export class WebGpuSession {
      * Setting this **consumes** the JS-side `TurboQuantConfig` handle
      * (wasm-bindgen's by-value `Option<T>` parameter shape), exactly like
      * the `SessionConfig.kvCompression` setter. Build a fresh config per
-     * session: reusing one across two `create` calls - two sessions, or a
-     * retry after a failed load - does **not** throw in a release build.
+     * session: reusing one across two `create` calls — two sessions, or a
+     * retry after a failed load — does **not** throw in a release build.
      * wasm-bindgen lowers an already-moved handle to pointer 0, which
      * arrives in Rust as `None`, so the second session silently runs
      * uncompressed. That makes handle reuse a third silent-downgrade cause
@@ -1635,7 +1694,7 @@ export class WebGpuSession {
      * keys *and* values together. Anything else falls back to uncompressed
      * KV. The engine records that as a `tracing::warn!`, and `cera-wasm`
      * installs no tracing subscriber, so **nothing reaches the browser
-     * console** - read the `kvCompression` getter to see what took effect.
+     * console** — read the `kvCompression` getter to see what took effect.
      */
     static create(bytes: Uint8Array, context_size?: number | null, kv_compression?: TurboQuantConfig | null): Promise<WebGpuSession>;
     /**
@@ -1758,6 +1817,11 @@ export class WebGpuSession {
      */
     readonly audioOut: boolean;
     /**
+     * Speech-output prompts, voices and sample text for this model, same
+     * shape as `CeraEngine.audioProfile` on the CPU path.
+     */
+    readonly audioProfile: AudioProfile;
+    /**
      * Modality capability flags for this session, same shape as
      * `Session.capabilities` on the CPU path.
      */
@@ -1771,7 +1835,7 @@ export class WebGpuSession {
      * The KV-cache mode this session actually resolved to:
      * `"turboquant(seed=N)"` or `"uncompressed"`.
      *
-     * Read this after `create` to confirm a TurboQuant request was honored -
+     * Read this after `create` to confirm a TurboQuant request was honored —
      * a downgrade is silent in the browser, so this is the only JS-visible
      * signal that compression is off. See `create` for what causes one.
      */
@@ -1830,7 +1894,7 @@ export class WebGpuSession {
 /**
  * Returns the version of the `cera` core library this binding wraps.
  *
- * Note this is **`cera`'s** version, not `cera-wasm`'s - JS callers
+ * Note this is **`cera`'s** version, not `cera-wasm`'s — JS callers
  * usually want to know what core lib is driving the engine, since
  * the wrapper crate version may evolve independently.
  */
@@ -1878,7 +1942,7 @@ export function listLeapBundles(): Promise<any>;
 
 /**
  * Parse tool calls out of generated model text. Returns a JSON string
- * encoding an array of `ToolCall` (`[{name, arguments}]`) - `JSON.parse` it.
+ * encoding an array of `ToolCall` (`[{name, arguments}]`) — `JSON.parse` it.
  * An empty array means the reply had no tool call.
  */
 export function parseToolCalls(text: string, format: ToolFormat): string;
@@ -1990,6 +2054,7 @@ export interface InitOutput {
     readonly ceraengine_addBosToken: (a: number) => number;
     readonly ceraengine_addEosToken: (a: number) => number;
     readonly ceraengine_architecture: (a: number, b: number) => void;
+    readonly ceraengine_audioProfile: (a: number) => number;
     readonly ceraengine_capabilities: (a: number) => number;
     readonly ceraengine_contextSize: (a: number) => number;
     readonly ceraengine_defaultGenerateOpts: (a: number) => number;
@@ -2179,6 +2244,7 @@ export interface InitOutput {
     readonly webgpusession_appendTokens: (a: number, b: number, c: number, d: number) => void;
     readonly webgpusession_audioIn: (a: number) => number;
     readonly webgpusession_audioOut: (a: number) => number;
+    readonly webgpusession_audioProfile: (a: number) => number;
     readonly webgpusession_cancel: (a: number) => void;
     readonly webgpusession_cancelHandle: (a: number) => number;
     readonly webgpusession_capabilities: (a: number) => number;
@@ -2205,11 +2271,11 @@ export interface InitOutput {
     readonly turnresult_tokensGenerated: (a: number) => number;
     readonly session_intoChat: (a: number, b: number) => void;
     readonly sessionconfig_set_seed: (a: number, b: number, c: bigint) => void;
-    readonly __wasm_bindgen_func_elem_7660: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6487: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6487_2: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6487_3: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_7675: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_7733: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6560: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6560_2: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6560_3: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_7748: (a: number, b: number, c: number, d: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

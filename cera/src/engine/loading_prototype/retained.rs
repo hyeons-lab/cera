@@ -49,6 +49,10 @@ impl GenerativeModel {
         self.engine.capabilities()
     }
 
+    pub fn audio_profile(&self) -> crate::audio_profile::AudioProfile {
+        self.engine.audio_profile()
+    }
+
     pub fn default_generate_opts(&self) -> GenerateOpts {
         self.engine.default_generate_opts()
     }

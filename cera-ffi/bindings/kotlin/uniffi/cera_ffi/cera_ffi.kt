@@ -898,6 +898,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_ceraengine_audio_profile(): Int
+
     external fun uniffi_cera_ffi_checksum_method_ceraengine_bos_token(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ceraengine_capabilities(): Int
@@ -1352,6 +1354,11 @@ internal object UniffiLib {
         `messages`: RustBuffer.ByValue,
         `tools`: RustBuffer.ByValue,
         `addGenerationPrompt`: Byte,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ceraengine_audio_profile(
+        `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
@@ -2752,6 +2759,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools() != 46076) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_audio_profile() != 17834) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token() != 30744) {
@@ -4229,6 +4239,13 @@ public interface CeraEngineInterface {
     ): kotlin.String
 
     /**
+     * The system prompts, voices and sample text this model needs for speech
+     * output (see [`AudioProfile`]). Meaningful when
+     * [`ModalityCapabilities::audio_out`] is set; a generic profile otherwise.
+     */
+    fun `audioProfile`(): AudioProfile
+
+    /**
      * Beginning-of-sequence token ID, if the model has one.
      * LLaMA-family models typically do; some don't. Honor
      * [`ModelMetadata::add_bos_token`] when deciding whether to
@@ -4571,6 +4588,23 @@ open class CeraEngine :
                         FfiConverterSequenceTypeChatMessage.lower(`messages`),
                         FfiConverterSequenceTypeToolDef.lower(`tools`),
                         FfiConverterBoolean.lower(`addGenerationPrompt`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * The system prompts, voices and sample text this model needs for speech
+     * output (see [`AudioProfile`]). Meaningful when
+     * [`ModalityCapabilities::audio_out`] is set; a generic profile otherwise.
+     */
+    override fun `audioProfile`(): AudioProfile =
+        FfiConverterTypeAudioProfile.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_audio_profile(
+                        it,
                         _status,
                     )
                 }
@@ -12602,6 +12636,66 @@ public object FfiConverterTypeAudioInput : FfiConverterRustBuffer<AudioInput> {
 }
 
 /**
+ * What an audio model needs to be told to speak. Mirrors [`cera::AudioProfile`].
+ *
+ * The system prompt that selects text-to-speech or interleaved output differs
+ * per model, and a voice the model was not trained on makes it answer in text
+ * with no audio. So the prompts and the voices a model accepts come from cera,
+ * not from the app: the bundle manifest's own `audio_profile`, else cera's
+ * built-in registry, else plain `Perform TTS.` with no voices.
+ *
+ * `voices` empty means the model has no voices: send `tts_system_prompt` as-is.
+ * `sample_texts` carry `{model}` where the model's display name goes, and are
+ * empty when the app should use its own generic samples.
+ */
+data class AudioProfile(
+    /**
+     * System prompt for text-to-speech with no voice chosen (the first voice's,
+     * or the bare prompt when there are no voices).
+     */
+    var `ttsSystemPrompt`: kotlin.String,
+    /**
+     * The same for interleaved text-and-audio replies.
+     */
+    var `interleavedSystemPrompt`: kotlin.String,
+    var `voices`: List<TtsVoice>,
+    var `sampleTexts`: List<kotlin.String>,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeAudioProfile : FfiConverterRustBuffer<AudioProfile> {
+    override fun read(buf: ByteBuffer): AudioProfile =
+        AudioProfile(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterSequenceTypeTtsVoice.read(buf),
+            FfiConverterSequenceString.read(buf),
+        )
+
+    override fun allocationSize(value: AudioProfile) =
+        (
+            FfiConverterString.allocationSize(value.`ttsSystemPrompt`) +
+                FfiConverterString.allocationSize(value.`interleavedSystemPrompt`) +
+                FfiConverterSequenceTypeTtsVoice.allocationSize(value.`voices`) +
+                FfiConverterSequenceString.allocationSize(value.`sampleTexts`)
+        )
+
+    override fun write(
+        value: AudioProfile,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`ttsSystemPrompt`, buf)
+        FfiConverterString.write(value.`interleavedSystemPrompt`, buf)
+        FfiConverterSequenceTypeTtsVoice.write(value.`voices`, buf)
+        FfiConverterSequenceString.write(value.`sampleTexts`, buf)
+    }
+}
+
+/**
  * One message in a chat-template conversation. Mirrors
  * [`cera::tokenizer::ChatMessage`]. Pass a `Vec<ChatMessage>` to
  * [`CeraEngine::apply_chat_template`] to render the model's
@@ -14300,6 +14394,54 @@ public object FfiConverterTypeToolDef : FfiConverterRustBuffer<ToolDef> {
         FfiConverterString.write(value.`name`, buf)
         FfiConverterOptionalString.write(value.`description`, buf)
         FfiConverterString.write(value.`parametersJson`, buf)
+    }
+}
+
+/**
+ * One speaker an audio model understands. Mirrors [`cera::TtsVoice`].
+ *
+ * `prompt` is the phrase that selects the voice and doubles as its stable
+ * identifier (save it as the user's choice). The two `*_system_prompt` fields
+ * are complete: pass one as the system message as-is, never assemble a prompt
+ * from parts.
+ */
+data class TtsVoice(
+    var `label`: kotlin.String,
+    var `prompt`: kotlin.String,
+    var `ttsSystemPrompt`: kotlin.String,
+    var `interleavedSystemPrompt`: kotlin.String,
+) {
+    companion object
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterTypeTtsVoice : FfiConverterRustBuffer<TtsVoice> {
+    override fun read(buf: ByteBuffer): TtsVoice =
+        TtsVoice(
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+            FfiConverterString.read(buf),
+        )
+
+    override fun allocationSize(value: TtsVoice) =
+        (
+            FfiConverterString.allocationSize(value.`label`) +
+                FfiConverterString.allocationSize(value.`prompt`) +
+                FfiConverterString.allocationSize(value.`ttsSystemPrompt`) +
+                FfiConverterString.allocationSize(value.`interleavedSystemPrompt`)
+        )
+
+    override fun write(
+        value: TtsVoice,
+        buf: ByteBuffer,
+    ) {
+        FfiConverterString.write(value.`label`, buf)
+        FfiConverterString.write(value.`prompt`, buf)
+        FfiConverterString.write(value.`ttsSystemPrompt`, buf)
+        FfiConverterString.write(value.`interleavedSystemPrompt`, buf)
     }
 }
 
@@ -18184,6 +18326,34 @@ public object FfiConverterSequenceTypeToolDef : FfiConverterRustBuffer<List<Tool
         buf.putInt(value.size)
         value.iterator().forEach {
             FfiConverterTypeToolDef.write(it, buf)
+        }
+    }
+}
+
+/**
+ * @suppress
+ */
+public object FfiConverterSequenceTypeTtsVoice : FfiConverterRustBuffer<List<TtsVoice>> {
+    override fun read(buf: ByteBuffer): List<TtsVoice> {
+        val len = buf.getInt()
+        return List<TtsVoice>(len) {
+            FfiConverterTypeTtsVoice.read(buf)
+        }
+    }
+
+    override fun allocationSize(value: List<TtsVoice>): ULong {
+        val sizeForLength = 4UL
+        val sizeForItems = value.map { FfiConverterTypeTtsVoice.allocationSize(it) }.sum()
+        return sizeForLength + sizeForItems
+    }
+
+    override fun write(
+        value: List<TtsVoice>,
+        buf: ByteBuffer,
+    ) {
+        buf.putInt(value.size)
+        value.iterator().forEach {
+            FfiConverterTypeTtsVoice.write(it, buf)
         }
     }
 }

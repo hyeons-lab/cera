@@ -105,6 +105,9 @@ extension type _Reply._(JSObject _) implements JSObject {
 extension type _OpenResult._(JSObject _) implements JSObject {
   external String get backend;
   external _Capabilities get capabilities;
+  // Absent when the page still serves a worker copied before cera reported
+  // profiles (`dart run cera_ffi:install_web` was not re-run after an upgrade).
+  external _AudioProfile? get audioProfile;
   external JSAny? get cancelBuffer;
 }
 
@@ -229,6 +232,37 @@ Future<Cera> openBundle(
   return worker;
 }
 
+extension type _TtsVoice._(JSObject _) implements JSObject {
+  external String get label;
+  external String get prompt;
+  external String get ttsSystemPrompt;
+  external String get interleavedSystemPrompt;
+}
+
+extension type _AudioProfile._(JSObject _) implements JSObject {
+  external String get ttsSystemPrompt;
+  external String get interleavedSystemPrompt;
+  external JSArray<_TtsVoice> get voices;
+  external JSArray<JSString> get sampleTexts;
+}
+
+CeraAudioProfile _audioProfileOf(_AudioProfile p) => CeraAudioProfile(
+  ttsSystemPrompt: p.ttsSystemPrompt,
+  interleavedSystemPrompt: p.interleavedSystemPrompt,
+  voices: List.unmodifiable([
+    for (final v in p.voices.toDart)
+      CeraTtsVoice(
+        label: v.label,
+        prompt: v.prompt,
+        ttsSystemPrompt: v.ttsSystemPrompt,
+        interleavedSystemPrompt: v.interleavedSystemPrompt,
+      ),
+  ]),
+  sampleTexts: List.unmodifiable([
+    for (final s in p.sampleTexts.toDart) s.toDart,
+  ]),
+);
+
 CeraCapabilities _capabilitiesOf(_Capabilities caps) => CeraCapabilities(
   textIn: caps.textIn,
   textOut: caps.textOut,
@@ -291,6 +325,11 @@ class _WorkerCera implements Cera {
 
   @override
   CeraCapabilities get capabilities => _capabilities;
+
+  late final CeraAudioProfile _audioProfile;
+
+  @override
+  CeraAudioProfile get audioProfile => _audioProfile;
 
   /// The resolved wasm module URL, set by [_spawn]. Every op that may run
   /// before a model is open has to pass it, since the worker imports the module
@@ -429,6 +468,11 @@ class _WorkerCera implements Cera {
     final opened = result as _OpenResult;
     _backend = opened.backend;
     _capabilities = _capabilitiesOf(opened.capabilities);
+    final profile = opened.audioProfile;
+    _audioProfile =
+        profile == null
+            ? const CeraAudioProfile.plain()
+            : _audioProfileOf(profile);
     final buf = opened.cancelBuffer;
     if (buf != null) {
       try {

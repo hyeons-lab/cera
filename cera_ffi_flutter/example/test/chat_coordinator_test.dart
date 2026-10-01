@@ -2,6 +2,7 @@ import 'dart:async';
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart' hide ModelSource;
 import 'package:cera_ffi_flutter_example/chat_controller.dart';
 import 'package:cera_ffi_flutter_example/chat_intent.dart';
+import 'package:cera_ffi_flutter_example/chat_state.dart';
 import 'package:cera_ffi_flutter_example/model_source.dart';
 import 'package:flutter/services.dart';
 import 'package:flutter_test/flutter_test.dart';
@@ -192,6 +193,142 @@ void main() {
         controller.dispose();
       },
     );
+
+    test(
+      'the loaded model\'s profile decides the text-to-speech system prompt',
+      () async {
+        final fakeCera = FakeCera()
+          ..profile = const CeraAudioProfile(
+            ttsSystemPrompt: 'Perform TTS in japanese.',
+            interleavedSystemPrompt: 'Respond with interleaved text and audio.',
+          );
+        final controller = ChatController();
+
+        await controller.dispatch(
+          LoadLocalModelIntent(TestModelSource('test-model', fakeCera)),
+        );
+        controller.value = controller.value.copyWith(
+          settings: controller.value.settings.copyWith(
+            audioChatMode: AudioChatMode.textToSpeech,
+          ),
+        );
+        await controller.dispatch(const SendMessageIntent('こんにちは'));
+
+        final system = fakeCera.templateCalls.single.firstWhere(
+          (m) => m.role == 'system',
+        );
+        expect(system.content, 'Perform TTS in japanese.');
+        controller.dispose();
+      },
+    );
+
+    test(
+      'a voice note is sent with the loaded model\'s system prompt and voice',
+      () async {
+        final fakeCera = FakeCera()
+          ..profile = const CeraAudioProfile(
+            ttsSystemPrompt: 'Speak.',
+            interleavedSystemPrompt: 'Talk and write.',
+            voices: [
+              CeraTtsVoice(
+                label: 'Ana',
+                prompt: 'Voice: ana.',
+                ttsSystemPrompt: 'Speak. Voice: ana.',
+                interleavedSystemPrompt: 'Talk and write. Voice: ana.',
+              ),
+            ],
+          );
+        final controller = ChatController();
+
+        await controller.dispatch(
+          LoadLocalModelIntent(TestModelSource('test-model', fakeCera)),
+        );
+        controller.value = controller.value.copyWith(
+          settings: controller.value.settings.copyWith(
+            audioChatMode: AudioChatMode.interleaved,
+            chatVoice: 'Voice: ana.',
+          ),
+        );
+        await controller.dispatch(
+          SendAudioPromptIntent(pcmSamples: List.filled(1600, 0.0)),
+        );
+        expect(fakeCera.audioSystemPrompts, ['Talk and write. Voice: ana.']);
+        controller.dispose();
+      },
+    );
+
+    test(
+      'a voice note in Text to Speech mode carries no system prompt',
+      () async {
+        final fakeCera = FakeCera();
+        final controller = ChatController();
+
+        await controller.dispatch(
+          LoadLocalModelIntent(TestModelSource('test-model', fakeCera)),
+        );
+        controller.value = controller.value.copyWith(
+          settings: controller.value.settings.copyWith(
+            audioChatMode: AudioChatMode.textToSpeech,
+          ),
+        );
+        await controller.dispatch(
+          SendAudioPromptIntent(pcmSamples: List.filled(1600, 0.0)),
+        );
+        expect(fakeCera.audioSystemPrompts, [null]);
+        controller.dispose();
+      },
+    );
+
+    test('a failed load leaves no profile behind', () async {
+      final controller = ChatController();
+      await controller.dispatch(
+        LoadLocalModelIntent(TestModelSource('test-model', FakeCera())),
+      );
+      expect(controller.value.audioProfile, isNotNull);
+
+      await controller.dispatch(LoadLocalModelIntent(ThrowingModelSource()));
+      expect(controller.value.loadedModel, isNull);
+      expect(controller.value.audioProfile, isNull);
+      controller.dispose();
+    });
+
+    test('the loaded model\'s profile follows the model in and out', () async {
+      final fakeCera = FakeCera();
+      final controller = ChatController();
+      expect(controller.value.audioProfile, isNull);
+
+      await controller.dispatch(
+        LoadLocalModelIntent(TestModelSource('test-model', fakeCera)),
+      );
+      expect(controller.value.audioProfile, same(fakeCera.profile));
+
+      await controller.dispatch(const UnloadModelIntent());
+      expect(controller.value.audioProfile, isNull);
+      controller.dispose();
+    });
+
+    test(
+      'a voice note in Text Only mode is sent with the text-only prompt',
+      () async {
+        final fakeCera = FakeCera();
+        final controller = ChatController();
+
+        await controller.dispatch(
+          LoadLocalModelIntent(TestModelSource('test-model', fakeCera)),
+        );
+        controller.value = controller.value.copyWith(
+          settings: controller.value.settings.copyWith(
+            audioChatMode: AudioChatMode.textOnly,
+          ),
+        );
+        await controller.dispatch(
+          SendAudioPromptIntent(pcmSamples: List.filled(1600, 0.0)),
+        );
+
+        expect(fakeCera.audioSystemPrompts, [ceraTextOnlySystemPrompt]);
+        controller.dispose();
+      },
+    );
   });
 }
 
@@ -210,6 +347,8 @@ class TestModelSource extends LoadedModel {
 class FakeCera implements Cera {
   final List<List<CeraMessage>> templateCalls = [];
   final List<String> generatedPrompts = [];
+  final List<String?> audioSystemPrompts = [];
+  CeraAudioProfile profile = const CeraAudioProfile.plain();
   int resetCount = 0;
   bool failReset = false;
   bool pauseGeneration = false;
@@ -229,6 +368,9 @@ class FakeCera implements Cera {
     audioIn: true,
     audioOut: true,
   );
+
+  @override
+  CeraAudioProfile get audioProfile => profile;
 
   @override
   String get backend => 'gpu';
@@ -303,7 +445,9 @@ class FakeCera implements Cera {
     int sampleRate = 16000,
     String? prompt,
     String? systemPrompt,
-  }) async {}
+  }) async {
+    audioSystemPrompts.add(systemPrompt);
+  }
 
   @override
   Future<String> transcribe(
@@ -316,4 +460,13 @@ class FakeCera implements Cera {
 
   @override
   Future<void> terminate() async {}
+}
+
+class ThrowingModelSource extends LoadedModel {
+  @override
+  String get name => 'broken-model';
+
+  @override
+  Future<Cera> open({CeraOptions options = const CeraOptions()}) async =>
+      throw StateError('cannot open');
 }

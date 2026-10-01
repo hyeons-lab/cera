@@ -1301,12 +1301,33 @@ do {
   missing prerequisites return an error. Accepts `sampleRate` from 1000 through
   192000 Hz and resamples to 16 kHz before encoding. Blocking; wrap it in
   `spawn_blocking` / `Task.detached` from an async context.
+- **`CeraEngine.audioProfile()`** returns the system prompts, voices and sample
+  text this model needs for speech output, so an app never hardcodes one model's
+  strings. The prompt that selects text-to-speech differs per release (the
+  English LFM2.5-Audio takes `"Perform TTS."` plus one of four voice phrases; the
+  Japanese one takes `"Perform TTS in japanese."` and no voice), and a voice the
+  model was not trained on makes it answer in text with no audio. The profile is
+  resolved by cera from the bundle manifest's own `audio_profile`, else its
+  built-in registry, else plain `"Perform TTS."` with no voices. Every voice
+  carries the **complete** `ttsSystemPrompt` / `interleavedSystemPrompt` to send
+  as the system message as-is; never assemble one from parts. `voices` empty
+  means the model has none, so send the profile's `ttsSystemPrompt`. Save the
+  user's choice as the voice's `prompt`; a saved voice the loaded model does not
+  list must not be sent to it. Meaningful when `capabilities.audioOut` is true.
+  The registry matches the model's and vocoder's **file names** (not directories
+  or hosts), so a model loaded from raw bytes with `ModelSource.Parts`, which has
+  no file names, reports the plain profile; load it from a bundle or path to get
+  the model's own.
 - **`GenerateOpts.audioMode`** (`AudioOutputMode`: `TextOnly`, `Sequential`,
   `Interleaved`; `null` is `Sequential`) says how a bundle **with a vocoder**
   answers, and must match the system prompt in play: `TextOnly` for
   `"Perform ASR."` and plain chat, `Sequential` for `"Perform TTS."` (audio starts
   when the model emits `<|audio_start|>`), `Interleaved` for
-  `"Respond with interleaved text and audio."`. The runtime, not the model,
+  `"Respond with interleaved text and audio."`. When the prompt comes from
+  `audioProfile()` (a manifest may word its prompts any way), choose the mode by
+  which field it came from, not by its words: `ttsSystemPrompt` (also a voice's)
+  means `Sequential`, `interleavedSystemPrompt` (also a voice's) means
+  `Interleaved`. The runtime, not the model,
   forces the text/audio alternation in an interleaved turn, at the cadence the
   vocoder declares (`interleaved_n_text` / `interleaved_n_audio`, default 6/12).
   Interleaving on a text turn corrupts the rest of the answer, which is why it is

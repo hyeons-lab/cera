@@ -47,34 +47,41 @@ class _TtsStudioViewState extends State<TtsStudioView> {
     return name;
   }
 
-  static String _defaultSampleText(String modelName) =>
-      'Hello, this voice was synthesized entirely on-device with the $modelName model powered by Cera.';
-
-  static List<String> _getSamplePrompts(String modelName) => [
-    _defaultSampleText(modelName),
+  static const _genericSamples = [
+    'Hello, this voice was synthesized entirely on-device with the {model} model powered by Cera.',
     'Cera runs high-performance multimodal AI on Apple Silicon, WebGPU, and CPU.',
     'On-device intelligence guarantees complete privacy with zero cloud latency.',
     'Streaming ISTFT produces 24 kHz neural audio in real-time without external TTS libraries.',
   ];
 
+  /// Sample sentences for the loaded model: its profile's own, or the generic
+  /// English ones.
+  static List<String> _getSamplePrompts(ChatState state) {
+    final modelName = _getModelDisplayName(state);
+    final custom = state.audioProfile?.sampleTexts ?? const <String>[];
+    final templates = custom.isNotEmpty ? custom : _genericSamples;
+    return [for (final t in templates) t.replaceAll('{model}', modelName)];
+  }
+
+  static String _defaultSampleText(ChatState state) =>
+      _getSamplePrompts(state).first;
+
   @override
   void initState() {
     super.initState();
-    final modelName = _getModelDisplayName(widget.state);
     _textController = TextEditingController(
-      text: _defaultSampleText(modelName),
+      text: _defaultSampleText(widget.state),
     );
   }
 
   @override
   void didUpdateWidget(TtsStudioView oldWidget) {
     super.didUpdateWidget(oldWidget);
-    final oldModel = _getModelDisplayName(oldWidget.state);
-    final newModel = _getModelDisplayName(widget.state);
-    if (oldModel != newModel) {
-      final oldDefault = _defaultSampleText(oldModel);
+    final oldDefault = _defaultSampleText(oldWidget.state);
+    final newDefault = _defaultSampleText(widget.state);
+    if (oldDefault != newDefault) {
       if (_textController.text.isEmpty || _textController.text == oldDefault) {
-        _textController.text = _defaultSampleText(newModel);
+        _textController.text = newDefault;
       }
     }
   }
@@ -84,6 +91,11 @@ class _TtsStudioViewState extends State<TtsStudioView> {
     _textController.dispose();
     super.dispose();
   }
+
+  /// The voice that will be sent: the saved one if this model lists it, else
+  /// the model's default (a voice saved under another model is not offered).
+  static String? _selectedVoice(ChatState state) =>
+      state.audioProfile?.voiceFor(state.settings.ttsStudioVoice)?.prompt;
 
   Future<void> _synthesize() async {
     final text = _textController.text.trim();
@@ -274,9 +286,7 @@ class _TtsStudioViewState extends State<TtsStudioView> {
           SingleChildScrollView(
             scrollDirection: Axis.horizontal,
             child: Row(
-              children: _getSamplePrompts(_getModelDisplayName(state)).map((
-                prompt,
-              ) {
+              children: _getSamplePrompts(state).map((prompt) {
                 return Padding(
                   padding: const EdgeInsets.only(right: 8),
                   child: ActionChip(
@@ -338,64 +348,34 @@ class _TtsStudioViewState extends State<TtsStudioView> {
               ),
             ),
           ),
-          // Voice Persona Selector
-          Text(
-            'VOICE PERSONA',
-            style: TextStyle(
-              fontSize: 11,
-              fontWeight: FontWeight.w600,
-              letterSpacing: 0.8,
-              color: theme.colorScheme.onSurfaceVariant,
+          // Voice Persona Selector: only for a model whose profile lists voices.
+          if (state.audioProfile?.hasVoices ?? false) ...[
+            Text(
+              'VOICE PERSONA',
+              style: TextStyle(
+                fontSize: 11,
+                fontWeight: FontWeight.w600,
+                letterSpacing: 0.8,
+                color: theme.colorScheme.onSurfaceVariant,
+              ),
             ),
-          ),
-          const SizedBox(height: 8),
-          Wrap(
-            spacing: 8,
-            runSpacing: 8,
-            children: [
-              _VoiceChip(
-                label: '👩 US Female (Default)',
-                selected:
-                    state.settings.ttsStudioVoice == 'Use the US female voice.',
-                onSelected: () => widget.controller.dispatch(
-                  const UpdateSettingsIntent(
-                    ttsStudioVoice: 'Use the US female voice.',
+            const SizedBox(height: 8),
+            Wrap(
+              spacing: 8,
+              runSpacing: 8,
+              children: [
+                for (final voice in state.audioProfile!.voices)
+                  _VoiceChip(
+                    label: voice.label,
+                    selected: _selectedVoice(state) == voice.prompt,
+                    onSelected: () => widget.controller.dispatch(
+                      UpdateSettingsIntent(ttsStudioVoice: voice.prompt),
+                    ),
                   ),
-                ),
-              ),
-              _VoiceChip(
-                label: '👨 US Male',
-                selected:
-                    state.settings.ttsStudioVoice == 'Use the US male voice.',
-                onSelected: () => widget.controller.dispatch(
-                  const UpdateSettingsIntent(
-                    ttsStudioVoice: 'Use the US male voice.',
-                  ),
-                ),
-              ),
-              _VoiceChip(
-                label: '👩 UK Female',
-                selected:
-                    state.settings.ttsStudioVoice == 'Use the UK female voice.',
-                onSelected: () => widget.controller.dispatch(
-                  const UpdateSettingsIntent(
-                    ttsStudioVoice: 'Use the UK female voice.',
-                  ),
-                ),
-              ),
-              _VoiceChip(
-                label: '👨 UK Male',
-                selected:
-                    state.settings.ttsStudioVoice == 'Use the UK male voice.',
-                onSelected: () => widget.controller.dispatch(
-                  const UpdateSettingsIntent(
-                    ttsStudioVoice: 'Use the UK male voice.',
-                  ),
-                ),
-              ),
-            ],
-          ),
-          const SizedBox(height: 16),
+              ],
+            ),
+            const SizedBox(height: 16),
+          ],
 
           // Action Buttons
           Row(

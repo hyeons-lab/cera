@@ -42,7 +42,8 @@ Evidence: [engine constructors](../../cera/src/engine.rs),
 
 `ModelFiles` has eight fields: `model`, `multimodal_projector`, `audio_decoder`,
 `audio_tokenizer`, `draft_model`, `extras`, `inference_type`, `chat_template`.
-`ModelBytes` also has eight; it replaces `extras` with `generation_defaults`.
+`ModelBytes` has nine; it replaces `extras` with `generation_defaults` and adds
+`audio_profile`.
 Do not invent byte-form extras or discard path-form extras when wrapping these
 records. Keep explicit sources; no string-to-HF/path inference.
 
