@@ -357,6 +357,14 @@ fn lora_batched_matches_per_token() {
     // accumulate identically, so this is typically bit-exact (max_abs 0).
     let base_logits = per_token(None);
     let (base_cos, base_max) = compare(&batched(None), &base_logits);
+    // What the adapter hooks are allowed to differ by. On a model whose base paths
+    // are bit-exact (Q8_0 on aarch64) that is the strict `1e-4` of cosine and
+    // `1e-3 x logit_scale` of max-abs. On Q4_0/Q4_K the batched prefill uses the
+    // repacked GEMMs, which reorder their sums on purpose, so the base already
+    // differs and an adapter run inherits that; there the hooks are judged by what
+    // they add, allowing twice the base divergence on top of the strict bound.
+    let cos_floor = 0.9999 - 2.0 * (1.0 - base_cos);
+    let abs_ceiling = |logit_scale: f64| 1e-3 * logit_scale + 2.0 * base_max;
     // Adapter-active divergence: `apply_prefill` (batched) vs `apply_decode`
     // (per-token). Both are f32 low-rank products with different accumulation
     // orders, so they're near-identical, not bit-exact.
@@ -375,19 +383,21 @@ fn lora_batched_matches_per_token() {
          rel={:.3e}",
         lora_max / logit_scale
     );
-    // Primary gate: the two paths must be near-identical in direction.
+    // Primary gate: the two paths must be near-identical in direction (see `cos_floor`).
     assert!(
-        lora_cos > 0.9999,
-        "adapter-active batched vs per-token cosine {lora_cos:.8} must exceed 0.9999"
+        lora_cos > cos_floor,
+        "adapter-active batched vs per-token cosine {lora_cos:.8} must exceed {cos_floor:.8} \
+         (base paths differ by cosine {base_cos:.8})"
     );
     // The adapter must also change the output (else this test proves nothing).
     assert_ne!(lora_batched, base_logits, "adapter must alter the logits");
     // Absolute diff must be tiny relative to the logit magnitude — pure f32
     // accumulation-order noise, not a wiring bug.
     assert!(
-        lora_max < 1e-3 * logit_scale,
-        "adapter batched vs per-token max_abs {lora_max:.6e} exceeds 1e-3 × logit_scale \
-         ({logit_scale:.4}) — the batched LoRA hook likely diverges"
+        lora_max < abs_ceiling(logit_scale),
+        "adapter batched vs per-token max_abs {lora_max:.6e} exceeds {:.6e} (1e-3 × logit_scale \
+         {logit_scale:.4} + 2 × base divergence {base_max:.6e}); the batched LoRA hook likely diverges",
+        abs_ceiling(logit_scale)
     );
 
     // Shortconv (conv-layer) LoRA: the batched-prefill conv hooks
@@ -412,16 +422,18 @@ fn lora_batched_matches_per_token() {
     let (sc_cos, sc_max) = compare(&sc_batched, &per_token(Some(sc.clone())));
     eprintln!("  shortconv: cos={sc_cos:.8} max_abs={sc_max:.6e}");
     assert!(
-        sc_cos > 0.9999,
-        "shortconv batched vs per-token cosine {sc_cos:.8} must exceed 0.9999"
+        sc_cos > cos_floor,
+        "shortconv batched vs per-token cosine {sc_cos:.8} must exceed {cos_floor:.8}"
     );
     assert_ne!(
         sc_batched, base_logits,
         "shortconv adapter must alter the logits"
     );
     assert!(
-        sc_max < 1e-3 * logit_scale,
-        "shortconv batched vs per-token max_abs {sc_max:.6e} exceeds 1e-3 × logit_scale \
-         ({logit_scale:.4}) — the batched conv LoRA hook likely diverges"
+        sc_max < abs_ceiling(logit_scale),
+        "shortconv batched vs per-token max_abs {sc_max:.6e} exceeds {:.6e} (1e-3 × logit_scale \
+         {logit_scale:.4} + 2 × base divergence {base_max:.6e}); the batched conv LoRA hook \
+         likely diverges",
+        abs_ceiling(logit_scale)
     );
 }

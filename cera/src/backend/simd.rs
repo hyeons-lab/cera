@@ -655,33 +655,26 @@ pub(crate) mod neon {
 
             let n_blocks = n / 32;
 
-            // Pass 1: compute sum of squares
-            let mut sum_sq_vec = vdupq_n_f32(0.0);
-            let mut i = 0usize;
-            while i + 15 < n {
-                let x0 = vld1q_f32(x.as_ptr().add(i));
-                let x1 = vld1q_f32(x.as_ptr().add(i + 4));
-                let x2 = vld1q_f32(x.as_ptr().add(i + 8));
-                let x3 = vld1q_f32(x.as_ptr().add(i + 12));
-                sum_sq_vec = vfmaq_f32(sum_sq_vec, x0, x0);
-                sum_sq_vec = vfmaq_f32(sum_sq_vec, x1, x1);
-                sum_sq_vec = vfmaq_f32(sum_sq_vec, x2, x2);
-                sum_sq_vec = vfmaq_f32(sum_sq_vec, x3, x3);
-                i += 16;
+            // Pass 1: sum of squares, accumulated in f64 exactly as `rmsnorm_neon`
+            // does (and as ggml does). The prefill path normalizes with
+            // `rmsnorm_neon` and then quantizes; if this fused decode kernel
+            // accumulated in f32 its `inv_rms` would differ by a few ulps, changing
+            // most normalized values and flipping rounding ties in the int8 quants,
+            // so decode and batched prefill would drift apart from the first layer.
+            // `n` is a multiple of 32 here, so there is no scalar tail.
+            let mut sum_sq0 = vdupq_n_f64(0.0);
+            let mut sum_sq1 = vdupq_n_f64(0.0);
+            for i in 0..n / 4 {
+                let v = vld1q_f32(x.as_ptr().add(i * 4));
+                let lo = vcvt_f64_f32(vget_low_f32(v));
+                let hi = vcvt_f64_f32(vget_high_f32(v));
+                sum_sq0 = vfmaq_f64(sum_sq0, lo, lo);
+                sum_sq1 = vfmaq_f64(sum_sq1, hi, hi);
             }
-            while i + 3 < n {
-                let x0 = vld1q_f32(x.as_ptr().add(i));
-                sum_sq_vec = vfmaq_f32(sum_sq_vec, x0, x0);
-                i += 4;
-            }
-            let mut sum_sq = vaddvq_f32(sum_sq_vec);
-            while i < n {
-                sum_sq += x[i] * x[i];
-                i += 1;
-            }
+            let sum_sq = vaddvq_f64(vaddq_f64(sum_sq0, sum_sq1));
 
-            let mean = sum_sq / (n as f32);
-            let inv_rms = 1.0 / (mean + eps).sqrt();
+            let mean = sum_sq / n as f64;
+            let inv_rms = (1.0 / (mean + eps as f64).sqrt()) as f32;
             let inv_rms_vec = vdupq_n_f32(inv_rms);
 
             // Pass 2: Normalize and Quantize in 32-float blocks
@@ -743,17 +736,24 @@ pub(crate) mod neon {
                 let max_all = vmaxnmq_f32(max0123, max4567);
                 let amax = vmaxnmvq_f32(max_all);
 
+                // Same definition as `quantize_f32_to_q8_0_neon` and ggml's
+                // `quantize_row_q8_0`: quantize with the *unrounded* reciprocal,
+                // store the f16-rounded scale. Quantizing with `1 / d_f16` instead
+                // (which is self-consistent but not ggml's) moves ~1% of the int8
+                // values, so decode would not match the prefill quantizer.
                 let (d, id) = if !amax.is_finite() || amax <= 0.0 {
                     (0.0f32, 0.0f32)
                 } else {
                     let d_raw = amax / 127.0;
-                    let d_f16 = crate::quant::f16_to_f32(crate::quant::f32_to_f16(d_raw));
-                    let id_val = if d_f16.is_finite() && d_f16 > 0.0 {
-                        1.0 / d_f16
+                    let id_val = if d_raw.is_finite() && d_raw > 0.0 {
+                        1.0 / d_raw
                     } else {
                         0.0
                     };
-                    (d_f16, id_val)
+                    (
+                        crate::quant::f16_to_f32(crate::quant::f32_to_f16(d_raw)),
+                        id_val,
+                    )
                 };
                 *scales.as_mut_ptr().add(b) = d;
                 let id_vec = vdupq_n_f32(id);
