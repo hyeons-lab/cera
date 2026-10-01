@@ -4745,31 +4745,26 @@ pub fn rmsnorm_and_quantize_q8_0(
         let inv_rms = (1.0 / rms) as f32;
 
         let mut out_opt = out_normed;
-        #[allow(clippy::needless_range_loop)]
+        // Per block: normalize, then quantize with the canonical Q8_0 definition
+        // shared by `quantize_f32_to_q8_0_scalar` and the SIMD kernels (quantize with
+        // the unrounded `1 / d`, store the f16-rounded `d`, ties to even), so this
+        // fused path and normalize-then-quantize produce the same bytes.
         for b in 0..n_blocks {
             let b_offset = b * 32;
-            let mut amax = 0.0f32;
-            for i in 0..32 {
-                let v = x[b_offset + i] * inv_rms * weight[b_offset + i];
-                if let Some(ref mut out) = out_opt {
-                    out[b_offset + i] = v;
-                }
-                let av = v.abs();
-                if av > amax {
-                    amax = av;
-                }
+            let mut normed = [0.0f32; 32];
+            normed
+                .iter_mut()
+                .zip(&x[b_offset..b_offset + 32])
+                .zip(&weight[b_offset..b_offset + 32])
+                .for_each(|((v, &xi), &wi)| *v = xi * inv_rms * wi);
+            if let Some(out) = out_opt.as_mut() {
+                out[b_offset..b_offset + 32].copy_from_slice(&normed);
             }
-            let (d, id) = if amax == 0.0 {
-                (0.0, 0.0)
-            } else {
-                (amax / 127.0, 127.0 / amax)
-            };
-            scales[b] = d;
-            for i in 0..32 {
-                let v = x[b_offset + i] * inv_rms * weight[b_offset + i];
-                let q = (v * id).round().clamp(-128.0, 127.0) as i8;
-                quants[b_offset + i] = q;
-            }
+            quantize_f32_to_q8_0_scalar(
+                &normed,
+                &mut scales[b..b + 1],
+                &mut quants[b_offset..b_offset + 32],
+            );
         }
     }
 }
