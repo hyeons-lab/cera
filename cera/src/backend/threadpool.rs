@@ -108,7 +108,10 @@ use std::sync::atomic::AtomicI64;
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
-use std::time::Instant;
+
+// The browser-safe clock: `std::time::Instant::now()` panics on wasm32, and the
+// cpuset probe below runs at every generation boundary on every target.
+use crate::time::Instant;
 
 /// Bounded spin iterations before a waiting worker parks. Sized to comfortably
 /// cover the between-GEMV gap (the caller's serial work between matmuls, ~µs)
