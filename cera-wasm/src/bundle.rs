@@ -1429,6 +1429,28 @@ pub(crate) fn split_vocoder_sidecar_url(
         .transpose()
 }
 
+/// Fold the fetch of a sidecar the manifest did NOT name (one derived by
+/// [`split_vocoder_sidecar_url`]) into an optional one.
+///
+/// The URL is a guess: a third-party host may not serve a sibling, or the
+/// request may fail transiently. Native treats the same guess as best-effort
+/// (a warning), and the session already loads a vocoder without its
+/// detokenizer, so a failed guess must not take down text-only inference. A
+/// sidecar the manifest names stays fatal; only callers of the derived URL use
+/// this.
+pub(crate) fn inferred_sidecar<T>(fetched: Result<T, JsError>, url: &str) -> Option<T> {
+    match fetched {
+        Ok(bytes) => Some(bytes),
+        Err(e) => {
+            crate::console_warn(&format!(
+                "[cera-wasm] could not fetch the inferred split-vocoder sidecar \"{url}\": {e:?}; \
+                 audio output will be unavailable"
+            ));
+            None
+        }
+    }
+}
+
 /// Load the bundle described by the parsed manifest.
 pub(crate) async fn load_manifest_struct(
     repo: &BundleRepo,
@@ -1478,7 +1500,9 @@ pub(crate) async fn load_manifest_struct(
         // The manifest names no tokenizer, but a llama.cpp vocoder keeps its
         // detokenizer backbone in the sibling `tokenizer-*` file.
         None => match split_vocoder_sidecar_url(manifest, base_url, audio_decoder.as_deref())? {
-            Some(url) => Some(repo.read_or_download(&url, None, on_progress).await?),
+            Some(url) => {
+                inferred_sidecar(repo.read_or_download(&url, None, on_progress).await, &url)
+            }
             None => None,
         },
     };
@@ -1634,5 +1658,83 @@ mod tests {
     #[wasm_bindgen_test]
     fn hex_is_lowercase_and_zero_padded() {
         assert_eq!(hex(&[0x00, 0x0f, 0xff]), "000fff");
+    }
+
+    /// A GGUF holding one tiny F32 tensor per name: enough header for
+    /// `sidecar_ref_for` to classify a vocoder as split or merged.
+    fn gguf_with(names: &[&str]) -> Vec<u8> {
+        use cera::convert::writer::{GGML_TYPE_F32, GgufWriter};
+        let mut w = GgufWriter::new();
+        for name in names {
+            w.add_tensor(*name, vec![4, 2], GGML_TYPE_F32, 32);
+        }
+        let mut out = Vec::new();
+        w.write_header_and_tensor_info(&mut out).unwrap();
+        for _ in names {
+            w.write_tensor_data(&mut out, &[0u8; 32]).unwrap();
+        }
+        out
+    }
+
+    /// A manifest shaped like the JP LeapBundles one: an audio decoder and an
+    /// EMPTY `audio_tokenizer`.
+    fn manifest_with_decoder(decoder: Option<&str>) -> cera::manifest::Manifest {
+        let audio = decoder
+            .map(|d| format!(r#","audio_decoder":"{d}","audio_tokenizer":"""#))
+            .unwrap_or_default();
+        let json = format!(
+            r#"{{"inference_type":"llama.cpp/lfm2-audio-v1","schema_version":"1.1.0","load_time_parameters":{{"model":"https://hf.co/a/m.gguf"{audio}}}}}"#
+        );
+        cera::manifest::Manifest::from_bytes(json.as_bytes()).unwrap()
+    }
+
+    const BASE: &str = "https://hf.co/a/Q4_0.json";
+    const SPLIT: &str = "emb.emb.weight";
+    const MERGED: &str = "lfm.layers.0.conv.in_proj.weight";
+
+    #[wasm_bindgen_test]
+    fn split_vocoder_names_its_sibling_tokenizer() {
+        let split = gguf_with(&[SPLIT]);
+        // Absolute URL, as the JP LeapBundles manifest writes it.
+        let m = manifest_with_decoder(Some("https://hf.co/b/vocoder-X-Q4_0.gguf"));
+        assert_eq!(
+            split_vocoder_sidecar_url(&m, BASE, Some(&split)).unwrap(),
+            Some("https://hf.co/b/tokenizer-X-Q4_0.gguf".to_string())
+        );
+        // Bare filename: resolved next to the manifest.
+        let m = manifest_with_decoder(Some("vocoder-X-Q4_0.gguf"));
+        assert_eq!(
+            split_vocoder_sidecar_url(&m, BASE, Some(&split)).unwrap(),
+            Some("https://hf.co/a/tokenizer-X-Q4_0.gguf".to_string())
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn nothing_to_fetch_for_merged_or_absent_vocoders() {
+        let m = manifest_with_decoder(Some("https://hf.co/b/vocoder-X-Q4_0.gguf"));
+        // Already carries its backbone (the LEAP EN vocoder).
+        assert_eq!(
+            split_vocoder_sidecar_url(&m, BASE, Some(&gguf_with(&[MERGED]))).unwrap(),
+            None
+        );
+        // No vocoder bytes yet, or no vocoder in the manifest at all.
+        assert_eq!(split_vocoder_sidecar_url(&m, BASE, None).unwrap(), None);
+        let none = manifest_with_decoder(None);
+        assert_eq!(
+            split_vocoder_sidecar_url(&none, BASE, Some(&gguf_with(&[SPLIT]))).unwrap(),
+            None
+        );
+    }
+
+    #[wasm_bindgen_test]
+    fn a_failed_inferred_sidecar_fetch_is_not_fatal() {
+        // The URL was a guess: a 404 or a network error must degrade to "no
+        // detokenizer", not reject the whole session.
+        assert_eq!(
+            inferred_sidecar(Ok(vec![1u8, 2]), "https://h/t.gguf"),
+            Some(vec![1, 2])
+        );
+        let failed: Result<Vec<u8>, JsError> = Err(JsError::new("404"));
+        assert_eq!(inferred_sidecar(failed, "https://h/t.gguf"), None);
     }
 }

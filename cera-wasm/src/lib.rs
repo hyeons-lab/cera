@@ -12,6 +12,8 @@
 //! the wasm wrapper.
 
 #![cfg(target_arch = "wasm32")]
+// The clock rule in clippy.toml: a stray `std::time::Instant::now()` panics in the browser.
+#![deny(clippy::disallowed_methods)]
 
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -3299,28 +3301,37 @@ mod webgpu {
                 }
 
                 let mut tok_bytes = None;
-                let tok_url = match manifest
+                match manifest
                     .files
                     .audio_tokenizer
                     .as_deref()
                     .filter(|s| !s.trim().is_empty())
                 {
-                    Some(rel) => Some(
-                        crate::bundle::join_url(base_url, rel).map_err(|e| JsError::new(&e))?,
-                    ),
+                    Some(rel) => {
+                        let tok_url =
+                            crate::bundle::join_url(base_url, rel).map_err(|e| JsError::new(&e))?;
+                        tok_bytes = Some(Arc::from(
+                            repo.read_or_download(&tok_url, None, on_progress.as_ref())
+                                .await?,
+                        ));
+                    }
                     // A llama.cpp vocoder keeps its detokenizer backbone in the
                     // sibling `tokenizer-*` file, which the manifest may not name.
-                    None => crate::bundle::split_vocoder_sidecar_url(
-                        &manifest,
-                        base_url,
-                        voc_bytes.as_deref(),
-                    )?,
-                };
-                if let Some(tok_url) = tok_url {
-                    tok_bytes = Some(Arc::from(
-                        repo.read_or_download(&tok_url, None, on_progress.as_ref())
-                            .await?,
-                    ));
+                    // That URL is a guess, so a failed fetch is not fatal.
+                    None => {
+                        if let Some(tok_url) = crate::bundle::split_vocoder_sidecar_url(
+                            &manifest,
+                            base_url,
+                            voc_bytes.as_deref(),
+                        )? {
+                            tok_bytes = crate::bundle::inferred_sidecar(
+                                repo.read_or_download(&tok_url, None, on_progress.as_ref())
+                                    .await,
+                                &tok_url,
+                            )
+                            .map(Arc::from);
+                        }
+                    }
                 }
 
                 if voc_bytes.is_some() || tok_bytes.is_some() {

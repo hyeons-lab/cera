@@ -15,10 +15,15 @@ use cera::gguf::GgufFile;
 use cera::model::audio_decoder::{AudioDecoderWeights, DetokenizerWeights};
 use cera::model::split_vocoder::{is_split_vocoder, merge_split_vocoder};
 
-fn fixture(lang: &str, file: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME")
+/// The user's home directory: `HOME`, or `USERPROFILE` where it is unset (Windows).
+fn home_dir() -> String {
+    std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
-        .expect("HOME or USERPROFILE must be set");
+        .expect("HOME or USERPROFILE must be set")
+}
+
+fn fixture(lang: &str, file: &str) -> Option<PathBuf> {
+    let home = home_dir();
     let p = PathBuf::from(home)
         .join(".leap/models/split-vocoder-fixtures")
         .join(lang)
@@ -71,7 +76,7 @@ fn merged_en_matches_leap_merged_vocoder() {
     let Some((_, _, m)) = merged("en", "LFM2.5-Audio-1.5B-Q4_0") else {
         return;
     };
-    let leap = PathBuf::from(std::env::var("HOME").unwrap())
+    let leap = PathBuf::from(home_dir())
         .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf");
     if !leap.exists() {
         assert!(
@@ -249,21 +254,22 @@ fn jp_asr_with_the_vocoder_attached_is_correct_and_deterministic() {
 #[test]
 fn sidecar_ref_follows_the_real_vocoders() {
     const URL: &str = "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP-GGUF/resolve/main/";
-    let Some(jp) = fixture("jp", "vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf") else {
-        return;
-    };
-    // The llama.cpp JP vocoder is the split half: its sibling is the tokenizer.
-    assert_eq!(
-        cera::model::split_vocoder::sidecar_ref_for(
-            &format!("{URL}vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf"),
-            &std::fs::read(jp).unwrap()
-        )
-        .as_deref(),
-        Some(format!("{URL}tokenizer-LFM2.5-Audio-1.5B-JP-Q4_0.gguf").as_str())
-    );
+    // Each fixture is checked on its own: a missing JP vocoder must not skip the
+    // EN assertion below (`fixture` already fails when the require flag is set).
+    if let Some(jp) = fixture("jp", "vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf") {
+        // The llama.cpp JP vocoder is the split half: its sibling is the tokenizer.
+        assert_eq!(
+            cera::model::split_vocoder::sidecar_ref_for(
+                &format!("{URL}vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf"),
+                &std::fs::read(jp).unwrap()
+            )
+            .as_deref(),
+            Some(format!("{URL}tokenizer-LFM2.5-Audio-1.5B-JP-Q4_0.gguf").as_str())
+        );
+    }
 
     // The LEAP-merged EN vocoder already has the backbone: nothing to fetch.
-    let leap = PathBuf::from(std::env::var("HOME").unwrap())
+    let leap = PathBuf::from(home_dir())
         .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf");
     if !leap.exists() {
         assert!(
