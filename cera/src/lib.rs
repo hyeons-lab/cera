@@ -2,13 +2,13 @@
 // here (keeping it would trip the `stable_features` lint). `stdarch_neon_i8mm`
 // and `stdarch_aarch64_prefetch` are still unstable — remove them from this
 // list as they stabilize.
-// Browser-reachable code must not call `std::time::Instant::now()` (panics on
-// wasm32); see clippy.toml. Allowed elsewhere via `[lints.clippy]` in Cargo.toml.
-#![cfg_attr(target_arch = "wasm32", deny(clippy::disallowed_methods))]
 #![cfg_attr(
     target_arch = "aarch64",
     feature(stdarch_aarch64_prefetch, stdarch_neon_i8mm)
 )]
+// Browser-reachable code must not call `std::time::Instant::now()` (panics on
+// wasm32); see clippy.toml. Allowed elsewhere via `[lints.clippy]` in Cargo.toml.
+#![cfg_attr(target_arch = "wasm32", deny(clippy::disallowed_methods))]
 
 /// Crate version, sourced from `Cargo.toml` at compile time. Useful
 /// for FFI / wrapper crates that want to surface the core lib version

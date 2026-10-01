@@ -217,7 +217,8 @@ pub fn sibling_tokenizer_ref(vocoder_ref: &str) -> Option<String> {
 
 /// How much of a vocoder GGUF to parse when deciding whether it is the split
 /// half. The header (metadata plus the tensor index) of the vocoders in this
-/// layout is under 8 KiB; this leaves ample room.
+/// layout is under 16 KiB (about 6.8 KiB split, 12 KiB for the merged LEAP one); this
+/// leaves ample room.
 const HEADER_PROBE_BYTES: usize = 1 << 20;
 
 /// The `tokenizer-*` reference to fetch for a vocoder that turns out to be the
@@ -226,14 +227,36 @@ const HEADER_PROBE_BYTES: usize = 1 << 20;
 /// For loaders that already hold the vocoder's bytes but have no filesystem to
 /// look beside it (the browser): `vocoder_ref` is the manifest's reference to the
 /// vocoder (a URL or a relative path), `vocoder_bytes` its contents. Only the
-/// header is parsed, so a 100 MB vocoder is not copied. A merged vocoder, one not
-/// named `vocoder-*`, or bytes that do not parse all return `None`, which leaves
-/// the existing "no sidecar" behaviour untouched.
+/// leading `HEADER_PROBE_BYTES` (1 MiB) are parsed and copied, never the whole
+/// vocoder. A merged vocoder, one not named `vocoder-*`, or bytes that do not
+/// parse all return `None`, which leaves the existing "no sidecar" behaviour
+/// untouched.
 pub fn sidecar_ref_for(vocoder_ref: &str, vocoder_bytes: &[u8]) -> Option<String> {
-    let sidecar = sibling_tokenizer_ref(vocoder_ref)?;
-    let header = &vocoder_bytes[..vocoder_bytes.len().min(HEADER_PROBE_BYTES)];
-    let gguf = GgufFile::from_header_bytes(Arc::from(header), vocoder_bytes.len() as u64).ok()?;
-    is_split_vocoder(&gguf).then_some(sidecar)
+    // Name first: it is free, and most vocoders are not named like a split half.
+    sibling_tokenizer_ref(vocoder_ref)?;
+    // The file size stays the real one: tensor offsets point past the probe window.
+    let gguf =
+        GgufFile::from_header_bytes(header_window(vocoder_bytes), vocoder_bytes.len() as u64)
+            .ok()?;
+    sidecar_ref_for_gguf(vocoder_ref, &gguf)
+}
+
+/// The `tokenizer-*` reference a parsed vocoder needs fetched beside it, or
+/// `None` when it is not the split half or is not named like one. The single
+/// home of the "is it split, and where is its sibling" decision, shared by the
+/// browser probe and the native engine.
+pub fn sidecar_ref_for_gguf(vocoder_ref: &str, vocoder: &GgufFile) -> Option<String> {
+    if !is_split_vocoder(vocoder) {
+        return None;
+    }
+    sibling_tokenizer_ref(vocoder_ref)
+}
+
+/// The copy of the leading `HEADER_PROBE_BYTES` of `bytes` that
+/// [`sidecar_ref_for`] parses. Returning the owned window keeps the cap from
+/// being bypassed by copying the whole buffer.
+fn header_window(bytes: &[u8]) -> Arc<[u8]> {
+    Arc::from(&bytes[..bytes.len().min(HEADER_PROBE_BYTES)])
 }
 
 /// Open a vocoder GGUF for a direct (non-manifest) load, folding in the sibling
@@ -377,7 +400,11 @@ mod tests {
     use super::*;
     use crate::convert::writer::{GGML_TYPE_F32, GgufWriter};
 
-    fn gguf(tensors: &[(&str, Vec<u64>, Vec<f32>)], meta: &[(&str, u32)]) -> GgufFile {
+    /// The bytes of a GGUF holding `meta` (u32 keys) and f32 `tensors`.
+    fn gguf_bytes_with_meta(
+        tensors: &[(&str, Vec<u64>, Vec<f32>)],
+        meta: &[(&str, u32)],
+    ) -> Vec<u8> {
         let mut w = GgufWriter::new();
         for (k, v) in meta {
             w.add_u32(*k, *v);
@@ -391,7 +418,11 @@ mod tests {
             let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
             w.write_tensor_data(&mut out, &bytes).unwrap();
         }
-        GgufFile::from_bytes(out.into()).unwrap()
+        out
+    }
+
+    fn gguf(tensors: &[(&str, Vec<u64>, Vec<f32>)], meta: &[(&str, u32)]) -> GgufFile {
+        GgufFile::from_bytes(gguf_bytes_with_meta(tensors, meta).into()).unwrap()
     }
 
     fn f(n: usize, base: f32) -> Vec<f32> {
@@ -666,17 +697,7 @@ mod tests {
     const JP_VOCODER_URL: &str = "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP-GGUF/resolve/main/vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf";
 
     fn gguf_bytes(tensors: &[(&str, Vec<u64>, Vec<f32>)]) -> Vec<u8> {
-        let mut w = GgufWriter::new();
-        for (name, dims, data) in tensors {
-            w.add_tensor(*name, dims.clone(), GGML_TYPE_F32, data.len() * 4);
-        }
-        let mut out = Vec::new();
-        w.write_header_and_tensor_info(&mut out).unwrap();
-        for (_, _, data) in tensors {
-            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
-            w.write_tensor_data(&mut out, &bytes).unwrap();
-        }
-        out
+        gguf_bytes_with_meta(tensors, &[])
     }
 
     #[test]
@@ -708,10 +729,44 @@ mod tests {
 
     #[test]
     fn sidecar_ref_only_needs_the_header() {
-        // A real vocoder is ~100 MB, but the answer comes from the header: pad the
-        // payload well past the probe size and the result is unchanged.
-        let mut split = gguf_bytes(&[("emb.emb.weight", vec![4, 2], f(8, 0.0))]);
-        split.resize(split.len() + 2 * HEADER_PROBE_BYTES, 0);
+        // A real vocoder is ~100 MB, but the answer comes from the header. Put a
+        // tensor bigger than the probe window ahead of the probe tensor, so the
+        // payload really lies past the window: the answer must not depend on the
+        // window holding the data, and the probe must stay a prefix of the file.
+        let pad = 2 * HEADER_PROBE_BYTES / 4;
+        let split = gguf_bytes(&[
+            ("pad.weight", vec![pad as u64, 1], f(pad, 0.0)),
+            ("emb.emb.weight", vec![4, 2], f(8, 0.0)),
+        ]);
+        assert!(split.len() > 2 * HEADER_PROBE_BYTES);
+        assert_eq!(header_window(&split).len(), HEADER_PROBE_BYTES);
         assert!(sidecar_ref_for(JP_VOCODER_URL, &split).is_some());
+        // Short input is not padded or over-read.
+        assert_eq!(header_window(&split[..100]).len(), 100);
+    }
+
+    #[test]
+    fn sidecar_ref_reads_a_header_far_larger_than_the_real_ones() {
+        // Real split headers are ~7 KiB, merged ones ~12 KiB. The probe window
+        // must stay comfortably above that: a window cut mid-header parses to
+        // None and silently drops the sidecar, with every other test green.
+        let keys: Vec<String> = (0..3000).map(|i| format!("meta.key.{i:05}")).collect();
+        let meta: Vec<(&str, u32)> = keys.iter().map(|k| (k.as_str(), 1)).collect();
+        let big_header = gguf_bytes_with_meta(&[("emb.emb.weight", vec![4, 2], f(8, 0.0))], &meta);
+        assert!(big_header.len() > 64 * 1024, "{}", big_header.len());
+        assert!(sidecar_ref_for(JP_VOCODER_URL, &big_header).is_some());
+    }
+
+    #[test]
+    fn sidecar_ref_is_none_for_a_hostile_header() {
+        // Counts far beyond the buffer must read as "does not parse", not abort.
+        for (tensors, kvs) in [(u64::MAX, 0u64), (1 << 40, 0), (0, u64::MAX), (0, 1 << 40)] {
+            let mut bytes = b"GGUF".to_vec();
+            bytes.extend_from_slice(&3u32.to_le_bytes());
+            bytes.extend_from_slice(&tensors.to_le_bytes());
+            bytes.extend_from_slice(&kvs.to_le_bytes());
+            bytes.resize(bytes.len() + 64, 0);
+            assert_eq!(sidecar_ref_for(JP_VOCODER_URL, &bytes), None);
+        }
     }
 }

@@ -288,3 +288,41 @@ fn sidecar_ref_follows_the_real_vocoders() {
         None
     );
 }
+
+/// Metadata plus tensor index (no weights) of the real JP split vocoder and the
+/// LEAP-merged EN vocoder, committed so the split decision runs against real
+/// tensor names in CI, where the full models are absent and the tests above skip.
+/// Cut from the first `header_end` bytes of the release files, with their real
+/// sizes: tensor offsets point past the excerpt.
+const JP_SPLIT_HEADER: &[u8] = include_bytes!("fixtures/split_vocoder/jp-split-vocoder.header.bin");
+const JP_SPLIT_FILE_SIZE: u64 = 108_986_656;
+const LEAP_MERGED_HEADER: &[u8] =
+    include_bytes!("fixtures/split_vocoder/leap-merged-vocoder.header.bin");
+const LEAP_MERGED_FILE_SIZE: u64 = 148_508_512;
+
+#[test]
+fn sidecar_ref_follows_the_committed_real_vocoder_headers() {
+    use cera::model::split_vocoder::sidecar_ref_for_gguf;
+    const URL: &str = "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP-GGUF/resolve/main/";
+
+    let jp = GgufFile::from_header_bytes(Arc::from(JP_SPLIT_HEADER), JP_SPLIT_FILE_SIZE)
+        .expect("JP split vocoder header");
+    assert!(is_split_vocoder(&jp), "llama.cpp vocoder should be split");
+    assert_eq!(
+        sidecar_ref_for_gguf(&format!("{URL}vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf"), &jp)
+            .as_deref(),
+        Some(format!("{URL}tokenizer-LFM2.5-Audio-1.5B-JP-Q4_0.gguf").as_str())
+    );
+
+    // The LEAP-merged vocoder already carries its backbone: nothing to fetch.
+    let leap = GgufFile::from_header_bytes(Arc::from(LEAP_MERGED_HEADER), LEAP_MERGED_FILE_SIZE)
+        .expect("LEAP merged vocoder header");
+    assert!(!is_split_vocoder(&leap));
+    assert_eq!(
+        sidecar_ref_for_gguf(
+            "https://h/LFM2.5-Audio-1.5B-GGUF-LEAP/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf",
+            &leap
+        ),
+        None
+    );
+}

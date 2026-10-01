@@ -469,7 +469,7 @@ impl BundleRepo {
         };
 
         // GGUF self-healing integrity validation: verify magic bytes `GGUF`
-        if url.ends_with(".gguf") {
+        if is_gguf_url(url) {
             let size = file_size(&handle).await?;
             if size < 4.0 {
                 console_warn(&format!(
@@ -1432,23 +1432,95 @@ pub(crate) fn split_vocoder_sidecar_url(
 /// Fold the fetch of a sidecar the manifest did NOT name (one derived by
 /// [`split_vocoder_sidecar_url`]) into an optional one.
 ///
-/// The URL is a guess: a third-party host may not serve a sibling, or the
-/// request may fail transiently. Native treats the same guess as best-effort
-/// (a warning), and the session already loads a vocoder without its
-/// detokenizer, so a failed guess must not take down text-only inference. A
-/// sidecar the manifest names stays fatal; only callers of the derived URL use
-/// this.
-pub(crate) fn inferred_sidecar<T>(fetched: Result<T, JsError>, url: &str) -> Option<T> {
+/// The URL is a guess: a third-party host may not serve a sibling, may answer
+/// an unknown path with an HTTP 200 page, or the request may fail transiently.
+/// Native treats the same guess as best-effort (a warning), and the session
+/// already loads a vocoder without its detokenizer, so a failed guess must not
+/// take down text-only inference. A body without the GGUF magic counts as a
+/// failed guess (the common case is a catch-all host answering an unknown path
+/// with an HTTP 200 page); one that has the magic but does not parse is dropped
+/// later, with a warning on the WebGPU path (`parse_audio_sidecar`) and
+/// silently by the CPU engine. A sidecar the manifest names stays fatal to
+/// fetch; only callers of the derived URL use this.
+pub(crate) fn inferred_sidecar(fetched: Result<Vec<u8>, JsError>, url: &str) -> Option<Vec<u8>> {
+    let fetched = fetched.and_then(|bytes| {
+        if bytes.starts_with(b"GGUF") {
+            Ok(bytes)
+        } else {
+            Err(JsError::new(
+                "not a GGUF file (does the host answer unknown paths with HTTP 200?)",
+            ))
+        }
+    });
     match fetched {
         Ok(bytes) => Some(bytes),
         Err(e) => {
             crate::console_warn(&format!(
-                "[cera-wasm] could not fetch the inferred split-vocoder sidecar \"{url}\": {e:?}; \
+                "[cera-wasm] could not load the inferred split-vocoder sidecar \"{url}\": {}; \
+                 audio output will be unavailable (the load continues without it)",
+                describe(&JsValue::from(e))
+            ));
+            None
+        }
+    }
+}
+
+/// Parse an audio sidecar (`what` names it in the warning), best-effort like
+/// native: bytes that do not parse (a truncated download, an inferred sidecar
+/// the host answered with something else) lose audio output, not the whole load.
+#[cfg(any(test, feature = "wgpu"))]
+pub(crate) fn parse_audio_sidecar(
+    bytes: std::sync::Arc<[u8]>,
+    what: &str,
+) -> Option<std::sync::Arc<cera::gguf::GgufFile>> {
+    match cera::gguf::GgufFile::from_bytes(bytes) {
+        Ok(g) => Some(std::sync::Arc::new(g)),
+        Err(e) => {
+            crate::console_warn(&format!(
+                "[cera-wasm] ignoring the {what} sidecar, it does not parse: {e:#}; \
                  audio output will be unavailable"
             ));
             None
         }
     }
+}
+
+/// Whether `url` names a `.gguf` file, ignoring any query string or fragment
+/// (`...tokenizer-x.gguf?download=true` is still a GGUF).
+fn is_gguf_url(url: &str) -> bool {
+    url.split(['?', '#'])
+        .next()
+        .is_some_and(|path| path.ends_with(".gguf"))
+}
+
+/// Fetch the sidecar a split vocoder needs but the manifest does not name.
+///
+/// One home for the "derive the URL, fetch it, a failed guess is not fatal"
+/// decision, shared by [`load_manifest_struct`] and the streaming WebGPU
+/// loader. A bad body that reached the cache is not reused: the next load's
+/// `cache_hit_valid` evicts a `.gguf` entry with the wrong magic and refetches.
+pub(crate) async fn fetch_inferred_sidecar(
+    repo: &BundleRepo,
+    manifest: &cera::manifest::Manifest,
+    base_url: &str,
+    vocoder_bytes: Option<&[u8]>,
+    on_progress: Option<&Function>,
+) -> Option<Vec<u8>> {
+    let url = match split_vocoder_sidecar_url(manifest, base_url, vocoder_bytes) {
+        Ok(Some(url)) => url,
+        Ok(None) => return None,
+        // The vocoder's own URL joined, so this is a malformed sibling name.
+        Err(e) => {
+            crate::console_warn(&format!(
+                "[cera-wasm] could not derive the split-vocoder sidecar URL: {}; \
+                 audio output will be unavailable",
+                describe(&JsValue::from(e))
+            ));
+            return None;
+        }
+    };
+    let fetched = repo.read_or_download(&url, None, on_progress).await;
+    inferred_sidecar(fetched, &url)
 }
 
 /// Load the bundle described by the parsed manifest.
@@ -1499,12 +1571,16 @@ pub(crate) async fn load_manifest_struct(
         }
         // The manifest names no tokenizer, but a llama.cpp vocoder keeps its
         // detokenizer backbone in the sibling `tokenizer-*` file.
-        None => match split_vocoder_sidecar_url(manifest, base_url, audio_decoder.as_deref())? {
-            Some(url) => {
-                inferred_sidecar(repo.read_or_download(&url, None, on_progress).await, &url)
-            }
-            None => None,
-        },
+        None => {
+            fetch_inferred_sidecar(
+                repo,
+                manifest,
+                base_url,
+                audio_decoder.as_deref(),
+                on_progress,
+            )
+            .await
+        }
     };
 
     let draft_model = match manifest
@@ -1727,14 +1803,80 @@ mod tests {
     }
 
     #[wasm_bindgen_test]
+    fn a_query_string_does_not_hide_a_gguf_url() {
+        assert!(is_gguf_url("https://h/a/tokenizer-x.gguf"));
+        assert!(is_gguf_url("https://h/a/tokenizer-x.gguf?download=true"));
+        assert!(is_gguf_url("https://h/a/tokenizer-x.gguf#frag"));
+        assert!(!is_gguf_url("https://h/a/model.safetensors"));
+        // `.gguf` only inside the query is not a GGUF path.
+        assert!(!is_gguf_url("https://h/a/page?file=x.gguf"));
+    }
+
+    #[wasm_bindgen_test]
+    fn an_unparseable_audio_sidecar_is_dropped_not_fatal() {
+        use std::sync::Arc;
+        // Junk, and a body with the GGUF magic that is cut off after it.
+        assert!(parse_audio_sidecar(Arc::from(&b"<html>"[..]), "test").is_none());
+        assert!(parse_audio_sidecar(Arc::from(&b"GGUF\x03"[..]), "test").is_none());
+        // A real (empty) GGUF parses.
+        let mut ok = b"GGUF".to_vec();
+        ok.extend_from_slice(&3u32.to_le_bytes());
+        ok.extend_from_slice(&[0u8; 16]);
+        assert!(parse_audio_sidecar(Arc::from(ok.as_slice()), "test").is_some());
+    }
+
+    #[wasm_bindgen_test]
+    fn header_counts_that_wrap_on_32_bit_are_rejected() {
+        // cera's own tests never run on wasm32, where a u64 count narrowed to
+        // `usize` wraps (2^32 + k becomes k) and would slip past a size check.
+        // A hostile count must be an error here, as it is on 64-bit hosts.
+        let header = |tensors: u64, kvs: u64| {
+            let mut b = b"GGUF".to_vec();
+            b.extend_from_slice(&3u32.to_le_bytes());
+            b.extend_from_slice(&tensors.to_le_bytes());
+            b.extend_from_slice(&kvs.to_le_bytes());
+            b.resize(b.len() + 64, 0);
+            std::sync::Arc::<[u8]>::from(b.as_slice())
+        };
+        for (tensors, kvs) in [(1u64 << 32, 1u64 << 32), (1 << 32, 0), (0, (1 << 32) + 2)] {
+            assert!(
+                cera::gguf::GgufFile::from_bytes(header(tensors, kvs)).is_err(),
+                "tensors={tensors} kv={kvs}"
+            );
+        }
+        // An array count of 2^32 + 3 over three real elements.
+        let mut b = b"GGUF".to_vec();
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.extend_from_slice(&1u64.to_le_bytes());
+        b.push(b'k');
+        b.extend_from_slice(&9u32.to_le_bytes()); // array
+        b.extend_from_slice(&0u32.to_le_bytes()); // of u8
+        b.extend_from_slice(&((1u64 << 32) + 3).to_le_bytes());
+        b.extend_from_slice(&[1, 2, 3]);
+        assert!(cera::gguf::GgufFile::from_bytes(std::sync::Arc::from(b.as_slice())).is_err());
+    }
+
+    #[wasm_bindgen_test]
     fn a_failed_inferred_sidecar_fetch_is_not_fatal() {
         // The URL was a guess: a 404 or a network error must degrade to "no
         // detokenizer", not reject the whole session.
         assert_eq!(
-            inferred_sidecar(Ok(vec![1u8, 2]), "https://h/t.gguf"),
-            Some(vec![1, 2])
+            inferred_sidecar(Ok(b"GGUF\x03".to_vec()), "https://h/t.gguf"),
+            Some(b"GGUF\x03".to_vec())
         );
         let failed: Result<Vec<u8>, JsError> = Err(JsError::new("404"));
         assert_eq!(inferred_sidecar(failed, "https://h/t.gguf"), None);
+        // An HTTP 200 page (SPA fallback, captive portal) has no GGUF magic.
+        // The whole four-byte magic counts, not just its first bytes.
+        assert_eq!(
+            inferred_sidecar(Ok(b"GGUX\x03".to_vec()), "https://h/t.gguf"),
+            None
+        );
+        assert_eq!(
+            inferred_sidecar(Ok(b"<html>not found</html>".to_vec()), "https://h/t.gguf"),
+            None
+        );
     }
 }
