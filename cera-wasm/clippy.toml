@@ -1,0 +1,13 @@
+# `std::time::Instant::now()` and `SystemTime::now()` compile on
+# wasm32-unknown-unknown but panic on first call ("time not implemented on this
+# platform"). Browser-reachable code must take its clock from `crate::time`.
+#
+# On native targets `crate::time::Instant` IS `std::time::Instant`, so these
+# paths would flag every legitimate call there. The lint is therefore allowed
+# for the package in Cargo.toml and denied for the library on wasm32 only (see
+# `lib.rs`), where `crate::time::Instant` is `web_time::Instant` and only a
+# direct `std` use trips it. CI's wasm32 clippy legs enforce it.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "panics on wasm32; use crate::time::Instant" },
+    { path = "std::time::SystemTime::now", reason = "panics on wasm32; use web_time::SystemTime or js_sys::Date" },
+]

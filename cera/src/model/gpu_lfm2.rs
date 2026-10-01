@@ -621,7 +621,7 @@ fn soak_and_measure(run: impl Fn(u32) -> std::time::Duration, iters: u32) -> (f6
     // both harness entries `ensure!(iters >= 1)`, so a zero here is a
     // caller bug that must fail fast in release too.
     assert!(iters >= 1, "soak_and_measure: iters must be >= 1");
-    let soak_start = std::time::Instant::now();
+    let soak_start = crate::time::Instant::now();
     while soak_start.elapsed() < std::time::Duration::from_millis(SOAK_MS) {
         run(10);
     }
