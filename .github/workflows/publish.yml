@@ -474,10 +474,19 @@ jobs:
           # r28 floor: first NDK with 16KB ELF alignment by default (see
           # the android-abis job in ci.yml). Keep in sync with it.
           ndk-version: r30
+      # ubuntu-latest ships no `just`, and the next step runs a recipe.
+      - uses: extractions/setup-just@v4
+        if: ${{ matrix.android }}
       - name: Build Android jniLibs
         if: ${{ matrix.android }}
         env:
           ANDROID_NDK_HOME: ${{ steps.setup-ndk.outputs.ndk-path }}
+          # The workflow-level `RUSTFLAGS: ""` replaces .cargo/config.toml, which drops the
+          # 16KB page-size linker flags of the Android targets. NDK r30 aligns the 64-bit ABIs
+          # on its own, but armeabi-v7a and x86 come out 4KB-aligned and fail
+          # `assert-16k-pages.py` in `just android-libs`. Restore the flags, as ci.yml's
+          # android-abis job does.
+          RUSTFLAGS: "-C link-arg=-Wl,-z,max-page-size=16384 -C link-arg=-Wl,-z,common-page-size=16384"
         run: |
           rustup target add aarch64-linux-android armv7-linux-androideabi x86_64-linux-android i686-linux-android
           cargo install cargo-ndk --version '^4' --locked
