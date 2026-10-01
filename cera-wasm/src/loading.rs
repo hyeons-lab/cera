@@ -41,6 +41,10 @@ pub struct ModelParts {
     pub model: Vec<u8>,
     pub multimodal_projector: Option<Vec<u8>>,
     pub audio_decoder: Option<Vec<u8>>,
+    /// The audio detokenizer backbone. A llama.cpp split-layout vocoder
+    /// (`vocoder-*.gguf`) does not carry it: fetch its sibling `tokenizer-*.gguf`
+    /// and pass it here, or the model loads without audio output. The bundle
+    /// loaders do this for you.
     pub audio_tokenizer: Option<Vec<u8>>,
     pub draft_model: Option<Vec<u8>>,
     pub inference_type: Option<String>,

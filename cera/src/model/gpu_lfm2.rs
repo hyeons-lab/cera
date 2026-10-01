@@ -621,7 +621,7 @@ fn soak_and_measure(run: impl Fn(u32) -> std::time::Duration, iters: u32) -> (f6
     // both harness entries `ensure!(iters >= 1)`, so a zero here is a
     // caller bug that must fail fast in release too.
     assert!(iters >= 1, "soak_and_measure: iters must be >= 1");
-    let soak_start = std::time::Instant::now();
+    let soak_start = crate::time::Instant::now();
     while soak_start.elapsed() < std::time::Duration::from_millis(SOAK_MS) {
         run(10);
     }
@@ -4186,9 +4186,9 @@ impl GpuLfm2Model {
     /// Submit encoder and wait for GPU to finish.
     fn submit_and_wait(&self, enc: wgpu::CommandEncoder) {
         let host_prof = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
-        let t_submit = host_prof.then(std::time::Instant::now);
+        let t_submit = host_prof.then(crate::time::Instant::now);
         self.ctx.submit_encoder(enc);
-        let t_stall = host_prof.then(std::time::Instant::now);
+        let t_stall = host_prof.then(crate::time::Instant::now);
         self.ctx.device.poll_wait();
         if let (Some(t_submit), Some(t_stall)) = (t_submit, t_stall) {
             eprintln!(
@@ -5408,7 +5408,7 @@ impl GpuLfm2Model {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let hs32 = hs as u32;
-        let t_entry = std::time::Instant::now();
+        let t_entry = crate::time::Instant::now();
 
         self.ctx.reset_profiler();
 
@@ -5563,7 +5563,7 @@ impl GpuLfm2Model {
         // cost eats the overlap saving now that encode is lean (cached bind
         // groups). One submit stands; do not re-split without re-measuring.
         let host_prof_pre = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
-        let t_pre = std::time::Instant::now();
+        let t_pre = crate::time::Instant::now();
         if host_prof_pre {
             eprintln!(
                 "[GPU-HOST] pre={:.0}µs",
@@ -6058,14 +6058,14 @@ impl GpuLfm2Model {
         // The argmax rides along in the output projection's encoder, so a decode
         // step is one submit-and-stall, not two.
         let host_prof = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
-        let t_compute = std::time::Instant::now();
+        let t_compute = crate::time::Instant::now();
         self.forward_inner_compute_tail(
             tokens,
             pos,
             state,
             DecodeTail::Logits(TailArgmax::DispatchAndStage),
         );
-        let t_map = std::time::Instant::now();
+        let t_map = crate::time::Instant::now();
         let argmax = self.ctx.read_mapped_u32(&self.argmax_readback_buf, 1);
         let Some(&tok) = argmax.first() else {
             // The map failure is recorded first-wins in the readback slot
@@ -8384,7 +8384,7 @@ impl GpuLfm2Model {
         let n = tokens.len();
         let host_prof = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
         let passes_before = crate::backend::wgpu::io_stats::snapshot().passes;
-        let t_enc = std::time::Instant::now();
+        let t_enc = crate::time::Instant::now();
         let enc =
             self.encode_prefill_batched_locked(tokens, start_pos, state, all_logits, need_logits);
         if host_prof {
@@ -9940,7 +9940,7 @@ async fn gemv_q4_0_microbench_async(
                 pass.set_bind_group(0, bg, &[]);
                 pass.dispatch_workgroups(grid.0, grid.1, grid.2);
             }
-            let t = std::time::Instant::now();
+            let t = crate::time::Instant::now();
             ctx.submit_encoder(enc);
             ctx.device.poll_wait();
             t.elapsed()
@@ -10131,7 +10131,7 @@ async fn gemm_q4_0_microbench_async(
                     pass.dispatch_workgroups(grid.0, grid.1, grid.2);
                 }
             }
-            let t = std::time::Instant::now();
+            let t = crate::time::Instant::now();
             ctx.submit_encoder(enc);
             ctx.device.poll_wait();
             t.elapsed()

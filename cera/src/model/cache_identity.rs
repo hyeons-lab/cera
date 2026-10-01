@@ -82,7 +82,7 @@ mod tests {
         let gguf = GgufFile::from_bytes(bytes.into()).unwrap();
         let mut elapsed = Vec::new();
         for _ in 0..5 {
-            let start = std::time::Instant::now();
+            let start = crate::time::Instant::now();
             std::hint::black_box(for_loaded_weights(&gguf, "cost-fixture"));
             elapsed.push(start.elapsed().as_micros());
         }

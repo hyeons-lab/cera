@@ -15,10 +15,15 @@ use cera::gguf::GgufFile;
 use cera::model::audio_decoder::{AudioDecoderWeights, DetokenizerWeights};
 use cera::model::split_vocoder::{is_split_vocoder, merge_split_vocoder};
 
-fn fixture(lang: &str, file: &str) -> Option<PathBuf> {
-    let home = std::env::var("HOME")
+/// The user's home directory: `HOME`, or `USERPROFILE` where it is unset (Windows).
+fn home_dir() -> String {
+    std::env::var("HOME")
         .or_else(|_| std::env::var("USERPROFILE"))
-        .expect("HOME or USERPROFILE must be set");
+        .expect("HOME or USERPROFILE must be set")
+}
+
+fn fixture(lang: &str, file: &str) -> Option<PathBuf> {
+    let home = home_dir();
     let p = PathBuf::from(home)
         .join(".leap/models/split-vocoder-fixtures")
         .join(lang)
@@ -71,7 +76,7 @@ fn merged_en_matches_leap_merged_vocoder() {
     let Some((_, _, m)) = merged("en", "LFM2.5-Audio-1.5B-Q4_0") else {
         return;
     };
-    let leap = PathBuf::from(std::env::var("HOME").unwrap())
+    let leap = PathBuf::from(home_dir())
         .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf");
     if !leap.exists() {
         assert!(
@@ -241,4 +246,83 @@ fn jp_asr_with_the_vocoder_attached_is_correct_and_deterministic() {
             }
         }
     }
+}
+
+/// The browser has the vocoder's bytes but no filesystem to look beside: the
+/// decision to fetch a sibling `tokenizer-*` must come from the header alone, and
+/// must say "nothing to fetch" for a vocoder that already carries its backbone.
+#[test]
+fn sidecar_ref_follows_the_real_vocoders() {
+    const URL: &str = "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP-GGUF/resolve/main/";
+    // Each fixture is checked on its own: a missing JP vocoder must not skip the
+    // EN assertion below (`fixture` already fails when the require flag is set).
+    if let Some(jp) = fixture("jp", "vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf") {
+        // The llama.cpp JP vocoder is the split half: its sibling is the tokenizer.
+        assert_eq!(
+            cera::model::split_vocoder::sidecar_ref_for(
+                &format!("{URL}vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf"),
+                &std::fs::read(jp).unwrap()
+            )
+            .as_deref(),
+            Some(format!("{URL}tokenizer-LFM2.5-Audio-1.5B-JP-Q4_0.gguf").as_str())
+        );
+    }
+
+    // The LEAP-merged EN vocoder already has the backbone: nothing to fetch.
+    let leap = PathBuf::from(home_dir())
+        .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf");
+    if !leap.exists() {
+        assert!(
+            std::env::var_os("CERA_REQUIRE_SPLIT_VOCODER_FIXTURES").is_none(),
+            "missing fixture {}",
+            leap.display()
+        );
+        eprintln!("skipping: {} not found", leap.display());
+        return;
+    }
+    assert_eq!(
+        cera::model::split_vocoder::sidecar_ref_for(
+            "https://h/LFM2.5-Audio-1.5B-GGUF-LEAP/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf",
+            &std::fs::read(leap).unwrap()
+        ),
+        None
+    );
+}
+
+/// Metadata plus tensor index (no weights) of the real JP split vocoder and the
+/// LEAP-merged EN vocoder, committed so the split decision runs against real
+/// tensor names in CI, where the full models are absent and the tests above skip.
+/// Cut from the first `header_end` bytes of the release files, with their real
+/// sizes: tensor offsets point past the excerpt.
+const JP_SPLIT_HEADER: &[u8] = include_bytes!("fixtures/split_vocoder/jp-split-vocoder.header.bin");
+const JP_SPLIT_FILE_SIZE: u64 = 108_986_656;
+const LEAP_MERGED_HEADER: &[u8] =
+    include_bytes!("fixtures/split_vocoder/leap-merged-vocoder.header.bin");
+const LEAP_MERGED_FILE_SIZE: u64 = 148_508_512;
+
+#[test]
+fn sidecar_ref_follows_the_committed_real_vocoder_headers() {
+    use cera::model::split_vocoder::sidecar_ref_for_gguf;
+    const URL: &str = "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP-GGUF/resolve/main/";
+
+    let jp = GgufFile::from_header_bytes(Arc::from(JP_SPLIT_HEADER), JP_SPLIT_FILE_SIZE)
+        .expect("JP split vocoder header");
+    assert!(is_split_vocoder(&jp), "llama.cpp vocoder should be split");
+    assert_eq!(
+        sidecar_ref_for_gguf(&format!("{URL}vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf"), &jp)
+            .as_deref(),
+        Some(format!("{URL}tokenizer-LFM2.5-Audio-1.5B-JP-Q4_0.gguf").as_str())
+    );
+
+    // The LEAP-merged vocoder already carries its backbone: nothing to fetch.
+    let leap = GgufFile::from_header_bytes(Arc::from(LEAP_MERGED_HEADER), LEAP_MERGED_FILE_SIZE)
+        .expect("LEAP merged vocoder header");
+    assert!(!is_split_vocoder(&leap));
+    assert_eq!(
+        sidecar_ref_for_gguf(
+            "https://h/LFM2.5-Audio-1.5B-GGUF-LEAP/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf",
+            &leap
+        ),
+        None
+    );
 }

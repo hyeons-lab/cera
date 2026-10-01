@@ -222,6 +222,10 @@ wasm-bindgen-test = { workspace = true }
 # The downloader code itself lives in `src/bundle/download.rs` under the
 # same feature, so there is a single implementation.
 
+# See clippy.toml: `disallowed_methods` is enforced for the library on wasm32 only.
+[lints.clippy]
+disallowed_methods = "allow"
+
 [features]
 # Portability feature set (Phase 1.3).
 #

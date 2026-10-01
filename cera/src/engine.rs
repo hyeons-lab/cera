@@ -326,6 +326,23 @@ pub struct CeraEngine {
     drafter: Option<Arc<dyn crate::spec::Drafter>>,
 }
 
+/// Parse an optional audio sidecar, best-effort: bytes that do not parse (a
+/// truncated download, a body that is not a GGUF) lose audio output, not the
+/// whole load, and the reason is logged instead of vanishing.
+fn parse_audio_sidecar(bytes: Arc<[u8]>, what: &str) -> Option<Arc<GgufFile>> {
+    match GgufFile::from_bytes(bytes) {
+        Ok(g) => Some(Arc::new(g)),
+        Err(e) => {
+            tracing::warn!(
+                target: "cera::engine",
+                error = %format!("{e:#}"),
+                "ignoring the {what} sidecar: it does not parse"
+            );
+            None
+        }
+    }
+}
+
 impl CeraEngine {
     /// Load from a path that may be:
     /// - a bare `.gguf` file → internally synthesizes a text manifest,
@@ -353,7 +370,7 @@ impl CeraEngine {
     pub fn from_bytes(bytes: impl Into<Arc<[u8]>>, cfg: EngineConfig) -> Result<Self, CeraError> {
         let arc_bytes: Arc<[u8]> = bytes.into();
         let gguf = GgufFile::from_bytes(arc_bytes)
-            .map_err(|e| CeraError::Backend(format!("parsing GGUF bytes: {e}")))?;
+            .map_err(|e| CeraError::Backend(format!("parsing GGUF bytes: {e:#}")))?;
         let manifest = Manifest::synthetic_text(Path::new("<bytes>"));
         Self::from_gguf(gguf, manifest, cfg, None, AuxWeights::default())
     }
@@ -452,12 +469,10 @@ impl CeraEngine {
         let (audio_decoder, detok_weights, audio_accelerator) = {
             let voc_arc = parts
                 .audio_decoder
-                .and_then(|b| GgufFile::from_bytes(b).ok())
-                .map(Arc::new);
+                .and_then(|b| parse_audio_sidecar(b, "audio decoder"));
             let tok_arc = parts
                 .audio_tokenizer
-                .and_then(|b| GgufFile::from_bytes(b).ok())
-                .map(Arc::new);
+                .and_then(|b| parse_audio_sidecar(b, "audio tokenizer"));
 
             let voc_arc = voc_arc
                 .map(|vg| crate::model::split_vocoder::resolve_vocoder(vg, tok_arc.as_ref()));
@@ -1592,10 +1607,8 @@ fn attach_split_vocoder_sidecar(
     let Ok(vocoder) = GgufFile::open(Path::new(local)) else {
         return;
     };
-    if !crate::model::split_vocoder::is_split_vocoder(&vocoder) {
-        return;
-    }
-    let Some(sibling) = crate::model::split_vocoder::sibling_tokenizer_ref(decoder_ref) else {
+    let Some(sibling) = crate::model::split_vocoder::sidecar_ref_for_gguf(decoder_ref, &vocoder)
+    else {
         return;
     };
     match resolve_url_or_path(&sibling, manifest_dir, cfg) {
