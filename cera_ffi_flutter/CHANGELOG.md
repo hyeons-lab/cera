@@ -4,6 +4,9 @@
 
 - Add Qualcomm Hexagon NPU backend preference support.
 - The 64-bit Android AAR now bundles the Hexagon and wgpu backends, so `BackendPreference.auto` probes Hexagon, then wgpu, then CPU there.
+- Include the `cera_ffi` 0.7.0 session additions: `GenerateOpts.no_spec`, `SessionConfig.disable_spec`, `Session.disable_spec` / `enable_spec`, `append_raw_image` with `PixelFormat`, `configure_prefix_cache`, the `image_max_long_size` getter, `hexagon_probe` and `hexagon_install_skels`.
+- Include the `cera_ffi` 0.7.0 fix for loading real Qwen 3.5 GGUFs (`post_attention_norm` tensor naming).
+- Breaking: the `BackendPreference` enum gained a `hexagon` value, so an exhaustive Dart `switch` over it needs a new case.
 - Align platform manifests and the dependency on `cera_ffi` at 0.7.0.
 - Add `Cera.audioProfile` (re-exported from `cera_ffi`): per-model TTS and interleaved system prompts, voices and sample texts resolved by cera. The example app reads it, so TTS Studio and Voice Chat work with models such as LFM2.5-Audio-1.5B-JP without hardcoded personas. Custom `Cera` implementations must add the getter. `Cera.appendAudio` with no `systemPrompt` now uses the profile's interleaved prompt, which includes the first voice on models that have voices.
 

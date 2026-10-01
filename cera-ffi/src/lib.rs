@@ -1808,8 +1808,11 @@ pub struct GenerateOpts {
     /// Ignored under synchronous generate; reserved for streaming.
     #[uniffi(default = 50)]
     pub flush_every_ms: u32,
-    /// Optional speculative decoding configuration (prompt-lookup drafting).
-    /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
+    /// Optional speculative decoding configuration. `None` turns speculative
+    /// decoding on only when a drafter is attached (a draft sidecar model next
+    /// to the target); with no drafter it stays off. `Some` honours the given
+    /// configuration. `no_spec` disables it for this call, and
+    /// `SessionConfig.disable_spec` (or `Session.disable_spec`) wins over both.
     #[uniffi(default = None)]
     pub spec: Option<SpecDecodeConfig>,
     /// Disable speculative decoding (even when a draft sidecar model is present).
@@ -2840,6 +2843,9 @@ impl Session {
     /// - `ContextOverflow` if appending image tokens exceeds context limit.
     /// - `Cancelled` if execution is interrupted.
     /// - `PoisonedSession` if the session lock is poisoned.
+    ///
+    /// A buffer longer than `width * height * bytes_per_pixel` is accepted:
+    /// only the leading bytes are read and the excess is ignored.
     pub fn append_raw_image(
         &self,
         pixels: Vec<u8>,

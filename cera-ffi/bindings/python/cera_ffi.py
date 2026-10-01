@@ -781,7 +781,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 38950:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 27818:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -10359,6 +10359,9 @@ class SessionProtocol(typing.Protocol):
         - `ContextOverflow` if appending image tokens exceeds context limit.
         - `Cancelled` if execution is interrupted.
         - `PoisonedSession` if the session lock is poisoned.
+
+        A buffer longer than `width * height * bytes_per_pixel` is accepted:
+        only the leading bytes are read and the excess is ignored.
 """
         raise NotImplementedError
     def append_text(self, text: str) -> None:
@@ -10940,6 +10943,9 @@ class Session(SessionProtocol):
         - `ContextOverflow` if appending image tokens exceeds context limit.
         - `Cancelled` if execution is interrupted.
         - `PoisonedSession` if the session lock is poisoned.
+
+        A buffer longer than `width * height * bytes_per_pixel` is accepted:
+        only the leading bytes are read and the excess is ignored.
 """
         
         _UniffiFfiConverterBytes.check_lower(pixels)
