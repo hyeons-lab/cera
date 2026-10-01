@@ -67,7 +67,7 @@ fn write_f32_as_f16(buf: &Buffer, dst_off_bytes: usize, data: &[f32]) {
 
 /// Read `count` f16 elements starting at byte offset `src_off` and
 /// return as a freshly-allocated `Vec<f32>`. Mirrors the f16-read
-/// path used by `MetalLfm2Model`'s attention kernels.
+/// path used by `MetalLfmModel`'s attention kernels.
 fn read_f16_as_f32(buf: &Buffer, src_off_bytes: usize, count: usize) -> Vec<f32> {
     let src_ptr = unsafe { (buf.contents() as *const u8).add(src_off_bytes) as *const f16 };
     (0..count)

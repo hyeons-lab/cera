@@ -1,6 +1,6 @@
 // Native Metal LFM2 forward pass.
 //
-// Mirrors GpuLfm2Model (wgpu) but dispatches directly through the metal crate.
+// Mirrors GpuLfmModel (wgpu) but dispatches directly through the metal crate.
 // All GPU work per token is encoded into ONE command buffer and committed once.
 
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicUsize, Ordering};
@@ -424,8 +424,8 @@ struct MetalState {
     /// The f16 generation KV caches, allocated on first use.
     ///
     /// Lazy so a TurboQuant session never pays for them: under compression every
-    /// KV write and attention read goes through `MetalLfm2Model::tq`, and this
-    /// `OnceLock` stays empty. See [`MetalLfm2Model::f16_kv`].
+    /// KV write and attention read goes through `MetalLfmModel::tq`, and this
+    /// `OnceLock` stays empty. See [`MetalLfmModel::f16_kv`].
     kv_caches: std::sync::OnceLock<Vec<Option<(Buffer, Buffer)>>>,
     conv_buffers: Vec<Option<Buffer>>,
     seq_len: AtomicUsize,
@@ -433,7 +433,7 @@ struct MetalState {
     embedding_hidden_size: usize,
 }
 
-/// Scratch KV/conv caches for [`MetalLfm2Model::hidden_states`], mirroring the
+/// Scratch KV/conv caches for [`MetalLfmModel::hidden_states`], mirroring the
 /// generation caches' shapes. Allocated **lazily** on first `hidden_states` call
 /// (via `OnceLock`), so a generation-only load never pays the (doubled) KV-cache
 /// VRAM. Selected over the generation caches by `use_hs_scratch`.
@@ -460,7 +460,7 @@ struct ParamsBufs {
     gemv_output: Buffer,
 }
 
-pub struct MetalLfm2Model {
+pub struct MetalLfmModel {
     ctx: MetalContext,
     config: ModelConfig,
     pipelines: MetalPipelines,
@@ -550,7 +550,7 @@ pub struct MetalLfm2Model {
     /// scratch is re-used across all attention layers (one shift
     /// event processes layers serially within a single command
     /// buffer) and across both K and V passes per layer. See
-    /// `MetalLfm2Model::shift_kv` and
+    /// `MetalLfmModel::shift_kv` and
     /// `cera/src/backend/shaders/kv_shift.metal`.
     kv_shift_scratch: Buffer,
     state: MetalState,
@@ -641,8 +641,8 @@ pub struct MetalLfm2Model {
     lora_tmp_batched: Buffer,
 }
 
-impl MetalLfm2Model {
-    /// LFM2 entry point. Builds the CPU `Lfm2Model` (config + weight refs) and
+impl MetalLfmModel {
+    /// LFM2 entry point. Builds the CPU `LfmModel` (config + weight refs) and
     /// drives the shared loader. The CPU source is dropped on return; Metal
     /// retains its exact parsed mapping or copies owned bytes into a shared
     /// Metal buffer.
@@ -653,7 +653,7 @@ impl MetalLfm2Model {
     ) -> Result<Self> {
         // No CPU repacks: the Metal loader only resolves metadata from this
         // model (see `with_repack_if`).
-        let cpu = super::lfm2::Lfm2Model::from_gguf_no_repack(gguf, context_size)?;
+        let cpu = super::lfm2::LfmModel::from_gguf_no_repack(gguf, context_size)?;
         Self::from_weight_source(&cpu, path, context_size)
     }
 
@@ -1630,7 +1630,7 @@ fn sz2d(x: u64, y: u64) -> MTLSize {
     }
 }
 
-/// Clears `MetalLfm2Model::active_lora` when dropped, so a leaked `Some` can't
+/// Clears `MetalLfmModel::active_lora` when dropped, so a leaked `Some` can't
 /// send a later base-model forward through the adapter. Mirrors the
 /// `ScratchGuard`/`use_hs_scratch` pattern.
 struct LoraGuard<'a>(&'a Mutex<Option<Arc<MetalLoraAdapter>>>);
@@ -1641,7 +1641,7 @@ impl Drop for LoraGuard<'_> {
     }
 }
 
-impl MetalLfm2Model {
+impl MetalLfmModel {
     /// Dequantize one embedding row into `dst`. Handles Q6_K, Q8_0, Q4_0, Q4_1,
     /// Q4_K, Q5_K, F16, BF16, and F32.
     fn dequant_embedding_row(&self, token_id: usize, dst: &mut [f32]) {
@@ -3872,7 +3872,7 @@ impl MetalLfm2Model {
 
 mod recovery;
 
-impl Model for MetalLfm2Model {
+impl Model for MetalLfmModel {
     fn try_reset_kv(
         &self,
         state: &mut InferenceState,
@@ -4082,7 +4082,7 @@ impl Model for MetalLfm2Model {
         // hidden state, which the caller hands to the depthformer.
         //
         // The output norm below IS part of that, despite reading like a step
-        // past it. `Lfm2Model::run_layers` ends with
+        // past it. `LfmModel::run_layers` ends with
         // `rmsnorm(hidden, output_norm_weight)`, so the CPU's `forward_embedding`
         // returns the normed vector and this has to as well. Pinned by
         // `gpu_lfm2_embedding_input::forward_embedding_matches_the_cpu_model`
@@ -4427,7 +4427,7 @@ impl Model for MetalLfm2Model {
     /// embedding-input modality. The trait default (parent `Model`)
     /// loops `forward_from_embedding` per frame and pays full per-
     /// token GEMV setup × n_frames; this override mirrors the CPU
-    /// `Lfm2Model::forward_prefill_from_embeddings` (PR #104) so
+    /// `LfmModel::forward_prefill_from_embeddings` (PR #104) so
     /// Metal audio prefill can amortize per-layer GEMM dispatch the
     /// same way text prefill already does.
     ///
@@ -4483,7 +4483,7 @@ impl Model for MetalLfm2Model {
     }
 
     fn supports_kv_shift(&self) -> bool {
-        // Mirror of CPU `Lfm2Model::supports_kv_shift` — Metal now
+        // Mirror of CPU `LfmModel::supports_kv_shift` — Metal now
         // implements the GPU-side shift via `kv_shift_k_to_scratch`
         // + `memcpy_f16_offsets`. See `Self::shift_kv`.
         //
@@ -4551,7 +4551,7 @@ impl Model for MetalLfm2Model {
     }
 }
 
-impl MetalLfm2Model {
+impl MetalLfmModel {
     /// Lock-free body of `Model::snapshot_state`. Callers that
     /// already hold `infer_lock` (e.g. `forward_prefill`'s prefix-
     /// cache write step) call this directly to avoid a recursive
@@ -4645,7 +4645,7 @@ impl MetalLfm2Model {
                     // kernels reading whatever was in the f16 cache before.
                     let tq = self.tq_cache().unwrap_or_else(|| {
                         panic!(
-                            "MetalLfm2Model::restore_state_locked received a \
+                            "MetalLfmModel::restore_state_locked received a \
                              TurboQuant-compressed snapshot at layer {i} but this \
                              model is not TurboQuant-configured; callers must gate \
                              on `StateSnapshot::is_compressed`"
@@ -4674,7 +4674,7 @@ impl MetalLfm2Model {
                     // `"metal:"` vs `"cpu:"` model_id fingerprint namespaces
                     // keep a Metal session from loading a CPU-written f16 entry.
                     panic!(
-                        "MetalLfm2Model::restore_state_locked received an f16 \
+                        "MetalLfmModel::restore_state_locked received an f16 \
                          snapshot at layer {i}; Metal stores its own f16 KV in \
                          tag-0 Attention snapshots. This indicates a \
                          cross-backend cache-namespace leak."
@@ -4684,8 +4684,8 @@ impl MetalLfm2Model {
                 | LayerSnapshot::ParallelAttentionMamba2 { .. }
                 | LayerSnapshot::DeltaNet { .. } => {
                     panic!(
-                        "MetalLfm2Model::restore_state_locked received an unsupported recurrent snapshot at layer {i}; \
-                         Mamba2 and DeltaNet are not supported on MetalLfm2Model."
+                        "MetalLfmModel::restore_state_locked received an unsupported recurrent snapshot at layer {i}; \
+                         Mamba2 and DeltaNet are not supported on MetalLfmModel."
                     );
                 }
             }
@@ -4707,7 +4707,7 @@ impl MetalLfm2Model {
     /// stale tail data is invisible (kernels honor seq_len). But
     /// conv layers always read the entire rolling buffer regardless
     /// of seq_len, see `shaders/slang/conv1d.slang`. Without this zero, an FFI /
-    /// long-lived process that reuses the same `MetalLfm2Model`
+    /// long-lived process that reuses the same `MetalLfmModel`
     /// across multiple `Session`s would drift on conv state.
     fn zero_conv_buffers_locked(&self) {
         let cfg = &self.config;
@@ -4724,7 +4724,7 @@ impl MetalLfm2Model {
     }
 }
 
-impl MetalLfm2Model {
+impl MetalLfmModel {
     /// Per-layer dispatch loop for the n_keep KV shift. Split out from
     /// `Model::shift_kv` so the trait method can early-return on the
     /// `retained == 0` edge case before encoding any GPU work — Metal
@@ -5740,7 +5740,7 @@ impl MetalLfm2Model {
     }
 }
 
-impl MetalLfm2Model {
+impl MetalLfmModel {
     /// Profiled prefill: per-phase timings for one forward pass.
     ///
     /// `CERA_PROFILE=gpu` selects the GPU-timestamp variant (single command
@@ -6534,7 +6534,7 @@ impl CategoryTimer {
     }
 }
 
-impl MetalLfm2Model {
+impl MetalLfmModel {
     /// Open a new compute encoder with start-of-encoder / end-of-encoder sample
     /// attachments, run `f` on the encoder, end encoding. The sample pair
     /// records the GPU start/end ticks for this category.
@@ -6721,7 +6721,7 @@ impl MetalLfm2Model {
 
     /// The namespace string itself, so the constructor (which has no `self` yet)
     /// and [`Self::cache_namespace`] can't disagree on the format. Mirrors
-    /// `Lfm2Model::namespace_for`.
+    /// `LfmModel::namespace_for`.
     fn namespace_for(tag: &str, model_id: &str) -> String {
         format!("metal:{tag}{model_id}")
     }

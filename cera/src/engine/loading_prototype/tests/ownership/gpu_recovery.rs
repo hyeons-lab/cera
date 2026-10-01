@@ -219,7 +219,7 @@ fn wgpu_destroyed_device_cannot_report_checked_reset() {
     let device = ctx.device.clone();
     let gguf = crate::gguf::GgufFile::from_bytes(fixture::tiny_hybrid()).unwrap();
     let model =
-        crate::model::gpu_lfm2::GpuLfm2Model::from_gguf_with_ctx(gguf, 64, String::new(), ctx)
+        crate::model::gpu_lfm2::GpuLfmModel::from_gguf_with_ctx(gguf, 64, String::new(), ctx)
             .unwrap();
     model
         .configure_kv_compression(&KvCompression::None)
@@ -254,7 +254,7 @@ fn wgpu_device_loss_preserves_primary_and_secondary_session_errors() {
     use std::sync::atomic::{AtomicBool, AtomicUsize};
 
     struct LoseDevice {
-        model: crate::model::gpu_lfm2::GpuLfm2Model,
+        model: crate::model::gpu_lfm2::GpuLfmModel,
         device: wgpu::Device,
         armed: AtomicBool,
         forwards: AtomicUsize,
@@ -291,7 +291,7 @@ fn wgpu_device_loss_preserves_primary_and_secondary_session_errors() {
     let gguf = crate::gguf::GgufFile::from_bytes(fixture::tiny_hybrid()).unwrap();
     let tokenizer = Arc::new(crate::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap());
     let model = Arc::new(LoseDevice {
-        model: crate::model::gpu_lfm2::GpuLfm2Model::from_gguf_with_ctx(
+        model: crate::model::gpu_lfm2::GpuLfmModel::from_gguf_with_ctx(
             gguf,
             64,
             String::new(),

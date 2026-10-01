@@ -405,7 +405,7 @@ impl Model for MockModel {
 
     fn shift_kv(&self, state: &mut InferenceState, n_keep: usize, shift: usize) {
         self.shift_calls.fetch_add(1, Ordering::Relaxed);
-        // Mirror what `Lfm2Model::shift_kv` does structurally (drain +
+        // Mirror what `LfmModel::shift_kv` does structurally (drain +
         // seq_len decrement) minus the RoPE rotation — enough for
         // Session to observe a correct post-shift state without needing
         // a real RoPE-bearing KV.

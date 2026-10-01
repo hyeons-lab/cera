@@ -277,7 +277,7 @@ fn shared_metal_mapping_keeps_the_parsed_inode_after_replacement() {
 #[ignore = "requires a Metal device; executes the replaced-path ownership control"]
 fn metal_execution_uses_parsed_weights_after_path_replacement() {
     use crate::model::Model;
-    use crate::model::metal_lfm2::MetalLfm2Model;
+    use crate::model::metal_lfm2::MetalLfmModel;
 
     let dir = tempfile::tempdir().unwrap();
     let path = dir.path().join("model.gguf");
@@ -288,12 +288,11 @@ fn metal_execution_uses_parsed_weights_after_path_replacement() {
     let replacement = dir.path().join("replacement.gguf");
     std::fs::write(&replacement, &changed).unwrap();
     std::fs::rename(replacement, &path).unwrap();
-    let actual = MetalLfm2Model::from_gguf(parsed, Some(&path), 64).unwrap();
+    let actual = MetalLfmModel::from_gguf(parsed, Some(&path), 64).unwrap();
     let control =
-        MetalLfm2Model::from_gguf(GgufFile::from_bytes(original).unwrap(), None, 64).unwrap();
-    let other =
-        MetalLfm2Model::from_gguf(GgufFile::from_bytes(changed).unwrap(), None, 64).unwrap();
-    let execute = |model: &MetalLfm2Model| {
+        MetalLfmModel::from_gguf(GgufFile::from_bytes(original).unwrap(), None, 64).unwrap();
+    let other = MetalLfmModel::from_gguf(GgufFile::from_bytes(changed).unwrap(), None, 64).unwrap();
+    let execute = |model: &MetalLfmModel| {
         model.configure_cache(KvCacheConfig {
             max_warm_entries: 0,
             ..KvCacheConfig::default()

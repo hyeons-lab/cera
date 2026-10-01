@@ -528,7 +528,7 @@ pub trait Model: Send + Sync {
     /// through the model rather than calling [`InferenceState::truncate_to`]
     /// directly because `InferenceState` only describes the CPU cache. A backend
     /// holding its KV in device memory keeps its own length counter beside it
-    /// (`GpuLfm2Model` and `MetalLfm2Model` both carry one on the model), so a
+    /// (`GpuLfmModel` and `MetalLfmModel` both carry one on the model), so a
     /// bare `state.truncate_to(len)` would move the CPU-side counter while the
     /// device slab and its counter stayed put. Every later position is then
     /// wrong, with no panic and no wrong-looking intermediate value. Overriding
@@ -668,7 +668,7 @@ pub trait Model: Send + Sync {
     /// The default is `false` so new backends opt in deliberately.
     /// RoPE-based models override to `true` across their backends: the
     /// CPU path re-rotates the KV cache on-CPU (`shift_kv_with_rope`,
-    /// used by both `Lfm2Model` and `LlamaModel`), while the LFM2 GPU
+    /// used by both `LfmModel` and `LlamaModel`), while the LFM2 GPU
     /// backends do a shader-based GPU-side shift (Metal `kv_shift.metal`,
     /// wgpu `kv_shift.wgsl`). Non-RoPE architectures stay `false` — the
     /// shift semantics differ per positional-encoding scheme.
@@ -753,7 +753,7 @@ pub trait Model: Send + Sync {
     /// Default impl loops [`Self::forward_from_embedding`] per frame —
     /// preserves correctness for backends that haven't overridden but
     /// gives no perf win. Backends with a true batched path (CPU
-    /// `Lfm2Model`) override to share their `forward_prefill` layer
+    /// `LfmModel`) override to share their `forward_prefill` layer
     /// loop.
     ///
     /// Panics on `n_tokens == 0` or shape mismatch (`embeddings.len()
@@ -846,16 +846,16 @@ pub trait Model: Send + Sync {
     /// Snapshot the current KV and conv state for prefix caching.
     ///
     /// Implemented by GPU backends whose state lives on the model
-    /// instance (`MetalLfm2Model`, `GpuLfm2Model`) — they take
+    /// instance (`MetalLfmModel`, `GpuLfmModel`) — they take
     /// `infer_lock` then delegate to a private `_locked` body that
     /// reads GPU buffers into byte vectors.
     ///
-    /// **Not implemented by CPU `Lfm2Model`** — its state lives on
+    /// **Not implemented by CPU `LfmModel`** — its state lives on
     /// the caller's `InferenceState`, not on the model, so the
     /// argument-less trait signature can't be honored. CPU
     /// consumers should call `InferenceState::snapshot` directly
     /// (added in PR #119); the prefix cache integration inside
-    /// `Lfm2Model::forward_prefill` does this internally without
+    /// `LfmModel::forward_prefill` does this internally without
     /// going through the trait.
     fn snapshot_state(&self) -> crate::kv_cache::StateSnapshot {
         unimplemented!("snapshot_state not supported by this backend")
@@ -881,7 +881,7 @@ pub trait Model: Send + Sync {
     /// could have run, which a user sees immediately; the opposite default
     /// would silently produce subtly wrong logits.
     ///
-    /// `Lfm2Model` is the one backend with the hooks, and returns `true`. Both
+    /// `LfmModel` is the one backend with the hooks, and returns `true`. Both
     /// GPU backends run the routed FFN but have no LoRA path through it, and
     /// restate `false` at their own definitions rather than inheriting this one,
     /// so whoever adds the hooks reads the reason where the work is.
@@ -914,7 +914,7 @@ pub trait Model: Send + Sync {
     /// Metal). On CPU, TurboQuant is fully driven by `KvCompression` on the
     /// `InferenceState`; the GPU backends additionally need
     /// [`Self::configure_kv_compression`] to build their GPU-resident
-    /// compressed cache. Implemented by the CPU `Lfm2Model` and both GPU
+    /// compressed cache. Implemented by the CPU `LfmModel` and both GPU
     /// backends.
     fn turboquant_supported(&self) -> bool {
         false
@@ -925,7 +925,7 @@ pub trait Model: Send + Sync {
     /// caches. Called by `Session::new` / `Session::reset` before any forward pass.
     ///
     /// The CPU backends allocate their KV from `InferenceState` instead, so they
-    /// have nothing to build — but `Lfm2Model` still implements this to namespace
+    /// have nothing to build — but `LfmModel` still implements this to namespace
     /// its prefix cache by mode (see `KvCompression::cache_tag`), so it is not a
     /// no-op there either.
     ///
@@ -956,7 +956,7 @@ pub trait Model: Send + Sync {
     /// forward pass. Like `turboquant_supported`, this is driven by
     /// `KvCompression` on the `InferenceState`; the model just needs to read/
     /// write the `*_f16` slots. Currently the CPU dense transformer
-    /// (`LlamaModel`) and `Lfm2Model` do; otherwise the CLI falls back to the
+    /// (`LlamaModel`) and `LfmModel` do; otherwise the CLI falls back to the
     /// backend's uncompressed KV (f32 on CPU and wgpu, f16 on native Metal).
     fn f16_kv_supported(&self) -> bool {
         false
@@ -1019,7 +1019,7 @@ pub fn load_model(
 
     let model: Box<dyn Model> = match arch.as_str() {
         // `lfm2moe` shares this loader: same graph, experts in the FFN slot.
-        "lfm2" | "lfm2moe" => Box::new(lfm2::Lfm2Model::from_gguf_with_id(
+        "lfm2" | "lfm2moe" => Box::new(lfm2::LfmModel::from_gguf_with_id(
             gguf,
             context_size,
             model_id,
@@ -1086,11 +1086,11 @@ pub fn load_model_gpu(
         .unwrap_or_default();
     match arch.as_str() {
         // `lfm2moe` shares this loader: same graph, experts in the FFN slot.
-        // `GpuLfm2Model` picks the routed path per layer from
+        // `GpuLfmModel` picks the routed path per layer from
         // `GpuWeightSource::moe_refs`, so the only difference here is that the
         // arch string is admitted. The expert kernels are Q4_0-only and reject
         // anything else at load with a named error.
-        "lfm2" | "lfm2moe" => Ok(Box::new(gpu_lfm2::GpuLfm2Model::from_gguf_with_id(
+        "lfm2" | "lfm2moe" => Ok(Box::new(gpu_lfm2::GpuLfmModel::from_gguf_with_id(
             gguf,
             context_size,
             model_id,
@@ -1099,7 +1099,7 @@ pub fn load_model_gpu(
         // QK-norm / QKV-bias / untied-output / Granite scalars are driven by the
         // GpuWeightSource accessors). Mirrors the CPU `load_model` allow-list.
         "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" | "minicpm5" | "nanbeige" | "phi3"
-        | "phi" => Ok(Box::new(gpu_lfm2::GpuLfm2Model::from_llama_with_id(
+        | "phi" => Ok(Box::new(gpu_lfm2::GpuLfmModel::from_llama_with_id(
             gguf,
             context_size,
             model_id,
@@ -1127,14 +1127,14 @@ pub fn load_model_metal(
         // Both GPU backends dispatch the same three routing / expert kernels,
         // each generated from its own Slang source; see `load_model_gpu` above
         // for the wgpu half.
-        "lfm2" | "lfm2moe" => Ok(Box::new(metal_lfm2::MetalLfm2Model::from_gguf(
+        "lfm2" | "lfm2moe" => Ok(Box::new(metal_lfm2::MetalLfmModel::from_gguf(
             gguf,
             path,
             context_size,
         )?)),
         // Dense transformers share the generalized Metal forward path.
         "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" | "minicpm5" | "nanbeige" | "phi3"
-        | "phi" => Ok(Box::new(metal_lfm2::MetalLfm2Model::from_llama(
+        | "phi" => Ok(Box::new(metal_lfm2::MetalLfmModel::from_llama(
             gguf,
             path,
             context_size,
@@ -1155,7 +1155,7 @@ pub fn load_model_hexagon(
         .unwrap_or("unknown")
         .to_string();
     match arch.as_str() {
-        "lfm2" => Ok(Box::new(hexagon_lfm2::HexagonLfm2Model::from_gguf(
+        "lfm2" => Ok(Box::new(hexagon_lfm2::HexagonLfmModel::from_gguf(
             gguf,
             path,
             context_size,

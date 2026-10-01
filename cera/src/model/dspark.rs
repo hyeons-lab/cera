@@ -976,7 +976,7 @@ impl Drafter for DSparkSessionDrafter {
     }
 }
 
-/// GPU weight accessor surface for loading DSpark onto WebGPU / Metal via [`crate::model::gpu_lfm2::GpuLfm2Model`].
+/// GPU weight accessor surface for loading DSpark onto WebGPU / Metal via [`crate::model::gpu_lfm2::GpuLfmModel`].
 #[cfg(any(
     feature = "gpu",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))

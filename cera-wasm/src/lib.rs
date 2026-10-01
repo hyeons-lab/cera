@@ -2952,7 +2952,7 @@ mod webgpu {
     /// model + KV/conv state and streams decoded token text to a JS callback.
     #[wasm_bindgen]
     pub struct WebGpuSession {
-        model: cera::model::gpu_lfm2::GpuLfm2Model,
+        model: cera::model::gpu_lfm2::GpuLfmModel,
         tokenizer: Arc<cera::tokenizer::BpeTokenizer>,
         state: cera::kv_cache::InferenceState,
         compression: cera::kv_cache::KvCompression,
@@ -3164,7 +3164,7 @@ mod webgpu {
             let tokenizer =
                 Arc::new(cera::tokenizer::BpeTokenizer::from_gguf(&gguf).map_err(map_err)?);
             let eos = tokenizer.eos_token();
-            let model = cera::model::gpu_lfm2::GpuLfm2Model::from_gguf_with_ctx(
+            let model = cera::model::gpu_lfm2::GpuLfmModel::from_gguf_with_ctx(
                 gguf,
                 ctx_size,
                 String::new(),
@@ -3178,7 +3178,7 @@ mod webgpu {
                 .configure_kv_compression(&compression)
                 .map_err(crate::map_cera_err)?;
             let compression = effective_compression(model.is_compressed(), compression);
-            // Pass the mode even though `GpuLfm2Model` keeps its real KV on the
+            // Pass the mode even though `GpuLfmModel` keeps its real KV on the
             // GPU and reads TurboQuant state from its own `tq` cache, never from
             // `InferenceState`. The reason is memory, not correctness:
             // `from_config_capped` replaces a side's f32 `key_cache`/`value_cache`
@@ -3335,7 +3335,7 @@ mod webgpu {
                 let ctx = cera::backend::wgpu::GpuContext::new_async()
                     .await
                     .map_err(map_err)?;
-                let model = cera::model::gpu_lfm2::GpuLfm2Model::from_weight_source_with_ctx(
+                let model = cera::model::gpu_lfm2::GpuLfmModel::from_weight_source_with_ctx(
                     &opfs_source,
                     ctx_size,
                     bundle_id.clone(),

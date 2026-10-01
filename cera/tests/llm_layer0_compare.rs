@@ -23,7 +23,7 @@ fn stat(label: &str, data: &[f32]) {
 fn llm_layer0_conv_standalone() {
     use cera::backend::cpu;
     use cera::model::Model;
-    use cera::model::lfm2::Lfm2Model;
+    use cera::model::lfm2::LfmModel;
 
     let model_path = std::path::PathBuf::from(std::env::var("HOME").expect("HOME not set"))
         .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/LFM2.5-Audio-1.5B-Q4_0.gguf");
@@ -33,7 +33,7 @@ fn llm_layer0_conv_standalone() {
     }
 
     let gguf = cera::gguf::GgufFile::open(&model_path).unwrap();
-    let model = Lfm2Model::from_gguf(gguf, 8192).unwrap();
+    let model = LfmModel::from_gguf(gguf, 8192).unwrap();
     let cfg = model.config();
     let hs = cfg.hidden_size;
 

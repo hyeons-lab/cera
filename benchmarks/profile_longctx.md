@@ -11,7 +11,7 @@ Goal: attribute the long-context regression visible in
 real data.
 
 **Review fixes incorporated in this version:**
-- Added chunking to `MetalLfm2Model::forward_prefill_profiled`: the
+- Added chunking to `MetalLfmModel::forward_prefill_profiled`: the
   initial pass called it with n=1024 and n=4096, overflowing
   `prefill_batch_buf` (capped at `MAX_PREFILL_TOKENS`=512). The
   overflow produced partially-corrupted compute that finished faster

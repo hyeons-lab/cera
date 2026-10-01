@@ -551,7 +551,7 @@ fn slang_cases() -> Vec<(usize, &'static str, &'static str)> {
 /// was violated: `argmax_f32` uploaded 4 bytes for a kernel that reads 8.
 ///
 /// Pairs a Rust mirror with the `.slang` it is uploaded to. Every persistent
-/// params `Buffer` in `MetalLfm2Model` now goes through one of these rather than
+/// params `Buffer` in `MetalLfmModel` now goes through one of these rather than
 /// a literal `cast_slice(&[..])`, which is what makes the width a thing a test
 /// can see.
 #[test]

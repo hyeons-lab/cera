@@ -203,7 +203,7 @@ impl MetalParams for GemmF32Params {}
 ///
 /// The last field is the shader's `_pad`, and it is genuinely padding: **none of the
 /// three kernels reads it**, so they always plain-store and never accumulate. Callers
-/// must not smuggle an `accumulate` flag through it. `MetalLfm2Model::encode_gemm`
+/// must not smuggle an `accumulate` flag through it. `MetalLfmModel::encode_gemm`
 /// enforces that by routing every accumulating call to the GEMV fallback before it can
 /// reach these kernels — see the `accumulate` guard there. Contrast [`GemvBatchParams`],
 /// whose equivalent slot is a real `accum` flag the kernel honours.

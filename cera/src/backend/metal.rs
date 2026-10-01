@@ -27,7 +27,7 @@ pub use params::{
 /// Metal compute context: device, command queue, compiled shader library cache.
 ///
 /// `library_cache` uses `Mutex` rather than `RefCell` so `MetalContext`
-/// (and transitively `MetalLfm2Model`, `Arc<dyn Model>`, `Session`) is
+/// (and transitively `MetalLfmModel`, `Arc<dyn Model>`, `Session`) is
 /// `Sync`, which UniFFI requires on every type it exposes. Contention
 /// is negligible — MSL libraries are only looked up during pipeline
 /// creation, not on the per-token hot path.

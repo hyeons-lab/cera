@@ -1703,7 +1703,7 @@ impl GpuContext {
     /// subgroup-reduction twin of `gemv_q4_0_fast` that reads the
     /// pre-transposed (q, d) repack instead of raw 18-byte blocks. 5-binding
     /// interface (q, d, x, y, params), ROWS_PER_WG=16 dispatch; see
-    /// `GpuLfm2Model::make_gemv_bg`. SPIR-V-only: the resident layout only
+    /// `GpuLfmModel::make_gemv_bg`. SPIR-V-only: the resident layout only
     /// exists where passthrough does, so there is no WGSL twin.
     ///
     /// # Safety
@@ -2237,7 +2237,7 @@ pub mod shaders {
     /// Mixture-of-experts routing (`lfm2moe`), generated from
     /// `shaders/slang/moe_route.slang` and shared with the Metal backend.
     ///
-    /// Dispatched by `GpuLfm2Model::moe_ffn_steps` for every routed layer.
+    /// Dispatched by `GpuLfmModel::moe_ffn_steps` for every routed layer.
     /// `tests/slang_multitarget_parity.rs` pins the generated WGSL against the
     /// CPU reference, including exact expert-id agreement on a fixture whose
     /// biases land ties on the top-k boundary.
@@ -2461,7 +2461,7 @@ pub fn kv_shift_workgroups(total_threads: u32) -> (u32, u32, u32) {
 /// workgroup counts (`n * rank`, `n * d`) — any dispatch that flattens a 1-D
 /// count into (x, y). Pins the X extent to exactly [`MAX_WG`] once the count
 /// spills into Y so `get_wid` recovers a gap-free, overlap-free index over
-/// `[0, count)`. Shared source of truth for `GpuLfm2Model::gemv_workgroups` and
+/// `[0, count)`. Shared source of truth for `GpuLfmModel::gemv_workgroups` and
 /// the flattening test so the host grid and the shader's `get_wid` can't drift.
 pub fn gemv_row_workgroups(count: u32) -> (u32, u32, u32) {
     (count.min(MAX_WG), count.div_ceil(MAX_WG), 1)
@@ -2473,7 +2473,7 @@ pub fn gemv_row_workgroups(count: u32) -> (u32, u32, u32) {
 /// [`Self::to_u32_array`]. Named fields are the single source of truth for *this
 /// (wgpu) kernel's* positional `params[i]` reads — keep this struct, the kernel's
 /// `params` unpacking, and the kernel's header comment in lockstep. Used by both
-/// the production shift (`GpuLfm2Model::encode_kv_shift_layers`) and the
+/// the production shift (`GpuLfmModel::encode_kv_shift_layers`) and the
 /// `wgpu_kv_shift_oracle` test so the wgpu layout cannot drift between them. (The
 /// Metal backend has its own `KParams`; this is only the wgpu-side definition.)
 #[derive(Copy, Clone)]
@@ -4664,7 +4664,7 @@ mod tests {
     /// the production `dequantize_q4_k_m_block`, GEMV on the wgpu `gemv_q4_k`
     /// kernel, compare. Validates the `gemv_q4_k` shader itself (the kernel
     /// `gemv_pipeline_rows_label` dispatches for Q4KM, NR=2 → ceil(m/2)); it runs
-    /// the pipeline directly and does not exercise `GpuLfm2Model`'s host dispatch.
+    /// the pipeline directly and does not exercise `GpuLfmModel`'s host dispatch.
     #[test]
     fn test_gpu_gemv_q4_k() {
         let ctx = match GpuContext::new() {
@@ -5106,7 +5106,7 @@ mod tests {
         let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "mm_q8_params");
 
         // The register-tiled kernel with the Q8_0 shmem loader — the same pipeline
-        // `GpuLfm2Model` builds for Q8_0 prefill. Tile geometry must match
+        // `GpuLfmModel` builds for Q8_0 prefill. Tile geometry must match
         // `MUL_MAT_TILE_*` in gpu_lfm2.rs; the dispatch below derives from it.
         let pipeline = ctx.create_pipeline_with_defines(
             shaders::MUL_MAT_REG_TILE,
@@ -5396,7 +5396,7 @@ mod tests {
         let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "gemm_q6k_params");
 
         // The register-tiled kernel with the Q6_K shmem loader — the same pipeline
-        // `GpuLfm2Model` builds for Q6_K prefill. Tile geometry must match
+        // `GpuLfmModel` builds for Q6_K prefill. Tile geometry must match
         // `MUL_MAT_TILE_*` in gpu_lfm2.rs; the dispatch below derives from it.
         let pipeline = ctx.create_pipeline_with_defines(
             shaders::MUL_MAT_REG_TILE,
@@ -5547,7 +5547,7 @@ mod tests {
             Case {
                 name: "q4_0",
                 dtype: DType::Q4_0,
-                // Mirror production selection (`GpuLfm2Model` pipelines):
+                // Mirror production selection (`GpuLfmModel` pipelines):
                 // SPIR-V subgroup twin when passthrough is available, else
                 // the WGSL tree twin. Same NR=8 and bindings either way.
                 shader: shaders::GEMV_Q4_0_FAST,

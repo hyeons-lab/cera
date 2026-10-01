@@ -221,7 +221,7 @@ fn test_end_to_end_tts_synthesis() {
     let voc_gguf = cera::gguf::GgufFile::open_arc(&vocoder_path).unwrap();
 
     let tk = cera::tokenizer::BpeTokenizer::from_gguf(&model_gguf).unwrap();
-    let model = cera::model::lfm2::Lfm2Model::from_gguf(model_gguf, 512).unwrap();
+    let model = cera::model::lfm2::LfmModel::from_gguf(model_gguf, 512).unwrap();
     let dec_w = cera::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_gguf).unwrap();
     let detok_w = cera::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_gguf).unwrap();
 
@@ -334,8 +334,8 @@ fn test_end_to_end_tts_synthesis_gpu_parity() {
     let tk = cera::tokenizer::BpeTokenizer::from_gguf(&gguf).unwrap();
     let dec_w = cera::model::audio_decoder::AudioDecoderWeights::from_gguf(&voc_gguf).unwrap();
     let detok_w = cera::model::audio_decoder::DetokenizerWeights::from_gguf(&voc_gguf).unwrap();
-    let cpu_model = cera::model::lfm2::Lfm2Model::from_gguf((*gguf).clone(), 2048).unwrap();
-    let gpu_model = cera::model::gpu_lfm2::GpuLfm2Model::from_gguf_with_id(
+    let cpu_model = cera::model::lfm2::LfmModel::from_gguf((*gguf).clone(), 2048).unwrap();
+    let gpu_model = cera::model::gpu_lfm2::GpuLfmModel::from_gguf_with_id(
         (*gguf).clone(),
         2048,
         "test_gpu".to_string(),
