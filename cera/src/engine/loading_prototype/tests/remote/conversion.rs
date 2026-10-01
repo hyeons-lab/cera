@@ -8,6 +8,7 @@ use std::collections::HashMap;
 
 mod fixture;
 mod integrity;
+mod lfm2;
 mod recovery;
 mod upstream;
 
@@ -53,7 +54,8 @@ fn check_output(path: &Path, quant: &str) {
         let got = &actual.tensors[name];
         assert_eq!(got.shape, tensor.shape, "{name}");
         let expected_type = match quant {
-            "F16" => GGML_TYPE_F16,
+            // norm weights stay F32 in an F16 file: llama.cpp aborts on an F16 norm
+            "F16" if tensor.shape.len() >= 2 => GGML_TYPE_F16,
             "Q8_0" if tensor.shape.len() == 2 && tensor.size_bytes >= 1024 => GGML_TYPE_Q8_0,
             "Q4_0" if tensor.shape.len() == 2 && tensor.size_bytes >= 1024 => GGML_TYPE_Q4_0,
             _ => GGML_TYPE_F32,

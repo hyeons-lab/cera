@@ -28,7 +28,9 @@ pub(super) struct ConversionRequest {
 impl ConversionRequest {
     pub(super) fn new(spec: &HfSpec, opts: &QuantizeOptions, resolved_revision: &str) -> Self {
         Self {
-            version: 2,
+            // 3: the LFM2 layout and the F16 tensor types changed; this rebuilds every
+            // cached conversion once, whatever its architecture
+            version: 3,
             owner: spec.owner.clone(),
             repo: spec.repo.clone(),
             revision: spec.revision.clone(),

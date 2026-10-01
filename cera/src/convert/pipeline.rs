@@ -23,9 +23,10 @@ use crate::convert::checkpoint::{HashingWriter, hash_prefix};
 use crate::convert::config::HfModelConfig;
 use crate::convert::quantize::{QuantStrategy, TargetQuant, quantize_tensor_data_with_strategy};
 use crate::convert::safetensors::{
-    SafeTensorsHeader, decode_safetensor_to_f32_into, translate_hf_to_gguf_tensor_name_with_arch,
+    SafeTensorsHeader, decode_safetensor_to_f32_into, gguf_tensor_dims,
+    translate_hf_to_gguf_tensor_name_with_arch,
 };
-use crate::convert::tokenizer::HfTokenizerJson;
+use crate::convert::tokenizer::{HfTokenizerJson, VocabOptions};
 use crate::convert::writer::GgufWriter;
 #[cfg(feature = "remote")]
 use crate::manifest::{GenerationDefaults, InferenceType, Manifest, ManifestFiles};
@@ -123,6 +124,30 @@ fn extract_chat_template(tokenizer_config: &serde_json::Value) -> Option<String>
     })
 }
 
+/// The chat template for a checkpoint: the `chat_template` field of
+/// `tokenizer_config.json`, else the standalone `chat_template.jinja` that
+/// Transformers 5 writes instead.
+fn resolve_chat_template(
+    tokenizer_config: Option<&serde_json::Value>,
+    template_jinja: Option<String>,
+) -> Option<String> {
+    tokenizer_config
+        .and_then(extract_chat_template)
+        .or(template_jinja.filter(|t| !t.trim().is_empty()))
+}
+
+/// Vocabulary layout options for `config`'s architecture.
+fn vocab_options<'a>(
+    config: &HfModelConfig,
+    tokenizer_config: Option<&'a serde_json::Value>,
+) -> VocabOptions<'a> {
+    VocabOptions {
+        llama_cpp_layout: config.uses_llama_cpp_vocab_layout(),
+        pad_to: config.vocab_size,
+        tokenizer_config,
+    }
+}
+
 fn transform_qwen35_ssm_a_inplace(f32_data: &mut [f32]) {
     for v in f32_data.iter_mut() {
         let clamped = v.clamp(-80.0, 80.0);
@@ -216,6 +241,7 @@ pub fn stream_quantize_hf_repo(
     let config_url = pinned_spec.file_download_url("config.json");
     let config_bytes = fetch_hf_file_bytes(&client, &config_url, opts.auth_token.as_deref())?;
     let config = HfModelConfig::parse_from_bytes(&config_bytes)?;
+    config.ensure_convertible()?;
 
     let tokenizer_url = pinned_spec.file_download_url("tokenizer.json");
     let tokenizer_bytes = fetch_hf_file_bytes(&client, &tokenizer_url, opts.auth_token.as_deref())?;
@@ -223,10 +249,17 @@ pub fn stream_quantize_hf_repo(
 
     // Optional chat template & generation config
     let template_url = pinned_spec.file_download_url("tokenizer_config.json");
-    let chat_template = fetch_hf_file_bytes(&client, &template_url, opts.auth_token.as_deref())
+    let tokenizer_config = fetch_hf_file_bytes(&client, &template_url, opts.auth_token.as_deref())
         .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-        .and_then(|v| extract_chat_template(&v));
+        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+    let template_jinja = fetch_hf_file_bytes(
+        &client,
+        &pinned_spec.file_download_url("chat_template.jinja"),
+        opts.auth_token.as_deref(),
+    )
+    .ok()
+    .and_then(|b| String::from_utf8(b).ok());
+    let chat_template = resolve_chat_template(tokenizer_config.as_ref(), template_jinja);
 
     let gen_url = pinned_spec.file_download_url("generation_config.json");
     let gen_defaults = fetch_hf_file_bytes(&client, &gen_url, opts.auth_token.as_deref())
@@ -305,7 +338,11 @@ pub fn stream_quantize_hf_repo(
     // 5. Initialize GgufWriter & register all tensor metadata
     let mut writer = GgufWriter::new();
     config.apply_to_gguf_writer(&mut writer, &spec.repo);
-    tokenizer.apply_to_gguf_writer(&mut writer, chat_template.as_deref());
+    tokenizer.apply_to_gguf_writer_with(
+        &mut writer,
+        chat_template.as_deref(),
+        &vocab_options(&config, tokenizer_config.as_ref()),
+    );
 
     // Register all tensors in GGUF writer
     struct PendingTensor {
@@ -340,7 +377,7 @@ pub fn stream_quantize_hf_repo(
             let out_bytes = TargetQuant::compute_tensor_bytes(ggml_type, num_elements);
 
             // In GGUF, dimensions are column-major (reversed shape: [cols, rows])
-            let dims: Vec<u64> = tensor_info.shape.iter().rev().map(|&d| d as u64).collect();
+            let dims = gguf_tensor_dims(&gguf_name, &tensor_info.shape);
 
             writer.add_tensor(&gguf_name, dims, ggml_type, out_bytes);
 
@@ -769,6 +806,7 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
         CeraError::Backend(format!("failed to read `{}`: {e}", config_path.display()))
     })?;
     let config = HfModelConfig::parse_from_bytes(&config_bytes)?;
+    config.ensure_convertible()?;
     let arch = config.gguf_architecture().to_string();
 
     let mut writer = GgufWriter::new();
@@ -783,11 +821,18 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
             ))
         })?;
         let tokenizer = HfTokenizerJson::parse_from_bytes(&tok_bytes)?;
-        let chat_template = fs::read(dir.join("tokenizer_config.json"))
+        let tokenizer_config = fs::read(dir.join("tokenizer_config.json"))
             .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok())
-            .and_then(|v| extract_chat_template(&v));
-        tokenizer.apply_to_gguf_writer(&mut writer, chat_template.as_deref());
+            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
+        let chat_template = resolve_chat_template(
+            tokenizer_config.as_ref(),
+            fs::read_to_string(dir.join("chat_template.jinja")).ok(),
+        );
+        tokenizer.apply_to_gguf_writer_with(
+            &mut writer,
+            chat_template.as_deref(),
+            &vocab_options(&config, tokenizer_config.as_ref()),
+        );
     }
 
     let mut safetensors_files = Vec::new();
@@ -860,7 +905,7 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
                 overrides,
             );
 
-            let dims: Vec<u64> = tensor_info.shape.iter().rev().map(|&d| d as u64).collect();
+            let dims = gguf_tensor_dims(&gguf_name, &tensor_info.shape);
             let out_bytes = TargetQuant::compute_tensor_bytes(ggml_type, num_elements);
 
             writer.add_tensor(&gguf_name, dims, ggml_type, out_bytes);
