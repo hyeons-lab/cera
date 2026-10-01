@@ -3299,14 +3299,24 @@ mod webgpu {
                 }
 
                 let mut tok_bytes = None;
-                if let Some(rel) = manifest
+                let tok_url = match manifest
                     .files
                     .audio_tokenizer
                     .as_deref()
                     .filter(|s| !s.trim().is_empty())
                 {
-                    let tok_url =
-                        crate::bundle::join_url(base_url, rel).map_err(|e| JsError::new(&e))?;
+                    Some(rel) => Some(
+                        crate::bundle::join_url(base_url, rel).map_err(|e| JsError::new(&e))?,
+                    ),
+                    // A llama.cpp vocoder keeps its detokenizer backbone in the
+                    // sibling `tokenizer-*` file, which the manifest may not name.
+                    None => crate::bundle::split_vocoder_sidecar_url(
+                        &manifest,
+                        base_url,
+                        voc_bytes.as_deref(),
+                    )?,
+                };
+                if let Some(tok_url) = tok_url {
                     tok_bytes = Some(Arc::from(
                         repo.read_or_download(&tok_url, None, on_progress.as_ref())
                             .await?,

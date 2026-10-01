@@ -242,3 +242,43 @@ fn jp_asr_with_the_vocoder_attached_is_correct_and_deterministic() {
         }
     }
 }
+
+/// The browser has the vocoder's bytes but no filesystem to look beside: the
+/// decision to fetch a sibling `tokenizer-*` must come from the header alone, and
+/// must say "nothing to fetch" for a vocoder that already carries its backbone.
+#[test]
+fn sidecar_ref_follows_the_real_vocoders() {
+    const URL: &str = "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP-GGUF/resolve/main/";
+    let Some(jp) = fixture("jp", "vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf") else {
+        return;
+    };
+    // The llama.cpp JP vocoder is the split half: its sibling is the tokenizer.
+    assert_eq!(
+        cera::model::split_vocoder::sidecar_ref_for(
+            &format!("{URL}vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf"),
+            &std::fs::read(jp).unwrap()
+        )
+        .as_deref(),
+        Some(format!("{URL}tokenizer-LFM2.5-Audio-1.5B-JP-Q4_0.gguf").as_str())
+    );
+
+    // The LEAP-merged EN vocoder already has the backbone: nothing to fetch.
+    let leap = PathBuf::from(std::env::var("HOME").unwrap())
+        .join(".leap/models/LFM2.5-Audio-1.5B-Q4_0/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf");
+    if !leap.exists() {
+        assert!(
+            std::env::var_os("CERA_REQUIRE_SPLIT_VOCODER_FIXTURES").is_none(),
+            "missing fixture {}",
+            leap.display()
+        );
+        eprintln!("skipping: {} not found", leap.display());
+        return;
+    }
+    assert_eq!(
+        cera::model::split_vocoder::sidecar_ref_for(
+            "https://h/LFM2.5-Audio-1.5B-GGUF-LEAP/vocoder-LFM2.5-Audio-1.5B-Q4_0.gguf",
+            &std::fs::read(leap).unwrap()
+        ),
+        None
+    );
+}

@@ -1401,6 +1401,34 @@ pub(crate) async fn load_bundle(
     Ok(model_bytes)
 }
 
+/// The sibling `tokenizer-*` URL to fetch when the manifest's vocoder is the split
+/// half of a llama.cpp LFM2-Audio bundle, or `None` when there is nothing to add.
+///
+/// LeapBundles manifests for these bundles (the Japanese LFM2.5-Audio) leave
+/// `audio_tokenizer` empty, so without this the vocoder arrives with no
+/// detokenizer backbone and audio output never initialises. The decision is
+/// [`cera::model::split_vocoder::sidecar_ref_for`], which reads only the
+/// vocoder's header.
+pub(crate) fn split_vocoder_sidecar_url(
+    manifest: &cera::manifest::Manifest,
+    base_url: &str,
+    vocoder_bytes: Option<&[u8]>,
+) -> Result<Option<String>, JsError> {
+    let (Some(bytes), Some(rel)) = (
+        vocoder_bytes,
+        manifest
+            .files
+            .audio_decoder
+            .as_deref()
+            .filter(|s| !s.trim().is_empty()),
+    ) else {
+        return Ok(None);
+    };
+    cera::model::split_vocoder::sidecar_ref_for(rel, bytes)
+        .map(|sidecar| join_url(base_url, &sidecar).map_err(|e| JsError::new(&e)))
+        .transpose()
+}
+
 /// Load the bundle described by the parsed manifest.
 pub(crate) async fn load_manifest_struct(
     repo: &BundleRepo,
@@ -1447,7 +1475,12 @@ pub(crate) async fn load_manifest_struct(
             let url = join_url(base_url, rel).map_err(|e| JsError::new(&e))?;
             Some(repo.read_or_download(&url, None, on_progress).await?)
         }
-        None => None,
+        // The manifest names no tokenizer, but a llama.cpp vocoder keeps its
+        // detokenizer backbone in the sibling `tokenizer-*` file.
+        None => match split_vocoder_sidecar_url(manifest, base_url, audio_decoder.as_deref())? {
+            Some(url) => Some(repo.read_or_download(&url, None, on_progress).await?),
+            None => None,
+        },
     };
 
     let draft_model = match manifest

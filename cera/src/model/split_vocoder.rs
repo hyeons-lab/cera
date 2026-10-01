@@ -215,6 +215,27 @@ pub fn sibling_tokenizer_ref(vocoder_ref: &str) -> Option<String> {
     })
 }
 
+/// How much of a vocoder GGUF to parse when deciding whether it is the split
+/// half. The header (metadata plus the tensor index) of the vocoders in this
+/// layout is under 8 KiB; this leaves ample room.
+const HEADER_PROBE_BYTES: usize = 1 << 20;
+
+/// The `tokenizer-*` reference to fetch for a vocoder that turns out to be the
+/// split half of a llama.cpp bundle, or `None` when there is nothing to fetch.
+///
+/// For loaders that already hold the vocoder's bytes but have no filesystem to
+/// look beside it (the browser): `vocoder_ref` is the manifest's reference to the
+/// vocoder (a URL or a relative path), `vocoder_bytes` its contents. Only the
+/// header is parsed, so a 100 MB vocoder is not copied. A merged vocoder, one not
+/// named `vocoder-*`, or bytes that do not parse all return `None`, which leaves
+/// the existing "no sidecar" behaviour untouched.
+pub fn sidecar_ref_for(vocoder_ref: &str, vocoder_bytes: &[u8]) -> Option<String> {
+    let sidecar = sibling_tokenizer_ref(vocoder_ref)?;
+    let header = &vocoder_bytes[..vocoder_bytes.len().min(HEADER_PROBE_BYTES)];
+    let gguf = GgufFile::from_header_bytes(Arc::from(header), vocoder_bytes.len() as u64).ok()?;
+    is_split_vocoder(&gguf).then_some(sidecar)
+}
+
 /// Open a vocoder GGUF for a direct (non-manifest) load, folding in the sibling
 /// `tokenizer-*.gguf` beside it when the vocoder is the split half of a
 /// llama.cpp bundle. A merged vocoder opens exactly as [`GgufFile::open_arc`].
@@ -640,5 +661,57 @@ mod tests {
                 );
             }
         });
+    }
+
+    const LEAP_URL: &str = "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP-GGUF/resolve/main/vocoder-LFM2.5-Audio-1.5B-JP-Q4_0.gguf";
+
+    fn gguf_bytes(tensors: &[(&str, Vec<u64>, Vec<f32>)]) -> Vec<u8> {
+        let mut w = GgufWriter::new();
+        for (name, dims, data) in tensors {
+            w.add_tensor(*name, dims.clone(), GGML_TYPE_F32, data.len() * 4);
+        }
+        let mut out = Vec::new();
+        w.write_header_and_tensor_info(&mut out).unwrap();
+        for (_, _, data) in tensors {
+            let bytes: Vec<u8> = data.iter().flat_map(|f| f.to_le_bytes()).collect();
+            w.write_tensor_data(&mut out, &bytes).unwrap();
+        }
+        out
+    }
+
+    #[test]
+    fn sidecar_ref_is_the_sibling_for_a_split_vocoder() {
+        let split = gguf_bytes(&[("emb.emb.weight", vec![4, 2], f(8, 0.0))]);
+        assert_eq!(
+            sidecar_ref_for(LEAP_URL, &split).as_deref(),
+            Some(
+                "https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-JP-GGUF/resolve/main/tokenizer-LFM2.5-Audio-1.5B-JP-Q4_0.gguf"
+            )
+        );
+    }
+
+    #[test]
+    fn sidecar_ref_is_none_when_there_is_nothing_to_fetch() {
+        let split = gguf_bytes(&[("emb.emb.weight", vec![4, 2], f(8, 0.0))]);
+        let merged = gguf_bytes(&[(MERGED_PROBE, vec![4, 3], f(12, 0.0))]);
+        // Already merged (the LEAP EN vocoder): nothing to fetch.
+        assert_eq!(sidecar_ref_for(LEAP_URL, &merged), None);
+        // Not named like a llama.cpp vocoder: no sibling to derive.
+        assert_eq!(
+            sidecar_ref_for("https://h/x/audio_decoder-Q4_0.gguf", &split),
+            None
+        );
+        // Not a GGUF at all.
+        assert_eq!(sidecar_ref_for(LEAP_URL, b"not a gguf"), None);
+        assert_eq!(sidecar_ref_for(LEAP_URL, &[]), None);
+    }
+
+    #[test]
+    fn sidecar_ref_only_needs_the_header() {
+        // A real vocoder is ~100 MB, but the answer comes from the header: pad the
+        // payload well past the probe size and the result is unchanged.
+        let mut split = gguf_bytes(&[("emb.emb.weight", vec![4, 2], f(8, 0.0))]);
+        split.resize(split.len() + 2 * HEADER_PROBE_BYTES, 0);
+        assert!(sidecar_ref_for(LEAP_URL, &split).is_some());
     }
 }
