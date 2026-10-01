@@ -1029,43 +1029,42 @@ pub fn load_model(
     #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
     let shape = crate::backend::calibrate::DecodeShape::from_gguf(&gguf);
 
-    let model: Box<dyn Model> = match arch.as_str() {
-        // `lfm2moe` shares this loader: same graph, experts in the FFN slot.
-        "lfm2" | "lfm2moe" => Box::new(lfm2::LfmModel::from_gguf_with_id(
-            gguf,
-            context_size,
-            model_id,
-        )?),
-        // Classic Mistral ships as arch "llama". Mistral 3 / Ministral 3 ships as "mistral3".
-        "qwen2" | "qwen3" | "llama" | "granite" | "gemma2" | "olmo2" | "olmo3" | "minicpm"
-        | "minicpm5" | "nanbeige" | "mistral3" | "ministral3" | "phi3" | "phi" | "starcoder2"
-        | "stablelm" | "internlm2" | "internlm" | "baichuan" | "deepseek" | "cohere"
-        | "command-r" | "openelm" => Box::new(llama::LlamaModel::from_gguf_with_id(
-            gguf,
-            context_size,
-            model_id,
-        )?),
-        "bert" | "modernbert" => Box::new(bert::BertModel::from_gguf_with_id(
-            gguf,
-            context_size,
-            model_id,
-        )?),
-        "granitehybrid" | "granite-hybrid" | "falcon-h1" | "falcon_h1" | "mamba2" => Box::new(
-            hybrid::HybridModel::from_gguf_with_id(gguf, context_size, model_id)?,
-        ),
-        "gemma4" | "gemma-4" | "gemma4-assistant" | "gemma-4-assistant" => Box::new(
-            gemma4::Gemma4Model::from_gguf_with_id(gguf, context_size, model_id)?,
-        ),
-        "qwen35" | "qwen3_5" | "qwen3.5" => Box::new(qwen35::Qwen35Model::from_gguf_with_id(
-            gguf,
-            context_size,
-            model_id,
-        )?),
-        "bailingmoe3" | "bailingmoe" | "bailingmoe2" => Box::new(
-            bailingmoe3::BailingMoe3Model::from_gguf_with_id(gguf, context_size, model_id)?,
-        ),
-        other => bail!("unsupported architecture: {other}"),
-    };
+    let model: Box<dyn Model> =
+        match arch.as_str() {
+            // `lfm2moe` shares this loader: same graph, experts in the FFN slot.
+            "lfm2" | "lfm2moe" => Box::new(lfm2::LfmModel::from_gguf_with_id(
+                gguf,
+                context_size,
+                model_id,
+            )?),
+            // Classic Mistral ships as arch "llama". Mistral 3 / Ministral 3 ships as "mistral3".
+            "qwen2" | "qwen3" | "llama" | "granite" | "gemma2" | "olmo2" | "olmo3" | "minicpm"
+            | "minicpm5" | "nanbeige" | "mistral3" | "ministral" | "ministral3" | "phi3"
+            | "phi" | "starcoder2" | "stablelm" | "internlm2" | "internlm" | "baichuan"
+            | "deepseek" | "cohere" | "command-r" | "openelm" => Box::new(
+                llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?,
+            ),
+            "bert" | "modernbert" => Box::new(bert::BertModel::from_gguf_with_id(
+                gguf,
+                context_size,
+                model_id,
+            )?),
+            "granitehybrid" | "granite-hybrid" | "falcon-h1" | "falcon_h1" | "mamba2" => Box::new(
+                hybrid::HybridModel::from_gguf_with_id(gguf, context_size, model_id)?,
+            ),
+            "gemma4" | "gemma-4" | "gemma4-assistant" | "gemma-4-assistant" => Box::new(
+                gemma4::Gemma4Model::from_gguf_with_id(gguf, context_size, model_id)?,
+            ),
+            "qwen35" | "qwen3_5" | "qwen3.5" => Box::new(qwen35::Qwen35Model::from_gguf_with_id(
+                gguf,
+                context_size,
+                model_id,
+            )?),
+            "bailingmoe3" | "bailingmoe" | "bailingmoe2" => Box::new(
+                bailingmoe3::BailingMoe3Model::from_gguf_with_id(gguf, context_size, model_id)?,
+            ),
+            other => bail!("unsupported architecture: {other}"),
+        };
 
     // Size the decode pool to this model rather than a flat cap. Registered
     // only now, after a constructor actually returned a model:

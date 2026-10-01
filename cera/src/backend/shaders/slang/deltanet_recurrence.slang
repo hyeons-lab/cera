@@ -12,8 +12,8 @@
 //   o[h, j]    = sum_i S[h, i, j] * q[kh, i]
 //
 // Grid dispatch:
-//   workgroup size: (256, 1, 1)
-//   num workgroups: (num_v_heads, 1, 1)
+//   workgroup size: (128, 1, 1)
+//   num workgroups: (num_v_heads, ceil(head_v_dim / 128), 1)
 //
 // Buffer bindings:
 //   0: q        f32, read, [num_k_heads * head_k_dim]

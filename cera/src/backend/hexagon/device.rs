@@ -126,9 +126,12 @@ pub struct HexagonDevice {
     handle: RemoteHandle64,
     arch: HexagonArch,
     hw_info: HtpHwInfo,
+    /// Torn down explicitly in `Drop` (taken, then the skel handle closed).
     queue_session: Option<HexagonQueueSession>,
     profiler_on: bool,
-    /// Declared last so the votes outlive the skel handle close in `Drop`.
+    /// Field order matters: struct fields drop top to bottom after `Drop::drop`
+    /// returns, so declaring this last keeps the votes held until the queue
+    /// session and the skel handle are closed.
     _power_vote: PowerVote,
 }
 
