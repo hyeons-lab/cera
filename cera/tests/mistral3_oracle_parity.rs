@@ -315,32 +315,130 @@ fn mistral3_long_prompt_prefill_and_temp_scaling() {
     }
 }
 
-#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-#[test]
-fn mistral3_metal_loader_rejects_unsupported_arch() {
-    let Some(path) = ensure_test_fixture() else {
+/// The fixture without projection/FFN biases (see `assert_gpu_matches_cpu`).
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+fn ensure_nobias_fixture() -> Option<std::path::PathBuf> {
+    let manifest_dir = Path::new(env!("CARGO_MANIFEST_DIR"));
+    let dir = manifest_dir.join("../target/tmp/cera_test_mistral3");
+    let _ = std::fs::create_dir_all(&dir);
+    let path = dir.join("test_mistral3_nobias.gguf");
+    if path.metadata().map(|m| m.len() > 1024).unwrap_or(false) {
+        return Some(path);
+    }
+    let script = manifest_dir.join("../scripts/oracle/create_mistral3_test_model.py");
+    let ok = std::process::Command::new("python3")
+        .arg(&script)
+        .arg(&path)
+        .arg("--no-bias")
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("skipping: could not generate the bias-free mistral3 fixture");
+        return None;
+    }
+    Some(path)
+}
+
+/// Greedy-free comparison of the GPU forward against the CPU one on the
+/// fixture, which carries YaRN rope scaling (factor 2) and attention
+/// temperature scaling (floor 64). Positions stay under the floor, the longest
+/// context the GPU backends serve; the CPU covers the rest.
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+fn assert_gpu_matches_cpu(
+    min_cosine: f64,
+    load_gpu: impl Fn(GgufFile, &Path) -> anyhow::Result<Box<dyn Model>>,
+) {
+    // The GPU backends skip projection/FFN biases (they warn and omit them),
+    // so the default fixture, which has them, would differ for that reason
+    // alone. The bias-free variant isolates the rope and attention scaling.
+    let Some(path) = ensure_nobias_fixture() else {
         return;
     };
-    let gguf = GgufFile::open(&path).expect("open test_mistral3.gguf");
-    let result = cera::model::load_model_metal(gguf, Some(&path), 256);
-    assert!(
-        result.is_err(),
-        "load_model_metal must reject mistral3 as unsupported architecture"
+    let cpu = LlamaModel::from_gguf(GgufFile::open(&path).unwrap(), 256).expect("cpu load");
+    let gpu = match load_gpu(GgufFile::open(&path).unwrap(), &path) {
+        Ok(m) => m,
+        Err(e) if e.to_string().contains("adapter") || e.to_string().contains("device") => {
+            eprintln!("skipping: no GPU available ({e})");
+            return;
+        }
+        Err(e) => panic!("gpu load of mistral3 failed: {e:#}"),
+    };
+    assert_eq!(
+        gpu.config().max_seq_len,
+        64,
+        "context must be capped at the attention-temperature floor"
     );
+
+    let tokens: Vec<u32> = (0..60).map(|i| 4 + (i * 7 % 200) as u32).collect();
+    let mut cpu_state =
+        InferenceState::from_config_with_compression(cpu.config(), &KvCompression::None).unwrap();
+    let mut gpu_state =
+        InferenceState::from_config_with_compression(gpu.config(), &KvCompression::None).unwrap();
+    let mut min_cos = 1.0f64;
+    for (i, &t) in tokens.iter().enumerate() {
+        let want = cpu.forward(&[t], i, &mut cpu_state);
+        let got = gpu.forward(&[t], i, &mut gpu_state);
+        let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+        for (&a, &b) in want.iter().zip(got.iter()) {
+            dot += a as f64 * b as f64;
+            na += (a as f64).powi(2);
+            nb += (b as f64).powi(2);
+        }
+        let cos = dot / (na.sqrt() * nb.sqrt());
+        min_cos = min_cos.min(cos);
+    }
+    eprintln!("[mistral3 gpu-vs-cpu] min cosine over 60 positions: {min_cos:.6}");
+    assert!(min_cos > min_cosine, "min cosine {min_cos}");
+
+    // The batched prefill rotates and scales through its own kernels.
+    let mut cpu_state =
+        InferenceState::from_config_with_compression(cpu.config(), &KvCompression::None).unwrap();
+    let mut gpu_state =
+        InferenceState::from_config_with_compression(gpu.config(), &KvCompression::None).unwrap();
+    let want = cpu.forward_prefill(&tokens, 0, &mut cpu_state);
+    let got = gpu.forward_prefill(&tokens, 0, &mut gpu_state);
+    let (mut dot, mut na, mut nb) = (0.0f64, 0.0f64, 0.0f64);
+    for (&a, &b) in want.iter().zip(got.iter()) {
+        dot += a as f64 * b as f64;
+        na += (a as f64).powi(2);
+        nb += (b as f64).powi(2);
+    }
+    let cos = dot / (na.sqrt() * nb.sqrt());
+    eprintln!("[mistral3 gpu-vs-cpu] batched prefill cosine: {cos:.6}");
+    assert!(cos > min_cosine, "batched prefill cosine {cos}");
+}
+
+/// Floors for the two backends' f16 KV rounding against the CPU: Metal lands at
+/// 0.99998 and wgpu at 0.9984 here, while dropping the YaRN angle table or
+/// `mscale^2` from the GPU path gives 0.96 or worse on both (checked by
+/// mutating the loader). Each floor sits between its own backend's noise and
+/// that failure.
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+const METAL_MIN_COSINE: f64 = 0.999;
+#[cfg(feature = "gpu")]
+const WGPU_MIN_COSINE: f64 = 0.99;
+
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+#[test]
+fn mistral3_metal_matches_cpu_with_yarn_and_temperature_floor() {
+    assert_gpu_matches_cpu(METAL_MIN_COSINE, |gguf, path| {
+        cera::model::load_model_metal(gguf, Some(path), 256)
+    });
 }
 
 #[cfg(feature = "gpu")]
 #[test]
-fn mistral3_gpu_loader_rejects_unsupported_arch() {
-    let Some(path) = ensure_test_fixture() else {
-        return;
-    };
-    let gguf = GgufFile::open(&path).expect("open test_mistral3.gguf");
-    let result = cera::model::load_model_gpu(gguf, Some(&path), 256);
-    assert!(
-        result.is_err(),
-        "load_model_gpu must reject mistral3 as unsupported architecture"
-    );
+fn mistral3_gpu_matches_cpu_with_yarn_and_temperature_floor() {
+    assert_gpu_matches_cpu(WGPU_MIN_COSINE, |gguf, path| {
+        cera::model::load_model_gpu(gguf, Some(path), 256)
+    });
 }
 
 #[test]

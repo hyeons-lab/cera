@@ -179,7 +179,8 @@ impl FastRpcDriver {
 
             if lib_handle.is_null() {
                 return Err(CeraError::Backend(format!(
-                    "Qualcomm FastRPC driver (libcdsprpc.so) could not be loaded ({})",
+                    "{} ({})",
+                    super::MSG_DRIVER_ABSENT,
                     load_errors.join("; ")
                 )));
             }
@@ -599,6 +600,201 @@ impl Drop for FastRpcDriver {
                 libc::dlclose(self.handle);
             }
         }
+    }
+}
+
+/// Host-side fake FastRPC driver for unit tests: every entry point is an
+/// `extern "C"` fn recording into a thread-local log, so tests (one thread
+/// each) stay isolated and the Hexagon paths that only need the driver's
+/// control flow (device open/close order, power votes, queue flush error
+/// handling) run without a DSP.
+#[cfg(test)]
+pub(crate) mod fake {
+    use super::*;
+    use std::cell::RefCell;
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub(crate) enum Event {
+        /// `FASTRPC_CONTROL_LATENCY` with the enable flag.
+        Qos(bool),
+        /// `FASTRPC_CONTROL_WAKELOCK` with the enable flag.
+        Wakelock(bool),
+        OpenSkel,
+        /// `htp_iface_*` method id.
+        Invoke(u32),
+        CloseSkel,
+        QueueClose,
+        /// `dspqueue_write` with the batch seq.
+        Write(u64),
+    }
+
+    #[derive(Default)]
+    pub(crate) struct State {
+        pub events: Vec<Event>,
+        pub fail_open: bool,
+        pub fail_invoke_method: Option<u32>,
+        pub fail_write: bool,
+        pub fail_read: bool,
+        /// Status word the fake DSP answers batches with (`None` = Ok).
+        pub rsp_status: Option<u32>,
+        last_seq: u64,
+    }
+
+    thread_local! {
+        static STATE: RefCell<State> = RefCell::new(State::default());
+    }
+
+    /// Reset this thread's fake state (call at the top of each test).
+    pub(crate) fn reset() {
+        STATE.with(|s| *s.borrow_mut() = State::default());
+    }
+
+    pub(crate) fn with<R>(f: impl FnOnce(&mut State) -> R) -> R {
+        STATE.with(|s| f(&mut s.borrow_mut()))
+    }
+
+    pub(crate) fn events() -> Vec<Event> {
+        with(|s| s.events.clone())
+    }
+
+    fn log(e: Event) {
+        with(|s| s.events.push(e));
+    }
+
+    extern "C" fn alloc(_heap: i32, _flags: u32, size: i32) -> *mut c_void {
+        unsafe { libc::calloc(1, size as usize) }
+    }
+    extern "C" fn free(p: *mut c_void) {
+        unsafe { libc::free(p) }
+    }
+    extern "C" fn to_fd(_p: *mut c_void) -> i32 {
+        42
+    }
+    extern "C" fn mmap(_d: i32, _fd: i32, _a: *mut c_void, _o: i32, _l: usize, _f: u32) -> i32 {
+        0
+    }
+    extern "C" fn munmap(_d: i32, _fd: i32, _a: *mut c_void, _l: usize) -> i32 {
+        0
+    }
+    extern "C" fn open(_name: *const c_char, ph: *mut RemoteHandle64) -> i32 {
+        if with(|s| s.fail_open) {
+            return -1;
+        }
+        log(Event::OpenSkel);
+        unsafe { *ph = 7 };
+        0
+    }
+    extern "C" fn invoke(_h: RemoteHandle64, scalars: u32, _pra: *mut RemoteArg) -> i32 {
+        let method = scalars >> 24;
+        log(Event::Invoke(method));
+        if with(|s| s.fail_invoke_method) == Some(method) {
+            -1
+        } else {
+            0
+        }
+    }
+    extern "C" fn close(_h: RemoteHandle64) -> i32 {
+        log(Event::CloseSkel);
+        0
+    }
+    extern "C" fn control(req: u32, data: *mut c_void, _len: u32) -> i32 {
+        // Both controls lead with the `enable` u32 (latency: enable, latency).
+        let enable = unsafe { *(data as *const u32) } != 0;
+        match req {
+            1 => log(Event::Qos(enable)),
+            4 => log(Event::Wakelock(enable)),
+            _ => {}
+        }
+        0
+    }
+    extern "C" fn q_create(
+        _d: i32,
+        _f: u32,
+        _rq: u32,
+        _sq: u32,
+        _pcb: Option<DspQueueCallback>,
+        _ecb: Option<DspQueueCallback>,
+        _ctx: *mut c_void,
+        q: *mut DspQueueHandle,
+    ) -> i32 {
+        unsafe { *q = 0x10 as DspQueueHandle };
+        0
+    }
+    extern "C" fn q_close(_q: DspQueueHandle) -> i32 {
+        log(Event::QueueClose);
+        0
+    }
+    extern "C" fn q_export(_q: DspQueueHandle, id: *mut u64) -> i32 {
+        unsafe { *id = 9 };
+        0
+    }
+    extern "C" fn q_write(
+        _q: DspQueueHandle,
+        _flags: u32,
+        _n: u32,
+        _bufs: *const super::super::types::DspQueueBuffer,
+        msg_len: u32,
+        msg: *const u8,
+        _t: u32,
+    ) -> i32 {
+        let req = unsafe { (msg as *const super::super::types::HtpOpBatchReq).read_unaligned() };
+        debug_assert!(msg_len as usize >= std::mem::size_of_val(&req));
+        with(|s| {
+            s.last_seq = req.seq;
+            s.events.push(Event::Write(req.seq));
+        });
+        if with(|s| s.fail_write) { -1 } else { 0 }
+    }
+    extern "C" fn q_read(
+        _q: DspQueueHandle,
+        _flags: *mut u32,
+        _max_bufs: u32,
+        _n_bufs: *mut u32,
+        _bufs: *mut super::super::types::DspQueueBuffer,
+        max_msg: u32,
+        msg_len: *mut u32,
+        msg: *mut u8,
+        _t: u32,
+    ) -> i32 {
+        if with(|s| s.fail_read) {
+            return -1;
+        }
+        let rsp = super::super::types::HtpOpBatchRsp {
+            seq: with(|s| s.last_seq),
+            status: with(|s| s.rsp_status).unwrap_or(super::super::types::HtpStatus::Ok as u32),
+            ..Default::default()
+        };
+        let n = std::mem::size_of_val(&rsp);
+        assert!(max_msg as usize >= n);
+        unsafe {
+            std::ptr::copy_nonoverlapping(&rsp as *const _ as *const u8, msg, n);
+            *msg_len = n as u32;
+        }
+        0
+    }
+
+    /// A driver wired to the fakes above.
+    pub(crate) fn driver() -> Arc<FastRpcDriver> {
+        Arc::new(FastRpcDriver {
+            #[cfg(unix)]
+            handle: std::ptr::null_mut(),
+            rpcmem_alloc: alloc,
+            rpcmem_alloc2: None,
+            rpcmem_free: free,
+            rpcmem_to_fd: to_fd,
+            fastrpc_mmap: mmap,
+            fastrpc_munmap: munmap,
+            remote_handle64_open: open,
+            remote_handle64_invoke: invoke,
+            remote_handle64_close: close,
+            remote_session_control: Some(control),
+            dspqueue_create: q_create,
+            dspqueue_close: q_close,
+            dspqueue_export: q_export,
+            dspqueue_write: q_write,
+            dspqueue_read: q_read,
+            oppoll: false,
+        })
     }
 }
 

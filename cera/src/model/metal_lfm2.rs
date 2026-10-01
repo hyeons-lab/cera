@@ -684,6 +684,13 @@ impl MetalLfmModel {
                 "Model specifies projection or FFN biases, which are not accelerated on Metal; biases will be omitted in forward passes"
             );
         }
+        if let Some(why) = cpu.gpu_unsupported_reason() {
+            anyhow::bail!("{why}");
+        }
+        let context_size = super::gpu_weight_source::cap_context_for_attn_temp(
+            context_size,
+            cpu.gpu_context_cap(),
+        );
         Self::from_weight_source(&cpu, path, context_size)
     }
 
@@ -712,7 +719,12 @@ impl MetalLfmModel {
         let head_dim = config.head_dim;
         let q_dim = config.n_heads * head_dim;
         let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * head_dim;
-        let scalars = config.scalars;
+        let mut scalars = config.scalars;
+        super::gpu_weight_source::fold_attn_scale_multiplier(
+            &mut scalars,
+            head_dim,
+            src.attn_scale_multiplier(),
+        );
         // The routed FFN's combine step adds its output into the residual
         // stream unscaled, matching the fused accumulate-GEMV the dense path
         // uses when `residual == 1.0`. No routed architecture also carries
@@ -1292,8 +1304,8 @@ impl MetalLfmModel {
         // Llama-3 RoPE frequency factors: always bound at qk_norm_rope binding(5).
         // A 1-element `[1.0]` dummy when the model uses plain RoPE; it also doubles
         // as the dummy bound for absent Q/K norm weights (rope-only archs).
-        let has_freq_factors = src.rope_freqs().is_some();
-        let rope_freqs_buf = match src.rope_freqs() {
+        let has_freq_factors = src.gpu_rope_freqs().is_some();
+        let rope_freqs_buf = match src.gpu_rope_freqs() {
             Some(rf) => ctx.upload_f32(rf),
             None => ctx.freq_factors_dummy(),
         };

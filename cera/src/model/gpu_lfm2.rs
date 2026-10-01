@@ -1982,6 +1982,13 @@ impl GpuLfmModel {
                 "Model specifies projection or FFN biases, which are not accelerated on WebGPU; biases will be omitted in GPU forward passes"
             );
         }
+        if let Some(why) = cpu_model.gpu_unsupported_reason() {
+            anyhow::bail!("{why}");
+        }
+        let context_size = super::gpu_weight_source::cap_context_for_attn_temp(
+            context_size,
+            cpu_model.gpu_context_cap(),
+        );
         Self::from_weight_source(&cpu_model, context_size, model_id)
     }
 
@@ -2040,7 +2047,12 @@ impl GpuLfmModel {
         let q_dim = config.n_heads * head_dim;
         let max_kv_dim = config.kv_heads_per_layer.iter().copied().max().unwrap_or(0) * head_dim;
         let rope_type = src.rope_type();
-        let scalars = config.scalars;
+        let mut scalars = config.scalars;
+        super::gpu_weight_source::fold_attn_scale_multiplier(
+            &mut scalars,
+            head_dim,
+            src.attn_scale_multiplier(),
+        );
         let batched_prefill = src.supports_batched_prefill();
         let loop_norm_interval = src.loop_norm_interval();
         // The routed FFN's combine step adds its output into the residual stream
@@ -2894,8 +2906,8 @@ impl GpuLfmModel {
         let rope_params = ctx.create_storage_rw(7 * 4, "rope_params");
         // Llama-3 RoPE frequency factors (binding 3 of the rope dispatch).
         // Always bound; a 1-element dummy when the model uses plain RoPE.
-        let has_freq_factors = src.rope_freqs().is_some();
-        let rope_freqs_buf = match src.rope_freqs() {
+        let has_freq_factors = src.gpu_rope_freqs().is_some();
+        let rope_freqs_buf = match src.gpu_rope_freqs() {
             Some(rf) => ctx.upload_f32(rf, "rope_freqs"),
             None => ctx.upload_f32(&[1.0f32], "rope_freqs_dummy"),
         };
@@ -8574,8 +8586,17 @@ impl GpuLfmModel {
     /// `--no-cache`.
     fn maybe_snapshot_prefix_locked(&self, tokens: &[u32]) {
         let mut cache = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
-        if cache.stores_entries() {
+        // A lost device or a recorded readback fault means the downloads
+        // below would be zero-filled: caching that would serve an all-zero
+        // KV to a later healthy request (and to the disk cold tier).
+        // Check before paying for the readbacks and again before the
+        // insert, since a fault can land mid-snapshot. The fault itself
+        // stays recorded for the session to surface.
+        if cache.stores_entries() && !self.ctx.has_readback_fault() {
             let snap = self.snapshot_state_locked();
+            if self.ctx.has_readback_fault() {
+                return;
+            }
             cache.insert(tokens, snap);
         }
     }
@@ -10798,7 +10819,7 @@ mod tests {
     /// (`MmapWeight::dequantize_row`) instead of a pre-dequantized f32 host
     /// copy: the rows must be bit-identical to `to_f32_vec` slices, or every
     /// GPU prefill/decode drifts from the old path. Needs the 230M model
-    /// locally; skips without it. Pure host math: runs without a GPU.
+    /// locally; skips without it (fails under `CERA_REQUIRE_MODEL`). Pure host math: runs without a GPU.
     #[test]
     #[cfg(feature = "mmap")]
     fn embedding_gather_matches_f32_table() {
@@ -10806,8 +10827,7 @@ mod tests {
         let home = std::env::var("HOME").expect("HOME unset");
         let path = std::path::PathBuf::from(home)
             .join(".leap/models/LFM2.5-230M-Q4_0/LFM2.5-230M-Q4_0.gguf");
-        if !path.exists() {
-            eprintln!("skipping: {} not present", path.display());
+        if !crate::model::transformer::require_model_or_skip(&path) {
             return;
         }
         let gguf = std::sync::Arc::new(crate::gguf::GgufFile::open(&path).unwrap());
@@ -10829,7 +10849,7 @@ mod tests {
     /// Same contract for the untied logit projection: the F16 head upload
     /// converts `output.weight` row by row from the mmap, so those rows must
     /// be bit-identical to `to_f32_vec` slices. Needs the TinyStories model
-    /// locally; skips without it. Pure host math: runs without a GPU.
+    /// locally; skips without it (fails under `CERA_REQUIRE_MODEL`). Pure host math: runs without a GPU.
     #[test]
     #[cfg(feature = "mmap")]
     fn untied_head_gather_matches_f32_table() {
@@ -10837,8 +10857,7 @@ mod tests {
         let home = std::env::var("HOME").expect("HOME unset");
         let path = std::path::PathBuf::from(home)
             .join(".leap/models/TinyStories-LLaMA2-20M-GQA.Q8_0.gguf");
-        if !path.exists() {
-            eprintln!("skipping: {} not present", path.display());
+        if !crate::model::transformer::require_model_or_skip(&path) {
             return;
         }
         let gguf = std::sync::Arc::new(crate::gguf::GgufFile::open(&path).unwrap());
@@ -11291,5 +11310,50 @@ mod tests {
                 "m={m} n={n} k={k} xs={xs} ys={ys}: max_diff={max_diff:.3e} exceeds f32-order noise"
             );
         }
+    }
+
+    /// A lost device zero-fills every download, so the prefix-cache snapshot
+    /// (warm tier, and the disk cold tier behind it) must not be built or
+    /// inserted: it would hand an all-zero KV to a later healthy request. The
+    /// healthy prefill first proves the snapshot path is live, so the lost
+    /// half cannot pass vacuously. Uses the synthetic LFM2 the CPU release
+    /// tests share, so it runs on every leg that has a GPU adapter (and
+    /// fails, not skips, under `CERA_REQUIRE_GPU` when it has none).
+    #[test]
+    fn lost_device_does_not_cache_prefix_snapshot() {
+        use crate::model::Model;
+        let Some(ctx) = gpu_ctx_or_skip() else {
+            return;
+        };
+        let probe = ctx.clone();
+        let gguf = crate::model::lfm2::release_tests::synthetic_lfm2_gguf();
+        let model = super::GpuLfmModel::from_gguf_with_ctx(gguf, 256, "lost-snapshot".into(), ctx)
+            .unwrap();
+        let mut state = crate::kv_cache::InferenceState::from_config(model.config()).unwrap();
+        let healthy: Vec<u32> = (1..9).collect();
+        model.forward_prefill(&healthy, 0, &mut state);
+        assert_eq!(
+            model.warm_cache_usage().map(|(n, _)| n),
+            Some(1),
+            "a healthy prefill must populate the prefix cache"
+        );
+        assert!(model.take_decode_error().is_none());
+
+        probe.simulate_device_lost("test: Unknown");
+        let mut state = crate::kv_cache::InferenceState::from_config(model.config()).unwrap();
+        let lost: Vec<u32> = (20..28).collect();
+        model.forward_prefill(&lost, 0, &mut state);
+        assert_eq!(
+            model.warm_cache_usage().map(|(n, _)| n),
+            Some(1),
+            "a lost device must not add a zero-filled snapshot"
+        );
+        assert!(
+            matches!(
+                model.take_decode_error(),
+                Some(crate::CeraError::Backend(m)) if m.contains("GPU device lost")
+            ),
+            "the loss must still surface as a typed error"
+        );
     }
 }

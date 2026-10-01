@@ -14,6 +14,8 @@ use cera::model::transformer::oracle_dump;
 use cera::model::{BlockType, Model};
 use cera::tokenizer::BpeTokenizer;
 
+mod common;
+
 /// Cosine similarity between two f32 slices.
 fn cosine_similarity(a: &[f32], b: &[f32]) -> f32 {
     assert_eq!(a.len(), b.len(), "slice lengths must match");
@@ -517,6 +519,48 @@ fn qwen35_ffn_norm_alias_loading() {
     assert!(
         model.is_ok(),
         "model should load with ffn_norm.weight alias"
+    );
+}
+
+#[test]
+fn qwen35_post_attention_norm_alias_loading() {
+    // llama.cpp's converter names the post-attention norm `post_attention_norm`;
+    // real Qwen3.5 GGUFs use it, so it must load without `attn_post_norm`.
+    let Some(path) = ensure_test_fixture() else {
+        return;
+    };
+    let mut gguf = GgufFile::open(&path).expect("open test_qwen35.gguf");
+    let tensor = gguf
+        .tensors
+        .remove("blk.0.attn_post_norm.weight")
+        .expect("fixture carries blk.0.attn_post_norm.weight");
+    gguf.tensors
+        .insert("blk.0.post_attention_norm.weight".to_string(), tensor);
+    let model = Qwen35Model::from_gguf(gguf, 256);
+    assert!(
+        model.is_ok(),
+        "model should load with post_attention_norm.weight: {:?}",
+        model.err()
+    );
+}
+
+/// The real Qwen3.5 checkpoint must load on the CPU path. The synthetic
+/// fixture uses `attn_post_norm`, which the real file does not, so only this
+/// test exercises the llama.cpp tensor naming.
+#[test]
+fn qwen35_real_checkpoint_loads() {
+    let Some(path) = common::fixture_or_skip(
+        "Qwen3.5-0.8B-Q4_K_M/Qwen3.5-0.8B-Q4_K_M.gguf",
+        "qwen35-real",
+    ) else {
+        return;
+    };
+    let gguf = GgufFile::open(&path).expect("open real Qwen3.5 GGUF");
+    let model = Qwen35Model::from_gguf(gguf, 256);
+    assert!(
+        model.is_ok(),
+        "real Qwen3.5 GGUF should load: {:?}",
+        model.err()
     );
 }
 

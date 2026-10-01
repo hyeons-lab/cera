@@ -2329,6 +2329,10 @@ fn load_text_model_auto(
                 return Ok(m);
             }
             Err(e) => {
+                // Driver-load failures are already surfaced by
+                // `log_context_unavailable` inside the loader; anything else
+                // here (unsupported arch or quant, or a DSP probe failure) is
+                // an ordinary fallthrough logged at debug.
                 tracing::debug!("cera::engine: Hexagon unavailable ({e}); trying next backend");
             }
         }

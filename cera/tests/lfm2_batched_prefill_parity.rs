@@ -29,10 +29,17 @@
     any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas")
 ))]
 
+mod common;
+
 use std::path::PathBuf;
 
 /// Resolve a model by trying a few roots, plus `CERA_LFM2_MODEL` as a direct path.
 fn find_model(rel: &str) -> Option<PathBuf> {
+    // The shared fixture-dir override wins, so a fixture set kept outside the
+    // tree is found instead of silently skipped.
+    if let Some(p) = common::oracle_fixture(rel) {
+        return Some(p);
+    }
     if let Ok(direct) = std::env::var("CERA_LFM2_MODEL") {
         let p = PathBuf::from(direct);
         if p.exists() {
@@ -188,7 +195,7 @@ fn check(rel: &str, tokens: &[u32]) {
         assert!(
             std::env::var("CERA_REQUIRE_MODEL").is_err(),
             "CERA_REQUIRE_MODEL is set but the fixture is absent: {rel} \
-             (set CERA_LFM2_MODEL or CERA_MODEL_ROOT)"
+             (set CERA_LFM2_MODEL, CERA_ORACLE_MODELS_DIR or CERA_MODEL_ROOT)"
         );
         eprintln!("[parity] SKIP (absent): {rel}");
         return;
