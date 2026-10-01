@@ -474,6 +474,9 @@ jobs:
           # r28 floor: first NDK with 16KB ELF alignment by default (see
           # the android-abis job in ci.yml). Keep in sync with it.
           ndk-version: r30
+      # ubuntu-latest ships no `just`, and the next step runs a recipe.
+      - uses: extractions/setup-just@v4
+        if: ${{ matrix.android }}
       - name: Build Android jniLibs
         if: ${{ matrix.android }}
         env:
