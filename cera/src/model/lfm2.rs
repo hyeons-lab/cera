@@ -1578,7 +1578,13 @@ impl Lfm2Model {
         }
         // conv_scratch now holds bx
 
-        // Depthwise conv1d with valid convolution using rolling buffer
+        // Depthwise conv1d with valid convolution using rolling buffer.
+        //
+        // Fused multiply-add (`vfmaq_f32`), like the batched-prefill conv kernel.
+        // `vmlaq_f32` lowers to a separate multiply and add, so decode and prefill
+        // rounded the conv output differently. The next Q8_0 quantization hides a
+        // 1-ulp difference, but anything reading it as f32 (the LoRA out_proj hook)
+        // sees it.
         let LayerState::Conv { buffer, history } = &mut state.layers[layer] else {
             panic!("expected Conv state for layer {layer}");
         };
@@ -1610,7 +1616,7 @@ impl Lfm2Model {
                             vw,
                         );
                         let vbuf = vld1q_f32(buffer.as_ptr().add(k * hidden_size + ch));
-                        vsum = vmlaq_f32(vsum, vbuf, vw);
+                        vsum = vfmaq_f32(vsum, vbuf, vw);
                     }
                     let mut vw_last = vdupq_n_f32(0.0);
                     vw_last = vsetq_lane_f32::<0>(
@@ -1630,7 +1636,7 @@ impl Lfm2Model {
                         vw_last,
                     );
                     let vcur = vld1q_f32(conv_scratch.as_ptr().add(ch));
-                    vsum = vmlaq_f32(vsum, vcur, vw_last);
+                    vsum = vfmaq_f32(vsum, vcur, vw_last);
                     vst1q_f32(out_buf.as_mut_ptr().add(ch), vsum);
                     ch += 4;
                 }
