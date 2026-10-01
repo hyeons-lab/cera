@@ -2176,7 +2176,7 @@ impl Lfm2Model {
 
         for i in 0..cfg.n_layers {
             let t0 = if profile {
-                Some(std::time::Instant::now())
+                Some(crate::time::Instant::now())
             } else {
                 None
             };
@@ -2193,7 +2193,7 @@ impl Lfm2Model {
             }
 
             let t1 = if profile {
-                Some(std::time::Instant::now())
+                Some(crate::time::Instant::now())
             } else {
                 None
             };
@@ -2212,7 +2212,7 @@ impl Lfm2Model {
             cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
             let t2 = if profile {
-                Some(std::time::Instant::now())
+                Some(crate::time::Instant::now())
             } else {
                 None
             };
@@ -2229,7 +2229,7 @@ impl Lfm2Model {
             }
 
             let t3 = if profile {
-                Some(std::time::Instant::now())
+                Some(crate::time::Instant::now())
             } else {
                 None
             };

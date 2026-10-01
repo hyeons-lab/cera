@@ -375,9 +375,9 @@ impl GpuContext {
         // The env read stays uncached so tests can toggle profiling
         // mid-process; the timestamps below are the part worth skipping.
         let host_prof = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
-        let t0 = host_prof.then(std::time::Instant::now);
+        let t0 = host_prof.then(crate::time::Instant::now);
         let cmd = enc.finish();
-        let t1 = host_prof.then(std::time::Instant::now);
+        let t1 = host_prof.then(crate::time::Instant::now);
         self.queue.submit(Some(cmd));
         if let (Some(t0), Some(t1)) = (t0, t1) {
             eprintln!(
@@ -3985,7 +3985,7 @@ mod tests {
 
         // Timed: 100 iterations of single GEMV dispatch
         let iters = 100;
-        let start = std::time::Instant::now();
+        let start = crate::time::Instant::now();
         for _ in 0..iters {
             let mut enc = ctx.device.create_command_encoder(&Default::default());
             {
@@ -4005,7 +4005,7 @@ mod tests {
         // CPU reference timing (use black_box to prevent dead-code elimination)
         let mut cpu_y = vec![0.0f32; m as usize];
         let cpu_iters = 1000;
-        let cpu_start = std::time::Instant::now();
+        let cpu_start = crate::time::Instant::now();
         for _ in 0..cpu_iters {
             for i in 0..m as usize {
                 let mut sum = 0.0f32;

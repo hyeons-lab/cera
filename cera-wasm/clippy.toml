@@ -1,0 +1,10 @@
+# `std::time::Instant::now()` and `SystemTime::now()` compile on
+# wasm32-unknown-unknown but panic on first call ("time not implemented on this
+# platform"). This crate is wasm32-only, so the rule applies to all of it; take
+# the clock from `cera::time` (or `js_sys::Date`). `cera/clippy.toml` carries
+# the same rule for the core library, which also builds natively and so scopes
+# it to wasm32 there.
+disallowed-methods = [
+    { path = "std::time::Instant::now", reason = "panics on wasm32; use cera::time::Instant" },
+    { path = "std::time::SystemTime::now", reason = "panics on wasm32; use js_sys::Date" },
+]

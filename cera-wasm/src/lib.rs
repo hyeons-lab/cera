@@ -12,6 +12,8 @@
 //! the wasm wrapper.
 
 #![cfg(target_arch = "wasm32")]
+// The clock rule in clippy.toml: a stray `std::time::Instant::now()` panics in the browser.
+#![deny(clippy::disallowed_methods)]
 
 use wasm_bindgen::JsCast;
 use wasm_bindgen::prelude::*;
@@ -307,6 +309,11 @@ impl Manifest {
     }
 
     /// URL of the audio-tokenizer checkpoint (typically `.safetensors`).
+    ///
+    /// `undefined` when the manifest does not name one, as for a llama.cpp
+    /// split-layout vocoder (`vocoder-*.gguf`): its detokenizer lives in the
+    /// sibling `tokenizer-*.gguf`, and callers assembling their own `ModelParts`
+    /// must fetch that file.
     #[wasm_bindgen(getter, js_name = audioTokenizerUrl)]
     pub fn audio_tokenizer_url(&self) -> Option<String> {
         self.inner.files.audio_tokenizer.clone()
@@ -3298,20 +3305,33 @@ mod webgpu {
                     ));
                 }
 
-                let mut tok_bytes = None;
-                if let Some(rel) = manifest
+                let tok_bytes = match manifest
                     .files
                     .audio_tokenizer
                     .as_deref()
                     .filter(|s| !s.trim().is_empty())
                 {
-                    let tok_url =
-                        crate::bundle::join_url(base_url, rel).map_err(|e| JsError::new(&e))?;
-                    tok_bytes = Some(Arc::from(
-                        repo.read_or_download(&tok_url, None, on_progress.as_ref())
-                            .await?,
-                    ));
-                }
+                    Some(rel) => {
+                        let tok_url =
+                            crate::bundle::join_url(base_url, rel).map_err(|e| JsError::new(&e))?;
+                        Some(Arc::from(
+                            repo.read_or_download(&tok_url, None, on_progress.as_ref())
+                                .await?,
+                        ))
+                    }
+                    // A llama.cpp vocoder keeps its detokenizer backbone in the
+                    // sibling `tokenizer-*` file, which the manifest may not name.
+                    // That URL is a guess, so a failed fetch is not fatal.
+                    None => crate::bundle::fetch_inferred_sidecar(
+                        repo,
+                        &manifest,
+                        base_url,
+                        voc_bytes.as_deref(),
+                        on_progress.as_ref(),
+                    )
+                    .await
+                    .map(Arc::from),
+                };
 
                 if voc_bytes.is_some() || tok_bytes.is_some() {
                     session.attach_audio_sidecars(voc_bytes, tok_bytes)?;
@@ -3390,20 +3410,12 @@ mod webgpu {
             vocoder_bytes: Option<Arc<[u8]>>,
             tokenizer_bytes: Option<Arc<[u8]>>,
         ) -> Result<(), JsError> {
-            let voc_arc = if let Some(vb) = vocoder_bytes {
-                Some(Arc::new(
-                    cera::gguf::GgufFile::from_bytes(vb).map_err(map_err)?,
-                ))
-            } else {
-                None
-            };
-            let tok_arc = if let Some(tb) = tokenizer_bytes {
-                Some(Arc::new(
-                    cera::gguf::GgufFile::from_bytes(tb).map_err(map_err)?,
-                ))
-            } else {
-                None
-            };
+            // Both best-effort, like native: an unparseable sidecar loses audio
+            // output, not the text model.
+            let voc_arc = vocoder_bytes
+                .and_then(|vb| crate::bundle::parse_audio_sidecar(vb, "audio vocoder"));
+            let tok_arc = tokenizer_bytes
+                .and_then(|tb| crate::bundle::parse_audio_sidecar(tb, "audio tokenizer"));
 
             // A llama.cpp-style vocoder keeps its detokenizer backbone in the
             // tokenizer sidecar; fold the two into the layout the loaders read.
@@ -3486,7 +3498,7 @@ mod webgpu {
                 self.audio_decoder = Some(Arc::clone(dw));
                 self.detok_weights = Some(Arc::clone(tw));
             } else if let Some(dw) = decoder_weights.as_ref() {
-                console_info("[cera-wasm] audio decoder (depthformer) loaded without detokenizer");
+                console_warn("[cera-wasm] audio decoder (depthformer) loaded without detokenizer");
                 self.audio_decoder = Some(Arc::clone(dw));
                 self.detok_weights = None;
                 self.gpu_audio_decoder = None;

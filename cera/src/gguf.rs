@@ -32,6 +32,11 @@ const GGUF_TYPE_UINT64: u32 = 10;
 const GGUF_TYPE_INT64: u32 = 11;
 const GGUF_TYPE_FLOAT64: u32 = 12;
 
+/// Deepest array-of-arrays nesting a header may use. Real files use one level
+/// (an array of strings); the parser recurses, so an unbounded chain from an
+/// untrusted body would overflow the stack, which no `Result` can catch.
+const MAX_ARRAY_DEPTH: u32 = 8;
+
 // GGUF tensor dtype IDs
 const GGML_TYPE_F32: u32 = 0;
 const GGML_TYPE_F16: u32 = 1;
@@ -182,11 +187,23 @@ pub(crate) mod parse_probe {
 struct GgufReader<R: Read> {
     reader: R,
     pos: u64,
+    /// Total bytes the reader can supply. Bounds how much an untrusted count may
+    /// reserve up front.
+    total_len: u64,
 }
 
 impl<R: Read> GgufReader<R> {
-    fn new(reader: R) -> Self {
-        Self { reader, pos: 0 }
+    fn new(reader: R, total_len: u64) -> Self {
+        Self {
+            reader,
+            pos: 0,
+            total_len,
+        }
+    }
+
+    /// Bytes the reader can still supply.
+    fn remaining(&self) -> u64 {
+        self.total_len.saturating_sub(self.pos)
     }
 
     fn read_u8(&mut self) -> Result<u8> {
@@ -252,15 +269,53 @@ impl<R: Read> GgufReader<R> {
     }
 
     fn read_string(&mut self) -> Result<String> {
-        let len = self.read_u64()? as usize;
+        // Compared as u64 before narrowing (a 32-bit `usize` would wrap), and
+        // against the bytes left so a tiny buffer cannot allocate its claim.
+        let len = self.read_u64()?;
         ensure!(len < 1_000_000, "string too long: {len}");
+        ensure!(
+            len <= self.remaining(),
+            "string of {len} bytes runs past the end of the data"
+        );
+        let len = len as usize;
         let mut buf = vec![0u8; len];
         self.reader.read_exact(&mut buf).context("read string")?;
         self.pos += len as u64;
         String::from_utf8(buf).context("invalid UTF-8 in string")
     }
 
-    fn read_value(&mut self, type_id: u32) -> Result<GgufValue> {
+    /// One metadata entry: key, value type, value.
+    fn read_kv_entry(&mut self) -> Result<(String, GgufValue)> {
+        let key = self.read_string()?;
+        let type_id = self.read_u32()?;
+        let value = self.read_value(type_id, 0)?;
+        Ok((key, value))
+    }
+
+    /// One tensor-info entry: name, shape, type id, data offset.
+    fn read_tensor_info(&mut self) -> Result<(String, Vec<usize>, u32, u64)> {
+        let name = self.read_string()?;
+        let n_dims = self.read_u32()? as usize;
+        ensure!(
+            n_dims <= 8,
+            "tensor {name} has too many dimensions: {n_dims}"
+        );
+
+        let mut shape = Vec::with_capacity(n_dims);
+        for _ in 0..n_dims {
+            let dim = self.read_u64()?;
+            shape
+                .push(usize::try_from(dim).with_context(|| {
+                    format!("tensor {name} dimension {dim} does not fit usize")
+                })?);
+        }
+
+        let type_id = self.read_u32()?;
+        let offset = self.read_u64()?;
+        Ok((name, shape, type_id, offset))
+    }
+
+    fn read_value(&mut self, type_id: u32, depth: u32) -> Result<GgufValue> {
         match type_id {
             GGUF_TYPE_UINT8 => Ok(GgufValue::U8(self.read_u8()?)),
             GGUF_TYPE_INT8 => Ok(GgufValue::I8(self.read_i8()?)),
@@ -276,16 +331,43 @@ impl<R: Read> GgufReader<R> {
             GGUF_TYPE_STRING => Ok(GgufValue::String(self.read_string()?)),
             GGUF_TYPE_ARRAY => {
                 let elem_type = self.read_u32()?;
-                let count = self.read_u64()? as usize;
+                let count = self.read_u64()?;
                 ensure!(count < 10_000_000, "array too long: {count}");
-                let mut arr = Vec::with_capacity(count);
+                // Refuse an unknown element type before reserving for its elements.
+                ensure!(
+                    count == 0 || elem_type <= GGUF_TYPE_FLOAT64,
+                    "unknown GGUF array element type: {elem_type}"
+                );
+                ensure!(
+                    depth < MAX_ARRAY_DEPTH,
+                    "arrays nested more than {MAX_ARRAY_DEPTH} deep"
+                );
+                let mut arr = Vec::with_capacity(array_presize(count, self.remaining(), depth));
                 for _ in 0..count {
-                    arr.push(self.read_value(elem_type)?);
+                    arr.push(self.read_value(elem_type, depth + 1)?);
                 }
                 Ok(GgufValue::Array(arr))
             }
             _ => bail!("unknown GGUF value type: {type_id}"),
         }
+    }
+}
+
+/// How many elements to reserve up front for an array that claims `count`.
+///
+/// `count` is untrusted, so reserve from the bytes actually left (`remaining`):
+/// each element consumes at least one byte, which makes it a true upper bound,
+/// and a tiny buffer cannot reserve hundreds of MiB before its first element
+/// fails to read. Growing from empty instead fragments the allocator on the
+/// large vocabulary arrays (repeated model loads retained ~20x more). Only a
+/// top-level array is pre-sized: nested levels share the same remaining bytes, so
+/// each one reserving it would multiply the reservation by the depth, and real
+/// files do not nest large arrays.
+fn array_presize(count: u64, remaining: u64, depth: u32) -> usize {
+    if depth == 0 {
+        count.min(remaining) as usize
+    } else {
+        0
     }
 }
 
@@ -484,7 +566,7 @@ impl GgufFile {
 
         // Parse header + metadata from the slice via a Cursor. Shares
         // one implementation across mmap and owned-buffer backings.
-        let mut reader = GgufReader::new(Cursor::new(data_slice));
+        let mut reader = GgufReader::new(Cursor::new(data_slice), data_slice.len() as u64);
 
         // ── Header ──────────────────────────────────────────────────────
         let magic = reader.read_u32()?;
@@ -499,42 +581,44 @@ impl GgufFile {
             "unsupported GGUF version {version} (expected 3)"
         );
 
-        let tensor_count = reader.read_u64()? as usize;
-        let kv_count = reader.read_u64()? as usize;
+        // The counts are untrusted: they only bound the loops below and never size
+        // an allocation, so a corrupt or hostile header ends at the first entry it
+        // cannot supply instead of panicking or reserving gigabytes. They stay u64:
+        // narrowing to `usize` would wrap 2^32 + k to k on 32-bit targets (wasm32).
+        let tensor_count = reader.read_u64()?;
+        let kv_count = reader.read_u64()?;
 
         // ── KV Metadata ─────────────────────────────────────────────────
-        let mut metadata = HashMap::with_capacity(kv_count);
-        for _ in 0..kv_count {
-            let key = reader.read_string()?;
-            let type_id = reader.read_u32()?;
-            let value = reader.read_value(type_id)?;
+        let mut metadata = HashMap::new();
+        for i in 0..kv_count {
+            let (key, value) = reader.read_kv_entry().with_context(|| {
+                format!(
+                    "reading metadata entry {i} of {kv_count} at byte {}",
+                    reader.pos
+                )
+            })?;
             metadata.insert(key, value);
         }
 
         // ── Tensor Info ─────────────────────────────────────────────────
         // We need raw type IDs for display, but also our DType for processing.
         // Parse tensor infos and store them.
-        let mut tensors = HashMap::with_capacity(tensor_count);
+        // Pre-size from the bytes left (a tensor info is at least 24 bytes), never
+        // from the untrusted count: skipping it made a 60k-tensor header ~28%
+        // slower to parse.
+        let tensor_hint = tensor_count.min(reader.remaining() / 24) as usize;
+        let mut tensors = HashMap::with_capacity(tensor_hint);
         let mut tensor_infos_raw: Vec<(String, Vec<usize>, u32, u64)> =
-            Vec::with_capacity(tensor_count);
+            Vec::with_capacity(tensor_hint);
 
-        for _ in 0..tensor_count {
-            let name = reader.read_string()?;
-            let n_dims = reader.read_u32()? as usize;
-            ensure!(
-                n_dims <= 8,
-                "tensor {name} has too many dimensions: {n_dims}"
-            );
-
-            let mut shape = Vec::with_capacity(n_dims);
-            for _ in 0..n_dims {
-                shape.push(reader.read_u64()? as usize);
-            }
-
-            let type_id = reader.read_u32()?;
-            let offset = reader.read_u64()?;
-
-            tensor_infos_raw.push((name, shape, type_id, offset));
+        for i in 0..tensor_count {
+            let info = reader.read_tensor_info().with_context(|| {
+                format!(
+                    "reading tensor info {i} of {tensor_count} at byte {}",
+                    reader.pos
+                )
+            })?;
+            tensor_infos_raw.push(info);
         }
 
         // The data section starts after the header, aligned to the GGUF alignment.
@@ -1105,7 +1189,8 @@ mod tests {
             0x47, 0x47, 0x55, 0x46, // magic "GGUF"
             0x03, 0x00, 0x00, 0x00, // version 3
         ];
-        let mut reader = GgufReader::new(std::io::Cursor::new(data));
+        let len = data.len() as u64;
+        let mut reader = GgufReader::new(std::io::Cursor::new(data), len);
         assert_eq!(reader.read_u32().unwrap(), GGUF_MAGIC);
         assert_eq!(reader.read_u32().unwrap(), 3);
         assert_eq!(reader.pos, 8);
@@ -1117,7 +1202,8 @@ mod tests {
         let mut data: Vec<u8> = Vec::new();
         data.extend_from_slice(&5u64.to_le_bytes()); // length = 5
         data.extend_from_slice(b"hello");
-        let mut reader = GgufReader::new(std::io::Cursor::new(data));
+        let len = data.len() as u64;
+        let mut reader = GgufReader::new(std::io::Cursor::new(data), len);
         assert_eq!(reader.read_string().unwrap(), "hello");
     }
 
@@ -1194,6 +1280,193 @@ mod tests {
         match GgufFile::from_reader_with_limit(std::io::Cursor::new(bytes), exact) {
             Ok(g) => assert_eq!(g.mmap_data().len() as u64, exact),
             Err(e) => panic!("stream exactly at limit should succeed, got: {e}"),
+        }
+    }
+
+    /// Magic, version 3, then the two counts, and a little padding.
+    fn header_with_counts(tensor_count: u64, kv_count: u64) -> Arc<[u8]> {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&tensor_count.to_le_bytes());
+        bytes.extend_from_slice(&kv_count.to_le_bytes());
+        bytes.resize(bytes.len() + 64, 0);
+        Arc::from(bytes.into_boxed_slice())
+    }
+
+    #[test]
+    fn from_bytes_rejects_hostile_header_counts() {
+        // Each of these used to panic ("capacity overflow") or abort the process
+        // (a multi-terabyte `with_capacity`) before a single entry was read. The
+        // counts never size an allocation now, so the parse just runs out of
+        // buffer.
+        for (tensors, kvs) in [
+            (u64::MAX, 0),
+            (1 << 40, 0),
+            (0, u64::MAX),
+            (0, 1 << 40),
+            (1 << 32, 1 << 32),
+        ] {
+            assert!(
+                GgufFile::from_bytes(header_with_counts(tensors, kvs)).is_err(),
+                "expected an error for tensors={tensors}, kv={kvs}"
+            );
+        }
+    }
+
+    /// One KV entry whose value is `depth` arrays wrapped around an empty u8
+    /// array (so `depth + 1` arrays in all), each holding the next as its single
+    /// element.
+    fn nested_array_gguf(depth: usize) -> Arc<[u8]> {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // kv_count
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // key length
+        bytes.push(b'k');
+        bytes.extend_from_slice(&GGUF_TYPE_ARRAY.to_le_bytes());
+        for _ in 0..depth {
+            bytes.extend_from_slice(&GGUF_TYPE_ARRAY.to_le_bytes()); // element type
+            bytes.extend_from_slice(&1u64.to_le_bytes()); // one element
+        }
+        bytes.extend_from_slice(&GGUF_TYPE_UINT8.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        Arc::from(bytes.into_boxed_slice())
+    }
+
+    #[test]
+    fn from_bytes_bounds_array_nesting() {
+        // A chain this long overflows the stack of a recursive parse (an abort,
+        // not an `Err`), and a guessed sidecar from a third-party host can carry
+        // one. Real files nest one level.
+        assert!(GgufFile::from_bytes(nested_array_gguf(1)).is_ok());
+        // `nested_array_gguf(d)` holds d + 1 arrays, so this is exactly the limit.
+        assert!(GgufFile::from_bytes(nested_array_gguf(MAX_ARRAY_DEPTH as usize - 1)).is_ok());
+        assert!(GgufFile::from_bytes(nested_array_gguf(MAX_ARRAY_DEPTH as usize)).is_err());
+        match GgufFile::from_bytes(nested_array_gguf(100_000)) {
+            Ok(_) => panic!("expected an error for a 100k-deep array chain"),
+            Err(e) => assert!(format!("{e:#}").contains("nested"), "unexpected error: {e}"),
+        }
+    }
+
+    /// One KV entry holding a u8 array that claims `count` elements and supplies
+    /// `supplied` of them.
+    fn array_gguf(count: u64, supplied: usize) -> Arc<[u8]> {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // kv_count
+        bytes.extend_from_slice(&1u64.to_le_bytes()); // key length
+        bytes.push(b'k');
+        bytes.extend_from_slice(&GGUF_TYPE_ARRAY.to_le_bytes());
+        bytes.extend_from_slice(&GGUF_TYPE_UINT8.to_le_bytes());
+        bytes.extend_from_slice(&count.to_le_bytes());
+        bytes.resize(bytes.len() + supplied, 1);
+        Arc::from(bytes.into_boxed_slice())
+    }
+
+    #[test]
+    fn from_bytes_bounds_array_counts() {
+        // A count at or past the cap is refused outright...
+        // (2^32 + 3 would wrap to 3 on wasm32; cera-wasm's tests cover that target.)
+        for count in [10_000_000u64, 10_000_001, (1 << 32) + 3, u64::MAX] {
+            match GgufFile::from_bytes(array_gguf(count, 3)) {
+                Ok(_) => panic!("expected an error for array count {count}"),
+                Err(e) => assert!(format!("{e:#}").contains("too long"), "{count}: {e}"),
+            }
+        }
+        // ...a count just under it fails only because the elements are missing...
+        assert!(GgufFile::from_bytes(array_gguf(9_999_999, 3)).is_err());
+        // ...and an honest array parses.
+        assert!(GgufFile::from_bytes(array_gguf(3, 3)).is_ok());
+    }
+
+    /// The full error chain of a parse that must fail.
+    fn parse_error(bytes: Arc<[u8]>) -> String {
+        match GgufFile::from_bytes(bytes) {
+            Ok(_) => panic!("expected the parse to fail"),
+            Err(e) => format!("{e:#}"),
+        }
+    }
+
+    #[test]
+    fn from_bytes_refuses_strings_and_element_types_the_data_cannot_back() {
+        // A key claiming nearly 1 MB over a tiny buffer must not allocate it.
+        let mut b = b"GGUF".to_vec();
+        b.extend_from_slice(&3u32.to_le_bytes());
+        b.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
+        b.extend_from_slice(&1u64.to_le_bytes()); // kv_count
+        b.extend_from_slice(&999_999u64.to_le_bytes()); // key length
+        b.extend_from_slice(b"short");
+        let err = parse_error(Arc::from(b.into_boxed_slice()));
+        assert!(err.contains("runs past the end"), "{err}");
+
+        // An unknown array element type is refused before reserving for its
+        // elements; an empty array of it has nothing to refuse.
+        let mut bad = array_gguf(5, 5).to_vec();
+        let at = bad.len() - 5 - 8 - 4; // the u8 element type of array_gguf
+        bad[at..at + 4].copy_from_slice(&99u32.to_le_bytes());
+        let err = parse_error(Arc::from(bad.into_boxed_slice()));
+        assert!(err.contains("unknown GGUF array element"), "{err}");
+        let mut empty = array_gguf(0, 0).to_vec();
+        let at = empty.len() - 8 - 4;
+        empty[at..at + 4].copy_from_slice(&99u32.to_le_bytes());
+        assert!(GgufFile::from_bytes(Arc::from(empty.into_boxed_slice())).is_ok());
+    }
+
+    #[test]
+    fn a_truncated_header_names_the_entry_it_stopped_at() {
+        // More entries promised than the 64 padding bytes can supply.
+        let msg = parse_error(header_with_counts(0, 100));
+        assert!(msg.contains("metadata entry"), "{msg}");
+        let msg = parse_error(header_with_counts(100, 0));
+        assert!(msg.contains("tensor info"), "{msg}");
+    }
+
+    #[test]
+    fn a_large_honest_array_is_allocated_once() {
+        // Pre-sized from the bytes left, so the Vec holds exactly its elements.
+        // Grown by push instead it would end at the next power of two (1_000_000
+        // becomes 1_048_576) and fragment the allocator on repeated model loads.
+        let g = GgufFile::from_bytes(array_gguf(1_000_000, 1_000_000)).unwrap();
+        let Some(GgufValue::Array(a)) = g.metadata.get("k") else {
+            panic!("missing array");
+        };
+        assert_eq!(a.len(), 1_000_000);
+        // `Vec::with_capacity` guarantees at least the request; grown by push it
+        // would be 1_048_576.
+        assert!(a.capacity() >= a.len() && a.capacity() < 1_048_576);
+    }
+
+    #[test]
+    fn array_presize_is_bounded_by_the_bytes_left_and_the_top_level() {
+        // Honest: the whole array fits in what is left.
+        assert_eq!(array_presize(1000, 5000, 0), 1000);
+        // Hostile: a huge count over a tiny buffer reserves only the buffer.
+        assert_eq!(array_presize(9_999_999, 49, 0), 49);
+        assert_eq!(array_presize(9_999_999, 0, 0), 0);
+        // Nested levels share the same bytes, so they reserve nothing up front.
+        assert_eq!(array_presize(1000, 5000, 1), 0);
+        assert_eq!(array_presize(9_999_999, 1 << 30, 7), 0);
+    }
+
+    #[test]
+    fn from_bytes_parses_a_large_legal_kv_header() {
+        // Thousands of distinct keys: the map grows well past any default size.
+        let n = 5000u64;
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend_from_slice(&3u32.to_le_bytes());
+        bytes.extend_from_slice(&0u64.to_le_bytes());
+        bytes.extend_from_slice(&n.to_le_bytes());
+        for i in 0..n {
+            let key = format!("k{i}");
+            bytes.extend_from_slice(&(key.len() as u64).to_le_bytes());
+            bytes.extend_from_slice(key.as_bytes());
+            bytes.extend_from_slice(&GGUF_TYPE_UINT8.to_le_bytes());
+            bytes.push(7);
+        }
+        match GgufFile::from_bytes(Arc::from(bytes.into_boxed_slice())) {
+            Ok(g) => assert_eq!(g.metadata.len(), n as usize),
+            Err(e) => panic!("legal header rejected: {e}"),
         }
     }
 
