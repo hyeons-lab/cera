@@ -888,6 +888,36 @@ void main() {
       );
     });
 
+    test('a voice note in Text Only mode is told to answer in text', () {
+      // Left null, the audio path falls back to the interleaved prompt and the
+      // model answers with speech even though Text Only is selected.
+      const profile = CeraAudioProfile(
+        ttsSystemPrompt: 'Perform TTS.',
+        interleavedSystemPrompt: 'Respond with interleaved text and audio.',
+      );
+      const settings = ChatSettings(audioChatMode: AudioChatMode.textOnly);
+      for (final CeraAudioProfile? p in [profile, null]) {
+        expect(
+          ChatController.systemPromptFor(
+            settings: settings,
+            uiMode: AppUIMode.chat,
+            isAudioPrompt: true,
+            profile: p,
+          ),
+          'Respond to the user.',
+        );
+        expect(
+          ChatController.systemPromptFor(
+            settings: settings,
+            uiMode: AppUIMode.chat,
+            profile: p,
+          ),
+          isNull,
+          reason: 'a typed message needs no system prompt',
+        );
+      }
+    });
+
     test('voiceTagFor maps capabilities to descriptive status labels', () {
       expect(
         ChatController.voiceTagFor(

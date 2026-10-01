@@ -1215,6 +1215,9 @@ class ChatController extends ValueNotifier<ChatState> {
       if (mode == AudioChatMode.textToSpeech && !isAudioPrompt) {
         return profile.ttsSystemPromptFor(voicePersona);
       }
+      if (mode == AudioChatMode.textOnly && isAudioPrompt) {
+        return _textOnlySystemPrompt;
+      }
       return null;
     }
     final personaSuffix = voicePersona.isNotEmpty ? ' $voicePersona' : '';
@@ -1224,8 +1227,15 @@ class ChatController extends ValueNotifier<ChatState> {
     if (mode == AudioChatMode.textToSpeech && !isAudioPrompt) {
       return 'Perform TTS.$personaSuffix'.trim();
     }
+    if (mode == AudioChatMode.textOnly && isAudioPrompt) {
+      return _textOnlySystemPrompt;
+    }
     return null;
   }
+
+  /// A voice note sent in Text Only mode: without a system prompt the audio
+  /// path falls back to the model's interleaved prompt and answers with speech.
+  static const _textOnlySystemPrompt = 'Respond to the user.';
 
   @override
   void dispose() {

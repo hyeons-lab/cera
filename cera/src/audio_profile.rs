@@ -413,6 +413,28 @@ mod tests {
     }
 
     #[test]
+    fn malformed_optional_fields_are_dropped_not_fatal() {
+        let m = manifest(
+            "SomeNewAudioModel-2B-Q4_0.gguf",
+            None,
+            r#","audio_profile":{
+                "tts_system_prompt":"Speak.",
+                "interleaved_system_prompt":42,
+                "voices":[{"prompt":7},{"label":"No prompt"},"x",{"prompt":"Voice: ana."}],
+                "sample_texts":[42,"Hi.",null]}"#,
+        );
+        let p = AudioProfile::for_manifest(&m);
+        assert_eq!(p.tts_system_prompt, "Speak. Voice: ana.");
+        assert_eq!(p.voices.len(), 1, "only the voice with a text prompt stays");
+        assert_eq!(p.sample_texts, ["Hi."]);
+        assert_eq!(
+            p.interleaved_system_prompt_for(None),
+            "Respond with interleaved text and audio. Voice: ana.",
+            "a non-string interleaved prompt falls back to the default"
+        );
+    }
+
+    #[test]
     fn a_manifest_without_a_profile_resolves_from_its_file_names() {
         let en = manifest(
             "LFM2.5-Audio-1.5B-Q4_0.gguf",
