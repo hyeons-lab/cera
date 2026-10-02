@@ -169,6 +169,43 @@ pub(crate) fn f32_to_f16(v: f32) -> u16 {
     sign | ((e << 10) as u16) | (((rounded >> 13) & 0x03FF) as u16)
 }
 
+/// Scale of a Q8_0 *activation* block with absolute maximum `amax`: the smallest
+/// f16 that is at least `amax / 127`, returned as f32.
+///
+/// The int8 values are produced with the reciprocal of this same stored scale, so
+/// they and the scale always describe the same numbers. The earlier convention
+/// (ggml's) divided by the unrounded `amax / 127` but stored the f16-rounded
+/// scale; for a block whose scale is an f16 subnormal (`amax` below about
+/// 7.7e-3, e.g. a short-conv output) the two disagree by up to a few percent of
+/// the block, and below `amax` ~4e-6 the stored scale flushed to zero and the
+/// block was lost. Rounding *up* (not to nearest) guarantees no element
+/// quantizes past 127, so the x86 VNNI kernels' `[-127, 127]` precondition holds
+/// without a clamp in the hot loop. For a normal scale this moves the stored
+/// scale by at most one f16 ulp.
+///
+/// A non-positive or non-finite result means the caller must take the
+/// zero-reciprocal branch.
+#[inline(always)]
+pub(crate) fn q8_0_activation_scale(amax: f32) -> f32 {
+    let d = amax / 127.0;
+    let h = f32_to_f16(d);
+    let r = f16_to_f32(h);
+    // `r < d` is false for NaN and for an infinite `r`, which keep their value.
+    if r < d {
+        f16_to_f32(h.wrapping_add(1))
+    } else {
+        r
+    }
+}
+
+/// The reciprocal a Q8_0 activation block is quantized with: `1 / scale`, or 0 for
+/// a zero or non-finite scale (all-zero block, NaN, or a scale that overflows f16).
+#[inline(always)]
+pub(crate) fn q8_0_activation_recip(scale: f32) -> f32 {
+    let r = 1.0 / scale;
+    if scale > 0.0 && r.is_finite() { r } else { 0.0 }
+}
+
 // ── Block layouts ────────────────────────────────────────────────────────────
 
 /// Q4_0 quantization block: 32 values in 18 bytes.

@@ -3,11 +3,12 @@
 //! normalized values, Q8_0 scales and int8 quants, bit for bit.
 //!
 //! They did not on aarch64: the fused NEON kernel summed squares in f32 while
-//! `rmsnorm_neon` sums in f64 (as ggml does), and it quantized with `1 / d_f16`
-//! where the standalone quantizer (like ggml) uses the unrounded `1 / d`. The
-//! resulting `inv_rms` differed by a few ulps, changing most normalized values,
-//! and ~1% of the int8 quants flipped, so batched prefill and per-token decode
-//! drifted apart from the first layer (cosine ~0.999 on LFM2.5-230M).
+//! `rmsnorm_neon` sums in f64 (as ggml does), and it quantized with a different
+//! reciprocal than the standalone quantizer. The resulting `inv_rms` differed by
+//! a few ulps, changing most normalized values, and ~1% of the int8 quants
+//! flipped, so batched prefill and per-token decode drifted apart from the first
+//! layer (cosine ~0.999 on LFM2.5-230M). Both now use the stored f16 scale
+//! (`quant::q8_0_activation_scale`) and its reciprocal.
 
 use cera::backend::cpu;
 
@@ -67,4 +68,21 @@ fn fused_rmsnorm_quantize_matches_with_outliers_and_zero_blocks() {
     let mut x: Vec<f32> = (0..n).map(|_| rnd()).collect();
     x[64..96].fill(0.0);
     assert_routes_agree(&x, &w, "zero block");
+}
+
+#[test]
+fn fused_rmsnorm_quantize_matches_on_small_magnitude_blocks() {
+    // Weights spanning ten orders of magnitude give blocks whose scale is an f16
+    // subnormal (and, at the small end, the smallest subnormal): the range where
+    // the stored scale and the quantizer's reciprocal used to disagree, and where
+    // the fused NEON kernel and the standalone quantizer must still agree.
+    let mut rnd = noise(2026);
+    let n = 320;
+    (0..100).for_each(|i| {
+        let x: Vec<f32> = (0..n).map(|_| rnd() * 3.0).collect();
+        let w: Vec<f32> = (0..n)
+            .map(|j| 10f32.powi(-(((j / 32) + i) % 10)) * (1.0 + rnd() * 0.3))
+            .collect();
+        assert_routes_agree(&x, &w, &format!("small-magnitude trial={i}"));
+    });
 }

@@ -541,7 +541,8 @@ pub(crate) mod neon {
         }
     }
 
-    /// Quantize f32 vector to Q8_0 format (NEON-vectorized, f16 scale roundtrip).
+    /// Quantize f32 vector to Q8_0 format (NEON-vectorized; the stored scale is the
+    /// smallest f16 at least `amax / 127`, and the values use its reciprocal).
     /// Stores scales and quants into caller-provided buffers.
     /// Returns the number of blocks written.
     #[target_feature(enable = "neon")]
@@ -583,13 +584,8 @@ pub(crate) mod neon {
                 let a6 = vmaxq_f32(a4, a5);
                 let amax = vmaxvq_f32(a6);
 
-                let d = amax / 127.0;
-                let id = if d.is_finite() && d > 0.0 {
-                    1.0 / d
-                } else {
-                    0.0
-                };
-                let d_stored = crate::quant::f16_to_f32(crate::quant::f32_to_f16(d));
+                let d_stored = crate::quant::q8_0_activation_scale(amax);
+                let id = crate::quant::q8_0_activation_recip(d_stored);
                 scales[bi] = d_stored;
 
                 // Quantize 32 f32 → 32 i8 using NEON vector narrowing.
@@ -736,24 +732,15 @@ pub(crate) mod neon {
                 let max_all = vmaxnmq_f32(max0123, max4567);
                 let amax = vmaxnmvq_f32(max_all);
 
-                // Same definition as `quantize_f32_to_q8_0_neon` and ggml's
-                // `quantize_row_q8_0`: quantize with the *unrounded* reciprocal,
-                // store the f16-rounded scale. Quantizing with `1 / d_f16` instead
-                // (which is self-consistent but not ggml's) moves ~1% of the int8
-                // values, so decode would not match the prefill quantizer.
+                // Same definition as `quantize_f32_to_q8_0_neon` (the fused and
+                // unfused quantizers must agree, or decode would not match the
+                // prefill quantizer): the stored scale is the smallest f16 at least
+                // `amax / 127`, and the int8 values use the reciprocal of that.
                 let (d, id) = if !amax.is_finite() || amax <= 0.0 {
                     (0.0f32, 0.0f32)
                 } else {
-                    let d_raw = amax / 127.0;
-                    let id_val = if d_raw.is_finite() && d_raw > 0.0 {
-                        1.0 / d_raw
-                    } else {
-                        0.0
-                    };
-                    (
-                        crate::quant::f16_to_f32(crate::quant::f32_to_f16(d_raw)),
-                        id_val,
-                    )
+                    let d = crate::quant::q8_0_activation_scale(amax);
+                    (d, crate::quant::q8_0_activation_recip(d))
                 };
                 *scales.as_mut_ptr().add(b) = d;
                 let id_vec = vdupq_n_f32(id);
@@ -833,9 +820,9 @@ pub(crate) mod neon {
                     let a6 = vmaxq_f32(a4, a5);
                     let amax = vmaxvq_f32(a6);
 
-                    let d = amax / 127.0;
-                    let id = if d != 0.0 { 1.0 / d } else { 0.0 };
-                    *s_out = crate::quant::f16_to_f32(crate::quant::f32_to_f16(d));
+                    let d = crate::quant::q8_0_activation_scale(amax);
+                    let id = crate::quant::q8_0_activation_recip(d);
+                    *s_out = d;
 
                     let vi0 = vcvtnq_s32_f32(vmulq_n_f32(v0, id));
                     let vi1 = vcvtnq_s32_f32(vmulq_n_f32(v1, id));
@@ -14012,16 +13999,17 @@ macro_rules! int8_gemm_kernels {
 //
 // THE `-128` ACTIVATION CORNER, worked through because "exact" is a strong word
 // and the `[-127, 127]` precondition is not quite a theorem. A block whose
-// `amax` is subnormal loses so much precision in `d = amax / 127` that
-// `v * (1/d)` can overshoot and clamp to `-128` — see `dot32`'s precondition
-// doc. Exactness survives it anyway, and the reason is the *sign* of the
+// `amax` is subnormal could once lose so much precision in `d = amax / 127` that
+// `v * (1/d)` overshot and clamped to `-128`; the activation quantizers now store
+// the smallest f16 at least `amax / 127` and quantize with its reciprocal, so no
+// activation exceeds 127 in magnitude (see `dot32`'s precondition doc). The
+// argument below is kept because it shows exactness survives even a stray `-128`,
+// and the reason is the *sign* of the
 // product, not its magnitude: the sign trick forms `|w| * sign(a, w)`, and a
 // `+128` second operand is unreachable (it would need `a = +128`, or `a = -128`
 // against a positive weight, which `sign` leaves negative). So the extreme pair
 // is `2 * 128 * -128 = -32768` — exactly `i16::MIN`, representable, not
-// saturated. Positive products stay capped at `2 * 128 * 127 = 32512`. Such a
-// block also has `f16::from_f32(d) == 0.0`, so it contributes nothing either
-// way; the point is that even its raw dot matches `dpbusd`.
+// saturated. Positive products stay capped at `2 * 128 * 127 = 32512`.
 //
 // **Registers.** VEX exposes 16 vector registers, not EVEX's 32, so the tile
 // constants are narrower than the VNNI instantiation's — a 4x4 strip would be
@@ -15045,14 +15033,11 @@ pub(crate) mod avx512_vnni {
     /// when `w < 0`, and negating `-128` wraps back to `-128`, silently flipping
     /// that lane's sign. Weights may be `-128` (only `|w|` is taken, and `0x80`
     /// is a valid u8 multiplicand); activations may not. Every activation
-    /// reaching here comes from `quantize_f32_to_q8_0_*`, which scales by
-    /// `127 / amax` and guards the non-finite case, so the rounded magnitude is
-    /// 127 (the worst case observed by exhaustive search over the f32 exponent
-    /// range is 127.00003, which rounds to 127). The one input that could reach
-    /// the quantizer's `-128.0` clamp is a block whose `amax` is denormal, where
-    /// `d = amax / 127` loses enough precision that `v * (1/d)` overshoots; that
-    /// block is harmless for a second reason — its `f16` scale is exactly 0.0,
-    /// so the lane contributes nothing whatever its sign.
+    /// reaching here comes from `quantize_f32_to_q8_0_*`, whose stored scale is
+    /// the smallest f16 at least `amax / 127` (`quant::q8_0_activation_scale`)
+    /// and which quantizes with the reciprocal of that stored scale, so no value
+    /// exceeds 127 in magnitude (the f32 product can overshoot by about one
+    /// part in 2^23, which rounds to 127), and the non-finite case is guarded.
     #[inline]
     #[target_feature(enable = "avx2,avx512vl,avx512vnni")]
     unsafe fn dot32(w: __m256i, a: __m256i) -> __m256i {
@@ -15067,10 +15052,10 @@ pub(crate) mod avx512_vnni {
 
     /// Quantize `x` to Q8_0 blocks (scales + int8 quants).
     ///
-    /// Mirrors `quantize_f32_to_q8_0_neon`, including the f16 round-trip of the
-    /// scale: the aarch64 kernels store `d` as f16 because that is what a Q8_0
-    /// block holds on disk, and a GEMV that mixed an f32 `d` here with an f16 `d`
-    /// there would drift from the reference by more than rounding.
+    /// Mirrors `quantize_f32_to_q8_0_neon`, including the stored f16 scale (the
+    /// smallest f16 at least `amax / 127`, see `quant::q8_0_activation_scale`) and
+    /// the values from its reciprocal: a GEMV that mixed an f32 `d` here with an
+    /// f16 `d` there would drift from the reference by more than rounding.
     #[target_feature(enable = "avx512f,avx512vl,avx2")]
     pub unsafe fn quantize_f32_to_q8_0_avx512(x: &[f32], scales: &mut [f32], quants: &mut [i8]) {
         unsafe {
@@ -15101,23 +15086,18 @@ pub(crate) mod avx512_vnni {
                     _mm512_and_ps(v1, abs_mask),
                 ));
 
-                let d = amax / 127.0;
-                // A near-zero block drives `d` denormal, and then `1.0 / d`
-                // overflows to infinity. `_mm512_cvtps_epi32` maps any non-finite
-                // operand to INT_MIN, which `cvtsepi32_epi8` saturates to -128 —
-                // the one activation value `dot32`'s sign trick cannot represent
-                // (`_mm256_sign_epi8` wraps negating it). The scalar quantizer
-                // saturates the other way (+127), so without this the two
-                // disagree byte-for-byte on the same input. The stored f16 scale
-                // flushes to 0 for every such block, so results are unaffected
-                // either way — but that is a coincidence, not a contract. Pin
-                // both paths to a defined 0.
-                let id = match 1.0 / d {
-                    r if d != 0.0 && r.is_finite() => r,
-                    _ => 0.0,
-                };
-                // Round-trip through f16 so the scale matches a stored Q8_0 block.
-                *scale = crate::quant::f16_to_f32(crate::quant::f32_to_f16(d));
+                // The stored scale is the smallest f16 at least `amax / 127`, and the
+                // reciprocal comes from that stored scale, so no value quantizes
+                // past 127. A zero or non-finite scale (an all-zero block, NaN, an
+                // f16 overflow) would make `1.0 / d` infinite, and
+                // `_mm512_cvtps_epi32` maps any non-finite operand to INT_MIN,
+                // which `cvtsepi32_epi8` saturates to -128 — the one activation
+                // value `dot32`'s sign trick cannot represent. The scalar quantizer
+                // saturates the other way (+127), so the reciprocal is pinned to a
+                // defined 0 on both paths.
+                let d = crate::quant::q8_0_activation_scale(amax);
+                let id = crate::quant::q8_0_activation_recip(d);
+                *scale = d;
 
                 let idv = _mm512_set1_ps(id);
                 let p0 = _mm512_mul_ps(v0, idv);
@@ -15126,8 +15106,8 @@ pub(crate) mod avx512_vnni {
                 // activation — or an infinity, whose product with the guarded
                 // `id` is NaN — converts to INT_MIN on x86 and saturates to
                 // -128, the one value `dot32`'s sign trick cannot represent.
-                // Unlike the denormal case above, a single NaN among otherwise
-                // normal values leaves the block scale perfectly normal, so that
+                // Unlike the zero or non-finite scale case above, a single NaN among
+                // otherwise normal values leaves the block scale perfectly normal, so that
                 // -128 is *live*: it would silently flip that lane's sign
                 // against any negative weight, turning a NaN that should have
                 // propagated into a plausible finite number. Mapping to 0
@@ -15209,13 +15189,20 @@ pub(crate) mod avx512_vnni {
             let mut quants = Vec::new();
             for blk in x.chunks(32) {
                 let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
+                // Written out independently of `q8_0_activation_scale`: the smallest
+                // f16 at least `amax / 127`, and values from its reciprocal.
                 let d = amax / 127.0;
+                let h = crate::quant::f32_to_f16(d);
+                let mut ds = crate::quant::f16_to_f32(h);
+                if ds < d {
+                    ds = crate::quant::f16_to_f32(h + 1);
+                }
                 // Mirrors the non-finite guard in the kernel under test.
-                let id = match 1.0 / d {
-                    r if d != 0.0 && r.is_finite() => r,
+                let id = match 1.0 / ds {
+                    r if ds > 0.0 && r.is_finite() => r,
                     _ => 0.0,
                 };
-                scales.push(crate::quant::f16_to_f32(crate::quant::f32_to_f16(d)));
+                scales.push(ds);
                 for &v in blk {
                     quants.push((v * id).round_ties_even().clamp(-128.0, 127.0) as i8);
                 }
@@ -15558,22 +15545,20 @@ pub(crate) mod avx512_vnni {
             }
             let mut st = 0x2468_ace0u64;
             let mut x: Vec<f32> = (0..320).map(|_| lcg01(&mut st) * 8.0 - 4.0).collect();
-            // Block 1: every lane subnormal, so `1.0 / d` overflows to
-            // infinity. This is the *discriminating* block — it is
-            // the only input where the two implementations could disagree, and
-            // it is what the non-finite guards on both sides exist for. A single
-            // tiny lane among normal ones proves nothing: `amax` comes from the
-            // whole block, so one `1e-30` next to a `3.9` leaves `d` normal.
-            // amax ~1e-40: subnormal, but not so small that `d = amax / 127`
-            // (~1e-42 here) underflows to exactly zero — at that point both
-            // sides take the `d == 0` branch and agree for the wrong reason.
-            // Here `d` is a nonzero subnormal and `1.0 / d` overflows to
-            // infinity, which is the case the guards actually handle.
+            // Block 1: every lane subnormal. The stored scale is the smallest
+            // f16 at least `amax / 127`, so a tiny block gets the smallest
+            // subnormal f16 scale (~6e-8) with a finite reciprocal and all-zero
+            // quants; both sides must agree on that. A single tiny lane among
+            // normal ones proves nothing: `amax` comes from the whole block.
             for (t, v) in x[32..64].iter_mut().enumerate() {
                 *v = f32::from_bits(71_000 + (t as u32 % 11) * 37);
             }
             // Block 2: all zero, the `d == 0` branch.
             x[64..96].fill(0.0);
+            // Block 3: `amax` so large that the f16 scale overflows to infinity,
+            // the case the zero-reciprocal guard still exists for.
+            x[96] = 1.0e7;
+            x[97] = -1.0e7;
             // And the bound cases in an otherwise ordinary block.
             x[100] = -7.5;
             x[101] = 7.5;
@@ -15611,12 +15596,14 @@ pub(crate) mod avx512_vnni {
 
         /// Non-finite inputs must not reach `dot32` as `-128`.
         ///
-        /// Two distinct hazards, both x86-specific: a near-zero block drives `d`
-        /// denormal and `1.0 / d` to infinity, and a NaN activation converts
-        /// straight to INT_MIN. Either saturates to `-128`, the one activation
-        /// value the sign trick cannot represent, while the scalar path
-        /// saturates to `+127`/`0` — so the two quantizers disagreed
-        /// byte-for-byte on the same input.
+        /// Two distinct hazards, both x86-specific: a block whose scale is zero
+        /// or overflows f16 makes `1.0 / d` infinite, and a NaN activation
+        /// converts straight to INT_MIN. Either saturates to `-128`, the one
+        /// activation value the sign trick cannot represent, while the scalar
+        /// path saturates to `+127`/`0` — so the two quantizers could disagree
+        /// byte-for-byte on the same input. (The tiny-amax cases below now get a
+        /// finite subnormal scale and zero quants; the f16-overflow case is the
+        /// one that reaches the zero-reciprocal guard with a nonzero block.)
         ///
         /// The mixed cases are the dangerous ones: with one NaN among normal
         /// values the block scale stays perfectly normal, so the `-128` is live
@@ -15634,6 +15621,7 @@ pub(crate) mod avx512_vnni {
                 ("denormal-d", 1e-38),
                 ("denormal-d2", 1e-40),
                 ("flush-to-zero", 1e-44),
+                ("f16-scale-overflow", 1.0e7),
                 ("all-nan", f32::NAN),
             ] {
                 let mut x = vec![0.0f32; 32];
