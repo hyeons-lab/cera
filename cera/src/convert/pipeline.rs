@@ -150,7 +150,11 @@ fn read_optional_template(path: &Path) -> Result<Option<String>, CeraError> {
 }
 
 fn template_from_utf8(bytes: Vec<u8>, what: &str) -> Result<String, CeraError> {
-    String::from_utf8(bytes)
+    // a byte order mark would be kept as a leading U+FEFF and rendered into every prompt,
+    // where it stops the first special token from matching
+    let text = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    std::str::from_utf8(text)
+        .map(str::to_owned)
         .map_err(|e| CeraError::Backend(format!("`{what}` is not valid UTF-8: {e}")))
 }
 
@@ -851,7 +855,7 @@ pub fn quantize_safetensors_to_gguf_with_overrides(
 ///
 /// # Errors
 ///
-/// The same refusals as [`stream_quantize_hf_repo`]. `tokenizer_config.json`,
+/// The same refusals as `stream_quantize_hf_repo` (available with the `remote` feature). `tokenizer_config.json`,
 /// `chat_template.jinja` and `tokenizer.json` are absent only when the file is not there:
 /// one that is unreadable (including a dangling symlink), not UTF-8, or not valid JSON is an
 /// error rather than a conversion without it.
@@ -1324,6 +1328,12 @@ mod tests {
         let path = dir.path().join("chat_template.jinja");
         assert_eq!(read_optional_template(&path).unwrap(), None);
         fs::write(&path, "{{ x }}").unwrap();
+        assert_eq!(
+            read_optional_template(&path).unwrap().as_deref(),
+            Some("{{ x }}")
+        );
+        // a byte order mark is not part of the template
+        fs::write(&path, b"\xef\xbb\xbf{{ x }}").unwrap();
         assert_eq!(
             read_optional_template(&path).unwrap().as_deref(),
             Some("{{ x }}")

@@ -232,20 +232,22 @@ impl HfModelConfig {
         {
             self.rms_norm_eps = eps.as_f64().map(|v| v as f32);
         }
+        // likewise a `rope_theta` that is there but not a number: it replaces the top-level
+        // value with `None`, which `ensure_convertible` refuses. `rope_parameters` that
+        // simply carries no base (only a `rope_type`) leaves the top-level value alone.
         if let Some(theta) = self.rope_parameter_theta("full_attention") {
-            self.rope_theta = Some(theta);
+            self.rope_theta = theta.as_f64().map(|v| v as f32);
         }
     }
 
     /// `rope_parameters.rope_theta`, or the one nested under `layer_type` when the
-    /// parameters are keyed by attention type.
-    fn rope_parameter_theta(&self, layer_type: &str) -> Option<f32> {
+    /// parameters are keyed by attention type, as the JSON value it is written as.
+    fn rope_parameter_theta(&self, layer_type: &str) -> Option<&Value> {
         let params = self.hparam("rope_parameters")?;
         params
             .get("rope_theta")
             .or_else(|| params.get(layer_type)?.get("rope_theta"))
-            .and_then(Value::as_f64)
-            .map(|v| v as f32)
+            .filter(|v| !v.is_null())
     }
 
     fn resolve_nested_text_config(&mut self) {
@@ -442,9 +444,10 @@ impl HfModelConfig {
             };
             // llama.cpp tells the two block kinds apart by a per-layer `head_count_kv`,
             // so a layout that cannot be read per block would write a file it loads wrongly
-            if let Err(why) = self.lfm2_layout(self.num_hidden_layers.unwrap_or(0)) {
-                return refuse(why);
-            }
+            let layout = match self.lfm2_layout(self.num_hidden_layers.unwrap_or(0)) {
+                Ok(layout) => layout,
+                Err(why) => return refuse(why),
+            };
             // what the loaders require: a config that gives none of these a usable value
             // would convert into a file that is rejected only when it is loaded
             let shown = |v: Option<String>| v.unwrap_or_else(|| "missing".into());
@@ -521,9 +524,7 @@ impl HfModelConfig {
                         self.head_dim.map_or(String::new(), |d| format!(" ({d})"))
                     ));
                 }
-                let has_conv = self
-                    .lfm2_layout(self.num_hidden_layers.unwrap_or(0))
-                    .is_ok_and(|l| l.contains(&false));
+                let has_conv = layout.contains(&false);
                 if hidden % 4 != 0 && has_conv {
                     return refuse(format!(
                         "`hidden_size` ({hidden}) is not a multiple of 4, which the \
@@ -562,12 +563,6 @@ impl HfModelConfig {
                         shown(value.map(|v| v.to_string()))
                     ));
                 }
-            }
-            if self
-                .head_dim
-                .is_some_and(|d| d == 0 || u32::try_from(d).is_err())
-            {
-                return refuse("`head_dim` is not in 1..=u32::MAX".into());
             }
         }
         Ok(())
@@ -2074,5 +2069,30 @@ mod tests {
         assert_eq!(causal_keys("Lfm2BidirP2ForTokenClassification"), non_causal);
         // a decoder keeps the default
         assert_eq!(causal_keys("Lfm2ForCausalLM"), (None, None));
+    }
+
+    #[test]
+    fn a_rope_base_that_is_present_but_unreadable_is_not_replaced_by_the_top_level_one() {
+        // `valid_lfm2()` has a top-level `rope_theta`
+        let err = refusal("rope_parameters", json!({"rope_theta": "invalid"})).unwrap_or_default();
+        assert!(err.contains("`rope_theta` is missing"), "{err}");
+        // `rope_parameters` that carries no base leaves the top-level one in force
+        assert_eq!(
+            refusal("rope_parameters", json!({"rope_type": "default"})),
+            None
+        );
+        // null is absent
+        assert_eq!(
+            refusal("rope_parameters", json!({"rope_theta": null})),
+            None
+        );
+    }
+
+    #[test]
+    fn a_head_dim_that_does_not_fill_the_hidden_width_is_refused_at_both_ends() {
+        // the equality check also bounds `head_dim`: 0 and 2^32 never reach a `u32` cast
+        for d in [json!(0), json!(4294967296u64), json!(17)] {
+            assert!(refusal("head_dim", d.clone()).is_some(), "{d}");
+        }
     }
 }

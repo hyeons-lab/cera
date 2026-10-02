@@ -275,7 +275,8 @@ impl HfTokenizerJson {
         // Invert vocab mapping ID -> token string
         let max_id = self.max_token_id();
 
-        let mut vocab_size = (max_id.min(1_000_000) + 1) as usize;
+        let mut vocab_size =
+            (max_id.min(crate::convert::config::MAX_PADDED_VOCAB as u32) + 1) as usize;
         if options.llama_cpp_layout {
             vocab_size = vocab_size.max(
                 options
