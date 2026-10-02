@@ -20,8 +20,8 @@ use crate::backend::hexagon::{
     build_flash_attn_kernel_params_with_softcap, build_get_rows_f32_kernel_params,
     build_hmx_fa_kernel_params_with_softcap, build_hmx_mm_kernel_params,
     build_mul_mat_kernel_params, build_rms_norm_params, build_rope_kernel_params,
-    build_rope_params, build_set_rows_kernel_params, build_ssm_conv_kernel_params,
-    build_unary_kernel_params, fa_is_hmx_eligible, lock_or_discard, mm_hmx_nb1, mm_is_hmx_eligible,
+    build_rope_params, build_set_rows_kernel_params, build_unary_kernel_params, fa_is_hmx_eligible,
+    lock_or_discard, mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::backend::hexagon::{hexagon_error, hexagon_warn};
 use crate::gguf::GgufFile;

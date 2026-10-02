@@ -293,6 +293,11 @@ pub struct HexagonQueueSession {
     /// hwinfo-failure fallback until `HexagonDevice` overwrites it.
     dsp_threads: u32,
     resident_staged_id: Option<u64>,
+    /// Sleep in the kernel for each batch response instead of polling for it,
+    /// whatever the driver's default. Polling wakes sooner but keeps a host
+    /// core busy for the whole batch; a queue running long, latency-tolerant
+    /// batches (the audio encoder in a background task) would rather free it.
+    blocking_wait: bool,
     /// Flush after every op (`CERA_HEXAGON_STEP`). A field, not a per-call
     /// env read, so tests can drive the step-mode error path.
     step_mode: bool,
@@ -351,6 +356,7 @@ impl HexagonQueueSession {
             prof_flushes: 0,
             dsp_threads: 8,
             resident_staged_id: None,
+            blocking_wait: false,
             step_mode: step_enabled(),
             outstanding: 0,
             #[cfg(test)]
@@ -471,7 +477,12 @@ impl HexagonQueueSession {
                 )
             };
             self.driver
-                .read_dsp_queue(self.queue, &mut resp_bufs, rsp_bytes)
+                .read_dsp_queue_with(
+                    self.queue,
+                    &mut resp_bufs,
+                    rsp_bytes,
+                    self.spin_for_responses(),
+                )
                 .map_err(|e| {
                     CeraError::Backend(format!(
                         "{} DSP batch(es) still outstanding after a timeout: {e}",
@@ -857,6 +868,18 @@ impl HexagonQueueSession {
             .map_err(|e| CeraError::Backend(format!("HTP step failed after {n_ops} ops: {e}")))
     }
 
+    /// Choose how this queue waits for batch responses: `true` sleeps in the
+    /// kernel (no busy core; wakeup costs about a scheduler tick more), `false`
+    /// follows the driver's `CERA_HEXAGON_OPPOLL` default. Returns the previous
+    /// setting so a caller can restore it.
+    pub fn set_blocking_wait(&mut self, blocking: bool) -> bool {
+        std::mem::replace(&mut self.blocking_wait, blocking)
+    }
+
+    fn spin_for_responses(&self) -> bool {
+        self.driver.polls_responses() && !self.blocking_wait
+    }
+
     /// Whether `CERA_HEXAGON_STEP` bisect mode is active. Templated decode
     /// exports a batch that step mode would already have flushed, so callers
     /// must not take the template path while this is set.
@@ -1024,10 +1047,12 @@ impl HexagonQueueSession {
                         std::mem::size_of::<HtpOpBatchRsp>(),
                     )
                 };
-                match self
-                    .driver
-                    .read_dsp_queue(self.queue, &mut resp_bufs, rsp_bytes)
-                {
+                match self.driver.read_dsp_queue_with(
+                    self.queue,
+                    &mut resp_bufs,
+                    rsp_bytes,
+                    self.spin_for_responses(),
+                ) {
                     Err(e) => {
                         read_res = Err(e);
                         break;
@@ -1492,6 +1517,37 @@ mod tests {
     /// its buffers); `quiesce` fails while the response is missing and
     /// succeeds, consuming it, once it arrives. A write failure never
     /// reached the DSP, so it leaves nothing outstanding.
+    /// A session on a polling driver spins for responses until it asks to
+    /// sleep, and the choice is per session and restorable.
+    #[test]
+    fn blocking_wait_overrides_response_polling_per_session() {
+        fake::reset();
+        let driver = fake::driver_with_polling(true);
+        let mut q = HexagonQueueSession::new(Arc::clone(&driver)).expect("fake queue session");
+        q.step_mode = false;
+        q.set_max_ops_per_flush(None);
+        let buf = RpcmemBuffer::alloc(driver, 4096, false).unwrap();
+        let last_timeout = || fake::with(|s| *s.read_timeouts.last().expect("a read"));
+
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        q.flush().unwrap();
+        assert_eq!(last_timeout(), 0, "the driver's default is a polled read");
+
+        assert!(!q.set_blocking_wait(true), "previous setting returned");
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        q.flush().unwrap();
+        assert_eq!(
+            last_timeout(),
+            crate::backend::hexagon::sys::DSPQUEUE_TIMEOUT_US,
+            "a blocking session sleeps in the kernel"
+        );
+
+        assert!(q.set_blocking_wait(false));
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        q.flush().unwrap();
+        assert_eq!(last_timeout(), 0, "restored to the driver default");
+    }
+
     #[test]
     fn quiesce_waits_for_outstanding_batches() {
         fake::reset();

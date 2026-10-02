@@ -21,7 +21,7 @@ use super::{
 use crate::session::CeraError;
 
 /// VTCM budget handed to every kernel-param builder (8 MB on Snapdragon 8 Elite).
-const VTCM_BUDGET: usize = 8 * 1024 * 1024;
+pub(crate) const VTCM_BUDGET: usize = 8 * 1024 * 1024;
 
 /// Destination for emitted tensors and ops.
 ///
@@ -314,6 +314,28 @@ pub(crate) fn layer_norm<S: OpSink>(
     session.end_group().map_err(|e| op_err("layer_norm", e))
 }
 
+/// /// In-place elementwise unary op over `[dim, n_tokens]` (`buf = op(buf)`).
+fn unary_inplace<S: OpSink>(
+    session: &mut S,
+    opcode: HtpOpCode,
+    name: &str,
+    buf: &S::Buf,
+    offset: usize,
+    shape: TokenShape,
+    tile: TokenTile,
+) -> Result<(), CeraError> {
+    let TokenShape { dim, n_tokens } = shape;
+    for (start, run) in token_runs(n_tokens, tile) {
+        let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
+        let kparams =
+            build_unary_kernel_params(dim, run, 0, VTCM_BUDGET, session.dsp_threads(), false);
+        session
+            .enqueue_op(opcode as u32, &[ti], &[ti], [0i32; 16], kparams)
+            .map_err(|e| op_err(name, e))?;
+    }
+    session.end_group().map_err(|e| op_err(name, e))
+}
+
 /// In-place GELU: `buf = gelu(buf)`.
 pub(crate) fn gelu<S: OpSink>(
     session: &mut S,
@@ -322,25 +344,18 @@ pub(crate) fn gelu<S: OpSink>(
     shape: TokenShape,
     tile: TokenTile,
 ) -> Result<(), CeraError> {
-    let TokenShape { dim, n_tokens } = shape;
-    for (start, run) in token_runs(n_tokens, tile) {
-        let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
-        let kparams =
-            build_unary_kernel_params(dim, run, 0, VTCM_BUDGET, session.dsp_threads(), false);
-        session
-            .enqueue_op(
-                HtpOpCode::UnaryGelu as u32,
-                &[ti],
-                &[ti],
-                [0i32; 16],
-                kparams,
-            )
-            .map_err(|e| op_err("gelu", e))?;
-    }
-    session.end_group().map_err(|e| op_err("gelu", e))
+    unary_inplace(
+        session,
+        HtpOpCode::UnaryGelu,
+        "gelu",
+        buf,
+        offset,
+        shape,
+        tile,
+    )
 }
 
-/// In-place SiLU: `buf = silu(buf)`.
+/// /// In-place SiLU: `buf = silu(buf)`.
 pub(crate) fn silu<S: OpSink>(
     session: &mut S,
     buf: &S::Buf,
@@ -348,22 +363,15 @@ pub(crate) fn silu<S: OpSink>(
     shape: TokenShape,
     tile: TokenTile,
 ) -> Result<(), CeraError> {
-    let TokenShape { dim, n_tokens } = shape;
-    for (start, run) in token_runs(n_tokens, tile) {
-        let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
-        let kparams =
-            build_unary_kernel_params(dim, run, 0, VTCM_BUDGET, session.dsp_threads(), false);
-        session
-            .enqueue_op(
-                HtpOpCode::UnarySilu as u32,
-                &[ti],
-                &[ti],
-                [0i32; 16],
-                kparams,
-            )
-            .map_err(|e| op_err("silu", e))?;
-    }
-    session.end_group().map_err(|e| op_err("silu", e))
+    unary_inplace(
+        session,
+        HtpOpCode::UnarySilu,
+        "silu",
+        buf,
+        offset,
+        shape,
+        tile,
+    )
 }
 
 /// In-place per-channel scale: `buf[row, :] *= vec[:]` for every row. The
@@ -396,7 +404,7 @@ pub(crate) fn mul_row_bcast<S: OpSink>(
     session.end_group().map_err(|e| op_err("mul_row_bcast", e))
 }
 
-/// In-place sigmoid: `buf = sigmoid(buf)`.
+/// /// In-place sigmoid: `buf = sigmoid(buf)`.
 pub(crate) fn sigmoid<S: OpSink>(
     session: &mut S,
     buf: &S::Buf,
@@ -404,22 +412,34 @@ pub(crate) fn sigmoid<S: OpSink>(
     shape: TokenShape,
     tile: TokenTile,
 ) -> Result<(), CeraError> {
-    let TokenShape { dim, n_tokens } = shape;
-    for (start, run) in token_runs(n_tokens, tile) {
-        let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
-        let kparams =
-            build_unary_kernel_params(dim, run, 0, VTCM_BUDGET, session.dsp_threads(), false);
-        session
-            .enqueue_op(
-                HtpOpCode::UnarySigmoid as u32,
-                &[ti],
-                &[ti],
-                [0i32; 16],
-                kparams,
-            )
-            .map_err(|e| op_err("sigmoid", e))?;
-    }
-    session.end_group().map_err(|e| op_err("sigmoid", e))
+    unary_inplace(
+        session,
+        HtpOpCode::UnarySigmoid,
+        "sigmoid",
+        buf,
+        offset,
+        shape,
+        tile,
+    )
+}
+
+/// In-place ReLU: `buf = max(buf, 0)`.
+pub(crate) fn relu<S: OpSink>(
+    session: &mut S,
+    buf: &S::Buf,
+    offset: usize,
+    shape: TokenShape,
+    tile: TokenTile,
+) -> Result<(), CeraError> {
+    unary_inplace(
+        session,
+        HtpOpCode::UnaryRelu,
+        "relu",
+        buf,
+        offset,
+        shape,
+        tile,
+    )
 }
 
 /// In-place bias add: `buf[row, :] += vec[:]` for every row.
@@ -542,7 +562,7 @@ pub(crate) fn concat_time_inner<S: OpSink>(
 /// `y[t, c] = sum_j x[t + j, c] * w[j, c]` over a channel-major input of
 /// `d_conv - 1 + n_t` positions (the caller supplies the padding) and a
 /// `[d_conv, d_inner]` tap matrix, producing a time-major `[n_t, d_inner]`
-/// output.
+/// output. `vtcm_budget` caps the VTCM the kernel may plan for.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn ssm_conv<S: OpSink>(
     session: &mut S,
@@ -555,6 +575,7 @@ pub(crate) fn ssm_conv<S: OpSink>(
     d_conv: usize,
     d_inner: usize,
     n_t: usize,
+    vtcm_budget: usize,
 ) -> Result<(), CeraError> {
     let ncs = d_conv - 1 + n_t;
     let x_bytes = ncs * d_inner * 4;
@@ -594,7 +615,7 @@ pub(crate) fn ssm_conv<S: OpSink>(
         1,
         ncs,
         session.dsp_threads(),
-        VTCM_BUDGET,
+        vtcm_budget,
     );
     session
         .enqueue_op(
@@ -1247,7 +1268,7 @@ mod tests {
         check(&s);
         add_row_bcast_to(&mut s, v(0), &"v", 0, v(1024)).unwrap();
         check(&s);
-        ssm_conv(&mut s, &"w", 0, &"b", 0, &"b", 4096, 3, 8, 4).unwrap();
+        ssm_conv(&mut s, &"w", 0, &"b", 0, &"b", 4096, 3, 8, 4, VTCM_BUDGET).unwrap();
         check(&s);
         let src = |off| ConcatSrc {
             buf: &"b",

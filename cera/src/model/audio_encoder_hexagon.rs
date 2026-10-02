@@ -13,7 +13,14 @@
 //!    half-weight residual), the only part that needs no new kernel support;
 //! 2. the convolution module (sigmoid GLU, depthwise conv, per-channel affine);
 //! 3. relative-position attention;
-//! 4. the whole block stack, the conv stem and the MLP adapter.
+//! 4. the whole block stack and the MLP adapter;
+//! 5. the conv stem (`audio_stem_hexagon`) and the log-mel front end
+//!    (`audio_mel_hexagon`), which were the CPU cost left once the blocks ran
+//!    on the DSP.
+//!
+//! The DSP queue waits for each batch with a blocking read rather than the
+//! driver's default spin (see `run_on_queue`): with the blocks on the DSP but
+//! the host spinning, the encoder still cost 0.043 CPU-seconds per audio second.
 //!
 //! All weights and activations live in `rpcmem` buffers, as in the ViT and
 //! Whisper paths, and every op is emitted through the shared
@@ -31,10 +38,16 @@ use crate::backend::hexagon::{
     repacked_matrix_size_q8_0,
 };
 use crate::model::audio_encoder::{
-    AudioEncoderConfig, AudioEncoderWeights, ConformerLayerWeights, POS_EMB_DIM, conv_stem_forward,
-    relative_pos_emb,
+    AudioEncoderConfig, AudioEncoderWeights, ConformerLayerWeights, POS_EMB_DIM, relative_pos_emb,
 };
 use crate::model::audio_encoder_gpu::AudioGpuEncode;
+use crate::model::audio_mel_hexagon::{
+    MelScratch, MelWeightOffsets, emit_mel, finish as finish_mel, put_mel, stage_samples,
+};
+use crate::model::audio_preprocessor::{n_frames_for, padded_preemphasized};
+use crate::model::audio_stem_hexagon::{
+    StemGeom, StemScratch, StemWeightOffsets, emit_stem, put_stem, stage_input, to_channel_major,
+};
 use crate::model::weights::MmapWeight;
 use crate::session::CeraError;
 use crate::tensor::DType;
@@ -47,14 +60,14 @@ use crate::tensor::DType;
 const TILE: TokenTile = TokenTile::Tiles(64);
 
 /// An F32 vector in `weights_buf`.
-fn plan_vec(cur: &mut usize, len: usize) -> usize {
+pub(crate) fn plan_vec(cur: &mut usize, len: usize) -> usize {
     let off = *cur;
     *cur += align128(len * 4);
     off
 }
 
 /// A repacked Q4_0 or Q8_0 linear weight in `weights_buf`.
-fn plan_linear(cur: &mut usize, w: &MmapWeight) -> Result<HexagonWeightDesc, CeraError> {
+pub(crate) fn plan_linear(cur: &mut usize, w: &MmapWeight) -> Result<HexagonWeightDesc, CeraError> {
     plan_matrix(cur, w.dtype, w.rows, w.cols)
 }
 
@@ -173,6 +186,8 @@ pub(crate) struct AdapterOffsets {
 pub(crate) struct WeightOffsets {
     pub layers: Vec<LayerOffsets>,
     pub adapter: AdapterOffsets,
+    pub stem: StemWeightOffsets,
+    pub mel: MelWeightOffsets,
     /// A `[n_embd]` vector of 0.5: the macaron residual scale.
     pub half_off: usize,
     /// Zeros, `[kernel - 1, n_embd]` time-inner: the depthwise conv's padding.
@@ -280,6 +295,8 @@ impl WeightOffsets {
             down_w: plan_linear(&mut cur, &ad.down_w)?,
             down_b: plan_vec(&mut cur, ad.down_b.len()),
         };
+        let stem = StemWeightOffsets::plan(&mut cur, &weights.conv_stem, &weights.config)?;
+        let mel = MelWeightOffsets::plan(&mut cur, weights.config.n_mel_bins);
         let kernel = weights.layers.first().map_or(9, |l| l.conv_dw_w.len() / n);
         let half_off = plan_vec(&mut cur, n);
         let zeros_off = plan_vec(&mut cur, (kernel - 1) * n);
@@ -287,6 +304,8 @@ impl WeightOffsets {
         Ok(Self {
             layers,
             adapter,
+            stem,
+            mel,
             half_off,
             zeros_off,
             attn_scale_off,
@@ -583,7 +602,17 @@ pub(crate) fn emit_conv_module<S: OpSink>(
         n,
     )?;
     dispatch::ssm_conv(
-        s, weights, conv.dw_w, scratch, so.conv_x, scratch, so.conv_y, kernel, n, t,
+        s,
+        weights,
+        conv.dw_w,
+        scratch,
+        so.conv_x,
+        scratch,
+        so.conv_y,
+        kernel,
+        n,
+        t,
+        dispatch::VTCM_BUDGET,
     )?;
     // Depthwise bias, the per-channel affine "conv_norm", then SiLU.
     dispatch::add_row_bcast(s, scratch, so.conv_y, weights, conv.dw_b, embd, TILE)?;
@@ -872,6 +901,22 @@ pub(crate) fn emit_block<S: OpSink>(
     dispatch::copy_view(s, rows(so.norm), rows(so.x))
 }
 
+/// Each stage of the NPU conv stem in the CPU stem's layouts.
+#[derive(Debug, Clone)]
+pub struct StemDump {
+    /// Convolution outputs, channel-major `[channels, height, width]`.
+    pub l0: Vec<f32>,
+    pub dw1: Vec<f32>,
+    pub pw2: Vec<f32>,
+    pub dw3: Vec<f32>,
+    pub pw4: Vec<f32>,
+    /// `[t, channels * width]`: what the projection reads.
+    pub flat: Vec<f32>,
+    /// `[t, n_embd]`: the stem's output.
+    pub out: Vec<f32>,
+    pub t: usize,
+}
+
 /// The attention stage's intermediates, as the NPU left them (see
 /// [`HexagonAudioEncoder::debug_attention`]). Per-head planes are
 /// `[head][row][col]`: `ac`/`sm` are `[t, t]` (row = query, col = key), `bd`
@@ -895,8 +940,9 @@ pub struct AttentionDump {
 /// LFM2-Audio's Conformer encoder on the Hexagon NPU. Work in progress: see
 /// the module docs for what is implemented.
 pub struct HexagonAudioEncoder {
+    driver: Arc<FastRpcDriver>,
     device: Arc<Mutex<HexagonDevice>>,
-    /// Kept for the CPU front end (log-mel and the conv stem).
+    /// Kept for the CPU conv stem fallback.
     weights: Arc<AudioEncoderWeights>,
     config: AudioEncoderConfig,
     weights_buf: RpcmemBuffer,
@@ -912,13 +958,17 @@ unsafe impl Send for HexagonAudioEncoder {}
 unsafe impl Sync for HexagonAudioEncoder {}
 
 /// Copy an F32 vector into the weights buffer.
-fn put_vec(dst: &mut [u8], off: usize, src: &[f32]) {
+pub(crate) fn put_vec(dst: &mut [u8], off: usize, src: &[f32]) {
     let bytes: &[u8] = bytemuck::cast_slice(src);
     dst[off..off + bytes.len()].copy_from_slice(bytes);
 }
 
 /// Repack a linear weight into its planned slot.
-fn put_linear(dst: &mut [u8], desc: HexagonWeightDesc, w: &MmapWeight) -> Result<(), CeraError> {
+pub(crate) fn put_linear(
+    dst: &mut [u8],
+    desc: HexagonWeightDesc,
+    w: &MmapWeight,
+) -> Result<(), CeraError> {
     let slot = &mut dst[desc.offset..desc.offset + desc.size_bytes];
     match desc.format {
         HexagonWeightFormat::RepackedQ8_0 => repack_q8_0(w.data(), w.cols, w.rows, slot),
@@ -1039,6 +1089,27 @@ fn put_layer(dst: &mut [u8], o: &LayerOffsets, l: &ConformerLayerWeights) -> Res
     )
 }
 
+/// Run `emit` on the queue and wait for everything it submitted. Each batch
+/// here is long and nothing is latency critical, so the wait sleeps in the
+/// kernel instead of keeping a core spinning: spinning was most of the
+/// encoder's CPU time (143 of 145 ms for the blocks of 10 s of audio on the
+/// S25 Ultra).
+fn run_on_queue(
+    what: &str,
+    session: &mut HexagonQueueSession,
+    emit: impl FnOnce(&mut HexagonQueueSession) -> Result<(), CeraError>,
+) -> Result<(), CeraError> {
+    session.drop_pending_batch();
+    let polled = session.set_blocking_wait(true);
+    let run = emit(session).and_then(|()| session.flush());
+    session.set_blocking_wait(polled);
+    if let Err(e) = run {
+        session.drop_pending_batch();
+        return Err(CeraError::Backend(format!("{what}: {e}")));
+    }
+    Ok(())
+}
+
 impl HexagonAudioEncoder {
     /// Stage `weights` on the device for sequences of up to `max_frames`
     /// frames (the length after the conv stem's 8x subsampling).
@@ -1059,6 +1130,8 @@ impl HexagonAudioEncoder {
             put_layer(dst, o, l)?;
         }
         put_adapter(dst, &offsets.adapter, &weights.mlp_adapter)?;
+        put_stem(dst, &offsets.stem, &weights.conv_stem)?;
+        put_mel(dst, &offsets.mel, config.n_mel_bins);
         put_vec(dst, offsets.half_off, &vec![0.5f32; config.n_embd]);
         let d_head = config.n_embd / config.n_head.max(1);
         put_vec(
@@ -1074,6 +1147,7 @@ impl HexagonAudioEncoder {
         weights_buf.flush_cpu_cache(0, offsets.total_bytes);
 
         Ok(Self {
+            driver,
             device,
             weights: Arc::clone(weights),
             config,
@@ -1129,22 +1203,42 @@ impl HexagonAudioEncoder {
                 self.max_frames
             )));
         }
-        let so = self.scratch_offsets;
         let bytes = t * cfg.n_embd * 4;
+        self.run_with_scratch(
+            what,
+            |scratch, so| {
+                scratch.as_mut_slice()[so.x..so.x + bytes].copy_from_slice(bytemuck::cast_slice(x));
+                scratch.flush_cpu_cache(so.x, bytes);
+                prepare(scratch, so);
+            },
+            emit,
+            out,
+        )
+    }
 
+    /// Lock the device and scratch, let `prepare` write what the stage needs
+    /// on the host, run `emit` on the queue and return `out` (an offset and a
+    /// length in floats) of the scratch buffer afterwards.
+    fn run_with_scratch(
+        &self,
+        what: &str,
+        prepare: impl FnOnce(&mut RpcmemBuffer, &ScratchOffsets),
+        emit: impl FnOnce(
+            &mut HexagonQueueSession,
+            &RpcmemBuffer,
+            &RpcmemBuffer,
+            &ScratchOffsets,
+        ) -> Result<(), CeraError>,
+        out: (usize, usize),
+    ) -> Result<Vec<f32>, CeraError> {
+        let so = self.scratch_offsets;
         let mut dev = self.device.lock_or_recover();
         let mut scratch = self.scratch.lock_or_recover();
-        scratch.as_mut_slice()[so.x..so.x + bytes].copy_from_slice(bytemuck::cast_slice(x));
-        scratch.flush_cpu_cache(so.x, bytes);
         prepare(&mut scratch, &so);
 
-        let session = dev.queue_session_mut();
-        session.drop_pending_batch();
-        let run = emit(session, &self.weights_buf, &scratch, &so).and_then(|()| session.flush());
-        if let Err(e) = run {
-            session.drop_pending_batch();
-            return Err(CeraError::Backend(format!("{what}: {e}")));
-        }
+        run_on_queue(what, dev.queue_session_mut(), |session| {
+            emit(session, &self.weights_buf, &scratch, &so)
+        })?;
         let (out_off, out_floats) = out;
         scratch.invalidate_cpu_cache(out_off, out_floats * 4);
         Ok(
@@ -1351,25 +1445,194 @@ impl HexagonAudioEncoder {
         )
     }
 
-    /// The whole encoder for mono 16 kHz PCM: log-mel and the conv stem on
-    /// the CPU, everything after on the NPU. Same output as
-    /// [`crate::model::audio_encoder::encode_audio_pcm`].
+    /// The whole encoder for mono 16 kHz PCM, on the NPU from the samples to
+    /// the embeddings: log-mel, conv stem, blocks and adapter. Same output as
+    /// [`crate::model::audio_encoder::encode_audio_pcm`]. A clip too long for
+    /// the NPU encoder is refused before any work is done.
     pub fn encode(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize), CeraError> {
-        let cfg = &self.config;
-        let (mel, n_frames) =
-            crate::model::audio_preprocessor::log_mel_spectrogram(pcm, cfg.n_mel_bins);
+        let n_frames = n_frames_for(pcm.len());
         if n_frames == 0 {
             return Ok((Vec::new(), 0));
         }
-        let (x, t) = conv_stem_forward(&mel, n_frames, &self.weights.conv_stem, cfg);
-        if t > self.max_frames {
+        self.stem_geom(n_frames)?;
+        let mel = self.log_mel_npu(pcm, n_frames)?;
+        self.encode_mel(&mel, n_frames)
+    }
+
+    /// Log-mel for `pcm` (`n_frames` frames, [`n_frames_for`]): the DFT and
+    /// the filterbank on the DSP, the log and the normalization on the host.
+    pub fn log_mel_npu(&self, pcm: &[f32], n_frames: usize) -> Result<Vec<f32>, CeraError> {
+        let n_mel = self.config.n_mel_bins;
+        let samples = padded_preemphasized(pcm)
+            .ok_or_else(|| CeraError::Backend("log-mel: input too long".into()))?;
+        let so = MelScratch::new(samples.len(), n_frames, n_mel);
+        let mut buf = RpcmemBuffer::alloc(Arc::clone(&self.driver), so.total_bytes, true)?;
+        stage_samples(buf.as_mut_slice(), &so, &samples);
+        buf.flush_cpu_cache(0, so.total_bytes);
+        let run = {
+            let mut dev = self.device.lock_or_recover();
+            run_on_queue("log-mel", dev.queue_session_mut(), |session| {
+                emit_mel(
+                    session,
+                    &self.weights_buf,
+                    &buf,
+                    &self.offsets.mel,
+                    &so,
+                    n_frames,
+                    n_mel,
+                )
+            })
+        };
+        let energies = run.map(|()| {
+            buf.invalidate_cpu_cache(so.mel, n_frames * n_mel * 4);
+            let floats: &[f32] = bytemuck::cast_slice(buf.as_slice());
+            floats[so.mel / 4..so.mel / 4 + n_frames * n_mel].to_vec()
+        });
+        self.release_buffer(&buf);
+        Ok(finish_mel(&energies?, n_mel, n_frames, pcm.len()))
+    }
+
+    /// The stem's geometry for `n_frames` mel frames, refused when the
+    /// sequence it produces is longer than the NPU encoder stages.
+    fn stem_geom(&self, n_frames: usize) -> Result<StemGeom, CeraError> {
+        let ch = self.weights.conv_stem.layers[0].bias.len();
+        let g = StemGeom::new(n_frames, self.config.n_mel_bins, ch)
+            .ok_or_else(|| CeraError::Backend(format!("conv stem: {n_frames} mel frames")))?;
+        if g.t_out() > self.max_frames {
             return Err(CeraError::Backend(format!(
-                "{t} encoder frames exceed the NPU encoder's {} (about {} s of audio)",
+                "{} encoder frames exceed the NPU encoder's {} (about {} s of audio)",
+                g.t_out(),
                 self.max_frames,
                 self.max_frames * 8 * 160 / 16_000
             )));
         }
-        Ok((self.encode_stem_output(&x, t)?, t))
+        Ok(g)
+    }
+
+    /// The stem's activation buffer for `g`, with the host-written parts of
+    /// the input filled in.
+    fn staged_stem_buffer(
+        &self,
+        g: &StemGeom,
+        mel: &[f32],
+        keep_stages: bool,
+    ) -> Result<(RpcmemBuffer, StemScratch), CeraError> {
+        let so = StemScratch::new(g, !keep_stages);
+        let mut st = RpcmemBuffer::alloc(Arc::clone(&self.driver), so.total_bytes, true)?;
+        stage_input(st.as_mut_slice(), &so, g, mel);
+        st.flush_cpu_cache(0, so.total_bytes);
+        Ok((st, so))
+    }
+
+    /// Log-mel in, embeddings out, with the stem on the NPU. The stem's
+    /// activations (tens of MB for a long clip) live in a buffer that exists
+    /// only for this call.
+    pub fn encode_mel(&self, mel: &[f32], n_frames: usize) -> Result<(Vec<f32>, usize), CeraError> {
+        let g = self.stem_geom(n_frames)?;
+        let t = g.t_out();
+        let cfg = &self.config;
+        let (st, st_so) = self.staged_stem_buffer(&g, mel, false)?;
+        let pos = relative_pos_emb(t.max(1));
+        let out = (self.scratch_offsets.adapter_out, t * cfg.llm_hidden_size);
+        let run = self.run_with_scratch(
+            "encode",
+            |scratch, so| {
+                self.clear_attention_padding(scratch, t);
+                let pos_bytes = pos.len() * 4;
+                scratch.as_mut_slice()[so.attn_pos..so.attn_pos + pos_bytes]
+                    .copy_from_slice(bytemuck::cast_slice(&pos));
+                scratch.flush_cpu_cache(so.attn_pos, pos_bytes);
+            },
+            |session, weights, scratch, so| {
+                emit_stem(
+                    session,
+                    weights,
+                    &st,
+                    scratch,
+                    so.x,
+                    &self.offsets.stem,
+                    &st_so,
+                    &g,
+                    &mut |s| s.flush(),
+                )?;
+                for layer in &self.offsets.layers {
+                    emit_block(session, weights, scratch, layer, &self.offsets, so, cfg, t)?;
+                    session.flush()?;
+                }
+                emit_adapter(session, weights, scratch, &self.offsets.adapter, so, cfg, t)?;
+                session.flush()
+            },
+            out,
+        );
+        self.release_buffer(&st);
+        Ok((run?, t))
+    }
+
+    /// Tell the DSP to let go of a per-call buffer before it is unmapped; an
+    /// unmap while the DSP still holds a reference fails and leaks the mapping.
+    /// Runs after every call, successful or not.
+    fn release_buffer(&self, st: &RpcmemBuffer) {
+        self.device
+            .lock_or_recover()
+            .queue_session_mut()
+            .release_dsp_reference(st);
+    }
+
+    /// Run only the stem on the NPU and return each stage's output in the CPU
+    /// stem's layouts, for the probe to compare against the CPU.
+    pub fn debug_stem(&self, mel: &[f32], n_frames: usize) -> Result<StemDump, CeraError> {
+        let g = self.stem_geom(n_frames)?;
+        let t = g.t_out();
+        let (st, so) = self.staged_stem_buffer(&g, mel, true)?;
+        let out = (self.scratch_offsets.x, t * self.config.n_embd);
+        let run = self.run_with_scratch(
+            "debug_stem",
+            |_, _| (),
+            |session, weights, scratch, sco| {
+                emit_stem(
+                    session,
+                    weights,
+                    &st,
+                    scratch,
+                    sco.x,
+                    &self.offsets.stem,
+                    &so,
+                    &g,
+                    &mut |s| s.flush(),
+                )?;
+                session.flush()
+            },
+            out,
+        );
+        // Stage outputs are read below, so the buffer is released only after.
+        let x = match run {
+            Ok(x) => x,
+            Err(e) => {
+                self.release_buffer(&st);
+                return Err(e);
+            }
+        };
+        st.invalidate_cpu_cache(0, so.total_bytes);
+        let all: &[f32] = bytemuck::cast_slice(st.as_slice());
+        let at = |off: usize, len: usize| &all[off / 4..off / 4 + len];
+        let ch = g.ch;
+        let dump = StemDump {
+            l0: to_channel_major(
+                at(so.b0, (g.h1 + 2) * (g.w1 + 2) * ch),
+                (g.h1, g.w1, ch),
+                g.w1 + 2,
+                g.w1 + 3,
+            ),
+            dw1: to_channel_major(at(so.b1, g.h2 * g.w2 * ch), (g.h2, g.w2, ch), g.w2, 0),
+            pw2: to_channel_major(at(so.pw2, g.h2 * g.w2 * ch), (g.h2, g.w2, ch), g.w2, 0),
+            dw3: to_channel_major(at(so.b3, g.h3 * g.w3 * ch), (g.h3, g.w3, ch), g.w3, 0),
+            pw4: to_channel_major(at(so.b4, g.h3 * g.w3 * ch), (g.h3, g.w3, ch), g.w3, 0),
+            flat: at(so.flat, g.h3 * ch * g.w3).to_vec(),
+            out: x,
+            t,
+        };
+        self.release_buffer(&st);
+        Ok(dump)
     }
 
     /// Run the convolution module of `layer` and return the updated sequence.
@@ -1389,6 +1652,18 @@ impl HexagonAudioEncoder {
                 t,
             )
         })
+    }
+}
+
+impl Drop for HexagonAudioEncoder {
+    /// The DSP holds references to the weights and scratch from the batches
+    /// that read them; telling it to let go first keeps the unmaps that follow
+    /// from failing (and from logging for every encoder dropped).
+    fn drop(&mut self) {
+        let mut dev = self.device.lock_or_recover();
+        let session = dev.queue_session_mut();
+        session.release_dsp_reference(&self.weights_buf);
+        session.release_dsp_reference(&self.scratch.lock_or_recover());
     }
 }
 

@@ -478,9 +478,91 @@ fn main() {
         report(&format!("layer {layer} conv"), &cpu, &npu);
     }
 
+    // The conv stem, stage by stage against the CPU's convolutions.
+    {
+        let (mel, n_frames) =
+            cera::model::audio_preprocessor::log_mel_spectrogram(&pcm, weights.config.n_mel_bins);
+        let layers = &weights.conv_stem.layers;
+        // (depthwise, stride, pad, relu) per stem layer, as in conv_stem_forward.
+        let modes = [
+            (false, 2, 1, true),
+            (true, 2, 1, false),
+            (false, 1, 0, true),
+            (true, 2, 1, false),
+            (false, 1, 0, true),
+        ];
+        let (mut cur, mut c_in, mut h, mut w) =
+            (mel.clone(), 1usize, n_frames, weights.config.n_mel_bins);
+        let mut cpu = Vec::new();
+        for (layer, &(depthwise, stride, pad, relu)) in layers.iter().zip(&modes) {
+            let (kw, kh, out_ch) = (layer.shape[0], layer.shape[1], layer.shape[3]);
+            let (nh, nw) = (
+                (h + 2 * pad - kh) / stride + 1,
+                (w + 2 * pad - kw) / stride + 1,
+            );
+            let mut next = vec![0f32; out_ch * nh * nw];
+            let groups = if depthwise { c_in } else { 1 };
+            cera::backend::cpu::conv2d(
+                &cur,
+                &layer.weight,
+                Some(&layer.bias),
+                &mut next,
+                c_in,
+                out_ch,
+                h,
+                w,
+                kh,
+                kw,
+                stride,
+                stride,
+                pad,
+                pad,
+                groups,
+            );
+            if relu {
+                cera::backend::cpu::relu_inplace(&mut next);
+            }
+            cpu.push(next.clone());
+            (cur, c_in, h, w) = (next, out_ch, nh, nw);
+        }
+        // The projection's input, per time step: [channel, freq].
+        let mut flat = vec![0f32; h * c_in * w];
+        for ti in 0..h {
+            for c in 0..c_in {
+                for f in 0..w {
+                    flat[ti * c_in * w + c * w + f] = cur[(c * h + ti) * w + f];
+                }
+            }
+        }
+        let (cpu_out, cpu_t) = cera::model::audio_encoder::conv_stem_forward(
+            &mel,
+            n_frames,
+            &weights.conv_stem,
+            &weights.config,
+        );
+        match enc.debug_stem(&mel, n_frames) {
+            Ok(d) => {
+                println!(
+                    "conv stem on the NPU ({n_frames} mel frames -> {} frames):",
+                    d.t
+                );
+                assert_eq!(d.t, cpu_t);
+                report("stem conv 0 (3x3 s2, relu)", &cpu[0], &d.l0);
+                report("stem conv 1 (dw 3x3 s2)", &cpu[1], &d.dw1);
+                report("stem conv 2 (pw, relu)", &cpu[2], &d.pw2);
+                report("stem conv 3 (dw 3x3 s2)", &cpu[3], &d.dw3);
+                report("stem conv 4 (pw, relu)", &cpu[4], &d.pw4);
+                report("stem flatten", &flat, &d.flat);
+                report("stem output", &cpu_out, &d.out);
+            }
+            Err(e) => println!("conv stem: NPU error: {e}"),
+        }
+    }
+
     // End to end on PCM: CPU front end plus NPU blocks and adapter against the
     // all-CPU encoder, with what each costs the CPU.
-    let cpu_seconds = || {
+    // (user, system) CPU seconds of this process.
+    let cpu_split = || {
         let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
         // SAFETY: `getrusage` fills the struct; RUSAGE_SELF is valid.
         let ru = unsafe {
@@ -488,7 +570,11 @@ fn main() {
             ru.assume_init()
         };
         let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
-        secs(ru.ru_utime) + secs(ru.ru_stime)
+        (secs(ru.ru_utime), secs(ru.ru_stime))
+    };
+    let cpu_seconds = || {
+        let (u, s) = cpu_split();
+        u + s
     };
     let (cpu_emb, cpu_t) = cera::model::audio_encoder::encode_audio_pcm(&pcm, &weights);
     match enc.encode(&pcm) {
@@ -526,6 +612,50 @@ fn main() {
             cpu / seconds
         );
     }
+
+    // Where the NPU path's CPU time goes.
+    let cfg = &weights.config;
+    let measure = |name: &str, run: &mut dyn FnMut()| {
+        run();
+        let ((u0, s0), t0) = (cpu_split(), std::time::Instant::now());
+        for _ in 0..reps {
+            run();
+        }
+        let (u1, s1) = cpu_split();
+        let per = |d: f64| d / reps as f64 * 1e3;
+        println!(
+            "  {name:<22} wall {:5.0} ms  cpu {:5.0} ms (user {:5.0}, sys {:5.0})",
+            per(t0.elapsed().as_secs_f64()),
+            per(u1 - u0 + s1 - s0),
+            per(u1 - u0),
+            per(s1 - s0)
+        );
+    };
+    println!("NPU path phases:");
+    let (mel, n_frames) =
+        cera::model::audio_preprocessor::log_mel_spectrogram(&pcm, cfg.n_mel_bins);
+    let npu_mel = enc.log_mel_npu(&pcm, n_frames).expect("NPU log-mel");
+    report("log-mel on the NPU", &mel, &npu_mel);
+    measure("log-mel (CPU)", &mut || {
+        drop(cera::model::audio_preprocessor::log_mel_spectrogram(
+            &pcm,
+            cfg.n_mel_bins,
+        ))
+    });
+    measure("log-mel (NPU)", &mut || {
+        drop(enc.log_mel_npu(&pcm, n_frames).expect("NPU log-mel"))
+    });
+    measure("conv stem (CPU)", &mut || {
+        drop(cera::model::audio_encoder::conv_stem_forward(
+            &mel,
+            n_frames,
+            &weights.conv_stem,
+            cfg,
+        ))
+    });
+    measure("stem+blocks+adapter", &mut || {
+        drop(enc.encode_mel(&mel, n_frames).expect("NPU encode"))
+    });
 }
 
 #[cfg(not(feature = "hexagon"))]
