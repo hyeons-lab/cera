@@ -2,7 +2,8 @@
 
 `libggml-htp-v{73,75,79,81,85}.so` are the DSP-side (Hexagon ELF) worker
 libraries the NPU backend loads into the CDSP unsigned PD at runtime.
-They are built from unmodified llama.cpp sources; the host side
+They are built from llama.cpp sources plus one patch (`patches/0001-*.patch`, described
+under Provenance); the host side
 (`sys.rs`, `queue.rs`, `params.rs`) speaks their `htp_iface` IDL, so the
 skel and host versions must move together: that is why they are
 vendored here instead of fetched at install time.
@@ -35,6 +36,20 @@ vendoring them.
 - Source: llama.cpp branch `feat/hexagon-v85` at commit `00ccd6970`
   (`ggml/src/ggml-hexagon/htp/` + `htp_iface.idl`), including extended
   Conv1D, ConvTranspose1D, Snake, and unary operations.
+- Patch: `patches/0001-hvx-q8-activation-quantizer-f32-reciprocal.patch`
+  (`hvx-mm-kernels-tiled.h`, the `q8_0` and `q8_1` tiled activation
+  quantizers). The upstream quantizer computed the Q8 scale and its
+  reciprocal in f16: for a block whose absolute maximum is below about
+  2e-3 the reciprocal overflowed f16 and the int8 values were wrongly
+  scaled (50% or more relative error on that block). Every HVX matmul
+  of 1 to 7 rows (all decode steps, short prompts, a prompt's tail
+  chunk) was affected. The patch rounds the scale to f16 first and
+  multiplies by the f32 reciprocal of the rounded scale. Measured on a
+  Galaxy S25 Ultra (v79) against the CPU: full-logit cosine on 2 to 7 row
+  chunks went from 0.95..0.99 to 0.9995 or better (LFM2.5-2.6B Q4_0 from
+  -0.003..0.99 to 0.991..0.9999), single tokens from as low as 0.377 to
+  0.9995, with unchanged decode throughput. v73, v75 and v81/v85 are the
+  same C code rebuilt; only v79 has been run on hardware.
 - Build: Hexagon SDK 6.6.0.0 with Hexagon Tools 19.0.07 (hexagon-clang with
   whole-program LTO), compiling `libggml-htp-v{73,75,79,81}.so` targets with
   `-DDSP_VERSION`, and copying `v81` to `v85`.
@@ -43,11 +58,14 @@ vendoring them.
 
 ## Integrity (md5)
 
-- v73: 2dd73769a93d4de017f629c8ae3d4f55
-- v75: 890dcd26125b92925506beca537b06f7
-- v79: 7da1d562316ad431b4427ab97d8b6ae0
-- v81: 43349eab25ddcb744cf7907e0a1806dc
-- v85: 43349eab25ddcb744cf7907e0a1806dc
+- v73: b38bb632b371a173ccc0e1deb0a06866
+- v75: 2bc548e1a3c22d8ce195cadf8f15c35e
+- v79: d6b2ae2de46ab1f466fdc9eb4872fdf3
+- v81: 1612c5eba751428e927c5f3896faea3c
+- v85: 1612c5eba751428e927c5f3896faea3c
+
+(Before the patch: v73 2dd73769..., v75 890dcd26..., v79 7da1d562...,
+v81/v85 43349eab....)
 
 ## Rebuilding
 
