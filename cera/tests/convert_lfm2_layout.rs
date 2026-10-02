@@ -24,7 +24,7 @@ use cera::convert::quantize::TargetQuant;
 use cera::gguf::GgufFile;
 use cera::kv_cache::{InferenceState, KvCompression};
 use cera::model::Model;
-use cera::model::lfm2::Lfm2Model;
+use cera::model::lfm2::LfmModel;
 use cera::tokenizer::BpeTokenizer;
 use serde_json::json;
 
@@ -444,7 +444,7 @@ fn converted_model_loads_and_runs() {
         };
         let tokenizer =
             BpeTokenizer::from_gguf(&GgufFile::open(&path).unwrap()).expect("tokenizer");
-        let model = Lfm2Model::from_gguf(GgufFile::open(&path).unwrap(), 256)
+        let model = LfmModel::from_gguf(GgufFile::open(&path).unwrap(), 256)
             .unwrap_or_else(|e| panic!("cera cannot load its own {quant:?} conversion: {e}"));
         let mut state =
             InferenceState::from_config_with_compression(model.config(), &KvCompression::None)

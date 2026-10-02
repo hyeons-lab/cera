@@ -5931,7 +5931,7 @@ mod moe_prefill_identity_tests {
         let Some(path) = generate_model() else {
             return;
         };
-        let model = Lfm2Model::from_gguf_no_repack(GgufFile::open(&path).unwrap(), 128).unwrap();
+        let model = LfmModel::from_gguf_no_repack(GgufFile::open(&path).unwrap(), 128).unwrap();
         let _ = std::fs::remove_file(&path);
 
         let (hs, n) = (model.config.hidden_size, 64usize);
@@ -5970,7 +5970,7 @@ mod moe_prefill_identity_tests {
             (0..n).for_each(|j| {
                 col.copy_from_slice(&ffn_input[j * hs..(j + 1) * hs]);
                 #[cfg(target_arch = "aarch64")]
-                Lfm2Model::quantize_to_scratch(&col, &mut state);
+                LfmModel::quantize_to_scratch(&col, &mut state);
                 model.forward_moe_ffn(layer, moe, hs, &col, &mut state);
                 want[j * hs..(j + 1) * hs].copy_from_slice(&state.scratch.out[..hs]);
             });

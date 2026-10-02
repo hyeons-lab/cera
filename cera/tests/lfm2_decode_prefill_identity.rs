@@ -36,7 +36,7 @@ use cera::gguf::GgufFile;
 use cera::kv_cache::{InferenceState, LayerState};
 use cera::lora::LoraAdapterWeights;
 use cera::model::Model;
-use cera::model::lfm2::Lfm2Model;
+use cera::model::lfm2::LfmModel;
 
 /// The tiny model's layout (see the generator).
 const N_EMBD: usize = 64;
@@ -160,7 +160,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// Run `tokens` through batched prefill and token-by-token decode on fresh state
 /// and check they agree: bit for bit where exactness applies, closely elsewhere.
 fn assert_prefill_matches_decode(
-    model: &Lfm2Model,
+    model: &LfmModel,
     tokens: &[u32],
     lora: Option<Arc<LoraAdapterWeights>>,
     label: &str,
@@ -230,7 +230,7 @@ fn lfm2_batched_prefill_matches_decode() {
     let Some(model_file) = synthetic_model(false) else {
         return;
     };
-    let model = Lfm2Model::from_gguf(GgufFile::open(&model_file.0).expect("open gguf"), 512)
+    let model = LfmModel::from_gguf(GgufFile::open(&model_file.0).expect("open gguf"), 512)
         .expect("load synthetic lfm2");
     assert_prefill_matches_decode(&model, &TOKENS, None, "base");
     assert_prefill_matches_decode(&model, &TOKENS, Some(full_adapter()), "adapter");
@@ -243,7 +243,7 @@ fn lfm2moe_batched_prefill_matches_decode() {
     };
     // No CPU repacks: see the module docs.
     let model =
-        Lfm2Model::from_gguf_no_repack(GgufFile::open(&model_file.0).expect("open gguf"), 512)
+        LfmModel::from_gguf_no_repack(GgufFile::open(&model_file.0).expect("open gguf"), 512)
             .expect("load synthetic lfm2moe");
     assert!(
         model.config().moe.is_some(),

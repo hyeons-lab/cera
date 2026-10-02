@@ -37,7 +37,7 @@ use cera::gguf::GgufFile;
 use cera::kv_cache::InferenceState;
 use cera::lora::LoraAdapterWeights;
 use cera::model::Model;
-use cera::model::lfm2::Lfm2Model;
+use cera::model::lfm2::LfmModel;
 use cera::model::load_model;
 
 fn model_path() -> Option<PathBuf> {
@@ -303,7 +303,7 @@ fn prefill_applies_the_same_expert_deltas_as_decode() {
     // (cosine 0.97 on LFM2.5-8B-A1B-Q4_0). Without repacking, batched prefill and
     // per-token decode are bit-identical, which is what makes the 0.9999 bar below
     // a statement about the MoE hooks rather than about GEMM summation order.
-    let model = Lfm2Model::from_gguf_no_repack(GgufFile::open(&path).expect("open"), 512)
+    let model = LfmModel::from_gguf_no_repack(GgufFile::open(&path).expect("open"), 512)
         .expect("cpu load");
     let cfg = model.config();
     let moe = cfg.moe.as_ref().expect("model is mixture-of-experts");
