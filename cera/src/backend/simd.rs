@@ -584,8 +584,8 @@ pub(crate) mod neon {
                 let a6 = vmaxq_f32(a4, a5);
                 let amax = vmaxvq_f32(a6);
 
-                let d_stored = crate::quant::q8_0_activation_scale(amax);
-                let id = crate::quant::q8_0_activation_recip(d_stored);
+                let d_stored = crate::quant::q8_0_block_scale(amax);
+                let id = crate::quant::q8_0_block_recip(d_stored);
                 scales[bi] = d_stored;
 
                 // Quantize 32 f32 → 32 i8 using NEON vector narrowing.
@@ -723,25 +723,25 @@ pub(crate) mod neon {
                 }
 
                 // Find max_abs across 32 values
-                let max01 = vmaxnmq_f32(vabsq_f32(x0), vabsq_f32(x1));
-                let max23 = vmaxnmq_f32(vabsq_f32(x2), vabsq_f32(x3));
-                let max45 = vmaxnmq_f32(vabsq_f32(x4), vabsq_f32(x5));
-                let max67 = vmaxnmq_f32(vabsq_f32(x6), vabsq_f32(x7));
-                let max0123 = vmaxnmq_f32(max01, max23);
-                let max4567 = vmaxnmq_f32(max45, max67);
-                let max_all = vmaxnmq_f32(max0123, max4567);
-                let amax = vmaxnmvq_f32(max_all);
+                // `vmaxq`/`vmaxvq` propagate a NaN (the `vmaxnm` forms would skip it),
+                // so a NaN in the block reaches the scale like in the unfused kernel.
+                let max01 = vmaxq_f32(vabsq_f32(x0), vabsq_f32(x1));
+                let max23 = vmaxq_f32(vabsq_f32(x2), vabsq_f32(x3));
+                let max45 = vmaxq_f32(vabsq_f32(x4), vabsq_f32(x5));
+                let max67 = vmaxq_f32(vabsq_f32(x6), vabsq_f32(x7));
+                let max0123 = vmaxq_f32(max01, max23);
+                let max4567 = vmaxq_f32(max45, max67);
+                let max_all = vmaxq_f32(max0123, max4567);
+                let amax = vmaxvq_f32(max_all);
 
                 // Same definition as `quantize_f32_to_q8_0_neon` (the fused and
                 // unfused quantizers must agree, or decode would not match the
                 // prefill quantizer): the stored scale is the smallest f16 at least
                 // `amax / 127`, and the int8 values use the reciprocal of that.
-                let (d, id) = if !amax.is_finite() || amax <= 0.0 {
-                    (0.0f32, 0.0f32)
-                } else {
-                    let d = crate::quant::q8_0_activation_scale(amax);
-                    (d, crate::quant::q8_0_activation_recip(d))
-                };
+                // No special case for non-finite blocks: they take the same path as
+                // every other quantizer (NaN / infinite scale, zero reciprocal).
+                let d = crate::quant::q8_0_block_scale(amax);
+                let id = crate::quant::q8_0_block_recip(d);
                 *scales.as_mut_ptr().add(b) = d;
                 let id_vec = vdupq_n_f32(id);
 
@@ -820,8 +820,8 @@ pub(crate) mod neon {
                     let a6 = vmaxq_f32(a4, a5);
                     let amax = vmaxvq_f32(a6);
 
-                    let d = crate::quant::q8_0_activation_scale(amax);
-                    let id = crate::quant::q8_0_activation_recip(d);
+                    let d = crate::quant::q8_0_block_scale(amax);
+                    let id = crate::quant::q8_0_block_recip(d);
                     *s_out = d;
 
                     let vi0 = vcvtnq_s32_f32(vmulq_n_f32(v0, id));
@@ -15034,7 +15034,7 @@ pub(crate) mod avx512_vnni {
     /// that lane's sign. Weights may be `-128` (only `|w|` is taken, and `0x80`
     /// is a valid u8 multiplicand); activations may not. Every activation
     /// reaching here comes from `quantize_f32_to_q8_0_*`, whose stored scale is
-    /// the smallest f16 at least `amax / 127` (`quant::q8_0_activation_scale`)
+    /// the smallest f16 at least `amax / 127` (`quant::q8_0_block_scale`)
     /// and which quantizes with the reciprocal of that stored scale, so no value
     /// exceeds 127 in magnitude (the f32 product can overshoot by about one
     /// part in 2^23, which rounds to 127), and the non-finite case is guarded.
@@ -15053,7 +15053,7 @@ pub(crate) mod avx512_vnni {
     /// Quantize `x` to Q8_0 blocks (scales + int8 quants).
     ///
     /// Mirrors `quantize_f32_to_q8_0_neon`, including the stored f16 scale (the
-    /// smallest f16 at least `amax / 127`, see `quant::q8_0_activation_scale`) and
+    /// smallest f16 at least `amax / 127`, see `quant::q8_0_block_scale`) and
     /// the values from its reciprocal: a GEMV that mixed an f32 `d` here with an
     /// f16 `d` there would drift from the reference by more than rounding.
     #[target_feature(enable = "avx512f,avx512vl,avx2")]
@@ -15081,10 +15081,20 @@ pub(crate) mod avx512_vnni {
                 let v0 = _mm512_loadu_ps(x_ptr);
                 let v1 = _mm512_loadu_ps(x_ptr.add(16));
 
-                let amax = _mm512_reduce_max_ps(_mm512_max_ps(
-                    _mm512_and_ps(v0, abs_mask),
-                    _mm512_and_ps(v1, abs_mask),
-                ));
+                // `_mm512_max_ps` returns its second operand when either is NaN, so a NaN
+                // would be dropped (or kept) depending on lane order. Detect it
+                // explicitly so a NaN anywhere in the block makes `amax` NaN, matching
+                // the NEON and portable quantizers.
+                let has_nan = _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(v0, v0)
+                    | _mm512_cmp_ps_mask::<_CMP_UNORD_Q>(v1, v1);
+                let amax = if has_nan != 0 {
+                    f32::NAN
+                } else {
+                    _mm512_reduce_max_ps(_mm512_max_ps(
+                        _mm512_and_ps(v0, abs_mask),
+                        _mm512_and_ps(v1, abs_mask),
+                    ))
+                };
 
                 // The stored scale is the smallest f16 at least `amax / 127`, and the
                 // reciprocal comes from that stored scale, so no value quantizes
@@ -15092,11 +15102,12 @@ pub(crate) mod avx512_vnni {
                 // f16 overflow) would make `1.0 / d` infinite, and
                 // `_mm512_cvtps_epi32` maps any non-finite operand to INT_MIN,
                 // which `cvtsepi32_epi8` saturates to -128 — the one activation
-                // value `dot32`'s sign trick cannot represent. The scalar quantizer
-                // saturates the other way (+127), so the reciprocal is pinned to a
-                // defined 0 on both paths.
-                let d = crate::quant::q8_0_activation_scale(amax);
-                let id = crate::quant::q8_0_activation_recip(d);
+                // value `dot32`'s sign trick cannot represent. The reciprocal is
+                // therefore pinned to a defined 0 (all quants zero), and a NaN or
+                // infinity anywhere in the block gives a NaN / infinite scale (see
+                // `quant::q8_0_block_scale`), identically on every quantizer.
+                let d = crate::quant::q8_0_block_scale(amax);
+                let id = crate::quant::q8_0_block_recip(d);
                 *scale = d;
 
                 let idv = _mm512_set1_ps(id);
@@ -15106,13 +15117,11 @@ pub(crate) mod avx512_vnni {
                 // activation — or an infinity, whose product with the guarded
                 // `id` is NaN — converts to INT_MIN on x86 and saturates to
                 // -128, the one value `dot32`'s sign trick cannot represent.
-                // Unlike the zero or non-finite scale case above, a single NaN among
-                // otherwise normal values leaves the block scale perfectly normal, so that
-                // -128 is *live*: it would silently flip that lane's sign
-                // against any negative weight, turning a NaN that should have
-                // propagated into a plausible finite number. Mapping to 0
-                // matches what the scalar path's saturating `as i8` cast
-                // already does, keeping the two byte-identical.
+                // A block holding one now has a NaN or infinite scale and a zero
+                // `id`, so every lane's product is 0 or NaN and the scrub leaves
+                // an all-zero block (the scale carries the poison). It stays as a
+                // guard: it keeps the result independent of how `amax` was derived,
+                // and matches the scalar path's saturating `as i8` cast.
                 let p0 = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask::<_CMP_ORD_Q>(p0, p0), p0);
                 let p1 = _mm512_maskz_mov_ps(_mm512_cmp_ps_mask::<_CMP_ORD_Q>(p1, p1), p1);
                 // Default rounding is round-to-nearest-even, matching NEON's `vcvtnq`.
@@ -15188,8 +15197,16 @@ pub(crate) mod avx512_vnni {
             let mut scales = Vec::new();
             let mut quants = Vec::new();
             for blk in x.chunks(32) {
-                let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-                // Written out independently of `q8_0_activation_scale`: the smallest
+                // NaN-propagating maximum, written out here rather than calling the
+                // production helper: a NaN anywhere makes the block's `amax` NaN.
+                let mut amax = 0.0f32;
+                for &v in blk {
+                    let a = v.abs();
+                    if a > amax || a.is_nan() {
+                        amax = a;
+                    }
+                }
+                // Written out independently of `q8_0_block_scale`: the smallest
                 // f16 at least `amax / 127`, and values from its reciprocal.
                 let d = amax / 127.0;
                 let h = crate::quant::f32_to_f16(d);
@@ -15605,11 +15622,11 @@ pub(crate) mod avx512_vnni {
         /// finite subnormal scale and zero quants; the f16-overflow case is the
         /// one that reaches the zero-reciprocal guard with a nonzero block.)
         ///
-        /// The mixed cases are the dangerous ones: with one NaN among normal
-        /// values the block scale stays perfectly normal, so the `-128` is live
-        /// and would silently flip that lane's sign against a negative weight,
-        /// converting a NaN that should have propagated into a plausible finite
-        /// number.
+        /// The mixed cases are the interesting ones: a NaN or infinity among
+        /// normal values must poison the whole block (NaN / infinite scale, all
+        /// quants zero), wherever in the block it sits. Quantizing the normal
+        /// lanes and clamping the bad one would convert a NaN that should have
+        /// propagated into a plausible finite number.
         #[test]
         fn quantize_q8_0_avx512_non_finite_blocks_match_scalar() {
             if !require_simd_or_skip("avx512", quantizer_callable()) {
@@ -15630,11 +15647,16 @@ pub(crate) mod avx512_vnni {
                 x[2] = amax / 2.0;
                 cases.push((label, x));
             }
-            // Scale stays normal here, so a stray -128 would be live.
+            // A NaN or infinity among normal values must poison the whole block
+            // (NaN / infinite scale, all-zero quants), wherever in the block it sits.
             let mut mixed_nan = vec![0.25f32; 32];
             mixed_nan[0] = f32::NAN;
             mixed_nan[1] = -1.0;
             cases.push(("nan-with-normal", mixed_nan));
+            let mut late_nan = vec![0.25f32; 32];
+            late_nan[20] = f32::NAN;
+            late_nan[21] = -1.0;
+            cases.push(("nan-in-second-half", late_nan));
             let mut mixed_inf = vec![0.25f32; 32];
             mixed_inf[0] = f32::INFINITY;
             mixed_inf[1] = -1.0;
@@ -15654,6 +15676,17 @@ pub(crate) mod avx512_vnni {
                 assert_eq!(gs[0].is_nan(), ws[0].is_nan(), "scale NaN-ness ({label})");
                 if !gs[0].is_nan() {
                     assert_eq!(gs[0], ws[0], "scale disagrees with scalar ({label})");
+                }
+                // The shared contract: a block holding a NaN gets a NaN scale, one
+                // holding an infinity (or overflowing f16) an infinite scale, and
+                // every int8 is zero, so the poison reaches the dot product.
+                if label.contains("nan") {
+                    assert!(gs[0].is_nan(), "NaN block must have a NaN scale ({label})");
+                    assert!(gq.iter().all(|&q| q == 0), "NaN block quants ({label})");
+                }
+                if label.contains("inf") || label.contains("overflow") {
+                    assert!(gs[0].is_infinite(), "inf block scale ({label})");
+                    assert!(gq.iter().all(|&q| q == 0), "inf block quants ({label})");
                 }
             }
         }

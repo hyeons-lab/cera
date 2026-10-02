@@ -8,7 +8,7 @@
 //! a few ulps, changing most normalized values, and ~1% of the int8 quants
 //! flipped, so batched prefill and per-token decode drifted apart from the first
 //! layer (cosine ~0.999 on LFM2.5-230M). Both now use the stored f16 scale
-//! (`quant::q8_0_activation_scale`) and its reciprocal.
+//! (`quant::q8_0_block_scale`) and its reciprocal.
 
 use cera::backend::cpu;
 
@@ -85,4 +85,49 @@ fn fused_rmsnorm_quantize_matches_on_small_magnitude_blocks() {
             .collect();
         assert_routes_agree(&x, &w, &format!("small-magnitude trial={i}"));
     });
+}
+
+/// Non-finite activations: the fused kernel and normalize-then-quantize must agree
+/// block for block. A NaN input makes every normalized value NaN, an infinity makes
+/// its block NaN (the inverse RMS is 0, and 0 * inf is NaN) and leaves the rest 0;
+/// each NaN block takes a NaN scale and zero quants on both routes, where the fused
+/// kernel alone used to emit a zero scale.
+#[test]
+fn fused_rmsnorm_quantize_matches_on_non_finite_inputs() {
+    let mut rnd = noise(7);
+    let n = 128;
+    let w = vec![1.0f32; n];
+    for (label, pos, bad) in [
+        ("nan", 40usize, f32::NAN),
+        ("inf", 100, f32::INFINITY),
+        ("-inf", 3, f32::NEG_INFINITY),
+    ] {
+        let mut x: Vec<f32> = (0..n).map(|_| rnd()).collect();
+        x[pos] = bad;
+        let (mut sc_f, mut q_f) = (vec![0f32; n / 32], vec![0i8; n]);
+        cpu::rmsnorm_and_quantize_q8_0(&x, &w, 1e-5, &mut sc_f, &mut q_f, None);
+        let mut norm = vec![0f32; n];
+        cpu::rmsnorm_into(&x, &mut norm, &w, 1e-5);
+        let (mut sc_s, mut q_s) = (vec![0f32; n / 32], vec![0i8; n]);
+        cpu::quantize_f32_to_q8_0_into(&norm, &mut sc_s, &mut q_s);
+        assert_eq!(q_f, q_s, "{label}: quants");
+        for (b, (a, s)) in sc_f.iter().zip(&sc_s).enumerate() {
+            assert_eq!(a.is_nan(), s.is_nan(), "{label}: block {b} scale NaN-ness");
+            assert_eq!(
+                a.is_infinite(),
+                s.is_infinite(),
+                "{label}: block {b} scale inf-ness"
+            );
+            if !a.is_nan() {
+                assert_eq!(a, s, "{label}: block {b} scale");
+            }
+            // a block that came out non-finite must not be masked into a zero scale
+            if norm[b * 32..b * 32 + 32].iter().any(|v| !v.is_finite()) {
+                assert!(
+                    !a.is_finite(),
+                    "{label}: block {b} scale {a} hides a non-finite block"
+                );
+            }
+        }
+    }
 }

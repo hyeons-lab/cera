@@ -169,8 +169,8 @@ pub(crate) fn f32_to_f16(v: f32) -> u16 {
     sign | ((e << 10) as u16) | (((rounded >> 13) & 0x03FF) as u16)
 }
 
-/// Scale of a Q8_0 *activation* block with absolute maximum `amax`: the smallest
-/// f16 that is at least `amax / 127`, returned as f32.
+/// Scale of a Q8_0 block (activations and re-quantized weights) with absolute
+/// maximum `amax`: the smallest f16 that is at least `amax / 127`, returned as f32.
 ///
 /// The int8 values are produced with the reciprocal of this same stored scale, so
 /// they and the scale always describe the same numbers. The earlier convention
@@ -183,10 +183,15 @@ pub(crate) fn f32_to_f16(v: f32) -> u16 {
 /// without a clamp in the hot loop. For a normal scale this moves the stored
 /// scale by at most one f16 ulp.
 ///
-/// A non-positive or non-finite result means the caller must take the
-/// zero-reciprocal branch.
+/// **Non-finite blocks.** Every quantizer computes `amax` so that a NaN anywhere in
+/// the block makes it NaN (not skipped), and an infinity makes it infinite. This
+/// function returns NaN / infinity for those, [`q8_0_block_recip`] returns 0, and
+/// the int8 values come out all zero. The block's scale then poisons any dot
+/// product it feeds (`scale * 0` is NaN), so a corrupted activation reaches the
+/// output instead of being quantized into a plausible finite number. A zero
+/// `amax` gives scale 0 and zero quants.
 #[inline(always)]
-pub(crate) fn q8_0_activation_scale(amax: f32) -> f32 {
+pub(crate) fn q8_0_block_scale(amax: f32) -> f32 {
     let d = amax / 127.0;
     let h = f32_to_f16(d);
     let r = f16_to_f32(h);
@@ -198,10 +203,27 @@ pub(crate) fn q8_0_activation_scale(amax: f32) -> f32 {
     }
 }
 
-/// The reciprocal a Q8_0 activation block is quantized with: `1 / scale`, or 0 for
+/// Largest absolute value in a block, with a NaN anywhere in the block making the
+/// result NaN (`f32::max` would skip it). The portable twin of the SIMD kernels'
+/// NaN-propagating maximum; see [`q8_0_block_scale`] for why NaN must survive.
+#[inline(always)]
+pub(crate) fn q8_0_block_amax(block: &[f32]) -> f32 {
+    let mut amax = 0.0f32;
+    for &v in block {
+        let a = v.abs();
+        // `a > amax` is false for NaN, so test it explicitly; once `amax` is NaN
+        // neither condition fires again, which keeps it NaN.
+        if a > amax || a.is_nan() {
+            amax = a;
+        }
+    }
+    amax
+}
+
+/// The reciprocal a Q8_0 block is quantized with: `1 / scale`, or 0 for
 /// a zero or non-finite scale (all-zero block, NaN, or a scale that overflows f16).
 #[inline(always)]
-pub(crate) fn q8_0_activation_recip(scale: f32) -> f32 {
+pub(crate) fn q8_0_block_recip(scale: f32) -> f32 {
     let r = 1.0 / scale;
     if scale > 0.0 && r.is_finite() { r } else { 0.0 }
 }

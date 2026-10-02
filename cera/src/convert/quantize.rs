@@ -405,6 +405,14 @@ pub fn quantize_tensor_data_with_strategy(
     }
 }
 
+/// Write a Q8_0 block for a non-finite `amax` (the NaN-propagating block maximum):
+/// the scale is that NaN or infinity (as f16) and every quant is zero, so the
+/// poison reaches whatever consumes the weight.
+fn write_poisoned_q8_0_block(amax: f32, block_out: &mut [u8]) {
+    block_out[0..2].copy_from_slice(&f32_to_f16(amax).to_le_bytes());
+    block_out[2..34].fill(0);
+}
+
 // ── Q8_0 Quantizers ───────────────────────────────────────────────────────────
 
 /// Standard Q8_0 Quantizer (32 floats -> 34 bytes).
@@ -428,12 +436,13 @@ pub fn quantize_q8_0(input: &[f32], output: &mut [u8]) -> Result<(), CeraError> 
         let block_in = &input[b * 32..(b + 1) * 32];
         let block_out = &mut output[b * 34..(b + 1) * 34];
 
-        let mut amax: f32 = 0.0;
-        for &x in block_in {
-            let abs = x.abs();
-            if abs > amax {
-                amax = abs;
-            }
+        // NaN-propagating maximum: a NaN or infinity poisons the block (non-finite
+        // scale, zero quants) instead of being skipped or clamped into a plausible
+        // weight (see `quant::q8_0_block_scale`).
+        let amax = crate::quant::q8_0_block_amax(block_in);
+        if !amax.is_finite() {
+            write_poisoned_q8_0_block(amax, block_out);
+            continue;
         }
 
         let d = amax / 127.0;
@@ -475,12 +484,13 @@ pub fn quantize_q8_0_smart_mse(input: &[f32], output: &mut [u8]) -> Result<(), C
         let block_in = &input[b * 32..(b + 1) * 32];
         let block_out = &mut output[b * 34..(b + 1) * 34];
 
-        let mut amax: f32 = 0.0;
-        for &x in block_in {
-            let abs = x.abs();
-            if abs > amax {
-                amax = abs;
-            }
+        // NaN-propagating maximum: a NaN or infinity poisons the block (non-finite
+        // scale, zero quants) instead of being skipped or clamped into a plausible
+        // weight (see `quant::q8_0_block_scale`).
+        let amax = crate::quant::q8_0_block_amax(block_in);
+        if !amax.is_finite() {
+            write_poisoned_q8_0_block(amax, block_out);
+            continue;
         }
 
         let base_d = amax / 127.0;
@@ -541,12 +551,13 @@ pub fn quantize_q8_0_hqq(input: &[f32], output: &mut [u8]) -> Result<(), CeraErr
         let block_in = &input[b * 32..(b + 1) * 32];
         let block_out = &mut output[b * 34..(b + 1) * 34];
 
-        let mut amax: f32 = 0.0;
-        for &x in block_in {
-            let abs = x.abs();
-            if abs > amax {
-                amax = abs;
-            }
+        // NaN-propagating maximum: a NaN or infinity poisons the block (non-finite
+        // scale, zero quants) instead of being skipped or clamped into a plausible
+        // weight (see `quant::q8_0_block_scale`).
+        let amax = crate::quant::q8_0_block_amax(block_in);
+        if !amax.is_finite() {
+            write_poisoned_q8_0_block(amax, block_out);
+            continue;
         }
 
         let mut d = amax / 127.0;
@@ -1162,6 +1173,51 @@ pub fn quantize_q6_k(input: &[f32], output: &mut [u8]) -> Result<(), CeraError> 
 
 #[cfg(test)]
 mod tests {
+    /// A NaN or infinity in a block poisons the whole block (non-finite scale, zero
+    /// quants) in every Q8_0 quantizer; neighbouring finite blocks are unchanged.
+    #[test]
+    fn q8_0_quantizers_poison_non_finite_blocks() {
+        type Quantizer = fn(&[f32], &mut [u8]) -> Result<(), CeraError>;
+        let quantizers: [(&str, Quantizer); 3] = [
+            ("standard", quantize_q8_0),
+            ("smart_mse", quantize_q8_0_smart_mse),
+            ("hqq", quantize_q8_0_hqq),
+        ];
+        for (name, quantize) in quantizers {
+            for (label, pos, bad) in [
+                ("nan", 7usize, f32::NAN),
+                ("nan last", 31, f32::NAN),
+                ("inf", 12, f32::INFINITY),
+                ("-inf", 0, f32::NEG_INFINITY),
+            ] {
+                let mut input = vec![0.5f32; 96];
+                input[1] = -2.0;
+                input[33] = -2.0;
+                input[65] = -2.0;
+                input[32 + pos] = bad;
+                let mut out = vec![0xAAu8; 3 * 34];
+                quantize(&input, &mut out).unwrap();
+                let scale = f16_to_f32(u16::from_le_bytes([out[34], out[35]]));
+                if bad.is_nan() {
+                    assert!(scale.is_nan(), "{name} {label}: scale {scale}");
+                } else {
+                    assert!(scale.is_infinite(), "{name} {label}: scale {scale}");
+                }
+                assert!(
+                    out[36..68].iter().all(|&b| b == 0),
+                    "{name} {label}: quants"
+                );
+                for b in [0usize, 2] {
+                    let d = f16_to_f32(u16::from_le_bytes([out[b * 34], out[b * 34 + 1]]));
+                    assert!(
+                        d.is_finite() && d > 0.0,
+                        "{name} {label}: neighbour {b} scale {d}"
+                    );
+                }
+            }
+        }
+    }
+
     use super::*;
     use crate::quant::{dequantize_q4_0_matrix, dequantize_q8_0_matrix};
 

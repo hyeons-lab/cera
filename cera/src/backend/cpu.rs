@@ -1259,19 +1259,19 @@ pub fn gemv_min_rows() -> usize {
 }
 
 /// Portable Q8_0 quantizer. Mirrors the NEON/AVX-512 kernels exactly — same
-/// scale ([`crate::quant::q8_0_activation_scale`]: the smallest f16 at least
+/// scale ([`crate::quant::q8_0_block_scale`]: the smallest f16 at least
 /// `amax / 127`), the int8 values from the reciprocal of that stored scale, same
 /// round-to-nearest-even — so a host that falls back here produces bit-identical
 /// blocks to one that doesn't.
 #[cfg(not(target_arch = "aarch64"))]
 pub(crate) fn quantize_f32_to_q8_0_scalar(x: &[f32], scales: &mut [f32], quants: &mut [i8]) {
     for (bi, blk) in x.chunks(32).enumerate() {
-        let amax = blk.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-        let d = crate::quant::q8_0_activation_scale(amax);
-        // Non-finite guard, matching `quantize_f32_to_q8_0_avx512` — see the
-        // comment there. Keeps this reference byte-identical to the SIMD kernel
-        // for NaN blocks instead of saturating the opposite way.
-        let id = crate::quant::q8_0_activation_recip(d);
+        // NaN-propagating maximum and the shared non-finite contract (see
+        // `quant::q8_0_block_scale`): a block holding a NaN or infinity gets a
+        // NaN / infinite scale and all-zero quants on every quantizer.
+        let amax = crate::quant::q8_0_block_amax(blk);
+        let d = crate::quant::q8_0_block_scale(amax);
+        let id = crate::quant::q8_0_block_recip(d);
         scales[bi] = d;
         for (t, &v) in blk.iter().enumerate() {
             quants[bi * 32 + t] = (v * id).round_ties_even().clamp(-128.0, 127.0) as i8;
@@ -4697,7 +4697,7 @@ pub fn rmsnorm_into(src: &[f32], dst: &mut [f32], weight: &[f32], eps: f32) {
 /// Combined RMSNorm and Q8_0 quantization in a single pass.
 ///
 /// Computes `normalized = x / rms(x) * weight`, finds block `amax`, scales,
-/// and quantizes to i8 with the stored scale `quant::q8_0_activation_scale(amax)`
+/// and quantizes to i8 with the stored scale `quant::q8_0_block_scale(amax)`
 /// (the smallest f16 at least `amax / 127`).
 ///
 /// If `out_normed` is `Some`, the unquantized normalized floats are written to
@@ -12740,7 +12740,7 @@ mod f16_gemv_tests {
 #[cfg(test)]
 mod q8_activation_quantizer_tests {
     use super::quantize_f32_to_q8_0_into;
-    use crate::quant::{f16_to_f32, f32_to_f16, q8_0_activation_recip, q8_0_activation_scale};
+    use crate::quant::{f16_to_f32, f32_to_f16, q8_0_block_recip, q8_0_block_scale};
 
     /// The stored scale is the smallest f16 at least `amax / 127`.
     #[test]
@@ -12749,7 +12749,7 @@ mod q8_activation_quantizer_tests {
             for m in [1.0f32, 1.0001, 1.37, 1.5, 1.999, 1.0 + 1.0 / 1024.0] {
                 let amax = m * 2f32.powi(e);
                 let d = amax / 127.0;
-                let s = q8_0_activation_scale(amax);
+                let s = q8_0_block_scale(amax);
                 assert!(
                     s.is_finite() && s >= d,
                     "amax {amax:e}: scale {s:e} < {d:e}"
@@ -12762,12 +12762,12 @@ mod q8_activation_quantizer_tests {
                 );
             }
         }
-        assert_eq!(q8_0_activation_scale(0.0), 0.0);
-        assert!(q8_0_activation_scale(f32::NAN).is_nan());
-        assert!(q8_0_activation_scale(f32::INFINITY).is_infinite());
-        assert_eq!(q8_0_activation_recip(0.0), 0.0);
-        assert_eq!(q8_0_activation_recip(f32::NAN), 0.0);
-        assert_eq!(q8_0_activation_recip(f32::INFINITY), 0.0);
+        assert_eq!(q8_0_block_scale(0.0), 0.0);
+        assert!(q8_0_block_scale(f32::NAN).is_nan());
+        assert!(q8_0_block_scale(f32::INFINITY).is_infinite());
+        assert_eq!(q8_0_block_recip(0.0), 0.0);
+        assert_eq!(q8_0_block_recip(f32::NAN), 0.0);
+        assert_eq!(q8_0_block_recip(f32::INFINITY), 0.0);
     }
 
     /// Whatever the block's magnitude, every int8 stays in `[-127, 127]` (the x86
@@ -12798,6 +12798,51 @@ mod q8_activation_quantizer_tests {
                 assert!(
                     err <= 0.5 * sb * 1.0001,
                     "amax 2^{e}: element {i} off by {err:e} with scale {sb:e}"
+                );
+            }
+        }
+    }
+
+    /// The shared non-finite contract: a NaN anywhere in a block (first lane, last
+    /// lane, anywhere) gives a NaN scale, an infinity an infinite scale, and every
+    /// int8 is zero, so the poison reaches the dot product (`scale * 0` is NaN)
+    /// instead of being quantized into a plausible number. Neighbouring finite
+    /// blocks are untouched.
+    #[test]
+    fn non_finite_blocks_poison_the_scale_and_zero_the_quants() {
+        for (label, pos, bad) in [
+            ("nan first", 0usize, f32::NAN),
+            ("nan last", 31, f32::NAN),
+            ("nan middle", 17, f32::NAN),
+            ("inf", 9, f32::INFINITY),
+            ("-inf", 30, f32::NEG_INFINITY),
+        ] {
+            let mut x = vec![0.5f32; 96];
+            x[1] = -2.0;
+            x[33] = -2.0;
+            x[65] = -2.0;
+            x[32 + pos] = bad;
+            let (mut s, mut q) = (vec![0.0f32; 3], vec![7i8; 96]);
+            quantize_f32_to_q8_0_into(&x, &mut s, &mut q);
+            if bad.is_nan() {
+                assert!(s[1].is_nan(), "{label}: scale {}", s[1]);
+            } else {
+                assert!(s[1].is_infinite(), "{label}: scale {}", s[1]);
+            }
+            assert!(
+                q[32..64].iter().all(|&v| v == 0),
+                "{label}: quants {:?}",
+                &q[32..64]
+            );
+            for b in [0usize, 2] {
+                assert!(
+                    s[b].is_finite() && s[b] > 0.0,
+                    "{label}: neighbour {b} scale {}",
+                    s[b]
+                );
+                assert!(
+                    q[b * 32..b * 32 + 32].contains(&-127),
+                    "{label}: neighbour {b} quants"
                 );
             }
         }

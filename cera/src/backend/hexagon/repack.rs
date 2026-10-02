@@ -542,27 +542,25 @@ pub fn repack_q6_k(
     Ok(())
 }
 
-/// ggml Q8_0 quant bound: `quantize_row_q8_0_ref` scales by `amax / 127`
-/// so the int8 quants span the full symmetric range.
-const Q8_0_QUANT_MAX: f32 = 127.0;
-
-/// Quantize 32 f32 values to one Q8_0 block (absmax/127 scale).
+/// Quantize 32 f32 values to one Q8_0 block.
 ///
-/// Mirrors ggml `quantize_row_q8_0_ref`: `d = amax / 127`, quants are
-/// `round(x / d)`; an all-zero block yields scale 0 and zero quants.
+/// The stored scale is the smallest f16 at least `amax / 127` and the quants are
+/// `round(x / scale)` with that stored scale, so scale and quants always describe
+/// the same numbers (`quant::q8_0_block_scale`). ggml's `quantize_row_q8_0_ref`
+/// divides by the unrounded `amax / 127` but stores the f16-rounded scale, which
+/// for a block whose scale is an f16 subnormal (`amax` below about 7.7e-3) leaves
+/// them a few percent apart, and below `amax` ~4e-6 flushed the block to zero.
+/// An all-zero block yields scale 0 and zero quants.
 fn quantize_q8_0_block(vals: &[f32; 32]) -> BlockQ8_0 {
-    let mut amax = 0.0f32;
-    for &v in vals {
-        amax = amax.max(v.abs());
-    }
-    let d = amax / Q8_0_QUANT_MAX;
-    let inv = if d != 0.0 { 1.0 / d } else { 0.0 };
+    let amax = crate::quant::q8_0_block_amax(vals);
+    let scale = crate::quant::q8_0_block_scale(amax);
+    let inv = crate::quant::q8_0_block_recip(scale);
     let mut quants = [0i8; 32];
     for (q, &v) in quants.iter_mut().zip(vals.iter()) {
         *q = (v * inv).round() as i8;
     }
     BlockQ8_0 {
-        delta: f32_to_f16(d),
+        delta: f32_to_f16(scale),
         quants,
     }
 }
@@ -701,6 +699,56 @@ pub fn quantize_f32_to_q8_0(vals: &[f32], cols: usize, rows: usize) -> Result<Ve
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A Q8_0 block re-quantized for the NPU must agree with its own stored scale at
+    /// every magnitude: each value within half a scale step, int8 within [-127, 127],
+    /// and no nonzero block flushed to a zero scale. The ggml convention (unrounded
+    /// reciprocal, f16-rounded stored scale) missed all three for an f16-subnormal
+    /// scale.
+    #[test]
+    fn quantize_q8_0_block_agrees_with_its_stored_scale_at_every_magnitude() {
+        let mut st = 0x2545_f491u32;
+        for e in -34..=13 {
+            let amax = 2f32.powi(e);
+            let mut vals = [0.0f32; 32];
+            for v in vals.iter_mut() {
+                st = st.wrapping_mul(1_664_525).wrapping_add(1_013_904_223);
+                *v = ((st >> 8) as f32 / (1u32 << 24) as f32 * 2.0 - 1.0) * amax;
+            }
+            vals[5] = amax;
+            vals[20] = -amax;
+            let b = quantize_q8_0_block(&vals);
+            let d = f16_to_f32(b.delta);
+            assert!(d > 0.0, "amax 2^{e}: nonzero block lost its scale");
+            for (i, (&q, &v)) in b.quants.iter().zip(&vals).enumerate() {
+                assert!((-127..=127).contains(&q), "amax 2^{e}: quant {i} = {q}");
+                let err = (q as f32 * d - v).abs();
+                assert!(
+                    err <= 0.5 * d * 1.0001,
+                    "amax 2^{e}: element {i} off by {err:e}"
+                );
+            }
+        }
+        let zero = quantize_q8_0_block(&[0.0; 32]);
+        assert_eq!(f16_to_f32(zero.delta), 0.0);
+        assert!(zero.quants.iter().all(|&q| q == 0));
+    }
+
+    /// A NaN or infinity poisons the whole block (non-finite scale, zero quants)
+    /// instead of being skipped.
+    #[test]
+    fn quantize_q8_0_block_poisons_non_finite_blocks() {
+        let mut nan = [0.25f32; 32];
+        nan[30] = f32::NAN;
+        let b = quantize_q8_0_block(&nan);
+        assert!(f16_to_f32(b.delta).is_nan());
+        assert!(b.quants.iter().all(|&q| q == 0));
+        let mut inf = [0.25f32; 32];
+        inf[3] = f32::INFINITY;
+        let b = quantize_q8_0_block(&inf);
+        assert!(f16_to_f32(b.delta).is_infinite());
+        assert!(b.quants.iter().all(|&q| q == 0));
+    }
 
     #[test]
     fn test_repack_q8_0_sizes() {
@@ -924,10 +972,7 @@ mod tests {
             }
         }
         let amax = vals.iter().fold(0.0f32, |a, &v| a.max(v.abs()));
-        assert!(
-            max_err <= amax / Q8_0_QUANT_MAX,
-            "max_err={max_err} amax={amax}"
-        );
+        assert!(max_err <= amax / 127.0, "max_err={max_err} amax={amax}");
 
         // All-zero block requants to zero blocks.
         let zero = vec![0u8; 176];
