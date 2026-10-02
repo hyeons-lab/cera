@@ -11,28 +11,36 @@
 <!-- Loops append bullets here. -->
 - **Refcount Process-Global Toggles**: Enabling a process-wide vote or mode (wakelock, QoS, power hint) per device or session: the first owner to drop cancels it for the rest, and a failed constructor leaks it; hold it in an RAII guard behind a global count (0 to 1 acquires, 1 to 0 releases), created before the first fallible step, and verify with a stub driver that logs acquire and release calls.
 - **Recover Poison Consistently**: Fixing a poisoned-lock path in one function: sibling entry points that restage the same state still fail permanently, while recovering a lock over state that persists across calls (recurrent buffers, counters) continues over a torn pair; grep every lock site guarding the same resources, recover only state rewritten in full per call (log the recovery, drop any half-built pending work on entry), and reset persistent state explicitly on poison. A std `Mutex` stays poisoned after `into_inner()`: clear the flag (`clear_poison`) when recovering, or every later call repeats the reset and the warning; route all sites through one helper and unit-test that recovery reports once. For a lock guarding DSP-resident state that a panic can tear (the device lock), fail closed with an error until an explicit reset rewrites it, instead of recovering and continuing.
+- **Pop After Success**: A tracked collection (rotation window, pending list) drained with `pop_front` before the fallible release step (unmap, free): a refusal leaves the resource held but untracked, so it is never retried and the budget leaks; peek, release, then pop, and verify with a fake that can refuse the call and a retry that succeeds.
 
 ### Pillar 4: Error Handling, Resilience & Diagnostics
 <!-- Loops append bullets here. -->
 - **Errors Not Silent Prefixes**: A multi-step operation whose earlier stage returns bare results (logs plus zeros): dropping that result and continuing over the gap yields plausible output computed over missing state; propagate the failed stage as an error, and verify with a fault-injecting test that the caller sees Err.
 - **Recover Poison When Overwriting**: Resetting state behind a mutex with `if let Ok(guard)`: a poisoned lock skips the zeroing while counters still reset; recover with `into_inner` when the guarded state is fully overwritten.
+- **No Silent Default Arms**: A `match (Option, Option)` whose `_ =>` arm quietly picks the common buffer or path: an inconsistent state (planned for paging, no pager) reads the wrong weights with no error; make every impossible combination a typed error, not a `debug_assert` or a fallback.
+- **Warn Where Logcat Can See**: A new warning or an "active" notice in the Hexagon path emitted with `tracing::warn!` alone: `cera-ffi` installs no subscriber, so on a phone a partial pin or a typo'd knob is invisible; use `hexagon_warn!` (tracing plus stderr), including for a failure swallowed in `Drop`.
 
 ### Pillar 5: Interface Contracts, API Design & Compatibility
 <!-- Loops append bullets here. -->
 - **Idempotent Attach Setters**: A setter that also flips an unrelated opt-out flag (attach resets disable): callers that set the flag in config get it silently undone; keep each setter to its own field, and test the real construction path rather than assigning fields directly.
 - **Docs Feed Generated Checksums**: Editing a doc comment on an exported FFI item: generated bindings embed the doc text and the interface checksum, so the drift job fails and native and binding checksums disagree; regenerate every binding target (including the separately generated ones) in the same change, and verify with the drift check.
 - **Plumb Opt-In Flags**: Renaming a constructor parameter to `_unused` while adding a new default: the config flag becomes dead and the experimental path turns on for everyone; keep the flag live end to end and test with a stub where support is true and the default is false.
+- **Hermetic Knob Seams**: A new `CERA_*` env knob read straight from `std::env` in a constructor: a stray variable in the developer's shell flips the golden tests, and the parse rule drifts from the sibling knobs; give it a `from_lookup` seam, make the constructor ignore the environment under `cfg(test)`, parse opt-ins like the existing ones, warn on garbage, and document it in the env table.
 
 ### Pillar 6: Performance, Resource Efficiency & Scalability
 <!-- Loops append bullets here. -->
 - **Unaligned By-Value Descriptors**: Casting a byte buffer (align 1) to a struct reference to patch DSP or wire descriptors: relies on allocator alignment and is UB or a panic otherwise; read and write the descriptor by value with unaligned accessors behind a range check, and verify with a test that patches at a deliberately odd offset.
+- **Derive Margins From Inputs**: A fit-or-page decision using a fixed slack for something sized later (KV cache by context length): a long context passes the check and then fails at allocation; compute the margin from the same inputs the later allocation uses.
 
 ### Pillar 7: Code Simplification, Clean Architecture & Maintainability
 <!-- Loops append bullets here. -->
 - **Doc Comment Theft**: Inserting an item between a doc comment and its item, or a `use` under one: the doc silently reattaches to the wrong item; after every insertion read the lines directly above each touched item.
+- **Stale Limit Claims**: Lifting a limit with a new mechanism (paging past the DSP map ceiling): error strings, hints, doc comments and a docs bullet still say the old limit is absolute; grep the old claim everywhere and keep the message at the call site that still means it.
+- **Estimates Assert Their Plan**: A second copy of a planning loop that feeds a decision (KV bytes for the paging choice): it drifts silently and zeroing it is caught by nothing; `debug_assert_eq!` it against the real plan's total after planning, and scope an error suffix ("these weights cannot run") to the call site that means it, not the shared allocator.
 
 ### Pillar 8: Testing, Observability & Verification Invariants
 <!-- Loops append bullets here. -->
 - **Mirror Tests Are Vacuous**: A test that re-implements the production formula or patch loop inline and asserts its own copy passes when production drifts; extract the logic into a function the production path calls and test that, and prove non-vacuity by mutating production in a scratch copy.
 - **Throttles Vacate No-Op Tests**: Adding a rate limiter or cache in front of an entry point: a test asserting the no-op result passes without running the checked logic when another test consumed the window; test the unthrottled core directly and unit-test the limiter with an injected clock.
 - **Untested Fix Is Unfixed**: Fixing a defect in code needing a device or driver: the fix regresses silently; extract the pure decision (counter, chunk split, validation) so a host test can pin it, and mutate production once to prove the test fails.
+- **Fakes Must Be Able To Refuse**: A fix that depends on call order or a refusal (release before unmap, munmap error 1): a fake driver that always succeeds, answers every buffer with one fd and ignores arguments cannot fail the test; give each call the fix depends on a refusal knob and an event with its fd, assert the order, and mutate production once to see the test fail.

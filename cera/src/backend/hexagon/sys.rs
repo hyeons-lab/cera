@@ -13,7 +13,7 @@ pub type DspQueueHandle = *mut c_void;
 pub type DspQueueCallback = extern "C" fn(context: *mut c_void);
 
 pub const DOMAIN_CDSP: i32 = 3;
-/// Mapping size from which a `fastrpc_mmap` failure is blamed on the DSP address space.
+/// One GiB.
 const GIB: usize = 1 << 30;
 
 /// Hard ceiling on the bytes this process can have mapped into the CDSP at
@@ -328,8 +328,7 @@ impl FastRpcDriver {
         if mapped.saturating_add(length) > DSP_MAP_CEILING {
             return Err(CeraError::Backend(format!(
                 "cannot map {} MiB into the DSP: {} MiB is already mapped and the DSP address \
-                 space holds at most about {} MiB in total, so this model's weights cannot \
-                 run on the NPU",
+                 space holds at most about {} MiB in total",
                 length >> 20,
                 mapped >> 20,
                 DSP_MAP_CEILING >> 20
@@ -355,11 +354,11 @@ impl FastRpcDriver {
         if ret != 0 {
             // The CDSP unsigned PD has a 32-bit address space shared by every
             // mapping. Measured on an S25 Ultra: one buffer maps up to about
-            // 3.9 GiB when nothing else is mapped, but the total across buffers
-            // stops near 3 GiB, so splitting a large model does not help.
+            // 3.9 GiB when nothing else is mapped, and several smaller buffers
+            // are refused sooner (a fourth 1 GiB buffer did not fit). A mapping
+            // of 1 GiB or more that is refused is blamed on that limit.
             let hint = if length >= GIB {
-                " (the DSP address space is about 3 to 4 GiB in total; models whose weights \
-                 exceed it cannot run on the NPU)"
+                " (the DSP address space is about 3 to 4 GiB in total)"
             } else {
                 ""
             };
@@ -691,6 +690,12 @@ pub(crate) mod fake {
         OpenSkel,
         /// `htp_iface_*` method id.
         Invoke(u32),
+        /// `fastrpc_mmap` / `fastrpc_munmap` of the buffer with this fd (only
+        /// logged when the call succeeds).
+        Map(i32),
+        Unmap(i32),
+        /// `htp_iface_munmap` (method 5) for the buffer with this fd.
+        Release(i32),
         CloseSkel,
         QueueClose,
         /// `dspqueue_write` with the batch seq.
@@ -704,8 +709,15 @@ pub(crate) mod fake {
         pub fail_invoke_method: Option<u32>,
         pub fail_write: bool,
         pub fail_read: bool,
+        /// `fastrpc_mmap` / `fastrpc_munmap` answer with an error.
+        pub fail_mmap: bool,
+        pub fail_munmap: bool,
         /// `rpcmem_alloc` calls the fake has served.
         pub allocs: usize,
+        /// Hand every buffer its own fd (default: all 42, which the captured
+        /// op goldens hash) so a test can tell buffers apart.
+        pub distinct_fds: bool,
+        next_fd: i32,
         /// Status word the fake DSP answers batches with (`None` = Ok).
         pub rsp_status: Option<u32>,
         last_seq: u64,
@@ -740,12 +752,27 @@ pub(crate) mod fake {
         unsafe { libc::free(p) }
     }
     extern "C" fn to_fd(_p: *mut c_void) -> i32 {
-        42
+        with(|s| {
+            if s.distinct_fds {
+                s.next_fd += 1;
+                100 + s.next_fd
+            } else {
+                42
+            }
+        })
     }
-    extern "C" fn mmap(_d: i32, _fd: i32, _a: *mut c_void, _o: i32, _l: usize, _f: u32) -> i32 {
+    extern "C" fn mmap(_d: i32, fd: i32, _a: *mut c_void, _o: i32, _l: usize, _f: u32) -> i32 {
+        if with(|s| s.fail_mmap) {
+            return -1;
+        }
+        log(Event::Map(fd));
         0
     }
-    extern "C" fn munmap(_d: i32, _fd: i32, _a: *mut c_void, _l: usize) -> i32 {
+    extern "C" fn munmap(_d: i32, fd: i32, _a: *mut c_void, _l: usize) -> i32 {
+        if with(|s| s.fail_munmap) {
+            return -1;
+        }
+        log(Event::Unmap(fd));
         0
     }
     extern "C" fn open(_name: *const c_char, ph: *mut RemoteHandle64) -> i32 {
@@ -756,9 +783,14 @@ pub(crate) mod fake {
         unsafe { *ph = 7 };
         0
     }
-    extern "C" fn invoke(_h: RemoteHandle64, scalars: u32, _pra: *mut RemoteArg) -> i32 {
+    extern "C" fn invoke(_h: RemoteHandle64, scalars: u32, pra: *mut RemoteArg) -> i32 {
         let method = scalars >> 24;
         log(Event::Invoke(method));
+        if method == 5 {
+            // The one in-buffer argument is the u32 fd to release.
+            let fd = unsafe { *((*pra).buf.buf as *const u32) };
+            log(Event::Release(fd as i32));
+        }
         if with(|s| s.fail_invoke_method) == Some(method) {
             -1
         } else {
@@ -898,7 +930,9 @@ mod tests {
         let err = RpcmemBuffer::alloc(driver.clone(), DSP_MAP_CEILING + 1, true)
             .err()
             .expect("a buffer larger than the DSP address space must be refused");
-        assert!(err.to_string().contains("cannot run on the NPU"), "{err}");
+        let msg = err.to_string();
+        assert!(msg.contains("DSP address space"), "{msg}");
+        assert!(!msg.contains("weights"), "buffer-agnostic: {msg}");
         assert_eq!(
             fake::with(|s| s.allocs),
             0,

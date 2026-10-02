@@ -397,8 +397,15 @@ impl HexagonLfmModel {
         )?;
         let dst_ti = Self::add_f32_vec(session, dst, dst_offset, dim, HTP_TENSOR_COMPUTE)?;
         let params = [0i32; 16];
+        // A one-element `src1` needs the DSP's scalar-broadcast kernel; the
+        // same-shape kernel would read `dim` elements from it.
         let kparams =
-            build_binary_kernel_params(dim, 1, 1, 1, 1, 4, 8 * 1024 * 1024, session.dsp_threads());
+            build_binary_scalar_kernel_params(dim, 8 * 1024 * 1024, session.dsp_threads())
+                .ok_or_else(|| {
+                    CeraError::Backend(format!(
+                        "{label}: {dim}-element scalar op does not fit VTCM"
+                    ))
+                })?;
         Self::enqueue_labeled(
             session,
             label,
@@ -671,6 +678,7 @@ impl HexagonLfmModel {
         dst_offset: usize,
         n_rows_in: usize,
         n_rows_out: usize,
+        dsp_threads: u32,
     ) -> Result<(), CeraError> {
         let src0_ti = session.add_tensor(
             src0,
@@ -705,7 +713,8 @@ impl HexagonLfmModel {
             [4, 4, (n_rows_out * 4) as u32, (n_rows_out * 4) as u32],
         )?;
         let params = [0i32; 16];
-        let kparams = [0i32; 32];
+        // The DSP splits the gather by these; zeros leave the output untouched.
+        let kparams = build_get_rows_f32_kernel_params(1, 1, 1, n_rows_out, 1, 1, dsp_threads);
         Self::enqueue_labeled(
             session,
             "dispatch_get_rows",
@@ -730,6 +739,8 @@ impl HexagonLfmModel {
         out_act: &RpcmemBuffer,
         out_offset: usize,
         n_expert_used: usize,
+        dsp_threads: u32,
+        vtcm_budget: usize,
     ) -> Result<(), CeraError> {
         let pad32 = |x: usize| (x + 31) & !31;
         let k = w.in_dim;
@@ -798,6 +809,18 @@ impl HexagonLfmModel {
             ],
         )?;
 
+        // The same host-precomputed HVX matmul params as `dispatch_mul_mat`:
+        // the DSP rejects an all-zero set (`InvalParams`). `in_rows` activation
+        // rows per expert slice, one batch.
+        let kparams = build_mul_mat_kernel_params(
+            w.wire_dtype,
+            k,
+            in_rows as u32,
+            1,
+            m * 4,
+            dsp_threads,
+            vtcm_budget,
+        );
         Self::enqueue_labeled(
             session,
             "dispatch_mul_mat_id",
@@ -805,9 +828,57 @@ impl HexagonLfmModel {
             &[src0_ti, src1_ti, src2_ti],
             &[dst_ti],
             [0i32; 16],
-            [0i32; 32],
+            kparams,
         )?;
         Ok(())
+    }
+
+    /// The buffer holding a stacked expert weight: its layer's expert buffer
+    /// when the experts are paged, else the shared weights buffer.
+    pub(super) fn stacked_buf(&self, w: &HexagonStackedWeight) -> Result<&RpcmemBuffer, CeraError> {
+        let Some((group, pager)) = self.pager_for(w.group)? else {
+            return Ok(&self.weights_buf);
+        };
+        let buf = pager.buf(group);
+        // `emit_ffn_block` pages the layer in first; an unmapped buffer would
+        // fault the whole batch on the DSP.
+        if !buf.is_mapped() {
+            return Err(CeraError::Backend(format!(
+                "expert group {group} used while unmapped from the DSP"
+            )));
+        }
+        Ok(buf)
+    }
+
+    /// The pager and group a weight with expert group `group` lives under, or
+    /// `None` for a weight in the shared buffer. A group without a pager is an
+    /// inconsistent plan, not a reason to read the shared buffer.
+    pub(super) fn pager_for(
+        &self,
+        group: Option<usize>,
+    ) -> Result<Option<(usize, &ExpertPager)>, CeraError> {
+        match (group, &self.pager) {
+            (None, _) => Ok(None),
+            (Some(group), Some(pager)) => Ok(Some((group, pager))),
+            (Some(group), None) => Err(CeraError::Backend(format!(
+                "expert group {group} was planned for paging but the model has no pager"
+            ))),
+        }
+    }
+
+    /// Map layer `moe`'s expert buffer before ops that read it are queued.
+    ///
+    /// Making room flushes the pending batch and waits for the DSP, since a
+    /// buffer cannot be unmapped under a batch that reads it.
+    pub(super) fn page_in_experts(
+        &self,
+        session: &mut HexagonQueueSession,
+        moe: &HexagonMoeFfn,
+    ) -> Result<(), CeraError> {
+        match self.pager_for(moe.gate.group)? {
+            Some((group, pager)) => pager.page_in(group, &mut SessionHost(session)),
+            None => Ok(()),
+        }
     }
 
     pub(super) fn dispatch_moe_token(
@@ -894,6 +965,7 @@ impl HexagonLfmModel {
             selected_weights_off,
             n_exp,
             n_used,
+            session.dsp_threads(),
         )?;
 
         // 5b. Renormalization divisor for the selected weights: the CPU
@@ -906,7 +978,7 @@ impl HexagonLfmModel {
         // 6. Gate projection: [hs, 1] * stacked_gate -> [ff, n_used]
         Self::dispatch_mul_mat_id(
             session,
-            &self.weights_buf,
+            self.stacked_buf(&moe.gate)?,
             &moe.gate,
             scratch,
             in_act_offset,
@@ -916,12 +988,14 @@ impl HexagonLfmModel {
             scratch,
             gate_off,
             n_used,
+            session.dsp_threads(),
+            self.vtcm_budget,
         )?;
 
         // 7. Up projection: [hs, 1] * stacked_up -> [ff, n_used]
         Self::dispatch_mul_mat_id(
             session,
-            &self.weights_buf,
+            self.stacked_buf(&moe.up)?,
             &moe.up,
             scratch,
             in_act_offset,
@@ -931,6 +1005,8 @@ impl HexagonLfmModel {
             scratch,
             up_off,
             n_used,
+            session.dsp_threads(),
+            self.vtcm_budget,
         )?;
 
         // 8. FFN activation: swiglu([ff, n_used])
@@ -950,7 +1026,7 @@ impl HexagonLfmModel {
         // 9. Down projection: [ff, n_used] * stacked_down -> [hs, n_used]
         Self::dispatch_mul_mat_id(
             session,
-            &self.weights_buf,
+            self.stacked_buf(&moe.down)?,
             &moe.down,
             scratch,
             swiglu_off,
@@ -960,6 +1036,8 @@ impl HexagonLfmModel {
             scratch,
             down_off,
             n_used,
+            session.dsp_threads(),
+            self.vtcm_budget,
         )?;
 
         // 10. Combine expert outputs: sum_{e=0..n_used} (down[e] * weight[e])
@@ -2369,5 +2447,20 @@ impl HexagonLfmModel {
             kparams,
         )?;
         Ok(())
+    }
+}
+
+/// The queue a pager pages for: finishing pending work is a flush plus a wait
+/// for the response, and a release goes through the device's skel handle.
+struct SessionHost<'a>(&'a mut HexagonQueueSession);
+
+impl super::pager::PagerHost for SessionHost<'_> {
+    fn finish_pending(&mut self) -> Result<(), CeraError> {
+        self.0.flush()?;
+        self.0.quiesce()
+    }
+
+    fn release(&mut self, buf: &RpcmemBuffer) {
+        self.0.release_dsp_reference(buf);
     }
 }

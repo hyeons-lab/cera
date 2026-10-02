@@ -180,6 +180,8 @@ impl HexagonDevice {
             }
         };
 
+        queue_session.set_skel_handle(handle);
+
         // Query DSP capabilities via `htp_iface_hwinfo` (IDL Method 8).
         // Like the start payload, scalars pack as one C struct, here a
         // single out-buffer. kparams thread counts derive from this

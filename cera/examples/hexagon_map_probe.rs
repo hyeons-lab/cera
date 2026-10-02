@@ -1,9 +1,9 @@
 //! Probe how the CDSP address space behaves under map / unmap, on a device.
 //!
-//! The NPU backend keeps every weight in one mapped `rpcmem` buffer, and the
-//! CDSP maps only about 3 to 4 GiB in total, so a larger model cannot load.
-//! Paging weights through the mapping works only if three things hold, and
-//! this measures each of them:
+//! The CDSP maps only about 3 to 4 GiB in total, so a model whose weights
+//! exceed that cannot keep them all mapped. The routed-expert pager
+//! (`model/hexagon_lfm2/pager.rs`) rotates per-layer buffers through the
+//! mapping, and works only if three things hold; this measures each of them:
 //!
 //! 1. unmapping a buffer gives its address space back (so a sliding window of
 //!    mappings can cover more than the ceiling over time);
