@@ -121,6 +121,18 @@ pub(super) struct WeightPlanner<'a> {
     pub(super) src: &'a dyn TensorSource,
     pub(super) total: usize,
     pub(super) copies: Vec<CopyOp>,
+    /// Plan each routed layer's expert stacks into their own buffer so they
+    /// can be paged through the DSP mapping (see `pager`).
+    paged_experts: bool,
+    pub(super) groups: Vec<ExpertGroup>,
+}
+
+/// The plan of one routed layer's expert buffer: its size and its copies,
+/// with offsets local to that buffer.
+#[derive(Default)]
+pub(super) struct ExpertGroup {
+    pub(super) total: usize,
+    pub(super) copies: Vec<CopyOp>,
 }
 
 impl<'a> WeightPlanner<'a> {
@@ -129,7 +141,16 @@ impl<'a> WeightPlanner<'a> {
             src,
             total: 0,
             copies: Vec::new(),
+            paged_experts: false,
+            groups: Vec::new(),
         }
+    }
+
+    /// Plan routed experts into one buffer per layer instead of the shared
+    /// weights buffer.
+    pub(super) fn with_paged_experts(mut self, on: bool) -> Self {
+        self.paged_experts = on;
+        self
     }
 
     /// Reserve an F32 vector of `len` elements, filled from the source
@@ -196,20 +217,31 @@ impl<'a> WeightPlanner<'a> {
         Ok(w)
     }
 
-    /// Plan the stacked expert weight `name` (`n_expert` slices).
+    /// Plan the stacked expert weight `name` (`n_expert` slices) into the
+    /// shared buffer, or into expert group `group` when paging.
     pub(super) fn stacked(
         &mut self,
         name: &str,
         in_dim: usize,
         out_dim: usize,
         n_expert: usize,
+        group: Option<usize>,
     ) -> Result<HexagonStackedWeight, CeraError> {
         let slice_plan = self.src.stacked_slice_plan(name, in_dim, out_dim)?;
-        let weight = plan_stacked(&mut self.total, slice_plan, name, in_dim, out_dim, n_expert)?;
-        self.copies.push(CopyOp::Stacked {
+        let total = match group {
+            Some(g) => &mut self.groups[g].total,
+            None => &mut self.total,
+        };
+        let mut weight = plan_stacked(total, slice_plan, name, in_dim, out_dim, n_expert)?;
+        weight.group = group;
+        let op = CopyOp::Stacked {
             name: name.to_string(),
             weight,
-        });
+        };
+        match group {
+            Some(g) => self.groups[g].copies.push(op),
+            None => self.copies.push(op),
+        }
         Ok(weight)
     }
 
@@ -260,23 +292,30 @@ impl<'a> WeightPlanner<'a> {
         {
             let router = self.weight(&format!("blk.{i}.ffn_gate_inp.weight"), hidden, n_expert)?;
             let exp_probs_b_offset = self.vector(&format!("blk.{i}.exp_probs_b.bias"), n_expert);
+            let group = self.paged_experts.then(|| {
+                self.groups.push(ExpertGroup::default());
+                self.groups.len() - 1
+            });
             let gate = self.stacked(
                 &format!("blk.{i}.ffn_gate_exps.weight"),
                 hidden,
                 expert_ff_len,
                 n_expert,
+                group,
             )?;
             let up = self.stacked(
                 &format!("blk.{i}.ffn_up_exps.weight"),
                 hidden,
                 expert_ff_len,
                 n_expert,
+                group,
             )?;
             let down = self.stacked(
                 &format!("blk.{i}.ffn_down_exps.weight"),
                 expert_ff_len,
                 hidden,
                 n_expert,
+                group,
             )?;
             Ok(HexagonFfn::Moe(HexagonMoeFfn {
                 router,
@@ -374,76 +413,93 @@ pub(super) struct WeightCopy<'a> {
     pub(super) weights_total: usize,
     pub(super) kv_total: usize,
     pub(super) copies: &'a [CopyOp],
+    /// Per-layer expert buffers when paging (empty otherwise).
+    pub(super) groups: &'a [ExpertGroup],
 }
 
 impl WeightCopy<'_> {
     /// Allocate `weights_buf` and `kv_state_buf`, run every planned copy from
-    /// `src` into the former, and flush it.
+    /// `src` into the former, and flush it. When paging, also allocate one
+    /// buffer per expert group, filled the same way but left unmapped: the
+    /// pager maps them as the forward pass needs them.
     pub(super) fn run(
         &self,
         driver: &Arc<crate::backend::hexagon::FastRpcDriver>,
-    ) -> Result<(RpcmemBuffer, RpcmemBuffer), CeraError> {
+    ) -> Result<(RpcmemBuffer, RpcmemBuffer, Vec<RpcmemBuffer>), CeraError> {
         let mut buf = RpcmemBuffer::alloc(Arc::clone(driver), self.weights_total, true)?;
         let kv_state_buf = alloc_zeroed_state(driver, self.kv_total)?;
-        let src = self.src;
-
-        for op in self.copies {
-            match op {
-                CopyOp::Weight { name, offset } => src.copy_weight(name, *offset, &mut buf)?,
-                CopyOp::Vector { name, offset, len } => {
-                    let v = src.vector(name)?;
-                    // `<=`: LFM2 q/k norm slots are q_dim / kv_dim wide while
-                    // the tensor is head_dim long. Longer would spill into the
-                    // next tensor's region.
-                    if v.len() > *len {
-                        return Err(CeraError::Backend(format!(
-                            "{name} has {} elements, more than its {len}-element slot",
-                            v.len()
-                        )));
-                    }
-                    copy_f32_into(&v, name, *offset, &mut buf)?;
-                }
-                CopyOp::Stacked { name, weight } => src.copy_stacked(name, weight, &mut buf)?,
-                CopyOp::ConvTaps {
-                    name,
-                    hidden_size,
-                    taps,
-                    ssm,
-                } => {
-                    let hidden_size = *hidden_size;
-                    let conv = src.vector(name)?;
-                    let expected = hidden_size.checked_mul(3).ok_or_else(|| {
-                        CeraError::Backend(
-                            "hidden_size overflow calculating conv weight size".into(),
-                        )
-                    })?;
-                    if conv.len() != expected {
-                        return Err(CeraError::Backend(format!(
-                            "{name} size {} != hidden_size * 3 ({hidden_size} * 3)",
-                            conv.len()
-                        )));
-                    }
-                    // Per-tap planes for the manual decode chain; the SsmConv
-                    // taps use the GGUF `[3, C]` layout (already oldest-first
-                    // per channel) verbatim.
-                    for (tap, offset) in taps.iter().enumerate() {
-                        let plane: Vec<f32> =
-                            (0..hidden_size).map(|ch| conv[ch * 3 + tap]).collect();
-                        copy_f32_into(&plane, name, *offset, &mut buf)?;
-                    }
-                    copy_f32_into(&conv, name, *ssm, &mut buf)?;
-                }
-                CopyOp::Constant {
-                    label,
-                    offset,
-                    values,
-                } => copy_f32_into(values, label, *offset, &mut buf)?,
-            }
-        }
-
+        run_copies(self.src, self.copies, &mut buf)?;
         buf.flush_cpu_cache(0, self.weights_total);
-        Ok((buf, kv_state_buf))
+
+        let mut expert_bufs = Vec::with_capacity(self.groups.len());
+        for group in self.groups {
+            let mut gbuf = RpcmemBuffer::alloc(Arc::clone(driver), group.total, false)?;
+            run_copies(self.src, &group.copies, &mut gbuf)?;
+            gbuf.flush_cpu_cache(0, group.total);
+            expert_bufs.push(gbuf);
+        }
+        Ok((buf, kv_state_buf, expert_bufs))
     }
+}
+
+/// Run the planned copies of one buffer from `src` into `buf`.
+fn run_copies(
+    src: &dyn TensorSource,
+    copies: &[CopyOp],
+    buf: &mut RpcmemBuffer,
+) -> Result<(), CeraError> {
+    for op in copies {
+        match op {
+            CopyOp::Weight { name, offset } => src.copy_weight(name, *offset, buf)?,
+            CopyOp::Vector { name, offset, len } => {
+                let v = src.vector(name)?;
+                // `<=`: LFM2 q/k norm slots are q_dim / kv_dim wide while
+                // the tensor is head_dim long. Longer would spill into the
+                // next tensor's region.
+                if v.len() > *len {
+                    return Err(CeraError::Backend(format!(
+                        "{name} has {} elements, more than its {len}-element slot",
+                        v.len()
+                    )));
+                }
+                copy_f32_into(&v, name, *offset, buf)?;
+            }
+            CopyOp::Stacked { name, weight } => src.copy_stacked(name, weight, buf)?,
+            CopyOp::ConvTaps {
+                name,
+                hidden_size,
+                taps,
+                ssm,
+            } => {
+                let hidden_size = *hidden_size;
+                let conv = src.vector(name)?;
+                let expected = hidden_size.checked_mul(3).ok_or_else(|| {
+                    CeraError::Backend("hidden_size overflow calculating conv weight size".into())
+                })?;
+                if conv.len() != expected {
+                    return Err(CeraError::Backend(format!(
+                        "{name} size {} != hidden_size * 3 ({hidden_size} * 3)",
+                        conv.len()
+                    )));
+                }
+                // Per-tap planes for the manual decode chain; the SsmConv
+                // taps use the GGUF `[3, C]` layout (already oldest-first
+                // per channel) verbatim.
+                for (tap, offset) in taps.iter().enumerate() {
+                    let plane: Vec<f32> = (0..hidden_size).map(|ch| conv[ch * 3 + tap]).collect();
+                    copy_f32_into(&plane, name, *offset, buf)?;
+                }
+                copy_f32_into(&conv, name, *ssm, buf)?;
+            }
+            CopyOp::Constant {
+                label,
+                offset,
+                values,
+            } => copy_f32_into(values, label, *offset, buf)?,
+        }
+    }
+
+    Ok(())
 }
 
 /// [`TensorSource`] over a GGUF file (the LFM2 / LFM2-MoE loader).
@@ -1013,6 +1069,7 @@ fn plan_stacked(
     })?;
     let offset = plan_offset(total, total_bytes);
     Ok(HexagonStackedWeight {
+        group: None,
         offset,
         size: total_bytes,
         in_dim,
@@ -1161,6 +1218,7 @@ mod tests {
 
     fn stacked_fixture() -> HexagonStackedWeight {
         HexagonStackedWeight {
+            group: None,
             offset: 1024,
             size: 3 * 512,
             in_dim: 64,
@@ -1406,6 +1464,7 @@ mod tests {
             weights_total: 4096,
             kv_total: 256,
             copies: &copies,
+            groups: &[],
         }
         .run(&crate::backend::hexagon::sys::fake::driver())
         .map(|_| ())
@@ -1506,6 +1565,7 @@ mod tests {
                 weights_total: planner.total,
                 kv_total: 256,
                 copies: &planner.copies,
+                groups: &[],
             }
             .run(&crate::backend::hexagon::sys::fake::driver())
             .map(|_| ())

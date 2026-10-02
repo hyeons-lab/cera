@@ -289,6 +289,7 @@ fn build(mut spec: Spec) -> HexagonLfmModel {
             config: spec.config,
             token_embd: embd_table(),
             weights_buf: alloc(spec.plan.weights).unwrap(),
+            pager: None,
             layers: spec.layers,
             output_norm_offset,
             lm_head,

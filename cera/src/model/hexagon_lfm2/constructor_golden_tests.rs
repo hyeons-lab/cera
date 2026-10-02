@@ -261,9 +261,14 @@ fn qwen35_gguf() -> GgufFile {
 /// LFM2: layer 0 short conv, layer 1 attention with QK norm; `moe` swaps the
 /// FFN of layers 1 and 2 for routed experts (layer 2 is a second conv).
 fn lfm2_gguf(moe: bool) -> GgufFile {
+    lfm2_gguf_layers(moe, if moe { 3 } else { 2 })
+}
+
+/// [`lfm2_gguf`] with `n_layers` layers: past layer 1 they alternate no
+/// further, every extra layer is a short conv (routed FFN when `moe`).
+fn lfm2_gguf_layers(moe: bool, n_layers: usize) -> GgufFile {
     let mut g = Gen(0x9e37_79b9);
     let prefix = if moe { "lfm2moe" } else { "lfm2" };
-    let n_layers = if moe { 3 } else { 2 };
     let mut t = vec![
         g.f32("token_embd.weight", &[HS, VOCAB], 1.0, 0.0),
         g.f32("token_embd_norm.weight", &[HS], 0.1, 1.0),
@@ -438,7 +443,11 @@ fn constructors_build_pinned_models() {
         (8055141403873995527, 1102571476056680706),
     );
     let moe = HexagonLfmModel::from_gguf_on(backend(), lfm2_gguf(true), 64).unwrap();
-    assert_model("ctor_moe", &moe, (7716646402643736676, 381770302451998499));
+    assert_model(
+        "ctor_moe",
+        &moe,
+        (10223184744877565750, 2737927026610381759),
+    );
     let cpu = crate::model::qwen35::Qwen35Model::from_gguf(qwen35_gguf(), 64).unwrap();
     let qwen35 = HexagonLfmModel::from_qwen35_model_on(backend(), &cpu, 64).unwrap();
     assert_model(
@@ -606,4 +615,99 @@ fn real_qwen35_gguf_builds_on_the_fake_device() {
     let model = HexagonLfmModel::from_qwen35_model_on(backend(), &cpu, 64).unwrap();
     assert!(model.has_deltanet);
     assert_eq!(model.config.n_layers, cpu.config().n_layers);
+}
+
+fn moe_of(layer: &HexagonLayer) -> Option<&HexagonMoeFfn> {
+    let ffn = match layer {
+        HexagonLayer::Attention(a) => &a.ffn,
+        HexagonLayer::Conv(c) => &c.ffn,
+        HexagonLayer::DeltaNet(_) => return None,
+    };
+    match ffn {
+        HexagonFfn::Moe(m) => Some(m),
+        HexagonFfn::Dense(_) => None,
+    }
+}
+
+/// Paging moves only the DSP mapping: every expert byte is where the
+/// unpaged layout puts it, relative to the layer's own buffer, and a pass over
+/// the model flushes once per window rotation instead of once per layer.
+#[test]
+fn paged_experts_hold_the_same_bytes_and_rotate_through_a_window() {
+    let file = lfm2_gguf_layers(true, 8);
+    let roomy = Paging {
+        force: false,
+        budget: 1 << 30,
+    };
+    let unpaged = HexagonLfmModel::from_gguf_on_with(backend(), file.clone(), 64, roomy).unwrap();
+    assert!(unpaged.pager.is_none(), "a model that fits is not paged");
+
+    // Forced paging with room for everything pins every layer: this reveals
+    // the sizes the tight budget below is built from.
+    let all_pinned = HexagonLfmModel::from_gguf_on_with(
+        backend(),
+        file.clone(),
+        64,
+        Paging {
+            force: true,
+            ..roomy
+        },
+    )
+    .unwrap();
+    let pager = all_pinned.pager.as_ref().expect("forced paging");
+    let groups: Vec<usize> = (1..8)
+        .map(|i| moe_of(&all_pinned.layers[i]).unwrap().gate.group.unwrap())
+        .collect();
+    assert_eq!(groups, (0..7).collect::<Vec<_>>());
+    assert_eq!(pager.pinned(), 7);
+    let layer_bytes = pager.buf(0).size();
+    let resident = pager.mapped_bytes() - 7 * layer_bytes;
+
+    // Room for the resident mappings and a two-layer window, nothing to pin.
+    let tight = Paging {
+        force: true,
+        budget: resident + 2 * layer_bytes + layer_bytes / 2,
+    };
+    let paged = HexagonLfmModel::from_gguf_on_with(backend(), file, 64, tight).unwrap();
+    let pager = paged.pager.as_ref().unwrap();
+    assert_eq!(pager.pinned(), 0);
+
+    for (u, p) in unpaged.layers.iter().zip(&paged.layers) {
+        let (Some(u), Some(p)) = (moe_of(u), moe_of(p)) else {
+            continue;
+        };
+        for (uw, pw) in [(&u.gate, &p.gate), (&u.up, &p.up), (&u.down, &p.down)] {
+            assert_eq!((uw.size, uw.expert_stride), (pw.size, pw.expert_stride));
+            let want = &unpaged.weights_buf.as_slice()[uw.offset..uw.offset + uw.size];
+            let got = &pager.buf(pw.group.unwrap()).as_slice()[pw.offset..pw.offset + pw.size];
+            assert!(want == got, "expert bytes differ in group {:?}", pw.group);
+        }
+    }
+
+    let mut state = InferenceState::from_config_capped(
+        &paged.config,
+        &KvCompression::None,
+        paged.config.max_seq_len,
+    )
+    .unwrap();
+    let _ = op_capture::take();
+    paged
+        .try_forward_input(DecodeInput::Token(3), DecodeOutput::Logits, 0, &mut state)
+        .unwrap();
+    let decode_flushes = op_capture::take().len();
+    // 7 routed layers through a window of 2: layers 3, 5 and 7 each rotate.
+    assert_eq!(pager.stats().page_ins, 7);
+    assert_eq!(pager.stats().rotations, 3);
+    assert_eq!(
+        decode_flushes,
+        3 + 1,
+        "one flush per rotation plus the last"
+    );
+
+    let tokens: Vec<u32> = (0..16).collect();
+    paged
+        .try_forward_prefill_chunk(&tokens, 1, &mut state)
+        .unwrap();
+    // The pass starts with layers 6 and 7 still mapped; layer 1 rotates.
+    assert!(pager.stats().rotations > 3);
 }

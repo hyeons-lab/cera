@@ -47,6 +47,9 @@ struct HexagonWeight {
 
 #[derive(Clone, Copy, Debug)]
 struct HexagonStackedWeight {
+    /// Paged experts only: which per-layer expert buffer holds the weight
+    /// (`offset` is then local to it). `None` = the resident weights buffer.
+    group: Option<usize>,
     offset: usize,
     size: usize,
     in_dim: usize,
@@ -504,6 +507,9 @@ struct ModelParts {
     config: ModelConfig,
     token_embd: EmbeddingTable,
     weights_buf: RpcmemBuffer,
+    /// Routed-expert buffers paged through the DSP mapping (`None` = the
+    /// experts, if any, live in `weights_buf`).
+    pager: Option<ExpertPager>,
     layers: Vec<HexagonLayer>,
     output_norm_offset: usize,
     lm_head: HexagonWeight,
@@ -1049,6 +1055,9 @@ pub struct HexagonLfmModel {
     token_embd: EmbeddingTable,
 
     // Unified weights buffer in rpcmem (all static weights across all layers)
+    /// Per-layer routed-expert buffers when the experts are paged through the
+    /// DSP mapping; stacked weights with a `group` live here, not in `weights_buf`.
+    pager: Option<ExpertPager>,
     weights_buf: RpcmemBuffer,
     layers: Vec<HexagonLayer>,
     output_norm_offset: usize,
@@ -1149,7 +1158,9 @@ enum DecodeResult {
 mod blocks;
 mod host;
 mod ops;
+mod pager;
 mod weights;
+use pager::{ExpertPager, Paging};
 use weights::*;
 
 impl HexagonLfmModel {
@@ -1242,6 +1253,7 @@ impl HexagonLfmModel {
             session_gate: ModelSessionGate::default(),
             token_embd: p.token_embd,
             weights_buf: p.weights_buf,
+            pager: p.pager,
             layers: p.layers,
             output_norm_offset: p.output_norm_offset,
             lm_head: p.lm_head,
@@ -1286,6 +1298,16 @@ impl HexagonLfmModel {
         backend: Backend,
         gguf: GgufFile,
         context_size: usize,
+    ) -> Result<Self, CeraError> {
+        Self::from_gguf_on_with(backend, gguf, context_size, Paging::from_env())
+    }
+
+    /// [`Self::from_gguf_on`] with the paging policy given (host tests force it).
+    fn from_gguf_on_with(
+        backend: Backend,
+        gguf: GgufFile,
+        context_size: usize,
+        paging: Paging,
     ) -> Result<Self, CeraError> {
         let gguf = Arc::new(gguf);
         let config = crate::model::lfm2::LfmModel::parse_config(&gguf, context_size)
@@ -1352,7 +1374,13 @@ impl HexagonLfmModel {
         }
 
         let src = GgufSource { gguf: &gguf };
-        let mut plan = WeightPlanner::new(&src);
+        // Routed experts that cannot all stay mapped are planned into one
+        // buffer per layer and paged (see `pager`). Scratch is already mapped
+        // here, so `mapped_bytes` counts it.
+        let map_budget = paging.budget;
+        let gguf_bytes: u64 = gguf.tensors.values().map(|t| t.size_bytes as u64).sum();
+        let paged = config.moe.is_some() && paging.should_page(gguf_bytes, driver.mapped_bytes());
+        let mut plan = WeightPlanner::new(&src).with_paged_experts(paged);
         let mut kv = KvPlanner::new(kv_dtype, max_seq_len);
         let state_size = align256(hidden_size * 4);
         let moe_dims = |i: usize| {
@@ -1445,13 +1473,28 @@ impl HexagonLfmModel {
         let output_norm_offset = plan.vector(output_norm_name, hidden_size);
         let lm_head = plan.weight(lm_head_name, hidden_size, vocab_size)?;
 
-        let (weights_buf, kv_state_buf) = WeightCopy {
+        let (weights_buf, kv_state_buf, expert_bufs) = WeightCopy {
             src: &src,
             weights_total: plan.total,
             kv_total: kv.total,
             copies: &plan.copies,
+            groups: &plan.groups,
         }
         .run(driver)?;
+        let pager = if expert_bufs.is_empty() {
+            None
+        } else {
+            let n_groups = expert_bufs.len();
+            let pager = ExpertPager::new(Arc::clone(driver), expert_bufs, map_budget)?;
+            tracing::info!(
+                "cera::hexagon: paging routed experts through the DSP mapping: {} of {n_groups} \
+                 layers pinned, the rest rotate (budget {} MiB, {} MiB mapped)",
+                pager.pinned(),
+                map_budget >> 20,
+                driver.mapped_bytes() >> 20
+            );
+            Some(pager)
+        };
 
         Ok(Self::from_parts(
             device,
@@ -1461,6 +1504,7 @@ impl HexagonLfmModel {
                 config,
                 token_embd,
                 weights_buf,
+                pager,
                 layers,
                 output_norm_offset,
                 lm_head,
@@ -1738,13 +1782,15 @@ impl HexagonLfmModel {
         };
         let lm_head = plan.weight(head_name, hidden_size, vocab_size)?;
 
-        let (weights_buf, kv_state_buf) = WeightCopy {
+        let (weights_buf, kv_state_buf, expert_bufs) = WeightCopy {
             src: &src,
             weights_total: plan.total,
             kv_total: kv.total,
             copies: &plan.copies,
+            groups: &[],
         }
         .run(driver)?;
+        debug_assert!(expert_bufs.is_empty());
 
         let dense = DenseSemantics {
             rope_dim: partial_rope.then_some(cpu.rope_dim),
@@ -1768,6 +1814,7 @@ impl HexagonLfmModel {
                 config,
                 token_embd,
                 weights_buf,
+                pager: None,
                 layers,
                 output_norm_offset,
                 lm_head,
@@ -1998,13 +2045,15 @@ impl HexagonLfmModel {
         };
         let lm_head = plan.weight(head_name, hidden_size, vocab_size)?;
 
-        let (weights_buf, kv_state_buf) = WeightCopy {
+        let (weights_buf, kv_state_buf, expert_bufs) = WeightCopy {
             src: &src_tensors,
             weights_total: plan.total,
             kv_total: kv.total,
             copies: &plan.copies,
+            groups: &[],
         }
         .run(driver)?;
+        debug_assert!(expert_bufs.is_empty());
 
         let dense = DenseSemantics {
             attn_scale: scalars.attn,
@@ -2027,6 +2076,7 @@ impl HexagonLfmModel {
                 config,
                 token_embd,
                 weights_buf,
+                pager: None,
                 layers,
                 output_norm_offset,
                 lm_head,

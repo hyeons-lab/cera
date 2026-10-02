@@ -163,6 +163,7 @@ impl HexagonLfmModel {
                 }
             }
             HexagonFfn::Moe(moe) => {
+                self.page_in_experts(session, moe)?;
                 // Routing is per token: one chain per row.
                 for row in 0..rows {
                     self.dispatch_moe_token(

@@ -730,6 +730,8 @@ impl HexagonLfmModel {
         out_act: &RpcmemBuffer,
         out_offset: usize,
         n_expert_used: usize,
+        dsp_threads: u32,
+        vtcm_budget: usize,
     ) -> Result<(), CeraError> {
         let pad32 = |x: usize| (x + 31) & !31;
         let k = w.in_dim;
@@ -798,6 +800,18 @@ impl HexagonLfmModel {
             ],
         )?;
 
+        // The same host-precomputed HVX matmul params as `dispatch_mul_mat`:
+        // the DSP rejects an all-zero set (`InvalParams`). `in_rows` activation
+        // rows per expert slice, one batch.
+        let kparams = build_mul_mat_kernel_params(
+            w.wire_dtype,
+            k,
+            in_rows as u32,
+            1,
+            m * 4,
+            dsp_threads,
+            vtcm_budget,
+        );
         Self::enqueue_labeled(
             session,
             "dispatch_mul_mat_id",
@@ -805,9 +819,42 @@ impl HexagonLfmModel {
             &[src0_ti, src1_ti, src2_ti],
             &[dst_ti],
             [0i32; 16],
-            [0i32; 32],
+            kparams,
         )?;
         Ok(())
+    }
+
+    /// The buffer holding a stacked expert weight: its layer's expert buffer
+    /// when the experts are paged, else the shared weights buffer.
+    fn stacked_buf(&self, w: &HexagonStackedWeight) -> &RpcmemBuffer {
+        match (w.group, &self.pager) {
+            (Some(group), Some(pager)) => {
+                let buf = pager.buf(group);
+                // `emit_ffn_block` pages the layer in first; an unmapped
+                // buffer here would fault the whole batch on the DSP.
+                debug_assert!(buf.is_mapped(), "expert group {group} used while unmapped");
+                buf
+            }
+            _ => &self.weights_buf,
+        }
+    }
+
+    /// Map layer `moe`'s expert buffer before ops that read it are queued.
+    ///
+    /// Making room flushes the pending batch and waits for the DSP, since a
+    /// buffer cannot be unmapped under a batch that reads it.
+    pub(super) fn page_in_experts(
+        &self,
+        session: &mut HexagonQueueSession,
+        moe: &HexagonMoeFfn,
+    ) -> Result<(), CeraError> {
+        let (Some(group), Some(pager)) = (moe.gate.group, &self.pager) else {
+            return Ok(());
+        };
+        pager.page_in(group, || {
+            session.flush()?;
+            session.quiesce()
+        })
     }
 
     pub(super) fn dispatch_moe_token(
@@ -906,7 +953,7 @@ impl HexagonLfmModel {
         // 6. Gate projection: [hs, 1] * stacked_gate -> [ff, n_used]
         Self::dispatch_mul_mat_id(
             session,
-            &self.weights_buf,
+            self.stacked_buf(&moe.gate),
             &moe.gate,
             scratch,
             in_act_offset,
@@ -916,12 +963,14 @@ impl HexagonLfmModel {
             scratch,
             gate_off,
             n_used,
+            session.dsp_threads(),
+            self.vtcm_budget,
         )?;
 
         // 7. Up projection: [hs, 1] * stacked_up -> [ff, n_used]
         Self::dispatch_mul_mat_id(
             session,
-            &self.weights_buf,
+            self.stacked_buf(&moe.up),
             &moe.up,
             scratch,
             in_act_offset,
@@ -931,6 +980,8 @@ impl HexagonLfmModel {
             scratch,
             up_off,
             n_used,
+            session.dsp_threads(),
+            self.vtcm_budget,
         )?;
 
         // 8. FFN activation: swiglu([ff, n_used])
@@ -950,7 +1001,7 @@ impl HexagonLfmModel {
         // 9. Down projection: [ff, n_used] * stacked_down -> [hs, n_used]
         Self::dispatch_mul_mat_id(
             session,
-            &self.weights_buf,
+            self.stacked_buf(&moe.down),
             &moe.down,
             scratch,
             swiglu_off,
@@ -960,6 +1011,8 @@ impl HexagonLfmModel {
             scratch,
             down_off,
             n_used,
+            session.dsp_threads(),
+            self.vtcm_budget,
         )?;
 
         // 10. Combine expert outputs: sum_{e=0..n_used} (down[e] * weight[e])

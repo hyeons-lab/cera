@@ -4,6 +4,7 @@
 //! and the Hexagon DSP without PCIe-style copying.
 
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::sys::FastRpcDriver;
 use crate::session::CeraError;
@@ -14,7 +15,10 @@ pub struct RpcmemBuffer {
     ptr: *mut u8,
     size: usize,
     fd: i32,
-    mapped: bool,
+    /// Whether the buffer is currently mapped into the CDSP. Atomic so a
+    /// pager can map and unmap through a shared reference while the model
+    /// holds `&RpcmemBuffer` for emitting ops.
+    mapped: AtomicBool,
 }
 
 // SAFETY (Send + Sync): the allocation is DSP-visible from any thread, but
@@ -63,8 +67,38 @@ impl RpcmemBuffer {
             ptr,
             size,
             fd,
-            mapped,
+            mapped: AtomicBool::new(mapped),
         })
+    }
+
+    /// Whether the buffer is currently mapped into the CDSP.
+    pub fn is_mapped(&self) -> bool {
+        self.mapped.load(Ordering::SeqCst)
+    }
+
+    /// Map the buffer into the CDSP (no-op when already mapped). The caller
+    /// must keep the total within the DSP address space; see
+    /// [`FastRpcDriver::ensure_map_fits`].
+    pub fn map_to_dsp(&self) -> Result<(), CeraError> {
+        if self.is_mapped() {
+            return Ok(());
+        }
+        self.driver.ensure_map_fits(self.size)?;
+        self.driver.fastrpc_mmap(self.fd, self.ptr, self.size)?;
+        self.mapped.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Unmap the buffer from the CDSP, returning its address space. The host
+    /// memory stays allocated and intact. Every batch that reads the buffer
+    /// must have completed first.
+    pub fn unmap_from_dsp(&self) -> Result<(), CeraError> {
+        if !self.is_mapped() {
+            return Ok(());
+        }
+        self.driver.fastrpc_munmap(self.fd, self.ptr, self.size)?;
+        self.mapped.store(false, Ordering::SeqCst);
+        Ok(())
     }
 
     /// Obtain a shared slice view of the host-accessible memory.
@@ -129,7 +163,7 @@ impl RpcmemBuffer {
 
 impl Drop for RpcmemBuffer {
     fn drop(&mut self) {
-        if self.mapped {
+        if self.is_mapped() {
             let _ = self.driver.fastrpc_munmap(self.fd, self.ptr, self.size);
         }
         self.driver.rpcmem_free(self.ptr);
