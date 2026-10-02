@@ -72,14 +72,14 @@ impl RpcmemBuffer {
     }
 
     /// Whether the buffer is currently mapped into the CDSP.
-    pub fn is_mapped(&self) -> bool {
+    pub(crate) fn is_mapped(&self) -> bool {
         self.mapped.load(Ordering::SeqCst)
     }
 
-    /// Map the buffer into the CDSP (no-op when already mapped). The caller
-    /// must keep the total within the DSP address space; see
+    /// Map the buffer into the CDSP (no-op when already mapped). Refused up
+    /// front when the DSP address space cannot hold it; see
     /// [`FastRpcDriver::ensure_map_fits`].
-    pub fn map_to_dsp(&self) -> Result<(), CeraError> {
+    pub(crate) fn map_to_dsp(&self) -> Result<(), CeraError> {
         if self.is_mapped() {
             return Ok(());
         }
@@ -91,8 +91,9 @@ impl RpcmemBuffer {
 
     /// Unmap the buffer from the CDSP, returning its address space. The host
     /// memory stays allocated and intact. Every batch that reads the buffer
-    /// must have completed first.
-    pub fn unmap_from_dsp(&self) -> Result<(), CeraError> {
+    /// must have completed first, and the caller must be the one serializing
+    /// access to the queue (the mapped flag is check-then-act).
+    pub(crate) fn unmap_from_dsp(&self) -> Result<(), CeraError> {
         if !self.is_mapped() {
             return Ok(());
         }
@@ -163,8 +164,13 @@ impl RpcmemBuffer {
 
 impl Drop for RpcmemBuffer {
     fn drop(&mut self) {
-        if self.is_mapped() {
-            let _ = self.driver.fastrpc_munmap(self.fd, self.ptr, self.size);
+        if self.is_mapped()
+            && let Err(e) = self.driver.fastrpc_munmap(self.fd, self.ptr, self.size)
+        {
+            // The mapping (and its share of the address space) leaks. Debug
+            // level: the skel session is closed before the model's buffers
+            // drop, and a refusal there has not been seen on a device.
+            tracing::debug!("cera::hexagon: dropping a mapped buffer: {e}");
         }
         self.driver.rpcmem_free(self.ptr);
     }

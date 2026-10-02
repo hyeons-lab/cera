@@ -634,10 +634,11 @@ fn moe_of(layer: &HexagonLayer) -> Option<&HexagonMoeFfn> {
 /// the model flushes once per window rotation instead of once per layer.
 #[test]
 fn paged_experts_hold_the_same_bytes_and_rotate_through_a_window() {
+    use crate::backend::hexagon::sys::fake::{self, Event};
     let file = lfm2_gguf_layers(true, 8);
     let roomy = Paging {
-        force: false,
         budget: 1 << 30,
+        ..Paging::default()
     };
     let unpaged = HexagonLfmModel::from_gguf_on_with(backend(), file.clone(), 64, roomy).unwrap();
     assert!(unpaged.pager.is_none(), "a model that fits is not paged");
@@ -667,10 +668,24 @@ fn paged_experts_hold_the_same_bytes_and_rotate_through_a_window() {
     let tight = Paging {
         force: true,
         budget: resident + 2 * layer_bytes + layer_bytes / 2,
+        ..Paging::default()
     };
-    let paged = HexagonLfmModel::from_gguf_on_with(backend(), file, 64, tight).unwrap();
+    // Distinct fds let the event log tell the buffers apart (the goldens do
+    // not hash this test's batches). A fresh backend resets the fake, so this
+    // comes after it.
+    let backend = backend();
+    fake::with(|s| s.distinct_fds = true);
+    let paged = HexagonLfmModel::from_gguf_on_with(backend, file, 64, tight).unwrap();
     let pager = paged.pager.as_ref().unwrap();
     assert_eq!(pager.pinned(), 0);
+
+    // Nothing the paged model reads is mapped until it is paged in.
+    let moe = paged.layers.iter().find_map(moe_of).unwrap();
+    let err = paged
+        .stacked_buf(&moe.gate)
+        .err()
+        .expect("an unmapped expert buffer is an error, not a fault on the DSP");
+    assert!(err.to_string().contains("unmapped"), "{err}");
 
     for (u, p) in unpaged.layers.iter().zip(&paged.layers) {
         let (Some(u), Some(p)) = (moe_of(u), moe_of(p)) else {
@@ -695,6 +710,23 @@ fn paged_experts_hold_the_same_bytes_and_rotate_through_a_window() {
         .try_forward_input(DecodeInput::Token(3), DecodeOutput::Logits, 0, &mut state)
         .unwrap();
     let decode_flushes = op_capture::take().len();
+    // The production adapter tells the DSP to let go of a buffer before the
+    // host unmaps it, every time.
+    let mut released = std::collections::HashSet::new();
+    let mut unmaps = 0;
+    for e in fake::events() {
+        match e {
+            Event::Release(fd) => {
+                released.insert(fd);
+            }
+            Event::Unmap(fd) => {
+                assert!(released.remove(&fd), "fd {fd} unmapped without a release");
+                unmaps += 1;
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(unmaps, 6, "three rotations of a two-layer window");
     // 7 routed layers through a window of 2: layers 3, 5 and 7 each rotate.
     assert_eq!(pager.stats().page_ins, 7);
     assert_eq!(pager.stats().rotations, 3);
@@ -710,6 +742,97 @@ fn paged_experts_hold_the_same_bytes_and_rotate_through_a_window() {
         .unwrap();
     // The pass starts with layers 6 and 7 still mapped; layer 1 rotates.
     assert!(pager.stats().rotations > 3);
+}
+
+/// `--device auto` refuses a routed model that would have to be paged (the
+/// CPU is faster) without ever opening the device, loads one that fits, and
+/// pages once paging is asked for.
+#[test]
+fn auto_refuses_paging_unless_asked() {
+    let file = lfm2_gguf_layers(true, 8);
+    let roomy = Paging {
+        budget: 1 << 30,
+        ..Paging::default()
+    };
+    // Fits: auto loads it, unpaged.
+    let m =
+        HexagonLfmModel::from_gguf_auto_on(|| Ok(()), || Ok(backend()), file.clone(), 64, roomy)
+            .unwrap();
+    assert!(m.pager.is_none());
+
+    // A budget the weights cannot meet needs paging: refused from the GGUF
+    // alone, before the opener runs.
+    let tight = Paging {
+        budget: 1 << 20,
+        ..Paging::default()
+    };
+    let opened = std::cell::Cell::new(false);
+    let err = HexagonLfmModel::from_gguf_auto_on(
+        || Ok(()),
+        || {
+            opened.set(true);
+            Ok(backend())
+        },
+        file.clone(),
+        64,
+        tight,
+    )
+    .err()
+    .expect("auto must not page");
+    let msg = err.to_string();
+    assert!(msg.contains("CERA_HEXAGON_PAGE_EXPERTS"), "{msg}");
+    assert!(msg.contains("--device hexagon") && msg.contains("MiB DSP mapping budget"));
+    assert!(!opened.get(), "refused before opening the device");
+
+    // With no NPU (no driver, or the kill switch) the caller sees that error,
+    // not a paging notice that would send the user after the wrong knob.
+    let err = HexagonLfmModel::from_gguf_auto_on(
+        || Err(CeraError::Backend("no NPU here".into())),
+        || Ok(backend()),
+        file.clone(),
+        64,
+        tight,
+    )
+    .err()
+    .expect("no device");
+    assert!(err.to_string().contains("no NPU here"), "{err}");
+
+    // The late check still guards a borderline model that got that far.
+    let err = HexagonLfmModel::from_gguf_on_with(backend(), file.clone(), 64, tight.for_auto())
+        .err()
+        .expect("late check");
+    assert!(
+        err.to_string().contains("CERA_HEXAGON_PAGE_EXPERTS"),
+        "{err}"
+    );
+
+    // The opt-in pages it under auto; an explicit load pages it too.
+    let forced = Paging {
+        force: true,
+        ..roomy
+    };
+    let m =
+        HexagonLfmModel::from_gguf_auto_on(|| Ok(()), || Ok(backend()), file.clone(), 64, forced)
+            .unwrap();
+    assert!(m.pager.is_some());
+    let m = HexagonLfmModel::from_gguf_on_with(backend(), file, 64, forced).unwrap();
+    assert!(m.pager.is_some(), "an explicit NPU load pages");
+}
+
+/// A weight planned for an expert group on a model with no pager is an error,
+/// not a read of the shared buffer.
+#[test]
+fn grouped_weight_without_a_pager_is_an_error() {
+    let file = lfm2_gguf_layers(true, 4);
+    let m = HexagonLfmModel::from_gguf_on(backend(), file, 64).unwrap();
+    assert!(m.pager.is_none());
+    let moe = m.layers.iter().find_map(moe_of).unwrap();
+    let grouped = HexagonStackedWeight {
+        group: Some(0),
+        ..moe.gate
+    };
+    let err = m.stacked_buf(&grouped).err().expect("no pager for group 0");
+    assert!(err.to_string().contains("no pager"), "{err}");
 }
 
 /// A prefill chunk whose routed rows would not fit one staging buffer is

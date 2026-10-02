@@ -58,8 +58,10 @@ use crate::tokenizer::BpeTokenizer;
 
 /// Which compute backend to use when loading a model.
 ///
-/// `Auto` probes `metal → gpu → cpu` at load time with runtime fallback,
-/// matching the existing CLI `--device auto` behavior. Explicit variants
+/// `Auto` probes `metal → hexagon → gpu → cpu` at load time with runtime
+/// fallback, matching the existing CLI `--device auto` behavior. Hexagon is
+/// skipped for a routed-expert model that would need paging through the DSP
+/// mapping (slower than the CPU) unless `CERA_HEXAGON_PAGE_EXPERTS=1`. Explicit variants
 /// error if their feature isn't compiled in.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackendPreference {
@@ -2323,16 +2325,18 @@ fn load_text_model_auto(
     #[cfg(feature = "hexagon")]
     {
         let gguf_for_hex = gguf.clone();
-        match model::load_model_hexagon(gguf_for_hex, path, context_size) {
+        match model::load_model_hexagon_auto(gguf_for_hex, path, context_size) {
             Ok(m) => {
                 tracing::debug!("cera::engine: using Qualcomm Hexagon NPU backend (auto)");
                 return Ok(m);
             }
             Err(e) => {
                 // Driver-load failures are already surfaced by
-                // `log_context_unavailable` inside the loader; anything else
-                // here (unsupported arch or quant, or a DSP probe failure) is
-                // an ordinary fallthrough logged at debug.
+                // `log_context_unavailable` inside the loader, and a routed
+                // model that would need paging (see `Paging::for_auto`) by a
+                // `hexagon_warn!` at the refusal; anything else here
+                // (unsupported arch or quant, or a DSP probe failure) is an
+                // ordinary fallthrough logged at debug.
                 tracing::debug!("cera::engine: Hexagon unavailable ({e}); trying next backend");
             }
         }

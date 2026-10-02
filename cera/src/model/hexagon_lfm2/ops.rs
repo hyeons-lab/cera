@@ -835,16 +835,34 @@ impl HexagonLfmModel {
 
     /// The buffer holding a stacked expert weight: its layer's expert buffer
     /// when the experts are paged, else the shared weights buffer.
-    fn stacked_buf(&self, w: &HexagonStackedWeight) -> &RpcmemBuffer {
-        match (w.group, &self.pager) {
-            (Some(group), Some(pager)) => {
-                let buf = pager.buf(group);
-                // `emit_ffn_block` pages the layer in first; an unmapped
-                // buffer here would fault the whole batch on the DSP.
-                debug_assert!(buf.is_mapped(), "expert group {group} used while unmapped");
-                buf
-            }
-            _ => &self.weights_buf,
+    pub(super) fn stacked_buf(&self, w: &HexagonStackedWeight) -> Result<&RpcmemBuffer, CeraError> {
+        let Some((group, pager)) = self.pager_for(w.group)? else {
+            return Ok(&self.weights_buf);
+        };
+        let buf = pager.buf(group);
+        // `emit_ffn_block` pages the layer in first; an unmapped buffer would
+        // fault the whole batch on the DSP.
+        if !buf.is_mapped() {
+            return Err(CeraError::Backend(format!(
+                "expert group {group} used while unmapped from the DSP"
+            )));
+        }
+        Ok(buf)
+    }
+
+    /// The pager and group a weight with expert group `group` lives under, or
+    /// `None` for a weight in the shared buffer. A group without a pager is an
+    /// inconsistent plan, not a reason to read the shared buffer.
+    pub(super) fn pager_for(
+        &self,
+        group: Option<usize>,
+    ) -> Result<Option<(usize, &ExpertPager)>, CeraError> {
+        match (group, &self.pager) {
+            (None, _) => Ok(None),
+            (Some(group), Some(pager)) => Ok(Some((group, pager))),
+            (Some(group), None) => Err(CeraError::Backend(format!(
+                "expert group {group} was planned for paging but the model has no pager"
+            ))),
         }
     }
 
@@ -857,10 +875,10 @@ impl HexagonLfmModel {
         session: &mut HexagonQueueSession,
         moe: &HexagonMoeFfn,
     ) -> Result<(), CeraError> {
-        let (Some(group), Some(pager)) = (moe.gate.group, &self.pager) else {
-            return Ok(());
-        };
-        pager.page_in(group, &mut SessionHost(session))
+        match self.pager_for(moe.gate.group)? {
+            Some((group, pager)) => pager.page_in(group, &mut SessionHost(session)),
+            None => Ok(()),
+        }
     }
 
     pub(super) fn dispatch_moe_token(
@@ -960,7 +978,7 @@ impl HexagonLfmModel {
         // 6. Gate projection: [hs, 1] * stacked_gate -> [ff, n_used]
         Self::dispatch_mul_mat_id(
             session,
-            self.stacked_buf(&moe.gate),
+            self.stacked_buf(&moe.gate)?,
             &moe.gate,
             scratch,
             in_act_offset,
@@ -977,7 +995,7 @@ impl HexagonLfmModel {
         // 7. Up projection: [hs, 1] * stacked_up -> [ff, n_used]
         Self::dispatch_mul_mat_id(
             session,
-            self.stacked_buf(&moe.up),
+            self.stacked_buf(&moe.up)?,
             &moe.up,
             scratch,
             in_act_offset,
@@ -1008,7 +1026,7 @@ impl HexagonLfmModel {
         // 9. Down projection: [ff, n_used] * stacked_down -> [hs, n_used]
         Self::dispatch_mul_mat_id(
             session,
-            self.stacked_buf(&moe.down),
+            self.stacked_buf(&moe.down)?,
             &moe.down,
             scratch,
             swiglu_off,

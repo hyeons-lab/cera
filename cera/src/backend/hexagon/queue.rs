@@ -427,7 +427,7 @@ impl HexagonQueueSession {
     /// it, and the host's `fastrpc_munmap` is refused (error 1) until that is
     /// released. Best effort, as in llama.cpp: a buffer no batch has touched
     /// has nothing to release.
-    pub fn release_dsp_reference(&self, buf: &RpcmemBuffer) {
+    pub(crate) fn release_dsp_reference(&self, buf: &RpcmemBuffer) {
         let Some(handle) = self.skel_handle else {
             return;
         };
@@ -438,9 +438,14 @@ impl HexagonQueueSession {
                 len: std::mem::size_of::<u32>(),
             },
         }];
-        let _ =
+        // An error is expected for a buffer no batch has read; a real refusal
+        // surfaces as the host unmap failing right after, with its own error.
+        if let Err(e) =
             self.driver
-                .invoke_skel(handle, super::sys::remote_scalars_make(5, 1, 0), &mut args);
+                .invoke_skel(handle, super::sys::remote_scalars_make(5, 1, 0), &mut args)
+        {
+            tracing::debug!("cera::hexagon: htp_iface_munmap(fd {}): {e}", buf.fd());
+        }
     }
 
     /// Wait until every batch written to the DSP has answered.
@@ -493,7 +498,7 @@ impl HexagonQueueSession {
 
     /// Bytes the pending batch would occupy in the staging buffer if flushed
     /// now (descriptors only).
-    pub fn pending_bytes(&self) -> usize {
+    pub(crate) fn pending_bytes(&self) -> usize {
         self.bufs.len() * std::mem::size_of::<HtpBufDesc>()
             + self.tens.len() * std::mem::size_of::<HtpTensor>()
             + self.ops.len()
@@ -501,7 +506,7 @@ impl HexagonQueueSession {
     }
 
     /// Size of the staging buffer a batch must fit in.
-    pub fn staging_capacity(&self) -> usize {
+    pub(crate) fn staging_capacity(&self) -> usize {
         #[cfg(test)]
         if let Some(cap) = self.staging_cap_override {
             return cap.min(self.staging_buf.size());
@@ -566,10 +571,10 @@ impl HexagonQueueSession {
         let prof_bytes = self.ops.len() * std::mem::size_of::<HtpProfDesc>();
         let total_bytes = bufs_bytes + tens_bytes + ops_bytes + prof_bytes;
 
-        if total_bytes > self.staging_buf.size() {
+        if total_bytes > self.staging_capacity() {
             return Err(CeraError::Backend(format!(
                 "HTP batch size ({total_bytes} bytes) exceeds staging buffer ({})",
-                self.staging_buf.size()
+                self.staging_capacity()
             )));
         }
 
@@ -612,10 +617,10 @@ impl HexagonQueueSession {
         self.resident_staged_id = None;
         staged.validate()?;
         let total_bytes = staged.total_bytes;
-        if total_bytes > self.staging_buf.size() {
+        if total_bytes > self.staging_capacity() {
             return Err(CeraError::Backend(format!(
                 "HTP batch size ({total_bytes} bytes) exceeds staging buffer ({})",
-                self.staging_buf.size()
+                self.staging_capacity()
             )));
         }
 
@@ -648,10 +653,10 @@ impl HexagonQueueSession {
     ) -> Result<(), CeraError> {
         staged.validate()?;
         let total_bytes = staged.total_bytes;
-        if total_bytes > self.staging_buf.size() {
+        if total_bytes > self.staging_capacity() {
             return Err(CeraError::Backend(format!(
                 "HTP batch size ({total_bytes} bytes) exceeds staging buffer ({})",
-                self.staging_buf.size()
+                self.staging_capacity()
             )));
         }
 
@@ -923,12 +928,14 @@ impl HexagonQueueSession {
         let ops_bytes = self.ops.len() * std::mem::size_of::<HtpOpDesc>();
         let prof_bytes = self.ops.len() * std::mem::size_of::<HtpProfDesc>();
         let total_bytes = bufs_bytes + tens_bytes + ops_bytes + prof_bytes;
+        // Row-boundary flushes in the model decide from `pending_bytes()`.
+        debug_assert_eq!(total_bytes, self.pending_bytes());
 
-        if total_bytes > self.staging_buf.size() {
+        if total_bytes > self.staging_capacity() {
             self.drop_pending_batch();
             return Err(CeraError::Backend(format!(
                 "HTP batch size ({total_bytes} bytes) exceeds staging buffer ({})",
-                self.staging_buf.size()
+                self.staging_capacity()
             )));
         }
 
@@ -1360,6 +1367,35 @@ mod tests {
         q.step_mode = false;
         q.set_max_ops_per_flush(None);
         q
+    }
+
+    /// The DSP is told to drop its hold on a buffer through the skel handle,
+    /// and only when the session has one.
+    #[test]
+    fn release_dsp_reference_invokes_the_skel_for_that_buffer() {
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let mut q = test_session();
+        q.release_dsp_reference(&buf);
+        assert!(
+            !fake::events().contains(&fake::Event::Release(buf.fd())),
+            "no skel handle, nothing to call"
+        );
+        q.set_skel_handle(7);
+        q.release_dsp_reference(&buf);
+        assert!(fake::events().contains(&fake::Event::Release(buf.fd())));
+        // A refusal is not fatal (a buffer no batch read has no hold), and the
+        // call still reaches the skel.
+        let invokes = || {
+            fake::events()
+                .iter()
+                .filter(|e| **e == fake::Event::Invoke(5))
+                .count()
+        };
+        let before = invokes();
+        fake::with(|s| s.fail_invoke_method = Some(5));
+        q.release_dsp_reference(&buf);
+        assert_eq!(invokes(), before + 1);
     }
 
     /// Register one tensor (so `tens`/`bufs` are non-empty) then enqueue.

@@ -167,7 +167,8 @@ impl HexagonLfmModel {
                 // Routing is per token: one chain per row. Every row's chain
                 // registers its own tensors, so a row boundary is a valid place
                 // to flush; a long chunk would otherwise overflow the staging
-                // buffer (each row adds well over 100 KB of descriptors).
+                // buffer (each row adds roughly 10 KB of descriptors, so a chunk
+                // of a few hundred rows is more than the 4 MiB staging buffer).
                 for row in 0..rows {
                     if session.pending_bytes() > session.staging_capacity() / 2 {
                         session.flush()?;
@@ -180,15 +181,6 @@ impl HexagonLfmModel {
                         cur_normed + row * hs * 4,
                         row,
                     )?;
-                }
-                if self.dump_act {
-                    self.dump_moe_row(
-                        session,
-                        moe,
-                        layer_idx,
-                        rows - 1,
-                        cur_normed + (rows - 1) * hs * 4,
-                    );
                 }
             }
         }

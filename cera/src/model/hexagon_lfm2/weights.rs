@@ -413,33 +413,63 @@ pub(super) struct WeightCopy<'a> {
     pub(super) weights_total: usize,
     pub(super) kv_total: usize,
     pub(super) copies: &'a [CopyOp],
-    /// Per-layer expert buffers when paging (empty otherwise).
-    pub(super) groups: &'a [ExpertGroup],
 }
 
 impl WeightCopy<'_> {
-    /// Allocate `weights_buf` and `kv_state_buf`, run every planned copy from
-    /// `src` into the former, and flush it. When paging, also allocate one
-    /// buffer per expert group, filled the same way but left unmapped: the
-    /// pager maps them as the forward pass needs them.
+    /// Allocate `weights_buf` (mapped) and `kv_state_buf`, run every planned
+    /// copy from `src` into the former, and flush it.
     pub(super) fn run(
         &self,
         driver: &Arc<crate::backend::hexagon::FastRpcDriver>,
-    ) -> Result<(RpcmemBuffer, RpcmemBuffer, Vec<RpcmemBuffer>), CeraError> {
-        let mut buf = RpcmemBuffer::alloc(Arc::clone(driver), self.weights_total, true)?;
+    ) -> Result<(RpcmemBuffer, RpcmemBuffer), CeraError> {
+        let mut buf =
+            RpcmemBuffer::alloc(Arc::clone(driver), self.weights_total, true).map_err(|e| {
+                CeraError::Backend(format!(
+                    "{}; these weights cannot run on the NPU",
+                    backend_msg(e)
+                ))
+            })?;
         let kv_state_buf = alloc_zeroed_state(driver, self.kv_total)?;
         run_copies(self.src, self.copies, &mut buf)?;
         buf.flush_cpu_cache(0, self.weights_total);
-
-        let mut expert_bufs = Vec::with_capacity(self.groups.len());
-        for group in self.groups {
-            let mut gbuf = RpcmemBuffer::alloc(Arc::clone(driver), group.total, false)?;
-            run_copies(self.src, &group.copies, &mut gbuf)?;
-            gbuf.flush_cpu_cache(0, group.total);
-            expert_bufs.push(gbuf);
-        }
-        Ok((buf, kv_state_buf, expert_bufs))
+        Ok((buf, kv_state_buf))
     }
+}
+
+/// An error's message without the `backend: ` prefix its `Display` adds, for
+/// wrapping it in another backend error.
+pub(super) fn backend_msg(e: CeraError) -> String {
+    match e {
+        CeraError::Backend(m) => m,
+        other => other.to_string(),
+    }
+}
+
+/// One buffer per expert group, filled from `src` but left unmapped: the
+/// pager maps them as the forward pass needs them.
+pub(super) fn run_expert_copies(
+    src: &dyn TensorSource,
+    groups: &[ExpertGroup],
+    driver: &Arc<crate::backend::hexagon::FastRpcDriver>,
+) -> Result<Vec<RpcmemBuffer>, CeraError> {
+    groups
+        .iter()
+        .enumerate()
+        .map(|(i, group)| {
+            let ctx = |e: CeraError| {
+                CeraError::Backend(format!(
+                    "expert layer group {i} ({} bytes): {}",
+                    group.total,
+                    backend_msg(e)
+                ))
+            };
+            let mut gbuf =
+                RpcmemBuffer::alloc(Arc::clone(driver), group.total, false).map_err(ctx)?;
+            run_copies(src, &group.copies, &mut gbuf).map_err(ctx)?;
+            gbuf.flush_cpu_cache(0, group.total);
+            Ok(gbuf)
+        })
+        .collect()
 }
 
 /// Run the planned copies of one buffer from `src` into `buf`.
@@ -1464,10 +1494,31 @@ mod tests {
             weights_total: 4096,
             kv_total: 256,
             copies: &copies,
-            groups: &[],
         }
         .run(&crate::backend::hexagon::sys::fake::driver())
         .map(|_| ())
+    }
+
+    /// Weights that can never fit the DSP address space are refused before
+    /// anything is allocated, and say it is the weights (a KV overflow does not).
+    #[test]
+    fn weights_past_the_dsp_ceiling_are_refused_by_name() {
+        use crate::backend::hexagon::sys::{DSP_MAP_CEILING, fake};
+        fake::reset();
+        let src = OneVector(vec![1.0; 4]);
+        let err = WeightCopy {
+            src: &src,
+            weights_total: DSP_MAP_CEILING + 1,
+            kv_total: 256,
+            copies: &[],
+        }
+        .run(&fake::driver())
+        .err()
+        .expect("too large to map")
+        .to_string();
+        assert!(err.contains("these weights cannot run on the NPU"), "{err}");
+        assert_eq!(err.matches("backend:").count(), 1, "one prefix only: {err}");
+        assert_eq!(fake::with(|s| s.allocs), 0);
     }
 
     /// A vector longer than its reserved slot would spill into the next
@@ -1565,7 +1616,6 @@ mod tests {
                 weights_total: planner.total,
                 kv_total: 256,
                 copies: &planner.copies,
-                groups: &[],
             }
             .run(&crate::backend::hexagon::sys::fake::driver())
             .map(|_| ())

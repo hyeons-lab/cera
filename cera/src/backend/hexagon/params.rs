@@ -205,7 +205,12 @@ pub(crate) fn build_unary_kernel_params_with(
 /// ne03]`, the I32 indices `[ne10, ne11, ne12]`, the output the same type with
 /// matching row strides. With zero params the DSP's task split is empty and
 /// the output is left untouched.
-pub fn build_get_rows_f32_kernel_params(
+///
+/// The host precompute also requires `src0.type == dst.type` and equal row
+/// strides before it picks the DMA path; this builder assumes both (a
+/// contiguous F32 table gathered into a contiguous F32 output) and takes no
+/// strides, so it cannot express a strided source.
+pub(crate) fn build_get_rows_f32_kernel_params(
     ne00: usize,
     ne02: usize,
     ne03: usize,
@@ -228,7 +233,9 @@ pub fn build_get_rows_f32_kernel_params(
         n_threads = sess_threads.min(nr).max(1);
         tasks_per_thread = nr.div_ceil(n_threads);
     } else {
-        // Few rows over many threads: split each F32 row into chunks.
+        // Few rows over many threads: split each F32 row into chunks. Mirrors
+        // the host precompute; with the 2048-element DMA threshold and the
+        // 1024-element chunk floor it only ever yields one chunk today.
         if nr < sess_threads {
             let max_chunks = (ne00 / MIN_CHUNK_ELEMS).max(1);
             chunks_per_row = sess_threads.div_ceil(nr.max(1)).min(max_chunks);
@@ -274,7 +281,7 @@ const HTP_BINARY_KERNEL_CHUNKED: i32 = 7;
 /// chunk size from the thread count, VTCM for double-buffered `src0` and
 /// `dst` chunks per thread plus one 128-byte slot for the scalar. `None` when
 /// that does not fit `vtcm_size`.
-pub fn build_binary_scalar_kernel_params(
+pub(crate) fn build_binary_scalar_kernel_params(
     total_elems: usize,
     vtcm_size: usize,
     n_threads: u32,
@@ -1409,6 +1416,8 @@ pub fn build_hmx_fa_kernel_params_with_softcap(
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     /// The routed-FFN case: gather 4 unbiased expert weights from a 32-entry
     /// table (`src0` `[1, 32]`, indices `[4]`), worked out from the host
     /// precompute: 4 tasks over 4 threads, no DMA, no chunking.
@@ -1471,8 +1480,6 @@ mod tests {
         // Too little VTCM is a refusal, not a clipped layout.
         assert!(build_binary_scalar_kernel_params(64, 1000, 8).is_none());
     }
-
-    use super::*;
 
     #[test]
     fn test_fastdiv_basic() {
