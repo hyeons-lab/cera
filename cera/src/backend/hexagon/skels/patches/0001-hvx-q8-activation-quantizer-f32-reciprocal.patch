@@ -1,0 +1,221 @@
+diff --git a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+index 4564b1524..1b909973f 100644
+--- a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
++++ b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
+@@ -1,46 +1,117 @@
+ // Dynamic quantizers that produce tiled activations
+ 
+-static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * restrict y_block) {
+-    assert((unsigned long) x % 128 == 0);
+-    assert((unsigned long) y_block % 128 == 0);
+-
+-    HVX_Vector * vx = (HVX_Vector *) x;
+-    HVX_Vector zero = Q6_V_vzero();
+-
+-    HVX_Vector vmax0_sf = hvx_vec_reduce_max_f32(hvx_vec_abs_f32(vx[0]));
+-    HVX_Vector vmax1_sf = hvx_vec_reduce_max_f32(hvx_vec_abs_f32(vx[1]));
+-    HVX_Vector vmax2_sf = hvx_vec_reduce_max_f32(hvx_vec_abs_f32(vx[2]));
+-    HVX_Vector vmax3_sf = hvx_vec_reduce_max_f32(hvx_vec_abs_f32(vx[3]));
+-
+-    HVX_Vector vx0_qf = Q6_Vqf32_vsub_VsfVsf(vx[0], zero);
+-    HVX_Vector vx1_qf = Q6_Vqf32_vsub_VsfVsf(vx[1], zero);
+-    HVX_Vector vx2_qf = Q6_Vqf32_vsub_VsfVsf(vx[2], zero);
+-    HVX_Vector vx3_qf = Q6_Vqf32_vsub_VsfVsf(vx[3], zero);
++// f32 -> f16 bits, round to nearest even, with subnormals. Plain integer code, so these two helpers
++// need no compiler runtime on the DSP.
++static inline uint16_t htp_q8_f32_to_f16_bits(float f) {
++    union { float f; uint32_t u; } v = { f };
++    const uint32_t x    = v.u;
++    const uint32_t sign = (x >> 16) & 0x8000u;
++    const uint32_t e    = (x >> 23) & 0xffu;
++    uint32_t       m    = x & 0x7fffffu;
++    if (e == 0xffu) {
++        return (uint16_t) (sign | 0x7c00u | (m ? 0x200u : 0u));
++    }
++    const int32_t exp = (int32_t) e - 127 + 15;
++    if (exp >= 0x1f) {
++        return (uint16_t) (sign | 0x7c00u);
++    }
++    if (exp <= 0) {
++        if (exp < -10) {
++            return (uint16_t) sign;
++        }
++        m |= 0x800000u;
++        const uint32_t shift = (uint32_t) (14 - exp);
++        const uint32_t half  = 1u << (shift - 1);
++        uint32_t       r     = m >> shift;
++        const uint32_t rem   = m & ((1u << shift) - 1u);
++        if (rem > half || (rem == half && (r & 1u))) {
++            r++;
++        }
++        return (uint16_t) (sign | r);
++    }
++    uint32_t       r   = ((uint32_t) exp << 10) | (m >> 13);
++    const uint32_t rem = m & 0x1fffu;
++    if (rem > 0x1000u || (rem == 0x1000u && (r & 1u))) {
++        r++;
++    }
++    return (uint16_t) (sign | r);
++}
+ 
+-    HVX_Vector vmax0_qf = Q6_Vqf32_vsub_VsfVsf(vmax0_sf, zero);
+-    HVX_Vector vmax1_qf = Q6_Vqf32_vsub_VsfVsf(vmax1_sf, zero);
+-    HVX_Vector vmax2_qf = Q6_Vqf32_vsub_VsfVsf(vmax2_sf, zero);
+-    HVX_Vector vmax3_qf = Q6_Vqf32_vsub_VsfVsf(vmax3_sf, zero);
++// f16 bits -> f32, for the non-negative scales produced above (the sign bit is ignored).
++static inline float htp_q8_f16_bits_to_f32(uint16_t h) {
++    const uint32_t e = (h >> 10) & 0x1fu;
++    const uint32_t m = h & 0x3ffu;
++    if (e == 0) {
++        return (float) m * (1.0f / 16777216.0f);  // subnormal: m * 2^-24
++    }
++    union { float f; uint32_t u; } v;
++    v.u = e == 31 ? (0x7f800000u | (m << 13)) : (((e + 112u) << 23) | (m << 13));
++    return v.f;
++}
+ 
+-    HVX_Vector vmax01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vmax1_qf, vmax0_qf)));
+-    HVX_Vector vmax23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vmax3_qf, vmax2_qf)));
++// First stage of the Q8 activation quantizers: 128 floats (four groups of 32) to packed int8
++// values (`vx_i8`, in element order) and the four f16 group scales laid out the way the HVX tail
++// expects them (group 0 in halfword lanes 0..31 of `vd01_hf`, group 1 in 32..63; groups 2 and 3
++// likewise in `vd23_hf`). `d_f32` returns the scales as f32.
++//
++// Each scale is rounded UP to f16 FIRST (the smallest f16 at least amax / 127) and the values are
++// then multiplied by the reciprocal of the ROUNDED scale (in f32), so the int8 values and the
++// stored scale always describe the same numbers. A block holding a NaN or infinity gets a NaN or
++// infinite scale and all-zero values, so the poison reaches the dot product.
++// The previous HVX path did this whole stage in f16, which breaks for blocks with a small maximum:
++// below about 7.7e-3 the scale is an f16 subnormal, and below about 2e-3 its reciprocal overflows
++// f16, so the values came out wrongly scaled (relative error of 50% or more).
++static inline void htp_quantize_q8_stage(const float * restrict x, HVX_Vector * restrict vd01_hf,
++                                         HVX_Vector * restrict vd23_hf, HVX_Vector * restrict vx_i8,
++                                         float * restrict d_f32) {
++    const HVX_Vector * vx   = (const HVX_Vector *) x;
++    const HVX_Vector   zero = Q6_V_vzero();
++
++    float    __attribute__((aligned(128))) mx[32];
++    uint16_t __attribute__((aligned(128))) dbits[2][64];
++    HVX_Vector vq_qf[4];
++
++    for (int g = 0; g < 4; ++g) {
++        *(HVX_Vector *) mx = hvx_vec_reduce_max_f32(hvx_vec_abs_f32(vx[g]));
++        // The stored scale is the smallest f16 at least amax / 127 (round UP, like the CPU
++        // quantizers): rounding to nearest could land below it, and for an f16-subnormal scale
++        // the largest element would then quantize past 127 and saturate.
++        const float    raw_d = mx[0] / 127.0f;
++        uint16_t       dh    = htp_q8_f32_to_f16_bits(raw_d);
++        float          d     = htp_q8_f16_bits_to_f32(dh);
++        if (d < raw_d && dh < 0x7c00u) {
++            dh++;
++            d = htp_q8_f16_bits_to_f32(dh);
++        }
++        const float    inv = d > 0.0f ? 1.0f / d : 0.0f;
++        d_f32[g]           = d;
+ 
+-    HVX_Vector vx01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx1_qf, vx0_qf)));
+-    HVX_Vector vx23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx3_qf, vx2_qf)));
++        uint32_t * dw = (uint32_t *) (dbits[g >> 1] + (g & 1) * 32);
++        const uint32_t w = (uint32_t) dh * 0x10001u;
++        for (int i = 0; i < 16; ++i) {
++            dw[i] = w;
++        }
++        // inv is 0 for a zero, NaN or infinite scale: force the values to 0 instead of letting a
++        // NaN or infinite lane convert to an arbitrary int8.
++        vq_qf[g] = inv != 0.0f ?
++                       Q6_Vqf32_vsub_VsfVsf(hvx_vec_mul_f32_f32(vx[g], hvx_vec_splat_f32(inv)), zero) :
++                       zero;
++    }
+ 
+-    HVX_Vector vd01_qf16 = Q6_Vqf16_vmpy_VhfVhf(vmax01_hf, Q6_Vh_vsplat_R(0x2008));  // 1.0 / 127.0
+-    HVX_Vector vd23_qf16 = Q6_Vqf16_vmpy_VhfVhf(vmax23_hf, Q6_Vh_vsplat_R(0x2008));  // 1.0 / 127.0
+-    HVX_Vector vd01_hf   = Q6_Vhf_equals_Vqf16(vd01_qf16);
+-    HVX_Vector vd23_hf   = Q6_Vhf_equals_Vqf16(vd23_qf16);
++    HVX_Vector vx01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vq_qf[1], vq_qf[0])));
++    HVX_Vector vx23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vq_qf[3], vq_qf[2])));
++    *vx_i8 = Q6_Vb_vpack_VhVh_sat(hvx_vec_i16_from_hf_rnd_sat(vx23_hf), hvx_vec_i16_from_hf_rnd_sat(vx01_hf));
++    *vd01_hf = *(const HVX_Vector *) dbits[0];
++    *vd23_hf = *(const HVX_Vector *) dbits[1];
++}
+ 
+-    HVX_Vector vd01_inv_hf = hvx_vec_inverse_f16(vd01_hf);
+-    HVX_Vector vd23_inv_hf = hvx_vec_inverse_f16(vd23_hf);
+-    vx01_hf              = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(vx01_hf, vd01_inv_hf));
+-    vx23_hf              = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(vx23_hf, vd23_inv_hf));
++static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * restrict y_block) {
++    assert((unsigned long) x % 128 == 0);
++    assert((unsigned long) y_block % 128 == 0);
+ 
+-    HVX_Vector vx01_i16 = hvx_vec_i16_from_hf_rnd_sat(vx01_hf);
+-    HVX_Vector vx23_i16 = hvx_vec_i16_from_hf_rnd_sat(vx23_hf);
+-    HVX_Vector vx_i8    = Q6_Vb_vpack_VhVh_sat(vx23_i16, vx01_i16);
++    HVX_Vector vd01_hf, vd23_hf, vx_i8;
++    float      d_f32[4];
++    htp_quantize_q8_stage(x, &vd01_hf, &vd23_hf, &vx_i8, d_f32);
+ 
+     const HVX_Vector ones = Q6_Vb_vsplat_R(1);
+     HVX_Vector v_sums = Q6_Vw_vrmpy_VbVb(vx_i8, ones);
+@@ -48,11 +119,11 @@ static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * r
+     v_sums = Q6_Vw_vadd_VwVw(v_sums, Q6_V_vror_VR(v_sums, 8));
+     v_sums = Q6_Vw_vadd_VwVw(v_sums, Q6_V_vror_VR(v_sums, 16));
+ 
+-    const HVX_Vector v_inv127 = hvx_vec_splat_f32(1.0f / 127.0f);
+-    HVX_Vector vd0_sf = hvx_vec_mul_f32_f32(vmax0_sf, v_inv127);
+-    HVX_Vector vd1_sf = hvx_vec_mul_f32_f32(vmax1_sf, v_inv127);
+-    HVX_Vector vd2_sf = hvx_vec_mul_f32_f32(vmax2_sf, v_inv127);
+-    HVX_Vector vd3_sf = hvx_vec_mul_f32_f32(vmax3_sf, v_inv127);
++    // the offset term uses the same rounded scales the int8 values were built against
++    HVX_Vector vd0_sf = hvx_vec_splat_f32(d_f32[0]);
++    HVX_Vector vd1_sf = hvx_vec_splat_f32(d_f32[1]);
++    HVX_Vector vd2_sf = hvx_vec_splat_f32(d_f32[2]);
++    HVX_Vector vd3_sf = hvx_vec_splat_f32(d_f32[3]);
+ 
+     HVX_Vector v_sums_sf = Q6_Vsf_equals_Vw(v_sums);
+     HVX_Vector voff0_sf = hvx_vec_mul_f32_f32(vd0_sf, v_sums_sf);
+@@ -118,43 +189,9 @@ static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * r
+     assert((unsigned long) x % 128 == 0);
+     assert((unsigned long) y_block % 128 == 0);
+ 
+-    HVX_Vector * vx = (HVX_Vector *) x;
+-    HVX_Vector zero   = Q6_V_vzero();
+-
+-    HVX_Vector vmax0_sf = hvx_vec_reduce_max_f32(hvx_vec_abs_f32(vx[0]));
+-    HVX_Vector vmax1_sf = hvx_vec_reduce_max_f32(hvx_vec_abs_f32(vx[1]));
+-    HVX_Vector vmax2_sf = hvx_vec_reduce_max_f32(hvx_vec_abs_f32(vx[2]));
+-    HVX_Vector vmax3_sf = hvx_vec_reduce_max_f32(hvx_vec_abs_f32(vx[3]));
+-
+-    HVX_Vector vx0_qf = Q6_Vqf32_vsub_VsfVsf(vx[0], zero);
+-    HVX_Vector vx1_qf = Q6_Vqf32_vsub_VsfVsf(vx[1], zero);
+-    HVX_Vector vx2_qf = Q6_Vqf32_vsub_VsfVsf(vx[2], zero);
+-    HVX_Vector vx3_qf = Q6_Vqf32_vsub_VsfVsf(vx[3], zero);
+-
+-    HVX_Vector vmax0_qf = Q6_Vqf32_vsub_VsfVsf(vmax0_sf, zero);
+-    HVX_Vector vmax1_qf = Q6_Vqf32_vsub_VsfVsf(vmax1_sf, zero);
+-    HVX_Vector vmax2_qf = Q6_Vqf32_vsub_VsfVsf(vmax2_sf, zero);
+-    HVX_Vector vmax3_qf = Q6_Vqf32_vsub_VsfVsf(vmax3_sf, zero);
+-
+-    HVX_Vector vmax01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vmax1_qf, vmax0_qf)));
+-    HVX_Vector vmax23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vmax3_qf, vmax2_qf)));
+-
+-    HVX_Vector vx01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx1_qf, vx0_qf)));
+-    HVX_Vector vx23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx3_qf, vx2_qf)));
+-
+-    HVX_Vector vd01_qf16 = Q6_Vqf16_vmpy_VhfVhf(vmax01_hf, Q6_Vh_vsplat_R(0x2008));
+-    HVX_Vector vd23_qf16 = Q6_Vqf16_vmpy_VhfVhf(vmax23_hf, Q6_Vh_vsplat_R(0x2008));
+-    HVX_Vector vd01_hf   = Q6_Vhf_equals_Vqf16(vd01_qf16);
+-    HVX_Vector vd23_hf   = Q6_Vhf_equals_Vqf16(vd23_qf16);
+-
+-    HVX_Vector vd01_inv_hf = hvx_vec_inverse_f16(vd01_hf);
+-    HVX_Vector vd23_inv_hf = hvx_vec_inverse_f16(vd23_hf);
+-    vx01_hf                = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(vx01_hf, vd01_inv_hf));
+-    vx23_hf                = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(vx23_hf, vd23_inv_hf));
+-
+-    HVX_Vector vx01_i16 = hvx_vec_i16_from_hf_rnd_sat(vx01_hf);
+-    HVX_Vector vx23_i16 = hvx_vec_i16_from_hf_rnd_sat(vx23_hf);
+-    HVX_Vector vx_i8    = Q6_Vb_vpack_VhVh_sat(vx23_i16, vx01_i16);
++    HVX_Vector vd01_hf, vd23_hf, vx_i8;
++    float      d_f32[4];
++    htp_quantize_q8_stage(x, &vd01_hf, &vd23_hf, &vx_i8, d_f32);
+ 
+     HVX_VectorPair vp01 = Q6_W_vshuff_VVR(vd01_hf, vd01_hf, -64);
+     HVX_VectorPair vp23 = Q6_W_vshuff_VVR(vd23_hf, vd23_hf, -64);
