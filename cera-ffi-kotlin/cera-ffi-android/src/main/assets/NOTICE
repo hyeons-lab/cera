@@ -5,7 +5,8 @@ This library embeds prebuilt Qualcomm Hexagon DSP worker libraries
 (`libggml-htp-v73.so`, `libggml-htp-v75.so`, `libggml-htp-v79.so`,
 `libggml-htp-v81.so`, `libggml-htp-v85.so`, inside libcera_ffi.so). They are compiled from
 llama.cpp sources plus one patch to the Q8 activation quantizer
-(`cera/src/backend/hexagon/skels/patches/`):
+(in the cera repository under
+`cera/src/backend/hexagon/skels/patches/`):
 
   Copyright (c) 2023-2026 The ggml authors
   License: MIT (full text below)
