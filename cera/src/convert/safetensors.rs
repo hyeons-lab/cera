@@ -178,13 +178,20 @@ pub fn translate_hf_to_gguf_tensor_name_with_arch(hf_name: &str, arch: &str) -> 
     // Direct global mappings
     if hf_name == "model.embed_tokens.weight"
         || hf_name == "lfm2.embed_tokens.weight"
+        || (arch == "lfm2" && hf_name == "embed_tokens.weight")
         || hf_name == "transformer.wte.weight"
         || hf_name == "embeddings.word_embeddings.weight"
     {
         return "token_embd.weight".to_string();
     }
+    // the bidirectional LFM2 encoders (Embedding, ColBERT) are saved without the `model.`
+    // prefix
     if hf_name == "lfm2.embedding_norm.weight"
-        || (arch == "lfm2" && hf_name == "model.embedding_norm.weight")
+        || (arch == "lfm2"
+            && matches!(
+                hf_name,
+                "model.embedding_norm.weight" | "embedding_norm.weight"
+            ))
     {
         return "token_embd_norm.weight".to_string();
     }
@@ -495,6 +502,46 @@ pub fn decode_safetensor_to_f32_into(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn gguf_tensor_dims_squeezes_only_the_singleton_conv_axis() {
+        let conv = "blk.0.shortconv.conv.weight";
+        assert_eq!(gguf_tensor_dims(conv, &[64, 1, 3]), vec![3, 64]);
+        // a middle axis that holds data is kept
+        assert_eq!(gguf_tensor_dims(conv, &[64, 2, 3]), vec![3, 2, 64]);
+        // any other tensor is just the reversed shape
+        assert_eq!(
+            gguf_tensor_dims("blk.0.ffn_gate.weight", &[8, 4]),
+            vec![4, 8]
+        );
+        assert_eq!(gguf_tensor_dims("blk.0.attn_norm.weight", &[8]), vec![8]);
+        // only the conv kernel, and only when it is 3-D
+        assert_eq!(
+            gguf_tensor_dims("blk.0.other.weight", &[64, 1, 3]),
+            vec![3, 1, 64]
+        );
+        assert_eq!(gguf_tensor_dims(conv, &[64, 1]), vec![1, 64]);
+    }
+
+    #[test]
+    fn bidirectional_lfm2_encoders_use_unprefixed_embedding_names() {
+        // LFM2.5-Embedding / ColBERT save `embed_tokens.weight`, not `model.embed_tokens.weight`
+        for (hf, gguf) in [
+            ("embed_tokens.weight", "token_embd.weight"),
+            ("embedding_norm.weight", "token_embd_norm.weight"),
+            (
+                "layers.3.conv.in_proj.weight",
+                "blk.3.shortconv.in_proj.weight",
+            ),
+        ] {
+            assert_eq!(translate_hf_to_gguf_tensor_name_with_arch(hf, "lfm2"), gguf);
+        }
+        // the bare names are not claimed for other architectures
+        assert_eq!(
+            translate_hf_to_gguf_tensor_name_with_arch("embedding_norm.weight", "llama"),
+            "embedding_norm.weight"
+        );
+    }
 
     #[test]
     fn test_tensor_name_translation() {
