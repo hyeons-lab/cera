@@ -269,6 +269,8 @@ pub struct HexagonQueueSession {
     /// The skel handle of the device this queue belongs to, for `htp_iface`
     /// calls that name a buffer (set by `HexagonDevice`).
     skel_handle: Option<crate::backend::hexagon::sys::RemoteHandle64>,
+    #[cfg(test)]
+    staging_cap_override: Option<usize>,
     queue: crate::backend::hexagon::sys::DspQueueHandle,
     queue_id: u64,
     staging_buf: RpcmemBuffer,
@@ -332,6 +334,8 @@ impl HexagonQueueSession {
         Ok(Self {
             driver,
             skel_handle: None,
+            #[cfg(test)]
+            staging_cap_override: None,
             queue,
             queue_id,
             staging_buf,
@@ -485,6 +489,31 @@ impl HexagonQueueSession {
     #[cfg(test)]
     pub(crate) fn outstanding_batches(&self) -> u64 {
         self.outstanding
+    }
+
+    /// Bytes the pending batch would occupy in the staging buffer if flushed
+    /// now (descriptors only).
+    pub fn pending_bytes(&self) -> usize {
+        self.bufs.len() * std::mem::size_of::<HtpBufDesc>()
+            + self.tens.len() * std::mem::size_of::<HtpTensor>()
+            + self.ops.len()
+                * (std::mem::size_of::<HtpOpDesc>() + std::mem::size_of::<HtpProfDesc>())
+    }
+
+    /// Size of the staging buffer a batch must fit in.
+    pub fn staging_capacity(&self) -> usize {
+        #[cfg(test)]
+        if let Some(cap) = self.staging_cap_override {
+            return cap.min(self.staging_buf.size());
+        }
+        self.staging_buf.size()
+    }
+
+    /// Test hook: pretend the staging buffer is smaller, so size-driven flushes
+    /// can be exercised with a model small enough to run on the host.
+    #[cfg(test)]
+    pub(crate) fn set_staging_capacity_for_test(&mut self, cap: Option<usize>) {
+        self.staging_cap_override = cap;
     }
 
     /// Number of operations currently enqueued in the pending batch.

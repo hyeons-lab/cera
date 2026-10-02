@@ -678,6 +678,7 @@ impl HexagonLfmModel {
         dst_offset: usize,
         n_rows_in: usize,
         n_rows_out: usize,
+        dsp_threads: u32,
     ) -> Result<(), CeraError> {
         let src0_ti = session.add_tensor(
             src0,
@@ -712,7 +713,8 @@ impl HexagonLfmModel {
             [4, 4, (n_rows_out * 4) as u32, (n_rows_out * 4) as u32],
         )?;
         let params = [0i32; 16];
-        let kparams = [0i32; 32];
+        // The DSP splits the gather by these; zeros leave the output untouched.
+        let kparams = build_get_rows_f32_kernel_params(1, 1, 1, n_rows_out, 1, 1, dsp_threads);
         Self::enqueue_labeled(
             session,
             "dispatch_get_rows",
@@ -945,6 +947,7 @@ impl HexagonLfmModel {
             selected_weights_off,
             n_exp,
             n_used,
+            session.dsp_threads(),
         )?;
 
         // 5b. Renormalization divisor for the selected weights: the CPU

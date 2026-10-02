@@ -164,8 +164,14 @@ impl HexagonLfmModel {
             }
             HexagonFfn::Moe(moe) => {
                 self.page_in_experts(session, moe)?;
-                // Routing is per token: one chain per row.
+                // Routing is per token: one chain per row. Every row's chain
+                // registers its own tensors, so a row boundary is a valid place
+                // to flush; a long chunk would otherwise overflow the staging
+                // buffer (each row adds well over 100 KB of descriptors).
                 for row in 0..rows {
+                    if session.pending_bytes() > session.staging_capacity() / 2 {
+                        session.flush()?;
+                    }
                     self.dispatch_moe_token(
                         session,
                         moe,
@@ -174,6 +180,15 @@ impl HexagonLfmModel {
                         cur_normed + row * hs * 4,
                         row,
                     )?;
+                }
+                if self.dump_act {
+                    self.dump_moe_row(
+                        session,
+                        moe,
+                        layer_idx,
+                        rows - 1,
+                        cur_normed + (rows - 1) * hs * 4,
+                    );
                 }
             }
         }

@@ -446,7 +446,7 @@ fn constructors_build_pinned_models() {
     assert_model(
         "ctor_moe",
         &moe,
-        (10223184744877565750, 6782386862919579423),
+        (10223184744877565750, 11398544486494475589),
     );
     let cpu = crate::model::qwen35::Qwen35Model::from_gguf(qwen35_gguf(), 64).unwrap();
     let qwen35 = HexagonLfmModel::from_qwen35_model_on(backend(), &cpu, 64).unwrap();
@@ -710,4 +710,37 @@ fn paged_experts_hold_the_same_bytes_and_rotate_through_a_window() {
         .unwrap();
     // The pass starts with layers 6 and 7 still mapped; layer 1 rotates.
     assert!(pager.stats().rotations > 3);
+}
+
+/// A prefill chunk whose routed rows would not fit one staging buffer is
+/// flushed between rows instead of failing: with the staging buffer pretended
+/// to be tiny, the chunk still runs, in several batches each within it.
+#[test]
+fn long_routed_prefill_chunk_flushes_between_rows() {
+    let file = lfm2_gguf_layers(true, 4);
+    let mut model = HexagonLfmModel::from_gguf_on(backend(), file, 64).unwrap();
+    let cap = 128 * 1024;
+    model
+        .device
+        .get_mut()
+        .unwrap()
+        .queue_session_mut()
+        .set_staging_capacity_for_test(Some(cap));
+    let mut state = InferenceState::from_config_capped(
+        &model.config,
+        &KvCompression::None,
+        model.config.max_seq_len,
+    )
+    .unwrap();
+    let tokens: Vec<u32> = (0..60).collect();
+    let _ = op_capture::take();
+    model
+        .try_forward_prefill_chunk(&tokens, 0, &mut state)
+        .expect("routed rows must flush between rows once the batch is half full");
+    let batches = op_capture::take();
+    assert!(
+        batches.len() > 3,
+        "expected several flushes, got {}",
+        batches.len()
+    );
 }
