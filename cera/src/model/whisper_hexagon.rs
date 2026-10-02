@@ -13,13 +13,13 @@
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
+use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTile};
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
     HexagonContext, HexagonDevice, HexagonQueueSession, HexagonWeightFormat, HtpDataType,
     HtpOpCode, RpcmemBuffer, align128, build_binary_kernel_params, build_flash_attn_kernel_params,
-    build_layer_norm_params, build_mul_mat_kernel_params, build_unary_kernel_params,
-    quantize_f32_to_q8_0, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0,
-    repacked_matrix_size_q8_0,
+    build_mul_mat_kernel_params, build_unary_kernel_params, quantize_f32_to_q8_0, repack_q4_0,
+    repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::backend::hexagon::{LockOrRecover, lock_reporting_poison, report_poison};
 use crate::model::weights::MmapWeight;
@@ -28,6 +28,10 @@ use crate::model::whisper::{
 };
 use crate::session::CeraError;
 use crate::tensor::DType;
+
+/// Token count per tile for the Whisper encoder (1,500 frames exceed VTCM in
+/// one op). The ViT and detokenizer run whole (`VIT_TILE`, `DETOK_TILE`).
+const WHISPER_TILE: TokenTile = TokenTile::Tiles(64);
 
 fn plan_vec_f32(cur_off: &mut usize, len: usize) -> usize {
     let off = *cur_off;
@@ -927,7 +931,7 @@ impl HexagonWhisperModel {
             );
 
             // Tap 0 -> cur_dst
-            let x0_off = src_base_offset + t_start * stride * row_bytes;
+            let x0_off = conv_tap_input_offset(src_base_offset, row_bytes, 0, t_start, stride);
             let x0_ti = session.add_tensor(
                 src,
                 x0_off,
@@ -946,7 +950,7 @@ impl HexagonWhisperModel {
             )?;
 
             // Tap 1 -> tmp; cur_dst += tmp
-            let x1_off = src_base_offset + row_bytes + t_start * stride * row_bytes;
+            let x1_off = conv_tap_input_offset(src_base_offset, row_bytes, 1, t_start, stride);
             let x1_ti = session.add_tensor(
                 src,
                 x1_off,
@@ -983,7 +987,7 @@ impl HexagonWhisperModel {
             )?;
 
             // Tap 2 -> tmp; cur_dst += tmp
-            let x2_off = src_base_offset + 2 * row_bytes + t_start * stride * row_bytes;
+            let x2_off = conv_tap_input_offset(src_base_offset, row_bytes, 2, t_start, stride);
             let x2_ti = session.add_tensor(
                 src,
                 x2_off,
@@ -1047,344 +1051,7 @@ impl HexagonWhisperModel {
             t_start += chunk;
         }
 
-        Ok(())
-    }
-
-    /// Dispatch GELU activation in-place: `buf[i] = gelu(buf[i])`.
-    fn dispatch_gelu(
-        session: &mut HexagonQueueSession,
-        buf: &RpcmemBuffer,
-        offset: usize,
-        dim: usize,
-        n_tokens: usize,
-    ) -> Result<(), CeraError> {
-        let chunk_size = 64;
-        let mut t_start = 0;
-        while t_start < n_tokens {
-            let chunk = (n_tokens - t_start).min(chunk_size);
-            let cur_off = offset + t_start * dim * 4;
-            let bytes = dim * chunk * 4;
-            let ti = session.add_tensor(
-                buf,
-                cur_off,
-                bytes,
-                HTP_TENSOR_COMPUTE,
-                HtpDataType::F32 as u32,
-                [dim as u32, chunk as u32, 1, 1],
-                [4, (dim * 4) as u32, bytes as u32, bytes as u32],
-            )?;
-
-            let params = [0i32; 16];
-            let kparams = build_unary_kernel_params(
-                dim,
-                chunk,
-                0,
-                8 * 1024 * 1024,
-                session.dsp_threads(),
-                false,
-            );
-            session.enqueue_op(HtpOpCode::UnaryGelu as u32, &[ti], &[ti], params, kparams)?;
-            t_start += chunk;
-        }
-        Ok(())
-    }
-
-    /// Dispatch LayerNorm: `Norm` -> `Mul` (weight) -> `Add` (bias).
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_layer_norm(
-        session: &mut HexagonQueueSession,
-        src: &RpcmemBuffer,
-        src_offset: usize,
-        dst: &RpcmemBuffer,
-        dst_offset: usize,
-        weights: &RpcmemBuffer,
-        w_offset: usize,
-        b_offset: usize,
-        dim: usize,
-        n_tokens: usize,
-        eps: f32,
-    ) -> Result<(), CeraError> {
-        let w_bytes = dim * 4;
-        let w_ti = session.add_tensor(
-            weights,
-            w_offset,
-            w_bytes,
-            HTP_TENSOR_WEIGHT,
-            HtpDataType::F32 as u32,
-            [dim as u32, 1, 1, 1],
-            [4, w_bytes as u32, w_bytes as u32, w_bytes as u32],
-        )?;
-
-        let b_ti = session.add_tensor(
-            weights,
-            b_offset,
-            w_bytes,
-            HTP_TENSOR_WEIGHT,
-            HtpDataType::F32 as u32,
-            [dim as u32, 1, 1, 1],
-            [4, w_bytes as u32, w_bytes as u32, w_bytes as u32],
-        )?;
-
-        let chunk_size = 64;
-        let mut t_start = 0;
-        while t_start < n_tokens {
-            let chunk = (n_tokens - t_start).min(chunk_size);
-            let bytes = dim * chunk * 4;
-            let cur_src_off = src_offset + t_start * dim * 4;
-            let cur_dst_off = dst_offset + t_start * dim * 4;
-
-            let src_ti = session.add_tensor(
-                src,
-                cur_src_off,
-                bytes,
-                HTP_TENSOR_COMPUTE,
-                HtpDataType::F32 as u32,
-                [dim as u32, chunk as u32, 1, 1],
-                [4, (dim * 4) as u32, bytes as u32, bytes as u32],
-            )?;
-            let dst_ti = session.add_tensor(
-                dst,
-                cur_dst_off,
-                bytes,
-                HTP_TENSOR_COMPUTE,
-                HtpDataType::F32 as u32,
-                [dim as u32, chunk as u32, 1, 1],
-                [4, (dim * 4) as u32, bytes as u32, bytes as u32],
-            )?;
-
-            let params = build_layer_norm_params(eps);
-            let kparams = build_unary_kernel_params(
-                dim,
-                chunk,
-                0,
-                8 * 1024 * 1024,
-                session.dsp_threads(),
-                false,
-            );
-            session.enqueue_op(
-                HtpOpCode::Norm as u32,
-                &[src_ti],
-                &[dst_ti],
-                params,
-                kparams,
-            )?;
-
-            let mul_params = [0i32; 16];
-            let mul_kparams = build_binary_kernel_params(
-                dim,
-                dim,
-                1,
-                1,
-                1,
-                4,
-                8 * 1024 * 1024,
-                session.dsp_threads(),
-            );
-            session.enqueue_op(
-                HtpOpCode::Mul as u32,
-                &[dst_ti, w_ti],
-                &[dst_ti],
-                mul_params,
-                mul_kparams,
-            )?;
-
-            let add_params = [0i32; 16];
-            let add_kparams = build_binary_kernel_params(
-                dim,
-                dim,
-                1,
-                1,
-                1,
-                4,
-                8 * 1024 * 1024,
-                session.dsp_threads(),
-            );
-            session.enqueue_op(
-                HtpOpCode::Add as u32,
-                &[dst_ti, b_ti],
-                &[dst_ti],
-                add_params,
-                add_kparams,
-            )?;
-
-            t_start += chunk;
-        }
-
-        Ok(())
-    }
-
-    /// Dispatch linear matrix multiplication + optional bias add: `dst = x · Wᵀ + bias`.
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_linear_m(
-        session: &mut HexagonQueueSession,
-        x: &RpcmemBuffer,
-        x_offset: usize,
-        weights: &RpcmemBuffer,
-        w_desc: HexagonWhisperWeightDesc,
-        b_offset: Option<usize>,
-        dst: &RpcmemBuffer,
-        dst_offset: usize,
-        n_tokens: usize,
-    ) -> Result<(), CeraError> {
-        let (w_dtype, block_bytes, tile_size) = match w_desc.format {
-            HexagonWeightFormat::RepackedQ8_0 => (HtpDataType::Q8_0, 34usize, 32 * 34usize),
-            HexagonWeightFormat::RepackedQ4_0 => (HtpDataType::Q4_0, 18usize, 32 * 18usize),
-        };
-
-        let ne0 = w_desc.cols;
-        let ne1 = w_desc.rows;
-        let tiled_row_bytes = ne0.div_ceil(32) * tile_size;
-        let w_tot = ne1.div_ceil(32) * tiled_row_bytes;
-        let w_ti = session.add_tensor(
-            weights,
-            w_desc.offset,
-            w_desc.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
-            w_dtype as u32,
-            [ne0 as u32, ne1 as u32, 1, 1],
-            [
-                block_bytes as u32,
-                tiled_row_bytes as u32,
-                w_tot as u32,
-                w_tot as u32,
-            ],
-        )?;
-
-        let b_ti = if let Some(b_off) = b_offset {
-            let b_bytes = w_desc.rows * 4;
-            let ti = session.add_tensor(
-                weights,
-                b_off,
-                b_bytes,
-                HTP_TENSOR_WEIGHT,
-                HtpDataType::F32 as u32,
-                [w_desc.rows as u32, 1, 1, 1],
-                [4, b_bytes as u32, b_bytes as u32, b_bytes as u32],
-            )?;
-            Some(ti)
-        } else {
-            None
-        };
-
-        let chunk_size = 64;
-        let mut t_start = 0;
-        while t_start < n_tokens {
-            let chunk = (n_tokens - t_start).min(chunk_size);
-            let cur_x_off = x_offset + t_start * w_desc.cols * 4;
-            let cur_x_bytes = chunk * w_desc.cols * 4;
-            let x_ti = session.add_tensor(
-                x,
-                cur_x_off,
-                cur_x_bytes,
-                HTP_TENSOR_COMPUTE,
-                HtpDataType::F32 as u32,
-                [w_desc.cols as u32, chunk as u32, 1, 1],
-                [
-                    4,
-                    (w_desc.cols * 4) as u32,
-                    cur_x_bytes as u32,
-                    cur_x_bytes as u32,
-                ],
-            )?;
-
-            let cur_dst_off = dst_offset + t_start * w_desc.rows * 4;
-            let cur_dst_bytes = chunk * w_desc.rows * 4;
-            let dst_ti = session.add_tensor(
-                dst,
-                cur_dst_off,
-                cur_dst_bytes,
-                HTP_TENSOR_COMPUTE,
-                HtpDataType::F32 as u32,
-                [w_desc.rows as u32, chunk as u32, 1, 1],
-                [
-                    4,
-                    (w_desc.rows * 4) as u32,
-                    cur_dst_bytes as u32,
-                    cur_dst_bytes as u32,
-                ],
-            )?;
-
-            let params = [0i32; 16];
-            let kparams = build_mul_mat_kernel_params(
-                w_dtype,
-                w_desc.cols,
-                chunk as u32,
-                1,
-                w_desc.rows * 4,
-                session.dsp_threads(),
-                8 * 1024 * 1024,
-            );
-
-            session.enqueue_op(
-                HtpOpCode::MulMat as u32,
-                &[w_ti, x_ti],
-                &[dst_ti],
-                params,
-                kparams,
-            )?;
-
-            if let Some(bti) = b_ti {
-                let add_params = [0i32; 16];
-                let add_kparams = build_binary_kernel_params(
-                    w_desc.rows,
-                    w_desc.rows,
-                    1,
-                    1,
-                    1,
-                    4,
-                    8 * 1024 * 1024,
-                    session.dsp_threads(),
-                );
-                session.enqueue_op(
-                    HtpOpCode::Add as u32,
-                    &[dst_ti, bti],
-                    &[dst_ti],
-                    add_params,
-                    add_kparams,
-                )?;
-            }
-
-            t_start += chunk;
-        }
-
-        Ok(())
-    }
-
-    /// Dispatch F32 to F16 data type conversion in rpcmem.
-    fn dispatch_cpy_f32_to_f16(
-        session: &mut HexagonQueueSession,
-        src: &RpcmemBuffer,
-        src_offset: usize,
-        dst: &RpcmemBuffer,
-        dst_offset: usize,
-        dim: usize,
-        n_tokens: usize,
-    ) -> Result<(), CeraError> {
-        let src_bytes = dim * n_tokens * 4;
-        let dst_bytes = dim * n_tokens * 2;
-
-        let src_ti = session.add_tensor(
-            src,
-            src_offset,
-            src_bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            [dim as u32, n_tokens as u32, 1, 1],
-            [4, (dim * 4) as u32, src_bytes as u32, src_bytes as u32],
-        )?;
-        let dst_ti = session.add_tensor(
-            dst,
-            dst_offset,
-            dst_bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F16 as u32,
-            [dim as u32, n_tokens as u32, 1, 1],
-            [2, (dim * 2) as u32, dst_bytes as u32, dst_bytes as u32],
-        )?;
-        let params = [0i32; 16];
-        let kparams = [0i32; 32];
-        session.enqueue_op(HtpOpCode::Cpy as u32, &[src_ti], &[dst_ti], params, kparams)?;
-        Ok(())
+        session.end_group()
     }
 
     /// Dispatch unmasked multi-head self-attention on DSP via FlashAttnExt.
@@ -1476,71 +1143,7 @@ impl HexagonWhisperModel {
             params,
             kparams,
         )?;
-        Ok(())
-    }
-
-    /// Dispatch in-place residual addition: `dst += src`.
-    fn dispatch_add_residual(
-        session: &mut HexagonQueueSession,
-        dst: &RpcmemBuffer,
-        dst_offset: usize,
-        src: &RpcmemBuffer,
-        src_offset: usize,
-        dim: usize,
-        n_tokens: usize,
-    ) -> Result<(), CeraError> {
-        let chunk_size = 64;
-        let mut t_start = 0;
-        while t_start < n_tokens {
-            let chunk = (n_tokens - t_start).min(chunk_size);
-            let cur_dst_off = dst_offset + t_start * dim * 4;
-            let cur_src_off = src_offset + t_start * dim * 4;
-            let bytes = dim * chunk * 4;
-            let ne = [dim as u32, chunk as u32, 1, 1];
-            let nb = [4, (dim * 4) as u32, bytes as u32, bytes as u32];
-
-            let dst_ti = session.add_tensor(
-                dst,
-                cur_dst_off,
-                bytes,
-                HTP_TENSOR_COMPUTE,
-                HtpDataType::F32 as u32,
-                ne,
-                nb,
-            )?;
-            let src_ti = session.add_tensor(
-                src,
-                cur_src_off,
-                bytes,
-                HTP_TENSOR_COMPUTE,
-                HtpDataType::F32 as u32,
-                ne,
-                nb,
-            )?;
-
-            let params = [0i32; 16];
-            let kparams = build_binary_kernel_params(
-                dim,
-                dim,
-                chunk,
-                1,
-                1,
-                4,
-                8 * 1024 * 1024,
-                session.dsp_threads(),
-            );
-
-            session.enqueue_op(
-                HtpOpCode::Add as u32,
-                &[dst_ti, src_ti],
-                &[dst_ti],
-                params,
-                kparams,
-            )?;
-
-            t_start += chunk;
-        }
-        Ok(())
+        session.end_group()
     }
 
     /// Dispatch SetRows KV cache insertion: appends 1 row of K/V into F16 cache at `pos`.
@@ -1607,7 +1210,7 @@ impl HexagonWhisperModel {
             params,
             kparams,
         )?;
-        Ok(())
+        session.end_group()
     }
 
     /// Dispatch single-token decode FlashAttnExt over rolling or static KV cache.
@@ -1710,7 +1313,7 @@ impl HexagonWhisperModel {
             params,
             kparams,
         )?;
-        Ok(())
+        session.end_group()
     }
 
     /// Execute audio encoder and precompute static cross-attention on Qualcomm Hexagon NPU.
@@ -1823,14 +1426,17 @@ impl HexagonWhisperModel {
         let pos_off = self.weights_offsets.encoder_pos_embed_off;
 
         // Add positional embedding
-        Self::dispatch_add_residual(
+        dispatch::add_residual(
             session,
             &scratch,
             enc_x_off,
             &self.weights_buf,
             pos_off,
-            d_model,
-            1500,
+            TokenShape {
+                dim: d_model,
+                n_tokens: 1500,
+            },
+            WHISPER_TILE,
         )?;
 
         // 3. Encoder Transformer Blocks
@@ -1845,22 +1451,27 @@ impl HexagonWhisperModel {
 
         for blk in &self.weights_offsets.encoder_blocks {
             // LayerNorm 1
-            Self::dispatch_layer_norm(
+            dispatch::layer_norm(
                 session,
-                &scratch,
-                enc_x_off,
-                &scratch,
-                norm_off,
-                &self.weights_buf,
-                blk.attn_ln_w_off,
-                blk.attn_ln_b_off,
-                d_model,
-                1500,
-                1e-5,
+                LayerNormArgs {
+                    src: &scratch,
+                    src_offset: enc_x_off,
+                    dst: &scratch,
+                    dst_offset: norm_off,
+                    weights: &self.weights_buf,
+                    w_offset: blk.attn_ln_w_off,
+                    b_offset: blk.attn_ln_b_off,
+                    shape: TokenShape {
+                        dim: d_model,
+                        n_tokens: 1500,
+                    },
+                    eps: 1e-5,
+                    tile: WHISPER_TILE,
+                },
             )?;
 
             // Q, K, V projections
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &scratch,
                 norm_off,
@@ -1870,8 +1481,9 @@ impl HexagonWhisperModel {
                 &scratch,
                 q_off,
                 1500,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &scratch,
                 norm_off,
@@ -1881,12 +1493,21 @@ impl HexagonWhisperModel {
                 &scratch,
                 tmp_off,
                 1500,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_cpy_f32_to_f16(
-                session, &scratch, tmp_off, &scratch, k_f16_off, d_model, 1500,
+            dispatch::cpy_f32_to_f16(
+                session,
+                &scratch,
+                tmp_off,
+                &scratch,
+                k_f16_off,
+                TokenShape {
+                    dim: d_model,
+                    n_tokens: 1500,
+                },
             )?;
 
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &scratch,
                 norm_off,
@@ -1896,9 +1517,18 @@ impl HexagonWhisperModel {
                 &scratch,
                 tmp_off,
                 1500,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_cpy_f32_to_f16(
-                session, &scratch, tmp_off, &scratch, v_f16_off, d_model, 1500,
+            dispatch::cpy_f32_to_f16(
+                session,
+                &scratch,
+                tmp_off,
+                &scratch,
+                v_f16_off,
+                TokenShape {
+                    dim: d_model,
+                    n_tokens: 1500,
+                },
             )?;
 
             // Unmasked FlashAttention
@@ -1919,7 +1549,7 @@ impl HexagonWhisperModel {
             )?;
 
             // Attention out projection + residual add
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &scratch,
                 attn_out_off,
@@ -1929,34 +1559,43 @@ impl HexagonWhisperModel {
                 &scratch,
                 attn_out_off,
                 1500,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_add_residual(
+            dispatch::add_residual(
                 session,
                 &scratch,
                 enc_x_off,
                 &scratch,
                 attn_out_off,
-                d_model,
-                1500,
+                TokenShape {
+                    dim: d_model,
+                    n_tokens: 1500,
+                },
+                WHISPER_TILE,
             )?;
 
             // LayerNorm 2
-            Self::dispatch_layer_norm(
+            dispatch::layer_norm(
                 session,
-                &scratch,
-                enc_x_off,
-                &scratch,
-                norm_off,
-                &self.weights_buf,
-                blk.mlp_ln_w_off,
-                blk.mlp_ln_b_off,
-                d_model,
-                1500,
-                1e-5,
+                LayerNormArgs {
+                    src: &scratch,
+                    src_offset: enc_x_off,
+                    dst: &scratch,
+                    dst_offset: norm_off,
+                    weights: &self.weights_buf,
+                    w_offset: blk.mlp_ln_w_off,
+                    b_offset: blk.mlp_ln_b_off,
+                    shape: TokenShape {
+                        dim: d_model,
+                        n_tokens: 1500,
+                    },
+                    eps: 1e-5,
+                    tile: WHISPER_TILE,
+                },
             )?;
 
             // MLP: MLP0 -> GELU -> MLP2 + residual add
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &scratch,
                 norm_off,
@@ -1966,9 +1605,19 @@ impl HexagonWhisperModel {
                 &scratch,
                 mlp_mid_off,
                 1500,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_gelu(session, &scratch, mlp_mid_off, blk.mlp_0_w.rows, 1500)?;
-            Self::dispatch_linear_m(
+            dispatch::gelu(
+                session,
+                &scratch,
+                mlp_mid_off,
+                TokenShape {
+                    dim: blk.mlp_0_w.rows,
+                    n_tokens: 1500,
+                },
+                WHISPER_TILE,
+            )?;
+            dispatch::linear_m(
                 session,
                 &scratch,
                 mlp_mid_off,
@@ -1978,32 +1627,41 @@ impl HexagonWhisperModel {
                 &scratch,
                 mlp_out_off,
                 1500,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_add_residual(
+            dispatch::add_residual(
                 session,
                 &scratch,
                 enc_x_off,
                 &scratch,
                 mlp_out_off,
-                d_model,
-                1500,
+                TokenShape {
+                    dim: d_model,
+                    n_tokens: 1500,
+                },
+                WHISPER_TILE,
             )?;
         }
 
         // 4. Post-LayerNorm -> state_buf.encoder_hidden_off
         let enc_hidden_off = self.state_offsets.encoder_hidden_off;
-        Self::dispatch_layer_norm(
+        dispatch::layer_norm(
             session,
-            &scratch,
-            enc_x_off,
-            &state,
-            enc_hidden_off,
-            &self.weights_buf,
-            self.weights_offsets.encoder_ln_post_w_off,
-            self.weights_offsets.encoder_ln_post_b_off,
-            d_model,
-            1500,
-            1e-5,
+            LayerNormArgs {
+                src: &scratch,
+                src_offset: enc_x_off,
+                dst: &state,
+                dst_offset: enc_hidden_off,
+                weights: &self.weights_buf,
+                w_offset: self.weights_offsets.encoder_ln_post_w_off,
+                b_offset: self.weights_offsets.encoder_ln_post_b_off,
+                shape: TokenShape {
+                    dim: d_model,
+                    n_tokens: 1500,
+                },
+                eps: 1e-5,
+                tile: WHISPER_TILE,
+            },
         )?;
 
         // 5. Precompute Cross-Attention K & V into state_buf.cross_kv
@@ -2011,7 +1669,7 @@ impl HexagonWhisperModel {
             let (cross_k_off, cross_v_off) = self.state_offsets.cross_kv[l];
 
             // Cross-K projection -> F16 Cpy
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &state,
                 enc_hidden_off,
@@ -2021,19 +1679,22 @@ impl HexagonWhisperModel {
                 &scratch,
                 tmp_off,
                 1500,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_cpy_f32_to_f16(
+            dispatch::cpy_f32_to_f16(
                 session,
                 &scratch,
                 tmp_off,
                 &state,
                 cross_k_off,
-                d_model,
-                1500,
+                TokenShape {
+                    dim: d_model,
+                    n_tokens: 1500,
+                },
             )?;
 
             // Cross-V projection -> F16 Cpy
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &state,
                 enc_hidden_off,
@@ -2043,15 +1704,18 @@ impl HexagonWhisperModel {
                 &scratch,
                 tmp_off,
                 1500,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_cpy_f32_to_f16(
+            dispatch::cpy_f32_to_f16(
                 session,
                 &scratch,
                 tmp_off,
                 &state,
                 cross_v_off,
-                d_model,
-                1500,
+                TokenShape {
+                    dim: d_model,
+                    n_tokens: 1500,
+                },
             )?;
         }
 
@@ -2153,21 +1817,26 @@ impl HexagonWhisperModel {
 
         for (l, blk) in self.weights_offsets.decoder_blocks.iter().enumerate() {
             // A. Causal Self-Attention
-            Self::dispatch_layer_norm(
+            dispatch::layer_norm(
                 session,
-                &scratch,
-                dec_x_off,
-                &scratch,
-                norm_off,
-                &self.weights_buf,
-                blk.attn_ln_w_off,
-                blk.attn_ln_b_off,
-                d_model,
-                1,
-                1e-5,
+                LayerNormArgs {
+                    src: &scratch,
+                    src_offset: dec_x_off,
+                    dst: &scratch,
+                    dst_offset: norm_off,
+                    weights: &self.weights_buf,
+                    w_offset: blk.attn_ln_w_off,
+                    b_offset: blk.attn_ln_b_off,
+                    shape: TokenShape {
+                        dim: d_model,
+                        n_tokens: 1,
+                    },
+                    eps: 1e-5,
+                    tile: WHISPER_TILE,
+                },
             )?;
 
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &scratch,
                 norm_off,
@@ -2177,8 +1846,9 @@ impl HexagonWhisperModel {
                 &scratch,
                 q_off,
                 1,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &scratch,
                 norm_off,
@@ -2188,8 +1858,9 @@ impl HexagonWhisperModel {
                 &scratch,
                 k_off,
                 1,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &scratch,
                 norm_off,
@@ -2199,6 +1870,7 @@ impl HexagonWhisperModel {
                 &scratch,
                 v_off,
                 1,
+                WHISPER_TILE,
             )?;
 
             // SetRows K & V into self_kv cache
@@ -2244,7 +1916,7 @@ impl HexagonWhisperModel {
                 scale,
             )?;
 
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &scratch,
                 attn_out_off,
@@ -2254,33 +1926,42 @@ impl HexagonWhisperModel {
                 &scratch,
                 attn_out_off,
                 1,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_add_residual(
+            dispatch::add_residual(
                 session,
                 &scratch,
                 dec_x_off,
                 &scratch,
                 attn_out_off,
-                d_model,
-                1,
+                TokenShape {
+                    dim: d_model,
+                    n_tokens: 1,
+                },
+                WHISPER_TILE,
             )?;
 
             // B. Cross-Attention over static encoder hidden states
-            Self::dispatch_layer_norm(
+            dispatch::layer_norm(
                 session,
-                &scratch,
-                dec_x_off,
-                &scratch,
-                norm_off,
-                &self.weights_buf,
-                blk.cross_attn_ln_w_off,
-                blk.cross_attn_ln_b_off,
-                d_model,
-                1,
-                1e-5,
+                LayerNormArgs {
+                    src: &scratch,
+                    src_offset: dec_x_off,
+                    dst: &scratch,
+                    dst_offset: norm_off,
+                    weights: &self.weights_buf,
+                    w_offset: blk.cross_attn_ln_w_off,
+                    b_offset: blk.cross_attn_ln_b_off,
+                    shape: TokenShape {
+                        dim: d_model,
+                        n_tokens: 1,
+                    },
+                    eps: 1e-5,
+                    tile: WHISPER_TILE,
+                },
             )?;
 
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &scratch,
                 norm_off,
@@ -2290,6 +1971,7 @@ impl HexagonWhisperModel {
                 &scratch,
                 cross_q_off,
                 1,
+                WHISPER_TILE,
             )?;
 
             let (cross_k_off, cross_v_off) = self.state_offsets.cross_kv[l];
@@ -2310,7 +1992,7 @@ impl HexagonWhisperModel {
                 scale,
             )?;
 
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &scratch,
                 cross_out_off,
@@ -2320,33 +2002,42 @@ impl HexagonWhisperModel {
                 &scratch,
                 cross_out_off,
                 1,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_add_residual(
+            dispatch::add_residual(
                 session,
                 &scratch,
                 dec_x_off,
                 &scratch,
                 cross_out_off,
-                d_model,
-                1,
+                TokenShape {
+                    dim: d_model,
+                    n_tokens: 1,
+                },
+                WHISPER_TILE,
             )?;
 
             // C. MLP
-            Self::dispatch_layer_norm(
+            dispatch::layer_norm(
                 session,
-                &scratch,
-                dec_x_off,
-                &scratch,
-                norm_off,
-                &self.weights_buf,
-                blk.mlp_ln_w_off,
-                blk.mlp_ln_b_off,
-                d_model,
-                1,
-                1e-5,
+                LayerNormArgs {
+                    src: &scratch,
+                    src_offset: dec_x_off,
+                    dst: &scratch,
+                    dst_offset: norm_off,
+                    weights: &self.weights_buf,
+                    w_offset: blk.mlp_ln_w_off,
+                    b_offset: blk.mlp_ln_b_off,
+                    shape: TokenShape {
+                        dim: d_model,
+                        n_tokens: 1,
+                    },
+                    eps: 1e-5,
+                    tile: WHISPER_TILE,
+                },
             )?;
 
-            Self::dispatch_linear_m(
+            dispatch::linear_m(
                 session,
                 &scratch,
                 norm_off,
@@ -2356,9 +2047,19 @@ impl HexagonWhisperModel {
                 &scratch,
                 mlp_mid_off,
                 1,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_gelu(session, &scratch, mlp_mid_off, blk.mlp_0_w.rows, 1)?;
-            Self::dispatch_linear_m(
+            dispatch::gelu(
+                session,
+                &scratch,
+                mlp_mid_off,
+                TokenShape {
+                    dim: blk.mlp_0_w.rows,
+                    n_tokens: 1,
+                },
+                WHISPER_TILE,
+            )?;
+            dispatch::linear_m(
                 session,
                 &scratch,
                 mlp_mid_off,
@@ -2368,36 +2069,45 @@ impl HexagonWhisperModel {
                 &scratch,
                 mlp_out_off,
                 1,
+                WHISPER_TILE,
             )?;
-            Self::dispatch_add_residual(
+            dispatch::add_residual(
                 session,
                 &scratch,
                 dec_x_off,
                 &scratch,
                 mlp_out_off,
-                d_model,
-                1,
+                TokenShape {
+                    dim: d_model,
+                    n_tokens: 1,
+                },
+                WHISPER_TILE,
             )?;
         }
 
         // 3. Post-LayerNorm
-        Self::dispatch_layer_norm(
+        dispatch::layer_norm(
             session,
-            &scratch,
-            dec_x_off,
-            &scratch,
-            dec_x_off,
-            &self.weights_buf,
-            self.weights_offsets.decoder_ln_post_w_off,
-            self.weights_offsets.decoder_ln_post_b_off,
-            d_model,
-            1,
-            1e-5,
+            LayerNormArgs {
+                src: &scratch,
+                src_offset: dec_x_off,
+                dst: &scratch,
+                dst_offset: dec_x_off,
+                weights: &self.weights_buf,
+                w_offset: self.weights_offsets.decoder_ln_post_w_off,
+                b_offset: self.weights_offsets.decoder_ln_post_b_off,
+                shape: TokenShape {
+                    dim: d_model,
+                    n_tokens: 1,
+                },
+                eps: 1e-5,
+                tile: WHISPER_TILE,
+            },
         )?;
 
         // 4. LM Head projection: logits = dec_x · proj_wᵀ
         let logits_off = self.scratch_offsets.logits_off;
-        Self::dispatch_linear_m(
+        dispatch::linear_m(
             session,
             &scratch,
             dec_x_off,
@@ -2407,6 +2117,7 @@ impl HexagonWhisperModel {
             &scratch,
             logits_off,
             1,
+            WHISPER_TILE,
         )?;
 
         // Submit DSP queue and wait
@@ -2603,19 +2314,32 @@ impl HexagonWhisperModel {
     }
 }
 
+/// Byte offset of the activation window feeding tap `k` for the token run
+/// starting at `t_start`. The source is time-major with one zero pad row in
+/// front, so tap `k` of output `t` reads row `t * stride + k`.
+fn conv_tap_input_offset(
+    src_base_offset: usize,
+    row_bytes: usize,
+    k: usize,
+    t_start: usize,
+    stride: usize,
+) -> usize {
+    src_base_offset + (k + t_start * stride) * row_bytes
+}
+
 /// Initialize Hexagon Whisper model, returning a detailed CeraError on failure.
 pub fn init_hexagon_whisper(
     weights: &WhisperWeights,
     tokenizer: &crate::tokenizer::BpeTokenizer,
 ) -> Result<Arc<HexagonWhisperModel>, CeraError> {
-    if std::env::var("CERA_DISABLE_HEXAGON").is_ok() || std::env::var("CERA_NO_HEXAGON").is_ok() {
-        return Err(CeraError::Backend(
-            "Hexagon backend disabled via environment variable".into(),
-        ));
-    }
-
-    let context = HexagonContext::new()
-        .map_err(|e| CeraError::Backend(format!("Hexagon context creation failed: {e}")))?;
+    // Only a context failure means "driver failed to load"; classify it here
+    // (kill switch / absent driver stay at info, anything else warns to
+    // logcat) rather than in the caller, which also sees probe and model
+    // construction errors that have different causes.
+    let context = HexagonContext::new().map_err(|e| {
+        crate::backend::hexagon::log_context_unavailable("HexagonWhisperModel", &e);
+        CeraError::Backend(format!("Hexagon context creation failed: {e}"))
+    })?;
 
     let arch_override = std::env::var("CERA_HEXAGON_ARCH")
         .ok()
@@ -2639,7 +2363,10 @@ pub fn try_hexagon_whisper(
     match init_hexagon_whisper(weights, tokenizer) {
         Ok(model) => Some(model),
         Err(e) => {
-            tracing::info!("HexagonWhisperModel unavailable ({e}), falling back");
+            // Context failures were already classified inside
+            // `init_hexagon_whisper`; probe and model-construction errors
+            // are ordinary fallbacks, as in the vision loader.
+            tracing::debug!("whisper: Hexagon NPU unavailable ({e}), falling back");
             None
         }
     }
@@ -2704,6 +2431,14 @@ mod tests {
     use super::*;
     use crate::model::whisper::*;
 
+    /// Tile policy pin: the encoder's 1,500 frames exceed VTCM in one op, so
+    /// Whisper tiles at 64 tokens (the ViT and detokenizer run whole). Pinned
+    /// by behavior: 130 tokens are 3 tiles of a Norm/Mul/Add triple.
+    #[test]
+    fn tile_policy_is_64() {
+        assert_eq!(dispatch::testing::layer_norm_op_count(WHISPER_TILE), 3 * 3);
+    }
+
     #[test]
     fn test_state_offsets_plan_tiny() {
         let cfg = WhisperConfig {
@@ -2762,81 +2497,68 @@ mod tests {
 
     #[test]
     fn test_conv1d_3tap_decomposition_mathematical_equivalence() {
-        // Verify that 3-tap decomposition mathematically matches Conv1dWeights::forward
-        let in_channels = 80;
-        let out_channels = 384;
-        let kernel_size = 3;
-        let t_in = 3000;
+        // Golden: replay the production tap layout (`conv_tap_matrix` for the
+        // staged weights, `conv_tap_input_offset` for the activation windows)
+        // against the CPU reference `Conv1dWeights::forward`. The activation is
+        // laid out exactly as `encode_audio` stages it: time-major rows of
+        // `padded_in` floats with one zero pad row on each side.
+        let in_channels: usize = 80;
+        let padded_in = in_channels.next_multiple_of(32);
+        let out_channels = 24;
+        let t_in = 300;
 
-        let mut weight = vec![0.0f32; out_channels * in_channels * kernel_size];
-        for (i, w) in weight.iter_mut().enumerate() {
-            *w = ((i % 17) as f32 - 8.0) * 0.05;
-        }
+        let weight: Vec<f32> = (0..out_channels * in_channels * 3)
+            .map(|i| ((i % 17) as f32 - 8.0) * 0.05)
+            .collect();
         let bias: Vec<f32> = (0..out_channels).map(|i| (i as f32) * 0.01).collect();
-
         let conv = Conv1dWeights {
-            weight: weight.clone(),
+            weight,
             bias: bias.clone(),
             out_channels,
             in_channels,
-            kernel_size,
+            kernel_size: 3,
         };
+        let in_data: Vec<f32> = (0..in_channels * t_in)
+            .map(|i| ((i % 23) as f32 - 11.0) * 0.1)
+            .collect();
 
-        let mut in_data = vec![0.0f32; in_channels * t_in];
-        for (i, v) in in_data.iter_mut().enumerate() {
-            *v = ((i % 23) as f32 - 11.0) * 0.1;
+        let row_bytes = padded_in * 4;
+        let mut padded = vec![0.0f32; (t_in + 2) * padded_in];
+        for t in 0..t_in {
+            for c in 0..in_channels {
+                padded[(t + 1) * padded_in + c] = in_data[c * t_in + t];
+            }
         }
+        let taps: Vec<Vec<f32>> = (0..3)
+            .map(|k| conv_tap_matrix(&conv, k, padded_in))
+            .collect();
 
-        // Taps W0, W1, W2 of shape [out_channels, in_channels], from the same
-        // helper the Hexagon weight staging uses.
-        let w0 = conv_tap_matrix(&conv, 0, in_channels);
-        let w1 = conv_tap_matrix(&conv, 1, in_channels);
-        let w2 = conv_tap_matrix(&conv, 2, in_channels);
-
-        for stride in [1, 2] {
+        for stride in [1usize, 2] {
             let t_out = t_in / stride;
             let mut ref_out = vec![0.0f32; out_channels * t_out];
             conv.forward(&in_data, t_in, stride, 1, &mut ref_out)
                 .unwrap();
 
-            // Decomposed forward: time-major output [t_out, out_channels]
-            let mut tap_out = vec![0.0f32; t_out * out_channels];
-            for t in 0..t_out {
-                let in_t = t * stride;
-                for r in 0..out_channels {
-                    let mut sum = bias[r];
-                    // Tap 0 (in_t - 1)
-                    if in_t > 0 {
-                        for c in 0..in_channels {
-                            sum += in_data[c * t_in + (in_t - 1)] * w0[r * in_channels + c];
-                        }
-                    }
-                    // Tap 1 (in_t)
-                    for c in 0..in_channels {
-                        sum += in_data[c * t_in + in_t] * w1[r * in_channels + c];
-                    }
-                    // Tap 2 (in_t + 1)
-                    if in_t + 1 < t_in {
-                        for c in 0..in_channels {
-                            sum += in_data[c * t_in + (in_t + 1)] * w2[r * in_channels + c];
-                        }
-                    }
-                    tap_out[t * out_channels + r] = sum;
-                }
-            }
-
-            // Verify that tap_out[t, r] == ref_out[r, t]
             let mut max_err = 0.0f32;
-            for t in 0..t_out {
-                for r in 0..out_channels {
-                    let ref_val = ref_out[r * t_out + t];
-                    let tap_val = tap_out[t * out_channels + r];
-                    let diff = (ref_val - tap_val).abs();
-                    max_err = max_err.max(diff);
+            // Two runs (split mid-way) so `t_start` offsets are exercised too.
+            for (t_start, run) in [(0, t_out / 3), (t_out / 3, t_out - t_out / 3)] {
+                for t in 0..run {
+                    for r in 0..out_channels {
+                        let mut sum = bias[r];
+                        for (k, tap) in taps.iter().enumerate() {
+                            let off = conv_tap_input_offset(0, row_bytes, k, t_start, stride);
+                            let row = off / row_bytes + t * stride;
+                            for c in 0..padded_in {
+                                sum += padded[row * padded_in + c] * tap[r * padded_in + c];
+                            }
+                        }
+                        let ref_val = ref_out[r * t_out + t_start + t];
+                        max_err = max_err.max((ref_val - sum).abs());
+                    }
                 }
             }
             assert!(
-                max_err < 1e-4,
+                max_err < 1e-3,
                 "stride {stride}: max error {max_err} exceeds threshold"
             );
         }

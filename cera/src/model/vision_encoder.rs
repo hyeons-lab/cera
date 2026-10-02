@@ -911,7 +911,9 @@ struct VitScratch {
     /// 12 blocks (was previously allocated per block).
     attn_out: Vec<f32>,
     /// Per-query attention scores `[n_tokens]` used in serial attention.
-    #[allow(dead_code)]
+    /// The `parallel` build gives each rayon worker its own scores buffer,
+    /// so the field (and its allocation) exists only without that feature.
+    #[cfg(not(feature = "parallel"))]
     scores: Vec<f32>,
     attn_proj: Vec<f32>,
     ffn_mid: Vec<f32>,
@@ -932,6 +934,7 @@ impl VitScratch {
             k: vec![0.0; n_pe],
             v: vec![0.0; n_pe],
             attn_out: vec![0.0; n_pe],
+            #[cfg(not(feature = "parallel"))]
             scores: vec![0.0; n_tokens],
             attn_proj: vec![0.0; n_pe],
             ffn_mid: vec![0.0; n_pf],

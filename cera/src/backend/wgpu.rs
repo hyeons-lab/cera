@@ -227,12 +227,13 @@ pub struct GpuContext {
     /// Set by the device-lost callback with the driver reason. wgpu drops
     /// all work silently after loss (instant submits, failed maps, no
     /// validation errors), which used to surface as absurd prefill tok/s
-    /// and an index-OOB panic on the empty argmax readback — so every
-    /// submit/download choke point fails fast when this is set.
+    /// and an index-OOB panic on the empty argmax readback, so every
+    /// submit/download choke point records a fault and skips its work when
+    /// this is set.
     device_lost: Arc<std::sync::Mutex<Option<String>>>,
     /// Sticky record of the last blocking-readback map failure (the
     /// `warn_readback_zeros` sites below). The in-flight failure returns
-    /// zeros to its caller *before* `fail_if_device_lost` can fire on a
+    /// zeros to its caller *before* `device_is_lost` can fire on a
     /// later call, so without this slot a GPU decode fault would be
     /// sampled as token 0 and generation would continue. The model drains
     /// it via [`Self::take_readback_fault`] into `take_decode_error`.
@@ -241,6 +242,11 @@ pub struct GpuContext {
     /// owns its context 1:1 in every production topology, and the session
     /// gate allows one live session per model, so the take is unambiguous.
     readback_fault: Arc<std::sync::Mutex<Option<CeraError>>>,
+    /// Per-context count of submits that actually reached the queue. The
+    /// global `io_stats` counter is shared by every context in the process,
+    /// so a test pinning the lost-device submit guard needs its own.
+    #[cfg(test)]
+    submit_count: Arc<std::sync::atomic::AtomicU64>,
 }
 
 impl Clone for GpuContext {
@@ -261,6 +267,8 @@ impl Clone for GpuContext {
             staging_size: Arc::clone(&self.staging_size),
             device_lost: Arc::clone(&self.device_lost),
             readback_fault: Arc::clone(&self.readback_fault),
+            #[cfg(test)]
+            submit_count: Arc::clone(&self.submit_count),
         }
     }
 }
@@ -318,7 +326,27 @@ pub(crate) struct PendingReadback {
     device: wgpu::Device,
     staging: wgpu::Buffer,
     size: u64,
-    rx: futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>,
+    /// `None` when the map was never requested because the device was already
+    /// lost at [`GpuContext::begin_download_with_encoder`]: the copy was
+    /// skipped, so there is nothing valid to wait for.
+    rx: Option<futures_channel::oneshot::Receiver<Result<(), wgpu::BufferAsyncError>>>,
+    /// The context's device-lost slot, re-checked around the await so a loss
+    /// that lands mid-flight cannot hand back stale or zeroed bytes as `Ok`.
+    device_lost: Arc<std::sync::Mutex<Option<String>>>,
+}
+
+/// Fail with the recorded loss detail when the device is lost. `outcome`
+/// names what happened to the readback ("skipped" before the await,
+/// "discarded" after it) so the two checks stay distinguishable.
+fn check_not_lost(device_lost: &std::sync::Mutex<Option<String>>, outcome: &str) -> Result<()> {
+    let lost = device_lost
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone();
+    if let Some(detail) = lost {
+        anyhow::bail!("GPU device lost ({detail}); readback {outcome}");
+    }
+    Ok(())
 }
 
 impl PendingReadback {
@@ -326,16 +354,22 @@ impl PendingReadback {
     /// GPU device) surface as `anyhow::Error` instead of panicking, so async
     /// callers can propagate them to the JS boundary.
     pub(crate) async fn recv(self) -> Result<Vec<u8>> {
+        check_not_lost(&self.device_lost, "skipped")?;
+        let Some(rx) = self.rx else {
+            anyhow::bail!("GPU device lost; readback was never issued");
+        };
         // Native: drive the queue so the map callback fires before the await
         // resolves (keeps this usable from a blocking executor). wasm: the
         // WebGPU backend ignores `poll`; the await suspends to the JS event
         // loop, which fires the callback.
         #[cfg(not(target_arch = "wasm32"))]
         self.device.poll_wait();
-        self.rx
-            .await
+        rx.await
             .map_err(|_| anyhow::anyhow!("GPU readback channel closed"))?
             .map_err(|e| anyhow::anyhow!("GPU readback failed: {e:?}"))?;
+        // A device lost while the copy was in flight completes the map with
+        // undefined contents on some drivers; treat it as a failed readback.
+        check_not_lost(&self.device_lost, "discarded")?;
 
         let slice = self.staging.slice(0..self.size);
         let data = slice
@@ -349,29 +383,40 @@ impl PendingReadback {
 }
 
 impl GpuContext {
+    /// Report (and record) device loss. A lost device drops all work
+    /// silently, so submitting/reading back anyway would produce
+    /// fake-instant timings and zero/empty readbacks. Instead of panicking
+    /// (which would poison the session mutex and unwind across FFI), the
+    /// first observation records a fault in [`Self::readback_fault`]
+    /// (surfaced by the model as a typed `Backend` error through
+    /// `take_decode_error`) and every choke point that sees `true` skips
+    /// its work and returns an empty/zero value. Loss stays unrecoverable
+    /// without recreating the whole context.
+    fn device_is_lost(&self) -> bool {
+        let guard = self.device_lost.lock().unwrap_or_else(|e| e.into_inner());
+        match guard.as_ref() {
+            Some(detail) => {
+                let detail = detail.clone();
+                drop(guard);
+                self.record_readback_fault(format!("GPU device lost ({detail})"));
+                true
+            }
+            None => false,
+        }
+    }
+
     /// Finish `enc` and submit it, counting the submit.
     ///
     /// Every GPU submit in this backend goes through here, so the submit count
     /// is exact and there is a single choke point to batch submissions at.
-    /// Fail fast when the device-lost callback has fired. A lost device
-    /// drops all work silently, so submitting/reading back anyway would
-    /// produce fake-instant timings and zero/empty readbacks. Panics like
-    /// `poll_wait` on a genuinely broken device: loss is unrecoverable
-    /// without recreating the whole context.
-    fn fail_if_device_lost(&self) {
-        if let Some(detail) = self
-            .device_lost
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .as_ref()
-        {
-            panic!("GPU device lost ({detail}); cannot continue");
-        }
-    }
-
     pub(crate) fn submit_encoder(&self, enc: wgpu::CommandEncoder) {
-        self.fail_if_device_lost();
+        if self.device_is_lost() {
+            return;
+        }
         io_stats::record_submit();
+        #[cfg(test)]
+        self.submit_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         // The env read stays uncached so tests can toggle profiling
         // mid-process; the timestamps below are the part worth skipping.
         let host_prof = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
@@ -583,6 +628,8 @@ impl GpuContext {
             staging_size: Arc::new(std::sync::atomic::AtomicU64::new(0)),
             device_lost: Arc::clone(&device_lost),
             readback_fault: Arc::new(std::sync::Mutex::new(None)),
+            #[cfg(test)]
+            submit_count: Arc::new(std::sync::atomic::AtomicU64::new(0)),
         })
     }
 
@@ -715,7 +762,9 @@ impl GpuContext {
     /// The caller is responsible for having submitted that copy first; this
     /// reads whatever the buffer currently holds.
     pub fn read_mapped_u32(&self, staging: &wgpu::Buffer, count: usize) -> Vec<u32> {
-        self.fail_if_device_lost();
+        if self.device_is_lost() {
+            return Vec::new();
+        }
         let size = (count * std::mem::size_of::<u32>()) as u64;
         assert!(
             staging.size() >= size,
@@ -770,7 +819,7 @@ impl GpuContext {
     ///
     /// Also records the fault in [`Self::readback_fault`] (sticky until
     /// taken): the zeros return to the caller before any later
-    /// `fail_if_device_lost` can fire, so the record is what lets the
+    /// `device_is_lost` can fire, so the record is what lets the
     /// session fail the generation instead of sampling token 0. First
     /// fault wins: one forward can fail several readbacks before the
     /// session takes once, and the surfaced detail should name the first
@@ -817,11 +866,34 @@ impl GpuContext {
         crate::model::take_fault(&self.readback_fault)
     }
 
+    /// Test hook: behave as if the driver's device-lost callback fired.
+    #[cfg(test)]
+    pub(crate) fn simulate_device_lost(&self, detail: &str) {
+        *self.device_lost.lock().unwrap_or_else(|e| e.into_inner()) = Some(detail.to_string());
+    }
+
+    /// Non-consuming peek: true when the device is lost or a readback
+    /// fault is recorded and not yet taken. Lost-device downloads return
+    /// zeros, so anything that would persist a readback (the prefix-cache
+    /// snapshot) must check this before building and again before
+    /// committing, instead of caching zeros as if they were state. Does
+    /// not consume the fault, so the session still surfaces it.
+    pub(crate) fn has_readback_fault(&self) -> bool {
+        self.device_is_lost()
+            || self
+                .readback_fault
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_some()
+    }
+
     /// Read f32 data back from a GPU buffer (blocking). Reuses a cached
     /// staging buffer to avoid per-token allocation.
     pub fn download_f32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {
         use std::sync::atomic::Ordering;
-        self.fail_if_device_lost();
+        if self.device_is_lost() {
+            return vec![0.0f32; count];
+        }
         let size = (count * std::mem::size_of::<f32>()) as u64;
         // Grow staging buffer if needed (typically allocated once for
         // vocab_size). Size check + possible re-allocation happen under
@@ -915,16 +987,25 @@ impl GpuContext {
             mapped_at_creation: false,
         });
 
-        encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
-        self.submit_encoder(encoder);
+        // A lost device drops the submit, so mapping the never-written staging
+        // buffer would resolve `Ok` with zeros. Record the fault and hand back
+        // a handle whose `recv` fails instead.
+        let lost = self.device_is_lost();
+        let rx = if lost {
+            None
+        } else {
+            encoder.copy_buffer_to_buffer(buffer, 0, &staging, 0, size);
+            self.submit_encoder(encoder);
 
-        io_stats::record_readback(size);
-        let (tx, rx) = futures_channel::oneshot::channel();
-        staging
-            .slice(0..size)
-            .map_async(wgpu::MapMode::Read, move |result| {
-                let _ = tx.send(result);
-            });
+            io_stats::record_readback(size);
+            let (tx, rx) = futures_channel::oneshot::channel();
+            staging
+                .slice(0..size)
+                .map_async(wgpu::MapMode::Read, move |result| {
+                    let _ = tx.send(result);
+                });
+            Some(rx)
+        };
 
         PendingReadback {
             #[cfg(not(target_arch = "wasm32"))]
@@ -932,6 +1013,7 @@ impl GpuContext {
             staging,
             size,
             rx,
+            device_lost: Arc::clone(&self.device_lost),
         }
     }
 
@@ -941,6 +1023,11 @@ impl GpuContext {
         buffer: &wgpu::Buffer,
         count: usize,
     ) -> Result<Vec<f32>> {
+        if self.device_is_lost() {
+            // Same gate as the blocking twins, but async callers have a
+            // Result channel, so fail typed instead of returning zeros.
+            anyhow::bail!("GPU device lost; download_f32_async skipped");
+        }
         let size = (count * std::mem::size_of::<f32>()) as u64;
         let bytes = self.begin_download(buffer, size).recv().await?;
         // Copy into a properly aligned Vec<f32> rather than `cast_slice`-ing the
@@ -957,6 +1044,11 @@ impl GpuContext {
         buffer: &wgpu::Buffer,
         count: usize,
     ) -> Result<Vec<u32>> {
+        if self.device_is_lost() {
+            // Same gate as the blocking twins, but async callers have a
+            // Result channel, so fail typed instead of returning zeros.
+            anyhow::bail!("GPU device lost; download_u32_async skipped");
+        }
         let size = (count * std::mem::size_of::<u32>()) as u64;
         let bytes = self.begin_download(buffer, size).recv().await?;
         // Aligned copy — see `download_f32_async`.
@@ -970,7 +1062,9 @@ impl GpuContext {
     /// Used by the argmax kernel which writes `out: array<u32>`.
     pub fn download_u32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<u32> {
         use std::sync::atomic::Ordering;
-        self.fail_if_device_lost();
+        if self.device_is_lost() {
+            return vec![0u32; count];
+        }
         let size = (count * std::mem::size_of::<u32>()) as u64;
         let staging_guard = {
             let mut guard = self.staging.lock().unwrap_or_else(|e| e.into_inner());
@@ -1027,7 +1121,9 @@ impl GpuContext {
     /// Read f16 data back from a GPU buffer and convert to f32 (blocking).
     pub fn download_f16_as_f32(&self, buffer: &wgpu::Buffer, count: usize) -> Vec<f32> {
         use std::sync::atomic::Ordering;
-        self.fail_if_device_lost();
+        if self.device_is_lost() {
+            return vec![0.0f32; count];
+        }
         let size = (count * std::mem::size_of::<f16>()) as u64;
         // copy_buffer_to_buffer requires 4-byte alignment for size and offsets.
         let aligned_size = size.div_ceil(4) * 4;
@@ -2252,6 +2348,16 @@ pub mod shaders {
     /// Weighted sum of a token's expert outputs, generated from
     /// `shaders/slang/moe_combine.slang`. See [`MOE_ROUTE`].
     pub const MOE_COMBINE: &str = include_str!(concat!(env!("OUT_DIR"), "/moe_combine.wgsl"));
+    /// Single-token Gated Delta Net recurrence step for Qwen 3.5 / Ornith 1.0,
+    /// generated from `shaders/slang/deltanet_recurrence.slang` by build.rs and
+    /// shared with the Metal backend.
+    ///
+    /// Validated against a CPU reference by `tests/slang_multitarget_parity.rs`
+    /// (including `head_k_dim > 128`), but not yet dispatched by any model: GPU
+    /// decode for Qwen 3.5 still rejects DeltaNet layers.
+    #[doc(hidden)]
+    pub const DELTANET_RECURRENCE: &str =
+        include_str!(concat!(env!("OUT_DIR"), "/deltanet_recurrence.wgsl"));
     /// Two kernels (`rmsnorm_batch` + `add_rmsnorm_batch`), generated from
     /// `shaders/slang/rmsnorm_batch.slang` by build.rs and shared with the Metal
     /// backend's `metal::shaders::RMSNORM_BATCH`. A
@@ -2560,6 +2666,25 @@ pub(crate) fn require_passthrough_or_skip(ctx: &GpuContext, ran: bool, label: &s
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::future::Future;
+
+    /// A GPU context, or `None` (skip) when no adapter exists. Under
+    /// `CERA_REQUIRE_GPU` a missing adapter fails instead of skipping, so a
+    /// CI leg that must exercise the GPU cannot pass vacuously.
+    fn gpu_or_skip() -> Option<GpuContext> {
+        match GpuContext::new() {
+            Ok(ctx) => Some(ctx),
+            Err(e) => {
+                assert!(
+                    std::env::var("CERA_REQUIRE_GPU")
+                        .unwrap_or_default()
+                        .is_empty(),
+                    "CERA_REQUIRE_GPU is set but no GPU is available: {e}"
+                );
+                None
+            }
+        }
+    }
 
     /// Pack f32 pairs LE (even elem in the low bits) for KV-cache uploads,
     /// exactly as `kv_append` lays them out. One copy for every oracle that
@@ -2721,6 +2846,154 @@ mod tests {
         let buf = ctx.upload_f32(&data, "test");
         let result = ctx.download_f32(&buf, data.len());
         assert_eq!(data, result);
+    }
+
+    /// Device loss must record a typed fault and return empty/zero values
+    /// from every submit/readback choke point instead of panicking.
+    #[test]
+    fn test_device_lost_records_fault_without_panic() {
+        let Some(ctx) = gpu_or_skip() else {
+            return;
+        };
+        let buf = ctx.upload_f32(&[1.0, 2.0, 3.0], "lost");
+        assert!(ctx.take_readback_fault().is_none());
+        // Simulate the driver callback firing.
+        ctx.simulate_device_lost("test: Unknown");
+
+        assert_eq!(ctx.download_f32(&buf, 3), vec![0.0f32; 3]);
+        assert_eq!(ctx.download_u32(&buf, 3), vec![0u32; 3]);
+        assert_eq!(ctx.download_f16_as_f32(&buf, 3), vec![0.0f32; 3]);
+        let staging = ctx.create_readback_buffer(16, "lost");
+        assert!(ctx.read_mapped_u32(&staging, 4).is_empty());
+        let enc = ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("lost"),
+            });
+        let submits_before = ctx.submit_count.load(std::sync::atomic::Ordering::Relaxed);
+        ctx.submit_encoder(enc);
+        assert_eq!(
+            ctx.submit_count.load(std::sync::atomic::Ordering::Relaxed),
+            submits_before,
+            "a lost device must not count or issue a submit"
+        );
+        assert!(ctx.has_readback_fault(), "peek must report the loss");
+        assert!(
+            pollster::block_on(ctx.download_f32_async(&buf, 3)).is_err(),
+            "async download must fail typed on a lost device"
+        );
+        assert!(
+            pollster::block_on(ctx.download_u32_async(&buf, 3)).is_err(),
+            "async download must fail typed on a lost device"
+        );
+
+        match ctx.take_readback_fault() {
+            Some(CeraError::Backend(msg)) => assert!(msg.contains("GPU device lost"), "{msg}"),
+            other => panic!("expected a Backend device-lost fault, got {other:?}"),
+        }
+        assert!(ctx.take_readback_fault().is_none(), "take must drain");
+    }
+
+    /// The pending-download handle used by the async decode paths must fail
+    /// typed on a lost device, never resolve `Ok` with zeros. The healthy
+    /// half first proves the handle really carries data.
+    #[test]
+    fn test_pending_download_fails_typed_on_lost_device() {
+        let Some(ctx) = gpu_or_skip() else {
+            return;
+        };
+        let data = [1.5f32, 2.5, 3.5, 4.5];
+        let buf = ctx.upload_f32(&data, "pending-lost");
+        let size = std::mem::size_of_val(&data) as u64;
+
+        let enc = |label| {
+            ctx.device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: Some(label) })
+        };
+        let healthy = pollster::block_on(
+            ctx.begin_download_with_encoder(enc("ok"), &buf, size)
+                .recv(),
+        )
+        .expect("healthy readback");
+        assert_eq!(bytemuck::cast_slice::<u8, f32>(&healthy), &data);
+
+        // Loss before the handle is created: the copy is skipped, recv fails.
+        let pending = {
+            ctx.simulate_device_lost("test: Unknown");
+            ctx.begin_download_with_encoder(enc("lost"), &buf, size)
+        };
+        let err = pollster::block_on(pending.recv()).expect_err("lost device must not yield Ok");
+        assert!(err.to_string().contains("readback skipped"), "{err}");
+        assert!(ctx.has_readback_fault());
+    }
+
+    /// `rx` is `None` only when the device was lost at creation, and `recv`
+    /// normally reports that through the sticky loss check first. Clearing
+    /// the slot by hand isolates the defensive branch behind it.
+    #[test]
+    fn test_pending_download_without_map_request_fails_typed() {
+        let Some(ctx) = gpu_or_skip() else {
+            return;
+        };
+        let buf = ctx.upload_f32(&[1.0f32; 4], "pending-no-rx");
+        ctx.simulate_device_lost("test: Unknown");
+        let pending = ctx.begin_download(&buf, 16);
+        assert!(pending.rx.is_none(), "a lost device must not issue the map");
+        *ctx.device_lost.lock().unwrap() = None;
+        let err = pollster::block_on(pending.recv()).expect_err("no map request must not yield Ok");
+        assert!(err.to_string().contains("never issued"), "{err}");
+    }
+
+    /// Loss that lands after the map was issued but before `recv` is polled
+    /// is caught by the pre-await check ("skipped"), not returned as data.
+    /// (The post-await check is the next test.)
+    #[test]
+    fn test_pending_download_discards_loss_lost_before_recv() {
+        let Some(ctx) = gpu_or_skip() else {
+            return;
+        };
+        let buf = ctx.upload_f32(&[1.0f32; 4], "pending-flight");
+        let pending = ctx.begin_download(&buf, 16);
+        ctx.simulate_device_lost("test: Unknown");
+        let err = pollster::block_on(pending.recv()).expect_err("in-flight loss must fail");
+        assert!(err.to_string().contains("device lost"), "{err}");
+        assert!(err.to_string().contains("readback skipped"), "{err}");
+    }
+
+    /// The post-await check: the map completes `Ok` only after the loss
+    /// lands while `recv` is parked on the channel, so the pre-await check
+    /// cannot be what catches it. A hand-built handle with a controllable
+    /// channel makes that ordering deterministic.
+    #[test]
+    fn test_pending_download_discards_loss_after_await() {
+        let Some(ctx) = gpu_or_skip() else {
+            return;
+        };
+        let staging = ctx.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("parked"),
+            size: 16,
+            usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (tx, rx) = futures_channel::oneshot::channel();
+        let pending = PendingReadback {
+            #[cfg(not(target_arch = "wasm32"))]
+            device: ctx.device.clone(),
+            staging,
+            size: 16,
+            rx: Some(rx),
+            device_lost: Arc::clone(&ctx.device_lost),
+        };
+        let mut fut = Box::pin(pending.recv());
+        let mut cx = std::task::Context::from_waker(std::task::Waker::noop());
+        assert!(
+            fut.as_mut().poll(&mut cx).is_pending(),
+            "recv must park on the channel while the map is outstanding"
+        );
+        ctx.simulate_device_lost("test: Unknown");
+        tx.send(Ok(())).expect("receiver alive");
+        let err = pollster::block_on(fut).expect_err("loss during the await must fail");
+        assert!(err.to_string().contains("readback discarded"), "{err}");
     }
 
     #[test]

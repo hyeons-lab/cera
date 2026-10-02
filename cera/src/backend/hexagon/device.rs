@@ -126,9 +126,12 @@ pub struct HexagonDevice {
     handle: RemoteHandle64,
     arch: HexagonArch,
     hw_info: HtpHwInfo,
+    /// Torn down explicitly in `Drop` (taken, then the skel handle closed).
     queue_session: Option<HexagonQueueSession>,
     profiler_on: bool,
-    /// Declared last so the votes outlive the skel handle close in `Drop`.
+    /// Field order matters: struct fields drop top to bottom after `Drop::drop`
+    /// returns, so declaring this last keeps the votes held until the queue
+    /// session and the skel handle are closed.
     _power_vote: PowerVote,
 }
 
@@ -215,9 +218,7 @@ impl HexagonDevice {
                 vtcm_size: hw_out.vtcm_size,
             }
         } else {
-            if std::env::var_os("CERA_HEXAGON_DEBUG").is_some() {
-                eprintln!("[cera-hexagon] hwinfo query failed; using fallback threads=8");
-            }
+            super::hexagon_warn!("hwinfo query failed; using fallback threads=8");
             HtpHwInfo {
                 n_threads: 8,
                 n_hvx: 8,
@@ -226,15 +227,14 @@ impl HexagonDevice {
             }
         };
         queue_session.set_dsp_threads(hw_info.n_threads);
-        if std::env::var_os("CERA_HEXAGON_DEBUG").is_some() {
-            eprintln!(
-                "[cera-hexagon] hwinfo: threads={} hvx={} hmx={} vtcm={}MB",
-                hw_info.n_threads,
-                hw_info.n_hvx,
-                hw_info.n_hmx,
-                hw_info.vtcm_size / (1024 * 1024),
-            );
-        }
+        tracing::debug!(
+            target: "cera::hexagon",
+            "hwinfo: threads={} hvx={} hmx={} vtcm={}MB",
+            hw_info.n_threads,
+            hw_info.n_hvx,
+            hw_info.n_hmx,
+            hw_info.vtcm_size / (1024 * 1024),
+        );
 
         // Start session on DSP via htp_iface_start (Method 2: 1 in, 0 out)
         let mut start_payload = HtpStartPayload {
@@ -255,6 +255,7 @@ impl HexagonDevice {
 
         let start_scalars = remote_scalars_make(2, 1, 0);
         if let Err(e) = driver.invoke_skel(handle, start_scalars, &mut in_args) {
+            // Same order as `Drop`: queue session first, then the handle.
             drop(queue_session);
             driver.close_skel_handle(handle);
             return Err(e);
@@ -343,6 +344,16 @@ pub fn probe_device(
     driver: &Arc<FastRpcDriver>,
     arch_override: Option<HexagonArch>,
 ) -> Result<HexagonDevice, CeraError> {
+    probe_device_with(driver, arch_override, |k| std::env::var_os(k))
+}
+
+/// [`probe_device`] with the kill-switch env lookup injected (tests).
+pub(crate) fn probe_device_with(
+    driver: &Arc<FastRpcDriver>,
+    arch_override: Option<HexagonArch>,
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+) -> Result<HexagonDevice, CeraError> {
+    super::ensure_not_disabled_with(get)?;
     let probe_archs: &[HexagonArch] = match arch_override {
         Some(ref arch) => std::slice::from_ref(arch),
         None => &super::skels::PROBE_ARCHS,
@@ -372,6 +383,7 @@ pub fn probe_device(
 
 #[cfg(test)]
 mod tests {
+    use super::super::sys::fake;
     use super::*;
 
     /// The FFI `arch` wire strings are pinned literals: mobile clients
@@ -403,6 +415,20 @@ mod tests {
                 HexagonArch::V85,
             ]
         );
+    }
+
+    /// A failed start closes in `Drop` order: the queue session first, then
+    /// the skel handle.
+    #[test]
+    fn failed_start_closes_queue_before_handle() {
+        fake::reset();
+        fake::with(|s| s.fail_invoke_method = Some(2));
+        let r = HexagonDevice::new(fake::driver(), HexagonArch::V75);
+        assert!(r.is_err());
+        let ev = fake::events();
+        let q = ev.iter().position(|e| *e == fake::Event::QueueClose);
+        let h = ev.iter().position(|e| *e == fake::Event::CloseSkel);
+        assert!(q.is_some() && h.is_some() && q < h, "{ev:?}");
     }
 
     #[test]

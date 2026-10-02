@@ -23,6 +23,8 @@
 
 #![cfg(all(target_arch = "x86_64", not(has_blas), feature = "mmap"))]
 
+mod common;
+
 use std::sync::{Arc, Mutex};
 
 use tracing_subscriber::layer::SubscriberExt;
@@ -140,6 +142,11 @@ fn per_token_fallback_emits_a_warning() {
 /// Mirrors the parity suites' fixture resolution: crate dir's parent, cwd, then
 /// `CERA_MODEL_ROOT`.
 fn find_fixture(rel: &str) -> Option<std::path::PathBuf> {
+    // The shared fixture-dir override wins, so a fixture set kept outside the
+    // tree is found instead of silently skipped.
+    if let Some(p) = common::oracle_fixture(rel) {
+        return Some(p);
+    }
     let mut roots: Vec<std::path::PathBuf> = Vec::new();
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR")
         && let Some(parent) = std::path::PathBuf::from(&manifest).parent()

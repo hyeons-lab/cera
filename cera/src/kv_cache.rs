@@ -443,6 +443,9 @@ pub struct ScratchBuffers {
     pub logits: Vec<f32>,
     /// Scratch for token embedding lookup / hidden state input (hidden_size).
     pub hidden_in: Vec<f32>,
+    /// Gather buffers for partial-rotary RoPE (`n_rot < head_dim`). Stay empty
+    /// for models that rotate whole heads.
+    pub(crate) rope_gather: crate::model::llama::RopeGather,
 }
 
 /// Pre-allocated scratch buffers reused across prefill layers and turns.
@@ -483,6 +486,9 @@ pub struct PrefillScratch {
     /// FFN up matrix (n * intermediate_size).
     pub up_mat: Vec<f32>,
     /// Fused gate and up matrix for BLAS SGEMM (2 * n * intermediate_size).
+    /// Only the BLAS prefill path (`cfg(has_blas)`) touches it, so
+    /// [`Self::ensure`] sizes it only in BLAS builds and it stays empty
+    /// elsewhere.
     pub gate_up_mat: Vec<f32>,
     /// Down projection quantized scales (n * nb_is).
     pub dq_scales: Vec<f32>,
@@ -537,6 +543,7 @@ impl PrefillScratch {
         Self::resize_i8(&mut self.bq_quants, n * hs);
         Self::resize_f32(&mut self.gate_mat, is * n);
         Self::resize_f32(&mut self.up_mat, is * n);
+        #[cfg(has_blas)]
         Self::resize_f32(&mut self.gate_up_mat, 2 * is * n);
         Self::resize_f32(&mut self.dq_scales, n * nb_is);
         Self::resize_i8(&mut self.dq_quants, n * is);
@@ -545,6 +552,95 @@ impl PrefillScratch {
         self.kv_widen_k.clear();
         self.kv_widen_v.clear();
     }
+
+    /// Total heap bytes currently reserved by the scratch buffers.
+    pub fn capacity_bytes(&self) -> usize {
+        // Exhaustive destructure (no `..`): adding a buffer field without
+        // counting it here is a compile error, so it cannot silently escape
+        // the release threshold.
+        let Self {
+            normed,
+            block_out,
+            ffn_input,
+            ffn_out,
+            col,
+            gate_col,
+            up_col,
+            out_col,
+            proj_mat,
+            out_proj_input,
+            q_mat,
+            k_mat,
+            v_mat,
+            bq_scales,
+            bq_quants,
+            gate_mat,
+            up_mat,
+            gate_up_mat,
+            dq_scales,
+            dq_quants,
+            flash_out,
+            q_col,
+            kv_widen_k,
+            kv_widen_v,
+        } = self;
+        let f32s = [
+            normed,
+            block_out,
+            ffn_input,
+            ffn_out,
+            col,
+            gate_col,
+            up_col,
+            out_col,
+            proj_mat,
+            out_proj_input,
+            q_mat,
+            k_mat,
+            v_mat,
+            bq_scales,
+            gate_mat,
+            up_mat,
+            gate_up_mat,
+            dq_scales,
+            flash_out,
+            q_col,
+            kv_widen_k,
+            kv_widen_v,
+        ]
+        .iter()
+        .map(|v| v.capacity())
+        .sum::<usize>();
+        f32s * std::mem::size_of::<f32>() + bq_quants.capacity() + dq_quants.capacity()
+    }
+
+    /// Drop every buffer once the scratch holds more than
+    /// [`Self::RELEASE_THRESHOLD_BYTES`]; returns whether it released.
+    ///
+    /// Release rule: `ensure` keeps the high-water capacity so a run of
+    /// prefill chunks reuses one allocation, and the CPU decode entry
+    /// (`LfmModel::run_layers`) calls this on the first token after a
+    /// prefill; verify-only decoding never reaches `run_layers`, so
+    /// `forward_prefill_logits_all_inner` also calls it for small batches
+    /// (16 tokens or fewer). The first decode token is the natural end of a prefill
+    /// sequence: nothing on the decode path reads these buffers, and the
+    /// next prefill re-allocates once. A large prompt (about 114 MiB at
+    /// hidden 2048, intermediate 8192, n 512) therefore does not pin its
+    /// working set for the rest of the session, while small prefills (e.g.
+    /// speculative verify batches) stay under the threshold and keep
+    /// their buffers. Once released the buffers are empty and this is one
+    /// branch, so the decode path adds no per-token allocation.
+    #[inline]
+    pub fn release_if_large(&mut self) -> bool {
+        if self.normed.capacity() == 0 || self.capacity_bytes() <= Self::RELEASE_THRESHOLD_BYTES {
+            return false;
+        }
+        *self = Self::default();
+        true
+    }
+
+    /// Scratch size above which [`Self::release_if_large`] drops the buffers.
+    pub const RELEASE_THRESHOLD_BYTES: usize = 16 << 20;
 
     #[inline]
     fn resize_f32(vec: &mut Vec<f32>, len: usize) {
@@ -634,6 +730,7 @@ impl InferenceState {
                 moe_selected: Vec::new(),
                 logits: Vec::new(),
                 hidden_in: Vec::new(),
+                rope_gather: Default::default(),
             },
             tq_encode_scratch: None,
             tq_query_scratch: None,
@@ -1051,6 +1148,7 @@ impl InferenceState {
                     .unwrap_or_default(),
                 logits: zeroed_f32(config.vocab_size)?,
                 hidden_in: zeroed_f32(config.hidden_size)?,
+                rope_gather: Default::default(),
             },
             // Scratch is needed whenever either side is compressed. The
             // EncodeScratch `rot` buffer is shared between key and value
@@ -3463,6 +3561,35 @@ mod tests {
             is_causal: true,
             class_labels: Vec::new(),
         }
+    }
+
+    #[test]
+    fn prefill_scratch_releases_large_working_set_only() {
+        let cfg = tiny_config(2, 2048);
+        let mut scratch = PrefillScratch::default();
+
+        // Chunked prefill: same-size chunks reuse one allocation.
+        scratch.ensure(512, &cfg);
+        let ptr = scratch.normed.as_ptr();
+        scratch.ensure(512, &cfg);
+        assert_eq!(ptr, scratch.normed.as_ptr());
+        assert!(scratch.capacity_bytes() > PrefillScratch::RELEASE_THRESHOLD_BYTES);
+        #[cfg(not(has_blas))]
+        assert_eq!(scratch.gate_up_mat.capacity(), 0, "BLAS-only buffer");
+
+        // First decode token: the large working set is dropped.
+        assert!(scratch.release_if_large());
+        assert_eq!(scratch.capacity_bytes(), 0);
+        // Idle afterwards: nothing to release, no reallocation.
+        assert!(!scratch.release_if_large());
+        assert_eq!(scratch.capacity_bytes(), 0);
+
+        // Small prefills (spec-verify batches) keep their buffers.
+        scratch.ensure(4, &cfg);
+        let small = scratch.capacity_bytes();
+        assert!(small > 0 && small <= PrefillScratch::RELEASE_THRESHOLD_BYTES);
+        assert!(!scratch.release_if_large());
+        assert_eq!(scratch.capacity_bytes(), small);
     }
 
     #[test]

@@ -5381,6 +5381,9 @@ public protocol SessionProtocol: AnyObject, Sendable {
      * - `ContextOverflow` if appending image tokens exceeds context limit.
      * - `Cancelled` if execution is interrupted.
      * - `PoisonedSession` if the session lock is poisoned.
+     *
+     * A buffer longer than `width * height * bytes_per_pixel` is accepted:
+     * only the leading bytes are read and the excess is ignored.
      */
     func appendRawImage(pixels: Data, width: UInt32, height: UInt32, format: PixelFormat, maxLongSize: UInt32?) throws 
     
@@ -5973,6 +5976,9 @@ open func appendImage(bytes: Data, maxLongSize: UInt32?)throws   {try rustCallWi
      * - `ContextOverflow` if appending image tokens exceeds context limit.
      * - `Cancelled` if execution is interrupted.
      * - `PoisonedSession` if the session lock is poisoned.
+     *
+     * A buffer longer than `width * height * bytes_per_pixel` is accepted:
+     * only the leading bytes are read and the excess is ignored.
      */
 open func appendRawImage(pixels: Data, width: UInt32, height: UInt32, format: PixelFormat, maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_session_append_raw_image(
@@ -7823,8 +7829,11 @@ public struct GenerateOpts: Equatable, Hashable {
      */
     public var flushEveryMs: UInt32
     /**
-     * Optional speculative decoding configuration (prompt-lookup drafting).
-     * When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
+     * Optional speculative decoding configuration. `None` turns speculative
+     * decoding on only when a drafter is attached (a draft sidecar model next
+     * to the target); with no drafter it stays off. `Some` honours the given
+     * configuration. `no_spec` disables it for this call, and
+     * `SessionConfig.disable_spec` (or `Session.disable_spec`) wins over both.
      */
     public var spec: SpecDecodeConfig?
     /**
@@ -7885,8 +7894,11 @@ public struct GenerateOpts: Equatable, Hashable {
          * Ignored under synchronous generate; reserved for streaming.
          */flushEveryMs: UInt32 = UInt32(50), 
         /**
-         * Optional speculative decoding configuration (prompt-lookup drafting).
-         * When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
+         * Optional speculative decoding configuration. `None` turns speculative
+         * decoding on only when a drafter is attached (a draft sidecar model next
+         * to the target); with no drafter it stays off. `Some` honours the given
+         * configuration. `no_spec` disables it for this call, and
+         * `SessionConfig.disable_spec` (or `Session.disable_spec`) wins over both.
          */spec: SpecDecodeConfig? = nil, 
         /**
          * Disable speculative decoding (even when a draft sidecar model is present).
@@ -13467,7 +13479,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_append_image() != 60729) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_append_raw_image() != 38950) {
+    if (uniffi_cera_ffi_checksum_method_session_append_raw_image() != 27818) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {

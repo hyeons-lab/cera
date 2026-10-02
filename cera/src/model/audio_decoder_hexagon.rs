@@ -12,13 +12,13 @@ use std::sync::{Arc, Mutex};
 use anyhow::Result;
 
 pub use crate::backend::hexagon::HexagonWeightFormat;
+use crate::backend::hexagon::dispatch::{self, TokenShape, TokenTile};
 use crate::backend::hexagon::{
-    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
-    HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer,
-    align128, build_binary_kernel_params, build_flash_attn_kernel_params,
-    build_mul_mat_kernel_params, build_rms_norm_params, build_rope_kernel_params,
-    build_rope_params, build_unary_kernel_params, repack_q4_0, repack_q8_0,
-    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_WEIGHT, HexagonArch, HexagonContext,
+    HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer, align128,
+    build_binary_kernel_params, build_flash_attn_kernel_params, build_rms_norm_params,
+    build_rope_kernel_params, build_rope_params, build_unary_kernel_params, repack_q4_0,
+    repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::backend::hexagon::{LockOrRecover, lock_reporting_poison, report_poison};
 use crate::gguf::GgufFile;
@@ -32,6 +32,10 @@ use crate::tensor::DType;
 
 /// Metadata describing a detokenizer weight tensor in shared rpcmem.
 pub use crate::backend::hexagon::types::HexagonWeightDesc as HexagonDetokWeightDesc;
+
+/// The detokenizer emits one op over all tokens (see `dispatch::TokenTile`);
+/// only the Whisper encoder tiles. Every `dispatch::*` call here passes this.
+const DETOK_TILE: TokenTile = TokenTile::Whole;
 
 /// Offsets for one detokenizer layer in `weights_buf`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -973,7 +977,7 @@ impl HexagonDepthformer {
 
             // 4. Depth linear projection: LLM embedding -> hidden_off
             let res = (|| -> Result<(), CeraError> {
-                HexagonAudioDecoder::dispatch_linear_m(
+                dispatch::linear_m(
                     session,
                     &scratch_guard,
                     so.llm_emb_off,
@@ -983,6 +987,7 @@ impl HexagonDepthformer {
                     &scratch_guard,
                     so.hidden_off,
                     1,
+                    DETOK_TILE,
                 )?;
 
                 // 5. Add previous codebook token embedding
@@ -990,14 +995,17 @@ impl HexagonDepthformer {
                     let prev_cb = &self.weights.depth_embeddings[j - 1];
                     let tok = prev_token as usize;
                     if tok < prev_cb.embedding.rows {
-                        HexagonAudioDecoder::dispatch_add_residual(
+                        dispatch::add_residual(
                             session,
                             &scratch_guard,
                             so.hidden_off,
                             &scratch_guard,
                             so.token_emb_off,
-                            n_embd,
-                            1,
+                            TokenShape {
+                                dim: n_embd,
+                                n_tokens: 1,
+                            },
+                            DETOK_TILE,
                         )?;
                     }
                 }
@@ -1020,7 +1028,7 @@ impl HexagonDepthformer {
                     )?;
 
                     // QKV projection -> qkv_off
-                    HexagonAudioDecoder::dispatch_linear_m(
+                    dispatch::linear_m(
                         session,
                         &scratch_guard,
                         so.normed_off,
@@ -1030,6 +1038,7 @@ impl HexagonDepthformer {
                         &scratch_guard,
                         so.qkv_off,
                         1,
+                        DETOK_TILE,
                     )?;
 
                     // Q per-head RMSNorm
@@ -1093,23 +1102,27 @@ impl HexagonDepthformer {
                     // Write K and V into KV cache as F16
                     let k_dst = self.state_offsets.layers[il].k_cache_off + pos * (kv_dim * 2);
                     let v_dst = self.state_offsets.layers[il].v_cache_off + pos * (kv_dim * 2);
-                    HexagonAudioDecoder::dispatch_cpy_f32_to_f16(
+                    dispatch::cpy_f32_to_f16(
                         session,
                         &scratch_guard,
                         so.qkv_off + q_bytes,
                         &state_buf_guard,
                         k_dst,
-                        kv_dim,
-                        1,
+                        TokenShape {
+                            dim: kv_dim,
+                            n_tokens: 1,
+                        },
                     )?;
-                    HexagonAudioDecoder::dispatch_cpy_f32_to_f16(
+                    dispatch::cpy_f32_to_f16(
                         session,
                         &scratch_guard,
                         so.qkv_off + q_bytes + k_bytes,
                         &state_buf_guard,
                         v_dst,
-                        kv_dim,
-                        1,
+                        TokenShape {
+                            dim: kv_dim,
+                            n_tokens: 1,
+                        },
                     )?;
 
                     // Multi-head self-attention
@@ -1133,7 +1146,7 @@ impl HexagonDepthformer {
                     )?;
 
                     // Out projection -> attn_proj_off
-                    HexagonAudioDecoder::dispatch_linear_m(
+                    dispatch::linear_m(
                         session,
                         &scratch_guard,
                         so.attn_out_off,
@@ -1143,17 +1156,21 @@ impl HexagonDepthformer {
                         &scratch_guard,
                         so.attn_proj_off,
                         1,
+                        DETOK_TILE,
                     )?;
 
                     // Residual add: hidden += attn_proj
-                    HexagonAudioDecoder::dispatch_add_residual(
+                    dispatch::add_residual(
                         session,
                         &scratch_guard,
                         so.hidden_off,
                         &scratch_guard,
                         so.attn_proj_off,
-                        n_embd,
-                        1,
+                        TokenShape {
+                            dim: n_embd,
+                            n_tokens: 1,
+                        },
+                        DETOK_TILE,
                     )?;
 
                     // FFN RMSNorm -> normed_off
@@ -1171,7 +1188,7 @@ impl HexagonDepthformer {
                     )?;
 
                     // Gate + Up GEMVs
-                    HexagonAudioDecoder::dispatch_linear_m(
+                    dispatch::linear_m(
                         session,
                         &scratch_guard,
                         so.normed_off,
@@ -1181,8 +1198,9 @@ impl HexagonDepthformer {
                         &scratch_guard,
                         so.ffn_gate_off,
                         1,
+                        DETOK_TILE,
                     )?;
-                    HexagonAudioDecoder::dispatch_linear_m(
+                    dispatch::linear_m(
                         session,
                         &scratch_guard,
                         so.normed_off,
@@ -1192,6 +1210,7 @@ impl HexagonDepthformer {
                         &scratch_guard,
                         so.ffn_up_off,
                         1,
+                        DETOK_TILE,
                     )?;
 
                     // SwiGLU: silu(gate) * up -> ffn_mid_off
@@ -1208,7 +1227,7 @@ impl HexagonDepthformer {
                     )?;
 
                     // Down projection -> ffn_out_off
-                    HexagonAudioDecoder::dispatch_linear_m(
+                    dispatch::linear_m(
                         session,
                         &scratch_guard,
                         so.ffn_mid_off,
@@ -1218,17 +1237,21 @@ impl HexagonDepthformer {
                         &scratch_guard,
                         so.ffn_out_off,
                         1,
+                        DETOK_TILE,
                     )?;
 
                     // Residual add: hidden += ffn_out
-                    HexagonAudioDecoder::dispatch_add_residual(
+                    dispatch::add_residual(
                         session,
                         &scratch_guard,
                         so.hidden_off,
                         &scratch_guard,
                         so.ffn_out_off,
-                        n_embd,
-                        1,
+                        TokenShape {
+                            dim: n_embd,
+                            n_tokens: 1,
+                        },
+                        DETOK_TILE,
                     )?;
                 }
 
@@ -1246,7 +1269,7 @@ impl HexagonDepthformer {
                     1,
                 )?;
 
-                HexagonAudioDecoder::dispatch_linear_m(
+                dispatch::linear_m(
                     session,
                     &scratch_guard,
                     so.normed_off,
@@ -1256,6 +1279,7 @@ impl HexagonDepthformer {
                     &scratch_guard,
                     so.logits_off,
                     1,
+                    DETOK_TILE,
                 )?;
 
                 session.flush()?;
@@ -1263,7 +1287,9 @@ impl HexagonDepthformer {
             })();
 
             if let Err(e) = res {
-                tracing::warn!("HexagonDepthformer NPU execution failed at codebook {j}: {e}");
+                crate::backend::hexagon::hexagon_warn!(
+                    "HexagonDepthformer NPU execution failed at codebook {j}: {e}"
+                );
                 session.drop_pending_batch();
                 return Err(e);
             }
@@ -1386,7 +1412,9 @@ impl HexagonAudioDecoder {
                     Some(df)
                 }
                 Err(e) => {
-                    tracing::warn!("audio decoder: Hexagon NPU Depthformer unavailable: {e:#}");
+                    crate::backend::hexagon::hexagon_warn!(
+                        "audio decoder: Hexagon NPU Depthformer unavailable: {e:#}"
+                    );
                     None
                 }
             }
@@ -1597,138 +1625,8 @@ impl HexagonAudioDecoder {
                 params,
                 kparams,
             )
-            .map_err(|e| CeraError::Backend(format!("detok_rms_norm_mul: {e}")))
-    }
-
-    /// Dispatch linear layer matmul + optional bias: `dst = x · wᵀ (+ bias)`.
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_linear_m(
-        session: &mut HexagonQueueSession,
-        x: &RpcmemBuffer,
-        x_offset: usize,
-        weights: &RpcmemBuffer,
-        w_desc: HexagonDetokWeightDesc,
-        b_offset: Option<usize>,
-        dst: &RpcmemBuffer,
-        dst_offset: usize,
-        n_tokens: usize,
-    ) -> Result<(), CeraError> {
-        let x_bytes = n_tokens * w_desc.cols * 4;
-        let x_ne = [w_desc.cols as u32, n_tokens as u32, 1, 1];
-        let x_nb = [4, (w_desc.cols * 4) as u32, x_bytes as u32, x_bytes as u32];
-        let x_ti = session.add_tensor(
-            x,
-            x_offset,
-            x_bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            x_ne,
-            x_nb,
-        )?;
-
-        let (w_dtype, block_bytes, tile_size) = match w_desc.format {
-            HexagonWeightFormat::RepackedQ8_0 => (HtpDataType::Q8_0, 34usize, 32 * 34usize),
-            HexagonWeightFormat::RepackedQ4_0 => (HtpDataType::Q4_0, 18usize, 32 * 18usize),
-        };
-
-        let ne0 = w_desc.cols;
-        let ne1 = w_desc.rows;
-        let tiled_row_bytes = ne0.div_ceil(32) * tile_size;
-        let w_tot = ne1.div_ceil(32) * tiled_row_bytes;
-        let w_nb = [
-            block_bytes as u32,
-            tiled_row_bytes as u32,
-            w_tot as u32,
-            w_tot as u32,
-        ];
-        let w_ne = [ne0 as u32, ne1 as u32, 1, 1];
-
-        let w_ti = session.add_tensor(
-            weights,
-            w_desc.offset,
-            w_desc.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
-            w_dtype as u32,
-            w_ne,
-            w_nb,
-        )?;
-
-        let dst_bytes = n_tokens * w_desc.rows * 4;
-        let dst_ne = [w_desc.rows as u32, n_tokens as u32, 1, 1];
-        let dst_nb = [
-            4,
-            (w_desc.rows * 4) as u32,
-            dst_bytes as u32,
-            dst_bytes as u32,
-        ];
-        let dst_ti = session.add_tensor(
-            dst,
-            dst_offset,
-            dst_bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            dst_ne,
-            dst_nb,
-        )?;
-
-        let params = [0i32; 16];
-        let kparams = build_mul_mat_kernel_params(
-            w_dtype,
-            w_desc.cols,
-            n_tokens as u32,
-            1,
-            w_desc.rows * 4,
-            session.dsp_threads(),
-            8 * 1024 * 1024,
-        );
-
-        session
-            .enqueue_op(
-                HtpOpCode::MulMat as u32,
-                &[w_ti, x_ti],
-                &[dst_ti],
-                params,
-                kparams,
-            )
-            .map_err(|e| CeraError::Backend(format!("detok_linear_m: {e}")))?;
-
-        if let Some(b_off) = b_offset {
-            let b_bytes = w_desc.rows * 4;
-            let b_ne = [w_desc.rows as u32, 1, 1, 1];
-            let b_nb = [4, b_bytes as u32, b_bytes as u32, b_bytes as u32];
-            let b_ti = session.add_tensor(
-                weights,
-                b_off,
-                b_bytes,
-                HTP_TENSOR_WEIGHT,
-                HtpDataType::F32 as u32,
-                b_ne,
-                b_nb,
-            )?;
-
-            let add_params = [0i32; 16];
-            let add_kparams = build_binary_kernel_params(
-                w_desc.rows,
-                w_desc.rows,
-                1,
-                1,
-                1,
-                4,
-                8 * 1024 * 1024,
-                session.dsp_threads(),
-            );
-            session
-                .enqueue_op(
-                    HtpOpCode::Add as u32,
-                    &[dst_ti, b_ti],
-                    &[dst_ti],
-                    add_params,
-                    add_kparams,
-                )
-                .map_err(|e| CeraError::Backend(format!("detok_bias_add: {e}")))?;
-        }
-
-        Ok(())
+            .map_err(|e| CeraError::Backend(format!("detok_rms_norm_mul: {e}")))?;
+        session.end_group()
     }
 
     /// Dispatch SwiGLU activation on DSP: `dst = silu(gate) * up`.
@@ -1786,7 +1684,8 @@ impl HexagonAudioDecoder {
                 params,
                 kparams,
             )
-            .map_err(|e| CeraError::Backend(format!("dispatch_swiglu: {e}")))
+            .map_err(|e| CeraError::Backend(format!("dispatch_swiglu: {e}")))?;
+        session.end_group()
     }
 
     /// Dispatch elementwise multiplication on DSP: `dst = src0 * src1`.
@@ -1853,7 +1752,8 @@ impl HexagonAudioDecoder {
                 params,
                 kparams,
             )
-            .map_err(|e| CeraError::Backend(format!("detok_mul: {e}")))
+            .map_err(|e| CeraError::Backend(format!("detok_mul: {e}")))?;
+        session.end_group()
     }
 
     /// Dispatch elementwise addition on DSP: `dst = src0 + src1`.
@@ -1920,63 +1820,8 @@ impl HexagonAudioDecoder {
                 params,
                 kparams,
             )
-            .map_err(|e| CeraError::Backend(format!("detok_add: {e}")))
-    }
-
-    /// Dispatch residual add: `dst += src`.
-    fn dispatch_add_residual(
-        session: &mut HexagonQueueSession,
-        dst: &RpcmemBuffer,
-        dst_offset: usize,
-        src: &RpcmemBuffer,
-        src_offset: usize,
-        dim: usize,
-        n_tokens: usize,
-    ) -> Result<(), CeraError> {
-        let bytes = dim * n_tokens * 4;
-        let ne = [dim as u32, n_tokens as u32, 1, 1];
-        let nb = [4, (dim * 4) as u32, bytes as u32, bytes as u32];
-
-        let dst_ti = session.add_tensor(
-            dst,
-            dst_offset,
-            bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            ne,
-            nb,
-        )?;
-        let src_ti = session.add_tensor(
-            src,
-            src_offset,
-            bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            ne,
-            nb,
-        )?;
-
-        let params = [0i32; 16];
-        let kparams = build_binary_kernel_params(
-            dim,
-            dim,
-            n_tokens,
-            1,
-            1,
-            4,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-        );
-
-        session
-            .enqueue_op(
-                HtpOpCode::Add as u32,
-                &[dst_ti, src_ti],
-                &[dst_ti],
-                params,
-                kparams,
-            )
-            .map_err(|e| CeraError::Backend(format!("detok_add_residual: {e}")))
+            .map_err(|e| CeraError::Backend(format!("detok_add: {e}")))?;
+        session.end_group()
     }
 
     /// Dispatch flat buffer copy on DSP: `dst = src`.
@@ -2015,44 +1860,8 @@ impl HexagonAudioDecoder {
 
         session
             .enqueue_op(HtpOpCode::Cpy as u32, &[src_ti], &[dst_ti], params, kparams)
-            .map_err(|e| CeraError::Backend(format!("detok_cpy: {e}")))
-    }
-
-    /// Dispatch F32 to F16 precision conversion on DSP: `dst = f16(src)`.
-    fn dispatch_cpy_f32_to_f16(
-        session: &mut HexagonQueueSession,
-        src: &RpcmemBuffer,
-        src_offset: usize,
-        dst: &RpcmemBuffer,
-        dst_offset: usize,
-        dim: usize,
-        n_tokens: usize,
-    ) -> Result<(), CeraError> {
-        let src_bytes = dim * n_tokens * 4;
-        let dst_bytes = dim * n_tokens * 2;
-        let src_ti = session.add_tensor(
-            src,
-            src_offset,
-            src_bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            [dim as u32, n_tokens as u32, 1, 1],
-            [4, (dim * 4) as u32, src_bytes as u32, src_bytes as u32],
-        )?;
-        let dst_ti = session.add_tensor(
-            dst,
-            dst_offset,
-            dst_bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F16 as u32,
-            [dim as u32, n_tokens as u32, 1, 1],
-            [2, (dim * 2) as u32, dst_bytes as u32, dst_bytes as u32],
-        )?;
-        let params = [0i32; 16];
-        let kparams = [0i32; 32];
-        session
-            .enqueue_op(HtpOpCode::Cpy as u32, &[src_ti], &[dst_ti], params, kparams)
-            .map_err(|e| CeraError::Backend(format!("detok_cpy_f32_to_f16: {e}")))
+            .map_err(|e| CeraError::Backend(format!("detok_cpy: {e}")))?;
+        session.end_group()
     }
 
     /// Dispatch multi-head RoPE NeoX rotation on DSP.
@@ -2112,7 +1921,8 @@ impl HexagonAudioDecoder {
                 params,
                 kparams,
             )
-            .map_err(|e| CeraError::Backend(format!("detok_rope_m: {e}")))
+            .map_err(|e| CeraError::Backend(format!("detok_rope_m: {e}")))?;
+        session.end_group()
     }
 
     /// Dispatch unmasked multi-head self-attention on DSP via FlashAttnExt.
@@ -2212,7 +2022,8 @@ impl HexagonAudioDecoder {
                 params,
                 kparams,
             )
-            .map_err(|e| CeraError::Backend(format!("detok_self_attention: {e}")))
+            .map_err(|e| CeraError::Backend(format!("detok_self_attention: {e}")))?;
+        session.end_group()
     }
 
     /// Dispatch native audio detokenizer forward pass entirely on Qualcomm Hexagon NPU.
@@ -2325,7 +2136,7 @@ impl HexagonAudioDecoder {
                     )?;
 
                     // in_proj: normed -> conv_bcx [3 * hs]
-                    Self::dispatch_linear_m(
+                    dispatch::linear_m(
                         session,
                         &scratch_guard,
                         so.normed_off,
@@ -2335,6 +2146,7 @@ impl HexagonAudioDecoder {
                         &scratch_guard,
                         so.conv_bcx_off,
                         1,
+                        DETOK_TILE,
                     )?;
 
                     // bx = b * x (b at offset 0, x at offset 2 * hs * 4)
@@ -2432,7 +2244,7 @@ impl HexagonAudioDecoder {
                     )?;
 
                     // out_proj: gated y -> conv_out
-                    Self::dispatch_linear_m(
+                    dispatch::linear_m(
                         session,
                         &scratch_guard,
                         so.conv_y_off,
@@ -2442,6 +2254,7 @@ impl HexagonAudioDecoder {
                         &scratch_guard,
                         so.conv_out_off,
                         1,
+                        DETOK_TILE,
                     )?;
 
                     // Residual add: tok[t] += conv_out
@@ -2469,7 +2282,7 @@ impl HexagonAudioDecoder {
                         hs,
                         1,
                     )?;
-                    Self::dispatch_linear_m(
+                    dispatch::linear_m(
                         session,
                         &scratch_guard,
                         so.normed_off,
@@ -2479,8 +2292,9 @@ impl HexagonAudioDecoder {
                         &scratch_guard,
                         so.ffn_gate_off,
                         1,
+                        DETOK_TILE,
                     )?;
-                    Self::dispatch_linear_m(
+                    dispatch::linear_m(
                         session,
                         &scratch_guard,
                         so.normed_off,
@@ -2490,6 +2304,7 @@ impl HexagonAudioDecoder {
                         &scratch_guard,
                         so.ffn_up_off,
                         1,
+                        DETOK_TILE,
                     )?;
                     Self::dispatch_swiglu(
                         session,
@@ -2502,7 +2317,7 @@ impl HexagonAudioDecoder {
                         ffn_dim,
                         1,
                     )?;
-                    Self::dispatch_linear_m(
+                    dispatch::linear_m(
                         session,
                         &scratch_guard,
                         so.ffn_mid_off,
@@ -2512,6 +2327,7 @@ impl HexagonAudioDecoder {
                         &scratch_guard,
                         so.ffn_out_off,
                         1,
+                        DETOK_TILE,
                     )?;
                     Self::dispatch_add(
                         session,
@@ -2562,7 +2378,7 @@ impl HexagonAudioDecoder {
                 )?;
 
                 // 2. Q, K, V projections
-                Self::dispatch_linear_m(
+                dispatch::linear_m(
                     session,
                     &scratch_guard,
                     so.normed_off,
@@ -2572,8 +2388,9 @@ impl HexagonAudioDecoder {
                     &scratch_guard,
                     so.q_off,
                     n_tokens,
+                    DETOK_TILE,
                 )?;
-                Self::dispatch_linear_m(
+                dispatch::linear_m(
                     session,
                     &scratch_guard,
                     so.normed_off,
@@ -2583,8 +2400,9 @@ impl HexagonAudioDecoder {
                     &scratch_guard,
                     so.k_off,
                     n_tokens,
+                    DETOK_TILE,
                 )?;
-                Self::dispatch_linear_m(
+                dispatch::linear_m(
                     session,
                     &scratch_guard,
                     so.normed_off,
@@ -2594,6 +2412,7 @@ impl HexagonAudioDecoder {
                     &scratch_guard,
                     so.v_off,
                     n_tokens,
+                    DETOK_TILE,
                 )?;
 
                 // 3. Per-head RMSNorm on Q and K
@@ -2679,23 +2498,27 @@ impl HexagonAudioDecoder {
 
                 // 6. Sliding window length and F16 conversion
                 let seq_len = (n_past + n_tokens).min(swa_window_size);
-                Self::dispatch_cpy_f32_to_f16(
+                dispatch::cpy_f32_to_f16(
                     session,
                     &state_buf_guard,
                     attn_state.k_cache_off,
                     &scratch_guard,
                     so.k_f16_off,
-                    n_kv * hd,
-                    seq_len,
+                    TokenShape {
+                        dim: n_kv * hd,
+                        n_tokens: seq_len,
+                    },
                 )?;
-                Self::dispatch_cpy_f32_to_f16(
+                dispatch::cpy_f32_to_f16(
                     session,
                     &state_buf_guard,
                     attn_state.v_cache_off,
                     &scratch_guard,
                     so.v_f16_off,
-                    n_kv * hd,
-                    seq_len,
+                    TokenShape {
+                        dim: n_kv * hd,
+                        n_tokens: seq_len,
+                    },
                 )?;
 
                 // 7. FlashAttnExt
@@ -2719,7 +2542,7 @@ impl HexagonAudioDecoder {
                 )?;
 
                 // 8. Out projection
-                Self::dispatch_linear_m(
+                dispatch::linear_m(
                     session,
                     &scratch_guard,
                     so.attn_out_off,
@@ -2729,17 +2552,18 @@ impl HexagonAudioDecoder {
                     &scratch_guard,
                     so.attn_proj_off,
                     n_tokens,
+                    DETOK_TILE,
                 )?;
 
                 // 9. Residual add
-                Self::dispatch_add_residual(
+                dispatch::add_residual(
                     session,
                     &scratch_guard,
                     so.tokens_off,
                     &scratch_guard,
                     so.attn_proj_off,
-                    hs,
-                    n_tokens,
+                    TokenShape { dim: hs, n_tokens },
+                    DETOK_TILE,
                 )?;
 
                 // 10. FFN
@@ -2755,7 +2579,7 @@ impl HexagonAudioDecoder {
                     hs,
                     n_tokens,
                 )?;
-                Self::dispatch_linear_m(
+                dispatch::linear_m(
                     session,
                     &scratch_guard,
                     so.normed_off,
@@ -2765,8 +2589,9 @@ impl HexagonAudioDecoder {
                     &scratch_guard,
                     so.ffn_gate_off,
                     n_tokens,
+                    DETOK_TILE,
                 )?;
-                Self::dispatch_linear_m(
+                dispatch::linear_m(
                     session,
                     &scratch_guard,
                     so.normed_off,
@@ -2776,6 +2601,7 @@ impl HexagonAudioDecoder {
                     &scratch_guard,
                     so.ffn_up_off,
                     n_tokens,
+                    DETOK_TILE,
                 )?;
                 Self::dispatch_swiglu(
                     session,
@@ -2788,7 +2614,7 @@ impl HexagonAudioDecoder {
                     ffn_dim,
                     n_tokens,
                 )?;
-                Self::dispatch_linear_m(
+                dispatch::linear_m(
                     session,
                     &scratch_guard,
                     so.ffn_mid_off,
@@ -2798,15 +2624,16 @@ impl HexagonAudioDecoder {
                     &scratch_guard,
                     so.ffn_out_off,
                     n_tokens,
+                    DETOK_TILE,
                 )?;
-                Self::dispatch_add_residual(
+                dispatch::add_residual(
                     session,
                     &scratch_guard,
                     so.tokens_off,
                     &scratch_guard,
                     so.ffn_out_off,
-                    hs,
-                    n_tokens,
+                    TokenShape { dim: hs, n_tokens },
+                    DETOK_TILE,
                 )?;
             }
         }
@@ -2826,7 +2653,7 @@ impl HexagonAudioDecoder {
         )?;
 
         // 6. Linear projection head
-        Self::dispatch_linear_m(
+        dispatch::linear_m(
             session,
             &scratch_guard,
             so.normed_off,
@@ -2836,6 +2663,7 @@ impl HexagonAudioDecoder {
             &scratch_guard,
             so.spec_out_off,
             n_tokens,
+            DETOK_TILE,
         )?;
 
         // 7. Submit session and await completion
@@ -2888,11 +2716,18 @@ impl AudioAccelerator for HexagonAudioDecoder {
         match self.detokenize_to_spectrum_npu(&tokens, n_frames) {
             Ok(spec) if spec.len() == expected_spec_len => spec,
             Err(e) => {
-                tracing::warn!(error = %e, "Hexagon audio detokenizer NPU execution failed");
+                crate::backend::hexagon::hexagon_warn!(
+                    "Hexagon audio detokenizer NPU execution failed: {e}"
+                );
                 {
                     let mut dev = self.device.lock_or_recover();
                     dev.queue_session_mut().drop_pending_batch();
                 }
+                // The failed pass may have advanced the on-device conv/KV
+                // state partway (`n_past` only moves on success). The engine
+                // recomputes this frame on CPU; restart the NPU detokenizer
+                // from a clean state rather than continue over a torn one.
+                self.reset_detokenizer();
                 self.record_error(e);
                 Vec::new()
             }
@@ -2902,7 +2737,10 @@ impl AudioAccelerator for HexagonAudioDecoder {
                     spec.len(),
                     expected_spec_len
                 ));
-                tracing::warn!(error = %err, "Hexagon audio detokenizer NPU output length mismatch");
+                crate::backend::hexagon::hexagon_warn!(
+                    "Hexagon audio detokenizer NPU output length mismatch: {err}"
+                );
+                self.reset_detokenizer();
                 self.record_error(err);
                 Vec::new()
             }
@@ -2971,13 +2809,19 @@ pub fn try_hexagon_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAc
     let detok_weights = match DetokenizerWeights::from_gguf(gguf) {
         Ok(w) => Arc::new(w),
         Err(e) => {
-            tracing::warn!("audio decoder: failed to parse detokenizer weights from GGUF: {e:#}");
+            crate::backend::hexagon::hexagon_warn!(
+                "audio decoder: failed to parse detokenizer weights from GGUF: {e:#}"
+            );
             return None;
         }
     };
     let audio_dec_weights = AudioDecoderWeights::from_gguf(gguf).ok().map(Arc::new);
 
-    let context = HexagonContext::new().ok()?;
+    let context = HexagonContext::new()
+        .inspect_err(|e| {
+            crate::backend::hexagon::log_context_unavailable("HexagonAudioDecoder", e);
+        })
+        .ok()?;
 
     let arch_override = std::env::var("CERA_HEXAGON_ARCH")
         .ok()
@@ -3004,8 +2848,7 @@ pub fn try_hexagon_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAc
             Some(Arc::new(decoder))
         }
         Err(e) => {
-            eprintln!("[cera-hexagon] failed to create HexagonAudioDecoder: {e}");
-            tracing::warn!("failed to create HexagonAudioDecoder: {e}");
+            crate::backend::hexagon::hexagon_error!("failed to create HexagonAudioDecoder: {e}");
             None
         }
     }
@@ -3014,6 +2857,16 @@ pub fn try_hexagon_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAc
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Tile policy pin: see `VIT_TILE`; a flip must be deliberate. Pinned by
+    /// behavior: 130 tokens are one Norm/Mul/Add triple.
+    #[test]
+    fn tile_policy_is_whole() {
+        assert_eq!(
+            crate::backend::hexagon::dispatch::testing::layer_norm_op_count(DETOK_TILE),
+            3
+        );
+    }
 
     #[test]
     fn test_detok_scratch_offsets_alignment() {
@@ -3077,14 +2930,8 @@ mod tests {
     }
 
     #[test]
-    fn test_try_hexagon_audio_decoder_returns_none_for_unloadable_weights() {
-        let mut data = Vec::new();
-        data.extend_from_slice(b"GGUF");
-        data.extend_from_slice(&3u32.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        data.extend_from_slice(&0u64.to_le_bytes());
-        let bytes: Arc<[u8]> = Arc::from(data.into_boxed_slice());
-        let gguf = Arc::new(GgufFile::from_bytes(bytes).expect("parse minimal gguf"));
+    fn test_try_hexagon_audio_decoder_on_host_without_dsp() {
+        let gguf = Arc::new(crate::gguf::GgufBuilder::new().build());
         let result = try_hexagon_audio_decoder(&gguf);
         assert!(result.is_none());
     }

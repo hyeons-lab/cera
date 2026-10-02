@@ -8,10 +8,14 @@
 //! `repack_q4_K_tiled` / `repack_q6_K_tiled`. Q5_K has no DSP wire format and
 //! is requanted to Q8_0 on the host ([`requant_q5_k_to_q8_0`]) before repack.
 
-use crate::par::{IndexedParallelIterator, ParallelIterator, ParallelSliceMut};
+use crate::par::{IndexedParallelIterator, ParallelSliceMut};
+// Only rayon's `for_each` needs the trait in scope; the sequential shim's
+// iterators are plain `Iterator`s.
+#[cfg(feature = "parallel")]
+use crate::par::ParallelIterator;
 use crate::quant::{
-    BlockQ4_0, BlockQ4KM, BlockQ5K, BlockQ6K, BlockQ8_0, decode_q4km_scales, dequantize_q5_k_block,
-    f16_to_f32, f32_to_f16,
+    BlockQ4_0, BlockQ4_1, BlockQ4KM, BlockQ5K, BlockQ6K, BlockQ8_0, decode_q4km_scales,
+    dequantize_q5_k_block, f16_to_f32, f32_to_f16,
 };
 use crate::session::CeraError;
 
@@ -74,6 +78,11 @@ fn checked_src_bytes(
 /// Calculate the total buffer size in bytes for a repacked Q4_0 matrix.
 pub fn repacked_matrix_size_q4_0(ne0: usize, ne1: usize) -> Result<usize, CeraError> {
     checked_tiled_size(ne0, ne1, TILE_SIZE_Q4_0, "repacked_matrix_size_q4_0")
+}
+
+/// Calculate the total buffer size in bytes for a repacked Q4_1 matrix.
+pub fn repacked_matrix_size_q4_1(ne0: usize, ne1: usize) -> Result<usize, CeraError> {
+    checked_tiled_size(ne0, ne1, TILE_SIZE_Q4_K, "repacked_matrix_size_q4_1")
 }
 
 /// Calculate the total buffer size in bytes for a repacked Q8_0 matrix.
@@ -249,6 +258,87 @@ pub fn repack_q4_0(
                     for row in 0..32 {
                         tile_quants[cp * 32 + row] =
                             (quants[row][2 * cp + 1] << 4) | quants[row][2 * cp];
+                    }
+                }
+            }
+        });
+
+    Ok(())
+}
+
+/// Repack a linear GGUF Q4_1 weight matrix into HTP 32x32 tiled layout.
+///
+/// Q4_1 shares the 640-byte Q4_1/Q4_K wire tile format with per-row f16
+/// scale (d) and minimum (m) pairs. Each block of 32 K values feeds one
+/// K tile: low nibbles are elements 0..15, high nibbles are elements 16..31.
+/// These are column-interleaved into the 512-byte quant plane as
+/// `tile[cp * 32 + row] = (q[2*cp+1] << 4) | q[2*cp]`.
+pub fn repack_q4_1(
+    src_bytes: &[u8],
+    ne0: usize,
+    ne1: usize,
+    dst: &mut [u8],
+) -> Result<(), CeraError> {
+    if ne0 == 0 || ne1 == 0 {
+        return Err(CeraError::Backend(format!(
+            "repack_q4_1: dimensions must be non-zero (ne0={ne0}, ne1={ne1})"
+        )));
+    }
+    if !ne0.is_multiple_of(32) {
+        return Err(CeraError::Backend(format!(
+            "repack_q4_1: ne0 ({ne0}) must be a multiple of 32"
+        )));
+    }
+    let blocks_per_row = ne0 / 32;
+    let block_size = std::mem::size_of::<BlockQ4_1>();
+    let total_src_bytes = checked_src_bytes(ne1, blocks_per_row, block_size, "repack_q4_1")?;
+    if src_bytes.len() < total_src_bytes {
+        return Err(CeraError::Backend(format!(
+            "repack_q4_1: source buffer too short (expected {} bytes, got {})",
+            total_src_bytes,
+            src_bytes.len()
+        )));
+    }
+
+    let matrix_size = checked_tiled_size(ne0, ne1, TILE_SIZE_Q4_K, "repack_q4_1")?;
+    let n_k_tiles = ne0.div_ceil(32);
+    if dst.len() < matrix_size {
+        return Err(CeraError::Backend(format!(
+            "repack_q4_1: destination buffer too short (expected {} bytes, got {})",
+            matrix_size,
+            dst.len()
+        )));
+    }
+    dst[..matrix_size].fill(0);
+
+    let col_tile_bytes = n_k_tiles * TILE_SIZE_Q4_K;
+    dst[..matrix_size]
+        .par_chunks_mut(col_tile_bytes)
+        .enumerate()
+        .for_each(|(ct, ct_dst)| {
+            for kt in 0..n_k_tiles {
+                let tile_dst = &mut ct_dst[kt * TILE_SIZE_Q4_K..][..TILE_SIZE_Q4_K];
+                let (tile_quants, tile_scales) = tile_dst.split_at_mut(TILE_QUANTS_Q4_K);
+
+                for row in 0..32 {
+                    let r = ct * 32 + row;
+                    if r < ne1 {
+                        let blk_off = (r * blocks_per_row + kt) * block_size;
+                        let b = &src_bytes[blk_off..blk_off + block_size];
+                        tile_scales[row * 4..row * 4 + 4].copy_from_slice(&b[0..4]);
+
+                        let qs = &b[4..20];
+                        for cp in 0..8 {
+                            let q0 = qs[2 * cp] & 0x0f;
+                            let q1 = qs[2 * cp + 1] & 0x0f;
+                            tile_quants[cp * 32 + row] = (q1 << 4) | q0;
+                        }
+                        for cp in 8..16 {
+                            let idx = 2 * (cp - 8);
+                            let q0 = qs[idx] >> 4;
+                            let q1 = qs[idx + 1] >> 4;
+                            tile_quants[cp * 32 + row] = (q1 << 4) | q0;
+                        }
                     }
                 }
             }
@@ -489,6 +579,13 @@ pub fn requant_q5_k_to_q8_0(
     ne0: usize,
     ne1: usize,
 ) -> Result<Vec<u8>, CeraError> {
+    static WARNED_Q5_K: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+    if !WARNED_Q5_K.swap(true, std::sync::atomic::Ordering::Relaxed) {
+        super::hexagon_warn!(
+            "Hexagon NPU does not have native Q5_K kernels; requantizing Q5_K tensor to Q8_0 at load time"
+        );
+    }
+
     // Reject degenerate dims fail-closed: without this, `(0, N)` passes
     // the `% 256` gate below and burns an O(N) no-op loop to produce an
     // empty vec, and small zero dims flow through the downstream repack
@@ -626,6 +723,54 @@ mod tests {
         let src = vec![0u8; ne1 * (ne0 / 32) * 18];
         let mut dst = vec![0xccu8; size];
         assert!(repack_q4_0(&src, ne0, ne1, &mut dst).is_ok());
+    }
+
+    #[test]
+    fn test_repack_q4_1_sizes() {
+        assert_eq!(repacked_matrix_size_q4_1(256, 4).unwrap(), 8 * 640);
+
+        let (ne0, ne1) = (64, 32);
+        let size = repacked_matrix_size_q4_1(ne0, ne1).unwrap();
+        let src = vec![0u8; ne1 * (ne0 / 32) * 20];
+        let mut dst = vec![0xccu8; size];
+        assert!(repack_q4_1(&src, ne0, ne1, &mut dst).is_ok());
+
+        assert!(repack_q4_1(&src[..src.len() - 1], ne0, ne1, &mut dst).is_err());
+        assert!(repack_q4_1(&src, ne0, ne1, &mut dst[..size - 1]).is_err());
+        assert!(repack_q4_1(&src, 16, ne1, &mut dst).is_err());
+    }
+
+    #[test]
+    fn test_repack_q4_1_single_tile_layout() {
+        let (ne0, ne1) = (32, 1);
+        let mut src = vec![0u8; 20];
+        // d = 1.0 (f16 0x3c00), m = -0.5 (f16 0xb800)
+        src[0..2].copy_from_slice(&0x3c00u16.to_le_bytes());
+        src[2..4].copy_from_slice(&0xb800u16.to_le_bytes());
+        for i in 0..16 {
+            src[4 + i] = ((15 - i as u8) << 4) | (i as u8);
+        }
+        let mut dst = vec![0u8; TILE_SIZE_Q4_K];
+        repack_q4_1(&src, ne0, ne1, &mut dst).unwrap();
+
+        // cp in 0..8: low nibbles from qs[2*cp], qs[2*cp+1]
+        for cp in 0..8 {
+            let expected = ((2 * cp + 1) << 4 | (2 * cp)) as u8;
+            assert_eq!(dst[cp * 32], expected, "cp={cp}");
+        }
+        // cp in 8..16: high nibbles from qs[2*(cp-8)], qs[2*(cp-8)+1]
+        for cp in 8..16 {
+            let j = cp - 8;
+            let q0 = 15 - 2 * j as u8;
+            let q1 = 15 - (2 * j + 1) as u8;
+            let expected = (q1 << 4) | q0;
+            assert_eq!(dst[cp * 32], expected, "cp={cp}");
+        }
+        assert_eq!(u16::from_le_bytes([dst[512], dst[513]]), 0x3c00);
+        assert_eq!(u16::from_le_bytes([dst[514], dst[515]]), 0xb800);
+        // Padding rows 1..32 stay zero.
+        assert!(dst[1..32].iter().all(|&b| b == 0));
+        assert!(dst[512 + 4..512 + 128].iter().all(|&b| b == 0));
     }
 
     #[test]
@@ -833,6 +978,7 @@ mod tests {
         let huge = usize::MAX / 2;
         for f in [
             repacked_matrix_size_q4_0,
+            repacked_matrix_size_q4_1,
             repacked_matrix_size_q8_0,
             repacked_matrix_size_q4_k,
             repacked_matrix_size_q6_k,
@@ -846,12 +992,14 @@ mod tests {
         let mut dst = vec![0u8; 64];
         assert!(repack_q8_0(empty, huge, huge, &mut dst).is_err());
         assert!(repack_q4_0(empty, huge, huge, &mut dst).is_err());
+        assert!(repack_q4_1(empty, huge, huge, &mut dst).is_err());
         // Zero in one dim defeats the src-size check (0 times anything is 0)
         // and used to reach the unchecked tile math and panic. Each leg uses
         // an alignment-passing partner dimension (32) to isolate the zero check.
         for (ne0, ne1) in [(0, 32), (32, 0), (0, usize::MAX), (usize::MAX, 0)] {
             assert!(repack_q8_0(empty, ne0, ne1, &mut dst).is_err());
             assert!(repack_q4_0(empty, ne0, ne1, &mut dst).is_err());
+            assert!(repack_q4_1(empty, ne0, ne1, &mut dst).is_err());
             assert!(repack_q4_k(empty, ne0, ne1, &mut dst).is_err());
             assert!(repack_q6_k(empty, ne0, ne1, &mut dst).is_err());
         }

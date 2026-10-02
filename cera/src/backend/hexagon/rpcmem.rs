@@ -37,6 +37,9 @@ impl RpcmemBuffer {
                 "rpcmem allocation size must be non-zero".into(),
             ));
         }
+        if map_to_dsp {
+            driver.ensure_map_fits(size)?;
+        }
         let ptr = driver.rpcmem_alloc(size)?;
         let fd = match driver.rpcmem_to_fd(ptr) {
             Ok(fd) => fd,

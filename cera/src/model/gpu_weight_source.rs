@@ -68,6 +68,44 @@ pub trait GpuWeightSource {
     /// Llama-3 RoPE frequency factors (`rope_freqs.weight`, `head_dim/2`);
     /// `None` ⇒ plain RoPE.
     fn rope_freqs(&self) -> Option<&[f32]>;
+    /// Per-pair divisors that reproduce YaRN's angle blend through the same
+    /// `theta / factor` RoPE kernel input as [`Self::rope_freqs`]. Kept apart
+    /// from `rope_freqs` because a consumer that rotates YaRN itself (Hexagon's
+    /// host rope) must not see it twice. `None` ⇒ the model is not YaRN-scaled.
+    fn yarn_rope_freq_factors(&self) -> Option<&[f32]> {
+        None
+    }
+    /// The factors a GPU rope kernel divides by: the Llama-3 table, else the
+    /// YaRN-derived one.
+    fn gpu_rope_freqs(&self) -> Option<&[f32]> {
+        self.rope_freqs().or_else(|| self.yarn_rope_freq_factors())
+    }
+    /// Multiplier folded into the attention softmax scale. YaRN scales `cos`
+    /// and `sin` by `mscale`, and both Q and K are rotated, so scores scale by
+    /// `mscale^2`; a GPU forward has no separate hook for it. `1.0` otherwise.
+    fn attn_scale_multiplier(&self) -> f32 {
+        1.0
+    }
+    /// Post-attention norm weights (Gemma 2, Olmo 2/3).
+    fn attn_post_norm_weight(&self, _layer: usize) -> Option<&[f32]> {
+        None
+    }
+    /// Post-FFN norm weights (Gemma 2, Olmo 2/3).
+    fn ffn_post_norm_weight(&self, _layer: usize) -> Option<&[f32]> {
+        None
+    }
+    /// FFN activation function (SwiGLU or GeGLU).
+    fn activation(&self) -> crate::model::transformer::FfnActivation {
+        crate::model::transformer::FfnActivation::Swiglu
+    }
+    /// Attention logit soft-capping value (e.g. 50.0 for Gemma 2).
+    fn attn_logit_softcapping(&self) -> Option<f32> {
+        None
+    }
+    /// Final logit soft-capping value (e.g. 30.0 for Gemma 2).
+    fn final_logit_softcapping(&self) -> Option<f32> {
+        None
+    }
 
     /// Token embedding tensor metadata (`token_embd.weight`).
     fn embedding_tensor(&self) -> Result<crate::tensor::Tensor> {
@@ -84,7 +122,7 @@ pub trait GpuWeightSource {
     // ── Raw quantized-weight access (GGUF mmap handles) ─────────────────────
     // The metal loader maps weights by absolute `wref.start` offset into its own
     // mmap buffer, so it needs neither the byte slice nor a full dequantize.
-    #[cfg_attr(not(feature = "gpu"), allow(dead_code))]
+    #[cfg_attr(not(any(feature = "gpu", feature = "hexagon")), allow(dead_code))]
     fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]>;
     // The metal loader references weights via mmap byte offsets, or dequantizes
     // non-native quant dtypes to F32 buffers during upload.
@@ -159,17 +197,20 @@ pub trait GpuWeightSource {
 /// `shaders/slang/moe_route.slang`, where it sizes the groupshared probability
 /// scratch. Both backends check it at load so an oversized model is a named
 /// error instead of a groupshared overrun.
+#[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
 pub(crate) const MOE_MAX_EXPERTS: u32 = 256;
 
 /// Largest `n_expert_used` the routing kernel can hold, matching `MAX_USED` in
 /// `shaders/slang/moe_route.slang`. The kernel clamps rather than overruns, but
 /// a clamp would silently drop experts, so both backends reject here instead.
+#[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
 pub(crate) const MOE_MAX_EXPERT_USED: u32 = 16;
 
 /// One stacked expert projection's validated layout.
 ///
 /// `rows`/`inner` describe a *single* expert's slice; `expert_stride` is the
 /// byte distance to the next one.
+#[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
 pub(crate) struct StackedExperts {
     // Read by the wgpu loader only. Metal takes its shapes from the
     // `MetalWeight` it uploads for expert 0 instead, so on a metal-only build
@@ -203,6 +244,7 @@ pub(crate) struct StackedExperts {
 /// `range.start + e * tensor_data_size(&[ne0, ne1], dtype)`, the same product
 /// from the same shape, so evenly stacked is its definition rather than its
 /// finding.
+#[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
 pub(crate) fn stacked_expert_layout(
     refs: &[WeightRef],
     layer: usize,
@@ -281,6 +323,46 @@ pub(crate) fn stacked_expert_layout(
         expert_stride: stride,
         total_bytes,
     })
+}
+
+/// Fold a softmax-scale multiplier (see
+/// [`GpuWeightSource::attn_scale_multiplier`]) into `scalars.attn`, the
+/// override both GPU forwards already read in place of `1/sqrt(head_dim)`.
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+pub(crate) fn fold_attn_scale_multiplier(
+    scalars: &mut crate::model::ScalarMultipliers,
+    head_dim: usize,
+    multiplier: f32,
+) {
+    if multiplier != 1.0 {
+        let base = scalars
+            .attn
+            .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
+        scalars.attn = Some(base * multiplier);
+    }
+}
+
+/// Clamp `context_size` to the attention-temperature floor (see
+/// `LlamaModel::gpu_context_cap`), warning when it bites.
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+pub(crate) fn cap_context_for_attn_temp(context_size: usize, cap: Option<usize>) -> usize {
+    match cap {
+        Some(cap) if cap < context_size => {
+            tracing::warn!(
+                "Model uses attention temperature scaling, which the GPU forward does not implement; \
+                 limiting the context to {cap} tokens, below which it has no effect (use the CPU \
+                 backend for longer contexts)"
+            );
+            cap
+        }
+        _ => context_size,
+    }
 }
 
 #[cfg(test)]

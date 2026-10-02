@@ -439,6 +439,55 @@ pub(crate) fn weight_data<'a>(gguf: &'a GgufFile, wref: &WeightRef) -> &'a [u8] 
     &gguf.mmap_data()[start..start + wref.size]
 }
 
+/// Fixture gate for unit tests that read a model from a hard-coded path.
+/// Returns `true` when `path` exists. When it is absent the test skips with a
+/// loud `eprintln` and this returns `false`, unless `CERA_REQUIRE_MODEL` is
+/// set (non-empty), which turns the miss into a hard failure so a CI leg
+/// cannot report green on a skipped fixture. Unit-test twin of
+/// `tests/common::fixture_or_skip` (an integration test's helper cannot be
+/// named from inside the library).
+#[cfg(all(test, feature = "mmap"))]
+pub(crate) fn require_model_or_skip(path: &std::path::Path) -> bool {
+    let require = !std::env::var("CERA_REQUIRE_MODEL")
+        .unwrap_or_default()
+        .is_empty();
+    model_present_or_skip(path, require)
+}
+
+/// Env-free core of [`require_model_or_skip`] so the policy is testable
+/// without mutating process environment.
+#[cfg(all(test, feature = "mmap"))]
+fn model_present_or_skip(path: &std::path::Path, require: bool) -> bool {
+    if path.exists() {
+        return true;
+    }
+    assert!(
+        !require,
+        "CERA_REQUIRE_MODEL is set but {} is absent",
+        path.display()
+    );
+    eprintln!("skipping: {} not present", path.display());
+    false
+}
+
+#[cfg(all(test, feature = "mmap"))]
+mod fixture_gate_tests {
+    use super::*;
+
+    #[test]
+    fn missing_model_skips_unless_required() {
+        let bogus = std::path::Path::new("/nonexistent/cera-fixture.gguf");
+        assert!(!model_present_or_skip(bogus, false));
+        assert!(model_present_or_skip(std::path::Path::new("/"), true));
+    }
+
+    #[test]
+    #[should_panic(expected = "CERA_REQUIRE_MODEL is set but")]
+    fn missing_model_fails_when_required() {
+        model_present_or_skip(std::path::Path::new("/nonexistent/cera-fixture.gguf"), true);
+    }
+}
+
 /// Gated exactly like `batched_gemm_supports` itself, which is
 /// `#[cfg(any(aarch64, x86_64, has_blas))]`. Without this the module
 /// still compiles into a wasm32 test build and fails on a function that does
@@ -1692,7 +1741,8 @@ pub(crate) fn dequantize_row(gguf: &GgufFile, wref: &WeightRef, row_idx: usize) 
 /// Used by the GPU and Metal loaders to upload non-quantized-kernel dtypes as F32.
 #[cfg(any(
     feature = "gpu",
-    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    all(feature = "metal", any(target_os = "macos", target_os = "ios")),
+    feature = "hexagon"
 ))]
 pub(crate) fn dequantize_weight(gguf: &GgufFile, wref: &WeightRef) -> Vec<f32> {
     let mut out = vec![0.0f32; wref.m * wref.k];

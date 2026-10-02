@@ -59,4 +59,4 @@ python3 tests/api_contracts/test_wasm_loading.py /tmp/cera-wasm-node/cera_wasm.d
 
 This checks method/constructor names, return types and complete optional payload
 fields. Ownership, errors and inference still require the executable Node tests.
-The retained 71-surface Rust baseline above remains unchanged.
+The retained 73-surface Rust baseline above remains unchanged.

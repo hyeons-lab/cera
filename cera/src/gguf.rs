@@ -162,6 +162,180 @@ impl Clone for GgufFile {
     }
 }
 
+impl GgufFile {
+    /// A handle onto the same backing bytes with EMPTY `metadata` and
+    /// `tensors` maps. Shares the mmap or owned buffer (a refcount bump, no
+    /// deep copy), so [`Self::mmap_data`] and the raw offsets behave as on
+    /// `self`. For callers that only read raw byte ranges (for example an
+    /// embedding table) and would otherwise clone both maps.
+    #[cfg(any(feature = "hexagon", test))]
+    pub(crate) fn mapping_only(&self) -> GgufFile {
+        GgufFile {
+            metadata: HashMap::new(),
+            tensors: HashMap::new(),
+            data: SafeDataPtr {
+                ptr: self.data.ptr,
+                len: self.data.len,
+            },
+            _backing: self._backing.clone(),
+            data_offset: self.data_offset,
+        }
+    }
+}
+
+/// One metadata value for [`GgufBuilder`].
+#[cfg(test)]
+#[derive(Clone, Debug)]
+pub(crate) enum KvValue {
+    U32(u32),
+    F32(f32),
+    Str(String),
+    I32Array(Vec<i32>),
+    /// Pre-encoded value: GGUF value type id plus its exact bytes.
+    Raw(u32, Vec<u8>),
+}
+
+/// Synthetic GGUF v3 writer for tests. Metadata keys and tensors are
+/// written in exactly the order they were added; tensor data is laid out in
+/// that same order, each tensor padded to 32 bytes, and the data section
+/// starts on a 32-byte boundary. [`Self::unpadded_tail`] drops the padding
+/// after the last tensor.
+#[cfg(test)]
+#[derive(Default)]
+pub(crate) struct GgufBuilder {
+    kv: Vec<(String, KvValue)>,
+    tensors: Vec<(String, Vec<usize>, u32, Vec<u8>)>,
+    unpadded_tail: bool,
+}
+
+#[cfg(test)]
+impl GgufBuilder {
+    pub(crate) fn new() -> Self {
+        Self::default()
+    }
+
+    pub(crate) fn kv(mut self, key: impl Into<String>, v: KvValue) -> Self {
+        self.kv.push((key.into(), v));
+        self
+    }
+
+    pub(crate) fn kv_u32(self, key: impl Into<String>, v: u32) -> Self {
+        self.kv(key, KvValue::U32(v))
+    }
+
+    pub(crate) fn kv_f32(self, key: impl Into<String>, v: f32) -> Self {
+        self.kv(key, KvValue::F32(v))
+    }
+
+    pub(crate) fn kv_str(self, key: impl Into<String>, v: impl Into<String>) -> Self {
+        self.kv(key, KvValue::Str(v.into()))
+    }
+
+    pub(crate) fn kv_i32_array(self, key: impl Into<String>, v: Vec<i32>) -> Self {
+        self.kv(key, KvValue::I32Array(v))
+    }
+
+    pub(crate) fn kv_raw(self, key: impl Into<String>, ty: u32, bytes: Vec<u8>) -> Self {
+        self.kv(key, KvValue::Raw(ty, bytes))
+    }
+
+    /// Append a tensor with `ggml_type` and already-encoded `data`.
+    pub(crate) fn tensor(
+        mut self,
+        name: impl Into<String>,
+        dims: &[usize],
+        ggml_type: u32,
+        data: Vec<u8>,
+    ) -> Self {
+        self.tensors
+            .push((name.into(), dims.to_vec(), ggml_type, data));
+        self
+    }
+
+    /// Append an F32 tensor (ggml type 0).
+    pub(crate) fn tensor_f32(self, name: impl Into<String>, dims: &[usize], data: &[f32]) -> Self {
+        let bytes = data.iter().flat_map(|v| v.to_le_bytes()).collect();
+        self.tensor(name, dims, 0, bytes)
+    }
+
+    /// Do not pad after the last tensor's data.
+    pub(crate) fn unpadded_tail(mut self) -> Self {
+        self.unpadded_tail = true;
+        self
+    }
+
+    pub(crate) fn build_bytes(&self) -> Vec<u8> {
+        fn put_str(out: &mut Vec<u8>, s: &str) {
+            out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+            out.extend_from_slice(s.as_bytes());
+        }
+        let mut out = Vec::new();
+        out.extend_from_slice(b"GGUF");
+        out.extend_from_slice(&3u32.to_le_bytes());
+        out.extend_from_slice(&(self.tensors.len() as u64).to_le_bytes());
+        out.extend_from_slice(&(self.kv.len() as u64).to_le_bytes());
+        for (key, v) in &self.kv {
+            put_str(&mut out, key);
+            match v {
+                KvValue::U32(x) => {
+                    out.extend_from_slice(&4u32.to_le_bytes());
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+                KvValue::F32(x) => {
+                    out.extend_from_slice(&6u32.to_le_bytes());
+                    out.extend_from_slice(&x.to_le_bytes());
+                }
+                KvValue::Str(x) => {
+                    out.extend_from_slice(&8u32.to_le_bytes());
+                    put_str(&mut out, x);
+                }
+                KvValue::I32Array(a) => {
+                    out.extend_from_slice(&9u32.to_le_bytes());
+                    out.extend_from_slice(&5u32.to_le_bytes());
+                    out.extend_from_slice(&(a.len() as u64).to_le_bytes());
+                    for x in a {
+                        out.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+                KvValue::Raw(ty, bytes) => {
+                    out.extend_from_slice(&ty.to_le_bytes());
+                    out.extend_from_slice(bytes);
+                }
+            }
+        }
+        let mut offset = 0usize;
+        for (name, dims, ty, data) in &self.tensors {
+            put_str(&mut out, name);
+            out.extend_from_slice(&(dims.len() as u32).to_le_bytes());
+            for d in dims {
+                out.extend_from_slice(&(*d as u64).to_le_bytes());
+            }
+            out.extend_from_slice(&ty.to_le_bytes());
+            out.extend_from_slice(&(offset as u64).to_le_bytes());
+            offset = (offset + data.len()).next_multiple_of(32);
+        }
+        while !out.len().is_multiple_of(32) {
+            out.push(0);
+        }
+        let base = out.len();
+        let last = self.tensors.len().saturating_sub(1);
+        for (i, (_, _, _, data)) in self.tensors.iter().enumerate() {
+            out.extend_from_slice(data);
+            if !(self.unpadded_tail && i == last) {
+                while !(out.len() - base).is_multiple_of(32) {
+                    out.push(0);
+                }
+            }
+        }
+        out
+    }
+
+    pub(crate) fn build(&self) -> GgufFile {
+        GgufFile::from_bytes(Arc::from(self.build_bytes().into_boxed_slice()))
+            .expect("synthetic gguf")
+    }
+}
+
 // Count real parser entries in loading regressions without cross-test races or
 // any instrumentation in production builds.
 #[cfg(test)]
@@ -1481,6 +1655,46 @@ mod tests {
                 "unexpected error: {e}"
             ),
         }
+    }
+
+    #[test]
+    fn mapping_only_shares_bytes_with_empty_maps() {
+        let g = GgufBuilder::new()
+            .kv_u32("a.b", 7)
+            .tensor_f32("t", &[2], &[1.0, 2.0])
+            .build();
+        let m = g.mapping_only();
+        assert!(m.metadata.is_empty() && m.tensors.is_empty());
+        assert!(!g.metadata.is_empty() && !g.tensors.is_empty());
+        assert_eq!(m.mmap_data().as_ptr(), g.mmap_data().as_ptr());
+        assert_eq!(m.mmap_data().len(), g.mmap_data().len());
+    }
+
+    #[test]
+    fn builder_layout_order_padding_and_roundtrip() {
+        let g = GgufBuilder::new()
+            .kv_str("general.architecture", "x")
+            .kv_u32("x.n", 3)
+            .kv_f32("x.eps", 0.5)
+            .kv_i32_array("x.arr", vec![0, 1])
+            .kv_raw("x.raw", 4, 9u32.to_le_bytes().to_vec());
+        let g = g.tensor_f32("a", &[3], &[1.0, 2.0, 3.0]).tensor(
+            "b",
+            &[1],
+            0,
+            4.0f32.to_le_bytes().to_vec(),
+        );
+        let bytes = g.build_bytes();
+        let file = GgufFile::from_bytes(Arc::from(bytes.clone().into_boxed_slice())).unwrap();
+        assert_eq!(file.metadata.len(), 5);
+        assert_eq!(file.tensors.len(), 2);
+        // Insertion order drives data order: `b` sits after `a` padded to 32.
+        assert_eq!(file.tensors["b"].offset - file.tensors["a"].offset, 32);
+        assert_eq!(file.tensor_data("b").unwrap(), &4.0f32.to_le_bytes());
+        // Padded tail by default, trimmed on request.
+        let trimmed = g.unpadded_tail().build_bytes();
+        assert_eq!(bytes.len(), trimmed.len() + 28);
+        assert_eq!(bytes[..trimmed.len()], trimmed[..]);
     }
 }
 

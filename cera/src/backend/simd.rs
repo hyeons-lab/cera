@@ -3385,7 +3385,6 @@ pub(crate) mod neon {
     /// Returns the row index `usize` having the maximum dot product without materializing
     /// all output logits into memory.
     #[target_feature(enable = "neon,dotprod")]
-    #[allow(dead_code)]
     pub unsafe fn gemv_q6k_q8_0_argmax_neon(
         a_quant: &[u8],
         x_scales: &[f32],
@@ -4607,9 +4606,7 @@ pub(crate) mod neon {
     /// `for nh { for h { for g } }` accumulation order (with `d·sc·xs` formed before
     /// the multiply), so a remainder cell is bit-identical to the batched path.
     // Remainder helper for the i8mm Q6_K kernel, reachable (non-test) only via
-    // `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
-    // --all-features (blas on), live under the default CI gate.
-    #[allow(dead_code)]
+    // `transformer::gemm_preq` (gated `not(feature = "blas")`).
     #[allow(clippy::too_many_arguments)]
     fn gemm_q6_k_scalar_dot(
         a_quant: &[u8],
@@ -4672,9 +4669,7 @@ pub(crate) mod neon {
     /// result is **bit-identical** to the dotprod path: the integer dots are exact
     /// (SMMLA and SDOT compute the same integer), and only the f32 scaling order
     /// matters, which matches. Odd row/col remainders use `gemm_q6_k_scalar_dot`.
-    // i8mm dispatch target of `gemm_q6_k_q8_0_neon`; dead under --all-features (blas
-    // on), live under the default CI gate — same as the Q4_0/Q4_K i8mm kernels.
-    #[allow(dead_code)]
+    // i8mm dispatch target of `gemm_q6_k_q8_0_neon`, like the Q4_0/Q4_K i8mm kernels.
     #[target_feature(enable = "neon,i8mm,fp16")]
     unsafe fn gemm_q6_k_q8_0_neon_i8mm(
         a_quant: &[u8],
@@ -4888,7 +4883,6 @@ pub(crate) mod neon {
     /// the caller's gate. Prefers the i8mm (`vmmlaq_s32`) kernel when the tier
     /// resolves to it, else dotprod. Returns `false` without writing `out` when it
     /// cannot run.
-    #[allow(dead_code)]
     pub unsafe fn gemm_q6_k_q8_0_neon(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -4923,7 +4917,6 @@ pub(crate) mod neon {
     /// Unused under the `blas` feature (SGEMM via Accelerate replaces it on
     /// the prefill hot path) but kept compiled so the GEMM microbench can
     /// still A/B against it.
-    #[allow(dead_code)]
     #[target_feature(enable = "neon,dotprod")]
     unsafe fn gemm_q4_0_q8_0_neon_dotprod(
         a_quant: &[u8],
@@ -5164,7 +5157,6 @@ pub(crate) mod neon {
     /// Unused under the `blas` feature (SGEMM via Accelerate replaces it on
     /// the prefill hot path) but kept compiled so the GEMM microbench can
     /// still A/B against it.
-    #[allow(dead_code)]
     #[target_feature(enable = "neon,dotprod")]
     unsafe fn gemm_q8_0_q8_0_neon_dotprod(
         a_quant: &[u8],
@@ -5490,9 +5482,7 @@ pub(crate) mod neon {
 
     /// Baseline-NEON Q4_0 × Q8_0 GEMM using the emulated integer dot.
     // Dispatch target of `gemm_q4_0_q8_0_neon`, whose only non-test consumer is
-    // `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
-    // --all-features (blas on), live under the default CI gate.
-    #[allow(dead_code)]
+    // `transformer::gemm_preq` (gated `not(feature = "blas")`).
     #[target_feature(enable = "neon")]
     unsafe fn gemm_q4_0_q8_0_neon_base(
         a_quant: &[u8],
@@ -5538,9 +5528,7 @@ pub(crate) mod neon {
 
     /// Baseline-NEON Q8_0 × Q8_0 GEMM using the emulated integer dot.
     // Dispatch target of `gemm_q8_0_q8_0_neon`, whose only non-test consumer is
-    // `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
-    // --all-features (blas on), live under the default CI gate.
-    #[allow(dead_code)]
+    // `transformer::gemm_preq` (gated `not(feature = "blas")`).
     #[target_feature(enable = "neon")]
     unsafe fn gemm_q8_0_q8_0_neon_base(
         a_quant: &[u8],
@@ -5753,9 +5741,7 @@ pub(crate) mod neon {
 
     /// Scalar single-output Q8_0 GEMM dot, for odd row/col remainders.
     // Remainder helper for the i8mm/neon Q8_0 kernels, reachable (non-test) only
-    // via `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
-    // --all-features (blas on), live under the default CI gate.
-    #[allow(dead_code)]
+    // via `transformer::gemm_preq` (gated `not(feature = "blas")`).
     #[allow(clippy::too_many_arguments)]
     fn gemm_q8_0_scalar_dot(
         a_quant: &[u8],
@@ -5789,9 +5775,7 @@ pub(crate) mod neon {
     /// i8mm Q8_0 × Q8_0 GEMM. Processes 2×2 output tiles with `vmmlaq_s32`,
     /// parallelized across row-pairs; odd row/col remainders use the scalar dot.
     // i8mm dispatch target of `gemm_q8_0_q8_0_neon`, whose only non-test consumer
-    // is `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
-    // --all-features (blas on), live under the default CI gate.
-    #[allow(dead_code)]
+    // is `transformer::gemm_preq` (gated `not(feature = "blas")`).
     #[target_feature(enable = "neon,i8mm,fp16")]
     unsafe fn gemm_q8_0_q8_0_neon_i8mm(
         a_quant: &[u8],
@@ -5910,9 +5894,7 @@ pub(crate) mod neon {
     /// (low nibble of `qs[l]` = element `l`, high nibble = element `16 + l`),
     /// matching `gemm_dot_single!`.
     // Remainder helper for the i8mm Q4_0 kernel, reachable (non-test) only via
-    // `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
-    // --all-features (blas on), live under the default CI gate.
-    #[allow(dead_code)]
+    // `transformer::gemm_preq` (gated `not(feature = "blas")`).
     #[allow(clippy::too_many_arguments)]
     fn gemm_q4_0_scalar_dot(
         a_quant: &[u8],
@@ -5954,9 +5936,7 @@ pub(crate) mod neon {
     /// activation (B) side is already Q8_0 int8, identical to the Q8_0 kernel.
     /// Odd row/col remainders fall back to [`gemm_q4_0_scalar_dot`].
     // i8mm dispatch target of `gemm_q4_0_q8_0_neon`, whose only non-test consumer
-    // is `transformer::gemm_preq` (gated `not(feature = "blas")`); dead under
-    // --all-features (blas on), live under the default CI gate.
-    #[allow(dead_code)]
+    // is `transformer::gemm_preq` (gated `not(feature = "blas")`).
     #[target_feature(enable = "neon,i8mm,fp16")]
     unsafe fn gemm_q4_0_q8_0_neon_i8mm(
         a_quant: &[u8],
@@ -6101,9 +6081,7 @@ pub(crate) mod neon {
     /// Q4_0 × Q8_0 GEMM dispatcher. Prefers i8mm (`vmmlaq_s32`) when the tier is
     /// resolved to it, else the dotprod GEMM, else the emulated-integer base.
     // Only non-test consumer is `transformer::gemm_preq`, gated
-    // `not(feature = "blas")`; dead under --all-features (blas on), live under
-    // the default CI gate.
-    #[allow(dead_code)]
+    // `not(feature = "blas")`.
     pub unsafe fn gemm_q4_0_q8_0_neon(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -6130,7 +6108,7 @@ pub(crate) mod neon {
     /// group `g` at `j * k + b * 32 + g * 4`) and `b_scales` is `[n, nb]` (at
     /// `j * nb + b`). Every main and remainder loop in this kernel family
     /// addresses them identically; columns are never interleaved.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemm_q4_0_8x8_q8_0(
@@ -6349,7 +6327,7 @@ pub(crate) mod neon {
     /// `[n, nb]` (at `j * nb + b`). Every main and remainder loop in this
     /// kernel family addresses them identically; columns are never
     /// interleaved.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemm_q4_0_8x8_q8_0_rowmajor(
@@ -6567,7 +6545,6 @@ pub(crate) mod neon {
     /// group `g` at `j * k + b * 32 + g * 4`) and `b_scales` is `[n, nb]` (at
     /// `j * nb + b`). Every main and remainder loop in this kernel family
     /// addresses them identically; columns are never interleaved.
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemm_q4_0_gate_up_silu_rowmajor(
@@ -7047,7 +7024,7 @@ pub(crate) mod neon {
     /// Same output contract as the vdot twin; the per-`smmla` 2×2 dots replace
     /// its broadcast+`vdotq` inner loop (the 1.59x per-thread prefill gap to
     /// llama.cpp's `ggml_gemm_q4_0_8x8_q8_0`, which is the same dataflow).
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,i8mm")]
     pub unsafe fn gemm_q4_0_smmla_8x4_q8_0(
@@ -7122,7 +7099,7 @@ pub(crate) mod neon {
     /// × Q8_0 batched GEMM writing directly in row-major `out[n, m]` layout,
     /// with B quants packed by
     /// [`crate::model::transformer::quantize_rows`].
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,i8mm")]
     pub unsafe fn gemm_q4_0_smmla_8x4_q8_0_rowmajor(
@@ -7225,7 +7202,7 @@ pub(crate) mod neon {
     /// Computes `out[tok, r] = silu(gate[r] · act[tok]) * (up[r] · act[tok])`
     /// directly in registers, eliminating intermediate memory allocations,
     /// store/load rounds, and cache thrashing for `up_mat`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,i8mm")]
     pub unsafe fn gemm_q4_0_smmla_gate_up_silu_rowmajor(
@@ -7661,7 +7638,6 @@ pub(crate) mod neon {
     /// silently drop the tail of every dot product — a truncated matmul, in release,
     /// with no assert. A guard that lives only in the gate is a guard the next caller
     /// can walk past.
-    #[allow(dead_code)]
     pub unsafe fn gemm_q4_k_q8_0_neon(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -7879,7 +7855,7 @@ pub(crate) mod neon {
     }
 
     /// Smmla (i8mm) repacked Q4_K x Q8_0 batched GEMM writing column-major `out[m, n]`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,i8mm")]
     pub unsafe fn gemm_q4_k_smmla_8x4_q8_0(
@@ -7959,7 +7935,7 @@ pub(crate) mod neon {
     }
 
     /// Smmla (i8mm) repacked Q4_K x Q8_0 batched GEMM writing row-major `out[n, m]`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,i8mm")]
     pub unsafe fn gemm_q4_k_smmla_8x4_q8_0_rowmajor(
@@ -8060,7 +8036,7 @@ pub(crate) mod neon {
     }
 
     /// Fused Gate + Up + SiLU smmla repacked Q4_K x Q8_0 batched GEMM writing directly into `out[n, m]`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,i8mm")]
     pub unsafe fn gemm_q4_k_smmla_gate_up_silu_rowmajor(
@@ -8374,7 +8350,7 @@ pub(crate) mod neon {
     }
 
     /// Dotprod repacked Q4_K x Q8_0 batched GEMM writing column-major `out[m, n]`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemm_q4_k_8x8_q8_0(
@@ -8454,7 +8430,7 @@ pub(crate) mod neon {
     }
 
     /// Dotprod repacked Q4_K x Q8_0 batched GEMM writing row-major `out[n, m]`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemm_q4_k_8x8_q8_0_rowmajor(
@@ -8555,7 +8531,6 @@ pub(crate) mod neon {
     }
 
     /// Fused Gate + Up + SiLU dotprod repacked Q4_K x Q8_0 batched GEMM writing directly into `out[n, m]`.
-    #[allow(dead_code)]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemm_q4_k_gate_up_silu_rowmajor(
@@ -8859,7 +8834,7 @@ pub(crate) mod neon {
     }
 
     /// Smmla (i8mm) repacked Q6_K x Q8_0 batched GEMM writing column-major `out[m, n]`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,i8mm")]
     pub unsafe fn gemm_q6_k_smmla_8x4_q8_0(
@@ -8929,7 +8904,7 @@ pub(crate) mod neon {
     }
 
     /// Smmla (i8mm) repacked Q6_K x Q8_0 batched GEMM writing row-major `out[n, m]`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,i8mm")]
     pub unsafe fn gemm_q6_k_smmla_8x4_q8_0_rowmajor(
@@ -9169,7 +9144,7 @@ pub(crate) mod neon {
     }
 
     /// Dotprod repacked Q6_K x Q8_0 batched GEMM writing column-major `out[m, n]`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemm_q6_k_8x8_q8_0(
@@ -9239,7 +9214,7 @@ pub(crate) mod neon {
     }
 
     /// Dotprod repacked Q6_K x Q8_0 batched GEMM writing row-major `out[n, m]`.
-    #[allow(dead_code)]
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,dotprod")]
     pub unsafe fn gemm_q6_k_8x8_q8_0_rowmajor(
@@ -9365,7 +9340,6 @@ pub(crate) mod neon {
     /// it, so the caller falls back to the per-token path rather than shipping a wrong
     /// answer. Unlike the K-quants there is no `k % 256` constraint: Q4_1 blocks are 32
     /// wide, so any `k` divisible by 32 (guaranteed by the `gemm_preq` wrapper) is fine.
-    #[allow(dead_code)]
     pub unsafe fn gemm_q4_1_q8_0_neon(
         a_quant: &[u8],
         b_scales: &[f32],
@@ -9385,9 +9359,7 @@ pub(crate) mod neon {
     /// Q8_0 × Q8_0 GEMM dispatcher. Prefers i8mm (`vmmlaq_s32`) when the tier is
     /// resolved to it, else dotprod, else the emulated-integer base.
     // Only non-test consumer is `transformer::gemm_preq`, gated
-    // `not(feature = "blas")`; dead under --all-features (blas on), live under
-    // the default CI gate.
-    #[allow(dead_code)]
+    // `not(feature = "blas")`.
     pub unsafe fn gemm_q8_0_q8_0_neon(
         a_quant: &[u8],
         b_scales: &[f32],
