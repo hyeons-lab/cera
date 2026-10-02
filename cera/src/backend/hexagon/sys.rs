@@ -15,6 +15,14 @@ pub type DspQueueCallback = extern "C" fn(context: *mut c_void);
 pub const DOMAIN_CDSP: i32 = 3;
 /// Mapping size from which a `fastrpc_mmap` failure is blamed on the DSP address space.
 const GIB: usize = 1 << 30;
+
+/// Hard ceiling on the bytes this process can have mapped into the CDSP at
+/// once. Measured on an S25 Ultra: one buffer maps up to about 3.9 GiB when
+/// nothing else is mapped, and several smaller buffers stop sooner (three
+/// 1 GiB buffers fit, a fourth does not). A request past this can never
+/// succeed; one under it may still be refused by the DSP, which
+/// [`FastRpcDriver::fastrpc_mmap`] reports.
+pub const DSP_MAP_CEILING: usize = GIB / 10 * 39;
 pub const FASTRPC_MAP_FD: u32 = 2;
 pub const FASTRPC_MAP_FD_DELAYED: u32 = 3;
 pub const DSPQUEUE_TIMEOUT_US: u32 = 1_000_000;
@@ -130,6 +138,10 @@ pub struct FastRpcDriver {
     /// core during active inference is cheaper than CPU inference);
     /// `CERA_HEXAGON_OPPOLL=0` restores blocking reads.
     oppoll: bool,
+
+    /// Bytes currently mapped through [`Self::fastrpc_mmap`], so a mapping
+    /// that cannot fit is refused before the (large) allocation behind it.
+    mapped_bytes: std::sync::atomic::AtomicUsize,
 }
 
 // FastRPC driver dispatch is thread-safe across function invocations.
@@ -241,6 +253,7 @@ impl FastRpcDriver {
                     dspqueue_export: resolve!("dspqueue_export", DspqueueExportFn),
                     dspqueue_write: resolve!("dspqueue_write", DspqueueWriteFn),
                     dspqueue_read: resolve!("dspqueue_read", DspqueueReadFn),
+                    mapped_bytes: std::sync::atomic::AtomicUsize::new(0),
                     oppoll: std::env::var("CERA_HEXAGON_OPPOLL")
                         .map(|v| v != "0")
                         .unwrap_or(true),
@@ -300,6 +313,31 @@ impl FastRpcDriver {
         }
     }
 
+    /// Bytes currently mapped into the CDSP through this driver.
+    pub fn mapped_bytes(&self) -> usize {
+        self.mapped_bytes.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// Refuse a mapping that can never fit, before anything is allocated.
+    ///
+    /// Allocating the DMA buffer first costs `length` bytes of RAM that the
+    /// failed map then gives back; for a model larger than the DSP address
+    /// space that is gigabytes of pinned memory spent to learn nothing.
+    pub fn ensure_map_fits(&self, length: usize) -> Result<(), CeraError> {
+        let mapped = self.mapped_bytes();
+        if mapped.saturating_add(length) > DSP_MAP_CEILING {
+            return Err(CeraError::Backend(format!(
+                "cannot map {} MiB into the DSP: {} MiB is already mapped and the DSP address \
+                 space holds at most about {} MiB in total, so this model's weights cannot \
+                 run on the NPU",
+                length >> 20,
+                mapped >> 20,
+                DSP_MAP_CEILING >> 20
+            )));
+        }
+        Ok(())
+    }
+
     /// Map a memory buffer into the CDSP virtual memory address space.
     pub fn fastrpc_mmap(&self, fd: i32, addr: *mut u8, length: usize) -> Result<(), CeraError> {
         let ret = (self.fastrpc_mmap)(
@@ -310,6 +348,10 @@ impl FastRpcDriver {
             length,
             FASTRPC_MAP_FD,
         );
+        if ret == 0 {
+            self.mapped_bytes
+                .fetch_add(length, std::sync::atomic::Ordering::SeqCst);
+        }
         if ret != 0 {
             // The CDSP unsigned PD has a 32-bit address space shared by every
             // mapping. Measured on an S25 Ultra: one buffer maps up to about
@@ -333,6 +375,21 @@ impl FastRpcDriver {
     /// Unmap a memory buffer from the CDSP virtual memory address space.
     pub fn fastrpc_munmap(&self, fd: i32, addr: *mut u8, length: usize) -> Result<(), CeraError> {
         let ret = (self.fastrpc_munmap)(DOMAIN_CDSP, fd, addr as *mut c_void, length);
+        if ret == 0 {
+            // Saturating: never wrap if a buffer is unmapped that was mapped
+            // outside this accounting. (A CAS loop: `fetch_update` is
+            // deprecated on current toolchains and its replacement is newer
+            // than the MSRV.)
+            let mut cur = self.mapped_bytes.load(std::sync::atomic::Ordering::SeqCst);
+            while let Err(seen) = self.mapped_bytes.compare_exchange_weak(
+                cur,
+                cur.saturating_sub(length),
+                std::sync::atomic::Ordering::SeqCst,
+                std::sync::atomic::Ordering::SeqCst,
+            ) {
+                cur = seen;
+            }
+        }
         if ret != 0 {
             Err(CeraError::Backend(format!(
                 "fastrpc_munmap failed for fd {} length {} (error {})",
@@ -647,6 +704,8 @@ pub(crate) mod fake {
         pub fail_invoke_method: Option<u32>,
         pub fail_write: bool,
         pub fail_read: bool,
+        /// `rpcmem_alloc` calls the fake has served.
+        pub allocs: usize,
         /// Status word the fake DSP answers batches with (`None` = Ok).
         pub rsp_status: Option<u32>,
         last_seq: u64,
@@ -674,6 +733,7 @@ pub(crate) mod fake {
     }
 
     extern "C" fn alloc(_heap: i32, _flags: u32, size: i32) -> *mut c_void {
+        with(|s| s.allocs += 1);
         unsafe { libc::calloc(1, size as usize) }
     }
     extern "C" fn free(p: *mut c_void) {
@@ -806,6 +866,7 @@ pub(crate) mod fake {
             dspqueue_write: q_write,
             dspqueue_read: q_read,
             oppoll: false,
+            mapped_bytes: std::sync::atomic::AtomicUsize::new(0),
         })
     }
 }
@@ -827,5 +888,50 @@ mod tests {
         assert_eq!(remote_scalars_make(3, 0, 0), 0x0300_0000);
         // Byte masking: values > 0xff should truncate to lowest 8 bits
         assert_eq!(remote_scalars_make(0x1ff, 0x2ff, 0x3ff), 0xffff_ff00);
+    }
+
+    #[test]
+    fn mapping_past_the_ceiling_is_refused_before_allocating() {
+        use crate::backend::hexagon::rpcmem::RpcmemBuffer;
+        fake::reset();
+        let driver = fake::driver();
+        let err = RpcmemBuffer::alloc(driver.clone(), DSP_MAP_CEILING + 1, true)
+            .err()
+            .expect("a buffer larger than the DSP address space must be refused");
+        assert!(err.to_string().contains("cannot run on the NPU"), "{err}");
+        assert_eq!(
+            fake::with(|s| s.allocs),
+            0,
+            "nothing may be allocated first"
+        );
+        assert_eq!(driver.mapped_bytes(), 0);
+    }
+
+    #[test]
+    fn mapped_bytes_track_buffers_and_gate_the_next_map() {
+        use crate::backend::hexagon::rpcmem::RpcmemBuffer;
+        fake::reset();
+        let driver = fake::driver();
+        let first = RpcmemBuffer::alloc(driver.clone(), 4096, true).unwrap();
+        assert_eq!(driver.mapped_bytes(), 4096);
+        // The headroom left after the first buffer is what the next map is
+        // judged against, not the ceiling alone.
+        let err = driver
+            .ensure_map_fits(DSP_MAP_CEILING - 4095)
+            .expect_err("one byte over the remaining headroom");
+        assert!(err.to_string().contains("already mapped"), "{err}");
+        driver.ensure_map_fits(DSP_MAP_CEILING - 4096).unwrap();
+        drop(first);
+        assert_eq!(driver.mapped_bytes(), 0, "dropping unmaps and releases it");
+        driver.ensure_map_fits(DSP_MAP_CEILING).unwrap();
+    }
+
+    #[test]
+    fn unmapped_buffers_do_not_count_against_the_ceiling() {
+        use crate::backend::hexagon::rpcmem::RpcmemBuffer;
+        fake::reset();
+        let driver = fake::driver();
+        let _host_only = RpcmemBuffer::alloc(driver.clone(), 4096, false).unwrap();
+        assert_eq!(driver.mapped_bytes(), 0);
     }
 }

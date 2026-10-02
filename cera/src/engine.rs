@@ -2340,14 +2340,32 @@ fn load_text_model_auto(
 
     #[cfg(feature = "gpu")]
     {
-        let gguf_for_gpu = gguf.clone();
-        match model::load_model_gpu(gguf_for_gpu, path, context_size) {
-            Ok(m) => {
-                tracing::debug!("cera::engine: using wgpu GPU backend (auto)");
-                return Ok(m);
-            }
-            Err(e) => {
-                tracing::debug!("cera::engine: wgpu unavailable ({e}); falling back to CPU");
+        let weight_bytes = gguf_weight_bytes(&gguf);
+        // Android only: GPU buffers there are the same RAM the process runs
+        // in. Elsewhere discrete VRAM or a unified-memory gate of its own
+        // decides, and the host's free RAM says nothing about the fit.
+        let available = if cfg!(target_os = "android") {
+            crate::sysmem::available_memory_bytes()
+        } else {
+            None
+        };
+        if wgpu_would_exhaust_memory(weight_bytes, available) {
+            tracing::debug!(
+                "cera::engine: skipping wgpu (auto): {} MiB of weights need about twice that \
+                 resident to upload, and only {} MiB is available; using CPU",
+                weight_bytes >> 20,
+                available.unwrap_or(0) >> 20
+            );
+        } else {
+            let gguf_for_gpu = gguf.clone();
+            match model::load_model_gpu(gguf_for_gpu, path, context_size) {
+                Ok(m) => {
+                    tracing::debug!("cera::engine: using wgpu GPU backend (auto)");
+                    return Ok(m);
+                }
+                Err(e) => {
+                    tracing::debug!("cera::engine: wgpu unavailable ({e}); falling back to CPU");
+                }
             }
         }
     }
@@ -2355,6 +2373,29 @@ fn load_text_model_auto(
     tracing::debug!("cera::engine: using CPU backend (auto)");
     model::load_model(gguf, path, context_size)
         .map_err(|e| CeraError::Backend(format!("CPU model load failed: {e}")))
+}
+
+/// Total bytes of tensor data in `gguf`: what a backend that copies the
+/// weights has to hold.
+#[cfg(feature = "gpu")]
+fn gguf_weight_bytes(gguf: &GgufFile) -> u64 {
+    gguf.tensors.values().map(|t| t.size_bytes as u64).sum()
+}
+
+/// Whether uploading `weight_bytes` through wgpu would outgrow `available`
+/// bytes of RAM.
+///
+/// On a phone the GPU's memory is the process's memory, and it is not
+/// reclaimable: the upload briefly holds the weights twice (staging and the
+/// device copy). Measured on an S25 Ultra: a 4.5 GiB model took the whole 7 GiB
+/// that was available and the process was OOM-killed before it finished
+/// loading, while the CPU path (a plain file mapping) ran the same file at
+/// 38 tok/s. `auto` therefore prefers the CPU over a load that cannot finish;
+/// an explicit `--device gpu` is left to the caller. `None` (cannot query)
+/// proceeds.
+#[cfg(any(feature = "gpu", test))]
+fn wgpu_would_exhaust_memory(weight_bytes: u64, available: Option<u64>) -> bool {
+    available.is_some_and(|a| weight_bytes.saturating_mul(2) > a)
 }
 
 fn build_metadata(
@@ -2438,6 +2479,28 @@ pub use loading_prototype::{
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn wgpu_skipped_when_the_upload_cannot_fit() {
+        const GIB: u64 = 1 << 30;
+        // The measured case: 4.5 GiB of weights with about 7 GiB available.
+        assert!(super::wgpu_would_exhaust_memory(4_620 << 20, Some(7 * GIB)));
+        // A 1.5 GiB model on the same phone loads fine.
+        assert!(!super::wgpu_would_exhaust_memory(
+            3 * GIB / 2,
+            Some(7 * GIB)
+        ));
+        // Exactly twice the weights still fits; one byte more does not.
+        assert!(!super::wgpu_would_exhaust_memory(GIB, Some(2 * GIB)));
+        assert!(super::wgpu_would_exhaust_memory(GIB, Some(2 * GIB - 1)));
+        // Not being able to ask must not block the GPU.
+        assert!(!super::wgpu_would_exhaust_memory(64 * GIB, None));
+        // Overflow saturates instead of wrapping into "fits".
+        assert!(super::wgpu_would_exhaust_memory(
+            u64::MAX,
+            Some(u64::MAX - 1)
+        ));
+    }
+
     use super::*;
 
     #[test]
