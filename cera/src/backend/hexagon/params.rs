@@ -100,14 +100,40 @@ pub fn build_unary_kernel_params(
     sess_threads: u32,
     has_weight: bool,
 ) -> [i32; 32] {
-    let mut kparams = [0i32; 32];
-    // Debug: single-threaded single-row blocking (pre-port behavior).
+    // Debug: single-threaded single-row blocking (pre-port behavior). Never
+    // read under `cfg(test)`, so an exported `CERA_HEXAGON_UNARY_T1` cannot
+    // change goldens or param tests; tests reach the legacy shape through
+    // [`build_unary_kernel_params_with`].
     static LEGACY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let legacy = *LEGACY.get_or_init(|| {
-        std::env::var("CERA_HEXAGON_UNARY_T1")
-            .map(|v| v == "1")
-            .unwrap_or(false)
-    });
+    let legacy = !cfg!(test)
+        && *LEGACY.get_or_init(|| {
+            std::env::var("CERA_HEXAGON_UNARY_T1")
+                .map(|v| v == "1")
+                .unwrap_or(false)
+        });
+    build_unary_kernel_params_with(
+        legacy,
+        ne0,
+        nrows,
+        weight_dim,
+        vtcm_size,
+        sess_threads,
+        has_weight,
+    )
+}
+
+/// [`build_unary_kernel_params`] with the legacy (single-thread, single-row)
+/// blocking choice explicit instead of read from the environment.
+pub(crate) fn build_unary_kernel_params_with(
+    legacy: bool,
+    ne0: usize,
+    nrows: usize,
+    weight_dim: usize,
+    vtcm_size: usize,
+    sess_threads: u32,
+    has_weight: bool,
+) -> [i32; 32] {
+    let mut kparams = [0i32; 32];
     let n_threads = if legacy {
         1
     } else {
@@ -543,6 +569,26 @@ pub fn build_flash_attn_kernel_params(
     kparams[30] = div_n_tokens.mp as i32;
     kparams[31] = div_n_tokens.l as i32;
 
+    kparams
+}
+
+/// Same as [`build_flash_attn_kernel_params`] with attention logit soft-capping.
+#[allow(clippy::too_many_arguments)]
+pub fn build_flash_attn_kernel_params_with_softcap(
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    n_tokens: usize,
+    seq_len: usize,
+    scale: f32,
+    n_threads: u32,
+    has_mask: bool,
+    softcap: f32,
+) -> [i32; 32] {
+    let mut kparams = build_flash_attn_kernel_params(
+        head_dim, n_heads, n_kv_heads, n_tokens, seq_len, scale, n_threads, has_mask,
+    );
+    kparams[5] = softcap.to_bits() as i32;
     kparams
 }
 
@@ -1223,6 +1269,33 @@ pub fn build_hmx_fa_kernel_params(
     Some(kparams)
 }
 
+/// Same as [`build_hmx_fa_kernel_params`] with attention logit soft-capping.
+#[allow(clippy::too_many_arguments)]
+pub fn build_hmx_fa_kernel_params_with_softcap(
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    n_tokens: usize,
+    seq_len: usize,
+    scale: f32,
+    n_threads: u32,
+    vtcm_budget: usize,
+    softcap: f32,
+) -> Option<[i32; 32]> {
+    let mut kparams = build_hmx_fa_kernel_params(
+        head_dim,
+        n_heads,
+        n_kv_heads,
+        n_tokens,
+        seq_len,
+        scale,
+        n_threads,
+        vtcm_budget,
+    )?;
+    kparams[5] = softcap.to_bits() as i32;
+    Some(kparams)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1245,6 +1318,21 @@ mod tests {
         let fd = init_fastdiv(0);
         assert_eq!(fd.mp, 0);
         assert_eq!(fd.l, 0);
+    }
+
+    /// The legacy knob shape is reachable only through the explicit seam, and
+    /// differs from the default blocking (one thread, one row).
+    #[test]
+    fn unary_legacy_blocking_is_explicit() {
+        let legacy = build_unary_kernel_params_with(true, 1024, 32, 1024, 8 << 20, 4, true);
+        assert_eq!(legacy[0], 1);
+        assert_eq!(legacy[2], 1);
+        let new = build_unary_kernel_params_with(false, 1024, 32, 1024, 8 << 20, 4, true);
+        assert_eq!(
+            new,
+            build_unary_kernel_params(1024, 32, 1024, 8 << 20, 4, true)
+        );
+        assert_ne!(new, legacy);
     }
 
     #[test]
@@ -1559,5 +1647,16 @@ mod tests {
         let p = build_flash_attn_kernel_params(64, 0, 1, 1, 1, 0.1, 1, false);
         // Offset 12 corresponds to n_head_log2; must be 0 when n_heads == 0 without underflow
         assert_eq!(p[12], 0);
+    }
+
+    #[test]
+    fn test_flash_attn_kernel_params_with_softcap() {
+        let p = build_flash_attn_kernel_params_with_softcap(64, 16, 8, 1, 64, 0.125, 1, true, 50.0);
+        assert_eq!(p[5], 50.0f32.to_bits() as i32);
+
+        let hmx =
+            build_hmx_fa_kernel_params_with_softcap(64, 16, 8, 32, 602, 0.125, 4, 8 << 20, 50.0)
+                .expect("should fit");
+        assert_eq!(hmx[5], 50.0f32.to_bits() as i32);
     }
 }

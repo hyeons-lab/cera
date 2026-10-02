@@ -5006,12 +5006,34 @@ pub fn softmax_inplace(x: &mut [f32]) {
 pub fn layer_norm_inplace(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32) {
     debug_assert_eq!(x.len(), weight.len());
     debug_assert_eq!(x.len(), bias.len());
+    let Some((mean_f32, inv_std)) = layer_norm_stats(x, eps) else {
+        return;
+    };
+    for i in 0..x.len() {
+        x[i] = (x[i] - mean_f32) * inv_std * weight[i] + bias[i];
+    }
+}
+
+/// [`layer_norm_inplace`] for a norm that carries weight only (Cohere,
+/// per-head Q/K norms): same statistics and rounding, no bias operand, so
+/// callers need not materialize a zero bias per call.
+pub fn layer_norm_weight_only_inplace(x: &mut [f32], weight: &[f32], eps: f32) {
+    debug_assert_eq!(x.len(), weight.len());
+    let Some((mean_f32, inv_std)) = layer_norm_stats(x, eps) else {
+        return;
+    };
+    for i in 0..x.len() {
+        x[i] = (x[i] - mean_f32) * inv_std * weight[i];
+    }
+}
+
+/// Mean and inverse standard deviation of `x` for LayerNorm, accumulated in
+/// f64. `None` for an empty slice.
+fn layer_norm_stats(x: &[f32], eps: f32) -> Option<(f32, f32)> {
     let n = x.len();
     if n == 0 {
-        return;
+        return None;
     }
-
-    // Mean + variance in f64.
     let mut sum = 0.0f64;
     for &v in x.iter() {
         sum += v as f64;
@@ -5024,11 +5046,7 @@ pub fn layer_norm_inplace(x: &mut [f32], weight: &[f32], bias: &[f32], eps: f32)
     }
     let var = var_sum / n as f64;
     let inv_std = (1.0 / (var + eps as f64).sqrt()) as f32;
-    let mean_f32 = mean as f32;
-
-    for i in 0..n {
-        x[i] = (x[i] - mean_f32) * inv_std * weight[i] + bias[i];
-    }
+    Some((mean as f32, inv_std))
 }
 
 /// erf-form GELU activation in-place:
@@ -8230,6 +8248,54 @@ fn compute_yarn_cos_sin(
     true
 }
 
+/// Per-pair frequency divisors that reproduce YaRN's angle blend on a backend
+/// whose RoPE kernel computes `theta / factors[i]` (the Llama-3 `rope_freqs`
+/// convention). YaRN's per-pair angle is `pos * theta_i * m_i` with
+/// `m_i = freq_scale * (1 - ramp_i) + ramp_i` (`ramp_i` is the ramp times
+/// `ext_factor`), independent of `pos`, so the divisor is `1 / m_i`.
+///
+/// This carries only the angles. YaRN also scales `cos` and `sin` by
+/// `yarn.mscale`; the caller must fold `mscale^2` into the attention softmax
+/// scale (both Q and K are rotated, so the scores scale by `mscale` twice).
+/// `None` for parameters the CPU path would also refuse.
+pub fn yarn_freq_factors(head_dim: usize, freq_base: f32, yarn: &YarnParams) -> Option<Vec<f32>> {
+    if head_dim < 2
+        || !head_dim.is_multiple_of(2)
+        || !freq_base.is_finite()
+        || freq_base <= 0.0
+        || !yarn.ext_factor.is_finite()
+        || !yarn.freq_scale.is_finite()
+        || yarn.freq_scale <= 0.0
+        || !yarn.mscale.is_finite()
+        || yarn.mscale <= 0.0
+    {
+        return None;
+    }
+    let corr_dims = if yarn.ext_factor != 0.0 {
+        rope_yarn_corr_dims(
+            head_dim,
+            yarn.orig_ctx_len,
+            freq_base,
+            yarn.beta_fast,
+            yarn.beta_slow,
+        )
+    } else {
+        [0.0, 0.0]
+    };
+    Some(
+        (0..head_dim / 2)
+            .map(|i| {
+                let mix = if yarn.ext_factor != 0.0 {
+                    rope_yarn_ramp(corr_dims[0], corr_dims[1], i * 2) * yarn.ext_factor
+                } else {
+                    0.0
+                };
+                1.0 / (yarn.freq_scale * (1.0 - mix) + mix)
+            })
+            .collect(),
+    )
+}
+
 /// Apply precomputed NeoX RoPE rotation to a single head slice.
 #[inline(always)]
 fn rotate_head_neox_with_cos_sin(head: &mut [f32], half_dim: usize, cos_sin: &[(f32, f32)]) {
@@ -8911,6 +8977,47 @@ pub fn axpy_inplace(a: &mut [f32], b: &[f32], alpha: f32) {
 
 #[cfg(test)]
 mod tests {
+    /// A backend that divides each pair's angle by `yarn_freq_factors` and
+    /// scales `cos`/`sin` by `mscale` must land on the CPU YaRN rotation.
+    #[test]
+    fn yarn_freq_factors_reproduce_the_cpu_yarn_angles() {
+        let (head_dim, base) = (64usize, 1_000_000.0f32);
+        for (factor, ext) in [(16.0f32, 1.0f32), (4.0, 1.0), (8.0, 0.5), (1.0, 1.0)] {
+            let yarn = YarnParams::new(1.0 / factor, ext, 1.0, 32.0, 1.0, 4096);
+            let factors = yarn_freq_factors(head_dim, base, &yarn).unwrap();
+            assert_eq!(factors.len(), head_dim / 2);
+            for pos in [0usize, 1, 7, 513, 4095, 9000] {
+                let mut want = vec![(0.0f32, 0.0f32); head_dim / 2];
+                assert!(compute_yarn_cos_sin(pos, head_dim, base, &yarn, &mut want));
+                let theta_scale = base.powf(-2.0 / head_dim as f32);
+                let mut theta = pos as f32;
+                for (i, &(wc, ws)) in want.iter().enumerate() {
+                    let (s, c) = (theta / factors[i]).sin_cos();
+                    assert!(
+                        (c * yarn.mscale - wc).abs() < 2e-3 && (s * yarn.mscale - ws).abs() < 2e-3,
+                        "factor {factor} ext {ext} pos {pos} pair {i}: got ({}, {}) want ({wc}, {ws})",
+                        c * yarn.mscale,
+                        s * yarn.mscale
+                    );
+                    theta *= theta_scale;
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn yarn_freq_factors_refuse_what_the_cpu_refuses() {
+        let ok = YarnParams::new(0.25, 1.0, 1.0, 32.0, 1.0, 4096);
+        assert!(yarn_freq_factors(64, 1e6, &ok).is_some());
+        assert!(yarn_freq_factors(63, 1e6, &ok).is_none(), "odd head_dim");
+        assert!(yarn_freq_factors(64, 0.0, &ok).is_none(), "bad base");
+        let bad = YarnParams::new(0.0, 1.0, 1.0, 32.0, 1.0, 4096);
+        assert!(
+            yarn_freq_factors(64, 1e6, &bad).is_none(),
+            "zero freq_scale"
+        );
+    }
+
     use super::*;
 
     /// `RAYON_NUM_THREADS` wins when usable, the detected perf-core count is

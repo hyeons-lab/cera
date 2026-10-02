@@ -11,6 +11,7 @@ use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, LayerState};
 use crate::model::transformer::{self, DecodeAttnDims, KvView, WeightRef};
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers, SsmConfig};
+use crate::tensor::Tensor;
 
 /// Weight references for a full attention layer.
 pub(crate) struct AttnLayerRefs {
@@ -52,19 +53,43 @@ pub(crate) struct LayerRefs {
 
 /// Qwen 3.5 / Ornith 1.0 hybrid model.
 pub struct Qwen35Model {
-    gguf: GgufFile,
-    config: ModelConfig,
-    head_dim: usize,
-    embd_ref: WeightRef,
-    output_norm_weight: Vec<f32>,
-    output_ref: Option<WeightRef>,
-    layers: Vec<LayerRefs>,
-    sliding_window: Option<usize>,
+    pub(crate) gguf: GgufFile,
+    pub(crate) config: ModelConfig,
+    pub(crate) head_dim: usize,
+    /// Rotated dims per head (`{prefix}.rope.dimension_count`, `head_dim` when
+    /// absent). llama.cpp rotates only this prefix of each head; the tail passes
+    /// through unrotated. Qwen 3.5 GGUFs ship 64 on head_dim 256.
+    pub(crate) rope_dim: usize,
+    pub(crate) embd_ref: WeightRef,
+    pub(crate) output_norm_weight: Vec<f32>,
+    pub(crate) output_ref: Option<WeightRef>,
+    pub(crate) layers: Vec<LayerRefs>,
+    pub(crate) sliding_window: Option<usize>,
     #[allow(dead_code)]
-    model_id: String,
+    pub(crate) model_id: String,
+}
+
+/// The post-attention norm of layer `il`. llama.cpp's converter names it
+/// `post_attention_norm`; older exports used `attn_post_norm` or fell back to
+/// `ffn_norm`. Lookup order: `attn_post_norm`, `post_attention_norm`, `ffn_norm`.
+fn attn_post_norm_tensor(gguf: &GgufFile, il: usize) -> Result<Tensor> {
+    gguf.get_tensor(&format!("blk.{il}.attn_post_norm.weight"))
+        .or_else(|_| gguf.get_tensor(&format!("blk.{il}.post_attention_norm.weight")))
+        .or_else(|_| gguf.get_tensor(&format!("blk.{il}.ffn_norm.weight")))
+        .with_context(|| {
+            format!(
+                "missing blk.{il}.attn_post_norm.weight, post_attention_norm.weight or ffn_norm.weight"
+            )
+        })
 }
 
 impl Qwen35Model {
+    /// Return the raw byte slice for a weight reference within the GGUF mmap.
+    #[cfg_attr(not(feature = "hexagon"), allow(dead_code))]
+    pub(crate) fn weight_bytes(&self, wref: &WeightRef) -> &[u8] {
+        transformer::weight_data(&self.gguf, wref)
+    }
+
     pub fn from_gguf(gguf: GgufFile, context_size: usize) -> Result<Self> {
         Self::from_gguf_with_id(gguf, context_size, String::new())
     }
@@ -137,6 +162,14 @@ impl Qwen35Model {
         ensure!(
             head_dim.is_multiple_of(2),
             "head_dim ({head_dim}) must be an even integer for RoPE rotation"
+        );
+        let rope_dim = match gguf.get_u32(&format!("{prefix}.rope.dimension_count")) {
+            Some(v) => v as usize,
+            None => head_dim,
+        };
+        ensure!(
+            rope_dim > 0 && rope_dim.is_multiple_of(2) && rope_dim <= head_dim,
+            "{prefix}.rope.dimension_count ({rope_dim}) must be even and within (0, head_dim={head_dim}]"
         );
         ensure!(
             rms_norm_eps > 0.0 && rms_norm_eps.is_finite(),
@@ -302,13 +335,7 @@ impl Qwen35Model {
                 .get_tensor(&format!("blk.{il}.attn_norm.weight"))
                 .with_context(|| format!("missing blk.{il}.attn_norm.weight"))?
                 .to_f32_vec();
-            let attn_post_norm = gguf
-                .get_tensor(&format!("blk.{il}.attn_post_norm.weight"))
-                .or_else(|_| gguf.get_tensor(&format!("blk.{il}.ffn_norm.weight")))
-                .with_context(|| {
-                    format!("missing blk.{il}.attn_post_norm.weight or ffn_norm.weight")
-                })?
-                .to_f32_vec();
+            let attn_post_norm = attn_post_norm_tensor(&gguf, il)?.to_f32_vec();
 
             let ffn_gate =
                 transformer::resolve_weight(&gguf, &format!("blk.{il}.ffn_gate.weight"))?;
@@ -589,6 +616,7 @@ impl Qwen35Model {
             gguf,
             config,
             head_dim,
+            rope_dim,
             embd_ref,
             output_norm_weight,
             output_ref,
@@ -750,10 +778,10 @@ impl Qwen35Model {
                 let qi = q[i];
                 let row_offset = i * s_dim;
                 let row = &mut s_mat[row_offset..row_offset + s_dim];
-                for j in 0..s_dim {
-                    let updated = row[j] + ki * d[j];
-                    row[j] = updated;
-                    o_head[j] += updated * qi;
+                for ((r, &dj), o) in row.iter_mut().zip(d.iter()).zip(o_head.iter_mut()) {
+                    let updated = *r + ki * dj;
+                    *r = updated;
+                    *o += updated * qi;
                 }
             }
         }
@@ -856,14 +884,19 @@ impl Qwen35Model {
         transformer::gemv(&self.gguf, &refs.attn_v, normed, &mut v);
 
         // Apply RoPE to Q and K
-        cpu::rope(
+        // Text-only IMROPE reduces to NEOX over the first `rope_dim` dims of each
+        // head (all position components are equal).
+        super::llama::rope_partial(
             &mut q,
             &mut k,
             pos,
             n_heads,
             n_kv_heads,
             head_dim,
+            self.rope_dim,
             self.config.rope_theta,
+            cpu::RopeType::Neox,
+            &mut state.scratch.rope_gather,
         );
 
         // Append K and V to cache
@@ -1174,5 +1207,59 @@ impl Model for Qwen35Model {
 
     fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
         state.truncate_to(len);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::gguf::GgufBuilder;
+
+    fn gguf_with(names: &[&str]) -> GgufFile {
+        let mut b = GgufBuilder::new();
+        for (i, n) in names.iter().enumerate() {
+            b = b.tensor_f32(*n, &[2], &[i as f32 + 1.0, i as f32 + 1.0]);
+        }
+        b.build()
+    }
+
+    /// Each of the three accepted names resolves on its own, so a real
+    /// llama.cpp export (`post_attention_norm`) loads without the python or
+    /// checkpoint fixtures the oracle tests need.
+    #[test]
+    fn attn_post_norm_resolves_each_alias() {
+        for name in [
+            "blk.3.attn_post_norm.weight",
+            "blk.3.post_attention_norm.weight",
+            "blk.3.ffn_norm.weight",
+        ] {
+            let g = gguf_with(&[name]);
+            let t = attn_post_norm_tensor(&g, 3).unwrap_or_else(|e| panic!("{name}: {e}"));
+            assert_eq!(t.to_f32_vec(), vec![1.0, 1.0], "{name}");
+        }
+    }
+
+    #[test]
+    fn attn_post_norm_prefers_attn_post_norm_then_post_attention_norm() {
+        let g = gguf_with(&[
+            "blk.0.ffn_norm.weight",
+            "blk.0.post_attention_norm.weight",
+            "blk.0.attn_post_norm.weight",
+        ]);
+        assert_eq!(attn_post_norm_tensor(&g, 0).unwrap().to_f32_vec()[0], 3.0);
+        let g = gguf_with(&["blk.0.ffn_norm.weight", "blk.0.post_attention_norm.weight"]);
+        assert_eq!(attn_post_norm_tensor(&g, 0).unwrap().to_f32_vec()[0], 2.0);
+    }
+
+    #[test]
+    fn attn_post_norm_missing_lists_all_three_names() {
+        let g = gguf_with(&["blk.0.attn_norm.weight"]);
+        let Err(e) = attn_post_norm_tensor(&g, 0) else {
+            panic!("no alias present must error")
+        };
+        let e = e.to_string();
+        for n in ["attn_post_norm", "post_attention_norm", "ffn_norm"] {
+            assert!(e.contains(n), "{e}");
+        }
     }
 }

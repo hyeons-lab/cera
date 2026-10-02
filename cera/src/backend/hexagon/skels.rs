@@ -82,7 +82,10 @@ fn write_new_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
         .create_new(true)
         .mode(0o644)
         .open(path)?;
-    f.write_all(bytes)
+    f.write_all(bytes)?;
+    // Flushed before the rename so a power loss cannot leave a zero-length
+    // `.so` at the loader-visible path.
+    f.sync_all()
 }
 
 /// Write the embedded skels into `dir` (created private, mode 0700, if
@@ -95,6 +98,18 @@ fn write_new_file(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 /// read the environment: `set_var` is process-global and cannot be made
 /// sound against foreign threads (JVM, loader) racing a `getenv` from
 /// inside this process.
+///
+/// Why the env mutation cannot be made opt-in or skipped today: the JVM and
+/// desktop flows reach this function through `hexagon_install_skels`, whose
+/// contract is that it also points the loader at `dir`, so dropping the
+/// `set_var` would silently break every caller that relies on it, and a flag
+/// to skip it would change the UniFFI surface pinned by the api_contracts
+/// snapshot. Kotlin `HexagonNpu.setup` therefore runs both mutations (this
+/// one, then its `Os.setenv` that adds the vendor fallback paths) exactly
+/// once, on the caller's thread, inside its `@Synchronized` setup at startup.
+/// A cleaner split (a file-staging entry point that never touches the
+/// environment, with the caller owning `setenv`) is a public API change and
+/// belongs in a deliberate FFI revision.
 ///
 /// The two staging flows (this function and Kotlin `HexagonNpu.setup`)
 /// serialize internally (this side via `SKEL_ENV_LOCK`) but against
@@ -442,8 +457,21 @@ pub struct HexagonProbe {
 /// order, and return the first working device's capabilities. The probe
 /// device is dropped before returning; use [`HexagonDevice`] for real
 /// sessions. On failure the error aggregates every arch's message.
+///
+/// Honors the `CERA_DISABLE_HEXAGON` / `CERA_NO_HEXAGON` kill switches before
+/// touching the driver: a probe that reported a working NPU (and took a power
+/// vote) while every loader refuses would mislead callers.
 pub fn probe() -> Result<HexagonProbe, CeraError> {
-    let driver = FastRpcDriver::load()?;
+    probe_with(|k| std::env::var_os(k), FastRpcDriver::load)
+}
+
+/// [`probe`] with the env lookup and driver loader injected (tests).
+pub(crate) fn probe_with(
+    get: impl Fn(&str) -> Option<std::ffi::OsString>,
+    load: impl FnOnce() -> Result<Arc<FastRpcDriver>, CeraError>,
+) -> Result<HexagonProbe, CeraError> {
+    super::ensure_not_disabled_with(get)?;
+    let driver = load()?;
     let mut errors = Vec::new();
     for arch in PROBE_ARCHS {
         match HexagonDevice::new(Arc::clone(&driver), arch) {

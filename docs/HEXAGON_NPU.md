@@ -127,6 +127,11 @@ The DSP-side worker libraries (`libggml-htp-v{73,75,79,81}.so`) are precompiled 
 - **Unified Backend Resolution**: Vocoder detokenizer and depthformer acceleration routes through `cera::model::audio_decoder::build_audio_accelerator`, providing immediate parity with `--device hexagon` and honoring `CERA_AUDIO_GPU` environment overrides.
 - **Automatic Depthformer Activation**: When targeting Hexagon NPU, hardware-accelerated depthformer codebook sampling executes automatically without requiring auxiliary experimental flags. The Metal and wgpu depthformers stay opt-in (`CERA_GPU_DF=1`); an accelerator opts in to the default through `AudioAccelerator::depthformer_default_on`.
 
+### 4.9 Failure Handling: Torn State, Lock Poisoning, and Timeouts
+- **Torn recurrent state**: a forward that fails after any batch reached the DSP may have advanced the short-conv or DeltaNet state in `kv_state_buf` while `seq_len` did not move. `HexagonLfmModel` then refuses every forward and partial rewind with a typed "recurrent state torn" error until `truncate_kv(0)` or `try_reset_kv` zeroes the state. A failure before any dispatch (emit-time validation, batch registration) leaves the state intact and does not tear it. Attention-only models rewrite their KV slots idempotently and never tear.
+- **Lock poisoning**: the LFM2 device lock is taken through one helper. If a panic unwound through a forward, the helper marks the state torn, clears the poison and returns the guard, so recovery is the same full reset. The check that refuses torn state takes the device guard as an argument, so checking before locking does not compile. The audio-decoder, vision and Whisper paths recover a poisoned device lock through `LockOrRecover` (logged once) and drop any half-built pending batch before they stage a new one, since each call restages its batch in full. Whisper's decode keeps its scratch and state buffers behind locks that fail closed with a backend error, because that state resumes across calls and a torn one cannot be told from a good one. Cached decode templates that are patched in place are discarded on poison (`lock_or_discard`) and rebuilt.
+- **DSP read timeout**: `dspqueue_read` gives up after 30 s and the queue counts the batch as outstanding, because the DSP may still complete it later and write the buffers it targets (KV, recurrent state). The LFM2 reset paths (`truncate_kv(0)`, `try_reset_kv`) first wait for every outstanding batch to answer and only then zero the state buffer; if the DSP still does not answer, `try_reset_kv` returns an error and `truncate_kv(0)` leaves the buffer untouched and the model torn, so the only way out is to retry the reset later or drop the model. Not validated on device: the S25 Ultra has not been driven into a real 30 s hang, so the timing of a late completion relative to the reset is covered only by the fake-driver tests. Forwards after a timeout on an attention-only model do not wait, and rely on their KV slots being rewritten before they are read.
+
 ---
 
 ## 5. Mobile & Android Integration
@@ -197,6 +202,38 @@ cera run -m model-Q4_0.gguf -p "Hello from Qualcomm Hexagon!" --device hexagon
 cera run -m model-Q4_0.gguf -p "Auto device selection" --device auto
 ```
 
+### 5.1 Environment Switches
+
+Every environment knob the Hexagon path reads. All are read at model load or first use unless noted, and are meant for debugging and A/B work rather than production configuration.
+
+Boolean rule (the intended convention for the LFM2 loader knobs, consolidated in `HexagonKnobs`): an **opt-in** knob (default off) is enabled only by `1` or `true` (case-insensitive); a **default-on** knob is disabled only by `0` or `false`. Any other value keeps the default. Knobs marked "set" instead test only that the variable exists (any value, including `0`, turns them on). The kill switches are the one deliberate exception: they fail safe, so any value except empty, `0` or `false` disables the backend.
+
+Diagnostics convention: warnings and failures on the model path are paired, emitted through both `tracing` and stderr by the `hexagon_warn!` / `hexagon_error!` macros (`backend/hexagon/mod.rs`, one formatted message, `cera-hexagon: ` prefix), since `cera-ffi` installs no tracing subscriber and stderr is what Android logcat shows. Opt-in debug knobs (`DEBUG`, `STEP`, `PROFILE`, `PROFILE_OPS`) use plain `eprintln!` because the output is the point of setting them.
+
+| Variable | Default | Parse rule | Effect |
+|----------|---------|------------|--------|
+| `CERA_DISABLE_HEXAGON` | unset | Any value except empty, `0`, `false` disables | Kill switch, checked centrally in `HexagonContext::new`, `probe_device` and `probe` (the FFI `hexagon_probe`, which reports no NPU while it is set), so the LFM2, vision, audio and whisper loaders all honor it. Loaders fall back to the CPU/GPU path. |
+| `CERA_NO_HEXAGON` | unset | Same as `CERA_DISABLE_HEXAGON` | Alias of the kill switch above; either one suffices. |
+| `CERA_HEXAGON_ARCH` | auto-probe | Integer `73`, `75`, `79` or `81`; anything else ignored | Force the DSP architecture (skel) instead of probing `V79, V75, V73, V81` in order. Read by the LFM2, vision, audio and whisper loaders. |
+| `CERA_HEXAGON_OPPOLL` | on | `0` disables (any other value keeps it) | DSP queue completion polling. On: non-blocking `dspqueue_read` with a spin (lower wakeup latency, one busy host core during batches). `0`: blocking reads. |
+| `CERA_HEXAGON_ADPF` | on | `0` disables | Android ADPF performance-hint session for the calling thread. |
+| `CERA_HEXAGON_ADPF_TARGET_MS` | `10` | Unsigned integer milliseconds; invalid values fall back to the default | ADPF work-duration target. |
+| `CERA_HEXAGON_SPIN` | off | `1` enables | Park a detached spinner thread for the process lifetime to hold CPU clocks across DSP waits (governor experiments; burns a core). |
+| `CERA_HEXAGON_DEBUG` | off | set | Verbose flush dump (buffers, tensors, ops) and NX-fallback notices, printed to stderr (`eprintln!`, so it shows on Android logcat without a tracing subscriber). |
+| `CERA_HEXAGON_STEP` | off | set | Flush at every op-group boundary (one `dispatch::*` helper or model-local op emitter, so ops that share tensor indices stay in one batch) instead of once per forward; bisects a faulty group, very slow. Progress lines go to stderr. Read once per process. |
+| `CERA_HEXAGON_PROFILE` | off | set | Enable the DSP profiler and aggregate per-op timings; a per-flush line and a table on session drop are printed to stderr. Read once per process. |
+| `CERA_HEXAGON_PROFILE_OPS` | off | set | With `CERA_HEXAGON_PROFILE`, also print one stderr line per op per batch. |
+| `CERA_HEXAGON_UNARY_T1` | off | `1` enables | Legacy single-threaded, single-row unary kernel params (pre-port behavior). Read once per process; ignored under `cfg(test)` so goldens stay hermetic. |
+| `CERA_HEXAGON_BARRIERS` | off | `1` enables | LFM2 debug: flush between blocks (`debug_barriers`). |
+| `CERA_HEXAGON_CPU_ROPE` | off | `1` enables | LFM2 decode applies RoPE on the host CPU instead of the NPU. |
+| `CERA_HEXAGON_KV_Q8` | off (F16 KV) | `1` or `true` (case-insensitive) enables | Store the on-device KV cache as Q8_0 instead of F16. |
+| `CERA_HEXAGON_SSM_CONV` | on | `0` disables | Use the `SsmConv` DSP op for the short-conv state update instead of the manual op chain. |
+| `CERA_HEXAGON_HMX` | on | `0` disables | Prefer HMX matmul kernels (HVX fallback when off). |
+| `CERA_HEXAGON_DECODE_OPS` | unset (single-flush decode) | Positive integer caps ops per decode flush; `0`, unset or invalid means no cap | Decode ops-per-flush cap (bring-up and bisection aid, not a safety threshold). Captured once per model at load (via `HexagonKnobs`), not per decode step. |
+| `CERA_DUMP_ACT` | off | set | LFM2 debug: flush and log RMS/max-abs of activations at layer boundaries for cross-backend diffing. |
+
+Testing: host tests pin the emitted op sequence with a thread-local recorder (`backend/hexagon/op_capture.rs`, test-only). `CERA_UPDATE_GOLDEN=1` (or `true`; test-only, never read in production) dumps the recorded op text of each golden to `target/golden/<label>.txt` so a changed golden can be diffed. The hexagon test session is hermetic against `CERA_HEXAGON_STEP` and `CERA_HEXAGON_UNARY_T1`.
+
 ---
 
 ## 6. Physical Hardware Benchmarks
@@ -212,3 +249,26 @@ Measurements taken on a retail Samsung Galaxy S25 Ultra (Snapdragon 8 Elite, SM-
 | **Vision Generation** | LFM2.5-VL-450M (Q4_0) | Decode Throughput | **146.35 tok/s** | CPU: 140.97 tok/s |
 | **Audio Time-To-First-Token** | LFM2-Audio-1.5B (Q4_0) | Audio TTFT | **238.5 ms** | Leap CPU: 600.0 ms (2.52x faster) |
 | **Audio Synthesis** | Audio Vocoder / Detok | Decode Throughput | **36.67 tok/s** | Leap CPU: 23.02 tok/s (1.59x faster) |
+
+---
+
+## 7. Operator Coverage & Model Tier Support
+
+The following table inventories Hexagon DSP kernel implementation and Cera host driver dispatch coverage across model architecture tiers:
+
+| Tier | Architectures | Operations Required | In DSP Skeleton | In Host Driver | Status |
+|------|---------------|---------------------|-----------------|----------------|--------|
+| **T0** | LFM2, LFM2-VL, Whisper, Audio Decoder | `MulMat`, `MulMatNx`, `RmsNormMul`, `GluSwiglu`, `Rope`, `FlashAttnExt`, `Add`, `Mul`, `SsmConv`, `Argmax`, `SetRows`, `Cpy`, `Concat` | Yes | Yes | LFM2, LFM2-VL and the audio decoder measured on device (section 6); Whisper is host-tested only |
+| **T1 (Dense)** | LLaMA, Qwen2, Qwen3, Granite, Mistral3, Ministral3, MiniCPM, MiniCPM5, Nanbeige, Olmo2/3, Phi/Phi3 | `RmsNormMul`, `MulMat`, `MulMatNx`, `Rope` (Norm and Neox), `FlashAttnExt`, `Add` (residual and QKV/output/FFN bias, row-broadcast), `Mul` (residual scalar), `GluSwiglu`, Granite attention scale (kparams) and host-side logit scale, `Argmax`, Per-head QK-norm | Yes | Yes | Verified on S25 Ultra for Qwen3-0.6B, Qwen2-0.5B, SmolLM-135M and Llama-3.2-1B (Q8_0 and Q4_K_M): top-3 logits match the CPU at 700 tokens |
+| **T2 (Dense+)** | Gemma 2, Gemma 4 | `FlashAttnExt` (sliding window), Attn logit soft-capping (`kparams[5]`), Final logit soft-capping, Sandwich norms, `GluGeglu`, Q4_1 wire repacking | Yes | Yes | Implemented in Hexagon engine and routed in model loader |
+| **T3 (MoE)** | LFM2-MoE (BailingMoE is CPU-only; the Hexagon loader does not accept it) | Router `MulMat`, `UnarySigmoid`, `Add` (bias), `Argsort`, `GetRows`, `MulMatId`, `MulScalar` | Yes | Yes | Implemented in Hexagon engine (dispatch_moe_token) and routed in model loader; top-k weights are renormalized on the DSP (`Add` chain, `max(sum, 2^-14)` via `Sub` + `UnaryRelu`, then `Div`), matching the CPU `select_experts`. Router and SSM gate weights ride the Q8_0 wire (no F32 matmul layout), so near-tied experts can flip |
+| **T4 (Hybrid SSM)** | Qwen3.5, GraniteHybrid, Falcon-H1, Mamba2 | `GatedDeltaNet`, `SsmConv`, `Cumsum`, `SolveTri`, `L2Norm`, Mamba-2 1D state-space scan | Partial (Mamba-2 SSD scan missing in DSP firmware) | Partial (needs state layout) | Qwen3.5 verified on S25 Ultra (0.8B Q4_K_M, prompts up to 1100 tokens, matches CPU). DSP kernel needed for Mamba-2; others supported or CPU-split |
+
+Notes on the tiers above:
+
+- **Host CPU steps.** YaRN, Llama-3 `rope_freqs` scaling, Mistral 3 attention temperature and Qwen 3.5 partial rotary are not expressible in the DSP rope kernel. For those models the queue is flushed, the step runs on the host and the model continues (one warning at load). Decode then flushes once per attention layer, which costs throughput.
+- **CPU-only architectures.** `stablelm`, `starcoder2`, `cohere` and `command-r` need LayerNorm and/or parallel residual, which only the CPU `LlamaModel` path implements. The wgpu, Metal and Hexagon loaders return a clear error for them.
+- **Q4_1 wire.** Q4_1 weights are repacked onto the `Q4K` wire type with `block_bytes` 20 (Q4_K uses 144). The host layout is pinned by tests; confirm the DSP stride on a Q4_1 model on the S25 Ultra.
+- **DSP address space limits model size.** All static weights live in one rpcmem buffer, and the CDSP maps at most about 3 to 4 GiB in total. Measured on an S25 Ultra with a probe that maps buffers after opening a DSP session: a single buffer maps up to 3.9 GiB when nothing else is mapped, but three 1 GiB buffers fit and a fourth (or an extra 512 MiB) fails with `error 1`. So LFM2.5-8B-A1B Q4_0 (4.8 GiB of weights) cannot load on the NPU, and splitting the buffer would not help because the limit is on the total mapped. Running such a model needs layers split between NPU and CPU, or weights paged in and out of the mapping. The loader refuses it before allocating anything (`FastRpcDriver::ensure_map_fits`, which tracks the bytes mapped so far against a 3.9 GiB ceiling), and the error says why. `--device auto` then falls back to the CPU; on Android it also skips wgpu when twice the weights exceed the available RAM, because that upload OOM-killed the process on this phone (the CPU path runs the same 4.8 GiB file at about 40 tok/s). `cera/examples/hexagon_map_probe.rs` measured whether paging is possible, on the same S25 Ultra: unmapping returns the address space (eight map and unmap cycles of 1 GiB all succeed), a sliding window of four mapped 512 MiB buffers over nine buffers that all stay allocated works with no copy per page-in, and mapping costs about 0.16 ms for 16 MiB, 2.7 ms for 256 MiB and 11.7 ms for 1 GiB (unmapping 0.2 to 0.5 ms). With 256 MiB buffers the total ceiling is 3840 MiB. So paging resident `rpcmem` buffers is feasible on the mapping side; what it still needs is a weights layout of several buffers instead of one, and DSP ops that take more than one weight buffer. A prefill chunk of 64 or more rows used to fail with `VtcmTooSmall` on Qwen 3.5, because the attention gate ran as one flat vector; it now runs one row per token.
+- **NPU text-to-speech needs a voice phrase.** LFM2.5-Audio-1.5B Q4_0 given only `Perform TTS.` is out of distribution: greedy runs ranged from 23 to 4070 audio frames on the NPU, and a long runaway is also why the CPU run on the phone did not finish in five minutes. With `Perform TTS. Use the US female voice.` the NPU gave 25, 25 and 23 frames (CPU model with NPU audio: 23, 23), against 24 on a Mac CPU. Use the voice prompts from the audio profile (PR 463).
+- **Still needs S25 Ultra validation.** Routed experts (LFM2-MoE) on a model that fits, Q4_1 weights (the wire stride, block bytes 20 against 144), Gemma 2 and sliding-window models past the window, a forced 30 s DSP hang (quiesce and reset), and Whisper and ViT parity beyond the short samples tried (Whisper-base.en and LFM2.5-VL-450M matched the CPU on one clip each).

@@ -10,12 +10,12 @@
 use anyhow::{Result, anyhow, ensure};
 use std::sync::{Arc, Mutex};
 
-use crate::backend::hexagon::LockOrRecover;
+use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTile};
 use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
-    HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer,
-    align128, build_binary_kernel_params, build_layer_norm_params, build_unary_kernel_params,
-    repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+    HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, LockOrRecover,
+    RpcmemBuffer, align128, build_binary_kernel_params, repack_q4_0, repack_q8_0,
+    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::model::vision_encoder::{
     PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionEncoderWeights,
@@ -27,6 +27,9 @@ use crate::session::CeraError;
 use crate::tensor::DType;
 
 pub use crate::backend::hexagon::HexagonWeightFormat;
+/// The ViT emits one op over all tokens (see `dispatch::TokenTile`); only the
+/// Whisper encoder tiles. Every `dispatch::*` call here passes this constant.
+const VIT_TILE: TokenTile = TokenTile::Whole;
 
 pub use crate::backend::hexagon::types::HexagonWeightDesc as HexagonVitWeightDesc;
 
@@ -375,229 +378,6 @@ impl HexagonVisionEncoder {
         })
     }
 
-    /// Dispatch LayerNorm: Opcode 49 `Norm`, followed by affine scale and shift.
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_layer_norm(
-        session: &mut HexagonQueueSession,
-        src: &RpcmemBuffer,
-        src_offset: usize,
-        dst: &RpcmemBuffer,
-        dst_offset: usize,
-        weights: &RpcmemBuffer,
-        w_offset: usize,
-        b_offset: usize,
-        eps: f32,
-        n_tokens: usize,
-        dim: usize,
-    ) -> Result<(), CeraError> {
-        let bytes = n_tokens * dim * 4;
-        let ne = [dim as u32, n_tokens as u32, 1, 1];
-        let nb = [4, (dim * 4) as u32, bytes as u32, bytes as u32];
-
-        let src_ti = session.add_tensor(
-            src,
-            src_offset,
-            bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            ne,
-            nb,
-        )?;
-        let dst_ti = session.add_tensor(
-            dst,
-            dst_offset,
-            bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            ne,
-            nb,
-        )?;
-
-        let params = build_layer_norm_params(eps);
-        let kparams = build_unary_kernel_params(
-            dim,
-            n_tokens,
-            0,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-            false,
-        );
-
-        session
-            .enqueue_op(
-                HtpOpCode::Norm as u32,
-                &[src_ti],
-                &[dst_ti],
-                params,
-                kparams,
-            )
-            .map_err(|e| CeraError::Backend(format!("dispatch_layer_norm: {e}")))?;
-
-        // Scale by weight
-        let w_bytes = dim * 4;
-        let w_ne = [dim as u32, 1, 1, 1];
-        let w_nb = [4, w_bytes as u32, w_bytes as u32, w_bytes as u32];
-        let w_ti = session.add_tensor(
-            weights,
-            w_offset,
-            w_bytes,
-            HTP_TENSOR_WEIGHT,
-            HtpDataType::F32 as u32,
-            w_ne,
-            w_nb,
-        )?;
-
-        let mul_params = [0i32; 16];
-        let mul_kparams = build_binary_kernel_params(
-            dim,
-            dim,
-            1,
-            1,
-            1,
-            4,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-        );
-        session
-            .enqueue_op(
-                HtpOpCode::Mul as u32,
-                &[dst_ti, w_ti],
-                &[dst_ti],
-                mul_params,
-                mul_kparams,
-            )
-            .map_err(|e| CeraError::Backend(format!("layer_norm_mul: {e}")))?;
-
-        // Add bias
-        let b_ti = session.add_tensor(
-            weights,
-            b_offset,
-            w_bytes,
-            HTP_TENSOR_WEIGHT,
-            HtpDataType::F32 as u32,
-            w_ne,
-            w_nb,
-        )?;
-        let add_params = [0i32; 16];
-        let add_kparams = build_binary_kernel_params(
-            dim,
-            dim,
-            1,
-            1,
-            1,
-            4,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-        );
-        session
-            .enqueue_op(
-                HtpOpCode::Add as u32,
-                &[dst_ti, b_ti],
-                &[dst_ti],
-                add_params,
-                add_kparams,
-            )
-            .map_err(|e| CeraError::Backend(format!("layer_norm_add: {e}")))?;
-
-        Ok(())
-    }
-
-    /// Dispatch linear layer matmul + bias: `dst[tokens, out_dim] = x[tokens, in_dim] · wᵀ + bias`.
-    #[allow(clippy::too_many_arguments)]
-    fn dispatch_linear_m(
-        session: &mut HexagonQueueSession,
-        x: &RpcmemBuffer,
-        x_offset: usize,
-        weights: &RpcmemBuffer,
-        w_desc: HexagonVitWeightDesc,
-        b_offset: usize,
-        dst: &RpcmemBuffer,
-        dst_offset: usize,
-        n_tokens: usize,
-    ) -> Result<(), CeraError> {
-        let x_bytes = n_tokens * w_desc.cols * 4;
-        let x_ne = [w_desc.cols as u32, n_tokens as u32, 1, 1];
-        let x_nb = [4, (w_desc.cols * 4) as u32, x_bytes as u32, x_bytes as u32];
-        let x_ti = session.add_tensor(
-            x,
-            x_offset,
-            x_bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            x_ne,
-            x_nb,
-        )?;
-
-        let (w_dtype, block_bytes, tile_size) = match w_desc.format {
-            HexagonWeightFormat::RepackedQ8_0 => (HtpDataType::Q8_0, 34usize, 32 * 34usize),
-            HexagonWeightFormat::RepackedQ4_0 => (HtpDataType::Q4_0, 18usize, 32 * 18usize),
-        };
-
-        let ne0 = w_desc.cols;
-        let ne1 = w_desc.rows;
-        let tiled_row_bytes = ne0.div_ceil(32) * tile_size;
-        let w_tot = ne1.div_ceil(32) * tiled_row_bytes;
-        let w_nb = [
-            block_bytes as u32,
-            tiled_row_bytes as u32,
-            w_tot as u32,
-            w_tot as u32,
-        ];
-        let w_ne = [ne0 as u32, ne1 as u32, 1, 1];
-
-        let w_ti = session.add_tensor(
-            weights,
-            w_desc.offset,
-            w_desc.size_bytes,
-            HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
-            w_dtype as u32,
-            w_ne,
-            w_nb,
-        )?;
-
-        let dst_bytes = n_tokens * w_desc.rows * 4;
-        let dst_ne = [w_desc.rows as u32, n_tokens as u32, 1, 1];
-        let dst_nb = [
-            4,
-            (w_desc.rows * 4) as u32,
-            dst_bytes as u32,
-            dst_bytes as u32,
-        ];
-        let dst_ti = session.add_tensor(
-            dst,
-            dst_offset,
-            dst_bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            dst_ne,
-            dst_nb,
-        )?;
-
-        let params = [0i32; 16];
-        let kparams = crate::backend::hexagon::build_mul_mat_kernel_params(
-            w_dtype,
-            w_desc.cols,
-            n_tokens as u32,
-            1,
-            w_desc.rows * 4,
-            session.dsp_threads(),
-            8 * 1024 * 1024,
-        );
-
-        session
-            .enqueue_op(
-                HtpOpCode::MulMat as u32,
-                &[w_ti, x_ti],
-                &[dst_ti],
-                params,
-                kparams,
-            )
-            .map_err(|e| CeraError::Backend(format!("dispatch_linear_m: {e}")))?;
-
-        // Broadcast bias add
-        Self::dispatch_bias_add(session, dst_ti, weights, b_offset, w_desc.rows)
-    }
-
     /// Dispatch broadcast bias add: `dst[i] += bias[i]`.
     fn dispatch_bias_add(
         session: &mut HexagonQueueSession,
@@ -669,14 +449,14 @@ impl HexagonVisionEncoder {
             && q_w.format == k_w.format
             && k_w.format == v_w.format)
         {
-            Self::dispatch_linear_m(
-                session, x, x_offset, weights, q_w, q_b_off, dst, q_dst_off, n_tokens,
+            dispatch::linear_m(
+                session, x, x_offset, weights, q_w, q_b_off, dst, q_dst_off, n_tokens, VIT_TILE,
             )?;
-            Self::dispatch_linear_m(
-                session, x, x_offset, weights, k_w, k_b_off, dst, k_dst_off, n_tokens,
+            dispatch::linear_m(
+                session, x, x_offset, weights, k_w, k_b_off, dst, k_dst_off, n_tokens, VIT_TILE,
             )?;
-            Self::dispatch_linear_m(
-                session, x, x_offset, weights, v_w, v_b_off, dst, v_dst_off, n_tokens,
+            dispatch::linear_m(
+                session, x, x_offset, weights, v_w, v_b_off, dst, v_dst_off, n_tokens, VIT_TILE,
             )?;
             return Ok(());
         }
@@ -799,136 +579,7 @@ impl HexagonVisionEncoder {
         Self::dispatch_bias_add(session, k_dst_ti, weights, k_b_off, ne1)?;
         Self::dispatch_bias_add(session, v_dst_ti, weights, v_b_off, ne1)?;
 
-        Ok(())
-    }
-
-    /// Dispatch GELU activation in-place.
-    fn dispatch_gelu(
-        session: &mut HexagonQueueSession,
-        buf: &RpcmemBuffer,
-        offset: usize,
-        dim: usize,
-        n_tokens: usize,
-    ) -> Result<(), CeraError> {
-        let bytes = dim * n_tokens * 4;
-        let ne = [dim as u32, n_tokens as u32, 1, 1];
-        let nb = [4, (dim * 4) as u32, bytes as u32, bytes as u32];
-
-        let ti = session.add_tensor(
-            buf,
-            offset,
-            bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            ne,
-            nb,
-        )?;
-        let params = [0i32; 16];
-        let kparams = build_unary_kernel_params(
-            dim,
-            n_tokens,
-            0,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-            false,
-        );
-
-        session
-            .enqueue_op(HtpOpCode::UnaryGelu as u32, &[ti], &[ti], params, kparams)
-            .map_err(|e| CeraError::Backend(format!("dispatch_gelu: {e}")))
-    }
-
-    /// Dispatch in-place residual add: `dst[i] += src[i]`.
-    fn dispatch_add_residual(
-        session: &mut HexagonQueueSession,
-        dst: &RpcmemBuffer,
-        dst_offset: usize,
-        src: &RpcmemBuffer,
-        src_offset: usize,
-        dim: usize,
-        n_tokens: usize,
-    ) -> Result<(), CeraError> {
-        let bytes = dim * n_tokens * 4;
-        let ne = [dim as u32, n_tokens as u32, 1, 1];
-        let nb = [4, (dim * 4) as u32, bytes as u32, bytes as u32];
-
-        let dst_ti = session.add_tensor(
-            dst,
-            dst_offset,
-            bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            ne,
-            nb,
-        )?;
-        let src_ti = session.add_tensor(
-            src,
-            src_offset,
-            bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            ne,
-            nb,
-        )?;
-
-        let params = [0i32; 16];
-        let kparams = build_binary_kernel_params(
-            dim,
-            dim,
-            n_tokens,
-            1,
-            1,
-            4,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-        );
-
-        session
-            .enqueue_op(
-                HtpOpCode::Add as u32,
-                &[dst_ti, src_ti],
-                &[dst_ti],
-                params,
-                kparams,
-            )
-            .map_err(|e| CeraError::Backend(format!("dispatch_add_residual: {e}")))
-    }
-
-    /// Dispatch Cpy from F32 to F16 on DSP.
-    fn dispatch_cpy_f32_to_f16(
-        session: &mut HexagonQueueSession,
-        src: &RpcmemBuffer,
-        src_offset: usize,
-        dst: &RpcmemBuffer,
-        dst_offset: usize,
-        dim: usize,
-        n_tokens: usize,
-    ) -> Result<(), CeraError> {
-        let src_bytes = n_tokens * dim * 4;
-        let dst_bytes = n_tokens * dim * 2;
-        let src_ti = session.add_tensor(
-            src,
-            src_offset,
-            src_bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            [dim as u32, n_tokens as u32, 1, 1],
-            [4, (dim * 4) as u32, src_bytes as u32, src_bytes as u32],
-        )?;
-        let dst_ti = session.add_tensor(
-            dst,
-            dst_offset,
-            dst_bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F16 as u32,
-            [dim as u32, n_tokens as u32, 1, 1],
-            [2, (dim * 2) as u32, dst_bytes as u32, dst_bytes as u32],
-        )?;
-        let params = [0i32; 16];
-        let kparams = [0i32; 32];
-        session
-            .enqueue_op(HtpOpCode::Cpy as u32, &[src_ti], &[dst_ti], params, kparams)
-            .map_err(|e| CeraError::Backend(format!("dispatch_cpy_f32_to_f16: {e}")))
+        session.end_group()
     }
 
     /// Dispatch unmasked multi-head self-attention on DSP via FlashAttnExt.
@@ -1024,7 +675,8 @@ impl HexagonVisionEncoder {
                 params,
                 kparams,
             )
-            .map_err(|e| CeraError::Backend(format!("dispatch_self_attention: {e}")))
+            .map_err(|e| CeraError::Backend(format!("dispatch_self_attention: {e}")))?;
+        session.end_group()
     }
 }
 
@@ -1120,18 +772,23 @@ impl VisionGpuEncode for HexagonVisionEncoder {
          -> Result<(), CeraError> {
             for blk in &self.weights_offsets.blocks {
                 // Pre-attention LayerNorm: tokens -> pre_norm
-                Self::dispatch_layer_norm(
+                dispatch::layer_norm(
                     session,
-                    scratch_guard,
-                    so.tokens_off,
-                    scratch_guard,
-                    so.pre_norm_off,
-                    &self.weights_buf,
-                    blk.ln1_w_off,
-                    blk.ln1_b_off,
-                    cfg.eps,
-                    n_patches,
-                    n_embd,
+                    LayerNormArgs {
+                        src: scratch_guard,
+                        src_offset: so.tokens_off,
+                        dst: scratch_guard,
+                        dst_offset: so.pre_norm_off,
+                        weights: &self.weights_buf,
+                        w_offset: blk.ln1_w_off,
+                        b_offset: blk.ln1_b_off,
+                        shape: TokenShape {
+                            dim: n_embd,
+                            n_tokens: n_patches,
+                        },
+                        eps: cfg.eps,
+                        tile: VIT_TILE,
+                    },
                 )?;
 
                 // Fused Q, K, V linear projections via MulMatNx
@@ -1154,23 +811,27 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                 )?;
 
                 // Convert K and V from F32 to F16 in rpcmem for FlashAttnExt
-                Self::dispatch_cpy_f32_to_f16(
+                dispatch::cpy_f32_to_f16(
                     session,
                     scratch_guard,
                     so.k_off,
                     scratch_guard,
                     so.k_f16_off,
-                    n_embd,
-                    n_patches,
+                    TokenShape {
+                        dim: n_embd,
+                        n_tokens: n_patches,
+                    },
                 )?;
-                Self::dispatch_cpy_f32_to_f16(
+                dispatch::cpy_f32_to_f16(
                     session,
                     scratch_guard,
                     so.v_off,
                     scratch_guard,
                     so.v_f16_off,
-                    n_embd,
-                    n_patches,
+                    TokenShape {
+                        dim: n_embd,
+                        n_tokens: n_patches,
+                    },
                 )?;
 
                 // Full on-NPU Flash Attention
@@ -1191,7 +852,7 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                 )?;
 
                 // Out projection + bias: attn_out -> proj_out
-                Self::dispatch_linear_m(
+                dispatch::linear_m(
                     session,
                     scratch_guard,
                     so.attn_out_off,
@@ -1201,36 +862,45 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                     scratch_guard,
                     so.proj_out_off,
                     n_patches,
+                    VIT_TILE,
                 )?;
 
                 // Residual add: tokens += proj_out
-                Self::dispatch_add_residual(
+                dispatch::add_residual(
                     session,
                     scratch_guard,
                     so.tokens_off,
                     scratch_guard,
                     so.proj_out_off,
-                    n_embd,
-                    n_patches,
+                    TokenShape {
+                        dim: n_embd,
+                        n_tokens: n_patches,
+                    },
+                    VIT_TILE,
                 )?;
 
                 // Pre-MLP LayerNorm: tokens -> pre_norm
-                Self::dispatch_layer_norm(
+                dispatch::layer_norm(
                     session,
-                    scratch_guard,
-                    so.tokens_off,
-                    scratch_guard,
-                    so.pre_norm_off,
-                    &self.weights_buf,
-                    blk.ln2_w_off,
-                    blk.ln2_b_off,
-                    cfg.eps,
-                    n_patches,
-                    n_embd,
+                    LayerNormArgs {
+                        src: scratch_guard,
+                        src_offset: so.tokens_off,
+                        dst: scratch_guard,
+                        dst_offset: so.pre_norm_off,
+                        weights: &self.weights_buf,
+                        w_offset: blk.ln2_w_off,
+                        b_offset: blk.ln2_b_off,
+                        shape: TokenShape {
+                            dim: n_embd,
+                            n_tokens: n_patches,
+                        },
+                        eps: cfg.eps,
+                        tile: VIT_TILE,
+                    },
                 )?;
 
                 // FFN up projection: pre_norm -> ffn_mid
-                Self::dispatch_linear_m(
+                dispatch::linear_m(
                     session,
                     scratch_guard,
                     so.pre_norm_off,
@@ -1240,13 +910,23 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                     scratch_guard,
                     so.ffn_mid_off,
                     n_patches,
+                    VIT_TILE,
                 )?;
 
                 // GELU activation on ffn_mid
-                Self::dispatch_gelu(session, scratch_guard, so.ffn_mid_off, cfg.n_ff, n_patches)?;
+                dispatch::gelu(
+                    session,
+                    scratch_guard,
+                    so.ffn_mid_off,
+                    TokenShape {
+                        dim: cfg.n_ff,
+                        n_tokens: n_patches,
+                    },
+                    VIT_TILE,
+                )?;
 
                 // FFN down projection: ffn_mid -> ffn_out
-                Self::dispatch_linear_m(
+                dispatch::linear_m(
                     session,
                     scratch_guard,
                     so.ffn_mid_off,
@@ -1256,33 +936,42 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                     scratch_guard,
                     so.ffn_out_off,
                     n_patches,
+                    VIT_TILE,
                 )?;
 
                 // Residual add: tokens += ffn_out
-                Self::dispatch_add_residual(
+                dispatch::add_residual(
                     session,
                     scratch_guard,
                     so.tokens_off,
                     scratch_guard,
                     so.ffn_out_off,
-                    n_embd,
-                    n_patches,
+                    TokenShape {
+                        dim: n_embd,
+                        n_tokens: n_patches,
+                    },
+                    VIT_TILE,
                 )?;
             }
 
             // Post-LN on tokens
-            Self::dispatch_layer_norm(
+            dispatch::layer_norm(
                 session,
-                scratch_guard,
-                so.tokens_off,
-                scratch_guard,
-                so.tokens_off,
-                &self.weights_buf,
-                self.weights_offsets.post_ln_w_off,
-                self.weights_offsets.post_ln_b_off,
-                cfg.eps,
-                n_patches,
-                n_embd,
+                LayerNormArgs {
+                    src: scratch_guard,
+                    src_offset: so.tokens_off,
+                    dst: scratch_guard,
+                    dst_offset: so.tokens_off,
+                    weights: &self.weights_buf,
+                    w_offset: self.weights_offsets.post_ln_w_off,
+                    b_offset: self.weights_offsets.post_ln_b_off,
+                    shape: TokenShape {
+                        dim: n_embd,
+                        n_tokens: n_patches,
+                    },
+                    eps: cfg.eps,
+                    tile: VIT_TILE,
+                },
             )?;
 
             // Execute all queued operations on DSP
@@ -1323,7 +1012,7 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                 scratch_guard.flush_cpu_cache(so.tokens_off, in_bytes);
 
                 let proj_res = (|| -> Result<(), CeraError> {
-                    Self::dispatch_linear_m(
+                    dispatch::linear_m(
                         session,
                         &scratch_guard,
                         so.tokens_off,
@@ -1333,15 +1022,19 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                         &scratch_guard,
                         so.proj_mid_off,
                         n_tokens,
+                        VIT_TILE,
                     )?;
-                    Self::dispatch_gelu(
+                    dispatch::gelu(
                         session,
                         &scratch_guard,
                         so.proj_mid_off,
-                        mid_dim,
-                        n_tokens,
+                        TokenShape {
+                            dim: mid_dim,
+                            n_tokens,
+                        },
+                        VIT_TILE,
                     )?;
-                    Self::dispatch_linear_m(
+                    dispatch::linear_m(
                         session,
                         &scratch_guard,
                         so.proj_mid_off,
@@ -1351,6 +1044,7 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                         &scratch_guard,
                         so.proj_final_off,
                         n_tokens,
+                        VIT_TILE,
                     )?;
                     session.flush()?;
                     Ok(())
@@ -1366,7 +1060,7 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                         return Ok(out_slice.to_vec());
                     }
                     Err(e) => {
-                        tracing::warn!(
+                        crate::backend::hexagon::hexagon_warn!(
                             "HexagonVisionEncoder: DSP projector failed ({e}), falling back to CPU"
                         );
                         session.drop_pending_batch();
@@ -1390,7 +1084,11 @@ impl VisionGpuEncode for HexagonVisionEncoder {
 pub fn try_hexagon_vision_encoder(
     weights: &VisionEncoderWeights,
 ) -> Option<Arc<dyn VisionGpuEncode>> {
-    let context = HexagonContext::new().ok()?;
+    let context = HexagonContext::new()
+        .inspect_err(|e| {
+            crate::backend::hexagon::log_context_unavailable("HexagonVisionEncoder", e);
+        })
+        .ok()?;
 
     let arch_override = std::env::var("CERA_HEXAGON_ARCH")
         .ok()
@@ -1409,8 +1107,7 @@ pub fn try_hexagon_vision_encoder(
     match HexagonVisionEncoder::new(Arc::clone(context.driver()), device, weights) {
         Ok(encoder) => Some(Arc::new(encoder)),
         Err(e) => {
-            eprintln!("[cera-hexagon] failed to create HexagonVisionEncoder: {e}");
-            tracing::warn!("failed to create HexagonVisionEncoder: {e}");
+            crate::backend::hexagon::hexagon_error!("failed to create HexagonVisionEncoder: {e}");
             None
         }
     }
@@ -1420,6 +1117,14 @@ pub fn try_hexagon_vision_encoder(
 mod tests {
     use super::*;
     use crate::model::vision_encoder::VitBlockWeights;
+
+    /// Tile policy pin: a tiled ViT would multiply the op count and change
+    /// the emitted graph, so a flip must be deliberate. Pinned by behavior:
+    /// 130 tokens are one Norm/Mul/Add triple.
+    #[test]
+    fn tile_policy_is_whole() {
+        assert_eq!(dispatch::testing::layer_norm_op_count(VIT_TILE), 3);
+    }
 
     #[test]
     fn test_scratch_offsets_alignment_and_bounds() {

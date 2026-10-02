@@ -33,6 +33,22 @@ use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 #[cfg(all(any(target_arch = "aarch64", target_arch = "x86_64"), not(has_blas)))]
 use crate::tensor::DType;
 
+/// Which normalization the block uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub(crate) enum NormKind {
+    #[default]
+    Rms,
+    /// Mean-subtracting LayerNorm with optional bias (StableLM, StarCoder2,
+    /// Cohere/Command-R).
+    Layer,
+}
+
+/// Archs that need the LayerNorm / parallel-residual / ungated-FFN / partial-RoPE
+/// graph. CPU only: the GPU and NPU loaders reject them.
+fn requires_layernorm_path(prefix: &str) -> bool {
+    matches!(prefix, "stablelm" | "starcoder2" | "cohere" | "command-r")
+}
+
 /// Layer normalization ordering (Pre-Norm vs Post-Norm).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub(crate) enum NormOrder {
@@ -57,6 +73,13 @@ struct LayerWeightRefs {
 
 // ── LLaMA-family Model ──────────────────────────────────────────────────────
 
+/// LLaMA-family dense transformer (llama, qwen2/3, granite, ...).
+///
+/// The LayerNorm archs (stablelm, starcoder2, cohere, command-r) run the
+/// sequential per-token path `run_layers_ext`: it has no batched prefill, so
+/// every prompt token re-reads every weight once (prefill costs the same per
+/// token as decode), and it supports neither LoRA nor yarn, `rope_freqs`,
+/// sliding-window or temperature-scaled attention (rejected at load).
 pub struct LlamaModel {
     gguf: GgufFile,
     config: ModelConfig,
@@ -67,7 +90,29 @@ pub struct LlamaModel {
     /// applied per-pair on the NORM path. `None` for archs without the tensor
     /// (Qwen/Mistral/Granite) ⇒ plain RoPE.
     rope_freqs: Option<Vec<f32>>,
+    /// YaRN expressed as `rope_freqs`-style per-pair divisors, for the GPU
+    /// backends only (the CPU rotates with `yarn` directly). `None` unless the
+    /// model is YaRN-scaled and the GPU rotation can reproduce it exactly.
+    #[cfg_attr(
+        not(any(
+            feature = "gpu",
+            all(feature = "metal", any(target_os = "macos", target_os = "ios")),
+            feature = "hexagon"
+        )),
+        allow(dead_code)
+    )]
+    yarn_freq_factors: Option<Vec<f32>>,
     norm_order: NormOrder,
+    /// True for the archs served by the sequential LayerNorm path
+    /// (`run_layers_ext`): stablelm, starcoder2, cohere, command-r.
+    ext: bool,
+    /// Rotated dims per head (`{prefix}.rope.dimension_count`); `head_dim` unless
+    /// the arch rotates a prefix of each head (StableLM). Only the ext path
+    /// honors a value below `head_dim`.
+    n_rot: usize,
+    /// False for plain up/down FFNs (StarCoder2). `layer_refs[i].ffn_gate` then
+    /// aliases `ffn_up` and must not be read.
+    ffn_gated: bool,
     activation: FfnActivation,
     attn_logit_softcapping: Option<f32>,
     final_logit_softcapping: Option<f32>,
@@ -75,8 +120,13 @@ pub struct LlamaModel {
     // for every other arch): see `ScalarMultipliers`.
     // Pre-dequantized small F32 weights.
     output_norm_weight: Vec<f32>,
+    /// LayerNorm bias (`output_norm.bias`), StableLM/StarCoder2 only.
+    output_norm_bias: Option<Vec<f32>>,
     attn_norm_weights: Vec<Vec<f32>>,
     ffn_norm_weights: Vec<Vec<f32>>,
+    /// LayerNorm biases (`blk.N.attn_norm.bias` / `ffn_norm.bias`).
+    attn_norm_biases: Vec<Option<Vec<f32>>>,
+    ffn_norm_biases: Vec<Option<Vec<f32>>>,
     attn_post_norm_weights: Vec<Option<Vec<f32>>>,
     ffn_post_norm_weights: Vec<Option<Vec<f32>>>,
     // Qwen3 / Olmo 2 QK-norm weights (None for Qwen2).
@@ -151,6 +201,15 @@ fn warn_lm_head_unbatched(head: &str, dtype: DType) {
     }
 }
 
+// Test-only count of vocab-head projections on this thread, so the
+// sequential prefill's "skip the LM head for all but the last token"
+// optimisation is pinned by call count, not only by logits equivalence
+// (a regression to per-token `forward` yields identical logits).
+#[cfg(test)]
+thread_local! {
+    static PROJECT_LOGITS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// Force the batched LM-head projection to decline, for A/B measurement.
 ///
 /// `CERA_LM_HEAD_NO_GEMM=1` puts the projection back on the per-row loop the
@@ -186,7 +245,131 @@ fn apply_column_major_bias(mat: &mut [f32], bias: &[f32], dim: usize, n: usize) 
     }
 }
 
+/// RoPE layout per arch, mirroring llama.cpp `llama_model_rope_type`.
+///
+/// Qwen, Gemma 2, Olmo 2/3, Phi, StableLM, StarCoder2 and OpenELM are NEOX
+/// (split-halves); Llama-style, InternLM2 and Cohere/Command-R are NORM
+/// (interleaved pairs). Keep exhaustive with the `load_model` allow-list:
+/// an arch without a mapping must fail loudly rather than default to NORM.
+fn rope_type_for_arch(prefix: &str) -> Option<RopeType> {
+    match prefix {
+        "qwen2" | "qwen3" | "gemma2" | "olmo2" | "olmo3" | "phi3" | "phi" | "starcoder2"
+        | "stablelm" | "openelm" => Some(RopeType::Neox),
+        // "llama" also covers classic Mistral (it ships as GGUF arch "llama").
+        "llama" | "granite" | "minicpm" | "minicpm5" | "nanbeige" | "mistral3" | "ministral3"
+        | "ministral" | "baichuan" | "deepseek" | "internlm2" | "internlm" | "cohere"
+        | "command-r" => Some(RopeType::Norm),
+        _ => None,
+    }
+}
+
+/// LayerNorm `x = (x - mean) / sqrt(var + eps) * weight (+ bias)` in place.
+/// A missing bias is a zero bias (Cohere norms carry weight only); that case
+/// takes the bias-less kernel so no zero vector is allocated per call.
+fn layer_norm_opt_bias(x: &mut [f32], weight: &[f32], bias: Option<&[f32]>, eps: f32) {
+    match bias {
+        Some(b) => cpu::layer_norm_inplace(x, weight, b, eps),
+        None => cpu::layer_norm_weight_only_inplace(x, weight, eps),
+    }
+}
+
+/// Per-head LayerNorm for the optional Q/K norm of the LayerNorm archs
+/// (StableLM 2, Command-R+). `weight` is either one `head_dim` vector shared by
+/// all heads or `n_heads * head_dim` (each head its own slice). No bias.
+fn layer_norm_per_head(x: &mut [f32], weight: &[f32], head_dim: usize, eps: f32) {
+    for (h, head) in x.chunks_mut(head_dim).enumerate() {
+        let w = if weight.len() == head_dim {
+            weight
+        } else {
+            &weight[h * head_dim..(h + 1) * head_dim]
+        };
+        layer_norm_opt_bias(head, w, None, eps);
+    }
+}
+
+/// Reusable gather buffers for [`rope_partial`]: the rotated prefixes of every
+/// Q head and every K head.
+#[derive(Default)]
+pub(crate) struct RopeGather {
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+}
+
+/// RoPE over the first `n_rot` dims of every head, leaving the tail of each
+/// head untouched (StableLM `rope.dimension_count < head_dim`). Gathers the
+/// rotated prefixes, runs the ordinary full-head kernel with `head_dim = n_rot`,
+/// and scatters back; identical to llama.cpp rotating `n_rot` dims per head.
+/// The gathered prefixes live in `scratch` so the partial path allocates
+/// nothing once the buffers have grown to size.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn rope_partial(
+    q: &mut [f32],
+    k: &mut [f32],
+    pos: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    head_dim: usize,
+    n_rot: usize,
+    rope_theta: f32,
+    rope_type: RopeType,
+    scratch: &mut RopeGather,
+) {
+    let rotate = |q: &mut [f32], k: &mut [f32], nh: usize, nkv: usize, hd: usize| match rope_type {
+        RopeType::Neox => cpu::rope(q, k, pos, nh, nkv, hd, rope_theta),
+        RopeType::Norm => cpu::rope_norm(q, k, pos, nh, nkv, hd, rope_theta, None),
+    };
+    if n_rot == head_dim {
+        rotate(q, k, n_heads, n_kv_heads, head_dim);
+        return;
+    }
+    let gather = |x: &[f32], nh: usize, out: &mut Vec<f32>| {
+        out.clear();
+        for h in 0..nh {
+            out.extend_from_slice(&x[h * head_dim..h * head_dim + n_rot]);
+        }
+    };
+    gather(q, n_heads, &mut scratch.q);
+    gather(k, n_kv_heads, &mut scratch.k);
+    rotate(&mut scratch.q, &mut scratch.k, n_heads, n_kv_heads, n_rot);
+    for h in 0..n_heads {
+        q[h * head_dim..h * head_dim + n_rot]
+            .copy_from_slice(&scratch.q[h * n_rot..(h + 1) * n_rot]);
+    }
+    for h in 0..n_kv_heads {
+        k[h * head_dim..h * head_dim + n_rot]
+            .copy_from_slice(&scratch.k[h * n_rot..(h + 1) * n_rot]);
+    }
+}
+
 impl LlamaModel {
+    /// Embedding row for `token`, scaled and recorded exactly as `forward`
+    /// does. Panics on an out-of-range token, like `forward`.
+    fn embed_token(&self, token: u32, what: &str) -> Vec<f32> {
+        let token_id = token as usize;
+        let cfg = &self.config;
+        assert!(
+            token_id < cfg.vocab_size,
+            "{what}: token_id {token_id} out of range (vocab_size={})",
+            cfg.vocab_size
+        );
+        let mut hidden = transformer::dequantize_row(&self.gguf, &self.embd_ref, token_id);
+        if self.config.scalars.embedding != 1.0 {
+            cpu::scale_inplace(&mut hidden, self.config.scalars.embedding);
+        }
+        // Record after the embedding scale: llama.cpp fires its "embd" callback
+        // post-scale, so the dumped node is GET_ROWS for plain archs (scale=1) and
+        // SCALE for Granite. Either way the value matches.
+        transformer::oracle_dump::record("embd", &hidden);
+        hidden
+    }
+
+    /// `forward` minus the LM head: advances the KV cache for one token and
+    /// returns nothing. For prompt tokens whose logits are never read.
+    fn forward_no_head(&self, token: u32, pos: usize, state: &mut InferenceState) {
+        let mut hidden = self.embed_token(token, "forward_prefill");
+        self.run_layers(&mut hidden, pos, state);
+    }
+
     fn check_rewind_mode(
         &self,
         state: &InferenceState,
@@ -215,8 +398,11 @@ impl LlamaModel {
     /// Load without the CPU int8 repacks. For the GPU/Metal loaders, which
     /// resolve weight metadata from this model but never dispatch CPU
     /// kernels — the repacks would be gigabytes allocated only to be freed
-    /// after upload. Do NOT use for CPU inference (stays correct, just
-    /// slower: dispatch falls back to the naive path without them).
+    /// after upload. Do NOT use for CPU inference (dispatch falls back to the
+    /// naive path without the repacks, which is slower). This entry point is
+    /// also the accelerator gate: the LayerNorm archs (`stablelm`, `starcoder2`,
+    /// `cohere`, `command-r`) run only on the CPU path, so they fail to load
+    /// here with an error naming the arch instead of loading slowly.
     pub fn from_gguf_with_id_no_repack(
         gguf: GgufFile,
         context_size: usize,
@@ -252,26 +438,42 @@ impl LlamaModel {
                 && gguf.metadata.contains_key("phi3.block_count"))
         {
             "phi3"
+        } else if arch == "cohere"
+            && (!gguf.metadata.contains_key("cohere.block_count")
+                && gguf.metadata.contains_key("command-r.block_count"))
+        {
+            "command-r"
+        } else if arch == "command-r"
+            && (!gguf.metadata.contains_key("command-r.block_count")
+                && gguf.metadata.contains_key("cohere.block_count"))
+        {
+            "cohere"
+        } else if arch == "internlm"
+            && (!gguf.metadata.contains_key("internlm.block_count")
+                && gguf.metadata.contains_key("internlm2.block_count"))
+        {
+            "internlm2"
         } else {
             arch.as_str()
         };
         let prefix = resolved_prefix;
+        let ext = requires_layernorm_path(prefix);
+        if ext && !repack {
+            bail!(
+                "LlamaModel: arch {prefix:?} requires LayerNorm/parallel-residual support, \
+                 which the GPU and NPU backends do not implement (CPU only)"
+            );
+        }
+        let norm_kind = if ext { NormKind::Layer } else { NormKind::Rms };
+        // StarCoder2 has no `ffn_gate`: plain up -> GELU -> down.
+        let ffn_gated = prefix != "starcoder2";
 
-        // RoPE layout per arch. Qwen, Gemma 2, Olmo 2, and Olmo 3 GGUFs are NEOX (split-halves);
-        let rope_type = match prefix {
-            "qwen2" | "qwen3" | "gemma2" | "olmo2" | "olmo3" | "phi3" | "phi" => RopeType::Neox,
-            // "llama" also covers classic Mistral (it ships as GGUF arch "llama").
-            "llama" | "granite" | "minicpm" | "minicpm5" | "nanbeige" | "mistral3"
-            | "ministral3" | "ministral" => RopeType::Norm,
-            // Keep exhaustive with the `load_model` dispatch allow-list: a new arch
-            // routed here without a layout mapping must fail loudly rather than
-            // silently default to NORM (wrong for any NEOX-family arch: phi3,
-            // stablelm, starcoder2, etc. are all NEOX in llama.cpp).
-            other => bail!(
-                "LlamaModel: no RoPE layout mapping for arch {other:?}; \
-                 add it to the rope_type match in llama.rs"
-            ),
-        };
+        let rope_type = rope_type_for_arch(prefix).ok_or_else(|| {
+            anyhow::anyhow!(
+                "LlamaModel: no RoPE layout mapping for arch {prefix:?}; \
+                 add it to rope_type_for_arch in llama.rs"
+            )
+        })?;
 
         let norm_order = match prefix {
             "olmo2" | "olmo3" => NormOrder::PostNorm,
@@ -279,7 +481,7 @@ impl LlamaModel {
         };
 
         let activation = match prefix {
-            "gemma2" => FfnActivation::Geglu,
+            "gemma2" | "starcoder2" => FfnActivation::Geglu,
             _ => FfnActivation::Swiglu,
         };
 
@@ -496,6 +698,22 @@ impl LlamaModel {
         if prefix == "gemma2" && scalars.embedding == 1.0 {
             scalars.embedding = (hidden_size as f32).sqrt();
         }
+        // Cohere/Command-R MULTIPLY the logits by `logit_scale` (llama.cpp
+        // `ggml_scale(cur, f_logit_scale)`), while `ScalarMultipliers::logit` is a
+        // divisor (Granite `logits_scaling`), so store the reciprocal. Absent key
+        // means no scaling.
+        if matches!(prefix, "cohere" | "command-r") {
+            scalars.logit = match gguf.get_f32(&format!("{prefix}.logit_scale")) {
+                Some(ls) => {
+                    ensure!(
+                        ls.is_finite() && ls > 0.0,
+                        "{prefix}.logit_scale must be finite and positive, got {ls}"
+                    );
+                    1.0 / ls
+                }
+                None => 1.0,
+            };
+        }
         let intermediate_size = gguf
             .get_u32(&format!("{prefix}.feed_forward_length"))
             .with_context(|| format!("missing {prefix}.feed_forward_length"))?
@@ -551,9 +769,16 @@ impl LlamaModel {
             rope_theta.is_finite() && (1.0..=1e9).contains(&rope_theta),
             "{prefix}.rope.freq_base must be finite and within [1.0, 1e9]"
         );
-        let rms_norm_eps = gguf
-            .get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
-            .unwrap_or(1e-6);
+        // LayerNorm archs store `layer_norm_epsilon`; llama.cpp defaults it to 1e-5.
+        let rms_norm_eps = if norm_kind == NormKind::Layer {
+            gguf.get_f32(&format!("{prefix}.attention.layer_norm_epsilon"))
+                .or_else(|| gguf.get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon")))
+                .unwrap_or(1e-5)
+        } else {
+            gguf.get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
+                .or_else(|| gguf.get_f32(&format!("{prefix}.attention.layer_norm_epsilon")))
+                .unwrap_or(1e-6)
+        };
         ensure!(
             rms_norm_eps.is_finite() && (1e-12..=1e-2).contains(&rms_norm_eps),
             "{prefix}.attention.layer_norm_rms_epsilon must be finite and within [1e-12, 1e-2]"
@@ -578,6 +803,34 @@ impl LlamaModel {
             head_dim > 0 && head_dim.is_multiple_of(2) && head_dim <= 4096,
             "head_dim ({head_dim}) must be positive, even for RoPE rotation, and <= 4096"
         );
+
+        // Rotated prefix of each head. Only StableLM sets a partial value; the
+        // other archs keep the full-head rotation they always had.
+        let n_rot = if prefix == "stablelm" {
+            match gguf.get_u32(&format!("{prefix}.rope.dimension_count")) {
+                Some(v) => {
+                    let v = v as usize;
+                    ensure!(
+                        v > 0 && v.is_multiple_of(2) && v <= head_dim,
+                        "{prefix}.rope.dimension_count ({v}) must be even and within (0, head_dim={head_dim}]"
+                    );
+                    v
+                }
+                None => head_dim,
+            }
+        } else {
+            // Only StableLM's partial rotary is implemented. A file that rotates
+            // fewer than `head_dim` dims on any other arch would silently get
+            // full-head RoPE, so refuse it.
+            if let Some(v) = gguf.get_u32(&format!("{prefix}.rope.dimension_count")) {
+                ensure!(
+                    v as usize >= head_dim,
+                    "arch '{prefix}' sets {prefix}.rope.dimension_count ({v}) below head_dim \
+                     ({head_dim}); partial rotary is only supported for stablelm"
+                );
+            }
+            head_dim
+        };
 
         let block_types = vec![BlockType::Attention; n_layers];
         let kv_heads_per_layer = vec![n_kv_heads; n_layers];
@@ -612,6 +865,21 @@ impl LlamaModel {
             "output_norm length {} != hidden_size ({hidden_size})",
             output_norm_weight.len()
         );
+        let output_norm_bias = if gguf.tensors.contains_key("output_norm.bias") {
+            ensure!(
+                norm_kind == NormKind::Layer,
+                "`output_norm.bias` is a LayerNorm bias, but {prefix:?} is loaded as an RMSNorm architecture"
+            );
+            let b = gguf.get_tensor("output_norm.bias")?.try_to_f32_vec()?;
+            ensure!(
+                b.len() == hidden_size,
+                "output_norm.bias length {} != hidden_size ({hidden_size})",
+                b.len()
+            );
+            Some(b)
+        } else {
+            None
+        };
 
         let q_dim = config
             .n_heads
@@ -636,6 +904,8 @@ impl LlamaModel {
 
         let mut attn_norm_weights = Vec::with_capacity(n_layers);
         let mut ffn_norm_weights = Vec::with_capacity(n_layers);
+        let mut attn_norm_biases: Vec<Option<Vec<f32>>> = Vec::with_capacity(n_layers);
+        let mut ffn_norm_biases: Vec<Option<Vec<f32>>> = Vec::with_capacity(n_layers);
         let mut attn_post_norm_weights = Vec::with_capacity(n_layers);
         let mut ffn_post_norm_weights = Vec::with_capacity(n_layers);
         let mut attn_q_norm_weights = Vec::with_capacity(n_layers);
@@ -670,16 +940,38 @@ impl LlamaModel {
                 );
             }
             attn_norm_weights.push(attn_norm);
+            // LayerNorm bias tensors (StableLM/StarCoder2). RMSNorm archs have
+            // none; a stray one on an RMS arch would be silently dropped, so it
+            // fails closed instead.
+            let load_norm_bias = |name: String| -> Result<Option<Vec<f32>>> {
+                if !gguf.tensors.contains_key(&name) {
+                    return Ok(None);
+                }
+                ensure!(
+                    norm_kind == NormKind::Layer,
+                    "`{name}` is a LayerNorm bias, but {prefix:?} is loaded as an RMSNorm architecture"
+                );
+                let b = gguf.get_tensor(&name)?.try_to_f32_vec()?;
+                ensure!(
+                    b.len() == hidden_size,
+                    "layer {i} {name} length {} != hidden_size ({hidden_size})",
+                    b.len()
+                );
+                Ok(Some(b))
+            };
+            attn_norm_biases.push(load_norm_bias(format!("blk.{i}.attn_norm.bias"))?);
 
             let ffn_norm_name = format!("blk.{i}.ffn_norm.weight");
             let ffn_norm = if gguf.tensors.contains_key(&ffn_norm_name) {
                 gguf.get_tensor(&ffn_norm_name)?.try_to_f32_vec()?
-            } else if norm_order == NormOrder::PostNorm {
+            } else if norm_order == NormOrder::PostNorm || norm_kind == NormKind::Layer {
+                // LayerNorm archs without `ffn_norm` run attention and FFN in
+                // parallel off the attention norm (Cohere, StableLM 2 12B).
                 Vec::new()
             } else {
                 bail!("missing required tensor `{ffn_norm_name}` for PreNorm architecture");
             };
-            if norm_order == NormOrder::PreNorm {
+            if norm_order == NormOrder::PreNorm && !ffn_norm.is_empty() {
                 ensure!(
                     ffn_norm.len() == hidden_size,
                     "layer {i} {ffn_norm_name} length {} != hidden_size ({hidden_size})",
@@ -687,6 +979,7 @@ impl LlamaModel {
                 );
             }
             ffn_norm_weights.push(ffn_norm);
+            ffn_norm_biases.push(load_norm_bias(format!("blk.{i}.ffn_norm.bias"))?);
 
             // Post-norms (Gemma 2, Olmo 2/3): check canonical GGUF names first.
             let attn_post = [
@@ -799,7 +1092,22 @@ impl LlamaModel {
                 attn_q_bias.push(Some(qkv_b[..q_dim].to_vec()));
                 attn_k_bias.push(Some(qkv_b[q_dim..q_dim + k_dim].to_vec()));
                 attn_v_bias.push(Some(qkv_b[q_dim + k_dim..qkv_dim].to_vec()));
-            } else if gguf.tensors.contains_key(&q_bias_name) {
+            } else if [&q_bias_name, &k_bias_name, &v_bias_name]
+                .iter()
+                .any(|n| gguf.tensors.contains_key(*n))
+            {
+                // All-or-none: the forward path applies Q/K/V biases only as a
+                // set, so a partial set would otherwise be dropped silently.
+                let missing: Vec<&str> = [&q_bias_name, &k_bias_name, &v_bias_name]
+                    .into_iter()
+                    .filter(|n| !gguf.tensors.contains_key(*n))
+                    .map(String::as_str)
+                    .collect();
+                ensure!(
+                    missing.is_empty(),
+                    "layer {i} has a partial Q/K/V bias set (missing {}); biases must be all-or-none",
+                    missing.join(", ")
+                );
                 let qb = gguf.get_tensor(&q_bias_name)?.try_to_f32_vec()?;
                 let kb = gguf.get_tensor(&k_bias_name)?.try_to_f32_vec()?;
                 let vb = gguf.get_tensor(&v_bias_name)?.try_to_f32_vec()?;
@@ -944,7 +1252,24 @@ impl LlamaModel {
             // packed `ffn_up.weight` containing both gate and up stacked row-wise (Phi-3).
             let ffn_gate_name = format!("blk.{i}.ffn_gate.weight");
             let ffn_up_name = format!("blk.{i}.ffn_up.weight");
-            let (ffn_gate, ffn_up) = if gguf.tensors.contains_key(&ffn_gate_name) {
+            let (ffn_gate, ffn_up) = if !ffn_gated {
+                // Plain up/down FFN (StarCoder2). `ffn_gate` aliases `ffn_up` so
+                // the shared ref plumbing stays total; `ffn_gated` guards reads.
+                ensure!(
+                    !gguf.tensors.contains_key(&ffn_gate_name),
+                    "{prefix:?} is loaded as an ungated FFN but layer {i} has `{ffn_gate_name}`"
+                );
+                let up = transformer::resolve_weight(&gguf, &ffn_up_name)?;
+                ensure!(
+                    up.m == config.intermediate_size && up.k == config.hidden_size,
+                    "layer {i} {ffn_up_name} is {}x{}, expected {}x{}",
+                    up.m,
+                    up.k,
+                    config.intermediate_size,
+                    config.hidden_size
+                );
+                (up.clone(), up)
+            } else if gguf.tensors.contains_key(&ffn_gate_name) {
                 let gate = transformer::resolve_weight(&gguf, &ffn_gate_name)?;
                 let up = transformer::resolve_weight(&gguf, &ffn_up_name)?;
                 ensure!(
@@ -1019,6 +1344,8 @@ impl LlamaModel {
             for _ in 1..n_loops {
                 attn_norm_weights.extend_from_within(..n_phys_layers);
                 ffn_norm_weights.extend_from_within(..n_phys_layers);
+                attn_norm_biases.extend_from_within(..n_phys_layers);
+                ffn_norm_biases.extend_from_within(..n_phys_layers);
                 attn_post_norm_weights.extend_from_within(..n_phys_layers);
                 ffn_post_norm_weights.extend_from_within(..n_phys_layers);
                 attn_q_norm_weights.extend_from_within(..n_phys_layers);
@@ -1118,19 +1445,57 @@ impl LlamaModel {
             );
         }
 
+        // The LayerNorm path (`run_layers_ext`) applies plain (partial) RoPE and
+        // full causal attention only. Loading a GGUF that asks for anything else
+        // would silently produce wrong logits, so fail closed and name the arch.
+        if ext {
+            let unsupported: Vec<&str> = [
+                ("rope yarn scaling", yarn.is_some()),
+                ("rope_freqs.weight", rope_freqs.is_some()),
+                ("attention.sliding_window", sliding_window.is_some()),
+                ("attention temperature scaling", attn_temp_scale.is_some()),
+            ]
+            .into_iter()
+            .filter_map(|(name, present)| present.then_some(name))
+            .collect();
+            ensure!(
+                unsupported.is_empty(),
+                "arch '{prefix}' uses the LayerNorm inference path, which does not support {}",
+                unsupported.join(", ")
+            );
+        }
+
+        // A GPU RoPE kernel takes one factor table and no per-layer variants,
+        // so YaRN is reproducible there only when the table is otherwise free,
+        // every layer rotates (no SWA layers, which skip YaRN) and the whole
+        // head does (`n_rot == head_dim`).
+        let yarn_freq_factors = match &yarn {
+            Some(y) if rope_freqs.is_none() && sliding_window.is_none() && n_rot == head_dim => {
+                cpu::yarn_freq_factors(head_dim, config.rope_theta, y)
+            }
+            _ => None,
+        };
+
         Ok(Self {
             gguf,
             config,
             head_dim,
             rope_type,
             rope_freqs,
+            yarn_freq_factors,
             norm_order,
+            ext,
+            n_rot,
+            ffn_gated,
             activation,
             attn_logit_softcapping,
             final_logit_softcapping,
             output_norm_weight,
+            output_norm_bias,
             attn_norm_weights,
             ffn_norm_weights,
+            attn_norm_biases,
+            ffn_norm_biases,
             attn_post_norm_weights,
             ffn_post_norm_weights,
             attn_q_norm_weights,
@@ -1175,7 +1540,67 @@ impl LlamaModel {
         self.sliding_window
     }
 
-    /// Return whether any layer specifies projection or FFN biases.
+    /// Attention-output projection bias for layer `il`, if the model has one.
+    #[cfg_attr(not(feature = "hexagon"), allow(dead_code))]
+    pub(crate) fn attn_output_bias(&self, il: usize) -> Option<&[f32]> {
+        self.attn_output_bias.get(il).and_then(|b| b.as_deref())
+    }
+
+    /// FFN gate projection bias for layer `il`, if any.
+    #[cfg_attr(not(feature = "hexagon"), allow(dead_code))]
+    pub(crate) fn ffn_gate_bias(&self, il: usize) -> Option<&[f32]> {
+        self.ffn_gate_bias.get(il).and_then(|b| b.as_deref())
+    }
+
+    /// FFN up projection bias for layer `il`, if any.
+    #[cfg_attr(not(feature = "hexagon"), allow(dead_code))]
+    pub(crate) fn ffn_up_bias(&self, il: usize) -> Option<&[f32]> {
+        self.ffn_up_bias.get(il).and_then(|b| b.as_deref())
+    }
+
+    /// FFN down projection bias for layer `il`, if any.
+    #[cfg_attr(not(feature = "hexagon"), allow(dead_code))]
+    pub(crate) fn ffn_down_bias(&self, il: usize) -> Option<&[f32]> {
+        self.ffn_down_bias.get(il).and_then(|b| b.as_deref())
+    }
+
+    /// Attention temperature scaling `(scale, floor_scale)` (Mistral 3 / Llama 4).
+    /// The CPU rule (`transformer::forward_attn_block`): for a token at `pos`,
+    /// when `scale > 0 && floor_scale > 0 && pos >= floor_scale`, Q is multiplied
+    /// by `ln(floor(pos / floor_scale) + 1) * scale + 1` after RoPE.
+    #[cfg_attr(not(feature = "hexagon"), allow(dead_code))]
+    pub(crate) fn attn_temp_scale(&self) -> Option<(f32, usize)> {
+        self.attn_temp_scale
+    }
+
+    /// Why the GPU backends cannot run this model's rotary scheme, if they
+    /// cannot: YaRN that does not reduce to a frequency table (see
+    /// `yarn_freq_factors`).
+    #[cfg(any(
+        feature = "gpu",
+        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    ))]
+    pub(crate) fn gpu_unsupported_reason(&self) -> Option<String> {
+        (self.yarn.is_some() && self.yarn_freq_factors.is_none()).then(|| {
+            "YaRN rope scaling combined with rope_freqs, sliding-window layers or partial rotary \
+             is not reproducible by the GPU rotary kernel"
+                .to_string()
+        })
+    }
+
+    /// Longest context the GPU backends can serve exactly. Attention
+    /// temperature scaling multiplies Q by a per-position factor that is 1
+    /// below `floor_scale`; the GPU forward has no hook for the factor, so it
+    /// is exact only below that position.
+    #[cfg(any(
+        feature = "gpu",
+        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    ))]
+    pub(crate) fn gpu_context_cap(&self) -> Option<usize> {
+        self.attn_temp_scale.map(|(_, floor_scale)| floor_scale)
+    }
+
+    /// Return whether any layer specifies an attention-output or FFN bias.
     pub fn has_projection_or_ffn_biases(&self) -> bool {
         self.attn_output_bias.iter().any(Option::is_some)
             || self.ffn_gate_bias.iter().any(Option::is_some)
@@ -1224,8 +1649,226 @@ impl LlamaModel {
         }
     }
 
+    /// Sequential LayerNorm graph for stablelm / starcoder2 / cohere / command-r
+    /// (`self.ext`), one token. Mirrors llama.cpp's `build_stablelm`,
+    /// `build_starcoder2` and `build_command_r`:
+    ///
+    /// - norms are true LayerNorm (mean-subtracting, optional bias);
+    /// - a layer without `ffn_norm` runs attention and FFN in parallel off the
+    ///   attention norm: `h + attn(norm(h)) + ffn(norm(h))` (Cohere, StableLM 2
+    ///   12B), otherwise sequential `h1 = h + attn(norm(h)); h1 + ffn(norm2(h1))`;
+    /// - the FFN is gated (SwiGLU) or, for StarCoder2, plain `up -> GELU -> down`;
+    /// - optional per-head Q/K LayerNorm precedes RoPE; StableLM rotates only the
+    ///   first `n_rot` dims of each head.
+    ///
+    /// Plain f32 GEMVs (no Q8 pre-quantized fast paths): this path serves four
+    /// niche archs, so simplicity beats speed. No LoRA, no batched prefill.
+    fn run_layers_ext(&self, hidden: &mut [f32], pos: usize, state: &mut InferenceState) {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let head_dim = self.head_dim;
+        let n_heads = cfg.n_heads;
+        let n_kv_heads = cfg.n_kv_heads;
+        let q_dim = n_heads * head_dim;
+        let kv_dim = n_kv_heads * head_dim;
+        let eps = cfg.rms_norm_eps;
+        let inter = cfg.intermediate_size;
+        let use_f16 = state.kv_f16;
+
+        // Per-token buffers reused across layers (each is re-zeroed or fully
+        // overwritten per layer, so numerics match fresh allocations).
+        let mut normed = vec![0.0f32; hs];
+        let mut ffn_norm_buf = vec![0.0f32; hs];
+        let mut q = vec![0.0f32; q_dim];
+        let mut k = vec![0.0f32; kv_dim];
+        let mut v = vec![0.0f32; kv_dim];
+        let mut attn_out = vec![0.0f32; q_dim];
+        let mut attn_proj = vec![0.0f32; hs];
+        let mut gate = vec![0.0f32; if self.ffn_gated { inter } else { 0 }];
+        let mut down_in = vec![0.0f32; inter];
+        let mut ffn_out = vec![0.0f32; hs];
+
+        for i in 0..cfg.n_layers {
+            let refs = &self.layer_refs[i];
+
+            normed.copy_from_slice(hidden);
+            layer_norm_opt_bias(
+                &mut normed,
+                &self.attn_norm_weights[i],
+                self.attn_norm_biases[i].as_deref(),
+                eps,
+            );
+
+            // Attention.
+            q.fill(0.0);
+            k.fill(0.0);
+            v.fill(0.0);
+            transformer::gemv(&self.gguf, &refs.attn_q, &normed, &mut q);
+            transformer::gemv(&self.gguf, &refs.attn_k, &normed, &mut k);
+            transformer::gemv(&self.gguf, &refs.attn_v, &normed, &mut v);
+            if let (Some(qb), Some(kb), Some(vb)) = (
+                self.attn_q_bias[i].as_deref(),
+                self.attn_k_bias[i].as_deref(),
+                self.attn_v_bias[i].as_deref(),
+            ) {
+                cpu::add_inplace(&mut q, qb);
+                cpu::add_inplace(&mut k, kb);
+                cpu::add_inplace(&mut v, vb);
+            }
+            if let (Some(qn), Some(kn)) = (
+                self.attn_q_norm_weights[i].as_deref(),
+                self.attn_k_norm_weights[i].as_deref(),
+            ) {
+                layer_norm_per_head(&mut q, qn, head_dim, eps);
+                layer_norm_per_head(&mut k, kn, head_dim, eps);
+            }
+            rope_partial(
+                &mut q,
+                &mut k,
+                pos,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                self.n_rot,
+                cfg.rope_theta,
+                self.rope_type,
+                &mut state.scratch.rope_gather,
+            );
+
+            if let crate::kv_cache::LayerState::Attention {
+                key_cache,
+                value_cache,
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            } = &mut state.layers[i]
+            {
+                if use_f16 {
+                    key_cache_f16.extend(k.iter().map(|&x| crate::quant::f32_to_f16(x)));
+                    value_cache_f16.extend(v.iter().map(|&x| crate::quant::f32_to_f16(x)));
+                } else {
+                    key_cache.extend_from_slice(&k);
+                    value_cache.extend_from_slice(&v);
+                }
+            }
+            attn_out.fill(0.0);
+            {
+                let (kc, vc, kc16, vc16) = match &state.layers[i] {
+                    crate::kv_cache::LayerState::Attention {
+                        key_cache,
+                        value_cache,
+                        key_cache_f16,
+                        value_cache_f16,
+                        ..
+                    } => (
+                        key_cache.as_slice(),
+                        value_cache.as_slice(),
+                        key_cache_f16.as_slice(),
+                        value_cache_f16.as_slice(),
+                    ),
+                    _ => panic!("expected Attention state for layer {i}"),
+                };
+                let seq_len = if use_f16 {
+                    kc16.len() / kv_dim
+                } else {
+                    kc.len() / kv_dim
+                };
+                let kv = if use_f16 {
+                    transformer::KvView::F16 { k: kc16, v: vc16 }
+                } else {
+                    transformer::KvView::F32 { k: kc, v: vc }
+                };
+                transformer::decode_attention(
+                    &q,
+                    &kv,
+                    &transformer::DecodeAttnDims {
+                        n_heads,
+                        n_kv_heads,
+                        head_dim,
+                        scale: cfg
+                            .scalars
+                            .attn
+                            .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt()),
+                        seq_len,
+                        attn_logit_softcapping: None,
+                        sliding_window: None,
+                    },
+                    &mut attn_out,
+                    &mut state.scratch.scores,
+                );
+            }
+            attn_proj.fill(0.0);
+            transformer::gemv(&self.gguf, &refs.attn_output, &attn_out, &mut attn_proj);
+            if let Some(b) = self.attn_output_bias[i].as_deref() {
+                cpu::add_inplace(&mut attn_proj, b);
+            }
+
+            // FFN input: the same normed activation (parallel residual) or a
+            // second LayerNorm after the attention residual.
+            let parallel = self.ffn_norm_weights[i].is_empty();
+            let ffn_in: &[f32] = if parallel {
+                &normed
+            } else {
+                cpu::add_inplace(hidden, &attn_proj);
+                ffn_norm_buf.copy_from_slice(hidden);
+                layer_norm_opt_bias(
+                    &mut ffn_norm_buf,
+                    &self.ffn_norm_weights[i],
+                    self.ffn_norm_biases[i].as_deref(),
+                    eps,
+                );
+                &ffn_norm_buf
+            };
+
+            down_in.fill(0.0);
+            if self.ffn_gated {
+                gate.fill(0.0);
+                transformer::gemv(&self.gguf, &refs.ffn_gate, ffn_in, &mut gate);
+                transformer::gemv(&self.gguf, &refs.ffn_up, ffn_in, &mut down_in);
+                if let Some(b) = self.ffn_gate_bias[i].as_deref() {
+                    cpu::add_inplace(&mut gate, b);
+                }
+                if let Some(b) = self.ffn_up_bias[i].as_deref() {
+                    cpu::add_inplace(&mut down_in, b);
+                }
+                match self.activation {
+                    FfnActivation::Swiglu => cpu::silu_mul_inplace(&mut gate, &down_in),
+                    FfnActivation::Geglu => cpu::gelu_mul_inplace(&mut gate, &down_in),
+                }
+                down_in.copy_from_slice(&gate);
+            } else {
+                transformer::gemv(&self.gguf, &refs.ffn_up, ffn_in, &mut down_in);
+                if let Some(b) = self.ffn_up_bias[i].as_deref() {
+                    cpu::add_inplace(&mut down_in, b);
+                }
+                cpu::gelu_inplace(&mut down_in);
+            }
+            ffn_out.fill(0.0);
+            transformer::gemv(&self.gguf, &refs.ffn_down, &down_in, &mut ffn_out);
+            if let Some(b) = self.ffn_down_bias[i].as_deref() {
+                cpu::add_inplace(&mut ffn_out, b);
+            }
+
+            if parallel {
+                cpu::add_inplace(hidden, &attn_proj);
+            }
+            cpu::add_inplace(hidden, &ffn_out);
+        }
+
+        layer_norm_opt_bias(
+            hidden,
+            &self.output_norm_weight,
+            self.output_norm_bias.as_deref(),
+            eps,
+        );
+        state.seq_len += 1;
+    }
+
     /// Run all layers + final RMSNorm on a single-token hidden state.
     fn run_layers(&self, hidden: &mut [f32], pos: usize, state: &mut InferenceState) {
+        if self.ext {
+            return self.run_layers_ext(hidden, pos, state);
+        }
         let cfg = &self.config;
         let hs = cfg.hidden_size;
 
@@ -1389,6 +2032,8 @@ impl LlamaModel {
     /// Project the final hidden state to logits over the vocabulary, using the
     /// separate `output.weight` when present, else the tied embedding table.
     fn project_logits(&self, hidden: &[f32], state: &mut InferenceState) -> Vec<f32> {
+        #[cfg(test)]
+        PROJECT_LOGITS_CALLS.with(|c| c.set(c.get() + 1));
         let cfg = &self.config;
         let out_ref = self.output_ref.as_ref().unwrap_or(&self.embd_ref);
         let mut logits = vec![0.0f32; cfg.vocab_size];
@@ -2593,7 +3238,8 @@ impl Model for LlamaModel {
     /// LoRA hooks live in the shared `transformer::forward_*_block` helpers
     /// this backend decodes through.
     fn supports_lora(&self) -> bool {
-        true
+        // The LayerNorm path (`run_layers_ext`) has no LoRA hooks.
+        !self.ext
     }
 
     fn f16_kv_supported(&self) -> bool {
@@ -2611,7 +3257,7 @@ impl Model for LlamaModel {
         // projection GEMM); non-gemmable dtypes fall back to the per-token decode
         // hooks, which apply it too.
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
-        if tokens.len() > 1 {
+        if tokens.len() > 1 && !self.ext {
             let mut out = Vec::new();
             self.forward_prefill_batched(tokens, 0, state, Some(&mut out));
             return out;
@@ -2621,22 +3267,7 @@ impl Model for LlamaModel {
 
     fn forward(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
         assert_eq!(tokens.len(), 1, "LlamaModel forward expects single token");
-        let token_id = tokens[0] as usize;
-        let cfg = &self.config;
-        assert!(
-            token_id < cfg.vocab_size,
-            "token_id {token_id} out of range (vocab_size={})",
-            cfg.vocab_size
-        );
-
-        let mut hidden = transformer::dequantize_row(&self.gguf, &self.embd_ref, token_id);
-        if self.config.scalars.embedding != 1.0 {
-            cpu::scale_inplace(&mut hidden, self.config.scalars.embedding);
-        }
-        // Record after the embedding scale: llama.cpp fires its "embd" callback
-        // post-scale, so the dumped node is GET_ROWS for plain archs (scale=1) and
-        // SCALE for Granite. Either way the value matches.
-        transformer::oracle_dump::record("embd", &hidden);
+        let mut hidden = self.embed_token(tokens[0], "forward");
         self.run_layers(&mut hidden, pos, state);
         self.project_logits(&hidden, state)
     }
@@ -2779,11 +3410,22 @@ impl Model for LlamaModel {
         // GEMM), so it no longer forces the per-token path; non-gemmable dtypes
         // still fall back to the per-token decode hooks, which apply it too.
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
-        if tokens.len() > 1 && !transformer::oracle_dump::is_active() {
+        if tokens.len() > 1 && !self.ext && !transformer::oracle_dump::is_active() {
             return self.forward_prefill_batched(tokens, start_pos, state, None);
         }
 
-        // Sequential per-token prefill (single-token, or no batched kernel).
+        // Sequential per-token prefill (single-token, LayerNorm archs, or no
+        // batched kernel). Only the last token's logits are returned, so the
+        // earlier tokens run embed + layers and skip the vocab-sized LM head
+        // and logits allocation. The oracle-dump harness keeps the full
+        // `forward` per token so every node is recorded.
+        let last = tokens.len() - 1;
+        if !transformer::oracle_dump::is_active() {
+            for (i, &token) in tokens[..last].iter().enumerate() {
+                self.forward_no_head(token, start_pos + i, state);
+            }
+            return self.forward(&tokens[last..], start_pos + last, state);
+        }
         let mut logits = Vec::new();
         for (i, &token) in tokens.iter().enumerate() {
             logits = self.forward(&[token], start_pos + i, state);
@@ -2819,7 +3461,7 @@ impl Model for LlamaModel {
         // oracle-dump harness needs the per-token substep records, so defer to
         // the per-token path when it is active.
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
-        if n > 1 && !transformer::oracle_dump::is_active() {
+        if n > 1 && !self.ext && !transformer::oracle_dump::is_active() {
             let hs = self.config.hidden_size;
             let mut hidden = Vec::new();
             let _ = self.forward_prefill_batched(tokens, start_pos, state, Some(&mut hidden));
@@ -2867,11 +3509,11 @@ impl Model for LlamaModel {
     fn supports_kv_shift(&self) -> bool {
         // YaRN frequencies and per-layer SWA patterns do not compose with standard
         // unscaled RoPE delta rotation in `shift_kv_with_rope`.
-        self.yarn.is_none() && self.sliding_window.is_none()
+        self.yarn.is_none() && self.sliding_window.is_none() && self.n_rot == self.head_dim
     }
 
     fn shift_kv(&self, state: &mut InferenceState, n_keep: usize, shift: usize) {
-        if self.yarn.is_some() || self.sliding_window.is_some() {
+        if self.yarn.is_some() || self.sliding_window.is_some() || self.n_rot != self.head_dim {
             tracing::warn!(
                 "shift_kv called on model with YaRN or sliding window; skipping unscaled RoPE rotation"
             );
@@ -2897,7 +3539,8 @@ impl Model for LlamaModel {
 // accessors. Granite scalars ride on `config().scalars`.
 #[cfg(any(
     feature = "gpu",
-    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    all(feature = "metal", any(target_os = "macos", target_os = "ios")),
+    feature = "hexagon"
 ))]
 impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
     fn cache_identity_sources(&self) -> Option<Vec<&GgufFile>> {
@@ -2939,6 +3582,34 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
     }
     fn rope_freqs(&self) -> Option<&[f32]> {
         self.rope_freqs.as_deref()
+    }
+    fn yarn_rope_freq_factors(&self) -> Option<&[f32]> {
+        self.yarn_freq_factors.as_deref()
+    }
+    fn attn_scale_multiplier(&self) -> f32 {
+        match (&self.yarn_freq_factors, &self.yarn) {
+            (Some(_), Some(y)) => y.mscale * y.mscale,
+            _ => 1.0,
+        }
+    }
+    fn attn_post_norm_weight(&self, layer: usize) -> Option<&[f32]> {
+        self.attn_post_norm_weights
+            .get(layer)
+            .and_then(|w| w.as_deref())
+    }
+    fn ffn_post_norm_weight(&self, layer: usize) -> Option<&[f32]> {
+        self.ffn_post_norm_weights
+            .get(layer)
+            .and_then(|w| w.as_deref())
+    }
+    fn activation(&self) -> crate::model::transformer::FfnActivation {
+        self.activation
+    }
+    fn attn_logit_softcapping(&self) -> Option<f32> {
+        self.attn_logit_softcapping
+    }
+    fn final_logit_softcapping(&self) -> Option<f32> {
+        self.final_logit_softcapping
     }
 
     fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]> {
@@ -3010,6 +3681,7 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
 
 #[cfg(test)]
 mod tests {
+    use super::rope_type_for_arch;
     use crate::model::ScalarMultipliers;
 
     #[test]
@@ -3033,5 +3705,799 @@ mod tests {
             ..Default::default()
         };
         assert!(pos.logit > 0.0);
+    }
+
+    #[test]
+    fn test_llama_arch_rope_type_coverage() {
+        use crate::backend::cpu::RopeType;
+
+        let neox_archs = [
+            "qwen2",
+            "qwen3",
+            "gemma2",
+            "olmo2",
+            "olmo3",
+            "phi3",
+            "phi",
+            "starcoder2",
+            "stablelm",
+            "openelm",
+        ];
+        let norm_archs = [
+            "llama",
+            "granite",
+            "minicpm",
+            "minicpm5",
+            "nanbeige",
+            "mistral3",
+            "ministral3",
+            "ministral",
+            "baichuan",
+            "deepseek",
+            "internlm2",
+            "internlm",
+            "cohere",
+            "command-r",
+        ];
+        for arch in neox_archs {
+            assert_eq!(rope_type_for_arch(arch), Some(RopeType::Neox), "{arch}");
+        }
+        for arch in norm_archs {
+            assert_eq!(rope_type_for_arch(arch), Some(RopeType::Norm), "{arch}");
+        }
+        assert_eq!(rope_type_for_arch("not-an-arch"), None);
+    }
+
+    // ── LayerNorm-arch (stablelm / starcoder2 / cohere / command-r) tests ────
+
+    use super::{
+        LlamaModel, layer_norm_opt_bias, layer_norm_per_head, requires_layernorm_path, rope_partial,
+    };
+    use crate::backend::cpu;
+    use crate::gguf::GgufFile;
+    use crate::model::Model;
+    use std::sync::Arc;
+
+    fn scalar_layer_norm(x: &[f32], w: &[f32], b: Option<&[f32]>, eps: f32) -> Vec<f32> {
+        let n = x.len() as f64;
+        let mean = x.iter().map(|&v| v as f64).sum::<f64>() / n;
+        let var = x.iter().map(|&v| (v as f64 - mean).powi(2)).sum::<f64>() / n;
+        let inv = 1.0 / (var + eps as f64).sqrt();
+        x.iter()
+            .enumerate()
+            .map(|(i, &v)| {
+                ((v as f64 - mean) * inv * w[i] as f64 + b.map_or(0.0, |b| b[i] as f64)) as f32
+            })
+            .collect()
+    }
+
+    #[test]
+    fn layer_norm_matches_scalar_reference_with_and_without_bias() {
+        let x: Vec<f32> = (0..32)
+            .map(|i| (i as f32 * 0.37).sin() * 3.0 + 1.5)
+            .collect();
+        let w: Vec<f32> = (0..32).map(|i| 0.5 + i as f32 * 0.03).collect();
+        let b: Vec<f32> = (0..32).map(|i| (i as f32 * 0.11).cos() * 0.2).collect();
+        for bias in [Some(&b[..]), None] {
+            let mut got = x.clone();
+            layer_norm_opt_bias(&mut got, &w, bias, 1e-5);
+            let want = scalar_layer_norm(&x, &w, bias, 1e-5);
+            for (g, r) in got.iter().zip(&want) {
+                assert!((g - r).abs() < 1e-4, "{g} vs {r}");
+            }
+        }
+        // LayerNorm subtracts the mean; RMSNorm does not. A constant vector
+        // normalizes to the bias under LayerNorm.
+        let mut c = vec![2.0f32; 32];
+        layer_norm_opt_bias(&mut c, &w, Some(&b), 1e-5);
+        for (g, bb) in c.iter().zip(&b) {
+            assert!((g - bb).abs() < 1e-3);
+        }
+    }
+
+    #[test]
+    fn per_head_layer_norm_slices_weights_per_head() {
+        let hd = 8;
+        let x: Vec<f32> = (0..24).map(|i| (i as f32 * 0.7).sin() + 0.3).collect();
+        let w: Vec<f32> = (0..24).map(|i| 1.0 + i as f32 * 0.05).collect();
+        let mut got = x.clone();
+        layer_norm_per_head(&mut got, &w, hd, 1e-5);
+        for h in 0..3 {
+            let want = scalar_layer_norm(
+                &x[h * hd..(h + 1) * hd],
+                &w[h * hd..(h + 1) * hd],
+                None,
+                1e-5,
+            );
+            for (g, r) in got[h * hd..(h + 1) * hd].iter().zip(&want) {
+                assert!((g - r).abs() < 1e-4);
+            }
+        }
+        // A head_dim-length weight is shared by all heads.
+        let shared = &w[..hd];
+        let mut got = x.clone();
+        layer_norm_per_head(&mut got, shared, hd, 1e-5);
+        let want = scalar_layer_norm(&x[hd..2 * hd], shared, None, 1e-5);
+        for (g, r) in got[hd..2 * hd].iter().zip(&want) {
+            assert!((g - r).abs() < 1e-4);
+        }
+    }
+
+    #[test]
+    fn partial_rope_rotates_only_the_prefix_of_each_head() {
+        use crate::backend::cpu::RopeType;
+        let (nh, nkv, hd, nrot) = (2usize, 1usize, 16usize, 8usize);
+        let q0: Vec<f32> = (0..nh * hd).map(|i| (i as f32 * 0.21).sin()).collect();
+        let k0: Vec<f32> = (0..nkv * hd).map(|i| (i as f32 * 0.13).cos()).collect();
+        for rt in [RopeType::Neox, RopeType::Norm] {
+            let (mut q, mut k) = (q0.clone(), k0.clone());
+            let mut scratch = crate::model::llama::RopeGather::default();
+            rope_partial(
+                &mut q,
+                &mut k,
+                5,
+                nh,
+                nkv,
+                hd,
+                nrot,
+                10000.0,
+                rt,
+                &mut scratch,
+            );
+            // The gather buffers were sized by the call and a second call
+            // reuses them: capacity is stable (pointer equality is not a
+            // reliable signal, the allocator may hand back the same block).
+            let (cq, ck) = (scratch.q.capacity(), scratch.k.capacity());
+            assert!(cq >= nh * nrot && ck >= nkv * nrot);
+            let (mut q2, mut k2) = (q0.clone(), k0.clone());
+            rope_partial(
+                &mut q2,
+                &mut k2,
+                5,
+                nh,
+                nkv,
+                hd,
+                nrot,
+                10000.0,
+                rt,
+                &mut scratch,
+            );
+            assert_eq!((scratch.q.capacity(), scratch.k.capacity()), (cq, ck));
+            assert_eq!(
+                (&q2, &k2),
+                (&q, &k),
+                "reused scratch must not change the result"
+            );
+            // Tails untouched.
+            for h in 0..nh {
+                assert_eq!(
+                    &q[h * hd + nrot..(h + 1) * hd],
+                    &q0[h * hd + nrot..(h + 1) * hd]
+                );
+            }
+            assert_eq!(&k[nrot..hd], &k0[nrot..hd]);
+            // Prefix equals the full kernel applied to a head of size nrot.
+            let mut qr: Vec<f32> = (0..nh)
+                .flat_map(|h| q0[h * hd..h * hd + nrot].to_vec())
+                .collect();
+            let mut kr = k0[..nrot].to_vec();
+            match rt {
+                RopeType::Neox => cpu::rope(&mut qr, &mut kr, 5, nh, nkv, nrot, 10000.0),
+                RopeType::Norm => cpu::rope_norm(&mut qr, &mut kr, 5, nh, nkv, nrot, 10000.0, None),
+            }
+            for h in 0..nh {
+                assert_eq!(&q[h * hd..h * hd + nrot], &qr[h * nrot..(h + 1) * nrot]);
+            }
+            assert_eq!(&k[..nrot], &kr[..]);
+            // n_rot == head_dim is the ordinary full rotation.
+            let (mut qf, mut kf) = (q0.clone(), k0.clone());
+            rope_partial(
+                &mut qf,
+                &mut kf,
+                5,
+                nh,
+                nkv,
+                hd,
+                hd,
+                10000.0,
+                rt,
+                &mut scratch,
+            );
+            let (mut qg, mut kg) = (q0.clone(), k0.clone());
+            match rt {
+                RopeType::Neox => cpu::rope(&mut qg, &mut kg, 5, nh, nkv, hd, 10000.0),
+                RopeType::Norm => cpu::rope_norm(&mut qg, &mut kg, 5, nh, nkv, hd, 10000.0, None),
+            }
+            assert_eq!(qf, qg);
+            assert_eq!(kf, kg);
+        }
+    }
+
+    #[test]
+    fn layernorm_arch_classifier_names_exactly_four_archs() {
+        for a in ["stablelm", "starcoder2", "cohere", "command-r"] {
+            assert!(requires_layernorm_path(a), "{a}");
+        }
+        for a in ["llama", "qwen2", "phi3", "internlm2", "gemma2"] {
+            assert!(!requires_layernorm_path(a), "{a}");
+        }
+    }
+
+    // A tiny synthetic GGUF (F32 tensors) per arch, run through the production
+    // loader and `forward`, checked against an independent scalar
+    // implementation of llama.cpp's graph.
+
+    const HS: usize = 32;
+    const NH: usize = 2;
+    const NKV: usize = 1;
+    const HD: usize = 16;
+    const INTER: usize = 32;
+    const VOCAB: usize = 8;
+    const NLAYER: usize = 2;
+    const THETA: f32 = 10000.0;
+    const EPS: f32 = 1e-5;
+
+    #[derive(Clone, Copy, PartialEq, Debug)]
+    enum Kind {
+        Cohere,
+        Starcoder2,
+        Stablelm,
+    }
+
+    struct Tiny {
+        kind: Kind,
+        arch: Option<&'static str>,
+        tensors: Vec<(String, Vec<usize>, Vec<f32>)>,
+        /// Extra metadata as `(key suffix after "<arch>.", gguf type, bytes)`.
+        extra_kv: Vec<(&'static str, u32, Vec<u8>)>,
+    }
+
+    impl Tiny {
+        fn get(&self, name: &str) -> &[f32] {
+            &self
+                .tensors
+                .iter()
+                .find(|t| t.0 == name)
+                .unwrap_or_else(|| panic!("missing {name}"))
+                .2
+        }
+        fn has(&self, name: &str) -> bool {
+            self.tensors.iter().any(|t| t.0 == name)
+        }
+        fn prefix(&self) -> &'static str {
+            if let Some(a) = self.arch {
+                return a;
+            }
+            match self.kind {
+                Kind::Cohere => "cohere",
+                Kind::Starcoder2 => "starcoder2",
+                Kind::Stablelm => "stablelm",
+            }
+        }
+        const NROT_STABLELM: usize = 8;
+        const LOGIT_SCALE: f32 = 0.5;
+    }
+
+    fn lcg_vec(seed: &mut u64, n: usize, scale: f32) -> Vec<f32> {
+        (0..n)
+            .map(|_| {
+                *seed = seed
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                (((*seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5) * 2.0 * scale
+            })
+            .collect()
+    }
+
+    fn build_tiny(kind: Kind) -> Tiny {
+        let mut seed = 0x1234_5678_9abc_def0u64 ^ (kind as u64 + 1);
+        let mut t: Vec<(String, Vec<usize>, Vec<f32>)> = Vec::new();
+        let mut add = |name: &str, dims: Vec<usize>, scale: f32, base: f32| {
+            let n: usize = dims.iter().product();
+            let v: Vec<f32> = lcg_vec(&mut seed, n, scale)
+                .into_iter()
+                .map(|x| x + base)
+                .collect();
+            t.push((name.to_string(), dims, v));
+        };
+        let q_dim = NH * HD;
+        let kv_dim = NKV * HD;
+        add("token_embd.weight", vec![HS, VOCAB], 1.0, 0.0);
+        add("output_norm.weight", vec![HS], 0.2, 1.0);
+        if kind != Kind::Cohere {
+            add("output_norm.bias", vec![HS], 0.1, 0.0);
+            add("output.weight", vec![HS, VOCAB], 0.5, 0.0);
+        }
+        for l in 0..NLAYER {
+            let b = |s: &str| format!("blk.{l}.{s}");
+            add(&b("attn_norm.weight"), vec![HS], 0.2, 1.0);
+            if kind != Kind::Cohere {
+                add(&b("attn_norm.bias"), vec![HS], 0.1, 0.0);
+                add(&b("ffn_norm.weight"), vec![HS], 0.2, 1.0);
+                add(&b("ffn_norm.bias"), vec![HS], 0.1, 0.0);
+            }
+            add(&b("attn_q.weight"), vec![HS, q_dim], 0.3, 0.0);
+            add(&b("attn_k.weight"), vec![HS, kv_dim], 0.3, 0.0);
+            add(&b("attn_v.weight"), vec![HS, kv_dim], 0.3, 0.0);
+            add(&b("attn_output.weight"), vec![q_dim, HS], 0.3, 0.0);
+            if kind != Kind::Cohere {
+                add(&b("attn_q.bias"), vec![q_dim], 0.1, 0.0);
+                add(&b("attn_k.bias"), vec![kv_dim], 0.1, 0.0);
+                add(&b("attn_v.bias"), vec![kv_dim], 0.1, 0.0);
+            }
+            if kind == Kind::Stablelm {
+                add(&b("attn_q_norm.weight"), vec![q_dim], 0.2, 1.0);
+                add(&b("attn_k_norm.weight"), vec![kv_dim], 0.2, 1.0);
+            }
+            if kind == Kind::Starcoder2 {
+                add(&b("attn_output.bias"), vec![HS], 0.1, 0.0);
+                add(&b("ffn_up.weight"), vec![HS, INTER], 0.3, 0.0);
+                add(&b("ffn_up.bias"), vec![INTER], 0.1, 0.0);
+                add(&b("ffn_down.weight"), vec![INTER, HS], 0.3, 0.0);
+                add(&b("ffn_down.bias"), vec![HS], 0.1, 0.0);
+            } else {
+                add(&b("ffn_gate.weight"), vec![HS, INTER], 0.3, 0.0);
+                add(&b("ffn_up.weight"), vec![HS, INTER], 0.3, 0.0);
+                add(&b("ffn_down.weight"), vec![INTER, HS], 0.3, 0.0);
+            }
+        }
+        Tiny {
+            kind,
+            arch: None,
+            tensors: t,
+            extra_kv: Vec::new(),
+        }
+    }
+
+    fn gguf_bytes(m: &Tiny) -> Vec<u8> {
+        use crate::gguf::{GgufBuilder, KvValue};
+        let p = m.prefix();
+        let mut b = GgufBuilder::new()
+            .kv_str("general.architecture", p)
+            .kv_u32(format!("{p}.block_count"), NLAYER as u32)
+            .kv_u32(format!("{p}.embedding_length"), HS as u32)
+            .kv_u32(format!("{p}.feed_forward_length"), INTER as u32)
+            .kv_u32(format!("{p}.attention.head_count"), NH as u32)
+            .kv_u32(format!("{p}.attention.head_count_kv"), NKV as u32)
+            .kv_f32(format!("{p}.attention.layer_norm_epsilon"), EPS)
+            .kv_f32(format!("{p}.rope.freq_base"), THETA)
+            .kv_u32(format!("{p}.context_length"), 64)
+            .kv_u32(format!("{p}.vocab_size"), VOCAB as u32);
+        if m.kind == Kind::Stablelm {
+            b = b.kv_u32(
+                format!("{p}.rope.dimension_count"),
+                Tiny::NROT_STABLELM as u32,
+            );
+        }
+        if m.kind == Kind::Cohere {
+            b = b.kv_f32(format!("{p}.logit_scale"), Tiny::LOGIT_SCALE);
+        }
+        for (suffix, ty, bytes) in &m.extra_kv {
+            b = b.kv(format!("{p}.{suffix}"), KvValue::Raw(*ty, bytes.clone()));
+        }
+        for (name, dims, data) in &m.tensors {
+            b = b.tensor_f32(name.as_str(), dims, data);
+        }
+        b.build_bytes()
+    }
+
+    fn put_str(out: &mut Vec<u8>, s: &str) {
+        out.extend_from_slice(&(s.len() as u64).to_le_bytes());
+        out.extend_from_slice(s.as_bytes());
+    }
+
+    fn matvec(w: &[f32], x: &[f32], out_dim: usize) -> Vec<f32> {
+        let in_dim = x.len();
+        (0..out_dim)
+            .map(|o| (0..in_dim).map(|i| w[o * in_dim + i] * x[i]).sum())
+            .collect()
+    }
+
+    fn add_bias(v: &mut [f32], b: Option<&[f32]>) {
+        if let Some(b) = b {
+            for (x, y) in v.iter_mut().zip(b) {
+                *x += y;
+            }
+        }
+    }
+
+    /// Independent scalar reference of the four archs' graphs.
+    fn reference_logits(m: &Tiny, tokens: &[usize]) -> Vec<Vec<f32>> {
+        let neox = matches!(m.kind, Kind::Starcoder2 | Kind::Stablelm);
+        let n_rot = if m.kind == Kind::Stablelm {
+            Tiny::NROT_STABLELM
+        } else {
+            HD
+        };
+        let q_dim = NH * HD;
+        let kv_dim = NKV * HD;
+        let mut kcache: Vec<Vec<Vec<f32>>> = vec![Vec::new(); NLAYER];
+        let mut vcache: Vec<Vec<Vec<f32>>> = vec![Vec::new(); NLAYER];
+        let opt = |name: String| -> Option<Vec<f32>> {
+            if m.has(&name) {
+                Some(m.get(&name).to_vec())
+            } else {
+                None
+            }
+        };
+        let mut all = Vec::new();
+        for (pos, &tok) in tokens.iter().enumerate() {
+            let mut h = m.get("token_embd.weight")[tok * HS..(tok + 1) * HS].to_vec();
+            for l in 0..NLAYER {
+                let b = |s: &str| format!("blk.{l}.{s}");
+                let attn_norm_b = opt(b("attn_norm.bias"));
+                let normed = scalar_layer_norm(
+                    &h,
+                    m.get(&b("attn_norm.weight")),
+                    attn_norm_b.as_deref(),
+                    EPS,
+                );
+                let mut q = matvec(m.get(&b("attn_q.weight")), &normed, q_dim);
+                let mut k = matvec(m.get(&b("attn_k.weight")), &normed, kv_dim);
+                let mut v = matvec(m.get(&b("attn_v.weight")), &normed, kv_dim);
+                add_bias(&mut q, opt(b("attn_q.bias")).as_deref());
+                add_bias(&mut k, opt(b("attn_k.bias")).as_deref());
+                add_bias(&mut v, opt(b("attn_v.bias")).as_deref());
+                if m.has(&b("attn_q_norm.weight")) {
+                    for hh in 0..NH {
+                        let w = &m.get(&b("attn_q_norm.weight"))[hh * HD..(hh + 1) * HD];
+                        let r = scalar_layer_norm(&q[hh * HD..(hh + 1) * HD], w, None, EPS);
+                        q[hh * HD..(hh + 1) * HD].copy_from_slice(&r);
+                    }
+                    for hh in 0..NKV {
+                        let w = &m.get(&b("attn_k_norm.weight"))[hh * HD..(hh + 1) * HD];
+                        let r = scalar_layer_norm(&k[hh * HD..(hh + 1) * HD], w, None, EPS);
+                        k[hh * HD..(hh + 1) * HD].copy_from_slice(&r);
+                    }
+                }
+                let rot = |x: &mut [f32], heads: usize| {
+                    for hh in 0..heads {
+                        let base = hh * HD;
+                        for i in 0..n_rot / 2 {
+                            let theta = pos as f32 * THETA.powf(-2.0 * i as f32 / n_rot as f32);
+                            let (s, c) = theta.sin_cos();
+                            let (a, bb) = if neox {
+                                (base + i, base + i + n_rot / 2)
+                            } else {
+                                (base + 2 * i, base + 2 * i + 1)
+                            };
+                            let (x0, x1) = (x[a], x[bb]);
+                            x[a] = x0 * c - x1 * s;
+                            x[bb] = x0 * s + x1 * c;
+                        }
+                    }
+                };
+                rot(&mut q, NH);
+                rot(&mut k, NKV);
+                kcache[l].push(k);
+                vcache[l].push(v);
+                let mut attn = vec![0.0f32; q_dim];
+                for hh in 0..NH {
+                    let kvh = hh / (NH / NKV);
+                    let scores: Vec<f32> = kcache[l]
+                        .iter()
+                        .map(|kk| {
+                            (0..HD)
+                                .map(|d| q[hh * HD + d] * kk[kvh * HD + d])
+                                .sum::<f32>()
+                                / (HD as f32).sqrt()
+                        })
+                        .collect();
+                    let mx = scores.iter().cloned().fold(f32::MIN, f32::max);
+                    let ex: Vec<f32> = scores.iter().map(|s| (s - mx).exp()).collect();
+                    let sum: f32 = ex.iter().sum();
+                    for (t, e) in ex.iter().enumerate() {
+                        for d in 0..HD {
+                            attn[hh * HD + d] += e / sum * vcache[l][t][kvh * HD + d];
+                        }
+                    }
+                }
+                let mut a_out = matvec(m.get(&b("attn_output.weight")), &attn, HS);
+                add_bias(&mut a_out, opt(b("attn_output.bias")).as_deref());
+
+                let parallel = !m.has(&b("ffn_norm.weight"));
+                let ffn_in = if parallel {
+                    normed.clone()
+                } else {
+                    for (x, y) in h.iter_mut().zip(&a_out) {
+                        *x += y;
+                    }
+                    let fb = opt(b("ffn_norm.bias"));
+                    scalar_layer_norm(&h, m.get(&b("ffn_norm.weight")), fb.as_deref(), EPS)
+                };
+                let mut up = matvec(m.get(&b("ffn_up.weight")), &ffn_in, INTER);
+                add_bias(&mut up, opt(b("ffn_up.bias")).as_deref());
+                let act: Vec<f32> = if m.has(&b("ffn_gate.weight")) {
+                    let gate = matvec(m.get(&b("ffn_gate.weight")), &ffn_in, INTER);
+                    gate.iter()
+                        .zip(&up)
+                        .map(|(g, u)| g / (1.0 + (-g).exp()) * u)
+                        .collect()
+                } else {
+                    up.iter()
+                        .map(|&x| {
+                            let inner = 0.797_884_6 * (x + 0.044_715 * x * x * x);
+                            0.5 * x * (1.0 + inner.tanh())
+                        })
+                        .collect()
+                };
+                let mut f = matvec(m.get(&b("ffn_down.weight")), &act, HS);
+                add_bias(&mut f, opt(b("ffn_down.bias")).as_deref());
+                if parallel {
+                    for (x, y) in h.iter_mut().zip(&a_out) {
+                        *x += y;
+                    }
+                }
+                for (x, y) in h.iter_mut().zip(&f) {
+                    *x += y;
+                }
+            }
+            let ob = opt("output_norm.bias".to_string());
+            let hn = scalar_layer_norm(&h, m.get("output_norm.weight"), ob.as_deref(), EPS);
+            let head = if m.has("output.weight") {
+                m.get("output.weight")
+            } else {
+                m.get("token_embd.weight")
+            };
+            let mut logits = matvec(head, &hn, VOCAB);
+            if m.kind == Kind::Cohere {
+                for l in &mut logits {
+                    *l *= Tiny::LOGIT_SCALE;
+                }
+            }
+            all.push(logits);
+        }
+        all
+    }
+
+    fn load_tiny(m: &Tiny) -> LlamaModel {
+        let gguf = GgufFile::from_bytes(Arc::from(gguf_bytes(m).into_boxed_slice()))
+            .expect("synthetic gguf parses");
+        LlamaModel::from_gguf(gguf, 64).expect("synthetic model loads")
+    }
+
+    fn check_arch(kind: Kind) {
+        let m = build_tiny(kind);
+        let model = load_tiny(&m);
+        assert!(model.ext);
+        let tokens = [1usize, 5, 2, 7];
+        let want = reference_logits(&m, &tokens);
+        let mut state = crate::kv_cache::InferenceState::from_config(model.config()).unwrap();
+        // Decode one token at a time.
+        for (pos, &t) in tokens.iter().enumerate() {
+            let got = model.forward(&[t as u32], pos, &mut state);
+            for (g, r) in got.iter().zip(&want[pos]) {
+                assert!(
+                    (g - r).abs() < 2e-3 * r.abs().max(1.0),
+                    "pos {pos}: {g} vs {r}"
+                );
+            }
+        }
+        // Batched-prefill entry point takes the same sequential path.
+        let mut state2 = crate::kv_cache::InferenceState::from_config(model.config()).unwrap();
+        let toks: Vec<u32> = tokens.iter().map(|&t| t as u32).collect();
+        let last = model.forward_prefill(&toks, 0, &mut state2);
+        for (g, r) in last.iter().zip(&want[tokens.len() - 1]) {
+            assert!((g - r).abs() < 2e-3 * r.abs().max(1.0), "{g} vs {r}");
+        }
+    }
+
+    #[test]
+    fn cohere_parallel_residual_matches_scalar_reference() {
+        check_arch(Kind::Cohere);
+    }
+
+    #[test]
+    fn starcoder2_ungated_layernorm_ffn_matches_scalar_reference() {
+        check_arch(Kind::Starcoder2);
+    }
+
+    #[test]
+    fn stablelm_partial_rope_and_qk_layernorm_matches_scalar_reference() {
+        check_arch(Kind::Stablelm);
+    }
+
+    #[test]
+    fn layernorm_archs_are_rejected_by_the_no_repack_accelerator_loader() {
+        let m = build_tiny(Kind::Cohere);
+        let gguf = GgufFile::from_bytes(Arc::from(gguf_bytes(&m).into_boxed_slice())).unwrap();
+        match LlamaModel::from_gguf_with_id_no_repack(gguf, 64, String::new()) {
+            Ok(_) => panic!("accelerator loaders must not accept LayerNorm archs"),
+            Err(e) => assert!(e.to_string().contains("LayerNorm"), "{e}"),
+        }
+    }
+
+    #[test]
+    fn rms_arch_rejects_a_layernorm_bias_tensor() {
+        // A llama-arch file carrying `attn_norm.bias` would silently lose it.
+        let mut m = build_tiny(Kind::Cohere);
+        m.arch = Some("llama");
+        m.tensors
+            .push(("blk.0.attn_norm.bias".into(), vec![HS], vec![0.0; HS]));
+        let gguf = GgufFile::from_bytes(Arc::from(gguf_bytes(&m).into_boxed_slice())).unwrap();
+        match LlamaModel::from_gguf(gguf, 64) {
+            Ok(_) => panic!("an RMSNorm arch must reject a LayerNorm bias"),
+            Err(e) => assert!(e.to_string().contains("LayerNorm bias"), "{e}"),
+        }
+    }
+
+    /// The LayerNorm path implements plain (partial) RoPE and full causal
+    /// attention only. Each feature it lacks must fail the load, naming the
+    /// feature, instead of yielding wrong logits.
+    #[test]
+    fn layernorm_arch_fails_closed_on_unsupported_features() {
+        let u32v = |v: u32| v.to_le_bytes().to_vec();
+        let f32v = |v: f32| v.to_le_bytes().to_vec();
+        let str_v = |s: &str| {
+            let mut b = Vec::new();
+            put_str(&mut b, s);
+            b
+        };
+        for kind in [Kind::Cohere, Kind::Starcoder2, Kind::Stablelm] {
+            type Case = (&'static str, Box<dyn Fn(&mut Tiny)>);
+            let cases: Vec<Case> = vec![
+                (
+                    "attention.sliding_window",
+                    Box::new(move |m| {
+                        m.extra_kv.push(("attention.sliding_window", 4, u32v(8)));
+                    }),
+                ),
+                (
+                    "rope yarn scaling",
+                    Box::new(move |m| {
+                        m.extra_kv.push(("rope.scaling.type", 8, str_v("yarn")));
+                    }),
+                ),
+                (
+                    "rope_freqs.weight",
+                    Box::new(|m| {
+                        m.tensors.push((
+                            "rope_freqs.weight".into(),
+                            vec![HD / 2],
+                            vec![1.0; HD / 2],
+                        ));
+                    }),
+                ),
+                (
+                    "attention temperature scaling",
+                    Box::new(move |m| {
+                        m.extra_kv
+                            .push(("attention.temperature_scale", 6, f32v(0.5)));
+                    }),
+                ),
+            ];
+            for (feature, mutate) in cases {
+                let mut m = build_tiny(kind);
+                mutate(&mut m);
+                let gguf =
+                    GgufFile::from_bytes(Arc::from(gguf_bytes(&m).into_boxed_slice())).unwrap();
+                match LlamaModel::from_gguf(gguf, 64) {
+                    Ok(_) => panic!("LayerNorm arch must reject {feature}"),
+                    Err(e) => {
+                        let msg = e.to_string();
+                        assert!(msg.contains("does not support"), "{msg}");
+                        assert!(msg.contains(feature), "{feature} not named: {msg}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Only StableLM implements partial rotary; any other arch declaring
+    /// `rope.dimension_count < head_dim` would silently get full-head RoPE.
+    #[test]
+    fn non_stablelm_arch_rejects_partial_rotary() {
+        let u32v = |v: u32| v.to_le_bytes().to_vec();
+        for arch in [None, Some("llama")] {
+            let mut m = build_tiny(Kind::Cohere);
+            m.arch = arch;
+            m.extra_kv
+                .push(("rope.dimension_count", 4, u32v((HD / 2) as u32)));
+            let gguf = GgufFile::from_bytes(Arc::from(gguf_bytes(&m).into_boxed_slice())).unwrap();
+            match LlamaModel::from_gguf(gguf, 64) {
+                Ok(_) => panic!("partial rotary must be rejected on {arch:?}"),
+                Err(e) => assert!(e.to_string().contains("partial rotary"), "{e}"),
+            }
+        }
+        // A full-width value stays accepted.
+        let mut ok = build_tiny(Kind::Cohere);
+        ok.extra_kv
+            .push(("rope.dimension_count", 4, u32v(HD as u32)));
+        let gguf = GgufFile::from_bytes(Arc::from(gguf_bytes(&ok).into_boxed_slice())).unwrap();
+        LlamaModel::from_gguf(gguf, 64).expect("full rotary loads");
+    }
+
+    /// Pins the call count, which the logits comparison below cannot: a
+    /// regression to per-token `forward` yields identical logits but pays a
+    /// vocab-sized projection for every prompt token. The oracle-dump path
+    /// deliberately keeps one projection per token.
+    #[test]
+    fn ext_prefill_projects_the_vocab_head_once() {
+        let calls = || super::PROJECT_LOGITS_CALLS.with(|c| c.get());
+        let toks: Vec<u32> = vec![1, 5, 2, 7, 3];
+        for kind in [Kind::Cohere, Kind::Starcoder2, Kind::Stablelm] {
+            let model = load_tiny(&build_tiny(kind));
+            let mut st = crate::kv_cache::InferenceState::from_config(model.config()).unwrap();
+            let before = calls();
+            model.forward_prefill(&toks, 0, &mut st);
+            assert_eq!(
+                calls() - before,
+                1,
+                "{kind:?}: head must run for the last token only"
+            );
+
+            crate::model::transformer::oracle_dump::begin();
+            let mut st = crate::kv_cache::InferenceState::from_config(model.config()).unwrap();
+            let before = calls();
+            model.forward_prefill(&toks, 0, &mut st);
+            let after = calls();
+            crate::model::transformer::oracle_dump::take();
+            assert_eq!(
+                after - before,
+                toks.len(),
+                "{kind:?}: the oracle-dump path records every token"
+            );
+        }
+    }
+
+    /// A partial Q/K/V bias set would be dropped silently by the forward
+    /// path (it applies biases only as a set), so the load must reject it,
+    /// naming the layer and the missing tensors.
+    #[test]
+    fn partial_qkv_bias_set_fails_the_load() {
+        for missing in [&["attn_q.bias"][..], &["attn_k.bias", "attn_v.bias"][..]] {
+            let mut m = build_tiny(Kind::Starcoder2);
+            m.tensors
+                .retain(|(n, _, _)| !missing.iter().any(|s| n == &format!("blk.1.{s}")));
+            let gguf = GgufFile::from_bytes(Arc::from(gguf_bytes(&m).into_boxed_slice())).unwrap();
+            match LlamaModel::from_gguf(gguf, 64) {
+                Ok(_) => panic!("a partial Q/K/V bias set must fail the load ({missing:?})"),
+                Err(e) => {
+                    let msg = e.to_string();
+                    assert!(msg.contains("layer 1"), "{msg}");
+                    assert!(msg.contains("partial Q/K/V bias"), "{msg}");
+                    for s in missing {
+                        assert!(msg.contains(&format!("blk.1.{s}")), "{msg}");
+                    }
+                }
+            }
+        }
+        // Control: the full set loads.
+        load_tiny(&build_tiny(Kind::Starcoder2));
+    }
+
+    /// The sequential prefill skips the LM head for every token but the last.
+    /// It must leave the same KV state and return the same last-token logits
+    /// (bit for bit) as running the full `forward` on every token, and it must
+    /// also agree with the independent scalar reference.
+    #[test]
+    fn ext_prefill_skipping_head_matches_token_by_token_forward() {
+        for kind in [Kind::Cohere, Kind::Starcoder2, Kind::Stablelm] {
+            let m = build_tiny(kind);
+            let model = load_tiny(&m);
+            let toks: Vec<u32> = vec![1, 5, 2, 7, 3];
+            let mut a = crate::kv_cache::InferenceState::from_config(model.config()).unwrap();
+            let got = model.forward_prefill(&toks, 0, &mut a);
+            let mut b = crate::kv_cache::InferenceState::from_config(model.config()).unwrap();
+            let mut want = Vec::new();
+            for (i, &t) in toks.iter().enumerate() {
+                want = model.forward(&[t], i, &mut b);
+            }
+            assert_eq!(got, want, "last-token logits must be bit-identical");
+            assert_eq!(a.seq_len, b.seq_len);
+            // The cached K/V is what later decode reads: continue both.
+            let na = model.forward(&[4], toks.len(), &mut a);
+            let nb = model.forward(&[4], toks.len(), &mut b);
+            assert_eq!(na, nb, "decode after prefill must see identical KV");
+            // A prefill that starts from a non-empty cache (chunked prompts).
+            let mut c = crate::kv_cache::InferenceState::from_config(model.config()).unwrap();
+            model.forward_prefill(&toks[..2], 0, &mut c);
+            let chunked = model.forward_prefill(&toks[2..], 2, &mut c);
+            assert_eq!(chunked, want, "chunked prefill must match");
+            let refl = reference_logits(&m, &toks.iter().map(|&t| t as usize).collect::<Vec<_>>());
+            for (g, r) in got.iter().zip(&refl[toks.len() - 1]) {
+                assert!((g - r).abs() < 2e-3 * r.abs().max(1.0), "{g} vs {r}");
+            }
+        }
     }
 }

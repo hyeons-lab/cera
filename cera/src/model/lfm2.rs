@@ -235,7 +235,12 @@ pub struct LfmModel {
 /// rule is directly testable: the bias affects rank only, which means the
 /// returned weights are *not* necessarily descending, and a version that
 /// weights by the biased score produces plausible text while being wrong.
-fn select_experts(probs: &[f32], biases: &[f32], n_used: usize, selected: &mut Vec<(usize, f32)>) {
+pub(crate) fn select_experts(
+    probs: &[f32],
+    biases: &[f32],
+    n_used: usize,
+    selected: &mut Vec<(usize, f32)>,
+) {
     selected.clear();
     let n_expert = probs.len().min(biases.len());
     let mut stack_biased = [0.0f32; 256];
@@ -2157,6 +2162,8 @@ impl LfmModel {
     fn run_layers(&self, hidden: &mut [f32], pos: usize, state: &mut InferenceState) {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
+        // Decode has started: a large prefill working set is dead weight now.
+        state.prefill_scratch.release_if_large();
         // Reuse pre-allocated scratch from InferenceState instead of allocating
         // fresh Vecs on every call. Take them out of `state.scratch` to avoid
         // borrow-checker conflicts with the mutable `state` passed to
@@ -4869,6 +4876,10 @@ impl LfmModel {
         self.prefill_layers_and_logits(hidden, n, start_pos, state)
     }
 
+    /// Largest `forward_prefill_logits_all` batch treated as a speculative
+    /// verify that releases a large earlier prefill working set.
+    const VERIFY_RELEASE_MAX_TOKENS: usize = 16;
+
     /// Multi-token prefill producing all `[n × vocab_size]` logits (used for speculative verification).
     pub(crate) fn forward_prefill_logits_all_inner(
         &self,
@@ -4888,6 +4899,14 @@ impl LfmModel {
             "forward_prefill_logits_all: start_pos ({start_pos}) must equal state.seq_len ({})",
             state.seq_len
         );
+
+        // A small batch is a speculative verify: it never goes through
+        // `run_layers`, so a large earlier prefill working set would be pinned
+        // for as long as decoding stays verify-only. Same release rule as the
+        // first decode token; it only fires above the threshold.
+        if n <= Self::VERIFY_RELEASE_MAX_TOKENS {
+            state.prefill_scratch.release_if_large();
+        }
 
         let mut hidden = vec![0.0f32; hs * n];
         for (j, &token_id) in tokens.iter().enumerate() {
@@ -5562,7 +5581,8 @@ impl Model for LfmModel {
 // scalars, and supports the batched-prefill GPU path.
 #[cfg(any(
     feature = "gpu",
-    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    all(feature = "metal", any(target_os = "macos", target_os = "ios")),
+    feature = "hexagon"
 ))]
 impl crate::model::gpu_weight_source::GpuWeightSource for LfmModel {
     fn cache_identity_sources(&self) -> Option<Vec<&GgufFile>> {
@@ -5826,14 +5846,13 @@ mod no_repack_tests {
 
     /// The no-repack loader resolves identical metadata without the CPU int8
     /// repacks (gigabytes the GPU/Metal loaders would allocate only to free
-    /// after upload). Needs the 230M model locally; skips without it.
+    /// after upload). Needs the 230M model locally; skips without it (fails under `CERA_REQUIRE_MODEL`).
     #[test]
     fn no_repack_skips_cpu_repacks() {
         let home = std::env::var("HOME").expect("HOME unset");
         let path = std::path::PathBuf::from(home)
             .join(".leap/models/LFM2.5-230M-Q4_0/LFM2.5-230M-Q4_0.gguf");
-        if !path.exists() {
-            eprintln!("skipping: {} not present", path.display());
+        if !crate::model::transformer::require_model_or_skip(&path) {
             return;
         }
         let full = LfmModel::from_gguf(GgufFile::open(&path).unwrap(), 64).unwrap();
@@ -5994,5 +6013,164 @@ mod moe_prefill_identity_tests {
                 n * hs
             );
         });
+    }
+}
+
+#[cfg(test)]
+pub(crate) mod release_tests {
+    use super::*;
+
+    /// Minimal synthetic LFM2 GGUF: one short-conv layer and one attention
+    /// layer, Q4_0 projections, F32 norms and embedding, sized so a 512-token
+    /// prefill puts the batched working set above the release threshold.
+    /// Runs anywhere, no model file needed. Shared with the GPU lost-device
+    /// test, which needs a loadable model on every CI leg.
+    pub(crate) fn synthetic_lfm2_gguf() -> GgufFile {
+        const HS: usize = 512;
+        const INTER: usize = 1024;
+        const VOCAB: usize = 64;
+        const N_HEADS: usize = 8;
+        const HEAD_DIM: usize = 64;
+        struct T {
+            name: String,
+            dims: Vec<usize>,
+            ty: u32,
+            data: Vec<u8>,
+        }
+        let mut seed = 0x9e37_79b9u64;
+        let mut next = move || {
+            seed = seed
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        };
+        let mut f32t = |name: &str, dims: &[usize], scale: f32, base: f32| {
+            let n: usize = dims.iter().product();
+            T {
+                name: name.into(),
+                dims: dims.to_vec(),
+                ty: 0,
+                data: (0..n)
+                    .flat_map(|_| (base + next() * 2.0 * scale).to_le_bytes())
+                    .collect(),
+            }
+        };
+        let mut q4 = {
+            let mut seed = 0x1357_9bdfu64;
+            move |name: &str, dims: &[usize]| {
+                let blocks: usize = dims.iter().product::<usize>() / 32;
+                let mut data = Vec::with_capacity(blocks * 18);
+                for _ in 0..blocks {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    let scale = 0.01 + ((seed >> 40) as f32 / (1u64 << 24) as f32) * 0.02;
+                    data.extend_from_slice(&crate::quant::f32_to_f16(scale).to_le_bytes());
+                    for _ in 0..16 {
+                        seed = seed
+                            .wrapping_mul(6364136223846793005)
+                            .wrapping_add(1442695040888963407);
+                        data.push((seed >> 56) as u8);
+                    }
+                }
+                T {
+                    name: name.into(),
+                    dims: dims.to_vec(),
+                    ty: 2,
+                    data,
+                }
+            }
+        };
+        let q_dim = N_HEADS * HEAD_DIM;
+        let mut t = vec![
+            f32t("token_embd.weight", &[HS, VOCAB], 1.0, 0.0),
+            f32t("token_embd_norm.weight", &[HS], 0.1, 1.0),
+        ];
+        for l in 0..2 {
+            let n = |s: &str| format!("blk.{l}.{s}");
+            t.push(f32t(&n("attn_norm.weight"), &[HS], 0.1, 1.0));
+            t.push(f32t(&n("ffn_norm.weight"), &[HS], 0.1, 1.0));
+            if l == 1 {
+                t.push(q4(&n("attn_q.weight"), &[HS, q_dim]));
+                t.push(q4(&n("attn_k.weight"), &[HS, HEAD_DIM]));
+                t.push(q4(&n("attn_v.weight"), &[HS, HEAD_DIM]));
+                t.push(q4(&n("attn_output.weight"), &[q_dim, HS]));
+                t.push(f32t(&n("attn_q_norm.weight"), &[HEAD_DIM], 0.1, 1.0));
+                t.push(f32t(&n("attn_k_norm.weight"), &[HEAD_DIM], 0.1, 1.0));
+            } else {
+                t.push(q4(&n("shortconv.in_proj.weight"), &[HS, 3 * HS]));
+                t.push(q4(&n("shortconv.out_proj.weight"), &[HS, HS]));
+                t.push(f32t(&n("shortconv.conv.weight"), &[3, HS], 0.3, 0.0));
+            }
+            t.push(q4(&n("ffn_gate.weight"), &[HS, INTER]));
+            t.push(q4(&n("ffn_up.weight"), &[HS, INTER]));
+            t.push(q4(&n("ffn_down.weight"), &[INTER, HS]));
+        }
+
+        use crate::gguf::GgufBuilder;
+        let mut b = GgufBuilder::new()
+            .kv_str("general.architecture", "lfm2")
+            .kv_u32("lfm2.block_count", 2)
+            .kv_u32("lfm2.embedding_length", HS as u32)
+            .kv_u32("lfm2.feed_forward_length", INTER as u32)
+            .kv_u32("lfm2.attention.head_count", N_HEADS as u32)
+            // Per-layer KV heads: 0 marks the short-conv layer.
+            .kv_i32_array("lfm2.attention.head_count_kv", vec![0, 1])
+            .kv_u32("lfm2.shortconv.l_cache", 3)
+            .kv_f32("lfm2.attention.layer_norm_rms_epsilon", 1e-5)
+            .kv_f32("lfm2.rope.freq_base", 10_000.0)
+            .kv_u32("lfm2.context_length", 1024)
+            .kv_u32("lfm2.vocab_size", VOCAB as u32);
+        for x in t {
+            b = b.tensor(x.name, &x.dims, x.ty, x.data);
+        }
+        b.build()
+    }
+
+    /// The first decode token after a large prefill drops the batched
+    /// working set (`run_layers` calls `release_if_large`). Pins that
+    /// wiring: without the call the scratch pins its prefill high-water
+    /// mark for the rest of the session. Uses a synthetic model, so it runs
+    /// on every CI leg.
+    #[test]
+    fn decode_after_large_prefill_releases_prefill_scratch() {
+        use crate::kv_cache::PrefillScratch;
+        use crate::model::Model;
+        let model = LfmModel::from_gguf(synthetic_lfm2_gguf(), 1024).unwrap();
+        let mut state = InferenceState::from_config(model.config()).unwrap();
+        let prompt: Vec<u32> = (0..512).map(|i| 1 + (i % 60) as u32).collect();
+        model.forward_prefill(&prompt, 0, &mut state);
+        assert!(
+            state.prefill_scratch.capacity_bytes() > PrefillScratch::RELEASE_THRESHOLD_BYTES,
+            "a 512-token prefill must exceed the release threshold, got {} bytes",
+            state.prefill_scratch.capacity_bytes()
+        );
+        model.forward(&[1], prompt.len(), &mut state);
+        assert_eq!(
+            state.prefill_scratch.capacity_bytes(),
+            0,
+            "the first decode step must release the prefill working set"
+        );
+    }
+
+    /// Speculative verification calls `forward_prefill_logits_all` with a
+    /// handful of tokens and never decodes a single token in between, so it
+    /// must release a large earlier prefill working set itself.
+    #[test]
+    fn small_verify_batch_after_large_prefill_releases_prefill_scratch() {
+        use crate::kv_cache::PrefillScratch;
+        use crate::model::Model;
+        let model = LfmModel::from_gguf(synthetic_lfm2_gguf(), 1024).unwrap();
+        let mut state = InferenceState::from_config(model.config()).unwrap();
+        let prompt: Vec<u32> = (0..512).map(|i| 1 + (i % 60) as u32).collect();
+        model.forward_prefill(&prompt, 0, &mut state);
+        assert!(state.prefill_scratch.capacity_bytes() > PrefillScratch::RELEASE_THRESHOLD_BYTES);
+        let logits = model.forward_prefill_logits_all(&[1, 2, 3, 4], prompt.len(), &mut state);
+        assert_eq!(logits.len(), 4 * model.config().vocab_size);
+        assert!(
+            state.prefill_scratch.capacity_bytes() <= PrefillScratch::RELEASE_THRESHOLD_BYTES,
+            "a small verify batch must not keep the 512-token working set, got {} bytes",
+            state.prefill_scratch.capacity_bytes()
+        );
     }
 }

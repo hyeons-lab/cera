@@ -54,10 +54,16 @@ Falcon H1 and Mamba-2. See the [loading dispatch](cera/src/model/mod.rs) for
 architecture aliases and backend admission rules.
 
 Metal and wgpu support `lfm2`, `lfm2moe`, `llama`, `qwen2`, `qwen3`, `granite`,
-`minicpm`, `minicpm5`, `nanbeige`, `phi3` and `phi`. Qualcomm Hexagon NPU supports
-`lfm2` (`HexagonLfmModel`). The listed `qwen35`, `mistral3` and `bailingmoe3` families
-use CPU; requesting an unsupported GPU or NPU backend explicitly returns an error.
-Auto selection can fall back to CPU.
+`minicpm`, `minicpm5`, `nanbeige`, `phi3`, `phi` and `mistral3` / `ministral3`
+(YaRN is folded into the rope kernel's frequency table; attention temperature
+scaling is not implemented on GPU, so those models are limited to the context
+below its floor, the original context length, and warn when that caps a longer
+request). Qualcomm Hexagon NPU supports `lfm2`, `lfm2moe`, the dense families
+(`llama`, `qwen2`, `qwen3`, `granite`, `gemma2`, `olmo2`/`olmo3`, `mistral3`,
+`phi3` and others listed in `docs/HEXAGON_NPU.md`) and `qwen35`
+(`HexagonLfmModel`); those paths are host-tested and still need device validation.
+The listed `bailingmoe3` family uses CPU; requesting an unsupported GPU or NPU
+backend explicitly returns an error. Auto selection can fall back to CPU.
 The LFM2 and supported dense-transformer paths use batched-GEMM prefill,
 including on CPU, with tiled flash attention for long prompts where supported.
 

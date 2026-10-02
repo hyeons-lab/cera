@@ -29,7 +29,8 @@ fn step_enabled() -> bool {
     *STEP.get_or_init(|| std::env::var_os("CERA_HEXAGON_STEP").is_some())
 }
 
-fn debug_enabled() -> bool {
+/// `CERA_HEXAGON_DEBUG` set, read once.
+pub(crate) fn debug_enabled() -> bool {
     static DEBUG: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
     *DEBUG.get_or_init(|| std::env::var_os("CERA_HEXAGON_DEBUG").is_some())
 }
@@ -287,6 +288,18 @@ pub struct HexagonQueueSession {
     /// hwinfo-failure fallback until `HexagonDevice` overwrites it.
     dsp_threads: u32,
     resident_staged_id: Option<u64>,
+    /// Flush after every op (`CERA_HEXAGON_STEP`). A field, not a per-call
+    /// env read, so tests can drive the step-mode error path.
+    step_mode: bool,
+    /// Batches written to the DSP whose response has not been read back yet.
+    /// A read timeout leaves the batch outstanding: the DSP may still be
+    /// running it, and writing the buffers it targets (KV / recurrent state)
+    /// is unsafe until [`Self::quiesce`] has seen its response.
+    outstanding: u64,
+    /// Test hook: fail `add_tensor` once this many tensors are registered,
+    /// the way a real over-full batch does, before anything reaches the DSP.
+    #[cfg(test)]
+    tensor_cap: Option<usize>,
 }
 
 // Queue session operations are Send across threads when guarded by model session locks.
@@ -330,6 +343,10 @@ impl HexagonQueueSession {
             prof_flushes: 0,
             dsp_threads: 8,
             resident_staged_id: None,
+            step_mode: step_enabled(),
+            outstanding: 0,
+            #[cfg(test)]
+            tensor_cap: None,
         })
     }
 
@@ -380,6 +397,63 @@ impl HexagonQueueSession {
         self.tens.clear();
         self.ops.clear();
         self.resident_staged_id = None;
+    }
+
+    /// Number of batch dispatch attempts so far; advances on success and
+    /// failure. Counts only batches that reached the DSP queue (an empty flush
+    /// or a batch rejected before dispatch, e.g. over the staging size, does
+    /// not advance it), so a caller can tell whether a failed forward pass
+    /// could have run any op on the device.
+    pub fn dispatch_attempts(&self) -> u64 {
+        self.seq
+    }
+
+    /// Wait until every batch written to the DSP has answered.
+    ///
+    /// After a read timeout the DSP may still complete the batch and write
+    /// the buffers it targets, so a caller about to zero or overwrite such a
+    /// buffer (a state reset) must quiesce first. Errors when a response
+    /// still does not arrive (the read's own 30 s hang guard); the caller
+    /// must then leave the buffers alone.
+    ///
+    /// Blocking: each outstanding batch can wait the full 30 s guard and the
+    /// wait does not poll cancellation. Callers that quiesce twice on a hung
+    /// DSP (a rewind to 0 refused, then a full reset) wait up to twice that
+    /// while holding the device lock; no failure memo shortens the second wait.
+    pub fn quiesce(&mut self) -> Result<(), CeraError> {
+        let mut rsp = HtpOpBatchRsp::default();
+        let mut resp_bufs = [DspQueueBuffer::default(); 1];
+        while self.outstanding > 0 {
+            let rsp_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut rsp as *mut _ as *mut u8,
+                    std::mem::size_of::<HtpOpBatchRsp>(),
+                )
+            };
+            self.driver
+                .read_dsp_queue(self.queue, &mut resp_bufs, rsp_bytes)
+                .map_err(|e| {
+                    CeraError::Backend(format!(
+                        "{} DSP batch(es) still outstanding after a timeout: {e}",
+                        self.outstanding
+                    ))
+                })?;
+            self.outstanding -= 1;
+        }
+        Ok(())
+    }
+
+    /// Test hook: make `add_tensor` fail once `cap` tensors are registered
+    /// (`None` lifts it). Fails before any flush, so nothing is dispatched.
+    #[cfg(test)]
+    pub(crate) fn set_tensor_cap(&mut self, cap: Option<usize>) {
+        self.tensor_cap = cap;
+    }
+
+    /// Number of batches written to the DSP with no response read back yet.
+    #[cfg(test)]
+    pub(crate) fn outstanding_batches(&self) -> u64 {
+        self.outstanding
     }
 
     /// Number of operations currently enqueued in the pending batch.
@@ -544,6 +618,21 @@ impl HexagonQueueSession {
                     }
                 }
             }
+            // The DSP wrote per-op timings into the resident profile region
+            // last flush; `flush()` re-zeroes it every batch, and the patch
+            // ranges never cover it, so without this `CERA_HEXAGON_PROFILE`
+            // would aggregate the previous batch's stale descriptors.
+            let prof_start = staged.bufs_bytes + staged.tens_bytes + staged.ops_bytes;
+            let prof_end = (prof_start + staged.prof_bytes).min(total_bytes);
+            if prof_start < prof_end {
+                unsafe {
+                    std::ptr::write_bytes(
+                        self.staging_buf.as_mut_ptr().add(prof_start),
+                        0,
+                        prof_end - prof_start,
+                    );
+                }
+            }
         }
 
         let prof_offset = staged.bufs_bytes + staged.tens_bytes + staged.ops_bytes;
@@ -588,6 +677,13 @@ impl HexagonQueueSession {
         nb: [u32; 4],
     ) -> Result<u16, CeraError> {
         let bi = self.add_buffer(buf)?;
+        #[cfg(test)]
+        if self.tensor_cap.is_some_and(|cap| self.tens.len() >= cap) {
+            self.drop_pending_batch();
+            return Err(CeraError::Backend(
+                "HTP batch exceeds the test tensor cap".into(),
+            ));
+        }
         let ti = Self::batch_index(self.tens.len(), "tensors")
             .inspect_err(|_| self.drop_pending_batch())?;
         // The DSP descriptor carries a u32 size; a wrapped size would reach the
@@ -675,59 +771,90 @@ impl HexagonQueueSession {
                 ))
             })?;
         }
-        if step_enabled() {
-            eprintln!("[cera-hexagon] step op opcode={opcode}");
-            self.flush().map_err(|e| {
-                CeraError::Backend(format!("HTP step failed on opcode {opcode}: {e}"))
-            })?;
-        }
         Ok(())
+    }
+
+    /// Mark an op-group boundary: a run of ops that may share tensor
+    /// indices (one `dispatch::*` helper, one model-local op emitter). Under
+    /// `CERA_HEXAGON_STEP` this flushes the group so a DSP fault names the
+    /// group that caused it; otherwise it is a no-op. A flush clears the
+    /// tensor table, so it must only run where no later op reuses an index
+    /// registered before the boundary. Flushing per `enqueue_op` instead
+    /// (the old behavior) broke every helper that registers a tensor once
+    /// and reuses it across ops.
+    pub fn end_group(&mut self) -> Result<(), CeraError> {
+        if !self.step_mode {
+            return Ok(());
+        }
+        let n_ops = self.ops.len();
+        eprintln!("cera-hexagon: step group ({n_ops} ops)");
+        self.flush()
+            .map_err(|e| CeraError::Backend(format!("HTP step failed after {n_ops} ops: {e}")))
+    }
+
+    /// Whether `CERA_HEXAGON_STEP` bisect mode is active. Templated decode
+    /// exports a batch that step mode would already have flushed, so callers
+    /// must not take the template path while this is set.
+    pub fn step_mode(&self) -> bool {
+        self.step_mode
+    }
+
+    /// Test hook: force `CERA_HEXAGON_STEP` behavior without touching the
+    /// process environment.
+    #[cfg(test)]
+    pub(crate) fn set_step_mode(&mut self, on: bool) {
+        self.step_mode = on;
     }
 
     /// Flush all queued operations in a single atomic batch execution.
     pub fn flush(&mut self) -> Result<(), CeraError> {
+        // Test-only op capture at the one choke point every flush passes
+        // through (explicit, capped and step-mode alike), so goldens see
+        // queue-internal auto-flushes too.
         self.resident_staged_id = None;
         if self.ops.is_empty() {
             return Ok(());
         }
+        #[cfg(test)]
+        super::op_capture::record(self);
 
         if debug_enabled() {
             eprintln!(
-                "[cera-hexagon] flush: bufs.len={} tens.len={} ops.len={}",
+                "cera-hexagon: flush bufs={} tens={} ops={}",
                 self.bufs.len(),
                 self.tens.len(),
                 self.ops.len()
             );
             for (i, b) in self.bufs.iter().enumerate() {
                 eprintln!(
-                    "  buf[{}]: fd={} size={} (0x{:x}) base=0x{:x}",
+                    "cera-hexagon:   buf[{}]: fd={} size={} (0x{:x}) base=0x{:x}",
                     i, b.fd, b.size, b.size, b.base
                 );
             }
             for (i, t) in self.tens.iter().enumerate() {
                 eprintln!(
-                    "  ten[{}]: bi={} data=0x{:x} size={} dtype={} flags={} ne={:?} nb={:?}",
+                    "cera-hexagon:   ten[{}]: bi={} data=0x{:x} size={} dtype={} flags={} ne={:?} nb={:?}",
                     i, t.bi, t.data, t.size, t.dtype, t.flags, t.ne, t.nb
                 );
             }
             for (i, o) in self.ops.iter().enumerate() {
                 eprintln!(
-                    "  op[{}]: opcode={} src={:?} dst={:?} params={:?}",
+                    "cera-hexagon:   op[{}]: opcode={} src={:?} dst={:?} params={:?} kparams={:?}",
                     i,
                     o.opcode,
                     o.src
                         .iter()
-                        .cloned()
+                        .copied()
                         .filter(|&s| s != 0xffff)
                         .collect::<Vec<_>>(),
                     o.dst
                         .iter()
-                        .cloned()
+                        .copied()
                         .filter(|&d| d != 0xffff)
                         .collect::<Vec<_>>(),
                     o.params,
+                    o.kernel_params,
                 );
-                eprintln!("    kparams={:?}", o.kernel_params);
             }
         }
 
@@ -821,6 +948,7 @@ impl HexagonQueueSession {
         // attribution by one batch.
         let mut read_res: Result<(), CeraError> = Ok(());
         if write_res.is_ok() {
+            self.outstanding += 1;
             let mut stale_drained = 0u32;
             loop {
                 let rsp_bytes = unsafe {
@@ -838,6 +966,8 @@ impl HexagonQueueSession {
                         break;
                     }
                     Ok(n_read) => {
+                        // Any message read consumed one outstanding response.
+                        self.outstanding = self.outstanding.saturating_sub(1);
                         if (n_read as usize) < std::mem::size_of::<HtpOpBatchRsp>() {
                             read_res = Err(CeraError::Backend(format!(
                                 "DSP queue response truncated: got {n_read} bytes, expected at least {}",
@@ -848,18 +978,11 @@ impl HexagonQueueSession {
                         match stale_drain_action(rsp.seq, self.seq, stale_drained) {
                             StaleDrainAction::DrainStale => {
                                 stale_drained += 1;
-                                tracing::warn!(
-                                    stale_seq = rsp.seq,
-                                    expected_seq = self.seq,
-                                    "drained stale DSP queue response"
-                                );
-                                // No `tracing` subscriber on the shipping NPU
-                                // platforms; without this the drain is silent
-                                // exactly where field debugging needs it.
-                                eprintln!(
-                                    "[cera-hexagon] drained stale DSP queue response \
-                                     (stale seq {}, expected {})",
-                                    rsp.seq, self.seq
+                                super::hexagon_warn!(
+                                    "drained stale DSP queue response \
+                                     (stale_seq={}, expected_seq={})",
+                                    rsp.seq,
+                                    self.seq
                                 );
                                 continue;
                             }
@@ -949,7 +1072,7 @@ impl HexagonQueueSession {
             dsp_total += desc.usecs as u64;
             if per_op {
                 eprintln!(
-                    "[cera-hexagon] profile-op: seq={} idx={} op={} {} usec={}",
+                    "cera-hexagon: profile-op: seq={} idx={} op={} {} usec={}",
                     batch_seq,
                     i,
                     desc.opcode,
@@ -967,7 +1090,7 @@ impl HexagonQueueSession {
             0.0
         };
         eprintln!(
-            "[cera-hexagon] profile: seq={} ops={} dsp_op_us={} dsp_batch_us={} host_us={} mhz={:.1}",
+            "cera-hexagon: profile: seq={} ops={} dsp_op_us={} dsp_batch_us={} host_us={} mhz={:.1}",
             batch_seq,
             n_ops,
             dsp_total,
@@ -984,11 +1107,17 @@ impl Drop for HexagonQueueSession {
         // session was already stopped, flushing will hang for 30 seconds
         // awaiting a response that will never arrive. Discard pending work instead.
         if !self.ops.is_empty() {
-            eprintln!(
-                "[cera-hexagon] dropping queue session with {} uncommitted ops; discarding batch",
+            super::hexagon_warn!(
+                "dropping queue session with {} uncommitted ops; discarding batch",
                 self.ops.len()
             );
             self.drop_pending_batch();
+        }
+        if self.outstanding > 0 {
+            super::hexagon_warn!(
+                "dropping queue session with {} unanswered batch(es)",
+                self.outstanding
+            );
         }
         if let Some(rtt) = self
             .prof_host_us
@@ -996,7 +1125,7 @@ impl Drop for HexagonQueueSession {
             .checked_div(self.prof_flushes)
         {
             eprintln!(
-                "[cera-hexagon] profile: {} flushes, host_total={}us dsp_total={}us mean_rtt={}us",
+                "cera-hexagon: profile: {} flushes, host_total={}us dsp_total={}us mean_rtt={}us",
                 self.prof_flushes, self.prof_host_us, self.prof_dsp_us, rtt
             );
             // Per-op descs are zero unless the DSP profiler was enabled
@@ -1007,12 +1136,12 @@ impl Drop for HexagonQueueSession {
                     self.prof.iter().map(|(&k, &v)| (k, v)).collect();
                 rows.sort_by_key(|&(_, (_, us))| std::cmp::Reverse(us));
                 eprintln!(
-                    "[cera-hexagon] profile: {:>5} {:>14} {:>8} {:>10} {:>10}",
+                    "cera-hexagon: profile: {:>5} {:>14} {:>8} {:>10} {:>10}",
                     "op", "name", "count", "total_us", "mean_us"
                 );
                 for (op, (count, us)) in rows {
                     eprintln!(
-                        "[cera-hexagon] profile: {:>5} {:>14} {:>8} {:>10} {:>10}",
+                        "cera-hexagon: profile: {:>5} {:>14} {:>8} {:>10} {:>10}",
                         op,
                         htp_opcode_name(op),
                         count,
@@ -1034,6 +1163,7 @@ fn htp_opcode_name(opcode: u32) -> &'static str {
 
 #[cfg(test)]
 mod tests {
+    use super::super::sys::fake;
     use super::*;
 
     /// A batch shaped like `export_staged_batch` output: `n_tensors`
@@ -1160,6 +1290,183 @@ mod tests {
         // A future batch's response is a desync, never drained past.
         assert_eq!(stale_drain_action(11, 10, 7), Future);
         assert_eq!(stale_drain_action(u64::MAX, 10, 0), Future);
+    }
+
+    /// Hermetic: no ops-per-flush cap and no step mode, whatever the process
+    /// exports (`CERA_HEXAGON_STEP` is read at session creation). Tests that
+    /// want step mode set it explicitly.
+    fn test_session() -> HexagonQueueSession {
+        let mut q = HexagonQueueSession::new(fake::driver()).expect("fake queue session");
+        q.step_mode = false;
+        q.set_max_ops_per_flush(None);
+        q
+    }
+
+    /// Register one tensor (so `tens`/`bufs` are non-empty) then enqueue.
+    fn enqueue_with_tensor(
+        q: &mut HexagonQueueSession,
+        buf: &RpcmemBuffer,
+    ) -> Result<(), CeraError> {
+        let ti = q.add_tensor(buf, 0, 64, 0, 0, [1; 4], [4; 4])?;
+        q.enqueue_op(HtpOpCode::Add as u32, &[ti], &[ti], [0; 16], [0; 32])?;
+        // The group boundary is where step mode flushes.
+        q.end_group()
+    }
+
+    fn assert_pending_empty(q: &HexagonQueueSession, ctx: &str) {
+        let (bufs, map, tens, ops) = q.export_batch();
+        assert!(
+            bufs.is_empty() && map.is_empty() && tens.is_empty() && ops.is_empty(),
+            "{ctx}: pending batch must be dropped, not retained"
+        );
+        assert_eq!(q.ops_len(), 0, "{ctx}");
+    }
+
+    /// Every flush error path is single-shot: the pending batch is dropped
+    /// (never half-retained), `seq` advances, and the session then accepts
+    /// and completes a fresh batch. Covers the capped auto-flush in
+    /// `enqueue_op` (write failure and read failure) and the step-mode flush.
+    #[test]
+    fn flush_errors_drop_pending_batch_and_session_recovers() {
+        for (name, fail_write, step, cap) in [
+            ("capped write", true, false, Some(1)),
+            ("capped read", false, false, Some(1)),
+            ("step write", true, true, None),
+        ] {
+            fake::reset();
+            let mut q = test_session();
+            let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+            q.set_max_ops_per_flush(cap);
+            q.step_mode = step;
+            fake::with(|s| {
+                s.fail_write = fail_write;
+                s.fail_read = !fail_write;
+            });
+            let err = enqueue_with_tensor(&mut q, &buf).unwrap_err();
+            assert!(err.to_string().contains("failed"), "{name}: {err}");
+            assert_pending_empty(&q, name);
+            assert_eq!(q.seq, 2, "{name}: failed attempt still advances seq");
+
+            fake::with(|s| {
+                s.fail_write = false;
+                s.fail_read = false;
+            });
+            q.set_max_ops_per_flush(None);
+            q.step_mode = false;
+            enqueue_with_tensor(&mut q, &buf).expect(name);
+            assert_eq!(q.ops_len(), 1, "{name}");
+            q.flush().expect(name);
+            assert_pending_empty(&q, name);
+            assert_eq!(q.seq, 3, "{name}");
+        }
+    }
+
+    /// `dispatch_attempts` advances once per batch that reached the DSP
+    /// queue, on success and on write or read failure alike, and not for an
+    /// empty flush.
+    #[test]
+    fn dispatch_attempts_advance_on_success_and_failure() {
+        fake::reset();
+        let mut q = test_session();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let start = q.dispatch_attempts();
+        q.flush().unwrap();
+        assert_eq!(
+            q.dispatch_attempts(),
+            start,
+            "empty flush dispatches nothing"
+        );
+
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        q.flush().unwrap();
+        assert_eq!(q.dispatch_attempts(), start + 1, "success");
+
+        for (n, (fail_write, fail_read)) in [(true, false), (false, true)].into_iter().enumerate() {
+            fake::with(|s| {
+                s.fail_write = fail_write;
+                s.fail_read = fail_read;
+            });
+            enqueue_with_tensor(&mut q, &buf).unwrap();
+            q.flush().unwrap_err();
+            assert_eq!(q.dispatch_attempts(), start + 2 + n as u64, "failure {n}");
+        }
+    }
+
+    /// A read timeout leaves the batch outstanding (the DSP may still write
+    /// its buffers); `quiesce` fails while the response is missing and
+    /// succeeds, consuming it, once it arrives. A write failure never
+    /// reached the DSP, so it leaves nothing outstanding.
+    #[test]
+    fn quiesce_waits_for_outstanding_batches() {
+        fake::reset();
+        let mut q = test_session();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        q.flush().unwrap();
+        assert_eq!(q.outstanding_batches(), 0, "answered batch");
+        q.quiesce().unwrap();
+
+        fake::with(|s| s.fail_write = true);
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        q.flush().unwrap_err();
+        assert_eq!(q.outstanding_batches(), 0, "write failure");
+        fake::with(|s| s.fail_write = false);
+
+        fake::with(|s| s.fail_read = true);
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        q.flush().unwrap_err();
+        assert_eq!(q.outstanding_batches(), 1, "timed-out batch");
+        let err = q.quiesce().unwrap_err();
+        assert!(err.to_string().contains("outstanding"), "{err}");
+        assert_eq!(q.outstanding_batches(), 1);
+
+        fake::with(|s| s.fail_read = false);
+        q.quiesce().unwrap();
+        assert_eq!(q.outstanding_batches(), 0);
+    }
+
+    /// A DSP-reported batch failure also leaves nothing pending.
+    #[test]
+    fn flush_status_error_drops_pending_batch() {
+        fake::reset();
+        let mut q = test_session();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        fake::with(|s| s.rsp_status = Some(HtpStatus::InvalParams as u32));
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        assert!(q.flush().is_err());
+        assert_pending_empty(&q, "status");
+    }
+
+    /// Resident patching must re-zero the profile-descriptor region the DSP
+    /// filled last flush (as `flush()` does), or `CERA_HEXAGON_PROFILE`
+    /// aggregates stale timings.
+    #[test]
+    fn resident_flush_rezeroes_profile_region() {
+        fake::reset();
+        let mut q = test_session();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        let staged = q.export_staged_batch().unwrap();
+        q.drop_pending_batch();
+        assert!(staged.prof_bytes > 0);
+        let prof = staged.bufs_bytes + staged.tens_bytes + staged.ops_bytes;
+
+        q.flush_staged_resident(1, &staged, &[]).unwrap();
+        // The DSP writes timings into the profile region.
+        unsafe {
+            std::ptr::write_bytes(
+                q.staging_buf.as_mut_ptr().add(prof),
+                0xAB,
+                staged.prof_bytes,
+            )
+        };
+        q.flush_staged_resident(1, &staged, &[]).unwrap();
+        let region = &q.staging_buf.as_slice()[prof..prof + staged.prof_bytes];
+        assert!(
+            region.iter().all(|&b| b == 0),
+            "stale profile descs survived"
+        );
     }
 
     #[test]

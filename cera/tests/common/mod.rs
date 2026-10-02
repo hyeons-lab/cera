@@ -53,6 +53,22 @@ pub fn models_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../target/oracle/models")
 }
 
+/// A `target/oracle/models/<name>` fixture path resolved against
+/// `CERA_ORACLE_MODELS_DIR`: `Some(dir/<name>)` when `rel` has that prefix,
+/// the variable is set and the file exists. `None` means "not found here",
+/// not "absent": callers keep their own remaining roots and their own
+/// skip-vs-fail policy, so a fixture set kept outside the tree is found
+/// instead of silently skipped without weakening any gate.
+///
+/// Callers: `lfm2_batched_prefill_parity`, `llama_batched_prefill_parity`,
+/// `unbatchable_warning`.
+pub fn oracle_fixture(rel: &str) -> Option<std::path::PathBuf> {
+    let name = rel.strip_prefix("target/oracle/models/")?;
+    let dir = std::env::var("CERA_ORACLE_MODELS_DIR").ok()?;
+    let p = std::path::PathBuf::from(dir).join(name);
+    p.exists().then_some(p)
+}
+
 /// Resolve `fixture` under [`models_dir`], or skip the calling test.
 ///
 /// A missing fixture skips with a loud `eprintln` carrying the suite's
@@ -61,7 +77,7 @@ pub fn models_dir() -> std::path::PathBuf {
 /// skips. One definition for all suites (a copy per file is how the
 /// copies (and the fail-closed policy) drift).
 ///
-/// Callers: the `gpu_lfm2_*` suites.
+/// Callers: the `gpu_lfm2_*` suites and `qwen35_oracle_parity`.
 pub fn fixture_or_skip(fixture: &str, tag: &str) -> Option<std::path::PathBuf> {
     let p = models_dir().join(fixture);
     if p.exists() {
@@ -135,8 +151,11 @@ pub fn metal_context() -> Option<cera::backend::metal::MetalContext> {
         Ok(ctx) => Some(ctx),
         Err(e) => {
             assert!(
-                std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1"),
-                "CERA_REQUIRE_METAL=1 but no Metal device is available ({e})"
+                std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1")
+                    && std::env::var("CERA_REQUIRE_GPU")
+                        .unwrap_or_default()
+                        .is_empty(),
+                "CERA_REQUIRE_METAL=1 or CERA_REQUIRE_GPU is set but no Metal device is available ({e})"
             );
             eprintln!("skipping: no Metal device ({e})");
             None

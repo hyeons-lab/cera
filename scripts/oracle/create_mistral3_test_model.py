@@ -7,7 +7,7 @@ import gguf
 def rand_weight(*shape):
     return (np.random.randn(*shape).astype(np.float32) * 0.05)
 
-def create_mistral3_model(out_path, seed=42):
+def create_mistral3_model(out_path, seed=42, with_bias=True):
     np.random.seed(seed)
     arch = "mistral3"
     parent_dir = os.path.dirname(os.path.abspath(out_path))
@@ -23,6 +23,10 @@ def create_mistral3_model(out_path, seed=42):
     n_layers = 4
     vocab_size = 260
     orig_ctx_len = 64
+    # The bias-free variant (for GPU-vs-CPU comparisons) gets larger Q/K weights so
+    # attention is peaked: with the default near-uniform scores a wrong softmax
+    # scale or rope angle moves the logits by less than the comparison can see.
+    qk_gain = 1.0 if with_bias else 6.0
 
     # Architecture metadata
     writer.add_context_length(256)
@@ -91,20 +95,24 @@ def create_mistral3_model(out_path, seed=42):
 
     for i in range(n_layers):
         writer.add_tensor(f"blk.{i}.attn_norm.weight", np.ones((n_embd,), dtype=np.float32))
-        writer.add_tensor(f"blk.{i}.attn_q.weight", rand_weight(n_head * head_dim, n_embd))
-        writer.add_tensor(f"blk.{i}.attn_k.weight", rand_weight(n_head_kv * head_dim, n_embd))
+        writer.add_tensor(f"blk.{i}.attn_q.weight", qk_gain * rand_weight(n_head * head_dim, n_embd))
+        writer.add_tensor(f"blk.{i}.attn_k.weight", qk_gain * rand_weight(n_head_kv * head_dim, n_embd))
         writer.add_tensor(f"blk.{i}.attn_v.weight", rand_weight(n_head_kv * head_dim, n_embd))
         writer.add_tensor(f"blk.{i}.attn_output.weight", rand_weight(n_embd, n_head * head_dim))
-        # Optional projection bias
-        writer.add_tensor(f"blk.{i}.attn_output.bias", rand_weight(n_embd))
+        # Optional projection bias (absent in real Ministral 3 files)
+        if with_bias:
+            writer.add_tensor(f"blk.{i}.attn_output.bias", rand_weight(n_embd))
 
         writer.add_tensor(f"blk.{i}.ffn_norm.weight", np.ones((n_embd,), dtype=np.float32))
         writer.add_tensor(f"blk.{i}.ffn_gate.weight", rand_weight(n_ff, n_embd))
-        writer.add_tensor(f"blk.{i}.ffn_gate.bias", rand_weight(n_ff))
+        if with_bias:
+            writer.add_tensor(f"blk.{i}.ffn_gate.bias", rand_weight(n_ff))
         writer.add_tensor(f"blk.{i}.ffn_up.weight", rand_weight(n_ff, n_embd))
-        writer.add_tensor(f"blk.{i}.ffn_up.bias", rand_weight(n_ff))
+        if with_bias:
+            writer.add_tensor(f"blk.{i}.ffn_up.bias", rand_weight(n_ff))
         writer.add_tensor(f"blk.{i}.ffn_down.weight", rand_weight(n_embd, n_ff))
-        writer.add_tensor(f"blk.{i}.ffn_down.bias", rand_weight(n_embd))
+        if with_bias:
+            writer.add_tensor(f"blk.{i}.ffn_down.bias", rand_weight(n_embd))
 
     try:
         writer.write_header_to_file()
@@ -120,7 +128,10 @@ def create_mistral3_model(out_path, seed=42):
                 pass
 
 if __name__ == "__main__":
-    if len(sys.argv) < 2:
-        print(f"Usage: {sys.argv[0]} <output_path>")
+    args = [a for a in sys.argv[1:] if a != "--no-bias"]
+    if len(args) < 1:
+        print(f"Usage: {sys.argv[0]} <output_path> [--no-bias]")
         sys.exit(1)
-    create_mistral3_model(sys.argv[1])
+    # `--no-bias` drops the projection/FFN biases the GPU backends do not
+    # run, so a GPU-vs-CPU comparison isolates the rope and attention scaling.
+    create_mistral3_model(args[0], with_bias="--no-bias" not in sys.argv[1:])

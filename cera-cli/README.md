@@ -124,7 +124,9 @@ their metadata).
 `run`, `chat`, and `bench` accept speculative decoding flags: `--spec` enables
 prompt-lookup drafting, `--no-spec` disables speculative decoding even when a
 draft sidecar is present, `--draft <PATH>` attaches a neural draft model, and
-`--spec-ngram <N>` / `--spec-k <K>` configure drafting parameters. For audio models
+`--spec-ngram <N>` / `--spec-k <K>` configure drafting parameters (`--spec-k`
+defaults to 6 draft tokens per round; it was 8 through v0.6.3, so pass
+`--spec-k 8` to keep the old round size). For audio models
 with an external vocoder, `--vocoder <PATH>` routes audio accelerator loading
 through the resolved `--device` backend (or `CERA_AUDIO_GPU` override).
 

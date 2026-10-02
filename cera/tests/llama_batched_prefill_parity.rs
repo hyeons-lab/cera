@@ -42,11 +42,18 @@
     any(target_arch = "aarch64", target_arch = "x86_64", feature = "blas")
 ))]
 
+mod common;
+
 use std::path::PathBuf;
 
 /// Try a few candidate roots so the test works both from the crate dir and
 /// from a git worktree whose fixtures live in the main checkout.
 fn find_model(rel: &str) -> Option<PathBuf> {
+    // The shared fixture-dir override wins, so a fixture set kept outside the
+    // tree is found instead of silently skipped.
+    if let Some(p) = common::oracle_fixture(rel) {
+        return Some(p);
+    }
     let mut roots: Vec<PathBuf> = Vec::new();
     // Crate dir → workspace root (../ from CARGO_MANIFEST_DIR).
     if let Ok(manifest) = std::env::var("CARGO_MANIFEST_DIR") {
@@ -308,7 +315,7 @@ fn check(rel: &str, tokens: &[u32], x86_naive_floor: f32) {
         assert!(
             std::env::var("CERA_REQUIRE_MODEL").is_err(),
             "CERA_REQUIRE_MODEL is set but the fixture is absent: {rel} \
-             (set CERA_MODEL_ROOT)"
+             (set CERA_ORACLE_MODELS_DIR or CERA_MODEL_ROOT)"
         );
         eprintln!("[parity] SKIP (absent): {rel}");
         return;

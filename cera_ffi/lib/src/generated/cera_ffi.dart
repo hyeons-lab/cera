@@ -936,8 +936,11 @@ class GenerateOpts {
     this.flushEveryTokens = 16,
     /// Ignored under synchronous generate; reserved for streaming.
     this.flushEveryMs = 50,
-    /// Optional speculative decoding configuration (prompt-lookup drafting).
-    /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
+    /// Optional speculative decoding configuration. `None` turns speculative
+    /// decoding on only when a drafter is attached (a draft sidecar model next
+    /// to the target); with no drafter it stays off. `Some` honours the given
+    /// configuration. `no_spec` disables it for this call, and
+    /// `SessionConfig.disable_spec` (or `Session.disable_spec`) wins over both.
     this.spec = null,
     /// Disable speculative decoding (even when a draft sidecar model is present).
     this.noSpec = false,
@@ -985,8 +988,11 @@ class GenerateOpts {
   final int flushEveryTokens;
   /// Ignored under synchronous generate; reserved for streaming.
   final int flushEveryMs;
-  /// Optional speculative decoding configuration (prompt-lookup drafting).
-  /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
+  /// Optional speculative decoding configuration. `None` turns speculative
+  /// decoding on only when a drafter is attached (a draft sidecar model next
+  /// to the target); with no drafter it stays off. `Some` honours the given
+  /// configuration. `no_spec` disables it for this call, and
+  /// `SessionConfig.disable_spec` (or `Session.disable_spec`) wins over both.
   final SpecDecodeConfig? spec;
   /// Disable speculative decoding (even when a draft sidecar model is present).
   final bool noSpec;
@@ -9756,8 +9762,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_append_raw_image`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image != 38950) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_raw_image`: expected 38950, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image != 27818) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_raw_image`: expected 27818, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_append_text;
     try {
@@ -31590,6 +31596,9 @@ final class Session {
   /// - `ContextOverflow` if appending image tokens exceeds context limit.
   /// - `Cancelled` if execution is interrupted.
   /// - `PoisonedSession` if the session lock is poisoned.
+  ///
+  /// A buffer longer than `width * height * bytes_per_pixel` is accepted:
+  /// only the leading bytes are read and the excess is ignored.
   void appendRawImage(Uint8List pixels, int width, int height, PixelFormat format, int? maxLongSize) {
     _ensureOpen();
     _ffi.sessionInvokeAppendRawImage(_handle, pixels, width, height, format, maxLongSize);

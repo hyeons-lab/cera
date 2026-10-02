@@ -868,8 +868,11 @@ class GenerateOpts {
     this.flushEveryTokens = 16,
     /// Ignored under synchronous generate; reserved for streaming.
     this.flushEveryMs = 50,
-    /// Optional speculative decoding configuration (prompt-lookup drafting).
-    /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
+    /// Optional speculative decoding configuration. `None` turns speculative
+    /// decoding on only when a drafter is attached (a draft sidecar model next
+    /// to the target); with no drafter it stays off. `Some` honours the given
+    /// configuration. `no_spec` disables it for this call, and
+    /// `SessionConfig.disable_spec` (or `Session.disable_spec`) wins over both.
     this.spec = null,
     /// Disable speculative decoding (even when a draft sidecar model is present).
     this.noSpec = false,
@@ -917,8 +920,11 @@ class GenerateOpts {
   final int flushEveryTokens;
   /// Ignored under synchronous generate; reserved for streaming.
   final int flushEveryMs;
-  /// Optional speculative decoding configuration (prompt-lookup drafting).
-  /// When set, runs prompt-lookup speculative drafting to accelerate greedy decoding.
+  /// Optional speculative decoding configuration. `None` turns speculative
+  /// decoding on only when a drafter is attached (a draft sidecar model next
+  /// to the target); with no drafter it stays off. `Some` honours the given
+  /// configuration. `no_spec` disables it for this call, and
+  /// `SessionConfig.disable_spec` (or `Session.disable_spec`) wins over both.
   final SpecDecodeConfig? spec;
   /// Disable speculative decoding (even when a draft sidecar model is present).
   final bool noSpec;
@@ -6909,6 +6915,9 @@ final class Session {
   /// - `ContextOverflow` if appending image tokens exceeds context limit.
   /// - `Cancelled` if execution is interrupted.
   /// - `PoisonedSession` if the session lock is poisoned.
+  ///
+  /// A buffer longer than `width * height * bytes_per_pixel` is accepted:
+  /// only the leading bytes are read and the excess is ignored.
   void appendRawImage(Uint8List pixels, int width, int height, PixelFormat format, int? maxLongSize) => _unsupportedOnWeb('Session.appendRawImage');
 
   /// Append raw text to the context, running a prefill over just

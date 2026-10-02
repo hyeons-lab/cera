@@ -101,12 +101,12 @@ impl AdpfSession {
             let session = create(manager, &tid, 1, target_nanos);
             if session.is_null() {
                 libc::dlclose(lib);
-                tracing::debug!("cera-hexagon: ADPF session rejected by power HAL");
+                tracing::debug!("ADPF session rejected by power HAL");
                 return None;
             }
             tracing::info!(
                 target_ms = target_nanos / 1_000_000,
-                "cera-hexagon: ADPF hint session active"
+                "ADPF hint session active"
             );
             // lib intentionally leaked: process-lifetime, keeps symbols valid.
             Some(Self {

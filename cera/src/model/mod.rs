@@ -33,12 +33,14 @@ pub mod gpu_turboquant;
 
 #[cfg(any(
     feature = "gpu",
-    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    all(feature = "metal", any(target_os = "macos", target_os = "ios")),
+    feature = "hexagon"
 ))]
 pub mod gpu_weight_source;
 #[cfg(any(
     feature = "gpu",
-    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    all(feature = "metal", any(target_os = "macos", target_os = "ios")),
+    feature = "hexagon"
 ))]
 pub use gpu_weight_source::{GpuWeightSource, RopeType};
 pub use transformer::WeightRef;
@@ -576,6 +578,12 @@ pub trait Model: Send + Sync {
     /// operation. Implementors must revalidate every component immediately
     /// before mutation under the same lock/borrow. Success restores only KV;
     /// complete Session recovery also requires its execution metadata.
+    ///
+    /// Blocking: a backend that must wait for an accelerator to drain (Hexagon
+    /// quiesces the DSP queue) can block up to that wait's own hang guard, and
+    /// cancellation is not polled meanwhile. Recovery that tries this and then
+    /// [`Model::try_reset_kv`] on a hung device can therefore wait once per
+    /// call, each bounded by the guard (30 s on Hexagon).
     fn try_truncate_kv(
         &self,
         _state: &mut InferenceState,
@@ -591,6 +599,10 @@ pub trait Model: Send + Sync {
     /// lock and preserve the attached adapter. An error may leave state invalid;
     /// callers must not infer readiness from a zero position. This operation does
     /// not reset Session metadata or touch its external cancellation latch.
+    ///
+    /// Blocking: see [`Model::try_truncate_kv`]. On Hexagon a hung DSP makes
+    /// this wait up to the 30 s read guard (cancellation is not polled) and
+    /// leave the model torn, so the next forward refuses until a reset lands.
     fn try_reset_kv(
         &self,
         _state: &mut InferenceState,
@@ -1017,39 +1029,42 @@ pub fn load_model(
     #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
     let shape = crate::backend::calibrate::DecodeShape::from_gguf(&gguf);
 
-    let model: Box<dyn Model> = match arch.as_str() {
-        // `lfm2moe` shares this loader: same graph, experts in the FFN slot.
-        "lfm2" | "lfm2moe" => Box::new(lfm2::LfmModel::from_gguf_with_id(
-            gguf,
-            context_size,
-            model_id,
-        )?),
-        // Classic Mistral ships as arch "llama". Mistral 3 / Ministral 3 ships as "mistral3".
-        "qwen2" | "qwen3" | "llama" | "granite" | "gemma2" | "olmo2" | "olmo3" | "minicpm"
-        | "minicpm5" | "nanbeige" | "mistral3" | "ministral3" | "phi3" | "phi" => Box::new(
-            llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?,
-        ),
-        "bert" | "modernbert" => Box::new(bert::BertModel::from_gguf_with_id(
-            gguf,
-            context_size,
-            model_id,
-        )?),
-        "granitehybrid" | "granite-hybrid" | "falcon-h1" | "falcon_h1" | "mamba2" => Box::new(
-            hybrid::HybridModel::from_gguf_with_id(gguf, context_size, model_id)?,
-        ),
-        "gemma4" | "gemma-4" | "gemma4-assistant" | "gemma-4-assistant" => Box::new(
-            gemma4::Gemma4Model::from_gguf_with_id(gguf, context_size, model_id)?,
-        ),
-        "qwen35" | "qwen3_5" | "qwen3.5" => Box::new(qwen35::Qwen35Model::from_gguf_with_id(
-            gguf,
-            context_size,
-            model_id,
-        )?),
-        "bailingmoe3" | "bailingmoe" | "bailingmoe2" => Box::new(
-            bailingmoe3::BailingMoe3Model::from_gguf_with_id(gguf, context_size, model_id)?,
-        ),
-        other => bail!("unsupported architecture: {other}"),
-    };
+    let model: Box<dyn Model> =
+        match arch.as_str() {
+            // `lfm2moe` shares this loader: same graph, experts in the FFN slot.
+            "lfm2" | "lfm2moe" => Box::new(lfm2::LfmModel::from_gguf_with_id(
+                gguf,
+                context_size,
+                model_id,
+            )?),
+            // Classic Mistral ships as arch "llama". Mistral 3 / Ministral 3 ships as "mistral3".
+            "qwen2" | "qwen3" | "llama" | "granite" | "gemma2" | "olmo2" | "olmo3" | "minicpm"
+            | "minicpm5" | "nanbeige" | "mistral3" | "ministral" | "ministral3" | "phi3"
+            | "phi" | "starcoder2" | "stablelm" | "internlm2" | "internlm" | "baichuan"
+            | "deepseek" | "cohere" | "command-r" | "openelm" => Box::new(
+                llama::LlamaModel::from_gguf_with_id(gguf, context_size, model_id)?,
+            ),
+            "bert" | "modernbert" => Box::new(bert::BertModel::from_gguf_with_id(
+                gguf,
+                context_size,
+                model_id,
+            )?),
+            "granitehybrid" | "granite-hybrid" | "falcon-h1" | "falcon_h1" | "mamba2" => Box::new(
+                hybrid::HybridModel::from_gguf_with_id(gguf, context_size, model_id)?,
+            ),
+            "gemma4" | "gemma-4" | "gemma4-assistant" | "gemma-4-assistant" => Box::new(
+                gemma4::Gemma4Model::from_gguf_with_id(gguf, context_size, model_id)?,
+            ),
+            "qwen35" | "qwen3_5" | "qwen3.5" => Box::new(qwen35::Qwen35Model::from_gguf_with_id(
+                gguf,
+                context_size,
+                model_id,
+            )?),
+            "bailingmoe3" | "bailingmoe" | "bailingmoe2" => Box::new(
+                bailingmoe3::BailingMoe3Model::from_gguf_with_id(gguf, context_size, model_id)?,
+            ),
+            other => bail!("unsupported architecture: {other}"),
+        };
 
     // Size the decode pool to this model rather than a flat cap. Registered
     // only now, after a constructor actually returned a model:
@@ -1099,11 +1114,13 @@ pub fn load_model_gpu(
         // QK-norm / QKV-bias / untied-output / Granite scalars are driven by the
         // GpuWeightSource accessors). Mirrors the CPU `load_model` allow-list.
         "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" | "minicpm5" | "nanbeige" | "phi3"
-        | "phi" => Ok(Box::new(gpu_lfm2::GpuLfmModel::from_llama_with_id(
-            gguf,
-            context_size,
-            model_id,
-        )?)),
+        | "phi" | "mistral3" | "ministral" | "ministral3" | "internlm2" | "internlm"
+        | "baichuan" | "deepseek" | "openelm" => Ok(Box::new(
+            gpu_lfm2::GpuLfmModel::from_llama_with_id(gguf, context_size, model_id)?,
+        )),
+        "stablelm" | "starcoder2" | "cohere" | "command-r" => bail!(
+            "architecture {arch} requires LayerNorm/parallel-residual support, which the GPU backends do not implement (CPU only)"
+        ),
         other => bail!("unsupported architecture for GPU: {other}"),
     }
 }
@@ -1134,11 +1151,13 @@ pub fn load_model_metal(
         )?)),
         // Dense transformers share the generalized Metal forward path.
         "qwen2" | "qwen3" | "llama" | "granite" | "minicpm" | "minicpm5" | "nanbeige" | "phi3"
-        | "phi" => Ok(Box::new(metal_lfm2::MetalLfmModel::from_llama(
-            gguf,
-            path,
-            context_size,
-        )?)),
+        | "phi" | "mistral3" | "ministral" | "ministral3" | "internlm2" | "internlm"
+        | "baichuan" | "deepseek" | "openelm" => Ok(Box::new(
+            metal_lfm2::MetalLfmModel::from_llama(gguf, path, context_size)?,
+        )),
+        "stablelm" | "starcoder2" | "cohere" | "command-r" => bail!(
+            "architecture {arch} requires LayerNorm/parallel-residual support, which the Metal backend does not implement (CPU only)"
+        ),
         other => bail!("unsupported architecture for Metal: {other}"),
     }
 }
@@ -1155,13 +1174,26 @@ pub fn load_model_hexagon(
         .unwrap_or("unknown")
         .to_string();
     match arch.as_str() {
-        "lfm2" => Ok(Box::new(hexagon_lfm2::HexagonLfmModel::from_gguf(
+        "lfm2" | "lfm2moe" => Ok(Box::new(hexagon_lfm2::HexagonLfmModel::from_gguf(
             gguf,
             path,
             context_size,
         )?)),
+        // LayerNorm (with bias) and parallel-residual blocks: the CPU loader
+        // runs them, but the Hexagon dense path only has RMSNorm ops.
+        "stablelm" | "starcoder2" | "cohere" | "command-r" => bail!(
+            "architecture {arch} requires LayerNorm/parallel-residual support, which the Hexagon NPU backend does not have (CPU only)"
+        ),
+        "qwen2" | "qwen3" | "llama" | "granite" | "gemma2" | "olmo2" | "olmo3" | "minicpm"
+        | "minicpm5" | "nanbeige" | "mistral3" | "ministral" | "ministral3" | "phi3" | "phi"
+        | "internlm2" | "internlm" | "baichuan" | "deepseek" | "openelm" => Ok(Box::new(
+            hexagon_lfm2::HexagonLfmModel::from_llama(gguf, path, context_size)?,
+        )),
+        "qwen35" | "qwen3_5" | "qwen3.5" => Ok(Box::new(
+            hexagon_lfm2::HexagonLfmModel::from_qwen35(gguf, path, context_size)?,
+        )),
         other => bail!(
-            "unsupported architecture for Hexagon NPU: {other} (Hexagon backend currently supports dense LFM2 architectures)"
+            "unsupported architecture for Hexagon NPU: {other} (Hexagon backend currently supports LFM2, LFM2-MoE, Tier 1/2 dense architectures, and Qwen 3.5 hybrid)"
         ),
     }
 }

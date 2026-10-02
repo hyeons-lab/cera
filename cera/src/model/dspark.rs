@@ -979,7 +979,8 @@ impl Drafter for DSparkSessionDrafter {
 /// GPU weight accessor surface for loading DSpark onto WebGPU / Metal via [`crate::model::gpu_lfm2::GpuLfmModel`].
 #[cfg(any(
     feature = "gpu",
-    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    all(feature = "metal", any(target_os = "macos", target_os = "ios")),
+    feature = "hexagon"
 ))]
 pub(crate) struct DSparkGpuWeightSource {
     pub(crate) config: ModelConfig,
@@ -988,7 +989,8 @@ pub(crate) struct DSparkGpuWeightSource {
 
 #[cfg(any(
     feature = "gpu",
-    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    all(feature = "metal", any(target_os = "macos", target_os = "ios")),
+    feature = "hexagon"
 ))]
 impl DSparkGpuWeightSource {
     fn is_base_weight(&self, wref: &WeightRef) -> bool {
@@ -1003,7 +1005,8 @@ impl DSparkGpuWeightSource {
 
 #[cfg(any(
     feature = "gpu",
-    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    all(feature = "metal", any(target_os = "macos", target_os = "ios")),
+    feature = "hexagon"
 ))]
 impl crate::model::gpu_weight_source::GpuWeightSource for DSparkGpuWeightSource {
     fn cache_identity_sources(&self) -> Option<Vec<&GgufFile>> {
