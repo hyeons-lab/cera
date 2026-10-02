@@ -11327,8 +11327,8 @@ mod tests {
         };
         let probe = ctx.clone();
         let gguf = crate::model::lfm2::release_tests::synthetic_lfm2_gguf();
-        let model = super::GpuLfmModel::from_gguf_with_ctx(gguf, 256, "lost-snapshot".into(), ctx)
-            .unwrap();
+        let model =
+            super::GpuLfmModel::from_gguf_with_ctx(gguf, 256, "lost-snapshot".into(), ctx).unwrap();
         let mut state = crate::kv_cache::InferenceState::from_config(model.config()).unwrap();
         let healthy: Vec<u32> = (1..9).collect();
         model.forward_prefill(&healthy, 0, &mut state);
