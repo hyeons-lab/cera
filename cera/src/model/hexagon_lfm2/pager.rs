@@ -43,13 +43,18 @@ pub(super) struct Paging {
 }
 
 impl Paging {
-    /// `CERA_HEXAGON_MAP_BUDGET_MIB` (default 3584, never past the driver's
-    /// hard ceiling) and `CERA_HEXAGON_PAGE_EXPERTS=1`.
+    /// `CERA_HEXAGON_MAP_BUDGET_MIB` or `_KIB` (default 3584 MiB, never past
+    /// the driver's hard ceiling) and `CERA_HEXAGON_PAGE_EXPERTS=1`.
     pub(super) fn from_env() -> Self {
-        let budget = std::env::var("CERA_HEXAGON_MAP_BUDGET_MIB")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .map(|mib| mib.saturating_mul(MIB))
+        let env_usize = |k: &str| {
+            std::env::var(k)
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+        };
+        // `_KIB` is for tiny models, where a MiB is more than the whole window.
+        let budget = env_usize("CERA_HEXAGON_MAP_BUDGET_KIB")
+            .map(|kib| kib.saturating_mul(1024))
+            .or_else(|| env_usize("CERA_HEXAGON_MAP_BUDGET_MIB").map(|m| m.saturating_mul(MIB)))
             .unwrap_or(DEFAULT_MAP_BUDGET)
             .min(crate::backend::hexagon::sys::DSP_MAP_CEILING);
         Self {
@@ -69,6 +74,16 @@ impl Paging {
                 .saturating_add(KV_MARGIN)
                 > self.budget
     }
+}
+
+/// What the pager needs from the queue it pages for.
+pub(super) trait PagerHost {
+    /// Complete every batch that may still read a buffer about to be unmapped
+    /// (flush the queue and wait for the DSP).
+    fn finish_pending(&mut self) -> Result<(), CeraError>;
+    /// Tell the DSP to drop its hold on `buf`; the host's unmap is refused
+    /// while the DSP keeps one after a batch has read the buffer.
+    fn release(&mut self, buf: &RpcmemBuffer);
 }
 
 /// Counters over a pager's lifetime.
@@ -173,23 +188,19 @@ impl ExpertPager {
 
     /// Make layer group `group` mapped before ops that read it are queued.
     ///
-    /// When the window is full, `finish_pending` must complete every batch
-    /// that may still read the buffers about to be unmapped (flush the queue
-    /// and wait for the DSP). It is not called when the layer is already
-    /// mapped or there is room.
-    pub(super) fn page_in(
-        &self,
-        group: usize,
-        finish_pending: impl FnOnce() -> Result<(), CeraError>,
-    ) -> Result<(), CeraError> {
+    /// When the window is full, `host` must finish every pending batch before
+    /// the window's buffers are released and unmapped. Neither happens when
+    /// the layer is already mapped or there is room.
+    pub(super) fn page_in(&self, group: usize, host: &mut impl PagerHost) -> Result<(), CeraError> {
         let buf = &self.bufs[group];
         if buf.is_mapped() {
             return Ok(());
         }
         let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
         if self.driver.mapped_bytes().saturating_add(buf.size()) > self.budget {
-            finish_pending()?;
+            host.finish_pending()?;
             while let Some(old) = window.pop_front() {
+                host.release(&self.bufs[old]);
                 self.bufs[old].unmap_from_dsp()?;
             }
             self.rotations.fetch_add(1, Ordering::SeqCst);
@@ -224,6 +235,28 @@ mod tests {
         (driver, pager)
     }
 
+    /// Counts what the pager asks of its queue; `fail` makes the flush fail.
+    #[derive(Default)]
+    struct Host {
+        flushes: usize,
+        released: Vec<usize>,
+        fail: bool,
+    }
+
+    impl PagerHost for Host {
+        fn finish_pending(&mut self) -> Result<(), CeraError> {
+            if self.fail {
+                return Err(CeraError::Backend("dsp fault".into()));
+            }
+            self.flushes += 1;
+            Ok(())
+        }
+
+        fn release(&mut self, buf: &RpcmemBuffer) {
+            self.released.push(buf.size());
+        }
+    }
+
     fn mapped(p: &ExpertPager) -> Vec<bool> {
         (0..p.bufs.len()).map(|i| p.bufs[i].is_mapped()).collect()
     }
@@ -233,10 +266,11 @@ mod tests {
         let (_d, p) = pager(&[100, 100, 100], 400);
         assert_eq!(mapped(&p), [true, true, true]);
         assert_eq!(p.pinned(), 3);
+        let mut host = Host::default();
         for g in 0..3 {
-            p.page_in(g, || panic!("a resident layer must not flush"))
-                .unwrap();
+            p.page_in(g, &mut host).unwrap();
         }
+        assert_eq!((host.flushes, host.released.len()), (0, 0));
         assert_eq!(p.stats(), PagerStats::default());
     }
 
@@ -252,18 +286,16 @@ mod tests {
     #[test]
     fn a_full_window_flushes_once_and_releases_all_of_it() {
         let (d, p) = pager(&[100; 6], 450);
-        let flushes = std::cell::Cell::new(0);
-        let flush = || {
-            flushes.set(flushes.get() + 1);
-            Ok(())
-        };
+        let mut host = Host::default();
         // Pinned layers cost nothing; the paged ones fill the 250 MiB of room
         // two at a time.
         for g in 0..6 {
-            p.page_in(g, flush).unwrap();
+            p.page_in(g, &mut host).unwrap();
         }
         // Layers 2,3 fit; 4 forces a rotation (flush #1) and holds 4,5.
-        assert_eq!(flushes.get(), 1);
+        assert_eq!(host.flushes, 1);
+        // The DSP is told to let go of both window buffers before the unmap.
+        assert_eq!(host.released, [100 * MIB, 100 * MIB]);
         assert_eq!(mapped(&p), [true, true, false, false, true, true]);
         assert!(d.mapped_bytes() <= 450 * MIB);
         assert_eq!(
@@ -275,23 +307,26 @@ mod tests {
         );
         // The next pass wraps: layers 2 and 3 are out, so mapping 2 rotates.
         for g in 0..6 {
-            p.page_in(g, flush).unwrap();
+            p.page_in(g, &mut host).unwrap();
         }
-        assert_eq!(flushes.get(), 3, "one flush per window, not per layer");
+        assert_eq!(host.flushes, 3, "one flush per window, not per layer");
         assert_eq!(p.pinned(), 2);
     }
 
     #[test]
     fn a_failed_flush_leaves_the_window_mapped() {
         let (_d, p) = pager(&[100; 6], 450);
+        let mut host = Host::default();
         for g in 2..4 {
-            p.page_in(g, || Ok(())).unwrap();
+            p.page_in(g, &mut host).unwrap();
         }
+        host.fail = true;
         let err = p
-            .page_in(4, || Err(CeraError::Backend("dsp fault".into())))
+            .page_in(4, &mut host)
             .expect_err("the flush failure must surface");
         assert!(err.to_string().contains("dsp fault"));
-        // Nothing was unmapped under a batch the DSP may still be running.
+        // Nothing was released or unmapped under a batch the DSP may still run.
+        assert!(host.released.is_empty());
         assert!(p.bufs[2].is_mapped() && p.bufs[3].is_mapped());
         assert!(!p.bufs[4].is_mapped());
     }

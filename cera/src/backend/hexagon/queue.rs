@@ -266,6 +266,9 @@ impl StagedBatch {
 /// An active DSP command queue session managing batched request and response dispatch.
 pub struct HexagonQueueSession {
     driver: Arc<FastRpcDriver>,
+    /// The skel handle of the device this queue belongs to, for `htp_iface`
+    /// calls that name a buffer (set by `HexagonDevice`).
+    skel_handle: Option<crate::backend::hexagon::sys::RemoteHandle64>,
     queue: crate::backend::hexagon::sys::DspQueueHandle,
     queue_id: u64,
     staging_buf: RpcmemBuffer,
@@ -328,6 +331,7 @@ impl HexagonQueueSession {
 
         Ok(Self {
             driver,
+            skel_handle: None,
             queue,
             queue_id,
             staging_buf,
@@ -406,6 +410,33 @@ impl HexagonQueueSession {
     /// could have run any op on the device.
     pub fn dispatch_attempts(&self) -> u64 {
         self.seq
+    }
+
+    /// Record the skel handle `htp_iface` calls about this queue's buffers go
+    /// through.
+    pub(crate) fn set_skel_handle(&mut self, handle: super::sys::RemoteHandle64) {
+        self.skel_handle = Some(handle);
+    }
+
+    /// Tell the DSP to drop its reference to `buf` (`htp_iface_munmap`, IDL
+    /// method 5). Once a batch has read a buffer the DSP keeps its own hold on
+    /// it, and the host's `fastrpc_munmap` is refused (error 1) until that is
+    /// released. Best effort, as in llama.cpp: a buffer no batch has touched
+    /// has nothing to release.
+    pub fn release_dsp_reference(&self, buf: &RpcmemBuffer) {
+        let Some(handle) = self.skel_handle else {
+            return;
+        };
+        let mut fd = buf.fd() as u32;
+        let mut args = [super::sys::RemoteArg {
+            buf: super::sys::RemoteBuf {
+                buf: &mut fd as *mut u32 as *mut std::ffi::c_void,
+                len: std::mem::size_of::<u32>(),
+            },
+        }];
+        let _ =
+            self.driver
+                .invoke_skel(handle, super::sys::remote_scalars_make(5, 1, 0), &mut args);
     }
 
     /// Wait until every batch written to the DSP has answered.

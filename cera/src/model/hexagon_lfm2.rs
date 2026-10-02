@@ -16,7 +16,7 @@ use crate::backend::cpu::RopeType;
 use crate::backend::hexagon::{
     AdpfSession, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
     HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, LockOrRecover,
-    RpcmemBuffer, StagedBatch, build_binary_kernel_params,
+    RpcmemBuffer, StagedBatch, build_binary_kernel_params, build_binary_scalar_kernel_params,
     build_flash_attn_kernel_params_with_softcap, build_hmx_fa_kernel_params_with_softcap,
     build_hmx_mm_kernel_params, build_mul_mat_kernel_params, build_rms_norm_params,
     build_rope_kernel_params, build_rope_params, build_set_rows_kernel_params,
@@ -1488,10 +1488,11 @@ impl HexagonLfmModel {
             let pager = ExpertPager::new(Arc::clone(driver), expert_bufs, map_budget)?;
             tracing::info!(
                 "cera::hexagon: paging routed experts through the DSP mapping: {} of {n_groups} \
-                 layers pinned, the rest rotate (budget {} MiB, {} MiB mapped)",
+                 layers pinned, the rest rotate (budget {} KiB, {} KiB mapped, {} KiB per layer)",
                 pager.pinned(),
-                map_budget >> 20,
-                driver.mapped_bytes() >> 20
+                map_budget >> 10,
+                driver.mapped_bytes() >> 10,
+                pager.buf(0).size() >> 10
             );
             Some(pager)
         };

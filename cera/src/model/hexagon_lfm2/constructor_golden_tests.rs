@@ -446,7 +446,7 @@ fn constructors_build_pinned_models() {
     assert_model(
         "ctor_moe",
         &moe,
-        (10223184744877565750, 2737927026610381759),
+        (10223184744877565750, 6782386862919579423),
     );
     let cpu = crate::model::qwen35::Qwen35Model::from_gguf(qwen35_gguf(), 64).unwrap();
     let qwen35 = HexagonLfmModel::from_qwen35_model_on(backend(), &cpu, 64).unwrap();

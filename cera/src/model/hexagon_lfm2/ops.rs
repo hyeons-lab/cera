@@ -397,8 +397,15 @@ impl HexagonLfmModel {
         )?;
         let dst_ti = Self::add_f32_vec(session, dst, dst_offset, dim, HTP_TENSOR_COMPUTE)?;
         let params = [0i32; 16];
+        // A one-element `src1` needs the DSP's scalar-broadcast kernel; the
+        // same-shape kernel would read `dim` elements from it.
         let kparams =
-            build_binary_kernel_params(dim, 1, 1, 1, 1, 4, 8 * 1024 * 1024, session.dsp_threads());
+            build_binary_scalar_kernel_params(dim, 8 * 1024 * 1024, session.dsp_threads())
+                .ok_or_else(|| {
+                    CeraError::Backend(format!(
+                        "{label}: {dim}-element scalar op does not fit VTCM"
+                    ))
+                })?;
         Self::enqueue_labeled(
             session,
             label,
@@ -851,10 +858,7 @@ impl HexagonLfmModel {
         let (Some(group), Some(pager)) = (moe.gate.group, &self.pager) else {
             return Ok(());
         };
-        pager.page_in(group, || {
-            session.flush()?;
-            session.quiesce()
-        })
+        pager.page_in(group, &mut SessionHost(session))
     }
 
     pub(super) fn dispatch_moe_token(
@@ -2422,5 +2426,20 @@ impl HexagonLfmModel {
             kparams,
         )?;
         Ok(())
+    }
+}
+
+/// The queue a pager pages for: finishing pending work is a flush plus a wait
+/// for the response, and a release goes through the device's skel handle.
+struct SessionHost<'a>(&'a mut HexagonQueueSession);
+
+impl super::pager::PagerHost for SessionHost<'_> {
+    fn finish_pending(&mut self) -> Result<(), CeraError> {
+        self.0.flush()?;
+        self.0.quiesce()
+    }
+
+    fn release(&mut self, buf: &RpcmemBuffer) {
+        self.0.release_dsp_reference(buf);
     }
 }

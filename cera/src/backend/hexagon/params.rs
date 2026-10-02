@@ -200,6 +200,55 @@ pub(crate) fn build_unary_kernel_params_with(
     kparams
 }
 
+/// `HTP_BINARY_KERNEL_CHUNKED`: the kernel the DSP runs for a contiguous
+/// op whose `src1` is a single element (`ggml_hexagon_precompute_binary_params`'s
+/// scalar-broadcast branch). A scalar `src1` under the same-shape kernel makes
+/// the DSP read `src0`-many elements from it and fault.
+const HTP_BINARY_KERNEL_CHUNKED: i32 = 7;
+
+/// Host-computed kernel parameters for `dst[i] = src0[i] <op> scalar` over a
+/// contiguous `total_elems`-element F32 vector (Mul by a routed-expert weight,
+/// Div by the renormalization sum). Mirrors the llama.cpp host precompute:
+/// chunk size from the thread count, VTCM for double-buffered `src0` and
+/// `dst` chunks per thread plus one 128-byte slot for the scalar. `None` when
+/// that does not fit `vtcm_size`.
+pub fn build_binary_scalar_kernel_params(
+    total_elems: usize,
+    vtcm_size: usize,
+    n_threads: u32,
+) -> Option<[i32; 32]> {
+    const ELEM: usize = 4;
+    const MAX_CHUNK_BYTES: usize = 32768;
+    const MIN_CHUNK_ELEMS: usize = 256;
+    let n_threads = n_threads.max(1) as usize;
+
+    let max_chunk_elems = MAX_CHUNK_BYTES / ELEM;
+    let target = (total_elems.div_ceil(2 * n_threads)).next_multiple_of(32);
+    let chunk_size = max_chunk_elems.min(target.max(MIN_CHUNK_ELEMS));
+    let chunk_bytes = (chunk_size * ELEM).next_multiple_of(128);
+
+    // src0 and dst: two chunks per thread each; the scalar takes one slot.
+    let vtcm_total = n_threads * 2 * chunk_bytes + 128 + n_threads * 2 * chunk_bytes;
+    if vtcm_total > vtcm_size {
+        return None;
+    }
+    let row_aligned = (total_elems * ELEM).next_multiple_of(128);
+
+    let mut kparams = [0i32; 32];
+    kparams[0] = HTP_BINARY_KERNEL_CHUNKED;
+    kparams[1] = n_threads as i32;
+    kparams[2] = 1; // rows_per_buffer
+    kparams[3] = row_aligned as i32; // src0_row_size_aligned
+    kparams[4] = 0; // src1_row_size_aligned: the scalar needs no row
+    kparams[5] = row_aligned as i32; // dst_row_size_aligned
+    kparams[6] = 0; // src1_size
+    kparams[7] = vtcm_total as i32;
+    kparams[8] = chunk_size as i32;
+    kparams[9] = chunk_bytes as i32;
+    kparams[10] = 1; // is_scalar
+    Some(kparams)
+}
+
 /// Host-computed kernel parameters for binary operations (Mul, Add, Sub, Div).
 // Arity mirrors llama.cpp's fixed kparam builder signature; bundling into a
 // struct would diverge from that C truth for no readability gain.
@@ -1298,6 +1347,41 @@ pub fn build_hmx_fa_kernel_params_with_softcap(
 
 #[cfg(test)]
 mod tests {
+    /// The scalar-broadcast params the llama.cpp host precompute produces
+    /// (`ggml_hexagon_precompute_binary_params`, contiguous src1 of one
+    /// element), worked out by hand from its formulas.
+    #[test]
+    fn scalar_binary_kparams_follow_the_host_precompute() {
+        // 64 elements over 8 threads: chunk floors at 256 elements (1 KiB);
+        // VTCM = src0 + dst double buffers per thread + one 128 B scalar slot.
+        let k = build_binary_scalar_kernel_params(64, 8 << 20, 8).unwrap();
+        assert_eq!(
+            k[..11],
+            [
+                7,
+                8,
+                1,
+                256,
+                0,
+                256,
+                0,
+                2 * 8 * 2 * 1024 + 128,
+                256,
+                1024,
+                1
+            ]
+        );
+        assert!(k[11..].iter().all(|&v| v == 0));
+        // 2048 elements: the row is 8 KiB, the chunk size unchanged.
+        let k = build_binary_scalar_kernel_params(2048, 8 << 20, 8).unwrap();
+        assert_eq!((k[3], k[5], k[8], k[9]), (8192, 8192, 256, 1024));
+        // A big vector caps the chunk at 32 KiB.
+        let k = build_binary_scalar_kernel_params(1_000_000, 8 << 20, 4).unwrap();
+        assert_eq!((k[8], k[9], k[7]), (8192, 32768, 2 * 4 * 2 * 32768 + 128));
+        // Too little VTCM is a refusal, not a clipped layout.
+        assert!(build_binary_scalar_kernel_params(64, 1000, 8).is_none());
+    }
+
     use super::*;
 
     #[test]
