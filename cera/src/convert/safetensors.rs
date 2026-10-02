@@ -497,6 +497,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn gguf_tensor_dims_squeezes_only_the_singleton_conv_axis() {
+        let conv = "blk.0.shortconv.conv.weight";
+        assert_eq!(gguf_tensor_dims(conv, &[64, 1, 3]), vec![3, 64]);
+        // a middle axis that holds data is kept
+        assert_eq!(gguf_tensor_dims(conv, &[64, 2, 3]), vec![3, 2, 64]);
+        // any other tensor is just the reversed shape
+        assert_eq!(
+            gguf_tensor_dims("blk.0.ffn_gate.weight", &[8, 4]),
+            vec![4, 8]
+        );
+        assert_eq!(gguf_tensor_dims("blk.0.attn_norm.weight", &[8]), vec![8]);
+        // only the conv kernel, and only when it is 3-D
+        assert_eq!(
+            gguf_tensor_dims("blk.0.other.weight", &[64, 1, 3]),
+            vec![3, 1, 64]
+        );
+        assert_eq!(gguf_tensor_dims(conv, &[64, 1]), vec![1, 64]);
+    }
+
+    #[test]
     fn test_tensor_name_translation() {
         assert_eq!(
             translate_hf_to_gguf_tensor_name("model.embed_tokens.weight"),

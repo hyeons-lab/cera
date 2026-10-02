@@ -1,6 +1,7 @@
 //! The streaming converter writes the llama.cpp LFM2 layout: the same checks as
 //! `tests/convert_lfm2_layout.rs` makes of the local converter, through the HTTP path.
 
+use super::super::http::Context;
 use super::*;
 use crate::bundle::HfSpec;
 use crate::convert::{QuantizeOptions, TargetQuant, stream_quantize_hf_repo};
@@ -162,6 +163,180 @@ fn streaming_conversion_refuses_lfm2_moe_before_fetching_weights() {
             let err = stream_quantize_hf_repo(&spec, options(&cfg, progress))
                 .expect_err("MoE conversion is not implemented");
             assert!(err.to_string().contains("LFM2-MoE"), "{err}");
+            assert_no_conversion_artifacts(&ctx);
+        },
+        |_requests, ranges| {
+            assert!(
+                ranges.is_empty(),
+                "no shard bytes may be fetched: {ranges:?}"
+            );
+        },
+    );
+}
+
+/// The LFM2 fixture with one file's response replaced.
+fn file_route(name: &'static str, response: Response) -> impl Fn() -> HashMap<String, Response> {
+    move || {
+        let mut routes = routes("lfm2");
+        routes.insert(url(name), response.clone());
+        routes
+    }
+}
+
+fn url(name: &str) -> String {
+    format!("/fixture/{REPO}/resolve/{}/{name}", fixture::commit("main"))
+}
+
+/// Convert the fixture to F32 and open the result.
+fn convert(ctx: &Context) -> Result<GgufFile, crate::CeraError> {
+    let progress = Arc::new(Progress::default());
+    let cfg = config(&ctx.root, &progress);
+    let spec = HfSpec::parse(&format!("fixture/{REPO}:F32")).unwrap();
+    stream_quantize_hf_repo(&spec, options(&cfg, progress))?;
+    Ok(GgufFile::open(&cache_dir(&cfg, REPO, "F32").join("model.gguf")).unwrap())
+}
+
+/// A refused conversion leaves nothing a later call could mistake for a result: no GGUF,
+/// no temp file, no checkpoint and no receipt.
+fn assert_no_conversion_artifacts(ctx: &Context) {
+    let progress = Arc::new(Progress::default());
+    let cfg = config(&ctx.root, &progress);
+    let left: Vec<_> = fs::read_dir(cache_dir(&cfg, REPO, "F32"))
+        .map(|dir| dir.flatten().map(|e| e.file_name()).collect())
+        .unwrap_or_default();
+    assert!(left.is_empty(), "a refused conversion left {left:?}");
+}
+
+#[test]
+fn a_repo_without_chat_template_jinja_converts_without_a_template() {
+    isolated_with_ranges(
+        "conversion::lfm2::a_repo_without_chat_template_jinja_converts_without_a_template",
+        file_route("chat_template.jinja", Response::status(404)),
+        |ctx| {
+            let gguf = convert(&ctx).unwrap();
+            assert_eq!(gguf.get_str("tokenizer.chat_template"), None);
+        },
+        |_requests, _ranges| {},
+    );
+}
+
+#[test]
+fn a_chat_template_that_cannot_be_fetched_fails_the_conversion() {
+    // 403 is not retried. Treating it like a 404 would convert to a GGUF with no
+    // chat template and cache it as complete.
+    isolated_with_ranges(
+        "conversion::lfm2::a_chat_template_that_cannot_be_fetched_fails_the_conversion",
+        file_route("chat_template.jinja", Response::status(403)),
+        |ctx| {
+            let err = convert(&ctx)
+                .err()
+                .expect("an unreadable template must not be skipped");
+            assert!(err.to_string().contains("chat_template.jinja"), "{err}");
+            assert_no_conversion_artifacts(&ctx);
+        },
+        |requests, _ranges| {
+            assert_eq!(count(requests, "GET", &url("chat_template.jinja")), 1);
+        },
+    );
+}
+
+#[test]
+fn a_chat_template_that_is_not_text_fails_the_conversion() {
+    isolated_with_ranges(
+        "conversion::lfm2::a_chat_template_that_is_not_text_fails_the_conversion",
+        file_route("chat_template.jinja", Response::bytes([0xff, 0xfe])),
+        |ctx| {
+            let err = convert(&ctx)
+                .err()
+                .expect("a template that is not UTF-8 must not be skipped");
+            assert!(err.to_string().contains("chat_template.jinja"), "{err}");
+            assert_no_conversion_artifacts(&ctx);
+        },
+        |_requests, _ranges| {},
+    );
+}
+
+/// `tokenizer_config.json` carries the special tokens, the `add_*_token` overrides and
+/// often the template, so one that is present but unusable fails the conversion.
+fn unusable_tokenizer_config(name: &str, response: Response) {
+    isolated_with_ranges(
+        &format!("conversion::lfm2::{name}"),
+        file_route("tokenizer_config.json", response),
+        |ctx| {
+            let err = convert(&ctx)
+                .err()
+                .expect("an unusable tokenizer_config must not be skipped");
+            assert!(err.to_string().contains("tokenizer_config.json"), "{err}");
+            assert_no_conversion_artifacts(&ctx);
+        },
+        |_requests, _ranges| {},
+    );
+}
+
+#[test]
+fn a_tokenizer_config_that_cannot_be_fetched_fails_the_conversion() {
+    unusable_tokenizer_config(
+        "a_tokenizer_config_that_cannot_be_fetched_fails_the_conversion",
+        Response::status(403),
+    );
+}
+
+#[test]
+fn a_tokenizer_config_that_is_not_json_fails_the_conversion() {
+    unusable_tokenizer_config(
+        "a_tokenizer_config_that_is_not_json_fails_the_conversion",
+        Response::bytes("{ nope"),
+    );
+}
+
+#[test]
+fn chat_template_jinja_is_not_fetched_when_tokenizer_config_has_the_template() {
+    let config = json!({"bos_token": "<s>", "eos_token": "</s>", "chat_template": "{{ x }}"});
+    isolated_with_ranges(
+        "conversion::lfm2::chat_template_jinja_is_not_fetched_when_tokenizer_config_has_the_template",
+        // the standalone file would fail the conversion if it were consulted
+        move || {
+            let mut routes = file_route("chat_template.jinja", Response::status(403))();
+            routes.insert(
+                url("tokenizer_config.json"),
+                Response::bytes(config.to_string()),
+            );
+            routes
+        },
+        |ctx| {
+            let gguf = convert(&ctx).unwrap();
+            assert_eq!(gguf.get_str("tokenizer.chat_template"), Some("{{ x }}"));
+        },
+        |requests, _ranges| {
+            assert_eq!(count(requests, "GET", &url("chat_template.jinja")), 0);
+        },
+    );
+}
+
+#[test]
+fn a_token_id_past_vocab_size_is_refused_before_fetching_weights() {
+    isolated_with_ranges(
+        "conversion::lfm2::a_token_id_past_vocab_size_is_refused_before_fetching_weights",
+        || {
+            let mut routes = routes("lfm2");
+            // `vocab_size` is 8, so id 8 is one past the embedding
+            routes.insert(
+                url("tokenizer.json"),
+                Response::bytes(
+                    json!({
+                        "model": {"type": "BPE", "vocab": {"a": 0, "b": 8}, "merges": []},
+                    })
+                    .to_string(),
+                ),
+            );
+            routes
+        },
+        |ctx| {
+            let err = convert(&ctx)
+                .err()
+                .expect("a token id past vocab_size must not be converted");
+            assert!(err.to_string().contains("vocab_size"), "{err}");
+            assert_no_conversion_artifacts(&ctx);
         },
         |_requests, ranges| {
             assert!(

@@ -472,3 +472,67 @@ fn moe_checkpoints_are_refused_not_mislabelled() {
         .expect_err("MoE conversion is not implemented");
     assert!(err.to_string().contains("LFM2-MoE"), "{err}");
 }
+
+/// An optional input of the checkpoint that exists but cannot be used fails the
+/// conversion; it is not converted as if it were absent.
+#[test]
+fn unusable_optional_inputs_fail_the_conversion() {
+    for (name, file, bytes) in [
+        // tokenizer_config.json is the source of the special tokens and add_*_token
+        ("badconfig", "tokenizer_config.json", b"{ nope".to_vec()),
+        // chat_template.jinja is consulted when tokenizer_config.json has no template
+        ("badjinja", "chat_template.jinja", vec![0xff, 0xfe]),
+    ] {
+        let ckpt = Checkpoint::new(name);
+        std::fs::write(ckpt.0.join(file), bytes).unwrap();
+        let out = ckpt.0.join("out.gguf");
+        let err = quantize_safetensors_to_gguf(&ckpt.0, &out, TargetQuant::F32)
+            .expect_err("an unusable input must not be skipped");
+        assert!(err.to_string().contains(file), "{err}");
+        assert!(!out.exists(), "{file}: no output for a failed conversion");
+    }
+}
+
+#[test]
+fn chat_template_jinja_is_not_read_when_tokenizer_config_has_the_template() {
+    let ckpt = Checkpoint::new("configtemplate");
+    std::fs::write(
+        ckpt.0.join("tokenizer_config.json"),
+        json!({"bos_token": BOS, "eos_token": "<|im_end|>", "chat_template": "{{ x }}"})
+            .to_string(),
+    )
+    .unwrap();
+    // would fail the conversion if it were consulted
+    std::fs::write(ckpt.0.join("chat_template.jinja"), [0xff, 0xfe]).unwrap();
+    let gguf = ckpt.convert(TargetQuant::F32);
+    assert_eq!(gguf.get_str("tokenizer.chat_template"), Some("{{ x }}"));
+}
+
+#[test]
+fn an_explicit_add_bos_token_in_tokenizer_config_reaches_the_gguf() {
+    let ckpt = Checkpoint::new("addbos");
+    std::fs::write(
+        ckpt.0.join("tokenizer_config.json"),
+        json!({"bos_token": BOS, "eos_token": "<|im_end|>", "add_bos_token": false}).to_string(),
+    )
+    .unwrap();
+    let gguf = ckpt.convert(TargetQuant::F32);
+    assert_eq!(gguf.get_bool("tokenizer.ggml.add_bos_token"), Some(false));
+}
+
+#[test]
+fn a_token_id_past_vocab_size_is_refused() {
+    // the embedding has `vocab_size` rows: a token past them would index outside it
+    let ckpt = Checkpoint::new("bigid");
+    let mut tokenizer = tokenizer_json();
+    tokenizer["added_tokens"]
+        .as_array_mut()
+        .unwrap()
+        .push(json!({"id": VOCAB_SIZE + 5, "content": "<|late|>", "special": true}));
+    std::fs::write(ckpt.0.join("tokenizer.json"), tokenizer.to_string()).unwrap();
+    let out = ckpt.0.join("out.gguf");
+    let err = quantize_safetensors_to_gguf(&ckpt.0, &out, TargetQuant::F32)
+        .expect_err("a token id past vocab_size must not be converted");
+    assert!(err.to_string().contains("vocab_size"), "{err}");
+    assert!(!out.exists());
+}

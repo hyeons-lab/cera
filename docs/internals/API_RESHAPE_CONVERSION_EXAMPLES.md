@@ -280,8 +280,8 @@ all remaining values and also checks independent logits through position seven.
 The non-main metadata URL uses `/api/models/<owner>/<repo>/revision/<revision>`,
 matching the [official Hub client](https://github.com/huggingface/huggingface_hub/blob/main/src/huggingface_hub/hf_api.py).
 The internal metadata fetch honors the converter's explicit authentication option.
-Credentials are not stored in conversion records. The version-two request stores
-both requested revision and resolved commit; version-one records rebuild once.
+Credentials are not stored in conversion records. The version-three request stores
+both requested revision and resolved commit; version-one and version-two records rebuild once.
 
 **Remote conversion now requires a successful metadata lookup on every call**,
 including cached loads and explicit commit requests. The existing loader does

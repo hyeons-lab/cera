@@ -220,6 +220,12 @@ impl HfTokenizerJson {
         self.apply_to_gguf_writer_with(writer, chat_template, &VocabOptions::default());
     }
 
+    /// The highest token id, vocabulary and added tokens together.
+    pub fn max_token_id(&self) -> u32 {
+        let max_added = self.added_tokens.iter().map(|t| t.id).max().unwrap_or(0);
+        self.model.vocab.max_id().max(max_added)
+    }
+
     /// [`Self::apply_to_gguf_writer`] with explicit layout options.
     pub fn apply_to_gguf_writer_with(
         &self,
@@ -267,13 +273,16 @@ impl HfTokenizerJson {
         writer.add_string("tokenizer.ggml.pre", pre_type);
 
         // Invert vocab mapping ID -> token string
-        let max_vocab = self.model.vocab.max_id();
-        let max_added = self.added_tokens.iter().map(|t| t.id).max().unwrap_or(0);
-        let max_id = max_vocab.max(max_added);
+        let max_id = self.max_token_id();
 
         let mut vocab_size = (max_id.min(1_000_000) + 1) as usize;
         if options.llama_cpp_layout {
-            vocab_size = vocab_size.max(options.pad_to.unwrap_or(0).min(1_000_000));
+            vocab_size = vocab_size.max(
+                options
+                    .pad_to
+                    .unwrap_or(0)
+                    .min(crate::convert::config::MAX_PADDED_VOCAB),
+            );
         }
         let mut tokens = vec![String::new(); vocab_size];
         let mut scores = vec![0.0f32; vocab_size];
