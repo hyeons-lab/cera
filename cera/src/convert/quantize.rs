@@ -82,6 +82,8 @@ impl TargetQuant {
     }
 
     /// Select the appropriate GGML type for a tensor, checking per-tensor overrides first.
+    /// An override is an explicit instruction and is honoured as written: it can narrow a
+    /// 1-D norm that the default selection keeps in F32 (which llama.cpp then rejects).
     pub fn select_ggml_type_with_overrides(
         &self,
         tensor_name: &str,

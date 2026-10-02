@@ -124,6 +124,54 @@ fn extract_chat_template(tokenizer_config: &serde_json::Value) -> Option<String>
     })
 }
 
+/// An optional file of a checkpoint directory: `None` only when it is absent. A file
+/// that exists but cannot be read is an error, not a checkpoint without that file.
+fn read_optional_file(path: &Path) -> Result<Option<Vec<u8>>, CeraError> {
+    match fs::read(path) {
+        Ok(bytes) => Ok(Some(bytes)),
+        // a dangling symlink (a pruned blob in a Hugging Face cache snapshot) reads as
+        // not found, but the file is there: it is unreadable, not absent
+        Err(e)
+            if e.kind() == std::io::ErrorKind::NotFound && fs::symlink_metadata(path).is_err() =>
+        {
+            Ok(None)
+        }
+        Err(e) => Err(CeraError::Backend(format!(
+            "failed to read `{}`: {e}",
+            path.display()
+        ))),
+    }
+}
+
+fn read_optional_template(path: &Path) -> Result<Option<String>, CeraError> {
+    read_optional_file(path)?
+        .map(|bytes| template_from_utf8(bytes, &path.display().to_string()))
+        .transpose()
+}
+
+fn template_from_utf8(bytes: Vec<u8>, what: &str) -> Result<String, CeraError> {
+    // a byte order mark would be kept as a leading U+FEFF and rendered into every prompt,
+    // where it stops the first special token from matching
+    let text = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(&bytes);
+    std::str::from_utf8(text)
+        .map(str::to_owned)
+        .map_err(|e| CeraError::Backend(format!("`{what}` is not valid UTF-8: {e}")))
+}
+
+/// `tokenizer_config.json`, parsed. It supplies the special tokens, the `add_*_token`
+/// overrides and usually the chat template, so a file that is present but unusable is
+/// an error rather than a checkpoint without one.
+fn parse_tokenizer_config(bytes: &[u8], what: &str) -> Result<serde_json::Value, CeraError> {
+    // a UTF-8 byte order mark is common in files saved on Windows
+    let bytes = bytes.strip_prefix(b"\xef\xbb\xbf").unwrap_or(bytes);
+    serde_json::from_slice(bytes).map_err(|e| {
+        CeraError::Backend(format!(
+            "`{what}` is not valid JSON ({e}); NaN, Infinity and trailing commas are \
+             not accepted"
+        ))
+    })
+}
+
 /// The chat template for a checkpoint: the `chat_template` field of
 /// `tokenizer_config.json`, else the standalone `chat_template.jinja` that
 /// Transformers 5 writes instead.
@@ -131,9 +179,30 @@ fn resolve_chat_template(
     tokenizer_config: Option<&serde_json::Value>,
     template_jinja: Option<String>,
 ) -> Option<String> {
+    config_chat_template(tokenizer_config).or(template_jinja.filter(|t| !t.trim().is_empty()))
+}
+
+/// The non-blank `chat_template` of `tokenizer_config.json`. A blank one falls through to
+/// the standalone file, and the standalone file is fetched only when this is `None`.
+fn config_chat_template(tokenizer_config: Option<&serde_json::Value>) -> Option<String> {
     tokenizer_config
         .and_then(extract_chat_template)
-        .or(template_jinja.filter(|t| !t.trim().is_empty()))
+        .filter(|t| !t.trim().is_empty())
+}
+
+/// llama.cpp's converter asserts that every token id is below `vocab_size`: the
+/// embedding has `vocab_size` rows, so a token past them would index outside it.
+fn ensure_vocab_fits(config: &HfModelConfig, tokenizer: &HfTokenizerJson) -> Result<(), CeraError> {
+    let max_id = tokenizer.max_token_id() as usize;
+    match config.vocab_size {
+        Some(vocab_size) if config.uses_llama_cpp_vocab_layout() && max_id >= vocab_size => {
+            Err(CeraError::Backend(format!(
+                "tokenizer.json has a token id {max_id}, but config.json `vocab_size` is \
+                 {vocab_size}"
+            )))
+        }
+        _ => Ok(()),
+    }
 }
 
 /// Vocabulary layout options for `config`'s architecture.
@@ -163,6 +232,15 @@ fn transform_bailingmoe_ssm_a_inplace(f32_data: &mut [f32]) {
 }
 
 /// Stream and quantize a remote Hugging Face SafeTensors repository into a cached GGUF model.
+///
+/// # Errors
+///
+/// Besides network and format failures, this refuses (before fetching any weights) a
+/// checkpoint it would write a wrong GGUF for: LFM2-MoE, an LFM2 config whose layout or
+/// hyperparameters the loaders cannot use (see [`HfModelConfig::ensure_convertible`]), and
+/// an LFM2 tokenizer with a token id past `vocab_size`. The optional files
+/// `tokenizer_config.json` and `chat_template.jinja` are absent only on a 404; any other
+/// failure to fetch or parse them is an error rather than a conversion without them.
 #[cfg(feature = "remote")]
 pub fn stream_quantize_hf_repo(
     spec: &HfSpec,
@@ -246,19 +324,24 @@ pub fn stream_quantize_hf_repo(
     let tokenizer_url = pinned_spec.file_download_url("tokenizer.json");
     let tokenizer_bytes = fetch_hf_file_bytes(&client, &tokenizer_url, opts.auth_token.as_deref())?;
     let tokenizer = HfTokenizerJson::parse_from_bytes(&tokenizer_bytes)?;
+    ensure_vocab_fits(&config, &tokenizer)?;
 
     // Optional chat template & generation config
     let template_url = pinned_spec.file_download_url("tokenizer_config.json");
-    let tokenizer_config = fetch_hf_file_bytes(&client, &template_url, opts.auth_token.as_deref())
-        .ok()
-        .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-    let template_jinja = fetch_hf_file_bytes(
-        &client,
-        &pinned_spec.file_download_url("chat_template.jinja"),
-        opts.auth_token.as_deref(),
-    )
-    .ok()
-    .and_then(|b| String::from_utf8(b).ok());
+    let tokenizer_config =
+        fetch_optional_hf_file_bytes(&client, &template_url, opts.auth_token.as_deref())?
+            .map(|b| parse_tokenizer_config(&b, &template_url))
+            .transpose()?;
+    // the standalone file is only consulted when tokenizer_config.json has no template,
+    // so a repo that never needed it is not failed by it
+    let template_jinja = if config_chat_template(tokenizer_config.as_ref()).is_some() {
+        None
+    } else {
+        let jinja_url = pinned_spec.file_download_url("chat_template.jinja");
+        fetch_optional_hf_file_bytes(&client, &jinja_url, opts.auth_token.as_deref())?
+            .map(|b| template_from_utf8(b, &jinja_url))
+            .transpose()?
+    };
     let chat_template = resolve_chat_template(tokenizer_config.as_ref(), template_jinja);
 
     let gen_url = pinned_spec.file_download_url("generation_config.json");
@@ -769,6 +852,13 @@ pub fn quantize_safetensors_to_gguf_with_overrides(
 }
 
 /// Quantize a local SafeTensors directory or file to GGUF with explicit strategy and per-tensor overrides.
+///
+/// # Errors
+///
+/// The same refusals as `stream_quantize_hf_repo` (available with the `remote` feature). `tokenizer_config.json`,
+/// `chat_template.jinja` and `tokenizer.json` are absent only when the file is not there:
+/// one that is unreadable (including a dangling symlink), not UTF-8, or not valid JSON is an
+/// error rather than a conversion without it.
 pub fn quantize_safetensors_to_gguf_with_strategy(
     input_path: &Path,
     output_gguf_path: &Path,
@@ -813,21 +903,19 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
     let model_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("model");
     config.apply_to_gguf_writer(&mut writer, model_name);
 
-    if tokenizer_path.exists() {
-        let tok_bytes = fs::read(&tokenizer_path).map_err(|e| {
-            CeraError::Backend(format!(
-                "failed to read `{}`: {e}",
-                tokenizer_path.display()
-            ))
-        })?;
+    if let Some(tok_bytes) = read_optional_file(&tokenizer_path)? {
         let tokenizer = HfTokenizerJson::parse_from_bytes(&tok_bytes)?;
-        let tokenizer_config = fs::read(dir.join("tokenizer_config.json"))
-            .ok()
-            .and_then(|b| serde_json::from_slice::<serde_json::Value>(&b).ok());
-        let chat_template = resolve_chat_template(
-            tokenizer_config.as_ref(),
-            fs::read_to_string(dir.join("chat_template.jinja")).ok(),
-        );
+        ensure_vocab_fits(&config, &tokenizer)?;
+        let tokenizer_config_path = dir.join("tokenizer_config.json");
+        let tokenizer_config = read_optional_file(&tokenizer_config_path)?
+            .map(|b| parse_tokenizer_config(&b, &tokenizer_config_path.display().to_string()))
+            .transpose()?;
+        let template_jinja = if config_chat_template(tokenizer_config.as_ref()).is_some() {
+            None
+        } else {
+            read_optional_template(&dir.join("chat_template.jinja"))?
+        };
+        let chat_template = resolve_chat_template(tokenizer_config.as_ref(), template_jinja);
         tokenizer.apply_to_gguf_writer_with(
             &mut writer,
             chat_template.as_deref(),
@@ -1055,6 +1143,24 @@ fn fetch_hf_file_bytes(
     url: &str,
     auth_token: Option<&str>,
 ) -> Result<Vec<u8>, CeraError> {
+    fetch_optional_hf_file_bytes(client, url, auth_token)?.ok_or_else(|| {
+        CeraError::Backend(format!(
+            "HTTP {} when fetching `{url}`",
+            reqwest::StatusCode::NOT_FOUND
+        ))
+    })
+}
+
+/// Like [`fetch_hf_file_bytes`], but a 404 is `Ok(None)`: the file is absent from the
+/// repo. Every other failure (retries exhausted, 401/403, a dropped connection) stays
+/// an error, so a file that exists but could not be read is never mistaken for one
+/// that is not there.
+#[cfg(feature = "remote")]
+fn fetch_optional_hf_file_bytes(
+    client: &reqwest::blocking::Client,
+    url: &str,
+    auth_token: Option<&str>,
+) -> Result<Option<Vec<u8>>, CeraError> {
     let mut last_error = String::new();
     for attempt in 0..MAX_RETRIES {
         if attempt > 0 {
@@ -1074,7 +1180,9 @@ fn fetch_hf_file_bytes(
                     let bytes = resp
                         .bytes()
                         .map_err(|e| CeraError::Backend(format!("reading `{url}` bytes: {e}")))?;
-                    return Ok(bytes.to_vec());
+                    return Ok(Some(bytes.to_vec()));
+                } else if status == reqwest::StatusCode::NOT_FOUND {
+                    return Ok(None);
                 } else if is_retryable_status(status) {
                     last_error = format!("HTTP {status} when fetching `{url}`");
                 } else {
@@ -1213,6 +1321,113 @@ fn fetch_hf_file_range(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_template_file_is_absent_only_when_it_is_not_there() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("chat_template.jinja");
+        assert_eq!(read_optional_template(&path).unwrap(), None);
+        fs::write(&path, "{{ x }}").unwrap();
+        assert_eq!(
+            read_optional_template(&path).unwrap().as_deref(),
+            Some("{{ x }}")
+        );
+        // a byte order mark is not part of the template
+        fs::write(&path, b"\xef\xbb\xbf{{ x }}").unwrap();
+        assert_eq!(
+            read_optional_template(&path).unwrap().as_deref(),
+            Some("{{ x }}")
+        );
+        // present but unreadable as text: an error, not "no template"
+        fs::write(&path, [0xff, 0xfe]).unwrap();
+        assert!(read_optional_template(&path).is_err());
+        // a directory in its place is not "not found" either
+        fs::remove_file(&path).unwrap();
+        fs::create_dir(&path).unwrap();
+        assert!(read_optional_template(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_dangling_symlink_is_unreadable_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let link = dir.path().join("tokenizer_config.json");
+        std::os::unix::fs::symlink(dir.path().join("pruned-blob"), &link).unwrap();
+        // a Hugging Face cache snapshot whose blob is gone
+        assert!(read_optional_file(&link).is_err());
+        assert_eq!(
+            read_optional_file(&dir.path().join("never-there")).unwrap(),
+            None
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_path_under_a_regular_file_is_an_error_not_absent() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("a-file");
+        fs::write(&file, "x").unwrap();
+        // ENOTDIR: the file may well be there, the path just cannot be walked
+        assert!(read_optional_file(&file.join("chat_template.jinja")).is_err());
+    }
+
+    #[test]
+    fn a_blank_template_is_no_template() {
+        let blank = serde_json::json!({"chat_template": "  "});
+        // a blank one in tokenizer_config.json falls through to the standalone file
+        assert_eq!(config_chat_template(Some(&blank)), None);
+        assert_eq!(
+            resolve_chat_template(Some(&blank), Some("{{ x }}".into())).as_deref(),
+            Some("{{ x }}")
+        );
+        // and a blank standalone file is nothing
+        assert_eq!(resolve_chat_template(None, Some(" \n".into())), None);
+        // a real one in tokenizer_config.json wins
+        let real = serde_json::json!({"chat_template": "{{ y }}"});
+        assert_eq!(
+            resolve_chat_template(Some(&real), Some("{{ x }}".into())).as_deref(),
+            Some("{{ y }}")
+        );
+    }
+
+    #[test]
+    fn tokenizer_config_tolerates_a_byte_order_mark_and_explains_other_failures() {
+        let with_bom = [&b"\xef\xbb\xbf"[..], br#"{"bos_token": "<s>"}"#].concat();
+        assert_eq!(
+            parse_tokenizer_config(&with_bom, "t").unwrap()["bos_token"],
+            "<s>"
+        );
+        let err = parse_tokenizer_config(b"{\"x\": Infinity}", "tok.json").unwrap_err();
+        let err = err.to_string();
+        // names the file, carries the parser's position, and hints at the cause
+        assert!(err.contains("tok.json") && err.contains("line 1"), "{err}");
+        assert!(err.contains("Infinity"), "{err}");
+    }
+
+    #[test]
+    fn a_tokenizer_with_an_id_past_vocab_size_is_refused_for_lfm2_only() {
+        let tokenizer = |max_id: u32| {
+            HfTokenizerJson::parse_from_bytes(
+                serde_json::json!({
+                    "model": {"type": "BPE", "vocab": {"a": 0, "b": max_id}, "merges": []},
+                })
+                .to_string()
+                .as_bytes(),
+            )
+            .unwrap()
+        };
+        let config = |model_type: &str| {
+            HfModelConfig::from_json_str(
+                &serde_json::json!({"model_type": model_type, "vocab_size": 8}).to_string(),
+            )
+            .unwrap()
+        };
+        // the last row is id 7; id 8 is one past the embedding
+        assert!(ensure_vocab_fits(&config("lfm2"), &tokenizer(7)).is_ok());
+        assert!(ensure_vocab_fits(&config("lfm2"), &tokenizer(8)).is_err());
+        // other architectures keep their unchecked behaviour
+        assert!(ensure_vocab_fits(&config("llama"), &tokenizer(8)).is_ok());
+    }
 
     #[test]
     fn test_extract_chat_template_string_and_array() {

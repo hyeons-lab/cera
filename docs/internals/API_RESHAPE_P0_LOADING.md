@@ -672,7 +672,7 @@ platform sharing, large-model budgets and full P0-L/chat/Leap gates remain open.
 ## Plan19 upstream conversion revisions — completed 2026-09-09T12:16-0700
 
 An internal snapshot parser preserves HfModelInfo's public fields while validating
-a resolved full commit. Conversion binds that identity into version-two requests
+a resolved full commit. Conversion binds that identity into version-two requests (bumped to three by the LFM2 layout change)
 and pins all input URLs before cache/checkpoint reuse. The non-main metadata URL
 now uses the revision path. Four new upstream fixtures cover mutable inputs,
 changed weights with identical layout, cache refresh, rejected resolution and
