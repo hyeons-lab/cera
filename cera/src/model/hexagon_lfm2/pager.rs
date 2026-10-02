@@ -23,7 +23,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::weights::backend_msg;
-use crate::backend::hexagon::{FastRpcDriver, RpcmemBuffer, hexagon_warn};
+use crate::backend::hexagon::{FastRpcDriver, RpcmemBuffer, hexagon_warn, lock_reporting_poison};
 use crate::session::CeraError;
 
 const MIB: usize = 1 << 20;
@@ -257,7 +257,13 @@ impl ExpertPager {
         // Held for the whole call, so the check-then-act on the mapped flag is
         // atomic against any other caller (the device lock already keeps the
         // model to one forward at a time).
-        let mut window = self.window.lock().unwrap_or_else(|p| p.into_inner());
+        let (mut window, poisoned) = lock_reporting_poison(&self.window);
+        if poisoned {
+            // The window is consistent after any panic (see the field), so
+            // there is nothing to repair; the flag is cleared so this is said
+            // once rather than on every later page-in.
+            hexagon_warn!("expert window lock was poisoned by an earlier panic; continuing");
+        }
         if buf.is_mapped() {
             return Ok(());
         }
@@ -484,6 +490,30 @@ mod tests {
         p.page_in(4, &mut host).unwrap();
         assert_eq!(mapped(&p), [true, true, false, false, true, false]);
         assert_eq!(d.mapped_bytes(), 300 * MIB);
+    }
+
+    #[test]
+    fn a_poisoned_window_lock_is_recovered_once_and_cleared() {
+        let (_d, p) = pager(&[100; 6], 450);
+        let mut host = Host::default();
+        for g in 2..4 {
+            p.page_in(g, &mut host).unwrap();
+        }
+        // A panic while holding the lock poisons it.
+        std::thread::scope(|s| {
+            let _ = s
+                .spawn(|| {
+                    let _held = p.window.lock().unwrap();
+                    panic!("poison the window");
+                })
+                .join();
+        });
+        assert!(p.window.is_poisoned());
+        // The next page-in still rotates the window correctly...
+        p.page_in(4, &mut host).unwrap();
+        assert_eq!(mapped(&p), [true, true, false, false, true, false]);
+        // ...and clears the flag, so later calls do not recover again.
+        assert!(!p.window.is_poisoned());
     }
 
     #[test]
