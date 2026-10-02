@@ -46,7 +46,9 @@ vendoring them.
   chunk) was affected. The patch stores the smallest f16 at least
   `amax / 127` (rounded up, like the CPU quantizers, so no element quantizes
   past 127 even for a subnormal scale) and multiplies by the f32 reciprocal of
-  that stored scale. Measured on a
+  that stored scale. A block holding a NaN or infinity gets a NaN or
+  infinite scale and all-zero values (the CPU contract), so the poison reaches
+  the dot product. Measured on a
   Galaxy S25 Ultra (v79) against the CPU: full-logit cosine on 2 to 7 row
   chunks went from 0.95..0.99 to 0.9995 or better (LFM2.5-2.6B Q4_0 from
   -0.003..0.99 to 0.991..0.9999), single tokens from as low as 0.377 to
@@ -60,11 +62,11 @@ vendoring them.
 
 ## Integrity (md5)
 
-- v73: 57a35a38a7ba96cbb1532307260b0dcc
-- v75: b2df0421b98d5fe3638535a3437bfc7a
-- v79: fd6c087439f663b440c4729d68059cee
-- v81: 54a097f1e742a9944a5cbabab220d340
-- v85: 54a097f1e742a9944a5cbabab220d340
+- v73: 00e174b04ec625eb54eab8bd5933a816
+- v75: 304baf4b6fedeb47ea05dd6c5172c4e5
+- v79: 8d94eb0467b762dcb01a111c3847a402
+- v81: 1023a904c5bebc6d3b482e21a618c290
+- v85: 1023a904c5bebc6d3b482e21a618c290
 
 (Before the patch: v73 2dd73769..., v75 890dcd26..., v79 7da1d562...,
 v81/v85 43349eab....)
@@ -72,11 +74,17 @@ v81/v85 43349eab....)
 ## Rebuilding
 
 ```bash
-# in a llama.cpp checkout with HEXAGON_SDK_ROOT set (Linux):
+# in a llama.cpp checkout at the pinned commit, with HEXAGON_SDK_ROOT set (Linux):
+git checkout 00ccd6970
+git apply <cera>/cera/src/backend/hexagon/skels/patches/0001-*.patch
 cmake -S . -B build-snapdragon -DGGML_HEXAGON=ON <android preset>
-cmake --build build-snapdragon --target ggml-htp-v73 ggml-htp-v75 ggml-htp-v79 ggml-htp-v81 ggml-htp-v85
+cmake --build build-snapdragon --target ggml-htp-v73 ggml-htp-v75 ggml-htp-v79 ggml-htp-v81
+cp build-snapdragon/ggml/src/ggml-hexagon/libggml-htp-v81.so <...>/libggml-htp-v85.so
 # outputs: build-snapdragon/ggml/src/ggml-hexagon/libggml-htp-vXX.so
 ```
+
+Skipping the `git apply` reproduces the unpatched skels, whose md5s do not match
+the ones above.
 
 After replacing any skel: update the md5s above and re-run the full
 on-device determinism matrix (logits m=1..8 x5, greedy md5 2x2x6,

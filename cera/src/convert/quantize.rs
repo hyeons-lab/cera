@@ -1173,6 +1173,9 @@ pub fn quantize_q6_k(input: &[f32], output: &mut [u8]) -> Result<(), CeraError> 
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+    use crate::quant::{dequantize_q4_0_matrix, dequantize_q8_0_matrix};
+
     /// A NaN or infinity in a block poisons the whole block (non-finite scale, zero
     /// quants) in every Q8_0 quantizer; neighbouring finite blocks are unchanged.
     #[test]
@@ -1217,9 +1220,6 @@ mod tests {
             }
         }
     }
-
-    use super::*;
-    use crate::quant::{dequantize_q4_0_matrix, dequantize_q8_0_matrix};
 
     #[test]
     fn test_quantize_q8_0_roundtrip() {
