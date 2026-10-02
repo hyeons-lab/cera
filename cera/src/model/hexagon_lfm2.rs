@@ -16,12 +16,12 @@ use crate::backend::cpu::RopeType;
 use crate::backend::hexagon::{
     AdpfSession, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
     HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, LockOrRecover,
-    RpcmemBuffer, StagedBatch, build_binary_kernel_params,
-    build_flash_attn_kernel_params_with_softcap, build_hmx_fa_kernel_params_with_softcap,
-    build_hmx_mm_kernel_params, build_mul_mat_kernel_params, build_rms_norm_params,
-    build_rope_kernel_params, build_rope_params, build_set_rows_kernel_params,
-    build_ssm_conv_kernel_params, build_unary_kernel_params, fa_is_hmx_eligible, lock_or_discard,
-    mm_hmx_nb1, mm_is_hmx_eligible,
+    RpcmemBuffer, StagedBatch, build_binary_kernel_params, build_binary_scalar_kernel_params,
+    build_flash_attn_kernel_params_with_softcap, build_get_rows_f32_kernel_params,
+    build_hmx_fa_kernel_params_with_softcap, build_hmx_mm_kernel_params,
+    build_mul_mat_kernel_params, build_rms_norm_params, build_rope_kernel_params,
+    build_rope_params, build_set_rows_kernel_params, build_ssm_conv_kernel_params,
+    build_unary_kernel_params, fa_is_hmx_eligible, lock_or_discard, mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::backend::hexagon::{hexagon_error, hexagon_warn};
 use crate::gguf::GgufFile;
@@ -47,6 +47,9 @@ struct HexagonWeight {
 
 #[derive(Clone, Copy, Debug)]
 struct HexagonStackedWeight {
+    /// Paged experts only: which per-layer expert buffer holds the weight
+    /// (`offset` is then local to it). `None` = the resident weights buffer.
+    group: Option<usize>,
     offset: usize,
     size: usize,
     in_dim: usize,
@@ -425,6 +428,68 @@ impl HexagonKnobs {
     }
 }
 
+/// Bytes of KV and conv state the model will map, sized the way the real plan
+/// sizes them (`debug_assert`ed equal to it after planning).
+fn kv_state_bytes(config: &ModelConfig, kv_dtype: HtpDataType) -> usize {
+    let mut est = KvPlanner::new(kv_dtype, config.max_seq_len);
+    for i in 0..config.n_layers {
+        if config.block_types[i] == BlockType::Attention {
+            est.attention(config.kv_heads_per_layer[i] * config.head_dim);
+        } else {
+            est.conv(align256(config.hidden_size * 4));
+        }
+    }
+    est.total
+}
+
+/// Why `--device auto` will not page a routed model.
+fn paging_refusal(gguf_bytes: u64, kv_bytes: usize, paging: &Paging) -> String {
+    format!(
+        "{} MiB of weights and {} MiB of KV state do not fit the {} MiB DSP mapping budget and \
+         would need paging, which decodes at about 40% of the CPU's speed; skipping the NPU. Set \
+         CERA_HEXAGON_PAGE_EXPERTS=1, or request the NPU explicitly (BackendPreference::Hexagon, \
+         `--device hexagon`), to page them",
+        gguf_bytes >> 20,
+        kv_bytes >> 20,
+        paging.budget >> 20
+    )
+}
+
+/// [`paging_refusal`] as an error, with a visible notice: the caller logs the
+/// error at debug only, and a phone shows nothing below that. Only for a
+/// device that is known to be there (a missing NPU is not worth a notice).
+fn paging_refused(gguf_bytes: u64, kv_bytes: usize, paging: &Paging) -> CeraError {
+    let msg = paging_refusal(gguf_bytes, kv_bytes, paging);
+    hexagon_warn!("{msg}");
+    CeraError::Backend(msg)
+}
+
+/// `--device auto`'s refusal, decided from the GGUF before any device work: a
+/// routed model that cannot fit the budget even with nothing else mapped would
+/// need paging. Returns the refusal text without logging it, because whether
+/// to announce it depends on an NPU being there at all. (The check in
+/// `from_gguf_on_with` stays for the borderline case where the scratch buffers
+/// tip it over.)
+fn auto_precheck(
+    gguf: &GgufFile,
+    context_size: usize,
+    paging: &Paging,
+) -> Result<Option<String>, CeraError> {
+    if paging.allow_paged {
+        return Ok(None);
+    }
+    let config = crate::model::lfm2::LfmModel::parse_config(gguf, context_size)
+        .map_err(|e| CeraError::Backend(e.to_string()))?;
+    if config.moe.is_none() {
+        return Ok(None);
+    }
+    let gguf_bytes: u64 = gguf.tensors.values().map(|t| t.size_bytes as u64).sum();
+    let kv_bytes = kv_state_bytes(&config, HexagonKnobs::from_env().kv_dtype());
+    Ok(paging
+        .should_page(gguf_bytes, 0, kv_bytes)
+        .then(|| paging_refusal(gguf_bytes, kv_bytes, paging)))
+}
+
 /// The device side every constructor needs, opened once: FastRPC driver, the
 /// probed DSP session, the parsed knobs and the ADPF hint session.
 struct Backend {
@@ -504,6 +569,9 @@ struct ModelParts {
     config: ModelConfig,
     token_embd: EmbeddingTable,
     weights_buf: RpcmemBuffer,
+    /// Routed-expert buffers paged through the DSP mapping (`None` = the
+    /// experts, if any, live in `weights_buf`).
+    pager: Option<ExpertPager>,
     layers: Vec<HexagonLayer>,
     output_norm_offset: usize,
     lm_head: HexagonWeight,
@@ -1048,6 +1116,9 @@ pub struct HexagonLfmModel {
     // Token embedding on CPU
     token_embd: EmbeddingTable,
 
+    /// Per-layer routed-expert buffers when the experts are paged through the
+    /// DSP mapping; stacked weights with a `group` live here, not in `weights_buf`.
+    pager: Option<ExpertPager>,
     // Unified weights buffer in rpcmem (all static weights across all layers)
     weights_buf: RpcmemBuffer,
     layers: Vec<HexagonLayer>,
@@ -1149,7 +1220,9 @@ enum DecodeResult {
 mod blocks;
 mod host;
 mod ops;
+mod pager;
 mod weights;
+use pager::{ExpertPager, Paging};
 use weights::*;
 
 impl HexagonLfmModel {
@@ -1242,6 +1315,7 @@ impl HexagonLfmModel {
             session_gate: ModelSessionGate::default(),
             token_embd: p.token_embd,
             weights_buf: p.weights_buf,
+            pager: p.pager,
             layers: p.layers,
             output_norm_offset: p.output_norm_offset,
             lm_head: p.lm_head,
@@ -1281,11 +1355,73 @@ impl HexagonLfmModel {
         Self::from_gguf_on(Backend::open()?, gguf, context_size)
     }
 
+    /// [`Self::from_gguf`] for `--device auto`: a routed model that does not
+    /// fit the DSP address space is refused rather than paged (paging runs at
+    /// about 40% of the CPU's decode speed), unless `CERA_HEXAGON_PAGE_EXPERTS`
+    /// asks for it.
+    pub(crate) fn from_gguf_auto(
+        gguf: GgufFile,
+        _path: Option<&Path>,
+        context_size: usize,
+    ) -> Result<Self, CeraError> {
+        Self::from_gguf_auto_on(
+            || {
+                // Driver present and not switched off, without the DSP session.
+                HexagonContext::new().map(|_| ()).inspect_err(|e| {
+                    crate::backend::hexagon::log_context_unavailable("HexagonLfmModel", e);
+                })
+            },
+            Backend::open,
+            gguf,
+            context_size,
+            Paging::from_env(),
+        )
+    }
+
+    /// [`Self::from_gguf_auto`] with the device-presence check, the device
+    /// opener and the base paging policy given. The refusal is decided from the
+    /// GGUF alone first, so a model that will not be loaded never pays for
+    /// opening the device; it is announced only once `present` confirms there
+    /// is an NPU (with none, or the kill switch set, the usual unavailable
+    /// error is what the caller should see).
+    fn from_gguf_auto_on(
+        present: impl FnOnce() -> Result<(), CeraError>,
+        open: impl FnOnce() -> Result<Backend, CeraError>,
+        gguf: GgufFile,
+        context_size: usize,
+        base: Paging,
+    ) -> Result<Self, CeraError> {
+        let paging = base.for_auto();
+        if let Some(refusal) = auto_precheck(&gguf, context_size, &paging)? {
+            present()?;
+            hexagon_warn!("{refusal}");
+            return Err(CeraError::Backend(refusal));
+        }
+        Self::from_gguf_on_with(open()?, gguf, context_size, paging)
+    }
+
     /// [`Self::from_gguf`] on an already opened device (host tests pass a fake).
     fn from_gguf_on(
         backend: Backend,
         gguf: GgufFile,
         context_size: usize,
+    ) -> Result<Self, CeraError> {
+        // Tests build models on the host and must not depend on the developer's
+        // environment (a stray `CERA_HEXAGON_PAGE_EXPERTS` flips the goldens).
+        let paging = if cfg!(test) {
+            Paging::default()
+        } else {
+            Paging::from_env()
+        };
+        Self::from_gguf_on_with(backend, gguf, context_size, paging)
+    }
+
+    /// [`Self::from_gguf_on`] with the paging policy given (host tests force it).
+    fn from_gguf_on_with(
+        backend: Backend,
+        gguf: GgufFile,
+        context_size: usize,
+        paging: Paging,
     ) -> Result<Self, CeraError> {
         let gguf = Arc::new(gguf);
         let config = crate::model::lfm2::LfmModel::parse_config(&gguf, context_size)
@@ -1352,7 +1488,20 @@ impl HexagonLfmModel {
         }
 
         let src = GgufSource { gguf: &gguf };
-        let mut plan = WeightPlanner::new(&src);
+        // Routed experts that cannot all stay mapped are planned into one
+        // buffer per layer and paged (see `pager`). Scratch is already mapped
+        // here, so `mapped_bytes` counts it.
+        let map_budget = paging.budget;
+        let gguf_bytes: u64 = gguf.tensors.values().map(|t| t.size_bytes as u64).sum();
+        // KV and conv state are mapped after the weights are planned; size them
+        // now so a long context counts against the choice to page.
+        let kv_bytes = kv_state_bytes(&config, kv_dtype);
+        let paged =
+            config.moe.is_some() && paging.should_page(gguf_bytes, driver.mapped_bytes(), kv_bytes);
+        if paged && !paging.allow_paged {
+            return Err(paging_refused(gguf_bytes, kv_bytes, &paging));
+        }
+        let mut plan = WeightPlanner::new(&src).with_paged_experts(paged);
         let mut kv = KvPlanner::new(kv_dtype, max_seq_len);
         let state_size = align256(hidden_size * 4);
         let moe_dims = |i: usize| {
@@ -1445,6 +1594,8 @@ impl HexagonLfmModel {
         let output_norm_offset = plan.vector(output_norm_name, hidden_size);
         let lm_head = plan.weight(lm_head_name, hidden_size, vocab_size)?;
 
+        // The estimate that chose paging must be the plan's own total.
+        debug_assert_eq!(kv.total, kv_bytes);
         let (weights_buf, kv_state_buf) = WeightCopy {
             src: &src,
             weights_total: plan.total,
@@ -1452,6 +1603,22 @@ impl HexagonLfmModel {
             copies: &plan.copies,
         }
         .run(driver)?;
+        let expert_bufs = run_expert_copies(&src, &plan.groups, driver)?;
+        let pager = if expert_bufs.is_empty() {
+            None
+        } else {
+            let n_groups = expert_bufs.len();
+            let pager = ExpertPager::new(Arc::clone(driver), expert_bufs, map_budget)?;
+            hexagon_warn!(
+                "paging routed experts through the DSP mapping: {} of {n_groups} layers \
+                 pinned, the rest rotate (budget {} KiB, {} KiB mapped, {} KiB per layer)",
+                pager.pinned(),
+                map_budget >> 10,
+                driver.mapped_bytes() >> 10,
+                pager.buf(0).size() >> 10
+            );
+            Some(pager)
+        };
 
         Ok(Self::from_parts(
             device,
@@ -1461,6 +1628,7 @@ impl HexagonLfmModel {
                 config,
                 token_embd,
                 weights_buf,
+                pager,
                 layers,
                 output_norm_offset,
                 lm_head,
@@ -1768,6 +1936,7 @@ impl HexagonLfmModel {
                 config,
                 token_embd,
                 weights_buf,
+                pager: None,
                 layers,
                 output_norm_offset,
                 lm_head,
@@ -2027,6 +2196,7 @@ impl HexagonLfmModel {
                 config,
                 token_embd,
                 weights_buf,
+                pager: None,
                 layers,
                 output_norm_offset,
                 lm_head,

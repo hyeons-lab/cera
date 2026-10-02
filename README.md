@@ -101,7 +101,7 @@ or you can pin one:
 | **Qualcomm Hexagon NPU** | `hexagon` | Android, Linux (aarch64) | FastRPC Unsigned Process Domain, shared DMA memory, repacked 32x32 Q4_0/Q8_0 matrix kernels on Snapdragon 8 Gen 2 / 8 Gen 3 / 8 Elite |
 | **wgpu** | `gpu` | macOS, Linux, Windows, browser | WGSL shaders over **Metal / Vulkan / DX12 / WebGPU** |
 
-`--device auto` prefers native Metal on macOS and iOS, Qualcomm Hexagon NPU on supported Snapdragon devices, and wgpu where a GPU is available, falling back to CPU otherwise.
+`--device auto` prefers native Metal on macOS and iOS, Qualcomm Hexagon NPU on supported Snapdragon devices, and wgpu where a GPU is available, falling back to CPU otherwise. A routed-expert model too large for the DSP's mappable memory (LFM2.5-8B-A1B) skips the NPU under `auto`, since paging it is slower than the CPU; set `CERA_HEXAGON_PAGE_EXPERTS=1`, or ask for `--device hexagon`, to page it.
 
 ### Qualcomm Hexagon NPU backend
 

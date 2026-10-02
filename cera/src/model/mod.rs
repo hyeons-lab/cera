@@ -1169,11 +1169,38 @@ pub fn load_model_hexagon(
     path: Option<&std::path::Path>,
     context_size: usize,
 ) -> Result<Box<dyn Model>> {
+    load_model_hexagon_impl(gguf, path, context_size, false)
+}
+
+/// [`load_model_hexagon`] for `--device auto`: a routed-expert model that would
+/// have to be paged through the DSP mapping is refused (so auto falls through
+/// to the CPU, which is faster) unless `CERA_HEXAGON_PAGE_EXPERTS` asks for it.
+#[cfg(feature = "hexagon")]
+pub(crate) fn load_model_hexagon_auto(
+    gguf: GgufFile,
+    path: Option<&std::path::Path>,
+    context_size: usize,
+) -> Result<Box<dyn Model>> {
+    load_model_hexagon_impl(gguf, path, context_size, true)
+}
+
+#[cfg(feature = "hexagon")]
+fn load_model_hexagon_impl(
+    gguf: GgufFile,
+    path: Option<&std::path::Path>,
+    context_size: usize,
+    auto: bool,
+) -> Result<Box<dyn Model>> {
     let arch = gguf
         .get_str("general.architecture")
         .unwrap_or("unknown")
         .to_string();
     match arch.as_str() {
+        "lfm2" | "lfm2moe" if auto => Ok(Box::new(hexagon_lfm2::HexagonLfmModel::from_gguf_auto(
+            gguf,
+            path,
+            context_size,
+        )?)),
         "lfm2" | "lfm2moe" => Ok(Box::new(hexagon_lfm2::HexagonLfmModel::from_gguf(
             gguf,
             path,
