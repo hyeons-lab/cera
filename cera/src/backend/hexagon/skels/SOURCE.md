@@ -37,6 +37,8 @@ vendoring them.
   (`ggml/src/ggml-hexagon/htp/` + `htp_iface.idl`), including extended
   Conv1D, ConvTranspose1D, Snake, and unary operations.
 - Patch: `patches/0001-hvx-q8-activation-quantizer-f32-reciprocal.patch`
+  (also the branch `fix/hvx-q8-activation-quantizer` of `hyeons-lab/llama.cpp`,
+  two commits on top of `00ccd6970`, tip `2b2070940`)
   (`hvx-mm-kernels-tiled.h`, the `q8_0` and `q8_1` tiled activation
   quantizers). The upstream quantizer computed the Q8 scale and its
   reciprocal in f16: for a block whose absolute maximum is below about
