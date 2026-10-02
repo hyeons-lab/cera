@@ -1,27 +1,8 @@
-From 8295af1ede159a25fc6a6eac0f506ff810e33f14 Mon Sep 17 00:00:00 2001
-From: David Berrios <david@hyeons-lab.com>
-Date: Thu, 1 Oct 2026 23:55:26 -0700
-Subject: [PATCH] fix(hexagon): quantize HVX matmul activations with an f32
- reciprocal of the rounded f16 scale
-
-The Q8 activation quantizer did its whole first stage in f16: scale = max/127 and its
-reciprocal both as f16. For a block with a small absolute maximum the scale is an f16
-subnormal below ~7.7e-3 and its reciprocal overflows f16 below ~2e-3, so the int8 values
-were scaled wrongly (50%+ relative error on those blocks). Activations such as a short
-convolution's output hit this regularly.
-
-Round the scale to f16 first, then multiply by the f32 reciprocal of the rounded scale, so
-the int8 values and the stored scale describe the same numbers. The 128-element multiply,
-rounding and packing stay in HVX.
----
- .../ggml-hexagon/htp/hvx-mm-kernels-tiled.h   | 179 ++++++++++--------
- 1 file changed, 101 insertions(+), 78 deletions(-)
-
 diff --git a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
-index 4564b1524..1b0c9d856 100644
+index 4564b1524..70a917a23 100644
 --- a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
 +++ b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
-@@ -1,46 +1,103 @@
+@@ -1,46 +1,111 @@
  // Dynamic quantizers that produce tiled activations
  
 -static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * restrict y_block) {
@@ -40,11 +21,6 @@ index 4564b1524..1b0c9d856 100644
 -    HVX_Vector vx1_qf = Q6_Vqf32_vsub_VsfVsf(vx[1], zero);
 -    HVX_Vector vx2_qf = Q6_Vqf32_vsub_VsfVsf(vx[2], zero);
 -    HVX_Vector vx3_qf = Q6_Vqf32_vsub_VsfVsf(vx[3], zero);
--
--    HVX_Vector vmax0_qf = Q6_Vqf32_vsub_VsfVsf(vmax0_sf, zero);
--    HVX_Vector vmax1_qf = Q6_Vqf32_vsub_VsfVsf(vmax1_sf, zero);
--    HVX_Vector vmax2_qf = Q6_Vqf32_vsub_VsfVsf(vmax2_sf, zero);
--    HVX_Vector vmax3_qf = Q6_Vqf32_vsub_VsfVsf(vmax3_sf, zero);
 +// f32 -> f16 bits, round to nearest even, with subnormals. Plain integer code so it needs no
 +// compiler runtime on the DSP.
 +static inline uint16_t htp_q8_f32_to_f16_bits(float f) {
@@ -82,8 +58,10 @@ index 4564b1524..1b0c9d856 100644
 +    return (uint16_t) (sign | r);
 +}
  
--    HVX_Vector vmax01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vmax1_qf, vmax0_qf)));
--    HVX_Vector vmax23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vmax3_qf, vmax2_qf)));
+-    HVX_Vector vmax0_qf = Q6_Vqf32_vsub_VsfVsf(vmax0_sf, zero);
+-    HVX_Vector vmax1_qf = Q6_Vqf32_vsub_VsfVsf(vmax1_sf, zero);
+-    HVX_Vector vmax2_qf = Q6_Vqf32_vsub_VsfVsf(vmax2_sf, zero);
+-    HVX_Vector vmax3_qf = Q6_Vqf32_vsub_VsfVsf(vmax3_sf, zero);
 +// f16 bits -> f32, for the non-negative finite scales produced above.
 +static inline float htp_q8_f16_bits_to_f32(uint16_t h) {
 +    const uint32_t e = (h >> 10) & 0x1fu;
@@ -96,15 +74,15 @@ index 4564b1524..1b0c9d856 100644
 +    return v.f;
 +}
  
--    HVX_Vector vx01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx1_qf, vx0_qf)));
--    HVX_Vector vx23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx3_qf, vx2_qf)));
+-    HVX_Vector vmax01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vmax1_qf, vmax0_qf)));
+-    HVX_Vector vmax23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vmax3_qf, vmax2_qf)));
 +// First stage of the Q8 activation quantizers: 128 floats (four groups of 32) to packed int8
 +// values (`vx_i8`, in element order) and the four f16 group scales laid out the way the HVX tail
 +// expects them (group 0 in halfword lanes 0..31 of `vd01_hf`, group 1 in 32..63; groups 2 and 3
 +// likewise in `vd23_hf`). `d_f32` returns the scales as f32.
 +//
-+// Each scale is rounded to f16 FIRST and the values are then multiplied by the reciprocal of the
-+// ROUNDED scale (in f32), so the int8 values and the stored scale always describe the same numbers.
++// Each scale is rounded UP to f16 FIRST (the smallest f16 at least amax / 127) and the values are then
++// multiplied by the reciprocal of the ROUNDED scale (in f32), so the int8 values and the stored scale always describe the same numbers.
 +// The previous HVX path did this whole stage in f16, which breaks for blocks with a small maximum:
 +// below about 7.7e-3 the scale is an f16 subnormal, and below about 2e-3 its reciprocal overflows
 +// f16, so the values came out wrongly scaled (relative error of 50% or more).
@@ -120,11 +98,21 @@ index 4564b1524..1b0c9d856 100644
 +
 +    for (int g = 0; g < 4; ++g) {
 +        *(HVX_Vector *) mx = hvx_vec_reduce_max_f32(hvx_vec_abs_f32(vx[g]));
-+        const uint16_t dh  = htp_q8_f32_to_f16_bits(mx[0] * (1.0f / 127.0f));
-+        const float    d   = htp_q8_f16_bits_to_f32(dh);
++        // The stored scale is the smallest f16 at least amax / 127 (round UP, like the CPU
++        // quantizers): rounding to nearest could land below it, and for an f16-subnormal scale
++        // the largest element would then quantize past 127 and saturate.
++        const float    raw_d = mx[0] * (1.0f / 127.0f);
++        uint16_t       dh    = htp_q8_f32_to_f16_bits(raw_d);
++        float          d     = htp_q8_f16_bits_to_f32(dh);
++        if (d < raw_d && dh < 0x7c00u) {
++            dh++;
++            d = htp_q8_f16_bits_to_f32(dh);
++        }
 +        const float    inv = d > 0.0f ? 1.0f / d : 0.0f;
 +        d_f32[g]           = d;
-+
+ 
+-    HVX_Vector vx01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx1_qf, vx0_qf)));
+-    HVX_Vector vx23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx3_qf, vx2_qf)));
 +        uint32_t * dw = (uint32_t *) (dbits[g >> 1] + (g & 1) * 32);
 +        const uint32_t w = (uint32_t) dh * 0x10001u;
 +        for (int i = 0; i < 16; ++i) {
@@ -161,7 +149,7 @@ index 4564b1524..1b0c9d856 100644
  
      const HVX_Vector ones = Q6_Vb_vsplat_R(1);
      HVX_Vector v_sums = Q6_Vw_vrmpy_VbVb(vx_i8, ones);
-@@ -48,11 +105,11 @@ static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * r
+@@ -48,11 +113,11 @@ static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * r
      v_sums = Q6_Vw_vadd_VwVw(v_sums, Q6_V_vror_VR(v_sums, 8));
      v_sums = Q6_Vw_vadd_VwVw(v_sums, Q6_V_vror_VR(v_sums, 16));
  
@@ -178,7 +166,7 @@ index 4564b1524..1b0c9d856 100644
  
      HVX_Vector v_sums_sf = Q6_Vsf_equals_Vw(v_sums);
      HVX_Vector voff0_sf = hvx_vec_mul_f32_f32(vd0_sf, v_sums_sf);
-@@ -118,43 +175,9 @@ static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * r
+@@ -118,43 +183,9 @@ static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * r
      assert((unsigned long) x % 128 == 0);
      assert((unsigned long) y_block % 128 == 0);
  
@@ -225,6 +213,3 @@ index 4564b1524..1b0c9d856 100644
  
      HVX_VectorPair vp01 = Q6_W_vshuff_VVR(vd01_hf, vd01_hf, -64);
      HVX_VectorPair vp23 = Q6_W_vshuff_VVR(vd23_hf, vd23_hf, -64);
--- 
-2.50.1 (Apple Git-155)
-

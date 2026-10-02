@@ -43,8 +43,10 @@ vendoring them.
   2e-3 the reciprocal overflowed f16 and the int8 values were wrongly
   scaled (50% or more relative error on that block). Every HVX matmul
   of 1 to 7 rows (all decode steps, short prompts, a prompt's tail
-  chunk) was affected. The patch rounds the scale to f16 first and
-  multiplies by the f32 reciprocal of the rounded scale. Measured on a
+  chunk) was affected. The patch stores the smallest f16 at least
+  `amax / 127` (rounded up, like the CPU quantizers, so no element quantizes
+  past 127 even for a subnormal scale) and multiplies by the f32 reciprocal of
+  that stored scale. Measured on a
   Galaxy S25 Ultra (v79) against the CPU: full-logit cosine on 2 to 7 row
   chunks went from 0.95..0.99 to 0.9995 or better (LFM2.5-2.6B Q4_0 from
   -0.003..0.99 to 0.991..0.9999), single tokens from as low as 0.377 to
@@ -58,11 +60,11 @@ vendoring them.
 
 ## Integrity (md5)
 
-- v73: b38bb632b371a173ccc0e1deb0a06866
-- v75: 2bc548e1a3c22d8ce195cadf8f15c35e
-- v79: d6b2ae2de46ab1f466fdc9eb4872fdf3
-- v81: 1612c5eba751428e927c5f3896faea3c
-- v85: 1612c5eba751428e927c5f3896faea3c
+- v73: 57a35a38a7ba96cbb1532307260b0dcc
+- v75: b2df0421b98d5fe3638535a3437bfc7a
+- v79: fd6c087439f663b440c4729d68059cee
+- v81: 54a097f1e742a9944a5cbabab220d340
+- v85: 54a097f1e742a9944a5cbabab220d340
 
 (Before the patch: v73 2dd73769..., v75 890dcd26..., v79 7da1d562...,
 v81/v85 43349eab....)

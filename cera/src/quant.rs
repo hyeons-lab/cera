@@ -192,6 +192,12 @@ pub(crate) fn f32_to_f16(v: f32) -> u16 {
 /// `amax` gives scale 0 and zero quants.
 #[inline(always)]
 pub(crate) fn q8_0_block_scale(amax: f32) -> f32 {
+    // `amax` is an absolute maximum. A negative one would put the sign bit in `h`,
+    // and `h + 1` then rounds *down*, breaking the "at least amax / 127" contract.
+    debug_assert!(
+        amax.is_nan() || amax >= 0.0,
+        "q8_0_block_scale takes an absolute maximum"
+    );
     let d = amax / 127.0;
     let h = f32_to_f16(d);
     let r = f16_to_f32(h);

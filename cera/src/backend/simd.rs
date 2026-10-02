@@ -15212,7 +15212,7 @@ pub(crate) mod avx512_vnni {
                 let h = crate::quant::f32_to_f16(d);
                 let mut ds = crate::quant::f16_to_f32(h);
                 if ds < d {
-                    ds = crate::quant::f16_to_f32(h + 1);
+                    ds = crate::quant::f16_to_f32(h.wrapping_add(1));
                 }
                 // Mirrors the non-finite guard in the kernel under test.
                 let id = match 1.0 / ds {

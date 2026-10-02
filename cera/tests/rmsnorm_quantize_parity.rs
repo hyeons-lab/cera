@@ -131,3 +131,29 @@ fn fused_rmsnorm_quantize_matches_on_non_finite_inputs() {
         }
     }
 }
+
+/// A block whose normalized values exceed what an f16 scale can hold (`amax` above
+/// about 8.3e6) takes an infinite scale and zero quants on both routes, so decode and
+/// prefill stay identical there too.
+#[test]
+fn fused_rmsnorm_quantize_matches_when_the_f16_scale_overflows() {
+    let mut rnd = noise(31);
+    let n = 128;
+    let x: Vec<f32> = (0..n).map(|_| rnd() + 0.5).collect();
+    // block 1 gets a huge weight, the others stay ordinary
+    let w: Vec<f32> = (0..n)
+        .map(|j| if (32..64).contains(&j) { 1.0e8 } else { 1.0 })
+        .collect();
+    let (mut sc_f, mut q_f) = (vec![0f32; n / 32], vec![0i8; n]);
+    cpu::rmsnorm_and_quantize_q8_0(&x, &w, 1e-5, &mut sc_f, &mut q_f, None);
+    let mut norm = vec![0f32; n];
+    cpu::rmsnorm_into(&x, &mut norm, &w, 1e-5);
+    let (mut sc_s, mut q_s) = (vec![0f32; n / 32], vec![0i8; n]);
+    cpu::quantize_f32_to_q8_0_into(&norm, &mut sc_s, &mut q_s);
+    assert_eq!(q_f, q_s, "quants");
+    assert!(sc_f[1].is_infinite(), "overflowing block scale {}", sc_f[1]);
+    assert!(q_f[32..64].iter().all(|&q| q == 0));
+    for b in 0..4 {
+        assert_eq!(sc_f[b].to_bits(), sc_s[b].to_bits(), "block {b} scale");
+    }
+}
