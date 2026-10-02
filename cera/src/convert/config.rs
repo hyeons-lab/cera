@@ -201,6 +201,14 @@ impl HfModelConfig {
         })
     }
 
+    /// An encoder checkpoint (`Lfm2BidirectionalModel`, `Lfm2BidirP2ForTokenClassification`):
+    /// full attention and a centred short convolution instead of the causal ones.
+    fn is_bidirectional(&self) -> bool {
+        self.architectures
+            .first()
+            .is_some_and(|a| a.to_ascii_lowercase().contains("bidir"))
+    }
+
     fn is_lfm_family(&self) -> bool {
         matches!(self.gguf_architecture(), "lfm2" | "lfm2moe")
     }
@@ -712,6 +720,11 @@ impl HfModelConfig {
             }
         } else if let Some(ffn) = self.intermediate_size {
             writer.add_u32(format!("{arch}.feed_forward_length"), ffn as u32);
+        }
+        if arch == "lfm2" && self.is_bidirectional() {
+            // `is_causal` is the key cera reads, `attention.causal` the one llama.cpp does
+            writer.add_bool(format!("{arch}.is_causal"), false);
+            writer.add_bool(format!("{arch}.attention.causal"), false);
         }
         if let Some(dim) = self.head_dim {
             writer.add_u32(format!("{arch}.attention.key_length"), dim as u32);
@@ -2036,5 +2049,30 @@ mod tests {
         };
         assert_eq!(write(512), Some(MetadataValue::Uint32(512)));
         assert_eq!(write(4294967297), None);
+    }
+
+    #[test]
+    fn bidirectional_lfm2_encoders_are_written_non_causal() {
+        let causal_keys = |architecture: &str| {
+            let mut cfg = valid_lfm2();
+            cfg["architectures"] = json!([architecture]);
+            let mut writer = GgufWriter::new();
+            HfModelConfig::from_json_str(&cfg.to_string())
+                .unwrap()
+                .apply_to_gguf_writer(&mut writer, "t");
+            (
+                writer.get_metadata("lfm2.is_causal").cloned(),
+                writer.get_metadata("lfm2.attention.causal").cloned(),
+            )
+        };
+        // cera reads `is_causal`, llama.cpp reads `attention.causal`
+        let non_causal = (
+            Some(MetadataValue::Bool(false)),
+            Some(MetadataValue::Bool(false)),
+        );
+        assert_eq!(causal_keys("Lfm2BidirectionalModel"), non_causal);
+        assert_eq!(causal_keys("Lfm2BidirP2ForTokenClassification"), non_causal);
+        // a decoder keeps the default
+        assert_eq!(causal_keys("Lfm2ForCausalLM"), (None, None));
     }
 }

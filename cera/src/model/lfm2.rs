@@ -494,7 +494,12 @@ impl LfmModel {
             None
         };
 
-        let is_causal = if let Some(causal) = gguf.get_bool(&format!("{prefix}.is_causal")) {
+        // `is_causal` is cera's key; `attention.causal` is the one llama.cpp's converter writes
+        // for the bidirectional encoders (Embedding, ColBERT)
+        let is_causal = if let Some(causal) = gguf
+            .get_bool(&format!("{prefix}.is_causal"))
+            .or_else(|| gguf.get_bool(&format!("{prefix}.attention.causal")))
+        {
             causal
         } else if gguf.get_tensor("classifier.weight").is_ok() {
             // Token classification models default to bidirectional attention
