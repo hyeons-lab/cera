@@ -881,6 +881,225 @@ pub fn build_mul_mat_kernel_params(
     kparams
 }
 
+/// Shape of an F32 x F32 matmul, in the strides the host precompute reads.
+///
+/// `ne0x` are the weight-side (`src0`) dims, `ne1x` the activation-side
+/// (`src1`) dims; `ne10 == ne00` is the contraction length. `src0_nb1` is
+/// `src0`'s row stride in bytes and `dst_nb1` the destination's.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MulMatF32Shape {
+    pub ne00: usize,
+    pub ne02: usize,
+    pub ne03: usize,
+    pub src0_nb1: usize,
+    pub ne11: usize,
+    pub ne12: usize,
+    pub ne13: usize,
+    pub dst_nb1: usize,
+}
+
+/// VTCM bytes the HVX F32 x F32 kernel needs for `src1_nrows` activation rows
+/// (`htp_mm_hvx_vtcm_layout_build`, `HTP_MM_KERNEL_HVX_F32_F32_VTCM`, no
+/// fused or ID path): the activation rows, then the per-thread weight
+/// prefetch rows and (single-row only) the output slice.
+struct MmF32Layout {
+    src0: usize,
+    src1: usize,
+    dst: usize,
+    total: usize,
+}
+
+fn mm_f32_vtcm_layout(
+    ne10: usize,
+    src1_nrows: usize,
+    n_threads: usize,
+    dst_row_size: usize,
+    src0_row_size: usize,
+    n_prefetch: usize,
+) -> MmF32Layout {
+    let round_up = |n: usize, m: usize| n.next_multiple_of(m);
+    let src0_row_padded = round_up(src0_row_size, 128);
+    let src1 = round_up(round_up(ne10 * 4, 128) * src1_nrows, 256);
+    let src0 = round_up(n_prefetch * src0_row_padded, 256) * n_threads;
+    let dst = if src1_nrows > 1 {
+        0
+    } else {
+        round_up(dst_row_size, 128) * n_threads
+    };
+    // Group A (the activations) then group B (weights and output); no raw
+    // staging buffer on this path.
+    MmF32Layout {
+        src0,
+        src1,
+        dst,
+        total: src1 + src0 + dst,
+    }
+}
+
+/// Kernel parameters for an F32 x F32 `MulMat` on the HVX path
+/// (`ggml_hexagon_precompute_hvx_mm_params`, F32 branch, plus the
+/// `finalize` divisors): `dst[n, m] = sum_k src0[k, n] * src1[k, m]`, batched
+/// over `ne02 x ne03` weight matrices that `ne12 x ne13` activation batches
+/// are broadcast over (`ne12 / ne02`). `None` when even one activation row
+/// does not fit `vtcm_budget` (the host falls back to the CPU then).
+pub fn build_mul_mat_f32_kernel_params(
+    shape: MulMatF32Shape,
+    n_threads: u32,
+    vtcm_budget: usize,
+) -> Option<[i32; 32]> {
+    const N_PREFETCH: usize = 16;
+    const KERNEL_HVX_F32_F32_VTCM: i32 = 4;
+    let MulMatF32Shape {
+        ne00,
+        ne02,
+        ne03,
+        src0_nb1,
+        ne11,
+        ne12,
+        ne13,
+        dst_nb1,
+    } = shape;
+    let n_threads = n_threads.max(1) as usize;
+    let ne10 = ne00;
+    let src1_nrows = ne11 * ne12 * ne13;
+    let layout =
+        |rows: usize| mm_f32_vtcm_layout(ne10, rows, n_threads, dst_nb1, src0_nb1, N_PREFETCH);
+
+    // `htp_mm_hvx_solve_vtcm_params`: all activation rows at once when they
+    // fit, otherwise the largest even chunk that does.
+    let mut m_chunk = src1_nrows;
+    let mut l = layout(m_chunk);
+    if l.total > vtcm_budget {
+        let fixed = l.src0 + l.dst;
+        let avail = vtcm_budget.checked_sub(fixed).filter(|&a| a > 0)?;
+        let row = (ne10 * 4).next_multiple_of(128);
+        m_chunk = avail / row;
+        if m_chunk > 1 {
+            m_chunk &= !1;
+        }
+        m_chunk = m_chunk.min(src1_nrows);
+        if m_chunk < 1 {
+            return None;
+        }
+        l = layout(m_chunk);
+        while m_chunk > 2 && l.total > vtcm_budget {
+            m_chunk -= 2;
+            l = layout(m_chunk);
+        }
+        if l.total > vtcm_budget {
+            return None;
+        }
+    }
+
+    let mut k = [0i32; 32];
+    k[0] = KERNEL_HVX_F32_F32_VTCM;
+    k[1] = 0; // pipeline
+    k[2] = if m_chunk < src1_nrows {
+        m_chunk as i32
+    } else {
+        0
+    };
+    k[3] = 0; // n_chunk (HMX only)
+    k[4] = n_threads as i32;
+    k[5] = 0; // n_act_threads
+    k[6] = 0; // n_hmx
+    k[7] = N_PREFETCH as i32;
+    k[8] = 0; // tile_size (quantized only)
+    k[9] = 0; // aligned_tile_size
+    k[10] = (ne10 * 4).next_multiple_of(128) as i32; // src1_row_size
+    k[11] = l.total as i32;
+    k[12] = l.src0 as i32;
+    k[13] = l.src1 as i32;
+    k[14] = 0; // src2 (fused only)
+    k[15] = 0; // src3
+    k[16] = l.dst as i32;
+    k[17] = 0; // n_weights
+    let fd = |d: usize, slot: usize, k: &mut [i32; 32]| {
+        let f = init_fastdiv(d as u32);
+        k[slot] = f.mp as i32;
+        k[slot + 1] = f.l as i32;
+    };
+    fd(ne12 * ne11, 18, &mut k); // div_ne12_ne1
+    fd(ne11, 20, &mut k); // div_ne1
+    fd(ne12.checked_div(ne02).unwrap_or(1), 22, &mut k); // div_r2
+    fd(ne13.checked_div(ne03).unwrap_or(1), 24, &mut k); // div_r3
+    fd(ne12, 26, &mut k); // div_ne12
+    Some(k)
+}
+
+/// Kernel parameters for `Softmax` over F32 rows
+/// (`ggml_hexagon_precompute_softmax_params`):
+/// `dst = softmax(scale * src0 + mask)` along dim 0, with an optional F32
+/// `mask` of `[ne10, ne11, ne12, ne13]` broadcast over `src0`'s dims 2 and 3.
+///
+/// `mask_dims` is `[ne10, ne12, ne13]` of the mask when there is one.
+pub fn build_softmax_kernel_params(
+    src0_ne: [usize; 4],
+    mask_dims: Option<[usize; 3]>,
+    scale: f32,
+    n_threads: u32,
+) -> [i32; 32] {
+    const KERNEL_NOMASK: i32 = 0;
+    const KERNEL_MASK_F32: i32 = 1;
+    let round_up = |n: usize, m: usize| n.next_multiple_of(m);
+    let [ne00, ne01, ne02, ne03] = src0_ne;
+    let src0_nrows = ne01 * ne02 * ne03;
+    let n_threads = (n_threads.max(1) as usize).min(src0_nrows.max(1));
+    let use_src1 = mask_dims.is_some();
+    let ne10 = mask_dims.map_or(1, |m| m[0]);
+
+    let src0_row = round_up(ne00 * 4, 128);
+    let dst_row = round_up(ne00 * 4, 128);
+    let src1_row = if use_src1 { round_up(ne10 * 4, 128) } else { 0 };
+    // Double-buffered half-buffers per thread (`htp_softmax_vtcm_layout_build`).
+    let (src0_pt, dst_pt, src1_pt) = (src0_row * 2, dst_row * 2, src1_row * 2);
+    let total = (src0_pt + dst_pt + src1_pt) * n_threads;
+
+    let n_head = ne02;
+    let n_head_log2 = if n_head > 0 {
+        1usize << n_head.ilog2()
+    } else {
+        0
+    };
+
+    let mut k = [0i32; 32];
+    k[0] = n_threads as i32;
+    k[1] = src0_nrows as i32;
+    k[2] = src0_nrows.div_ceil(n_threads) as i32;
+    k[3] = total as i32;
+    k[4] = src0_pt as i32;
+    k[5] = src1_pt as i32;
+    k[6] = dst_pt as i32;
+    k[7] = src0_row as i32; // src0_row_size_aligned
+    k[8] = src1_row as i32;
+    k[9] = dst_row as i32;
+    k[10] = src0_row as i32; // src0_spad_half_size
+    k[11] = src1_row as i32;
+    k[12] = dst_row as i32;
+    k[13] = n_head as i32;
+    k[14] = n_head_log2 as i32;
+    k[15] = use_src1 as i32;
+    k[16] = 0; // use_f16: the mask is F32 here
+    k[17] = if use_src1 {
+        KERNEL_MASK_F32
+    } else {
+        KERNEL_NOMASK
+    };
+    k[18] = scale.to_bits() as i32;
+    k[19] = 0f32.to_bits() as i32; // max_bias: no ALiBi
+    k[20] = 1f32.to_bits() as i32; // m0
+    k[21] = 1f32.to_bits() as i32; // m1
+    let [_, ne12, ne13] = mask_dims.unwrap_or([1, 1, 1]);
+    for (slot, d) in [(22, ne01), (24, ne02), (26, ne12), (28, ne13)] {
+        if d > 0 {
+            let f = init_fastdiv(d as u32);
+            k[slot] = f.mp as i32;
+            k[slot + 1] = f.l as i32;
+        }
+    }
+    k
+}
+
 /// Minimum M rows for HMX matmul. Upstream `HTP_MM_HMX_MIN_NROWS` is 4,
 /// but the HMX worker is nondeterministic for M < 8 on-device (8-row
 /// microtile overhang; measured: M <= 7 racy, M >= 8 bitwise stable and
@@ -1416,6 +1635,97 @@ pub fn build_hmx_fa_kernel_params_with_softcap(
 
 #[cfg(test)]
 mod tests {
+    /// A per-head attention-score matmul worked out from the host precompute:
+    /// K as `[64, 126, 8]` (row stride 2048 B) against 8 batches of 126 query
+    /// rows. 1008 activation rows of 256 B, 16 prefetched 2048 B weight rows
+    /// per thread, no output slice, all in one chunk.
+    #[test]
+    fn f32_matmul_params_follow_the_host_precompute() {
+        let k = build_mul_mat_f32_kernel_params(
+            MulMatF32Shape {
+                ne00: 64,
+                ne02: 8,
+                ne03: 1,
+                src0_nb1: 2048,
+                ne11: 126,
+                ne12: 8,
+                ne13: 1,
+                dst_nb1: 126 * 4,
+            },
+            8,
+            8 << 20,
+        )
+        .unwrap();
+        assert_eq!(k[0], 4, "HVX_F32_F32_VTCM");
+        assert_eq!((k[4], k[6], k[7]), (8, 0, 16));
+        assert_eq!(k[2], 0, "everything fits: no chunking");
+        assert_eq!(k[10], 256); // round_up(64 * 4, 128) is 256
+        assert_eq!(k[13], 258048); // round_up(256 * 1008, 256)
+        assert_eq!(k[12], 262144); // round_up(16 * 2048, 256) * 8 threads
+        assert_eq!(k[16], 0, "no output slice for more than one row");
+        assert_eq!(k[11], 258048 + 262144);
+        // Divisors: ne12 * ne11, ne11, ne12 / ne02 = 1, ne13 / ne03 = 1, ne12.
+        let fd = |d: u32| {
+            let f = init_fastdiv(d);
+            [f.mp as i32, f.l as i32]
+        };
+        assert_eq!(k[18..20], fd(8 * 126));
+        assert_eq!(k[20..22], fd(126));
+        assert_eq!(k[22..24], fd(1));
+        assert_eq!(k[24..26], fd(1));
+        assert_eq!(k[26..28], fd(8));
+    }
+
+    /// Too little VTCM for all the activation rows: the largest even chunk
+    /// that fits, and refusal when not even one row does.
+    #[test]
+    fn f32_matmul_params_chunk_the_activation_rows_or_refuse() {
+        let shape = MulMatF32Shape {
+            ne00: 64,
+            ne02: 8,
+            ne03: 1,
+            src0_nb1: 2048,
+            ne11: 126,
+            ne12: 8,
+            ne13: 1,
+            dst_nb1: 504,
+        };
+        // 262144 for the weights leaves 100000 B: 390 rows of 256 B, made even.
+        let k = build_mul_mat_f32_kernel_params(shape, 8, 262144 + 100_000).unwrap();
+        assert_eq!(k[2], 390);
+        assert!(k[11] as usize <= 262144 + 100_000);
+        assert!(build_mul_mat_f32_kernel_params(shape, 8, 262144).is_none());
+    }
+
+    #[test]
+    fn softmax_params_follow_the_host_precompute() {
+        let k = build_softmax_kernel_params([126, 126, 8, 1], Some([126, 8, 1]), 0.125, 8);
+        // 126 * 8 rows over 8 threads; every row buffer is 512 B aligned and
+        // double-buffered for src0, dst and the mask.
+        assert_eq!((k[0], k[1], k[2]), (8, 1008, 126));
+        assert_eq!(k[3], (1024 * 3) * 8);
+        assert_eq!((k[4], k[5], k[6]), (1024, 1024, 1024));
+        assert_eq!((k[7], k[8], k[9]), (512, 512, 512));
+        assert_eq!((k[13], k[14], k[15], k[16], k[17]), (8, 8, 1, 0, 1));
+        assert_eq!(f32::from_bits(k[18] as u32), 0.125);
+        assert_eq!(f32::from_bits(k[19] as u32), 0.0);
+        assert_eq!(f32::from_bits(k[20] as u32), 1.0);
+        let fd = |d: u32| {
+            let f = init_fastdiv(d);
+            [f.mp as i32, f.l as i32]
+        };
+        assert_eq!(k[22..24], fd(126));
+        assert_eq!(k[24..26], fd(8));
+        assert_eq!(k[26..28], fd(8));
+        assert_eq!(k[28..30], fd(1));
+        // Without a mask the kernel is NOMASK and has no mask buffers.
+        let k = build_softmax_kernel_params([126, 126, 8, 1], None, 1.0, 8);
+        assert_eq!((k[15], k[17], k[5], k[8]), (0, 0, 0, 0));
+        // Fewer rows than threads: one thread per row.
+        let k = build_softmax_kernel_params([16, 3, 1, 1], None, 1.0, 8);
+        assert_eq!((k[0], k[2]), (3, 1));
+    }
+
     use super::*;
 
     /// The routed-FFN case: gather 4 unbiased expert weights from a 32-entry

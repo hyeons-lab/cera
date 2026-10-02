@@ -136,6 +136,16 @@ required-features = ["metal"]
 name = "embedder_path"
 required-features = ["mmap", "parallel"]
 
+# CPU cost of the LFM2-Audio Conformer encoder, per second of audio.
+[[example]]
+name = "audio_encoder_bench"
+required-features = ["mmap", "parallel"]
+
+# The NPU Conformer encoder, stage by stage against the CPU one (device only).
+[[example]]
+name = "hexagon_conformer_probe"
+required-features = ["hexagon", "mmap"]
+
 # wgpu parity/oracle tests: bodies are `#[cfg(feature = "gpu")]` and load
 # fixtures via `GgufFile::open` / `open_arc`, which are `#[cfg(feature =
 # "mmap")]`. Without `required-features` the `--no-default-features

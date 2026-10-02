@@ -64,6 +64,8 @@ pub mod wgpu_audio_decoder;
 #[cfg(feature = "hexagon")]
 pub mod audio_decoder_hexagon;
 #[cfg(feature = "hexagon")]
+pub mod audio_encoder_hexagon;
+#[cfg(feature = "hexagon")]
 pub mod hexagon_lfm2;
 #[cfg(feature = "hexagon")]
 pub mod vision_encoder_hexagon;

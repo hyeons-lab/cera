@@ -13,8 +13,9 @@
 
 use super::{
     HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonQueueSession,
-    HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode, RpcmemBuffer,
-    build_binary_kernel_params, build_layer_norm_params, build_mul_mat_kernel_params,
+    HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode, MulMatF32Shape, RpcmemBuffer,
+    build_binary_kernel_params, build_layer_norm_params, build_mul_mat_f32_kernel_params,
+    build_mul_mat_kernel_params, build_softmax_kernel_params, build_ssm_conv_kernel_params,
     build_unary_kernel_params,
 };
 use crate::session::CeraError;
@@ -337,6 +338,448 @@ pub(crate) fn gelu<S: OpSink>(
             .map_err(|e| op_err("gelu", e))?;
     }
     session.end_group().map_err(|e| op_err("gelu", e))
+}
+
+/// In-place SiLU: `buf = silu(buf)`.
+pub(crate) fn silu<S: OpSink>(
+    session: &mut S,
+    buf: &S::Buf,
+    offset: usize,
+    shape: TokenShape,
+    tile: TokenTile,
+) -> Result<(), CeraError> {
+    let TokenShape { dim, n_tokens } = shape;
+    for (start, run) in token_runs(n_tokens, tile) {
+        let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
+        let kparams =
+            build_unary_kernel_params(dim, run, 0, VTCM_BUDGET, session.dsp_threads(), false);
+        session
+            .enqueue_op(
+                HtpOpCode::UnarySilu as u32,
+                &[ti],
+                &[ti],
+                [0i32; 16],
+                kparams,
+            )
+            .map_err(|e| op_err("silu", e))?;
+    }
+    session.end_group().map_err(|e| op_err("silu", e))
+}
+
+/// In-place per-channel scale: `buf[row, :] *= vec[:]` for every row. The
+/// vector lives in `vec_buf` at `vec_offset` (an F32 weight row of `dim`).
+pub(crate) fn mul_row_bcast<S: OpSink>(
+    session: &mut S,
+    buf: &S::Buf,
+    offset: usize,
+    vec_buf: &S::Buf,
+    vec_offset: usize,
+    shape: TokenShape,
+    tile: TokenTile,
+) -> Result<(), CeraError> {
+    let TokenShape { dim, n_tokens } = shape;
+    let vec_ti = add_f32_vector(session, vec_buf, vec_offset, dim)?;
+    for (start, run) in token_runs(n_tokens, tile) {
+        let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
+        let kparams =
+            build_binary_kernel_params(dim, dim, 1, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
+        session
+            .enqueue_op(
+                HtpOpCode::Mul as u32,
+                &[ti, vec_ti],
+                &[ti],
+                [0i32; 16],
+                kparams,
+            )
+            .map_err(|e| op_err("mul_row_bcast", e))?;
+    }
+    session.end_group().map_err(|e| op_err("mul_row_bcast", e))
+}
+
+/// In-place sigmoid: `buf = sigmoid(buf)`.
+pub(crate) fn sigmoid<S: OpSink>(
+    session: &mut S,
+    buf: &S::Buf,
+    offset: usize,
+    shape: TokenShape,
+    tile: TokenTile,
+) -> Result<(), CeraError> {
+    let TokenShape { dim, n_tokens } = shape;
+    for (start, run) in token_runs(n_tokens, tile) {
+        let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
+        let kparams =
+            build_unary_kernel_params(dim, run, 0, VTCM_BUDGET, session.dsp_threads(), false);
+        session
+            .enqueue_op(
+                HtpOpCode::UnarySigmoid as u32,
+                &[ti],
+                &[ti],
+                [0i32; 16],
+                kparams,
+            )
+            .map_err(|e| op_err("sigmoid", e))?;
+    }
+    session.end_group().map_err(|e| op_err("sigmoid", e))
+}
+
+/// In-place bias add: `buf[row, :] += vec[:]` for every row.
+pub(crate) fn add_row_bcast<S: OpSink>(
+    session: &mut S,
+    buf: &S::Buf,
+    offset: usize,
+    vec_buf: &S::Buf,
+    vec_offset: usize,
+    shape: TokenShape,
+    tile: TokenTile,
+) -> Result<(), CeraError> {
+    let TokenShape { dim, n_tokens } = shape;
+    let vec_ti = add_f32_vector(session, vec_buf, vec_offset, dim)?;
+    for (start, run) in token_runs(n_tokens, tile) {
+        let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
+        enqueue_broadcast_add(session, ti, vec_ti, dim, "add_row_bcast")?;
+    }
+    session.end_group().map_err(|e| op_err("add_row_bcast", e))
+}
+
+/// In-place elementwise product: `dst *= src` over `[dim, n_tokens]`.
+pub(crate) fn mul_inplace<S: OpSink>(
+    session: &mut S,
+    dst: &S::Buf,
+    dst_offset: usize,
+    src: &S::Buf,
+    src_offset: usize,
+    shape: TokenShape,
+    tile: TokenTile,
+) -> Result<(), CeraError> {
+    let TokenShape { dim, n_tokens } = shape;
+    for (start, run) in token_runs(n_tokens, tile) {
+        let dst_ti = add_f32_rows(session, dst, dst_offset + start * dim * 4, dim, run)?;
+        let src_ti = add_f32_rows(session, src, src_offset + start * dim * 4, dim, run)?;
+        let kparams =
+            build_binary_kernel_params(dim, dim, run, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
+        session
+            .enqueue_op(
+                HtpOpCode::Mul as u32,
+                &[dst_ti, src_ti],
+                &[dst_ti],
+                [0i32; 16],
+                kparams,
+            )
+            .map_err(|e| op_err("mul_inplace", e))?;
+    }
+    session.end_group().map_err(|e| op_err("mul_inplace", e))
+}
+
+/// A source for [`concat_time_inner`]: `rows` positions of `dim` channels,
+/// the position step `nb0` and the channel step `nb1` in bytes.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct ConcatSrc<'a, B> {
+    pub buf: &'a B,
+    pub offset: usize,
+    pub rows: usize,
+    pub nb0: usize,
+    pub nb1: usize,
+}
+
+/// Concatenate two sequences along time into a channel-major `[rows, dim]`
+/// destination (one channel's positions contiguous), the layout `SsmConv`
+/// reads. `Concat` along dim 0: each source is read through its own strides,
+/// so a time-major `[rows, dim]` activation (position step `dim * 4`, channel
+/// step 4) transposes on the way in.
+pub(crate) fn concat_time_inner<S: OpSink>(
+    session: &mut S,
+    s0: ConcatSrc<'_, S::Buf>,
+    s1: ConcatSrc<'_, S::Buf>,
+    dst: &S::Buf,
+    dst_offset: usize,
+    dim: usize,
+) -> Result<(), CeraError> {
+    let span = |s: &ConcatSrc<'_, S::Buf>| {
+        s.rows.saturating_sub(1) * s.nb0 + dim.saturating_sub(1) * s.nb1 + 4
+    };
+    let add = |session: &mut S, s: &ConcatSrc<'_, S::Buf>| {
+        let span = span(s);
+        session.add_tensor(
+            s.buf,
+            s.offset,
+            span,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            [s.rows as u32, dim as u32, 1, 1],
+            [s.nb0 as u32, s.nb1 as u32, span as u32, span as u32],
+        )
+    };
+    let s0_ti = add(session, &s0)?;
+    let s1_ti = add(session, &s1)?;
+    let dst_rows = s0.rows + s1.rows;
+    let dst_span = dst_rows * dim * 4;
+    let dst_ti = session.add_tensor(
+        dst,
+        dst_offset,
+        dst_span,
+        HTP_TENSOR_COMPUTE,
+        HtpDataType::F32 as u32,
+        [dst_rows as u32, dim as u32, 1, 1],
+        [4, (dst_rows * 4) as u32, dst_span as u32, dst_span as u32],
+    )?;
+    let mut params = [0i32; 16];
+    params[0] = 0; // concat along dim 0
+    session
+        .enqueue_op(
+            HtpOpCode::Concat as u32,
+            &[s0_ti, s1_ti],
+            &[dst_ti],
+            params,
+            [0i32; 32],
+        )
+        .map_err(|e| op_err("concat_time_inner", e))?;
+    session
+        .end_group()
+        .map_err(|e| op_err("concat_time_inner", e))
+}
+
+/// Depthwise 1-D convolution through `SsmConv`:
+/// `y[t, c] = sum_j x[t + j, c] * w[j, c]` over a channel-major input of
+/// `d_conv - 1 + n_t` positions (the caller supplies the padding) and a
+/// `[d_conv, d_inner]` tap matrix, producing a time-major `[n_t, d_inner]`
+/// output.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn ssm_conv<S: OpSink>(
+    session: &mut S,
+    taps: &S::Buf,
+    taps_offset: usize,
+    x: &S::Buf,
+    x_offset: usize,
+    dst: &S::Buf,
+    dst_offset: usize,
+    d_conv: usize,
+    d_inner: usize,
+    n_t: usize,
+) -> Result<(), CeraError> {
+    let ncs = d_conv - 1 + n_t;
+    let x_bytes = ncs * d_inner * 4;
+    let x_ti = session.add_tensor(
+        x,
+        x_offset,
+        x_bytes,
+        HTP_TENSOR_COMPUTE,
+        HtpDataType::F32 as u32,
+        [ncs as u32, d_inner as u32, 1, 1],
+        [4, (ncs * 4) as u32, x_bytes as u32, x_bytes as u32],
+    )?;
+    let w_bytes = d_conv * d_inner * 4;
+    let w_ti = session.add_tensor(
+        taps,
+        taps_offset,
+        w_bytes,
+        HTP_TENSOR_WEIGHT,
+        HtpDataType::F32 as u32,
+        [d_conv as u32, d_inner as u32, 1, 1],
+        [4, (d_conv * 4) as u32, w_bytes as u32, w_bytes as u32],
+    )?;
+    let dst_bytes = d_inner * n_t * 4;
+    let dst_ti = session.add_tensor(
+        dst,
+        dst_offset,
+        dst_bytes,
+        HTP_TENSOR_COMPUTE,
+        HtpDataType::F32 as u32,
+        [d_inner as u32, n_t as u32, 1, 1],
+        [4, (d_inner * 4) as u32, dst_bytes as u32, dst_bytes as u32],
+    )?;
+    let kparams = build_ssm_conv_kernel_params(
+        d_conv,
+        d_inner,
+        n_t,
+        1,
+        ncs,
+        session.dsp_threads(),
+        VTCM_BUDGET,
+    );
+    session
+        .enqueue_op(
+            HtpOpCode::SsmConv as u32,
+            &[x_ti, w_ti],
+            &[dst_ti],
+            [0i32; 16],
+            kparams,
+        )
+        .map_err(|e| op_err("ssm_conv", e))?;
+    session.end_group().map_err(|e| op_err("ssm_conv", e))
+}
+
+/// A strided F32 view of up to three dims, for ops that take shaped tensors
+/// (batched matmul, softmax, copies). Strides are in bytes and `nb[0]` is
+/// always 4 unless the view transposes (`nb[0] > 4`).
+pub(crate) struct View<'a, B> {
+    pub buf: &'a B,
+    pub offset: usize,
+    pub ne: [usize; 3],
+    pub nb: [usize; 3],
+}
+
+// Manual impls: a view only holds a reference, so it is `Copy` whatever `B` is.
+impl<B> Clone for View<'_, B> {
+    fn clone(&self) -> Self {
+        *self
+    }
+}
+impl<B> Copy for View<'_, B> {}
+
+impl<'a, B> View<'a, B> {
+    pub(crate) fn new(buf: &'a B, offset: usize, ne: [usize; 3], nb: [usize; 3]) -> Self {
+        Self {
+            buf,
+            offset,
+            ne,
+            nb,
+        }
+    }
+
+    /// Bytes from the first element to one past the last.
+    fn span(&self) -> usize {
+        (0..3)
+            .map(|i| self.ne[i].saturating_sub(1) * self.nb[i])
+            .sum::<usize>()
+            + 4
+    }
+
+    fn add<S: OpSink<Buf = B>>(&self, session: &mut S, flags: u32) -> Result<u16, CeraError> {
+        let span = self.span();
+        let [nb0, nb1, nb2] = self.nb.map(|v| v as u32);
+        session.add_tensor(
+            self.buf,
+            self.offset,
+            span,
+            flags,
+            HtpDataType::F32 as u32,
+            [self.ne[0] as u32, self.ne[1] as u32, self.ne[2] as u32, 1],
+            [nb0, nb1, nb2, span as u32],
+        )
+    }
+}
+
+/// Batched F32 matmul on the HVX path: for every batch `b`,
+/// `dst[n, m, b] = sum_k a[k, n, b] * x[k, m, b]`.
+pub(crate) fn matmul_f32<S: OpSink>(
+    session: &mut S,
+    a: View<'_, S::Buf>,
+    x: View<'_, S::Buf>,
+    dst: View<'_, S::Buf>,
+) -> Result<(), CeraError> {
+    let kparams = build_mul_mat_f32_kernel_params(
+        MulMatF32Shape {
+            ne00: a.ne[0],
+            ne02: a.ne[2],
+            ne03: 1,
+            src0_nb1: a.nb[1],
+            ne11: x.ne[1],
+            ne12: x.ne[2],
+            ne13: 1,
+            dst_nb1: dst.nb[1],
+        },
+        session.dsp_threads(),
+        VTCM_BUDGET,
+    )
+    .ok_or_else(|| {
+        op_err(
+            "matmul_f32",
+            CeraError::Backend("activations do not fit the VTCM".into()),
+        )
+    })?;
+    let a_ti = a.add(session, HTP_TENSOR_COMPUTE)?;
+    let x_ti = x.add(session, HTP_TENSOR_COMPUTE)?;
+    let dst_ti = dst.add(session, HTP_TENSOR_COMPUTE)?;
+    session
+        .enqueue_op(
+            HtpOpCode::MulMat as u32,
+            &[a_ti, x_ti],
+            &[dst_ti],
+            [0i32; 16],
+            kparams,
+        )
+        .map_err(|e| op_err("matmul_f32", e))?;
+    session.end_group().map_err(|e| op_err("matmul_f32", e))
+}
+
+/// `dst = softmax(scale * x + mask)` along dim 0. The mask (F32) is read
+/// through its own strides, one row per `x` row and one plane per head, so a
+/// shifted view of a larger matrix works as a relative-position bias.
+pub(crate) fn softmax<S: OpSink>(
+    session: &mut S,
+    x: View<'_, S::Buf>,
+    mask: Option<View<'_, S::Buf>>,
+    dst: View<'_, S::Buf>,
+    scale: f32,
+) -> Result<(), CeraError> {
+    let kparams = build_softmax_kernel_params(
+        [x.ne[0], x.ne[1], x.ne[2], 1],
+        mask.as_ref().map(|m| [m.ne[0], m.ne[2], 1]),
+        scale,
+        session.dsp_threads(),
+    );
+    let x_ti = x.add(session, HTP_TENSOR_COMPUTE)?;
+    let mask_ti = match &mask {
+        Some(m) => Some(m.add(session, HTP_TENSOR_COMPUTE)?),
+        None => None,
+    };
+    let dst_ti = dst.add(session, HTP_TENSOR_COMPUTE)?;
+    let mut params = [0i32; 16];
+    params[0] = scale.to_bits() as i32;
+    let src: Vec<u16> = std::iter::once(x_ti).chain(mask_ti).collect();
+    session
+        .enqueue_op(HtpOpCode::Softmax as u32, &src, &[dst_ti], params, kparams)
+        .map_err(|e| op_err("softmax", e))?;
+    session.end_group().map_err(|e| op_err("softmax", e))
+}
+
+/// `dst = src` through the DSP's generic same-type copy, which reads and
+/// writes through each view's strides (a transpose when the strides differ).
+pub(crate) fn copy_view<S: OpSink>(
+    session: &mut S,
+    src: View<'_, S::Buf>,
+    dst: View<'_, S::Buf>,
+) -> Result<(), CeraError> {
+    let src_ti = src.add(session, HTP_TENSOR_COMPUTE)?;
+    let dst_ti = dst.add(session, HTP_TENSOR_COMPUTE)?;
+    session
+        .enqueue_op(
+            HtpOpCode::Cpy as u32,
+            &[src_ti],
+            &[dst_ti],
+            [0i32; 16],
+            [0i32; 32],
+        )
+        .map_err(|e| op_err("copy_view", e))?;
+    session.end_group().map_err(|e| op_err("copy_view", e))
+}
+
+/// Out-of-place row-broadcast add: `dst[row, :] = src[row, :] + vec[:]`.
+pub(crate) fn add_row_bcast_to<S: OpSink>(
+    session: &mut S,
+    src: View<'_, S::Buf>,
+    vec_buf: &S::Buf,
+    vec_offset: usize,
+    dst: View<'_, S::Buf>,
+) -> Result<(), CeraError> {
+    let dim = src.ne[0];
+    let vec_ti = add_f32_vector(session, vec_buf, vec_offset, dim)?;
+    let src_ti = src.add(session, HTP_TENSOR_COMPUTE)?;
+    let dst_ti = dst.add(session, HTP_TENSOR_COMPUTE)?;
+    let kparams =
+        build_binary_kernel_params(dim, dim, 1, 1, 1, 4, VTCM_BUDGET, session.dsp_threads());
+    session
+        .enqueue_op(
+            HtpOpCode::Add as u32,
+            &[src_ti, vec_ti],
+            &[dst_ti],
+            [0i32; 16],
+            kparams,
+        )
+        .map_err(|e| op_err("add_row_bcast_to", e))?;
+    session
+        .end_group()
+        .map_err(|e| op_err("add_row_bcast_to", e))
 }
 
 /// In-place residual add: `dst += src`.
@@ -693,6 +1136,30 @@ mod tests {
     }
 
     #[test]
+    fn silu_is_in_place_and_mul_row_bcast_scales_by_the_vector() {
+        let mut s = RecordingSink::default();
+        let shape = TokenShape {
+            dim: 16,
+            n_tokens: 5,
+        };
+        silu(&mut s, &"b", 64, shape, TokenTile::Whole).unwrap();
+        mul_row_bcast(&mut s, &"b", 64, &"v", 4096, shape, TokenTile::Whole).unwrap();
+        assert_eq!(s.opcodes(), vec![HtpOpCode::UnarySilu as u32, OP_MUL]);
+        assert_eq!(s.ops[0].src, s.ops[0].dst);
+        // The vector tensor is registered once, as a weight row of `dim`.
+        let v = &s.tensors[s.ops[1].src[1] as usize];
+        assert_eq!((v.buf, v.offset, v.ne), ("v", 4096, [16, 1, 1, 1]));
+        assert_eq!(v.flags, HTP_TENSOR_WEIGHT);
+        assert_eq!(s.src(1, 0).ne, [16, 5, 1, 1]);
+        // Same row-broadcast kernel params the bias add uses.
+        assert_eq!(
+            s.ops[1].kparams,
+            build_binary_kernel_params(16, 16, 1, 1, 1, 4, VTCM_BUDGET, 8)
+        );
+        assert_eq!(s.ops[1].dst, vec![s.ops[1].src[0]]);
+    }
+
+    #[test]
     fn enqueue_failure_names_the_dispatch() {
         let mut s = RecordingSink {
             fail_op_at: Some(1),
@@ -749,6 +1216,58 @@ mod tests {
         assert_eq!(s.group_ends, vec![6, 9, 10]);
         cpy_f32_to_f16(&mut s, &"a", 0, &"h", 0, shape).unwrap();
         assert_eq!(s.group_ends, vec![6, 9, 10, 11]);
+    }
+
+    /// The shaped-tensor helpers also end exactly one group each (the step-mode
+    /// flush must not land between a helper's own ops).
+    #[test]
+    fn view_and_conv_helpers_end_exactly_one_group() {
+        let mut s = RecordingSink::default();
+        let shape = TokenShape {
+            dim: 8,
+            n_tokens: 4,
+        };
+        let v = |off| View::new(&"b", off, [8, 4, 1], [4, 32, 128]);
+        let mut groups = 0;
+        let mut check = |s: &RecordingSink| {
+            groups += 1;
+            assert_eq!(s.group_ends.len(), groups, "one group per helper");
+        };
+        sigmoid(&mut s, &"b", 0, shape, TokenTile::Whole).unwrap();
+        check(&s);
+        add_row_bcast(&mut s, &"b", 0, &"v", 0, shape, TokenTile::Whole).unwrap();
+        check(&s);
+        mul_inplace(&mut s, &"b", 0, &"b", 512, shape, TokenTile::Whole).unwrap();
+        check(&s);
+        matmul_f32(&mut s, v(0), v(1024), v(2048)).unwrap();
+        check(&s);
+        softmax(&mut s, v(0), Some(v(512)), v(1024), 0.5).unwrap();
+        check(&s);
+        copy_view(&mut s, v(0), v(1024)).unwrap();
+        check(&s);
+        add_row_bcast_to(&mut s, v(0), &"v", 0, v(1024)).unwrap();
+        check(&s);
+        ssm_conv(&mut s, &"w", 0, &"b", 0, &"b", 4096, 3, 8, 4).unwrap();
+        check(&s);
+        let src = |off| ConcatSrc {
+            buf: &"b",
+            offset: off,
+            rows: 4,
+            nb0: 4,
+            nb1: 16,
+        };
+        concat_time_inner(&mut s, src(0), src(512), &"b", 2048, 8).unwrap();
+        check(&s);
+        // The softmax carries the mask as its second source and the scale in
+        // both the op params and the kernel params.
+        let sm = s
+            .ops
+            .iter()
+            .find(|o| o.opcode == HtpOpCode::Softmax as u32)
+            .unwrap();
+        assert_eq!(sm.src.len(), 2);
+        assert_eq!(f32::from_bits(sm.params[0] as u32), 0.5);
+        assert_eq!(f32::from_bits(sm.kparams[18] as u32), 0.5);
     }
 
     /// `CERA_HEXAGON_STEP` on the real queue: the helpers reuse tensor
