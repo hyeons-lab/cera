@@ -23,10 +23,14 @@ use crate::backend::hexagon::{
     FastRpcDriver, HexagonDevice, HexagonQueueSession, HexagonWeightDesc, LockOrRecover,
     RpcmemBuffer, align128,
 };
+use crate::model::audio_encoder_hexagon::HexagonAudioEncoder;
 use crate::model::audio_encoder_hexagon::{
     pad32, plan_linear, plan_vec, put_linear, put_vec, run_on_queue, settled,
 };
-use crate::model::sortformer::{SortformerModel, SortformerWeights};
+use crate::model::audio_stem_hexagon::STEM_CHUNK_ROWS;
+use crate::model::sortformer::{
+    SortformerAccelerator, SortformerModel, SortformerWeights, stem_frames,
+};
 use crate::model::weights::MmapWeight;
 use crate::session::CeraError;
 
@@ -647,6 +651,121 @@ impl Drop for HexagonSortformerTail {
         session.release_dsp_references([&self.weights_buf, &*self.scratch.lock_or_recover()]);
         let _ = &self.driver;
     }
+}
+
+/// The whole diarizer network on the Hexagon NPU: the conv stem and the FastConformer blocks
+/// ([`HexagonAudioEncoder`]) and the tail ([`HexagonSortformerTail`]). Plug it into a model with
+/// [`SortformerModel::set_accelerator`], or use [`try_hexagon_sortformer`].
+///
+/// Only the x-scale between the stem and the blocks runs on the host (one multiply per value).
+pub struct HexagonSortformer {
+    encoder: HexagonAudioEncoder,
+    tail: HexagonSortformerTail,
+    /// Encoder frames the staging covers; longer inputs are declined (the CPU takes them).
+    max_frames: usize,
+    n_blocks: usize,
+    scale: f32,
+    n_embd: usize,
+}
+
+impl HexagonSortformer {
+    /// Stage the model on the device for steps of up to `max_frames` encoder frames (use
+    /// [`StreamingParams::window_frames`]). Needs the Q8_0-tail GGUF, see the module docs.
+    pub fn new(
+        driver: Arc<FastRpcDriver>,
+        device: Arc<Mutex<HexagonDevice>>,
+        model: &SortformerModel,
+        max_frames: usize,
+    ) -> Result<Self, CeraError> {
+        let parts = model.encoder_parts();
+        let encoder = HexagonAudioEncoder::from_parts(
+            Arc::clone(&driver),
+            Arc::clone(&device),
+            &parts,
+            max_frames,
+            false,
+        )?;
+        let tail = HexagonSortformerTail::new(driver, device, model, max_frames)?;
+        Ok(Self {
+            encoder,
+            tail,
+            max_frames,
+            n_blocks: parts.layers.len(),
+            scale: model.encoder_input_scale(),
+            n_embd: parts.config.n_embd,
+        })
+    }
+}
+
+impl SortformerAccelerator for HexagonSortformer {
+    fn pre_encode(&self, mel: &[f32], n_frames: usize) -> anyhow::Result<Option<Vec<f32>>> {
+        if n_frames == 0 || stem_frames(n_frames) > self.max_frames {
+            return Ok(None);
+        }
+        Ok(Some(self.encoder.stem_output(
+            mel,
+            n_frames,
+            STEM_CHUNK_ROWS,
+        )?))
+    }
+
+    fn predict(&self, emb: &[f32], t: usize) -> anyhow::Result<Option<Vec<f32>>> {
+        if t == 0 || t > self.max_frames {
+            return Ok(None);
+        }
+        anyhow::ensure!(
+            emb.len() == t * self.n_embd,
+            "predict: {} values for {t} frames of {}",
+            emb.len(),
+            self.n_embd
+        );
+        let x: Vec<f32> = emb.iter().map(|v| v * self.scale).collect();
+        let enc = self.encoder.run_blocks(self.n_blocks, &x, t)?;
+        Ok(Some(self.tail.predict(&enc, t)?))
+    }
+}
+
+/// Stage `model` on the NPU for steps of up to `max_frames` encoder frames and make it the
+/// model's accelerator. `None` (with the reason logged) when there is no usable NPU or the
+/// weights cannot be staged (for example a GGUF whose tail is not Q8_0); the model then
+/// keeps running on the CPU.
+pub fn try_hexagon_sortformer(
+    model: &SortformerModel,
+    max_frames: usize,
+) -> Option<Arc<HexagonSortformer>> {
+    let context = crate::backend::hexagon::HexagonContext::new()
+        .inspect_err(|e| {
+            crate::backend::hexagon::log_context_unavailable("HexagonSortformer", e);
+        })
+        .ok()?;
+    let arch_override = std::env::var("CERA_HEXAGON_ARCH")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .and_then(crate::backend::hexagon::HexagonArch::from_u32);
+    let dev = match crate::backend::hexagon::probe_device(context.driver(), arch_override) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::info!("HexagonSortformer: DSP device unavailable ({e}), using the CPU");
+            return None;
+        }
+    };
+    let device = Arc::new(Mutex::new(dev));
+    let staged =
+        match HexagonSortformer::new(Arc::clone(context.driver()), device, model, max_frames) {
+            Ok(s) => Arc::new(s),
+            Err(e) => {
+                crate::backend::hexagon::hexagon_error!(
+                    "failed to stage Sortformer on the NPU: {e}"
+                );
+                return None;
+            }
+        };
+    if let Err(e) = model.set_accelerator(staged.clone()) {
+        tracing::warn!("HexagonSortformer: {e:#}");
+        return None;
+    }
+    tracing::info!("sortformer: using the Hexagon NPU ({max_frames} encoder frames)");
+    Some(staged)
 }
 
 #[cfg(test)]

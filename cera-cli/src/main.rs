@@ -1229,6 +1229,12 @@ enum Command {
         /// Output the segments and timing as JSON.
         #[arg(long)]
         json: bool,
+
+        /// Run the network on the Hexagon NPU (builds with the `hexagon` feature, Qualcomm
+        /// devices). Needs a GGUF converted with `--tail-outtype q8_0`; steps the NPU cannot take
+        /// fall back to the CPU.
+        #[arg(long)]
+        npu: bool,
     },
 
     /// Transcribe speech in audio using Whisper or LFM2-Audio ASR.
@@ -4178,6 +4184,7 @@ fn main() -> Result<()> {
             merge_gap_ms,
             min_ms,
             json,
+            npu,
         } => {
             use cera::model::sortformer::SortformerModel;
             use cera::speaker_labeler::{FRAME_MS, speaker_segments};
@@ -4227,6 +4234,16 @@ fn main() -> Result<()> {
                 "low-latency" => m.low_latency_streaming(),
                 _ => unreachable!(),
             };
+            if npu {
+                #[cfg(feature = "hexagon")]
+                cera::model::sortformer_hexagon::try_hexagon_sortformer(&m, params.window_frames())
+                    .context(
+                        "the Hexagon NPU is not available or could not stage this model (it needs \
+                         a GGUF converted with `--tail-outtype q8_0`, see scripts/sortformer/README.md)",
+                    )?;
+                #[cfg(not(feature = "hexagon"))]
+                anyhow::bail!("--npu needs a build with the `hexagon` feature");
+            }
 
             if let (Some(vad), Some(whisper)) = (&vad, &whisper) {
                 return diarize_with_transcript(
@@ -7325,8 +7342,10 @@ mod tests {
                 merge_gap_ms,
                 min_ms,
                 json,
+                npu,
             } => {
                 assert_eq!((vad, whisper), (None, None));
+                assert!(!npu, "the NPU is opt-in");
                 assert_eq!(
                     (model.as_str(), audio.as_str()),
                     ("sortformer.gguf", "meeting.wav")
@@ -7366,6 +7385,12 @@ mod tests {
                     (Some("v.gguf"), Some("w.gguf"))
                 );
             }
+            _ => panic!("expected Diarize command"),
+        }
+        let cli = Cli::try_parse_from(["cera", "diarize", "-m", "m.gguf", "-a", "a.wav", "--npu"])
+            .unwrap();
+        match cli.command {
+            Command::Diarize { npu, .. } => assert!(npu),
             _ => panic!("expected Diarize command"),
         }
         // Defaults: the live mode with the checkpoint's own preset.

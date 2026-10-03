@@ -42,7 +42,8 @@
 
 #[cfg(feature = "mmap")]
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, ensure};
 
@@ -131,6 +132,12 @@ impl StreamingParams {
         self.with_chunking(6, 1, 7, 188, 188, 144)
     }
 
+    /// Encoder frames one step attends over at most: both contexts, the chunk, the FIFO and
+    /// the speaker cache. What an accelerator has to be staged for.
+    pub fn window_frames(&self) -> usize {
+        self.left_context + self.chunk_len + self.right_context + self.fifo_len + self.spkcache_len
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(self.chunk_len > 0, "chunk_len must be > 0");
         ensure!(self.update_period > 0, "update_period must be > 0");
@@ -211,6 +218,22 @@ impl StreamingParams {
     }
 }
 
+/// An accelerator (the Hexagon NPU) for the two heavy parts of a diarization step. Set once per
+/// model with [`SortformerModel::set_accelerator`]; every stream and live diarizer made from the
+/// model then uses it. Each method returns `Ok(None)` to decline an input it cannot take (for
+/// example one longer than the window it was staged for), and an `Err` is a failure: both fall
+/// back to the CPU, the failure with a one-time warning, so a diarizer never stops because the
+/// accelerator did.
+pub trait SortformerAccelerator: Send + Sync {
+    /// The conv stem and `pre_encode.out` over `n_frames` of `[n_frames x n_mel]` mel:
+    /// `[stem_frames(n_frames) x n_embd]`, like [`SortformerModel::pre_encode`].
+    fn pre_encode(&self, mel: &[f32], n_frames: usize) -> Result<Option<Vec<f32>>>;
+
+    /// The x-scale, FastConformer, `encoder_proj`, Transformer and speaker head over `t`
+    /// pre-encode embeddings: `[t x n_spk]` sigmoid activities, like [`SortformerModel::predict`].
+    fn predict(&self, emb: &[f32], t: usize) -> Result<Option<Vec<f32>>>;
+}
+
 // ── Config and weights ─────────────────────────────────────────────────────
 
 /// Architecture constants read from the GGUF.
@@ -288,6 +311,10 @@ pub(crate) struct SortformerWeights {
     window: Vec<f32>,
     /// `[n_mel_bins × N_FFT_BINS]`.
     mel_fb: Vec<f32>,
+    /// Set once by [`SortformerModel::set_accelerator`].
+    accel: OnceLock<Arc<dyn SortformerAccelerator>>,
+    /// Whether an accelerator failure has been logged (once per model).
+    accel_warned: AtomicBool,
 }
 
 fn req_u32(g: &GgufFile, key: &str) -> Result<usize> {
@@ -573,6 +600,8 @@ impl SortformerWeights {
             head_out_b,
             window,
             mel_fb,
+            accel: OnceLock::new(),
+            accel_warned: AtomicBool::new(false),
         })
     }
 }
@@ -902,7 +931,12 @@ impl SortformerModel {
     ///
     /// If `mel` is not `[n_frames x 128]`.
     pub fn pre_encode(&self, mel: &[f32], n_frames: usize) -> (Vec<f32>, usize) {
-        conv_stem_forward(mel, n_frames, &self.w.conv_stem, &self.w.enc_cfg)
+        assert_eq!(
+            mel.len(),
+            n_frames * self.w.config.n_mel_bins,
+            "pre_encode: mel must be [n_frames x n_mel_bins]"
+        );
+        self.w.conv_stem_for(mel)
     }
 
     /// Everything after the stem: x-scale, FastConformer, `encoder_proj`, Transformer and the
@@ -914,7 +948,33 @@ impl SortformerModel {
     /// If `emb` is not `[t x 512]`, or `t` is past the 7500-frame attention window the other
     /// entry points enforce (attention memory is quadratic in `t`).
     pub fn predict(&self, emb: &[f32], t: usize) -> Vec<f32> {
+        let c = &self.w.config;
+        assert_eq!(emb.len(), t * c.n_embd, "predict: emb must be [t x n_embd]");
+        assert!(
+            t <= MAX_OFFLINE_FRAMES,
+            "predict: {t} frames exceeds the {MAX_OFFLINE_FRAMES}-frame attention window"
+        );
+        if t > 0
+            && let Some(preds) = self.w.accelerated("predict", |a| a.predict(emb, t))
+        {
+            return preds;
+        }
         self.predict_with_taps(emb, t, &mut |_, _| {})
+    }
+
+    /// [`Self::predict`] on the CPU whatever accelerator is set: the reference the accelerated
+    /// path is compared against.
+    pub fn predict_cpu(&self, emb: &[f32], t: usize) -> Vec<f32> {
+        self.predict_with_taps(emb, t, &mut |_, _| {})
+    }
+
+    /// Run the stem and the prediction on `accel` from here on (one accelerator per model,
+    /// shared by every stream and live diarizer made from it, including clones).
+    pub fn set_accelerator(&self, accel: Arc<dyn SortformerAccelerator>) -> Result<()> {
+        self.w
+            .accel
+            .set(accel)
+            .map_err(|_| anyhow::anyhow!("this Sortformer model already has an accelerator"))
     }
 
     /// [`Self::predict`] that reports intermediates to `tap` as it goes: `"xscaled"`,
@@ -1923,10 +1983,35 @@ fn compress_spkcache(
 }
 
 impl SortformerWeights {
-    /// The stem on an already-validated slice of mel frames.
+    /// The stem on an already-validated slice of mel frames: on the accelerator when one is
+    /// set and takes it, else on the CPU.
     fn conv_stem_for(&self, mel: &[f32]) -> (Vec<f32>, usize) {
         let n = mel.len() / self.config.n_mel_bins;
+        if let Some(emb) = self.accelerated("conv stem", |a| a.pre_encode(mel, n)) {
+            return (emb, stem_frames(n));
+        }
         conv_stem_forward(mel, n, &self.conv_stem, &self.enc_cfg)
+    }
+
+    /// Run `call` on the accelerator if one is set. `None` means "use the CPU": nothing is set,
+    /// the accelerator declined, or it failed (logged once, then quiet).
+    fn accelerated<T>(
+        &self,
+        what: &str,
+        call: impl FnOnce(&dyn SortformerAccelerator) -> Result<Option<T>>,
+    ) -> Option<T> {
+        let accel = self.accel.get()?;
+        match call(accel.as_ref()) {
+            Ok(out) => out,
+            Err(e) => {
+                if !self.accel_warned.swap(true, Ordering::Relaxed) {
+                    tracing::warn!(
+                        "sortformer: {what} failed on the accelerator ({e:#}); using the CPU"
+                    );
+                }
+                None
+            }
+        }
     }
 }
 

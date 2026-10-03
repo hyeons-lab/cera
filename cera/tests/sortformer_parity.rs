@@ -29,7 +29,7 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use cera::convert::safetensors::SafeTensorsHeader;
-use cera::model::sortformer::{SortformerModel, StreamingParams};
+use cera::model::sortformer::{SortformerAccelerator, SortformerModel, StreamingParams};
 
 fn models_dir() -> Option<PathBuf> {
     match std::env::var_os("SORTFORMER_MODELS_DIR") {
@@ -1381,4 +1381,108 @@ fn live_diarizer_labels_utterances_as_the_audio_arrives() {
         "first utterance released at {} ms",
         first.2
     );
+}
+
+/// What an accelerator test double does with the work it is handed.
+#[derive(Clone, Copy)]
+enum Mode {
+    /// Compute it on the CPU (a stand-in for a correct accelerator).
+    Delegate,
+    /// Return `Ok(None)`: not taken.
+    Decline,
+    /// Return an error.
+    Fail,
+}
+
+/// A double that delegates to an independent CPU model and counts the calls it gets.
+struct CpuDouble {
+    cpu: SortformerModel,
+    mode: Mode,
+    stems: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    predicts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+}
+
+impl SortformerAccelerator for CpuDouble {
+    fn pre_encode(&self, mel: &[f32], n: usize) -> anyhow::Result<Option<Vec<f32>>> {
+        self.stems
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match self.mode {
+            Mode::Delegate => Ok(Some(self.cpu.pre_encode(mel, n).0)),
+            Mode::Decline => Ok(None),
+            Mode::Fail => anyhow::bail!("the accelerator is gone"),
+        }
+    }
+
+    fn predict(&self, emb: &[f32], t: usize) -> anyhow::Result<Option<Vec<f32>>> {
+        self.predicts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match self.mode {
+            Mode::Delegate => Ok(Some(self.cpu.predict_cpu(emb, t))),
+            Mode::Decline => Ok(None),
+            Mode::Fail => anyhow::bail!("the accelerator is gone"),
+        }
+    }
+}
+
+/// Stream the clip live and return every prediction, with the accelerator (if any) set first.
+fn live_run(m: &SortformerModel, params: &StreamingParams, pcm: &[f32]) -> Vec<f32> {
+    let mut live = m.new_live(params.clone()).unwrap();
+    let mut out = Vec::new();
+    for piece in pcm.chunks(1600) {
+        out.extend(live.push_audio(piece).unwrap());
+    }
+    out.extend(live.finish().unwrap());
+    out
+}
+
+/// The accelerator hook sits under `step`: a delegating accelerator is called for every
+/// stem and every prediction and changes nothing, and one that declines or fails leaves the
+/// CPU result untouched (the failure is survived, not propagated). One model per case, since a
+/// model takes an accelerator once.
+#[test]
+fn an_accelerator_is_used_by_the_stream_and_never_changes_the_answer() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    let file = "sortformer-4spk-v2.1-f32.gguf";
+    let (Some(reference), Some(golden)) = (model(file), Golden::load()) else {
+        return;
+    };
+    let pcm = read_clip();
+    let params = preset(&reference, &golden, "tiny");
+    let want = live_run(&reference, &params, &pcm);
+    assert!(!want.is_empty());
+
+    for (name, mode) in [
+        ("delegate", Mode::Delegate),
+        ("decline", Mode::Decline),
+        ("fail", Mode::Fail),
+    ] {
+        let m = model(file).unwrap();
+        let (stems, predicts) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
+        m.set_accelerator(Arc::new(CpuDouble {
+            cpu: model(file).unwrap(),
+            mode,
+            stems: stems.clone(),
+            predicts: predicts.clone(),
+        }))
+        .unwrap();
+        let got = live_run(&m, &params, &pcm);
+        assert_eq!(got, want, "{name}: predictions differ from the CPU run");
+        let (stems, predicts) = (
+            stems.load(Ordering::Relaxed),
+            predicts.load(Ordering::Relaxed),
+        );
+        assert!(
+            stems > 1 && predicts > 1,
+            "{name}: {stems} stems, {predicts} predicts"
+        );
+        // A second accelerator is refused rather than silently replacing the first.
+        let again = m.set_accelerator(Arc::new(CpuDouble {
+            cpu: model(file).unwrap(),
+            mode,
+            stems: Arc::default(),
+            predicts: Arc::default(),
+        }));
+        assert!(again.is_err(), "{name}: a second accelerator was accepted");
+    }
 }
