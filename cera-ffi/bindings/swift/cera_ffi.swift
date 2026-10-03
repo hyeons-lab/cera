@@ -2811,6 +2811,20 @@ public protocol FfiAudioPipelineProtocol: AnyObject, Sendable {
     func processChunk(chunk: [Float]) throws  -> [FfiAudioPipelineEvent]
     
     /**
+     * `process_chunk` for 16-bit signed little-endian PCM, as a capture API such as Android's
+     * `AudioRecord` delivers it: two bytes per sample, converted to float here.
+     *
+     * Prefer this over `process_chunk` from Kotlin, Swift and Dart. A `Vec<f32>` crosses the FFI
+     * as a list of boxed floats that the generated code walks twice per call; at 16 kHz that
+     * conversion cost about 0.05 CPU-seconds per audio second on a phone, ten times the whole
+     * NPU pipeline. A byte array is copied in one call.
+     *
+     * An odd byte count is an error: it can only be a torn read, and dropping the stray byte would
+     * shift every later sample.
+     */
+    func processChunkPcm16(pcm: Data) throws  -> [FfiAudioPipelineEvent]
+    
+    /**
      * Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
      */
     func reset() throws 
@@ -3102,6 +3116,27 @@ open func processChunk(chunk: [Float])throws  -> [FfiAudioPipelineEvent]  {
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk(
             self.uniffiCloneHandle(),
         FfiConverterSequenceFloat.lower(chunk),$0
+    )
+})
+}
+    
+    /**
+     * `process_chunk` for 16-bit signed little-endian PCM, as a capture API such as Android's
+     * `AudioRecord` delivers it: two bytes per sample, converted to float here.
+     *
+     * Prefer this over `process_chunk` from Kotlin, Swift and Dart. A `Vec<f32>` crosses the FFI
+     * as a list of boxed floats that the generated code walks twice per call; at 16 kHz that
+     * conversion cost about 0.05 CPU-seconds per audio second on a phone, ten times the whole
+     * NPU pipeline. A byte array is copied in one call.
+     *
+     * An odd byte count is an error: it can only be a torn read, and dropping the stray byte would
+     * shift every later sample.
+     */
+open func processChunkPcm16(pcm: Data)throws  -> [FfiAudioPipelineEvent]  {
+    return try  FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk_pcm16(
+            self.uniffiCloneHandle(),
+        FfiConverterData.lower(pcm),$0
     )
 })
 }
@@ -13817,6 +13852,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() != 51752) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16() != 58081) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() != 13673) {

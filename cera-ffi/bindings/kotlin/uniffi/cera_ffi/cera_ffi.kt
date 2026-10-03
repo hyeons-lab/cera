@@ -1100,6 +1100,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16(): Int
+
     external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state(): Int
@@ -2170,6 +2172,12 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk_pcm16(
+        `ptr`: Long,
+        `pcm`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_reset(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -3117,6 +3125,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() != 51752) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16() != 58081) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() != 13673) {
@@ -6924,6 +6935,20 @@ public interface FfiAudioPipelineInterface {
     fun `processChunk`(`chunk`: List<kotlin.Float>): List<FfiAudioPipelineEvent>
 
     /**
+     * `process_chunk` for 16-bit signed little-endian PCM, as a capture API such as Android's
+     * `AudioRecord` delivers it: two bytes per sample, converted to float here.
+     *
+     * Prefer this over `process_chunk` from Kotlin, Swift and Dart. A `Vec<f32>` crosses the FFI
+     * as a list of boxed floats that the generated code walks twice per call; at 16 kHz that
+     * conversion cost about 0.05 CPU-seconds per audio second on a phone, ten times the whole
+     * NPU pipeline. A byte array is copied in one call.
+     *
+     * An odd byte count is an error: it can only be a torn read, and dropping the stray byte would
+     * shift every later sample.
+     */
+    fun `processChunkPcm16`(`pcm`: kotlin.ByteArray): List<FfiAudioPipelineEvent>
+
+    /**
      * Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
      */
     fun `reset`()
@@ -7250,6 +7275,32 @@ open class FfiAudioPipeline :
                     UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk(
                         it,
                         FfiConverterSequenceFloat.lower(`chunk`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * `process_chunk` for 16-bit signed little-endian PCM, as a capture API such as Android's
+     * `AudioRecord` delivers it: two bytes per sample, converted to float here.
+     *
+     * Prefer this over `process_chunk` from Kotlin, Swift and Dart. A `Vec<f32>` crosses the FFI
+     * as a list of boxed floats that the generated code walks twice per call; at 16 kHz that
+     * conversion cost about 0.05 CPU-seconds per audio second on a phone, ten times the whole
+     * NPU pipeline. A byte array is copied in one call.
+     *
+     * An odd byte count is an error: it can only be a torn read, and dropping the stray byte would
+     * shift every later sample.
+     */
+    @Throws(FfiException::class)
+    override fun `processChunkPcm16`(`pcm`: kotlin.ByteArray): List<FfiAudioPipelineEvent> =
+        FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk_pcm16(
+                        it,
+                        FfiConverterByteArray.lower(`pcm`),
                         _status,
                     )
                 }

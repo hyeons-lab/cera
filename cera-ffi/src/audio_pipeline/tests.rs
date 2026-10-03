@@ -576,3 +576,64 @@ fn test_ffi_audio_pipeline_diarizer_on_the_npu() {
         ]
     );
 }
+
+#[test]
+fn pcm16_converts_little_endian_samples_to_unit_floats() {
+    let bytes = [
+        0x00, 0x80, // i16::MIN
+        0x00, 0x00, // 0
+        0xFF, 0x7F, // i16::MAX
+        0x00, 0x40, // 16384
+    ];
+    let floats = pcm16_le_to_f32(&bytes).expect("even length");
+    assert_eq!(floats, vec![-1.0, 0.0, 32767.0 / 32768.0, 0.5]);
+}
+
+#[test]
+fn pcm16_with_an_odd_length_is_refused_not_truncated() {
+    let err = pcm16_le_to_f32(&[0u8; 3]).expect_err("a torn read");
+    assert!(
+        matches!(&err, FfiError::Backend { detail } if detail.contains("odd length")),
+        "got {err:?}"
+    );
+}
+
+/// The PCM16 entry point must drive the pipeline exactly as `process_chunk` does with the same
+/// samples: it is only a cheaper way across the FFI.
+#[test]
+fn process_chunk_pcm16_matches_process_chunk() {
+    let config = || FfiAudioPipelineConfig {
+        auto_transcribe: false,
+        ..audio_pipeline_default_config()
+    };
+    // 0x0CCC / 32768 is the f32 the byte path produces for 3276.
+    let samples: Vec<i16> = vec![3276; 1600];
+    let floats: Vec<f32> = samples.iter().map(|&s| s as f32 / 32768.0).collect();
+    let bytes: Vec<u8> = samples.iter().flat_map(|s| s.to_le_bytes()).collect();
+
+    let by_float = FfiAudioPipeline::from_bytes(None, None, None, Some(config())).unwrap();
+    let by_bytes = FfiAudioPipeline::from_bytes(None, None, None, Some(config())).unwrap();
+    let a = by_float.process_chunk(floats).unwrap();
+    let b = by_bytes.process_chunk_pcm16(bytes).unwrap();
+    assert_eq!(a, b);
+    assert!(
+        !a.is_empty(),
+        "the chunk should start speech, or the comparison is vacuous"
+    );
+    assert_eq!(
+        by_float.flush().unwrap(),
+        by_bytes.flush().unwrap(),
+        "flush must agree too"
+    );
+    assert_eq!(
+        by_float.take_last_utterance().unwrap(),
+        by_bytes.take_last_utterance().unwrap()
+    );
+}
+
+#[test]
+fn process_chunk_pcm16_rejects_a_torn_chunk_without_advancing_the_stream() {
+    let pipeline = FfiAudioPipeline::from_bytes(None, None, None, None).unwrap();
+    assert!(pipeline.process_chunk_pcm16(vec![0u8; 3201]).is_err());
+    assert_eq!(pipeline.current_sample().unwrap(), 0);
+}

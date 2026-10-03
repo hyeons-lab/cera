@@ -10388,6 +10388,16 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk != 51752) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk`: expected 51752, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16');
+      _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16 = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16 != 58081) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16`: expected 58081, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16');
+    }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset;
     try {
       final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset');
@@ -26667,6 +26677,119 @@ class CeraFfiFfi {
     }
   }
 
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ffiAudioPipelineProcessChunkPcm16FfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ffiaudiopipeline_process_chunk_pcm16');
+
+  List<FfiAudioPipelineEvent> ffiAudioPipelineInvokeProcessChunkPcm16(int handle, Uint8List pcm) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _ffiAudioPipelineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final pcmWriter = _UniFfiBinaryWriter();
+      pcmWriter.writeI32(pcm.length);
+      pcmWriter.writeBytes(pcm);
+      final Uint8List pcmBytes = pcmWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> pcmPtr = pcmBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(pcmBytes.length);
+      if (pcmBytes.isNotEmpty) { pcmPtr.asTypedList(pcmBytes.length).setAll(0, pcmBytes); }
+      foreignArgPtrs.add(pcmPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> pcmFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      pcmFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      pcmFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> pcmForeignPtr = calloc<_UniFfiForeignBytes>();
+      pcmForeignPtr.ref
+        ..len = pcmBytes.length
+        ..data = pcmPtr;
+      final _UniFfiRustBuffer pcmRustBuffer = _uniFfiRustBufferFromBytes(pcmForeignPtr.ref, pcmFromBytesStatusPtr);
+      calloc.free(pcmForeignPtr);
+      final int pcmFromBytesCode = pcmFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer pcmFromBytesErrBuf = pcmFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(pcmFromBytesStatusPtr);
+      if (pcmFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> pcmFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        pcmFromBytesErrBufPtr.ref
+          ..capacity = pcmFromBytesErrBuf.capacity
+          ..len = pcmFromBytesErrBuf.len
+          ..data = pcmFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(pcmFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $pcmFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = pcmRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = pcmRustBuffer.len;
+      (argBuf + 3).ref.ptr = pcmRustBuffer.data.cast<ffi.Void>();
+      _ffiAudioPipelineProcessChunkPcm16FfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final _UniFfiBinaryReader retReader = _UniFfiBinaryReader(retBytes);
+      final decodedValue = (() { final int __len = retReader.readI32(); final out = <FfiAudioPipelineEvent>[]; for (var i = 0; i < __len; i++) { out.add(_uniffiReadFfiAudioPipelineEvent(retReader)); } return out; })();
+      if (!retReader.isDone) {
+        throw StateError('extra bytes remaining while decoding UniFFI ffibuffer return payload');
+      }
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ffiAudioPipelineResetFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ffiaudiopipeline_reset');
 
   void ffiAudioPipelineInvokeReset(int handle) {
@@ -33144,6 +33267,21 @@ final class FfiAudioPipeline {
   List<FfiAudioPipelineEvent> processChunk(List<double> chunk) {
     _ensureOpen();
     return _ffi.ffiAudioPipelineInvokeProcessChunk(_handle, chunk);
+  }
+
+  /// `process_chunk` for 16-bit signed little-endian PCM, as a capture API such as Android's
+  /// `AudioRecord` delivers it: two bytes per sample, converted to float here.
+  ///
+  /// Prefer this over `process_chunk` from Kotlin, Swift and Dart. A `Vec<f32>` crosses the FFI
+  /// as a list of boxed floats that the generated code walks twice per call; at 16 kHz that
+  /// conversion cost about 0.05 CPU-seconds per audio second on a phone, ten times the whole
+  /// NPU pipeline. A byte array is copied in one call.
+  ///
+  /// An odd byte count is an error: it can only be a torn read, and dropping the stray byte would
+  /// shift every later sample.
+  List<FfiAudioPipelineEvent> processChunkPcm16(Uint8List pcm) {
+    _ensureOpen();
+    return _ffi.ffiAudioPipelineInvokeProcessChunkPcm16(_handle, pcm);
   }
 
   /// Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.

@@ -1104,6 +1104,11 @@ RustBuffer uniffi_cera_ffi_fn_method_ffiaudiopipeline_pop_event(uint64_t ptr, Ru
 RustBuffer uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk(uint64_t ptr, RustBuffer chunk, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_PROCESS_CHUNK_PCM16
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_PROCESS_CHUNK_PCM16
+RustBuffer uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk_pcm16(uint64_t ptr, RustBuffer pcm, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_RESET
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_RESET
 void uniffi_cera_ffi_fn_method_ffiaudiopipeline_reset(uint64_t ptr, RustCallStatus *_Nonnull out_status
@@ -2482,6 +2487,12 @@ uint16_t uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_PROCESS_CHUNK
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_PROCESS_CHUNK
 uint16_t uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_PROCESS_CHUNK_PCM16
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_PROCESS_CHUNK_PCM16
+uint16_t uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16(void
     
 );
 #endif

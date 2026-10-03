@@ -380,6 +380,23 @@ impl FfiAudioPipeline {
     }
 }
 
+/// 16-bit signed little-endian PCM to `[-1, 1)` floats.
+fn pcm16_le_to_f32(pcm: &[u8]) -> Result<Vec<f32>, FfiError> {
+    let (samples, rest) = pcm.as_chunks::<2>();
+    if !rest.is_empty() {
+        return Err(FfiError::Backend {
+            detail: format!(
+                "PCM16 chunk has an odd length ({} bytes): a sample is two bytes",
+                pcm.len()
+            ),
+        });
+    }
+    Ok(samples
+        .iter()
+        .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
+        .collect())
+}
+
 #[uniffi::export]
 impl FfiAudioPipeline {
     /// Construct a pipeline from filesystem model paths.
@@ -487,6 +504,24 @@ impl FfiAudioPipeline {
                 detail: format!("failed to process audio chunk: {e}"),
             })?;
         Ok(events.into_iter().map(Into::into).collect())
+    }
+
+    /// `process_chunk` for 16-bit signed little-endian PCM, as a capture API such as Android's
+    /// `AudioRecord` delivers it: two bytes per sample, converted to float here.
+    ///
+    /// Prefer this over `process_chunk` from Kotlin, Swift and Dart. A `Vec<f32>` crosses the FFI
+    /// as a list of boxed floats that the generated code walks twice per call; at 16 kHz that
+    /// conversion cost about 0.05 CPU-seconds per audio second on a phone, ten times the whole
+    /// NPU pipeline. A byte array is copied in one call.
+    ///
+    /// An odd byte count is an error: it can only be a torn read, and dropping the stray byte would
+    /// shift every later sample.
+    pub fn process_chunk_pcm16(
+        &self,
+        pcm: Vec<u8>,
+    ) -> Result<Vec<FfiAudioPipelineEvent>, FfiError> {
+        let chunk = pcm16_le_to_f32(&pcm)?;
+        self.process_chunk(chunk)
     }
 
     /// Flush any in-flight speech segment at the end of the audio stream.
