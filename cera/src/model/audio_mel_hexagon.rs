@@ -57,11 +57,16 @@ impl MelWeightOffsets {
 /// The window is the padded Hann the CPU path uses, so a frame's DFT here is
 /// the FFT of the windowed frame there.
 pub(crate) fn dft_matrices() -> (Vec<f32>, Vec<f32>) {
-    let hann = build_padded_hann_window();
+    dft_matrices_for(&build_padded_hann_window())
+}
+
+/// [`dft_matrices`] for any `N_FFT`-long window (Sortformer ships its own in its GGUF).
+pub(crate) fn dft_matrices_for(window: &[f32]) -> (Vec<f32>, Vec<f32>) {
+    assert_eq!(window.len(), N_FFT, "window must be N_FFT long");
     let mut re = vec![0.0f32; BINS_PAD * N_FFT];
     let mut im = vec![0.0f32; BINS_PAD * N_FFT];
     for k in 0..N_FFT_BINS {
-        for (n, &h) in hann.iter().enumerate() {
+        for (n, &h) in window.iter().enumerate() {
             // Reduce k * n mod N_FFT before the trig call: it keeps the angle
             // exact in f64 and the table symmetric.
             let angle = std::f64::consts::TAU * ((k * n) % N_FFT) as f64 / N_FFT as f64;
@@ -74,7 +79,15 @@ pub(crate) fn dft_matrices() -> (Vec<f32>, Vec<f32>) {
 
 /// The mel filterbank with each row padded to [`BINS_PAD`] columns.
 pub(crate) fn padded_filters(n_mel: usize) -> Vec<f32> {
-    let filters = build_mel_filterbank(n_mel, N_FFT, SAMPLE_RATE as usize);
+    padded_filters_from(
+        &build_mel_filterbank(n_mel, N_FFT, SAMPLE_RATE as usize),
+        n_mel,
+    )
+}
+
+/// A `[n_mel, N_FFT_BINS]` filterbank with each row padded to [`BINS_PAD`] columns.
+pub(crate) fn padded_filters_from(filters: &[f32], n_mel: usize) -> Vec<f32> {
+    assert_eq!(filters.len(), n_mel * N_FFT_BINS, "filterbank shape");
     let mut out = vec![0.0f32; n_mel * BINS_PAD];
     for (row, src) in out
         .as_chunks_mut::<BINS_PAD>()
@@ -93,6 +106,20 @@ pub(crate) fn put_mel(dst: &mut [u8], o: &MelWeightOffsets, n_mel: usize) {
     put_vec(dst, o.dft_re, &re);
     put_vec(dst, o.dft_im, &im);
     put_vec(dst, o.filters, &padded_filters(n_mel));
+}
+
+/// [`put_mel`] with the caller's window and `[n_mel, N_FFT_BINS]` filterbank.
+pub(crate) fn put_mel_tables(
+    dst: &mut [u8],
+    o: &MelWeightOffsets,
+    window: &[f32],
+    filters: &[f32],
+    n_mel: usize,
+) {
+    let (re, im) = dft_matrices_for(window);
+    put_vec(dst, o.dft_re, &re);
+    put_vec(dst, o.dft_im, &im);
+    put_vec(dst, o.filters, &padded_filters_from(filters, n_mel));
 }
 
 /// Regions of the front end's per-clip buffer.

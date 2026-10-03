@@ -1182,7 +1182,7 @@ pub(crate) fn settled<R>(
 /// A per-call buffer of `bytes`, allocated only once the queue is idle
 /// ([`settle`]): a hung DSP fails the call before it allocates anything a stale
 /// batch could still reference.
-fn alloc_settled(
+pub(crate) fn alloc_settled(
     session: &mut HexagonQueueSession,
     driver: &Arc<FastRpcDriver>,
     bytes: usize,
@@ -1195,7 +1195,7 @@ fn alloc_settled(
 /// Leaked instead, with a warning, when a batch is still unanswered: the DSP
 /// may be running it against the buffer, and freeing it would let the next
 /// allocation reuse the address under that batch. Returns whether it leaked.
-fn release_or_leak(session: &HexagonQueueSession, st: RpcmemBuffer) -> bool {
+pub(crate) fn release_or_leak(session: &HexagonQueueSession, st: RpcmemBuffer) -> bool {
     if session.outstanding_batches() > 0 {
         hexagon_warn!(
             "audio encoder: leaking a {} B buffer, a batch is still unanswered",

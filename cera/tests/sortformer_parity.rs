@@ -1400,6 +1400,44 @@ struct CpuDouble {
     mode: Mode,
     stems: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     predicts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    mels: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The model's window and `[n_mel x 257]` filterbank, read from its GGUF.
+    mel_tables: (Vec<f32>, Vec<f32>),
+}
+
+/// An independent mel front end: a direct f64 DFT of the windowed frames and the filterbank
+/// projection, standing in for the NPU's matmuls. `samples` is pre-emphasised and centre-padded.
+fn naive_mel_energies(window: &[f32], fb: &[f32], samples: &[f32], n_frames: usize) -> Vec<f32> {
+    let n_mel = fb.len() / 257;
+    let (cos, sin): (Vec<f64>, Vec<f64>) = (0..512)
+        .map(|j| {
+            let a = std::f64::consts::TAU * j as f64 / 512.0;
+            (a.cos(), a.sin())
+        })
+        .unzip();
+    let mut out = Vec::with_capacity(n_frames * n_mel);
+    let mut power = vec![0f64; 257];
+    for f in 0..n_frames {
+        let frame = &samples[f * 160..f * 160 + 512];
+        for (k, p) in power.iter_mut().enumerate() {
+            let (mut re, mut im) = (0f64, 0f64);
+            for (n, (&w, &x)) in window.iter().zip(frame).enumerate() {
+                let v = w as f64 * x as f64;
+                re += v * cos[(k * n) % 512];
+                im -= v * sin[(k * n) % 512];
+            }
+            *p = re * re + im * im;
+        }
+        for m in 0..n_mel {
+            let e: f64 = fb[m * 257..(m + 1) * 257]
+                .iter()
+                .zip(&power)
+                .map(|(&w, &p)| w as f64 * p)
+                .sum();
+            out.push(e as f32);
+        }
+    }
+    out
 }
 
 impl SortformerAccelerator for CpuDouble {
@@ -1422,6 +1460,20 @@ impl SortformerAccelerator for CpuDouble {
             Mode::Fail => anyhow::bail!("the accelerator is gone"),
         }
     }
+
+    fn mel_energies(&self, samples: &[f32], n_frames: usize) -> anyhow::Result<Option<Vec<f32>>> {
+        self.mels.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match self.mode {
+            Mode::Delegate => Ok(Some(naive_mel_energies(
+                &self.mel_tables.0,
+                &self.mel_tables.1,
+                samples,
+                n_frames,
+            ))),
+            Mode::Decline => Ok(None),
+            Mode::Fail => anyhow::bail!("the accelerator is gone"),
+        }
+    }
 }
 
 /// Stream the clip live and return every prediction, with the accelerator (if any) set first.
@@ -1435,10 +1487,11 @@ fn live_run(m: &SortformerModel, params: &StreamingParams, pcm: &[f32]) -> Vec<f
     out
 }
 
-/// The accelerator hook sits under `step`: a delegating accelerator is called for every
-/// stem and every prediction and changes nothing, and one that declines or fails leaves the
-/// CPU result untouched (the failure is survived, not propagated). One model per case, since a
-/// model takes an accelerator once.
+/// The accelerator hook sits under `step` and the mel front end. A delegating accelerator is
+/// called for every stem and prediction and, with an independent f64 mel, gives the same
+/// activities to within the mel's rounding; one that declines or fails leaves the CPU result
+/// bit-identical (the failure is survived, not propagated). The mel is computed a chunk at a
+/// time, not once per push. One model per case, since a model takes an accelerator once.
 #[test]
 fn an_accelerator_is_used_by_the_stream_and_never_changes_the_answer() {
     use std::sync::Arc;
@@ -1451,6 +1504,27 @@ fn an_accelerator_is_used_by_the_stream_and_never_changes_the_answer() {
     let params = preset(&reference, &golden, "tiny");
     let want = live_run(&reference, &params, &pcm);
     assert!(!want.is_empty());
+    let g = cera::gguf::GgufFile::open_arc(&local(file).unwrap()).unwrap();
+    let tables = || {
+        // The checkpoint ships the 400-tap window; the front end centers it in the 512-sample FFT.
+        let taps = g.get_tensor("sf.mel.window").unwrap().to_f32_vec();
+        assert_eq!(taps.len(), 400);
+        let mut window = vec![0.0f32; 512];
+        window[56..456].copy_from_slice(&taps);
+        (window, g.get_tensor("sf.mel.fb").unwrap().to_f32_vec())
+    };
+    let counter = || Arc::new(AtomicUsize::new(0));
+    let double = |mode, c: &[Arc<AtomicUsize>; 3]| {
+        Arc::new(CpuDouble {
+            cpu: model(file).unwrap(),
+            mode,
+            stems: c[0].clone(),
+            predicts: c[1].clone(),
+            mels: c[2].clone(),
+            mel_tables: tables(),
+        })
+    };
+    let pushes = pcm.len().div_ceil(1600);
 
     for (name, mode) in [
         ("delegate", Mode::Delegate),
@@ -1458,31 +1532,43 @@ fn an_accelerator_is_used_by_the_stream_and_never_changes_the_answer() {
         ("fail", Mode::Fail),
     ] {
         let m = model(file).unwrap();
-        let (stems, predicts) = (Arc::new(AtomicUsize::new(0)), Arc::new(AtomicUsize::new(0)));
-        m.set_accelerator(Arc::new(CpuDouble {
-            cpu: model(file).unwrap(),
-            mode,
-            stems: stems.clone(),
-            predicts: predicts.clone(),
-        }))
-        .unwrap();
+        let c = [counter(), counter(), counter()];
+        m.set_accelerator(double(mode, &c)).unwrap();
         let got = live_run(&m, &params, &pcm);
-        assert_eq!(got, want, "{name}: predictions differ from the CPU run");
-        let (stems, predicts) = (
-            stems.load(Ordering::Relaxed),
-            predicts.load(Ordering::Relaxed),
-        );
+        assert_eq!(got.len(), want.len(), "{name}: frame count");
+        match mode {
+            Mode::Delegate => {
+                // The mel itself, offline and through the accelerator, against the CPU's.
+                let (cpu_mel, n) = reference.log_mel(&pcm);
+                let (acc_mel, n2) = m.log_mel(&pcm);
+                assert_eq!(n, n2);
+                let mel_worst = cpu_mel
+                    .iter()
+                    .zip(&acc_mel)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(mel_worst < 1e-2, "{name}: log-mel worst diff {mel_worst}");
+                let worst = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(worst < 1e-3, "{name}: worst activity diff {worst}");
+            }
+            _ => assert_eq!(got, want, "{name}: predictions differ from the CPU run"),
+        }
+        let [stems, predicts, mels] = [0, 1, 2].map(|i| c[i].load(Ordering::Relaxed));
         assert!(
             stems > 1 && predicts > 1,
             "{name}: {stems} stems, {predicts} predicts"
         );
+        // One mel batch per chunk, far fewer than the pushes (a chunk is about a second here).
+        assert!(
+            mels >= 1 && mels < pushes / 2,
+            "{name}: {mels} mel calls for {pushes} pushes"
+        );
         // A second accelerator is refused rather than silently replacing the first.
-        let again = m.set_accelerator(Arc::new(CpuDouble {
-            cpu: model(file).unwrap(),
-            mode,
-            stems: Arc::default(),
-            predicts: Arc::default(),
-        }));
+        let again = m.set_accelerator(double(mode, &[counter(), counter(), counter()]));
         assert!(again.is_err(), "{name}: a second accelerator was accepted");
     }
 }

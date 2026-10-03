@@ -54,7 +54,9 @@ use crate::model::audio_encoder::{
     N_FFT, POS_EMB_DIM, PREEMPH, SAMPLE_RATE, WINDOW_LEN, conformer_block_forward,
     conv_stem_forward, load_conformer_block, load_conv_layer, load_vec_f32, relative_pos_emb,
 };
-use crate::model::audio_preprocessor::{MelFrameComputer, N_FFT_BINS, log_mel_with_tables};
+use crate::model::audio_preprocessor::{
+    MelFrameComputer, N_FFT_BINS, log_mel_with_tables, n_frames_for, padded_preemphasized,
+};
 use crate::model::weights::MmapWeight;
 use crate::tensor::DType;
 
@@ -232,6 +234,15 @@ pub trait SortformerAccelerator: Send + Sync {
     /// The x-scale, FastConformer, `encoder_proj`, Transformer and speaker head over `t`
     /// pre-encode embeddings: `[t x n_spk]` sigmoid activities, like [`SortformerModel::predict`].
     fn predict(&self, emb: &[f32], t: usize) -> Result<Option<Vec<f32>>>;
+
+    /// Linear mel energies (before the log) of `n_frames` frames over pre-emphasised, centre-padded
+    /// samples: frame `f` is `samples[f * 160 .. f * 160 + 512]`, windowed with the model's own
+    /// window and projected with its own filterbank. `[n_frames x n_mel]`, time-major. The host
+    /// takes the log. Optional: the default declines, leaving the mel on the CPU.
+    fn mel_energies(&self, samples: &[f32], n_frames: usize) -> Result<Option<Vec<f32>>> {
+        let _ = (samples, n_frames);
+        Ok(None)
+    }
 }
 
 // ── Config and weights ─────────────────────────────────────────────────────
@@ -308,9 +319,9 @@ pub(crate) struct SortformerWeights {
     pub(crate) head_out_w: MmapWeight,
     pub(crate) head_out_b: Vec<f32>,
     /// `N_FFT`-long window with the `WINDOW_LEN` taps centered in it.
-    window: Vec<f32>,
+    pub(crate) window: Vec<f32>,
     /// `[n_mel_bins × N_FFT_BINS]`.
-    mel_fb: Vec<f32>,
+    pub(crate) mel_fb: Vec<f32>,
     /// Set once by [`SortformerModel::set_accelerator`].
     accel: OnceLock<Arc<dyn SortformerAccelerator>>,
     /// Whether an accelerator failure has been logged (once per model).
@@ -912,6 +923,9 @@ impl SortformerModel {
     /// `n / 160`, and the last STFT frame (the one that reaches into the trailing center
     /// padding) is masked out of everything downstream. This returns only the valid frames.
     pub fn log_mel(&self, pcm: &[f32]) -> (Vec<f32>, usize) {
+        if let Some(done) = self.log_mel_accelerated(pcm) {
+            return done;
+        }
         let (mut mel, n) = log_mel_with_tables(
             pcm,
             self.w.config.n_mel_bins,
@@ -922,6 +936,28 @@ impl SortformerModel {
         let valid = n.min(pcm.len() / HOP_LEN);
         mel.truncate(valid * self.w.config.n_mel_bins);
         (mel, valid)
+    }
+
+    /// [`Self::log_mel`] on the accelerator, or `None` when there is none, it declines, or the
+    /// clip has no frame.
+    fn log_mel_accelerated(&self, pcm: &[f32]) -> Option<(Vec<f32>, usize)> {
+        self.w.accel.get()?;
+        let valid = n_frames_for(pcm.len()).min(pcm.len() / HOP_LEN);
+        if valid == 0 {
+            return None;
+        }
+        let samples = padded_preemphasized(pcm)?;
+        let energies = self.w.accelerated("log-mel", |a| {
+            a.mel_energies(&samples[..(valid - 1) * HOP_LEN + N_FFT], valid)
+        })?;
+        if energies.len() != valid * self.w.config.n_mel_bins {
+            return None;
+        }
+        let mel = energies
+            .iter()
+            .map(|&v| (v as f64 + LOG_MEL_EPS as f64).ln() as f32)
+            .collect();
+        Some((mel, valid))
     }
 
     /// Conv stem plus `pre_encode.out`: `[frames × 128]` mel to `[ceil(frames/8) × 512]` embeddings.
@@ -1145,6 +1181,8 @@ fn ensure_finite_pcm(pcm: &[f32]) -> Result<()> {
 /// across calls (the offline path leaves the first sample untouched, which is the same thing
 /// with a previous sample of 0).
 pub struct MelStream {
+    /// The model's weights, for its accelerator (absent for the weight-free test streams).
+    weights: Option<Arc<SortformerWeights>>,
     computer: MelFrameComputer,
     n_mel_bins: usize,
     /// Pre-emphasized samples in padded coordinates (256 zeros of left padding, then audio);
@@ -1158,14 +1196,17 @@ pub struct MelStream {
 }
 
 impl MelStream {
-    fn new(w: &SortformerWeights) -> Self {
-        Self::from_tables(w.config.n_mel_bins, &w.window, &w.mel_fb)
+    fn new(w: &Arc<SortformerWeights>) -> Self {
+        let mut stream = Self::from_tables(w.config.n_mel_bins, &w.window, &w.mel_fb);
+        stream.weights = Some(Arc::clone(w));
+        stream
     }
 
     /// A front end over the given window (`N_FFT` long) and filterbank; weight-free, so the
     /// hermetic tests can drive it with synthetic tables.
     fn from_tables(n_mel_bins: usize, window: &[f32], mel_fb: &[f32]) -> Self {
         Self {
+            weights: None,
             computer: MelFrameComputer::new(n_mel_bins, window, mel_fb),
             n_mel_bins,
             buf: vec![0.0; N_FFT / 2],
@@ -1196,6 +1237,13 @@ impl MelStream {
     /// Append mono 16 kHz PCM. Returns the newly completed mel frames, `[k x 128]` time-major.
     /// Fails, consuming nothing, if the stream has finished or a sample is NaN or infinite.
     pub fn push(&mut self, pcm: &[f32]) -> Result<Vec<f32>> {
+        self.push_samples(pcm)?;
+        Ok(self.emit())
+    }
+
+    /// [`Self::push`] without computing any frame: the samples are pre-emphasised and held, and
+    /// [`Self::ready_frames`] / [`Self::compute_ready`] take the frames later, in one batch.
+    fn push_samples(&mut self, pcm: &[f32]) -> Result<()> {
         ensure!(!self.finished, "MelStream: push after finish");
         // One NaN would ride through the FFT into every later frame's attention, so refuse the
         // whole piece (nothing is consumed) instead of poisoning the stream.
@@ -1213,7 +1261,7 @@ impl MelStream {
             self.prev_raw = x;
             self.n_in += 1;
         }
-        Ok(self.emit())
+        Ok(())
     }
 
     /// End of audio: add the trailing center padding and return the remaining frames.
@@ -1226,19 +1274,52 @@ impl MelStream {
         self.emit()
     }
 
-    fn emit(&mut self) -> Vec<f32> {
-        let mut out = Vec::new();
-        let mut row = vec![0.0f32; self.n_mel_bins];
+    /// Frames that can be computed from the samples held now.
+    fn ready_frames(&self) -> usize {
         // NeMo's length is n / hop: the STFT's extra last frame is masked, never produced.
-        while self.next_frame < self.n_in / HOP_LEN {
-            let start = self.next_frame * HOP_LEN;
-            if start + N_FFT > self.base + self.buf.len() {
-                break;
+        let by_length = self.n_in / HOP_LEN;
+        let held = self.base + self.buf.len();
+        let by_samples = if held >= N_FFT {
+            (held - N_FFT) / HOP_LEN + 1
+        } else {
+            0
+        };
+        by_length.min(by_samples).saturating_sub(self.next_frame)
+    }
+
+    fn emit(&mut self) -> Vec<f32> {
+        self.compute_ready()
+    }
+
+    /// Compute every ready frame, in one accelerator batch when the model has an accelerator
+    /// that takes it, else one by one on the CPU.
+    fn compute_ready(&mut self) -> Vec<f32> {
+        let k = self.ready_frames();
+        let mut out = Vec::new();
+        if k > 0 {
+            let lo = self.next_frame * HOP_LEN - self.base;
+            let span = (k - 1) * HOP_LEN + N_FFT;
+            let energies = self.weights.as_ref().and_then(|w| {
+                w.accelerated("log-mel", |a| a.mel_energies(&self.buf[lo..lo + span], k))
+            });
+            match energies {
+                Some(e) if e.len() == k * self.n_mel_bins => {
+                    // The same `ln(x + eps)` in f64 as the CPU frame computer.
+                    out.extend(
+                        e.iter()
+                            .map(|&v| (v as f64 + LOG_MEL_EPS as f64).ln() as f32),
+                    );
+                }
+                _ => {
+                    let mut row = vec![0.0f32; self.n_mel_bins];
+                    for f in 0..k {
+                        let at = lo + f * HOP_LEN;
+                        self.computer.frame(&self.buf[at..at + N_FFT], &mut row);
+                        out.extend_from_slice(&row);
+                    }
+                }
             }
-            let lo = start - self.base;
-            self.computer.frame(&self.buf[lo..lo + N_FFT], &mut row);
-            out.extend_from_slice(&row);
-            self.next_frame += 1;
+            self.next_frame += k;
         }
         // Frames before `next_frame` are done with.
         let keep_from = self.next_frame * HOP_LEN;
@@ -1329,8 +1410,23 @@ impl SortformerLive {
     /// call this from an audio callback.
     pub fn push_audio(&mut self, pcm: &[f32]) -> Result<Vec<f32>> {
         ensure!(!self.finished, "SortformerLive: push_audio after finish");
-        let rows = self.mel.push(pcm)?;
-        self.accept(&rows);
+        if self.stream.w.accel.get().is_some() {
+            // With an accelerator the mel is computed a chunk at a time: a batch per chunk
+            // instead of one tiny accelerator call per push, which would cost the host more than
+            // the FFTs it replaces. The result is the same frames, computed when a chunk needs
+            // them.
+            self.mel.push_samples(pcm)?;
+            let ss = self.stream.w.config.subsampling;
+            let needed =
+                self.stt + (self.stream.params.chunk_len + self.stream.params.right_context) * ss;
+            if self.mel.frames() + self.mel.ready_frames() >= needed {
+                let rows = self.mel.compute_ready();
+                self.accept(&rows);
+            }
+        } else {
+            let rows = self.mel.push(pcm)?;
+            self.accept(&rows);
+        }
         self.drain(false)
     }
 

@@ -23,9 +23,14 @@ use crate::backend::hexagon::{
     FastRpcDriver, HexagonDevice, HexagonQueueSession, HexagonWeightDesc, LockOrRecover,
     RpcmemBuffer, align128,
 };
+use crate::model::audio_encoder::{HOP_LEN, N_FFT};
 use crate::model::audio_encoder_hexagon::HexagonAudioEncoder;
 use crate::model::audio_encoder_hexagon::{
-    pad32, plan_linear, plan_vec, put_linear, put_vec, run_on_queue, settled,
+    alloc_settled, pad32, plan_linear, plan_vec, put_linear, put_vec, release_or_leak,
+    run_on_queue, settled,
+};
+use crate::model::audio_mel_hexagon::{
+    MelScratch, MelWeightOffsets, emit_mel, put_mel_tables, stage_samples,
 };
 use crate::model::audio_stem_hexagon::STEM_CHUNK_ROWS;
 use crate::model::sortformer::{
@@ -653,14 +658,117 @@ impl Drop for HexagonSortformerTail {
     }
 }
 
-/// The whole diarizer network on the Hexagon NPU: the conv stem and the FastConformer blocks
-/// ([`HexagonAudioEncoder`]) and the tail ([`HexagonSortformerTail`]). Plug it into a model with
+/// Frames per DSP call of the log-mel front end: its per-call buffer holds the frames, the two
+/// DFT planes and the energies (about 11 KB per frame), so a longer clip goes in batches. The
+/// checkpoint's default chunk (188 encoder frames, 1504 mel frames) fits in one.
+const MEL_CALL_FRAMES: usize = 1536;
+
+/// Sortformer's log-mel front end on the NPU: the windowed DFT, the power and the filterbank
+/// (the model's own window and filterbank, from its GGUF), through the same ops as LFM2-Audio's
+/// front end. The DSP returns linear energies; the host takes the log.
+pub struct HexagonSortformerMel {
+    driver: Arc<FastRpcDriver>,
+    device: Arc<Mutex<HexagonDevice>>,
+    weights_buf: RpcmemBuffer,
+    offsets: MelWeightOffsets,
+    n_mel: usize,
+}
+
+impl HexagonSortformerMel {
+    /// Stage `window` (`N_FFT` long) and `filters` (`[n_mel, N_FFT_BINS]`) on the device.
+    pub fn new(
+        driver: Arc<FastRpcDriver>,
+        device: Arc<Mutex<HexagonDevice>>,
+        window: &[f32],
+        filters: &[f32],
+        n_mel: usize,
+    ) -> Result<Self, CeraError> {
+        if window.len() != N_FFT || n_mel == 0 || filters.len() != n_mel * (N_FFT / 2 + 1) {
+            return Err(CeraError::Backend(format!(
+                "sortformer mel: window of {}, filterbank of {} for {n_mel} mel bins",
+                window.len(),
+                filters.len()
+            )));
+        }
+        let mut cur = 0;
+        let offsets = MelWeightOffsets::plan(&mut cur, n_mel);
+        let mut weights_buf = RpcmemBuffer::alloc(Arc::clone(&driver), cur, true)?;
+        put_mel_tables(weights_buf.as_mut_slice(), &offsets, window, filters, n_mel);
+        weights_buf.flush_cpu_cache(0, cur);
+        Ok(Self {
+            driver,
+            device,
+            weights_buf,
+            offsets,
+            n_mel,
+        })
+    }
+
+    /// Linear mel energies `[n_frames, n_mel]` for `n_frames` frames over pre-emphasised,
+    /// centre-padded `samples` (frame `f` starts at `f * HOP_LEN`).
+    pub fn energies(&self, samples: &[f32], n_frames: usize) -> Result<Vec<f32>, CeraError> {
+        if n_frames == 0 || samples.len() != (n_frames - 1) * HOP_LEN + N_FFT {
+            return Err(CeraError::Backend(format!(
+                "sortformer mel: {} samples for {n_frames} frames",
+                samples.len()
+            )));
+        }
+        let mut out = Vec::with_capacity(n_frames * self.n_mel);
+        let mut done = 0;
+        while done < n_frames {
+            let k = (n_frames - done).min(MEL_CALL_FRAMES);
+            let lo = done * HOP_LEN;
+            out.extend(self.batch(&samples[lo..lo + (k - 1) * HOP_LEN + N_FFT], k)?);
+            done += k;
+        }
+        Ok(out)
+    }
+
+    fn batch(&self, samples: &[f32], k: usize) -> Result<Vec<f32>, CeraError> {
+        let so = MelScratch::new(samples.len(), k, self.n_mel);
+        let mut dev = self.device.lock_or_recover();
+        let mut buf = alloc_settled(dev.queue_session_mut(), &self.driver, so.total_bytes)?;
+        stage_samples(buf.as_mut_slice(), &so, samples);
+        buf.flush_cpu_cache(0, so.total_bytes);
+        let run = run_on_queue("sortformer mel", dev.queue_session_mut(), |session| {
+            emit_mel(
+                session,
+                &self.weights_buf,
+                &buf,
+                &self.offsets,
+                &so,
+                k,
+                self.n_mel,
+            )
+        });
+        let energies = run.map(|()| {
+            buf.invalidate_cpu_cache(so.mel, k * self.n_mel * 4);
+            let floats: &[f32] = bytemuck::cast_slice(buf.as_slice());
+            floats[so.mel / 4..so.mel / 4 + k * self.n_mel].to_vec()
+        });
+        release_or_leak(dev.queue_session_mut(), buf);
+        energies
+    }
+}
+
+impl Drop for HexagonSortformerMel {
+    fn drop(&mut self) {
+        let mut dev = self.device.lock_or_recover();
+        dev.queue_session_mut()
+            .release_dsp_references([&self.weights_buf]);
+    }
+}
+
+/// The whole diarizer network on the Hexagon NPU: the log-mel front end ([`HexagonSortformerMel`]),
+/// the conv stem and the FastConformer blocks ([`HexagonAudioEncoder`]) and the tail
+/// ([`HexagonSortformerTail`]). Plug it into a model with
 /// [`SortformerModel::set_accelerator`], or use [`try_hexagon_sortformer`].
 ///
 /// Only the x-scale between the stem and the blocks runs on the host (one multiply per value).
 pub struct HexagonSortformer {
     encoder: HexagonAudioEncoder,
     tail: HexagonSortformerTail,
+    mel: HexagonSortformerMel,
     /// Encoder frames the staging covers; longer inputs are declined (the CPU takes them).
     max_frames: usize,
     n_blocks: usize,
@@ -685,10 +793,19 @@ impl HexagonSortformer {
             max_frames,
             false,
         )?;
-        let tail = HexagonSortformerTail::new(driver, device, model, max_frames)?;
+        let tail = HexagonSortformerTail::new(
+            Arc::clone(&driver),
+            Arc::clone(&device),
+            model,
+            max_frames,
+        )?;
+        let w = model.weights();
+        let mel =
+            HexagonSortformerMel::new(driver, device, &w.window, &w.mel_fb, w.config.n_mel_bins)?;
         Ok(Self {
             encoder,
             tail,
+            mel,
             max_frames,
             n_blocks: parts.layers.len(),
             scale: model.encoder_input_scale(),
@@ -722,6 +839,13 @@ impl SortformerAccelerator for HexagonSortformer {
         let x: Vec<f32> = emb.iter().map(|v| v * self.scale).collect();
         let enc = self.encoder.run_blocks(self.n_blocks, &x, t)?;
         Ok(Some(self.tail.predict(&enc, t)?))
+    }
+
+    fn mel_energies(&self, samples: &[f32], n_frames: usize) -> anyhow::Result<Option<Vec<f32>>> {
+        if n_frames == 0 {
+            return Ok(None);
+        }
+        Ok(Some(self.mel.energies(samples, n_frames)?))
     }
 }
 

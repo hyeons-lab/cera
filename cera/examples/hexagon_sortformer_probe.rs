@@ -228,6 +228,43 @@ fn main() {
             cpu / seconds
         );
     };
+    // The log-mel front end, and a whole live run, on a second model with the NPU as its
+    // accelerator (mel, stem, blocks and tail) against the CPU model above.
+    let npu_model = SortformerModel::from_file(&model_path).expect("load Sortformer again");
+    let _npu = cera::model::sortformer_hexagon::try_hexagon_sortformer(&npu_model, MAX_FRAMES)
+        .expect("stage the NPU diarizer");
+    let (npu_mel, npu_n) = npu_model.log_mel(&pcm);
+    assert_eq!(npu_n, n_frames);
+    let worst = mel
+        .iter()
+        .zip(&npu_mel)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0f32, f32::max);
+    report("log-mel (natural log)", &mel, &npu_mel);
+    println!("log-mel worst |diff| {worst:.4} (log units; the floor is ln 2^-24 = -16.6)");
+    let params = model.default_streaming().clone();
+    let run_live = |m: &SortformerModel| {
+        let mut live = m.new_live(params.clone()).unwrap();
+        let mut out = Vec::new();
+        for piece in pcm.chunks(1600) {
+            out.extend(live.push_audio(piece).unwrap());
+        }
+        out.extend(live.finish().unwrap());
+        out
+    };
+    let (cpu_live, npu_live) = (run_live(&model), run_live(&npu_model));
+    report("live run, all NPU", &cpu_live, &npu_live);
+    let (a, b) = (hard(&cpu_live), hard(&npu_live));
+    let agree = a.iter().zip(&b).filter(|(x, y)| x == y).count();
+    println!(
+        "live decisions at 0.5: {agree}/{} agree ({:.3}%)",
+        a.len(),
+        100.0 * agree as f64 / a.len() as f64
+    );
+    measure("CPU log-mel", &mut || drop(model.log_mel(&pcm)));
+    measure("NPU log-mel", &mut || drop(npu_model.log_mel(&pcm)));
+    measure("live run (CPU model)", &mut || drop(run_live(&model)));
+    measure("live run (all NPU)", &mut || drop(run_live(&npu_model)));
     measure("CPU pre-encode (stem)", &mut || {
         drop(model.pre_encode(&mel, n_frames))
     });
