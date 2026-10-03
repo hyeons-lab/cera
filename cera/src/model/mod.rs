@@ -14,6 +14,7 @@ pub mod llama;
 pub mod pii;
 pub mod qwen35;
 mod session_gate;
+pub mod sortformer;
 pub use session_gate::{ModelSessionGate, ModelSessionLease};
 pub mod transformer;
 pub mod whisper;

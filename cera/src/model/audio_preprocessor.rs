@@ -317,8 +317,12 @@ pub(crate) fn finish_log_mel(
         }
     }
 
-    // Transpose mel-major [n_mel × n_frames] → time-major
-    // [n_frames × n_mel_bins].
+    mel_to_time_major(&mel, n_mel_bins, n_frames)
+}
+
+/// Transpose mel-major `[n_mel_bins x n_frames]` to the time-major `[n_frames x n_mel_bins]`
+/// layout the conv stem reads.
+pub(crate) fn mel_to_time_major(mel: &[f32], n_mel_bins: usize, n_frames: usize) -> Vec<f32> {
     let mut mel_time_major = vec![0.0f32; n_frames * n_mel_bins];
     for mi in 0..n_mel_bins {
         for ti in 0..n_frames {
@@ -359,18 +363,46 @@ pub fn log_mel_spectrogram(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) 
     if pcm.is_empty() || n_mel_bins == 0 {
         return (Vec::new(), 0);
     }
+    // Hann window centered inside an N_FFT-sized buffer. Shared with the GPU
+    // front-end, which uploads exactly these taps.
+    let hann = build_padded_hann_window();
+    let filters = build_mel_filterbank(n_mel_bins, N_FFT, SAMPLE_RATE as usize);
+    log_mel_with_tables(pcm, n_mel_bins, &hann, &filters, true)
+}
+
+/// The mel pipeline of [`log_mel_spectrogram`] with its tables supplied by the caller.
+///
+/// `hann` is the `N_FFT`-long window (the `WINDOW_LEN` taps already centered in it, as
+/// [`build_padded_hann_window`] returns), `filters` is `[n_mel_bins × N_FFT_BINS]`
+/// row-major, and `normalize` turns the final per-feature mean/variance normalization
+/// on or off. Everything else (center padding, pre-emphasis, STFT, power, mel
+/// projection, `ln(x + LOG_MEL_EPS)`, layout) is shared.
+///
+/// Models that ship their own front end (Sortformer exports the NeMo window and
+/// filterbank in its GGUF and trains with `normalize: NA`) call this directly; the
+/// LFM2A path goes through [`log_mel_spectrogram`] and is bit-identical to what it
+/// was before this split.
+pub(crate) fn log_mel_with_tables(
+    pcm: &[f32],
+    n_mel_bins: usize,
+    hann: &[f32],
+    filters: &[f32],
+    normalize: bool,
+) -> (Vec<f32>, usize) {
+    if pcm.is_empty() || n_mel_bins == 0 {
+        return (Vec::new(), 0);
+    }
+    assert_eq!(hann.len(), N_FFT, "window must be N_FFT long");
+    assert_eq!(
+        filters.len(),
+        n_mel_bins * N_FFT_BINS,
+        "filterbank must be [n_mel_bins x N_FFT_BINS]"
+    );
 
     let n_samples_in = pcm.len();
     let Some(samples) = padded_preemphasized(pcm) else {
         return (Vec::new(), 0);
     };
-
-    // Hann window centered inside an N_FFT-sized buffer. Shared with the GPU
-    // front-end, which uploads exactly these taps.
-    let hann = build_padded_hann_window();
-
-    // Mel filterbank.
-    let filters = build_mel_filterbank(n_mel_bins, N_FFT, SAMPLE_RATE as usize);
 
     // FFT planner (one per call; encoder runs per chunk so this
     // is amortized).
@@ -427,10 +459,12 @@ pub fn log_mel_spectrogram(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) 
         }
     }
 
-    (
-        finish_log_mel(mel, n_mel_bins, n_frames, n_samples_in),
-        n_frames,
-    )
+    let out = if normalize {
+        finish_log_mel(mel, n_mel_bins, n_frames, n_samples_in)
+    } else {
+        mel_to_time_major(&mel, n_mel_bins, n_frames)
+    };
+    (out, n_frames)
 }
 
 #[cfg(test)]
