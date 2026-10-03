@@ -1001,6 +1001,27 @@ pub struct AttentionDump {
     pub out: Vec<f32>,
 }
 
+/// The relative position embedding of the most recent sequence length. It depends only on that
+/// length, and an encoder usually runs the same one call after call (a diarizer's step in steady
+/// state, an utterance cap), so recomputing its `2t - 1` rows of sines and cosines (hundreds of
+/// thousands of them) each time is wasted host work.
+#[derive(Default)]
+struct PosEmbCache(Mutex<Option<(usize, Arc<Vec<f32>>)>>);
+
+impl PosEmbCache {
+    fn get(&self, t: usize) -> Arc<Vec<f32>> {
+        let mut slot = self.0.lock_or_recover();
+        match &*slot {
+            Some((cached, emb)) if *cached == t => Arc::clone(emb),
+            _ => {
+                let emb = Arc::new(relative_pos_emb(t));
+                *slot = Some((t, Arc::clone(&emb)));
+                emb
+            }
+        }
+    }
+}
+
 /// LFM2-Audio's Conformer encoder on the Hexagon NPU. Work in progress: see
 /// the module docs for what is implemented.
 pub struct HexagonAudioEncoder {
@@ -1016,6 +1037,8 @@ pub struct HexagonAudioEncoder {
     max_frames: usize,
     /// Whether LFM2-Audio's log-mel tables are staged (see [`Self::from_parts`]).
     lfm_mel: bool,
+    /// The relative position embedding of the last sequence length (see [`PosEmbCache`]).
+    pos_cache: PosEmbCache,
 }
 
 // SAFETY: the rpcmem buffers are only touched while holding `device` and
@@ -1295,7 +1318,13 @@ impl HexagonAudioEncoder {
             scratch_offsets,
             max_frames,
             lfm_mel,
+            pos_cache: PosEmbCache::default(),
         })
+    }
+
+    /// [`relative_pos_emb`] of `t`, cached for the last length.
+    fn pos_emb(&self, t: usize) -> Arc<Vec<f32>> {
+        self.pos_cache.get(t)
     }
 
     /// The adapter's offsets, or an error for an encoder staged without one.
@@ -1457,7 +1486,7 @@ impl HexagonAudioEncoder {
     /// device.
     pub fn run_attention(&self, layer: usize, x: &[f32], t: usize) -> Result<Vec<f32>, CeraError> {
         let attn = &self.layer("run_attention", layer)?.attn;
-        let pos = relative_pos_emb(t.max(1));
+        let pos = self.pos_emb(t.max(1));
         self.run_stage_with(
             "run_attention",
             x,
@@ -1466,7 +1495,7 @@ impl HexagonAudioEncoder {
                 self.clear_attention_padding(scratch, t);
                 let bytes = pos.len() * 4;
                 scratch.as_mut_slice()[so.attn_pos..so.attn_pos + bytes]
-                    .copy_from_slice(bytemuck::cast_slice(&pos));
+                    .copy_from_slice(bytemuck::cast_slice(&pos[..]));
                 scratch.flush_cpu_cache(so.attn_pos, bytes);
             },
             |session, weights, scratch, so| {
@@ -1549,7 +1578,7 @@ impl HexagonAudioEncoder {
                 self.offsets.layers.len()
             )));
         }
-        let pos = relative_pos_emb(t.max(1));
+        let pos = self.pos_emb(t.max(1));
         let cfg = &self.config;
         let bytes = t * cfg.n_embd * 4;
         self.run_stage_with(
@@ -1560,7 +1589,7 @@ impl HexagonAudioEncoder {
                 self.clear_attention_padding(scratch, t);
                 let pos_bytes = pos.len() * 4;
                 scratch.as_mut_slice()[so.attn_pos..so.attn_pos + pos_bytes]
-                    .copy_from_slice(bytemuck::cast_slice(&pos));
+                    .copy_from_slice(bytemuck::cast_slice(&pos[..]));
                 scratch.flush_cpu_cache(so.attn_pos, pos_bytes);
             },
             |session, weights, scratch, so| {
@@ -1580,7 +1609,7 @@ impl HexagonAudioEncoder {
     /// everything after the stem, in one call, one DSP batch per block.
     pub fn encode_stem_output(&self, x: &[f32], t: usize) -> Result<Vec<f32>, CeraError> {
         let adapter = self.adapter()?;
-        let pos = relative_pos_emb(t.max(1));
+        let pos = self.pos_emb(t.max(1));
         let cfg = &self.config;
         let out = (self.scratch_offsets.adapter_out, t * cfg.llm_hidden_size);
         self.run_stage_with(
@@ -1591,7 +1620,7 @@ impl HexagonAudioEncoder {
                 self.clear_attention_padding(scratch, t);
                 let pos_bytes = pos.len() * 4;
                 scratch.as_mut_slice()[so.attn_pos..so.attn_pos + pos_bytes]
-                    .copy_from_slice(bytemuck::cast_slice(&pos));
+                    .copy_from_slice(bytemuck::cast_slice(&pos[..]));
                 scratch.flush_cpu_cache(so.attn_pos, pos_bytes);
             },
             |session, weights, scratch, so| {
@@ -1739,7 +1768,7 @@ impl HexagonAudioEncoder {
         let cfg = &self.config;
         let chunks = plan_chunks(n_frames, cfg.n_mel_bins, STEM_CHUNK_ROWS);
         let (mut st, st_so) = self.stem_buffer(&chunks, false)?;
-        let pos = relative_pos_emb(t.max(1));
+        let pos = self.pos_emb(t.max(1));
         let out = (self.scratch_offsets.adapter_out, t * cfg.llm_hidden_size);
         let run = self.run_with_scratch(
             "encode",
@@ -1747,7 +1776,7 @@ impl HexagonAudioEncoder {
                 self.clear_attention_padding(scratch, t);
                 let pos_bytes = pos.len() * 4;
                 scratch.as_mut_slice()[so.attn_pos..so.attn_pos + pos_bytes]
-                    .copy_from_slice(bytemuck::cast_slice(&pos));
+                    .copy_from_slice(bytemuck::cast_slice(&pos[..]));
                 scratch.flush_cpu_cache(so.attn_pos, pos_bytes);
             },
             |session, weights, scratch, so| {
@@ -2317,6 +2346,27 @@ mod tests {
     /// The adapter's activations live in scratch sized for the encoder, and its
     /// vectors are read at the matrices' widths, so a file whose adapter does not
     /// line up with them is refused at planning, before anything is written.
+    /// The position embedding is computed once per length and shared afterwards; a new length
+    /// replaces it.
+    #[test]
+    fn the_position_embedding_is_cached_for_the_last_length() {
+        let cache = PosEmbCache::default();
+        let a = cache.get(7);
+        assert_eq!(a.len(), (2 * 7 - 1) * POS_EMB_DIM);
+        assert!(
+            Arc::ptr_eq(&a, &cache.get(7)),
+            "the same length is not recomputed"
+        );
+        let b = cache.get(9);
+        assert_eq!(b.len(), (2 * 9 - 1) * POS_EMB_DIM);
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(
+            *cache.get(7),
+            relative_pos_emb(7),
+            "the cached values are the real ones"
+        );
+    }
+
     #[test]
     fn an_adapter_the_scratch_cannot_hold_is_refused_at_planning() {
         use crate::model::audio_encoder::{
