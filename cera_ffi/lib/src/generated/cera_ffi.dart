@@ -2652,6 +2652,10 @@ enum BackendPreference {
   metal,
   /// Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
   hexagon,
+  /// Whichever NPU the device has: tries each NPU backend compiled into
+  /// the build and uses the first that loads, so callers need not name a
+  /// vendor. Fails when no NPU backend is compiled in or none can load.
+  npu,
 }
 
 /// Typed error surface for `cera-ffi`. Mirrors [`cera::CeraError`] one-
@@ -4851,6 +4855,7 @@ String _encodeBackendPreference(BackendPreference value) {
     BackendPreference.gpu => 'gpu',
     BackendPreference.metal => 'metal',
     BackendPreference.hexagon => 'hexagon',
+    BackendPreference.npu => 'npu',
   };
 }
 
@@ -4861,6 +4866,7 @@ BackendPreference _decodeBackendPreference(String raw) {
     'gpu' => BackendPreference.gpu,
     'metal' => BackendPreference.metal,
     'hexagon' => BackendPreference.hexagon,
+    'npu' => BackendPreference.npu,
     _ => throw StateError('Unknown BackendPreference variant: $raw'),
   };
 }
@@ -7773,6 +7779,7 @@ void _uniffiWriteBackendPreference(BackendPreference value, _UniFfiBinaryWriter 
     BackendPreference.gpu => 3,
     BackendPreference.metal => 4,
     BackendPreference.hexagon => 5,
+    BackendPreference.npu => 6,
   };
   writer.writeI32(tag);
 }
@@ -7796,6 +7803,8 @@ BackendPreference _uniffiReadBackendPreference(_UniFfiBinaryReader reader) {
       return BackendPreference.metal;
     case 5:
       return BackendPreference.hexagon;
+    case 6:
+      return BackendPreference.npu;
     default:
       throw StateError('Unknown BackendPreference variant tag: $tag');
   }

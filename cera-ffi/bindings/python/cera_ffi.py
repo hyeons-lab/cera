@@ -3426,6 +3426,13 @@ class BackendPreference(enum.Enum):
     Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
 """
     
+    NPU = 5
+    """
+    Whichever NPU the device has: tries each NPU backend compiled into
+    the build and uses the first that loads, so callers need not name a
+    vendor. Fails when no NPU backend is compiled in or none can load.
+"""
+    
 
 
 class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
@@ -3442,6 +3449,8 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
             return BackendPreference.METAL
         if variant == 5:
             return BackendPreference.HEXAGON
+        if variant == 6:
+            return BackendPreference.NPU
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -3455,6 +3464,8 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
         if value == BackendPreference.METAL:
             return
         if value == BackendPreference.HEXAGON:
+            return
+        if value == BackendPreference.NPU:
             return
         raise ValueError(value)
 
@@ -3470,6 +3481,8 @@ class _UniffiFfiConverterTypeBackendPreference(_UniffiConverterRustBuffer):
             buf.write_i32(4)
         if value == BackendPreference.HEXAGON:
             buf.write_i32(5)
+        if value == BackendPreference.NPU:
+            buf.write_i32(6)
 
 
 

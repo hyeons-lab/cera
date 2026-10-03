@@ -2176,30 +2176,30 @@ impl WhisperModel {
         #[cfg(feature = "hexagon")]
         let hexagon = match backend {
             crate::engine::BackendPreference::Cpu => None,
-            crate::engine::BackendPreference::Hexagon => {
+            crate::engine::BackendPreference::Hexagon | crate::engine::BackendPreference::Npu => {
                 if let Some(tok) = tokenizer {
                     match crate::model::whisper_hexagon::init_hexagon_whisper(&weights, tok) {
                         Ok(hex) => Some(hex),
                         Err(e) => {
-                            bail!("Hexagon backend requested but initialization failed: {e}");
+                            bail!("NPU backend requested but initialization failed: {e}");
                         }
                     }
                 } else {
-                    bail!("Hexagon backend requires a tokenizer to stage special token tables");
+                    bail!("NPU backend requires a tokenizer to stage special token tables");
                 }
             }
             crate::engine::BackendPreference::Auto => tokenizer
                 .and_then(|tok| crate::model::whisper_hexagon::try_hexagon_whisper(&weights, tok)),
             other => bail!(
-                "Whisper does not support backend preference {other:?}; only CPU and Hexagon are supported"
+                "Whisper does not support backend preference {other:?}; only CPU and NPU are supported"
             ),
         };
 
         #[cfg(not(feature = "hexagon"))]
         match backend {
             crate::engine::BackendPreference::Cpu | crate::engine::BackendPreference::Auto => {}
-            crate::engine::BackendPreference::Hexagon => {
-                bail!("Hexagon backend requested but `hexagon` feature is not enabled");
+            crate::engine::BackendPreference::Hexagon | crate::engine::BackendPreference::Npu => {
+                bail!("NPU backend requested but no NPU backend feature (`hexagon`) is enabled");
             }
             other => {
                 bail!(
