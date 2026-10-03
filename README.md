@@ -467,6 +467,7 @@ Cera provides a **unified stateful streaming audio pipeline** (`cera::audio_pipe
 - **Pre-roll sample preservation**: Automatically captures and preserves pre-roll audio ring buffers upon wake word detection so trailing speech onset is never clipped.
 - **Utterance chunking with VAD state preservation**: Splits long continuous speech at `max_utterance_ms` without resetting Silero VAD recurrent hidden states across continuation segments.
 - **Wait-free cancellation**: Fast cooperative cancellation via atomic handles without mutex contention during active Whisper inference.
+- **Speaker labels (optional)**: Attach a Streaming Sortformer diarizer (`AudioPipelineBuilder::with_diarizer`, or `FfiAudioPipeline.fromFilesWithDiarizer`) and every transcribed utterance is followed by an `UtteranceLabeled` event with its speaker slot (0 to 3), once the diarizer has covered it. The diarizer hears the same samples as the pipeline, so both share one clock, and it can run on the Hexagon NPU (`prefer_npu`, with a GGUF converted using `--tail-outtype q8_0`; see `scripts/sortformer/README.md`).
 - **Cross-platform bindings**: Available in Rust (`AudioPipeline`), Swift, Kotlin, Python, and Dart/Flutter (`FfiAudioPipeline`).
 
 ## Hugging Face Models & Streaming Quantization

@@ -2298,9 +2298,9 @@ fn transcript_labeler_config(threshold: f32) -> cera::speaker_labeler::SpeakerLa
     }
 }
 
-/// `cera diarize --vad .. --whisper ..`: the VAD plus Whisper pipeline and the live diarizer
-/// hear the same audio, piece by piece, as a background service would. Each utterance is printed
-/// with its speaker as soon as the diarizer has covered it.
+/// `cera diarize --vad .. --whisper ..`: the audio pipeline (VAD, Whisper and the Sortformer
+/// diarizer) hears the audio piece by piece, as a background service would. Each utterance is
+/// printed with its speaker as soon as the diarizer has covered it.
 #[allow(clippy::too_many_arguments)]
 fn diarize_with_transcript(
     model: &cera::model::sortformer::SortformerModel,
@@ -2313,37 +2313,38 @@ fn diarize_with_transcript(
     json: bool,
 ) -> Result<()> {
     use cera::audio_pipeline::AudioPipelineEvent;
-    use cera::live_diarizer::LiveDiarizer;
-    use cera::speaker_labeler::LabeledUtterance;
-    use std::collections::HashMap;
 
+    let latency_s = (params.chunk_len + params.right_context) as f64 * 0.08;
     let mut pipeline = cera::AudioPipeline::builder()
         .with_vad_from_file(vad)
         .with_context(|| format!("loading VAD from `{vad}`"))?
         .with_whisper_from_file(whisper)
         .with_context(|| format!("loading Whisper from `{whisper}`"))?
+        .with_diarizer(model.clone(), params)
+        .with_speaker_labeler_config(transcript_labeler_config(threshold))
         .build()?;
-    let mut diarizer = LiveDiarizer::new(model, params, transcript_labeler_config(threshold))?;
-    let latency_s = (diarizer.latency_frames() as f64 * cera::speaker_labeler::FRAME_MS) / 1000.0;
 
-    let mut texts: HashMap<u64, String> = HashMap::new();
-    let mut next_id = 0u64;
+
     let mut rows: Vec<serde_json::Value> = Vec::new();
-    let mut emit = |u: LabeledUtterance, texts: &mut HashMap<u64, String>| {
-        let text = texts.remove(&u.id).unwrap_or_default();
-        let (speaker, confidence, overlapping) = match &u.label {
-            Some(l) => (Some(l.speaker), Some(l.confidence), l.overlapping),
-            None => (None, None, None),
+    let mut emit = |ev: AudioPipelineEvent| {
+        let AudioPipelineEvent::UtteranceLabeled {
+            text,
+            start_ms,
+            end_ms,
+            speaker,
+            confidence,
+            overlapping,
+        } = ev
+        else {
+            return;
         };
         if json {
             rows.push(serde_json::json!({
-                "id": u.id,
-                "start_ms": u.start_ms,
-                "end_ms": u.end_ms,
+                "start_ms": start_ms,
+                "end_ms": end_ms,
                 "speaker": speaker,
                 "confidence": confidence,
                 "overlapping": overlapping,
-                "dropped": u.dropped,
                 "text": text,
             }));
         } else {
@@ -2355,44 +2356,22 @@ fn diarize_with_transcript(
             };
             println!(
                 "[{:7.2}s - {:7.2}s] speaker {who}{extra}: {}",
-                u.start_ms / 1000.0,
-                u.end_ms / 1000.0,
+                start_ms / 1000.0,
+                end_ms / 1000.0,
                 text.trim()
             );
-        }
-    };
-    let mut register = |events: Vec<AudioPipelineEvent>,
-                        diarizer: &mut LiveDiarizer,
-                        texts: &mut HashMap<u64, String>| {
-        for ev in events {
-            if let AudioPipelineEvent::UtteranceTranscribed {
-                text,
-                start_ms,
-                end_ms,
-                ..
-            } = ev
-            {
-                texts.insert(next_id, text);
-                diarizer.add_utterance(next_id, start_ms as f64, end_ms as f64);
-                next_id += 1;
-            }
         }
     };
 
     let started = std::time::Instant::now();
     let piece = (piece_ms * 16).max(1);
     for part in pcm.chunks(piece) {
-        let events = pipeline.process_chunk(part)?;
-        diarizer.push_audio(part)?;
-        register(events, &mut diarizer, &mut texts);
-        for u in diarizer.poll() {
-            emit(u, &mut texts);
+        for ev in pipeline.process_chunk(part)? {
+            emit(ev);
         }
     }
-    let events = pipeline.flush()?;
-    register(events, &mut diarizer, &mut texts);
-    for u in diarizer.finish()? {
-        emit(u, &mut texts);
+    for ev in pipeline.flush()? {
+        emit(ev);
     }
     let wall_s = started.elapsed().as_secs_f64();
     let audio_s = pcm.len() as f64 / 16_000.0;

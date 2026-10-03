@@ -663,13 +663,21 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer() != 56903:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance() != 27373:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 57820:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 57672:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 47716:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu() != 32703:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 1087:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer() != 11141:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() != 57051:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1855,6 +1863,24 @@ _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files.argtypes =
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_int8,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_add_utterance.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.c_float,
+    ctypes.c_float,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_add_utterance.restype = ctypes.c_int8
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_cancel.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1870,11 +1896,21 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_current_sample.argtypes = 
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_current_sample.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_diarizer_on_npu.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_diarizer_on_npu.restype = ctypes.c_int8
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_has_diarizer.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_has_diarizer.restype = ctypes.c_int8
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_listening_for_hotword.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2686,6 +2722,12 @@ _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes.rest
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel.restype = ctypes.c_uint16
@@ -2695,9 +2737,15 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel.restype
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword.restype = ctypes.c_uint16
@@ -8765,6 +8813,79 @@ class FfiAudioPipelineEvent:
                 return False
             return True
 
+    @dataclass
+    class UTTERANCE_LABELED:
+        """
+        The attached speaker diarizer has covered an utterance and assigned it a speaker. One per
+        utterance, after its `UtteranceTranscribed`: a chunk plus its lookahead later (seconds with
+        the default preset). Needs a pipeline built with `from_files_with_diarizer`.
+"""
+        
+        def __init__(self, text:str, start_ms:float, end_ms:float, speaker:typing.Optional[int], confidence:typing.Optional[float], overlapping:typing.Optional[int]):
+            self.text = text
+            
+            """
+        The utterance text, as in its `UtteranceTranscribed` event.
+"""
+        
+            self.start_ms = start_ms
+            
+            """
+        Start timestamp of the utterance in milliseconds.
+"""
+        
+            self.end_ms = end_ms
+            
+            """
+        End timestamp of the utterance in milliseconds.
+"""
+        
+            self.speaker = speaker
+            
+            """
+        The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
+        span or the labeler had to give the utterance up.
+"""
+        
+            self.confidence = confidence
+            
+            """
+        The speaker's share of all speakers' active time over the span, in (0, 1].
+"""
+        
+            self.overlapping = overlapping
+            
+            """
+        A second speaker who was also clearly active over the span, if any.
+"""
+        
+            pass
+
+    
+            
+            
+    
+        def __str__(self):
+            return "FfiAudioPipelineEvent.UTTERANCE_LABELED(text={}, start_ms={}, end_ms={}, speaker={}, confidence={}, overlapping={})".format(self.text, self.start_ms, self.end_ms, self.speaker, self.confidence, self.overlapping)
+        def __eq__(self, other):
+            if not isinstance(other, FfiAudioPipelineEvent):
+                return NotImplemented
+            if not other.is_UTTERANCE_LABELED():
+                return False
+            if self.text != other.text:
+                return False
+            if self.start_ms != other.start_ms:
+                return False
+            if self.end_ms != other.end_ms:
+                return False
+            if self.speaker != other.speaker:
+                return False
+            if self.confidence != other.confidence:
+                return False
+            if self.overlapping != other.overlapping:
+                return False
+            return True
+
     
 
     # For each variant, we have `is_NAME` and `is_name` methods for easily checking
@@ -8785,6 +8906,10 @@ class FfiAudioPipelineEvent:
         return isinstance(self, FfiAudioPipelineEvent.UTTERANCE_TRANSCRIBED)
     def is_utterance_transcribed(self) -> bool:
         return isinstance(self, FfiAudioPipelineEvent.UTTERANCE_TRANSCRIBED)
+    def is_UTTERANCE_LABELED(self) -> bool:
+        return isinstance(self, FfiAudioPipelineEvent.UTTERANCE_LABELED)
+    def is_utterance_labeled(self) -> bool:
+        return isinstance(self, FfiAudioPipelineEvent.UTTERANCE_LABELED)
     
 
 # Now, a little trick - we make each nested variant class be a subclass of the main
@@ -8794,6 +8919,7 @@ FfiAudioPipelineEvent.WAKE_WORD_DETECTED = type("FfiAudioPipelineEvent.WAKE_WORD
 FfiAudioPipelineEvent.SPEECH_START = type("FfiAudioPipelineEvent.SPEECH_START", (FfiAudioPipelineEvent.SPEECH_START, FfiAudioPipelineEvent,), {})  # type: ignore
 FfiAudioPipelineEvent.SPEECH_END = type("FfiAudioPipelineEvent.SPEECH_END", (FfiAudioPipelineEvent.SPEECH_END, FfiAudioPipelineEvent,), {})  # type: ignore
 FfiAudioPipelineEvent.UTTERANCE_TRANSCRIBED = type("FfiAudioPipelineEvent.UTTERANCE_TRANSCRIBED", (FfiAudioPipelineEvent.UTTERANCE_TRANSCRIBED, FfiAudioPipelineEvent,), {})  # type: ignore
+FfiAudioPipelineEvent.UTTERANCE_LABELED = type("FfiAudioPipelineEvent.UTTERANCE_LABELED", (FfiAudioPipelineEvent.UTTERANCE_LABELED, FfiAudioPipelineEvent,), {})  # type: ignore
 
 
 
@@ -8828,6 +8954,15 @@ class _UniffiFfiConverterTypeFfiAudioPipelineEvent(_UniffiConverterRustBuffer):
                 _UniffiFfiConverterFloat32.read(buf),
                 _UniffiFfiConverterUInt64.read(buf),
             )
+        if variant == 5:
+            return FfiAudioPipelineEvent.UTTERANCE_LABELED(
+                _UniffiFfiConverterString.read(buf),
+                _UniffiFfiConverterFloat32.read(buf),
+                _UniffiFfiConverterFloat32.read(buf),
+                _UniffiFfiConverterOptionalUInt32.read(buf),
+                _UniffiFfiConverterOptionalFloat32.read(buf),
+                _UniffiFfiConverterOptionalUInt32.read(buf),
+            )
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -8853,6 +8988,14 @@ class _UniffiFfiConverterTypeFfiAudioPipelineEvent(_UniffiConverterRustBuffer):
             _UniffiFfiConverterFloat32.check_lower(value.start_ms)
             _UniffiFfiConverterFloat32.check_lower(value.end_ms)
             _UniffiFfiConverterUInt64.check_lower(value.sample_count)
+            return
+        if value.is_UTTERANCE_LABELED():
+            _UniffiFfiConverterString.check_lower(value.text)
+            _UniffiFfiConverterFloat32.check_lower(value.start_ms)
+            _UniffiFfiConverterFloat32.check_lower(value.end_ms)
+            _UniffiFfiConverterOptionalUInt32.check_lower(value.speaker)
+            _UniffiFfiConverterOptionalFloat32.check_lower(value.confidence)
+            _UniffiFfiConverterOptionalUInt32.check_lower(value.overlapping)
             return
         raise ValueError(value)
 
@@ -8880,6 +9023,14 @@ class _UniffiFfiConverterTypeFfiAudioPipelineEvent(_UniffiConverterRustBuffer):
             _UniffiFfiConverterFloat32.write(value.start_ms, buf)
             _UniffiFfiConverterFloat32.write(value.end_ms, buf)
             _UniffiFfiConverterUInt64.write(value.sample_count, buf)
+        if value.is_UTTERANCE_LABELED():
+            buf.write_i32(5)
+            _UniffiFfiConverterString.write(value.text, buf)
+            _UniffiFfiConverterFloat32.write(value.start_ms, buf)
+            _UniffiFfiConverterFloat32.write(value.end_ms, buf)
+            _UniffiFfiConverterOptionalUInt32.write(value.speaker, buf)
+            _UniffiFfiConverterOptionalFloat32.write(value.confidence, buf)
+            _UniffiFfiConverterOptionalUInt32.write(value.overlapping, buf)
 
 
 
@@ -14035,6 +14186,13 @@ class FfiAudioPipelineProtocol(typing.Protocol):
     Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
 """
     
+    def add_utterance(self, text: str,start_ms: float,end_ms: float) -> bool:
+        """
+        Register an utterance transcribed outside the pipeline so it gets an `UtteranceLabeled`
+        event too. `start_ms` and `end_ms` are on the pipeline's clock, as in
+        `UtteranceTranscribed`. Returns whether a diarizer will label it.
+"""
+        raise NotImplementedError
     def cancel(self, ) -> None:
         """
         Cooperatively cancel any active transcription.
@@ -14053,9 +14211,20 @@ class FfiAudioPipelineProtocol(typing.Protocol):
         Total audio samples processed since start or reset.
 """
         raise NotImplementedError
+    def diarizer_on_npu(self, ) -> bool:
+        """
+        Whether the diarizer runs on the Hexagon NPU (false: the CPU, or no diarizer).
+"""
+        raise NotImplementedError
     def flush(self, ) -> typing.List[FfiAudioPipelineEvent]:
         """
         Flush any in-flight speech segment at the end of the audio stream.
+"""
+        raise NotImplementedError
+    def has_diarizer(self, ) -> bool:
+        """
+        Whether a speaker diarizer is attached and running. It stops, with a warning in the log,
+        if it fails; the pipeline then keeps transcribing without speaker labels.
 """
         raise NotImplementedError
     def is_listening_for_hotword(self, ) -> bool:
@@ -14164,6 +14333,45 @@ class FfiAudioPipeline(FfiAudioPipelineProtocol):
             *_uniffi_lowered_args,
         )
         return cls._uniffi_make_instance(_uniffi_ffi_result)
+    @classmethod
+    def from_files_with_diarizer(cls, vad_path: typing.Optional[str],hotword_path: typing.Optional[str],whisper_path: typing.Optional[str],diarizer_path: str,prefer_npu: bool,config: typing.Optional[FfiAudioPipelineConfig]) -> FfiAudioPipeline:
+        """
+        Construct a pipeline from filesystem model paths with a Sortformer speaker diarizer
+        (`diarizer_path`, a converted Sortformer GGUF). Every transcribed utterance then gets an
+        `UtteranceLabeled` event with its speaker, once the diarizer has covered it.
+
+        With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+        device offers it (the GGUF must have been converted with `--tail-outtype q8_0`); otherwise,
+        or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+"""
+        
+        _UniffiFfiConverterOptionalString.check_lower(vad_path)
+
+        _UniffiFfiConverterOptionalString.check_lower(hotword_path)
+
+        _UniffiFfiConverterOptionalString.check_lower(whisper_path)
+
+        _UniffiFfiConverterString.check_lower(diarizer_path)
+
+        _UniffiFfiConverterBoolean.check_lower(prefer_npu)
+
+        _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig.check_lower(config)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterOptionalString.lower(vad_path),
+            _UniffiFfiConverterOptionalString.lower(hotword_path),
+            _UniffiFfiConverterOptionalString.lower(whisper_path),
+            _UniffiFfiConverterString.lower(diarizer_path),
+            _UniffiFfiConverterBoolean.lower(prefer_npu),
+            _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig.lower(config),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeFfiAudioPipeline.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
     
     def __init__(self, *args, **kwargs):
         raise ValueError("This class has no default constructor")
@@ -14185,6 +14393,32 @@ class FfiAudioPipeline(FfiAudioPipelineProtocol):
         inst = cls.__new__(cls)
         inst._handle = handle
         return inst
+    def add_utterance(self, text: str,start_ms: float,end_ms: float) -> bool:
+        """
+        Register an utterance transcribed outside the pipeline so it gets an `UtteranceLabeled`
+        event too. `start_ms` and `end_ms` are on the pipeline's clock, as in
+        `UtteranceTranscribed`. Returns whether a diarizer will label it.
+"""
+        
+        _UniffiFfiConverterString.check_lower(text)
+
+        _UniffiFfiConverterFloat32.check_lower(start_ms)
+
+        _UniffiFfiConverterFloat32.check_lower(end_ms)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(text),
+            _UniffiFfiConverterFloat32.lower(start_ms),
+            _UniffiFfiConverterFloat32.lower(end_ms),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_add_utterance,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def cancel(self, ) -> None:
         """
         Cooperatively cancel any active transcription.
@@ -14233,6 +14467,21 @@ class FfiAudioPipeline(FfiAudioPipelineProtocol):
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)
+    def diarizer_on_npu(self, ) -> bool:
+        """
+        Whether the diarizer runs on the Hexagon NPU (false: the CPU, or no diarizer).
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_diarizer_on_npu,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
     def flush(self, ) -> typing.List[FfiAudioPipelineEvent]:
         """
         Flush any in-flight speech segment at the end of the audio stream.
@@ -14245,6 +14494,22 @@ class FfiAudioPipeline(FfiAudioPipelineProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def has_diarizer(self, ) -> bool:
+        """
+        Whether a speaker diarizer is attached and running. It stops, with a warning in the log,
+        if it fails; the pipeline then keeps transcribing without speaker labels.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_has_diarizer,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)

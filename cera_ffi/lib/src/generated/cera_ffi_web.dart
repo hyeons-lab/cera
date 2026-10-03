@@ -3421,6 +3421,53 @@ final class FfiAudioPipelineEventUtteranceTranscribed extends FfiAudioPipelineEv
   int get hashCode => Object.hash(text, startMs, endMs, sampleCount);
 }
 
+/// The attached speaker diarizer has covered an utterance and assigned it a speaker. One per
+/// utterance, after its `UtteranceTranscribed`: a chunk plus its lookahead later (seconds with
+/// the default preset). Needs a pipeline built with `from_files_with_diarizer`.
+final class FfiAudioPipelineEventUtteranceLabeled extends FfiAudioPipelineEvent {
+  const FfiAudioPipelineEventUtteranceLabeled({
+    /// The utterance text, as in its `UtteranceTranscribed` event.
+    required this.text,
+    /// Start timestamp of the utterance in milliseconds.
+    required this.startMs,
+    /// End timestamp of the utterance in milliseconds.
+    required this.endMs,
+    /// The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
+    /// span or the labeler had to give the utterance up.
+    required this.speaker,
+    /// The speaker's share of all speakers' active time over the span, in (0, 1].
+    required this.confidence,
+    /// A second speaker who was also clearly active over the span, if any.
+    required this.overlapping,
+  });
+  /// The utterance text, as in its `UtteranceTranscribed` event.
+  final String text;
+  /// Start timestamp of the utterance in milliseconds.
+  final double startMs;
+  /// End timestamp of the utterance in milliseconds.
+  final double endMs;
+  /// The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
+  /// span or the labeler had to give the utterance up.
+  final int? speaker;
+  /// The speaker's share of all speakers' active time over the span, in (0, 1].
+  final double? confidence;
+  /// A second speaker who was also clearly active over the span, if any.
+  final int? overlapping;
+
+  @override
+  String toString() {
+    return 'FfiAudioPipelineEventUtteranceLabeled(text: $text, startMs: $startMs, endMs: $endMs, speaker: $speaker, confidence: $confidence, overlapping: $overlapping)';
+  }
+
+  @override
+  bool operator ==(Object other) =>
+      identical(this, other) ||
+      other is FfiAudioPipelineEventUtteranceLabeled && text == other.text && startMs == other.startMs && endMs == other.endMs && speaker == other.speaker && confidence == other.confidence && overlapping == other.overlapping;
+
+  @override
+  int get hashCode => Object.hash(text, startMs, endMs, speaker, confidence, overlapping);
+}
+
 /// Active state of the streaming audio pipeline.
 enum FfiAudioPipelineState {
   /// Awaiting a keyword spotting wake word before activating speech recording.
@@ -5080,6 +5127,17 @@ String _encodeFfiAudioPipelineEvent(FfiAudioPipelineEvent value) {
       'sampleCount': value.sampleCount,
     });
   }
+  if (value is FfiAudioPipelineEventUtteranceLabeled) {
+    return jsonEncode({
+      'tag': 'utteranceLabeled',
+      'text': value.text,
+      'startMs': value.startMs,
+      'endMs': value.endMs,
+      'speaker': value.speaker,
+      'confidence': value.confidence,
+      'overlapping': value.overlapping,
+    });
+  }
   throw StateError('Unknown FfiAudioPipelineEvent variant instance: $value');
 }
 
@@ -5112,6 +5170,15 @@ FfiAudioPipelineEvent _decodeFfiAudioPipelineEvent(String raw) {
         startMs: (map['startMs'] as num).toDouble(),
         endMs: (map['endMs'] as num).toDouble(),
         sampleCount: (map['sampleCount'] as num).toInt(),
+      );
+    case 'utteranceLabeled':
+      return FfiAudioPipelineEventUtteranceLabeled(
+        text: map['text'] as String,
+        startMs: (map['startMs'] as num).toDouble(),
+        endMs: (map['endMs'] as num).toDouble(),
+        speaker: map['speaker'] == null ? null : (map['speaker'] as num).toInt(),
+        confidence: map['confidence'] == null ? null : (map['confidence'] as num).toDouble(),
+        overlapping: map['overlapping'] == null ? null : (map['overlapping'] as num).toInt(),
       );
     default:
       throw StateError('Unknown FfiAudioPipelineEvent variant tag: $tag');
@@ -7259,6 +7326,20 @@ final class FfiAudioPipeline {
   /// Construct a pipeline from filesystem model paths.
   static FfiAudioPipeline fromFiles(String? vadPath, String? hotwordPath, String? whisperPath, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromFiles');
 
+  /// Construct a pipeline from filesystem model paths with a Sortformer speaker diarizer
+  /// (`diarizer_path`, a converted Sortformer GGUF). Every transcribed utterance then gets an
+  /// `UtteranceLabeled` event with its speaker, once the diarizer has covered it.
+  ///
+  /// With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+  /// device offers it (the GGUF must have been converted with `--tail-outtype q8_0`); otherwise,
+  /// or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+  static FfiAudioPipeline fromFilesWithDiarizer(String? vadPath, String? hotwordPath, String? whisperPath, String diarizerPath, bool preferNpu, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromFilesWithDiarizer');
+
+  /// Register an utterance transcribed outside the pipeline so it gets an `UtteranceLabeled`
+  /// event too. `start_ms` and `end_ms` are on the pipeline's clock, as in
+  /// `UtteranceTranscribed`. Returns whether a diarizer will label it.
+  bool addUtterance(String text, double startMs, double endMs) => _unsupportedOnWeb('FfiAudioPipeline.addUtterance');
+
   /// Cooperatively cancel any active transcription.
   ///
   /// Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
@@ -7271,8 +7352,15 @@ final class FfiAudioPipeline {
   /// Total audio samples processed since start or reset.
   int currentSample() => _unsupportedOnWeb('FfiAudioPipeline.currentSample');
 
+  /// Whether the diarizer runs on the Hexagon NPU (false: the CPU, or no diarizer).
+  bool diarizerOnNpu() => _unsupportedOnWeb('FfiAudioPipeline.diarizerOnNpu');
+
   /// Flush any in-flight speech segment at the end of the audio stream.
   List<FfiAudioPipelineEvent> flush() => _unsupportedOnWeb('FfiAudioPipeline.flush');
+
+  /// Whether a speaker diarizer is attached and running. It stops, with a warning in the log,
+  /// if it fails; the pipeline then keeps transcribing without speaker labels.
+  bool hasDiarizer() => _unsupportedOnWeb('FfiAudioPipeline.hasDiarizer');
 
   /// Whether the pipeline is currently awaiting a wake word trigger.
   bool isListeningForHotword() => _unsupportedOnWeb('FfiAudioPipeline.isListeningForHotword');

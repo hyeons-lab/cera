@@ -559,3 +559,28 @@ fn test_audio_pipeline_flush_clamps_speech_end_to_utterance_start_sample() {
         }
     }
 }
+
+/// Utterances still waiting on the diarizer are forgotten with the session on `reset`: nothing
+/// outside can see them (the new session never returns them), so they would only pile up.
+#[cfg(feature = "mmap")]
+#[test]
+fn reset_drops_the_utterances_waiting_on_the_old_diarizer_session() {
+    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf");
+    if !crate::model::transformer::require_model_or_skip(&path) {
+        return;
+    }
+    let model = crate::model::sortformer::SortformerModel::from_file(&path).unwrap();
+    let mut pipeline = AudioPipelineBuilder::new()
+        .with_auto_transcribe(false)
+        .with_diarizer(model.clone(), model.default_streaming().clone())
+        .build()
+        .unwrap();
+    assert!(pipeline.add_utterance("a".into(), 0.0, 100.0));
+    assert!(pipeline.add_utterance("b".into(), 200.0, 300.0));
+    assert_eq!(pipeline.diarizer.as_ref().unwrap().pending.len(), 2);
+    pipeline.reset();
+    assert!(pipeline.has_diarizer());
+    assert!(pipeline.diarizer.as_ref().unwrap().pending.is_empty());
+    assert_eq!(pipeline.diarizer.as_ref().unwrap().origin_ms, 0.0);
+}
