@@ -1,7 +1,7 @@
 # Streaming Sortformer: conversion and golden fixtures
 
 Tooling for bringing NVIDIA's `diar_streaming_sortformer_4spk-v2.1` (117 M params, 4 speakers) into
-cera. The design and the NPU plan are in `devlog/plans/000381-01-sortformer-diarization.md`.
+cera. The design and the NPU plan are in the repository's `.agents/plans/` directory (`background-diarization-sortformer`).
 
 | Script | Needs | Does |
 |---|---|---|
@@ -22,7 +22,7 @@ python scripts/sortformer/gen_golden.py --nemo $M/*.nemo --clip cera/tests/fixtu
 python scripts/sortformer/verify_gguf.py --nemo $M/*.nemo --gguf $M/sortformer-4spk-v2.1-f32.gguf \
   --clip cera/tests/fixtures/sortformer/clip.wav --tensors $M/golden/golden.safetensors --tol-pred 1e-4
 cargo test -p cera --test sortformer_gguf_layout   # CERA_REQUIRE_MODEL=1 to fail instead of skip
-cargo test -p cera --release --test sortformer_parity   # the CPU model against NeMo; SORTFORMER_FULL=1 adds the 33-step preset
+cargo test -p cera --release --test sortformer_parity   # the CPU model against NeMo; add -- --include-ignored for the 33-step preset
 ```
 
 `golden.json` and `clip.wav` are committed (about 650 KB). `golden.safetensors` (15 MB, every
@@ -92,23 +92,30 @@ filterbank, no per-feature normalization), the stem and the 17 FastConformer blo
 LFM2-Audio encoder through `audio_encoder::conformer_block_forward`), `encoder_proj`, the 18-layer
 Transformer, the speaker head, and a port of NeMo's streaming update (FIFO, arrival-order speaker
 cache with its importance scores and compression, silence profile). Use `diarize_offline` for one
-pass over a clip, `diarize_streaming` for NeMo's chunked loop over a clip, or `new_stream` + `step`
-for live audio.
+pass over a clip, `diarize_streaming` for NeMo's chunked loop over a clip, or `new_live` for live
+audio: `SortformerLive::push_audio` takes PCM in pieces of any size (an incremental `MelStream`
+inside) and returns each frame's speaker activities once they are final. `new_stream` + `step`
+is the lower-level loop that `SortformerLive` drives. `cera::speaker_labeler` then attaches
+those speakers to transcribed utterances.
 
 `cera/tests/sortformer_parity.rs` pins it to NeMo (all measured on the committed clip, f32 GGUF):
 
 * Every stage fed NeMo's own input: mel 1.8e-4, stem 2.1e-4, all 17 FastConformer blocks <= 2.8e-5, the
   Transformer layers <= 5.7e-6, sigmoids 1.3e-6 (max abs difference; cosine 1.0000000 throughout).
 * End to end from PCM: offline sigmoids 1.5e-6; Q8_0 2.7e-2 with 1 decision flipped of 772.
-* Streaming, four presets (default, `tiny`, `tiny_nofifo`, and the 33-step low-latency preset behind
-  `SORTFORMER_FULL=1`): predictions within 2.2e-6 of NeMo's, and for the two tiny presets the speaker
+* Streaming, four presets (default, `tiny`, `tiny_nofifo`, and the 33-step low-latency preset, which
+  is `#[ignore]`d: `--ignored`): predictions within 2.2e-6 of NeMo's, and for the two tiny presets the speaker
   cache, FIFO, predictions and silence profile match after every step (<= 3.7e-4, the mel front end's
   own difference), through 16 and 12 compressed-cache steps with 19 and 25 silence frames profiled.
 
 Mutation checks (each makes a test fail): strong-boost scale, the latest-frame boost, the silence
 disabling, the silence threshold, the `min_pos` boundary, ceil-vs-floor on the right context.
 
-Not covered: an incremental mel front end (the loop above computes the clip's mel first, as NeMo
-does); the asynchronous NeMo update path (variable-length batches; the sync path is what a single
-stream uses); non-f32 streaming (Q8_0 is checked offline only); the first-compression case where
-`spkcache_preds` is still `None` is covered by the tiny presets but not on its own.
+Live audio: `SortformerLive` gives bit-identical predictions to the unpadded streaming loop for
+any way of cutting the audio, and its `MelStream` the whole-clip mel exactly
+(`mel_stream_is_bit_identical_to_the_whole_clip_mel`, `live_matches_the_offline_streaming_loop_and_nemo`,
+`live_releases_a_chunk_when_its_lookahead_arrives`, `live_buffers_stay_bounded`).
+
+Not covered: the asynchronous NeMo update path (variable-length batches; the sync path is what a single
+stream uses); non-f32 streaming (Q8_0 is checked offline only); the first-compression case
+is pinned by its own hermetic test and by the tiny presets.

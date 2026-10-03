@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
-"""Build the 16 s multi-voice test clip used by the Sortformer golden fixtures.
+"""Build the 15.4 s multi-voice test clip used by the Sortformer golden fixtures.
 
 The clip is committed (cera/tests/fixtures/sortformer/clip.wav), so this script only documents
-how it was made and lets you rebuild it. Voices A/B/C are three different recordings; the clip has
-silence gaps (so the speaker cache sees silence frames) and one overlapped region (A over B).
+how it was made. The four source recordings are not in the repository, so rebuilding needs your
+own 16 kHz-or-higher speech files in their place; the committed clip is the fixture of record.
+
+Voices A/B/C are three different recordings; the clip has silence gaps (so the speaker cache sees silence frames) and one overlapped region (A over B).
 
     python scripts/sortformer/make_clip.py --en models/en.wav --fool fool_me_once_mono.wav \
         --kyoko1 kyoko1.wav --kyoko2 kyoko2.wav --out cera/tests/fixtures/sortformer/clip.wav
@@ -27,6 +29,8 @@ def load(path, start_s, dur_s):
         g = gcd(sr, SR)
         x = resample_poly(x, SR // g, sr // g).astype(np.float32)
     seg = x[int(start_s * SR) : int((start_s + dur_s) * SR)]
+    if seg.size == 0:
+        raise SystemExit(f"{path}: no audio at {start_s}..{start_s + dur_s} s (file is {len(x) / SR:.1f} s long)")
     peak = float(np.abs(seg).max()) or 1.0
     return (0.5 * seg / peak).astype(np.float32)
 

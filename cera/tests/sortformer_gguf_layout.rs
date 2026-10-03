@@ -18,12 +18,15 @@
 //! without them these tests skip with a message, and `CERA_REQUIRE_MODEL=1` turns the skip into a
 //! failure, like the other model-backed suites.
 
+#![cfg(feature = "mmap")] // `GgufFile::open_arc`
+
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 use std::sync::Arc;
 
 use cera::gguf::GgufFile;
 use cera::model::weights::MmapWeight;
+use cera::tensor::DType;
 
 const N_ENC: usize = 17;
 const N_TF: usize = 18;
@@ -269,9 +272,10 @@ fn matrices_agree_across_storage_types() {
         return;
     };
     // (file, tensors that file stores in that type, tolerance on the relative L2 of the GEMV)
-    let cases: [(&str, &[&str], f64); 3] = [
+    let cases: [(&str, DType, &[&str], f64); 3] = [
         (
             "sortformer-4spk-v2.1-q8_0.gguf",
+            DType::Q8_0,
             &[
                 "a.pre_encode.out.weight",
                 "a.blk.0.ffn_up.weight",
@@ -286,6 +290,7 @@ fn matrices_agree_across_storage_types() {
         (
             "sortformer-4spk-v2.1-q8_0.gguf",
             // the Transformer head is F16 in every non-f32 file
+            DType::F16,
             &[
                 "sf.enc_proj.weight",
                 "sf.blk.0.attn_q.weight",
@@ -297,6 +302,7 @@ fn matrices_agree_across_storage_types() {
         ),
         (
             "sortformer-4spk-v2.1-f16.gguf",
+            DType::F16,
             &[
                 "a.blk.0.ffn_up.weight",
                 "a.blk.9.attn_out.weight",
@@ -305,9 +311,15 @@ fn matrices_agree_across_storage_types() {
             1e-3,
         ),
     ];
-    for (file, names, tol) in cases {
+    for (file, stored, names, tol) in cases {
         let Some(g) = open(file) else { return };
         for name in names {
+            // Without this the comparison could be F32 against F32 and prove nothing.
+            let w = MmapWeight::from_gguf(&g, name).unwrap();
+            assert_eq!(
+                w.dtype, stored,
+                "{file}: {name} is not stored as {stored:?}"
+            );
             let got = gemv(&g, name);
             let want = gemv(&f32g, name);
             let err = rel_l2(&got, &want);

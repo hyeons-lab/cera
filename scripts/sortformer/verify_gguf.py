@@ -106,10 +106,13 @@ def load_into_nemo(m, g, n_layer, tf_layers):
     own = m.state_dict()
     missing = [k for k in sd if k not in own]
     bad = [(k, tuple(v.shape), tuple(own[k].shape)) for k, v in sd.items() if k in own and v.shape != own[k].shape]
-    assert not missing, f"names not in NeMo model: {missing[:5]}"
-    assert not bad, f"shape mismatches: {bad[:5]}"
+    if missing:
+        raise SystemExit(f"names not in NeMo model: {missing[:5]}")
+    if bad:
+        raise SystemExit(f"shape mismatches: {bad[:5]}")
     untouched = sorted(k for k in own if k not in sd and not k.endswith("num_batches_tracked"))
-    assert untouched == ["sortformer_modules.hidden_to_spks.bias", "sortformer_modules.hidden_to_spks.weight"], untouched
+    if untouched != ["sortformer_modules.hidden_to_spks.bias", "sortformer_modules.hidden_to_spks.weight"]:
+        raise SystemExit(f"NeMo parameters the GGUF does not cover: {untouched}")
     m.load_state_dict(sd, strict=False)
 
 
@@ -134,7 +137,9 @@ def main():
 
     g, reader = read_gguf(args.gguf)
     meta = {f.name: f for f in reader.fields.values()}
-    assert bytes(meta["general.architecture"].parts[-1]).decode() == "sortformer"
+    arch = bytes(meta["general.architecture"].parts[-1]).decode()
+    if arch != "sortformer":
+        raise SystemExit(f"{args.gguf}: general.architecture is {arch!r}, not sortformer")
 
     m = SortformerEncLabelModel.restore_from(restore_path=args.nemo, map_location="cpu")
     m.eval()

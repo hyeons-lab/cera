@@ -41,7 +41,7 @@ fn golden_frames() -> Vec<f32> {
 }
 
 /// (span in ms, expected slot). Spans sit inside the voices, away from their edges.
-const SPANS: [((f32, f32), usize); 4] = [
+const SPANS: [((f64, f64), usize); 4] = [
     ((700.0, 3_800.0), 0),
     ((4_700.0, 7_800.0), 1),
     ((8_700.0, 10_300.0), 2),
@@ -97,5 +97,5 @@ fn utterances_are_released_as_the_diarizer_catches_up() {
     }
     // The first utterance ends at 3.8 s = frame 47.5, so it is out with the 4th chunk (48 frames).
     assert_eq!(released[0].0, 3);
-    assert!(l.covered_ms() >= n as f32 * FRAME_MS - 1.0);
+    assert!(l.covered_ms() >= n as f64 * FRAME_MS - 1.0);
 }

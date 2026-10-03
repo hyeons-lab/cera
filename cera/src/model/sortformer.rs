@@ -50,14 +50,19 @@ use crate::backend::cpu;
 use crate::gguf::GgufFile;
 use crate::model::audio_encoder::{
     AudioEncoderConfig, ConformerLayerWeights, ConvStemWeights, HOP_LEN, LOG_MEL_EPS, N_FFT,
-    PREEMPH, SAMPLE_RATE, WINDOW_LEN, conformer_block_forward, conv_stem_forward,
+    POS_EMB_DIM, PREEMPH, SAMPLE_RATE, WINDOW_LEN, conformer_block_forward, conv_stem_forward,
     load_conformer_block, load_conv_layer, load_vec_f32, relative_pos_emb,
 };
 use crate::model::audio_preprocessor::{MelFrameComputer, N_FFT_BINS, log_mel_with_tables};
 use crate::model::weights::MmapWeight;
+use crate::tensor::DType;
 
 /// Largest speaker count the model's output head has; fixed by the checkpoint.
 pub const MAX_SPEAKERS: usize = 4;
+
+/// Largest value accepted for any streaming length, in 80 ms frames (about 24 hours). The
+/// checkpoint's own values are in the hundreds.
+const MAX_STREAM_FRAMES: usize = 1 << 20;
 
 // ── Streaming parameters ───────────────────────────────────────────────────
 
@@ -124,6 +129,48 @@ impl StreamingParams {
     fn validate(&self) -> Result<()> {
         ensure!(self.chunk_len > 0, "chunk_len must be > 0");
         ensure!(self.update_period > 0, "update_period must be > 0");
+        // Bound every length so the frame arithmetic downstream cannot overflow.
+        for (name, v) in [
+            ("chunk_len", self.chunk_len),
+            ("left_context", self.left_context),
+            ("right_context", self.right_context),
+            ("fifo_len", self.fifo_len),
+            ("spkcache_len", self.spkcache_len),
+            ("update_period", self.update_period),
+            ("sil_frames_per_spk", self.sil_frames_per_spk),
+        ] {
+            ensure!(
+                v <= MAX_STREAM_FRAMES,
+                "{name} {v} exceeds {MAX_STREAM_FRAMES}"
+            );
+        }
+        // One step attends over all of these at once (memory is quadratic in the sum), so cap
+        // the sum like the offline pass: a hostile file's defaults must not make a stream do
+        // an unbounded single pass.
+        let window = self.left_context
+            + self.chunk_len
+            + self.right_context
+            + self.fifo_len
+            + self.spkcache_len;
+        ensure!(
+            window <= MAX_OFFLINE_FRAMES,
+            "left + chunk + right + fifo + spkcache = {window} frames exceeds {MAX_OFFLINE_FRAMES}"
+        );
+        // `max_index` marks disabled cache slots, so it must lie above every real flat index
+        // (speaker-major over the frames of a cache about to be compressed, plus its silences).
+        let flat_range = MAX_SPEAKERS
+            * (self.spkcache_len + self.fifo_len + self.chunk_len + self.sil_frames_per_spk);
+        ensure!(
+            self.max_index >= flat_range,
+            "max_index {} lies inside the cache's flat index range (needs >= {flat_range})",
+            self.max_index
+        );
+        // The scores are `ln(max(p, threshold))`: a threshold of 0 would give `ln(0)`.
+        ensure!(
+            self.pred_score_threshold > 0.0 && self.pred_score_threshold <= 1.0,
+            "pred_score_threshold {} must be in (0, 1]",
+            self.pred_score_threshold
+        );
         ensure!(
             self.spkcache_len / MAX_SPEAKERS > self.sil_frames_per_spk,
             "spkcache_len {} leaves no room for speakers beside {} silence frames each",
@@ -190,8 +237,9 @@ struct TransformerLayer {
     down_b: Vec<f32>,
 }
 
-/// Every Sortformer tensor, loaded from a converted GGUF.
-pub struct SortformerWeights {
+/// Every Sortformer tensor, loaded from a converted GGUF. Held by [`SortformerModel`] and its
+/// streams; the crate's callers go through those.
+pub(crate) struct SortformerWeights {
     /// Architecture constants.
     pub config: SortformerConfig,
     /// The checkpoint's streaming defaults.
@@ -283,8 +331,16 @@ impl SortformerWeights {
             Some("relu"),
         )?;
 
+        // The padded length drives how many steps a clip takes, so a hostile value is a CPU hang.
+        let pad_to = req_u32(g, "sortformer.mel.pad_to")?;
+        ensure!(
+            (1..=MAX_PAD_TO).contains(&pad_to),
+            "sortformer.mel.pad_to {pad_to} outside 1..={MAX_PAD_TO}"
+        );
         let n_layer = req_u32(g, "clip.audio.block_count")?;
         let n_embd = req_u32(g, "clip.audio.embedding_length")?;
+        // The relative position table is a fixed `POS_EMB_DIM` columns wide.
+        expect_eq("embedding_length", n_embd, POS_EMB_DIM)?;
         let n_head = req_u32(g, "clip.audio.attention.head_count")?;
         let n_mel_bins = req_u32(g, "clip.audio.num_mel_bins")?;
         let eps = req_f32(g, "clip.audio.attention.layer_norm_epsilon")?;
@@ -297,8 +353,18 @@ impl SortformerWeights {
         expect_eq("max_speakers", n_spk, MAX_SPEAKERS)?;
         expect_eq("fc_d_model", req_u32(g, "sortformer.fc_d_model")?, n_embd)?;
         ensure!(
-            tf_d % tf_heads == 0,
-            "tf_d_model {tf_d} not divisible by {tf_heads} heads"
+            tf_heads > 0 && tf_d % tf_heads == 0,
+            "sortformer.tf_head_count {tf_heads} must be > 0 and divide sortformer.tf_d_model {tf_d}"
+        );
+        ensure!(
+            n_head > 0 && n_embd % n_head == 0,
+            "clip.audio.attention.head_count {n_head} must be > 0 and divide \
+             clip.audio.embedding_length {n_embd}"
+        );
+        // Counts come from the file; bound them before they size an allocation.
+        ensure!(
+            (1..=MAX_LAYERS).contains(&n_layer) && (1..=MAX_LAYERS).contains(&tf_layers),
+            "layer counts {n_layer} / {tf_layers} outside 1..={MAX_LAYERS}"
         );
         let subsampling = req_u32(g, "sortformer.subsampling_factor")?;
         expect_eq("subsampling_factor", subsampling, 8)?;
@@ -321,28 +387,12 @@ impl SortformerWeights {
         for il in 0..n_layer {
             layers.push(load_conformer_block(g, il)?);
         }
-        ensure!(
-            !layers.is_empty(),
-            "Sortformer GGUF has no FastConformer blocks"
-        );
         let n_ff = layers[0].ffn_up_w.rows;
+        let kernel = req_u32(g, "sortformer.conv_kernel_size")?;
         for (il, l) in layers.iter().enumerate() {
-            ensure!(
-                l.ffn_up_w.cols == n_embd
-                    && l.ffn_up_w.rows == n_ff
-                    && l.ffn_down_w.rows == n_embd
-                    && l.ffn_down_w.cols == n_ff
-                    && l.ffn_up_1_w.rows == n_ff
-                    && l.ffn_down_1_w.cols == n_ff,
-                "block {il}: FFN shapes disagree with n_embd {n_embd} / n_ff {n_ff}"
-            );
-            ensure!(
-                l.conv_dw_shape.first().copied()
-                    == Some(req_u32(g, "sortformer.conv_kernel_size")?),
-                "block {il}: depthwise kernel {:?} disagrees with sortformer.conv_kernel_size",
-                l.conv_dw_shape
-            );
+            check_encoder_block(il, l, n_embd, n_ff, kernel)?;
         }
+        check_stem(&conv_stem, n_embd, n_mel_bins)?;
         let enc_cfg = AudioEncoderConfig {
             n_layer,
             n_embd,
@@ -355,7 +405,9 @@ impl SortformerWeights {
         };
 
         let weight = |name: &str| -> Result<MmapWeight> {
-            MmapWeight::from_gguf(g, name).with_context(|| format!("loading {name}"))
+            let w = MmapWeight::from_gguf(g, name).with_context(|| format!("loading {name}"))?;
+            check_gemv_dtype(name, &w)?;
+            Ok(w)
         };
         let proj_w = weight("sf.enc_proj.weight")?;
         ensure!(
@@ -387,16 +439,7 @@ impl SortformerWeights {
                 down_w: w("ffn_down")?,
                 down_b: b("ffn_down")?,
             });
-            let l = &tf[n];
-            ensure!(
-                l.q_w.rows == tf_d
-                    && l.q_w.cols == tf_d
-                    && l.up_w.rows == tf_inner
-                    && l.up_w.cols == tf_d
-                    && l.down_w.rows == tf_d
-                    && l.down_w.cols == tf_inner,
-                "transformer layer {n}: shapes disagree with d {tf_d} / inner {tf_inner}"
-            );
+            check_transformer_layer(n, &tf[n], tf_d, tf_inner)?;
         }
         let head_hidden_w = weight("sf.head.hidden.weight")?;
         let head_out_w = weight("sf.head.out.weight")?;
@@ -407,6 +450,20 @@ impl SortformerWeights {
                 && head_out_w.cols == tf_d,
             "speaker head shapes disagree with d {tf_d} / {n_spk} speakers"
         );
+        let proj_b = load_vec_f32(g, "sf.enc_proj.bias")?;
+        let head_hidden_b = load_vec_f32(g, "sf.head.hidden.bias")?;
+        let head_out_b = load_vec_f32(g, "sf.head.out.bias")?;
+        for (name, v, want) in [
+            ("sf.enc_proj.bias", &proj_b, tf_d),
+            ("sf.head.hidden.bias", &head_hidden_b, tf_d),
+            ("sf.head.out.bias", &head_out_b, n_spk),
+        ] {
+            ensure!(
+                v.len() == want,
+                "{name} has {} values, expected {want}",
+                v.len()
+            );
+        }
 
         // Mel tables, exactly as the checkpoint ships them.
         let win = g
@@ -465,23 +522,242 @@ impl SortformerWeights {
                 n_spk,
                 subsampling,
                 xscaling,
-                pad_to: req_u32(g, "sortformer.mel.pad_to")?,
+                pad_to,
             },
             streaming,
             enc_cfg,
             conv_stem,
             layers,
             proj_w,
-            proj_b: load_vec_f32(g, "sf.enc_proj.bias")?,
+            proj_b,
             tf,
             head_hidden_w,
-            head_hidden_b: load_vec_f32(g, "sf.head.hidden.bias")?,
+            head_hidden_b,
             head_out_w,
-            head_out_b: load_vec_f32(g, "sf.head.out.bias")?,
+            head_out_b,
             window,
             mel_fb,
         })
     }
+}
+
+/// Upper bound on a layer count read from a GGUF (the shipped model has 17 and 18).
+const MAX_LAYERS: usize = 256;
+
+/// Longest clip [`SortformerModel::diarize_offline`] takes, and widest window any entry point
+/// attends over, in encoder frames (10 minutes). Full self-attention is quadratic: about 1.8 GB
+/// of scores per block at the limit, on top of the conv stem's peak of about 3.5 GB (about
+/// 58 KB per mel frame, measured).
+const MAX_OFFLINE_FRAMES: usize = 7_500;
+
+/// The matmul kernels cover these storage types; anything else would be a silent zero matrix
+/// (`gemv_dispatch` only `debug_assert`s on an unsupported type).
+fn check_gemv_dtype(name: &str, w: &MmapWeight) -> Result<()> {
+    ensure!(
+        matches!(
+            w.dtype,
+            DType::F32
+                | DType::F16
+                | DType::BF16
+                | DType::Q8_0
+                | DType::Q4_0
+                | DType::Q4_1
+                | DType::Q4KM
+                | DType::Q5KM
+                | DType::Q6K
+        ),
+        "{name}: storage type {:?} has no matmul kernel",
+        w.dtype
+    );
+    // The kernels read whole blocks per row: a column count that is not a multiple of the
+    // block size (a 192-wide matrix typed as a 256-wide K-quant) gives all-zero output.
+    ensure!(
+        w.cols.is_multiple_of(w.dtype.block_size()),
+        "{name}: {} columns is not a multiple of the {:?} block size {}",
+        w.cols,
+        w.dtype,
+        w.dtype.block_size()
+    );
+    Ok(())
+}
+
+/// Upper bound on `sortformer.mel.pad_to` (NeMo's value is 16).
+const MAX_PAD_TO: usize = 64;
+
+/// The stem's shapes, which `conv_stem_forward` otherwise only asserts at first audio.
+fn check_stem(stem: &ConvStemWeights, n_embd: usize, n_mel_bins: usize) -> Result<()> {
+    for (i, l) in stem.layers.iter().enumerate() {
+        ensure!(
+            l.shape.len() == 4
+                && l.bias.len() == l.shape[3]
+                && l.weight.len() == l.shape.iter().product::<usize>(),
+            "conv stem layer {i} ({}): weight shape {:?}, {} weights and {} biases disagree",
+            l.name,
+            l.shape,
+            l.weight.len(),
+            l.bias.len()
+        );
+    }
+    // `conv_stem_forward` hard-wires NeMo's dw_striding stem (kernel, stride and padding per
+    // layer), so the kernel and channel dims must be exactly NeMo's too: anything else panics
+    // at first audio or, for a bad kernel height, runs a different front end without a sound.
+    check_gemv_dtype("a.pre_encode.out.weight", &stem.pre_encode_out_w)?;
+    let out_ch = stem.layers.last().map_or(0, |l| l.shape[3]);
+    let c = out_ch;
+    let want_shapes = [
+        [3, 3, 1, c],
+        [3, 3, 1, c],
+        [1, 1, c, c],
+        [3, 3, 1, c],
+        [1, 1, c, c],
+    ];
+    for (i, (l, want)) in stem.layers.iter().zip(want_shapes).enumerate() {
+        ensure!(
+            l.shape == want,
+            "conv stem layer {i} ({}): weight shape {:?}, expected {want:?}",
+            l.name,
+            l.shape
+        );
+    }
+    let want_cols = out_ch * stem_frames(n_mel_bins);
+    ensure!(
+        stem.pre_encode_out_w.rows == n_embd && stem.pre_encode_out_w.cols == want_cols,
+        "a.pre_encode.out.weight is {}x{}, expected {n_embd}x{want_cols}",
+        stem.pre_encode_out_w.rows,
+        stem.pre_encode_out_w.cols
+    );
+    ensure!(
+        stem.pre_encode_out_b.len() == n_embd,
+        "a.pre_encode.out.bias has {} values, expected {n_embd}",
+        stem.pre_encode_out_b.len()
+    );
+    Ok(())
+}
+
+/// Every vector in `named` must have the length it is paired with: a truncated or hand-edited
+/// file otherwise runs with a partial bias in release builds (the kernels only `debug_assert`).
+fn check_lens(what: &str, named: &[(&str, usize, usize)]) -> Result<()> {
+    for &(name, got, want) in named {
+        ensure!(
+            got == want,
+            "{what}: {name} has {got} values, expected {want}"
+        );
+    }
+    Ok(())
+}
+
+/// Shapes the shared Conformer block kernel asserts on, checked once at load.
+fn check_encoder_block(
+    il: usize,
+    l: &ConformerLayerWeights,
+    n_embd: usize,
+    n_ff: usize,
+    kernel: usize,
+) -> Result<()> {
+    let what = format!("FastConformer block {il}");
+    for (name, w) in [
+        ("ffn_up", &l.ffn_up_w),
+        ("ffn_down", &l.ffn_down_w),
+        ("attn_q", &l.attn_q_w),
+        ("attn_k", &l.attn_k_w),
+        ("attn_v", &l.attn_v_w),
+        ("attn_out", &l.attn_o_w),
+        ("linear_pos", &l.linear_pos_w),
+        ("conv_pw1", &l.conv_pw1_w),
+        ("conv_pw2", &l.conv_pw2_w),
+        ("ffn_up_1", &l.ffn_up_1_w),
+        ("ffn_down_1", &l.ffn_down_1_w),
+    ] {
+        check_gemv_dtype(&format!("a.blk.{il}.{name}.weight"), w)?;
+    }
+    let square = |w: &MmapWeight| w.rows == n_embd && w.cols == n_embd;
+    ensure!(
+        l.ffn_up_w.cols == n_embd
+            && l.ffn_up_w.rows == n_ff
+            && l.ffn_down_w.rows == n_embd
+            && l.ffn_down_w.cols == n_ff
+            && l.ffn_up_1_w.rows == n_ff
+            && l.ffn_up_1_w.cols == n_embd
+            && l.ffn_down_1_w.rows == n_embd
+            && l.ffn_down_1_w.cols == n_ff,
+        "{what}: FFN shapes disagree with n_embd {n_embd} / n_ff {n_ff}"
+    );
+    ensure!(
+        square(&l.attn_q_w)
+            && square(&l.attn_k_w)
+            && square(&l.attn_v_w)
+            && square(&l.attn_o_w)
+            && square(&l.linear_pos_w)
+            && square(&l.conv_pw2_w)
+            && l.conv_pw1_w.rows == 2 * n_embd
+            && l.conv_pw1_w.cols == n_embd,
+        "{what}: attention or pointwise-conv shapes disagree with n_embd {n_embd}"
+    );
+    ensure!(
+        matches!(l.conv_dw_shape.len(), 2 | 3) && l.conv_dw_shape.first().copied() == Some(kernel),
+        "{what}: depthwise kernel weight shape {:?} is not a rank 2 or 3 weight of sortformer.conv_kernel_size {kernel}",
+        l.conv_dw_shape
+    );
+    check_lens(
+        &what,
+        &[
+            ("conv_dw.weight", l.conv_dw_w.len(), kernel * n_embd),
+            ("conv_dw.bias", l.conv_dw_b.len(), n_embd),
+            ("ffn_norm.weight", l.ffn_norm_w.len(), n_embd),
+            ("ffn_norm.bias", l.ffn_norm_b.len(), n_embd),
+            ("ffn_up.bias", l.ffn_up_b.len(), n_ff),
+            ("ffn_down.bias", l.ffn_down_b.len(), n_embd),
+            ("ln1.weight", l.ln1_w.len(), n_embd),
+            ("ln1.bias", l.ln1_b.len(), n_embd),
+            ("attn_q.bias", l.attn_q_b.len(), n_embd),
+            ("attn_k.bias", l.attn_k_b.len(), n_embd),
+            ("attn_v.bias", l.attn_v_b.len(), n_embd),
+            ("attn_out.bias", l.attn_o_b.len(), n_embd),
+            ("pos_bias_u", l.pos_bias_u.len(), n_embd),
+            ("pos_bias_v", l.pos_bias_v.len(), n_embd),
+            ("norm_conv.weight", l.norm_conv_w.len(), n_embd),
+            ("norm_conv.bias", l.norm_conv_b.len(), n_embd),
+            ("conv_pw1.bias", l.conv_pw1_b.len(), 2 * n_embd),
+            ("conv_norm.weight", l.conv_norm_w.len(), n_embd),
+            ("conv_norm.bias", l.conv_norm_b.len(), n_embd),
+            ("conv_pw2.bias", l.conv_pw2_b.len(), n_embd),
+            ("ffn_norm_1.weight", l.ffn_norm_1_w.len(), n_embd),
+            ("ffn_norm_1.bias", l.ffn_norm_1_b.len(), n_embd),
+            ("ffn_up_1.bias", l.ffn_up_1_b.len(), n_ff),
+            ("ffn_down_1.bias", l.ffn_down_1_b.len(), n_embd),
+            ("ln2.weight", l.ln2_w.len(), n_embd),
+            ("ln2.bias", l.ln2_b.len(), n_embd),
+        ],
+    )
+}
+
+fn check_transformer_layer(n: usize, l: &TransformerLayer, d: usize, inner: usize) -> Result<()> {
+    let what = format!("transformer layer {n}");
+    ensure!(
+        [&l.q_w, &l.k_w, &l.v_w, &l.o_w]
+            .iter()
+            .all(|w| w.rows == d && w.cols == d)
+            && l.up_w.rows == inner
+            && l.up_w.cols == d
+            && l.down_w.rows == d
+            && l.down_w.cols == inner,
+        "{what}: shapes disagree with d {d} / inner {inner}"
+    );
+    check_lens(
+        &what,
+        &[
+            ("ln1.weight", l.ln1_w.len(), d),
+            ("ln1.bias", l.ln1_b.len(), d),
+            ("attn_q.bias", l.q_b.len(), d),
+            ("attn_k.bias", l.k_b.len(), d),
+            ("attn_v.bias", l.v_b.len(), d),
+            ("attn_out.bias", l.o_b.len(), d),
+            ("ln2.weight", l.ln2_w.len(), d),
+            ("ln2.bias", l.ln2_b.len(), d),
+            ("ffn_up.bias", l.up_b.len(), inner),
+            ("ffn_down.bias", l.down_b.len(), d),
+        ],
+    )
 }
 
 /// Encoder frames a stem of three stride-2, kernel-3, pad-1 convolutions makes from `n` mel
@@ -553,6 +829,10 @@ impl SortformerModel {
 
     /// Conv stem plus `pre_encode.out`: `[frames × 128]` mel to `[ceil(frames/8) × 512]` embeddings.
     /// These are what the speaker cache and FIFO store.
+    ///
+    /// # Panics
+    ///
+    /// If `mel` is not `[n_frames x 128]`.
     pub fn pre_encode(&self, mel: &[f32], n_frames: usize) -> (Vec<f32>, usize) {
         conv_stem_forward(mel, n_frames, &self.w.conv_stem, &self.w.enc_cfg)
     }
@@ -560,6 +840,11 @@ impl SortformerModel {
     /// Everything after the stem: x-scale, FastConformer, `encoder_proj`, Transformer and the
     /// speaker head, over `t` pre-encode embeddings (`[t × 512]`). Returns the sigmoid
     /// speaker activities `[t × 4]`.
+    ///
+    /// # Panics
+    ///
+    /// If `emb` is not `[t x 512]`, or `t` is past the 7500-frame attention window the other
+    /// entry points enforce (attention memory is quadratic in `t`).
     pub fn predict(&self, emb: &[f32], t: usize) -> Vec<f32> {
         self.predict_with_taps(emb, t, &mut |_, _| {})
     }
@@ -576,6 +861,10 @@ impl SortformerModel {
         let w = &*self.w;
         let c = &w.config;
         assert_eq!(emb.len(), t * c.n_embd, "predict: emb must be [t x n_embd]");
+        assert!(
+            t <= MAX_OFFLINE_FRAMES,
+            "predict: {t} frames exceeds the {MAX_OFFLINE_FRAMES}-frame attention window"
+        );
         if t == 0 {
             return Vec::new();
         }
@@ -639,10 +928,20 @@ impl SortformerModel {
 
     /// Offline diarization of a whole clip in one pass (no streaming state, so the whole
     /// clip attends to itself). Returns `[frames × 4]` speaker activities, 80 ms per frame.
-    pub fn diarize_offline(&self, pcm: &[f32]) -> Vec<f32> {
+    ///
+    /// Attention memory and time grow with the square of the clip length (a 2-minute clip took
+    /// about 33 s on an M1 Max, and the 7500-frame limit would take on the order of 14 minutes),
+    /// so this is for clips of minutes, not hours; use [`Self::new_live`] for long audio. Peak
+    /// memory at the limit is about 3.5 GB (the conv stem, about 58 KB per mel frame) plus 1.8 GB
+    /// of attention scores per block.
+    ///
+    /// Fails if a sample is NaN or infinite, which would otherwise turn every prediction to NaN.
+    pub fn diarize_offline(&self, pcm: &[f32]) -> Result<Vec<f32>> {
+        ensure_finite_pcm(pcm)?;
+        ensure_offline_len(pcm.len())?;
         let (mel, n) = self.log_mel(pcm);
         let (emb, t) = self.pre_encode(&mel, n);
-        self.predict(&emb, t)
+        Ok(self.predict(&emb, t))
     }
 
     /// Start a streaming session with `params` (see [`Self::default_streaming`]).
@@ -651,24 +950,63 @@ impl SortformerModel {
         Ok(SortformerStream {
             w: self.w.clone(),
             params,
-            spkcache: Vec::new(),
-            spkcache_preds: None,
-            fifo: Vec::new(),
-            fifo_preds: Vec::new(),
-            mean_sil_emb: vec![0.0; self.w.config.n_embd],
-            n_sil_frames: 0,
+            state: StreamState::new(self.w.config.n_embd),
         })
     }
 
     /// Streaming diarization of a whole clip, chunked exactly as NeMo's feature loader
     /// chunks it. Returns `[frames × 4]`.
     pub fn diarize_streaming(&self, pcm: &[f32], params: StreamingParams) -> Result<Vec<f32>> {
+        ensure_finite_pcm(pcm)?;
         let (mel, n) = self.log_mel(pcm);
         self.new_stream(params)?.diarize_features(&mel, n)
     }
 }
 
 // ── Live audio ─────────────────────────────────────────────────────────────
+
+/// Refuse a clip the offline pass cannot attend over, from its length alone (before any mel
+/// or attention memory is allocated).
+fn ensure_offline_len(n_samples: usize) -> Result<()> {
+    let frames = stem_frames(n_samples / HOP_LEN);
+    ensure!(
+        frames <= MAX_OFFLINE_FRAMES,
+        "{frames} encoder frames is past the {MAX_OFFLINE_FRAMES} (10 minutes) the offline \
+         pass can attend over; use new_live or diarize_streaming for long audio"
+    );
+    Ok(())
+}
+
+/// Largest PCM magnitude accepted. Real audio is within +-1 (or +-32768 at 16-bit scale); the
+/// mel overflows to infinity only near `f32::MAX`, so this leaves room for any real signal and
+/// refuses reinterpreted garbage bytes deterministically.
+const MAX_ABS_PCM: f32 = 1e9;
+
+/// Largest |log-mel| accepted by the feature entry points. Real values stay within about
+/// [-17, 46] even for PCM at [`MAX_ABS_PCM`]; the stem overflows to NaN from about 1e9.
+const MAX_ABS_MEL: f32 = 1e3;
+
+/// Index of the first mel value that is NaN, infinite or beyond [`MAX_ABS_MEL`].
+fn first_bad_mel(mel: &[f32]) -> Option<usize> {
+    mel.iter()
+        .position(|x| !x.is_finite() || x.abs() > MAX_ABS_MEL)
+}
+
+/// Index of the first sample that is NaN, infinite or beyond [`MAX_ABS_PCM`].
+fn first_bad_sample(pcm: &[f32]) -> Option<usize> {
+    pcm.iter()
+        .position(|x| !x.is_finite() || x.abs() > MAX_ABS_PCM)
+}
+
+/// One NaN, infinite or absurdly large sample reaches every later frame through the FFT and the
+/// carried state (the mel overflows to infinity), so every entry point that takes PCM refuses it
+/// up front.
+fn ensure_finite_pcm(pcm: &[f32]) -> Result<()> {
+    if let Some(i) = first_bad_sample(pcm) {
+        anyhow::bail!("non-finite or out-of-range PCM sample at index {i}");
+    }
+    Ok(())
+}
 
 /// Incremental NeMo log-mel: feed PCM in pieces of any size, get the same mel frames the
 /// whole-clip [`SortformerModel::log_mel`] computes, bit for bit.
@@ -693,9 +1031,14 @@ pub struct MelStream {
 
 impl MelStream {
     fn new(w: &SortformerWeights) -> Self {
-        let n_mel_bins = w.config.n_mel_bins;
+        Self::from_tables(w.config.n_mel_bins, &w.window, &w.mel_fb)
+    }
+
+    /// A front end over the given window (`N_FFT` long) and filterbank; weight-free, so the
+    /// hermetic tests can drive it with synthetic tables.
+    fn from_tables(n_mel_bins: usize, window: &[f32], mel_fb: &[f32]) -> Self {
         Self {
-            computer: MelFrameComputer::new(n_mel_bins, &w.window, &w.mel_fb),
+            computer: MelFrameComputer::new(n_mel_bins, window, mel_fb),
             n_mel_bins,
             buf: vec![0.0; N_FFT / 2],
             base: 0,
@@ -716,9 +1059,24 @@ impl MelStream {
         self.next_frame
     }
 
+    /// Samples currently held (the part of the signal the next frames still need). It stays
+    /// within one FFT window plus one hop however long the stream runs.
+    pub fn buffered_samples(&self) -> usize {
+        self.buf.len()
+    }
+
     /// Append mono 16 kHz PCM. Returns the newly completed mel frames, `[k x 128]` time-major.
+    /// Fails, consuming nothing, if the stream has finished or a sample is NaN or infinite.
     pub fn push(&mut self, pcm: &[f32]) -> Result<Vec<f32>> {
         ensure!(!self.finished, "MelStream: push after finish");
+        // One NaN would ride through the FFT into every later frame's attention, so refuse the
+        // whole piece (nothing is consumed) instead of poisoning the stream.
+        if let Some(i) = first_bad_sample(pcm) {
+            anyhow::bail!(
+                "MelStream: non-finite or out-of-range PCM sample at stream offset {}",
+                self.n_in + i
+            );
+        }
         self.buf.reserve(pcm.len());
         for &x in pcm {
             // The first sample passes through unchanged because `prev_raw` starts at 0.
@@ -808,7 +1166,8 @@ impl SortformerModel {
 impl SortformerLive {
     /// Worst-case delay in frames (80 ms each): a chunk's first frame waits for the rest of
     /// the chunk and its lookahead, `chunk_len + right_context` (NeMo's definition of the
-    /// preset's latency), on top of the 160 ms the mel front end needs after a frame's center.
+    /// preset's latency), on top of the 16 ms (256 samples) the mel front end needs after a
+    /// frame's center.
     pub fn latency_frames(&self) -> usize {
         self.stream.params.chunk_len + self.stream.params.right_context
     }
@@ -818,13 +1177,28 @@ impl SortformerLive {
         self.emitted
     }
 
+    /// Mel frames currently held for the next chunks (their left context plus whatever is
+    /// waiting for lookahead). Bounded by the streaming parameters, not by the stream's length.
+    pub fn buffered_frames(&self) -> usize {
+        self.rows.len() / self.stream.w.config.n_mel_bins
+    }
+
     /// The underlying streaming state (speaker cache, FIFO, silence profile).
     pub fn stream(&self) -> &SortformerStream {
         &self.stream
     }
 
     /// Feed mono 16 kHz PCM of any length. Returns the predictions that became final,
-    /// `[k x 4]` for the next `k` frames in order (possibly empty).
+    /// `[k x 4]` for the next `k` frames in order (possibly empty). Fails if the stream has
+    /// finished or a sample is NaN, infinite or beyond 1e9 in magnitude (nothing is consumed in
+    /// that case).
+    ///
+    /// When the call completes a chunk it runs the model synchronously, and on the CPU that can
+    /// take longer than the audio it covers: with Q4_0 on an M1 Max a 390-frame window (the
+    /// card's 0.48 s low-latency preset) costs about 2.7 s per step, while the 15 s default chunk
+    /// costs about 2.7 s per 15 s. Cost grows with the square of the window (cache, FIFO, chunk
+    /// and contexts together), so size a worker for that, not for the audio rate, and never
+    /// call this from an audio callback.
     pub fn push_audio(&mut self, pcm: &[f32]) -> Result<Vec<f32>> {
         ensure!(!self.finished, "SortformerLive: push_audio after finish");
         let rows = self.mel.push(pcm)?;
@@ -833,6 +1207,10 @@ impl SortformerLive {
     }
 
     /// End of audio: flush the remaining frames with whatever lookahead exists.
+    ///
+    /// With validated parameters and bounded PCM a model step cannot fail; if one ever does, the
+    /// predictions already computed in that call are not returned and the stream should be
+    /// discarded.
     pub fn finish(&mut self) -> Result<Vec<f32>> {
         if self.finished {
             return Ok(Vec::new());
@@ -876,10 +1254,13 @@ impl SortformerLive {
             let first = self.stt - left_offset;
             let n_feat = end + right_offset - first;
             let lo = (first - self.rows_start) * nm;
-            let chunk = self.rows[lo..lo + n_feat * nm].to_vec();
-            let preds = self
-                .stream
-                .step(&chunk, n_feat, n_feat, left_offset, right_offset)?;
+            let preds = self.stream.step(
+                &self.rows[lo..lo + n_feat * nm],
+                n_feat,
+                n_feat,
+                left_offset,
+                right_offset,
+            )?;
             self.stt = end;
             self.emitted += preds.len() / self.stream.w.config.n_spk;
             out.extend(preds);
@@ -972,6 +1353,12 @@ fn transformer_layer_forward(x: &mut [f32], l: &TransformerLayer, t: usize, c: &
 pub struct SortformerStream {
     w: Arc<SortformerWeights>,
     params: StreamingParams,
+    state: StreamState,
+}
+
+/// The cross-step state of a stream and NeMo's `streaming_update` over it. It owns no weights,
+/// so the cache, FIFO and silence-profile logic can be exercised with synthetic embeddings.
+struct StreamState {
     /// `[n × n_embd]`, speaker-ordered once compressed.
     spkcache: Vec<f32>,
     /// `[n × n_spk]`; `None` until the cache has been compressed once (NeMo's `None`).
@@ -990,37 +1377,41 @@ impl SortformerStream {
 
     /// Speaker-cache embeddings, `[len × n_embd]`.
     pub fn spkcache(&self) -> &[f32] {
-        &self.spkcache
+        &self.state.spkcache
     }
 
     /// Speaker-cache predictions `[len × n_spk]`, or `None` before the first compression.
     pub fn spkcache_preds(&self) -> Option<&[f32]> {
-        self.spkcache_preds.as_deref()
+        self.state.spkcache_preds.as_deref()
     }
 
     /// FIFO embeddings, `[len × n_embd]`.
     pub fn fifo(&self) -> &[f32] {
-        &self.fifo
+        &self.state.fifo
     }
 
     /// FIFO predictions, `[len × n_spk]`.
     pub fn fifo_preds(&self) -> &[f32] {
-        &self.fifo_preds
+        &self.state.fifo_preds
     }
 
     /// Running mean of the embeddings of frames classified as silence.
     pub fn mean_sil_emb(&self) -> &[f32] {
-        &self.mean_sil_emb
+        &self.state.mean_sil_emb
     }
 
     /// How many silence frames fed [`Self::mean_sil_emb`].
     pub fn n_sil_frames(&self) -> usize {
-        self.n_sil_frames
+        self.state.n_sil_frames
     }
 
     /// Run a whole clip's features (`[n_frames × 128]`, from [`SortformerModel::log_mel`])
     /// through the streaming loop, chunked like NeMo's `streaming_feat_loader` over features
     /// padded to a multiple of `pad_to`. Returns `[frames × 4]`; frames past the audio are zeros.
+    ///
+    /// The stream keeps its speaker cache, FIFO and silence profile between calls, so a second
+    /// clip continues from the first; start a new stream ([`SortformerModel::new_stream`]) per
+    /// clip.
     pub fn diarize_features(&mut self, mel: &[f32], n_frames: usize) -> Result<Vec<f32>> {
         self.diarize_features_with(mel, n_frames, &mut |_, _, _| {})
     }
@@ -1041,8 +1432,11 @@ impl SortformerStream {
         n_frames: usize,
         on_step: &mut dyn FnMut(usize, &SortformerStream, &[f32]),
     ) -> Result<Vec<f32>> {
-        let pad_to = self.w.config.pad_to.max(1);
-        self.chunk_loop(mel, n_frames, n_frames.div_ceil(pad_to) * pad_to, on_step)
+        let pad_to = self.w.config.pad_to;
+        let feat_len = n_frames.checked_next_multiple_of(pad_to).with_context(|| {
+            format!("n_frames {n_frames} cannot be padded to a multiple of {pad_to}")
+        })?;
+        self.chunk_loop(mel, n_frames, feat_len, on_step)
     }
 
     /// NeMo's `streaming_feat_loader` over `feat_len` frames (`>= n_frames`; the tail past
@@ -1056,7 +1450,15 @@ impl SortformerStream {
     ) -> Result<Vec<f32>> {
         let c = &self.w.config;
         let (nm, ss) = (c.n_mel_bins, c.subsampling);
-        ensure!(mel.len() == n_frames * nm, "mel is not [n_frames x {nm}]");
+        ensure!(
+            n_frames.checked_mul(nm) == Some(mel.len()),
+            "mel is not [n_frames x {nm}]"
+        );
+        // Every chunk is checked again in `step`, but a bad value in a later chunk would only
+        // surface after earlier chunks had already changed the stream: refuse the clip up front.
+        if let Some(i) = first_bad_mel(mel) {
+            anyhow::bail!("non-finite or out-of-range mel value at frame {}", i / nm);
+        }
         let chunk_feat = self.params.chunk_len * ss;
 
         let mut total = Vec::new();
@@ -1069,7 +1471,10 @@ impl SortformerStream {
             let n_feat = end + right_offset - first;
             let valid = n_frames.saturating_sub(first).min(n_feat);
             let mut chunk = vec![0.0f32; n_feat * nm];
-            chunk[..valid * nm].copy_from_slice(&mel[first * nm..(first + valid) * nm]);
+            if valid > 0 {
+                // With `valid == 0` the chunk starts in the padding past the last real frame.
+                chunk[..valid * nm].copy_from_slice(&mel[first * nm..(first + valid) * nm]);
+            }
             stt = end;
             let preds = self.step(&chunk, n_feat, valid, left_offset, right_offset)?;
             on_step(idx, self, &preds);
@@ -1099,8 +1504,9 @@ impl SortformerStream {
         let w = self.w.clone();
         let c = &w.config;
         let (d, s, ss) = (c.n_embd, c.n_spk, c.subsampling);
+        // `checked_mul`: a wrapped product would let an empty `feats` pass for a huge `n_feat`.
         ensure!(
-            feats.len() == n_feat * c.n_mel_bins,
+            n_feat.checked_mul(c.n_mel_bins) == Some(feats.len()),
             "feats is not [n_feat x {}]",
             c.n_mel_bins
         );
@@ -1108,16 +1514,45 @@ impl SortformerStream {
             valid_feat <= n_feat,
             "valid_feat {valid_feat} > n_feat {n_feat}"
         );
+        // Checked before any state is touched: a NaN in the FIFO or cache would taint every
+        // later step.
+        if let Some(i) = first_bad_mel(&feats[..valid_feat * c.n_mel_bins]) {
+            anyhow::bail!(
+                "step: non-finite or out-of-range mel value at frame {}",
+                i / c.n_mel_bins
+            );
+        }
 
         // Frames NeMo would see (padding included) and the ones that exist here.
         let enc_total = stem_frames(n_feat);
-        let lc = left_offset / ss; // exact: left offsets are whole encoder frames
+        ensure!(
+            left_offset.is_multiple_of(ss),
+            "left_offset {left_offset} is not a whole number of encoder frames ({ss} mel frames each)"
+        );
+        let lc = left_offset / ss;
         let rc = right_offset.div_ceil(ss);
         ensure!(
             enc_total >= lc + rc,
             "chunk of {enc_total} encoder frames is shorter than its contexts ({lc} + {rc})"
         );
         let chunk_len = enc_total - lc - rc;
+        // The same window bound `StreamingParams::validate` puts on the configuration, checked
+        // against what this call really attends over (the caller chooses `n_feat`).
+        let window = (self.state.spkcache.len() + self.state.fifo.len()) / d + enc_total;
+        ensure!(
+            window <= MAX_OFFLINE_FRAMES,
+            "step window of {window} encoder frames exceeds {MAX_OFFLINE_FRAMES}"
+        );
+        // `validate` related `max_index` to the configured chunk; this call may be longer, and
+        // a real flat index at or past `max_index` would read as a disabled cache slot. Only
+        // the rows `update` can compress count (cache, FIFO and the chunk itself, not the
+        // contexts), the same terms `validate` uses.
+        let candidates = (self.state.spkcache.len() + self.state.fifo.len()) / d + chunk_len;
+        ensure!(
+            self.params.max_index >= MAX_SPEAKERS * (candidates + self.params.sil_frames_per_spk),
+            "max_index {} lies inside the flat index range of a {candidates}-frame step",
+            self.params.max_index
+        );
 
         let (chunk_valid, enc_valid) = if valid_feat == 0 {
             (Vec::new(), 0)
@@ -1127,11 +1562,11 @@ impl SortformerStream {
         debug_assert_eq!(enc_valid, stem_frames(valid_feat));
         let model = SortformerModel { w: w.clone() };
 
-        let n_sc = self.spkcache.len() / d;
-        let n_fifo = self.fifo.len() / d;
+        let n_sc = self.state.spkcache.len() / d;
+        let n_fifo = self.state.fifo.len() / d;
         let mut concat = Vec::with_capacity((n_sc + n_fifo + enc_valid) * d);
-        concat.extend_from_slice(&self.spkcache);
-        concat.extend_from_slice(&self.fifo);
+        concat.extend_from_slice(&self.state.spkcache);
+        concat.extend_from_slice(&self.state.fifo);
         concat.extend_from_slice(&chunk_valid);
         let valid_rows = n_sc + n_fifo + enc_valid;
         let mut preds = model.predict(&concat, valid_rows);
@@ -1141,12 +1576,44 @@ impl SortformerStream {
         let mut chunk_emb = chunk_valid;
         chunk_emb.resize(enc_total * d, 0.0);
 
-        // ---- streaming_update (synchronous path) ----
-        let (fifo_cap, update_period, cache_cap) = (
-            self.params.fifo_len,
-            self.params.update_period,
-            self.params.spkcache_len,
-        );
+        Ok(self.state.update(
+            &self.params,
+            (d, s),
+            &preds,
+            &chunk_emb,
+            (n_sc, n_fifo, lc, chunk_len),
+        ))
+    }
+}
+
+impl StreamState {
+    fn new(n_embd: usize) -> Self {
+        Self {
+            spkcache: Vec::new(),
+            spkcache_preds: None,
+            fifo: Vec::new(),
+            fifo_preds: Vec::new(),
+            mean_sil_emb: vec![0.0; n_embd],
+            n_sil_frames: 0,
+        }
+    }
+
+    /// NeMo's `streaming_update` (synchronous path) after a forward over
+    /// `[spkcache, fifo, chunk]`. `preds` is that forward's `[(n_sc + n_fifo + chunk rows) x s]`
+    /// sigmoid output and `chunk_emb` the chunk's pre-encode embeddings; `rows` is
+    /// `(n_sc, n_fifo, lc, chunk_len)`, where `lc` is the left-context frames at the front of the
+    /// chunk. Appends the chunk to the FIFO, pops into the cache when the FIFO overflows
+    /// (folding silent frames into the silence profile) and compresses the cache when it does.
+    /// Returns the chunk's own predictions, `[chunk_len x s]`.
+    fn update(
+        &mut self,
+        p: &StreamingParams,
+        (d, s): (usize, usize),
+        preds: &[f32],
+        chunk_emb: &[f32],
+        (n_sc, n_fifo, lc, chunk_len): (usize, usize, usize, usize),
+    ) -> Vec<f32> {
+        let (fifo_cap, update_period, cache_cap) = (p.fifo_len, p.update_period, p.spkcache_len);
         let fifo_preds_now = preds[n_sc * s..(n_sc + n_fifo) * s].to_vec();
         let chunk_slice = &chunk_emb[lc * d..(lc + chunk_len) * d];
         let base = n_sc + n_fifo + lc;
@@ -1157,13 +1624,13 @@ impl SortformerStream {
         self.fifo_preds.extend_from_slice(&chunk_preds);
 
         if n_fifo + chunk_len > fifo_cap {
-            let mut pop = update_period;
-            pop = pop.max((chunk_len + n_fifo).saturating_sub(fifo_cap));
-            pop = pop.min(n_fifo + chunk_len);
+            let pop = update_period
+                .max((chunk_len + n_fifo).saturating_sub(fifo_cap))
+                .min(n_fifo + chunk_len);
 
             let pop_embs = self.fifo[..pop * d].to_vec();
             let pop_preds = self.fifo_preds[..pop * s].to_vec();
-            self.update_silence_profile(&pop_embs, &pop_preds, pop);
+            self.update_silence_profile(p, (d, s), &pop_embs, &pop_preds, pop);
             self.fifo.drain(..pop * d);
             self.fifo_preds.drain(..pop * s);
 
@@ -1180,9 +1647,9 @@ impl SortformerStream {
                     self.spkcache_preds = Some(sp);
                 }
                 let (emb, pr) = compress_spkcache(
-                    &self.params,
-                    self.w.config.n_spk,
-                    self.w.config.n_embd,
+                    p,
+                    s,
+                    d,
                     &self.spkcache,
                     self.spkcache_preds.as_ref().expect("set above"),
                     cache_rows,
@@ -1192,17 +1659,23 @@ impl SortformerStream {
                 self.spkcache_preds = Some(pr);
             }
         }
-        Ok(chunk_preds)
+        chunk_preds
     }
 
     /// NeMo `_get_silence_profile`: fold the silent frames of `embs` into the running mean.
-    fn update_silence_profile(&mut self, embs: &[f32], preds: &[f32], n: usize) {
-        let (d, s) = (self.w.config.n_embd, self.w.config.n_spk);
+    fn update_silence_profile(
+        &mut self,
+        p: &StreamingParams,
+        (d, s): (usize, usize),
+        embs: &[f32],
+        preds: &[f32],
+        n: usize,
+    ) {
         let mut sum = vec![0.0f32; d];
         let mut count = 0usize;
         for f in 0..n {
             let total: f32 = preds[f * s..(f + 1) * s].iter().sum();
-            if total < self.params.sil_threshold {
+            if total < p.sil_threshold {
                 count += 1;
                 for (a, b) in sum.iter_mut().zip(&embs[f * d..(f + 1) * d]) {
                     *a += *b;
@@ -1213,7 +1686,7 @@ impl SortformerStream {
             return;
         }
         let upd = self.n_sil_frames + count;
-        let denom = upd.max(1) as f32;
+        let denom = upd as f32;
         for (m, add) in self.mean_sil_emb.iter_mut().zip(&sum) {
             *m = (*m * self.n_sil_frames as f32 + add) / denom;
         }
@@ -1479,5 +1952,521 @@ mod tests {
             emb, want,
             "frame 3 must appear once (speaker 1's), not twice"
         );
+    }
+
+    /// Like [`compress`] with the given parameters.
+    fn compress_with(p: &StreamingParams, preds: &[[f32; 4]]) -> Vec<f32> {
+        let n = preds.len();
+        let emb: Vec<f32> = (0..n).map(|f| (f + 1) as f32).collect();
+        let flat: Vec<f32> = preds.iter().flatten().copied().collect();
+        compress_spkcache(p, 4, 1, &emb, &flat, n, &[-1.0]).0
+    }
+
+    #[test]
+    fn newest_frames_get_the_latest_boost_once_the_cache_overflows() {
+        // 20 identical frames of one speaker, room for 12 speech frames (16 slots, 4 closing
+        // silences). Without a boost ties go to the oldest frames; with one, the 4 frames past
+        // `spkcache_len` (embeddings 17..=20) displace the middle of the cache.
+        let preds = [[0.9, 0.0, 0.0, 0.0]; 20];
+        let plain = StreamingParams {
+            scores_boost_latest: 0.0,
+            ..params(16)
+        };
+        let boosted = StreamingParams {
+            scores_boost_latest: 1.0,
+            ..params(16)
+        };
+        let keep = |p: &StreamingParams| {
+            let mut e = compress_with(p, &preds);
+            e.retain(|&x| x > 0.0);
+            e
+        };
+        assert_eq!(keep(&plain), (1..=12).map(|x| x as f32).collect::<Vec<_>>());
+        assert_eq!(
+            keep(&boosted),
+            [1., 2., 3., 4., 5., 6., 7., 8., 17., 18., 19., 20.]
+        );
+    }
+
+    #[test]
+    fn the_strong_boost_is_twice_the_weak_one() {
+        // 16 slots = 3 speech frames per speaker, so the top 2 scores of each speaker get the
+        // strong boost (2 x ln 2) and the top 4 the weak one (1 x ln 2) on top. Frame 4 of
+        // speaker 0 (embedding 5) sits just below the cut when the strong boost is 2 x ln 2,
+        // and above it when the strong boost is only 1 x ln 2: this layout was found by search
+        // against NeMo's scoring and pins the 2:1 ratio.
+        let preds = [
+            [0.93, 0.76, 0.0, 0.87],
+            [0.0, 0.6, 0.0, 0.82],
+            [0.58, 0.57, 0.0, 0.0],
+            [0.0, 0.0, 0.0, 0.75],
+            [0.92, 0.72, 0.0, 0.63],
+            [0.62, 0.7, 0.61, 0.79],
+            [0.92, 0.73, 0.65, 0.68],
+            [0.0, 0.0, 0.8, 0.55],
+            [0.61, 0.0, 0.0, 0.89],
+            [0.8, 0.0, 0.0, 0.9],
+            [0.0, 0.0, 0.0, 0.94],
+            [0.97, 0.74, 0.0, 0.0],
+        ];
+        let got = compress_with(&params(16), &preds);
+        assert_eq!(
+            got,
+            [
+                3., 9., 10., 12., -1., 2., 3., 5., 12., -1., 6., 8., -1., 4., 11., -1.
+            ]
+        );
+    }
+
+    /// A state with embedding width 1 (frame embeddings are markers) and 4 speakers.
+    fn state() -> StreamState {
+        StreamState::new(1)
+    }
+
+    /// Run `update` for a chunk of `chunk_len` frames with no left context. `rows` is the
+    /// predictions of the whole `[cache, fifo, chunk]` forward, one marker value per row.
+    fn feed(
+        st: &mut StreamState,
+        p: &StreamingParams,
+        chunk_len: usize,
+        first_marker: f32,
+        row: [f32; 4],
+    ) -> Vec<f32> {
+        let (n_sc, n_fifo) = (st.spkcache.len(), st.fifo.len());
+        let preds: Vec<f32> = (0..n_sc + n_fifo + chunk_len).flat_map(|_| row).collect();
+        let chunk_emb: Vec<f32> = (0..chunk_len).map(|i| first_marker + i as f32).collect();
+        st.update(p, (1, 4), &preds, &chunk_emb, (n_sc, n_fifo, 0, chunk_len))
+    }
+
+    #[test]
+    fn the_fifo_pops_enough_to_fit_and_at_least_one_update_period() {
+        let p = StreamingParams {
+            fifo_len: 4,
+            update_period: 2,
+            ..params(40)
+        };
+        let mut st = state();
+        // 6 new frames overflow a FIFO of 4 by 2, which is exactly one update period.
+        let out = feed(&mut st, &p, 6, 1.0, [0.9, 0.0, 0.0, 0.0]);
+        assert_eq!(out.len(), 6 * 4);
+        assert_eq!(st.fifo, [3., 4., 5., 6.]);
+        assert_eq!(st.spkcache, [1., 2.]);
+        // 4 queued + 6 new overflow by 6, more than an update period: all 6 move.
+        feed(&mut st, &p, 6, 7.0, [0.9, 0.0, 0.0, 0.0]);
+        assert_eq!(st.fifo.len(), 4);
+        assert_eq!(st.spkcache.len(), 2 + 6);
+        assert_eq!(st.fifo_preds.len(), 4 * 4);
+        // A chunk that fits pops nothing.
+        let p = StreamingParams { fifo_len: 100, ..p };
+        let mut st = state();
+        feed(&mut st, &p, 6, 1.0, [0.9, 0.0, 0.0, 0.0]);
+        assert_eq!((st.fifo.len(), st.spkcache.len()), (6, 0));
+    }
+
+    #[test]
+    fn update_returns_the_chunk_rows_between_its_contexts() {
+        // 1 frame of left context and 2 of right: the chunk's own rows are the 3 in the middle.
+        let p = params(40);
+        let mut st = state();
+        let (lc, chunk_len, rc) = (1, 3, 2);
+        let rows = lc + chunk_len + rc;
+        let preds: Vec<f32> = (0..rows * 4).map(|i| i as f32).collect();
+        let chunk_emb: Vec<f32> = (0..rows).map(|i| i as f32).collect();
+        let out = st.update(&p, (1, 4), &preds, &chunk_emb, (0, 0, lc, chunk_len));
+        assert_eq!(out, (4..16).map(|i| i as f32).collect::<Vec<_>>());
+        // The FIFO took the same middle rows, not the contexts.
+        assert_eq!(st.fifo, [1., 2., 3.]);
+    }
+
+    #[test]
+    fn the_silence_profile_averages_only_the_silent_frames() {
+        let p = params(24); // sil_threshold 0.2
+        let mut st = state();
+        let rows = [
+            [0.01, 0.0, 0.0, 0.0],  // silent
+            [0.9, 0.0, 0.0, 0.0],   // speech
+            [0.0, 0.05, 0.05, 0.0], // silent (sums to 0.1)
+        ];
+        let preds: Vec<f32> = rows.iter().flatten().copied().collect();
+        st.update_silence_profile(&p, (1, 4), &[2.0, 100.0, 6.0], &preds, 3);
+        assert_eq!((st.n_sil_frames, st.mean_sil_emb.clone()), (2, vec![4.0]));
+        // The mean is running: 3 silent frames in all, (4 * 2 + 10) / 3.
+        st.update_silence_profile(&p, (1, 4), &[10.0], &[0.0; 4], 1);
+        assert_eq!((st.n_sil_frames, st.mean_sil_emb.clone()), (3, vec![6.0]));
+        // A frame at exactly the threshold is speech.
+        st.update_silence_profile(&p, (1, 4), &[1000.0], &[0.2, 0.0, 0.0, 0.0], 1);
+        assert_eq!(st.n_sil_frames, 3);
+    }
+
+    #[test]
+    fn a_pop_with_no_silent_frame_leaves_the_profile_untouched() {
+        // The very first pop has no silence: the running mean must not become 0 / 0.
+        let p = params(24);
+        let mut st = state();
+        let preds = [0.9, 0.0, 0.0, 0.0, 0.0, 0.9, 0.0, 0.0];
+        st.update_silence_profile(&p, (1, 4), &[5.0, 7.0], &preds, 2);
+        assert_eq!((st.n_sil_frames, st.mean_sil_emb.clone()), (0, vec![0.0]));
+    }
+
+    #[test]
+    fn the_first_compression_takes_the_cache_predictions_from_the_forward() {
+        // No FIFO: every chunk goes straight to the cache. 20 frames overflow a 16-slot cache.
+        let p = StreamingParams {
+            fifo_len: 0,
+            update_period: 20,
+            ..params(16)
+        };
+        let mut st = state();
+        assert!(st.spkcache_preds.is_none());
+        feed(&mut st, &p, 20, 1.0, [0.9, 0.0, 0.0, 0.0]);
+        assert_eq!(st.spkcache.len(), 16);
+        let sp = st.spkcache_preds.as_ref().expect("compressed");
+        assert_eq!(sp.len(), 16 * 4);
+        // Real frames keep their predictions, the closing silence slots predict nothing.
+        assert_eq!(&sp[..4], &[0.9, 0.0, 0.0, 0.0]);
+        assert_eq!(&sp[sp.len() - 4..], &[0.0; 4]);
+    }
+
+    #[test]
+    fn streaming_params_reject_absurd_values() {
+        let ok = params(24);
+        assert!(ok.validate().is_ok());
+        let zero_threshold = StreamingParams {
+            pred_score_threshold: 0.0,
+            ..ok.clone()
+        };
+        assert!(zero_threshold.validate().is_err());
+        for bad in [-0.1, 1.5, f32::NAN] {
+            let p = StreamingParams {
+                pred_score_threshold: bad,
+                ..ok.clone()
+            };
+            assert!(p.validate().is_err(), "threshold {bad}");
+        }
+        // A `max_index` inside the flat index range would alias real cache frames: with 24
+        // cache slots, 188 FIFO, 6 chunk and 1 silence it must be at least 4 * 219.
+        let aliased = StreamingParams {
+            max_index: 5,
+            ..ok.clone()
+        };
+        assert!(aliased.validate().is_err());
+        let tight = StreamingParams {
+            max_index: 4 * (24 + 188 + 6 + 1),
+            ..ok.clone()
+        };
+        assert!(tight.validate().is_ok());
+        let below = StreamingParams {
+            max_index: 4 * (24 + 188 + 6 + 1) - 1,
+            ..ok.clone()
+        };
+        assert!(below.validate().is_err());
+        let huge = ok.with_chunking(usize::MAX, 1, 1, 1, 24, 1);
+        assert!(huge.validate().is_err());
+        let huge_context = ok.with_chunking(6, usize::MAX / 2, 1, 1, 24, 1);
+        assert!(huge_context.validate().is_err());
+    }
+
+    #[test]
+    fn the_fifo_pop_size_has_a_floor_a_ceiling_and_an_exact_fit() {
+        let hot = [0.9f32, 0.0, 0.0, 0.0];
+        // 6 new frames overflow a FIFO of 4 by 2, below the period of 4: the whole period moves.
+        let p = StreamingParams {
+            fifo_len: 4,
+            update_period: 4,
+            ..params(40)
+        };
+        let mut st = state();
+        feed(&mut st, &p, 6, 1.0, hot);
+        assert_eq!(
+            (st.spkcache.clone(), st.fifo.clone()),
+            (vec![1., 2., 3., 4.], vec![5., 6.])
+        );
+        // A period of 20 exceeds the 6 frames queued: everything moves and nothing slices past it.
+        let p = StreamingParams {
+            fifo_len: 4,
+            update_period: 20,
+            ..params(40)
+        };
+        let mut st = state();
+        feed(&mut st, &p, 6, 1.0, hot);
+        assert_eq!((st.spkcache.len(), st.fifo.len()), (6, 0));
+        // A FIFO that is exactly full does not overflow: nothing pops.
+        let p = StreamingParams {
+            fifo_len: 6,
+            update_period: 2,
+            ..params(40)
+        };
+        let mut st = state();
+        feed(&mut st, &p, 6, 1.0, hot);
+        assert_eq!((st.spkcache.len(), st.fifo.len()), (0, 6));
+    }
+
+    #[test]
+    fn compression_keeps_the_predictions_of_cache_frames_that_were_already_there() {
+        // No FIFO, period 10, 16-slot cache: chunk 1 fills 10 slots (no predictions kept yet),
+        // chunk 2 overflows and compresses. Speaker 1 spoke only in chunk 1's frames, so its
+        // predictions survive only if the first compression read them from the earlier forward.
+        let p = StreamingParams {
+            fifo_len: 0,
+            update_period: 10,
+            ..params(16)
+        };
+        let mut st = state();
+        feed(&mut st, &p, 10, 1.0, [0.9, 0.0, 0.0, 0.0]);
+        assert_eq!((st.spkcache.len(), st.spkcache_preds.is_none()), (10, true));
+        let preds: Vec<f32> = (0..10)
+            .flat_map(|_| [0.0, 0.9, 0.0, 0.0])
+            .chain((0..10).flat_map(|_| [0.9, 0.0, 0.0, 0.0]))
+            .collect();
+        let chunk_emb: Vec<f32> = (11..21).map(|x| x as f32).collect();
+        st.update(&p, (1, 4), &preds, &chunk_emb, (10, 0, 0, 10));
+        let sp = st.spkcache_preds.as_ref().expect("compressed");
+        assert!(
+            sp.chunks(4).any(|r| r[1] > 0.5),
+            "speaker 1 only spoke in the old cache frames"
+        );
+        // Later steps extend and recompress the cache: its predictions stay one row per slot.
+        for i in 0..3 {
+            feed(
+                &mut st,
+                &p,
+                10,
+                100.0 + 10.0 * i as f32,
+                [0.0, 0.9, 0.0, 0.0],
+            );
+            assert_eq!(st.spkcache.len(), 16);
+            assert_eq!(st.spkcache_preds.as_ref().unwrap().len(), 16 * 4);
+        }
+    }
+
+    #[test]
+    fn every_streaming_length_is_bounded_by_name() {
+        type Setter = fn(&mut StreamingParams, usize);
+        let setters: [(&str, Setter); 7] = [
+            ("chunk_len", |p, v| p.chunk_len = v),
+            ("left_context", |p, v| p.left_context = v),
+            ("right_context", |p, v| p.right_context = v),
+            ("fifo_len", |p, v| p.fifo_len = v),
+            ("spkcache_len", |p, v| p.spkcache_len = v),
+            ("update_period", |p, v| p.update_period = v),
+            ("sil_frames_per_spk", |p, v| p.sil_frames_per_spk = v),
+        ];
+        for (name, set) in setters {
+            let mut p = params(24);
+            set(&mut p, MAX_STREAM_FRAMES + 1);
+            let err = p.validate().unwrap_err().to_string();
+            assert!(
+                err.contains(name) && err.contains("exceeds"),
+                "{name}: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_cache_that_exactly_fits_is_not_compressed() {
+        // 16 frames into a 16-slot cache: nothing to drop, so the frames (and the absence of
+        // cache predictions) are left alone; one more frame tips it over.
+        let p = StreamingParams {
+            fifo_len: 0,
+            update_period: 16,
+            ..params(16)
+        };
+        let mut st = state();
+        feed(&mut st, &p, 16, 1.0, [0.9, 0.0, 0.0, 0.0]);
+        assert_eq!(st.spkcache, (1..=16).map(|x| x as f32).collect::<Vec<_>>());
+        assert!(st.spkcache_preds.is_none());
+        let p = StreamingParams {
+            update_period: 17,
+            ..p
+        };
+        let mut st = state();
+        feed(&mut st, &p, 17, 1.0, [0.9, 0.0, 0.0, 0.0]);
+        assert!(st.spkcache_preds.is_some());
+    }
+
+    #[test]
+    fn first_bad_sample_flags_nan_infinity_and_garbage_magnitudes() {
+        // Real signal, including 16-bit scale and the limit itself, is clean.
+        let clean = [0.0, 1.0, -32768.0, MAX_ABS_PCM, -MAX_ABS_PCM];
+        assert_eq!(first_bad_sample(&clean), None);
+        assert_eq!(first_bad_sample(&[0.0, f32::NAN]), Some(1));
+        assert_eq!(first_bad_sample(&[f32::NEG_INFINITY]), Some(0));
+        // Finite but reinterpreted-bytes garbage: the mel would overflow to infinity.
+        assert_eq!(first_bad_sample(&[0.0, 0.0, f32::MAX]), Some(2));
+        assert_eq!(first_bad_sample(&[0.0, 2.0 * MAX_ABS_PCM]), Some(1));
+        assert_eq!(first_bad_sample(&[-2.0 * MAX_ABS_PCM]), Some(0));
+    }
+
+    /// The shared block kernel asserts a rank 2 or 3 depthwise weight, so a GGUF that declares
+    /// another rank must be refused at load, not at first audio.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn a_depthwise_weight_of_the_wrong_rank_is_refused() {
+        let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".leap/models/sortformer/sortformer-4spk-v2.1-q4_0.gguf");
+        if !path.exists() {
+            assert!(
+                std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
+                "CERA_REQUIRE_MODEL=1 but {} is absent",
+                path.display()
+            );
+            eprintln!("{} not found, skipping", path.display());
+            return;
+        }
+        let g = GgufFile::open_arc(&path).unwrap();
+        let mut w = SortformerWeights::from_gguf(&g).unwrap();
+        let (n_embd, n_ff) = (w.config.n_embd, w.layers[0].ffn_up_w.rows);
+        let kernel = w.layers[0].conv_dw_shape[0];
+        check_encoder_block(0, &w.layers[0], n_embd, n_ff, kernel).unwrap();
+        w.layers[0].conv_dw_shape = vec![kernel, 1, 1, n_embd];
+        let err = check_encoder_block(0, &w.layers[0], n_embd, n_ff, kernel)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("rank 2 or 3"), "{err}");
+    }
+
+    #[test]
+    fn a_window_past_the_offline_bound_is_refused_by_name() {
+        let huge = StreamingParams {
+            max_index: 1 << 30,
+            ..params(188)
+        }
+        .with_chunking(1 << 20, 0, 0, 0, 188, 144);
+        let err = huge.validate().unwrap_err().to_string();
+        assert!(err.contains("exceeds") && err.contains("7500"), "{err}");
+        // Each term counts: the same total split another way is refused too.
+        let split = StreamingParams {
+            max_index: 1 << 30,
+            ..params(188)
+        }
+        .with_chunking(2_000, 2_000, 2_000, 2_000, 2_000, 144);
+        assert!(split.validate().is_err());
+        let ok = StreamingParams {
+            max_index: 1 << 30,
+            ..params(188)
+        }
+        .with_chunking(2_000, 2_000, 2_000, 1_000, 500, 144);
+        assert!(ok.validate().is_ok(), "7500 is allowed");
+    }
+
+    #[test]
+    fn a_matrix_whose_columns_do_not_fill_its_blocks_is_refused() {
+        // 192 columns are 6 blocks of 32 but 0.75 of a K-quant block: every row would read as
+        // zeros. A hermetic matrix with the dtype set stands in for a patched file.
+        let mut w = MmapWeight::from_owned_f32(vec![0.0; 4 * 192], 4, 192);
+        for ok in [
+            DType::F32,
+            DType::F16,
+            DType::BF16,
+            DType::Q8_0,
+            DType::Q4_0,
+            DType::Q4_1,
+        ] {
+            w.dtype = ok;
+            assert!(check_gemv_dtype("m", &w).is_ok(), "{ok:?}");
+        }
+        for bad in [DType::Q4KM, DType::Q5KM, DType::Q6K] {
+            w.dtype = bad;
+            let err = check_gemv_dtype("m", &w).unwrap_err().to_string();
+            assert!(err.contains("block size 256"), "{bad:?}: {err}");
+        }
+        w.dtype = DType::I32;
+        assert!(
+            check_gemv_dtype("m", &w)
+                .unwrap_err()
+                .to_string()
+                .contains("no matmul kernel")
+        );
+    }
+
+    #[test]
+    fn first_bad_mel_flags_nan_infinity_and_overflow_magnitudes() {
+        assert_eq!(
+            first_bad_mel(&[0.0, -17.0, 46.0, MAX_ABS_MEL, -MAX_ABS_MEL]),
+            None
+        );
+        assert_eq!(first_bad_mel(&[0.0, f32::NAN]), Some(1));
+        assert_eq!(first_bad_mel(&[f32::INFINITY]), Some(0));
+        assert_eq!(first_bad_mel(&[0.0, 0.0, 2.0 * MAX_ABS_MEL]), Some(2));
+        assert_eq!(first_bad_mel(&[-1e9]), Some(0));
+    }
+
+    #[test]
+    fn the_session_types_can_move_to_a_worker_thread() {
+        // `push_audio` tells callers to use a worker thread: keep that true.
+        fn send<T: Send>() {}
+        fn sync<T: Sync>() {}
+        send::<SortformerLive>();
+        send::<SortformerStream>();
+        send::<MelStream>();
+        send::<SortformerModel>();
+        sync::<SortformerModel>();
+    }
+
+    /// The incremental mel front end is the whole-clip mel to the bit for any way of cutting the
+    /// audio. Synthetic tables stand in for the checkpoint's, so this runs without a model.
+    #[test]
+    fn mel_stream_matches_the_whole_clip_mel_bit_for_bit() {
+        let nm = 8;
+        let window: Vec<f32> = (0..N_FFT)
+            .map(|i| 0.5 - 0.5 * (std::f32::consts::TAU * i as f32 / N_FFT as f32).cos())
+            .collect();
+        let fb: Vec<f32> = (0..nm * N_FFT_BINS)
+            .map(|i| ((i * 7919) % 101) as f32 / 1000.0)
+            .collect();
+        let mut seed = 12345u32;
+        let pcm: Vec<f32> = (0..3_000)
+            .map(|i| {
+                seed = seed.wrapping_mul(1664525).wrapping_add(1013904223);
+                0.3 * (i as f32 * 0.05).sin() + (seed >> 8) as f32 / (1u32 << 24) as f32 - 0.5
+            })
+            .collect();
+        let (mut want, n) = log_mel_with_tables(&pcm, nm, &window, &fb, false);
+        let valid = n.min(pcm.len() / HOP_LEN);
+        want.truncate(valid * nm);
+        for piece in [1usize, 7, 160, 161, 777, pcm.len()] {
+            let mut ms = MelStream::from_tables(nm, &window, &fb);
+            let mut got = Vec::new();
+            for part in pcm.chunks(piece) {
+                got.extend(ms.push(part).unwrap());
+                assert!(
+                    ms.buffered_samples() <= N_FFT + HOP_LEN + piece,
+                    "piece {piece}"
+                );
+            }
+            got.extend(ms.finish());
+            assert_eq!(ms.frames(), valid, "piece {piece}");
+            assert!(
+                got.len() == want.len()
+                    && got
+                        .iter()
+                        .zip(&want)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "piece {piece}: mel differs from the whole-clip mel"
+            );
+        }
+        let mut ms = MelStream::from_tables(nm, &window, &fb);
+        ms.finish();
+        assert!(ms.push(&[0.0]).is_err(), "no audio after finish");
+    }
+
+    #[test]
+    fn a_threshold_of_one_is_allowed() {
+        let p = StreamingParams {
+            pred_score_threshold: 1.0,
+            ..params(24)
+        };
+        assert!(p.validate().is_ok());
+    }
+
+    #[test]
+    fn the_offline_length_limit_is_exact() {
+        // 7500 encoder frames = 60_000 mel frames; one more is refused, from the length alone.
+        assert!(ensure_offline_len(60_000 * HOP_LEN).is_ok());
+        let err = ensure_offline_len(60_001 * HOP_LEN)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("7501") && err.contains("offline"), "{err}");
+        assert!(ensure_offline_len(0).is_ok());
     }
 }

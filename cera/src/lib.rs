@@ -47,6 +47,7 @@ pub mod gguf;
 pub mod grammar;
 pub mod hotword;
 pub mod kv_cache;
+pub mod live_diarizer;
 pub mod lora;
 pub mod manifest;
 pub mod model;

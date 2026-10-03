@@ -73,6 +73,12 @@ QUANT_SUFFIXES = (
 )
 
 
+def require(cond, msg):
+    """Refuse an unsupported checkpoint with a readable message (an `assert` vanishes under -O)."""
+    if not cond:
+        raise SystemExit(f"unsupported checkpoint: {msg}")
+
+
 def read_nemo(path):
     """Return (config dict, state dict, sha256 of the .nemo) from a .nemo archive."""
     sha = hashlib.sha256()
@@ -82,6 +88,8 @@ def read_nemo(path):
     cfg = ckpt = None
     with tarfile.open(path) as tar:
         for member in tar:
+            if not member.isfile():
+                continue
             base = member.name.split("/")[-1]
             if base == "model_config.yaml":
                 cfg = yaml.safe_load(tar.extractfile(member).read())
@@ -152,11 +160,11 @@ def encoder_tensors(sd, n_layer):
         yield f"{a}.pos_bias_v", f32(sd[f"{e}.self_attn.pos_bias_v"])
         for ours, theirs in (("conv_pw1", "pointwise_conv1"), ("conv_pw2", "pointwise_conv2")):
             w = f32(sd[f"{e}.conv.{theirs}.weight"])
-            assert w.shape[-1] == 1, (theirs, w.shape)
+            require(w.shape[-1] == 1, f"{theirs} weight {tuple(w.shape)} is not a pointwise conv")
             yield f"{a}.{ours}.weight", w[..., 0]
             yield f"{a}.{ours}.bias", f32(sd[f"{e}.conv.{theirs}.bias"])
         dw = f32(sd[f"{e}.conv.depthwise_conv.weight"])
-        assert dw.shape[1] == 1, dw.shape
+        require(dw.shape[1] == 1, f"depthwise weight {tuple(dw.shape)} has more than one input channel per group")
         yield f"{a}.conv_dw.weight", dw[:, 0, :]
         yield f"{a}.conv_dw.bias", f32(sd[f"{e}.conv.depthwise_conv.bias"])
         scale, shift = fold_batch_norm(sd, f"{e}.conv.batch_norm")
@@ -193,7 +201,7 @@ def head_tensors(sd, n_layer):
 def mel_tensors(sd):
     window = f32(sd["preprocessor.featurizer.window"])
     fb = f32(sd["preprocessor.featurizer.fb"])
-    assert fb.shape[0] == 1, fb.shape
+    require(fb.shape[0] == 1, f"mel filterbank {tuple(fb.shape)} has a batch axis")
     yield "sf.mel.window", window
     yield "sf.mel.fb", fb[0]
 
@@ -230,17 +238,42 @@ def main():
 
     cfg, sd, sha = read_nemo(args.nemo)
     enc, tf, sm, pre = cfg["encoder"], cfg["transformer_encoder"], cfg["sortformer_modules"], cfg["preprocessor"]
-    assert cfg["target"].endswith("SortformerEncLabelModel"), cfg["target"]
-    assert enc["self_attention_model"] == "rel_pos" and enc["conv_norm_type"] == "batch_norm"
-    assert enc["subsampling"] == "dw_striding" and enc["subsampling_factor"] == 8
-    assert pre["normalize"] == "NA", pre["normalize"]
-    assert tf["hidden_act"] == "relu" and not tf["pre_ln"], (tf["hidden_act"], tf["pre_ln"])
-    assert enc["att_context_size"] == [-1, -1], enc["att_context_size"]
-    assert enc["xscaling"] is True
+    require(cfg["target"].endswith("SortformerEncLabelModel"), f"target {cfg['target']!r} is not SortformerEncLabelModel")
+    require(enc["self_attention_model"] == "rel_pos" and enc["conv_norm_type"] == "batch_norm",
+            f"encoder uses {enc['self_attention_model']} attention and {enc['conv_norm_type']} conv norm, not rel_pos and batch_norm")
+    require(enc["subsampling"] == "dw_striding" and enc["subsampling_factor"] == 8,
+            f"subsampling {enc['subsampling']} x{enc['subsampling_factor']}, not dw_striding x8")
+    require(pre["normalize"] == "NA", f"mel normalize {pre['normalize']!r}, not NA")
+    require(tf["hidden_act"] == "relu" and not tf["pre_ln"],
+            f"transformer act {tf['hidden_act']} pre_ln {tf['pre_ln']}, not relu and post-LN")
+    require(enc["att_context_size"] == [-1, -1], f"att_context_size {enc['att_context_size']}, not full context")
+    require(enc["xscaling"] is True, f"encoder xscaling {enc['xscaling']}, not true")
 
     n_layer, d_model = enc["n_layers"], enc["d_model"]
     n_ff = d_model * enc["ff_expansion_factor"]
     tf_layers, tf_d = tf["num_layers"], tf["hidden_size"]
+    # The Rust loader (cera/src/model/sortformer.rs) refuses all of these; fail here instead of at load.
+    require(cfg["max_num_of_spks"] == 4, f"max_num_of_spks {cfg['max_num_of_spks']}, not 4")
+    require(sm["fc_d_model"] == d_model, f"fc_d_model {sm['fc_d_model']} != encoder d_model {d_model}")
+    require(pre["n_fft"] == 512 and round(pre["window_size"] * pre["sample_rate"]) == 400
+            and round(pre["window_stride"] * pre["sample_rate"]) == 160 and pre["sample_rate"] == 16000,
+            "mel front end is not 16 kHz, n_fft 512, 400-sample window, 160-sample hop")
+    require(1 <= n_layer <= 256 and 1 <= tf_layers <= 256, f"layer counts {n_layer} / {tf_layers} outside 1..256")
+    require(enc["n_heads"] > 0 and d_model % enc["n_heads"] == 0, f"{enc['n_heads']} heads do not divide d_model {d_model}")
+    require(tf["num_attention_heads"] > 0 and tf_d % tf["num_attention_heads"] == 0,
+            f"{tf['num_attention_heads']} heads do not divide transformer hidden size {tf_d}")
+    require(sm["spkcache_len"] // 4 > sm["spkcache_sil_frames_per_spk"],
+            "spkcache_len leaves no room for speakers beside their silence frames")
+    flat = 4 * (sm["spkcache_len"] + sm["fifo_len"] + sm["chunk_len"] + sm["spkcache_sil_frames_per_spk"])
+    require(sm["max_index"] >= flat, f"max_index {sm['max_index']} lies inside the cache's flat index range (needs >= {flat})")
+    require(0 < sm["pred_score_threshold"] <= 1, f"pred_score_threshold {sm['pred_score_threshold']} outside (0, 1]")
+    require(sm["chunk_len"] > 0 and sm["spkcache_update_period"] > 0, "chunk_len and spkcache_update_period must be > 0")
+    stream_keys = ("chunk_len", "chunk_left_context", "chunk_right_context", "fifo_len", "spkcache_len",
+                   "spkcache_update_period", "spkcache_sil_frames_per_spk")
+    require(all(sm[k] <= 1 << 20 for k in stream_keys), "a streaming length exceeds 2^20")
+    # Mirrors MAX_OFFLINE_FRAMES in cera/src/model/sortformer.rs (one step attends over the whole window).
+    window = sum(sm[k] for k in ("chunk_len", "chunk_left_context", "chunk_right_context", "fifo_len", "spkcache_len"))
+    require(window <= 7500, f"left + chunk + right + fifo + spkcache = {window} frames exceeds the loader's 7500")
 
     writer = gguf.GGUFWriter(args.out, arch="sortformer")
     writer.add_string("general.name", "Streaming Sortformer 4spk v2.1")

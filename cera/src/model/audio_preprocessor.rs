@@ -449,8 +449,8 @@ impl MelFrameComputer {
 ///
 /// Models that ship their own front end (Sortformer exports the NeMo window and
 /// filterbank in its GGUF and trains with `normalize: NA`) call this directly; the
-/// LFM2A path goes through [`log_mel_spectrogram`] and is bit-identical to what it
-/// was before this split.
+/// LFM2A path goes through [`log_mel_spectrogram`], which is this function with the
+/// per-feature normalization on.
 pub(crate) fn log_mel_with_tables(
     pcm: &[f32],
     n_mel_bins: usize,
