@@ -2181,11 +2181,17 @@ impl WhisperModel {
                     match crate::model::whisper_hexagon::init_hexagon_whisper(&weights, tok) {
                         Ok(hex) => Some(hex),
                         Err(e) => {
-                            bail!("NPU backend requested but initialization failed: {e}");
+                            bail!(
+                                "{} backend requested but initialization failed: {e}",
+                                npu_request_label(backend)
+                            );
                         }
                     }
                 } else {
-                    bail!("NPU backend requires a tokenizer to stage special token tables");
+                    bail!(
+                        "{} backend requires a tokenizer to stage special token tables",
+                        npu_request_label(backend)
+                    );
                 }
             }
             crate::engine::BackendPreference::Auto => tokenizer
@@ -2199,7 +2205,10 @@ impl WhisperModel {
         match backend {
             crate::engine::BackendPreference::Cpu | crate::engine::BackendPreference::Auto => {}
             crate::engine::BackendPreference::Hexagon | crate::engine::BackendPreference::Npu => {
-                bail!("NPU backend requested but no NPU backend feature (`hexagon`) is enabled");
+                bail!(
+                    "{} backend requested but no NPU backend feature (`hexagon`) is enabled",
+                    npu_request_label(backend)
+                );
             }
             other => {
                 bail!(
@@ -2353,6 +2362,16 @@ fn find_tensor_meta(
     bail!("metadata not found for candidates: {:?}", names)
 }
 
+/// How an NPU request is named in error text: `Hexagon` for an explicit
+/// Hexagon request and `NPU` for the vendor-neutral one, so a failure never
+/// reports one as the other.
+fn npu_request_label(backend: crate::engine::BackendPreference) -> &'static str {
+    match backend {
+        crate::engine::BackendPreference::Hexagon => "Hexagon",
+        _ => "NPU",
+    }
+}
+
 fn find_mmap_weight(gguf: &Arc<GgufFile>, prefixes: &[&str], suffix: &str) -> Result<MmapWeight> {
     for &pfx in prefixes {
         let full = if pfx.is_empty() {
@@ -2477,6 +2496,15 @@ pub fn generate_sinusoidal_embeddings(length: usize, d_model: usize) -> Vec<f32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An explicit Hexagon request and the vendor-neutral NPU request are named
+    /// apart in error text; the other preferences never reach the NPU wording.
+    #[test]
+    fn npu_request_label_names_the_request_that_failed() {
+        use crate::engine::BackendPreference as BP;
+        assert_eq!(npu_request_label(BP::Hexagon), "Hexagon");
+        assert_eq!(npu_request_label(BP::Npu), "NPU");
+    }
 
     fn empty_gguf_bytes() -> Vec<u8> {
         let mut data = Vec::new();

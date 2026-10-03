@@ -2332,8 +2332,11 @@ fn load_text_model_npu(
     #[allow(unused_mut)]
     let mut tried: Vec<String> = Vec::new();
 
+    // `GgufFile::clone` deep-copies the metadata and tensor maps, so only a
+    // vendor that a later one could follow pays for it: the last vendor takes
+    // `gguf` by value, and a vendor added after Hexagon makes Hexagon clone.
     #[cfg(feature = "hexagon")]
-    match model::load_model_hexagon(gguf.clone(), path, context_size) {
+    match model::load_model_hexagon(gguf, path, context_size) {
         Ok(m) => {
             tracing::debug!("cera::engine: using Qualcomm Hexagon NPU backend (npu)");
             return Ok(m);
