@@ -455,6 +455,7 @@ pub fn stream_quantize_hf_repo(
                 &gguf_name,
                 tensor_info.shape.len(),
                 num_elements,
+                tensor_info.shape.last().copied().unwrap_or(1),
                 &opts.tensor_overrides,
             );
             let out_bytes = TargetQuant::compute_tensor_bytes(ggml_type, num_elements);
@@ -990,6 +991,7 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
                 &gguf_name,
                 tensor_info.shape.len(),
                 num_elements,
+                tensor_info.shape.last().copied().unwrap_or(1),
                 overrides,
             );
 

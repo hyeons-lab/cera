@@ -101,6 +101,7 @@ impl MmapWeight {
         let (_off, rows, cols, dtype) = gguf
             .tensor_meta(name)
             .with_context(|| format!("loading metadata for {name}"))?;
+        GgufFile::ensure_whole_blocks(name, dtype, cols)?;
         Ok(Self {
             storage: Storage::Mmap {
                 gguf: gguf.clone(),
@@ -467,6 +468,45 @@ impl MmapWeight {
 
 #[cfg(test)]
 mod tests {
+    /// A GGUF holding one quantized tensor of `rows` x `cols` (a few zero blocks).
+    fn gguf_with_quantized_tensor(
+        ggml_type: u32,
+        cols: u64,
+        rows: u64,
+        nbytes: usize,
+    ) -> Arc<GgufFile> {
+        use crate::convert::writer::GgufWriter;
+        let mut w = GgufWriter::new();
+        w.add_string("general.architecture", "row-alignment-fixture");
+        w.add_tensor("x.weight", vec![cols, rows], ggml_type, nbytes);
+        let mut bytes = Vec::new();
+        w.write_header_and_tensor_info(&mut bytes).unwrap();
+        w.write_tensor_data(&mut bytes, &vec![0u8; nbytes]).unwrap();
+        Arc::new(GgufFile::from_bytes(bytes.into()).unwrap())
+    }
+
+    #[test]
+    fn a_quantized_matrix_must_have_whole_blocks_per_row() {
+        use crate::convert::writer::{GGML_TYPE_Q4_0, GGML_TYPE_Q4_K};
+        // 4 rows of 384: 1536 elements, a whole number of 256-blocks in total (6 x 144 bytes)
+        // but 1.5 blocks per row. This is what an older converter wrote for Whisper tiny.
+        let g = gguf_with_quantized_tensor(GGML_TYPE_Q4_K, 384, 4, 6 * 144);
+        let Err(err) = MmapWeight::from_gguf(&g, "x.weight") else {
+            panic!("a misaligned quantized matrix was accepted");
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("x.weight") && msg.contains("converter"),
+            "{msg}"
+        );
+        // The same data with 512-wide rows (2 blocks per row) loads, as does a 32-block type
+        // at width 384 (12 blocks per row).
+        let g = gguf_with_quantized_tensor(GGML_TYPE_Q4_K, 512, 3, 6 * 144);
+        assert!(MmapWeight::from_gguf(&g, "x.weight").is_ok());
+        let g = gguf_with_quantized_tensor(GGML_TYPE_Q4_0, 384, 4, 4 * 12 * 18);
+        assert!(MmapWeight::from_gguf(&g, "x.weight").is_ok());
+    }
+
     use super::*;
     use crate::quant::{BlockQ4_0, BlockQ8_0};
 

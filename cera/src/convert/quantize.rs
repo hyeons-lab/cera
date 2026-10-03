@@ -89,6 +89,7 @@ impl TargetQuant {
         tensor_name: &str,
         num_dims: usize,
         num_elements: usize,
+        row_len: usize,
         overrides: &[(String, TargetQuant)],
     ) -> u32 {
         for (pattern, target) in overrides {
@@ -104,11 +105,21 @@ impl TargetQuant {
                 };
             }
         }
-        self.select_ggml_type(tensor_name, num_dims, num_elements)
+        self.select_ggml_type(tensor_name, num_dims, num_elements, row_len)
     }
 
-    /// Select the appropriate GGML type for a tensor given its name and rank.
-    pub fn select_ggml_type(&self, tensor_name: &str, num_dims: usize, num_elements: usize) -> u32 {
+    /// Select the appropriate GGML type for a tensor given its name, rank and shape.
+    ///
+    /// `row_len` is the length of one row (the innermost dimension, `ne[0]` in GGUF order). The
+    /// block types quantize each row in whole blocks and the kernels read them row by row, so
+    /// it is the row length, not the element count, that must be a multiple of the block size.
+    pub fn select_ggml_type(
+        &self,
+        tensor_name: &str,
+        num_dims: usize,
+        num_elements: usize,
+        row_len: usize,
+    ) -> u32 {
         // llama.cpp's graph multiplies activations by norm weights in F32 and aborts on
         // an F16 norm, so a 1-D tensor (and the short-conv kernel) is never narrowed.
         let keep_f32 = num_dims <= 1
@@ -131,9 +142,10 @@ impl TargetQuant {
             return GGML_TYPE_F32;
         }
 
-        // Tensors must be a multiple of block size (256 for K-quants, 32 for Q4_0/Q8_0)
-        if !num_elements.is_multiple_of(256) {
-            if num_elements.is_multiple_of(32) {
+        // Rows must be a whole number of blocks (256 for K-quants, 32 for Q4_0/Q8_0). A 384-wide
+        // matrix has a 256-multiple element count but 1.5 K-blocks per row.
+        if !row_len.is_multiple_of(256) {
+            if row_len.is_multiple_of(32) {
                 return match self {
                     Self::Q8_0 => GGML_TYPE_Q8_0,
                     _ => GGML_TYPE_Q4_0,
@@ -1452,12 +1464,18 @@ mod tests {
             "classifier.weight",
             2,
             1024 * 161,
+            1024,
             &overrides,
         );
         assert_eq!(t_type, GGML_TYPE_F16);
 
-        let b_type =
-            default_quant.select_ggml_type_with_overrides("classifier.bias", 1, 161, &overrides);
+        let b_type = default_quant.select_ggml_type_with_overrides(
+            "classifier.bias",
+            1,
+            161,
+            161,
+            &overrides,
+        );
         assert_eq!(b_type, GGML_TYPE_F16);
 
         // Output weight is overridden to Q8_0
@@ -1465,6 +1483,7 @@ mod tests {
             "output.weight",
             2,
             1024 * 32000,
+            1024,
             &overrides,
         );
         assert_eq!(out_type, GGML_TYPE_Q8_0);
@@ -1474,9 +1493,48 @@ mod tests {
             "blk.0.attn_q.weight",
             2,
             1024 * 1024,
+            1024,
             &overrides,
         );
         assert_eq!(attn_type, GGML_TYPE_Q4_K);
+    }
+
+    #[test]
+    fn block_types_need_whole_blocks_per_row_not_per_tensor() {
+        // Whisper-tiny's 384 x 384 matrices: 147456 elements are a whole number of 256-blocks,
+        // but a row of 384 is 1.5 of them. The kernels read a row at a time, so a K-quant
+        // there is unreadable (dequantize_row asserts); Q4_0/Q8_0 blocks (32) fit.
+        let n = 384 * 384;
+        for (target, want) in [
+            (TargetQuant::Q4_K_M, GGML_TYPE_Q4_0),
+            (TargetQuant::Q5_K_M, GGML_TYPE_Q4_0),
+            (TargetQuant::Q8_0, GGML_TYPE_Q8_0),
+        ] {
+            assert_eq!(
+                target.select_ggml_type("blk.0.attn_q.weight", 2, n, 384),
+                want,
+                "{target:?}"
+            );
+        }
+        // The same element count with a 512-wide row is a whole number of K-blocks.
+        assert_eq!(
+            TargetQuant::Q4_K_M.select_ggml_type("blk.0.attn_q.weight", 2, n, 512),
+            GGML_TYPE_Q4_K
+        );
+        // A row that fits no block at all stays F32, however many elements there are.
+        assert_eq!(
+            TargetQuant::Q4_K_M.select_ggml_type("w", 2, 100 * 64, 100),
+            GGML_TYPE_F32
+        );
+        assert_eq!(
+            TargetQuant::Q8_0.select_ggml_type("w", 2, 100 * 64, 100),
+            GGML_TYPE_F32
+        );
+        // A short innermost dimension (a conv kernel) is F32 too.
+        assert_eq!(
+            TargetQuant::Q4_K_M.select_ggml_type("enc.conv.weight", 3, 384 * 80 * 3, 3),
+            GGML_TYPE_F32
+        );
     }
 
     #[test]
@@ -1519,24 +1577,24 @@ mod tests {
         let f16 = TargetQuant::F16;
         // 1-D tensors: llama.cpp aborts on an F16 norm weight
         assert_eq!(
-            f16.select_ggml_type("blk.0.attn_norm.weight", 1, 2048),
+            f16.select_ggml_type("blk.0.attn_norm.weight", 1, 2048, 2048),
             GGML_TYPE_F32
         );
         assert_eq!(
-            f16.select_ggml_type("blk.0.ffn_gate.bias", 1, 4096),
+            f16.select_ggml_type("blk.0.ffn_gate.bias", 1, 4096, 4096),
             GGML_TYPE_F32
         );
         assert_eq!(
-            f16.select_ggml_type("blk.0.shortconv.conv.weight", 2, 6144),
+            f16.select_ggml_type("blk.0.shortconv.conv.weight", 2, 6144, 3),
             GGML_TYPE_F32
         );
         // matrices still narrow
         assert_eq!(
-            f16.select_ggml_type("blk.0.ffn_gate.weight", 2, 1 << 20),
+            f16.select_ggml_type("blk.0.ffn_gate.weight", 2, 1 << 20, 1 << 10),
             GGML_TYPE_F16
         );
         assert_eq!(
-            f16.select_ggml_type("token_embd.weight", 2, 1 << 20),
+            f16.select_ggml_type("token_embd.weight", 2, 1 << 20, 1 << 10),
             GGML_TYPE_F16
         );
     }
