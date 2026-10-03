@@ -1327,6 +1327,45 @@ fn the_tensor_cap_bypasses_the_template_and_covers_every_prefill_chunk() {
     assert_eq!(capture().batches.len(), 1);
 }
 
+/// A sliding-window model feeds its second mask to the DSP, so teardown must
+/// release that buffer too; the dense drop test has no such buffer to miss.
+#[test]
+fn dropping_a_sliding_window_model_releases_its_swa_mask() {
+    use crate::backend::hexagon::sys::fake::Event;
+    DISTINCT_FDS.with(|d| d.set(true));
+    let model = build(extras_dsp_spec());
+    DISTINCT_FDS.with(|d| d.set(false));
+    assert!(model.dense.mask_swa.is_some());
+    let swa_fd = model.dense.mask_swa.as_ref().unwrap().fd();
+    // The device is created first, so the first mapping is its staging buffer
+    // (released with the device, not by the model).
+    let staging = fake::events()
+        .iter()
+        .find_map(|e| match e {
+            Event::Map(fd) => Some(*fd),
+            _ => None,
+        })
+        .unwrap();
+    let at_drop = fake::events().len();
+    drop(model);
+    let mut released = std::collections::HashSet::new();
+    let mut unreleased = Vec::new();
+    for e in &fake::events()[at_drop..] {
+        match e {
+            Event::Release(fd) => {
+                released.insert(*fd);
+            }
+            Event::Unmap(fd) if *fd != staging && !released.contains(fd) => unreleased.push(*fd),
+            _ => {}
+        }
+    }
+    assert!(released.contains(&swa_fd), "the SWA mask is released");
+    assert!(
+        unreleased.is_empty(),
+        "unmapped without a release: {unreleased:?}"
+    );
+}
+
 /// The fused matmul cannot chunk its rows, so when they overflow the VTCM the
 /// separate matmuls (which can) run instead. Removing the fallback would send
 /// the fused kernel a plan the DSP rejects with `VtcmTooSmall`.

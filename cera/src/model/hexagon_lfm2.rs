@@ -1264,6 +1264,32 @@ mod weights;
 use pager::{ExpertPager, Paging};
 use weights::*;
 
+impl Drop for HexagonLfmModel {
+    /// The DSP holds a reference to every buffer a batch read. Telling it to let
+    /// go while the device is still open keeps the host unmaps that follow
+    /// (field drop, after this) from failing and leaking their address space,
+    /// which logged four lines at every model teardown.
+    fn drop(&mut self) {
+        // `lock_or_recover`, not `lock_device`: the model is dying, so marking it
+        // torn on a poisoned lock would serve no one.
+        let mut device = self.device.lock_or_recover();
+        let session = device.queue_session_mut();
+        session.release_dsp_references(
+            [
+                &self.weights_buf,
+                &self.kv_state_buf,
+                &self.scratch_buf,
+                &self.mask_buf,
+            ]
+            .into_iter()
+            .chain(self.dense.mask_swa.as_ref()),
+        );
+        if let Some(pager) = &self.pager {
+            pager.release_dsp_references(session);
+        }
+    }
+}
+
 impl HexagonLfmModel {
     /// True when any layer keeps recurrent (conv or DeltaNet) state in `kv_state_buf`.
     fn has_recurrent_layers(&self) -> bool {

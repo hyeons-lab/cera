@@ -34,8 +34,8 @@ use crate::backend::hexagon::dispatch::{
 };
 use crate::backend::hexagon::{
     FastRpcDriver, HexagonDevice, HexagonQueueSession, HexagonWeightDesc, HexagonWeightFormat,
-    LockOrRecover, RpcmemBuffer, align128, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0,
-    repacked_matrix_size_q8_0,
+    LockOrRecover, RpcmemBuffer, align128, hexagon_warn, repack_q4_0, repack_q8_0,
+    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::model::audio_encoder::{
     AudioEncoderConfig, AudioEncoderWeights, ConformerLayerWeights, POS_EMB_DIM, relative_pos_emb,
@@ -46,7 +46,8 @@ use crate::model::audio_mel_hexagon::{
 };
 use crate::model::audio_preprocessor::{n_frames_for, padded_preemphasized};
 use crate::model::audio_stem_hexagon::{
-    StemGeom, StemScratch, StemWeightOffsets, emit_stem, put_stem, stage_input, to_channel_major,
+    STEM_CHUNK_ROWS, StemChunk, StemGeom, StemScratch, StemWeightOffsets, emit_stem, plan_chunks,
+    put_stem, stage_input, to_channel_major,
 };
 use crate::model::weights::MmapWeight;
 use crate::session::CeraError;
@@ -287,6 +288,22 @@ impl WeightOffsets {
         }
         let n = weights.config.n_embd;
         let ad = &weights.mlp_adapter;
+        // The adapter's activations live in scratch sized for the encoder's own
+        // widths; a file whose adapter is wider would be written past it.
+        if ad.up_w.cols != n
+            || ad.up_w.rows > weights.config.n_ff
+            || ad.down_w.cols != ad.up_w.rows
+            || ad.norm_w.len() != n
+            || ad.norm_b.len() != n
+            || ad.up_b.len() != ad.up_w.rows
+            || ad.down_b.len() != ad.down_w.rows
+            || ad.down_w.rows != weights.config.llm_hidden_size
+        {
+            return Err(CeraError::Backend(format!(
+                "audio adapter shapes up {}x{}, down {}x{} do not fit the encoder (width {n}, ffn {})",
+                ad.up_w.rows, ad.up_w.cols, ad.down_w.rows, ad.down_w.cols, weights.config.n_ff
+            )));
+        }
         let adapter = AdapterOffsets {
             norm_w: plan_vec(&mut cur, ad.norm_w.len()),
             norm_b: plan_vec(&mut cur, ad.norm_b.len()),
@@ -371,6 +388,29 @@ pub(crate) struct ScratchOffsets {
     /// row's width against.
     pub gelu_tmp_bytes: usize,
     pub total_bytes: usize,
+}
+
+/// `n_frames` must be what [`n_frames_for`] gives `n_samples`: the log-mel
+/// reads `(n_frames - 1) * HOP_LEN + N_FFT` samples from a buffer sized for it.
+pub(crate) fn check_n_frames(n_samples: usize, n_frames: usize) -> Result<(), CeraError> {
+    let want = n_frames_for(n_samples);
+    if n_frames != want {
+        return Err(CeraError::Backend(format!(
+            "log-mel: {n_frames} frames for {n_samples} samples (want {want})"
+        )));
+    }
+    Ok(())
+}
+
+/// `mel_len` must be exactly `n_frames` rows of `bins`: the chunk slices index
+/// the mel unchecked, inside the device lock.
+pub(crate) fn check_mel_len(mel_len: usize, n_frames: usize, bins: usize) -> Result<(), CeraError> {
+    if n_frames.checked_mul(bins) != Some(mel_len) {
+        return Err(CeraError::Backend(format!(
+            "audio encoder: {mel_len} mel values for {n_frames} frames of {bins} bins"
+        )));
+    }
+    Ok(())
 }
 
 /// Round up to a multiple of 32 elements (128 bytes of F32): the row padding
@@ -920,6 +960,7 @@ pub(crate) fn emit_block<S: OpSink>(
 }
 
 /// Each stage of the NPU conv stem in the CPU stem's layouts.
+#[doc(hidden)]
 #[derive(Debug, Clone)]
 pub struct StemDump {
     /// Convolution outputs, channel-major `[channels, height, width]`.
@@ -1107,6 +1148,59 @@ fn put_layer(dst: &mut [u8], o: &LayerOffsets, l: &ConformerLayerWeights) -> Res
     )
 }
 
+/// Wait for any batch a read timeout left unanswered, or fail if the DSP is
+/// hung (the caller then falls back to the CPU encoder). Such a batch may still
+/// be writing the scratch a call is about to overwrite, so this runs before the
+/// host stages anything, and before a call allocates buffers it could not free
+/// under that batch. A no-op when nothing is outstanding.
+fn settle(session: &mut HexagonQueueSession) -> Result<(), CeraError> {
+    let polled = session.set_blocking_wait(true);
+    let waited = session.quiesce();
+    session.set_blocking_wait(polled);
+    waited
+}
+
+/// Run `stage` (a host write into scratch the DSP reads) only once the queue is
+/// idle, so a late batch cannot overwrite what it staged. The write cannot be
+/// reached without the wait: this is the only way [`HexagonAudioEncoder`] runs
+/// its `prepare` step.
+fn settled<R>(
+    session: &mut HexagonQueueSession,
+    stage: impl FnOnce() -> R,
+) -> Result<R, CeraError> {
+    settle(session)?;
+    Ok(stage())
+}
+
+/// A per-call buffer of `bytes`, allocated only once the queue is idle
+/// ([`settle`]): a hung DSP fails the call before it allocates anything a stale
+/// batch could still reference.
+fn alloc_settled(
+    session: &mut HexagonQueueSession,
+    driver: &Arc<FastRpcDriver>,
+    bytes: usize,
+) -> Result<RpcmemBuffer, CeraError> {
+    settle(session).map_err(|e| CeraError::Backend(format!("audio encoder: {e}")))?;
+    RpcmemBuffer::alloc(Arc::clone(driver), bytes, true)
+}
+
+/// Tell the DSP to let go of a per-call buffer, then drop it (which unmaps it).
+/// Leaked instead, with a warning, when a batch is still unanswered: the DSP
+/// may be running it against the buffer, and freeing it would let the next
+/// allocation reuse the address under that batch. Returns whether it leaked.
+fn release_or_leak(session: &HexagonQueueSession, st: RpcmemBuffer) -> bool {
+    if session.outstanding_batches() > 0 {
+        hexagon_warn!(
+            "audio encoder: leaking a {} B buffer, a batch is still unanswered",
+            st.size()
+        );
+        std::mem::forget(st);
+        return true;
+    }
+    session.release_dsp_reference(&st);
+    false
+}
+
 /// Run `emit` on the queue and wait for everything it submitted. Each batch
 /// here is long and nothing is latency critical, so the wait sleeps in the
 /// kernel instead of keeping a core spinning: spinning was most of the
@@ -1252,7 +1346,8 @@ impl HexagonAudioEncoder {
         let so = self.scratch_offsets;
         let mut dev = self.device.lock_or_recover();
         let mut scratch = self.scratch.lock_or_recover();
-        prepare(&mut scratch, &so);
+        settled(dev.queue_session_mut(), || prepare(&mut scratch, &so))
+            .map_err(|e| CeraError::Backend(format!("{what}: {e}")))?;
 
         run_on_queue(what, dev.queue_session_mut(), |session| {
             emit(session, &self.weights_buf, &scratch, &so)
@@ -1480,11 +1575,12 @@ impl HexagonAudioEncoder {
     /// Log-mel for `pcm` (`n_frames` frames, [`n_frames_for`]): the DFT and
     /// the filterbank on the DSP, the log and the normalization on the host.
     pub fn log_mel_npu(&self, pcm: &[f32], n_frames: usize) -> Result<Vec<f32>, CeraError> {
+        check_n_frames(pcm.len(), n_frames)?;
         let n_mel = self.config.n_mel_bins;
         let samples = padded_preemphasized(pcm)
             .ok_or_else(|| CeraError::Backend("log-mel: input too long".into()))?;
         let so = MelScratch::new(samples.len(), n_frames, n_mel);
-        let mut buf = RpcmemBuffer::alloc(Arc::clone(&self.driver), so.total_bytes, true)?;
+        let mut buf = self.call_buffer(so.total_bytes)?;
         stage_samples(buf.as_mut_slice(), &so, &samples);
         buf.flush_cpu_cache(0, so.total_bytes);
         let run = {
@@ -1506,7 +1602,7 @@ impl HexagonAudioEncoder {
             let floats: &[f32] = bytemuck::cast_slice(buf.as_slice());
             floats[so.mel / 4..so.mel / 4 + n_frames * n_mel].to_vec()
         });
-        self.release_buffer(&buf);
+        self.release_buffer(buf);
         Ok(finish_mel(&energies?, n_mel, n_frames, pcm.len()))
     }
 
@@ -1527,29 +1623,72 @@ impl HexagonAudioEncoder {
         Ok(g)
     }
 
-    /// The stem's activation buffer for `g`, with the host-written parts of
-    /// the input filled in.
-    fn staged_stem_buffer(
+    /// An activation buffer for the stem sized for the largest of `chunks`,
+    /// and its layout.
+    fn stem_buffer(
         &self,
-        g: &StemGeom,
-        mel: &[f32],
+        chunks: &[StemChunk],
         keep_stages: bool,
     ) -> Result<(RpcmemBuffer, StemScratch), CeraError> {
-        let so = StemScratch::new(g, !keep_stages);
-        let mut st = RpcmemBuffer::alloc(Arc::clone(&self.driver), so.total_bytes, true)?;
-        stage_input(st.as_mut_slice(), &so, g, mel);
-        st.flush_cpu_cache(0, so.total_bytes);
+        let largest = chunks.iter().map(|c| c.mel_rows).max().unwrap_or(1);
+        let g = self.chunk_geom(largest)?;
+        let so = StemScratch::new(&g, !keep_stages);
+        let st = self.call_buffer(so.total_bytes)?;
         Ok((st, so))
     }
 
-    /// Log-mel in, embeddings out, with the stem on the NPU. The stem's
-    /// activations (tens of MB for a long clip) live in a buffer that exists
-    /// only for this call.
+    /// Geometry of a stem slice of `mel_rows` mel rows.
+    fn chunk_geom(&self, mel_rows: usize) -> Result<StemGeom, CeraError> {
+        let ch = self.weights.conv_stem.layers[0].bias.len();
+        StemGeom::new(mel_rows, self.config.n_mel_bins, ch)
+            .ok_or_else(|| CeraError::Backend(format!("conv stem: {mel_rows} mel rows")))
+    }
+
+    /// Stage chunk `c` of `mel` in `st` and emit its stem ops, leaving its
+    /// frames in `main` at `x_base` plus the chunk's first output row (the clip's
+    /// first output frame is at `x_base`). Flushes between stages, so the host may rewrite `st`
+    /// for the next chunk afterwards.
+    #[allow(clippy::too_many_arguments)]
+    fn run_stem_chunk(
+        &self,
+        session: &mut HexagonQueueSession,
+        weights: &RpcmemBuffer,
+        main: &RpcmemBuffer,
+        x_base: usize,
+        st: &mut RpcmemBuffer,
+        st_so: &StemScratch,
+        mel: &[f32],
+        c: &StemChunk,
+    ) -> Result<(), CeraError> {
+        let bins = self.config.n_mel_bins;
+        let g = self.chunk_geom(c.mel_rows)?;
+        let slice = &mel[c.mel_start * bins..(c.mel_start + c.mel_rows) * bins];
+        stage_input(st.as_mut_slice(), st_so, &g, slice);
+        st.flush_cpu_cache(0, st_so.total_bytes);
+        emit_stem(
+            session,
+            weights,
+            st,
+            main,
+            x_base + c.first_row * self.config.n_embd * 4,
+            c.skip,
+            &self.offsets.stem,
+            st_so,
+            &g,
+            &mut |s| s.flush(),
+        )
+    }
+
+    /// Log-mel in, embeddings out, with the stem on the NPU. The stem runs in
+    /// time chunks (`STEM_CHUNK_ROWS` output frames each) through a buffer
+    /// that exists only for this call, so its memory does not grow with the clip.
     pub fn encode_mel(&self, mel: &[f32], n_frames: usize) -> Result<(Vec<f32>, usize), CeraError> {
+        check_mel_len(mel.len(), n_frames, self.config.n_mel_bins)?;
         let g = self.stem_geom(n_frames)?;
         let t = g.t_out();
         let cfg = &self.config;
-        let (st, st_so) = self.staged_stem_buffer(&g, mel, false)?;
+        let chunks = plan_chunks(n_frames, cfg.n_mel_bins, STEM_CHUNK_ROWS);
+        let (mut st, st_so) = self.stem_buffer(&chunks, false)?;
         let pos = relative_pos_emb(t.max(1));
         let out = (self.scratch_offsets.adapter_out, t * cfg.llm_hidden_size);
         let run = self.run_with_scratch(
@@ -1562,17 +1701,9 @@ impl HexagonAudioEncoder {
                 scratch.flush_cpu_cache(so.attn_pos, pos_bytes);
             },
             |session, weights, scratch, so| {
-                emit_stem(
-                    session,
-                    weights,
-                    &st,
-                    scratch,
-                    so.x,
-                    &self.offsets.stem,
-                    &st_so,
-                    &g,
-                    &mut |s| s.flush(),
-                )?;
+                for c in &chunks {
+                    self.run_stem_chunk(session, weights, scratch, so.x, &mut st, &st_so, mel, c)?;
+                }
                 for layer in &self.offsets.layers {
                     emit_block(session, weights, scratch, layer, &self.offsets, so, cfg, t)?;
                     session.flush()?;
@@ -1582,43 +1713,76 @@ impl HexagonAudioEncoder {
             },
             out,
         );
-        self.release_buffer(&st);
+        self.release_buffer(st);
         Ok((run?, t))
     }
 
-    /// Tell the DSP to let go of a per-call buffer before it is unmapped; an
-    /// unmap while the DSP still holds a reference fails and leaks the mapping.
-    /// Runs after every call, successful or not.
-    fn release_buffer(&self, st: &RpcmemBuffer) {
-        self.device
-            .lock_or_recover()
-            .queue_session_mut()
-            .release_dsp_reference(st);
+    /// Run only the stem, in chunks of `chunk_rows` output frames, and return
+    /// its `[t, n_embd]` output: what the probe compares against the CPU stem
+    /// to check the chunking.
+    #[doc(hidden)]
+    pub fn stem_output(
+        &self,
+        mel: &[f32],
+        n_frames: usize,
+        chunk_rows: usize,
+    ) -> Result<Vec<f32>, CeraError> {
+        check_mel_len(mel.len(), n_frames, self.config.n_mel_bins)?;
+        let g = self.stem_geom(n_frames)?;
+        let chunks = plan_chunks(n_frames, self.config.n_mel_bins, chunk_rows);
+        let (mut st, st_so) = self.stem_buffer(&chunks, false)?;
+        let out = (self.scratch_offsets.x, g.t_out() * self.config.n_embd);
+        let run = self.run_with_scratch(
+            "stem_output",
+            |_, _| (),
+            |session, weights, scratch, so| {
+                for c in &chunks {
+                    self.run_stem_chunk(session, weights, scratch, so.x, &mut st, &st_so, mel, c)?;
+                }
+                Ok(())
+            },
+            out,
+        );
+        self.release_buffer(st);
+        run
+    }
+
+    /// [`release_or_leak`] on the device's queue. Runs after every call,
+    /// successful or not.
+    fn release_buffer(&self, st: RpcmemBuffer) {
+        release_or_leak(self.device.lock_or_recover().queue_session_mut(), st);
+    }
+
+    /// A per-call buffer of `bytes`. Every one is allocated through here (see
+    /// [`alloc_settled`]). The device lock is held only for the wait and the
+    /// allocation.
+    fn call_buffer(&self, bytes: usize) -> Result<RpcmemBuffer, CeraError> {
+        alloc_settled(
+            self.device.lock_or_recover().queue_session_mut(),
+            &self.driver,
+            bytes,
+        )
     }
 
     /// Run only the stem on the NPU and return each stage's output in the CPU
     /// stem's layouts, for the probe to compare against the CPU.
+    #[doc(hidden)]
     pub fn debug_stem(&self, mel: &[f32], n_frames: usize) -> Result<StemDump, CeraError> {
+        check_mel_len(mel.len(), n_frames, self.config.n_mel_bins)?;
         let g = self.stem_geom(n_frames)?;
         let t = g.t_out();
-        let (st, so) = self.staged_stem_buffer(&g, mel, true)?;
+        // One chunk over the whole clip, every stage kept, so each can be read.
+        let chunks = plan_chunks(n_frames, self.config.n_mel_bins, t);
+        let (mut st, so) = self.stem_buffer(&chunks, true)?;
         let out = (self.scratch_offsets.x, t * self.config.n_embd);
         let run = self.run_with_scratch(
             "debug_stem",
             |_, _| (),
             |session, weights, scratch, sco| {
-                emit_stem(
-                    session,
-                    weights,
-                    &st,
-                    scratch,
-                    sco.x,
-                    &self.offsets.stem,
-                    &so,
-                    &g,
-                    &mut |s| s.flush(),
-                )?;
-                session.flush()
+                for c in &chunks {
+                    self.run_stem_chunk(session, weights, scratch, sco.x, &mut st, &so, mel, c)?;
+                }
+                Ok(())
             },
             out,
         );
@@ -1626,7 +1790,7 @@ impl HexagonAudioEncoder {
         let x = match run {
             Ok(x) => x,
             Err(e) => {
-                self.release_buffer(&st);
+                self.release_buffer(st);
                 return Err(e);
             }
         };
@@ -1649,7 +1813,7 @@ impl HexagonAudioEncoder {
             out: x,
             t,
         };
-        self.release_buffer(&st);
+        self.release_buffer(st);
         Ok(dump)
     }
 
@@ -1680,8 +1844,7 @@ impl Drop for HexagonAudioEncoder {
     fn drop(&mut self) {
         let mut dev = self.device.lock_or_recover();
         let session = dev.queue_session_mut();
-        session.release_dsp_reference(&self.weights_buf);
-        session.release_dsp_reference(&self.scratch.lock_or_recover());
+        session.release_dsp_references([&self.weights_buf, &*self.scratch.lock_or_recover()]);
     }
 }
 
@@ -2087,6 +2250,245 @@ mod tests {
         assert!(so.total_bytes > 400 * 64 * 4 * 8);
         assert_eq!(so.adapter_out % 128, 0);
         assert!(so.adapter_out + 400 * 96 * 4 <= so.total_bytes);
+    }
+
+    #[test]
+    fn the_mel_must_be_exactly_frames_times_bins() {
+        assert!(check_mel_len(10 * 128, 10, 128).is_ok());
+        assert!(check_mel_len(10 * 128 - 1, 10, 128).is_err(), "short");
+        assert!(check_mel_len(10 * 128 + 1, 10, 128).is_err(), "long");
+        assert!(
+            check_mel_len(0, 1usize << 63, 2).is_err(),
+            "the product wraps to the length"
+        );
+        assert!(check_mel_len(0, 0, 128).is_ok(), "empty clip");
+    }
+
+    /// The adapter's activations live in scratch sized for the encoder, and its
+    /// vectors are read at the matrices' widths, so a file whose adapter does not
+    /// line up with them is refused at planning, before anything is written.
+    #[test]
+    fn an_adapter_the_scratch_cannot_hold_is_refused_at_planning() {
+        use crate::model::audio_encoder::{
+            AudioEncoderWeights, AudioMlpAdapterWeights, ConvStemWeights,
+        };
+        let c = cfg();
+        let dense = |r: usize, k: usize| MmapWeight::from_owned_f32(vec![0.0; r * k], r, k);
+        // (up rows, up cols, down cols, norm_w len, norm_b len, up bias len, down bias len)
+        let plan = |up_rows: usize,
+                    up_cols: usize,
+                    down_cols: usize,
+                    norm_w: usize,
+                    norm_b: usize,
+                    up_b: usize,
+                    down_b: usize,
+                    down_rows: usize| {
+            let w = AudioEncoderWeights {
+                config: c.clone(),
+                conv_stem: ConvStemWeights {
+                    layers: vec![],
+                    pre_encode_out_w: dense(0, 0),
+                    pre_encode_out_b: vec![],
+                },
+                layers: vec![],
+                mlp_adapter: AudioMlpAdapterWeights {
+                    norm_w: vec![0.0; norm_w],
+                    norm_b: vec![0.0; norm_b],
+                    up_w: dense(up_rows, up_cols),
+                    up_b: vec![0.0; up_b],
+                    down_w: dense(down_rows, down_cols),
+                    down_b: vec![0.0; down_b],
+                },
+            };
+            match WeightOffsets::plan(&w) {
+                Ok(_) => String::new(),
+                Err(e) => e.to_string(),
+            }
+        };
+        let refused = |m: String| m.contains("audio adapter shapes");
+        let (n, ff, h) = (c.n_embd, c.n_ff, c.llm_hidden_size);
+        assert!(
+            refused(plan(ff + 1, n, ff + 1, n, n, ff + 1, h, h)),
+            "up wider than the ffn"
+        );
+        assert!(
+            refused(plan(ff, n + 1, ff, n, n, ff, h, h)),
+            "up reads another width"
+        );
+        assert!(
+            refused(plan(ff, n, ff - 1, n, n, ff, h, h)),
+            "down does not read up's output"
+        );
+        assert!(
+            refused(plan(ff, n, ff, n - 1, n, ff, h, h)),
+            "short norm weight"
+        );
+        assert!(
+            refused(plan(ff, n, ff, n, n - 1, ff, h, h)),
+            "short norm bias"
+        );
+        assert!(
+            refused(plan(ff, n, ff, n, n, ff - 1, h, h)),
+            "short up bias"
+        );
+        assert!(
+            refused(plan(ff, n, ff, n, n, ff, h - 1, h)),
+            "short down bias"
+        );
+        // Every shape lines up except the down projection's rows against the
+        // LLM's hidden size.
+        assert!(
+            refused(plan(ff, n, ff, n, n, ff, h + 1, h + 1)),
+            "down projection wider than the output scratch"
+        );
+        // A matching adapter passes the check (and stops later, at the dense
+        // weights `plan_linear` does not take).
+        assert!(
+            !refused(plan(ff, n, ff, n, n, ff, h, h)),
+            "a matching adapter passes"
+        );
+    }
+
+    /// A session with one batch a read timeout left unanswered, and a buffer.
+    fn session_with_an_unanswered_batch() -> (HexagonDevice, RpcmemBuffer) {
+        unanswered_batch_on(false)
+    }
+
+    /// [`session_with_an_unanswered_batch`] on a driver that polls for
+    /// responses (`CERA_HEXAGON_OPPOLL`) or not.
+    fn unanswered_batch_on(polling: bool) -> (HexagonDevice, RpcmemBuffer) {
+        use crate::backend::hexagon::{HexagonArch, HtpOpCode, op_capture, sys::fake};
+        let (mut driver, mut device) = op_capture::fresh_device();
+        if polling {
+            driver = fake::driver_with_polling(true);
+            device = HexagonDevice::new(Arc::clone(&driver), HexagonArch::V79).unwrap();
+            op_capture::hermetic_session(&mut device);
+        }
+        fake::with(|s| s.distinct_fds = true);
+        let buf = RpcmemBuffer::alloc(driver, 4096, true).unwrap();
+        let session = device.queue_session_mut();
+        session.set_skel_handle(7);
+        let ti = session
+            .add_tensor(&buf, 0, 64, 0, 0, [1; 4], [4; 4])
+            .unwrap();
+        session
+            .enqueue_op(HtpOpCode::Add as u32, &[ti], &[ti], [0; 16], [0; 32])
+            .unwrap();
+        session.end_group().unwrap();
+        fake::with(|s| s.fail_read = true);
+        session.flush().unwrap_err();
+        assert_eq!(session.outstanding_batches(), 1);
+        (device, buf)
+    }
+
+    /// A call after a timeout waits for the batch to drain, or fails (so the
+    /// session falls back to the CPU encoder) while the DSP stays silent, and
+    /// either way leaves the queue's wait mode as it found it.
+    #[test]
+    fn settle_waits_for_an_unanswered_batch_or_fails() {
+        use crate::backend::hexagon::sys::fake;
+        let (mut device, _buf) = session_with_an_unanswered_batch();
+        let session = device.queue_session_mut();
+        let err = settle(session).unwrap_err().to_string();
+        assert!(err.contains("outstanding"), "{err}");
+        assert_eq!(session.outstanding_batches(), 1, "still unanswered");
+        let before = session.set_blocking_wait(false);
+        assert!(!before, "settle restored the polled wait");
+        fake::with(|s| s.fail_read = false);
+        settle(session).unwrap();
+        assert_eq!(session.outstanding_batches(), 0);
+        settle(session).unwrap();
+    }
+
+    /// A call waits in the kernel, not on a spinning core: `settle` turns the
+    /// blocking wait on over a polling driver, and only for its own wait.
+    #[test]
+    fn settle_sleeps_instead_of_polling() {
+        use crate::backend::hexagon::sys::{DSPQUEUE_TIMEOUT_US, fake};
+        let (mut device, _buf) = unanswered_batch_on(true);
+        let session = device.queue_session_mut();
+        let last_timeout = || fake::with(|s| *s.read_timeouts.last().expect("a read"));
+        assert_eq!(last_timeout(), 0, "the batch's own read polled");
+        settle(session).unwrap_err();
+        assert_eq!(last_timeout(), DSPQUEUE_TIMEOUT_US, "the settle slept");
+    }
+
+    /// A per-call buffer is allocated only once the queue is idle: with a batch
+    /// unanswered nothing is mapped, once it drains the buffer is.
+    #[test]
+    fn a_call_buffer_is_allocated_only_after_the_queue_is_idle() {
+        use crate::backend::hexagon::sys::fake::{self, Event};
+        let (mut device, _buf) = session_with_an_unanswered_batch();
+        let session = device.queue_session_mut();
+        let maps = || {
+            fake::events()
+                .iter()
+                .filter(|e| matches!(e, Event::Map(_)))
+                .count()
+        };
+        let before = maps();
+        let err = alloc_settled(session, &fake::driver(), 4096)
+            .err()
+            .expect("a stale batch refuses the allocation");
+        assert!(err.to_string().contains("audio encoder: "), "{err}");
+        assert_eq!(maps(), before, "nothing allocated under a stale batch");
+        fake::with(|s| s.fail_read = false);
+        alloc_settled(session, &fake::driver(), 4096).unwrap();
+        assert_eq!(maps(), before + 1, "allocated once idle");
+    }
+
+    #[test]
+    fn the_frame_count_must_match_the_samples() {
+        let n = n_frames_for(16_000);
+        check_n_frames(16_000, n).unwrap();
+        check_n_frames(16_000, n + 1).unwrap_err();
+        check_n_frames(16_000, n - 1).unwrap_err();
+        check_n_frames(16_000, 0).unwrap_err();
+    }
+
+    /// Host staging runs only once the queue is idle: with a batch unanswered
+    /// the stage never runs; once it drains, the stage runs with nothing
+    /// outstanding.
+    #[test]
+    fn staging_runs_only_after_the_queue_is_idle() {
+        use crate::backend::hexagon::sys::fake;
+        let (mut device, _buf) = session_with_an_unanswered_batch();
+        let session = device.queue_session_mut();
+        let mut staged = false;
+        settled(session, || staged = true).unwrap_err();
+        assert!(!staged, "no host write while a batch is unanswered");
+        fake::with(|s| s.fail_read = false);
+        let outstanding =
+            settled(session, || staged = true).map(|()| session.outstanding_batches());
+        assert!(staged, "staged once idle");
+        assert_eq!(outstanding.unwrap(), 0);
+    }
+
+    /// A per-call buffer is released and unmapped normally, but leaked, with no
+    /// release and no unmap, while a batch may still be running against it.
+    #[test]
+    fn a_buffer_is_leaked_not_freed_while_a_batch_is_unanswered() {
+        use crate::backend::hexagon::sys::fake::{self, Event};
+        let (mut device, buf) = session_with_an_unanswered_batch();
+        let fd = buf.fd();
+        let session = device.queue_session_mut();
+        let at = fake::events().len();
+        assert!(release_or_leak(session, buf), "leaked while unanswered");
+        let mine = |e: &&Event| matches!(e, Event::Release(f) | Event::Unmap(f) if *f == fd);
+        assert_eq!(fake::events()[at..].iter().filter(mine).count(), 0);
+
+        fake::with(|s| s.fail_read = false);
+        settle(session).unwrap();
+        let again = RpcmemBuffer::alloc(fake::driver(), 4096, true).unwrap();
+        let fd = again.fd();
+        let at = fake::events().len();
+        assert!(!release_or_leak(session, again), "freed once answered");
+        let order: Vec<_> = fake::events()[at..]
+            .iter()
+            .filter(|e| matches!(e, Event::Release(f) | Event::Unmap(f) if *f == fd))
+            .cloned()
+            .collect();
+        assert_eq!(order, vec![Event::Release(fd), Event::Unmap(fd)]);
     }
 
     #[test]

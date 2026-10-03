@@ -757,6 +757,18 @@ pub struct HexagonWhisperModel {
     encoded_ok: AtomicBool,
 }
 
+impl Drop for HexagonWhisperModel {
+    /// Let the DSP go of every buffer before the host unmaps them.
+    fn drop(&mut self) {
+        let mut device = self.device.lock_or_recover();
+        device.queue_session_mut().release_dsp_references([
+            &self.weights_buf,
+            &*self.state_buf.lock_or_recover(),
+            &*self.scratch_buf.lock_or_recover(),
+        ]);
+    }
+}
+
 unsafe impl Send for HexagonWhisperModel {}
 unsafe impl Sync for HexagonWhisperModel {}
 

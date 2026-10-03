@@ -554,6 +554,15 @@ fn main() {
                 report("stem conv 4 (pw, relu)", &cpu[4], &d.pw4);
                 report("stem flatten", &flat, &d.flat);
                 report("stem output", &cpu_out, &d.out);
+                // The same stem in small time chunks, overlap frames included.
+                for rows in [3usize, 8, 64] {
+                    match enc.stem_output(&mel, n_frames, rows) {
+                        Ok(out) => {
+                            report(&format!("stem output, {rows}-frame chunks"), &cpu_out, &out)
+                        }
+                        Err(e) => println!("stem output, {rows}-frame chunks: NPU error: {e}"),
+                    }
+                }
             }
             Err(e) => println!("conv stem: NPU error: {e}"),
         }

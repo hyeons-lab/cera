@@ -303,6 +303,16 @@ pub struct HexagonVisionEncoder {
     projector: ProjectorWeights,
 }
 
+impl Drop for HexagonVisionEncoder {
+    /// Let the DSP go of every buffer before the host unmaps them.
+    fn drop(&mut self) {
+        let mut device = self.device.lock_or_recover();
+        device
+            .queue_session_mut()
+            .release_dsp_references([&self.weights_buf, &*self.scratch_buf.lock_or_recover()]);
+    }
+}
+
 // SAFETY: Synchronization across threads is enforced by the device and scratch Mutex locks.
 unsafe impl Send for HexagonVisionEncoder {}
 unsafe impl Sync for HexagonVisionEncoder {}

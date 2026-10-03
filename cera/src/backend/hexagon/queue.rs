@@ -454,15 +454,44 @@ impl HexagonQueueSession {
         self.skel_handle = Some(handle);
     }
 
+    /// [`Self::release_dsp_reference`] for each of `bufs`: what a model's
+    /// `Drop` calls, while its device is still open, ahead of the unmaps that
+    /// dropping the buffers performs.
+    pub(crate) fn release_dsp_references<'a>(
+        &self,
+        bufs: impl IntoIterator<Item = &'a RpcmemBuffer>,
+    ) {
+        if self.outstanding > 0 {
+            super::hexagon_warn!(
+                "not releasing buffers: {} batch(es) unanswered",
+                self.outstanding
+            );
+            return;
+        }
+        for buf in bufs {
+            self.release_dsp_reference(buf);
+        }
+    }
+
     /// Tell the DSP to drop its reference to `buf` (`htp_iface_munmap`, IDL
     /// method 5). Once a batch has read a buffer the DSP keeps its own hold on
     /// it, and the host's `fastrpc_munmap` is refused (error 1) until that is
     /// released. Best effort, as in llama.cpp: a buffer no batch has touched
     /// has nothing to release.
+    ///
+    /// Skipped while a batch is unanswered: after a read timeout the DSP may
+    /// still be running it against `buf`, and releasing would pull the
+    /// mapping from under it. The host unmap that follows when the buffer
+    /// drops is not prevented: if the DSP already holds the buffer it is
+    /// refused (the mapping leaks), and if the batch has not taken its hold yet
+    /// the memory is freed regardless, as it was before this guard.
     pub(crate) fn release_dsp_reference(&self, buf: &RpcmemBuffer) {
         let Some(handle) = self.skel_handle else {
             return;
         };
+        if self.outstanding > 0 {
+            return;
+        }
         let mut fd = buf.fd() as u32;
         let mut args = [super::sys::RemoteArg {
             buf: super::sys::RemoteBuf {
@@ -533,7 +562,6 @@ impl HexagonQueueSession {
         self.max_tensors_per_flush
     }
 
-    #[cfg(test)]
     /// Number of batches written to the DSP with no response read back yet.
     pub(crate) fn outstanding_batches(&self) -> u64 {
         self.outstanding
@@ -1437,6 +1465,31 @@ mod tests {
         q
     }
 
+    /// Dropping a model releases all of its buffers, each once.
+    #[test]
+    fn release_dsp_references_releases_every_buffer_given() {
+        fake::reset();
+        fake::with(|s| s.distinct_fds = true);
+        let driver = fake::driver();
+        let bufs: Vec<RpcmemBuffer> = (0..3)
+            .map(|_| RpcmemBuffer::alloc(Arc::clone(&driver), 4096, false).unwrap())
+            .collect();
+        let mut q = test_session();
+        q.set_skel_handle(7);
+        q.release_dsp_references(&bufs);
+        let released: Vec<i32> = fake::events()
+            .into_iter()
+            .filter_map(|e| match e {
+                fake::Event::Release(fd) => Some(fd),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            released,
+            bufs.iter().map(RpcmemBuffer::fd).collect::<Vec<_>>()
+        );
+    }
+
     /// A flush the tensor cap triggers says so when it fails: the cap is the
     /// first suspect when chasing the nondeterminism it works around.
     #[test]
@@ -1449,6 +1502,54 @@ mod tests {
         // The helper ends its group, which is where the cap flushes.
         let err = enqueue_with_tensor(&mut q, &buf).unwrap_err().to_string();
         assert!(err.contains("cap=1") && err.contains("tensors=1"), "{err}");
+    }
+
+    /// A batch the DSP has not answered may still be running against the
+    /// buffer, so the release is withheld rather than raced.
+    #[test]
+    fn a_release_is_withheld_while_a_batch_is_unanswered() {
+        fake::reset();
+        let mut q = test_session();
+        q.set_skel_handle(7);
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let released = || fake::events().contains(&fake::Event::Release(buf.fd()));
+        fake::with(|s| s.fail_read = true);
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        q.flush().unwrap_err();
+        assert_eq!(q.outstanding_batches(), 1);
+        // Both forms hold back: the buffer-at-a-time one is what the encoder's
+        // per-call buffers and the pager use.
+        q.release_dsp_reference(&buf);
+        assert!(!released(), "single form: no release while unanswered");
+        q.release_dsp_references([&buf]);
+        assert!(!released(), "batch form: no release while unanswered");
+        fake::with(|s| s.fail_read = false);
+        q.quiesce().unwrap();
+        q.release_dsp_reference(&buf);
+        assert!(released(), "released once answered");
+    }
+
+    /// Holding back is announced once per call, not once per buffer, so a paged
+    /// model's dozens of buffers do not flood the log.
+    #[test]
+    fn a_withheld_release_warns_once_for_all_the_buffers() {
+        use crate::audio_profile::tests::warnings_of;
+        fake::reset();
+        fake::with(|s| s.distinct_fds = true);
+        let mut q = test_session();
+        q.set_skel_handle(7);
+        let bufs: Vec<_> = (0..3)
+            .map(|_| RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap())
+            .collect();
+        fake::with(|s| s.fail_read = true);
+        enqueue_with_tensor(&mut q, &bufs[0]).unwrap();
+        q.flush().unwrap_err();
+        let warned = warnings_of(|| q.release_dsp_references(&bufs));
+        let n = warned
+            .iter()
+            .filter(|m| m.contains("not releasing buffers"))
+            .count();
+        assert_eq!(n, 1, "{warned:?}");
     }
 
     /// The DSP is told to drop its hold on a buffer through the skel handle,
