@@ -172,6 +172,15 @@ impl HexagonVitWeightOffsets {
             && (weights.projector.mm2_w.dtype == DType::Q8_0
                 || weights.projector.mm2_w.dtype == DType::Q4_0)
         {
+            // The projector's hidden activation reuses the feed-forward's
+            // scratch and its GELU works through scratch sized by `n_ff`, so a
+            // wider one cannot run.
+            if weights.projector.mm1_w.rows > weights.config.n_ff {
+                return Err(CeraError::Backend(format!(
+                    "ViT projector hidden width {} exceeds the feed-forward width {}",
+                    weights.projector.mm1_w.rows, weights.config.n_ff
+                )));
+            }
             let mm1_w = plan_linear(&mut cur_off, &weights.projector.mm1_w)?;
             let mm1_b_off = plan_vec_f32(&mut cur_off, weights.projector.mm1_b.len());
             let mm2_w = plan_linear(&mut cur_off, &weights.projector.mm2_w)?;
@@ -304,7 +313,7 @@ pub struct HexagonVisionEncoder {
 }
 
 impl Drop for HexagonVisionEncoder {
-    /// Let the DSP go of every buffer before the host unmaps them.
+    /// Let the DSP let go of every buffer before the host unmaps them.
     fn drop(&mut self) {
         let mut device = self.device.lock_or_recover();
         device
@@ -1505,5 +1514,13 @@ mod tests {
         assert_eq!(proj.mm1_w.format, HexagonWeightFormat::RepackedQ8_0);
         assert_eq!(proj.mm2_w.format, HexagonWeightFormat::RepackedQ8_0);
         assert!(plan.total_bytes > proj.mm2_b_off);
+
+        // A projector wider than the feed-forward has no scratch to run in.
+        let mut wide = weights;
+        wide.projector.mm1_w = make_q8(256, 256);
+        let err = HexagonVitWeightOffsets::plan(&wide)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("projector hidden width 256"), "{err}");
     }
 }

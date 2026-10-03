@@ -199,6 +199,13 @@ impl StemWeightOffsets {
         {
             return Err(bad("unexpected conv layer shapes"));
         }
+        // `first_conv_rows`, `tap_major` and `put_stem` index the weights by the
+        // shape unchecked.
+        if stem.layers.iter().any(|l| {
+            l.shape.iter().try_fold(1usize, |a, &d| a.checked_mul(d)) != Some(l.weight.len())
+        }) {
+            return Err(bad("conv layer weights do not match their shapes"));
+        }
         let out_w = &stem.pre_encode_out_w;
         let flat = StemGeom::new(1, cfg.n_mel_bins, ch).map_or(0, |g| g.flat_dim());
         if out_w.rows != cfg.n_embd
@@ -827,6 +834,66 @@ mod tests {
         assert_eq!(s.dst(first).offset, x_off);
         let rows: u32 = out_ops.iter().map(|&i| s.src(i, 1).ne[1]).sum();
         assert_eq!(rows as usize, g.h3 - skip, "rows projected");
+    }
+
+    /// The weights are indexed by the layer shapes without a bounds check, so a
+    /// layer whose weights are shorter than its shape is refused at planning.
+    #[test]
+    fn a_conv_layer_shorter_than_its_shape_is_refused_at_planning() {
+        use crate::model::weights::MmapWeight;
+        let cfg = AudioEncoderConfig {
+            n_layer: 1,
+            n_embd: 64,
+            n_ff: 128,
+            n_head: 4,
+            eps: 1e-5,
+            n_mel_bins: 16,
+            llm_hidden_size: 96,
+        };
+        let ch = 4;
+        let layer = |shape: [usize; 4], len: usize| ConvLayerWeights {
+            name: "a.conv1d".into(),
+            weight: vec![0.0; len],
+            bias: vec![0.0; ch],
+            shape: shape.to_vec(),
+        };
+        let stem = |short: Option<usize>| {
+            let shapes = [
+                [3, 3, 1, ch],
+                [3, 3, 1, ch],
+                [1, 1, ch, ch],
+                [3, 3, 1, ch],
+                [1, 1, ch, ch],
+            ];
+            ConvStemWeights {
+                layers: shapes
+                    .iter()
+                    .enumerate()
+                    .map(|(i, s)| {
+                        let len = s.iter().product::<usize>();
+                        layer(*s, if short == Some(i) { len - 1 } else { len })
+                    })
+                    .collect(),
+                pre_encode_out_w: MmapWeight::from_owned_f32(vec![], 0, 0),
+                pre_encode_out_b: vec![],
+            }
+        };
+        let plan = |s: &ConvStemWeights| {
+            StemWeightOffsets::plan(&mut 0, s, &cfg)
+                .err()
+                .map(|e| e.to_string())
+                .unwrap_or_default()
+        };
+        for i in 0..5 {
+            let msg = plan(&stem(Some(i)));
+            assert!(
+                msg.contains("do not match their shapes"),
+                "layer {i}: {msg}"
+            );
+        }
+        // Whole weights get past that check (and stop at the projection, which
+        // this stem does not carry).
+        assert!(plan(&stem(None)).contains("output projection"));
     }
 
     #[test]

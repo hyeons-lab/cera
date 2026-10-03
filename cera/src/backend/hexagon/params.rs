@@ -1082,6 +1082,12 @@ pub fn build_mul_mat_f32_kernel_params(
         ne13,
         dst_nb1,
     } = shape;
+    // The kernel divides by these (row indices and the weights' batch
+    // broadcast): a zero extent, or a weight batch count that does not divide
+    // the activations', has no valid parameters.
+    if [ne00, ne02, ne03, ne11, ne12, ne13].contains(&0) || ne12 % ne02 != 0 || ne13 % ne03 != 0 {
+        return None;
+    }
     let n_threads = n_threads.max(1) as usize;
     let ne10 = ne00;
     let src1_nrows = ne11 * ne12 * ne13;
@@ -1144,8 +1150,8 @@ pub fn build_mul_mat_f32_kernel_params(
     };
     fd(ne12 * ne11, 18, &mut k); // div_ne12_ne1
     fd(ne11, 20, &mut k); // div_ne1
-    fd(ne12.checked_div(ne02).unwrap_or(1), 22, &mut k); // div_r2
-    fd(ne13.checked_div(ne03).unwrap_or(1), 24, &mut k); // div_r3
+    fd(ne12 / ne02, 22, &mut k); // div_r2
+    fd(ne13 / ne03, 24, &mut k); // div_r3
     fd(ne12, 26, &mut k); // div_ne12
     Some(k)
 }
@@ -1818,6 +1824,37 @@ mod tests {
         assert_eq!(k[2], 390);
         assert!(k[11] as usize <= 262144 + 100_000);
         assert!(build_mul_mat_f32_kernel_params(shape, 8, 262144).is_none());
+    }
+
+    /// A zero extent, or weights whose batch count does not divide the
+    /// activations', would put a zero divisor in the kernel's fastdiv slots.
+    #[test]
+    fn f32_matmul_params_refuse_shapes_with_a_zero_divisor() {
+        let ok = MulMatF32Shape {
+            ne00: 64,
+            ne02: 8,
+            ne03: 1,
+            src0_nb1: 2048,
+            ne11: 126,
+            ne12: 8,
+            ne13: 1,
+            dst_nb1: 504,
+        };
+        let params = |s: MulMatF32Shape| build_mul_mat_f32_kernel_params(s, 8, 8 << 20);
+        assert!(params(ok).is_some());
+        // Weights broadcast over a larger activation batch: fine.
+        assert!(params(MulMatF32Shape { ne02: 4, ..ok }).is_some());
+        assert!(
+            params(MulMatF32Shape { ne02: 16, ..ok }).is_none(),
+            "more weight batches"
+        );
+        assert!(
+            params(MulMatF32Shape { ne02: 3, ..ok }).is_none(),
+            "not a divisor"
+        );
+        assert!(params(MulMatF32Shape { ne11: 0, ..ok }).is_none());
+        assert!(params(MulMatF32Shape { ne12: 0, ..ok }).is_none());
+        assert!(params(MulMatF32Shape { ne02: 0, ..ok }).is_none());
     }
 
     #[test]

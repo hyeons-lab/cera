@@ -1442,7 +1442,9 @@ impl HexagonAudioEncoder {
 
     /// [`Self::run_attention`], returning the stage's intermediate tensors
     /// (compacted to their logical shapes) as well, so the probe can find the
-    /// first one that differs from the CPU's.
+    /// first one that differs from the CPU's. A probe helper for one caller at
+    /// a time: it reads the scratch after the run has released it, so a
+    /// concurrent encode would overwrite what it reads.
     pub fn debug_attention(
         &self,
         layer: usize,

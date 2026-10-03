@@ -747,7 +747,7 @@ fn paged_experts_hold_the_same_bytes_and_rotate_through_a_window() {
     // The pass starts with layers 6 and 7 still mapped; layer 1 rotates.
     assert!(pager.stats().rotations > 3);
 
-    // Dropping the model lets the DSP go of the pager's still-mapped window
+    // Dropping the model lets the DSP let go of the pager's still-mapped window
     // before the host unmaps it, like every other buffer. The device's own
     // staging buffer (the first mapping) is released with the device.
     let staging = fake::events()
@@ -903,7 +903,7 @@ fn long_routed_prefill_chunk_flushes_between_rows() {
     );
 }
 
-/// A dropped model lets the DSP go of each buffer a batch read before the host
+/// A dropped model lets the DSP let go of each buffer a batch read before the host
 /// unmaps it. Without that the unmap fails on a device and the mapping leaks
 /// (four debug lines at every teardown).
 #[test]

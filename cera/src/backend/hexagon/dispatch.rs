@@ -314,7 +314,7 @@ pub(crate) fn layer_norm<S: OpSink>(
     session.end_group().map_err(|e| op_err("layer_norm", e))
 }
 
-/// /// In-place elementwise unary op over `[dim, n_tokens]` (`buf = op(buf)`).
+/// In-place elementwise unary op over `[dim, n_tokens]` (`buf = op(buf)`).
 fn unary_inplace<S: OpSink>(
     session: &mut S,
     opcode: HtpOpCode,
@@ -503,7 +503,7 @@ pub(crate) fn mul_row_bcast<S: OpSink>(
     session.end_group().map_err(|e| op_err("mul_row_bcast", e))
 }
 
-/// /// In-place sigmoid: `buf = sigmoid(buf)`.
+/// In-place sigmoid: `buf = sigmoid(buf)`.
 pub(crate) fn sigmoid<S: OpSink>(
     session: &mut S,
     buf: &S::Buf,
@@ -804,7 +804,9 @@ pub(crate) fn matmul_f32<S: OpSink>(
     .ok_or_else(|| {
         op_err(
             "matmul_f32",
-            CeraError::Backend("activations do not fit the VTCM".into()),
+            CeraError::Backend(
+                "activations do not fit the VTCM, or the batch shapes do not line up".into(),
+            ),
         )
     })?;
     let a_ti = a.add(session, HTP_TENSOR_COMPUTE)?;

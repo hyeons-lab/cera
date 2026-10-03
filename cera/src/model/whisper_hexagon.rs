@@ -758,7 +758,7 @@ pub struct HexagonWhisperModel {
 }
 
 impl Drop for HexagonWhisperModel {
-    /// Let the DSP go of every buffer before the host unmaps them.
+    /// Let the DSP let go of every buffer before the host unmaps them.
     fn drop(&mut self) {
         let mut device = self.device.lock_or_recover();
         device.queue_session_mut().release_dsp_references([
