@@ -141,6 +141,11 @@ required-features = ["mmap", "parallel"]
 name = "audio_encoder_bench"
 required-features = ["mmap", "parallel"]
 
+# Is NPU decode bit-reproducible (device only).
+[[example]]
+name = "hexagon_decode_probe"
+required-features = ["hexagon", "mmap"]
+
 # The NPU Conformer encoder, stage by stage against the CPU one (device only).
 [[example]]
 name = "hexagon_conformer_probe"

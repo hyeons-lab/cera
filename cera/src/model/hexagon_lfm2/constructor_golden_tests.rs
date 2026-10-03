@@ -123,7 +123,11 @@ fn zero_dim_tensor_is_a_named_error() {
 
 fn backend() -> Backend {
     let (driver, device) = op_capture::fresh_device();
-    Backend::with_device(driver, device, HexagonKnobs::from_lookup(|_| None))
+    // Every default but the decode tensor cap, which would split the decode the
+    // goldens pin as one batch (the forward goldens say why).
+    let knobs =
+        HexagonKnobs::from_lookup(|k| (k == "CERA_HEXAGON_BATCH_TENSORS").then(|| "0".to_string()));
+    Backend::with_device(driver, device, knobs)
 }
 
 fn u32kv(key: &str, prefix: &str, v: u32) -> (String, KvValue) {

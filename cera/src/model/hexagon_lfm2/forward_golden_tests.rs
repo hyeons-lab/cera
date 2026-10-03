@@ -254,8 +254,28 @@ fn embd_table() -> EmbeddingTable {
     EmbeddingTable::new(&gguf, VOCAB, HS, 1.0).unwrap()
 }
 
-fn build(mut spec: Spec) -> HexagonLfmModel {
+/// Knobs for the goldens: every default except the decode tensor cap, which
+/// is off here. The goldens pin the op stream and the batch structure of one
+/// whole-token decode (and the resident template); the cap, which splits a
+/// decode into several batches without changing its ops, has its own tests.
+fn golden_knobs() -> HexagonKnobs {
+    HexagonKnobs::from_lookup(|k| (k == "CERA_HEXAGON_BATCH_TENSORS").then(|| "0".to_string()))
+}
+
+fn build(spec: Spec) -> HexagonLfmModel {
+    build_with(spec, &golden_knobs())
+}
+
+thread_local! {
+    /// Give each buffer `build_with` allocates its own fd (the fake driver
+    /// hands out one shared fd unless asked, and `fresh_device` resets it), for
+    /// tests that follow a particular buffer through the fake's event log.
+    static DISTINCT_FDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+fn build_with(mut spec: Spec, knobs: &HexagonKnobs) -> HexagonLfmModel {
     let (driver, device) = op_capture::fresh_device();
+    fake::with(|s| s.distinct_fds = DISTINCT_FDS.with(|d| d.get()));
     let q_dim = N_HEADS * HEAD_DIM;
     let mut so = ScratchOffsets::new(
         HS,
@@ -277,13 +297,12 @@ fn build(mut spec: Spec) -> HexagonLfmModel {
     if spec.with_swa_mask {
         spec.dense.mask_swa = Some(alloc(mask_size).unwrap());
     }
-    // The same assembly path the constructors use, with every knob at its
-    // default, so new knob-derived fields are covered and exported
-    // `CERA_HEXAGON_*` variables cannot change the goldens.
-    let knobs = HexagonKnobs::from_lookup(|_| None);
+    // The same assembly path the constructors use, so new knob-derived fields
+    // are covered and exported `CERA_HEXAGON_*` variables cannot change the
+    // goldens.
     HexagonLfmModel::from_parts(
         device,
-        &knobs,
+        knobs,
         Mutex::new(None),
         ModelParts {
             config: spec.config,
@@ -1203,4 +1222,107 @@ fn check_kv_rewind_takes_the_device_lock() {
             Err(KvRewindError::BackendUnsupported)
         ));
     });
+}
+
+/// A decode tensor cap ends the batch at op-group boundaries, so a token goes
+/// to the DSP as several batches whose ops are exactly the whole token's. The
+/// small model's decode holds far fewer tensors than the production cap, so the
+/// cap here is a few tensors to exercise the split.
+#[test]
+fn a_batch_tensor_cap_splits_the_batch_without_changing_the_ops() {
+    let decode = |cap: &str| {
+        let knobs =
+            HexagonKnobs::from_lookup(|k| (k == "CERA_HEXAGON_BATCH_TENSORS").then(|| cap.into()));
+        // Distinct fds, so a tensor pointing at the wrong buffer shows in the
+        // operand text instead of hiding behind one shared registry entry.
+        DISTINCT_FDS.with(|d| d.set(true));
+        let model = build_with(dense_spec(), &knobs);
+        DISTINCT_FDS.with(|d| d.set(false));
+        let mut state = fresh_state(&model);
+        model
+            .try_forward_input(DecodeInput::Token(3), DecodeOutput::Logits, 0, &mut state)
+            .unwrap();
+        capture().batches
+    };
+    let whole = decode("0");
+    let capped = decode("12");
+    assert_eq!(whole.len(), 1, "unbounded: one batch per token");
+    assert!(capped.len() > 2, "{} batches", capped.len());
+    assert_eq!(
+        histogram(&whole),
+        histogram(&capped),
+        "the cap moves batch boundaries, never ops"
+    );
+    // Not just the same ops: the same operands. A tensor index that survived a
+    // flush it should not have would read another tensor's shape or offset.
+    // The buffer index is per batch, so it is left out; the buffer size stays
+    // and, with distinct fds, identifies the buffer.
+    let operands = |batches: &[String]| -> Vec<String> {
+        batches
+            .iter()
+            .flat_map(|b| b.lines())
+            .map(|l| {
+                l.split(' ')
+                    .map(|t| if t.starts_with("[b") { "[b" } else { t })
+                    .collect::<Vec<_>>()
+                    .join(" ")
+            })
+            .collect()
+    };
+    assert_eq!(
+        operands(&whole),
+        operands(&capped),
+        "operands survive the split"
+    );
+}
+
+/// The cap covers decode and every prefill chunk, small or large, and bypasses
+/// the single-batch resident template.
+#[test]
+fn the_tensor_cap_bypasses_the_template_and_covers_every_prefill_chunk() {
+    let knobs = HexagonKnobs::from_lookup(|k| {
+        (k == "CERA_HEXAGON_BATCH_TENSORS").then(|| "12".to_string())
+    });
+    let model = build_with(dense_spec(), &knobs);
+    let mut state = fresh_state(&model);
+    let mut step_batches = Vec::new();
+    let cap_now = || {
+        model
+            .device
+            .lock_or_recover()
+            .queue_session_mut()
+            .tensor_flush_cap()
+    };
+    for pos in 0..3 {
+        model
+            .try_forward_input(DecodeInput::Token(3), DecodeOutput::Logits, pos, &mut state)
+            .unwrap();
+        step_batches.push(capture().batches.len());
+        assert_eq!(cap_now(), None, "cap cleared after decode step {pos}");
+    }
+    assert!(
+        step_batches.iter().all(|&n| n == step_batches[0] && n > 2),
+        "every step is emitted fresh, in several batches: {step_batches:?}"
+    );
+    // A one-row chunk and a chunk of PREFILL_M rows (HMX) are both capped.
+    model
+        .try_forward_prefill_chunk(&[5], 3, &mut state)
+        .unwrap();
+    assert!(capture().batches.len() > 2, "small chunks are capped");
+    assert_eq!(cap_now(), None, "cap cleared after a one-row chunk");
+    let tokens: Vec<u32> = (0..PREFILL_M as u32).collect();
+    model
+        .try_forward_prefill_chunk(&tokens, 4, &mut state)
+        .unwrap();
+    assert!(capture().batches.len() > 2, "large chunks are capped too");
+    // The cap is set for the forward and cleared after it, so it cannot leak
+    // onto the shared device queue the other NPU models use.
+    assert_eq!(cap_now(), None, "cap cleared after a PREFILL_M chunk");
+    // Uncapped, the same large chunk is one batch.
+    let model = build(dense_spec());
+    let mut state = fresh_state(&model);
+    model
+        .try_forward_prefill_chunk(&tokens, 0, &mut state)
+        .unwrap();
+    assert_eq!(capture().batches.len(), 1);
 }

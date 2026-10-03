@@ -279,9 +279,14 @@ pub struct HexagonQueueSession {
     tens: Vec<HtpTensor>,
     ops: Vec<HtpOpDesc>,
     /// Auto-flush once this many ops are queued (`None` = unbounded).
-    /// Small-M prefill chunks cap this (see `SMALL_M_MAX_OPS_PER_FLUSH`):
+    /// Small-M prefill chunks cap this (see `MAX_OPS_PER_FLUSH`):
     /// large single-flush batches compute nondeterministically there.
     max_ops_per_flush: Option<usize>,
+    /// Flush at an op-group boundary once the batch holds this many tensors
+    /// (`None` = unbounded). On the S25 Ultra a decode batch of a few dozen
+    /// tensors or more computes nondeterministically (logit swings up to 3, a
+    /// different result on every run); see [`Self::set_max_tensors_per_flush`].
+    max_tensors_per_flush: Option<usize>,
     seq: u64,
     /// Aggregate DSP microseconds per opcode across flushes (profiling only).
     prof: HashMap<u32, (u64, u64)>,
@@ -349,6 +354,7 @@ impl HexagonQueueSession {
             tens: Vec::with_capacity(256),
             ops: Vec::with_capacity(128),
             max_ops_per_flush: None,
+            max_tensors_per_flush: None,
             seq: 1,
             prof: HashMap::new(),
             prof_host_us: 0,
@@ -385,6 +391,26 @@ impl HexagonQueueSession {
     /// `enqueue_op` flushes automatically once the cap is reached.
     pub fn set_max_ops_per_flush(&mut self, max: Option<usize>) {
         self.max_ops_per_flush = max.filter(|&m| m >= 1);
+    }
+
+    /// Cap the tensors in a batch (`None` restores unbounded batching): once the
+    /// batch holds this many, the next op-group boundary ([`Self::end_group`])
+    /// flushes it. Unlike [`Self::set_max_ops_per_flush`] this never cuts a
+    /// helper's ops apart, which share tensor indices.
+    ///
+    /// Why it exists: decode on the S25 Ultra (v79) was found to compute
+    /// nondeterministically when a whole token went to the DSP as one batch:
+    /// every identical run gave a different logit sequence, differing by up to
+    /// 3 from decode step 1, while the CPU and the NPU's prefill were bit-exact.
+    /// Ending the batch at every 16 op groups or fewer gave the same logits on
+    /// every run, and at 24 groups or more did not; counted in tensors, caps of
+    /// 40 or fewer were reproducible on every model tried and 48 or more were
+    /// not on all of them. Enlarging the DSP's dirty-range table did not change
+    /// it, so the cause is elsewhere in the firmware's handling of long
+    /// batches, and this is a host-side bound on that. It costs decode speed
+    /// (8% to 20% on the models tried; more batches, and no resident template).
+    pub fn set_max_tensors_per_flush(&mut self, max: Option<usize>) {
+        self.max_tensors_per_flush = max.filter(|&m| m >= 1);
     }
 
     /// Next free DSP-visible index for a registry. The DSP reads `u16`
@@ -501,8 +527,14 @@ impl HexagonQueueSession {
         self.tensor_cap = cap;
     }
 
-    /// Number of batches written to the DSP with no response read back yet.
+    /// Test hook: the tensors-per-flush cap currently set.
     #[cfg(test)]
+    pub(crate) fn tensor_flush_cap(&self) -> Option<usize> {
+        self.max_tensors_per_flush
+    }
+
+    #[cfg(test)]
+    /// Number of batches written to the DSP with no response read back yet.
     pub(crate) fn outstanding_batches(&self) -> u64 {
         self.outstanding
     }
@@ -853,13 +885,24 @@ impl HexagonQueueSession {
     /// Mark an op-group boundary: a run of ops that may share tensor
     /// indices (one `dispatch::*` helper, one model-local op emitter). Under
     /// `CERA_HEXAGON_STEP` this flushes the group so a DSP fault names the
-    /// group that caused it; otherwise it is a no-op. A flush clears the
+    /// group that caused it. With a tensor cap ([`Self::set_max_tensors_per_flush`])
+    /// it flushes once the batch has reached it; otherwise it is a no-op. A flush clears the
     /// tensor table, so it must only run where no later op reuses an index
     /// registered before the boundary. Flushing per `enqueue_op` instead
     /// (the old behavior) broke every helper that registers a tensor once
     /// and reuses it across ops.
     pub fn end_group(&mut self) -> Result<(), CeraError> {
         if !self.step_mode {
+            if let Some(cap) = self.max_tensors_per_flush
+                && self.tens.len() >= cap
+            {
+                let pending = self.tens.len();
+                return self.flush().map_err(|e| {
+                    CeraError::Backend(format!(
+                        "HTP tensor-capped flush failed (cap={cap}, tensors={pending}): {e}"
+                    ))
+                });
+            }
             return Ok(());
         }
         let n_ops = self.ops.len();
@@ -1394,6 +1437,20 @@ mod tests {
         q
     }
 
+    /// A flush the tensor cap triggers says so when it fails: the cap is the
+    /// first suspect when chasing the nondeterminism it works around.
+    #[test]
+    fn a_capped_flush_failure_names_the_cap() {
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let mut q = test_session();
+        q.set_max_tensors_per_flush(Some(1));
+        fake::with(|s| s.fail_write = true);
+        // The helper ends its group, which is where the cap flushes.
+        let err = enqueue_with_tensor(&mut q, &buf).unwrap_err().to_string();
+        assert!(err.contains("cap=1") && err.contains("tensors=1"), "{err}");
+    }
+
     /// The DSP is told to drop its hold on a buffer through the skel handle,
     /// and only when the session has one.
     #[test]
@@ -1513,10 +1570,46 @@ mod tests {
         }
     }
 
-    /// A read timeout leaves the batch outstanding (the DSP may still write
-    /// its buffers); `quiesce` fails while the response is missing and
-    /// succeeds, consuming it, once it arrives. A write failure never
-    /// reached the DSP, so it leaves nothing outstanding.
+    /// A tensor cap flushes at the first op-group boundary at or past it, never
+    /// between the ops of one group, and `None` restores unbounded batching.
+    #[test]
+    fn a_tensor_cap_flushes_at_group_boundaries_only() {
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let mut q = test_session();
+        let writes = || {
+            fake::events()
+                .iter()
+                .filter(|e| matches!(e, fake::Event::Write(_)))
+                .count()
+        };
+        // Each helper call registers one tensor (a group of one op).
+        q.set_max_tensors_per_flush(Some(3));
+        for n in 1..=7 {
+            // `enqueue_with_tensor` ends its group, which is where a cap acts.
+            enqueue_with_tensor(&mut q, &buf).unwrap();
+            assert_eq!(writes(), n / 3, "after group {n}");
+        }
+        // Unbounded again: nothing more flushes at a group boundary.
+        q.set_max_tensors_per_flush(None);
+        for _ in 0..5 {
+            enqueue_with_tensor(&mut q, &buf).unwrap();
+        }
+        assert_eq!(writes(), 2);
+        // A cap never splits a group: three ops over one registered tensor stay
+        // together however small the cap is.
+        q.set_max_tensors_per_flush(Some(1));
+        let before = writes();
+        let ti = q.add_tensor(&buf, 0, 64, 0, 0, [1; 4], [4; 4]).unwrap();
+        for _ in 0..3 {
+            q.enqueue_op(HtpOpCode::Add as u32, &[ti], &[ti], [0; 16], [0; 32])
+                .unwrap();
+        }
+        assert_eq!(writes(), before, "no flush inside the group");
+        q.end_group().unwrap();
+        assert_eq!(writes(), before + 1, "flushed at its end");
+    }
+
     /// A session on a polling driver spins for responses until it asks to
     /// sleep, and the choice is per session and restorable.
     #[test]
@@ -1548,6 +1641,10 @@ mod tests {
         assert_eq!(last_timeout(), 0, "restored to the driver default");
     }
 
+    /// A read timeout leaves the batch outstanding (the DSP may still write
+    /// its buffers); `quiesce` fails while the response is missing and
+    /// succeeds, consuming it, once it arrives. A write failure never
+    /// reached the DSP, so it leaves nothing outstanding.
     #[test]
     fn quiesce_waits_for_outstanding_batches() {
         fake::reset();
