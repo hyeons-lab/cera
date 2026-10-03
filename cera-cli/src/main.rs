@@ -1174,6 +1174,61 @@ enum Command {
         json: bool,
     },
 
+    /// Diarize audio (who spoke when) with Streaming Sortformer 4spk on the CPU.
+    ///
+    /// Prints one line per speaker segment (slots 0..4, arrival ordered, not names). Overlapped
+    /// speech shows as overlapping segments. Convert the checkpoint with
+    /// `scripts/sortformer/convert_sortformer.py` first.
+    Diarize {
+        /// Path to the converted Sortformer `.gguf`.
+        #[arg(short, long)]
+        model: String,
+
+        /// Path to an input WAV file (resampled to 16 kHz if needed).
+        #[arg(short, long)]
+        audio: String,
+
+        /// `live` pushes audio in pieces through the incremental front end (what a background
+        /// service does); `streaming` runs NeMo's chunked loop over the whole clip; `offline`
+        /// attends over the whole clip at once (clips up to 10 minutes).
+        #[arg(long, default_value = "live")]
+        mode: String,
+
+        /// Streaming preset: `default` (the checkpoint's: 15 s chunks, about 15 s latency) or
+        /// `low-latency` (the model card's: 0.48 s chunks, 1.04 s latency, a much heavier step).
+        #[arg(long, default_value = "default")]
+        preset: String,
+
+        /// In `live` mode, how much audio to push at a time, in milliseconds.
+        #[arg(long, default_value_t = 100)]
+        piece_ms: usize,
+
+        /// Speaker probability at which a slot counts as active.
+        #[arg(long, default_value_t = 0.5)]
+        threshold: f32,
+
+        /// Silero VAD `.gguf`. With `--whisper`, runs the VAD plus Whisper pipeline over the same
+        /// audio and prints each utterance with the speaker the diarizer assigned it.
+        #[arg(long, requires = "whisper")]
+        vad: Option<String>,
+
+        /// Whisper `.gguf`. Needs `--vad`; implies `--mode live`.
+        #[arg(long, requires = "vad")]
+        whisper: Option<String>,
+
+        /// Join a speaker's runs separated by at most this much silence, in milliseconds.
+        #[arg(long, default_value_t = 240)]
+        merge_gap_ms: usize,
+
+        /// Drop segments shorter than this, in milliseconds.
+        #[arg(long, default_value_t = 160)]
+        min_ms: usize,
+
+        /// Output the segments and timing as JSON.
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Transcribe speech in audio using Whisper or LFM2-Audio ASR.
     Transcribe {
         /// Path or catalog alias for the ASR model (e.g. `tiny`, `base`, `small`, `medium`, `large-v3-turbo`, `lfm2-audio`, or a path to a `.gguf` file).
@@ -2223,6 +2278,125 @@ fn read_wav_pcm16_mono(path: &str) -> Result<(Vec<f32>, u32)> {
 /// have to special-case them.
 fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
     cera::model::audio_encoder::resample_linear(samples, sr_in, sr_out)
+}
+
+/// `cera diarize --vad .. --whisper ..`: the VAD plus Whisper pipeline and the live diarizer
+/// hear the same audio, piece by piece, as a background service would. Each utterance is printed
+/// with its speaker as soon as the diarizer has covered it.
+fn diarize_with_transcript(
+    model: &cera::model::sortformer::SortformerModel,
+    params: cera::model::sortformer::StreamingParams,
+    pcm: &[f32],
+    (vad, whisper): (&str, &str),
+    piece_ms: usize,
+    audio: &str,
+    json: bool,
+) -> Result<()> {
+    use cera::audio_pipeline::AudioPipelineEvent;
+    use cera::live_diarizer::LiveDiarizer;
+    use cera::speaker_labeler::{LabeledUtterance, SpeakerLabelerConfig};
+    use std::collections::HashMap;
+
+    let mut pipeline = cera::AudioPipeline::builder()
+        .with_vad_from_file(vad)
+        .with_context(|| format!("loading VAD from `{vad}`"))?
+        .with_whisper_from_file(whisper)
+        .with_context(|| format!("loading Whisper from `{whisper}`"))?
+        .build()?;
+    let mut diarizer = LiveDiarizer::new(model, params, SpeakerLabelerConfig::default())?;
+    let latency_s = diarizer.latency_frames() as f64 * 0.08;
+
+    let mut texts: HashMap<u64, String> = HashMap::new();
+    let mut next_id = 0u64;
+    let mut rows: Vec<serde_json::Value> = Vec::new();
+    let mut emit = |u: LabeledUtterance, texts: &mut HashMap<u64, String>| {
+        let text = texts.remove(&u.id).unwrap_or_default();
+        let (speaker, confidence, overlapping) = match &u.label {
+            Some(l) => (Some(l.speaker), Some(l.confidence), l.overlapping),
+            None => (None, None, None),
+        };
+        if json {
+            rows.push(serde_json::json!({
+                "id": u.id,
+                "start_ms": u.start_ms,
+                "end_ms": u.end_ms,
+                "speaker": speaker,
+                "confidence": confidence,
+                "overlapping": overlapping,
+                "dropped": u.dropped,
+                "text": text,
+            }));
+        } else {
+            let who = speaker.map_or("?".to_string(), |s| s.to_string());
+            let extra = match (confidence, overlapping) {
+                (Some(c), Some(o)) => format!(" ({:.0}%, overlaps {o})", c * 100.0),
+                (Some(c), None) => format!(" ({:.0}%)", c * 100.0),
+                _ => String::new(),
+            };
+            println!(
+                "[{:7.2}s - {:7.2}s] speaker {who}{extra}: {}",
+                u.start_ms / 1000.0,
+                u.end_ms / 1000.0,
+                text.trim()
+            );
+        }
+    };
+    let mut register = |events: Vec<AudioPipelineEvent>,
+                        diarizer: &mut LiveDiarizer,
+                        texts: &mut HashMap<u64, String>| {
+        for ev in events {
+            if let AudioPipelineEvent::UtteranceTranscribed {
+                text,
+                start_ms,
+                end_ms,
+                ..
+            } = ev
+            {
+                texts.insert(next_id, text);
+                diarizer.add_utterance(next_id, start_ms as f64, end_ms as f64);
+                next_id += 1;
+            }
+        }
+    };
+
+    let started = std::time::Instant::now();
+    let piece = (piece_ms * 16).max(1);
+    for part in pcm.chunks(piece) {
+        let events = pipeline.process_chunk(part)?;
+        diarizer.push_audio(part)?;
+        register(events, &mut diarizer, &mut texts);
+        for u in diarizer.poll() {
+            emit(u, &mut texts);
+        }
+    }
+    let events = pipeline.flush()?;
+    register(events, &mut diarizer, &mut texts);
+    for u in diarizer.finish()? {
+        emit(u, &mut texts);
+    }
+    let wall_s = started.elapsed().as_secs_f64();
+    let audio_s = pcm.len() as f64 / 16_000.0;
+
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({
+                "audio": audio,
+                "audio_s": audio_s,
+                "wall_s": wall_s,
+                "realtime_factor": wall_s / audio_s.max(1e-9),
+                "diarizer_latency_s": latency_s,
+                "utterances": rows,
+            }))?
+        );
+    } else {
+        println!(
+            "{} s of audio in {wall_s:.2} s wall ({:.2}x real time); diarizer latency {latency_s:.2} s",
+            audio_s as u64,
+            wall_s / audio_s.max(1e-9)
+        );
+    }
+    Ok(())
 }
 
 enum AsrResolvedModel {
@@ -3974,6 +4148,134 @@ fn main() -> Result<()> {
                         ts.end_ms,
                         ts.start_sample,
                         ts.end_sample
+                    );
+                }
+            }
+        }
+        Command::Diarize {
+            model,
+            audio,
+            mode,
+            preset,
+            piece_ms,
+            threshold,
+            vad,
+            whisper,
+            merge_gap_ms,
+            min_ms,
+            json,
+        } => {
+            use cera::model::sortformer::SortformerModel;
+            use cera::speaker_labeler::{FRAME_MS, speaker_segments};
+
+            let m = SortformerModel::from_file(&model)
+                .with_context(|| format!("loading Sortformer model from `{model}`"))?;
+            let (mut pcm, sr_in) = read_wav_pcm16_mono(&audio)
+                .with_context(|| format!("reading audio file `{audio}`"))?;
+            if sr_in != 16_000 {
+                pcm = resample_linear(&pcm, sr_in, 16_000);
+            }
+            let audio_s = pcm.len() as f64 / 16_000.0;
+            let params = match preset.as_str() {
+                "default" => m.default_streaming().clone(),
+                "low-latency" => m.default_streaming().with_chunking(6, 1, 7, 188, 188, 144),
+                other => anyhow::bail!("unknown preset `{other}`; use `default` or `low-latency`"),
+            };
+
+            if let (Some(vad), Some(whisper)) = (&vad, &whisper) {
+                return diarize_with_transcript(
+                    &m,
+                    params,
+                    &pcm,
+                    (vad, whisper),
+                    piece_ms,
+                    &audio,
+                    json,
+                );
+            }
+
+            let started = std::time::Instant::now();
+            let mut first_output_ms: Option<f64> = None;
+            let frames = match mode.as_str() {
+                "live" => {
+                    let mut live = m.new_live(params)?;
+                    let piece = (piece_ms * 16).max(1);
+                    let mut out = Vec::new();
+                    let mut pushed = 0usize;
+                    for part in pcm.chunks(piece) {
+                        let got = live.push_audio(part)?;
+                        pushed += part.len();
+                        if first_output_ms.is_none() && !got.is_empty() {
+                            // Audio time (not wall time) pushed when the first frames came out.
+                            first_output_ms = Some(pushed as f64 / 16.0);
+                        }
+                        out.extend(got);
+                    }
+                    out.extend(live.finish()?);
+                    out
+                }
+                "streaming" => m.diarize_streaming(&pcm, params)?,
+                "offline" => m.diarize_offline(&pcm)?,
+                other => {
+                    anyhow::bail!("unknown mode `{other}`; use `live`, `streaming` or `offline`")
+                }
+            };
+            let wall_s = started.elapsed().as_secs_f64();
+
+            let to_frames = |ms: usize| ms.div_ceil(FRAME_MS as usize);
+            let mut segments = speaker_segments(
+                &frames,
+                threshold,
+                to_frames(merge_gap_ms),
+                to_frames(min_ms),
+            );
+            // The streaming loop pads the clip to a multiple of 16 mel frames with zeros;
+            // clip anything past the audio.
+            let audio_ms = audio_s * 1000.0;
+            segments.retain(|s| s.start_ms < audio_ms);
+            for s in &mut segments {
+                s.end_ms = s.end_ms.min(audio_ms);
+            }
+
+            if json {
+                let segs: Vec<_> = segments
+                    .iter()
+                    .map(|s| {
+                        serde_json::json!({
+                            "speaker": s.speaker,
+                            "start_ms": s.start_ms,
+                            "end_ms": s.end_ms,
+                        })
+                    })
+                    .collect();
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&serde_json::json!({
+                        "audio_s": audio_s,
+                        "wall_s": wall_s,
+                        "realtime_factor": wall_s / audio_s.max(1e-9),
+                        "first_output_audio_ms": first_output_ms,
+                        "mode": mode,
+                        "preset": preset,
+                        "segments": segs,
+                    }))?
+                );
+            } else {
+                println!(
+                    "Sortformer: {} segment(s) in `{}` ({:.2}s audio, {:.2}s wall, {:.2}x real time)",
+                    segments.len(),
+                    audio,
+                    audio_s,
+                    wall_s,
+                    wall_s / audio_s.max(1e-9)
+                );
+                if let Some(ms) = first_output_ms {
+                    println!("  first predictions after {ms:.0} ms of audio");
+                }
+                for s in &segments {
+                    println!(
+                        "  speaker {}  {:8.2}ms - {:8.2}ms",
+                        s.speaker, s.start_ms, s.end_ms
                     );
                 }
             }
@@ -6940,6 +7242,92 @@ mod tests {
                 assert!(json);
             }
             _ => panic!("expected Vad command"),
+        }
+    }
+
+    #[test]
+    fn diarize_command_parses_flags() {
+        let cli = Cli::try_parse_from([
+            "cera",
+            "diarize",
+            "--model",
+            "sortformer.gguf",
+            "--audio",
+            "meeting.wav",
+            "--mode",
+            "streaming",
+            "--preset",
+            "low-latency",
+            "--piece-ms",
+            "250",
+            "--threshold",
+            "0.6",
+            "--json",
+        ])
+        .expect("diarize subcommand should parse");
+        match cli.command {
+            Command::Diarize {
+                model,
+                audio,
+                mode,
+                preset,
+                piece_ms,
+                threshold,
+                vad,
+                whisper,
+                merge_gap_ms,
+                min_ms,
+                json,
+            } => {
+                assert_eq!((vad, whisper), (None, None));
+                assert_eq!(
+                    (model.as_str(), audio.as_str()),
+                    ("sortformer.gguf", "meeting.wav")
+                );
+                assert_eq!(
+                    (mode.as_str(), preset.as_str()),
+                    ("streaming", "low-latency")
+                );
+                assert_eq!((piece_ms, merge_gap_ms, min_ms), (250, 240, 160));
+                assert_eq!(threshold, 0.6);
+                assert!(json);
+            }
+            _ => panic!("expected Diarize command"),
+        }
+        // `--vad` and `--whisper` go together.
+        assert!(
+            Cli::try_parse_from(["cera", "diarize", "-m", "m", "-a", "a", "--vad", "v.gguf"])
+                .is_err()
+        );
+        let cli = Cli::try_parse_from([
+            "cera",
+            "diarize",
+            "-m",
+            "m",
+            "-a",
+            "a",
+            "--vad",
+            "v.gguf",
+            "--whisper",
+            "w.gguf",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Diarize { vad, whisper, .. } => {
+                assert_eq!(
+                    (vad.as_deref(), whisper.as_deref()),
+                    (Some("v.gguf"), Some("w.gguf"))
+                );
+            }
+            _ => panic!("expected Diarize command"),
+        }
+        // Defaults: the live mode with the checkpoint's own preset.
+        let cli = Cli::try_parse_from(["cera", "diarize", "-m", "m.gguf", "-a", "a.wav"]).unwrap();
+        match cli.command {
+            Command::Diarize { mode, preset, .. } => {
+                assert_eq!((mode.as_str(), preset.as_str()), ("live", "default"));
+            }
+            _ => panic!("expected Diarize command"),
         }
     }
 
