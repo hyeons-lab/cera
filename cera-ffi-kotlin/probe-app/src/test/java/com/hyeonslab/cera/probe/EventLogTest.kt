@@ -1,7 +1,9 @@
 package com.hyeonslab.cera.probe
 
 import org.junit.Assert.assertEquals
+import org.junit.Assert.assertFalse
 import org.junit.Assert.assertNull
+import org.junit.Assert.assertTrue
 import org.junit.Test
 import uniffi.cera_ffi.FfiAudioPipelineEvent
 
@@ -49,5 +51,26 @@ class EventLogTest {
                 "\"text\":\"x\"}",
             eventJson(labeled(null, text = "x")),
         )
+    }
+
+    @Test
+    fun whispers_non_speech_tags_are_recognised() {
+        for (tag in listOf("[BLANK_AUDIO]", " [MUSIC PLAYING] ", "(applause)", "[Music]")) {
+            assertTrue(tag, isNonSpeechTag(tag))
+        }
+        for (words in listOf("hello", "I said [BLANK_AUDIO] twice", "[]", "", "(a) (b)")) {
+            assertFalse(words, isNonSpeechTag(words))
+        }
+    }
+
+    @Test
+    fun a_non_speech_tag_is_neither_shown_nor_saved() {
+        val tag = FfiAudioPipelineEvent.UtteranceTranscribed("[BLANK_AUDIO]", 0f, 1000f, 16_000uL)
+        assertNull(eventLine(tag))
+        assertNull(eventJson(tag))
+        assertNull(eventLine(labeled(0u, text = "[MUSIC PLAYING]")))
+        assertNull(eventJson(labeled(0u, text = "[MUSIC PLAYING]")))
+        // Real speech that merely mentions brackets is kept.
+        assertEquals("1:05 S1: see [1] for details", eventLine(labeled(0u, text = "see [1] for details")))
     }
 }

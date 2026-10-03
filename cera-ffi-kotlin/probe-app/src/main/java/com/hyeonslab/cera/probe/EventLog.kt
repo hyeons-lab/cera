@@ -3,10 +3,25 @@ package com.hyeonslab.cera.probe
 import uniffi.cera_ffi.FfiAudioPipelineEvent
 
 /**
- * One line per event that is worth showing or keeping: transcripts and speaker labels, wake words.
- * Speech boundaries are bookkeeping and return null.
+ * Whether [text] is only one of Whisper's bracketed non-speech tags, such as `[BLANK_AUDIO]`,
+ * `[MUSIC PLAYING]` or `(applause)`. Whisper emits them for noise and silence the VAD let through;
+ * they are not something anyone said, so they are neither shown nor saved.
  */
-fun eventLine(event: FfiAudioPipelineEvent): String? = when (event) {
+fun isNonSpeechTag(text: String): Boolean = NON_SPEECH_TAG.matches(text.trim())
+
+private val NON_SPEECH_TAG = Regex("""[\[(][^\])]{1,40}[\])]""")
+
+/**
+ * One line per event that is worth showing or keeping: transcripts and speaker labels, wake words.
+ * Speech boundaries and Whisper's non-speech tags are bookkeeping and return null.
+ */
+fun eventLine(event: FfiAudioPipelineEvent): String? = when {
+    event is FfiAudioPipelineEvent.UtteranceTranscribed && isNonSpeechTag(event.text) -> null
+    event is FfiAudioPipelineEvent.UtteranceLabeled && isNonSpeechTag(event.text) -> null
+    else -> speechLine(event)
+}
+
+private fun speechLine(event: FfiAudioPipelineEvent): String? = when (event) {
     is FfiAudioPipelineEvent.UtteranceTranscribed ->
         "${stamp(event.startMs)} ${event.text.trim()}"
     is FfiAudioPipelineEvent.UtteranceLabeled -> {
@@ -43,7 +58,13 @@ fun jsonString(text: String): String = buildString {
 }
 
 /** A transcript record for `transcript.jsonl`, or null for an event that is not kept. */
-fun eventJson(event: FfiAudioPipelineEvent): String? = when (event) {
+fun eventJson(event: FfiAudioPipelineEvent): String? = when {
+    event is FfiAudioPipelineEvent.UtteranceTranscribed && isNonSpeechTag(event.text) -> null
+    event is FfiAudioPipelineEvent.UtteranceLabeled && isNonSpeechTag(event.text) -> null
+    else -> speechJson(event)
+}
+
+private fun speechJson(event: FfiAudioPipelineEvent): String? = when (event) {
     is FfiAudioPipelineEvent.UtteranceLabeled ->
         "{\"type\":\"utterance\",\"start_ms\":${event.startMs},\"end_ms\":${event.endMs}," +
             "\"speaker\":${event.speaker ?: "null"},\"text\":${jsonString(event.text)}}"

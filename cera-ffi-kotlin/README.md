@@ -107,7 +107,10 @@ demote when the app is in the background (it does demote background CPU work).
 - Models are read from `audio-models/` under the app's `filesDir` (or the external files dir):
   `vad.gguf` (required), `whisper.gguf`, `diarizer.gguf`, `hotword.gguf`. Whisper must be Q8_0 or
   Q4_0 and the diarizer a `--tail-outtype q8_0` GGUF to run on the NPU.
-- Transcripts, with speaker labels, are appended to `filesDir/transcript.jsonl`.
+- Transcripts, with speaker labels, are appended to `filesDir/transcript.jsonl` (one `transcript`
+  record when Whisper finishes an utterance, then an `utterance` record with its speaker once the
+  diarizer has covered it, about 15 s later). Whisper's bracketed non-speech tags such as
+  `[BLANK_AUDIO]` are dropped.
 - It logs CPU seconds per audio second every minute, with the input peak and whether Android is
   silencing the recorder: `adb logcat -s CeraAudio`.
 - Intent extras (on `AudioServiceActivity`, forwarded to the service):
