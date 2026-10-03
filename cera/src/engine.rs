@@ -63,6 +63,11 @@ use crate::tokenizer::BpeTokenizer;
 /// skipped for a routed-expert model that would need paging through the DSP
 /// mapping (slower than the CPU) unless `CERA_HEXAGON_PAGE_EXPERTS=1`. Explicit variants
 /// error if their feature isn't compiled in.
+///
+/// `Npu` is the vendor-neutral way to ask for a neural accelerator: it tries
+/// each NPU backend compiled into this build and uses whichever one this
+/// machine has, so callers never have to name a vendor that may not be
+/// present. `Hexagon` forces that one vendor.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum BackendPreference {
     #[default]
@@ -74,20 +79,26 @@ pub enum BackendPreference {
     Metal,
     /// Qualcomm Hexagon NPU. Requires the `hexagon` feature.
     Hexagon,
+    /// Whichever NPU this machine has: tries each NPU backend compiled into
+    /// this build (today only Hexagon) and loads the first that works. Errors
+    /// with every vendor's reason when none does, or when no NPU backend is
+    /// compiled in.
+    Npu,
 }
 
 impl BackendPreference {
-    /// Parse a case-insensitive string (`"auto"`, `"cpu"`, `"gpu"`, `"wgpu"`, `"metal"`, `"hexagon"`).
-    /// Returns `Err` on an unknown label.
+    /// Parse a case-insensitive string (`"auto"`, `"cpu"`, `"gpu"`, `"wgpu"`, `"metal"`, `"npu"`,
+    /// `"hexagon"` / `"htp"`). Returns `Err` on an unknown label.
     pub fn parse_str(s: &str) -> Result<Self, CeraError> {
         match s.to_ascii_lowercase().as_str() {
             "auto" | "" => Ok(Self::Auto),
             "cpu" => Ok(Self::Cpu),
             "gpu" | "wgpu" => Ok(Self::Gpu),
             "metal" => Ok(Self::Metal),
-            "hexagon" | "npu" | "htp" => Ok(Self::Hexagon),
+            "hexagon" | "htp" => Ok(Self::Hexagon),
+            "npu" => Ok(Self::Npu),
             other => Err(CeraError::Backend(format!(
-                "unknown backend preference `{other}` (use auto, cpu, gpu, metal, or hexagon)"
+                "unknown backend preference `{other}` (use auto, cpu, gpu, metal, npu, or hexagon)"
             ))),
         }
     }
@@ -2299,6 +2310,47 @@ fn load_text_model(
         BackendPreference::Hexagon => Err(CeraError::Backend(
             "Hexagon backend not available (compile with --features hexagon)".into(),
         )),
+        BackendPreference::Npu => load_text_model_npu(gguf, path, cfg.context_size),
+    }
+}
+
+/// Load on whichever NPU this machine has. Each NPU backend compiled into
+/// this build gets a turn, in a fixed order, and the first that loads wins.
+/// There is no separate probe step: a probe would open the device and a load
+/// would open it again, and each backend's loader already fails fast when its
+/// hardware or driver is absent. When none loads, the error carries every
+/// vendor's reason so a Snapdragon-only build run on an AMD machine says why.
+fn load_text_model_npu(
+    gguf: GgufFile,
+    path: Option<&Path>,
+    context_size: usize,
+) -> Result<Box<dyn Model>, CeraError> {
+    // `gguf`, `path` and `context_size` are only read by the vendor arms below.
+    #[cfg(not(feature = "hexagon"))]
+    let _ = (&gguf, path, context_size);
+
+    #[allow(unused_mut)]
+    let mut tried: Vec<String> = Vec::new();
+
+    #[cfg(feature = "hexagon")]
+    match model::load_model_hexagon(gguf.clone(), path, context_size) {
+        Ok(m) => {
+            tracing::debug!("cera::engine: using Qualcomm Hexagon NPU backend (npu)");
+            return Ok(m);
+        }
+        Err(e) => tried.push(format!("Hexagon: {e}")),
+    }
+
+    if tried.is_empty() {
+        Err(CeraError::Backend(
+            "no NPU backend is compiled into this build (enable a vendor feature such as `hexagon`)"
+                .into(),
+        ))
+    } else {
+        Err(CeraError::Backend(format!(
+            "no NPU backend could load this model ({})",
+            tried.join("; ")
+        )))
     }
 }
 
@@ -2542,16 +2594,52 @@ mod tests {
             BackendPreference::parse_str("Hexagon").unwrap(),
             BackendPreference::Hexagon
         );
+        // `npu` is the vendor-neutral preference; only the vendor names pin Hexagon.
         assert_eq!(
             BackendPreference::parse_str("npu").unwrap(),
-            BackendPreference::Hexagon
+            BackendPreference::Npu
+        );
+        assert_eq!(
+            BackendPreference::parse_str("NPU").unwrap(),
+            BackendPreference::Npu
         );
         assert_eq!(
             BackendPreference::parse_str("htp").unwrap(),
             BackendPreference::Hexagon
         );
         let err = BackendPreference::parse_str("nvidia").unwrap_err();
-        assert!(err.to_string().contains("metal, or hexagon"));
+        assert!(err.to_string().contains("metal, npu, or hexagon"));
+    }
+
+    /// `Npu` never loads silently as something else: with no NPU backend
+    /// compiled in it says so, and with one compiled in but absent from this
+    /// machine it names that vendor and why it could not load. Runs on every
+    /// host because a minimal GGUF has no architecture, so a present NPU
+    /// refuses it too.
+    #[test]
+    fn npu_preference_errors_name_every_vendor_that_failed() {
+        let mut header = Vec::new();
+        header.extend_from_slice(b"GGUF");
+        header.extend_from_slice(&3u32.to_le_bytes());
+        header.extend_from_slice(&0u64.to_le_bytes());
+        header.extend_from_slice(&0u64.to_le_bytes());
+        let gguf = GgufFile::from_bytes(std::sync::Arc::from(header.into_boxed_slice()))
+            .expect("parse minimal gguf");
+
+        let Err(err) = load_text_model_npu(gguf, None, 128) else {
+            panic!("an empty GGUF must not load on any NPU");
+        };
+        let msg = err.to_string();
+        #[cfg(feature = "hexagon")]
+        assert!(
+            msg.contains("no NPU backend could load this model") && msg.contains("Hexagon:"),
+            "{msg}"
+        );
+        #[cfg(not(feature = "hexagon"))]
+        assert!(
+            msg.contains("no NPU backend is compiled into this build"),
+            "{msg}"
+        );
     }
 
     #[test]

@@ -156,7 +156,9 @@ pub fn build_audio_accelerator(
     use crate::engine::BackendPreference as BP;
     match backend {
         BP::Cpu => None,
-        BP::Hexagon => try_hexagon_audio_decoder(gguf),
+        // Hexagon is the only NPU with an audio accelerator today; `Npu` takes
+        // the same path and gains other vendors here as they grow one.
+        BP::Hexagon | BP::Npu => try_hexagon_audio_decoder(gguf),
         BP::Metal => try_metal_audio_decoder(gguf),
         BP::Gpu => try_wgpu_audio_decoder(gguf),
         BP::Auto => try_metal_audio_decoder(gguf)
@@ -1891,6 +1893,7 @@ mod tests {
         assert!(
             build_audio_accelerator(&gguf, crate::engine::BackendPreference::Hexagon).is_none()
         );
+        assert!(build_audio_accelerator(&gguf, crate::engine::BackendPreference::Npu).is_none());
     }
 
     struct MockAudioAccelerator {

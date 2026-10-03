@@ -244,6 +244,8 @@ final engine = CeraEngine.fromPath(
 );
 ```
 
+To avoid naming a vendor, request `CeraBackend.npu` (or `BackendPreference.npu`). The runtime tries each NPU backend compiled into the build and uses the first that loads, so the same setting works wherever a supported NPU exists. Unlike `CeraBackend.auto`, it fails instead of falling back to the CPU when none can load the model.
+
 For Android apps built with `cera_ffi_flutter`, DSP skeleton libraries are embedded in `libcera_ffi.so` and extracted directly to app storage via `HexagonNpu.setup(context)`. Standalone Dart environments on Linux or Android aarch64 can extract embedded skeletons by calling `hexagonInstallSkels(skelDir)` before probing or model loading.
 
 ### Voice Activity Detection (Silero VAD v5)
