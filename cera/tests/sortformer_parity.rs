@@ -30,8 +30,13 @@ fn models_dir() -> PathBuf {
     PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".leap/models/sortformer")
 }
 
+/// The committed fixtures. `SORTFORMER_FIXTURES` overrides the compile-time path so a test binary
+/// cross-built for a device (where the source tree does not exist) can run against pushed copies.
 fn fixtures_dir() -> PathBuf {
-    PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sortformer")
+    match std::env::var_os("SORTFORMER_FIXTURES") {
+        Some(dir) => PathBuf::from(dir),
+        None => PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sortformer"),
+    }
 }
 
 /// A model-backed file, or `None` to skip.
