@@ -977,8 +977,12 @@ fn step_refuses_inconsistent_arguments() {
         assert!(err.contains(want), "want `{want}`: {err}");
     };
     refused(s.step(&feats[..111 * 128], 112, 112, 0, 0), "feats is not");
-    // 2^57 x 128 wraps to 0 in a usize: an empty slice must not pass for that many frames.
-    refused(s.step(&[], 1usize << 57, 0, 0, 0), "feats is not");
+    // n_feat x 128 wraps to 0 in a usize of either width (2^57 on 64-bit, 2^25 on wasm32):
+    // an empty slice must not pass for that many frames.
+    refused(
+        s.step(&[], 1usize << (usize::BITS - 7), 0, 0, 0),
+        "feats is not",
+    );
     refused(s.step(feats, 112, 113, 0, 0), "valid_feat 113 > n_feat 112");
     // 112 frames are 14 encoder frames; 10 of left and 6 of right context leave none for the chunk.
     refused(s.step(feats, 112, 112, 80, 48), "shorter than its contexts");
