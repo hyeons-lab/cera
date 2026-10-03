@@ -14625,6 +14625,13 @@ enum class BackendPreference {
      */
     HEXAGON,
 
+    /**
+     * Whichever NPU the device has: tries each NPU backend compiled into
+     * the build and uses the first that loads, so callers need not name a
+     * vendor. Fails when no NPU backend is compiled in or none can load.
+     */
+    NPU,
+
     ;
 
     companion object

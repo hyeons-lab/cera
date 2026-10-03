@@ -77,7 +77,7 @@
       "kind": "record",
       "owner": "BackendPreference",
       "retained_home": "Rust core; retain existing engine and raw helpers",
-      "expected": "pub enum BackendPreference { #[default] Auto, Cpu, Gpu, Metal, Hexagon, }"
+      "expected": "pub enum BackendPreference { #[default] Auto, Cpu, Gpu, Metal, Hexagon, Npu, }"
     },
     {
       "source": "cera/src/engine.rs",
@@ -358,7 +358,7 @@
       "kind": "record",
       "owner": "BackendPreference",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
-      "expected": "pub enum BackendPreference { Auto, Cpu, Gpu, Metal, Hexagon, }"
+      "expected": "pub enum BackendPreference { Auto, Cpu, Gpu, Metal, Hexagon, Npu, }"
     },
     {
       "source": "cera-ffi/src/lib.rs",

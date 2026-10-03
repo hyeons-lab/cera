@@ -58,6 +58,15 @@ enum CeraBackend {
   /// Unsigned PD. When Hexagon hardware acceleration is unavailable, the engine falls
   /// back according to the native runtime configuration.
   hexagon,
+
+  /// Prefer whichever NPU the device has, without naming a vendor.
+  ///
+  /// The native runtime tries each NPU backend compiled into the build and uses
+  /// the first that loads, so the same setting works on a Snapdragon phone and
+  /// on hardware with another vendor's NPU. It fails, rather than falling back
+  /// to the CPU, when no NPU backend is compiled in or none can load the model;
+  /// use [auto] for a silent fallback. Today the only NPU backend is Hexagon.
+  npu,
 }
 
 /// Where the web implementation loads its JavaScript and wasm from.

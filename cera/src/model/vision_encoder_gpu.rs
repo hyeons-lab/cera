@@ -1540,7 +1540,9 @@ pub fn build_gpu_vision_encoder(
     use crate::engine::BackendPreference as BP;
     match backend {
         BP::Cpu => None,
-        BP::Hexagon => {
+        // Hexagon is the only NPU with a vision encoder today; `Npu` takes the
+        // same path and gains other vendors here as they grow one.
+        BP::Hexagon | BP::Npu => {
             #[cfg(feature = "hexagon")]
             {
                 crate::model::vision_encoder_hexagon::try_hexagon_vision_encoder(weights)
