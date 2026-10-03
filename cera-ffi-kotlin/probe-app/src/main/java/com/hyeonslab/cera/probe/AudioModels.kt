@@ -1,0 +1,51 @@
+package com.hyeonslab.cera.probe
+
+import java.io.File
+
+/**
+ * The model files an always-on audio service runs, found by fixed names in a directory. Only the
+ * VAD is required: a service with just a VAD reports speech boundaries, and each model added turns
+ * on the matching stage (Whisper transcribes, the diarizer labels speakers, the hotword model gates
+ * transcription behind a wake word).
+ *
+ * Whisper must be Q8_0 or Q4_0 and the diarizer must be a `--tail-outtype q8_0` GGUF to run on the
+ * NPU; anything else works but falls back to the CPU, which Android demotes in the background.
+ */
+data class AudioModels(
+    val vad: File,
+    val hotword: File?,
+    val whisper: File?,
+    val diarizer: File?,
+) {
+    /** Names of the stages that will run, for the status line. */
+    val stages: List<String>
+        get() = buildList {
+            add("vad")
+            if (hotword != null) add("hotword")
+            if (whisper != null) add("whisper")
+            if (diarizer != null) add("diarizer")
+        }
+
+    companion object {
+        const val DIR_NAME = "audio-models"
+        const val VAD = "vad.gguf"
+        const val HOTWORD = "hotword.gguf"
+        const val WHISPER = "whisper.gguf"
+        const val DIARIZER = "diarizer.gguf"
+
+        /**
+         * The models in the first of [dirs] that holds a VAD, or null when none does. Directories
+         * are searched in order so the app's private storage wins over a copy pushed to the
+         * external files directory.
+         */
+        fun find(dirs: List<File>): AudioModels? {
+            for (dir in dirs) {
+                val vad = File(dir, VAD)
+                if (!vad.isFile) continue
+                fun optional(name: String) = File(dir, name).takeIf { it.isFile && it.length() > 0 }
+                return AudioModels(vad, optional(HOTWORD), optional(WHISPER), optional(DIARIZER))
+            }
+            return null
+        }
+    }
+}

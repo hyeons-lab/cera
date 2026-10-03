@@ -93,6 +93,64 @@ downloader.download("LFM2-1.2B-GGUF", "Q4_0").collect { state ->
 AndroidBundleRepo.download(context, "LFM2-1.2B-GGUF", "Q4_0").collect { ... }
 ```
 
+## Always-on transcription service (probe-app)
+
+`probe-app` contains a reference foreground service, `AudioPipelineService`, that feeds the
+microphone to a cera `AudioPipeline` (VAD, Whisper, Sortformer speaker diarizer, optional wake
+word). In a build with the `hexagon` feature every stage runs on the NPU, which Android does not
+demote when the app is in the background (it does demote background CPU work).
+
+- A microphone foreground service (`foregroundServiceType="microphone"`). Android 14+ only starts
+  one from a visible activity with `RECORD_AUDIO` already granted, so `AudioServiceActivity` starts
+  it; the service does not restart itself after the system kills it (a restart from the background
+  would be refused), so reopen the app.
+- Models are read from `audio-models/` under the app's `filesDir` (or the external files dir):
+  `vad.gguf` (required), `whisper.gguf`, `diarizer.gguf`, `hotword.gguf`. Whisper must be Q8_0 or
+  Q4_0 and the diarizer a `--tail-outtype q8_0` GGUF to run on the NPU.
+- Transcripts, with speaker labels, are appended to `filesDir/transcript.jsonl`.
+- It logs CPU seconds per audio second every minute, with the input peak and whether Android is
+  silencing the recorder: `adb logcat -s CeraAudio`.
+- Intent extras (on `AudioServiceActivity`, forwarded to the service):
+
+  | Extra | Default | Meaning |
+  |-------|---------|---------|
+  | `autostart` (activity only) | false | start the service once the permissions are granted |
+  | `wake_lock` | true | hold a partial wake lock while running |
+  | `require_hotword` | false | wait for the wake word before transcribing |
+  | `chunk_ms` | 500 | audio per pipeline call, clamped to 100..2000 |
+  | `wav` | none | replay a 16 kHz mono 16-bit WAV instead of the microphone, then stop |
+  | `wav_speed` | 1.0 | replay rate for `wav` (0 = as fast as possible) |
+
+Two things matter for the CPU numbers the service is built to minimise:
+
+- **Measure with the `field` build** (`./gradlew :probe-app:assembleField`), not `debug`. A
+  debuggable app runs its managed code in a deoptimizable interpreter, which made the service look
+  about 1.7x more expensive. The `field` build is non-debuggable but `profileable`, so
+  `simpleperf record --app` still works; push models to the external files dir
+  (`/sdcard/Android/data/com.hyeonslab.cera.probe/files/audio-models/`) because `run-as` needs a
+  debuggable app.
+- **Feed it PCM16 bytes and big chunks.** `processChunkPcm16` takes the bytes `AudioRecord`
+  delivers; `processChunk` lowers a `List<Float>` element by element (79% of the service's CPU).
+  And every FFI call pays a fixed JNA cost for its call-status and buffer structures, so 500 ms
+  chunks cost a fifth of what 100 ms chunks do.
+
+Measured on a Galaxy S25 Ultra (VAD, Whisper tiny Q8_0 and the Sortformer diarizer, all on the
+NPU), CPU seconds per second of audio, whole process:
+
+| Configuration | CPU-s per audio-s |
+|---------------|-------------------|
+| debug build, `processChunk` floats, 100 ms chunks | 0.052 |
+| debug build, `processChunkPcm16`, 100 ms | 0.035 |
+| `field` build, 100 ms | 0.020 |
+| `field` build, 500 ms (default), quiet room | 0.0095 |
+| same, backgrounded with the screen off | 0.0093 to 0.0107 |
+| same, replaying 61 s of speech (Whisper and diarizer active) | 0.0112 |
+
+That is about 34 to 40 CPU-seconds per hour of audio, about 1% of one core.
+
+The pure parts (model discovery, PCM conversion, the capture loop, event formatting, CPU metering)
+have JVM unit tests: `./gradlew :probe-app:testDebugUnitTest`.
+
 ## Hexagon NPU (Android)
 
 `cera-ffi-android` can run inference on Qualcomm Hexagon NPUs from a
