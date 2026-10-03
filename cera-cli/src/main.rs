@@ -1282,6 +1282,13 @@ enum Command {
         /// Compute device / backend: `auto`, `cpu`, `npu` (whichever NPU is present), `hexagon`, `metal`, `gpu`.
         #[arg(long, visible_alias = "backend", default_value = "auto")]
         device: String,
+
+        /// Quantization of an official Whisper model converted on the fly (`q4_k_m`, `q8_0`,
+        /// `q4_0`, `f16`). Defaults to `q8_0` with `--device hexagon` and in a build with the
+        /// `hexagon` feature, `q4_k_m` otherwise: the Hexagon NPU reads only Q8_0, Q4_0 and F16
+        /// weights, and a model in any other format runs on the CPU.
+        #[arg(long)]
+        quant: Option<String>,
     },
 
     /// Compare a Cera-converted GGUF (or on-the-fly SafeTensors conversion) against a reference community GGUF.
@@ -2471,6 +2478,7 @@ fn whisper_gguf_is_loadable(path: &Path) -> bool {
 fn whisper_catalog_candidates(
     cache_dir: &Path,
     entry: &cera::WhisperModelCatalogEntry,
+    quant: cera::convert::TargetQuant,
 ) -> [PathBuf; 5] {
     [
         cache_dir.join(entry.gguf_filename),
@@ -2489,7 +2497,7 @@ fn whisper_catalog_candidates(
             .join("huggingface.co")
             .join(entry.hf_repo)
             .join("quantized")
-            .join("Q4_K_M")
+            .join(quant.as_str())
             .join("model.gguf"),
     ]
 }
@@ -2497,8 +2505,9 @@ fn whisper_catalog_candidates(
 fn whisper_catalog_cached_path(
     cache_dir: &Path,
     entry: &cera::WhisperModelCatalogEntry,
+    quant: cera::convert::TargetQuant,
 ) -> Option<PathBuf> {
-    whisper_catalog_candidates(cache_dir, entry)
+    whisper_catalog_candidates(cache_dir, entry, quant)
         .into_iter()
         .find(|p| p.exists() && whisper_gguf_is_loadable(p))
 }
@@ -2509,8 +2518,9 @@ fn whisper_catalog_cached_path(
 fn whisper_catalog_unloadable_path(
     cache_dir: &Path,
     entry: &cera::WhisperModelCatalogEntry,
+    quant: cera::convert::TargetQuant,
 ) -> Option<PathBuf> {
-    whisper_catalog_candidates(cache_dir, entry)
+    whisper_catalog_candidates(cache_dir, entry, quant)
         .into_iter()
         .find(|p| p.exists() && !whisper_gguf_is_loadable(p))
 }
@@ -2525,7 +2535,9 @@ fn print_asr_catalog(cache_dir: &Path) {
     println!("{:-<100}", "");
 
     for entry in cera::WHISPER_CATALOG {
-        let is_cached = whisper_catalog_cached_path(cache_dir, entry).is_some();
+        let is_cached =
+            whisper_catalog_cached_path(cache_dir, entry, cera::convert::TargetQuant::Q4_K_M)
+                .is_some();
         let status = if is_cached { "[cached]" } else { "-" };
         println!(
             "{:<16} {:<12} {:<12} {:<15} {:<10} {:<30}",
@@ -2567,6 +2579,7 @@ fn resolve_asr_model(
     cache_dir: &Path,
     repo: &cera::bundle::BundleRepo,
     progress: &Arc<CliDownloadProgress>,
+    quant: cera::convert::TargetQuant,
 ) -> Result<AsrResolvedModel> {
     // Check if it is a Liquid LFM2-Audio model
     if model_str.eq_ignore_ascii_case("lfm2-audio")
@@ -2615,14 +2628,14 @@ fn resolve_asr_model(
         cera::find_whisper_catalog_entry(model_str)
     };
     if let Some(entry) = whisper_entry
-        && let Some(cached) = whisper_catalog_cached_path(cache_dir, entry)
+        && let Some(cached) = whisper_catalog_cached_path(cache_dir, entry, quant)
     {
         return Ok(AsrResolvedModel::Whisper(cached, None));
     }
     if whisper_entry.is_some() || (!is_local_gguf && model_str.starts_with("openai/whisper")) {
         let hf_repo = whisper_entry.map_or(model_str, |e| e.hf_repo);
         if let Some(skipped) =
-            whisper_entry.and_then(|e| whisper_catalog_unloadable_path(cache_dir, e))
+            whisper_entry.and_then(|e| whisper_catalog_unloadable_path(cache_dir, e, quant))
         {
             eprintln!(
                 "note: cached `{}` is not in a layout cera can load; converting `{hf_repo}` instead",
@@ -2630,14 +2643,15 @@ fn resolve_asr_model(
             );
         }
         eprintln!(
-            "Streaming official OpenAI SafeTensors `{hf_repo}` and quantizing to GGUF in `{}`...",
+            "Streaming official OpenAI SafeTensors `{hf_repo}` and quantizing to {} GGUF in `{}`...",
+            quant.as_str(),
             cache_dir.display()
         );
         let spec = cera::bundle::HfSpec::parse(hf_repo)?;
         let manifest = cera::convert::stream_quantize_hf_repo(
             &spec,
             cera::convert::QuantizeOptions {
-                target_quant: cera::convert::TargetQuant::Q4_K_M,
+                target_quant: quant,
                 strategy: cera::convert::QuantStrategy::Auto,
                 cache_dir: cache_dir.to_path_buf(),
                 auth_token: cera::bundle::hf::get_hf_auth_token(),
@@ -4381,6 +4395,7 @@ fn main() -> Result<()> {
             download_model,
             cache_dir,
             device,
+            quant,
         } => {
             let cache_path = cache_dir
                 .map(PathBuf::from)
@@ -4418,7 +4433,20 @@ fn main() -> Result<()> {
                 progress.clone() as Arc<dyn cera::bundle::DownloadProgress>,
             );
 
-            let resolved = resolve_asr_model(&model_str, &cache_path, &repo, &progress)?;
+            let quant = match quant {
+                Some(q) => cera::convert::TargetQuant::parse_str(&q)
+                    .ok_or_else(|| anyhow::anyhow!("unknown --quant `{q}`"))?,
+                // The Hexagon NPU reads Q8_0, not the K-quants: a build that has the NPU (the
+                // `hexagon` feature) converts to Q8_0 unless told otherwise.
+                None if matches!(backend_pref, BackendPreference::Hexagon)
+                    || (cfg!(feature = "hexagon")
+                        && matches!(backend_pref, BackendPreference::Auto)) =>
+                {
+                    cera::convert::TargetQuant::Q8_0
+                }
+                None => cera::convert::TargetQuant::Q4_K_M,
+            };
+            let resolved = resolve_asr_model(&model_str, &cache_path, &repo, &progress, quant)?;
 
             if download_model {
                 match resolved {
@@ -5845,10 +5873,13 @@ mod tests {
             &[("stt.whisper.encoder.n_layers", 4)],
         );
         assert!(!whisper_gguf_is_loadable(&community));
-        assert_eq!(whisper_catalog_cached_path(dir.path(), entry), None);
+        assert_eq!(
+            whisper_catalog_cached_path(dir.path(), entry, cera::convert::TargetQuant::Q4_K_M),
+            None
+        );
         // It is what the resolver names in its "converting instead" note.
         assert_eq!(
-            whisper_catalog_unloadable_path(dir.path(), entry),
+            whisper_catalog_unloadable_path(dir.path(), entry, cera::convert::TargetQuant::Q4_K_M),
             Some(community.clone())
         );
 
@@ -5872,7 +5903,7 @@ mod tests {
         );
         assert!(whisper_gguf_is_loadable(&converted));
         assert_eq!(
-            whisper_catalog_cached_path(dir.path(), entry),
+            whisper_catalog_cached_path(dir.path(), entry, cera::convert::TargetQuant::Q4_K_M),
             Some(converted)
         );
         // A conversion from before rows were checked has a valid config but a matrix whose
@@ -7505,7 +7536,9 @@ mod tests {
                 download_model,
                 cache_dir,
                 device,
+                quant,
             } => {
+                assert_eq!(quant, None, "the quantization defaults per device");
                 assert_eq!(model.as_deref(), Some("models/whisper_base.gguf"));
                 assert_eq!(audio.as_deref(), Some("test.wav"));
                 assert_eq!(language.as_deref(), Some("es"));
@@ -7517,6 +7550,28 @@ mod tests {
                 assert!(!download_model);
                 assert!(cache_dir.is_none());
                 assert_eq!(device, "auto");
+            }
+            _ => panic!("expected Transcribe command"),
+        }
+    }
+
+    #[test]
+    fn transcribe_command_parses_the_quant_flag() {
+        let cli = Cli::try_parse_from([
+            "cera",
+            "transcribe",
+            "-m",
+            "tiny",
+            "--quant",
+            "q8_0",
+            "--device",
+            "npu",
+        ])
+        .expect("transcribe --quant should parse");
+        match cli.command {
+            Command::Transcribe { quant, device, .. } => {
+                assert_eq!(quant.as_deref(), Some("q8_0"));
+                assert_eq!(device, "npu");
             }
             _ => panic!("expected Transcribe command"),
         }
