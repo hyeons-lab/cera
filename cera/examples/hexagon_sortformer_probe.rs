@@ -1,0 +1,201 @@
+//! Check the Hexagon FastConformer on Sortformer's weights against the CPU, and time what each
+//! costs the CPU.
+//!
+//! Sortformer's encoder is the same NeMo FastConformer family as LFM2-Audio's, so the NPU
+//! encoder stages it through `HexagonAudioEncoder::from_parts` (no MLP adapter, no LFM2 mel
+//! tables). Everything runs on the same input on both sides: the CPU pre-encode embeddings of
+//! a clip, looped or trimmed to the requested length.
+//!
+//! ```text
+//! cargo ndk -t arm64-v8a build --release -p cera --example hexagon_sortformer_probe --features hexagon
+//! adb push target/aarch64-linux-android/release/examples/hexagon_sortformer_probe /data/local/tmp/cera-bench/
+//! adb shell 'cd /data/local/tmp/cera-bench && echo 0 > /proc/$$/oom_score_adj && \
+//!   ./hexagon_sortformer_probe sortformer-q8_0.gguf clip.wav 30'
+//! ```
+//!
+//! Arguments: the Sortformer GGUF, a mono 16 kHz 16-bit WAV, and the clip length in seconds
+//! (default: the WAV's own length; at most 608 encoder frames, about 48.6 s).
+
+#[cfg(feature = "hexagon")]
+fn read_wav(path: &str) -> Vec<f32> {
+    let bytes = std::fs::read(path).expect("read the WAV");
+    assert!(
+        &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "not a WAV"
+    );
+    let mut pos = 12;
+    while pos + 8 <= bytes.len() {
+        let id = &bytes[pos..pos + 4];
+        let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let body = &bytes[pos + 8..(pos + 8 + len).min(bytes.len())];
+        if id == b"fmt " {
+            let tag = u16::from_le_bytes([body[0], body[1]]);
+            let ch = u16::from_le_bytes([body[2], body[3]]);
+            let rate = u32::from_le_bytes(body[4..8].try_into().unwrap());
+            let bits = u16::from_le_bytes([body[14], body[15]]);
+            assert_eq!(
+                (tag, ch, rate, bits),
+                (1, 1, 16_000, 16),
+                "need mono 16 kHz s16"
+            );
+        } else if id == b"data" {
+            return body
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
+                .collect();
+        }
+        pos += 8 + len + (len & 1);
+    }
+    panic!("no data chunk");
+}
+
+#[cfg(feature = "hexagon")]
+fn main() {
+    use std::sync::{Arc, Mutex};
+
+    use cera::backend::hexagon::{FastRpcDriver, probe_device};
+    use cera::model::audio_encoder_hexagon::HexagonAudioEncoder;
+    use cera::model::sortformer::SortformerModel;
+
+    let mut args = std::env::args().skip(1);
+    let model_path = args
+        .next()
+        .expect("usage: hexagon_sortformer_probe <sortformer.gguf> <clip.wav> [seconds]");
+    let wav_path = args.next().expect("a WAV path");
+    let wav = read_wav(&wav_path);
+    let seconds: f64 = args
+        .next()
+        .map_or(wav.len() as f64 / 16_000.0, |s| s.parse().expect("seconds"));
+    let n = (seconds * 16_000.0) as usize;
+    let pcm: Vec<f32> = (0..n).map(|i| wav[i % wav.len()]).collect();
+
+    // The checkpoint's default streaming step encodes up to 608 frames (speaker cache 188,
+    // FIFO 188, chunk 188 and its contexts); the low-latency preset needs about 390.
+    const MAX_FRAMES: usize = 608;
+    let model = SortformerModel::from_file(&model_path).expect("load Sortformer");
+    let (mel, n_frames) = model.log_mel(&pcm);
+    let (emb, t) = model.pre_encode(&mel, n_frames);
+    println!("clip {seconds:.1} s -> {n_frames} mel frames -> {t} encoder frames");
+    assert!(
+        t <= MAX_FRAMES,
+        "{t} frames exceed the NPU encoder's {MAX_FRAMES}"
+    );
+
+    // CPU reference: the FastConformer output after block 0 and after the last block, from
+    // the model's own `predict`, with the time the blocks took.
+    let n_layer = model.encoder_parts().layers.len();
+    let mut xscaled = Vec::new();
+    let mut first = Vec::new();
+    let mut last = Vec::new();
+    let mut stamps: Vec<(String, std::time::Instant)> = Vec::new();
+    let _ = model.predict_with_taps(&emb, t, &mut |name, v| {
+        stamps.push((name.to_string(), std::time::Instant::now()));
+        if name == "xscaled" {
+            xscaled = v.to_vec();
+        } else if name == "enc.layer0" {
+            first = v.to_vec();
+        } else if name == format!("enc.layer{}", n_layer - 1) {
+            last = v.to_vec();
+        }
+    });
+    let at = |name: &str| stamps.iter().find(|(n, _)| n == name).map(|(_, i)| *i);
+    if let (Some(a), Some(b)) = (at("xscaled"), at(&format!("enc.layer{}", n_layer - 1))) {
+        println!("CPU blocks: {:.0} ms wall", (b - a).as_secs_f64() * 1e3);
+    }
+
+    let driver = FastRpcDriver::load().expect("load the FastRPC driver");
+    let device = probe_device(&driver, None).expect("open a DSP session");
+    let device = Arc::new(Mutex::new(device));
+    device
+        .lock()
+        .unwrap()
+        .queue_session_mut()
+        .set_blocking_wait(true);
+    let enc = HexagonAudioEncoder::from_parts(
+        driver,
+        Arc::clone(&device),
+        &model.encoder_parts(),
+        MAX_FRAMES,
+        false,
+    )
+    .expect("stage the encoder");
+
+    let report = |name: &str, cpu: &[f32], npu: &[f32]| {
+        assert_eq!(cpu.len(), npu.len(), "{name}: length");
+        let (mut dot, mut a2, mut b2, mut max) = (0f64, 0f64, 0f64, 0f32);
+        for (c, n) in cpu.iter().zip(npu) {
+            dot += *c as f64 * *n as f64;
+            a2 += (*c as f64).powi(2);
+            b2 += (*n as f64).powi(2);
+            max = max.max((c - n).abs());
+        }
+        println!(
+            "{name:<28} cosine {:.6}  max |diff| {max:.4}  (rms cpu {:.3})",
+            dot / (a2.sqrt() * b2.sqrt()).max(1e-30),
+            (a2 / cpu.len() as f64).sqrt()
+        );
+    };
+
+    // Stem on the NPU against the CPU pre-encode.
+    match enc.stem_output(&mel, n_frames, 64) {
+        Ok(out) => report("conv stem output", &emb, &out),
+        Err(e) => println!("conv stem: NPU error: {e}"),
+    }
+    // Blocks from the CPU's own x-scaled input.
+    match enc.run_blocks(1, &xscaled, t) {
+        Ok(out) => report("block 0", &first, &out),
+        Err(e) => println!("block 0: NPU error: {e}"),
+    }
+    match enc.run_blocks(n_layer, &xscaled, t) {
+        Ok(out) => report(&format!("blocks 0..{n_layer}"), &last, &out),
+        Err(e) => println!("blocks: NPU error: {e}"),
+    }
+
+    // CPU seconds of this process: what the NPU path costs the CPU.
+    let cpu_split = || {
+        let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
+        // SAFETY: `getrusage` fills the struct; RUSAGE_SELF is valid.
+        let ru = unsafe {
+            libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr());
+            ru.assume_init()
+        };
+        let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
+        secs(ru.ru_utime) + secs(ru.ru_stime)
+    };
+    let reps = 5;
+    let measure = |name: &str, run: &mut dyn FnMut()| {
+        run();
+        let (c0, t0) = (cpu_split(), std::time::Instant::now());
+        for _ in 0..reps {
+            run();
+        }
+        let (wall, cpu) = (
+            t0.elapsed().as_secs_f64() / reps as f64,
+            (cpu_split() - c0) / reps as f64,
+        );
+        println!(
+            "{name:<26} wall {:6.0} ms ({:.3} per audio s)  cpu {:6.0} ms ({:.3} cpu-s per audio s)",
+            wall * 1e3,
+            wall / seconds,
+            cpu * 1e3,
+            cpu / seconds
+        );
+    };
+    measure("CPU pre-encode (stem)", &mut || {
+        drop(model.pre_encode(&mel, n_frames))
+    });
+    measure("NPU stem", &mut || {
+        drop(enc.stem_output(&mel, n_frames, 64).expect("NPU stem"))
+    });
+    measure("CPU predict (all)", &mut || drop(model.predict(&emb, t)));
+    measure("NPU blocks", &mut || {
+        drop(enc.run_blocks(n_layer, &xscaled, t).expect("NPU blocks"))
+    });
+}
+
+#[cfg(not(feature = "hexagon"))]
+fn main() {
+    eprintln!("build with --features hexagon");
+}

@@ -277,6 +277,27 @@ pub struct AudioEncoderWeights {
     pub mlp_adapter: AudioMlpAdapterWeights,
 }
 
+/// Borrowed view of the weights an accelerated encoder stages. A model that has no MLP
+/// adapter (the Sortformer diarizer ends at the encoder) passes `adapter: None`.
+pub struct EncoderParts<'a> {
+    pub config: &'a AudioEncoderConfig,
+    pub conv_stem: &'a ConvStemWeights,
+    pub layers: &'a [ConformerLayerWeights],
+    pub adapter: Option<&'a AudioMlpAdapterWeights>,
+}
+
+impl AudioEncoderWeights {
+    /// The parts an accelerated encoder stages, adapter included.
+    pub fn parts(&self) -> EncoderParts<'_> {
+        EncoderParts {
+            config: &self.config,
+            conv_stem: &self.conv_stem,
+            layers: &self.layers,
+            adapter: Some(&self.mlp_adapter),
+        }
+    }
+}
+
 impl AudioEncoderWeights {
     /// Load every encoder tensor from a multimodal_projector GGUF.
     /// Errors if any required tensor or metadata key is missing —

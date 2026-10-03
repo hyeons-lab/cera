@@ -49,9 +49,9 @@ use anyhow::{Context, Result, ensure};
 use crate::backend::cpu;
 use crate::gguf::GgufFile;
 use crate::model::audio_encoder::{
-    AudioEncoderConfig, ConformerLayerWeights, ConvStemWeights, HOP_LEN, LOG_MEL_EPS, N_FFT,
-    POS_EMB_DIM, PREEMPH, SAMPLE_RATE, WINDOW_LEN, conformer_block_forward, conv_stem_forward,
-    load_conformer_block, load_conv_layer, load_vec_f32, relative_pos_emb,
+    AudioEncoderConfig, ConformerLayerWeights, ConvStemWeights, EncoderParts, HOP_LEN, LOG_MEL_EPS,
+    N_FFT, POS_EMB_DIM, PREEMPH, SAMPLE_RATE, WINDOW_LEN, conformer_block_forward,
+    conv_stem_forward, load_conformer_block, load_conv_layer, load_vec_f32, relative_pos_emb,
 };
 use crate::model::audio_preprocessor::{MelFrameComputer, N_FFT_BINS, log_mel_with_tables};
 use crate::model::weights::MmapWeight;
@@ -837,6 +837,27 @@ impl SortformerModel {
     /// Architecture constants.
     pub fn config(&self) -> &SortformerConfig {
         &self.w.config
+    }
+
+    /// The FastConformer weights an accelerated encoder stages (stem and blocks; there is no
+    /// MLP adapter, the diarizer continues with `encoder_proj`).
+    pub fn encoder_parts(&self) -> EncoderParts<'_> {
+        EncoderParts {
+            config: &self.w.enc_cfg,
+            conv_stem: &self.w.conv_stem,
+            layers: &self.w.layers,
+            adapter: None,
+        }
+    }
+
+    /// The factor applied to the pre-encode embeddings before the first FastConformer block
+    /// (`sqrt(d_model)` when the checkpoint trains with NeMo's `xscaling`, else 1).
+    pub fn encoder_input_scale(&self) -> f32 {
+        if self.w.config.xscaling {
+            (self.w.config.n_embd as f64).sqrt() as f32
+        } else {
+            1.0
+        }
     }
 
     /// The checkpoint's streaming defaults.
