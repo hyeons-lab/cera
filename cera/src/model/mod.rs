@@ -78,6 +78,8 @@ pub mod sortformer_hexagon;
 pub mod vision_encoder_hexagon;
 #[cfg(feature = "hexagon")]
 pub mod whisper_hexagon;
+#[cfg(feature = "hexagon")]
+pub(crate) mod whisper_mel_hexagon;
 
 #[allow(
     clippy::too_many_arguments,

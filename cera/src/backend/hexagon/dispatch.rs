@@ -541,6 +541,50 @@ pub(crate) fn sigmoid<S: OpSink>(
     )
 }
 
+/// `Argmax` over one row of `vocab` F32 values at `in_offset`: the index of the largest, as an
+/// I32 at `out_offset`. Greedy sampling on the DSP reads 4 bytes instead of the whole row.
+pub(crate) fn argmax_row<S: OpSink>(
+    session: &mut S,
+    buf: &S::Buf,
+    in_offset: usize,
+    out_offset: usize,
+    vocab: usize,
+) -> Result<(), CeraError> {
+    let in_ti = session.add_tensor(
+        buf,
+        in_offset,
+        vocab * 4,
+        HTP_TENSOR_COMPUTE,
+        HtpDataType::F32 as u32,
+        [vocab as u32, 1, 1, 1],
+        [
+            4,
+            (vocab * 4) as u32,
+            (vocab * 4) as u32,
+            (vocab * 4) as u32,
+        ],
+    )?;
+    let out_ti = session.add_tensor(
+        buf,
+        out_offset,
+        4,
+        HTP_TENSOR_COMPUTE,
+        HtpDataType::I32 as u32,
+        [1, 1, 1, 1],
+        [4, 4, 4, 4],
+    )?;
+    session
+        .enqueue_op(
+            HtpOpCode::Argmax as u32,
+            &[in_ti],
+            &[out_ti],
+            [0i32; 16],
+            [0i32; 32],
+        )
+        .map_err(|e| op_err("argmax", e))?;
+    session.end_group().map_err(|e| op_err("argmax", e))
+}
+
 /// In-place ReLU: `buf = max(buf, 0)`.
 pub(crate) fn relu<S: OpSink>(
     session: &mut S,

@@ -641,6 +641,11 @@ pub struct HexagonWhisperScratchOffsets {
     pub dec_mlp_mid_off: usize,
     pub dec_mlp_out_off: usize,
     pub logits_off: usize,
+    /// `[n_vocab]` F32 added to the logits before the on-DSP argmax: `-1e30` for the tokens a
+    /// greedy step must not pick (see `decode_step_greedy`), 0 elsewhere.
+    pub greedy_mask_off: usize,
+    /// The on-DSP argmax result, one I32.
+    pub argmax_off: usize,
     /// Scratch the tanh GELU works through, `gelu_tmp_rows` rows of the widest
     /// MLP activation.
     pub gelu_tmp_off: usize,
@@ -703,6 +708,8 @@ impl HexagonWhisperScratchOffsets {
 
         // Decoder logits [n_vocab]
         let logits_off = plan_vec_f32(&mut cur_off, cfg.n_vocab);
+        let greedy_mask_off = plan_vec_f32(&mut cur_off, cfg.n_vocab);
+        let argmax_off = plan_vec_f32(&mut cur_off, 1);
 
         // The tanh GELU's intermediate: a few rows of the widest activation.
         let gelu_tmp_rows = dispatch::GELU_TMP_ROWS;
@@ -732,11 +739,40 @@ impl HexagonWhisperScratchOffsets {
             dec_mlp_mid_off,
             dec_mlp_out_off,
             logits_off,
+            greedy_mask_off,
+            argmax_off,
             gelu_tmp_off,
             gelu_tmp_rows,
             total_bytes: cur_off,
         }
     }
+}
+
+/// The logit added to a token a greedy step must not pick (finite, so the DSP never sees an
+/// infinity; far below any real logit).
+const GREEDY_SUPPRESSED: f32 = -1e30;
+
+/// The additive logit mask of a greedy step: `GREEDY_SUPPRESSED` for the tokens the host's
+/// `suppress_whisper_special_tokens` sets to `-inf`, 0 for the rest.
+fn greedy_mask(t: &WhisperSpecialTokens, n_vocab: usize, timestamps: bool) -> Vec<f32> {
+    let mut mask = vec![0.0f32; n_vocab];
+    for tok in t.sot.min(t.no_timestamps)..=t.sot.max(t.no_timestamps) {
+        if tok != t.eot && (tok as usize) < n_vocab {
+            mask[tok as usize] = GREEDY_SUPPRESSED;
+        }
+    }
+    if !timestamps && (t.timestamp_begin as usize) < n_vocab {
+        mask[t.timestamp_begin as usize..].fill(GREEDY_SUPPRESSED);
+    }
+    mask
+}
+
+/// What a decoder step hands back.
+enum StepOut<'a> {
+    /// The full logits row, copied to the caller's buffer.
+    Logits(&'a mut [f32]),
+    /// The next token, picked on the DSP.
+    Greedy { timestamps: bool },
 }
 
 /// Native Qualcomm Hexagon NPU Whisper speech recognition model.
@@ -753,6 +789,10 @@ pub struct HexagonWhisperModel {
     token_embeddings: MmapWeight,
     positional_embedding: Vec<f32>,
     session_lock: Mutex<()>,
+    /// The `timestamps` setting the greedy suppression mask in scratch was staged for.
+    greedy_mask_for: Mutex<Option<bool>>,
+    /// The log-mel front end on the DSP; `None` runs it on the host.
+    mel: Option<crate::model::whisper_mel_hexagon::WhisperMelDsp>,
     /// True once `encode_audio` has fully rewritten `state_buf`.
     encoded_ok: AtomicBool,
 }
@@ -761,11 +801,15 @@ impl Drop for HexagonWhisperModel {
     /// Let the DSP let go of every buffer before the host unmaps them.
     fn drop(&mut self) {
         let mut device = self.device.lock_or_recover();
-        device.queue_session_mut().release_dsp_references([
-            &self.weights_buf,
-            &*self.state_buf.lock_or_recover(),
-            &*self.scratch_buf.lock_or_recover(),
-        ]);
+        let state = self.state_buf.lock_or_recover();
+        let scratch = self.scratch_buf.lock_or_recover();
+        let mel = self.mel.as_ref().map(|m| m.buffers());
+        let mut held = vec![&self.weights_buf, &*state, &*scratch];
+        if let Some((weights, mel_scratch)) = &mel {
+            held.push(weights);
+            held.push(mel_scratch);
+        }
+        device.queue_session_mut().release_dsp_references(held);
     }
 }
 
@@ -811,6 +855,17 @@ impl HexagonWhisperModel {
             RpcmemBuffer::alloc(Arc::clone(&driver), scratch_offsets.total_bytes, true)?;
 
         let special_tokens = WhisperSpecialTokens::from_tokenizer(tokenizer);
+        // The 80- and 128-bin windows are the ones the host front end supports too.
+        let mel = if matches!(weights.config.n_audio_mel_bins, 80 | 128) {
+            crate::model::whisper_mel_hexagon::WhisperMelDsp::new(
+                Arc::clone(&driver),
+                weights.config.n_audio_mel_bins,
+            )
+            .inspect_err(|e| tracing::warn!("whisper: log-mel stays on the host ({e})"))
+            .ok()
+        } else {
+            None
+        };
         device
             .lock_or_recover()
             .queue_session_mut()
@@ -829,6 +884,8 @@ impl HexagonWhisperModel {
             token_embeddings: weights.decoder.token_embeddings.clone(),
             positional_embedding: weights.decoder.positional_embedding.clone(),
             session_lock: Mutex::new(()),
+            greedy_mask_for: Mutex::new(None),
+            mel,
             encoded_ok: AtomicBool::new(false),
         })
     }
@@ -1776,6 +1833,31 @@ impl HexagonWhisperModel {
         pos: usize,
         logits_out: &mut [f32],
     ) -> Result<(), CeraError> {
+        self.decode_step_impl(token_id, pos, StepOut::Logits(logits_out))
+            .map(|_| ())
+    }
+
+    /// [`Self::decode_step`] that picks the next token on the DSP: the control tokens (and the
+    /// timestamp tokens unless `timestamps`) are masked out of the logits and an `Argmax` runs
+    /// over them, so the host reads 4 bytes instead of the whole 207 KB row and never scans it.
+    /// The same token as suppressing and taking the argmax on the host (greedy decoding,
+    /// temperature 0).
+    pub fn decode_step_greedy(
+        &self,
+        token_id: u32,
+        pos: usize,
+        timestamps: bool,
+    ) -> Result<u32, CeraError> {
+        self.decode_step_impl(token_id, pos, StepOut::Greedy { timestamps })?
+            .ok_or_else(|| CeraError::Backend("greedy step returned no token".into()))
+    }
+
+    fn decode_step_impl(
+        &self,
+        token_id: u32,
+        pos: usize,
+        mut out: StepOut<'_>,
+    ) -> Result<Option<u32>, CeraError> {
         if token_id as usize >= self.config.n_vocab {
             return Err(CeraError::Backend(format!(
                 "token_id {token_id} out of bounds for vocab size {}",
@@ -1788,7 +1870,9 @@ impl HexagonWhisperModel {
                 self.config.n_text_ctx
             )));
         }
-        if logits_out.len() < self.config.n_vocab {
+        if let StepOut::Logits(logits_out) = &out
+            && logits_out.len() < self.config.n_vocab
+        {
             return Err(CeraError::Backend(format!(
                 "logits_out buffer length {} smaller than vocab size {}",
                 logits_out.len(),
@@ -1817,6 +1901,9 @@ impl HexagonWhisperModel {
             ));
         };
 
+        if let StepOut::Greedy { timestamps } = &out {
+            self.stage_greedy_mask(&mut scratch, *timestamps);
+        }
         // 1. Stage input embedding + positional embedding into scratch.dec_x_off
         let scratch_slice = scratch.as_mut_slice();
         let dec_x_off = self.scratch_offsets.dec_x_off;
@@ -2161,19 +2248,103 @@ impl HexagonWhisperModel {
             WHISPER_TILE,
         )?;
 
+        if let StepOut::Greedy { .. } = &out {
+            // Mask the tokens a greedy step must not pick, then argmax the row on the DSP.
+            dispatch::add_residual(
+                session,
+                &scratch,
+                logits_off,
+                &scratch,
+                self.scratch_offsets.greedy_mask_off,
+                TokenShape {
+                    dim: self.config.n_vocab,
+                    n_tokens: 1,
+                },
+                WHISPER_TILE,
+            )?;
+            dispatch::argmax_row(
+                session,
+                &scratch,
+                logits_off,
+                self.scratch_offsets.argmax_off,
+                self.config.n_vocab,
+            )?;
+        }
+
         // Submit DSP queue and wait
         session.flush()?;
 
-        // 6. Invalidate CPU cache and copy logits out
-        let vocab_bytes = self.config.n_vocab * 4;
-        scratch.invalidate_cpu_cache(logits_off, vocab_bytes);
+        match &mut out {
+            StepOut::Logits(logits_out) => {
+                // 6. Invalidate CPU cache and copy logits out
+                let vocab_bytes = self.config.n_vocab * 4;
+                scratch.invalidate_cpu_cache(logits_off, vocab_bytes);
 
-        let scratch_slice = scratch.as_slice();
-        let logits_slice: &[f32] =
-            bytemuck::cast_slice(&scratch_slice[logits_off..logits_off + vocab_bytes]);
-        logits_out[..self.config.n_vocab].copy_from_slice(logits_slice);
+                let scratch_slice = scratch.as_slice();
+                let logits_slice: &[f32] =
+                    bytemuck::cast_slice(&scratch_slice[logits_off..logits_off + vocab_bytes]);
+                logits_out[..self.config.n_vocab].copy_from_slice(logits_slice);
+                Ok(None)
+            }
+            StepOut::Greedy { .. } => {
+                let at = self.scratch_offsets.argmax_off;
+                scratch.invalidate_cpu_cache(at, 4);
+                let token = i32::from_le_bytes(
+                    scratch.as_slice()[at..at + 4]
+                        .try_into()
+                        .expect("four bytes"),
+                );
+                u32::try_from(token)
+                    .ok()
+                    .filter(|&t| (t as usize) < self.config.n_vocab)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        CeraError::Backend(format!("the DSP argmax returned token {token}"))
+                    })
+            }
+        }
+    }
 
-        Ok(())
+    /// Stage the greedy suppression mask for `timestamps` unless it already is: `-1e30` for the
+    /// control tokens between `sot` and `no_timestamps` (except `eot`) and, without timestamps,
+    /// for every token from `timestamp_begin` on; the host's `suppress_whisper_special_tokens`.
+    fn stage_greedy_mask(&self, scratch: &mut RpcmemBuffer, timestamps: bool) {
+        let mut staged = self.greedy_mask_for.lock_or_recover();
+        if *staged == Some(timestamps) {
+            return;
+        }
+        let n = self.config.n_vocab;
+        let mask = greedy_mask(&self.special_tokens, n, timestamps);
+        let at = self.scratch_offsets.greedy_mask_off;
+        scratch.as_mut_slice()[at..at + n * 4].copy_from_slice(bytemuck::cast_slice(&mask));
+        scratch.flush_cpu_cache(at, n * 4);
+        *staged = Some(timestamps);
+    }
+
+    /// Whisper's log-mel for `pcm`: the DFT and the filterbank on the DSP when they are staged,
+    /// the host's FFT otherwise (and if the DSP call fails, with a warning).
+    #[doc(hidden)]
+    pub fn log_mel(&self, pcm: &[f32]) -> Vec<f32> {
+        use crate::model::whisper_preprocessor::{
+            active_frames, extract_whisper_mel, finish_whisper_mel, padded_whisper_audio_upto,
+            samples_for_frames,
+        };
+        let n_mels = self.config.n_audio_mel_bins;
+        if let Some(dsp) = &self.mel {
+            let n_active = active_frames(pcm.len());
+            let padded = padded_whisper_audio_upto(pcm, samples_for_frames(n_active));
+            let energies = {
+                let mut device = self.device.lock_or_recover();
+                dsp.energies(device.queue_session_mut(), &padded, n_active)
+            };
+            match energies {
+                Ok(e) => return finish_whisper_mel(&e, n_mels, n_active),
+                Err(e) => {
+                    tracing::warn!("whisper: log-mel failed on the DSP ({e}); using the host")
+                }
+            }
+        }
+        extract_whisper_mel(pcm, n_mels)
     }
 
     /// Transcribe PCM audio samples completely on Qualcomm Hexagon NPU.
@@ -2198,10 +2369,7 @@ impl HexagonWhisperModel {
         }
 
         // 1. Audio preprocessor: PCM -> log-mel spectrogram [n_mels x 3000]
-        let mel = crate::model::whisper_preprocessor::extract_whisper_mel(
-            pcm,
-            self.config.n_audio_mel_bins,
-        );
+        let mel = self.log_mel(pcm);
 
         if opts
             .cancel
@@ -2324,6 +2492,9 @@ impl HexagonWhisperModel {
             ..Default::default()
         });
 
+        // Temperature 0 is greedy decoding: the argmax is taken on the DSP.
+        let greedy = !opts.temperature.is_finite() || opts.temperature <= 0.0;
+
         for pos in start_pos..max_pos {
             if opts
                 .cancel
@@ -2333,16 +2504,20 @@ impl HexagonWhisperModel {
                 return Err(CeraError::Cancelled);
             }
 
-            self.decode_step(current_token, pos, &mut logits)?;
+            let next_token = if greedy {
+                self.decode_step_greedy(current_token, pos, opts.timestamps)?
+            } else {
+                self.decode_step(current_token, pos, &mut logits)?;
 
-            // Suppress special control tokens during autoregressive generation
-            crate::model::whisper::suppress_whisper_special_tokens(
-                &mut logits,
-                &self.special_tokens,
-                opts.timestamps,
-            );
+                // Suppress special control tokens during autoregressive generation
+                crate::model::whisper::suppress_whisper_special_tokens(
+                    &mut logits,
+                    &self.special_tokens,
+                    opts.timestamps,
+                );
 
-            let next_token = sampler.sample(&mut logits);
+                sampler.sample(&mut logits)
+            };
             if next_token == self.special_tokens.eot {
                 break;
             }
@@ -2747,6 +2922,37 @@ mod tests {
         let mut staged_bytes = vec![0u8; offsets.total_bytes];
         stage_whisper_weights(&weights, &offsets, &mut staged_bytes).unwrap();
         assert!(staged_bytes.iter().any(|&b| b != 0));
+    }
+
+    /// The greedy mask suppresses exactly the tokens the host's `suppress_whisper_special_tokens`
+    /// does, with and without timestamps, and leaves `eot` alone.
+    #[test]
+    fn the_greedy_mask_matches_the_host_suppression() {
+        let t = WhisperSpecialTokens {
+            sot: 10,
+            eot: 9,
+            transcribe: 12,
+            translate: 11,
+            no_timestamps: 14,
+            sot_prev: 13,
+            sot_lm: 15,
+            no_speech: 16,
+            timestamp_begin: 17,
+        };
+        for timestamps in [false, true] {
+            let mut host = vec![0.0f32; 40];
+            crate::model::whisper::suppress_whisper_special_tokens(&mut host, &t, timestamps);
+            let mask = greedy_mask(&t, 40, timestamps);
+            for (i, (&h, &m)) in host.iter().zip(&mask).enumerate() {
+                assert_eq!(
+                    h == f32::NEG_INFINITY,
+                    m == GREEDY_SUPPRESSED,
+                    "token {i}, timestamps {timestamps}"
+                );
+                assert!(m == 0.0 || m == GREEDY_SUPPRESSED);
+            }
+            assert_eq!(mask[t.eot as usize], 0.0, "eot stays selectable");
+        }
     }
 
     /// A K-quant weight (what `cera transcribe` converts to by default) is reported with the way

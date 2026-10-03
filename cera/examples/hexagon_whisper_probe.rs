@@ -67,13 +67,29 @@ fn main() {
         let (u1, s1) = cpu_seconds();
         let per = |d: f64| d / reps as f64 * 1e3;
         println!(
-            "{name:<22} wall {:6.0} ms  cpu {:6.0} ms (user {:6.0}, sys {:6.0})",
+            "{name:<26} wall {:7.2} ms  cpu {:7.2} ms (user {:7.2}, sys {:7.2})",
             per(t0.elapsed().as_secs_f64()),
             per(u1 - u0 + s1 - s0),
             per(u1 - u0),
             per(s1 - s0)
         );
     };
+    let text = model
+        .transcribe(&tokenizer, pcm, &opts)
+        .expect("transcribe");
+    println!("text ({} tokens): {text}", tokenizer.encode(&text).len());
+    measure("token_to_id", &mut || {
+        let _ = tokenizer.token_to_id("<|transcribe|>");
+    });
+    measure("assemble prompt", &mut || {
+        drop(cera::model::whisper::assemble_whisper_prompt(
+            &model.special_tokens,
+            Some(&tokenizer),
+            Some("en"),
+            false,
+            false,
+        ))
+    });
     measure("log-mel (host)", &mut || {
         drop(extract_whisper_mel(pcm, n_mel))
     });
@@ -83,6 +99,17 @@ fn main() {
         use cera::model::whisper_hexagon::init_hexagon_whisper;
         let hex = init_hexagon_whisper(&model.weights, &tokenizer).expect("stage the NPU model");
         let mel = extract_whisper_mel(pcm, n_mel);
+        let npu_mel = hex.log_mel(pcm);
+        let worst = mel
+            .iter()
+            .zip(&npu_mel)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        println!(
+            "log-mel on the NPU vs the host: max |diff| {worst:.5} over {} values",
+            mel.len()
+        );
+        measure("log-mel (NPU)", &mut || drop(hex.log_mel(pcm)));
         measure("encoder window (NPU)", &mut || {
             hex.encode_audio(&mel).expect("encode")
         });
@@ -92,6 +119,61 @@ fn main() {
         measure("one decoder step (NPU)", &mut || {
             hex.decode_step(sot, pos % 8, &mut logits).expect("decode");
             pos += 1;
+        });
+        // The host work around a decoder step: suppressing control tokens and the argmax.
+        let special = model.special_tokens.clone();
+        let mut sampler = cera::sampler::Sampler::new(cera::sampler::SamplerConfig {
+            temperature: 0.0,
+            top_p: 1.0,
+            top_k: 0,
+            ..Default::default()
+        });
+        measure("suppress + sample", &mut || {
+            cera::model::whisper::suppress_whisper_special_tokens(&mut logits, &special, false);
+            let _ = sampler.sample(&mut logits);
+        });
+        // The greedy step against the host's suppress + argmax, over a real decode.
+        hex.encode_audio(&mel).expect("encode");
+        let prompt = cera::model::whisper::assemble_whisper_prompt(
+            &special,
+            Some(&tokenizer),
+            Some("en"),
+            false,
+            false,
+        );
+        for (p, &tok) in prompt.iter().enumerate().take(prompt.len() - 1) {
+            hex.decode_step(tok, p, &mut logits).expect("prefill");
+        }
+        let (mut cur, mut steps, mut mismatches) = (*prompt.last().unwrap(), 0, 0);
+        for pos in prompt.len() - 1..prompt.len() + 40 {
+            hex.decode_step(cur, pos, &mut logits).expect("decode");
+            cera::model::whisper::suppress_whisper_special_tokens(&mut logits, &special, false);
+            let host = cera::sampler::Sampler::new(cera::sampler::SamplerConfig {
+                temperature: 0.0,
+                top_p: 1.0,
+                top_k: 0,
+                ..Default::default()
+            })
+            .sample(&mut logits);
+            let dsp = hex.decode_step_greedy(cur, pos, false).expect("greedy");
+            steps += 1;
+            mismatches += usize::from(host != dsp);
+            if host == special.eot {
+                break;
+            }
+            cur = host;
+        }
+        println!("greedy on the DSP vs the host: {mismatches} of {steps} tokens differ");
+        let mut gpos = 0usize;
+        measure("one greedy step (NPU)", &mut || {
+            let _ = hex
+                .decode_step_greedy(sot, gpos % 8, false)
+                .expect("greedy");
+            gpos += 1;
+        });
+        let tokens: Vec<u32> = (1000..1020).collect();
+        measure("tokenizer.decode(20)", &mut || {
+            drop(tokenizer.decode(&tokens))
         });
     }
     measure("whole transcribe", &mut || {
