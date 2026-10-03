@@ -799,7 +799,8 @@ pub struct HexagonSortformer {
 
 impl HexagonSortformer {
     /// Stage the model on the device for steps of up to `max_frames` encoder frames (use
-    /// [`StreamingParams::window_frames`]). Needs the Q8_0-tail GGUF, see the module docs.
+    /// [`window_frames`](crate::model::sortformer::StreamingParams::window_frames)). Needs the
+    /// Q8_0-tail GGUF, see the module docs.
     pub fn new(
         driver: Arc<FastRpcDriver>,
         device: Arc<Mutex<HexagonDevice>>,
