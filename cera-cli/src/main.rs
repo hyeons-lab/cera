@@ -2229,11 +2229,30 @@ enum AsrResolvedModel {
     Liquid(Box<CeraEngine>),
 }
 
-fn whisper_catalog_cached_path(
+/// Whether cera's Whisper loader can read `path`: the GGUF must declare the hyperparameters in
+/// the layout `cera convert` writes. The community GGUFs named in the catalog
+/// (`handy-computer/whisper-*-gguf`) use a different layout (`stt.whisper.*` keys,
+/// `enc.blocks.N` tensors), so a file in the cache can be a real Whisper model that this loader
+/// still cannot open.
+fn whisper_gguf_is_loadable(path: &Path) -> bool {
+    cera::gguf::GgufFile::open(path).ok().is_some_and(|g| {
+        // A conversion from before rows were checked for whole blocks has a valid config but
+        // matrices the kernels cannot read; treat it as absent so it is converted again.
+        cera::model::whisper::WhisperConfig::from_gguf(&g).is_ok()
+            && g.tensors.values().all(|t| {
+                t.shape
+                    .first()
+                    .is_none_or(|&c| c.is_multiple_of(t.dtype.block_size()))
+            })
+    })
+}
+
+/// Where a cached GGUF for `entry` can be, best first.
+fn whisper_catalog_candidates(
     cache_dir: &Path,
     entry: &cera::WhisperModelCatalogEntry,
-) -> Option<PathBuf> {
-    let candidates = [
+) -> [PathBuf; 5] {
+    [
         cache_dir.join(entry.gguf_filename),
         cache_dir.join("whisper").join(entry.gguf_filename),
         cache_dir
@@ -2252,8 +2271,28 @@ fn whisper_catalog_cached_path(
             .join("quantized")
             .join("Q4_K_M")
             .join("model.gguf"),
-    ];
-    candidates.into_iter().find(|p| p.exists())
+    ]
+}
+
+fn whisper_catalog_cached_path(
+    cache_dir: &Path,
+    entry: &cera::WhisperModelCatalogEntry,
+) -> Option<PathBuf> {
+    whisper_catalog_candidates(cache_dir, entry)
+        .into_iter()
+        .find(|p| p.exists() && whisper_gguf_is_loadable(p))
+}
+
+/// The first cached file for `entry` that exists but cera cannot load (another tensor layout,
+/// or rows from before they were checked for whole blocks), for the note `resolve_asr_model`
+/// prints when it falls back to converting.
+fn whisper_catalog_unloadable_path(
+    cache_dir: &Path,
+    entry: &cera::WhisperModelCatalogEntry,
+) -> Option<PathBuf> {
+    whisper_catalog_candidates(cache_dir, entry)
+        .into_iter()
+        .find(|p| p.exists() && !whisper_gguf_is_loadable(p))
 }
 
 fn print_asr_catalog(cache_dir: &Path) {
@@ -2341,41 +2380,40 @@ fn resolve_asr_model(
         return Ok(AsrResolvedModel::Liquid(Box::new(engine)));
     }
 
-    // Check Whisper catalog by alias or repo
-    if let Some(entry) = cera::find_whisper_catalog_entry(model_str) {
-        if let Some(cached) = whisper_catalog_cached_path(cache_dir, entry) {
-            return Ok(AsrResolvedModel::Whisper(cached, None));
-        }
-
-        // If user explicitly specified openai/whisper-*, fall through to streaming conversion
-        if !model_str.starts_with("openai/whisper") {
-            // Cache miss: download from community GGUF repository
-            let url = format!(
-                "https://huggingface.co/{}/resolve/main/{}",
-                entry.gguf_repo, entry.gguf_filename
-            );
-            eprintln!(
-                "Downloading Whisper model `{}` ({} {}) into `{}`...",
-                entry.alias,
-                entry.parameters,
-                entry.disk_size,
-                cache_dir.display()
-            );
-            let downloaded = repo
-                .resolve_url(&url, None)
-                .with_context(|| format!("failed to download Whisper model `{url}`"))?;
-            progress.finish_line();
-            return Ok(AsrResolvedModel::Whisper(downloaded, None));
-        }
+    // Whisper by catalog alias or repo id, or any official `openai/whisper-*` repo. A usable
+    // cached GGUF is reused; otherwise the official SafeTensors are streamed from Hugging Face
+    // and converted, which always yields a layout the loader reads. (The catalog's community
+    // GGUFs are not used: see `whisper_gguf_is_loadable`.)
+    // An existing `.gguf` path wins over a catalog spelling that happens to match it.
+    let is_local_gguf = Path::new(model_str).is_file()
+        && Path::new(model_str)
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"));
+    let whisper_entry = if is_local_gguf {
+        None
+    } else {
+        cera::find_whisper_catalog_entry(model_str)
+    };
+    if let Some(entry) = whisper_entry
+        && let Some(cached) = whisper_catalog_cached_path(cache_dir, entry)
+    {
+        return Ok(AsrResolvedModel::Whisper(cached, None));
     }
-
-    // Check if user requested streaming official OpenAI SafeTensors
-    if model_str.starts_with("openai/whisper") {
+    if whisper_entry.is_some() || (!is_local_gguf && model_str.starts_with("openai/whisper")) {
+        let hf_repo = whisper_entry.map_or(model_str, |e| e.hf_repo);
+        if let Some(skipped) =
+            whisper_entry.and_then(|e| whisper_catalog_unloadable_path(cache_dir, e))
+        {
+            eprintln!(
+                "note: cached `{}` is not in a layout cera can load; converting `{hf_repo}` instead",
+                skipped.display()
+            );
+        }
         eprintln!(
-            "Streaming official OpenAI SafeTensors `{model_str}` and quantizing to GGUF in `{}`...",
+            "Streaming official OpenAI SafeTensors `{hf_repo}` and quantizing to GGUF in `{}`...",
             cache_dir.display()
         );
-        let spec = cera::bundle::HfSpec::parse(model_str)?;
+        let spec = cera::bundle::HfSpec::parse(hf_repo)?;
         let manifest = cera::convert::stream_quantize_hf_repo(
             &spec,
             cera::convert::QuantizeOptions {
@@ -5367,16 +5405,115 @@ fn main() -> Result<()> {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
 
     use super::{
         BundleQuantPair, Cli, CliSamplingArgs, Command, convert_history_to_chat_messages,
         display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono, resample_linear,
         resolve_engine, simulate_truncate_oldest_turn_pairs, split_at_marker,
-        truncate_oldest_turn_pair, write_transcript, write_wav,
+        truncate_oldest_turn_pair, whisper_catalog_cached_path, whisper_catalog_unloadable_path,
+        whisper_gguf_is_loadable, write_transcript, write_wav,
     };
     use cera::tokenizer::ChatMessage;
     use clap::Parser;
+
+    /// Write a metadata-only GGUF with the given string and u32 keys.
+    fn write_whisper_fixture(path: &Path, strings: &[(&str, &str)], u32s: &[(&str, u32)]) {
+        let mut w = cera::convert::writer::GgufWriter::new();
+        for (k, v) in strings {
+            w.add_string(*k, *v);
+        }
+        for (k, v) in u32s {
+            w.add_u32(*k, *v);
+        }
+        let mut bytes = Vec::new();
+        w.write_header_and_tensor_info(&mut bytes).unwrap();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, bytes).unwrap();
+    }
+
+    #[test]
+    fn a_cached_whisper_gguf_is_used_only_if_cera_can_load_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let entry = cera::find_whisper_catalog_entry("tiny").unwrap();
+        let community = dir
+            .path()
+            .join("huggingface.co")
+            .join(entry.gguf_repo)
+            .join("resolve/main")
+            .join(entry.gguf_filename);
+        // The community GGUF is a real Whisper model in another layout (`stt.whisper.*`
+        // keys): present in the cache, but cera's loader cannot read it.
+        write_whisper_fixture(
+            &community,
+            &[("general.architecture", "whisper")],
+            &[("stt.whisper.encoder.n_layers", 4)],
+        );
+        assert!(!whisper_gguf_is_loadable(&community));
+        assert_eq!(whisper_catalog_cached_path(dir.path(), entry), None);
+        // It is what the resolver names in its "converting instead" note.
+        assert_eq!(
+            whisper_catalog_unloadable_path(dir.path(), entry),
+            Some(community.clone())
+        );
+
+        // A GGUF `cera convert` wrote is used, even with the community file also present.
+        let converted = dir
+            .path()
+            .join("huggingface.co")
+            .join(entry.hf_repo)
+            .join("quantized/Q4_K_M/model.gguf");
+        write_whisper_fixture(
+            &converted,
+            &[("general.architecture", "whisper")],
+            &[
+                ("whisper.audio.block_count", 4),
+                ("whisper.audio.embedding_length", 384),
+                ("whisper.audio.attention.head_count", 6),
+                ("whisper.text.block_count", 4),
+                ("whisper.text.attention.head_count", 6),
+                ("whisper.vocab_size", 51865),
+            ],
+        );
+        assert!(whisper_gguf_is_loadable(&converted));
+        assert_eq!(
+            whisper_catalog_cached_path(dir.path(), entry),
+            Some(converted)
+        );
+        // A conversion from before rows were checked has a valid config but a matrix whose
+        // rows end mid-block: not loadable, so the caller converts it again.
+        let stale = dir.path().join("stale.gguf");
+        let mut w = cera::convert::writer::GgufWriter::new();
+        w.add_string("general.architecture", "whisper");
+        for (k, v) in [
+            ("whisper.audio.block_count", 4),
+            ("whisper.audio.embedding_length", 384),
+            ("whisper.audio.attention.head_count", 6),
+            ("whisper.text.block_count", 4),
+            ("whisper.text.attention.head_count", 6),
+            ("whisper.vocab_size", 51865),
+        ] {
+            w.add_u32(k, v);
+        }
+        w.add_tensor(
+            "encoder.blocks.0.attn.query.weight",
+            vec![384, 4],
+            cera::convert::writer::GGML_TYPE_Q4_K,
+            6 * 144,
+        );
+        let mut bytes = Vec::new();
+        w.write_header_and_tensor_info(&mut bytes).unwrap();
+        w.write_tensor_data(&mut bytes, &vec![0u8; 6 * 144])
+            .unwrap();
+        std::fs::write(&stale, bytes).unwrap();
+        assert!(!whisper_gguf_is_loadable(&stale));
+        // A file that is not a GGUF at all is not loadable either.
+        let junk = dir.path().join("junk.gguf");
+        std::fs::write(&junk, b"not a gguf").unwrap();
+        assert!(!whisper_gguf_is_loadable(&junk));
+        assert!(!whisper_gguf_is_loadable(&dir.path().join("missing.gguf")));
+    }
 
     fn msg(role: &str, content: &str) -> ChatMessage {
         ChatMessage {

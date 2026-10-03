@@ -30,7 +30,9 @@ impl ConversionRequest {
         Self {
             // 3: the LFM2 layout and the F16 tensor types changed; this rebuilds every
             // cached conversion once, whatever its architecture
-            version: 3,
+            // 4: block quantization types need whole blocks per row, so conversions with
+            // rows that end mid-block (Whisper tiny/base) are rebuilt
+            version: 4,
             owner: spec.owner.clone(),
             repo: spec.repo.clone(),
             revision: spec.revision.clone(),

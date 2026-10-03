@@ -408,6 +408,7 @@ pub fn resolve_weight(gguf: &GgufFile, name: &str) -> Result<WeightRef> {
     } else {
         1
     };
+    GgufFile::ensure_whole_blocks(name, dtype, k)?;
 
     Ok(WeightRef::new(start, size, dtype, m, k))
 }
@@ -2675,6 +2676,43 @@ pub(crate) fn forward_ffn_block(
 
 #[cfg(all(test, target_arch = "aarch64", not(has_blas), feature = "parallel"))]
 mod tests {
+    fn gguf_with_one_quantized_tensor(dims: Vec<u64>, nbytes: usize) -> GgufFile {
+        use crate::convert::writer::{GGML_TYPE_Q4_K, GgufWriter};
+        let mut w = GgufWriter::new();
+        w.add_string("general.architecture", "row-alignment-fixture");
+        w.add_tensor("x.weight", dims, GGML_TYPE_Q4_K, nbytes);
+        let mut bytes = Vec::new();
+        w.write_header_and_tensor_info(&mut bytes).unwrap();
+        w.write_tensor_data(&mut bytes, &vec![0u8; nbytes]).unwrap();
+        GgufFile::from_bytes(bytes.into()).unwrap()
+    }
+
+    /// Rows of 384 are 1.5 Q4_K blocks: an older converter wrote these when it checked only
+    /// the element count, and the GEMM kernels then panic. The refusal names the tensor.
+    #[test]
+    fn a_matrix_with_rows_that_end_mid_block_is_refused_at_resolve() {
+        let g = gguf_with_one_quantized_tensor(vec![384, 4], 6 * 144);
+        let err = format!("{:#}", resolve_weight(&g, "x.weight").unwrap_err());
+        assert!(
+            err.contains("x.weight") && err.contains("convert it again"),
+            "{err}"
+        );
+        let g = gguf_with_one_quantized_tensor(vec![384, 4, 2], 12 * 144);
+        let err = format!(
+            "{:#}",
+            resolve_expert_weight(&g, "x.weight", 0).unwrap_err()
+        );
+        assert!(
+            err.contains("x.weight") && err.contains("convert it again"),
+            "{err}"
+        );
+        // Whole blocks per row resolve.
+        let g = gguf_with_one_quantized_tensor(vec![512, 4], 8 * 144);
+        assert!(resolve_weight(&g, "x.weight").is_ok());
+        let g = gguf_with_one_quantized_tensor(vec![512, 4, 2], 16 * 144);
+        assert!(resolve_expert_weight(&g, "x.weight", 1).is_ok());
+    }
+
     use super::*;
 
     /// `gemm_out_to_rows` must invert the GEMM's column-major layout, so output

@@ -837,13 +837,13 @@ impl WhisperWeights {
 
         // Output projection: untied decoder.proj.weight or output.weight,
         // falling back to token_embeddings when tied.
-        let proj_w = if let Ok(w) = find_mmap_weight(
+        let proj_w = if let Some(w) = find_mmap_weight_opt(
             gguf,
             &["decoder", "model.decoder", "whisper.decoder", "output"],
             "proj.weight",
-        ) {
+        )? {
             w
-        } else if let Ok(w) = MmapWeight::from_gguf(gguf, "output.weight") {
+        } else if let Some(w) = find_mmap_weight_opt(gguf, &[""], "output.weight")? {
             w
         } else {
             token_embeddings.clone()
@@ -1657,13 +1657,17 @@ pub struct WhisperModelCatalogEntry {
     pub alias: &'static str,
     /// Official OpenAI SafeTensors repository ID on Hugging Face.
     pub hf_repo: &'static str,
-    /// Community GGUF repository ID on Hugging Face.
+    /// Community GGUF repository ID on Hugging Face. Used to recognise the alias and to find a
+    /// file already placed in the cache; `cera transcribe` does not download from it, because
+    /// those files use another tensor layout than this loader reads.
     pub gguf_repo: &'static str,
-    /// Filename in the community GGUF repository.
+    /// Filename in the community GGUF repository (see `gguf_repo`).
     pub gguf_filename: &'static str,
     /// Model parameter count (e.g. "39M", "74M", "244M", "769M", "809M", "1550M").
     pub parameters: &'static str,
-    /// Approximate disk size for Q5_K_M quant.
+    /// Approximate size of the Q5_K_M community GGUF. The Q4_K_M file `cera transcribe`
+    /// converts from `hf_repo` is somewhat smaller; the download is the full-precision
+    /// SafeTensors, which is larger than either.
     pub disk_size: &'static str,
     /// Language capabilities ("multilingual" or "en-only").
     pub languages: &'static str,
@@ -2354,6 +2358,20 @@ fn find_tensor_meta(
 }
 
 fn find_mmap_weight(gguf: &Arc<GgufFile>, prefixes: &[&str], suffix: &str) -> Result<MmapWeight> {
+    match find_mmap_weight_opt(gguf, prefixes, suffix)? {
+        Some(w) => Ok(w),
+        None => bail!("could not find weight for suffix `{suffix}` with prefixes {prefixes:?}"),
+    }
+}
+
+/// Like [`find_mmap_weight`] but an absent tensor is `Ok(None)`. A tensor that is
+/// present and cannot be loaded (for example rows that are not whole quantization
+/// blocks) is an error: it must not read as "missing" and fall back to another weight.
+fn find_mmap_weight_opt(
+    gguf: &Arc<GgufFile>,
+    prefixes: &[&str],
+    suffix: &str,
+) -> Result<Option<MmapWeight>> {
     for &pfx in prefixes {
         let full = if pfx.is_empty() {
             suffix.to_string()
@@ -2362,11 +2380,13 @@ fn find_mmap_weight(gguf: &Arc<GgufFile>, prefixes: &[&str], suffix: &str) -> Re
         } else {
             format!("{pfx}.{suffix}")
         };
-        if let Ok(w) = MmapWeight::from_gguf(gguf, &full) {
-            return Ok(w);
+        match MmapWeight::from_gguf(gguf, &full) {
+            Ok(w) => return Ok(Some(w)),
+            Err(e) if gguf.tensors.contains_key(&full) => return Err(e),
+            Err(_) => {}
         }
     }
-    bail!("could not find weight for suffix `{suffix}` with prefixes {prefixes:?}")
+    Ok(None)
 }
 
 fn find_vec_f32(gguf: &GgufFile, prefixes: &[&str], suffix: &str) -> Result<Vec<f32>> {
@@ -2485,6 +2505,53 @@ mod tests {
         data.extend_from_slice(&0u64.to_le_bytes()); // tensor_count
         data.extend_from_slice(&0u64.to_le_bytes()); // kv_count
         data
+    }
+
+    fn gguf_with_one_tensor(name: &str, cols: u64, rows: u64, nbytes: usize) -> Arc<GgufFile> {
+        use crate::convert::writer::{GGML_TYPE_Q4_K, GgufWriter};
+        let mut w = GgufWriter::new();
+        w.add_string("general.architecture", "whisper");
+        w.add_tensor(name, vec![cols, rows], GGML_TYPE_Q4_K, nbytes);
+        let mut bytes = Vec::new();
+        w.write_header_and_tensor_info(&mut bytes).unwrap();
+        w.write_tensor_data(&mut bytes, &vec![0u8; nbytes]).unwrap();
+        Arc::new(GgufFile::from_bytes(bytes.into()).unwrap())
+    }
+
+    #[test]
+    fn a_present_but_unreadable_weight_is_an_error_not_a_missing_one() {
+        // Rows of 384 end mid-block for Q4_K: the tensor exists, the loader refuses it.
+        let g = gguf_with_one_tensor("encoder.blocks.0.attn.query.weight", 384, 4, 6 * 144);
+        let prefixes = ["encoder.blocks.0"];
+        let err = format!(
+            "{:#}",
+            find_mmap_weight(&g, &prefixes, "attn.query.weight").unwrap_err()
+        );
+        assert!(
+            err.contains("encoder.blocks.0.attn.query.weight") && err.contains("convert it again"),
+            "{err}"
+        );
+        // The optional lookup (decoder projection) must not read that as absent and fall back
+        // to another weight.
+        assert!(find_mmap_weight_opt(&g, &prefixes, "attn.query.weight").is_err());
+        // A tensor that is not there at all is `None`, and the strict lookup reports it missing.
+        assert!(
+            find_mmap_weight_opt(&g, &prefixes, "attn.key.weight")
+                .unwrap()
+                .is_none()
+        );
+        let missing = format!(
+            "{:#}",
+            find_mmap_weight(&g, &prefixes, "attn.key.weight").unwrap_err()
+        );
+        assert!(missing.contains("could not find weight"), "{missing}");
+        // Whole blocks per row load.
+        let ok = gguf_with_one_tensor("encoder.blocks.0.attn.query.weight", 512, 4, 8 * 144);
+        assert!(
+            find_mmap_weight_opt(&ok, &prefixes, "attn.query.weight")
+                .unwrap()
+                .is_some()
+        );
     }
 
     #[test]
