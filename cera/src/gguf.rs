@@ -1143,6 +1143,7 @@ impl GgufFile {
             "tensor_meta_expert: expert {expert} out of range for {name} ({n_expert} experts)"
         );
 
+        Self::ensure_whole_blocks(name, info.dtype, ne0)?;
         let slice_bytes = tensor_data_size(&[ne0, ne1], info.dtype)?;
         let start = expert
             .checked_mul(slice_bytes)
@@ -1159,6 +1160,20 @@ impl GgufFile {
         );
 
         Ok((start, slice_bytes, ne1, ne0, info.dtype))
+    }
+
+    /// Refuse a tensor whose rows are not a whole number of `dtype` blocks. The kernels read
+    /// one row at a time in whole blocks, so such a matrix cannot be read (its rows would
+    /// start mid-block); an older converter wrote them when it checked only the element count.
+    /// Refusing here gives a message naming the tensor instead of a panic at first use.
+    pub(crate) fn ensure_whole_blocks(name: &str, dtype: DType, row_len: usize) -> Result<()> {
+        ensure!(
+            row_len.is_multiple_of(dtype.block_size()),
+            "{name}: rows of {row_len} are not a whole number of {dtype:?} blocks ({}); the file \
+             was written by a converter that did not check row alignment, so convert it again",
+            dtype.block_size()
+        );
+        Ok(())
     }
 
     /// Print a summary of the GGUF file for inspection.

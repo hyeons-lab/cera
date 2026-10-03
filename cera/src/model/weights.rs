@@ -101,16 +101,7 @@ impl MmapWeight {
         let (_off, rows, cols, dtype) = gguf
             .tensor_meta(name)
             .with_context(|| format!("loading metadata for {name}"))?;
-        // The kernels read a row at a time in whole quantization blocks, so a quantized matrix
-        // whose row length is not a multiple of the block size cannot be read (its rows would
-        // start mid-block). An older converter wrote such tensors when only the element count
-        // was checked; refuse them here instead of panicking at first use.
-        anyhow::ensure!(
-            cols.is_multiple_of(dtype.block_size()),
-            "{name}: rows of {cols} are not a whole number of {dtype:?} blocks ({}); the file was \
-             written by a converter that did not check row alignment, so convert it again",
-            dtype.block_size()
-        );
+        GgufFile::ensure_whole_blocks(name, dtype, cols)?;
         Ok(Self {
             storage: Storage::Mmap {
                 gguf: gguf.clone(),

@@ -2247,11 +2247,12 @@ fn whisper_gguf_is_loadable(path: &Path) -> bool {
     })
 }
 
-fn whisper_catalog_cached_path(
+/// Where a cached GGUF for `entry` can be, best first.
+fn whisper_catalog_candidates(
     cache_dir: &Path,
     entry: &cera::WhisperModelCatalogEntry,
-) -> Option<PathBuf> {
-    let candidates = [
+) -> [PathBuf; 5] {
+    [
         cache_dir.join(entry.gguf_filename),
         cache_dir.join("whisper").join(entry.gguf_filename),
         cache_dir
@@ -2270,21 +2271,28 @@ fn whisper_catalog_cached_path(
             .join("quantized")
             .join("Q4_K_M")
             .join("model.gguf"),
-    ];
-    candidates.into_iter().find(|p| {
-        if !p.exists() {
-            return false;
-        }
-        let loadable = whisper_gguf_is_loadable(p);
-        if !loadable {
-            eprintln!(
-                "note: cached `{}` is not in a layout cera can load; it will be converted from `{}`",
-                p.display(),
-                entry.hf_repo
-            );
-        }
-        loadable
-    })
+    ]
+}
+
+fn whisper_catalog_cached_path(
+    cache_dir: &Path,
+    entry: &cera::WhisperModelCatalogEntry,
+) -> Option<PathBuf> {
+    whisper_catalog_candidates(cache_dir, entry)
+        .into_iter()
+        .find(|p| p.exists() && whisper_gguf_is_loadable(p))
+}
+
+/// The first cached file for `entry` that exists but cera cannot load (another tensor layout,
+/// or rows from before they were checked for whole blocks), for the note `resolve_asr_model`
+/// prints when it falls back to converting.
+fn whisper_catalog_unloadable_path(
+    cache_dir: &Path,
+    entry: &cera::WhisperModelCatalogEntry,
+) -> Option<PathBuf> {
+    whisper_catalog_candidates(cache_dir, entry)
+        .into_iter()
+        .find(|p| p.exists() && !whisper_gguf_is_loadable(p))
 }
 
 fn print_asr_catalog(cache_dir: &Path) {
@@ -2393,6 +2401,14 @@ fn resolve_asr_model(
     }
     if whisper_entry.is_some() || (!is_local_gguf && model_str.starts_with("openai/whisper")) {
         let hf_repo = whisper_entry.map_or(model_str, |e| e.hf_repo);
+        if let Some(skipped) =
+            whisper_entry.and_then(|e| whisper_catalog_unloadable_path(cache_dir, e))
+        {
+            eprintln!(
+                "note: cached `{}` is not in a layout cera can load; converting `{hf_repo}` instead",
+                skipped.display()
+            );
+        }
         eprintln!(
             "Streaming official OpenAI SafeTensors `{hf_repo}` and quantizing to GGUF in `{}`...",
             cache_dir.display()
@@ -5396,8 +5412,8 @@ mod tests {
         BundleQuantPair, Cli, CliSamplingArgs, Command, convert_history_to_chat_messages,
         display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono, resample_linear,
         resolve_engine, simulate_truncate_oldest_turn_pairs, split_at_marker,
-        truncate_oldest_turn_pair, whisper_catalog_cached_path, whisper_gguf_is_loadable,
-        write_transcript, write_wav,
+        truncate_oldest_turn_pair, whisper_catalog_cached_path, whisper_catalog_unloadable_path,
+        whisper_gguf_is_loadable, write_transcript, write_wav,
     };
     use cera::tokenizer::ChatMessage;
     use clap::Parser;
@@ -5436,6 +5452,11 @@ mod tests {
         );
         assert!(!whisper_gguf_is_loadable(&community));
         assert_eq!(whisper_catalog_cached_path(dir.path(), entry), None);
+        // It is what the resolver names in its "converting instead" note.
+        assert_eq!(
+            whisper_catalog_unloadable_path(dir.path(), entry),
+            Some(community.clone())
+        );
 
         // A GGUF `cera convert` wrote is used, even with the community file also present.
         let converted = dir
