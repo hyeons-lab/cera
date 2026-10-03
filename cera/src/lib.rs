@@ -54,6 +54,7 @@ pub mod par;
 pub mod quant;
 pub mod sampler;
 pub mod session;
+pub mod speaker_labeler;
 pub mod spec;
 pub mod sysmem;
 pub mod tensor;
