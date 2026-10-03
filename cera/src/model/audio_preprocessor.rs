@@ -237,6 +237,97 @@ pub fn n_frames_for(n_samples: usize) -> usize {
     }
 }
 
+/// The input as the STFT sees it: centre-padded by `N_FFT / 2` zeros on both
+/// sides, then pre-emphasised over the inner (un-padded) region only. `None`
+/// when the padded length overflows.
+///
+/// Shared by the CPU path and the Hexagon front-end, which hands these samples
+/// to the DSP for the windowed DFT.
+pub(crate) fn padded_preemphasized(pcm: &[f32]) -> Option<Vec<f32>> {
+    let n_samples_in = pcm.len();
+    let pad_amount = N_FFT / 2;
+
+    // Center-pad: prepend + append `pad_amount` zeros.
+    let n_samples_padded = n_samples_in.checked_add(2 * pad_amount)?;
+    let mut samples = vec![0.0f32; n_samples_padded];
+    samples[pad_amount..pad_amount + n_samples_in].copy_from_slice(pcm);
+
+    // Pre-emphasis on the inner region only (matches C++ ref).
+    // C++ writes back to samples[pad_amount + 1..n_samples - pad_amount];
+    // first inner sample is left untouched.
+    let inner_end = n_samples_padded - pad_amount;
+    if n_samples_in > 0 {
+        let mut prev = samples[pad_amount];
+        for s in samples[pad_amount + 1..inner_end].iter_mut() {
+            let cur = *s;
+            *s = cur - PREEMPH * prev;
+            prev = cur;
+        }
+    }
+    Some(samples)
+}
+
+/// The last stage of the log-mel front end: per-feature normalization of the
+/// natural-log mel energies `mel` (mel-major `[n_mel_bins, n_frames]`) over the
+/// effective frames, then the transpose to time-major `[n_frames, n_mel_bins]`
+/// the conv stem reads.
+///
+/// Shared by the CPU path and the Hexagon front-end, which computes the mel
+/// energies on the DSP and finishes here (the statistics need every frame).
+pub(crate) fn finish_log_mel(
+    mut mel: Vec<f32>,
+    n_mel_bins: usize,
+    n_frames: usize,
+    n_samples_in: usize,
+) -> Vec<f32> {
+    // Per-feature normalization across the effective_n_len timesteps
+    // (= n_samples_in / HOP_LEN). Frames beyond effective_n_len are
+    // always zeroed out. For `effective_n_len == 1`, the single
+    // live frame is also zeroed (centering around its own value
+    // gives 0; variance is undefined in the unbiased estimator) —
+    // this keeps the output uniformly zero-tailed for short inputs
+    // instead of leaving frame 0 as an unnormalized raw log-mel.
+    let effective_n_len = effective_n_len(n_samples_in, n_frames);
+    for mi in 0..n_mel_bins {
+        let row = &mut mel[mi * n_frames..(mi + 1) * n_frames];
+        if effective_n_len > 1 {
+            let mut mean_sum = 0.0f64;
+            for &v in &row[..effective_n_len] {
+                mean_sum += v as f64;
+            }
+            let mean = mean_sum / effective_n_len as f64;
+            let mut var_sum = 0.0f64;
+            for &v in &row[..effective_n_len] {
+                let d = v as f64 - mean;
+                var_sum += d * d;
+            }
+            let var = var_sum / (effective_n_len - 1) as f64; // unbiased
+            let inv_std = 1.0 / (var.sqrt() + NORM_VAR_EPS);
+            for v in row[..effective_n_len].iter_mut() {
+                *v = ((*v as f64 - mean) * inv_std) as f32;
+            }
+            for v in row[effective_n_len..].iter_mut() {
+                *v = 0.0;
+            }
+        } else {
+            // effective_n_len ∈ {0, 1}: zero everything.
+            for v in row.iter_mut() {
+                *v = 0.0;
+            }
+        }
+    }
+
+    // Transpose mel-major [n_mel × n_frames] → time-major
+    // [n_frames × n_mel_bins].
+    let mut mel_time_major = vec![0.0f32; n_frames * n_mel_bins];
+    for mi in 0..n_mel_bins {
+        for ti in 0..n_frames {
+            mel_time_major[ti * n_mel_bins + mi] = mel[mi * n_frames + ti];
+        }
+    }
+    mel_time_major
+}
+
 /// Compute the LFM2A log-mel spectrogram of a mono PCM chunk
 /// sampled at `SAMPLE_RATE` (16 kHz). Output is row-major
 /// `[n_frames × n_mel_bins]` ready to feed into
@@ -270,26 +361,9 @@ pub fn log_mel_spectrogram(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) 
     }
 
     let n_samples_in = pcm.len();
-    let pad_amount = N_FFT / 2;
-
-    // Center-pad: prepend + append `pad_amount` zeros.
-    let n_samples_padded = match n_samples_in.checked_add(2 * pad_amount) {
-        Some(val) => val,
-        None => return (Vec::new(), 0),
+    let Some(samples) = padded_preemphasized(pcm) else {
+        return (Vec::new(), 0);
     };
-    let mut samples = vec![0.0f32; n_samples_padded];
-    samples[pad_amount..pad_amount + n_samples_in].copy_from_slice(pcm);
-
-    // Pre-emphasis on the inner region only (matches C++ ref).
-    // C++ writes back to samples[pad_amount + 1..n_samples - pad_amount];
-    // first inner sample is left untouched.
-    let inner_end = n_samples_padded - pad_amount;
-    let mut prev = samples[pad_amount];
-    for s in samples[pad_amount + 1..inner_end].iter_mut() {
-        let cur = *s;
-        *s = cur - PREEMPH * prev;
-        prev = cur;
-    }
 
     // Hann window centered inside an N_FFT-sized buffer. Shared with the GPU
     // front-end, which uploads exactly these taps.
@@ -353,52 +427,10 @@ pub fn log_mel_spectrogram(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) 
         }
     }
 
-    // Per-feature normalization across the effective_n_len timesteps
-    // (= n_samples_in / HOP_LEN). Frames beyond effective_n_len are
-    // always zeroed out. For `effective_n_len == 1`, the single
-    // live frame is also zeroed (centering around its own value
-    // gives 0; variance is undefined in the unbiased estimator) —
-    // this keeps the output uniformly zero-tailed for short inputs
-    // instead of leaving frame 0 as an unnormalized raw log-mel.
-    let effective_n_len = effective_n_len(n_samples_in, n_frames);
-    for mi in 0..n_mel_bins {
-        let row = &mut mel[mi * n_frames..(mi + 1) * n_frames];
-        if effective_n_len > 1 {
-            let mut mean_sum = 0.0f64;
-            for &v in &row[..effective_n_len] {
-                mean_sum += v as f64;
-            }
-            let mean = mean_sum / effective_n_len as f64;
-            let mut var_sum = 0.0f64;
-            for &v in &row[..effective_n_len] {
-                let d = v as f64 - mean;
-                var_sum += d * d;
-            }
-            let var = var_sum / (effective_n_len - 1) as f64; // unbiased
-            let inv_std = 1.0 / (var.sqrt() + NORM_VAR_EPS);
-            for v in row[..effective_n_len].iter_mut() {
-                *v = ((*v as f64 - mean) * inv_std) as f32;
-            }
-            for v in row[effective_n_len..].iter_mut() {
-                *v = 0.0;
-            }
-        } else {
-            // effective_n_len ∈ {0, 1}: zero everything.
-            for v in row.iter_mut() {
-                *v = 0.0;
-            }
-        }
-    }
-
-    // Transpose mel-major [n_mel × n_frames] → time-major
-    // [n_frames × n_mel_bins].
-    let mut mel_time_major = vec![0.0f32; n_frames * n_mel_bins];
-    for mi in 0..n_mel_bins {
-        for ti in 0..n_frames {
-            mel_time_major[ti * n_mel_bins + mi] = mel[mi * n_frames + ti];
-        }
-    }
-    (mel_time_major, n_frames)
+    (
+        finish_log_mel(mel, n_mel_bins, n_frames, n_samples_in),
+        n_frames,
+    )
 }
 
 #[cfg(test)]

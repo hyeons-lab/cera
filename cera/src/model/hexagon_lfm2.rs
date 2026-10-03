@@ -20,8 +20,8 @@ use crate::backend::hexagon::{
     build_flash_attn_kernel_params_with_softcap, build_get_rows_f32_kernel_params,
     build_hmx_fa_kernel_params_with_softcap, build_hmx_mm_kernel_params,
     build_mul_mat_kernel_params, build_rms_norm_params, build_rope_kernel_params,
-    build_rope_params, build_set_rows_kernel_params, build_ssm_conv_kernel_params,
-    build_unary_kernel_params, fa_is_hmx_eligible, lock_or_discard, mm_hmx_nb1, mm_is_hmx_eligible,
+    build_rope_params, build_set_rows_kernel_params, build_unary_kernel_params, fa_is_hmx_eligible,
+    lock_or_discard, mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::backend::hexagon::{hexagon_error, hexagon_warn};
 use crate::gguf::GgufFile;
@@ -371,13 +371,20 @@ struct HexagonKnobs {
     /// `CERA_HEXAGON_KV_Q8` (opt-in): Q8_0 KV cache instead of F16.
     kv_q8: bool,
     /// `CERA_HEXAGON_DECODE_OPS`: decode ops-per-flush cap. Unset, `0` or
-    /// unparsable means no cap (single-flush decode); a positive N flushes the
+    /// unparsable means no ops cap (the tensor cap, `CERA_HEXAGON_BATCH_TENSORS`,
+    /// still bounds the batch); a positive N flushes the
     /// queue every N ops. A bring-up and bisection aid, not a safety
     /// threshold: the nondeterminism it once worked around is phase-sensitive
     /// (cap 20 was clean, then adding conv state-copy ops re-phased its
     /// windows back into the race), so any op-count change per layer must
     /// re-verify a chosen cap over long greedy runs.
     decode_ops: Option<usize>,
+    /// `CERA_HEXAGON_BATCH_TENSORS`: tensors per batch for decode and every
+    /// prefill chunk. Unset means [`MAX_TENSORS_PER_FLUSH`];
+    /// `0` means unbounded (and brings back the single-batch resident decode
+    /// template, which is nondeterministic on the device); a positive N ends
+    /// the batch at the first op-group boundary at or past N tensors.
+    batch_tensors: Option<usize>,
 }
 
 impl HexagonKnobs {
@@ -415,6 +422,19 @@ impl HexagonKnobs {
             decode_ops: get("CERA_HEXAGON_DECODE_OPS")
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .filter(|&v| v > 0),
+            batch_tensors: match get("CERA_HEXAGON_BATCH_TENSORS") {
+                None => Some(MAX_TENSORS_PER_FLUSH),
+                Some(raw) => match raw.trim().parse::<usize>() {
+                    Ok(0) => None,
+                    Ok(n) => Some(n),
+                    Err(_) => {
+                        hexagon_warn!(
+                            "CERA_HEXAGON_BATCH_TENSORS={raw:?} is not an unsigned integer; using {MAX_TENSORS_PER_FLUSH} (0 disables the cap)"
+                        );
+                        Some(MAX_TENSORS_PER_FLUSH)
+                    }
+                },
+            },
         }
     }
 
@@ -801,12 +821,26 @@ const PREFILL_MAX_ROWS: usize = 512;
 /// swings up to ±3.6 at m <= 14 (m >= 15 bit-clean across 1..128) and
 /// greedy-decode flips. The corruption needs a large co-batched window;
 /// 24 ops/flush is verified bit-clean across prefill shapes and prompts
-/// (single and chunked), so small chunks take the cap while large chunks
-/// keep single-flush speed. Decode is uncapped by default, see
-/// `HexagonKnobs::decode_ops` for the opt-in decode cap.
+/// (single and chunked). Every chunk and every decode step is also bounded
+/// by the tensor cap (`MAX_TENSORS_PER_FLUSH`, `CERA_HEXAGON_BATCH_TENSORS`);
+/// `HexagonKnobs::decode_ops` is the op-count bisection aid.
 const SMALL_M_FLUSH_CAP_ROWS: usize = 32;
 /// Ops-per-flush cap for small-M prefill chunks (see above).
 const MAX_OPS_PER_FLUSH: usize = 24;
+
+/// Tensors a decode or prefill batch may hold before the next op-group
+/// boundary ends it. A whole token as one batch computes nondeterministically
+/// on the device (different logits on every run, differing by up to 3 from
+/// decode step 1, in prefill chunks of one row too, and a large prefill chunk as
+/// one batch left the recurrent state different from process to process). Over 20 runs of 24 decode
+/// steps, caps of 40 or fewer gave one logit sequence on the 450M, the 2.6B and
+/// the 8B MoE, while 48 did not on the 2.6B and batches of 60 or more tensors
+/// did not on the 450M. The cap is checked at a group boundary, so a batch can
+/// pass it by one group; 32 leaves room for that. It costs decode speed on the
+/// device: about 20% on the 450M (dispatch bound), 8% on the 2.6B and 10% on the
+/// 8B MoE, a third of it from no longer replaying the resident template. See
+/// `HexagonQueueSession::set_max_tensors_per_flush`.
+const MAX_TENSORS_PER_FLUSH: usize = 32;
 
 pub const MAX_ALL_LOGITS_TOKENS: usize = 64;
 
@@ -1148,8 +1182,9 @@ pub struct HexagonLfmModel {
     has_moe: bool,
     has_deltanet: bool,
     /// Debug barriers: flush the DSP queue after every op group (the
-    /// bring-up behavior). Default off: the whole token submits as one
-    /// batch. Set `CERA_HEXAGON_BARRIERS=1` to restore per-group flushes
+    /// bring-up behavior). Default off: a token goes to the DSP in batches
+    /// ended by the tensor cap (`MAX_TENSORS_PER_FLUSH`), not one flush per op
+    /// group. Set `CERA_HEXAGON_BARRIERS=1` to restore per-group flushes
     /// when localizing a DSP-side failure.
     debug_barriers: bool,
     /// ADPF CPU hint session holding host clocks across DSP-bound waits.
@@ -1165,8 +1200,12 @@ pub struct HexagonLfmModel {
     use_hmx: bool,
     vtcm_budget: usize,
     dump_act: bool,
-    /// Decode ops-per-flush cap (`CERA_HEXAGON_DECODE_OPS`, `None` = single flush).
+    /// Decode ops-per-flush cap (`CERA_HEXAGON_DECODE_OPS`, `None` = no ops cap;
+    /// the tensor cap below still applies).
     decode_ops_cap: Option<usize>,
+    /// Tensors per DSP batch for decode and every prefill chunk
+    /// (`CERA_HEXAGON_BATCH_TENSORS`, `None` = unbounded).
+    batch_tensor_cap: Option<usize>,
     current_seq_len: AtomicUsize,
     /// Set when a forward failed mid-flight on a model with recurrent (conv or
     /// DeltaNet) layers: those states advance in `kv_state_buf` op by op while
@@ -1224,6 +1263,32 @@ mod pager;
 mod weights;
 use pager::{ExpertPager, Paging};
 use weights::*;
+
+impl Drop for HexagonLfmModel {
+    /// The DSP holds a reference to every buffer a batch read. Telling it to let
+    /// go while the device is still open keeps the host unmaps that follow
+    /// (field drop, after this) from failing and leaking their address space,
+    /// which logged four lines at every model teardown.
+    fn drop(&mut self) {
+        // `lock_or_recover`, not `lock_device`: the model is dying, so marking it
+        // torn on a poisoned lock would serve no one.
+        let mut device = self.device.lock_or_recover();
+        let session = device.queue_session_mut();
+        session.release_dsp_references(
+            [
+                &self.weights_buf,
+                &self.kv_state_buf,
+                &self.scratch_buf,
+                &self.mask_buf,
+            ]
+            .into_iter()
+            .chain(self.dense.mask_swa.as_ref()),
+        );
+        if let Some(pager) = &self.pager {
+            pager.release_dsp_references(session);
+        }
+    }
+}
 
 impl HexagonLfmModel {
     /// True when any layer keeps recurrent (conv or DeltaNet) state in `kv_state_buf`.
@@ -1336,6 +1401,7 @@ impl HexagonLfmModel {
             use_hmx: knobs.use_hmx,
             dump_act: knobs.dump_act,
             decode_ops_cap: knobs.decode_ops,
+            batch_tensor_cap: knobs.batch_tensors,
             current_seq_len: AtomicUsize::new(0),
             state_torn: AtomicBool::new(false),
             rope_scratch: Mutex::default(),
@@ -2356,6 +2422,13 @@ impl HexagonLfmModel {
         } else {
             None
         });
+        // The tensor cap covers every prefill chunk as it does decode: a large
+        // chunk (HMX) as one batch left the recurrent state different in about
+        // a third of processes (decode step 1 then differed from a warm run's
+        // while the chunk's own logits matched), a small one reproduced the
+        // logit nondeterminism itself. Set unconditionally, like the ops cap
+        // above, so a prior forward's exit path cannot leak its setting.
+        session.set_max_tensors_per_flush(self.batch_tensor_cap);
 
         let run_res = (|| -> Result<(), CeraError> {
             for (layer_idx, layer) in self.layers.iter().enumerate() {
@@ -2458,6 +2531,7 @@ impl HexagonLfmModel {
         })();
 
         session.set_max_ops_per_flush(None);
+        session.set_max_tensors_per_flush(None);
         if let Err(e) = run_res {
             session.drop_pending_batch();
             self.mark_state_torn_if_dispatched(session, dispatches_before);
@@ -2656,6 +2730,7 @@ impl HexagonLfmModel {
             && !self.debug_barriers
             && !self.dump_act
             && self.decode_ops_cap.is_none()
+            && self.batch_tensor_cap.is_none()
             && !session.step_mode()
             && (output == DecodeOutput::Logits || output == DecodeOutput::Greedy);
 
@@ -2725,8 +2800,10 @@ impl HexagonLfmModel {
             }
         }
 
-        // Decode determinism: cap ops per flush if configured.
+        // Decode determinism: cap ops per flush if configured, and tensors per
+        // batch (on by default; see `MAX_TENSORS_PER_FLUSH`).
         session.set_max_ops_per_flush(self.decode_ops_cap);
+        session.set_max_tensors_per_flush(self.batch_tensor_cap);
 
         let mut flash_attn_patches = Vec::new();
 
@@ -2843,6 +2920,7 @@ impl HexagonLfmModel {
         })();
 
         session.set_max_ops_per_flush(None);
+        session.set_max_tensors_per_flush(None);
         if let Err(e) = run_res {
             session.drop_pending_batch();
             self.mark_state_torn_if_dispatched(session, dispatches_before);

@@ -588,19 +588,42 @@ impl FastRpcDriver {
         }
     }
 
-    /// Read a response payload from the DSP command queue.
+    /// Whether responses are polled by default (`CERA_HEXAGON_OPPOLL`, on
+    /// unless set to `0`). A queue that would rather sleep in the kernel for
+    /// a long batch asks for that per session, see
+    /// `HexagonQueueSession::set_blocking_wait`.
+    pub fn polls_responses(&self) -> bool {
+        self.oppoll
+    }
+
+    /// Read a response payload from the DSP command queue, polling when the
+    /// driver is configured to.
     pub fn read_dsp_queue(
         &self,
         queue: DspQueueHandle,
         buffers: &mut [super::types::DspQueueBuffer],
         msg: &mut [u8],
     ) -> Result<u32, CeraError> {
+        self.read_dsp_queue_with(queue, buffers, msg, self.oppoll)
+    }
+
+    /// [`Self::read_dsp_queue`] with the wait mode chosen by the caller: `spin`
+    /// issues non-blocking reads and retries (lowest wakeup latency, a busy
+    /// host core), otherwise the read sleeps in the kernel until the response
+    /// lands.
+    pub fn read_dsp_queue_with(
+        &self,
+        queue: DspQueueHandle,
+        buffers: &mut [super::types::DspQueueBuffer],
+        msg: &mut [u8],
+        spin: bool,
+    ) -> Result<u32, CeraError> {
         let mut flags: u32 = 0;
         let mut n_bufs: u32 = 0;
         let mut msg_len: u32 = 0;
         // Oppoll: timeout 0 turns the read non-blocking; the retry loop
         // below spins on EWOULDBLOCK until the response lands.
-        let mut timeout = if self.oppoll { 0 } else { DSPQUEUE_TIMEOUT_US };
+        let mut timeout = if spin { 0 } else { DSPQUEUE_TIMEOUT_US };
         // Hang guard: 30s wall-clock budget for both oppoll and blocking modes.
         // Without it, repeated AEE_EINTERRUPTED or a wedged DSP can spin or loop
         // forever without bound. Checked at the top of every iteration.
@@ -637,7 +660,7 @@ impl FastRpcDriver {
             {
                 // ETIMEDOUT, AEE_EEXPIRED, AEE_EWOULDBLOCK: DSP is still
                 // processing.
-                if self.oppoll {
+                if spin {
                     spins += 1;
                     if spins > 500_000 {
                         // Slow batch: stop burning a core and block for the
@@ -712,6 +735,8 @@ pub(crate) mod fake {
         /// `fastrpc_mmap` / `fastrpc_munmap` answer with an error.
         pub fail_mmap: bool,
         pub fail_munmap: bool,
+        /// The timeout argument of every `dspqueue_read` (0 = polled read).
+        pub read_timeouts: Vec<u32>,
         /// `rpcmem_alloc` calls the fake has served.
         pub allocs: usize,
         /// Hand every buffer its own fd (default: all 42, which the captured
@@ -858,8 +883,9 @@ pub(crate) mod fake {
         max_msg: u32,
         msg_len: *mut u32,
         msg: *mut u8,
-        _t: u32,
+        timeout: u32,
     ) -> i32 {
+        with(|s| s.read_timeouts.push(timeout));
         if with(|s| s.fail_read) {
             return -1;
         }
@@ -879,6 +905,11 @@ pub(crate) mod fake {
 
     /// A driver wired to the fakes above.
     pub(crate) fn driver() -> Arc<FastRpcDriver> {
+        driver_with_polling(false)
+    }
+
+    /// The fake driver with response polling (`CERA_HEXAGON_OPPOLL`) forced.
+    pub(crate) fn driver_with_polling(oppoll: bool) -> Arc<FastRpcDriver> {
         Arc::new(FastRpcDriver {
             #[cfg(unix)]
             handle: std::ptr::null_mut(),
@@ -897,7 +928,7 @@ pub(crate) mod fake {
             dspqueue_export: q_export,
             dspqueue_write: q_write,
             dspqueue_read: q_read,
-            oppoll: false,
+            oppoll,
             mapped_bytes: std::sync::atomic::AtomicUsize::new(0),
         })
     }

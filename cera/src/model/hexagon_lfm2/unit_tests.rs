@@ -858,6 +858,29 @@ fn knobs(pairs: &[(&str, &str)]) -> HexagonKnobs {
     })
 }
 
+/// The decode tensor cap defaults on, `0` turns it off, and a number sets it.
+#[test]
+fn test_batch_tensor_cap_knob() {
+    let cap = |v: Option<&str>| match v {
+        Some(v) => knobs(&[("CERA_HEXAGON_BATCH_TENSORS", v)]).batch_tensors,
+        None => knobs(&[]).batch_tensors,
+    };
+    assert_eq!(cap(None), Some(MAX_TENSORS_PER_FLUSH));
+    assert_eq!(cap(Some("0")), None);
+    assert_eq!(cap(Some(" 24 ")), Some(24));
+    assert_eq!(
+        cap(Some("many")),
+        Some(MAX_TENSORS_PER_FLUSH),
+        "unparsable keeps the default"
+    );
+    const {
+        assert!(
+            MAX_TENSORS_PER_FLUSH <= 40,
+            "40 is the largest cap seen to decode reproducibly on every model"
+        );
+    }
+}
+
 /// One boolean rule per knob kind: opt-in on for `1`/`true` only, default-on
 /// off for `0`/`false` only; an unrecognized value keeps the default.
 #[test]
