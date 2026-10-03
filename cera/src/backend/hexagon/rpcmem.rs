@@ -167,11 +167,34 @@ impl Drop for RpcmemBuffer {
         if self.is_mapped()
             && let Err(e) = self.driver.fastrpc_munmap(self.fd, self.ptr, self.size)
         {
-            // The mapping (and its share of the address space) leaks. Debug
-            // level: the skel session is closed before the model's buffers
-            // drop, and a refusal there has not been seen on a device.
-            tracing::debug!("cera::hexagon: dropping a mapped buffer: {e}");
+            // The mapping (and its share of the address space) leaks. Warned
+            // where logcat can see it: this is the symptom of a buffer the DSP
+            // still holds, which the models' Drop impls release first.
+            super::hexagon_warn!("dropping a mapped buffer: {e}");
         }
         self.driver.rpcmem_free(self.ptr);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::audio_profile::tests::warnings_of;
+    use crate::backend::hexagon::sys::fake;
+
+    /// A refused unmap leaks the mapping, and says so where logcat can see it:
+    /// it is the symptom of a buffer the DSP still holds.
+    #[test]
+    fn a_refused_unmap_is_warned_not_hidden_at_debug() {
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, true).unwrap();
+        fake::with(|s| s.fail_munmap = true);
+        let warned = warnings_of(|| drop(buf));
+        assert!(
+            warned
+                .iter()
+                .any(|m| m.contains("dropping a mapped buffer")),
+            "{warned:?}"
+        );
     }
 }

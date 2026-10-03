@@ -681,6 +681,17 @@ pub struct HexagonDepthformer {
 }
 
 impl HexagonDepthformer {
+    /// Tell the DSP to let go of this depthformer's buffers, ahead of the
+    /// unmaps that dropping it performs (the decoder's `Drop` calls this with
+    /// its device open; the depthformer has no device of its own).
+    fn release_dsp_references(&self, session: &HexagonQueueSession) {
+        session.release_dsp_references([
+            &self.weights_buf,
+            &*self.scratch_buf.lock_or_recover(),
+            &*self.state_buf.lock_or_recover(),
+        ]);
+    }
+
     pub fn new(
         driver: Arc<FastRpcDriver>,
         weights: Arc<AudioDecoderWeights>,
@@ -1364,6 +1375,24 @@ pub struct HexagonAudioDecoder {
     depthformer: Option<HexagonDepthformer>,
     last_error: Mutex<Option<CeraError>>,
     session_active: std::sync::atomic::AtomicBool,
+}
+
+impl Drop for HexagonAudioDecoder {
+    /// The DSP holds a reference to every buffer a batch read; letting go of
+    /// them while the device is open keeps the host unmaps that follow from
+    /// failing and leaking their address space.
+    fn drop(&mut self) {
+        let mut device = self.device.lock_or_recover();
+        let session = device.queue_session_mut();
+        session.release_dsp_references([
+            &self.weights_buf,
+            &*self.scratch_buf.lock_or_recover(),
+            &*self.state_buf.lock_or_recover(),
+        ]);
+        if let Some(depthformer) = &self.depthformer {
+            depthformer.release_dsp_references(session);
+        }
+    }
 }
 
 impl HexagonAudioDecoder {

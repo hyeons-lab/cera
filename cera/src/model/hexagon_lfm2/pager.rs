@@ -23,7 +23,9 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use super::weights::backend_msg;
-use crate::backend::hexagon::{FastRpcDriver, RpcmemBuffer, hexagon_warn, lock_reporting_poison};
+use crate::backend::hexagon::{
+    FastRpcDriver, HexagonQueueSession, RpcmemBuffer, hexagon_warn, lock_reporting_poison,
+};
 use crate::session::CeraError;
 
 const MIB: usize = 1 << 20;
@@ -228,6 +230,12 @@ impl ExpertPager {
     #[cfg(test)]
     pub(super) fn mapped_bytes(&self) -> usize {
         self.driver.mapped_bytes()
+    }
+
+    /// Tell the DSP to let go of every layer buffer that is mapped, ahead of the
+    /// unmaps that dropping the pager performs.
+    pub(super) fn release_dsp_references(&self, session: &HexagonQueueSession) {
+        session.release_dsp_references(self.bufs.iter().filter(|b| b.is_mapped()));
     }
 
     /// Layers kept mapped for good.

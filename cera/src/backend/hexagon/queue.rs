@@ -279,9 +279,14 @@ pub struct HexagonQueueSession {
     tens: Vec<HtpTensor>,
     ops: Vec<HtpOpDesc>,
     /// Auto-flush once this many ops are queued (`None` = unbounded).
-    /// Small-M prefill chunks cap this (see `SMALL_M_MAX_OPS_PER_FLUSH`):
+    /// Small-M prefill chunks cap this (see `MAX_OPS_PER_FLUSH`):
     /// large single-flush batches compute nondeterministically there.
     max_ops_per_flush: Option<usize>,
+    /// Flush at an op-group boundary once the batch holds this many tensors
+    /// (`None` = unbounded). On the S25 Ultra a decode batch of a few dozen
+    /// tensors or more computes nondeterministically (logit swings up to 3, a
+    /// different result on every run); see [`Self::set_max_tensors_per_flush`].
+    max_tensors_per_flush: Option<usize>,
     seq: u64,
     /// Aggregate DSP microseconds per opcode across flushes (profiling only).
     prof: HashMap<u32, (u64, u64)>,
@@ -293,6 +298,11 @@ pub struct HexagonQueueSession {
     /// hwinfo-failure fallback until `HexagonDevice` overwrites it.
     dsp_threads: u32,
     resident_staged_id: Option<u64>,
+    /// Sleep in the kernel for each batch response instead of polling for it,
+    /// whatever the driver's default. Polling wakes sooner but keeps a host
+    /// core busy for the whole batch; a queue running long, latency-tolerant
+    /// batches (the audio encoder in a background task) would rather free it.
+    blocking_wait: bool,
     /// Flush after every op (`CERA_HEXAGON_STEP`). A field, not a per-call
     /// env read, so tests can drive the step-mode error path.
     step_mode: bool,
@@ -344,6 +354,7 @@ impl HexagonQueueSession {
             tens: Vec::with_capacity(256),
             ops: Vec::with_capacity(128),
             max_ops_per_flush: None,
+            max_tensors_per_flush: None,
             seq: 1,
             prof: HashMap::new(),
             prof_host_us: 0,
@@ -351,6 +362,7 @@ impl HexagonQueueSession {
             prof_flushes: 0,
             dsp_threads: 8,
             resident_staged_id: None,
+            blocking_wait: false,
             step_mode: step_enabled(),
             outstanding: 0,
             #[cfg(test)]
@@ -379,6 +391,26 @@ impl HexagonQueueSession {
     /// `enqueue_op` flushes automatically once the cap is reached.
     pub fn set_max_ops_per_flush(&mut self, max: Option<usize>) {
         self.max_ops_per_flush = max.filter(|&m| m >= 1);
+    }
+
+    /// Cap the tensors in a batch (`None` restores unbounded batching): once the
+    /// batch holds this many, the next op-group boundary ([`Self::end_group`])
+    /// flushes it. Unlike [`Self::set_max_ops_per_flush`] this never cuts a
+    /// helper's ops apart, which share tensor indices.
+    ///
+    /// Why it exists: decode on the S25 Ultra (v79) was found to compute
+    /// nondeterministically when a whole token went to the DSP as one batch:
+    /// every identical run gave a different logit sequence, differing by up to
+    /// 3 from decode step 1, while the CPU and the NPU's prefill were bit-exact.
+    /// Ending the batch at every 16 op groups or fewer gave the same logits on
+    /// every run, and at 24 groups or more did not; counted in tensors, caps of
+    /// 40 or fewer were reproducible on every model tried and 48 or more were
+    /// not on all of them. Enlarging the DSP's dirty-range table did not change
+    /// it, so the cause is elsewhere in the firmware's handling of long
+    /// batches, and this is a host-side bound on that. It costs decode speed
+    /// (8% to 20% on the models tried; more batches, and no resident template).
+    pub fn set_max_tensors_per_flush(&mut self, max: Option<usize>) {
+        self.max_tensors_per_flush = max.filter(|&m| m >= 1);
     }
 
     /// Next free DSP-visible index for a registry. The DSP reads `u16`
@@ -422,15 +454,44 @@ impl HexagonQueueSession {
         self.skel_handle = Some(handle);
     }
 
+    /// [`Self::release_dsp_reference`] for each of `bufs`: what a model's
+    /// `Drop` calls, while its device is still open, ahead of the unmaps that
+    /// dropping the buffers performs.
+    pub(crate) fn release_dsp_references<'a>(
+        &self,
+        bufs: impl IntoIterator<Item = &'a RpcmemBuffer>,
+    ) {
+        if self.outstanding > 0 {
+            super::hexagon_warn!(
+                "not releasing buffers: {} batch(es) unanswered",
+                self.outstanding
+            );
+            return;
+        }
+        for buf in bufs {
+            self.release_dsp_reference(buf);
+        }
+    }
+
     /// Tell the DSP to drop its reference to `buf` (`htp_iface_munmap`, IDL
     /// method 5). Once a batch has read a buffer the DSP keeps its own hold on
     /// it, and the host's `fastrpc_munmap` is refused (error 1) until that is
     /// released. Best effort, as in llama.cpp: a buffer no batch has touched
     /// has nothing to release.
+    ///
+    /// Skipped while a batch is unanswered: after a read timeout the DSP may
+    /// still be running it against `buf`, and releasing would pull the
+    /// mapping from under it. The host unmap that follows when the buffer
+    /// drops is not prevented: if the DSP already holds the buffer it is
+    /// refused (the mapping leaks), and if the batch has not taken its hold yet
+    /// the memory is freed regardless, as it was before this guard.
     pub(crate) fn release_dsp_reference(&self, buf: &RpcmemBuffer) {
         let Some(handle) = self.skel_handle else {
             return;
         };
+        if self.outstanding > 0 {
+            return;
+        }
         let mut fd = buf.fd() as u32;
         let mut args = [super::sys::RemoteArg {
             buf: super::sys::RemoteBuf {
@@ -471,7 +532,12 @@ impl HexagonQueueSession {
                 )
             };
             self.driver
-                .read_dsp_queue(self.queue, &mut resp_bufs, rsp_bytes)
+                .read_dsp_queue_with(
+                    self.queue,
+                    &mut resp_bufs,
+                    rsp_bytes,
+                    self.spin_for_responses(),
+                )
                 .map_err(|e| {
                     CeraError::Backend(format!(
                         "{} DSP batch(es) still outstanding after a timeout: {e}",
@@ -490,8 +556,13 @@ impl HexagonQueueSession {
         self.tensor_cap = cap;
     }
 
-    /// Number of batches written to the DSP with no response read back yet.
+    /// Test hook: the tensors-per-flush cap currently set.
     #[cfg(test)]
+    pub(crate) fn tensor_flush_cap(&self) -> Option<usize> {
+        self.max_tensors_per_flush
+    }
+
+    /// Number of batches written to the DSP with no response read back yet.
     pub(crate) fn outstanding_batches(&self) -> u64 {
         self.outstanding
     }
@@ -842,19 +913,42 @@ impl HexagonQueueSession {
     /// Mark an op-group boundary: a run of ops that may share tensor
     /// indices (one `dispatch::*` helper, one model-local op emitter). Under
     /// `CERA_HEXAGON_STEP` this flushes the group so a DSP fault names the
-    /// group that caused it; otherwise it is a no-op. A flush clears the
+    /// group that caused it. With a tensor cap ([`Self::set_max_tensors_per_flush`])
+    /// it flushes once the batch has reached it; otherwise it is a no-op. A flush clears the
     /// tensor table, so it must only run where no later op reuses an index
     /// registered before the boundary. Flushing per `enqueue_op` instead
     /// (the old behavior) broke every helper that registers a tensor once
     /// and reuses it across ops.
     pub fn end_group(&mut self) -> Result<(), CeraError> {
         if !self.step_mode {
+            if let Some(cap) = self.max_tensors_per_flush
+                && self.tens.len() >= cap
+            {
+                let pending = self.tens.len();
+                return self.flush().map_err(|e| {
+                    CeraError::Backend(format!(
+                        "HTP tensor-capped flush failed (cap={cap}, tensors={pending}): {e}"
+                    ))
+                });
+            }
             return Ok(());
         }
         let n_ops = self.ops.len();
         eprintln!("cera-hexagon: step group ({n_ops} ops)");
         self.flush()
             .map_err(|e| CeraError::Backend(format!("HTP step failed after {n_ops} ops: {e}")))
+    }
+
+    /// Choose how this queue waits for batch responses: `true` sleeps in the
+    /// kernel (no busy core; wakeup costs about a scheduler tick more), `false`
+    /// follows the driver's `CERA_HEXAGON_OPPOLL` default. Returns the previous
+    /// setting so a caller can restore it.
+    pub fn set_blocking_wait(&mut self, blocking: bool) -> bool {
+        std::mem::replace(&mut self.blocking_wait, blocking)
+    }
+
+    fn spin_for_responses(&self) -> bool {
+        self.driver.polls_responses() && !self.blocking_wait
     }
 
     /// Whether `CERA_HEXAGON_STEP` bisect mode is active. Templated decode
@@ -1024,10 +1118,12 @@ impl HexagonQueueSession {
                         std::mem::size_of::<HtpOpBatchRsp>(),
                     )
                 };
-                match self
-                    .driver
-                    .read_dsp_queue(self.queue, &mut resp_bufs, rsp_bytes)
-                {
+                match self.driver.read_dsp_queue_with(
+                    self.queue,
+                    &mut resp_bufs,
+                    rsp_bytes,
+                    self.spin_for_responses(),
+                ) {
                     Err(e) => {
                         read_res = Err(e);
                         break;
@@ -1369,6 +1465,93 @@ mod tests {
         q
     }
 
+    /// Dropping a model releases all of its buffers, each once.
+    #[test]
+    fn release_dsp_references_releases_every_buffer_given() {
+        fake::reset();
+        fake::with(|s| s.distinct_fds = true);
+        let driver = fake::driver();
+        let bufs: Vec<RpcmemBuffer> = (0..3)
+            .map(|_| RpcmemBuffer::alloc(Arc::clone(&driver), 4096, false).unwrap())
+            .collect();
+        let mut q = test_session();
+        q.set_skel_handle(7);
+        q.release_dsp_references(&bufs);
+        let released: Vec<i32> = fake::events()
+            .into_iter()
+            .filter_map(|e| match e {
+                fake::Event::Release(fd) => Some(fd),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            released,
+            bufs.iter().map(RpcmemBuffer::fd).collect::<Vec<_>>()
+        );
+    }
+
+    /// A flush the tensor cap triggers says so when it fails: the cap is the
+    /// first suspect when chasing the nondeterminism it works around.
+    #[test]
+    fn a_capped_flush_failure_names_the_cap() {
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let mut q = test_session();
+        q.set_max_tensors_per_flush(Some(1));
+        fake::with(|s| s.fail_write = true);
+        // The helper ends its group, which is where the cap flushes.
+        let err = enqueue_with_tensor(&mut q, &buf).unwrap_err().to_string();
+        assert!(err.contains("cap=1") && err.contains("tensors=1"), "{err}");
+    }
+
+    /// A batch the DSP has not answered may still be running against the
+    /// buffer, so the release is withheld rather than raced.
+    #[test]
+    fn a_release_is_withheld_while_a_batch_is_unanswered() {
+        fake::reset();
+        let mut q = test_session();
+        q.set_skel_handle(7);
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let released = || fake::events().contains(&fake::Event::Release(buf.fd()));
+        fake::with(|s| s.fail_read = true);
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        q.flush().unwrap_err();
+        assert_eq!(q.outstanding_batches(), 1);
+        // Both forms hold back: the buffer-at-a-time one is what the encoder's
+        // per-call buffers and the pager use.
+        q.release_dsp_reference(&buf);
+        assert!(!released(), "single form: no release while unanswered");
+        q.release_dsp_references([&buf]);
+        assert!(!released(), "batch form: no release while unanswered");
+        fake::with(|s| s.fail_read = false);
+        q.quiesce().unwrap();
+        q.release_dsp_reference(&buf);
+        assert!(released(), "released once answered");
+    }
+
+    /// Holding back is announced once per call, not once per buffer, so a paged
+    /// model's dozens of buffers do not flood the log.
+    #[test]
+    fn a_withheld_release_warns_once_for_all_the_buffers() {
+        use crate::audio_profile::tests::warnings_of;
+        fake::reset();
+        fake::with(|s| s.distinct_fds = true);
+        let mut q = test_session();
+        q.set_skel_handle(7);
+        let bufs: Vec<_> = (0..3)
+            .map(|_| RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap())
+            .collect();
+        fake::with(|s| s.fail_read = true);
+        enqueue_with_tensor(&mut q, &bufs[0]).unwrap();
+        q.flush().unwrap_err();
+        let warned = warnings_of(|| q.release_dsp_references(&bufs));
+        let n = warned
+            .iter()
+            .filter(|m| m.contains("not releasing buffers"))
+            .count();
+        assert_eq!(n, 1, "{warned:?}");
+    }
+
     /// The DSP is told to drop its hold on a buffer through the skel handle,
     /// and only when the session has one.
     #[test]
@@ -1486,6 +1669,77 @@ mod tests {
             q.flush().unwrap_err();
             assert_eq!(q.dispatch_attempts(), start + 2 + n as u64, "failure {n}");
         }
+    }
+
+    /// A tensor cap flushes at the first op-group boundary at or past it, never
+    /// between the ops of one group, and `None` restores unbounded batching.
+    #[test]
+    fn a_tensor_cap_flushes_at_group_boundaries_only() {
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let mut q = test_session();
+        let writes = || {
+            fake::events()
+                .iter()
+                .filter(|e| matches!(e, fake::Event::Write(_)))
+                .count()
+        };
+        // Each helper call registers one tensor (a group of one op).
+        q.set_max_tensors_per_flush(Some(3));
+        for n in 1..=7 {
+            // `enqueue_with_tensor` ends its group, which is where a cap acts.
+            enqueue_with_tensor(&mut q, &buf).unwrap();
+            assert_eq!(writes(), n / 3, "after group {n}");
+        }
+        // Unbounded again: nothing more flushes at a group boundary.
+        q.set_max_tensors_per_flush(None);
+        for _ in 0..5 {
+            enqueue_with_tensor(&mut q, &buf).unwrap();
+        }
+        assert_eq!(writes(), 2);
+        // A cap never splits a group: three ops over one registered tensor stay
+        // together however small the cap is.
+        q.set_max_tensors_per_flush(Some(1));
+        let before = writes();
+        let ti = q.add_tensor(&buf, 0, 64, 0, 0, [1; 4], [4; 4]).unwrap();
+        for _ in 0..3 {
+            q.enqueue_op(HtpOpCode::Add as u32, &[ti], &[ti], [0; 16], [0; 32])
+                .unwrap();
+        }
+        assert_eq!(writes(), before, "no flush inside the group");
+        q.end_group().unwrap();
+        assert_eq!(writes(), before + 1, "flushed at its end");
+    }
+
+    /// A session on a polling driver spins for responses until it asks to
+    /// sleep, and the choice is per session and restorable.
+    #[test]
+    fn blocking_wait_overrides_response_polling_per_session() {
+        fake::reset();
+        let driver = fake::driver_with_polling(true);
+        let mut q = HexagonQueueSession::new(Arc::clone(&driver)).expect("fake queue session");
+        q.step_mode = false;
+        q.set_max_ops_per_flush(None);
+        let buf = RpcmemBuffer::alloc(driver, 4096, false).unwrap();
+        let last_timeout = || fake::with(|s| *s.read_timeouts.last().expect("a read"));
+
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        q.flush().unwrap();
+        assert_eq!(last_timeout(), 0, "the driver's default is a polled read");
+
+        assert!(!q.set_blocking_wait(true), "previous setting returned");
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        q.flush().unwrap();
+        assert_eq!(
+            last_timeout(),
+            crate::backend::hexagon::sys::DSPQUEUE_TIMEOUT_US,
+            "a blocking session sleeps in the kernel"
+        );
+
+        assert!(q.set_blocking_wait(false));
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        q.flush().unwrap();
+        assert_eq!(last_timeout(), 0, "restored to the driver default");
     }
 
     /// A read timeout leaves the batch outstanding (the DSP may still write

@@ -123,7 +123,11 @@ fn zero_dim_tensor_is_a_named_error() {
 
 fn backend() -> Backend {
     let (driver, device) = op_capture::fresh_device();
-    Backend::with_device(driver, device, HexagonKnobs::from_lookup(|_| None))
+    // Every default but the decode tensor cap, which would split the decode the
+    // goldens pin as one batch (the forward goldens say why).
+    let knobs =
+        HexagonKnobs::from_lookup(|k| (k == "CERA_HEXAGON_BATCH_TENSORS").then(|| "0".to_string()));
+    Backend::with_device(driver, device, knobs)
 }
 
 fn u32kv(key: &str, prefix: &str, v: u32) -> (String, KvValue) {
@@ -742,6 +746,37 @@ fn paged_experts_hold_the_same_bytes_and_rotate_through_a_window() {
         .unwrap();
     // The pass starts with layers 6 and 7 still mapped; layer 1 rotates.
     assert!(pager.stats().rotations > 3);
+
+    // Dropping the model lets the DSP let go of the pager's still-mapped window
+    // before the host unmaps it, like every other buffer. The device's own
+    // staging buffer (the first mapping) is released with the device.
+    let staging = fake::events()
+        .iter()
+        .find_map(|e| match e {
+            Event::Map(fd) => Some(*fd),
+            _ => None,
+        })
+        .unwrap();
+    let at_drop = fake::events().len();
+    drop(paged);
+    let mut released = std::collections::HashSet::new();
+    let mut unmapped = 0;
+    for e in &fake::events()[at_drop..] {
+        match e {
+            Event::Release(fd) => {
+                released.insert(*fd);
+            }
+            Event::Unmap(fd) if *fd != staging => {
+                assert!(released.contains(fd), "fd {fd} unmapped without a release");
+                unmapped += 1;
+            }
+            _ => {}
+        }
+    }
+    assert!(
+        unmapped > 4,
+        "the model's buffers and the window: {unmapped}"
+    );
 }
 
 /// `--device auto` refuses a routed model that would have to be paged (the
@@ -866,4 +901,45 @@ fn long_routed_prefill_chunk_flushes_between_rows() {
         "expected several flushes, got {}",
         batches.len()
     );
+}
+
+/// A dropped model lets the DSP let go of each buffer a batch read before the host
+/// unmaps it. Without that the unmap fails on a device and the mapping leaks
+/// (four debug lines at every teardown).
+#[test]
+fn dropping_a_model_releases_every_mapped_buffer_before_unmapping_it() {
+    use crate::backend::hexagon::sys::fake::{self, Event};
+    let backend = backend();
+    fake::with(|s| s.distinct_fds = true);
+    // The device's own staging buffer is mapped before the model exists.
+    let before = fake::events().len();
+    let model = HexagonLfmModel::from_llama_on(backend, dense_gguf(), None, 64).unwrap();
+    let mapped: std::collections::HashSet<i32> = fake::events()[before..]
+        .iter()
+        .filter_map(|e| match e {
+            Event::Map(fd) => Some(*fd),
+            _ => None,
+        })
+        .collect();
+    assert!(
+        mapped.len() >= 4,
+        "weights, KV state, scratch and mask: {mapped:?}"
+    );
+    let at_drop = fake::events().len();
+    drop(model);
+    let mut released = std::collections::HashSet::new();
+    let mut unmapped = std::collections::HashSet::new();
+    for e in &fake::events()[at_drop..] {
+        match e {
+            Event::Release(fd) => {
+                released.insert(*fd);
+            }
+            Event::Unmap(fd) if mapped.contains(fd) => {
+                assert!(released.contains(fd), "fd {fd} unmapped without a release");
+                unmapped.insert(*fd);
+            }
+            _ => {}
+        }
+    }
+    assert_eq!(unmapped, mapped, "every mapping is unmapped at drop");
 }

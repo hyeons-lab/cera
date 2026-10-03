@@ -1,6 +1,7 @@
 //! Op emitters: one `dispatch_*` associated function per DSP operation.
 
 use super::*;
+use crate::backend::hexagon::dispatch::{self, ConcatSrc, TokenShape, TokenTile, View};
 
 impl HexagonLfmModel {
     /// Contiguous f32 vector descriptor (`[dim,1,1,1]`): the one spelling of
@@ -226,50 +227,21 @@ impl HexagonLfmModel {
         dst_offset: usize,
         dim: usize,
     ) -> Result<(), CeraError> {
-        let s0_span = s0_rows * dim * 4;
-        let s1_span = s1_rows.saturating_sub(1) * s1_nb0 + dim.saturating_sub(1) * s1_nb1 + 4;
-        let dst_rows = s0_rows + s1_rows;
-        let dst_span = dst_rows * dim * 4;
-        let s0_ti = session.add_tensor(
-            s0_buf,
-            s0_offset,
-            s0_span,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            [s0_rows as u32, dim as u32, 1, 1],
-            [4, (s0_rows * 4) as u32, s0_span as u32, s0_span as u32],
-        )?;
-        let s1_ti = session.add_tensor(
-            s1_buf,
-            s1_offset,
-            s1_span,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            [s1_rows as u32, dim as u32, 1, 1],
-            [s1_nb0 as u32, s1_nb1 as u32, s1_span as u32, s1_span as u32],
-        )?;
-        let dst_ti = session.add_tensor(
-            dst_buf,
-            dst_offset,
-            dst_span,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            [dst_rows as u32, dim as u32, 1, 1],
-            [4, (dst_rows * 4) as u32, dst_span as u32, dst_span as u32],
-        )?;
-        let mut params = [0i32; 16];
-        params[0] = 0; // concat dim
-        let kparams = [0i32; 32];
-        Self::enqueue_labeled(
-            session,
-            "dispatch_concat_2d",
-            HtpOpCode::Concat as u32,
-            &[s0_ti, s1_ti],
-            &[dst_ti],
-            params,
-            kparams,
-        )?;
-        Ok(())
+        let src0 = ConcatSrc {
+            buf: s0_buf,
+            offset: s0_offset,
+            rows: s0_rows,
+            nb0: 4,
+            nb1: s0_rows * 4,
+        };
+        let src1 = ConcatSrc {
+            buf: s1_buf,
+            offset: s1_offset,
+            rows: s1_rows,
+            nb0: s1_nb0,
+            nb1: s1_nb1,
+        };
+        dispatch::concat_time_inner(session, src0, src1, dst_buf, dst_offset, dim)
     }
 
     pub(super) fn dispatch_add(
@@ -1097,54 +1069,6 @@ impl HexagonLfmModel {
         Ok(())
     }
 
-    /// In-place row-broadcast elementwise op over `n_rows` rows of `dim` f32s:
-    /// `act[r, :] = act[r, :] <op> vec[:]`, with `vec` an F32 vector in the
-    /// weights buffer. This is the ROW_BCAST binary kernel (`ne11 == 1`), the
-    /// same shape the encoder models' bias add uses; projection biases use Add
-    /// and the Granite residual multiplier uses Mul with a constant vector.
-    fn dispatch_row_bcast(
-        session: &mut HexagonQueueSession,
-        opcode: HtpOpCode,
-        label: &str,
-        act: &RpcmemBuffer,
-        act_offset: usize,
-        vec_buf: &RpcmemBuffer,
-        vec_offset: usize,
-        dim: usize,
-        n_rows: usize,
-    ) -> Result<(), CeraError> {
-        let bytes = dim * n_rows * 4;
-        let act_ti = session.add_tensor(
-            act,
-            act_offset,
-            bytes,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            [dim as u32, n_rows as u32, 1, 1],
-            [4, (dim * 4) as u32, bytes as u32, bytes as u32],
-        )?;
-        let vec_ti = Self::add_f32_vec(session, vec_buf, vec_offset, dim, HTP_TENSOR_WEIGHT)?;
-        let kparams = build_binary_kernel_params(
-            dim,
-            dim,
-            1,
-            1,
-            1,
-            4,
-            8 * 1024 * 1024,
-            session.dsp_threads(),
-        );
-        Self::enqueue_labeled(
-            session,
-            label,
-            opcode as u32,
-            &[act_ti, vec_ti],
-            &[act_ti],
-            [0i32; 16],
-            kparams,
-        )
-    }
-
     /// Add the F32 bias at `bias_offset` of the weights buffer to `n_rows` rows.
     pub(super) fn dispatch_bias_add(
         &self,
@@ -1155,16 +1079,17 @@ impl HexagonLfmModel {
         dim: usize,
         n_rows: usize,
     ) -> Result<(), CeraError> {
-        Self::dispatch_row_bcast(
+        dispatch::add_row_bcast(
             session,
-            HtpOpCode::Add,
-            "dispatch_bias_add",
             act,
             act_offset,
             &self.weights_buf,
             bias_offset,
-            dim,
-            n_rows,
+            TokenShape {
+                dim,
+                n_tokens: n_rows,
+            },
+            TokenTile::Whole,
         )
     }
 
@@ -1181,16 +1106,17 @@ impl HexagonLfmModel {
         let Some(vec_offset) = self.dense.residual_vec_offset else {
             return Ok(());
         };
-        Self::dispatch_row_bcast(
+        dispatch::mul_row_bcast(
             session,
-            HtpOpCode::Mul,
-            "dispatch_residual_scale",
             act,
             act_offset,
             &self.weights_buf,
             vec_offset,
-            dim,
-            n_rows,
+            TokenShape {
+                dim,
+                n_tokens: n_rows,
+            },
+            TokenTile::Whole,
         )
     }
 
@@ -1462,9 +1388,10 @@ impl HexagonLfmModel {
     /// outside 2..=4, mixed K (`in_dim`) or wire dtype, HMX-eligibility
     /// mismatch across the set, Q6_K on the HVX path (no fused HVX
     /// kernel), or HMX chunking overflow (which retries HVX first, like
-    /// the single path). Kernel parameters are W0's single-matmul
-    /// parameters with `n_weights` set, so NX fits VTCM exactly when the
-    /// W0 single would; W0 must carry the largest N (`out_dim`) so the
+    /// the single path), or HVX rows past the fused limit. Kernel parameters are W0's single-matmul
+    /// parameters with `n_weights` set. On the HVX path the fused kernel cannot
+    /// chunk rows, so more rows than `mm_hvx_fused_nx_max_rows` also fall back;
+    /// W0 must carry the largest N (`out_dim`) so the
     /// m=1 dst scratch covers every output.
     pub(super) fn dispatch_mul_mat_nx(
         &self,
@@ -1543,6 +1470,21 @@ impl HexagonLfmModel {
                 session.dsp_threads(),
                 self.vtcm_budget,
             );
+            // The fused kernel cannot chunk rows: past what its layout holds
+            // the separate matmuls (which can) take over. Within the limit the
+            // plain layout needs no chunk either.
+            if n_rows
+                > crate::backend::hexagon::mm_hvx_fused_nx_max_rows(
+                    wtype,
+                    k,
+                    session.dsp_threads(),
+                    self.vtcm_budget,
+                )
+            {
+                unfused(self, session)?;
+                return Ok(());
+            }
+            debug_assert_eq!(kp[2], 0, "a fused matmul within the row limit chunks");
             kp[0] = 5; // HTP_MM_KERNEL_HVX_QUANT_ROW
             kp[17] = n as i32; // n_weights
             kp
@@ -2319,51 +2261,16 @@ impl HexagonLfmModel {
         dst_nb0: usize,
         dst_nb1: usize,
     ) -> Result<(), CeraError> {
-        let span = |nb0: usize, nb1: usize| {
-            src_ne0.saturating_sub(1) * nb0 + src_ne1.saturating_sub(1) * nb1 + 4
+        // The third stride of a one-plane view is its byte span.
+        let view = |buf, offset, nb0: usize, nb1: usize| {
+            let span = src_ne0.saturating_sub(1) * nb0 + src_ne1.saturating_sub(1) * nb1 + 4;
+            View::new(buf, offset, [src_ne0, src_ne1, 1], [nb0, nb1, span])
         };
-        let src_span = span(src_nb0, src_nb1);
-        let dst_span = span(dst_nb0, dst_nb1);
-        let src_ti = session.add_tensor(
-            src,
-            src_offset,
-            src_span,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            [src_ne0 as u32, src_ne1 as u32, 1, 1],
-            [
-                src_nb0 as u32,
-                src_nb1 as u32,
-                src_span as u32,
-                src_span as u32,
-            ],
-        )?;
-        let dst_ti = session.add_tensor(
-            dst,
-            dst_offset,
-            dst_span,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            [src_ne0 as u32, src_ne1 as u32, 1, 1],
-            [
-                dst_nb0 as u32,
-                dst_nb1 as u32,
-                dst_span as u32,
-                dst_span as u32,
-            ],
-        )?;
-        let params = [0i32; 16];
-        let kparams = [0i32; 32];
-        Self::enqueue_labeled(
+        dispatch::copy_view(
             session,
-            "dispatch_cpy_2d",
-            HtpOpCode::Cpy as u32,
-            &[src_ti],
-            &[dst_ti],
-            params,
-            kparams,
-        )?;
-        Ok(())
+            view(src, src_offset, src_nb0, src_nb1),
+            view(dst, dst_offset, dst_nb0, dst_nb1),
+        )
     }
 
     /// SsmConv dispatch: `y[c, m] = sum_t x[m + t, c] * w[t, c]` over the
@@ -2384,69 +2291,19 @@ impl HexagonLfmModel {
         d_inner: usize,
         n_t: usize,
     ) -> Result<(), CeraError> {
-        let ncs = d_conv - 1 + n_t;
-        let x_ti = session.add_tensor(
-            conv_x,
-            conv_x_offset,
-            ncs * d_inner * 4,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            [ncs as u32, d_inner as u32, 1, 1],
-            [
-                4,
-                (ncs * 4) as u32,
-                (ncs * d_inner * 4) as u32,
-                (ncs * d_inner * 4) as u32,
-            ],
-        )?;
-        let w_ti = session.add_tensor(
+        dispatch::ssm_conv(
+            session,
             weights,
             weights_offset,
-            d_conv * d_inner * 4,
-            HTP_TENSOR_WEIGHT,
-            HtpDataType::F32 as u32,
-            [d_conv as u32, d_inner as u32, 1, 1],
-            [
-                4,
-                (d_conv * 4) as u32,
-                (d_conv * d_inner * 4) as u32,
-                (d_conv * d_inner * 4) as u32,
-            ],
-        )?;
-        let dst_ti = session.add_tensor(
+            conv_x,
+            conv_x_offset,
             dst,
             dst_offset,
-            d_inner * n_t * 4,
-            HTP_TENSOR_COMPUTE,
-            HtpDataType::F32 as u32,
-            [d_inner as u32, n_t as u32, 1, 1],
-            [
-                4,
-                (d_inner * 4) as u32,
-                (d_inner * n_t * 4) as u32,
-                (d_inner * n_t * 4) as u32,
-            ],
-        )?;
-        let params = [0i32; 16];
-        let kparams = build_ssm_conv_kernel_params(
             d_conv,
             d_inner,
             n_t,
-            1,
-            ncs,
-            session.dsp_threads(),
             self.vtcm_budget,
-        );
-        Self::enqueue_labeled(
-            session,
-            "dispatch_ssm_conv",
-            HtpOpCode::SsmConv as u32,
-            &[x_ti, w_ti],
-            &[dst_ti],
-            params,
-            kparams,
-        )?;
-        Ok(())
+        )
     }
 }
 

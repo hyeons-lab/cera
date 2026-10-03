@@ -1774,14 +1774,31 @@ impl AudioGpuEncode for MetalAudioEncoder {
 /// encoder. `Auto` prefers Metal. wgpu is not wired yet (its kernels ship and are
 /// parity-tested, but the ops impl does not exist), so `Gpu` yields `None`.
 pub fn build_gpu_audio_encoder(
-    weights: &AudioEncoderWeights,
+    weights: &std::sync::Arc<AudioEncoderWeights>,
     backend: crate::engine::BackendPreference,
 ) -> Option<std::sync::Arc<dyn AudioGpuEncode>> {
     use crate::engine::BackendPreference as BP;
     match backend {
-        BP::Cpu | BP::Gpu | BP::Hexagon => None,
-        BP::Metal | BP::Auto => try_metal_audio_encoder(weights),
+        BP::Cpu | BP::Gpu => None,
+        BP::Hexagon => try_hexagon_audio_encoder(weights),
+        BP::Metal => try_metal_audio_encoder(weights),
+        // Metal first, then the NPU (the order the rest of `auto` uses).
+        BP::Auto => try_metal_audio_encoder(weights).or_else(|| try_hexagon_audio_encoder(weights)),
     }
+}
+
+#[cfg(feature = "hexagon")]
+fn try_hexagon_audio_encoder(
+    weights: &std::sync::Arc<AudioEncoderWeights>,
+) -> Option<std::sync::Arc<dyn AudioGpuEncode>> {
+    crate::model::audio_encoder_hexagon::try_hexagon_audio_encoder(weights)
+}
+
+#[cfg(not(feature = "hexagon"))]
+fn try_hexagon_audio_encoder(
+    _weights: &std::sync::Arc<AudioEncoderWeights>,
+) -> Option<std::sync::Arc<dyn AudioGpuEncode>> {
+    None
 }
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]

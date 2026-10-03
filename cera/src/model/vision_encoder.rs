@@ -299,6 +299,32 @@ impl ProjectorWeights {
     }
 }
 
+/// Intermediates of the first ViT block, in the layouts both encoders share
+/// (`[tokens, width]` row-major), for comparing the Hexagon encoder with this
+/// one stage by stage (see `examples/hexagon_vit_probe.rs`).
+#[derive(Debug, Clone, Default)]
+#[doc(hidden)]
+pub struct VitStageDump {
+    /// The tokens going in (patch embedding plus position embedding).
+    pub x0: Vec<f32>,
+    /// Q, K and V with their biases.
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    /// The attention output, and the output projection with its bias (both
+    /// before the residual add).
+    pub attn_out: Vec<f32>,
+    pub attn_proj: Vec<f32>,
+    /// The second LayerNorm's output, the feed-forward's activation (after
+    /// the up projection, its bias and GELU) and its down projection with bias
+    /// (before the residual add).
+    pub ln2: Vec<f32>,
+    pub ffn_mid: Vec<f32>,
+    pub ffn_out: Vec<f32>,
+    /// The tokens leaving the block.
+    pub tokens: Vec<f32>,
+}
+
 /// All vision-encoder weights, loaded from a multimodal_projector
 /// GGUF in one shot. Mirrors `audio_encoder::AudioEncoderWeights`
 /// for the audio counterpart.
@@ -607,6 +633,78 @@ impl VisionEncoderWeights {
 
         // 6. Projector: mm.1 + GELU + mm.2.
         Ok(self.projector_forward(&pooled, cfg))
+    }
+
+    /// The `[patches, n_embd]` tokens after patch embedding, the position
+    /// embeddings and the first `n_blocks` ViT blocks (before the final
+    /// LayerNorm, pooling and projector): the reference the Hexagon encoder is
+    /// compared with block by block.
+    #[doc(hidden)]
+    pub fn debug_blocks(
+        &self,
+        pixels: &[f32],
+        grid_w: usize,
+        grid_h: usize,
+        n_blocks: usize,
+    ) -> Result<Vec<f32>> {
+        let cfg = &self.config;
+        let n_patches = grid_w * grid_h;
+        anyhow::ensure!(
+            pixels.len() == n_patches * cfg.patch_size * cfg.patch_size * 3,
+            "debug_blocks: {} pixels for a {grid_w}x{grid_h} grid",
+            pixels.len()
+        );
+        let mut tokens = patch_embed_compute(pixels, &self.patch_embed, cfg, grid_w, grid_h);
+        let pos = self.resolved_position_embed(grid_w, grid_h);
+        for (t, p) in tokens.iter_mut().zip(pos.iter()) {
+            *t += *p;
+        }
+        let mut scratch = VitScratch::new(cfg, n_patches);
+        for block in self.blocks.iter().take(n_blocks) {
+            self.vit_block_forward(&mut tokens, block, &mut scratch, n_patches);
+        }
+        Ok(tokens)
+    }
+
+    /// Run only the first ViT block and return its intermediates.
+    #[doc(hidden)]
+    pub fn debug_first_block(
+        &self,
+        pixels: &[f32],
+        grid_w: usize,
+        grid_h: usize,
+    ) -> Result<VitStageDump> {
+        let cfg = &self.config;
+        let n_patches = grid_w * grid_h;
+        anyhow::ensure!(
+            pixels.len() == n_patches * cfg.patch_size * cfg.patch_size * 3,
+            "debug_first_block: {} pixels for a {grid_w}x{grid_h} grid",
+            pixels.len()
+        );
+        let mut tokens = patch_embed_compute(pixels, &self.patch_embed, cfg, grid_w, grid_h);
+        let pos = self.resolved_position_embed(grid_w, grid_h);
+        for (t, p) in tokens.iter_mut().zip(pos.iter()) {
+            *t += *p;
+        }
+        let x0 = tokens.clone();
+        let mut scratch = VitScratch::new(cfg, n_patches);
+        let block = self
+            .blocks
+            .first()
+            .ok_or_else(|| anyhow::anyhow!("no ViT blocks"))?;
+        self.vit_block_forward(&mut tokens, block, &mut scratch, n_patches);
+        Ok(VitStageDump {
+            x0,
+            q: scratch.q,
+            k: scratch.k,
+            v: scratch.v,
+            attn_out: scratch.attn_out,
+            attn_proj: scratch.attn_proj,
+            ln2: scratch.pre_norm,
+            ffn_mid: scratch.ffn_mid,
+            ffn_out: scratch.ffn_out,
+            tokens,
+        })
     }
 
     /// Return position embeddings for the requested dynamic patch
