@@ -272,6 +272,17 @@ impl LogMelFrontEnd {
     }
 }
 
+/// An accelerator (the Hexagon NPU) for the keyword spotter's backbone: the log-mel front end
+/// and the four stride-2 convolutions, the part that runs over a 1.2 s window every 80 ms
+/// whether or not anyone is speaking, and the largest cost of an always-on wake word.
+pub trait HotwordAccelerator: Send + Sync {
+    /// The temporal-mean-pooled embedding (`embedding_dim` values) of `window`, the
+    /// gain-normalized audio of one detection window. `Ok(None)` declines it (the CPU takes
+    /// it); an `Err` is a failure, after which the detector stops using the accelerator (with a
+    /// warning) and carries on on the CPU. The tiny dense head always runs on the host.
+    fn embedding(&self, window: &[f32]) -> Result<Option<Vec<f32>>>;
+}
+
 // ── Model Weights & Tensor Representation ─────────────────────────────────────
 
 struct HotwordWeights {
@@ -519,6 +530,8 @@ pub struct HotwordDetector {
     dense1_scratch: [f32; 32],
     scores_scratch: Vec<f32>,
     window_scratch: Vec<f32>,
+    /// Runs the backbone when set (see [`Self::set_accelerator`]).
+    accel: Option<Arc<dyn HotwordAccelerator>>,
 }
 
 impl HotwordDetector {
@@ -588,7 +601,47 @@ impl HotwordDetector {
             dense1_scratch: [0.0f32; 32],
             scores_scratch: Vec::with_capacity(num_keywords),
             window_scratch: vec![0.0f32; window_samples],
+            accel: None,
         })
+    }
+
+    /// Run the backbone of every window on `accel` from here on.
+    pub fn set_accelerator(&mut self, accel: Arc<dyn HotwordAccelerator>) {
+        self.accel = Some(accel);
+    }
+
+    /// The pooled embedding of the last window processed (for diagnostics and parity probes).
+    #[doc(hidden)]
+    pub fn last_embedding(&self) -> &[f32] {
+        &self.emb_scratch
+    }
+
+    /// Whether the backbone currently runs on an accelerator (it drops out, with a warning, if
+    /// it fails).
+    pub fn is_accelerated(&self) -> bool {
+        self.accel.is_some()
+    }
+
+    /// The pooled embedding of `window_scratch` from the accelerator into `emb_scratch`, or
+    /// `false` to run the backbone on the CPU.
+    fn accelerated_embedding(&mut self) -> bool {
+        let Some(accel) = self.accel.as_ref().map(Arc::clone) else {
+            return false;
+        };
+        match accel.embedding(&self.window_scratch) {
+            Ok(Some(emb)) if emb.len() == self.emb_scratch.len() => {
+                self.emb_scratch.copy_from_slice(&emb);
+                true
+            }
+            Ok(_) => false,
+            Err(e) => {
+                tracing::warn!(
+                    "hotword accelerator failed ({e:#}); running on the CPU from here on"
+                );
+                self.accel = None;
+                false
+            }
+        }
     }
 
     /// List of target keywords supported by this model.
@@ -651,62 +704,63 @@ impl HotwordDetector {
         for (dst, &src) in self.window_scratch.iter_mut().zip(window.iter()) {
             *dst = if src.is_finite() { src * scale } else { 0.0 };
         }
-        let input_window = &self.window_scratch[..];
+        if !self.accelerated_embedding() {
+            let input_window = &self.window_scratch[..];
+            // 2. Extract log-mel spectrogram
+            self.front_end.extract(input_window, &mut self.mel_scratch);
 
-        // 2. Extract log-mel spectrogram
-        self.front_end.extract(input_window, &mut self.mel_scratch);
+            // 3. Convolutional Backbone Forward Pass
+            let l0 = (num_frames - 1) / 2 + 1;
+            conv1d_silu_s2(
+                &self.mel_scratch,
+                &mut self.conv0_scratch,
+                self.weights.mel_bins,
+                num_frames,
+                64,
+                self.weights.conv0_w.as_f32_slice(),
+                self.weights.conv0_b.as_f32_slice(),
+            );
 
-        // 3. Convolutional Backbone Forward Pass
-        let l0 = (num_frames - 1) / 2 + 1;
-        conv1d_silu_s2(
-            &self.mel_scratch,
-            &mut self.conv0_scratch,
-            self.weights.mel_bins,
-            num_frames,
-            64,
-            self.weights.conv0_w.as_f32_slice(),
-            self.weights.conv0_b.as_f32_slice(),
-        );
+            let l1 = (l0 - 1) / 2 + 1;
+            conv1d_silu_s2(
+                &self.conv0_scratch,
+                &mut self.conv1_scratch,
+                64,
+                l0,
+                64,
+                self.weights.conv1_w.as_f32_slice(),
+                self.weights.conv1_b.as_f32_slice(),
+            );
 
-        let l1 = (l0 - 1) / 2 + 1;
-        conv1d_silu_s2(
-            &self.conv0_scratch,
-            &mut self.conv1_scratch,
-            64,
-            l0,
-            64,
-            self.weights.conv1_w.as_f32_slice(),
-            self.weights.conv1_b.as_f32_slice(),
-        );
+            let l2 = (l1 - 1) / 2 + 1;
+            conv1d_silu_s2(
+                &self.conv1_scratch,
+                &mut self.conv2_scratch,
+                64,
+                l1,
+                64,
+                self.weights.conv2_w.as_f32_slice(),
+                self.weights.conv2_b.as_f32_slice(),
+            );
 
-        let l2 = (l1 - 1) / 2 + 1;
-        conv1d_silu_s2(
-            &self.conv1_scratch,
-            &mut self.conv2_scratch,
-            64,
-            l1,
-            64,
-            self.weights.conv2_w.as_f32_slice(),
-            self.weights.conv2_b.as_f32_slice(),
-        );
+            let l3 = (l2 - 1) / 2 + 1;
+            conv1d_silu_s2(
+                &self.conv2_scratch,
+                &mut self.conv3_scratch,
+                64,
+                l2,
+                self.weights.embedding_dim,
+                self.weights.conv3_w.as_f32_slice(),
+                self.weights.conv3_b.as_f32_slice(),
+            );
 
-        let l3 = (l2 - 1) / 2 + 1;
-        conv1d_silu_s2(
-            &self.conv2_scratch,
-            &mut self.conv3_scratch,
-            64,
-            l2,
-            self.weights.embedding_dim,
-            self.weights.conv3_w.as_f32_slice(),
-            self.weights.conv3_b.as_f32_slice(),
-        );
-
-        // 3. Temporal Mean Pooling -> 64-dim embedding
-        let inv_l3 = 1.0 / (l3 as f32);
-        for c in 0..self.weights.embedding_dim {
-            let row = &self.conv3_scratch[c * l3..(c + 1) * l3];
-            let sum: f32 = row.iter().sum();
-            self.emb_scratch[c] = sum * inv_l3;
+            // 3. Temporal Mean Pooling -> 64-dim embedding
+            let inv_l3 = 1.0 / (l3 as f32);
+            for c in 0..self.weights.embedding_dim {
+                let row = &self.conv3_scratch[c * l3..(c + 1) * l3];
+                let sum: f32 = row.iter().sum();
+                self.emb_scratch[c] = sum * inv_l3;
+            }
         }
 
         // 4. Dense Head Layer 1: Linear 64 -> 32 + SiLU
@@ -848,6 +902,16 @@ pub struct HotwordIterator {
 }
 
 impl HotwordIterator {
+    /// The detector this iterator evaluates.
+    pub fn detector(&self) -> &HotwordDetector {
+        &self.detector
+    }
+
+    #[cfg(feature = "hexagon")]
+    pub(crate) fn detector_mut(&mut self) -> &mut HotwordDetector {
+        &mut self.detector
+    }
+
     pub(crate) fn with_config(self, config: HotwordConfig) -> Self {
         Self::new(self.detector, self.vad, config)
     }
@@ -1109,6 +1173,9 @@ const _: fn() = || {
 
 // ── Unit Tests ────────────────────────────────────────────────────────────────
 
+#[cfg(feature = "hexagon")]
+mod hexagon;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1269,6 +1336,7 @@ mod tests {
             dense1_scratch: [0.0; 32],
             scores_scratch: Vec::new(),
             window_scratch: vec![0.0f32; 19200],
+            accel: None,
         }
     }
 

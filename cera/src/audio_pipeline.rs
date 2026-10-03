@@ -176,6 +176,7 @@ pub struct AudioPipelineBuilder {
     vad_sample_rate: Option<VadSampleRate>,
     hotword: Option<HotwordIterator>,
     hotword_config_explicit: bool,
+    hotword_on_cpu: bool,
     whisper: Option<WhisperModel>,
     whisper_tokenizer: Option<BpeTokenizer>,
     config: Option<AudioPipelineConfig>,
@@ -240,6 +241,16 @@ impl AudioPipelineBuilder {
     /// Attach a custom VAD configuration.
     pub fn with_vad_config(mut self, config: VadConfig) -> Self {
         self.vad_config = Some(config);
+        self
+    }
+
+    /// Keep the keyword spotter on the CPU. In a build with the `hexagon` feature the pipeline
+    /// otherwise runs its backbone on the Hexagon NPU when one is available: the detector
+    /// re-evaluates a 1.2 s window every 80 ms whether or not anyone is speaking, so on the CPU it
+    /// is the largest always-on cost of a wake word, and Android demotes background CPU work and
+    /// not the NPU.
+    pub fn with_hotword_on_cpu(mut self) -> Self {
+        self.hotword_on_cpu = true;
         self
     }
 
@@ -428,7 +439,8 @@ impl AudioPipelineBuilder {
             .unwrap_or(config.vad_config.clone())
             .sanitized();
         config.vad_config = vad_config.clone();
-        let hotword = self.hotword.map(|iterator| {
+        #[cfg_attr(not(feature = "hexagon"), allow(unused_mut))]
+        let mut hotword = self.hotword.map(|iterator| {
             if !self.hotword_config_explicit
                 && let Some(cfg) = config.hotword_config.clone()
             {
@@ -437,6 +449,13 @@ impl AudioPipelineBuilder {
                 iterator
             }
         });
+        #[cfg(feature = "hexagon")]
+        if !self.hotword_on_cpu
+            && let Some(h) = hotword.as_mut()
+            && !h.detector().is_accelerated()
+        {
+            h.detector_mut().try_enable_hexagon();
+        }
         let vad = {
             let mut vad = self.vad;
             // Either the builder flag or the config opts out (fail-safe); `from_files` only
