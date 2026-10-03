@@ -107,8 +107,14 @@ fn linear(
             w.rows
         )));
     }
+    let w = plan_linear(cur, w).map_err(|e| {
+        CeraError::Backend(format!(
+            "sortformer tail: {what}: {e}; the NPU reads Q8_0 or Q4_0 weights, so convert the \
+             model with `--tail-outtype q8_0` (scripts/sortformer/README.md)"
+        ))
+    })?;
     Ok(LinearOffsets {
-        w: plan_linear(cur, w)?,
+        w,
         b: plan_vec(cur, b.len()),
     })
 }
@@ -913,6 +919,21 @@ mod tests {
             w: desc(rows, cols),
             b: 128,
         }
+    }
+
+    /// A weight the NPU cannot read (here dense F32, as an F16 or F32 GGUF would give) is refused
+    /// with the tensor's name and the way to convert the model so it works.
+    #[test]
+    fn a_tail_weight_the_npu_cannot_read_names_the_fix() {
+        let dense = MmapWeight::from_owned_f32(vec![0.0; 4 * 32], 4, 32);
+        let mut cur = 0;
+        let err = linear(&mut cur, &dense, &[0.0; 4], "transformer layer 3 q")
+            .unwrap_err()
+            .to_string();
+        assert!(
+            err.contains("transformer layer 3 q") && err.contains("--tail-outtype q8_0"),
+            "{err}"
+        );
     }
 
     /// Sortformer's real widths, two layers.

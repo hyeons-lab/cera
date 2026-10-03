@@ -178,3 +178,65 @@ fn test_ffi_audio_pipeline_with_a_diarizer() {
         "{err:?}"
     );
 }
+
+/// Device test, run with `--ignored` on a Qualcomm phone: `from_files_with_diarizer` with
+/// `prefer_npu` puts the diarizer on the NPU, and a registered utterance gets the speaker the
+/// CPU gives it. Needs `SORTFORMER_GGUF` (a model converted with `--tail-outtype q8_0`) and
+/// `SORTFORMER_CLIP` (the committed `clip.wav`) in the environment.
+#[cfg(feature = "hexagon")]
+#[test]
+#[ignore = "needs a Hexagon NPU, a Q8_0-tail Sortformer GGUF (SORTFORMER_GGUF) and clip.wav (SORTFORMER_CLIP)"]
+fn test_ffi_audio_pipeline_diarizer_on_the_npu() {
+    let gguf = std::env::var("SORTFORMER_GGUF").expect("SORTFORMER_GGUF");
+    let clip = std::fs::read(std::env::var("SORTFORMER_CLIP").expect("SORTFORMER_CLIP"))
+        .expect("read the clip");
+    let data = clip
+        .windows(4)
+        .position(|w| w == b"data")
+        .expect("data chunk");
+    let pcm: Vec<f32> = clip[data + 8..]
+        .as_chunks::<2>()
+        .0
+        .iter()
+        .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
+        .collect();
+    let config = FfiAudioPipelineConfig {
+        auto_transcribe: false,
+        ..audio_pipeline_default_config()
+    };
+    let pipeline =
+        FfiAudioPipeline::from_files_with_diarizer(None, None, None, gguf, true, Some(config))
+            .expect("pipeline with an NPU diarizer");
+    assert!(pipeline.has_diarizer().unwrap());
+    assert!(
+        pipeline.diarizer_on_npu(),
+        "the diarizer did not reach the NPU"
+    );
+    for (text, start, end) in [
+        ("first", 480.0, 4160.0),
+        ("second", 4960.0, 8240.0),
+        ("third", 8480.0, 10640.0),
+    ] {
+        assert!(pipeline.add_utterance(text.into(), start, end).unwrap());
+    }
+    let mut events = Vec::new();
+    for piece in pcm.chunks(1600) {
+        events.extend(pipeline.process_chunk(piece.to_vec()).unwrap());
+    }
+    events.extend(pipeline.flush().unwrap());
+    let labeled: Vec<(String, Option<u32>)> = events
+        .into_iter()
+        .filter_map(|e| match e {
+            FfiAudioPipelineEvent::UtteranceLabeled { text, speaker, .. } => Some((text, speaker)),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        labeled,
+        vec![
+            ("first".to_string(), Some(0)),
+            ("second".to_string(), Some(1)),
+            ("third".to_string(), Some(2)),
+        ]
+    );
+}
