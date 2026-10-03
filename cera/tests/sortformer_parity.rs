@@ -486,3 +486,123 @@ fn step_bookkeeping_follows_nemo() {
         "audio frames are sigmoids"
     );
 }
+
+/// Push `pcm` in pieces of `piece` samples through a live diarizer; returns every prediction.
+fn run_live(m: &SortformerModel, pcm: &[f32], params: StreamingParams, piece: usize) -> Vec<f32> {
+    let mut live = m.new_live(params).unwrap();
+    let mut out = Vec::new();
+    for part in pcm.chunks(piece) {
+        out.extend(live.push_audio(part).unwrap());
+    }
+    out.extend(live.finish().unwrap());
+    assert_eq!(live.frames_emitted() * 4, out.len());
+    out
+}
+
+/// The incremental mel must be the whole-clip mel exactly, for any way of cutting the audio:
+/// every frame is the same arithmetic on the same samples.
+#[test]
+fn mel_stream_is_bit_identical_to_the_whole_clip_mel() {
+    let Some(m) = model("sortformer-4spk-v2.1-f32.gguf") else {
+        return;
+    };
+    let pcm = read_clip();
+    let (want, n) = m.log_mel(&pcm);
+    for piece in [1usize, 7, 160, 161, 777, 8000, pcm.len()] {
+        let mut ms = m.new_mel_stream();
+        let mut got = Vec::new();
+        for part in pcm.chunks(piece) {
+            got.extend(ms.push(part).unwrap());
+        }
+        got.extend(ms.finish());
+        assert_eq!(
+            got.len(),
+            want.len(),
+            "piece {piece}: frame count (want {n})"
+        );
+        assert_eq!(ms.frames(), n);
+        assert!(
+            got.iter()
+                .zip(&want)
+                .all(|(a, b)| a.to_bits() == b.to_bits()),
+            "piece {piece}: mel differs from the whole-clip mel"
+        );
+    }
+    // Audio shorter than one hop has no valid frames, like the offline path.
+    let mut ms = m.new_mel_stream();
+    assert!(ms.push(&pcm[..100]).unwrap().is_empty() && ms.finish().is_empty());
+    assert_eq!(m.log_mel(&pcm[..100]).1, 0);
+}
+
+/// Live diarization is the feature-level streaming loop run on audio as it arrives: same
+/// predictions to the bit, however the audio is cut, and (apart from the final chunk's padding)
+/// the same as NeMo's.
+#[test]
+fn live_matches_the_offline_streaming_loop_and_nemo() {
+    let (Some(m), Some(golden)) = (model("sortformer-4spk-v2.1-f32.gguf"), Golden::load()) else {
+        return;
+    };
+    let pcm = read_clip();
+    let t = golden.n_frames();
+    for name in ["tiny", "tiny_nofifo", "default"] {
+        let params = preset(&m, &golden, name);
+        let (mel, n) = m.log_mel(&pcm);
+        let want = m
+            .new_stream(params.clone())
+            .unwrap()
+            .diarize_features_unpadded(&mel, n)
+            .unwrap();
+        assert_eq!(want.len(), t * 4, "{name}: one prediction per valid frame");
+        for piece in [777usize, pcm.len()] {
+            let got = run_live(&m, &pcm, params.clone(), piece);
+            assert!(
+                got.len() == want.len()
+                    && got
+                        .iter()
+                        .zip(&want)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{name}: live output differs from the offline loop (pieces of {piece})"
+            );
+        }
+        // Against NeMo: the unpadded loop chunks the last frames differently from NeMo's padded one,
+        // but every valid frame sees the same audio.
+        let nemo = &golden.t(&format!("{name}.total_preds"))[..t * 4];
+        let d = diff(&want, nemo);
+        eprintln!("  {name}: live vs NeMo max|d| {:.3e}", d.max_abs);
+        assert!(
+            d.max_abs <= 5e-3,
+            "{name}: live vs NeMo max|d| {:.3e}",
+            d.max_abs
+        );
+    }
+}
+
+/// A chunk is released as soon as it and its lookahead exist, not before and not later.
+#[test]
+fn live_releases_a_chunk_when_its_lookahead_arrives() {
+    let (Some(m), Some(golden)) = (model("sortformer-4spk-v2.1-f32.gguf"), Golden::load()) else {
+        return;
+    };
+    let pcm = read_clip();
+    let params = preset(&m, &golden, "tiny"); // chunk 12 frames, 1 frame of lookahead
+    let mut live = m.new_live(params).unwrap();
+    assert_eq!(live.latency_frames(), 13);
+
+    // 12 chunk frames + 1 lookahead frame = 104 mel frames; the 104th (index 103) needs audio
+    // through sample 103 * 160 + 256 = 16736.
+    let ready = 103 * 160 + 256;
+    assert!(live.push_audio(&pcm[..ready - 1]).unwrap().is_empty());
+    assert_eq!(live.frames_emitted(), 0);
+    let first = live.push_audio(&pcm[ready - 1..ready]).unwrap();
+    assert_eq!(first.len(), 12 * 4, "the first chunk is 12 frames");
+
+    // The tail comes out at finish, and the totals are one prediction per valid frame.
+    let rest: usize = live.push_audio(&pcm[ready..]).unwrap().len() + live.finish().unwrap().len();
+    assert_eq!(live.frames_emitted(), golden.n_frames());
+    assert_eq!((first.len() + rest) / 4, golden.n_frames());
+    assert!(
+        live.push_audio(&[0.0; 160]).is_err(),
+        "no audio after finish"
+    );
+    assert!(live.finish().unwrap().is_empty(), "finish is idempotent");
+}

@@ -53,7 +53,7 @@ use crate::model::audio_encoder::{
     PREEMPH, SAMPLE_RATE, WINDOW_LEN, conformer_block_forward, conv_stem_forward,
     load_conformer_block, load_conv_layer, load_vec_f32, relative_pos_emb,
 };
-use crate::model::audio_preprocessor::{N_FFT_BINS, log_mel_with_tables};
+use crate::model::audio_preprocessor::{MelFrameComputer, N_FFT_BINS, log_mel_with_tables};
 use crate::model::weights::MmapWeight;
 
 /// Largest speaker count the model's output head has; fixed by the checkpoint.
@@ -668,6 +668,233 @@ impl SortformerModel {
     }
 }
 
+// ── Live audio ─────────────────────────────────────────────────────────────
+
+/// Incremental NeMo log-mel: feed PCM in pieces of any size, get the same mel frames the
+/// whole-clip [`SortformerModel::log_mel`] computes, bit for bit.
+///
+/// A frame needs 512 samples centered on its hop position, so a frame is ready once 256
+/// samples past its center have arrived; the clip's last frames need the trailing center
+/// padding, which [`Self::finish`] supplies. Pre-emphasis carries the previous raw sample
+/// across calls (the offline path leaves the first sample untouched, which is the same thing
+/// with a previous sample of 0).
+pub struct MelStream {
+    computer: MelFrameComputer,
+    n_mel_bins: usize,
+    /// Pre-emphasized samples in padded coordinates (256 zeros of left padding, then audio);
+    /// `buf[0]` is padded index `base`.
+    buf: Vec<f32>,
+    base: usize,
+    n_in: usize,
+    prev_raw: f32,
+    next_frame: usize,
+    finished: bool,
+}
+
+impl MelStream {
+    fn new(w: &SortformerWeights) -> Self {
+        let n_mel_bins = w.config.n_mel_bins;
+        Self {
+            computer: MelFrameComputer::new(n_mel_bins, &w.window, &w.mel_fb),
+            n_mel_bins,
+            buf: vec![0.0; N_FFT / 2],
+            base: 0,
+            n_in: 0,
+            prev_raw: 0.0,
+            next_frame: 0,
+            finished: false,
+        }
+    }
+
+    /// Samples pushed so far.
+    pub fn samples(&self) -> usize {
+        self.n_in
+    }
+
+    /// Mel frames produced so far.
+    pub fn frames(&self) -> usize {
+        self.next_frame
+    }
+
+    /// Append mono 16 kHz PCM. Returns the newly completed mel frames, `[k x 128]` time-major.
+    pub fn push(&mut self, pcm: &[f32]) -> Result<Vec<f32>> {
+        ensure!(!self.finished, "MelStream: push after finish");
+        self.buf.reserve(pcm.len());
+        for &x in pcm {
+            // The first sample passes through unchanged because `prev_raw` starts at 0.
+            let y = x - PREEMPH * self.prev_raw;
+            self.buf.push(y);
+            self.prev_raw = x;
+            self.n_in += 1;
+        }
+        Ok(self.emit())
+    }
+
+    /// End of audio: add the trailing center padding and return the remaining frames.
+    pub fn finish(&mut self) -> Vec<f32> {
+        if self.finished {
+            return Vec::new();
+        }
+        self.finished = true;
+        self.buf.resize(self.buf.len() + N_FFT / 2, 0.0);
+        self.emit()
+    }
+
+    fn emit(&mut self) -> Vec<f32> {
+        let mut out = Vec::new();
+        let mut row = vec![0.0f32; self.n_mel_bins];
+        // NeMo's length is n / hop: the STFT's extra last frame is masked, never produced.
+        while self.next_frame < self.n_in / HOP_LEN {
+            let start = self.next_frame * HOP_LEN;
+            if start + N_FFT > self.base + self.buf.len() {
+                break;
+            }
+            let lo = start - self.base;
+            self.computer.frame(&self.buf[lo..lo + N_FFT], &mut row);
+            out.extend_from_slice(&row);
+            self.next_frame += 1;
+        }
+        // Frames before `next_frame` are done with.
+        let keep_from = self.next_frame * HOP_LEN;
+        if keep_from > self.base {
+            self.buf.drain(..keep_from - self.base);
+            self.base = keep_from;
+        }
+        out
+    }
+}
+
+/// Live diarization: push PCM as it arrives, receive each frame's speaker activities once they
+/// are final.
+///
+/// It chunks the incremental mel the way [`SortformerStream::diarize_features_unpadded`] does
+/// and gives bit-identical predictions to it. A chunk is computed once `chunk_len` frames plus
+/// `right_context` frames of lookahead exist (see [`Self::latency_frames`]); predictions are
+/// never revised. [`Self::finish`] flushes the tail.
+pub struct SortformerLive {
+    stream: SortformerStream,
+    mel: MelStream,
+    /// Mel frames from `rows_start` on, `[k x 128]`.
+    rows: Vec<f32>,
+    rows_start: usize,
+    total_mel: usize,
+    /// First mel frame of the next chunk (NeMo's `stt_feat`).
+    stt: usize,
+    emitted: usize,
+    finished: bool,
+}
+
+impl SortformerModel {
+    /// Start live diarization with `params` (see [`Self::default_streaming`]).
+    pub fn new_live(&self, params: StreamingParams) -> Result<SortformerLive> {
+        Ok(SortformerLive {
+            stream: self.new_stream(params)?,
+            mel: MelStream::new(&self.w),
+            rows: Vec::new(),
+            rows_start: 0,
+            total_mel: 0,
+            stt: 0,
+            emitted: 0,
+            finished: false,
+        })
+    }
+
+    /// An incremental mel front end on its own.
+    pub fn new_mel_stream(&self) -> MelStream {
+        MelStream::new(&self.w)
+    }
+}
+
+impl SortformerLive {
+    /// Worst-case delay in frames (80 ms each): a chunk's first frame waits for the rest of
+    /// the chunk and its lookahead, `chunk_len + right_context` (NeMo's definition of the
+    /// preset's latency), on top of the 160 ms the mel front end needs after a frame's center.
+    pub fn latency_frames(&self) -> usize {
+        self.stream.params.chunk_len + self.stream.params.right_context
+    }
+
+    /// Prediction frames returned so far (80 ms each).
+    pub fn frames_emitted(&self) -> usize {
+        self.emitted
+    }
+
+    /// The underlying streaming state (speaker cache, FIFO, silence profile).
+    pub fn stream(&self) -> &SortformerStream {
+        &self.stream
+    }
+
+    /// Feed mono 16 kHz PCM of any length. Returns the predictions that became final,
+    /// `[k x 4]` for the next `k` frames in order (possibly empty).
+    pub fn push_audio(&mut self, pcm: &[f32]) -> Result<Vec<f32>> {
+        ensure!(!self.finished, "SortformerLive: push_audio after finish");
+        let rows = self.mel.push(pcm)?;
+        self.accept(&rows);
+        self.drain(false)
+    }
+
+    /// End of audio: flush the remaining frames with whatever lookahead exists.
+    pub fn finish(&mut self) -> Result<Vec<f32>> {
+        if self.finished {
+            return Ok(Vec::new());
+        }
+        let rows = self.mel.finish();
+        self.accept(&rows);
+        self.finished = true;
+        self.drain(true)
+    }
+
+    fn accept(&mut self, rows: &[f32]) {
+        self.rows.extend_from_slice(rows);
+        self.total_mel += rows.len() / self.stream.w.config.n_mel_bins;
+    }
+
+    fn drain(&mut self, last: bool) -> Result<Vec<f32>> {
+        let (nm, ss) = (
+            self.stream.w.config.n_mel_bins,
+            self.stream.w.config.subsampling,
+        );
+        let chunk_feat = self.stream.params.chunk_len * ss;
+        let right_feat = self.stream.params.right_context * ss;
+        let left_feat = self.stream.params.left_context * ss;
+        let mut out = Vec::new();
+        loop {
+            let left_offset = left_feat.min(self.stt);
+            let (end, right_offset) = if last {
+                if self.stt >= self.total_mel {
+                    break;
+                }
+                let end = (self.stt + chunk_feat).min(self.total_mel);
+                (end, right_feat.min(self.total_mel - end))
+            } else {
+                // Wait for the full chunk and its whole lookahead, as in the middle of an
+                // offline clip.
+                if self.total_mel < self.stt + chunk_feat + right_feat {
+                    break;
+                }
+                (self.stt + chunk_feat, right_feat)
+            };
+            let first = self.stt - left_offset;
+            let n_feat = end + right_offset - first;
+            let lo = (first - self.rows_start) * nm;
+            let chunk = self.rows[lo..lo + n_feat * nm].to_vec();
+            let preds = self
+                .stream
+                .step(&chunk, n_feat, n_feat, left_offset, right_offset)?;
+            self.stt = end;
+            self.emitted += preds.len() / self.stream.w.config.n_spk;
+            out.extend(preds);
+
+            // Mel frames before the next chunk's left context are no longer needed.
+            let keep_from = self.stt.saturating_sub(left_feat);
+            if keep_from > self.rows_start {
+                self.rows.drain(..(keep_from - self.rows_start) * nm);
+                self.rows_start = keep_from;
+            }
+        }
+        Ok(out)
+    }
+}
+
 // ── Transformer layer ──────────────────────────────────────────────────────
 
 /// One post-LN Transformer layer, in place on `[t × d]`:
@@ -798,6 +1025,13 @@ impl SortformerStream {
         self.diarize_features_with(mel, n_frames, &mut |_, _, _| {})
     }
 
+    /// Like [`Self::diarize_features`], but chunked as a live stream sees the audio: the
+    /// features are not padded to `pad_to`, so the final chunk ends at the last real frame.
+    /// [`SortformerLive`] produces exactly these predictions.
+    pub fn diarize_features_unpadded(&mut self, mel: &[f32], n_frames: usize) -> Result<Vec<f32>> {
+        self.chunk_loop(mel, n_frames, n_frames, &mut |_, _, _| {})
+    }
+
     /// [`Self::diarize_features`] that calls `on_step(index, stream, chunk_preds)` after every
     /// step, with the stream's state as the step left it. The parity tests compare that state
     /// with NeMo's, step by step.
@@ -807,10 +1041,22 @@ impl SortformerStream {
         n_frames: usize,
         on_step: &mut dyn FnMut(usize, &SortformerStream, &[f32]),
     ) -> Result<Vec<f32>> {
+        let pad_to = self.w.config.pad_to.max(1);
+        self.chunk_loop(mel, n_frames, n_frames.div_ceil(pad_to) * pad_to, on_step)
+    }
+
+    /// NeMo's `streaming_feat_loader` over `feat_len` frames (`>= n_frames`; the tail past
+    /// `n_frames` is padding that is never computed).
+    fn chunk_loop(
+        &mut self,
+        mel: &[f32],
+        n_frames: usize,
+        feat_len: usize,
+        on_step: &mut dyn FnMut(usize, &SortformerStream, &[f32]),
+    ) -> Result<Vec<f32>> {
         let c = &self.w.config;
         let (nm, ss) = (c.n_mel_bins, c.subsampling);
         ensure!(mel.len() == n_frames * nm, "mel is not [n_frames x {nm}]");
-        let feat_len = n_frames.div_ceil(c.pad_to.max(1)) * c.pad_to.max(1);
         let chunk_feat = self.params.chunk_len * ss;
 
         let mut total = Vec::new();
