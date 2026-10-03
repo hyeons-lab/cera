@@ -141,6 +141,11 @@ required-features = ["mmap", "parallel"]
 name = "audio_encoder_bench"
 required-features = ["mmap", "parallel"]
 
+# The NPU ViT against the CPU one at several image sizes (device only).
+[[example]]
+name = "hexagon_vit_probe"
+required-features = ["hexagon", "mmap"]
+
 # Is NPU decode bit-reproducible (device only).
 [[example]]
 name = "hexagon_decode_probe"

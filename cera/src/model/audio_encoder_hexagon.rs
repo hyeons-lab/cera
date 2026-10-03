@@ -364,6 +364,12 @@ pub(crate) struct ScratchOffsets {
     pub attn_av: usize,
     /// The adapter's output, `[frames, llm_hidden_size]`: the embeddings.
     pub adapter_out: usize,
+    /// The tanh GELU's intermediate: [`dispatch::GELU_TMP_ROWS`] rows of the adapter's
+    /// widest activation.
+    pub gelu_tmp: usize,
+    /// The GELU scratch's size in bytes: what [`dispatch::gelu_tmp_rows`] bounds a
+    /// row's width against.
+    pub gelu_tmp_bytes: usize,
     pub total_bytes: usize,
 }
 
@@ -374,6 +380,11 @@ pub(crate) fn pad32(n: usize) -> usize {
 }
 
 impl ScratchOffsets {
+    /// Rows of `dim` elements the GELU scratch holds.
+    pub(crate) fn gelu_tmp_rows(&self, dim: usize) -> Result<usize, CeraError> {
+        dispatch::gelu_tmp_rows(self.gelu_tmp_bytes, dim)
+    }
+
     pub(crate) fn new(cfg: &AudioEncoderConfig, max_frames: usize, kernel: usize) -> Self {
         let seq = align128(max_frames * cfg.n_embd * 4);
         let padded = align128((max_frames + kernel) * cfg.n_embd * 4);
@@ -411,6 +422,9 @@ impl ScratchOffsets {
         let attn_vt = region(align128(n_head * d_head * pad32(max_frames) * 4));
         let attn_av = region(seq);
         let adapter_out = region(align128(max_frames * cfg.llm_hidden_size * 4));
+        let gelu_tmp_bytes =
+            align128(dispatch::GELU_TMP_ROWS * cfg.n_ff.max(cfg.llm_hidden_size) * 4);
+        let gelu_tmp = region(gelu_tmp_bytes);
         Self {
             x,
             norm,
@@ -435,6 +449,8 @@ impl ScratchOffsets {
             attn_vt,
             attn_av,
             adapter_out,
+            gelu_tmp,
+            gelu_tmp_bytes,
             total_bytes: cur,
         }
     }
@@ -792,15 +808,17 @@ pub(crate) fn emit_adapter<S: OpSink>(
     dispatch::linear_m(
         s, scratch, so.norm, weights, ad.up_w, ad.up_b, scratch, so.ff, t, TILE,
     )?;
-    dispatch::gelu(
+    dispatch::gelu_tanh(
         s,
         scratch,
         so.ff,
+        scratch,
+        so.gelu_tmp,
+        so.gelu_tmp_rows(ad.up_w.rows)?,
         TokenShape {
             dim: ad.up_w.rows,
             n_tokens: t,
         },
-        TILE,
     )?;
     dispatch::linear_m(
         s,
@@ -2042,14 +2060,23 @@ mod tests {
                 op(HtpOpCode::Add),
                 op(HtpOpCode::MulMat),
                 op(HtpOpCode::Add),
-                op(HtpOpCode::UnaryGelu),
+                // the tanh GELU: copy, x*x, scale+1, *x, scale, sigmoid, *x
+                op(HtpOpCode::Cpy),
+                op(HtpOpCode::Mul),
+                op(HtpOpCode::Scale),
+                op(HtpOpCode::Mul),
+                op(HtpOpCode::Scale),
+                op(HtpOpCode::UnarySigmoid),
+                op(HtpOpCode::Mul),
                 op(HtpOpCode::MulMat),
                 op(HtpOpCode::Add),
             ]
         );
         assert_eq!(s.dst(3).ne, [128, 10, 1, 1]);
-        assert_eq!(s.dst(6).ne, [96, 10, 1, 1]);
-        assert_eq!(s.dst(6).offset, so.adapter_out);
+        // The tanh GELU works in its own scratch region, not the activation's.
+        assert_eq!(s.dst(5).offset, so.gelu_tmp);
+        assert_eq!(s.dst(12).ne, [96, 10, 1, 1]);
+        assert_eq!(s.dst(12).offset, so.adapter_out);
     }
 
     /// Sequences past what the scratch was sized for are refused before any op
@@ -2060,6 +2087,15 @@ mod tests {
         assert!(so.total_bytes > 400 * 64 * 4 * 8);
         assert_eq!(so.adapter_out % 128, 0);
         assert!(so.adapter_out + 400 * 96 * 4 <= so.total_bytes);
+    }
+
+    #[test]
+    fn a_wider_gelu_row_than_the_scratch_is_refused() {
+        let so = ScratchOffsets::new(&cfg(), 400, 9);
+        let narrow = so.gelu_tmp_bytes / 4;
+        assert!(so.gelu_tmp_rows(narrow).unwrap() >= 1);
+        assert!(so.gelu_tmp_rows(narrow + 1).is_err());
+        assert!(so.gelu_tmp_rows(0).is_err());
     }
 
     #[test]

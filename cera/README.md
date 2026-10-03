@@ -233,7 +233,7 @@ The backend embeds prebuilt 16 KB page-aligned Hexagon ELF dynamic libraries (`l
   - `ConvTranspose1D`: Transposed 1D convolution for speech decoders and vocoder audio reconstruction.
   - `Snake` / `Snake1D`: Sinusoidal activation function ($\sin^2(\alpha x)$) for neural vocoders.
   - `UnaryStep` and `Sum`: Element-wise step activations and reductions executing directly on HVX vector units.
-- **ABI Opcode Alignment**: Realigned `HtpOpCode` discriminants with the v85 DSP firmware ABI (`UnaryStep = 21`, `Sum = 39`, `Cpy = 32`, `Scale = 33`, `Conv1d = 40`, `Snake = 41`), preventing opcode displacement.
+- **ABI Opcode Alignment**: Realigned `HtpOpCode` discriminants with the v85 DSP firmware ABI (`UnaryStep = 21`, `Sum = 39`, `Scale = 32`, `Cpy = 33`, `Conv1D = 63`, `UnarySnake = 64`), preventing opcode displacement.
 
 ### Accelerated Kernels & Subsystems
 - **LLM Text Generation (`HexagonLfmModel`)**: 32x32 tiled Q4_0 and Q8_0 matrix repacking for HTP hardware, forward decode batched to eliminate most synchronization boundaries (a single flush per token and the static batch template are opt-in with `CERA_HEXAGON_BATCH_TENSORS=0`; the default caps each batch at 32 tensors for run-to-run reproducibility), ping-pong scratch memory isolation across layers, FastRPC latency QoS (`FASTRPC_CONTROL_LATENCY = 100 µs`), and Q8_0 quantized KV cache (~47% memory reduction over F16).

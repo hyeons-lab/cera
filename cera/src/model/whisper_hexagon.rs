@@ -18,8 +18,8 @@ use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
     HexagonContext, HexagonDevice, HexagonQueueSession, HexagonWeightFormat, HtpDataType,
     HtpOpCode, RpcmemBuffer, align128, build_binary_kernel_params, build_flash_attn_kernel_params,
-    build_mul_mat_kernel_params, build_unary_kernel_params, quantize_f32_to_q8_0, repack_q4_0,
-    repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+    build_mul_mat_kernel_params, quantize_f32_to_q8_0, repack_q4_0, repack_q8_0,
+    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::backend::hexagon::{LockOrRecover, lock_reporting_poison, report_poison};
 use crate::model::weights::MmapWeight;
@@ -641,6 +641,10 @@ pub struct HexagonWhisperScratchOffsets {
     pub dec_mlp_mid_off: usize,
     pub dec_mlp_out_off: usize,
     pub logits_off: usize,
+    /// Scratch the tanh GELU works through, `gelu_tmp_rows` rows of the widest
+    /// MLP activation.
+    pub gelu_tmp_off: usize,
+    pub gelu_tmp_rows: usize,
     pub total_bytes: usize,
 }
 
@@ -700,6 +704,10 @@ impl HexagonWhisperScratchOffsets {
         // Decoder logits [n_vocab]
         let logits_off = plan_vec_f32(&mut cur_off, cfg.n_vocab);
 
+        // The tanh GELU's intermediate: a few rows of the widest activation.
+        let gelu_tmp_rows = dispatch::GELU_TMP_ROWS;
+        let gelu_tmp_off = plan_vec_f32(&mut cur_off, gelu_tmp_rows * max_mlp_mid);
+
         Self {
             mel_in_off,
             conv1_out_off,
@@ -724,6 +732,8 @@ impl HexagonWhisperScratchOffsets {
             dec_mlp_mid_off,
             dec_mlp_out_off,
             logits_off,
+            gelu_tmp_off,
+            gelu_tmp_rows,
             total_bytes: cur_off,
         }
     }
@@ -927,7 +937,7 @@ impl HexagonWhisperModel {
                 1,
                 out_channels * 4,
                 session.dsp_threads(),
-                8 * 1024 * 1024,
+                dispatch::VTCM_BUDGET,
             );
 
             // Tap 0 -> cur_dst
@@ -975,7 +985,7 @@ impl HexagonWhisperModel {
                 1,
                 1,
                 4,
-                8 * 1024 * 1024,
+                dispatch::VTCM_BUDGET,
                 session.dsp_threads(),
             );
             session.enqueue_op(
@@ -1020,7 +1030,7 @@ impl HexagonWhisperModel {
                 1,
                 1,
                 4,
-                8 * 1024 * 1024,
+                dispatch::VTCM_BUDGET,
                 session.dsp_threads(),
             );
             session.enqueue_op(
@@ -1031,27 +1041,26 @@ impl HexagonWhisperModel {
                 bias_add_kparams,
             )?;
 
-            // In-place GELU
-            let gelu_kparams = build_unary_kernel_params(
-                out_channels,
-                chunk,
-                0,
-                8 * 1024 * 1024,
-                session.dsp_threads(),
-                false,
-            );
-            session.enqueue_op(
-                HtpOpCode::UnaryGelu as u32,
-                &[cur_dst_ti],
-                &[cur_dst_ti],
-                [0i32; 16],
-                gelu_kparams,
-            )?;
-
             t_start += chunk;
         }
+        session.end_group()?;
 
-        session.end_group()
+        // GELU over the whole output, as a pass of its own (the taps' tensors
+        // are done with, and a helper that ends its own group must not run
+        // between ops that share tensor indices). `tmp` is free again and holds
+        // `chunk_size` rows.
+        dispatch::gelu_tanh(
+            session,
+            dst,
+            dst_offset,
+            tmp,
+            tmp_offset,
+            chunk_size,
+            TokenShape {
+                dim: out_channels,
+                n_tokens,
+            },
+        )
     }
 
     /// Dispatch unmasked multi-head self-attention on DSP via FlashAttnExt.
@@ -1607,15 +1616,17 @@ impl HexagonWhisperModel {
                 1500,
                 WHISPER_TILE,
             )?;
-            dispatch::gelu(
+            dispatch::gelu_tanh(
                 session,
                 &scratch,
                 mlp_mid_off,
+                &scratch,
+                self.scratch_offsets.gelu_tmp_off,
+                self.scratch_offsets.gelu_tmp_rows,
                 TokenShape {
                     dim: blk.mlp_0_w.rows,
                     n_tokens: 1500,
                 },
-                WHISPER_TILE,
             )?;
             dispatch::linear_m(
                 session,
@@ -1641,6 +1652,9 @@ impl HexagonWhisperModel {
                 },
                 WHISPER_TILE,
             )?;
+            // One batch per layer: the tanh GELU is seven ops a tile, and a whole
+            // deep encoder in one batch would not fit the staging buffer.
+            session.flush()?;
         }
 
         // 4. Post-LayerNorm -> state_buf.encoder_hidden_off
@@ -2049,15 +2063,17 @@ impl HexagonWhisperModel {
                 1,
                 WHISPER_TILE,
             )?;
-            dispatch::gelu(
+            dispatch::gelu_tanh(
                 session,
                 &scratch,
                 mlp_mid_off,
+                &scratch,
+                self.scratch_offsets.gelu_tmp_off,
+                self.scratch_offsets.gelu_tmp_rows,
                 TokenShape {
                     dim: blk.mlp_0_w.rows,
                     n_tokens: 1,
                 },
-                WHISPER_TILE,
             )?;
             dispatch::linear_m(
                 session,

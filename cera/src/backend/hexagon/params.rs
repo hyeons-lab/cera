@@ -802,12 +802,116 @@ fn mm_hvx_vtcm_layout(
     }
 }
 
+/// VTCM the DSP needs for the non-fused HVX quantized-row kernel over `rows`
+/// activation rows, as it rebuilds it in `htp_mm_hvx_vtcm_layout_build`: the
+/// quantized activations, then the larger of (weight prefetch rows and, for a
+/// single row, the output slice) and the raw f32 activation staging buffer,
+/// which share the space after them. The DSP checks this against its VTCM and
+/// answers `VtcmTooSmall` when it does not fit, so it is what decides the row
+/// chunk.
+fn mm_hvx_dsp_vtcm(
+    wtype: HtpDataType,
+    ne10: usize,
+    rows: usize,
+    n_threads: usize,
+    dst_row_size: usize,
+    n_prefetch: usize,
+) -> usize {
+    let round_up = |n: usize, m: usize| n.next_multiple_of(m);
+    let src1 = round_up(mm_act_tiled_row_size(wtype, ne10) * rows, 256);
+    let (_, aligned_tile) = mm_tile_sizes(wtype);
+    let tile_row = ne10.div_ceil(32) * aligned_tile as usize;
+    let src0 = round_up(n_prefetch * tile_row, 256) * n_threads;
+    let dst = if rows == 1 {
+        round_up(dst_row_size.div_ceil(n_threads), 128) * n_threads
+    } else {
+        0
+    };
+    let raw = round_up(round_up(ne10 * 4, 128) * rows, 128);
+    src1 + (src0 + dst).max(raw)
+}
+
+/// The activation rows per chunk (`kparams.m_chunk`) for a quantized matmul
+/// over `rows` rows, or `None` when all of them fit `vtcm_budget` at once:
+/// the DSP's `htp_mm_hvx_solve_vtcm_params`. The kernel walks the rows in
+/// chunks of this size; without one a projection whose quantized activations
+/// (36 bytes per element) pass the VTCM, such as the 3072-wide FFN of a vision
+/// transformer over a couple of hundred tokens, is rejected outright.
+fn mm_hvx_m_chunk(
+    wtype: HtpDataType,
+    ne10: usize,
+    rows: usize,
+    n_threads: usize,
+    dst_row_size: usize,
+    n_prefetch: usize,
+    vtcm_budget: usize,
+) -> Option<usize> {
+    let total = |m: usize| mm_hvx_dsp_vtcm(wtype, ne10, m, n_threads, dst_row_size, n_prefetch);
+    if rows <= 1 || total(rows) <= vtcm_budget {
+        return None;
+    }
+    // Rows that fit beside the fixed (weight) part, counting the raw staging
+    // row the solver adds for the quantized kernels.
+    let (_, aligned_tile) = mm_tile_sizes(wtype);
+    let tile_row = ne10.div_ceil(32) * aligned_tile as usize;
+    let fixed = (n_prefetch * tile_row).next_multiple_of(256) * n_threads;
+    let eff_row = mm_act_tiled_row_size(wtype, ne10) + (ne10 * 4).next_multiple_of(128);
+    let mut m = vtcm_budget.saturating_sub(fixed) / eff_row;
+    if m > 1 {
+        m &= !1;
+    }
+    let m = m.clamp(1, rows);
+    // `eff_row` already counts the rounding slack of every term, so the chunk
+    // fits; the sweep test pins that over the shapes in use.
+    debug_assert!(m < 2 || total(m) <= vtcm_budget, "m_chunk {m} overruns");
+    Some(m)
+}
+
+/// The most activation rows one fused `MulMatNx` (several weights sharing one
+/// activation, such as a vision transformer's Q, K and V) can take in
+/// `vtcm_budget`. That kernel has no row chunking, so a caller with more rows
+/// splits the work (the three projections separately chunk themselves).
+pub(crate) fn mm_hvx_fused_nx_max_rows(
+    wtype: HtpDataType,
+    ne10: usize,
+    n_threads: u32,
+    vtcm_budget: usize,
+) -> usize {
+    const N_PREFETCH: usize = 2;
+    let round_up = |n: usize, m: usize| n.next_multiple_of(m);
+    let n_threads = n_threads.max(1) as usize;
+    let (_, aligned_tile) = mm_tile_sizes(wtype);
+    let tile_row = ne10.div_ceil(32) * aligned_tile as usize;
+    // `htp_mm_hvx_vtcm_layout_build`, `is_fused_nx`: no output slice, 128-byte
+    // weight rounding.
+    let src0 = round_up(N_PREFETCH * tile_row, 128) * n_threads;
+    let row_q = mm_act_tiled_row_size(wtype, ne10);
+    let raw = round_up(ne10 * 4, 128);
+    let total = |m: usize| round_up(row_q * m, 128) + src0.max(round_up(raw * m, 128));
+    let (mut lo, mut hi) = (0usize, vtcm_budget / row_q.max(1));
+    while lo < hi {
+        let mid = (lo + hi).div_ceil(2);
+        if total(mid) <= vtcm_budget {
+            lo = mid;
+        } else {
+            hi = mid - 1;
+        }
+    }
+    lo
+}
+
 /// Build kernel parameters for matrix multiplication dispatch.
 ///
 /// Mirrors `ggml_hexagon_precompute_hvx_mm_params` for the quantized HVX
 /// decode path (repacked Q4_0/Q8_0 weights, non-batched). `ne10` is the
 /// activation width (K), `ne11`/`ne12` the activation rows/batches (1 for
 /// single-token decode), `dst_row_size` the output row stride in bytes.
+///
+/// `kparams[2]` (`m_chunk`) is non-zero when the activation rows do not fit
+/// the VTCM at once; the kernel then walks them in chunks of that size, and
+/// `kparams[11..16]` describe one chunk's layout. The fused `MulMatNx` kernel
+/// cannot chunk, so a caller building it must keep the rows within
+/// `mm_hvx_fused_nx_max_rows` (which implies `kparams[2] == 0`).
 pub fn build_mul_mat_kernel_params(
     wtype: HtpDataType,
     ne10: usize,
@@ -824,7 +928,6 @@ pub fn build_mul_mat_kernel_params(
     // Fewer rows than threads takes the block-partitioned quant path.
     kparams[0] = if src1_nrows < n_threads { 6 } else { 5 };
     kparams[1] = 0; // pipeline
-    kparams[2] = 0; // m_chunk (decode rows always fit; no chunking)
     kparams[3] = 0; // n_chunk (HMX only)
     kparams[4] = n_threads as i32;
     kparams[5] = 0; // n_act_threads (HMX only)
@@ -848,10 +951,30 @@ pub fn build_mul_mat_kernel_params(
         }
         d /= 2;
     }
+    // Rows the VTCM cannot hold at once are processed in chunks (the DSP walks
+    // `m_chunk` rows at a time); the layout below is the chunk's.
+    let m_chunk = mm_hvx_m_chunk(
+        wtype,
+        ne10,
+        src1_nrows,
+        n_threads,
+        dst_row_size,
+        best,
+        vtcm_budget,
+    );
+    // `kparams[11..16]` come from `mm_hvx_vtcm_layout`, the older model; the
+    // chunk decision above uses `mm_hvx_dsp_vtcm`, a port of the DSP's solver.
+    // They differ by the destination term, so for a few unchunked shapes the
+    // reported `vtcm_size` is above the budget: the DSP rebuilds its own
+    // layout from the other fields and rejects an overrun itself.
+    let layout_rows = m_chunk.unwrap_or(src1_nrows);
     // The device rebuilds this layout and rejects loudly (VTCM_TOO_SMALL)
     // when it overruns real VTCM, so falling back to depth 2 here is safe.
-    let layout = best_layout
-        .unwrap_or_else(|| mm_hvx_vtcm_layout(wtype, ne10, src1_nrows, n_threads, dst_row_size, 2));
+    let layout = match (m_chunk, best_layout) {
+        (None, Some(layout)) => layout,
+        _ => mm_hvx_vtcm_layout(wtype, ne10, layout_rows, n_threads, dst_row_size, best),
+    };
+    kparams[2] = m_chunk.map_or(0, |m| m as i32);
     kparams[7] = best as i32; // n_prefetch
     kparams[11] = layout.total_bytes as i32; // vtcm_size
     kparams[12] = layout.src0_bytes as i32; // vtcm_src0_size
@@ -2149,5 +2272,89 @@ mod tests {
             build_hmx_fa_kernel_params_with_softcap(64, 16, 8, 32, 602, 0.125, 4, 8 << 20, 50.0)
                 .expect("should fit");
         assert_eq!(hmx[5], 50.0f32.to_bits() as i32);
+    }
+
+    const VTCM: usize = 8 * 1024 * 1024;
+
+    /// The ViT's 3072-wide FFN down-projection over 160 tokens (the shape that
+    /// the DSP rejected with `VtcmTooSmall`): its quantized activations alone
+    /// are 17 MB, so the rows must go in chunks that fit.
+    #[test]
+    fn rows_the_vtcm_cannot_hold_are_chunked_to_fit() {
+        let k = build_mul_mat_kernel_params(HtpDataType::Q8_0, 3072, 160, 1, 768 * 4, 6, VTCM);
+        let chunk = k[2] as usize;
+        assert!(
+            (2..160).contains(&chunk) && chunk.is_multiple_of(2),
+            "m_chunk {chunk}"
+        );
+        assert!(mm_hvx_dsp_vtcm(HtpDataType::Q8_0, 3072, chunk, 6, 768 * 4, 2) <= VTCM);
+        // The DSP's solver: (VTCM - weight prefetch) / (quantized + raw row),
+        // rounded down to an even count: (8 MiB - 1327104) / (110592 + 12288).
+        assert_eq!(chunk, 56);
+        assert!(k[11] as usize <= VTCM, "the reported layout is the chunk's");
+    }
+
+    /// Over every shape the ViT, Whisper and the LFM2 prefill reach: a chunk
+    /// exists exactly when the whole does not fit, and is even, at least two
+    /// and itself fits (a plan that overran would be rejected by the DSP).
+    #[test]
+    fn the_chunk_exists_exactly_when_the_rows_do_not_fit() {
+        for wtype in [HtpDataType::Q8_0, HtpDataType::Q4_0] {
+            for n_threads in [1, 4, 6] {
+                for k_dim in [768, 1024, 2048, 3072] {
+                    for rows in 2..=512usize {
+                        let k = build_mul_mat_kernel_params(
+                            wtype,
+                            k_dim,
+                            rows as u32,
+                            1,
+                            4096,
+                            n_threads,
+                            VTCM,
+                        );
+                        let (chunk, prefetch) = (k[2] as usize, k[7] as usize);
+                        let total = |m: usize| {
+                            mm_hvx_dsp_vtcm(wtype, k_dim, m, n_threads as usize, 4096, prefetch)
+                        };
+                        let at = format!("{wtype:?} K {k_dim} rows {rows} threads {n_threads}");
+                        if total(rows) <= VTCM {
+                            assert_eq!(chunk, 0, "{at}: fits whole");
+                        } else {
+                            assert!(
+                                chunk >= 2 && chunk.is_multiple_of(2) && chunk < rows,
+                                "{at}: chunk {chunk}"
+                            );
+                            assert!(total(chunk) <= VTCM, "{at}: chunk {chunk} overruns");
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// Shapes that fit, and decode, are left alone: no chunk.
+    #[test]
+    fn rows_that_fit_and_single_rows_take_no_chunk() {
+        for (k_dim, rows) in [(768, 160), (3072, 40), (2048, 1), (2048, 4), (1024, 64)] {
+            let k = build_mul_mat_kernel_params(HtpDataType::Q8_0, k_dim, rows, 1, 4096, 6, VTCM);
+            assert_eq!(k[2], 0, "K {k_dim} rows {rows}");
+        }
+    }
+
+    /// The fused Q/K/V kernel cannot chunk, so its row limit is the largest
+    /// count its layout fits.
+    #[test]
+    fn the_fused_nx_row_limit_is_the_largest_that_fits() {
+        let max = mm_hvx_fused_nx_max_rows(HtpDataType::Q8_0, 768, 6, VTCM);
+        // 768 wide: 27648 quantized bytes per row, so a couple of hundred rows.
+        assert!((200..300).contains(&max), "{max}");
+        let tile_row: usize = 24 * 1152;
+        let src0 = (2 * tile_row).next_multiple_of(128) * 6;
+        let total = |m: usize| {
+            (27648 * m).next_multiple_of(128) + src0.max((3072 * m).next_multiple_of(128))
+        };
+        assert!(total(max) <= VTCM && total(max + 1) > VTCM);
+        // A wider activation takes fewer rows.
+        assert!(mm_hvx_fused_nx_max_rows(HtpDataType::Q8_0, 3072, 6, VTCM) < max);
     }
 }

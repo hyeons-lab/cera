@@ -1326,3 +1326,35 @@ fn the_tensor_cap_bypasses_the_template_and_covers_every_prefill_chunk() {
         .unwrap();
     assert_eq!(capture().batches.len(), 1);
 }
+
+/// The fused matmul cannot chunk its rows, so when they overflow the VTCM the
+/// separate matmuls (which can) run instead. Removing the fallback would send
+/// the fused kernel a plan the DSP rejects with `VtcmTooSmall`.
+#[test]
+fn nx_falls_back_to_unfused_when_the_rows_do_not_fit() {
+    let knobs = HexagonKnobs::from_lookup(|k| match k {
+        "CERA_HEXAGON_HMX" | "CERA_HEXAGON_BATCH_TENSORS" => Some("0".to_string()),
+        _ => None,
+    });
+    let nx_ops = |budget: Option<usize>| {
+        let mut model = build_with(dense_spec(), &knobs);
+        if let Some(b) = budget {
+            model.vtcm_budget = b;
+        }
+        let mut state = fresh_state(&model);
+        let tokens: Vec<u32> = (0..40).collect();
+        model
+            .try_forward_prefill_chunk(&tokens, 0, &mut state)
+            .unwrap();
+        let h = histogram(&capture().batches);
+        (
+            h.get("MulMatNx").copied().unwrap_or(0),
+            h.get("MulMat").copied().unwrap_or(0),
+        )
+    };
+    let (roomy_nx, roomy_mm) = nx_ops(None);
+    let (tight_nx, tight_mm) = nx_ops(Some(64 * 1024));
+    assert!(roomy_nx > 0, "fused when the rows fit");
+    assert_eq!(tight_nx, 0, "unfused when they do not");
+    assert!(tight_mm > roomy_mm, "the separate matmuls took over");
+}

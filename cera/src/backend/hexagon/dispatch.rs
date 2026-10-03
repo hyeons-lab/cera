@@ -324,30 +324,50 @@ fn unary_inplace<S: OpSink>(
     shape: TokenShape,
     tile: TokenTile,
 ) -> Result<(), CeraError> {
+    unary_inplace_with(session, opcode, name, [0i32; 16], buf, offset, shape, tile)
+}
+
+/// [`unary_inplace`] for ops that take parameters (`Scale`: scale and bias).
+#[allow(clippy::too_many_arguments)]
+fn unary_inplace_with<S: OpSink>(
+    session: &mut S,
+    opcode: HtpOpCode,
+    name: &str,
+    params: [i32; 16],
+    buf: &S::Buf,
+    offset: usize,
+    shape: TokenShape,
+    tile: TokenTile,
+) -> Result<(), CeraError> {
     let TokenShape { dim, n_tokens } = shape;
     for (start, run) in token_runs(n_tokens, tile) {
         let ti = add_f32_rows(session, buf, offset + start * dim * 4, dim, run)?;
         let kparams =
             build_unary_kernel_params(dim, run, 0, VTCM_BUDGET, session.dsp_threads(), false);
         session
-            .enqueue_op(opcode as u32, &[ti], &[ti], [0i32; 16], kparams)
+            .enqueue_op(opcode as u32, &[ti], &[ti], params, kparams)
             .map_err(|e| op_err(name, e))?;
     }
     session.end_group().map_err(|e| op_err(name, e))
 }
 
-/// In-place GELU: `buf = gelu(buf)`.
-pub(crate) fn gelu<S: OpSink>(
+/// In-place `buf = buf * scale + bias`.
+pub(crate) fn scale_offset<S: OpSink>(
     session: &mut S,
     buf: &S::Buf,
     offset: usize,
     shape: TokenShape,
     tile: TokenTile,
+    (scale, bias): (f32, f32),
 ) -> Result<(), CeraError> {
-    unary_inplace(
+    let mut params = [0i32; 16];
+    params[0] = scale.to_bits() as i32;
+    params[1] = bias.to_bits() as i32;
+    unary_inplace_with(
         session,
-        HtpOpCode::UnaryGelu,
-        "gelu",
+        HtpOpCode::Scale,
+        "scale_offset",
+        params,
         buf,
         offset,
         shape,
@@ -355,7 +375,86 @@ pub(crate) fn gelu<S: OpSink>(
     )
 }
 
-/// /// In-place SiLU: `buf = silu(buf)`.
+/// `2 * sqrt(2 / pi)`, the sigmoid form of the tanh GELU's constant.
+const GELU_TANH_SIGMOID_SCALE: f32 = 1.595_769_2;
+
+/// Rows of scratch the tanh GELU works through at a time.
+pub(crate) const GELU_TMP_ROWS: usize = 64;
+
+/// Rows of `dim` f32 elements that fit in `bytes` of GELU scratch. An error,
+/// not a clamp, when not even one fits: a row wider than the scratch would be
+/// written past its end by the DSP, and the shapes come from model files.
+pub(crate) fn gelu_tmp_rows(bytes: usize, dim: usize) -> Result<usize, CeraError> {
+    if dim == 0 || dim.saturating_mul(4) > bytes {
+        return Err(CeraError::Backend(format!(
+            "GELU row of {dim} elements does not fit the {bytes} B scratch"
+        )));
+    }
+    Ok(bytes / (dim * 4))
+}
+
+/// In-place GELU, tanh form (`gelu_pytorch_tanh`, what the CPU ViT and Whisper
+/// use; the CPU audio adapter uses the erf form, which this stays within about
+/// 5e-4 of, absolute). The DSP's own `UNARY_GELU` is not this: it is the quick approximation
+/// `x * sigmoid(1.702 x)`, up to about 2% per element away, which a wide
+/// down-projection turned into a 20% error in the vision transformer, so no
+/// helper here exposes it.
+///
+/// Computed as
+/// `x * sigmoid(2 sqrt(2/pi) * x * (1 + 0.044715 x^2))`, since
+/// `0.5 (1 + tanh z) = sigmoid(2 z)`. The DSP has no tanh GELU, so this is
+/// seven ops over `tmp`, a scratch region of `tmp_rows` rows of `shape.dim`
+/// elements that the rows are processed through, `tmp_rows` at a time.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gelu_tanh<S: OpSink>(
+    session: &mut S,
+    buf: &S::Buf,
+    offset: usize,
+    tmp: &S::Buf,
+    tmp_offset: usize,
+    tmp_rows: usize,
+    shape: TokenShape,
+) -> Result<(), CeraError> {
+    let TokenShape { dim, n_tokens } = shape;
+    for (start, run) in token_runs(n_tokens, TokenTile::Tiles(tmp_rows)) {
+        let x_off = offset + start * dim * 4;
+        let rows = TokenShape { dim, n_tokens: run };
+        fn whole<B>(buf: &B, off: usize, dim: usize, run: usize) -> View<'_, B> {
+            View::new(buf, off, [dim, run, 1], [4, dim * 4, run * dim * 4])
+        }
+        // tmp = x; tmp = x * x
+        copy_view(
+            session,
+            whole(buf, x_off, dim, run),
+            whole(tmp, tmp_offset, dim, run),
+        )?;
+        mul_inplace(session, tmp, tmp_offset, buf, x_off, rows, TokenTile::Whole)?;
+        // tmp = x * (1 + 0.044715 x^2)
+        scale_offset(
+            session,
+            tmp,
+            tmp_offset,
+            rows,
+            TokenTile::Whole,
+            (0.044_715, 1.0),
+        )?;
+        mul_inplace(session, tmp, tmp_offset, buf, x_off, rows, TokenTile::Whole)?;
+        // x = x * sigmoid(2 sqrt(2/pi) * tmp)
+        scale_offset(
+            session,
+            tmp,
+            tmp_offset,
+            rows,
+            TokenTile::Whole,
+            (GELU_TANH_SIGMOID_SCALE, 0.0),
+        )?;
+        sigmoid(session, tmp, tmp_offset, rows, TokenTile::Whole)?;
+        mul_inplace(session, buf, x_off, tmp, tmp_offset, rows, TokenTile::Whole)?;
+    }
+    Ok(())
+}
+
+/// In-place SiLU: `buf = silu(buf)`.
 pub(crate) fn silu<S: OpSink>(
     session: &mut S,
     buf: &S::Buf,
@@ -1008,7 +1107,7 @@ mod tests {
     const OP_ADD: u32 = HtpOpCode::Add as u32;
     const OP_NORM: u32 = HtpOpCode::Norm as u32;
     const OP_MULMAT: u32 = HtpOpCode::MulMat as u32;
-    const OP_GELU: u32 = HtpOpCode::UnaryGelu as u32;
+    const OP_SILU: u32 = HtpOpCode::UnarySilu as u32;
     const OP_CPY: u32 = HtpOpCode::Cpy as u32;
     /// A tiled policy for the tile-walk tests (the value Whisper uses).
     const TILE_64: TokenTile = TokenTile::Tiles(64);
@@ -1140,10 +1239,10 @@ mod tests {
             dim: 7,
             n_tokens: 3,
         };
-        gelu(&mut s, &"b", 0, shape, TokenTile::Whole).unwrap();
+        silu(&mut s, &"b", 0, shape, TokenTile::Whole).unwrap();
         add_residual(&mut s, &"d", 0, &"s", 0, shape, TokenTile::Whole).unwrap();
         cpy_f32_to_f16(&mut s, &"a", 0, &"h", 0, shape).unwrap();
-        assert_eq!(s.opcodes(), vec![OP_GELU, OP_ADD, OP_CPY]);
+        assert_eq!(s.opcodes(), vec![OP_SILU, OP_ADD, OP_CPY]);
         // In-place ops write their own source tensor.
         assert_eq!(s.ops[0].src, s.ops[0].dst);
         assert_eq!(s.ops[1].dst, vec![s.ops[1].src[0]]);
@@ -1231,7 +1330,7 @@ mod tests {
         )
         .unwrap();
         assert_eq!(s.group_ends, vec![6]);
-        gelu(&mut s, &"b", 0, shape, TokenTile::Tiles(64)).unwrap();
+        silu(&mut s, &"b", 0, shape, TokenTile::Tiles(64)).unwrap();
         assert_eq!(s.group_ends, vec![6, 9]);
         add_residual(&mut s, &"d", 0, &"s", 0, shape, TokenTile::Whole).unwrap();
         assert_eq!(s.group_ends, vec![6, 9, 10]);
@@ -1401,7 +1500,7 @@ mod tests {
             t,
         )
         .unwrap();
-        gelu(
+        silu(
             &mut s,
             &"m",
             0,
@@ -1423,9 +1522,164 @@ mod tests {
         expect.extend(per_tile(&[OP_ADD]));
         expect.extend(per_tile(&[OP_NORM, OP_MUL, OP_ADD]));
         expect.extend(per_tile(&[OP_MULMAT, OP_ADD]));
-        expect.extend(per_tile(&[OP_GELU]));
+        expect.extend(per_tile(&[OP_SILU]));
         expect.extend(per_tile(&[OP_MULMAT]));
         expect.extend(per_tile(&[OP_ADD]));
         assert_eq!(s.opcodes(), expect);
+    }
+
+    /// The tanh GELU is seven ops per row tile through a scratch region, and its
+    /// two `Scale` ops carry the constants in their parameters.
+    #[test]
+    fn gelu_tanh_emits_seven_ops_per_tile_with_the_scale_constants() {
+        use HtpOpCode::*;
+        let mut s = RecordingSink::default();
+        let shape = TokenShape {
+            dim: 96,
+            n_tokens: 130,
+        };
+        gelu_tanh(&mut s, &"x", 0, &"t", 4096, 64, shape).unwrap();
+        let tile = [Cpy, Mul, Scale, Mul, Scale, UnarySigmoid, Mul].map(|o| o as u32);
+        let want: Vec<u32> = (0..3).flat_map(|_| tile).collect();
+        assert_eq!(
+            s.opcodes(),
+            want,
+            "130 rows through a 64-row scratch: 3 tiles"
+        );
+        let scales: Vec<(f32, f32)> = s
+            .ops
+            .iter()
+            .filter(|o| o.opcode == Scale as u32)
+            .map(|o| {
+                (
+                    f32::from_bits(o.params[0] as u32),
+                    f32::from_bits(o.params[1] as u32),
+                )
+            })
+            .collect();
+        assert_eq!(
+            scales[..2],
+            [(0.044_715, 1.0), (GELU_TANH_SIGMOID_SCALE, 0.0)]
+        );
+        // The last tile is the 2-row remainder, and it works in the scratch.
+        let last_copy = s.ops.iter().rposition(|o| o.opcode == Cpy as u32).unwrap();
+        assert_eq!(s.dst(last_copy).ne[1], 2);
+        assert_eq!(s.dst(last_copy).offset, 4096);
+    }
+
+    /// The sequence computes the tanh GELU (not the DSP's quick GELU, which is
+    /// off by up to about 2% per element): done on the host in `f32`, it matches
+    /// the CPU's `gelu_approx_f32` over the range activations take.
+    #[test]
+    fn the_gelu_tanh_sequence_matches_the_cpu_tanh_gelu() {
+        let sigmoid = |z: f32| 1.0 / (1.0 + (-z).exp());
+        let sequence = |x: f32| {
+            let t = x * x;
+            let t = t * 0.044_715 + 1.0;
+            let t = t * x;
+            let t = t * GELU_TANH_SIGMOID_SCALE;
+            x * sigmoid(t)
+        };
+        let quick = |x: f32| x * sigmoid(1.702 * x);
+        let (mut worst, mut worst_quick) = (0.0f32, 0.0f32);
+        let mut x = -9.0f32;
+        while x <= 9.0 {
+            let want = crate::backend::cpu::gelu_approx_f32(x);
+            worst = worst.max((sequence(x) - want).abs());
+            worst_quick = worst_quick.max((quick(x) - want).abs());
+            x += 0.01;
+        }
+        assert!(worst < 2e-5, "tanh sequence off by {worst}");
+        // The audio adapter's CPU reference is the erf form; the NPU's tanh
+        // stays within 1e-3 of it (measured 4.7e-4 at the worst point).
+        let mut worst_erf = 0.0f32;
+        let mut x = -9.0f32;
+        while x <= 9.0 {
+            let mut e = [x];
+            crate::backend::cpu::gelu_erf_inplace(&mut e);
+            worst_erf = worst_erf.max((sequence(x) - e[0]).abs());
+            x += 0.01;
+        }
+        assert!(worst_erf < 1e-3, "tanh sequence is {worst_erf} from erf");
+        assert!(
+            worst_quick > 1e-2,
+            "the quick GELU is {worst_quick} off: why this exists"
+        );
+    }
+
+    /// A row width that overflows when multiplied by the element size is
+    /// refused, not wrapped into an accepted one (widths come from model files).
+    #[test]
+    fn a_gelu_row_width_that_overflows_is_refused() {
+        assert!(gelu_tmp_rows(1 << 20, usize::MAX / 2).is_err());
+        assert!(gelu_tmp_rows(1 << 20, usize::MAX).is_err());
+        // Widths whose product with the element size wraps to 0 and to 4 bytes.
+        assert!(gelu_tmp_rows(1 << 20, 1 << 62).is_err());
+        assert!(gelu_tmp_rows(1 << 20, (1 << 62) + 1).is_err());
+        assert!(gelu_tmp_rows(1 << 20, (1 << 63) + 1).is_err());
+        // A zero width, and a row that is exactly as wide as the scratch.
+        assert!(gelu_tmp_rows(4096, 0).is_err());
+        assert_eq!(gelu_tmp_rows(4096, 1024).unwrap(), 1);
+        assert!(gelu_tmp_rows(4096, 1025).is_err());
+        assert_eq!(gelu_tmp_rows(4096, 16).unwrap(), 64);
+    }
+
+    /// Execute the recorded elementwise ops on host memory, so a test can check
+    /// what an op sequence computes rather than only which ops it emits.
+    fn interpret(s: &RecordingSink, mem: &mut std::collections::HashMap<&'static str, Vec<f32>>) {
+        let at = |t: &testing::RecTensor, i0: usize, i1: usize| {
+            (t.offset + i0 * t.nb[0] as usize + i1 * t.nb[1] as usize) / 4
+        };
+        for (n, op) in s.ops.iter().enumerate() {
+            let dst = s.dst(n).clone();
+            for i1 in 0..dst.ne[1] as usize {
+                for i0 in 0..dst.ne[0] as usize {
+                    let a = {
+                        let t = s.src(n, 0);
+                        mem[t.buf][at(t, i0, i1)]
+                    };
+                    let v = match HtpOpCode::from_u32(op.opcode).unwrap() {
+                        HtpOpCode::Cpy => a,
+                        HtpOpCode::Mul => {
+                            let t = s.src(n, 1);
+                            a * mem[t.buf][at(t, i0, i1)]
+                        }
+                        HtpOpCode::Scale => {
+                            a * f32::from_bits(op.params[0] as u32)
+                                + f32::from_bits(op.params[1] as u32)
+                        }
+                        HtpOpCode::UnarySigmoid => 1.0 / (1.0 + (-a).exp()),
+                        other => panic!("not interpreted: {other:?}"),
+                    };
+                    let i = at(&dst, i0, i1);
+                    mem.get_mut(dst.buf).unwrap()[i] = v;
+                }
+            }
+        }
+    }
+
+    /// The emitted ops, run on the host, compute the CPU's tanh GELU in place
+    /// (130 rows through a 64-row scratch, so the remainder tile is covered).
+    #[test]
+    fn the_emitted_gelu_tanh_ops_compute_the_cpu_gelu() {
+        let (dim, n_tokens, tmp_rows) = (96usize, 130usize, 64usize);
+        let mut s = RecordingSink::default();
+        let shape = TokenShape { dim, n_tokens };
+        let tmp_off = 512;
+        gelu_tanh(&mut s, &"x", 0, &"t", tmp_off, tmp_rows, shape).unwrap();
+        let xs: Vec<f32> = (0..dim * n_tokens)
+            .map(|i| (i as f32 * 0.037).sin() * 6.0)
+            .collect();
+        let mut mem = std::collections::HashMap::new();
+        mem.insert("x", xs.clone());
+        mem.insert("t", vec![0.0f32; tmp_off / 4 + dim * tmp_rows]);
+        interpret(&s, &mut mem);
+        for (i, (&got, &x)) in mem["x"].iter().zip(&xs).enumerate() {
+            let want = crate::backend::cpu::gelu_approx_f32(x);
+            assert!(
+                (got - want).abs() < 2e-5,
+                "element {i}: {got} vs {want} at x={x}"
+            );
+        }
     }
 }

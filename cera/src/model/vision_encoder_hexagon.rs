@@ -18,7 +18,7 @@ use crate::backend::hexagon::{
     repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::model::vision_encoder::{
-    PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionEncoderWeights,
+    PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionEncoderWeights, VitStageDump,
     interpolate_pos_embed_2d, patch_embed_compute, pixel_shuffle,
 };
 use crate::model::vision_encoder_gpu::{MAX_VIT_TOKENS, VisionGpuEncode};
@@ -32,6 +32,19 @@ pub use crate::backend::hexagon::HexagonWeightFormat;
 const VIT_TILE: TokenTile = TokenTile::Whole;
 
 pub use crate::backend::hexagon::types::HexagonWeightDesc as HexagonVitWeightDesc;
+
+/// Whether `n_tokens` rows fit the fused Q/K/V kernel's VTCM layout. That
+/// kernel cannot chunk its activation rows, so past this the three projections
+/// run on their own, each chunking itself.
+fn qkv_fits_fused(dtype: HtpDataType, cols: usize, n_tokens: usize, threads: u32) -> bool {
+    n_tokens
+        <= crate::backend::hexagon::mm_hvx_fused_nx_max_rows(
+            dtype,
+            cols,
+            threads,
+            dispatch::VTCM_BUDGET,
+        )
+}
 
 /// Weight offsets for one ViT block in `weights_buf`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -199,6 +212,10 @@ pub struct HexagonVitScratchOffsets {
     pub ffn_out_off: usize,
     pub proj_mid_off: usize,
     pub proj_final_off: usize,
+    /// Scratch for the tanh GELU's intermediate: a few dozen rows wide enough
+    /// for the feed-forward activation (`gelu_tmp_bytes` of them at `gelu_tmp_off`).
+    pub gelu_tmp_off: usize,
+    pub gelu_tmp_bytes: usize,
     pub total_bytes: usize,
 }
 
@@ -243,6 +260,10 @@ impl HexagonVitScratchOffsets {
         let ffn_out_off = off;
         off += token_bytes;
 
+        let gelu_tmp_off = off;
+        let gelu_tmp_bytes = align128(dispatch::GELU_TMP_ROWS * n_ff * 4);
+        off += gelu_tmp_bytes;
+
         // Projector runs after ViT blocks complete. Reusing ffn_mid_off and
         // attn_out_off avoids inflating rpcmem scratch footprint.
         let proj_mid_off = ffn_mid_off;
@@ -262,6 +283,8 @@ impl HexagonVitScratchOffsets {
             ffn_out_off,
             proj_mid_off,
             proj_final_off,
+            gelu_tmp_off,
+            gelu_tmp_bytes,
             total_bytes: off,
         }
     }
@@ -407,7 +430,7 @@ impl HexagonVisionEncoder {
             1,
             1,
             4,
-            8 * 1024 * 1024,
+            dispatch::VTCM_BUDGET,
             session.dsp_threads(),
         );
         session
@@ -442,7 +465,16 @@ impl HexagonVisionEncoder {
         v_dst_off: usize,
         n_tokens: usize,
     ) -> Result<(), CeraError> {
-        if !(q_w.cols == k_w.cols
+        let fused_dtype = match q_w.format {
+            HexagonWeightFormat::RepackedQ8_0 => HtpDataType::Q8_0,
+            HexagonWeightFormat::RepackedQ4_0 => HtpDataType::Q4_0,
+        };
+        // The fused kernel cannot chunk its activation rows, so past what its
+        // VTCM layout holds the three projections run on their own (each
+        // chunks itself): a few hundred tokens of a large image.
+        let fits_fused = qkv_fits_fused(fused_dtype, q_w.cols, n_tokens, session.dsp_threads());
+        if !(fits_fused
+            && q_w.cols == k_w.cols
             && k_w.cols == v_w.cols
             && q_w.rows == k_w.rows
             && k_w.rows == v_w.rows
@@ -558,8 +590,12 @@ impl HexagonVisionEncoder {
             1,
             ne1 * 4,
             session.dsp_threads(),
-            8 * 1024 * 1024,
+            dispatch::VTCM_BUDGET,
         );
+        // `fits_fused` above keeps the rows inside what the fused layout holds,
+        // which implies the plain layout needs no chunk; the fused kernel could
+        // not honour one.
+        debug_assert_eq!(kparams[2], 0, "fused QKV must not need a row chunk");
         kparams[0] = 5; // HTP_MM_KERNEL_HVX_QUANT_ROW
         kparams[17] = 3; // n_weights
 
@@ -682,6 +718,49 @@ impl HexagonVisionEncoder {
 
 impl VisionGpuEncode for HexagonVisionEncoder {
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
+        self.encode_with(pixels, grid_w, grid_h, None, None)
+    }
+}
+
+impl HexagonVisionEncoder {
+    /// The tokens after the first `n_blocks` ViT blocks (before the final
+    /// LayerNorm, pooling and projector), for the probe to compare against the
+    /// CPU encoder block by block.
+    #[doc(hidden)]
+    pub fn debug_blocks(
+        &self,
+        pixels: &[f32],
+        grid_w: usize,
+        grid_h: usize,
+        n_blocks: usize,
+    ) -> Result<Vec<f32>> {
+        self.encode_with(pixels, grid_w, grid_h, Some(n_blocks), None)
+    }
+
+    /// The first block's intermediates as the device left them, in the layouts
+    /// of [`VisionEncoderWeights::debug_first_block`].
+    #[doc(hidden)]
+    pub fn debug_first_block(
+        &self,
+        pixels: &[f32],
+        grid_w: usize,
+        grid_h: usize,
+    ) -> Result<VitStageDump> {
+        let mut dump = VitStageDump::default();
+        self.encode_with(pixels, grid_w, grid_h, Some(1), Some(&mut dump))?;
+        Ok(dump)
+    }
+
+    /// The whole encoder, or with `stop_after_blocks` just the blocks and the
+    /// raw `[patches, n_embd]` tokens they leave.
+    fn encode_with(
+        &self,
+        pixels: &[f32],
+        grid_w: usize,
+        grid_h: usize,
+        stop_after_blocks: Option<usize>,
+        dump: Option<&mut VitStageDump>,
+    ) -> Result<Vec<f32>> {
         let cfg = &self.config;
         ensure!(grid_w > 0 && grid_h > 0, "grid dims must be > 0");
         ensure!(
@@ -744,6 +823,11 @@ impl VisionGpuEncode for HexagonVisionEncoder {
             *t += *p;
         }
 
+        let mut dump = dump;
+        if let Some(d) = dump.as_deref_mut() {
+            d.x0 = tokens.clone();
+        }
+
         // 3. Hexagon NPU ViT blocks execution
         let n_embd = cfg.n_embd;
         let n_head = cfg.n_head;
@@ -770,7 +854,12 @@ impl VisionGpuEncode for HexagonVisionEncoder {
         let run_vit_blocks = |session: &mut HexagonQueueSession,
                               scratch_guard: &mut RpcmemBuffer|
          -> Result<(), CeraError> {
-            for blk in &self.weights_offsets.blocks {
+            for blk in self
+                .weights_offsets
+                .blocks
+                .iter()
+                .take(stop_after_blocks.unwrap_or(usize::MAX))
+            {
                 // Pre-attention LayerNorm: tokens -> pre_norm
                 dispatch::layer_norm(
                     session,
@@ -914,15 +1003,17 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                 )?;
 
                 // GELU activation on ffn_mid
-                dispatch::gelu(
+                dispatch::gelu_tanh(
                     session,
                     scratch_guard,
                     so.ffn_mid_off,
+                    scratch_guard,
+                    so.gelu_tmp_off,
+                    dispatch::gelu_tmp_rows(so.gelu_tmp_bytes, cfg.n_ff)?,
                     TokenShape {
                         dim: cfg.n_ff,
                         n_tokens: n_patches,
                     },
-                    VIT_TILE,
                 )?;
 
                 // FFN down projection: ffn_mid -> ffn_out
@@ -954,25 +1045,27 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                 )?;
             }
 
-            // Post-LN on tokens
-            dispatch::layer_norm(
-                session,
-                LayerNormArgs {
-                    src: scratch_guard,
-                    src_offset: so.tokens_off,
-                    dst: scratch_guard,
-                    dst_offset: so.tokens_off,
-                    weights: &self.weights_buf,
-                    w_offset: self.weights_offsets.post_ln_w_off,
-                    b_offset: self.weights_offsets.post_ln_b_off,
-                    shape: TokenShape {
-                        dim: n_embd,
-                        n_tokens: n_patches,
+            // Post-LN on tokens (the debug entry stops before it).
+            if stop_after_blocks.is_none() {
+                dispatch::layer_norm(
+                    session,
+                    LayerNormArgs {
+                        src: scratch_guard,
+                        src_offset: so.tokens_off,
+                        dst: scratch_guard,
+                        dst_offset: so.tokens_off,
+                        weights: &self.weights_buf,
+                        w_offset: self.weights_offsets.post_ln_w_off,
+                        b_offset: self.weights_offsets.post_ln_b_off,
+                        shape: TokenShape {
+                            dim: n_embd,
+                            n_tokens: n_patches,
+                        },
+                        eps: cfg.eps,
+                        tile: VIT_TILE,
                     },
-                    eps: cfg.eps,
-                    tile: VIT_TILE,
-                },
-            )?;
+                )?;
+            }
 
             // Execute all queued operations on DSP
             session.flush()?;
@@ -990,6 +1083,24 @@ impl VisionGpuEncode for HexagonVisionEncoder {
         let normed_slice: &[f32] = bytemuck::cast_slice(
             &scratch_guard.as_slice()[so.tokens_off..so.tokens_off + tokens_bytes],
         );
+
+        if stop_after_blocks.is_some() {
+            if let Some(d) = dump {
+                let all: &[f32] = bytemuck::cast_slice(scratch_guard.as_slice());
+                let region = |off: usize, floats: usize| all[off / 4..off / 4 + floats].to_vec();
+                let (n, ff) = (n_patches * n_embd, n_patches * cfg.n_ff);
+                d.q = region(so.q_off, n);
+                d.k = region(so.k_off, n);
+                d.v = region(so.v_off, n);
+                d.attn_out = region(so.attn_out_off, n);
+                d.attn_proj = region(so.proj_out_off, n);
+                d.ln2 = region(so.pre_norm_off, n);
+                d.ffn_mid = region(so.ffn_mid_off, ff);
+                d.ffn_out = region(so.ffn_out_off, n);
+                d.tokens = normed_slice.to_vec();
+            }
+            return Ok(normed_slice.to_vec());
+        }
 
         // 4. Pixel-shuffle pool over dynamic grid
         let pooled = pixel_shuffle(normed_slice, cfg, grid_w, grid_h);
@@ -1024,15 +1135,17 @@ impl VisionGpuEncode for HexagonVisionEncoder {
                         n_tokens,
                         VIT_TILE,
                     )?;
-                    dispatch::gelu(
+                    dispatch::gelu_tanh(
                         session,
                         &scratch_guard,
                         so.proj_mid_off,
+                        &scratch_guard,
+                        so.gelu_tmp_off,
+                        dispatch::gelu_tmp_rows(so.gelu_tmp_bytes, mid_dim)?,
                         TokenShape {
                             dim: mid_dim,
                             n_tokens,
                         },
-                        VIT_TILE,
                     )?;
                     dispatch::linear_m(
                         session,
@@ -1084,6 +1197,15 @@ impl VisionGpuEncode for HexagonVisionEncoder {
 pub fn try_hexagon_vision_encoder(
     weights: &VisionEncoderWeights,
 ) -> Option<Arc<dyn VisionGpuEncode>> {
+    try_new_hexagon_vision_encoder(weights).map(|e| Arc::new(e) as Arc<dyn VisionGpuEncode>)
+}
+
+/// [`try_hexagon_vision_encoder`] with the concrete type, for the probe that
+/// compares it with the CPU encoder block by block.
+#[doc(hidden)]
+pub fn try_new_hexagon_vision_encoder(
+    weights: &VisionEncoderWeights,
+) -> Option<HexagonVisionEncoder> {
     let context = HexagonContext::new()
         .inspect_err(|e| {
             crate::backend::hexagon::log_context_unavailable("HexagonVisionEncoder", e);
@@ -1105,7 +1227,7 @@ pub fn try_hexagon_vision_encoder(
     let device = Arc::new(Mutex::new(dev));
 
     match HexagonVisionEncoder::new(Arc::clone(context.driver()), device, weights) {
-        Ok(encoder) => Some(Arc::new(encoder)),
+        Ok(encoder) => Some(encoder),
         Err(e) => {
             crate::backend::hexagon::hexagon_error!("failed to create HexagonVisionEncoder: {e}");
             None
@@ -1116,6 +1238,22 @@ pub fn try_hexagon_vision_encoder(
 #[cfg(test)]
 mod tests {
     use super::*;
+    /// The fused Q/K/V kernel is used up to its row limit and not one row past.
+    #[test]
+    fn the_fused_qkv_kernel_stops_at_its_row_limit() {
+        for (dtype, cols) in [(HtpDataType::Q8_0, 768), (HtpDataType::Q4_0, 1152)] {
+            let max = crate::backend::hexagon::mm_hvx_fused_nx_max_rows(
+                dtype,
+                cols,
+                6,
+                dispatch::VTCM_BUDGET,
+            );
+            assert!(max > 1, "{dtype:?} {cols}");
+            assert!(qkv_fits_fused(dtype, cols, max, 6), "at the limit");
+            assert!(!qkv_fits_fused(dtype, cols, max + 1, 6), "one past it");
+        }
+    }
+
     use crate::model::vision_encoder::VitBlockWeights;
 
     /// Tile policy pin: a tiled ViT would multiply the op count and change

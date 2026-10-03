@@ -1388,9 +1388,10 @@ impl HexagonLfmModel {
     /// outside 2..=4, mixed K (`in_dim`) or wire dtype, HMX-eligibility
     /// mismatch across the set, Q6_K on the HVX path (no fused HVX
     /// kernel), or HMX chunking overflow (which retries HVX first, like
-    /// the single path). Kernel parameters are W0's single-matmul
-    /// parameters with `n_weights` set, so NX fits VTCM exactly when the
-    /// W0 single would; W0 must carry the largest N (`out_dim`) so the
+    /// the single path), or HVX rows past the fused limit. Kernel parameters are W0's single-matmul
+    /// parameters with `n_weights` set. On the HVX path the fused kernel cannot
+    /// chunk rows, so more rows than `mm_hvx_fused_nx_max_rows` also fall back;
+    /// W0 must carry the largest N (`out_dim`) so the
     /// m=1 dst scratch covers every output.
     pub(super) fn dispatch_mul_mat_nx(
         &self,
@@ -1469,6 +1470,21 @@ impl HexagonLfmModel {
                 session.dsp_threads(),
                 self.vtcm_budget,
             );
+            // The fused kernel cannot chunk rows: past what its layout holds
+            // the separate matmuls (which can) take over. Within the limit the
+            // plain layout needs no chunk either.
+            if n_rows
+                > crate::backend::hexagon::mm_hvx_fused_nx_max_rows(
+                    wtype,
+                    k,
+                    session.dsp_threads(),
+                    self.vtcm_budget,
+                )
+            {
+                unfused(self, session)?;
+                return Ok(());
+            }
+            debug_assert_eq!(kp[2], 0, "a fused matmul within the row limit chunks");
             kp[0] = 5; // HTP_MM_KERNEL_HVX_QUANT_ROW
             kp[17] = n as i32; // n_weights
             kp
