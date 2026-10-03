@@ -1780,7 +1780,9 @@ pub fn build_gpu_audio_encoder(
     use crate::engine::BackendPreference as BP;
     match backend {
         BP::Cpu | BP::Gpu => None,
-        BP::Hexagon => try_hexagon_audio_encoder(weights),
+        // Hexagon is the only NPU with an audio encoder today; `Npu` takes the
+        // same path and gains other vendors here as they grow one.
+        BP::Hexagon | BP::Npu => try_hexagon_audio_encoder(weights),
         BP::Metal => try_metal_audio_encoder(weights),
         // Metal first, then the NPU (the order the rest of `auto` uses).
         BP::Auto => try_metal_audio_encoder(weights).or_else(|| try_hexagon_audio_encoder(weights)),

@@ -70,7 +70,7 @@ filesystem tree manually" workaround.
 | 26+ | CPU Session/Chat checkpoint export/import and file persistence; native Metal/Hexagon/wgpu checkpoints are rejected |
 | 27+ | Unified Audio Pipeline: `FfiAudioPipeline` uniting Silero VAD v5, Keyword Spotting, and Whisper ASR |
 | 28+ | Per-request seeds: `GenerateOpts.seed` (restarts the RNG for one call, KV-safe, session default untouched), `Session::set_seed` (persistent default, survives `reset()`) |
-| 29+ | Qualcomm Hexagon NPU: `BackendPreference.HEXAGON`, Android FastRPC skel integration, Unsigned PD runtime, dynamic CPU topology discovery and worker threadpool resizing; the 64-bit Android AAR also ships wgpu, so `Auto` probes Hexagon, then wgpu, then CPU |
+| 29+ | Qualcomm Hexagon NPU: `BackendPreference.HEXAGON` (or the vendor-neutral `BackendPreference.NPU`, which uses whichever NPU backend the build has and the device supports), Android FastRPC skel integration, Unsigned PD runtime, dynamic CPU topology discovery and worker threadpool resizing; the 64-bit Android AAR also ships wgpu, so `Auto` probes Hexagon, then wgpu, then CPU |
 
 Don't add FFI exposure to `cera` directly. The `cera` crate keeps its
 idiomatic Rust surface, and everything UniFFI-specific lives here.

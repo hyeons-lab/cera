@@ -31,6 +31,7 @@ BackendPreference _backendOf(CeraBackend backend) => switch (backend) {
         ? BackendPreference.metal
         : BackendPreference.auto,
   CeraBackend.hexagon => BackendPreference.hexagon,
+  CeraBackend.npu => BackendPreference.npu,
   CeraBackend.auto => BackendPreference.auto,
 };
 

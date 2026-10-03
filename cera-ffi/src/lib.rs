@@ -378,6 +378,10 @@ pub enum BackendPreference {
     Metal,
     /// Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
     Hexagon,
+    /// Whichever NPU the device has: tries each NPU backend compiled into
+    /// the build and uses the first that loads, so callers need not name a
+    /// vendor. Fails when no NPU backend is compiled in or none can load.
+    Npu,
 }
 
 impl From<BackendPreference> for cera::BackendPreference {
@@ -388,6 +392,7 @@ impl From<BackendPreference> for cera::BackendPreference {
             BackendPreference::Gpu => cera::BackendPreference::Gpu,
             BackendPreference::Metal => cera::BackendPreference::Metal,
             BackendPreference::Hexagon => cera::BackendPreference::Hexagon,
+            BackendPreference::Npu => cera::BackendPreference::Npu,
         }
     }
 }
@@ -400,6 +405,7 @@ impl From<cera::BackendPreference> for BackendPreference {
             cera::BackendPreference::Gpu => BackendPreference::Gpu,
             cera::BackendPreference::Metal => BackendPreference::Metal,
             cera::BackendPreference::Hexagon => BackendPreference::Hexagon,
+            cera::BackendPreference::Npu => BackendPreference::Npu,
         }
     }
 }
@@ -4780,6 +4786,7 @@ mod tests {
             BackendPreference::Gpu,
             BackendPreference::Metal,
             BackendPreference::Hexagon,
+            BackendPreference::Npu,
         ] {
             let core: cera::BackendPreference = ffi.into();
             let back: BackendPreference = core.into();

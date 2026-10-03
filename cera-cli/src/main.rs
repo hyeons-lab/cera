@@ -359,7 +359,7 @@ enum Command {
         #[arg(long, requires = "tools")]
         constrain_tools: bool,
 
-        /// Device to use: cpu, gpu, metal, hexagon, or auto.
+        /// Device to use: cpu, gpu, metal, npu, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -634,7 +634,7 @@ enum Command {
         #[arg(long)]
         system: Option<String>,
 
-        /// Device to use: cpu, gpu, metal, hexagon, or auto.
+        /// Device to use: cpu, gpu, metal, npu, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -773,7 +773,7 @@ enum Command {
         #[arg(short, long)]
         prompt: String,
 
-        /// Device to use: cpu, gpu, metal, hexagon, or auto.
+        /// Device to use: cpu, gpu, metal, npu, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -867,7 +867,7 @@ enum Command {
         #[arg(long)]
         add_bos: bool,
 
-        /// Device to use: cpu, gpu, metal, hexagon, or auto.
+        /// Device to use: cpu, gpu, metal, npu, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -975,7 +975,7 @@ enum Command {
         #[arg(long, default_value_t = 128)]
         max_tokens: usize,
 
-        /// Device to use: cpu, gpu, metal, hexagon, or auto.
+        /// Device to use: cpu, gpu, metal, npu, hexagon, or auto.
         #[arg(long, default_value = "auto")]
         device: String,
 
@@ -1216,7 +1216,7 @@ enum Command {
         #[arg(long)]
         cache_dir: Option<String>,
 
-        /// Compute device / backend: `auto`, `cpu`, `hexagon` / `npu`, `metal`, `gpu`.
+        /// Compute device / backend: `auto`, `cpu`, `npu` (whichever NPU is present), `hexagon`, `metal`, `gpu`.
         #[arg(long, visible_alias = "backend", default_value = "auto")]
         device: String,
     },
@@ -1797,6 +1797,7 @@ fn load_engine_from_spec(
             BackendPreference::Gpu => "wgpu",
             BackendPreference::Metal => "native Metal",
             BackendPreference::Hexagon => "Hexagon NPU",
+            BackendPreference::Npu => "NPU (auto-detected)",
         },
         engine.metadata().architecture,
     );
@@ -3254,7 +3255,8 @@ fn main() -> Result<()> {
                         "cpu" => BackendPreference::Cpu,
                         "metal" => BackendPreference::Metal,
                         "wgpu" | "gpu" => BackendPreference::Gpu,
-                        "hexagon" | "npu" => BackendPreference::Hexagon,
+                        "hexagon" => BackendPreference::Hexagon,
+                        "npu" => BackendPreference::Npu,
                         "auto" => BackendPreference::Auto,
                         other => {
                             eprintln!("unknown CERA_AUDIO_GPU={other}; using CPU");

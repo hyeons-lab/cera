@@ -304,6 +304,8 @@ void main() {
   test('Hexagon NPU bindings and backend preferences are exposed', () {
     expect(BackendPreference.values, contains(BackendPreference.hexagon));
     expect(CeraBackend.values, contains(CeraBackend.hexagon));
+    expect(BackendPreference.values, contains(BackendPreference.npu));
+    expect(CeraBackend.values, contains(CeraBackend.npu));
 
     const info = HexagonProbeInfo(
       arch: 'V79',

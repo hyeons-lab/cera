@@ -467,8 +467,8 @@ fn paging_refusal(gguf_bytes: u64, kv_bytes: usize, paging: &Paging) -> String {
     format!(
         "{} MiB of weights and {} MiB of KV state do not fit the {} MiB DSP mapping budget and \
          would need paging, which decodes at about 40% of the CPU's speed; skipping the NPU. Set \
-         CERA_HEXAGON_PAGE_EXPERTS=1, or request the NPU explicitly (BackendPreference::Hexagon, \
-         `--device hexagon`), to page them",
+         CERA_HEXAGON_PAGE_EXPERTS=1, or request the NPU explicitly (BackendPreference::Hexagon or \
+         BackendPreference::Npu, `--device hexagon` or `--device npu`), to page them",
         gguf_bytes >> 20,
         kv_bytes >> 20,
         paging.budget >> 20

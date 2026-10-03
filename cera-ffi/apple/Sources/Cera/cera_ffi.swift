@@ -9760,6 +9760,12 @@ public enum BackendPreference: Equatable, Hashable {
      * Native Qualcomm Hexagon NPU. Requires the `hexagon` feature.
      */
     case hexagon
+    /**
+     * Whichever NPU the device has: tries each NPU backend compiled into
+     * the build and uses the first that loads, so callers need not name a
+     * vendor. Fails when no NPU backend is compiled in or none can load.
+     */
+    case npu
 
 
 
@@ -9791,6 +9797,8 @@ public struct FfiConverterTypeBackendPreference: FfiConverterRustBuffer {
         
         case 5: return .hexagon
         
+        case 6: return .npu
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -9817,6 +9825,10 @@ public struct FfiConverterTypeBackendPreference: FfiConverterRustBuffer {
         
         case .hexagon:
             writeInt(&buf, Int32(5))
+        
+        
+        case .npu:
+            writeInt(&buf, Int32(6))
         
         }
     }
