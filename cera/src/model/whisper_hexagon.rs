@@ -782,6 +782,15 @@ impl std::fmt::Debug for HexagonWhisperModel {
 
 impl HexagonWhisperModel {
     /// Initialize a Hexagon Whisper model by allocating and staging shared DMA memory buffers.
+    ///
+    /// Waits on `device`'s queue session sleep in the kernel from here on, so pass a device this
+    /// model does not share (as [`init_hexagon_whisper`] does). The driver's default wait spins
+    /// a core for as long as the DSP runs: an encoder window is about 3,800 ops in five batches
+    /// and 340 ms of DSP time, and with the default wait the NPU path cost the CPU as much time
+    /// as the DSP took (336 ms per utterance on an S25 Ultra, 2 ms asleep), which is what moving
+    /// Whisper to the NPU for a background service is meant to avoid. The queue also flushes by
+    /// itself whenever a batch fills, so the setting has to hold for the whole call, not just the
+    /// final flush. A sleeping wake-up costs about a scheduler tick per batch.
     pub fn new(
         driver: Arc<FastRpcDriver>,
         device: Arc<Mutex<HexagonDevice>>,
@@ -802,6 +811,10 @@ impl HexagonWhisperModel {
             RpcmemBuffer::alloc(Arc::clone(&driver), scratch_offsets.total_bytes, true)?;
 
         let special_tokens = WhisperSpecialTokens::from_tokenizer(tokenizer);
+        device
+            .lock_or_recover()
+            .queue_session_mut()
+            .set_blocking_wait(true);
 
         Ok(Self {
             device,
@@ -2383,11 +2396,29 @@ pub fn init_hexagon_whisper(
     Ok(Arc::new(model))
 }
 
+/// Why `weights` cannot run on the NPU, or `None` when their formats are all supported. The NPU
+/// reads Q8_0, Q4_0, F16 and F32 matrices; the K-quants (`cera transcribe` converts to Q4_K_M
+/// unless told otherwise) are not among them.
+fn npu_weight_problem(weights: &WhisperWeights) -> Option<String> {
+    HexagonWhisperWeightOffsets::plan(weights).err().map(|e| {
+        format!(
+            "these weights cannot run on the Hexagon NPU ({e}); convert the model with \
+             `cera transcribe --quant q8_0` (Q8_0 is the more accurate of the two formats it reads)"
+        )
+    })
+}
+
 /// Probe for Qualcomm Hexagon DSP and instantiate `HexagonWhisperModel` if available.
 pub fn try_hexagon_whisper(
     weights: &WhisperWeights,
     tokenizer: &crate::tokenizer::BpeTokenizer,
 ) -> Option<Arc<HexagonWhisperModel>> {
+    // A weight format the NPU cannot read is worth a warning, not a debug line: the model then
+    // quietly runs on the CPU at about ten times the CPU time, and nothing says why.
+    if let Some(problem) = npu_weight_problem(weights) {
+        tracing::warn!("whisper: {problem}; running on the CPU instead");
+        return None;
+    }
     match init_hexagon_whisper(weights, tokenizer) {
         Ok(model) => Some(model),
         Err(e) => {
@@ -2592,8 +2623,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_whisper_weight_planning_and_staging() {
+    /// A one-layer, 64-wide Whisper with Q8_0 weights: small enough to stage on the fake driver.
+    fn tiny_whisper_weights() -> WhisperWeights {
         let d_model = 64;
         let n_vocab = 128;
         let config = WhisperConfig {
@@ -2700,18 +2731,68 @@ mod tests {
             proj_w: make_q8(n_vocab, d_model),
         };
 
-        let weights = WhisperWeights {
+        WhisperWeights {
             config,
             encoder,
             decoder,
-        };
+        }
+    }
 
+    #[test]
+    fn test_whisper_weight_planning_and_staging() {
+        let weights = tiny_whisper_weights();
         let offsets = HexagonWhisperWeightOffsets::plan(&weights).unwrap();
         assert!(offsets.total_bytes > 0);
 
         let mut staged_bytes = vec![0u8; offsets.total_bytes];
         stage_whisper_weights(&weights, &offsets, &mut staged_bytes).unwrap();
         assert!(staged_bytes.iter().any(|&b| b != 0));
+    }
+
+    /// A K-quant weight (what `cera transcribe` converts to by default) is reported with the way
+    /// to convert the model; Q8_0 weights are fine.
+    #[test]
+    fn a_weight_format_the_npu_cannot_read_is_explained() {
+        let mut weights = tiny_whisper_weights();
+        assert_eq!(npu_weight_problem(&weights), None);
+        let (rows, cols) = (64, 256);
+        weights.encoder.blocks[0].attn_q_w =
+            MmapWeight::from_owned_bytes(vec![0u8; rows * 144], DType::Q4KM, rows, cols);
+        let problem = npu_weight_problem(&weights).expect("a Q4_K weight is not supported");
+        assert!(
+            problem.contains("Q4KM") && problem.contains("--quant q8_0"),
+            "{problem}"
+        );
+    }
+
+    /// The model puts its own session's waits to sleep (see [`HexagonWhisperModel::new`]):
+    /// `set_blocking_wait` returns the previous setting, which must already be `true`.
+    #[test]
+    fn a_whisper_model_makes_its_sessions_waits_sleep() {
+        let (driver, device) = crate::backend::hexagon::op_capture::fresh_device();
+        let device = Arc::new(Mutex::new(device));
+        assert!(
+            !device
+                .lock_or_recover()
+                .queue_session_mut()
+                .set_blocking_wait(false),
+            "a fresh session spins by default"
+        );
+        let tokenizer = crate::tokenizer::BpeTokenizer::empty_for_test();
+        let _model = HexagonWhisperModel::new(
+            driver,
+            Arc::clone(&device),
+            &tiny_whisper_weights(),
+            &tokenizer,
+        )
+        .expect("stage the tiny model on the fake driver");
+        assert!(
+            device
+                .lock_or_recover()
+                .queue_session_mut()
+                .set_blocking_wait(true),
+            "the model left its session spinning"
+        );
     }
 
     #[test]
