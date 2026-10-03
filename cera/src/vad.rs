@@ -469,6 +469,34 @@ impl VadWeights {
     }
 }
 
+/// What one 16 kHz window leaves behind: the speech probability and the LSTM state.
+#[derive(Debug, Clone)]
+pub struct VadStep {
+    /// Speech probability in `[0, 1]`.
+    pub prob: f32,
+    /// LSTM hidden state after the window.
+    pub h: [f32; 128],
+    /// LSTM cell state after the window.
+    pub c: [f32; 128],
+}
+
+/// An accelerator (the Hexagon NPU) for one 16 kHz VAD window, the part of the model that runs
+/// for every 32 ms of audio, speech or not. The host keeps the LSTM state and hands it in with
+/// each window, so a window is a pure function of its input: resetting, cloning or falling back
+/// to the CPU needs nothing from the accelerator.
+pub trait VadAccelerator: Send + Sync {
+    /// Run the network over `padded`, the 640 samples of the window (64 samples of context, the
+    /// 512 of the chunk and 64 reflected ones) with LSTM state `h`, `c`. `Ok(None)` declines the
+    /// window (the CPU takes it); an `Err` is a failure, after which the VAD stops using the
+    /// accelerator (with a warning) and carries on on the CPU.
+    fn window_16k(
+        &self,
+        padded: &[f32; 640],
+        h: &[f32; 128],
+        c: &[f32; 128],
+    ) -> Result<Option<VadStep>>;
+}
+
 /// Stateful Silero Voice Activity Detector (VAD) session.
 pub struct SileroVad {
     weights: VadWeights,
@@ -480,6 +508,8 @@ pub struct SileroVad {
     context_16k: [f32; 64],
     /// Trailing context buffer for 8 kHz streams (32 samples).
     context_8k: [f32; 32],
+    /// Runs the 16 kHz windows when set (see [`Self::set_accelerator`]).
+    accel: Option<Arc<dyn VadAccelerator>>,
 }
 
 impl SileroVad {
@@ -492,7 +522,37 @@ impl SileroVad {
             c: [0.0; 128],
             context_16k: [0.0; 64],
             context_8k: [0.0; 32],
+            accel: None,
         })
+    }
+
+    /// Run the 16 kHz windows on `accel` from here on. The 8 kHz network stays on the CPU.
+    pub fn set_accelerator(&mut self, accel: Arc<dyn VadAccelerator>) {
+        self.accel = Some(accel);
+    }
+
+    /// Whether 16 kHz windows currently run on an accelerator (it drops out, with a warning,
+    /// if it fails).
+    pub fn is_accelerated(&self) -> bool {
+        self.accel.is_some()
+    }
+
+    /// One 16 kHz window on the accelerator, or `None` to run it on the CPU.
+    fn accelerated_16k(&mut self, padded: &[f32; 640]) -> Option<f32> {
+        let accel = Arc::clone(self.accel.as_ref()?);
+        match accel.window_16k(padded, &self.h, &self.c) {
+            Ok(Some(step)) => {
+                self.h = step.h;
+                self.c = step.c;
+                Some(step.prob)
+            }
+            Ok(None) => None,
+            Err(e) => {
+                tracing::warn!("VAD accelerator failed ({e:#}); running on the CPU from here on");
+                self.accel = None;
+                None
+            }
+        }
     }
 
     /// Load a Silero VAD model from a `.gguf` file path using memory mapping.
@@ -716,6 +776,10 @@ impl SileroVad {
 
         for i in 0..64 {
             padded[576 + i] = padded[575 - 1 - i];
+        }
+
+        if let Some(prob) = self.accelerated_16k(&padded) {
+            return prob;
         }
 
         // 3. STFT Conv: in_ch=1, out_ch=258, kernel=256, stride=128
@@ -1012,6 +1076,9 @@ fn conv1d_relu(
         }
     }
 }
+
+#[cfg(feature = "hexagon")]
+mod hexagon;
 
 #[cfg(test)]
 mod tests {

@@ -176,6 +176,7 @@ pub struct AudioPipelineBuilder {
     whisper_tokenizer: Option<BpeTokenizer>,
     config: Option<AudioPipelineConfig>,
     cancel: Option<Arc<AtomicBool>>,
+    vad_on_cpu: bool,
     diarizer: Option<(SortformerModel, StreamingParams)>,
     labeler_config: Option<SpeakerLabelerConfig>,
 }
@@ -189,6 +190,16 @@ impl AudioPipelineBuilder {
     /// Attach a Silero VAD session.
     pub fn with_vad(mut self, vad: SileroVad) -> Self {
         self.vad = Some(vad);
+        self
+    }
+
+    /// Keep the VAD on the CPU. In a build with the `hexagon` feature the pipeline otherwise runs
+    /// the VAD's 16 kHz windows on the Hexagon NPU when one is available: the VAD runs for every
+    /// 32 ms of audio, speech or not, so it is the model an always-on service keeps busiest, and
+    /// on the NPU it costs the CPU about a sixth of what it does on the CPU (and escapes
+    /// Android's demotion of background CPU work).
+    pub fn with_vad_on_cpu(mut self) -> Self {
+        self.vad_on_cpu = true;
         self
     }
 
@@ -392,8 +403,21 @@ impl AudioPipelineBuilder {
                 iterator
             }
         });
+        #[cfg(feature = "hexagon")]
+        let vad = {
+            let mut vad = self.vad;
+            if !self.vad_on_cpu
+                && let Some(v) = vad.as_mut()
+                && !v.is_accelerated()
+            {
+                v.try_enable_hexagon();
+            }
+            vad
+        };
+        #[cfg(not(feature = "hexagon"))]
+        let vad = self.vad;
         let vad_sample_rate = self.vad_sample_rate.unwrap_or(VadSampleRate::Rate16kHz);
-        let vad_iter = if self.vad.is_some() {
+        let vad_iter = if vad.is_some() {
             Some(VadIterator::new(vad_sample_rate, vad_config))
         } else {
             None
@@ -417,7 +441,7 @@ impl AudioPipelineBuilder {
             .context("failed to start the speaker diarizer")?;
 
         Ok(AudioPipeline {
-            vad: self.vad,
+            vad,
             vad_iter,
             hotword,
             whisper: self.whisper,

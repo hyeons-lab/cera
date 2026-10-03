@@ -1172,6 +1172,11 @@ enum Command {
         /// Output results as a JSON array of speech timestamps.
         #[arg(long)]
         json: bool,
+
+        /// Run the 16 kHz windows on the Hexagon NPU (builds with the `hexagon` feature, Qualcomm
+        /// devices). Fails when the NPU is not available.
+        #[arg(long)]
+        npu: bool,
     },
 
     /// Diarize audio (who spoke when) with Streaming Sortformer 4spk on the CPU.
@@ -4268,6 +4273,7 @@ fn main() -> Result<()> {
             speech_pad_ms,
             frame_stride,
             json,
+            npu,
         } => {
             let vad_rate = match sample_rate {
                 16000 => cera::vad::VadSampleRate::Rate16kHz,
@@ -4288,6 +4294,15 @@ fn main() -> Result<()> {
 
             let mut vad = cera::vad::SileroVad::from_file(&model)
                 .with_context(|| format!("loading Silero VAD model from `{model}`"))?;
+            if npu {
+                #[cfg(feature = "hexagon")]
+                anyhow::ensure!(
+                    vad.try_enable_hexagon(),
+                    "the Hexagon NPU is not available (see the log above)"
+                );
+                #[cfg(not(feature = "hexagon"))]
+                anyhow::bail!("--npu needs a build with the `hexagon` feature");
+            }
 
             let (mut pcm, sr_in) = read_wav_pcm16_mono(&audio)
                 .with_context(|| format!("reading audio file `{audio}`"))?;
@@ -7490,6 +7505,20 @@ mod tests {
                 assert_eq!(neg_threshold, 0.4);
                 assert!(json);
             }
+            _ => panic!("expected Vad command"),
+        }
+    }
+
+    #[test]
+    fn vad_command_parses_the_npu_flag() {
+        let cli = Cli::try_parse_from(["cera", "vad", "-a", "a.wav"]).unwrap();
+        match cli.command {
+            Command::Vad { npu, .. } => assert!(!npu, "the NPU is opt-in for `cera vad`"),
+            _ => panic!("expected Vad command"),
+        }
+        let cli = Cli::try_parse_from(["cera", "vad", "-a", "a.wav", "--npu"]).unwrap();
+        match cli.command {
+            Command::Vad { npu, .. } => assert!(npu),
             _ => panic!("expected Vad command"),
         }
     }

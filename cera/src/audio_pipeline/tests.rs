@@ -599,6 +599,14 @@ fn test_audio_pipeline_flush_clamps_speech_end_to_utterance_start_sample() {
     }
 }
 
+/// The pipeline tries the NPU for its VAD by default (in a build that has one) and
+/// `with_vad_on_cpu` opts out.
+#[test]
+fn test_audio_pipeline_builder_vad_on_cpu_opt_out() {
+    assert!(!AudioPipelineBuilder::new().vad_on_cpu);
+    assert!(AudioPipelineBuilder::new().with_vad_on_cpu().vad_on_cpu);
+}
+
 /// Utterances still waiting on the diarizer are forgotten with the session on `reset`: nothing
 /// outside can see them (the new session never returns them), so they would only pile up.
 #[cfg(feature = "mmap")]
