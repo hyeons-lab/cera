@@ -58,6 +58,7 @@ fn main() {
     use cera::backend::hexagon::{FastRpcDriver, probe_device};
     use cera::model::audio_encoder_hexagon::HexagonAudioEncoder;
     use cera::model::sortformer::SortformerModel;
+    use cera::model::sortformer_hexagon::{HexagonSortformerTail, TailStage};
 
     let mut args = std::env::args().skip(1);
     let model_path = args
@@ -90,7 +91,9 @@ fn main() {
     let mut first = Vec::new();
     let mut last = Vec::new();
     let mut stamps: Vec<(String, std::time::Instant)> = Vec::new();
-    let _ = model.predict_with_taps(&emb, t, &mut |name, v| {
+    let (mut enc_proj, mut tf0, mut tf_last) = (Vec::new(), Vec::new(), Vec::new());
+    let n_tf = model.config().tf_layers;
+    let cpu_preds = model.predict_with_taps(&emb, t, &mut |name, v| {
         stamps.push((name.to_string(), std::time::Instant::now()));
         if name == "xscaled" {
             xscaled = v.to_vec();
@@ -98,6 +101,12 @@ fn main() {
             first = v.to_vec();
         } else if name == format!("enc.layer{}", n_layer - 1) {
             last = v.to_vec();
+        } else if name == "enc_proj" {
+            enc_proj = v.to_vec();
+        } else if name == "tf.layer0" {
+            tf0 = v.to_vec();
+        } else if name == format!("tf.layer{}", n_tf - 1) {
+            tf_last = v.to_vec();
         }
     });
     let at = |name: &str| stamps.iter().find(|(n, _)| n == name).map(|(_, i)| *i);
@@ -113,6 +122,7 @@ fn main() {
         .unwrap()
         .queue_session_mut()
         .set_blocking_wait(true);
+    let enc_driver = Arc::clone(&driver);
     let enc = HexagonAudioEncoder::from_parts(
         driver,
         Arc::clone(&device),
@@ -121,6 +131,9 @@ fn main() {
         false,
     )
     .expect("stage the encoder");
+
+    let tail = HexagonSortformerTail::new(enc_driver, Arc::clone(&device), &model, MAX_FRAMES)
+        .expect("stage the tail");
 
     let report = |name: &str, cpu: &[f32], npu: &[f32]| {
         assert_eq!(cpu.len(), npu.len(), "{name}: length");
@@ -152,6 +165,38 @@ fn main() {
         Ok(out) => report(&format!("blocks 0..{n_layer}"), &last, &out),
         Err(e) => println!("blocks: NPU error: {e}"),
     }
+
+    // The tail, from the CPU's own FastConformer output.
+    for (name, stage, want) in [
+        ("encoder_proj", TailStage::Proj, &enc_proj),
+        ("transformer layer 0", TailStage::Layers(1), &tf0),
+        ("transformer last layer", TailStage::Layers(n_tf), &tf_last),
+        ("speaker activities", TailStage::Full, &cpu_preds),
+    ] {
+        match tail.run(&last, t, stage) {
+            Ok(out) => report(name, want, &out),
+            Err(e) => println!("{name}: NPU error: {e}"),
+        }
+    }
+
+    // Everything on the NPU: stem, x-scale (host), blocks, tail.
+    let chain = || -> Vec<f32> {
+        let emb = enc.stem_output(&mel, n_frames, 64).expect("NPU stem");
+        let scale = model.encoder_input_scale();
+        let x: Vec<f32> = emb.iter().map(|v| v * scale).collect();
+        let enc_out = enc.run_blocks(n_layer, &x, t).expect("NPU blocks");
+        tail.predict(&enc_out, t).expect("NPU tail")
+    };
+    let npu_preds = chain();
+    report("end to end (all NPU)", &cpu_preds, &npu_preds);
+    let hard = |v: &[f32]| v.iter().map(|&p| p > 0.5).collect::<Vec<_>>();
+    let (a, b) = (hard(&cpu_preds), hard(&npu_preds));
+    let agree = a.iter().zip(&b).filter(|(x, y)| x == y).count();
+    println!(
+        "speaker decisions at 0.5: {agree}/{} agree ({:.3}%)",
+        a.len(),
+        100.0 * agree as f64 / a.len() as f64
+    );
 
     // CPU seconds of this process: what the NPU path costs the CPU.
     let cpu_split = || {
@@ -190,6 +235,10 @@ fn main() {
         drop(enc.stem_output(&mel, n_frames, 64).expect("NPU stem"))
     });
     measure("CPU predict (all)", &mut || drop(model.predict(&emb, t)));
+    measure("NPU tail", &mut || {
+        drop(tail.predict(&last, t).expect("NPU tail"))
+    });
+    measure("NPU everything", &mut || drop(chain()));
     measure("NPU blocks", &mut || {
         drop(enc.run_blocks(n_layer, &xscaled, t).expect("NPU blocks"))
     });

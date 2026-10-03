@@ -1171,7 +1171,7 @@ fn settle(session: &mut HexagonQueueSession) -> Result<(), CeraError> {
 /// idle, so a late batch cannot overwrite what it staged. The write cannot be
 /// reached without the wait: this is the only way [`HexagonAudioEncoder`] runs
 /// its `prepare` step.
-fn settled<R>(
+pub(crate) fn settled<R>(
     session: &mut HexagonQueueSession,
     stage: impl FnOnce() -> R,
 ) -> Result<R, CeraError> {
@@ -1213,7 +1213,7 @@ fn release_or_leak(session: &HexagonQueueSession, st: RpcmemBuffer) -> bool {
 /// kernel instead of keeping a core spinning: spinning was most of the
 /// encoder's CPU time (143 of 145 ms for the blocks of 10 s of audio on the
 /// S25 Ultra).
-fn run_on_queue(
+pub(crate) fn run_on_queue(
     what: &str,
     session: &mut HexagonQueueSession,
     emit: impl FnOnce(&mut HexagonQueueSession) -> Result<(), CeraError>,

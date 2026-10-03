@@ -248,23 +248,23 @@ pub struct SortformerConfig {
     pub pad_to: usize,
 }
 
-struct TransformerLayer {
-    ln1_w: Vec<f32>,
-    ln1_b: Vec<f32>,
-    q_w: MmapWeight,
-    q_b: Vec<f32>,
-    k_w: MmapWeight,
-    k_b: Vec<f32>,
-    v_w: MmapWeight,
-    v_b: Vec<f32>,
-    o_w: MmapWeight,
-    o_b: Vec<f32>,
-    ln2_w: Vec<f32>,
-    ln2_b: Vec<f32>,
-    up_w: MmapWeight,
-    up_b: Vec<f32>,
-    down_w: MmapWeight,
-    down_b: Vec<f32>,
+pub(crate) struct TransformerLayer {
+    pub(crate) ln1_w: Vec<f32>,
+    pub(crate) ln1_b: Vec<f32>,
+    pub(crate) q_w: MmapWeight,
+    pub(crate) q_b: Vec<f32>,
+    pub(crate) k_w: MmapWeight,
+    pub(crate) k_b: Vec<f32>,
+    pub(crate) v_w: MmapWeight,
+    pub(crate) v_b: Vec<f32>,
+    pub(crate) o_w: MmapWeight,
+    pub(crate) o_b: Vec<f32>,
+    pub(crate) ln2_w: Vec<f32>,
+    pub(crate) ln2_b: Vec<f32>,
+    pub(crate) up_w: MmapWeight,
+    pub(crate) up_b: Vec<f32>,
+    pub(crate) down_w: MmapWeight,
+    pub(crate) down_b: Vec<f32>,
 }
 
 /// Every Sortformer tensor, loaded from a converted GGUF. Held by [`SortformerModel`] and its
@@ -277,13 +277,13 @@ pub(crate) struct SortformerWeights {
     enc_cfg: AudioEncoderConfig,
     conv_stem: ConvStemWeights,
     layers: Vec<ConformerLayerWeights>,
-    proj_w: MmapWeight,
-    proj_b: Vec<f32>,
-    tf: Vec<TransformerLayer>,
-    head_hidden_w: MmapWeight,
-    head_hidden_b: Vec<f32>,
-    head_out_w: MmapWeight,
-    head_out_b: Vec<f32>,
+    pub(crate) proj_w: MmapWeight,
+    pub(crate) proj_b: Vec<f32>,
+    pub(crate) tf: Vec<TransformerLayer>,
+    pub(crate) head_hidden_w: MmapWeight,
+    pub(crate) head_hidden_b: Vec<f32>,
+    pub(crate) head_out_w: MmapWeight,
+    pub(crate) head_out_b: Vec<f32>,
     /// `N_FFT`-long window with the `WINDOW_LEN` taps centered in it.
     window: Vec<f32>,
     /// `[n_mel_bins × N_FFT_BINS]`.
@@ -832,6 +832,12 @@ impl SortformerModel {
         let path = path.as_ref();
         let g = GgufFile::open_arc(path).with_context(|| format!("opening {}", path.display()))?;
         Self::from_gguf(&g)
+    }
+
+    /// The loaded weights, for backends that stage them (the Hexagon tail).
+    #[cfg(feature = "hexagon")]
+    pub(crate) fn weights(&self) -> &SortformerWeights {
+        &self.w
     }
 
     /// Architecture constants.

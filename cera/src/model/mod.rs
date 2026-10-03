@@ -73,6 +73,8 @@ pub(crate) mod audio_stem_hexagon;
 #[cfg(feature = "hexagon")]
 pub mod hexagon_lfm2;
 #[cfg(feature = "hexagon")]
+pub mod sortformer_hexagon;
+#[cfg(feature = "hexagon")]
 pub mod vision_encoder_hexagon;
 #[cfg(feature = "hexagon")]
 pub mod whisper_hexagon;

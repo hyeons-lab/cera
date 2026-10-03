@@ -37,6 +37,10 @@ Quantization (`--outtype`): f32 | f16 | q8_0 | q4_0 applies to the FastConformer
 depthwise taps, stem convs, positional biases, the mel tables, `encoder_proj`, the Transformer head
 and the speaker head stay F32 (f32) or F16 (otherwise, matrices only), never Q8/Q4: they are small
 (~8 M params) and sit on the path to the sigmoids, which the DER depends on.
+
+`--tail-outtype q8_0` quantizes those matrices (`encoder_proj`, the Transformer and the speaker
+head) to Q8_0 too. The Hexagon NPU's matmul reads only Q8_0 or Q4_0 weights, so the NPU port needs
+this variant; the default stays F16 for the CPU, whose output is checked against NeMo.
 """
 
 import argparse
@@ -206,14 +210,14 @@ def mel_tensors(sd):
     yield "sf.mel.fb", fb[0]
 
 
-def add_tensor(writer, name, arr, outtype):
+def add_tensor(writer, name, arr, outtype, tail_outtype=None):
     """Write one tensor, choosing its storage type from its name and shape."""
     arr = np.ascontiguousarray(arr)
     is_matrix = arr.ndim == 2 and not name.startswith("sf.mel.")
     if name.startswith("a.") and name.endswith(QUANT_SUFFIXES) or name == "a.pre_encode.out.weight":
         target = outtype
     elif name.startswith("sf.") and is_matrix and name.endswith(".weight"):
-        target = F32 if outtype == F32 else F16
+        target = tail_outtype or (F32 if outtype == F32 else F16)
     else:
         target = F32
     if target == F32:
@@ -233,8 +237,14 @@ def main():
     ap.add_argument("--nemo", required=True)
     ap.add_argument("--out", required=True)
     ap.add_argument("--outtype", choices=sorted(OUTTYPES), default="q8_0")
+    ap.add_argument("--tail-outtype", choices=["f16", "q8_0"], default=None,
+                    help="storage of encoder_proj, the Transformer and the speaker head matrices "
+                         "(default: F16, or F32 with --outtype f32); q8_0 is what the Hexagon NPU reads")
     args = ap.parse_args()
     outtype = OUTTYPES[args.outtype]
+    tail_outtype = OUTTYPES[args.tail_outtype] if args.tail_outtype else None
+    if tail_outtype is not None and outtype == F32:
+        raise SystemExit("--tail-outtype needs a quantized --outtype, not f32")
 
     cfg, sd, sha = read_nemo(args.nemo)
     enc, tf, sm, pre = cfg["encoder"], cfg["transformer_encoder"], cfg["sortformer_modules"], cfg["preprocessor"]
@@ -344,7 +354,7 @@ def main():
     counts = {}
     for gen in (encoder_tensors(sd, n_layer), head_tensors(sd, tf_layers), mel_tensors(sd)):
         for name, arr in gen:
-            t = add_tensor(writer, name, arr, outtype)
+            t = add_tensor(writer, name, arr, outtype, tail_outtype)
             counts[t.name] = counts.get(t.name, 0) + 1
 
     writer.write_header_to_file()
