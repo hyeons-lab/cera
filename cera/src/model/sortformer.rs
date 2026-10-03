@@ -235,11 +235,12 @@ pub trait SortformerAccelerator: Send + Sync {
     /// pre-encode embeddings: `[t x n_spk]` sigmoid activities, like [`SortformerModel::predict`].
     fn predict(&self, emb: &[f32], t: usize) -> Result<Option<Vec<f32>>>;
 
-    /// Linear mel energies (before the log) of `n_frames` frames over pre-emphasised, centre-padded
-    /// samples: frame `f` is `samples[f * 160 .. f * 160 + 512]`, windowed with the model's own
-    /// window and projected with its own filterbank. `[n_frames x n_mel]`, time-major. The host
-    /// takes the log. Optional: the default declines, leaving the mel on the CPU.
-    fn mel_energies(&self, samples: &[f32], n_frames: usize) -> Result<Option<Vec<f32>>> {
+    /// Log-mel of `n_frames` frames over pre-emphasised, centre-padded samples: frame `f` is
+    /// `samples[f * 160 .. f * 160 + 512]`, windowed with the model's own window, projected with
+    /// its own filterbank, and `ln(energy + 2^-24)` of the result. `[n_frames x n_mel]`,
+    /// time-major, the values [`SortformerModel::log_mel`] returns. Optional: the default
+    /// declines, leaving the mel on the CPU.
+    fn log_mel(&self, samples: &[f32], n_frames: usize) -> Result<Option<Vec<f32>>> {
         let _ = (samples, n_frames);
         Ok(None)
     }
@@ -947,16 +948,12 @@ impl SortformerModel {
             return None;
         }
         let samples = padded_preemphasized(pcm)?;
-        let energies = self.w.accelerated("log-mel", |a| {
-            a.mel_energies(&samples[..(valid - 1) * HOP_LEN + N_FFT], valid)
+        let mel = self.w.accelerated("log-mel", |a| {
+            a.log_mel(&samples[..(valid - 1) * HOP_LEN + N_FFT], valid)
         })?;
-        if energies.len() != valid * self.w.config.n_mel_bins {
+        if mel.len() != valid * self.w.config.n_mel_bins {
             return None;
         }
-        let mel = energies
-            .iter()
-            .map(|&v| (v as f64 + LOG_MEL_EPS as f64).ln() as f32)
-            .collect();
         Some((mel, valid))
     }
 
@@ -1299,17 +1296,12 @@ impl MelStream {
         if k > 0 {
             let lo = self.next_frame * HOP_LEN - self.base;
             let span = (k - 1) * HOP_LEN + N_FFT;
-            let energies = self.weights.as_ref().and_then(|w| {
-                w.accelerated("log-mel", |a| a.mel_energies(&self.buf[lo..lo + span], k))
-            });
-            match energies {
-                Some(e) if e.len() == k * self.n_mel_bins => {
-                    // The same `ln(x + eps)` in f64 as the CPU frame computer.
-                    out.extend(
-                        e.iter()
-                            .map(|&v| (v as f64 + LOG_MEL_EPS as f64).ln() as f32),
-                    );
-                }
+            let logged = self
+                .weights
+                .as_ref()
+                .and_then(|w| w.accelerated("log-mel", |a| a.log_mel(&self.buf[lo..lo + span], k)));
+            match logged {
+                Some(e) if e.len() == k * self.n_mel_bins => out.extend_from_slice(&e),
                 _ => {
                     let mut row = vec![0.0f32; self.n_mel_bins];
                     for f in 0..k {

@@ -1461,15 +1461,15 @@ impl SortformerAccelerator for CpuDouble {
         }
     }
 
-    fn mel_energies(&self, samples: &[f32], n_frames: usize) -> anyhow::Result<Option<Vec<f32>>> {
+    fn log_mel(&self, samples: &[f32], n_frames: usize) -> anyhow::Result<Option<Vec<f32>>> {
         self.mels.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         match self.mode {
-            Mode::Delegate => Ok(Some(naive_mel_energies(
-                &self.mel_tables.0,
-                &self.mel_tables.1,
-                samples,
-                n_frames,
-            ))),
+            Mode::Delegate => Ok(Some(
+                naive_mel_energies(&self.mel_tables.0, &self.mel_tables.1, samples, n_frames)
+                    .into_iter()
+                    .map(|e| (e as f64 + 2f64.powi(-24)).ln() as f32)
+                    .collect(),
+            )),
             Mode::Decline => Ok(None),
             Mode::Fail => anyhow::bail!("the accelerator is gone"),
         }

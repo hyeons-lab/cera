@@ -23,7 +23,7 @@ use crate::backend::hexagon::{
     FastRpcDriver, HexagonDevice, HexagonQueueSession, HexagonWeightDesc, LockOrRecover,
     RpcmemBuffer, align128,
 };
-use crate::model::audio_encoder::{HOP_LEN, N_FFT};
+use crate::model::audio_encoder::{HOP_LEN, LOG_MEL_EPS, N_FFT};
 use crate::model::audio_encoder_hexagon::HexagonAudioEncoder;
 use crate::model::audio_encoder_hexagon::{
     alloc_settled, pad32, plan_linear, plan_vec, put_linear, put_vec, release_or_leak,
@@ -671,7 +671,7 @@ const MEL_CALL_FRAMES: usize = 1536;
 
 /// Sortformer's log-mel front end on the NPU: the windowed DFT, the power and the filterbank
 /// (the model's own window and filterbank, from its GGUF), through the same ops as LFM2-Audio's
-/// front end. The DSP returns linear energies; the host takes the log.
+/// front end, then `ln(energy + 2^-24)` on the DSP too: the host only copies the result.
 pub struct HexagonSortformerMel {
     driver: Arc<FastRpcDriver>,
     device: Arc<Mutex<HexagonDevice>>,
@@ -710,9 +710,9 @@ impl HexagonSortformerMel {
         })
     }
 
-    /// Linear mel energies `[n_frames, n_mel]` for `n_frames` frames over pre-emphasised,
+    /// Log-mel `[n_frames, n_mel]` (`ln(energy + 2^-24)`) for `n_frames` frames over pre-emphasised,
     /// centre-padded `samples` (frame `f` starts at `f * HOP_LEN`).
-    pub fn energies(&self, samples: &[f32], n_frames: usize) -> Result<Vec<f32>, CeraError> {
+    pub fn log_mel(&self, samples: &[f32], n_frames: usize) -> Result<Vec<f32>, CeraError> {
         if n_frames == 0 || samples.len() != (n_frames - 1) * HOP_LEN + N_FFT {
             return Err(CeraError::Backend(format!(
                 "sortformer mel: {} samples for {n_frames} frames",
@@ -731,6 +731,7 @@ impl HexagonSortformerMel {
     }
 
     fn batch(&self, samples: &[f32], k: usize) -> Result<Vec<f32>, CeraError> {
+        use crate::backend::hexagon::dispatch::{log_inplace, scale_offset};
         let so = MelScratch::new(samples.len(), k, self.n_mel);
         let mut dev = self.device.lock_or_recover();
         let mut buf = alloc_settled(dev.queue_session_mut(), &self.driver, so.total_bytes)?;
@@ -745,7 +746,21 @@ impl HexagonSortformerMel {
                 &so,
                 k,
                 self.n_mel,
-            )
+            )?;
+            // ln(energy + 2^-24), on the DSP like the rest of the front end.
+            let shape = TokenShape {
+                dim: self.n_mel,
+                n_tokens: k,
+            };
+            scale_offset(
+                session,
+                &buf,
+                so.mel,
+                shape,
+                TokenTile::Whole,
+                (1.0, LOG_MEL_EPS),
+            )?;
+            log_inplace(session, &buf, so.mel, shape, TokenTile::Whole)
         });
         let energies = run.map(|()| {
             buf.invalidate_cpu_cache(so.mel, k * self.n_mel * 4);
@@ -847,11 +862,11 @@ impl SortformerAccelerator for HexagonSortformer {
         Ok(Some(self.tail.predict(&enc, t)?))
     }
 
-    fn mel_energies(&self, samples: &[f32], n_frames: usize) -> anyhow::Result<Option<Vec<f32>>> {
+    fn log_mel(&self, samples: &[f32], n_frames: usize) -> anyhow::Result<Option<Vec<f32>>> {
         if n_frames == 0 {
             return Ok(None);
         }
-        Ok(Some(self.mel.energies(samples, n_frames)?))
+        Ok(Some(self.mel.log_mel(samples, n_frames)?))
     }
 }
 
