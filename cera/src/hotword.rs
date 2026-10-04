@@ -638,6 +638,11 @@ impl HotwordDetector {
                 tracing::warn!(
                     "hotword accelerator failed ({e:#}); running on the CPU from here on"
                 );
+                // tracing alone is invisible on phones (cera-ffi installs no subscriber);
+                // keep the stderr line paired, as in SileroVad::drop_accelerator.
+                eprintln!(
+                    "cera-hotword: accelerator failed ({e:#}); running on the CPU from here on"
+                );
                 self.accel = None;
                 false
             }
