@@ -2580,6 +2580,25 @@ fn whisper_transcribe_is_doomed(
                 && matches!(backend, BackendPreference::Hexagon | BackendPreference::Npu)))
 }
 
+/// The error for a transcribe run `whisper_transcribe_is_doomed` already refused: names
+/// the requested backend, why the run cannot transcribe, and what to do instead. Pure
+/// so the test below pins the wording of both arms.
+fn doomed_run_error(device: &str, backend: BackendPreference) -> String {
+    if matches!(backend, BackendPreference::Gpu | BackendPreference::Metal) {
+        format!(
+            "--device `{device}` requests a GPU backend, but Whisper has no GPU path; \
+             not resolving the model for a run that cannot transcribe \
+             (use `--device auto` or `--device cpu` for Whisper transcription)"
+        )
+    } else {
+        format!(
+            "--device `{device}` requests the NPU, but this build has no NPU backend; \
+             not resolving the model for a run that cannot transcribe \
+             (rebuild with the `hexagon` feature for NPU transcription)"
+        )
+    }
+}
+
 fn print_asr_catalog(cache_dir: &Path, quant: cera::convert::TargetQuant) {
     println!(
         "Available ASR Models in Cera Catalog (cache status for {}):",
@@ -2630,6 +2649,40 @@ fn print_asr_catalog(cache_dir: &Path, quant: cera::convert::TargetQuant) {
     println!("  cera transcribe --model tiny --download-model");
 }
 
+/// Whether `model_str` selects a Liquid LFM2-Audio model: the `lfm2-audio`/`liquid`
+/// aliases (any case) or any spelling containing `LFM2-Audio` (case-sensitive, matching
+/// the upstream repo names). Shared by `resolve_asr_model`'s branch gate and
+/// `quant_warning_kind` so the two cannot drift apart; pinned by its own spelling test.
+fn is_liquid_model_spelling(model_str: &str) -> bool {
+    model_str.eq_ignore_ascii_case("lfm2-audio")
+        || model_str.eq_ignore_ascii_case("liquid")
+        || model_str.contains("LFM2-Audio")
+}
+
+/// The `--quant` warning `resolve_asr_model` emits before resolving, if any. `--quant`
+/// only affects on-the-fly conversion, so an explicit `--quant` is worth a warning when
+/// no conversion happens: Liquid models never convert, and the local branch loads its
+/// paths as-is. Pure so the matrix below pins every leg; both suppressions
+/// are structural: handled catalog spellings return before the local branch is reached,
+/// and unknown models bail after both branches. Overlap with the Whisper catalog
+/// resolves toward the local branch only for existing `.gguf` files, which suppress the
+/// Whisper catalog match (see `local_gguf_paths_win_over_catalog_spellings`), so they
+/// warn rather than converting; a same-named non-`.gguf` path does not suppress the
+/// match, so the catalog branch proceeds without warning (reusing a cached GGUF or
+/// converting). (Liquid spellings always take the Liquid branch, even if a same-named
+/// local path exists.) Both call sites pass
+/// `model_str` unchanged (there is no flag to flip); consult only in the Liquid branch
+/// or inside `if path.exists()`.
+fn quant_warning_kind(model_str: &str, explicit_quant: bool) -> Option<&'static str> {
+    if !explicit_quant {
+        return None;
+    }
+    if is_liquid_model_spelling(model_str) {
+        return Some("--quant is not supported for Liquid ASR models");
+    }
+    Some("--quant is ignored for local model files; it applies only to models converted on the fly")
+}
+
 fn resolve_asr_model(
     model_str: &str,
     cache_dir: &Path,
@@ -2638,13 +2691,9 @@ fn resolve_asr_model(
     quant: cera::convert::TargetQuant,
     explicit_quant: bool,
 ) -> Result<AsrResolvedModel> {
-    // Check if it is a Liquid LFM2-Audio model
-    if model_str.eq_ignore_ascii_case("lfm2-audio")
-        || model_str.eq_ignore_ascii_case("liquid")
-        || model_str.contains("LFM2-Audio")
-    {
-        if explicit_quant {
-            eprintln!("cera: warning: --quant is not supported for Liquid ASR models");
+    if is_liquid_model_spelling(model_str) {
+        if let Some(warning) = quant_warning_kind(model_str, explicit_quant) {
+            eprintln!("cera: warning: {warning}");
         }
         let bundle_id = if model_str.eq_ignore_ascii_case("lfm2-audio")
             || model_str.eq_ignore_ascii_case("liquid")
@@ -2727,11 +2776,11 @@ fn resolve_asr_model(
     // which load as engines below; the GGUF check itself is the shared helper).
     let path = Path::new(model_str);
     if path.exists() {
-        if explicit_quant {
-            eprintln!(
-                "cera: warning: --quant is ignored for local model files; \
-                 it applies only to models converted on the fly"
-            );
+        // Inside `if path.exists()`: reaching here proves the model is a local path the
+        // catalog branch did not handle (it returns when it does). Same call as the
+        // Liquid branch: the helper derives the warning from the spelling.
+        if let Some(warning) = quant_warning_kind(model_str, explicit_quant) {
+            eprintln!("cera: warning: {warning}");
         }
         if is_local_gguf_path(model_str) {
             let gguf = Arc::new(cera::gguf::GgufFile::open(path)?);
@@ -4515,20 +4564,7 @@ fn main() -> Result<()> {
                 is_local_gguf_path(&model_str),
                 &model_str,
             ) {
-                if matches!(
-                    backend_pref,
-                    BackendPreference::Gpu | BackendPreference::Metal
-                ) {
-                    anyhow::bail!(
-                        "--device `{device}` requests a GPU backend, but Whisper has no GPU \
-                         path; not resolving the model for a run that cannot transcribe"
-                    );
-                }
-                anyhow::bail!(
-                    "--device `{device}` requests the NPU, but this build has no NPU backend; \
-                     not resolving the model for a run that cannot transcribe \
-                     (rebuild with the `hexagon` feature for NPU transcription)"
-                );
+                anyhow::bail!("{}", doomed_run_error(&device, backend_pref));
             }
             let resolved = resolve_asr_model(
                 &model_str,
@@ -5922,12 +5958,12 @@ mod tests {
 
     use super::{
         BundleQuantPair, Cli, CliSamplingArgs, Command, convert_history_to_chat_messages,
-        default_target_quant, display_bundle_id, labeled_json_row, labeled_text_line,
-        normalize_bundle_id, read_wav_pcm16_mono, resample_linear, resolve_engine,
-        simulate_truncate_oldest_turn_pairs, split_at_marker, transcript_labeler_config,
-        truncate_oldest_turn_pair, whisper_catalog_cached_path, whisper_catalog_unloadable_path,
-        whisper_gguf_is_loadable, whisper_transcribe_is_doomed,
-        write_transcript, write_wav,
+        default_target_quant, display_bundle_id, doomed_run_error, is_liquid_model_spelling,
+        labeled_json_row, labeled_text_line, normalize_bundle_id, quant_warning_kind,
+        read_wav_pcm16_mono, resample_linear, resolve_engine, simulate_truncate_oldest_turn_pairs,
+        split_at_marker, transcript_labeler_config, truncate_oldest_turn_pair,
+        whisper_catalog_cached_path, whisper_catalog_unloadable_path, whisper_gguf_is_loadable,
+        whisper_transcribe_is_doomed, write_transcript, write_wav,
     };
     use cera::tokenizer::ChatMessage;
     use clap::Parser;
@@ -7788,6 +7824,24 @@ mod tests {
                 );
             }
         }
+        // The AND guards also exempt GPU requests: a GPU arm that bailed even for
+        // exempt runs (download-only, a local file, a Liquid model) must fail here.
+        for backend in gpuish {
+            for hexagon_build in [false, true] {
+                assert!(
+                    !whisper_transcribe_is_doomed(backend, hexagon_build, true, false, "tiny"),
+                    "{backend:?} hexagon_build={hexagon_build} download"
+                );
+                assert!(
+                    !whisper_transcribe_is_doomed(backend, hexagon_build, false, true, "tiny"),
+                    "{backend:?} hexagon_build={hexagon_build} local"
+                );
+                assert!(
+                    !whisper_transcribe_is_doomed(backend, hexagon_build, false, false, "liquid"),
+                    "{backend:?} hexagon_build={hexagon_build} liquid"
+                );
+            }
+        }
         assert!(!whisper_transcribe_is_doomed(
             BackendPreference::Hexagon,
             false,
@@ -7802,6 +7856,29 @@ mod tests {
             false,
             "no-such-model"
         ));
+    }
+
+    #[test]
+    fn doomed_run_errors_name_the_cause_and_a_remedy() {
+        use cera::BackendPreference;
+        for backend in [BackendPreference::Gpu, BackendPreference::Metal] {
+            assert_eq!(
+                doomed_run_error("gpu", backend),
+                "--device `gpu` requests a GPU backend, but Whisper has no GPU path; \
+                 not resolving the model for a run that cannot transcribe \
+                 (use `--device auto` or `--device cpu` for Whisper transcription)",
+                "{backend:?}"
+            );
+        }
+        for backend in [BackendPreference::Hexagon, BackendPreference::Npu] {
+            assert_eq!(
+                doomed_run_error("npu", backend),
+                "--device `npu` requests the NPU, but this build has no NPU backend; \
+                 not resolving the model for a run that cannot transcribe \
+                 (rebuild with the `hexagon` feature for NPU transcription)",
+                "{backend:?}"
+            );
+        }
     }
 
     #[test]
@@ -7822,6 +7899,72 @@ mod tests {
         assert!(!super::is_local_gguf_path(
             other.to_str().expect("utf-8 scratch path")
         ));
+        // The extension match is case-insensitive: a regression to a case-sensitive
+        // comparison must fail here.
+        let upper = dir.path().join("tiny.GGUF");
+        std::fs::write(&upper, [0u8; 4]).expect("write scratch upper gguf");
+        assert!(super::is_local_gguf_path(
+            upper.to_str().expect("utf-8 scratch path")
+        ));
+        // A directory named `*.gguf` is not a file: it falls through to the engine
+        // loader, so the `is_file` narrowing needs its own leg.
+        let subdir = dir.path().join("sub.gguf");
+        std::fs::create_dir(&subdir).expect("create scratch gguf dir");
+        assert!(!super::is_local_gguf_path(
+            subdir.to_str().expect("utf-8 scratch path")
+        ));
+    }
+
+    #[test]
+    fn quant_warnings_fire_only_when_no_conversion_happens() {
+        const LIQUID: &str = "--quant is not supported for Liquid ASR models";
+        const LOCAL: &str = "--quant is ignored for local model files; it applies only to models converted on the fly";
+        // (model_str, explicit_quant) -> warning. Every leg is production-fed: the
+        // Liquid branch feeds liquid spellings, the local branch feeds existing paths
+        // (a scratch file stands in for one).
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let local = dir.path().join("model.gguf");
+        std::fs::write(&local, [0u8; 4]).expect("write scratch gguf");
+        let local = local.to_str().expect("utf-8 scratch path");
+        for (model_str, explicit_quant, expected) in [
+            ("liquid", true, Some(LIQUID)),
+            ("LFM2-Audio-1.5B", true, Some(LIQUID)),
+            ("liquid", false, None),
+            (local, true, Some(LOCAL)),
+            (local, false, None),
+        ] {
+            assert_eq!(
+                quant_warning_kind(model_str, explicit_quant),
+                expected,
+                "{model_str:?} explicit={explicit_quant}"
+            );
+        }
+    }
+
+    #[test]
+    fn liquid_spellings_cover_aliases_and_repo_names() {
+        for spelling in [
+            "liquid",
+            "Liquid",
+            "LIQUID",
+            "lfm2-audio",
+            // Bare alias in non-lowercase: exercises only the first arm (not equal to
+            // `liquid`, and no case-sensitive `LFM2-Audio` substring).
+            "LFM2-AUDIO",
+            "LFM2-Audio-1.5B",
+            "x-LFM2-Audio",
+        ] {
+            assert!(is_liquid_model_spelling(spelling), "{spelling:?}");
+        }
+        for spelling in [
+            "tiny",
+            "openai/whisper-tiny",
+            "lfm2-audio-x",
+            "lfm2_audio",
+            "",
+        ] {
+            assert!(!is_liquid_model_spelling(spelling), "{spelling:?}");
+        }
     }
 
     #[test]

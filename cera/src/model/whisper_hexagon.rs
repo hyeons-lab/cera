@@ -759,9 +759,10 @@ const GREEDY_SUPPRESSED: f32 = -1e30;
 /// panicking the phone.
 fn readback_i32_le(scratch: &[u8], at: usize) -> Result<i32, CeraError> {
     let Some(&bytes) = scratch.get(at..).and_then(|tail| tail.first_chunk::<4>()) else {
-        return Err(CeraError::Backend(
-            "the DSP argmax read back a short row".into(),
-        ));
+        return Err(CeraError::Backend(format!(
+            "the DSP argmax read back a short row (offset {at} + 4 over scratch len {})",
+            scratch.len()
+        )));
     };
     Ok(i32::from_le_bytes(bytes))
 }
@@ -2618,9 +2619,9 @@ fn npu_weight_problem(weights: &WhisperWeights) -> Option<String> {
     HexagonWhisperWeightOffsets::plan(weights).err().map(|e| {
         format!(
             "these weights cannot run on the Hexagon NPU ({e}); reconvert the model to Q8_0 \
-             (for a catalog model: `cera transcribe --quant q8_0`; a local GGUF must be \
-             reconverted from its source; Q8_0 is the more accurate of the two quantized \
-             formats it reads (Q8_0 and Q4_0))"
+             (for a catalog model: `cera transcribe --model <alias> --quant q8_0 \
+             --download-model`; a local GGUF must be reconverted from its source; Q8_0 is \
+             the more accurate of the two quantized formats it reads (Q8_0 and Q4_0))"
         )
     })
 }
@@ -3011,6 +3012,13 @@ mod tests {
                 "at={at} should err, not panic"
             );
         }
+        // The error associates each value with its label (presence alone would pass a
+        // swapped message), so the failure is debuggable from the log as printed.
+        let msg = format!("{}", readback_i32_le(&scratch, 29).unwrap_err());
+        assert!(
+            msg.contains("offset 29") && msg.contains("len 32"),
+            "short-row error must label offset and len: {msg}"
+        );
         let empty: &[u8] = &[];
         assert!(readback_i32_le(empty, 0).is_err());
     }
@@ -3074,7 +3082,10 @@ mod tests {
             MmapWeight::from_owned_bytes(vec![0u8; rows * 144], DType::Q4KM, rows, cols);
         let problem = npu_weight_problem(&weights).expect("a Q4_K weight is not supported");
         assert!(
-            problem.contains("Q4KM") && problem.contains("--quant q8_0"),
+            problem.contains("Q4KM")
+                && problem.contains("--quant q8_0")
+                && problem.contains("--model <alias>")
+                && problem.contains("--download-model"),
             "{problem}"
         );
     }
