@@ -317,8 +317,12 @@ pub(crate) fn finish_log_mel(
         }
     }
 
-    // Transpose mel-major [n_mel × n_frames] → time-major
-    // [n_frames × n_mel_bins].
+    mel_to_time_major(&mel, n_mel_bins, n_frames)
+}
+
+/// Transpose mel-major `[n_mel_bins x n_frames]` to the time-major `[n_frames x n_mel_bins]`
+/// layout the conv stem reads.
+pub(crate) fn mel_to_time_major(mel: &[f32], n_mel_bins: usize, n_frames: usize) -> Vec<f32> {
     let mut mel_time_major = vec![0.0f32; n_frames * n_mel_bins];
     for mi in 0..n_mel_bins {
         for ti in 0..n_frames {
@@ -359,23 +363,115 @@ pub fn log_mel_spectrogram(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) 
     if pcm.is_empty() || n_mel_bins == 0 {
         return (Vec::new(), 0);
     }
+    // Hann window centered inside an N_FFT-sized buffer. Shared with the GPU
+    // front-end, which uploads exactly these taps.
+    let hann = build_padded_hann_window();
+    let filters = build_mel_filterbank(n_mel_bins, N_FFT, SAMPLE_RATE as usize);
+    log_mel_with_tables(pcm, n_mel_bins, &hann, &filters, true)
+}
+
+/// One mel frame at a time: Hann window, FFT, power spectrum, mel projection, `ln(x + eps)`.
+///
+/// The per-frame step of [`log_mel_with_tables`], split out so a streaming front end
+/// (`model::sortformer::MelStream`) computes frames with exactly the same arithmetic as the
+/// whole-clip path: the results are bit-identical, which is what lets the live and offline
+/// diarizers be compared with `==`.
+pub(crate) struct MelFrameComputer {
+    hann: Vec<f32>,
+    filters: Vec<f32>,
+    n_mel_bins: usize,
+    fft: std::sync::Arc<dyn rustfft::Fft<f32>>,
+    fft_buf: Vec<Complex32>,
+    // Power spectrum scratch: each frame computes |X[k]|^2 once instead of n_mel_bins times.
+    power_spec: Vec<f64>,
+}
+
+impl MelFrameComputer {
+    /// `hann` is `N_FFT` long (window centered in it); `filters` is `[n_mel_bins x N_FFT_BINS]`.
+    pub(crate) fn new(n_mel_bins: usize, hann: &[f32], filters: &[f32]) -> Self {
+        assert_eq!(hann.len(), N_FFT, "window must be N_FFT long");
+        assert_eq!(
+            filters.len(),
+            n_mel_bins * N_FFT_BINS,
+            "filterbank must be [n_mel_bins x N_FFT_BINS]"
+        );
+        let mut planner = FftPlanner::<f32>::new();
+        Self {
+            hann: hann.to_vec(),
+            filters: filters.to_vec(),
+            n_mel_bins,
+            fft: planner.plan_fft_forward(N_FFT),
+            fft_buf: vec![Complex32::new(0.0, 0.0); N_FFT],
+            power_spec: vec![0.0f64; N_FFT_BINS],
+        }
+    }
+
+    /// Log-mel of one `N_FFT`-sample frame (already center-padded and pre-emphasized) into `out`
+    /// (`n_mel_bins` values).
+    pub(crate) fn frame(&mut self, samples: &[f32], out: &mut [f32]) {
+        debug_assert_eq!(samples.len(), N_FFT);
+        debug_assert_eq!(out.len(), self.n_mel_bins);
+        // Apply the Hann window; clear the imaginary parts.
+        for (fb, (&h, &s)) in self.fft_buf.iter_mut().zip(self.hann.iter().zip(samples)) {
+            *fb = Complex32::new(h * s, 0.0);
+        }
+        self.fft.process(&mut self.fft_buf);
+
+        for (p, c) in self
+            .power_spec
+            .iter_mut()
+            .zip(self.fft_buf.iter().take(N_FFT_BINS))
+        {
+            *p = c.re as f64 * c.re as f64 + c.im as f64 * c.im as f64;
+        }
+
+        // Per-mel-bin filter dot product. f64 accumulation per the project convention.
+        for (mi, o) in out.iter_mut().enumerate() {
+            let frow = &self.filters[mi * N_FFT_BINS..(mi + 1) * N_FFT_BINS];
+            let sum: f64 = self
+                .power_spec
+                .iter()
+                .zip(frow)
+                .map(|(&p, &f)| p * f as f64)
+                .sum();
+            *o = (sum + LOG_MEL_EPS as f64).ln() as f32;
+        }
+    }
+}
+
+/// The mel pipeline of [`log_mel_spectrogram`] with its tables supplied by the caller.
+///
+/// `hann` is the `N_FFT`-long window (the `WINDOW_LEN` taps already centered in it, as
+/// [`build_padded_hann_window`] returns), `filters` is `[n_mel_bins × N_FFT_BINS]`
+/// row-major, and `normalize` turns the final per-feature mean/variance normalization
+/// on or off. Everything else (center padding, pre-emphasis, STFT, power, mel
+/// projection, `ln(x + LOG_MEL_EPS)`, layout) is shared.
+///
+/// Models that ship their own front end (Sortformer exports the NeMo window and
+/// filterbank in its GGUF and trains with `normalize: NA`) call this directly; the
+/// LFM2A path goes through [`log_mel_spectrogram`], which is this function with the
+/// per-feature normalization on.
+pub(crate) fn log_mel_with_tables(
+    pcm: &[f32],
+    n_mel_bins: usize,
+    hann: &[f32],
+    filters: &[f32],
+    normalize: bool,
+) -> (Vec<f32>, usize) {
+    if pcm.is_empty() || n_mel_bins == 0 {
+        return (Vec::new(), 0);
+    }
+    assert_eq!(hann.len(), N_FFT, "window must be N_FFT long");
+    assert_eq!(
+        filters.len(),
+        n_mel_bins * N_FFT_BINS,
+        "filterbank must be [n_mel_bins x N_FFT_BINS]"
+    );
 
     let n_samples_in = pcm.len();
     let Some(samples) = padded_preemphasized(pcm) else {
         return (Vec::new(), 0);
     };
-
-    // Hann window centered inside an N_FFT-sized buffer. Shared with the GPU
-    // front-end, which uploads exactly these taps.
-    let hann = build_padded_hann_window();
-
-    // Mel filterbank.
-    let filters = build_mel_filterbank(n_mel_bins, N_FFT, SAMPLE_RATE as usize);
-
-    // FFT planner (one per call; encoder runs per chunk so this
-    // is amortized).
-    let mut planner = FftPlanner::<f32>::new();
-    let fft = planner.plan_fft_forward(N_FFT);
 
     // Single source for the frame count: `n_frames_for` is what the GPU encoder
     // consults to size its capacity check before paying for this function, so a
@@ -387,43 +483,30 @@ pub fn log_mel_spectrogram(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) 
         return (Vec::new(), 0);
     }
 
+    let mut frame_fn = MelFrameComputer::new(n_mel_bins, hann, filters);
+    if !normalize {
+        let mut mel = vec![0.0f32; n_frames * n_mel_bins];
+        for ti in 0..n_frames {
+            let offset = ti * HOP_LEN;
+            let dst = &mut mel[ti * n_mel_bins..(ti + 1) * n_mel_bins];
+            frame_fn.frame(&samples[offset..offset + N_FFT], dst);
+        }
+        return (mel, n_frames);
+    }
+
     // Compute mel spectrogram in mel-major layout (per-feature
-    // norm walks per-mel-bin slices of consecutive timesteps —
+    // norm walks per-mel-bin slices of consecutive timesteps;
     // contiguous in this layout). Transpose to time-major at the
     // end for the conv_stem_forward consumer.
     let mut mel = vec![0.0f32; n_mel_bins * n_frames];
-    let mut fft_buf: Vec<Complex32> = vec![Complex32::new(0.0, 0.0); N_FFT];
-    // Power spectrum scratch — hoisted out of the (ti, mi) loop
-    // so each frame computes |X[k]|² exactly once instead of
-    // n_mel_bins times.
-    let mut power_spec = vec![0.0f64; N_FFT_BINS];
-
+    let mut row = vec![0.0f32; n_mel_bins];
     for ti in 0..n_frames {
+        // `n_frames` is sized so `offset + N_FFT - 1` always falls within `samples` (no
+        // out-of-bounds branch needed).
         let offset = ti * HOP_LEN;
-        // Apply Hann window to this frame; clear the imaginary
-        // parts. n_frames is sized so `offset + N_FFT - 1` always
-        // falls within `samples` (no out-of-bounds branch needed).
-        let frame_samples = &samples[offset..offset + N_FFT];
-        for (fb, (&h, &s)) in fft_buf.iter_mut().zip(hann.iter().zip(frame_samples)) {
-            *fb = Complex32::new(h * s, 0.0);
-        }
-        fft.process(&mut fft_buf);
-
-        // Per-frame power spectrum, computed once.
-        for (p, c) in power_spec.iter_mut().zip(fft_buf.iter().take(N_FFT_BINS)) {
-            *p = c.re as f64 * c.re as f64 + c.im as f64 * c.im as f64;
-        }
-
-        // Per-mel-bin filter dot product. f64 accumulation per
-        // the project convention.
-        for mi in 0..n_mel_bins {
-            let frow = &filters[mi * N_FFT_BINS..(mi + 1) * N_FFT_BINS];
-            let sum: f64 = power_spec
-                .iter()
-                .zip(frow)
-                .map(|(&p, &f)| p * f as f64)
-                .sum();
-            mel[mi * n_frames + ti] = (sum + LOG_MEL_EPS as f64).ln() as f32;
+        frame_fn.frame(&samples[offset..offset + N_FFT], &mut row);
+        for (mi, &v) in row.iter().enumerate() {
+            mel[mi * n_frames + ti] = v;
         }
     }
 

@@ -465,7 +465,7 @@ impl AudioEncoderWeights {
 
 /// Load one conv1d stem layer at the given positional index. Stem
 /// uses `a.conv1d.{idx}.weight` / `.bias` per llama.cpp's naming.
-fn load_conv_layer(gguf: &Arc<GgufFile>, idx: u32) -> Result<ConvLayerWeights> {
+pub(crate) fn load_conv_layer(gguf: &Arc<GgufFile>, idx: u32) -> Result<ConvLayerWeights> {
     let weight_name = format!("a.conv1d.{idx}.weight");
     let bias_name = format!("a.conv1d.{idx}.bias");
     let weight_t = gguf
@@ -483,7 +483,10 @@ fn load_conv_layer(gguf: &Arc<GgufFile>, idx: u32) -> Result<ConvLayerWeights> {
 }
 
 /// Load one Conformer block's full weight set.
-fn load_conformer_block(gguf: &Arc<GgufFile>, il: usize) -> Result<ConformerLayerWeights> {
+pub(crate) fn load_conformer_block(
+    gguf: &Arc<GgufFile>,
+    il: usize,
+) -> Result<ConformerLayerWeights> {
     let pfx = format!("a.blk.{il}");
 
     // Helpers — keep the per-tensor lines short.
@@ -547,7 +550,7 @@ fn load_conformer_block(gguf: &Arc<GgufFile>, il: usize) -> Result<ConformerLaye
 }
 
 /// Read a 1D `Vec<f32>` from a GGUF tensor by name.
-fn load_vec_f32(gguf: &Arc<GgufFile>, name: &str) -> Result<Vec<f32>> {
+pub(crate) fn load_vec_f32(gguf: &Arc<GgufFile>, name: &str) -> Result<Vec<f32>> {
     let tensor = gguf
         .get_tensor(name)
         .with_context(|| format!("loading {name}"))?;
@@ -1409,6 +1412,129 @@ pub fn conv_stem_forward(
     (encoder_in, t_out)
 }
 
+/// Run one full Conformer block (FFN ½ → self-attention → conv module → FFN ½ → `ln2`)
+/// in place on a `[t × n_embd]` time-major sequence.
+///
+/// This is the loop body of [`audio_encoder_forward`], shared with the Sortformer
+/// diarizer's encoder (`model::sortformer`), which stacks the same blocks on
+/// different inputs. `pos_emb` is [`relative_pos_emb`]`(t)`; the two scratch buffers
+/// are `[n_embd]` and `[n_ff]`.
+#[allow(clippy::too_many_arguments)]
+pub fn conformer_block_forward(
+    x: &mut [f32],
+    layer: &ConformerLayerWeights,
+    pos_emb: &[f32],
+    n_embd: usize,
+    n_ff: usize,
+    n_head: usize,
+    t: usize,
+    eps: f32,
+    scratch_pre_norm: &mut [f32],
+    scratch_ff: &mut [f32],
+) {
+    // FFN ½ #1: half-residual (handled inside conformer_ffn_forward).
+    conformer_ffn_forward(
+        x,
+        &layer.ffn_norm_w,
+        &layer.ffn_norm_b,
+        &layer.ffn_up_w,
+        &layer.ffn_up_b,
+        &layer.ffn_down_w,
+        &layer.ffn_down_b,
+        n_embd,
+        n_ff,
+        t,
+        eps,
+        scratch_pre_norm,
+        scratch_ff,
+    );
+
+    // Self-attention (with relative-position bias).
+    conformer_self_attention_forward(
+        x,
+        pos_emb,
+        &layer.ln1_w,
+        &layer.ln1_b,
+        &layer.attn_q_w,
+        &layer.attn_q_b,
+        &layer.attn_k_w,
+        &layer.attn_k_b,
+        &layer.attn_v_w,
+        &layer.attn_v_b,
+        &layer.attn_o_w,
+        &layer.attn_o_b,
+        &layer.pos_bias_u,
+        &layer.pos_bias_v,
+        &layer.linear_pos_w,
+        n_embd,
+        n_head,
+        t,
+        eps,
+    );
+
+    // Conv module: derive kernel_size from the loaded 1D
+    // conv shape so block-to-block kernel changes (if any)
+    // are picked up automatically. LFM2A stores conv_dw as
+    // 2D `[k, channels]` but other 1D-conv loaders in the
+    // codebase use the 3D form `[k, 1, channels]` (with the
+    // singleton in_per_group elided in 2D); accept both.
+    // First dim is kernel_size in either case.
+    let dw_rank = layer.conv_dw_shape.len();
+    assert!(
+        dw_rank == 2 || dw_rank == 3,
+        "conformer_block_forward: expected 2- or 3-dim conv_dw shape, got {:?}",
+        layer.conv_dw_shape
+    );
+    let kernel_size = layer.conv_dw_shape[0];
+    // Sanity: `kernel_size * n_embd` must match the actual
+    // weight buffer length (depthwise has in_per_group == 1).
+    assert_eq!(
+        kernel_size * n_embd,
+        layer.conv_dw_w.len(),
+        "conformer_block_forward: kernel_size ({kernel_size}) * n_embd ({n_embd}) != conv_dw_w.len() ({})",
+        layer.conv_dw_w.len()
+    );
+    conformer_conv_module_forward(
+        x,
+        &layer.norm_conv_w,
+        &layer.norm_conv_b,
+        &layer.conv_pw1_w,
+        &layer.conv_pw1_b,
+        &layer.conv_dw_w,
+        &layer.conv_dw_b,
+        &layer.conv_norm_w,
+        &layer.conv_norm_b,
+        &layer.conv_pw2_w,
+        &layer.conv_pw2_b,
+        n_embd,
+        t,
+        kernel_size,
+        eps,
+    );
+
+    // FFN ½ #2.
+    conformer_ffn_forward(
+        x,
+        &layer.ffn_norm_1_w,
+        &layer.ffn_norm_1_b,
+        &layer.ffn_up_1_w,
+        &layer.ffn_up_1_b,
+        &layer.ffn_down_1_w,
+        &layer.ffn_down_1_b,
+        n_embd,
+        n_ff,
+        t,
+        eps,
+        scratch_pre_norm,
+        scratch_ff,
+    );
+
+    // Final per-block LayerNorm (ln_2). No residual.
+    for row in x.chunks_exact_mut(n_embd) {
+        crate::backend::cpu::layer_norm_inplace(row, &layer.ln2_w, &layer.ln2_b, eps);
+    }
+}
+
 /// Run the full LFM2A audio encoder on a single mel-spectrogram
 /// chunk. Wires the conv subsampling stem (PR #98) +
 /// `n_layer` Conformer blocks + the per-block final LayerNorm +
@@ -1482,108 +1608,18 @@ pub fn audio_encoder_forward(
         weights.layers.len()
     );
     for il in 0..n_layer {
-        let layer = &weights.layers[il];
-        // FFN ½ #1 — half-residual (handled inside conformer_ffn_forward).
-        conformer_ffn_forward(
+        conformer_block_forward(
             &mut x,
-            &layer.ffn_norm_w,
-            &layer.ffn_norm_b,
-            &layer.ffn_up_w,
-            &layer.ffn_up_b,
-            &layer.ffn_down_w,
-            &layer.ffn_down_b,
+            &weights.layers[il],
+            &pos_emb,
             n_embd,
             n_ff,
-            t_out,
-            eps,
-            &mut scratch_pre_norm,
-            &mut scratch_ff,
-        );
-
-        // Self-attention (with relative-position bias).
-        conformer_self_attention_forward(
-            &mut x,
-            &pos_emb,
-            &layer.ln1_w,
-            &layer.ln1_b,
-            &layer.attn_q_w,
-            &layer.attn_q_b,
-            &layer.attn_k_w,
-            &layer.attn_k_b,
-            &layer.attn_v_w,
-            &layer.attn_v_b,
-            &layer.attn_o_w,
-            &layer.attn_o_b,
-            &layer.pos_bias_u,
-            &layer.pos_bias_v,
-            &layer.linear_pos_w,
-            n_embd,
             n_head,
             t_out,
             eps,
-        );
-
-        // Conv module — derive kernel_size from the loaded 1D
-        // conv shape so block-to-block kernel changes (if any)
-        // are picked up automatically. LFM2A stores conv_dw as
-        // 2D `[k, channels]` but other 1D-conv loaders in the
-        // codebase use the 3D form `[k, 1, channels]` (with the
-        // singleton in_per_group elided in 2D); accept both.
-        // First dim is kernel_size in either case.
-        let dw_rank = layer.conv_dw_shape.len();
-        assert!(
-            dw_rank == 2 || dw_rank == 3,
-            "audio_encoder_forward: block {il}: expected 2- or 3-dim conv_dw shape, got {:?}",
-            layer.conv_dw_shape
-        );
-        let kernel_size = layer.conv_dw_shape[0];
-        // Sanity: `kernel_size * n_embd` must match the actual
-        // weight buffer length (depthwise has in_per_group == 1).
-        assert_eq!(
-            kernel_size * n_embd,
-            layer.conv_dw_w.len(),
-            "audio_encoder_forward: block {il}: kernel_size ({kernel_size}) * n_embd ({n_embd}) != conv_dw_w.len() ({})",
-            layer.conv_dw_w.len()
-        );
-        conformer_conv_module_forward(
-            &mut x,
-            &layer.norm_conv_w,
-            &layer.norm_conv_b,
-            &layer.conv_pw1_w,
-            &layer.conv_pw1_b,
-            &layer.conv_dw_w,
-            &layer.conv_dw_b,
-            &layer.conv_norm_w,
-            &layer.conv_norm_b,
-            &layer.conv_pw2_w,
-            &layer.conv_pw2_b,
-            n_embd,
-            t_out,
-            kernel_size,
-            eps,
-        );
-
-        // FFN ½ #2.
-        conformer_ffn_forward(
-            &mut x,
-            &layer.ffn_norm_1_w,
-            &layer.ffn_norm_1_b,
-            &layer.ffn_up_1_w,
-            &layer.ffn_up_1_b,
-            &layer.ffn_down_1_w,
-            &layer.ffn_down_1_b,
-            n_embd,
-            n_ff,
-            t_out,
-            eps,
             &mut scratch_pre_norm,
             &mut scratch_ff,
         );
-
-        // Final per-block LayerNorm (ln_2). No residual.
-        for row in x.chunks_exact_mut(n_embd) {
-            crate::backend::cpu::layer_norm_inplace(row, &layer.ln2_w, &layer.ln2_b, eps);
-        }
     }
 
     // Stage 4: MLP adapter — per-timestep LN + 2-layer MLP with
