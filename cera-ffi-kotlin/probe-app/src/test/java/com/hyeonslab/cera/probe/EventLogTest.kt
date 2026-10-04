@@ -14,7 +14,7 @@ class EventLogTest {
         overlapping: UInt? = null,
         text: String = " hello ",
         confidence: Float? = 0.9f,
-    ) = FfiAudioPipelineEvent.UtteranceLabeled(text, 65_000f, 66_000f, speaker, confidence, overlapping)
+    ) = FfiAudioPipelineEvent.UtteranceLabeled(text, 65_000f, 66_000f, speaker, confidence, overlapping, false)
 
     private fun wake() = FfiAudioPipelineEvent.WakeWordDetected("Hey Liquid", 0.93f, 2_000f, 32_000uL)
 
@@ -81,7 +81,7 @@ class EventLogTest {
             "{\"type\":\"transcript\",\"start_ms\":null,\"end_ms\":null,\"text\":\"x\"}",
             eventJson(ev),
         )
-        val labeled = FfiAudioPipelineEvent.UtteranceLabeled("x", 1_000f, 2_000f, 1u, Float.NaN, null)
+        val labeled = FfiAudioPipelineEvent.UtteranceLabeled("x", 1_000f, 2_000f, 1u, Float.NaN, null, false)
         assertTrue(eventJson(labeled)!!.contains("\"confidence\":null"))
         val wake = FfiAudioPipelineEvent.WakeWordDetected("kw", Float.NaN, Float.NaN, 0uL)
         assertTrue(eventJson(wake)!!.contains("\"confidence\":null"))
