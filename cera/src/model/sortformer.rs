@@ -225,7 +225,8 @@ impl StreamingParams {
 /// model then uses it. Each method returns `Ok(None)` to decline an input it cannot take (for
 /// example one longer than the window it was staged for), and an `Err` is a failure: both fall
 /// back to the CPU, the failure with a one-time warning, so a diarizer never stops because the
-/// accelerator did.
+/// accelerator did. An output of the wrong length is treated like a failure of that stage (CPU
+/// fallback with a one-time warning), never trusted.
 pub trait SortformerAccelerator: Send + Sync {
     /// The conv stem and `pre_encode.out` over `n_frames` of `[n_frames x n_mel]` mel:
     /// `[stem_frames(n_frames) x n_embd]`, like [`SortformerModel::pre_encode`].
@@ -325,8 +326,35 @@ pub(crate) struct SortformerWeights {
     pub(crate) mel_fb: Vec<f32>,
     /// Set once by [`SortformerModel::set_accelerator`].
     accel: OnceLock<Arc<dyn SortformerAccelerator>>,
-    /// Whether an accelerator failure has been logged (once per model).
-    accel_warned: AtomicBool,
+    /// Whether an accelerator failure has been logged, once per [`AccelStage`].
+    accel_warned: [AtomicBool; 3],
+}
+
+/// One stage of the accelerated diarization step. Each stage warns once, independently: a
+/// transient failure in one must not suppress the first warning of another.
+#[derive(Clone, Copy)]
+enum AccelStage {
+    LogMel,
+    Stem,
+    Predict,
+}
+
+impl AccelStage {
+    fn label(self) -> &'static str {
+        match self {
+            AccelStage::LogMel => "log-mel",
+            AccelStage::Stem => "conv stem",
+            AccelStage::Predict => "predict",
+        }
+    }
+
+    fn index(self) -> usize {
+        match self {
+            AccelStage::LogMel => 0,
+            AccelStage::Stem => 1,
+            AccelStage::Predict => 2,
+        }
+    }
 }
 
 fn req_u32(g: &GgufFile, key: &str) -> Result<usize> {
@@ -613,7 +641,11 @@ impl SortformerWeights {
             window,
             mel_fb,
             accel: OnceLock::new(),
-            accel_warned: AtomicBool::new(false),
+            accel_warned: [
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+                AtomicBool::new(false),
+            ],
         })
     }
 }
@@ -875,6 +907,12 @@ impl SortformerModel {
         Self::from_gguf(&g)
     }
 
+    /// Load a converted Sortformer GGUF from in-memory bytes.
+    pub fn from_bytes(bytes: impl Into<Arc<[u8]>>) -> Result<Self> {
+        let g = Arc::new(GgufFile::from_bytes(bytes.into())?);
+        Self::from_gguf(&g)
+    }
+
     /// The loaded weights, for backends that stage them (the Hexagon tail).
     #[cfg(feature = "hexagon")]
     pub(crate) fn weights(&self) -> &SortformerWeights {
@@ -948,12 +986,10 @@ impl SortformerModel {
             return None;
         }
         let samples = padded_preemphasized(pcm)?;
-        let mel = self.w.accelerated("log-mel", |a| {
+        let want = valid * self.w.config.n_mel_bins;
+        let mel = self.w.accelerated_checked(AccelStage::LogMel, want, |a| {
             a.log_mel(&samples[..(valid - 1) * HOP_LEN + N_FFT], valid)
         })?;
-        if mel.len() != valid * self.w.config.n_mel_bins {
-            return None;
-        }
         Some((mel, valid))
     }
 
@@ -987,8 +1023,11 @@ impl SortformerModel {
             t <= MAX_OFFLINE_FRAMES,
             "predict: {t} frames exceeds the {MAX_OFFLINE_FRAMES}-frame attention window"
         );
+        let want = t * c.n_spk;
         if t > 0
-            && let Some(preds) = self.w.accelerated("predict", |a| a.predict(emb, t))
+            && let Some(preds) = self
+                .w
+                .accelerated_checked(AccelStage::Predict, want, |a| a.predict(emb, t))
         {
             return preds;
         }
@@ -1008,6 +1047,11 @@ impl SortformerModel {
             .accel
             .set(accel)
             .map_err(|_| anyhow::anyhow!("this Sortformer model already has an accelerator"))
+    }
+
+    /// Whether [`Self::set_accelerator`] already installed an accelerator.
+    pub fn has_accelerator(&self) -> bool {
+        self.w.accel.get().is_some()
     }
 
     /// [`Self::predict`] that reports intermediates to `tap` as it goes: `"xscaled"`,
@@ -1296,13 +1340,17 @@ impl MelStream {
         if k > 0 {
             let lo = self.next_frame * HOP_LEN - self.base;
             let span = (k - 1) * HOP_LEN + N_FFT;
-            let logged = self
-                .weights
-                .as_ref()
-                .and_then(|w| w.accelerated("log-mel", |a| a.log_mel(&self.buf[lo..lo + span], k)));
+            let want = k * self.n_mel_bins;
+            let logged = self.weights.as_ref().and_then(|w| {
+                w.accelerated_checked(AccelStage::LogMel, want, |a| {
+                    a.log_mel(&self.buf[lo..lo + span], k)
+                })
+            });
             match logged {
-                Some(e) if e.len() == k * self.n_mel_bins => out.extend_from_slice(&e),
-                _ => {
+                Some(e) => out.extend_from_slice(&e),
+                None => {
+                    // Declined or faulty (a wrong-length `Some` warns inside
+                    // `accelerated_checked`): compute the frames on the CPU.
                     let mut row = vec![0.0f32; self.n_mel_bins];
                     for f in 0..k {
                         let at = lo + f * HOP_LEN;
@@ -2075,30 +2123,63 @@ impl SortformerWeights {
     /// set and takes it, else on the CPU.
     fn conv_stem_for(&self, mel: &[f32]) -> (Vec<f32>, usize) {
         let n = mel.len() / self.config.n_mel_bins;
-        if let Some(emb) = self.accelerated("conv stem", |a| a.pre_encode(mel, n)) {
+        let want = stem_frames(n) * self.config.n_embd;
+        if let Some(emb) =
+            self.accelerated_checked(AccelStage::Stem, want, |a| a.pre_encode(mel, n))
+        {
             return (emb, stem_frames(n));
         }
         conv_stem_forward(mel, n, &self.conv_stem, &self.enc_cfg)
     }
 
     /// Run `call` on the accelerator if one is set. `None` means "use the CPU": nothing is set,
-    /// the accelerator declined, or it failed (logged once, then quiet).
+    /// the accelerator declined, or it failed (logged once per stage, then quiet).
     fn accelerated<T>(
         &self,
-        what: &str,
+        stage: AccelStage,
         call: impl FnOnce(&dyn SortformerAccelerator) -> Result<Option<T>>,
     ) -> Option<T> {
         let accel = self.accel.get()?;
         match call(accel.as_ref()) {
             Ok(out) => out,
             Err(e) => {
-                if !self.accel_warned.swap(true, Ordering::Relaxed) {
-                    tracing::warn!(
-                        "sortformer: {what} failed on the accelerator ({e:#}); using the CPU"
-                    );
-                }
+                self.warn_once(
+                    stage,
+                    &format!("failed on the accelerator ({e:#}); using the CPU"),
+                );
                 None
             }
+        }
+    }
+
+    /// Run `call` on the accelerator and take its output only at the expected length. A
+    /// wrong-length `Some` is a faulty stage, not a decline: warn once, then `None` so the
+    /// caller falls back to the CPU. Every `Vec<f32>` stage output goes through here so a
+    /// future stage cannot forget the length check and consume a short output as valid.
+    fn accelerated_checked(
+        &self,
+        stage: AccelStage,
+        want: usize,
+        call: impl FnOnce(&dyn SortformerAccelerator) -> Result<Option<Vec<f32>>>,
+    ) -> Option<Vec<f32>> {
+        let out = self.accelerated(stage, call)?;
+        if out.len() == want {
+            return Some(out);
+        }
+        self.warn_once(
+            stage,
+            &format!("returned {} values, want {want}; using the CPU", out.len()),
+        );
+        None
+    }
+
+    /// Log a stage's accelerator fault once (later faults of the same stage stay quiet).
+    fn warn_once(&self, stage: AccelStage, detail: &str) {
+        if !self.accel_warned[stage.index()].swap(true, Ordering::Relaxed) {
+            tracing::warn!("sortformer: {} {detail}", stage.label());
+            // No `tracing` subscriber on the shipping mobile/FFI platforms; without this
+            // the warning is invisible exactly where the fallback runs.
+            eprintln!("cera-sortformer: {} {detail}", stage.label());
         }
     }
 }

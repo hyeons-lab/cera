@@ -25,6 +25,8 @@
 
 #![cfg(feature = "mmap")] // `SortformerModel::from_file`
 
+mod common;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
@@ -78,35 +80,7 @@ fn model(file: &str) -> Option<SortformerModel> {
 
 /// 16-bit mono PCM WAV to f32, the way `soundfile.read(dtype="float32")` does it.
 fn read_clip() -> Vec<f32> {
-    let bytes = std::fs::read(fixtures_dir().join("clip.wav")).expect("clip.wav");
-    assert_eq!(&bytes[..4], b"RIFF");
-    let mut pos = 12;
-    let mut fmt_ok = false;
-    while pos + 8 <= bytes.len() {
-        let id = &bytes[pos..pos + 4];
-        let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
-        let body = &bytes[pos + 8..pos + 8 + len];
-        if id == b"fmt " {
-            let (tag, ch, rate, bits) = (
-                u16::from_le_bytes(body[0..2].try_into().unwrap()),
-                u16::from_le_bytes(body[2..4].try_into().unwrap()),
-                u32::from_le_bytes(body[4..8].try_into().unwrap()),
-                u16::from_le_bytes(body[14..16].try_into().unwrap()),
-            );
-            assert_eq!((tag, ch, rate, bits), (1, 1, 16_000, 16), "clip.wav format");
-            fmt_ok = true;
-        } else if id == b"data" {
-            assert!(fmt_ok, "data before fmt");
-            return body
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
-                .collect();
-        }
-        pos += 8 + len + (len & 1);
-    }
-    panic!("no data chunk in clip.wav");
+    common::read_wav_f32(&fixtures_dir().join("clip.wav"))
 }
 
 struct Golden {
@@ -1392,6 +1366,14 @@ enum Mode {
     Decline,
     /// Return an error.
     Fail,
+    /// Return one value short: a faulty stage the model must survive.
+    Short,
+}
+
+/// Drop the last value: a wrong-length output the model must refuse.
+fn truncate(mut v: Vec<f32>) -> Vec<f32> {
+    v.pop();
+    v
 }
 
 /// A double that delegates to an independent CPU model and counts the calls it gets.
@@ -1448,6 +1430,7 @@ impl SortformerAccelerator for CpuDouble {
             Mode::Delegate => Ok(Some(self.cpu.pre_encode(mel, n).0)),
             Mode::Decline => Ok(None),
             Mode::Fail => anyhow::bail!("the accelerator is gone"),
+            Mode::Short => Ok(Some(truncate(self.cpu.pre_encode(mel, n).0))),
         }
     }
 
@@ -1458,6 +1441,7 @@ impl SortformerAccelerator for CpuDouble {
             Mode::Delegate => Ok(Some(self.cpu.predict_cpu(emb, t))),
             Mode::Decline => Ok(None),
             Mode::Fail => anyhow::bail!("the accelerator is gone"),
+            Mode::Short => Ok(Some(truncate(self.cpu.predict_cpu(emb, t)))),
         }
     }
 
@@ -1472,6 +1456,12 @@ impl SortformerAccelerator for CpuDouble {
             )),
             Mode::Decline => Ok(None),
             Mode::Fail => anyhow::bail!("the accelerator is gone"),
+            Mode::Short => Ok(Some(truncate(
+                naive_mel_energies(&self.mel_tables.0, &self.mel_tables.1, samples, n_frames)
+                    .into_iter()
+                    .map(|e| (e as f64 + 2f64.powi(-24)).ln() as f32)
+                    .collect(),
+            ))),
         }
     }
 }
@@ -1490,12 +1480,16 @@ fn live_run(m: &SortformerModel, params: &StreamingParams, pcm: &[f32]) -> Vec<f
 /// The accelerator hook sits under `step` and the mel front end. A delegating accelerator is
 /// called for every stem and prediction and, with an independent f64 mel, gives the same
 /// activities to within the mel's rounding; one that declines or fails leaves the CPU result
-/// bit-identical (the failure is survived, not propagated). The mel is computed a chunk at a
-/// time, not once per push. One model per case, since a model takes an accelerator once.
+/// bit-identical (the failure is survived, not propagated), as does one whose outputs are one
+/// value short (wrong lengths fall back to the CPU, never trusted). The mel is computed a
+/// chunk at a time, not once per push. Each faulty stage warns once: a failing or short
+/// accelerator warns 3 times (log-mel, stem, predict), a healthy one never. One model per
+/// case, since a model takes an accelerator once.
 #[test]
 fn an_accelerator_is_used_by_the_stream_and_never_changes_the_answer() {
     use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::layer::SubscriberExt;
     let file = "sortformer-4spk-v2.1-f32.gguf";
     let (Some(reference), Some(golden)) = (model(file), Golden::load()) else {
         return;
@@ -1526,15 +1520,27 @@ fn an_accelerator_is_used_by_the_stream_and_never_changes_the_answer() {
     };
     let pushes = pcm.len().div_ceil(1600);
 
-    for (name, mode) in [
-        ("delegate", Mode::Delegate),
-        ("decline", Mode::Decline),
-        ("fail", Mode::Fail),
+    for (name, mode, want_warns) in [
+        ("delegate", Mode::Delegate, 0),
+        ("decline", Mode::Decline, 0),
+        ("fail", Mode::Fail, 3),
+        ("short", Mode::Short, 3),
     ] {
         let m = model(file).unwrap();
         let c = [counter(), counter(), counter()];
         m.set_accelerator(double(mode, &c)).unwrap();
-        let got = live_run(&m, &params, &pcm);
+        // Scoped to this thread: sibling tests on other threads keep their own subscriber.
+        // The `sortformer: ` prefix is the model's own fault tag, so warnings from any
+        // other target cannot move this count.
+        let warns = common::WarnCapture::default();
+        let sub = tracing_subscriber::registry().with(warns.clone());
+        let got = tracing::subscriber::with_default(sub, || live_run(&m, &params, &pcm));
+        let n = warns
+            .messages()
+            .iter()
+            .filter(|m| m.contains("sortformer: "))
+            .count();
+        assert_eq!(n, want_warns, "{name}: one warning per faulty stage");
         assert_eq!(got.len(), want.len(), "{name}: frame count");
         match mode {
             Mode::Delegate => {
@@ -1548,12 +1554,23 @@ fn an_accelerator_is_used_by_the_stream_and_never_changes_the_answer() {
                     .map(|(a, b)| (a - b).abs())
                     .fold(0f32, f32::max);
                 assert!(mel_worst < 1e-2, "{name}: log-mel worst diff {mel_worst}");
+                // Consumption, not just invocation: the Delegate mel comes from an
+                // independent f64 path, so bit equality means the accelerator output was
+                // dropped and the CPU value used instead.
+                assert_ne!(
+                    acc_mel, cpu_mel,
+                    "{name}: the offline path ignored the accelerator mel"
+                );
                 let worst = got
                     .iter()
                     .zip(&want)
                     .map(|(a, b)| (a - b).abs())
                     .fold(0f32, f32::max);
                 assert!(worst < 1e-3, "{name}: worst activity diff {worst}");
+                assert_ne!(
+                    got, want,
+                    "{name}: the streaming path ignored the accelerator mel"
+                );
             }
             _ => assert_eq!(got, want, "{name}: predictions differ from the CPU run"),
         }

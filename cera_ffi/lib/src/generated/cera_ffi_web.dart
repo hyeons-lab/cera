@@ -7323,6 +7323,15 @@ final class FfiAudioPipeline {
   /// Construct a pipeline from in-memory GGUF byte buffers.
   static FfiAudioPipeline fromBytes(Uint8List? vadBytes, Uint8List? hotwordBytes, Uint8List? whisperBytes, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromBytes');
 
+  /// Construct a pipeline from in-memory GGUF byte buffers with a Sortformer speaker
+  /// diarizer (`diarizer_bytes`, a converted Sortformer GGUF). Every transcribed utterance
+  /// then gets an `UtteranceLabeled` event with its speaker, once the diarizer covers it.
+  ///
+  /// With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+  /// device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+  /// otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+  static FfiAudioPipeline fromBytesWithDiarizer(Uint8List? vadBytes, Uint8List? hotwordBytes, Uint8List? whisperBytes, Uint8List diarizerBytes, bool preferNpu, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromBytesWithDiarizer');
+
   /// Construct a pipeline from filesystem model paths.
   static FfiAudioPipeline fromFiles(String? vadPath, String? hotwordPath, String? whisperPath, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromFiles');
 
@@ -7352,7 +7361,8 @@ final class FfiAudioPipeline {
   /// Total audio samples processed since start or reset.
   int currentSample() => _unsupportedOnWeb('FfiAudioPipeline.currentSample');
 
-  /// Whether the diarizer runs on the Hexagon NPU (false: the CPU, or no diarizer).
+  /// Whether the diarizer was staged on the Hexagon NPU and has not stopped (false: the
+  /// CPU, or no diarizer). Steps the NPU declines or that fail there still run on the CPU.
   bool diarizerOnNpu() => _unsupportedOnWeb('FfiAudioPipeline.diarizerOnNpu');
 
   /// Flush any in-flight speech segment at the end of the audio stream.

@@ -13,9 +13,9 @@ release:
 test:
     cargo test --workspace
 
-# Run clippy lints
+# Run clippy lints (mirrors CI: `--all-targets` lints tests and examples too)
 clippy:
-    cargo clippy --workspace -- -D warnings
+    cargo clippy --workspace --all-targets -- -D warnings
 
 # Check formatting. The second command exists because rustfmt does not descend
 # into `include!`d files, so the build-script helpers under cera/build_support/

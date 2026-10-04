@@ -661,6 +661,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 42076:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer() != 59328:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer() != 56903:
@@ -673,7 +675,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 47716:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu() != 32703:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu() != 39954:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 1087:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1855,6 +1857,16 @@ _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes.argtypes =
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_int8,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files.argtypes = (
     _UniffiRustBuffer,
     _UniffiRustBuffer,
@@ -2719,6 +2731,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.rest
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files.restype = ctypes.c_uint16
@@ -14213,7 +14228,8 @@ class FfiAudioPipelineProtocol(typing.Protocol):
         raise NotImplementedError
     def diarizer_on_npu(self, ) -> bool:
         """
-        Whether the diarizer runs on the Hexagon NPU (false: the CPU, or no diarizer).
+        Whether the diarizer was staged on the Hexagon NPU and has not stopped (false: the
+        CPU, or no diarizer). Steps the NPU declines or that fail there still run on the CPU.
 """
         raise NotImplementedError
     def flush(self, ) -> typing.List[FfiAudioPipelineEvent]:
@@ -14303,6 +14319,45 @@ class FfiAudioPipeline(FfiAudioPipelineProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    @classmethod
+    def from_bytes_with_diarizer(cls, vad_bytes: typing.Optional[bytes],hotword_bytes: typing.Optional[bytes],whisper_bytes: typing.Optional[bytes],diarizer_bytes: bytes,prefer_npu: bool,config: typing.Optional[FfiAudioPipelineConfig]) -> FfiAudioPipeline:
+        """
+        Construct a pipeline from in-memory GGUF byte buffers with a Sortformer speaker
+        diarizer (`diarizer_bytes`, a converted Sortformer GGUF). Every transcribed utterance
+        then gets an `UtteranceLabeled` event with its speaker, once the diarizer covers it.
+
+        With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+        device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+        otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+"""
+        
+        _UniffiFfiConverterOptionalBytes.check_lower(vad_bytes)
+
+        _UniffiFfiConverterOptionalBytes.check_lower(hotword_bytes)
+
+        _UniffiFfiConverterOptionalBytes.check_lower(whisper_bytes)
+
+        _UniffiFfiConverterBytes.check_lower(diarizer_bytes)
+
+        _UniffiFfiConverterBoolean.check_lower(prefer_npu)
+
+        _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig.check_lower(config)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterOptionalBytes.lower(vad_bytes),
+            _UniffiFfiConverterOptionalBytes.lower(hotword_bytes),
+            _UniffiFfiConverterOptionalBytes.lower(whisper_bytes),
+            _UniffiFfiConverterBytes.lower(diarizer_bytes),
+            _UniffiFfiConverterBoolean.lower(prefer_npu),
+            _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig.lower(config),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeFfiAudioPipeline.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer,
             *_uniffi_lowered_args,
         )
         return cls._uniffi_make_instance(_uniffi_ffi_result)
@@ -14469,7 +14524,8 @@ class FfiAudioPipeline(FfiAudioPipelineProtocol):
         return _uniffi_lift_return(_uniffi_ffi_result)
     def diarizer_on_npu(self, ) -> bool:
         """
-        Whether the diarizer runs on the Hexagon NPU (false: the CPU, or no diarizer).
+        Whether the diarizer was staged on the Hexagon NPU and has not stopped (false: the
+        CPU, or no diarizer). Steps the NPU declines or that fail there still run on the CPU.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),

@@ -215,11 +215,31 @@ pub fn audio_pipeline_default_config() -> FfiAudioPipelineConfig {
 pub struct FfiAudioPipeline {
     pub(crate) inner: Mutex<cera::audio_pipeline::AudioPipeline>,
     pub(crate) cancel: Arc<AtomicBool>,
-    /// Whether the diarizer runs on the Hexagon NPU (false: the CPU, or no diarizer).
+    /// Whether the diarizer was staged on the Hexagon NPU (false: the CPU, or no diarizer).
     pub(crate) diarizer_on_npu: bool,
 }
 
 impl FfiAudioPipeline {
+    /// Stage `model` on the Hexagon NPU when asked and possible; reports whether it runs
+    /// there (false on builds without the `hexagon` feature, or when staging fails).
+    fn stage_diarizer(
+        model: &cera::model::sortformer::SortformerModel,
+        window_frames: usize,
+        prefer_npu: bool,
+    ) -> bool {
+        #[cfg(feature = "hexagon")]
+        {
+            prefer_npu
+                && cera::model::sortformer_hexagon::try_hexagon_sortformer(model, window_frames)
+                    .is_some()
+        }
+        #[cfg(not(feature = "hexagon"))]
+        {
+            let _ = (model, window_frames, prefer_npu);
+            false
+        }
+    }
+
     fn build_from_files(
         vad_path: Option<String>,
         hotword_path: Option<String>,
@@ -264,18 +284,67 @@ impl FfiAudioPipeline {
                         }
                     })?;
                 let params = model.default_streaming().clone();
-                #[cfg(feature = "hexagon")]
-                let on_npu = prefer_npu
-                    && cera::model::sortformer_hexagon::try_hexagon_sortformer(
-                        &model,
-                        params.window_frames(),
-                    )
-                    .is_some();
-                #[cfg(not(feature = "hexagon"))]
-                let on_npu = {
-                    let _ = prefer_npu;
-                    false
-                };
+                let on_npu = Self::stage_diarizer(&model, params.window_frames(), prefer_npu);
+                builder = builder.with_diarizer(model, params);
+                on_npu
+            }
+        };
+        let pipeline = builder.build().map_err(|e| FfiError::Backend {
+            detail: format!("failed to build audio pipeline: {e}"),
+        })?;
+        let cancel = pipeline.cancel_handle();
+        Ok(Arc::new(Self {
+            inner: Mutex::new(pipeline),
+            cancel,
+            diarizer_on_npu,
+        }))
+    }
+
+    fn build_from_bytes(
+        vad_bytes: Option<Vec<u8>>,
+        hotword_bytes: Option<Vec<u8>>,
+        whisper_bytes: Option<Vec<u8>>,
+        diarizer: Option<(Vec<u8>, bool)>,
+        config: Option<FfiAudioPipelineConfig>,
+    ) -> Result<Arc<Self>, FfiError> {
+        let mut builder = cera::audio_pipeline::AudioPipelineBuilder::new();
+        if let Some(cfg) = config {
+            builder = builder.with_config(cfg.into());
+        }
+        if let Some(vb) = vad_bytes {
+            builder = builder
+                .with_vad_from_bytes(vb)
+                .map_err(|e| FfiError::Backend {
+                    detail: format!("failed to load VAD model from bytes: {e}"),
+                })?;
+        }
+        if let Some(hb) = hotword_bytes {
+            builder = builder
+                .with_hotword_from_bytes(hb, None)
+                .map_err(|e| FfiError::Backend {
+                    detail: format!("failed to load Hotword model from bytes: {e}"),
+                })?;
+        }
+        if let Some(wb) = whisper_bytes {
+            builder = builder
+                .with_whisper_from_bytes(wb)
+                .map_err(|e| FfiError::Backend {
+                    detail: format!("failed to load Whisper model from bytes: {e}"),
+                })?;
+        }
+        let diarizer_on_npu = match diarizer {
+            None => false,
+            Some((db, prefer_npu)) => {
+                let model =
+                    cera::model::sortformer::SortformerModel::from_bytes(db).map_err(|e| {
+                        FfiError::Backend {
+                            detail: format!(
+                                "failed to load the Sortformer diarizer from bytes: {e:#}"
+                            ),
+                        }
+                    })?;
+                let params = model.default_streaming().clone();
+                let on_npu = Self::stage_diarizer(&model, params.window_frames(), prefer_npu);
                 builder = builder.with_diarizer(model, params);
                 on_npu
             }
@@ -346,40 +415,32 @@ impl FfiAudioPipeline {
         whisper_bytes: Option<Vec<u8>>,
         config: Option<FfiAudioPipelineConfig>,
     ) -> Result<Arc<Self>, FfiError> {
-        let mut builder = cera::audio_pipeline::AudioPipelineBuilder::new();
-        if let Some(cfg) = config {
-            builder = builder.with_config(cfg.into());
-        }
-        if let Some(vb) = vad_bytes {
-            builder = builder
-                .with_vad_from_bytes(vb)
-                .map_err(|e| FfiError::Backend {
-                    detail: format!("failed to load VAD model from bytes: {e}"),
-                })?;
-        }
-        if let Some(hb) = hotword_bytes {
-            builder = builder
-                .with_hotword_from_bytes(hb, None)
-                .map_err(|e| FfiError::Backend {
-                    detail: format!("failed to load Hotword model from bytes: {e}"),
-                })?;
-        }
-        if let Some(wb) = whisper_bytes {
-            builder = builder
-                .with_whisper_from_bytes(wb)
-                .map_err(|e| FfiError::Backend {
-                    detail: format!("failed to load Whisper model from bytes: {e}"),
-                })?;
-        }
-        let pipeline = builder.build().map_err(|e| FfiError::Backend {
-            detail: format!("failed to build audio pipeline: {e}"),
-        })?;
-        let cancel = pipeline.cancel_handle();
-        Ok(Arc::new(Self {
-            inner: Mutex::new(pipeline),
-            cancel,
-            diarizer_on_npu: false,
-        }))
+        Self::build_from_bytes(vad_bytes, hotword_bytes, whisper_bytes, None, config)
+    }
+
+    /// Construct a pipeline from in-memory GGUF byte buffers with a Sortformer speaker
+    /// diarizer (`diarizer_bytes`, a converted Sortformer GGUF). Every transcribed utterance
+    /// then gets an `UtteranceLabeled` event with its speaker, once the diarizer covers it.
+    ///
+    /// With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+    /// device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+    /// otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+    #[uniffi::constructor]
+    pub fn from_bytes_with_diarizer(
+        vad_bytes: Option<Vec<u8>>,
+        hotword_bytes: Option<Vec<u8>>,
+        whisper_bytes: Option<Vec<u8>>,
+        diarizer_bytes: Vec<u8>,
+        prefer_npu: bool,
+        config: Option<FfiAudioPipelineConfig>,
+    ) -> Result<Arc<Self>, FfiError> {
+        Self::build_from_bytes(
+            vad_bytes,
+            hotword_bytes,
+            whisper_bytes,
+            Some((diarizer_bytes, prefer_npu)),
+            config,
+        )
     }
 
     /// Current lifecycle state of the pipeline.
@@ -484,9 +545,12 @@ impl FfiAudioPipeline {
         Ok(pipeline.has_diarizer())
     }
 
-    /// Whether the diarizer runs on the Hexagon NPU (false: the CPU, or no diarizer).
+    /// Whether the diarizer was staged on the Hexagon NPU and has not stopped (false: the
+    /// CPU, or no diarizer). Steps the NPU declines or that fail there still run on the CPU.
     pub fn diarizer_on_npu(&self) -> bool {
-        self.diarizer_on_npu
+        // A stopped diarizer reports false even when staging succeeded: the flag alone would
+        // claim the NPU exactly when the labels stop. A poisoned mutex reads as no diarizer.
+        self.diarizer_on_npu && self.inner.lock().is_ok_and(|p| p.has_diarizer())
     }
 
     /// Register an utterance transcribed outside the pipeline so it gets an `UtteranceLabeled`

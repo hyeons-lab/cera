@@ -20,8 +20,9 @@
 fn read_wav(path: &str) -> Vec<f32> {
     let bytes = std::fs::read(path).expect("read the WAV");
     assert!(
-        &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
-        "not a WAV"
+        bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "not a WAV: {} bytes with no RIFF/WAVE header",
+        bytes.len()
     );
     let mut pos = 12;
     while pos + 8 <= bytes.len() {
@@ -29,6 +30,11 @@ fn read_wav(path: &str) -> Vec<f32> {
         let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
         let body = &bytes[pos + 8..(pos + 8 + len).min(bytes.len())];
         if id == b"fmt " {
+            assert!(
+                body.len() >= 16,
+                "WAV fmt chunk holds {} bytes, need 16",
+                body.len()
+            );
             let tag = u16::from_le_bytes([body[0], body[1]]);
             let ch = u16::from_le_bytes([body[2], body[3]]);
             let rate = u32::from_le_bytes(body[4..8].try_into().unwrap());
@@ -66,6 +72,7 @@ fn main() {
         .expect("usage: hexagon_sortformer_probe <sortformer.gguf> <clip.wav> [seconds]");
     let wav_path = args.next().expect("a WAV path");
     let wav = read_wav(&wav_path);
+    assert!(!wav.is_empty(), "the WAV has no audio samples");
     let seconds: f64 = args
         .next()
         .map_or(wav.len() as f64 / 16_000.0, |s| s.parse().expect("seconds"));
@@ -279,9 +286,4 @@ fn main() {
     measure("NPU blocks", &mut || {
         drop(enc.run_blocks(n_layer, &xscaled, t).expect("NPU blocks"))
     });
-}
-
-#[cfg(not(feature = "hexagon"))]
-fn main() {
-    eprintln!("build with --features hexagon");
 }

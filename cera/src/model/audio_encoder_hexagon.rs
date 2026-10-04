@@ -1607,6 +1607,7 @@ impl HexagonAudioEncoder {
     /// Run every Conformer block and the adapter over the conv stem's output
     /// `x` (`[t, n_embd]`), returning the `[t, llm_hidden_size]` embeddings:
     /// everything after the stem, in one call, one DSP batch per block.
+    /// Errors when staged without an MLP adapter (see [`Self::from_parts`]).
     pub fn encode_stem_output(&self, x: &[f32], t: usize) -> Result<Vec<f32>, CeraError> {
         let adapter = self.adapter()?;
         let pos = self.pos_emb(t.max(1));
@@ -1651,6 +1652,7 @@ impl HexagonAudioEncoder {
 
     /// Log-mel for `pcm` (`n_frames` frames, [`n_frames_for`]): the DFT and
     /// the filterbank on the DSP, the log and the normalization on the host.
+    /// Errors when staged without LFM2-Audio's log-mel tables (see [`Self::from_parts`]).
     pub fn log_mel_npu(&self, pcm: &[f32], n_frames: usize) -> Result<Vec<f32>, CeraError> {
         self.require_lfm_mel()?;
         check_n_frames(pcm.len(), n_frames)?;
@@ -1760,6 +1762,7 @@ impl HexagonAudioEncoder {
     /// Log-mel in, embeddings out, with the stem on the NPU. The stem runs in
     /// time chunks (`STEM_CHUNK_ROWS` output frames each) through a buffer
     /// that exists only for this call, so its memory does not grow with the clip.
+    /// Errors when staged without an MLP adapter (see [`Self::from_parts`]).
     pub fn encode_mel(&self, mel: &[f32], n_frames: usize) -> Result<(Vec<f32>, usize), CeraError> {
         let adapter = self.adapter()?;
         check_mel_len(mel.len(), n_frames, self.config.n_mel_bins)?;
@@ -2343,9 +2346,6 @@ mod tests {
         assert!(check_mel_len(0, 0, 128).is_ok(), "empty clip");
     }
 
-    /// The adapter's activations live in scratch sized for the encoder, and its
-    /// vectors are read at the matrices' widths, so a file whose adapter does not
-    /// line up with them is refused at planning, before anything is written.
     /// The position embedding is computed once per length and shared afterwards; a new length
     /// replaces it.
     #[test]
@@ -2367,6 +2367,9 @@ mod tests {
         );
     }
 
+    /// The adapter's activations live in scratch sized for the encoder, and its
+    /// vectors are read at the matrices' widths, so a file whose adapter does not
+    /// line up with them is refused at planning, before anything is written.
     #[test]
     fn an_adapter_the_scratch_cannot_hold_is_refused_at_planning() {
         use crate::model::audio_encoder::{

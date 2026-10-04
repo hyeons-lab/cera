@@ -156,6 +156,11 @@ required-features = ["hexagon", "mmap"]
 name = "hexagon_conformer_probe"
 required-features = ["hexagon", "mmap"]
 
+# The NPU Sortformer encoder and tail against the CPU ones (device only).
+[[example]]
+name = "hexagon_sortformer_probe"
+required-features = ["hexagon", "mmap"]
+
 # wgpu parity/oracle tests: bodies are `#[cfg(feature = "gpu")]` and load
 # fixtures via `GgufFile::open` / `open_arc`, which are `#[cfg(feature =
 # "mmap")]`. Without `required-features` the `--no-default-features
@@ -221,6 +226,9 @@ required-features = ["mmap"]
 
 [dev-dependencies]
 tempfile.workspace = true
+# `tests/sortformer_parity.rs` counts the model's warnings under a thread-scoped
+# subscriber; already a main dependency, so this adds no new crate.
+tracing.workspace = true
 tracing-subscriber.workspace = true
 # `tests/from_parts_vl.rs` encodes a tiny PNG to exercise the image path.
 # Already in the tree as an optional dep behind `vl-preprocess`, so this

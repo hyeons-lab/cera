@@ -287,6 +287,16 @@ impl AudioPipelineBuilder {
         Ok(self.with_diarizer(model, params))
     }
 
+    /// Load a converted Sortformer GGUF from in-memory bytes and attach it with the
+    /// checkpoint's own streaming parameters (see [`Self::with_diarizer`]). The bytes path
+    /// for callers without filesystem access (wasm32 has no `from_file` loaders).
+    pub fn with_diarizer_from_bytes(self, bytes: impl Into<Arc<[u8]>>) -> Result<Self> {
+        let model = SortformerModel::from_bytes(bytes)
+            .context("failed to load the Sortformer diarizer from bytes")?;
+        let params = model.default_streaming().clone();
+        Ok(self.with_diarizer(model, params))
+    }
+
     /// How utterances are matched with the diarizer's speaker activity (see
     /// [`SpeakerLabelerConfig`]). Only used with [`Self::with_diarizer`].
     pub fn with_speaker_labeler_config(mut self, config: SpeakerLabelerConfig) -> Self {
@@ -450,6 +460,35 @@ struct PipelineDiarizer {
     pending: HashMap<u64, PendingUtterance>,
 }
 
+/// Pipeline-clock `ms` in session-local time: an utterance that began before this session
+/// did (the span straddles a flush) starts at the session's first frame.
+fn session_local_ms(ms: f32, origin_ms: f64) -> f64 {
+    (ms as f64 - origin_ms).max(0.0)
+}
+
+/// The `UtteranceLabeled` event for a registered utterance the diarizer has covered.
+fn labeled_event(p: PendingUtterance, u: &LabeledUtterance) -> AudioPipelineEvent {
+    let label = u.label.as_ref();
+    AudioPipelineEvent::UtteranceLabeled {
+        text: p.text,
+        start_ms: p.start_ms,
+        end_ms: p.end_ms,
+        speaker: label.map(|l| l.speaker as u32),
+        confidence: label.map(|l| l.confidence),
+        overlapping: label.and_then(|l| l.overlapping).map(|o| o as u32),
+    }
+}
+
+/// Take a covered utterance out of `pending` and label it. Unknown ids (already taken, or
+/// never registered) yield nothing.
+fn take_labeled_event(
+    pending: &mut HashMap<u64, PendingUtterance>,
+    u: LabeledUtterance,
+) -> Option<AudioPipelineEvent> {
+    let p = pending.remove(&u.id)?;
+    Some(labeled_event(p, &u))
+}
+
 impl PipelineDiarizer {
     fn new(
         model: SortformerModel,
@@ -471,6 +510,11 @@ impl PipelineDiarizer {
     /// Drop the session and everything waiting on it; the diarizer is out for good.
     fn fail(&mut self, what: &str, e: &anyhow::Error) {
         tracing::warn!("speaker diarizer {what} failed ({e:#}); continuing without speaker labels");
+        // No `tracing` subscriber on the shipping mobile/FFI platforms; without this
+        // the reason for the label loss goes nowhere.
+        eprintln!(
+            "cera-audio-pipeline: speaker diarizer {what} failed ({e:#}); continuing without speaker labels"
+        );
         self.session = None;
         self.pending.clear();
     }
@@ -484,16 +528,24 @@ impl PipelineDiarizer {
     }
 
     /// Register an utterance for labeling. Returns whether a diarizer will label it.
+    ///
+    /// Refuses (returns false) once `max_pending` utterances are waiting on a poll: the
+    /// labeler parks at most that many, so an unbounded grant would return true for an
+    /// utterance that can never emit `UtteranceLabeled` while pinning its text.
     fn register(&mut self, text: String, start_ms: f32, end_ms: f32) -> bool {
         let Some(session) = &mut self.session else {
             return false;
         };
+        if self.pending.len() >= self.cfg.max_pending.max(1) {
+            return false;
+        }
         let id = self.next_id;
         self.next_id += 1;
-        // An utterance that began before this session did (the span straddles a flush) starts at
-        // the session's first frame.
-        let local = |ms: f32| (ms as f64 - self.origin_ms).max(0.0);
-        session.add_utterance(id, local(start_ms), local(end_ms));
+        session.add_utterance(
+            id,
+            session_local_ms(start_ms, self.origin_ms),
+            session_local_ms(end_ms, self.origin_ms),
+        );
         self.pending.insert(
             id,
             PendingUtterance {
@@ -506,16 +558,7 @@ impl PipelineDiarizer {
     }
 
     fn labeled(&mut self, u: LabeledUtterance) -> Option<AudioPipelineEvent> {
-        let p = self.pending.remove(&u.id)?;
-        let label = u.label.as_ref();
-        Some(AudioPipelineEvent::UtteranceLabeled {
-            text: p.text,
-            start_ms: p.start_ms,
-            end_ms: p.end_ms,
-            speaker: label.map(|l| l.speaker as u32),
-            confidence: label.map(|l| l.confidence),
-            overlapping: label.and_then(|l| l.overlapping).map(|o| o as u32),
-        })
+        take_labeled_event(&mut self.pending, u)
     }
 
     /// Utterances the diarizer has covered by now.
@@ -730,7 +773,9 @@ impl AudioPipeline {
     /// Process a streaming chunk of 16 kHz mono PCM audio samples.
     ///
     /// Evaluates wake words, speech boundaries, and automatic transcription according to
-    /// the active state machine, returning all newly triggered pipeline events.
+    /// the active state machine, returning all newly triggered pipeline events. The attached
+    /// diarizer hears a chunk only when the pipeline accepts it: on failure its clock stays
+    /// with the pipeline's instead of running past the rejected audio.
     pub fn process_chunk(&mut self, chunk: &[f32]) -> Result<Vec<AudioPipelineEvent>> {
         if chunk.is_empty() {
             return Ok(Vec::new());
@@ -744,9 +789,17 @@ impl AudioPipeline {
         });
         let chunk = sanitized.as_deref().unwrap_or(chunk);
         let mut events = Vec::new();
+        let before = self.current_sample;
         let res = self.process_chunk_inner(chunk, &mut events);
-        // The diarizer hears the same samples as the pipeline, so the two clocks agree.
-        self.diarize(chunk, &mut events);
+        // The diarizer hears the samples the pipeline accepted, so the two clocks agree even
+        // when inner failed after advancing `current_sample` (an `end_utterance` Whisper
+        // error): feeding nothing would skew every later label until flush, feeding the whole
+        // chunk would run it ahead. `current_sample` only moves forward inside inner, so the
+        // subtraction is exact; on success `accepted` is the whole chunk.
+        let accepted = (self.current_sample - before).min(chunk.len() as u64) as usize;
+        if accepted > 0 {
+            self.diarize(&chunk[..accepted], &mut events);
+        }
         for ev in &events {
             self.enqueue_event(ev.clone());
         }
@@ -793,7 +846,8 @@ impl AudioPipeline {
     /// `auto_transcribe` off with [`Self::transcribe_pcm`] called by the caller) so it gets an
     /// [`AudioPipelineEvent::UtteranceLabeled`] like the ones the pipeline transcribes itself.
     /// `start_ms` and `end_ms` are on the pipeline's own clock, as in `UtteranceTranscribed`.
-    /// Returns whether a diarizer will label it (false when none is attached or it has stopped).
+    /// Returns whether a diarizer will label it (false when none is attached, it has stopped,
+    /// or `max_pending` utterances are already waiting on a poll).
     pub fn add_utterance(&mut self, text: String, start_ms: f32, end_ms: f32) -> bool {
         self.diarizer
             .as_mut()

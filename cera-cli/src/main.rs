@@ -2324,7 +2324,6 @@ fn diarize_with_transcript(
         .with_speaker_labeler_config(transcript_labeler_config(threshold))
         .build()?;
 
-
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let mut emit = |ev: AudioPipelineEvent| {
         let AudioPipelineEvent::UtteranceLabeled {

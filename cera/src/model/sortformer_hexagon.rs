@@ -485,8 +485,9 @@ fn emit_tail<S: OpSink>(
 }
 
 /// Sortformer's `encoder_proj`, Transformer and speaker head on the Hexagon NPU.
+///
+/// The `RpcmemBuffer`s retain the driver, so the struct keeps no `Arc` of its own.
 pub struct HexagonSortformerTail {
-    driver: Arc<FastRpcDriver>,
     device: Arc<Mutex<HexagonDevice>>,
     weights_buf: RpcmemBuffer,
     offsets: TailOffsets,
@@ -579,7 +580,6 @@ impl HexagonSortformerTail {
         weights_buf.flush_cpu_cache(0, offsets.total_bytes);
 
         Ok(Self {
-            driver,
             device,
             weights_buf,
             offsets,
@@ -660,7 +660,6 @@ impl Drop for HexagonSortformerTail {
         let mut dev = self.device.lock_or_recover();
         let session: &mut HexagonQueueSession = dev.queue_session_mut();
         session.release_dsp_references([&self.weights_buf, &*self.scratch.lock_or_recover()]);
-        let _ = &self.driver;
     }
 }
 
@@ -872,13 +871,18 @@ impl SortformerAccelerator for HexagonSortformer {
 }
 
 /// Stage `model` on the NPU for steps of up to `max_frames` encoder frames and make it the
-/// model's accelerator. `None` (with the reason logged) when there is no usable NPU or the
-/// weights cannot be staged (for example a GGUF whose tail is not Q8_0); the model then
-/// keeps running on the CPU.
+/// model's accelerator. `None` (with the reason logged) when there is no usable NPU, the
+/// weights cannot be staged (for example a GGUF whose tail is not Q8_0), or the model already
+/// has an accelerator (a repeat call stages nothing and keeps the first); in the first two
+/// cases the model keeps running on the CPU.
 pub fn try_hexagon_sortformer(
     model: &SortformerModel,
     max_frames: usize,
 ) -> Option<Arc<HexagonSortformer>> {
+    if model.has_accelerator() {
+        tracing::info!("HexagonSortformer: the model already has an accelerator; keeping it");
+        return None;
+    }
     let context = crate::backend::hexagon::HexagonContext::new()
         .inspect_err(|e| {
             crate::backend::hexagon::log_context_unavailable("HexagonSortformer", e);
@@ -907,7 +911,7 @@ pub fn try_hexagon_sortformer(
             }
         };
     if let Err(e) = model.set_accelerator(staged.clone()) {
-        tracing::warn!("HexagonSortformer: {e:#}");
+        crate::backend::hexagon::hexagon_warn!("HexagonSortformer: {e:#}");
         return None;
     }
     tracing::info!("sortformer: using the Hexagon NPU ({max_frames} encoder frames)");
@@ -1048,5 +1052,88 @@ mod tests {
         let (s_all, _, _) = emit(TailStage::Layers(99), 3, 7);
         let (s_three, _, _) = emit(TailStage::Layers(3), 3, 7);
         assert_eq!(s_all.opcodes(), s_three.opcodes());
+    }
+
+    /// Collects the `message` field of every `INFO` event. Same shape as the warn capture in
+    /// `transformer.rs` tests (a sibling unit test this module cannot import).
+    #[derive(Clone, Default)]
+    struct InfoCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+    impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for InfoCapture {
+        fn on_event(
+            &self,
+            event: &tracing::Event<'_>,
+            _ctx: tracing_subscriber::layer::Context<'_, S>,
+        ) {
+            if *event.metadata().level() != tracing::Level::INFO {
+                return;
+            }
+            struct Msg<'a>(&'a mut String);
+            impl tracing::field::Visit for Msg<'_> {
+                fn record_debug(
+                    &mut self,
+                    field: &tracing::field::Field,
+                    value: &dyn std::fmt::Debug,
+                ) {
+                    if field.name() == "message" {
+                        self.0.push_str(&format!("{value:?}"));
+                    }
+                }
+            }
+            let mut msg = String::new();
+            event.record(&mut Msg(&mut msg));
+            if !msg.is_empty() {
+                self.0.lock().unwrap_or_else(|p| p.into_inner()).push(msg);
+            }
+        }
+    }
+
+    /// A repeat staging attempt stages nothing and keeps the first accelerator. The early-out
+    /// fires before any NPU interaction, so the contract (plus its log line) holds on host.
+    #[cfg(feature = "mmap")]
+    #[test]
+    fn try_hexagon_sortformer_keeps_the_first_accelerator() {
+        use crate::model::sortformer::{SortformerAccelerator, SortformerModel};
+        use tracing_subscriber::layer::SubscriberExt;
+
+        struct Decline;
+        impl SortformerAccelerator for Decline {
+            fn pre_encode(
+                &self,
+                _mel: &[f32],
+                _n_frames: usize,
+            ) -> anyhow::Result<Option<Vec<f32>>> {
+                Ok(None)
+            }
+            fn predict(&self, _emb: &[f32], _t: usize) -> anyhow::Result<Option<Vec<f32>>> {
+                Ok(None)
+            }
+        }
+
+        let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+            .join(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf");
+        if !crate::model::transformer::require_model_or_skip(&path) {
+            return;
+        }
+        let model = SortformerModel::from_file(&path).unwrap();
+        assert!(!model.has_accelerator());
+        model.set_accelerator(std::sync::Arc::new(Decline)).unwrap();
+        assert!(model.has_accelerator());
+
+        let capture = InfoCapture::default();
+        let sub = tracing_subscriber::registry().with(capture.clone());
+        let out = tracing::subscriber::with_default(sub, || try_hexagon_sortformer(&model, 64));
+        assert!(out.is_none(), "a repeat call stages nothing");
+        assert!(
+            model.has_accelerator(),
+            "the repeat call keeps the first accelerator"
+        );
+        let fired = capture
+            .0
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .iter()
+            .any(|m| m.contains("already has an accelerator"));
+        assert!(fired, "the early-out fires instead of staging");
     }
 }

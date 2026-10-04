@@ -2769,7 +2769,8 @@ public protocol FfiAudioPipelineProtocol: AnyObject, Sendable {
     func currentSample() throws  -> UInt64
     
     /**
-     * Whether the diarizer runs on the Hexagon NPU (false: the CPU, or no diarizer).
+     * Whether the diarizer was staged on the Hexagon NPU and has not stopped (false: the
+     * CPU, or no diarizer). Steps the NPU declines or that fail there still run on the CPU.
      */
     func diarizerOnNpu()  -> Bool
     
@@ -2899,6 +2900,28 @@ public static func fromBytes(vadBytes: Data?, hotwordBytes: Data?, whisperBytes:
 }
     
     /**
+     * Construct a pipeline from in-memory GGUF byte buffers with a Sortformer speaker
+     * diarizer (`diarizer_bytes`, a converted Sortformer GGUF). Every transcribed utterance
+     * then gets an `UtteranceLabeled` event with its speaker, once the diarizer covers it.
+     *
+     * With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+     * device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+     * otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+     */
+public static func fromBytesWithDiarizer(vadBytes: Data?, hotwordBytes: Data?, whisperBytes: Data?, diarizerBytes: Data, preferNpu: Bool, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
+    return try  FfiConverterTypeFfiAudioPipeline_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer(
+        FfiConverterOptionData.lower(vadBytes),
+        FfiConverterOptionData.lower(hotwordBytes),
+        FfiConverterOptionData.lower(whisperBytes),
+        FfiConverterData.lower(diarizerBytes),
+        FfiConverterBool.lower(preferNpu),
+        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),$0
+    )
+})
+}
+    
+    /**
      * Construct a pipeline from filesystem model paths.
      */
 public static func fromFiles(vadPath: String?, hotwordPath: String?, whisperPath: String?, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
@@ -2987,7 +3010,8 @@ open func currentSample()throws  -> UInt64  {
 }
     
     /**
-     * Whether the diarizer runs on the Hexagon NPU (false: the CPU, or no diarizer).
+     * Whether the diarizer was staged on the Hexagon NPU and has not stopped (false: the
+     * CPU, or no diarizer). Steps the NPU declines or that fail there still run on the CPU.
      */
 open func diarizerOnNpu() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
@@ -13735,7 +13759,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 47716) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu() != 32703) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu() != 39954) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 1087) {
@@ -13943,6 +13967,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 42076) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer() != 59328) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812) {

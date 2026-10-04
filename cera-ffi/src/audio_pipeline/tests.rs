@@ -108,6 +108,57 @@ fn test_ffi_audio_pipeline_has_no_diarizer_by_default() {
     );
 }
 
+/// The NPU flag follows the live diarizer, not just staging: a bare pipeline with the flag
+/// forced on still reports false. Needs no models.
+#[test]
+fn test_diarizer_on_npu_is_false_without_a_running_diarizer() {
+    let pipeline = cera::audio_pipeline::AudioPipeline::builder()
+        .build()
+        .expect("pipeline");
+    let cancel = pipeline.cancel_handle();
+    let ffi = FfiAudioPipeline {
+        inner: Mutex::new(pipeline),
+        cancel,
+        diarizer_on_npu: true,
+    };
+    assert!(!ffi.diarizer_on_npu());
+}
+
+/// With a diarizer attached the flag reads true while it runs and false once it stops (here: a
+/// sample the front end refuses). Skipped when the model is absent.
+#[test]
+fn test_diarizer_on_npu_follows_a_failing_diarizer() {
+    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf");
+    if !path.exists() {
+        assert!(
+            std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
+            "CERA_REQUIRE_MODEL=1 but {} is absent",
+            path.display()
+        );
+        eprintln!("{} not found, skipping", path.display());
+        return;
+    }
+    let model = cera::model::sortformer::SortformerModel::from_file(&path).unwrap();
+    let params = model.default_streaming().clone();
+    let pipeline = cera::audio_pipeline::AudioPipeline::builder()
+        .with_diarizer(model, params)
+        .build()
+        .unwrap();
+    let cancel = pipeline.cancel_handle();
+    let ffi = FfiAudioPipeline {
+        inner: Mutex::new(pipeline),
+        cancel,
+        diarizer_on_npu: true,
+    };
+    assert!(ffi.diarizer_on_npu());
+    let mut bad = vec![0.0f32; 1600];
+    bad[10] = 2e9; // finite, so the pipeline passes it on; the mel front end refuses it
+    ffi.process_chunk(bad).expect("the pipeline itself is fine");
+    assert!(!ffi.has_diarizer().unwrap());
+    assert!(!ffi.diarizer_on_npu());
+}
+
 #[test]
 fn test_ffi_utterance_labeled_event_conversion() {
     let core = cera::audio_pipeline::AudioPipelineEvent::UtteranceLabeled {
@@ -177,6 +228,41 @@ fn test_ffi_audio_pipeline_with_a_diarizer() {
         format!("{err:?}").contains("/nonexistent/sortformer.gguf"),
         "{err:?}"
     );
+}
+
+/// The bytes constructor attaches the same diarizer as the file constructor (skipped when
+/// the model is absent); on a host the NPU flag stays `false`.
+#[test]
+fn test_ffi_audio_pipeline_with_a_diarizer_from_bytes() {
+    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf");
+    if !path.exists() {
+        assert!(
+            std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
+            "CERA_REQUIRE_MODEL=1 but {} is absent",
+            path.display()
+        );
+        eprintln!("{} not found, skipping", path.display());
+        return;
+    }
+    let config = FfiAudioPipelineConfig {
+        auto_transcribe: false,
+        ..audio_pipeline_default_config()
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let pipeline =
+        FfiAudioPipeline::from_bytes_with_diarizer(None, None, None, bytes, false, Some(config))
+            .expect("pipeline with a diarizer from bytes");
+    assert!(pipeline.has_diarizer().unwrap());
+    assert!(!pipeline.diarizer_on_npu());
+    assert!(pipeline.add_utterance("a".into(), 0.0, 300.0).unwrap());
+    // Garbage bytes are an error, not a pipeline without a diarizer.
+    let Err(err) =
+        FfiAudioPipeline::from_bytes_with_diarizer(None, None, None, vec![0u8; 64], false, None)
+    else {
+        panic!("garbage diarizer bytes were accepted");
+    };
+    assert!(format!("{err:?}").contains("from bytes"), "{err:?}");
 }
 
 /// Device test, run with `--ignored` on a Qualcomm phone: `from_files_with_diarizer` with

@@ -7,6 +7,8 @@
 
 #![cfg(feature = "mmap")]
 
+mod common;
+
 use std::path::PathBuf;
 
 use cera::audio_pipeline::{AudioPipeline, AudioPipelineEvent};
@@ -32,24 +34,9 @@ fn model() -> Option<SortformerModel> {
 
 /// The committed clip: 15.4 s, three speakers taking turns.
 fn clip() -> Vec<f32> {
-    let bytes = std::fs::read(
-        PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sortformer/clip.wav"),
+    common::read_wav_f32(
+        &PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sortformer/clip.wav"),
     )
-    .unwrap();
-    let mut pos = 12;
-    while pos + 8 <= bytes.len() {
-        let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
-        if &bytes[pos..pos + 4] == b"data" {
-            return bytes[pos + 8..pos + 8 + len]
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
-                .collect();
-        }
-        pos += 8 + len + (len & 1);
-    }
-    panic!("no data chunk");
 }
 
 /// Without a VAD the pipeline treats the stream as one utterance and transcribes nothing, so
