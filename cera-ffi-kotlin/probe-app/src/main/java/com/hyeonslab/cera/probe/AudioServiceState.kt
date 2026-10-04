@@ -29,4 +29,9 @@ object AudioServiceState {
 
     fun line(text: String) =
         mutable.update { it.copy(lines = (it.lines + text).takeLast(MAX_LINES)) }
+
+    /** Test seam: restore the initial snapshot so state tests do not leak into each other. */
+    internal fun reset() {
+        mutable.value = Snapshot()
+    }
 }

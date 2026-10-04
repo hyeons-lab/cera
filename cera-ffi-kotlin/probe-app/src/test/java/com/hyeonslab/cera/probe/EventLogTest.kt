@@ -9,14 +9,30 @@ import uniffi.cera_ffi.FfiAudioPipelineEvent
 import java.util.Locale
 
 class EventLogTest {
-    private fun labeled(speaker: UInt?, overlapping: UInt? = null, text: String = " hello ") =
-        FfiAudioPipelineEvent.UtteranceLabeled(text, 65_000f, 66_000f, speaker, 0.9f, overlapping)
+    private fun labeled(
+        speaker: UInt?,
+        overlapping: UInt? = null,
+        text: String = " hello ",
+        confidence: Float? = 0.9f,
+    ) = FfiAudioPipelineEvent.UtteranceLabeled(text, 65_000f, 66_000f, speaker, confidence, overlapping)
+
+    private fun wake() = FfiAudioPipelineEvent.WakeWordDetected("Hey Liquid", 0.93f, 2_000f, 32_000uL)
 
     @Test
     fun speakers_are_numbered_from_one() {
         assertEquals("1:05 S1: hello", eventLine(labeled(0u)))
         assertEquals("1:05 S3 (+S2): hello", eventLine(labeled(2u, 1u)))
         assertEquals("1:05 S?: hello", eventLine(labeled(null)))
+    }
+
+    @Test
+    fun padded_text_is_trimmed_on_screen_but_kept_raw_in_the_record() {
+        val ev = FfiAudioPipelineEvent.UtteranceTranscribed(" hello ", 1_000f, 2_000f, 3_000uL)
+        assertEquals("0:01 hello", eventLine(ev))
+        assertEquals(
+            "{\"type\":\"transcript\",\"start_ms\":1000.0,\"end_ms\":2000.0,\"text\":\" hello \"}",
+            eventJson(ev),
+        )
     }
 
     @Test
@@ -31,25 +47,50 @@ class EventLogTest {
 
     @Test
     fun a_wake_word_line_names_the_keyword() {
-        val ev = FfiAudioPipelineEvent.WakeWordDetected("Hey Liquid", 0.93f, 2_000f, 32_000uL)
+        val ev = wake()
         assertEquals("0:02 wake word \"Hey Liquid\" (0.93)", eventLine(ev))
     }
 
     @Test
     fun wake_lines_use_us_decimals_regardless_of_device_locale() {
-        val previous = Locale.getDefault()
-        Locale.setDefault(Locale.GERMANY)
-        try {
-            val ev = FfiAudioPipelineEvent.WakeWordDetected("Hey Liquid", 0.93f, 2_000f, 32_000uL)
+        withLocale(Locale.GERMANY) {
+            val ev = wake()
             assertEquals("0:02 wake word \"Hey Liquid\" (0.93)", eventLine(ev))
-        } finally {
-            Locale.setDefault(previous)
         }
     }
 
     @Test
+    fun stamps_use_us_digits_regardless_of_device_locale() {
+        withLocale(Locale.forLanguageTag("ar-EG")) {
+            assertEquals("1:05", stamp(65_000f))
+        }
+    }
+
+    @Test
+    fun stamps_clamp_negative_and_non_finite_timestamps_to_zero() {
+        assertEquals("0:00", stamp(-5_000f))
+        assertEquals("0:00", stamp(Float.NaN))
+        assertEquals("0:00", stamp(Float.POSITIVE_INFINITY))
+        assertEquals("0:00", stamp(Float.NEGATIVE_INFINITY))
+    }
+
+    @Test
+    fun non_finite_floats_render_as_null_to_keep_records_parseable() {
+        val ev = FfiAudioPipelineEvent.UtteranceTranscribed("x", Float.NaN, Float.POSITIVE_INFINITY, 0uL)
+        assertEquals(
+            "{\"type\":\"transcript\",\"start_ms\":null,\"end_ms\":null,\"text\":\"x\"}",
+            eventJson(ev),
+        )
+        val labeled = FfiAudioPipelineEvent.UtteranceLabeled("x", 1_000f, 2_000f, 1u, Float.NaN, null)
+        assertTrue(eventJson(labeled)!!.contains("\"confidence\":null"))
+        val wake = FfiAudioPipelineEvent.WakeWordDetected("kw", Float.NaN, Float.NaN, 0uL)
+        assertTrue(eventJson(wake)!!.contains("\"confidence\":null"))
+        assertTrue(eventJson(wake)!!.contains("\"start_ms\":null"))
+    }
+
+    @Test
     fun json_escapes_quotes_backslashes_and_control_characters() {
-        assertEquals("\"a\\\"b\\\\c\\nd\\u0001\"", jsonString("a\"b\\c\nd\u0001"))
+        assertEquals("\"a\\\"b\\\\c\\nd\\re\\tf\\u0001\"", jsonString("a\"b\\c\nd\re\tf\u0001"))
     }
 
     @Test
@@ -69,11 +110,26 @@ class EventLogTest {
                 "\"overlapping\":1,\"confidence\":0.9,\"text\":\"x\"}",
             eventJson(labeled(2u, 1u, text = "x")),
         )
+        assertEquals(
+            "{\"type\":\"utterance\",\"start_ms\":65000.0,\"end_ms\":66000.0,\"speaker\":1," +
+                "\"overlapping\":null,\"confidence\":null,\"text\":\"x\"}",
+            eventJson(labeled(1u, text = "x", confidence = null)),
+        )
+    }
+
+    @Test
+    fun a_transcript_line_and_record_carry_the_same_text() {
+        val ev = FfiAudioPipelineEvent.UtteranceTranscribed("say \"hi\"", 1_000f, 2_000f, 3_000uL)
+        assertEquals("0:01 say \"hi\"", eventLine(ev))
+        assertEquals(
+            "{\"type\":\"transcript\",\"start_ms\":1000.0,\"end_ms\":2000.0,\"text\":\"say \\\"hi\\\"\"}",
+            eventJson(ev),
+        )
     }
 
     @Test
     fun a_wake_word_is_one_json_line_with_a_start_ms_key() {
-        val ev = FfiAudioPipelineEvent.WakeWordDetected("Hey Liquid", 0.93f, 2_000f, 32_000uL)
+        val ev = wake()
         assertEquals(
             "{\"type\":\"wake_word\",\"start_ms\":2000.0,\"keyword\":\"Hey Liquid\",\"confidence\":0.93}",
             eventJson(ev),
@@ -98,6 +154,14 @@ class EventLogTest {
         ) {
             assertFalse(words, isNonSpeechTag(words))
         }
+    }
+
+    @Test
+    fun overlong_bracketed_tags_are_kept_as_speech() {
+        assertTrue(isNonSpeechTag("[" + "x".repeat(40) + "]"))
+        assertFalse(isNonSpeechTag("[" + "x".repeat(41) + "]"))
+        assertTrue(isNonSpeechTag("(" + "y".repeat(40) + ")"))
+        assertFalse(isNonSpeechTag("(" + "y".repeat(41) + ")"))
     }
 
     @Test

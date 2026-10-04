@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import android.util.Log
 import java.util.concurrent.atomic.AtomicBoolean
 
 /** A blocking source of 16 kHz mono PCM16. */
@@ -35,11 +36,13 @@ class MicSource private constructor(private val record: AudioRecord) : AudioSour
 
     override fun close() {
         if (!closed.compareAndSet(false, true)) return
-        runCatching { record.stop() }
+        runCatching { record.stop() }.onFailure { Log.w(TAG, "recorder stop failed; releasing anyway", it) }
         record.release()
     }
 
     companion object {
+        private const val TAG = "CeraAudio"
+
         /** Seconds of audio the capture buffer holds, so a slow pipeline call drops nothing. */
         private const val BUFFER_SECONDS = 2
 

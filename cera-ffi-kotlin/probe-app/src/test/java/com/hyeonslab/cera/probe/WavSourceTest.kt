@@ -63,28 +63,80 @@ class WavSourceTest {
         assertThrows(IllegalArgumentException::class.java) { WavSource.parse(rate) }
         val float = wav(fmt(format = 3, bits = 32), chunk("data", samplesBytes(1, 2)))
         assertThrows(IllegalArgumentException::class.java) { WavSource.parse(float) }
+        // One leg falsifying exactly each conjunct of the combined guard: the float leg
+        // above falsifies format and bits together, and 0xFFFE never reaches this guard.
+        val formatOnly = wav(fmt(format = 3, bits = 16), chunk("data", samplesBytes(1, 2)))
+        assertEquals(
+            "need 16 kHz mono 16-bit PCM, got format=3 channels=1 rate=16000 bits=16",
+            assertThrows(IllegalArgumentException::class.java) { WavSource.parse(formatOnly) }.message,
+        )
+        val bitsOnly = wav(fmt(bits = 8), chunk("data", samplesBytes(1, 2)))
+        assertEquals(
+            "need 16 kHz mono 16-bit PCM, got format=1 channels=1 rate=16000 bits=8",
+            assertThrows(IllegalArgumentException::class.java) { WavSource.parse(bitsOnly) }.message,
+        )
+        // The extensible container names its true cause instead of misreporting the audio,
+        // which may genuinely be 16 kHz mono 16-bit.
+        val extensible = wav(fmt(format = 0xFFFE), chunk("data", samplesBytes(1, 2)))
+        assertEquals(
+            "WAVEFORMATEXTENSIBLE is not supported; convert to plain 16 kHz mono 16-bit PCM " +
+                "(channels=1 rate=16000 bits=16)",
+            assertThrows(IllegalArgumentException::class.java) { WavSource.parse(extensible) }.message,
+        )
     }
 
     @Test
     fun garbage_and_missing_chunks_are_refused() {
-        assertThrows(IllegalArgumentException::class.java) { WavSource.parse(ByteArray(40)) }
-        assertThrows(IllegalArgumentException::class.java) { WavSource.parse(wav(fmt())) }
-        assertThrows(IllegalArgumentException::class.java) {
-            WavSource.parse(wav(chunk("data", samplesBytes(1))))
-        }
+        // Each leg names its guard: a throw-only assert passes whichever guard fires, so a
+        // deleted header guard survives behind the later "no data chunk" refusal.
+        assertEquals(
+            "not a RIFF/WAVE file",
+            assertThrows(IllegalArgumentException::class.java) { WavSource.parse(ByteArray(40)) }.message,
+        )
+        assertEquals(
+            "no data chunk",
+            assertThrows(IllegalArgumentException::class.java) { WavSource.parse(wav(fmt())) }.message,
+        )
+        assertEquals(
+            "data chunk before the fmt chunk",
+            assertThrows(IllegalArgumentException::class.java) {
+                WavSource.parse(wav(chunk("data", samplesBytes(1))))
+            }.message,
+        )
+    }
+
+    @Test
+    fun a_truncated_fmt_chunk_is_refused() {
+        val short = "fmt ".toByteArray() + le32(8) + ByteArray(8)
+        assertEquals(
+            "truncated fmt chunk",
+            assertThrows(IllegalArgumentException::class.java) {
+                WavSource.parse(wav(short, chunk("data", samplesBytes(1, 2))))
+            }.message,
+        )
     }
 
     @Test
     fun a_chunk_declaring_more_than_remains_is_refused() {
         // 0x7FFFFFF0 narrowed to a negative step and threw an index crash; 0xFFFFFFF8 never
-        // advanced the walker at all and hung. Both must refuse loudly now.
-        for (declared in listOf(0x7FFFFFF0L, 0xFFFFFFF8L)) {
+        // advanced the walker at all and hung. Both must refuse loudly now, as must the
+        // maximum u32.
+        for (declared in listOf(0x7FFFFFF0L, 0xFFFFFFF8L, 0xFFFFFFFFL)) {
             val junk = "JUNK".toByteArray() + le32(declared) + ByteArray(4)
             val e = assertThrows(IllegalArgumentException::class.java) {
                 WavSource.parse(wav(fmt(), junk))
             }
             assertTrue("$declared", e.message!!.contains("declares $declared bytes"))
         }
+    }
+
+    @Test
+    fun a_streamed_size_of_max_u32_takes_whatever_follows() {
+        // Only the data chunk may declare more than remains: recorders that stream the file
+        // write the maximum size up front.
+        val body = samplesBytes(-5, 6)
+        val file = wav(fmt(), "data".toByteArray() + le32(0xFFFFFFFFL) + body)
+        assertArrayEquals(shortArrayOf(-5, 6), WavSource.parse(file))
     }
 
     @Test
@@ -102,6 +154,17 @@ class WavSourceTest {
     }
 
     @Test
+    fun open_reads_the_file_through_the_parser() {
+        val wavFile = tmp.newFile("speech.wav")
+        FileOutputStream(wavFile).use { it.write(wav(fmt(), chunk("data", samplesBytes(1, -2, 300)))) }
+        val src = WavSource.open(wavFile, speed = 0.0)
+        val buf = ShortArray(8)
+        assertEquals(3, src.read(buf, 0, buf.size))
+        assertArrayEquals(shortArrayOf(1, -2, 300), buf.copyOf(3))
+        assertEquals(AudioSource.END_OF_STREAM, src.read(buf, 0, buf.size))
+    }
+
+    @Test
     fun a_negative_or_non_finite_speed_is_refused() {
         assertThrows(IllegalArgumentException::class.java) {
             WavSource(ShortArray(10), speed = -1.0)
@@ -112,6 +175,24 @@ class WavSourceTest {
         assertThrows(IllegalArgumentException::class.java) {
             WavSource(ShortArray(10), speed = Double.POSITIVE_INFINITY)
         }
+        // Below the 0.1 floor (other than 0, as fast as possible) sleeps minutes per read.
+        assertThrows(IllegalArgumentException::class.java) {
+            WavSource(ShortArray(10), speed = 0.05)
+        }
+        WavSource(ShortArray(10), speed = 0.1)
+        WavSource(ShortArray(10), speed = 0.0)
+    }
+
+    @Test
+    fun a_close_during_a_paced_read_returns_minus_one_at_once() {
+        val sleeps = mutableListOf<Long>()
+        var src: WavSource? = null
+        src = WavSource(ShortArray(SAMPLE_RATE), speed = 0.1, sleep = { ms -> sleeps += ms; src?.close() })
+        // The first 100 ms slice closes the source, so the 5 s wait ends after one slice.
+        assertEquals(-1, src.read(ShortArray(8000), 0, 8000))
+        assertEquals(listOf(100L), sleeps)
+        // And a closed source stays closed.
+        assertEquals(-1, src.read(ShortArray(8000), 0, 8000))
     }
 
     @Test
@@ -127,8 +208,9 @@ class WavSourceTest {
         val buf = ShortArray(SAMPLE_RATE / 2)
         assertEquals(buf.size, src.read(buf, 0, buf.size))
         assertEquals(buf.size, src.read(buf, 0, buf.size))
-        // The first half second is due at 500 ms, the second at 1000 ms.
-        assertEquals(listOf(500L, 500L), sleeps)
+        // The first half second is due at 500 ms, the second at 1000 ms, each slept in
+        // 100 ms slices so a close cuts the wait short.
+        assertEquals(List(10) { 100L }, sleeps)
         assertEquals(AudioSource.END_OF_STREAM, src.read(buf, 0, buf.size))
     }
 

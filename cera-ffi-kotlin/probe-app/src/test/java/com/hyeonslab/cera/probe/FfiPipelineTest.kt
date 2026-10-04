@@ -10,10 +10,21 @@ import uniffi.cera_ffi.NoHandle
 
 private class CapturingPipeline : FfiAudioPipeline(NoHandle) {
     val sent = mutableListOf<ByteArray>()
+    var flushCalls = 0
+    var closeCalls = 0
 
     override fun processChunkPcm16(pcm: ByteArray): List<FfiAudioPipelineEvent> {
         sent += pcm
         return emptyList()
+    }
+
+    override fun flush(): List<FfiAudioPipelineEvent> {
+        flushCalls++
+        return listOf(FfiAudioPipelineEvent.SpeechEnd(0uL, 1uL, 0f, 0f))
+    }
+
+    override fun close() {
+        closeCalls++
     }
 }
 
@@ -51,5 +62,15 @@ class FfiPipelineTest {
         port.process(ShortArray(16) { 7 }, 16)
         assertEquals(1, backend.sent.size)
         assertEquals(32, backend.sent[0].size)
+    }
+
+    @Test
+    fun flush_and_close_reach_the_backend() {
+        val backend = CapturingPipeline()
+        val port = FfiPipeline(backend, chunkSamples = 8)
+        assertEquals(1, port.flush().size)
+        port.close()
+        assertEquals(1, backend.flushCalls)
+        assertEquals(1, backend.closeCalls)
     }
 }

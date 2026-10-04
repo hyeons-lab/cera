@@ -39,9 +39,11 @@ class FfiPipeline(
  * source and pipeline.
  *
  * [onProgress] gets the audio seconds processed so far and the largest absolute sample since the
- * previous report, every [progressEverySeconds] seconds of audio. The service reports CPU time per
- * audio second with it, and the peak shows whether the microphone is live: a recorder Android
- * silences in the background delivers all zeros, which is easy to mistake for a quiet room.
+ * previous report, every [progressEverySeconds] seconds of audio. Exits also emit one final
+ * report for the partial interval since the previous report (or none when no audio was
+ * processed). The service reports CPU time per audio second with it, and the peak shows whether
+ * the microphone is live: a recorder Android silences in the background delivers all zeros,
+ * which is easy to mistake for a quiet room.
  */
 class PipelineRunner(
     private val source: AudioSource,
@@ -55,46 +57,66 @@ class PipelineRunner(
     var samples: Long = 0
         private set
 
+    init {
+        require(chunkSamples > 0) { "chunkSamples must be positive, got $chunkSamples" }
+    }
+
     /**
      * Run until [shouldStop] returns true, then flush. [shouldStop] is checked between chunks, so
-     * a stop takes effect within one read. Throws if the source fails while running; the pipeline
-     * is not flushed then, because a capture error says nothing about the audio already
-     * processed. A failure that lands after a stop was requested (the service closes the source
-     * to unblock a stuck read) instead finishes like end-of-stream: it is the stop, not an error.
+     * a stop takes effect within one chunk (plus the in-flight FFI call). Throws if the source
+     * fails while running; the pipeline is not flushed then, because a capture error says
+     * nothing about the audio already processed. A failure that lands after a stop was requested
+     * (the service closes the source to unblock a stuck read) instead finishes like
+     * end-of-stream: it is the stop, not an error.
      */
     fun run(shouldStop: () -> Boolean) {
         val pcm = ShortArray(chunkSamples)
         var nextProgress = progressEverySeconds.toLong() * SAMPLE_RATE
         var peak = 0
+        var reportedUpTo = 0L
+        fun peakThrough(count: Int) {
+            for (i in 0 until count) peak = maxOf(peak, abs(pcm[i].toInt()))
+        }
+        // Report the unreported remainder once, then flush, at whichever exit runs: otherwise
+        // the tail after every stop, and every run shorter than the cadence, reports nothing.
+        fun finish() {
+            if (samples > reportedUpTo) {
+                onProgress(samples.toDouble() / SAMPLE_RATE, peak)
+                reportedUpTo = samples
+            }
+            pipeline.flush().forEach(onEvent)
+        }
         while (!shouldStop()) {
             var filled = 0
             while (filled < chunkSamples) {
                 val n = source.read(pcm, filled, chunkSamples - filled)
-                if (n == AudioSource.END_OF_STREAM || (n < 0 && shouldStop())) {
+                // A stop on a quiet source (a stopped recorder reads 0) ends the run like
+                // end-of-stream: without the n == 0 arm the loop spins forever once a
+                // partial chunk exists, since 0-reads neither grow `filled` nor exit.
+                if (n == AudioSource.END_OF_STREAM || (n <= 0 && shouldStop())) {
                     // The source ran out, or a stop closed it mid-read: process the partial
                     // chunk, then flush.
                     if (filled > 0) {
-                        for (i in 0 until filled) peak = maxOf(peak, abs(pcm[i].toInt()))
+                        peakThrough(filled)
                         pipeline.process(pcm, filled).forEach(onEvent)
                         samples += filled
                     }
-                    pipeline.flush().forEach(onEvent)
+                    finish()
                     return
                 }
                 if (n < 0) throw IllegalStateException("audio capture failed with code $n")
                 filled += n
-                if (shouldStop() && filled == 0) break
             }
-            if (filled < chunkSamples) break
-            for (i in 0 until filled) peak = maxOf(peak, abs(pcm[i].toInt()))
+            peakThrough(filled)
             pipeline.process(pcm, filled).forEach(onEvent)
             samples += filled
             if (samples >= nextProgress) {
                 onProgress(samples.toDouble() / SAMPLE_RATE, peak)
                 peak = 0
+                reportedUpTo = samples
                 nextProgress += progressEverySeconds.toLong() * SAMPLE_RATE
             }
         }
-        pipeline.flush().forEach(onEvent)
+        finish()
     }
 }

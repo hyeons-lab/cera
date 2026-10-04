@@ -35,6 +35,7 @@ class AudioServiceActivity : Activity() {
 
     override fun onCreate(savedInstanceState: Bundle?) {
         super.onCreate(savedInstanceState)
+        startAfterPermission = savedInstanceState?.getBoolean(STATE_START_AFTER_PERMISSION) == true
         status = TextView(this).apply { textSize = 14f }
         transcript = TextView(this).apply { textSize = 16f }
         scroll = ScrollView(this).apply { addView(transcript) }
@@ -60,7 +61,11 @@ class AudioServiceActivity : Activity() {
                 addView(scroll, LinearLayout.LayoutParams(MATCH, 0, 1f))
             },
         )
-        if (intent?.getBooleanExtra(EXTRA_AUTOSTART, false) == true) startService()
+        // Fresh launches only: the intent (and its autostart extra) survives recreation,
+        // so without the gate a rotation restarts the service after the user stopped it.
+        if (savedInstanceState == null && intent?.getBooleanExtra(EXTRA_AUTOSTART, false) == true) {
+            startService()
+        }
     }
 
     override fun onStart() {
@@ -110,24 +115,41 @@ class AudioServiceActivity : Activity() {
         // The notification permission is optional: the service runs without it.
         val micGranted = checkSelfPermission(Manifest.permission.RECORD_AUDIO) ==
             PackageManager.PERMISSION_GRANTED
-        if (code == REQUEST_PERMISSIONS && startAfterPermission && micGranted) {
+        if (code == REQUEST_PERMISSIONS && startAfterPermission) {
             startAfterPermission = false
-            launchService()
+            if (micGranted) {
+                launchService()
+            } else {
+                AudioServiceState.status(
+                    AudioServiceState.Status.STOPPED,
+                    "microphone permission denied; grant it to start transcription",
+                )
+            }
         }
     }
 
     /** Starts the service, passing along the launch extras (see [AudioPipelineService]). */
     private fun launchService() {
-        val extras = intent
-        AudioPipelineService.start(
-            this,
-            wakeLock = extras?.getBooleanExtra(AudioPipelineService.EXTRA_WAKE_LOCK, true) ?: true,
-            requireHotword =
-                extras?.getBooleanExtra(AudioPipelineService.EXTRA_REQUIRE_HOTWORD, false) ?: false,
-            chunkMs = extras?.getIntExtra(AudioPipelineService.EXTRA_CHUNK_MS, 0) ?: 0,
-            wavPath = extras?.getStringExtra(AudioPipelineService.EXTRA_WAV),
-            wavSpeed = extras?.getDoubleExtra(AudioPipelineService.EXTRA_WAV_SPEED, 1.0) ?: 1.0,
-        )
+        try {
+            val extras = intent
+            AudioPipelineService.start(
+                this,
+                wakeLock = extras?.getBooleanExtra(AudioPipelineService.EXTRA_WAKE_LOCK, true) ?: true,
+                requireHotword =
+                    extras?.getBooleanExtra(AudioPipelineService.EXTRA_REQUIRE_HOTWORD, false) ?: false,
+                chunkMs = extras?.takeIf { it.hasExtra(AudioPipelineService.EXTRA_CHUNK_MS) }
+                    ?.getIntExtra(AudioPipelineService.EXTRA_CHUNK_MS, 500),
+                wavPath = extras?.getStringExtra(AudioPipelineService.EXTRA_WAV),
+                wavSpeed = extras?.getDoubleExtra(AudioPipelineService.EXTRA_WAV_SPEED, 1.0) ?: 1.0,
+            )
+        } catch (e: RuntimeException) {
+            // startForegroundService refused (background start, broken manifest
+            // permission): report it where the user looks instead of crashing.
+            AudioServiceState.status(
+                AudioServiceState.Status.FAILED,
+                "cannot start the microphone service: ${e.message ?: e.javaClass.simpleName}",
+            )
+        }
     }
 
     private fun modelStatus(): String {
@@ -136,9 +158,15 @@ class AudioServiceActivity : Activity() {
             ?: "no ${AudioModels.VAD} in ${dirs.joinToString { it.path }}"
     }
 
+    override fun onSaveInstanceState(outState: Bundle) {
+        super.onSaveInstanceState(outState)
+        outState.putBoolean(STATE_START_AFTER_PERMISSION, startAfterPermission)
+    }
+
     companion object {
         const val EXTRA_AUTOSTART = "autostart"
         private const val REQUEST_PERMISSIONS = 1
         private const val MATCH = ViewGroup.LayoutParams.MATCH_PARENT
+        private const val STATE_START_AFTER_PERMISSION = "start_after_permission"
     }
 }

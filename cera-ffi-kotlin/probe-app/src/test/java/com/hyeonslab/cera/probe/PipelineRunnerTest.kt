@@ -3,7 +3,9 @@ package com.hyeonslab.cera.probe
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 import uniffi.cera_ffi.FfiAudioPipelineEvent
 
 /**
@@ -54,6 +56,9 @@ private class FakePipeline : AudioPipelinePort {
 }
 
 class PipelineRunnerTest {
+    @get:Rule
+    val tmp = TemporaryFolder()
+
     @Test
     fun partial_reads_are_assembled_into_whole_chunks() {
         val pipeline = FakePipeline()
@@ -93,6 +98,31 @@ class PipelineRunnerTest {
     }
 
     @Test
+    fun a_run_shorter_than_the_cadence_reports_exactly_once() {
+        val progress = mutableListOf<Double>()
+        val peaks = mutableListOf<Int>()
+        var stop = false
+        PipelineRunner(
+            FakeSource(chunks = 2, onDrained = { stop = true }),
+            FakePipeline(),
+            onEvent = {},
+            onProgress = { audio, peak ->
+                progress += audio
+                peaks += peak
+            },
+        ).run { stop }
+        assertEquals(listOf(1.0), progress)
+        assertEquals(listOf(16384), peaks)
+    }
+
+    @Test
+    fun a_zero_chunk_length_is_refused() {
+        assertThrows(IllegalArgumentException::class.java) {
+            PipelineRunner(FakeSource(chunks = 1), FakePipeline(), onEvent = {}, chunkSamples = 0)
+        }
+    }
+
+    @Test
     fun a_capture_error_after_a_stop_finishes_cleanly_like_end_of_stream() {
         val pipeline = FakePipeline()
         var stop = false
@@ -121,9 +151,45 @@ class PipelineRunnerTest {
     @Test
     fun a_stop_before_any_audio_flushes_without_processing() {
         val pipeline = FakePipeline()
-        PipelineRunner(FakeSource(chunks = 5), pipeline, onEvent = {}).run { true }
+        val progress = mutableListOf<Double>()
+        PipelineRunner(
+            FakeSource(chunks = 5),
+            pipeline,
+            onEvent = {},
+            onProgress = { audio, _ -> progress += audio },
+        ).run { true }
         assertEquals(0, pipeline.chunks.size)
         assertEquals(1, pipeline.flushed)
+        // No audio, no report: the finish() guard suppresses a spurious zero-length stats line.
+        assertEquals(emptyList<Double>(), progress)
+    }
+
+    // A stopped recorder reads 0; without the n == 0 stop arm the fill loop spins
+    // forever once a partial chunk exists (the timeout fails the test instead of hanging
+    // the suite).
+    @Test(timeout = 5000)
+    fun a_quiet_source_after_a_stop_exits_with_the_partial_chunk() {
+        var stop = false
+        val source = object : AudioSource {
+            var reads = 0
+            override fun read(buffer: ShortArray, offset: Int, length: Int): Int {
+                reads++
+                if (reads == 1) {
+                    for (i in 0 until 100) buffer[offset + i] = 5
+                    stop = true
+                    return 100
+                }
+                return 0
+            }
+            override fun close() {}
+        }
+        val pipeline = FakePipeline()
+        val runner = PipelineRunner(source, pipeline, onEvent = {})
+        runner.run { stop }
+        assertEquals(1, pipeline.chunks.size)
+        assertEquals(100, pipeline.chunks[0].size)
+        assertEquals(1, pipeline.flushed)
+        assertEquals(100L, runner.samples)
     }
 
     @Test
@@ -143,9 +209,9 @@ class PipelineRunnerTest {
             },
             progressEverySeconds = 1,
         ).run { stop }
-        assertEquals(listOf(1.0, 2.0), progress)
+        assertEquals(listOf(1.0, 2.0, 2.5), progress)
         // The fake plays a constant 16384; the peak is per interval, not a running maximum.
-        assertEquals(listOf(16384, 16384), peaks)
+        assertEquals(listOf(16384, 16384, 16384), peaks)
     }
 
     @Test
@@ -196,5 +262,26 @@ class PipelineRunnerTest {
         assertEquals(100, pipeline.chunks[0].size)
         assertEquals(1, pipeline.flushed)
         assertEquals(100L, runner.samples)
+    }
+
+    @Test
+    fun transcript_faults_do_not_end_the_run() {
+        val pipeline = FakePipeline()
+        // A directory is not appendable on any platform: every record faults.
+        val unappendable = tmp.newFolder()
+        var faults = 0
+        // Drives the production record path, not a test-local mirror of it.
+        val runner = PipelineRunner(
+            FakeSource(chunks = 2, endCode = AudioSource.END_OF_STREAM),
+            pipeline,
+            onEvent = {
+                val (_, fault) = AudioPipelineService.storeTranscriptRecord(unappendable, "{}")
+                if (fault != null) faults++
+            },
+        )
+        runner.run { false }
+        assertEquals(2L * CHUNK_SAMPLES, runner.samples)
+        assertEquals(1, pipeline.flushed)
+        assertTrue("fault injection never fired", faults > 0)
     }
 }

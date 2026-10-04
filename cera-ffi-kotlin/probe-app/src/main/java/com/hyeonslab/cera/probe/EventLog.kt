@@ -43,10 +43,10 @@ private fun speechLine(event: FfiAudioPipelineEvent): String? = when (event) {
     is FfiAudioPipelineEvent.SpeechEnd -> null
 }
 
-/** `m:ss` of a pipeline timestamp in milliseconds. */
+/** `m:ss` of a pipeline timestamp in milliseconds; negative and non-finite input renders `0:00`. */
 fun stamp(ms: Float): String {
-    val total = (ms / 1000f).toLong().coerceAtLeast(0)
-    return "%d:%02d".format(total / 60, total % 60)
+    val total = if (ms.isFinite()) (ms / 1000f).toLong().coerceAtLeast(0) else 0L
+    return String.format(Locale.US, "%d:%02d", total / 60, total % 60)
 }
 
 /** [text] as a JSON string literal, quotes included. */
@@ -66,23 +66,30 @@ fun jsonString(text: String): String = buildString {
     append('"')
 }
 
-/** A transcript record for `transcript.jsonl`, or null for an event that is not kept. */
+/**
+ * A transcript record for `transcript.jsonl`, or null for an event that is not kept.
+ * `speaker` and `overlapping` keep the diarizer's zero-based ids; [eventLine] shows them
+ * one-based (`S1`, …). The text is kept raw here while [eventLine] trims it for display.
+ */
 fun eventJson(event: FfiAudioPipelineEvent): String? =
     if (isDroppedTag(event)) null else speechJson(event)
 
 private fun speechJson(event: FfiAudioPipelineEvent): String? = when (event) {
     is FfiAudioPipelineEvent.UtteranceLabeled ->
-        "{\"type\":\"utterance\",\"start_ms\":${event.startMs},\"end_ms\":${event.endMs}," +
+        "{\"type\":\"utterance\",\"start_ms\":${jsonFloat(event.startMs)},\"end_ms\":${jsonFloat(event.endMs)}," +
             "\"speaker\":${event.speaker ?: "null"}," +
             "\"overlapping\":${event.overlapping ?: "null"}," +
-            "\"confidence\":${event.confidence ?: "null"}," +
+            "\"confidence\":${event.confidence?.let(::jsonFloat) ?: "null"}," +
             "\"text\":${jsonString(event.text)}}"
     is FfiAudioPipelineEvent.UtteranceTranscribed ->
-        "{\"type\":\"transcript\",\"start_ms\":${event.startMs},\"end_ms\":${event.endMs}," +
+        "{\"type\":\"transcript\",\"start_ms\":${jsonFloat(event.startMs)},\"end_ms\":${jsonFloat(event.endMs)}," +
             "\"text\":${jsonString(event.text)}}"
     is FfiAudioPipelineEvent.WakeWordDetected ->
-        "{\"type\":\"wake_word\",\"start_ms\":${event.timestampMs}," +
-            "\"keyword\":${jsonString(event.keyword)},\"confidence\":${event.confidence}}"
+        "{\"type\":\"wake_word\",\"start_ms\":${jsonFloat(event.timestampMs)}," +
+            "\"keyword\":${jsonString(event.keyword)},\"confidence\":${jsonFloat(event.confidence)}}"
     is FfiAudioPipelineEvent.SpeechStart -> null
     is FfiAudioPipelineEvent.SpeechEnd -> null
 }
+
+/** A float as JSON: non-finite values are not numbers in JSON, so they become null. */
+private fun jsonFloat(value: Float): String = if (value.isFinite()) value.toString() else "null"

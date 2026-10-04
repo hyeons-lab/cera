@@ -16,9 +16,12 @@
          exactly as for any third-party consumer. Skeletons are extracted
          from libcera_ffi.so at runtime by HexagonNpu.setup, and the vendor
          FastRPC client is visible to the linker. -->
+    <!-- No backup: this is a measurement probe with no preferences to restore, and its
+         transcript.jsonl holds ambient speech transcripts that must not leave the device. -->
     <application
         android:label="Cera NPU Probe"
-        android:theme="@android:style/Theme.Material.Light.NoActionBar">
+        android:theme="@android:style/Theme.Material.Light.NoActionBar"
+        android:allowBackup="false">
         <!-- Lets simpleperf profile the non-debuggable field build from the shell. -->
         <profileable android:shell="true" />
         <activity

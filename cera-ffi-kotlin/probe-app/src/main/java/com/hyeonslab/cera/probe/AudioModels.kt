@@ -8,8 +8,9 @@ import java.io.File
  * on the matching stage (Whisper transcribes, the diarizer labels speakers, the hotword model gates
  * transcription behind a wake word).
  *
- * Whisper must be Q8_0 or Q4_0 and the diarizer must be a `--tail-outtype q8_0` GGUF to run on the
- * NPU; anything else works but falls back to the CPU, which Android demotes in the background.
+ * Whisper runs on the NPU from Q8_0, Q4_0, F16, or F32 weights (the engine repacks F16/F32
+ * to Q8_0 at load) and the diarizer must be a `--tail-outtype q8_0` GGUF to run on the NPU;
+ * anything else works but falls back to the CPU, which Android demotes in the background.
  *
  * The recommended Whisper is `base` at Q8_0 (82 MB): clearly more accurate than `tiny` and still
  * about twice as fast as real time on the NPU. `small` is the most accurate but takes longer than
@@ -23,24 +24,26 @@ data class AudioModels(
     val diarizer: File?,
 ) {
     /**
-     * The stages with the size of each model file, for the startup log: it is the only record of
-     * which Whisper was loaded, and the models are swapped by copying a file over `whisper.gguf`.
+     * The stages with the size of each model file but the VAD, for the startup log: it is the
+     * only record of which Whisper was loaded, and the models are swapped by copying a file
+     * over `whisper.gguf`.
      */
     val summary: String
-        get() = buildList {
-            add("vad")
-            if (hotword != null) add("hotword ${megabytes(hotword)}")
-            if (whisper != null) add("whisper ${megabytes(whisper)}")
-            if (diarizer != null) add("diarizer ${megabytes(diarizer)}")
-        }.joinToString(" + ")
+        get() = presentStages.joinToString(" + ") { (name, file) ->
+            if (file == null) name else "$name ${megabytes(file)}"
+        }
 
     /** Names of the stages that will run, for the status line. */
     val stages: List<String>
+        get() = presentStages.map { (name, _) -> name }
+
+    /** The stages with models, in order: the VAD is always present, the rest optional. */
+    private val presentStages: List<Pair<String, File?>>
         get() = buildList {
-            add("vad")
-            if (hotword != null) add("hotword")
-            if (whisper != null) add("whisper")
-            if (diarizer != null) add("diarizer")
+            add("vad" to null)
+            if (hotword != null) add("hotword" to hotword)
+            if (whisper != null) add("whisper" to whisper)
+            if (diarizer != null) add("diarizer" to diarizer)
         }
 
     private fun megabytes(file: File) = "(${(file.length() + 500_000) / 1_000_000} MB)"
@@ -53,11 +56,6 @@ data class AudioModels(
         const val DIARIZER = "diarizer.gguf"
 
         /**
-         * The models in the first of [dirs] that holds a VAD, or null when none does. Directories
-         * are searched in order so the app's private storage wins over a copy pushed to the
-         * external files directory.
-         */
-        /**
          * The directories to search, in order: the app's private storage first so it wins over a
          * copy pushed to the external files directory.
          */
@@ -66,6 +64,11 @@ data class AudioModels(
             externalFilesDir?.let { File(it, DIR_NAME) },
         )
 
+        /**
+         * The models in the first of [dirs] that holds a VAD, or null when none does. Directories
+         * are searched in order so the app's private storage wins over a copy pushed to the
+         * external files directory.
+         */
         fun find(dirs: List<File>): AudioModels? {
             for (dir in dirs) {
                 val vad = File(dir, VAD)

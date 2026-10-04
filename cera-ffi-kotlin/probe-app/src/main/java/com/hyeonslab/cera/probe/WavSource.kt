@@ -2,6 +2,7 @@ package com.hyeonslab.cera.probe
 
 import java.io.ByteArrayOutputStream
 import java.io.File
+import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Plays a 16 kHz mono 16-bit WAV file through the service as if it were the microphone, which is
@@ -10,7 +11,8 @@ import java.io.File
  *
  * [speed] is the playback rate relative to real time: 1.0 paces reads like a live recording, so
  * CPU-per-audio-second numbers mean what they do for the microphone; 0 reads as fast as the
- * pipeline consumes. [sleep] and [nowNanos] are parameters so pacing is testable.
+ * pipeline consumes. Speeds below 0.1 (other than 0) are refused: they would sleep minutes per
+ * read with no timely stop. [sleep] and [nowNanos] are parameters so pacing is testable.
  */
 class WavSource(
     private val pcm: ShortArray,
@@ -20,33 +22,53 @@ class WavSource(
 ) : AudioSource {
     private var position = 0
     private var startNanos = -1L
+    private val closed = AtomicBoolean(false)
 
     init {
-        require(speed >= 0.0 && speed.isFinite()) { "speed must be finite and at least 0, got $speed" }
+        requireValidSpeed(speed)
     }
 
     override fun read(buffer: ShortArray, offset: Int, length: Int): Int {
+        if (closed.get()) return -1
         if (position >= pcm.size) return AudioSource.END_OF_STREAM
         val n = minOf(length, pcm.size - position)
         if (speed > 0) {
             if (startNanos < 0) startNanos = nowNanos()
             // Deliver sample `position + n` no earlier than it would have been recorded.
             val dueNanos = ((position + n) * 1e9 / SAMPLE_RATE / speed).toLong()
-            val waitMs = (dueNanos - (nowNanos() - startNanos)) / 1_000_000
-            if (waitMs > 0) sleep(waitMs)
+            // Sleep in slices so a close (a stop) cuts the wait short instead of riding it out.
+            var remaining = (dueNanos - (nowNanos() - startNanos)) / 1_000_000
+            while (remaining > 0 && !closed.get()) {
+                val slice = minOf(remaining, 100)
+                sleep(slice)
+                remaining -= slice
+            }
+            if (closed.get()) return -1
         }
         System.arraycopy(pcm, position, buffer, offset, n)
         position += n
         return n
     }
 
-    override fun close() {}
+    override fun close() {
+        closed.set(true)
+    }
 
     companion object {
         /** Replay files are capped: the whole file is buffered, and the path is intent input. */
-        private const val MAX_WAV_BYTES = 64 * 1024 * 1024 // ~33 min at 16 kHz mono 16-bit
+        private const val MAX_WAV_BYTES = 64 * 1024 * 1024 // ~35 min at 16 kHz mono 16-bit
+
+        /** Slowest paced replay besides 0 (as fast as possible): bounds the worst sleep to 10x. */
+        private const val MIN_SPEED = 0.1
+
+        internal fun requireValidSpeed(speed: Double) {
+            require(speed == 0.0 || (speed >= MIN_SPEED && speed.isFinite())) {
+                "speed must be 0 (as fast as possible) or at least $MIN_SPEED, got $speed"
+            }
+        }
 
         fun open(file: File, speed: Double = 1.0): WavSource {
+            requireValidSpeed(speed)
             // Streamed with a running cap rather than readBytes(): the length of a special file
             // cannot be trusted, and readBytes would hold the whole thing before any check runs.
             // (A manual loop because readNBytes needs API 33 and minSdk is 28.)
@@ -92,6 +114,10 @@ class WavSource(
                     }
                     "data" -> {
                         val f = requireNotNull(format) { "data chunk before the fmt chunk" }
+                        require(f[0] != 0xFFFE) {
+                            "WAVEFORMATEXTENSIBLE is not supported; convert to plain 16 kHz mono " +
+                                "16-bit PCM (channels=${f[1]} rate=${f[2]} bits=${f[3]})"
+                        }
                         require(f[0] == 1 && f[1] == 1 && f[2] == SAMPLE_RATE && f[3] == 16) {
                             "need 16 kHz mono 16-bit PCM, got format=${f[0]} channels=${f[1]} " +
                                 "rate=${f[2]} bits=${f[3]}"
@@ -108,8 +134,10 @@ class WavSource(
                 require(size <= bytes.size - body) {
                     "chunk $id declares $size bytes but only ${bytes.size - body} remain"
                 }
-                // Chunks are word aligned. Long math so the step itself can never narrow or wrap.
-                at = (body.toLong() + size + (size and 1L)).toInt()
+                // Chunks are word aligned. Long math so the step itself can never wrap, clamped
+                // to the size so the final narrowing cannot wrap either (any step past the end
+                // exits the loop identically).
+                at = minOf(body.toLong() + size + (size and 1L), bytes.size.toLong()).toInt()
             }
             throw IllegalArgumentException("no data chunk")
         }

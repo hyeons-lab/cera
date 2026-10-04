@@ -5,8 +5,9 @@ const val SAMPLE_RATE = 16_000
 
 /**
  * Samples per pipeline call by default: 500 ms. Every FFI call pays a fixed cost for JNA to build
- * its call-status and buffer structures, about five JNA calls and a few milliseconds of CPU on a
- * phone. At 100 ms chunks that was roughly 60% of the whole service's CPU; the pipeline tracks
+ * its call-status and buffer structures, three native calls (alloc, invoke, free) and a few
+ * milliseconds of CPU on a phone. At 100 ms chunks that was about two-thirds of the whole
+ * service's CPU; the pipeline tracks
  * sample positions itself, so a larger chunk only delays events by up to its own length.
  */
 const val CHUNK_SAMPLES = 8_000
@@ -21,11 +22,11 @@ fun chunkSamplesForMs(ms: Int): Int = ms.coerceIn(MIN_CHUNK_MS, MAX_CHUNK_MS) * 
 /**
  * Writes `count` samples of [src] into [dst] as 16-bit little-endian bytes, the format
  * `FfiAudioPipeline.processChunkPcm16` takes. A byte array crosses the FFI in one copy; the
- * `List<Float>` that `processChunk` takes is lowered element by element, which cost about 0.05
- * CPU-seconds per audio second on a phone.
+ * `List<Float>` that `processChunk` takes is lowered element by element, which cost about 0.017
+ * CPU-seconds per audio second on a phone at 100 ms chunks (see the README table).
  */
 fun pcm16ToLeBytes(src: ShortArray, count: Int, dst: ByteArray) {
-    require(count >= 0 && count <= src.size && count * 2 <= dst.size) {
+    require(count >= 0 && count <= src.size && count * 2L <= dst.size) {
         "count $count exceeds the buffers"
     }
     for (i in 0 until count) {

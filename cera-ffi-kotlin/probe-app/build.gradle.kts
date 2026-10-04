@@ -34,7 +34,9 @@ android {
 
 
     lint {
-        abortOnError = false
+        // Fail on errors like cera-ffi-android does: CI runs lintField, and an Error-level
+        // NewApi here once shipped green because unit tests exercise only host APIs.
+        abortOnError = true
     }
 }
 
