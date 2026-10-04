@@ -1614,9 +1614,12 @@ impl StreamState {
         (n_sc, n_fifo, lc, chunk_len): (usize, usize, usize, usize),
     ) -> Vec<f32> {
         let (fifo_cap, update_period, cache_cap) = (p.fifo_len, p.update_period, p.spkcache_len);
+        let base = n_sc + n_fifo + lc;
+        // The forward covers [spkcache, fifo, chunk]: every slice below lands inside it.
+        debug_assert!((base + chunk_len) * s <= preds.len());
+        debug_assert!((lc + chunk_len) * d <= chunk_emb.len());
         let fifo_preds_now = preds[n_sc * s..(n_sc + n_fifo) * s].to_vec();
         let chunk_slice = &chunk_emb[lc * d..(lc + chunk_len) * d];
-        let base = n_sc + n_fifo + lc;
         let chunk_preds = preds[base * s..(base + chunk_len) * s].to_vec();
 
         self.fifo.extend_from_slice(chunk_slice);
@@ -1646,17 +1649,21 @@ impl StreamState {
                     sp.extend_from_slice(&pop_preds);
                     self.spkcache_preds = Some(sp);
                 }
-                let (emb, pr) = compress_spkcache(
-                    p,
-                    s,
-                    d,
-                    &self.spkcache,
-                    self.spkcache_preds.as_ref().expect("set above"),
-                    cache_rows,
-                    &self.mean_sil_emb,
-                );
-                self.spkcache = emb;
-                self.spkcache_preds = Some(pr);
+                // Always `Some` here (set just above when missing, or already present);
+                // skip the compression rather than panic.
+                if let Some(preds_ref) = self.spkcache_preds.as_ref() {
+                    let (emb, pr) = compress_spkcache(
+                        p,
+                        s,
+                        d,
+                        &self.spkcache,
+                        preds_ref,
+                        cache_rows,
+                        &self.mean_sil_emb,
+                    );
+                    self.spkcache = emb;
+                    self.spkcache_preds = Some(pr);
+                }
             }
         }
         chunk_preds

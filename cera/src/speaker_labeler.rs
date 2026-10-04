@@ -257,7 +257,11 @@ impl SpeakerLabeler {
         let mut i = 0;
         while i < self.pending.len() {
             if self.pending[i].end_ms > covered && self.pending[i].start_ms < horizon {
-                let p = self.pending.remove(i).expect("index checked");
+                let Some(p) = self.pending.remove(i) else {
+                    // Unreachable: `i < len` by the loop condition. Skip, do not panic.
+                    i += 1;
+                    continue;
+                };
                 let u = self.release(p, false);
                 self.park(u);
             } else {
@@ -306,7 +310,9 @@ impl SpeakerLabeler {
             end_ms: end_ms.max(start_ms.max(0.0)),
         });
         while self.pending.len() > self.cfg.max_pending {
-            let p = self.pending.pop_front().expect("len checked");
+            let Some(p) = self.pending.pop_front() else {
+                break;
+            };
             let u = self.release(p, false);
             self.park(u);
         }
@@ -325,7 +331,11 @@ impl SpeakerLabeler {
             // A zero-length utterance is a point that needs its own frame, which has not
             // arrived while `start == covered`.
             if p.end_ms <= covered && (p.end_ms > p.start_ms || p.start_ms < covered) {
-                let p = self.pending.remove(i).expect("index checked");
+                let Some(p) = self.pending.remove(i) else {
+                    // Unreachable: `i < len` by the loop condition. Skip, do not panic.
+                    i += 1;
+                    continue;
+                };
                 out.push(self.release(p, true));
             } else {
                 i += 1;

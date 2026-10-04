@@ -1217,10 +1217,12 @@ enum Command {
         whisper: Option<String>,
 
         /// Join a speaker's runs separated by at most this much silence, in milliseconds.
+        /// Segment output only; ignored with `--vad`/`--whisper`, where Whisper's spans stand.
         #[arg(long, default_value_t = 240)]
         merge_gap_ms: usize,
 
         /// Drop segments shorter than this, in milliseconds.
+        /// Segment output only; ignored with `--vad`/`--whisper`, where Whisper's spans stand.
         #[arg(long, default_value_t = 160)]
         min_ms: usize,
 
@@ -2283,18 +2285,30 @@ fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
 /// `cera diarize --vad .. --whisper ..`: the VAD plus Whisper pipeline and the live diarizer
 /// hear the same audio, piece by piece, as a background service would. Each utterance is printed
 /// with its speaker as soon as the diarizer has covered it.
+/// The transcript path labels Whisper's utterances, whose spans are fixed: the only
+/// diarizer knob that applies is the activity threshold (`merge_gap_ms`/`min_ms` reshape
+/// segment runs and are segment output only).
+fn transcript_labeler_config(threshold: f32) -> cera::speaker_labeler::SpeakerLabelerConfig {
+    cera::speaker_labeler::SpeakerLabelerConfig {
+        active_threshold: threshold,
+        ..Default::default()
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
 fn diarize_with_transcript(
     model: &cera::model::sortformer::SortformerModel,
     params: cera::model::sortformer::StreamingParams,
     pcm: &[f32],
     (vad, whisper): (&str, &str),
     piece_ms: usize,
+    threshold: f32,
     audio: &str,
     json: bool,
 ) -> Result<()> {
     use cera::audio_pipeline::AudioPipelineEvent;
     use cera::live_diarizer::LiveDiarizer;
-    use cera::speaker_labeler::{LabeledUtterance, SpeakerLabelerConfig};
+    use cera::speaker_labeler::LabeledUtterance;
     use std::collections::HashMap;
 
     let mut pipeline = cera::AudioPipeline::builder()
@@ -2303,7 +2317,7 @@ fn diarize_with_transcript(
         .with_whisper_from_file(whisper)
         .with_context(|| format!("loading Whisper from `{whisper}`"))?
         .build()?;
-    let mut diarizer = LiveDiarizer::new(model, params, SpeakerLabelerConfig::default())?;
+    let mut diarizer = LiveDiarizer::new(model, params, transcript_labeler_config(threshold))?;
     let latency_s = diarizer.latency_frames() as f64 * 0.08;
 
     let mut texts: HashMap<u64, String> = HashMap::new();
@@ -4189,6 +4203,7 @@ fn main() -> Result<()> {
                     &pcm,
                     (vad, whisper),
                     piece_ms,
+                    threshold,
                     &audio,
                     json,
                 );
@@ -5716,8 +5731,8 @@ mod tests {
         BundleQuantPair, Cli, CliSamplingArgs, Command, convert_history_to_chat_messages,
         display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono, resample_linear,
         resolve_engine, simulate_truncate_oldest_turn_pairs, split_at_marker,
-        truncate_oldest_turn_pair, whisper_catalog_cached_path, whisper_catalog_unloadable_path,
-        whisper_gguf_is_loadable, write_transcript, write_wav,
+        transcript_labeler_config, truncate_oldest_turn_pair, whisper_catalog_cached_path,
+        whisper_catalog_unloadable_path, whisper_gguf_is_loadable, write_transcript, write_wav,
     };
     use cera::tokenizer::ChatMessage;
     use clap::Parser;
@@ -7329,6 +7344,19 @@ mod tests {
             }
             _ => panic!("expected Diarize command"),
         }
+    }
+
+    #[test]
+    fn transcript_path_uses_the_cli_threshold() {
+        // `--threshold` must reach the labeler's activity gate; everything else stays default.
+        let cfg = transcript_labeler_config(0.7);
+        assert_eq!(
+            cfg,
+            cera::speaker_labeler::SpeakerLabelerConfig {
+                active_threshold: 0.7,
+                ..Default::default()
+            }
+        );
     }
 
     #[test]
