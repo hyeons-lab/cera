@@ -341,6 +341,21 @@ impl Drop for HexagonDevice {
     }
 }
 
+/// The `CERA_HEXAGON_ARCH` skeleton override (numeric arch, e.g. `75`), the one parse every
+/// device probe shares.
+pub(crate) fn arch_override() -> Option<HexagonArch> {
+    arch_override_with(|k| std::env::var(k).ok())
+}
+
+/// [`arch_override`] with the env lookup injected (tests).
+pub(crate) fn arch_override_with(get: impl Fn(&str) -> Option<String>) -> Option<HexagonArch> {
+    get("CERA_HEXAGON_ARCH")?
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .and_then(HexagonArch::from_u32)
+}
+
 /// Probe and initialize a Hexagon device, respecting optional architecture override.
 pub fn probe_device(
     driver: &Arc<FastRpcDriver>,
@@ -387,6 +402,16 @@ pub(crate) fn probe_device_with(
 mod tests {
     use super::super::sys::fake;
     use super::*;
+
+    #[test]
+    fn arch_override_parses_and_ignores_garbage() {
+        let get = |v: Option<&str>| arch_override_with(|_| v.map(str::to_string));
+        assert_eq!(get(None), None);
+        assert_eq!(get(Some("75")), Some(HexagonArch::V75));
+        assert_eq!(get(Some("  75\n")), Some(HexagonArch::V75));
+        assert_eq!(get(Some("garbage")), None);
+        assert_eq!(get(Some("99")), None);
+    }
 
     /// The FFI `arch` wire strings are pinned literals: mobile clients
     /// match on them, so any rename must be a deliberate breaking change.

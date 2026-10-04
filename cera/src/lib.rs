@@ -64,6 +64,7 @@ pub mod tokenizer;
 pub mod tools;
 pub mod turboquant;
 pub mod vad;
+pub mod wav;
 
 // Canonical public re-exports for the stateful API. Consumers should
 // `use cera::{Session, ModalitySink, ...}` rather than reaching into
@@ -102,7 +103,10 @@ pub use session::{
     ModalitySink, Session, SessionConfig, SpecDecode,
 };
 pub use sysmem::{available_memory_bytes, fits_in_available_memory};
-pub use vad::{SileroVad, SpeechTimestamp, VadConfig, VadEvent, VadIterator, VadSampleRate};
+pub use vad::{
+    SileroVad, SpeechTimestamp, VadAccelerator, VadConfig, VadEvent, VadIterator, VadSampleRate,
+    VadStep,
+};
 
 #[cfg(test)]
 mod build_info_tests {

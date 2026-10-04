@@ -1,6 +1,8 @@
 //! Silero VAD on the Hexagon NPU against the CPU: the speech probability of every 32 ms window
 //! of a clip, and what each costs the CPU.
 //!
+//! The clip must be mono 16 kHz 16-bit PCM; anything else is refused rather than mis-decoded.
+//!
 //! ```text
 //! cargo ndk -t arm64-v8a build --release -p cera --example hexagon_vad_probe --features hexagon
 //! adb push target/aarch64-linux-android/release/examples/hexagon_vad_probe /data/local/tmp/cera-bench/
@@ -8,8 +10,10 @@
 //! ```
 
 #[cfg(feature = "hexagon")]
-fn main() {
+fn main() -> anyhow::Result<()> {
+    use anyhow::Context;
     use cera::vad::{SileroVad, VadSampleRate};
+    use cera::wav::{full_windows, read_wav_mono_16k};
 
     tracing_subscriber::fmt()
         .with_writer(std::io::stderr)
@@ -18,33 +22,28 @@ fn main() {
     let mut args = std::env::args().skip(1);
     let model = args
         .next()
-        .expect("usage: hexagon_vad_probe <silero_vad.gguf> <clip.wav>");
-    let wav = std::fs::read(args.next().expect("a WAV path")).expect("read the WAV");
-    let data = wav
-        .windows(4)
-        .position(|w| w == b"data")
-        .expect("data chunk");
-    let pcm: Vec<f32> = wav[data + 8..]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
-        .collect();
-    let windows: Vec<&[f32]> = pcm.as_chunks::<512>().0.iter().map(|w| &w[..]).collect();
+        .context("usage: hexagon_vad_probe <silero_vad.gguf> <clip.wav>")?;
+    let clip = args
+        .next()
+        .context("usage: hexagon_vad_probe <silero_vad.gguf> <clip.wav>")?;
+    let pcm = read_wav_mono_16k(&clip)?;
+    let windows = full_windows(&pcm, 512);
+    anyhow::ensure!(!windows.is_empty(), "{clip}: no complete 512-sample window");
 
     let cpu_seconds = || {
         let mut ru = std::mem::MaybeUninit::<libc::rusage>::zeroed();
         // SAFETY: `getrusage` fills the struct; RUSAGE_SELF is valid.
-        let ru = unsafe {
-            libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr());
-            ru.assume_init()
-        };
+        let rc = unsafe { libc::getrusage(libc::RUSAGE_SELF, ru.as_mut_ptr()) };
+        assert_eq!(rc, 0, "getrusage failed");
+        let ru = unsafe { ru.assume_init() };
         let secs = |t: libc::timeval| t.tv_sec as f64 + t.tv_usec as f64 * 1e-6;
         (secs(ru.ru_utime), secs(ru.ru_stime))
     };
 
-    let mut cpu = SileroVad::from_file(&model).expect("load the VAD");
-    let mut npu = SileroVad::from_file(&model).expect("load the VAD");
+    let mut cpu =
+        SileroVad::from_file(&model).with_context(|| format!("load the VAD from {model}"))?;
+    let mut npu =
+        SileroVad::from_file(&model).with_context(|| format!("load the VAD from {model}"))?;
     assert!(npu.try_enable_hexagon(), "the NPU is not available");
     assert!(npu.is_accelerated());
 
@@ -99,6 +98,7 @@ fn main() {
         (u_cpu + s_cpu) / (n * 0.032),
         (u_npu + s_npu) / (n * 0.032)
     );
+    Ok(())
 }
 
 #[cfg(not(feature = "hexagon"))]

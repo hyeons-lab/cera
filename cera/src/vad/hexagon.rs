@@ -1,8 +1,10 @@
 //! Silero VAD v5's 16 kHz window on the Hexagon NPU.
 //!
 //! The VAD runs for every 32 ms of audio, speech or not, so it is the one model an always-on
-//! background service keeps busy all day. It is tiny (about 0.7 MFLOP a window) but the CPU still
-//! pays 0.3 ms for each, and Android demotes background CPU work and not the NPU.
+//! background service keeps busy all day. It is tiny (about 0.7 MFLOP a window by op count) but
+//! the CPU still pays on the order of 0.3 ms for each (S25 Ultra, release build; re-measure on
+//! your SoC with `cera/examples/hexagon_vad_probe.rs`), and Android demotes background CPU work
+//! and not the NPU.
 //!
 //! A window is the same graph every time (fixed shapes, fixed buffers), so it is built once,
 //! serialized, and replayed: per window the host writes the 640 input samples and the LSTM state,
@@ -14,7 +16,9 @@
 //! -> 4 frames of 256 (hop 128)      framing copy
 //! -> STFT: re, im = basis . frame   two F32 matmuls (129 bins, padded to 160)
 //! -> magnitude = sqrt(re^2 + im^2)
-//! -> 4 x (conv k=3 + ReLU)          three tap matmuls each, strides 1, 2, 2, 1
+//! -> 4 x (conv k=3 + ReLU)          three tap matmuls each but the last (one centre
+//!                                    tap: the outer taps read only the zero border),
+//!                                    strides 1, 2, 2, 1
 //! -> LSTM cell (128)                two matmuls, sigmoid and tanh gates
 //! -> ReLU -> Linear(128 -> 1) -> sigmoid
 //! ```
@@ -339,7 +343,7 @@ fn emit_window<S: OpSink>(
     dispatch::mul_inplace(s, b, mag, b, mag, bins, TILE)?;
     dispatch::mul_inplace(s, b, so.tmp_a, b, so.tmp_a, bins, TILE)?;
     dispatch::add_residual(s, b, mag, b, so.tmp_a, bins, TILE)?;
-    dispatch::sqrt_inplace(s, b, mag, bins, TILE)?;
+    dispatch::sqrt(s, b, mag, bins, TILE)?;
 
     // Encoder: 4 positions -> 4 -> 2 -> 1 -> 1.
     emit_conv(s, w, b, &wo.conv[0], so.pad0, 1, 4, so.pad1 + 128 * 4, so)?;
@@ -399,14 +403,14 @@ fn emit_window<S: OpSink>(
         },
         TILE,
     )?;
-    dispatch::tanh_inplace(s, b, gg, one, TILE)?;
+    dispatch::tanh(s, b, gg, one, TILE)?;
     dispatch::sigmoid(s, b, go, one, TILE)?;
     // c' = f * c + i * g, left in the f slot; h' = o * tanh(c'), left in the o slot.
     dispatch::mul_inplace(s, b, gf, b, so.c_in, one, TILE)?;
     dispatch::mul_inplace(s, b, gi, b, gg, one, TILE)?;
     dispatch::add_residual(s, b, gf, b, gi, one, TILE)?;
     dispatch::copy_view(s, rows(gf, HID, 1), rows(so.t128, HID, 1))?;
-    dispatch::tanh_inplace(s, b, so.t128, one, TILE)?;
+    dispatch::tanh(s, b, so.t128, one, TILE)?;
     dispatch::mul_inplace(s, b, go, b, so.t128, one, TILE)?;
 
     // Head: relu(h') -> Linear(128 -> 1) -> sigmoid (32 rows, one real).
@@ -537,10 +541,16 @@ impl VadAccelerator for HexagonVad {
         };
         step.h.copy_from_slice(at(so.gates + 3 * HID * 4, HID));
         step.c.copy_from_slice(at(so.gates + HID * 4, HID));
+        // The boundary in `accelerated_16k` re-checks the whole step for every accelerator;
+        // these device-side checks attribute an NPU fault to the readback value or state.
         ensure!(
-            step.prob.is_finite() && (0.0..=1.0).contains(&step.prob),
+            step.prob_valid(),
             "the NPU returned a speech probability of {}",
             step.prob
+        );
+        ensure!(
+            step.state_finite(),
+            "the NPU returned non-finite LSTM state",
         );
         Ok(Some(step))
     }
@@ -558,16 +568,18 @@ impl Drop for HexagonVad {
 impl SileroVad {
     /// Run this VAD's 16 kHz windows on the Hexagon NPU. Returns whether it did: `false` (with
     /// the reason logged) when there is no usable NPU, in which case it keeps running on the CPU.
+    /// The window batch is built and exported lazily on the first window (which maps the buffers
+    /// for the DSP), so that window pays the staging cost and a staging failure only drops out
+    /// there: run one warm-up window before timing short jobs. Replaces any accelerator set
+    /// before (sessions own their VAD, so sharing one accelerator across sessions can only come
+    /// from an explicit `set_accelerator`).
     pub fn try_enable_hexagon(&mut self) -> bool {
         let Ok(context) = HexagonContext::new().inspect_err(|e| {
             crate::backend::hexagon::log_context_unavailable("HexagonVad", e);
         }) else {
             return false;
         };
-        let arch_override = std::env::var("CERA_HEXAGON_ARCH")
-            .ok()
-            .and_then(|s| s.parse::<u32>().ok())
-            .and_then(crate::backend::hexagon::HexagonArch::from_u32);
+        let arch_override = crate::backend::hexagon::arch_override();
         let device = match crate::backend::hexagon::probe_device(context.driver(), arch_override) {
             Ok(d) => Arc::new(Mutex::new(d)),
             Err(e) => {
@@ -598,7 +610,7 @@ mod tests {
     /// The window is one fixed graph: its op sequence is pinned so a change shows up here, and so
     /// does anything that would make it depend on the input (it is built once and replayed).
     #[test]
-    fn a_window_is_a_fixed_graph_of_about_fifty_ops() {
+    fn a_window_is_a_fixed_graph_of_forty_nine_ops() {
         let (wo, so) = (WeightOffsets::plan(), Scratch::plan());
         let mut s = RecordingSink::default();
         emit_window(&mut s, &"w", &"b", &wo, &so).unwrap();
@@ -612,43 +624,124 @@ mod tests {
         // The i and f gates in one op, the o gate, and the head.
         assert_eq!(count(UnarySigmoid), 3);
         assert_eq!(ops.last().copied(), Some(UnarySigmoid as u32));
-        assert!((45..=60).contains(&ops.len()), "{} ops", ops.len());
+        // Framing (1) + STFT (6) + three emit_conv (3 x 7) + conv3 (3) + LSTM (13) + head (5).
+        assert_eq!(ops.len(), 49);
+        let conv = [MulMat, MulMat, MulMat, Add, Add, Add, UnaryRelu];
+        let tail = [
+            MulMat,
+            Add,
+            UnaryRelu, // conv3: one centre tap plus bias and ReLU
+            MulMat,
+            MulMat,
+            Add,
+            Add, // LSTM projections plus state plus bias
+            UnarySigmoid,
+            UnaryTanh,
+            UnarySigmoid, // i+f, g, o gates
+            Mul,
+            Mul,
+            Add,
+            Cpy,
+            UnaryTanh,
+            Mul, // c' then h'
+            Cpy,
+            UnaryRelu,
+            MulMat,
+            Add,
+            UnarySigmoid, // head
+        ];
+        let want: Vec<u32> = [Cpy, MulMat, MulMat, Mul, Mul, Add, Sqrt]
+            .into_iter()
+            .chain(conv.iter().copied().cycle().take(3 * conv.len()))
+            .chain(tail)
+            .map(|o| o as u32)
+            .collect();
+        assert_eq!(ops, want);
         // Every region fits its buffer: the last write of each is inside it.
         assert!(so.head + HEAD_ROWS * 4 <= so.total_bytes);
         assert!(wo.head_b + HEAD_ROWS * 4 <= wo.total_bytes);
+        // `tmp_a`/`tmp_b` back both the STFT imaginary part and every conv layer's tap outputs:
+        // each consumer must fit (the STFT fills it exactly). The capacity is read off the plan,
+        // not restated.
+        let tmp_floats = (so.tmp_b - so.tmp_a) / 4;
+        assert!(
+            FRAMES * BINS_PAD <= tmp_floats,
+            "STFT imag ({} floats) must fit tmp ({tmp_floats})",
+            FRAMES * BINS_PAD
+        );
+        for (layer, &n_out) in wo.conv.iter().zip(&[4, 2, 1]) {
+            assert!(
+                layer.out * n_out <= tmp_floats,
+                "conv out {} x {n_out} must fit tmp ({tmp_floats})",
+                layer.out
+            );
+        }
     }
 
-    /// The strided conv layers read every other row, starting one row further in per tap.
+    /// Every `emit_conv` layer reads its taps one row further in, stepping `stride` rows per
+    /// output position, with tap `k` on tap `k`'s weights; the summed output lands at `dst`.
     #[test]
-    fn strided_layers_step_two_rows_and_taps_start_one_row_further() {
+    fn conv_taps_step_rows_and_start_one_row_further() {
+        let (wo, so) = (WeightOffsets::plan(), Scratch::plan());
+        // (layer, src, stride, n_out, dst): the exact `emit_window` call sites.
+        let cases = [
+            (&wo.conv[0], so.pad0, 1, 4, so.pad1 + 128 * 4),
+            (&wo.conv[1], so.pad1, 2, 2, so.pad2 + 64 * 4),
+            (&wo.conv[2], so.pad2, 2, 1, so.enc2),
+        ];
+        for (layer, src, stride, n_out, dst) in cases {
+            let mut s = RecordingSink::default();
+            emit_conv(&mut s, &"w", &"b", layer, src, stride, n_out, dst, &so).unwrap();
+            let mulmats: Vec<usize> = (0..s.ops.len())
+                .filter(|&i| s.ops[i].opcode == MulMat as u32)
+                .collect();
+            assert_eq!(mulmats.len(), 3);
+            let row = layer.in_pad * 4;
+            for (k, &i) in mulmats.iter().enumerate() {
+                let x = s.src(i, 1);
+                assert_eq!(x.offset, src + k * row, "tap {k} start");
+                assert_eq!(x.nb[1], (stride * row) as u32, "tap {k} step");
+                assert_eq!(x.ne[1], n_out as u32, "tap {k} positions");
+                assert_eq!(
+                    s.src(i, 0).offset,
+                    layer.taps[k],
+                    "tap {k} reads tap {k}'s weights"
+                );
+            }
+            assert_eq!(
+                s.dst(mulmats[0]).offset,
+                dst,
+                "the summed output lands at dst"
+            );
+        }
+    }
+
+    /// The last layer is one hand-rolled centre-tap matmul: no op may read its outer taps.
+    #[test]
+    fn the_last_layer_reads_only_the_centre_tap() {
         let (wo, so) = (WeightOffsets::plan(), Scratch::plan());
         let mut s = RecordingSink::default();
-        emit_conv(
-            &mut s,
-            &"w",
-            &"b",
-            &wo.conv[1],
-            so.pad1,
-            2,
-            2,
-            so.pad2 + 64 * 4,
-            &so,
-        )
-        .unwrap();
-        let mulmats: Vec<usize> = (0..s.ops.len())
-            .filter(|&i| s.ops[i].opcode == MulMat as u32)
-            .collect();
-        assert_eq!(mulmats.len(), 3);
-        for (k, &i) in mulmats.iter().enumerate() {
-            let x = s.src(i, 1);
-            assert_eq!(x.offset, so.pad1 + k * 128 * 4, "tap {k} start");
-            assert_eq!(
-                x.nb[1],
-                (2 * 128 * 4) as u32,
-                "two rows per output position"
+        emit_window(&mut s, &"w", &"b", &wo, &so).unwrap();
+        let c3 = &wo.conv[3];
+        let mut centre = Vec::new();
+        for (i, op) in s.ops.iter().enumerate() {
+            if op.opcode != MulMat as u32 {
+                continue;
+            }
+            let w = s.src(i, 0).offset;
+            assert!(
+                w != c3.taps[0] && w != c3.taps[2],
+                "op {i} reads a zero-border tap of the last layer"
             );
-            assert_eq!(x.ne[1], 2);
+            if w == c3.taps[1] {
+                centre.push(i);
+            }
         }
+        assert_eq!(centre.len(), 1);
+        let x = s.src(centre[0], 1);
+        assert_eq!((x.offset, x.ne[0], x.ne[1]), (so.enc2, 64, 1));
+        let d = s.dst(centre[0]);
+        assert_eq!((d.offset, d.ne[0], d.ne[1]), (so.enc3, 128, 1));
     }
 
     /// Tap `k` of `[out, in, 3]` lands at `[out, in_pad]` with zero padded channels.
@@ -668,6 +761,48 @@ mod tests {
                     };
                     assert_eq!(t[o * in_pad + i], want, "tap {k} out {o} in {i}");
                 }
+            }
+        }
+    }
+
+    /// Tap order against the CPU ground truth: composing the three taps over a bordered
+    /// input must equal `conv1d_relu` (layout, tap order, bias and ReLU).
+    #[test]
+    fn conv_taps_match_cpu_conv1d_relu() {
+        let (out_c, in_c, in_pad) = (2, 3, 4);
+        let (stride, pad, in_len) = (2, 1, 5);
+        let input: Vec<f32> = (0..in_c * in_len).map(|i| i as f32 * 0.37 - 2.0).collect();
+        let w: Vec<f32> = (0..out_c * in_c * 3)
+            .map(|i| i as f32 * 0.13 - 1.0)
+            .collect();
+        let b: Vec<f32> = (0..out_c).map(|i| i as f32 * 0.5 - 0.25).collect();
+        let out_len = (in_len + 2 * pad - 3) / stride + 1;
+        let mut want = vec![0.0f32; out_c * out_len];
+        crate::vad::conv1d_relu(&input, &mut want, in_c, in_len, out_c, stride, pad, &w, &b);
+        let taps: Vec<Vec<f32>> = (0..3)
+            .map(|k| conv_tap(&w, out_c, in_c, in_pad, k))
+            .collect();
+        for o in 0..out_c {
+            for t in 0..out_len {
+                let mut acc = b[o];
+                for (k, tap) in taps.iter().enumerate() {
+                    // Bordered row (`emit_conv` reads `src + k` stepping `stride` over a
+                    // zero-bordered buffer); row 0 and row `in_len + 1` are the zero border.
+                    let row = t * stride + k;
+                    for i in 0..in_pad {
+                        let x = if row == 0 || row == in_len + 1 || i >= in_c {
+                            0.0
+                        } else {
+                            input[i * in_len + (row - 1)]
+                        };
+                        acc += tap[o * in_pad + i] * x;
+                    }
+                }
+                let (got, want) = (acc.max(0.0), want[o * out_len + t]);
+                assert!(
+                    (got - want).abs() < 1e-5,
+                    "out {o} pos {t}: tap composition {got} != CPU {want}"
+                );
             }
         }
     }

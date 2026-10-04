@@ -699,6 +699,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 51228:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes() != 51326:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file() != 44957:
@@ -1970,6 +1972,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm.argtypes = 
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu.restype = ctypes.c_int8
 _UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_bytes.argtypes = (
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2788,6 +2795,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance.
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes.restype = ctypes.c_uint16
@@ -5412,7 +5422,7 @@ class FfiAudioPipelineConfig:
     """
     Configuration options for the unified audio pipeline.
 """
-    def __init__(self, *, require_hotword:bool, auto_transcribe:bool, pre_roll_ms:int, max_utterance_ms:int, vad_config:typing.Optional[FfiVadConfig], hotword_config:typing.Optional[FfiHotwordConfig], whisper_opts:typing.Optional[FfiWhisperTranscribeOpts]):
+    def __init__(self, *, require_hotword:bool, auto_transcribe:bool, pre_roll_ms:int, max_utterance_ms:int, vad_config:typing.Optional[FfiVadConfig], hotword_config:typing.Optional[FfiHotwordConfig], whisper_opts:typing.Optional[FfiWhisperTranscribeOpts], vad_on_cpu:bool):
         self.require_hotword = require_hotword
         self.auto_transcribe = auto_transcribe
         self.pre_roll_ms = pre_roll_ms
@@ -5420,12 +5430,13 @@ class FfiAudioPipelineConfig:
         self.vad_config = vad_config
         self.hotword_config = hotword_config
         self.whisper_opts = whisper_opts
+        self.vad_on_cpu = vad_on_cpu
         
         
 
     
     def __str__(self):
-        return "FfiAudioPipelineConfig(require_hotword={}, auto_transcribe={}, pre_roll_ms={}, max_utterance_ms={}, vad_config={}, hotword_config={}, whisper_opts={})".format(self.require_hotword, self.auto_transcribe, self.pre_roll_ms, self.max_utterance_ms, self.vad_config, self.hotword_config, self.whisper_opts)
+        return "FfiAudioPipelineConfig(require_hotword={}, auto_transcribe={}, pre_roll_ms={}, max_utterance_ms={}, vad_config={}, hotword_config={}, whisper_opts={}, vad_on_cpu={})".format(self.require_hotword, self.auto_transcribe, self.pre_roll_ms, self.max_utterance_ms, self.vad_config, self.hotword_config, self.whisper_opts, self.vad_on_cpu)
     def __eq__(self, other):
         if self.require_hotword != other.require_hotword:
             return False
@@ -5441,6 +5452,8 @@ class FfiAudioPipelineConfig:
             return False
         if self.whisper_opts != other.whisper_opts:
             return False
+        if self.vad_on_cpu != other.vad_on_cpu:
+            return False
         return True
 
 class _UniffiFfiConverterTypeFfiAudioPipelineConfig(_UniffiConverterRustBuffer):
@@ -5454,6 +5467,7 @@ class _UniffiFfiConverterTypeFfiAudioPipelineConfig(_UniffiConverterRustBuffer):
             vad_config=_UniffiFfiConverterOptionalTypeFfiVadConfig.read(buf),
             hotword_config=_UniffiFfiConverterOptionalTypeFfiHotwordConfig.read(buf),
             whisper_opts=_UniffiFfiConverterOptionalTypeFfiWhisperTranscribeOpts.read(buf),
+            vad_on_cpu=_UniffiFfiConverterBoolean.read(buf),
         )
 
     @staticmethod
@@ -5465,6 +5479,7 @@ class _UniffiFfiConverterTypeFfiAudioPipelineConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalTypeFfiVadConfig.check_lower(value.vad_config)
         _UniffiFfiConverterOptionalTypeFfiHotwordConfig.check_lower(value.hotword_config)
         _UniffiFfiConverterOptionalTypeFfiWhisperTranscribeOpts.check_lower(value.whisper_opts)
+        _UniffiFfiConverterBoolean.check_lower(value.vad_on_cpu)
 
     @staticmethod
     def write(value, buf):
@@ -5475,6 +5490,7 @@ class _UniffiFfiConverterTypeFfiAudioPipelineConfig(_UniffiConverterRustBuffer):
         _UniffiFfiConverterOptionalTypeFfiVadConfig.write(value.vad_config, buf)
         _UniffiFfiConverterOptionalTypeFfiHotwordConfig.write(value.hotword_config, buf)
         _UniffiFfiConverterOptionalTypeFfiWhisperTranscribeOpts.write(value.whisper_opts, buf)
+        _UniffiFfiConverterBoolean.write(value.vad_on_cpu, buf)
 
 @dataclass
 class FfiEntitySpan:
@@ -14301,6 +14317,12 @@ class FfiAudioPipelineProtocol(typing.Protocol):
         Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
 """
         raise NotImplementedError
+    def vad_on_npu(self, ) -> bool:
+        """
+        Whether the VAD runs on the Hexagon NPU (false: the CPU, or no VAD). Read live: the VAD
+        drops back to the CPU if the NPU fails mid-run.
+"""
+        raise NotImplementedError
 
 class FfiAudioPipeline(FfiAudioPipelineProtocol):
     """
@@ -14720,6 +14742,22 @@ class FfiAudioPipeline(FfiAudioPipelineProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def vad_on_npu(self, ) -> bool:
+        """
+        Whether the VAD runs on the Hexagon NPU (false: the CPU, or no VAD). Read live: the VAD
+        drops back to the CPU if the NPU fails mid-run.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)

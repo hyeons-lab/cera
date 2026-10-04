@@ -415,9 +415,7 @@ impl HexagonKnobs {
                 .unwrap_or(10_000_000),
             use_ssm_conv: default_on("CERA_HEXAGON_SSM_CONV"),
             use_hmx: default_on("CERA_HEXAGON_HMX"),
-            arch_override: get("CERA_HEXAGON_ARCH")
-                .and_then(|s| s.trim().parse::<u32>().ok())
-                .and_then(HexagonArch::from_u32),
+            arch_override: crate::backend::hexagon::arch_override_with(&get),
             kv_q8: opt_in("CERA_HEXAGON_KV_Q8"),
             decode_ops: get("CERA_HEXAGON_DECODE_OPS")
                 .and_then(|v| v.trim().parse::<usize>().ok())

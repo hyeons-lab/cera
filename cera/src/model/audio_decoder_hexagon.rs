@@ -14,8 +14,8 @@ use anyhow::Result;
 pub use crate::backend::hexagon::HexagonWeightFormat;
 use crate::backend::hexagon::dispatch::{self, TokenShape, TokenTile};
 use crate::backend::hexagon::{
-    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_WEIGHT, HexagonArch, HexagonContext,
-    HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer, align128,
+    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_WEIGHT, HexagonContext, HexagonDevice,
+    HexagonQueueSession, HtpDataType, HtpOpCode, RpcmemBuffer, align128,
     build_binary_kernel_params, build_flash_attn_kernel_params, build_rms_norm_params,
     build_rope_kernel_params, build_rope_params, build_unary_kernel_params, repack_q4_0,
     repack_q8_0, repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
@@ -2852,10 +2852,7 @@ pub fn try_hexagon_audio_decoder(gguf: &Arc<GgufFile>) -> Option<Arc<dyn AudioAc
         })
         .ok()?;
 
-    let arch_override = std::env::var("CERA_HEXAGON_ARCH")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .and_then(HexagonArch::from_u32);
+    let arch_override = crate::backend::hexagon::arch_override();
 
     let dev = match crate::backend::hexagon::probe_device(context.driver(), arch_override) {
         Ok(d) => d,

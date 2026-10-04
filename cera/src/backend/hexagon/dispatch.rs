@@ -542,7 +542,7 @@ pub(crate) fn sigmoid<S: OpSink>(
 }
 
 /// In-place square root: `buf = sqrt(buf)` (the inputs must not be negative).
-pub(crate) fn sqrt_inplace<S: OpSink>(
+pub(crate) fn sqrt<S: OpSink>(
     session: &mut S,
     buf: &S::Buf,
     offset: usize,
@@ -553,7 +553,7 @@ pub(crate) fn sqrt_inplace<S: OpSink>(
 }
 
 /// In-place hyperbolic tangent: `buf = tanh(buf)`.
-pub(crate) fn tanh_inplace<S: OpSink>(
+pub(crate) fn tanh<S: OpSink>(
     session: &mut S,
     buf: &S::Buf,
     offset: usize,

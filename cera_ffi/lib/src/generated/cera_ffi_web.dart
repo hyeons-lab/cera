@@ -1929,6 +1929,9 @@ class FfiAudioPipelineConfig {
     required this.hotwordConfig,
     /// Whisper transcription options.
     required this.whisperOpts,
+    /// Keep the VAD on the CPU. In a build with the `hexagon` feature the pipeline otherwise
+    /// runs the VAD's 16 kHz windows on the Hexagon NPU when one is available.
+    required this.vadOnCpu,
   });
 
   /// Whether a keyword spotting wake word must be detected before speech tracking begins.
@@ -1945,6 +1948,9 @@ class FfiAudioPipelineConfig {
   final FfiHotwordConfig? hotwordConfig;
   /// Whisper transcription options.
   final FfiWhisperTranscribeOpts? whisperOpts;
+  /// Keep the VAD on the CPU. In a build with the `hexagon` feature the pipeline otherwise
+  /// runs the VAD's 16 kHz windows on the Hexagon NPU when one is available.
+  final bool vadOnCpu;
 
   Map<String, dynamic> toJson() {
     return {
@@ -1955,6 +1961,7 @@ class FfiAudioPipelineConfig {
       'vadConfig': this.vadConfig == null ? null : (() { final __tmp = this.vadConfig!; return __tmp.toJson(); })(),
       'hotwordConfig': this.hotwordConfig == null ? null : (() { final __tmp = this.hotwordConfig!; return __tmp.toJson(); })(),
       'whisperOpts': this.whisperOpts == null ? null : (() { final __tmp = this.whisperOpts!; return __tmp.toJson(); })(),
+      'vadOnCpu': this.vadOnCpu,
     };
   }
 
@@ -1967,6 +1974,7 @@ class FfiAudioPipelineConfig {
       vadConfig: json['vadConfig'] == null ? null : (() { final __tmp = json['vadConfig']; return FfiVadConfig.fromJson(__tmp as Map<String, dynamic>); })(),
       hotwordConfig: json['hotwordConfig'] == null ? null : (() { final __tmp = json['hotwordConfig']; return FfiHotwordConfig.fromJson(__tmp as Map<String, dynamic>); })(),
       whisperOpts: json['whisperOpts'] == null ? null : (() { final __tmp = json['whisperOpts']; return FfiWhisperTranscribeOpts.fromJson(__tmp as Map<String, dynamic>); })(),
+      vadOnCpu: json['vadOnCpu'] as bool,
     );
   }
 
@@ -1978,6 +1986,7 @@ class FfiAudioPipelineConfig {
     Object? vadConfig = _sentinel,
     Object? hotwordConfig = _sentinel,
     Object? whisperOpts = _sentinel,
+    bool? vadOnCpu,
   }) {
     return FfiAudioPipelineConfig(
       requireHotword: requireHotword ?? this.requireHotword,
@@ -1987,21 +1996,22 @@ class FfiAudioPipelineConfig {
       vadConfig: vadConfig == _sentinel ? this.vadConfig : vadConfig as FfiVadConfig?,
       hotwordConfig: hotwordConfig == _sentinel ? this.hotwordConfig : hotwordConfig as FfiHotwordConfig?,
       whisperOpts: whisperOpts == _sentinel ? this.whisperOpts : whisperOpts as FfiWhisperTranscribeOpts?,
+      vadOnCpu: vadOnCpu ?? this.vadOnCpu,
     );
   }
 
   @override
   String toString() {
-    return 'FfiAudioPipelineConfig(requireHotword: $requireHotword, autoTranscribe: $autoTranscribe, preRollMs: $preRollMs, maxUtteranceMs: $maxUtteranceMs, vadConfig: $vadConfig, hotwordConfig: $hotwordConfig, whisperOpts: $whisperOpts)';
+    return 'FfiAudioPipelineConfig(requireHotword: $requireHotword, autoTranscribe: $autoTranscribe, preRollMs: $preRollMs, maxUtteranceMs: $maxUtteranceMs, vadConfig: $vadConfig, hotwordConfig: $hotwordConfig, whisperOpts: $whisperOpts, vadOnCpu: $vadOnCpu)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is FfiAudioPipelineConfig && requireHotword == other.requireHotword && autoTranscribe == other.autoTranscribe && preRollMs == other.preRollMs && maxUtteranceMs == other.maxUtteranceMs && vadConfig == other.vadConfig && hotwordConfig == other.hotwordConfig && whisperOpts == other.whisperOpts;
+      other is FfiAudioPipelineConfig && requireHotword == other.requireHotword && autoTranscribe == other.autoTranscribe && preRollMs == other.preRollMs && maxUtteranceMs == other.maxUtteranceMs && vadConfig == other.vadConfig && hotwordConfig == other.hotwordConfig && whisperOpts == other.whisperOpts && vadOnCpu == other.vadOnCpu;
 
   @override
-  int get hashCode => Object.hash(requireHotword, autoTranscribe, preRollMs, maxUtteranceMs, vadConfig, hotwordConfig, whisperOpts);
+  int get hashCode => Object.hash(requireHotword, autoTranscribe, preRollMs, maxUtteranceMs, vadConfig, hotwordConfig, whisperOpts, vadOnCpu);
 }
 
 /// Summary of a successful message ingestion.
@@ -7408,6 +7418,10 @@ final class FfiAudioPipeline {
 
   /// Transcribe an arbitrary buffer of 16 kHz mono PCM audio samples.
   String transcribePcm(List<double> pcm) => _unsupportedOnWeb('FfiAudioPipeline.transcribePcm');
+
+  /// Whether the VAD runs on the Hexagon NPU (false: the CPU, or no VAD). Read live: the VAD
+  /// drops back to the CPU if the NPU fails mid-run.
+  bool vadOnNpu() => _unsupportedOnWeb('FfiAudioPipeline.vadOnNpu');
 }
 
 final class FfiAudioPipelineFfiCodec {

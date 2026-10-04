@@ -1997,6 +1997,9 @@ class FfiAudioPipelineConfig {
     required this.hotwordConfig,
     /// Whisper transcription options.
     required this.whisperOpts,
+    /// Keep the VAD on the CPU. In a build with the `hexagon` feature the pipeline otherwise
+    /// runs the VAD's 16 kHz windows on the Hexagon NPU when one is available.
+    required this.vadOnCpu,
   });
 
   /// Whether a keyword spotting wake word must be detected before speech tracking begins.
@@ -2013,6 +2016,9 @@ class FfiAudioPipelineConfig {
   final FfiHotwordConfig? hotwordConfig;
   /// Whisper transcription options.
   final FfiWhisperTranscribeOpts? whisperOpts;
+  /// Keep the VAD on the CPU. In a build with the `hexagon` feature the pipeline otherwise
+  /// runs the VAD's 16 kHz windows on the Hexagon NPU when one is available.
+  final bool vadOnCpu;
 
   Map<String, dynamic> toJson() {
     return {
@@ -2023,6 +2029,7 @@ class FfiAudioPipelineConfig {
       'vadConfig': this.vadConfig == null ? null : (() { final __tmp = this.vadConfig!; return __tmp.toJson(); })(),
       'hotwordConfig': this.hotwordConfig == null ? null : (() { final __tmp = this.hotwordConfig!; return __tmp.toJson(); })(),
       'whisperOpts': this.whisperOpts == null ? null : (() { final __tmp = this.whisperOpts!; return __tmp.toJson(); })(),
+      'vadOnCpu': this.vadOnCpu,
     };
   }
 
@@ -2035,6 +2042,7 @@ class FfiAudioPipelineConfig {
       vadConfig: json['vadConfig'] == null ? null : (() { final __tmp = json['vadConfig']; return FfiVadConfig.fromJson(__tmp as Map<String, dynamic>); })(),
       hotwordConfig: json['hotwordConfig'] == null ? null : (() { final __tmp = json['hotwordConfig']; return FfiHotwordConfig.fromJson(__tmp as Map<String, dynamic>); })(),
       whisperOpts: json['whisperOpts'] == null ? null : (() { final __tmp = json['whisperOpts']; return FfiWhisperTranscribeOpts.fromJson(__tmp as Map<String, dynamic>); })(),
+      vadOnCpu: json['vadOnCpu'] as bool,
     );
   }
 
@@ -2046,6 +2054,7 @@ class FfiAudioPipelineConfig {
     Object? vadConfig = _sentinel,
     Object? hotwordConfig = _sentinel,
     Object? whisperOpts = _sentinel,
+    bool? vadOnCpu,
   }) {
     return FfiAudioPipelineConfig(
       requireHotword: requireHotword ?? this.requireHotword,
@@ -2055,21 +2064,22 @@ class FfiAudioPipelineConfig {
       vadConfig: vadConfig == _sentinel ? this.vadConfig : vadConfig as FfiVadConfig?,
       hotwordConfig: hotwordConfig == _sentinel ? this.hotwordConfig : hotwordConfig as FfiHotwordConfig?,
       whisperOpts: whisperOpts == _sentinel ? this.whisperOpts : whisperOpts as FfiWhisperTranscribeOpts?,
+      vadOnCpu: vadOnCpu ?? this.vadOnCpu,
     );
   }
 
   @override
   String toString() {
-    return 'FfiAudioPipelineConfig(requireHotword: $requireHotword, autoTranscribe: $autoTranscribe, preRollMs: $preRollMs, maxUtteranceMs: $maxUtteranceMs, vadConfig: $vadConfig, hotwordConfig: $hotwordConfig, whisperOpts: $whisperOpts)';
+    return 'FfiAudioPipelineConfig(requireHotword: $requireHotword, autoTranscribe: $autoTranscribe, preRollMs: $preRollMs, maxUtteranceMs: $maxUtteranceMs, vadConfig: $vadConfig, hotwordConfig: $hotwordConfig, whisperOpts: $whisperOpts, vadOnCpu: $vadOnCpu)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is FfiAudioPipelineConfig && requireHotword == other.requireHotword && autoTranscribe == other.autoTranscribe && preRollMs == other.preRollMs && maxUtteranceMs == other.maxUtteranceMs && vadConfig == other.vadConfig && hotwordConfig == other.hotwordConfig && whisperOpts == other.whisperOpts;
+      other is FfiAudioPipelineConfig && requireHotword == other.requireHotword && autoTranscribe == other.autoTranscribe && preRollMs == other.preRollMs && maxUtteranceMs == other.maxUtteranceMs && vadConfig == other.vadConfig && hotwordConfig == other.hotwordConfig && whisperOpts == other.whisperOpts && vadOnCpu == other.vadOnCpu;
 
   @override
-  int get hashCode => Object.hash(requireHotword, autoTranscribe, preRollMs, maxUtteranceMs, vadConfig, hotwordConfig, whisperOpts);
+  int get hashCode => Object.hash(requireHotword, autoTranscribe, preRollMs, maxUtteranceMs, vadConfig, hotwordConfig, whisperOpts, vadOnCpu);
 }
 
 /// Summary of a successful message ingestion.
@@ -7381,6 +7391,7 @@ void _uniffiWriteFfiAudioPipelineConfig(FfiAudioPipelineConfig value, _UniFfiBin
     writer.writeI8(1);
     _uniffiWriteFfiWhisperTranscribeOpts(value.whisperOpts!, writer);
   }
+  writer.writeBool(value.vadOnCpu);
 }
 
 Uint8List _uniffiEncodeFfiAudioPipelineConfig(FfiAudioPipelineConfig value) {
@@ -7398,6 +7409,7 @@ FfiAudioPipelineConfig _uniffiReadFfiAudioPipelineConfig(_UniFfiBinaryReader rea
     vadConfig: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return _uniffiReadFfiVadConfig(reader); })(),
     hotwordConfig: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return _uniffiReadFfiHotwordConfig(reader); })(),
     whisperOpts: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return _uniffiReadFfiWhisperTranscribeOpts(reader); })(),
+    vadOnCpu: reader.readBool(),
   );
 }
 
@@ -10415,6 +10427,16 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm != 58760) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm`: expected 58760, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu');
+      _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu != 51228) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu`: expected 51228, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_cancel;
     try {
@@ -26977,6 +26999,73 @@ class CeraFfiFfi {
     }
   }
 
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ffiAudioPipelineVadOnNpuFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu');
+
+  bool ffiAudioPipelineInvokeVadOnNpu(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _ffiAudioPipelineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _ffiAudioPipelineVadOnNpuFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return (returnBuf + 0).ref.i8 == 1;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _chatSessionFreeRaw = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('uniffi_cera_ffi_fn_free_chatsession');
   late final void Function(int handle) _chatSessionFree = (int handle) {
     final statusPtr = calloc<_UniFfiRustCallStatus>();
@@ -33083,6 +33172,13 @@ final class FfiAudioPipeline {
   String transcribePcm(List<double> pcm) {
     _ensureOpen();
     return _ffi.ffiAudioPipelineInvokeTranscribePcm(_handle, pcm);
+  }
+
+  /// Whether the VAD runs on the Hexagon NPU (false: the CPU, or no VAD). Read live: the VAD
+  /// drops back to the CPU if the NPU fails mid-run.
+  bool vadOnNpu() {
+    _ensureOpen();
+    return _ffi.ffiAudioPipelineInvokeVadOnNpu(_handle);
   }
 
 }

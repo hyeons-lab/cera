@@ -480,6 +480,26 @@ pub struct VadStep {
     pub c: [f32; 128],
 }
 
+impl VadStep {
+    /// Finite probability in `[0, 1]` and finite LSTM state: the whole step the host adopts
+    /// (state is carried forever, so partial validity is useless).
+    pub fn is_valid(&self) -> bool {
+        self.prob_valid() && self.state_finite()
+    }
+
+    /// The probability half of [`Self::is_valid`], kept separate so device-side checks can
+    /// attribute a fault to the readback value.
+    pub fn prob_valid(&self) -> bool {
+        self.prob.is_finite() && (0.0..=1.0).contains(&self.prob)
+    }
+
+    /// The state half of [`Self::is_valid`], kept separate so device-side checks can attribute
+    /// a fault to the readback state.
+    pub fn state_finite(&self) -> bool {
+        self.h.iter().all(|v| v.is_finite()) && self.c.iter().all(|v| v.is_finite())
+    }
+}
+
 /// An accelerator (the Hexagon NPU) for one 16 kHz VAD window, the part of the model that runs
 /// for every 32 ms of audio, speech or not. The host keeps the LSTM state and hands it in with
 /// each window, so a window is a pure function of its input: resetting, cloning or falling back
@@ -487,8 +507,13 @@ pub struct VadStep {
 pub trait VadAccelerator: Send + Sync {
     /// Run the network over `padded`, the 640 samples of the window (64 samples of context, the
     /// 512 of the chunk and 64 reflected ones) with LSTM state `h`, `c`. `Ok(None)` declines the
-    /// window (the CPU takes it); an `Err` is a failure, after which the VAD stops using the
-    /// accelerator (with a warning) and carries on on the CPU.
+    /// window (the CPU takes it) and must leave no observable state behind: declining a window
+    /// and then accepting the next must equal accepting directly. Implementations must be
+    /// thread-safe: one accelerator may be shared across sessions and threads via `Arc`. An
+    /// `Err` is a failure, after which the VAD stops using the accelerator (with a warning),
+    /// never calls that accelerator again, and carries on on the CPU; `window_16k` must therefore
+    /// fail safe (no partial state a later call could observe). A later `set_accelerator` starts
+    /// over with a new one.
     fn window_16k(
         &self,
         padded: &[f32; 640],
@@ -527,8 +552,15 @@ impl SileroVad {
     }
 
     /// Run the 16 kHz windows on `accel` from here on. The 8 kHz network stays on the CPU.
+    /// The LSTM state is shared across rates: 8 kHz windows resume from state last written by
+    /// the accelerator and vice versa, so mixed-rate sessions mix DSP and CPU numerics.
     pub fn set_accelerator(&mut self, accel: Arc<dyn VadAccelerator>) {
         self.accel = Some(accel);
+    }
+
+    /// Run the 16 kHz windows on the CPU again, forgetting `accel`.
+    pub fn clear_accelerator(&mut self) {
+        self.accel = None;
     }
 
     /// Whether 16 kHz windows currently run on an accelerator (it drops out, with a warning,
@@ -542,17 +574,33 @@ impl SileroVad {
         let accel = Arc::clone(self.accel.as_ref()?);
         match accel.window_16k(padded, &self.h, &self.c) {
             Ok(Some(step)) => {
+                // The boundary validates the whole step, not just the probability: the state is
+                // carried forever (and survives into CPU fallback), so a corrupt `h`/`c` would
+                // poison every later window with no error.
+                if !step.is_valid() {
+                    self.drop_accelerator("returned an invalid step");
+                    return None;
+                }
                 self.h = step.h;
                 self.c = step.c;
                 Some(step.prob)
             }
             Ok(None) => None,
             Err(e) => {
-                tracing::warn!("VAD accelerator failed ({e:#}); running on the CPU from here on");
-                self.accel = None;
+                self.drop_accelerator(&format!("failed ({e:#})"));
                 None
             }
         }
+    }
+
+    /// Retire the accelerator after a failure, falling back to the CPU from here on. Warns on
+    /// both tracing and stderr (mirroring `hexagon_warn!`): this module is not hexagon-gated so
+    /// the macro is unavailable here, and `cera-ffi` installs no tracing subscriber, so tracing
+    /// alone would be invisible on phones.
+    fn drop_accelerator(&mut self, reason: &str) {
+        tracing::warn!("VAD accelerator {reason}; running on the CPU from here on");
+        eprintln!("cera-vad: accelerator {reason}; running on the CPU from here on");
+        self.accel = None;
     }
 
     /// Load a Silero VAD model from a `.gguf` file path using memory mapping.
@@ -1297,5 +1345,306 @@ mod tests {
         // Subsequent valid chunk completing the window succeeds
         let valid_chunk = [0.0f32; 412];
         assert!(iterator.process_chunk(&mut vad, &valid_chunk).is_ok());
+    }
+
+    /// A VAD over zero weights: the accelerator legs return before weights are read, and the
+    /// CPU-fallthrough legs run the ordinary forward pass over zeros.
+    fn scripted_vad() -> SileroVad {
+        let z = |n: usize| Tensor::zeros_f32(vec![n]);
+        SileroVad {
+            weights: VadWeights {
+                stft_16k_basis: z(258 * 256),
+                encoder_16k_0_w: z(128 * 129 * 3),
+                encoder_16k_0_b: z(128),
+                encoder_16k_1_w: z(64 * 128 * 3),
+                encoder_16k_1_b: z(64),
+                encoder_16k_2_w: z(64 * 64 * 3),
+                encoder_16k_2_b: z(64),
+                encoder_16k_3_w: z(128 * 64 * 3),
+                encoder_16k_3_b: z(128),
+                decoder_16k_rnn_w_ih: z(512 * 128),
+                decoder_16k_rnn_w_hh: z(512 * 128),
+                decoder_16k_rnn_b_ih: z(512),
+                decoder_16k_rnn_b_hh: z(512),
+                decoder_16k_head_w: z(128),
+                decoder_16k_head_b: z(1),
+                stft_8k_basis: z(130 * 128),
+                encoder_8k_0_w: z(128 * 65 * 3),
+                encoder_8k_0_b: z(128),
+                encoder_8k_1_w: z(64 * 128 * 3),
+                encoder_8k_1_b: z(64),
+                encoder_8k_2_w: z(64 * 64 * 3),
+                encoder_8k_2_b: z(64),
+                encoder_8k_3_w: z(128 * 64 * 3),
+                encoder_8k_3_b: z(128),
+                decoder_8k_rnn_w_ih: z(512 * 128),
+                decoder_8k_rnn_w_hh: z(512 * 128),
+                decoder_8k_rnn_b_ih: z(512),
+                decoder_8k_rnn_b_hh: z(512),
+                decoder_8k_head_w: z(128),
+                decoder_8k_head_b: z(1),
+            },
+            h: [0.0; 128],
+            c: [0.0; 128],
+            context_16k: [0.0; 64],
+            context_8k: [0.0; 32],
+            accel: None,
+        }
+    }
+
+    struct ScriptedAccel {
+        script: std::sync::Mutex<Vec<Result<Option<VadStep>>>>,
+        calls: std::sync::atomic::AtomicUsize,
+    }
+
+    impl VadAccelerator for ScriptedAccel {
+        fn window_16k(
+            &self,
+            _: &[f32; 640],
+            _: &[f32; 128],
+            _: &[f32; 128],
+        ) -> Result<Option<VadStep>> {
+            self.calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            self.script.lock().unwrap().remove(0)
+        }
+    }
+
+    /// A VAD with a scripted accelerator attached, plus a concrete handle to count
+    /// consultations (the VAD holds its `Arc` as a trait object).
+    fn accel_vad(
+        script: Vec<Result<Option<VadStep>>>,
+    ) -> (SileroVad, std::sync::Arc<ScriptedAccel>) {
+        let mut vad = scripted_vad();
+        let accel = std::sync::Arc::new(ScriptedAccel {
+            script: std::sync::Mutex::new(script),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let handle = std::sync::Arc::clone(&accel);
+        vad.set_accelerator(accel);
+        (vad, handle)
+    }
+
+    fn calls(handle: &std::sync::Arc<ScriptedAccel>) -> usize {
+        handle.calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    #[test]
+    fn accelerator_step_is_adopted() {
+        let step = VadStep {
+            prob: 0.7,
+            h: [1.0; 128],
+            c: [2.0; 128],
+        };
+        let (mut vad, handle) = accel_vad(vec![Ok(Some(step))]);
+        let prob = vad
+            .process_chunk(&[0.0f32; 512], VadSampleRate::Rate16kHz)
+            .unwrap();
+        assert_eq!(prob, 0.7);
+        assert_eq!(calls(&handle), 1);
+        assert!(vad.is_accelerated());
+        let (h, c) = vad.hidden_states();
+        assert!(h.iter().all(|&v| v == 1.0));
+        assert!(c.iter().all(|&v| v == 2.0));
+    }
+
+    #[test]
+    fn accelerator_decline_falls_through_to_cpu() {
+        let (mut vad, handle) = accel_vad(vec![Ok(None)]);
+        let chunk = [0.0f32; 512];
+        let prob = vad.process_chunk(&chunk, VadSampleRate::Rate16kHz).unwrap();
+        let mut control = scripted_vad();
+        let cpu = control
+            .process_chunk(&chunk, VadSampleRate::Rate16kHz)
+            .unwrap();
+        assert_eq!(prob, cpu);
+        // A decline leaves no observable state behind: probability and carried state alike.
+        assert_eq!(vad.hidden_states(), control.hidden_states());
+        assert_eq!(calls(&handle), 1);
+        assert!(
+            vad.is_accelerated(),
+            "a decline must not drop the accelerator"
+        );
+    }
+
+    #[test]
+    fn accelerator_decline_then_accept() {
+        let step = VadStep {
+            prob: 0.7,
+            h: [1.0; 128],
+            c: [2.0; 128],
+        };
+        let (mut vad, handle) = accel_vad(vec![Ok(None), Ok(Some(step))]);
+        let chunk = [0.0f32; 512];
+        let cpu = scripted_vad()
+            .process_chunk(&chunk, VadSampleRate::Rate16kHz)
+            .unwrap();
+        assert_eq!(
+            vad.process_chunk(&chunk, VadSampleRate::Rate16kHz).unwrap(),
+            cpu,
+            "decline: pure CPU"
+        );
+        assert_eq!(
+            vad.process_chunk(&chunk, VadSampleRate::Rate16kHz).unwrap(),
+            0.7,
+            "accept the next window"
+        );
+        assert_eq!(calls(&handle), 2);
+        assert!(vad.is_accelerated());
+        let (h, c) = vad.hidden_states();
+        assert!(h.iter().all(|&v| v == 1.0));
+        assert!(c.iter().all(|&v| v == 2.0));
+    }
+
+    #[test]
+    fn accelerator_shared_across_threads() {
+        let step = VadStep {
+            prob: 0.7,
+            h: [1.0; 128],
+            c: [2.0; 128],
+        };
+        let script: Vec<Result<Option<VadStep>>> = (0..8).map(|_| Ok(Some(step.clone()))).collect();
+        let accel = std::sync::Arc::new(ScriptedAccel {
+            script: std::sync::Mutex::new(script),
+            calls: std::sync::atomic::AtomicUsize::new(0),
+        });
+        let chunk = [0.0f32; 512];
+        std::thread::scope(|s| {
+            let mut workers = Vec::new();
+            for _ in 0..2 {
+                let accel = std::sync::Arc::clone(&accel);
+                workers.push(s.spawn(move || {
+                    let mut vad = scripted_vad();
+                    vad.set_accelerator(accel);
+                    for _ in 0..4 {
+                        let prob = vad.process_chunk(&chunk, VadSampleRate::Rate16kHz).unwrap();
+                        assert_eq!(prob, 0.7);
+                    }
+                    assert!(vad.is_accelerated());
+                    vad
+                }));
+            }
+            for w in workers {
+                let vad = w.join().unwrap();
+                let (h, c) = vad.hidden_states();
+                assert!(h.iter().all(|&v| v == 1.0));
+                assert!(c.iter().all(|&v| v == 2.0));
+            }
+        });
+        assert_eq!(accel.calls.load(std::sync::atomic::Ordering::SeqCst), 8);
+    }
+
+    #[test]
+    fn accelerator_error_drops_out_to_cpu() {
+        let (mut vad, handle) = accel_vad(vec![Err(anyhow::anyhow!("DSP hung"))]);
+        let chunk = [0.0f32; 512];
+        let prob = vad.process_chunk(&chunk, VadSampleRate::Rate16kHz).unwrap();
+        let cpu = scripted_vad()
+            .process_chunk(&chunk, VadSampleRate::Rate16kHz)
+            .unwrap();
+        assert_eq!(prob, cpu);
+        assert!(!vad.is_accelerated());
+        // The dropped accelerator is never consulted again.
+        let _ = vad.process_chunk(&chunk, VadSampleRate::Rate16kHz).unwrap();
+        assert_eq!(calls(&handle), 1);
+    }
+
+    #[test]
+    fn accelerator_invalid_step_drops_out_without_poisoning_state() {
+        for step in [
+            VadStep {
+                prob: 0.5,
+                h: [f32::INFINITY; 128],
+                c: [0.0; 128],
+            },
+            VadStep {
+                prob: 2.0,
+                h: [0.0; 128],
+                c: [0.0; 128],
+            },
+        ] {
+            let (mut vad, _) = accel_vad(vec![Ok(Some(step))]);
+            let chunk = [0.0f32; 512];
+            let prob = vad.process_chunk(&chunk, VadSampleRate::Rate16kHz).unwrap();
+            let cpu = scripted_vad()
+                .process_chunk(&chunk, VadSampleRate::Rate16kHz)
+                .unwrap();
+            assert_eq!(prob, cpu);
+            assert!(!vad.is_accelerated());
+            let (h, c) = vad.hidden_states();
+            assert!(h.iter().all(|v| v.is_finite()));
+            assert!(c.iter().all(|v| v.is_finite()));
+        }
+    }
+
+    #[test]
+    fn step_validity_pins_both_inclusive_ends() {
+        let step = |prob: f32, h0: f32, c0: f32| VadStep {
+            prob,
+            h: [h0; 128],
+            c: [c0; 128],
+        };
+        // Accept: interior, both inclusive ends, negative zero.
+        for prob in [0.0, 1.0, -0.0, 0.5] {
+            assert!(step(prob, 0.0, 0.0).is_valid(), "prob {prob} valid");
+        }
+        // Reject: NaN, infinities, just outside each end, non-finite state.
+        for prob in [
+            f32::NAN,
+            f32::INFINITY,
+            f32::NEG_INFINITY,
+            -1e-7,
+            1.0 + f32::EPSILON,
+        ] {
+            assert!(!step(prob, 0.0, 0.0).is_valid(), "prob {prob} invalid");
+        }
+        assert!(!step(0.5, f32::NAN, 0.0).is_valid(), "NaN h invalid");
+        assert!(!step(0.5, 0.0, f32::INFINITY).is_valid(), "inf c invalid");
+        // The sub-predicates split the halves for device-side attribution.
+        assert!(step(2.0, 0.0, 0.0).state_finite());
+        assert!(!step(2.0, 0.0, 0.0).prob_valid());
+    }
+
+    #[test]
+    fn reset_preserves_the_accelerator() {
+        let (mut vad, _) = accel_vad(vec![Ok(Some(VadStep {
+            prob: 0.7,
+            h: [1.0; 128],
+            c: [2.0; 128],
+        }))]);
+        vad.reset();
+        assert!(vad.is_accelerated());
+        let (h, c) = vad.hidden_states();
+        assert!(h.iter().all(|&v| v == 0.0));
+        assert!(c.iter().all(|&v| v == 0.0));
+    }
+
+    #[test]
+    fn eight_khz_windows_never_consult_the_accelerator() {
+        // An empty script panics on `remove(0)`, so any consultation fails the test.
+        let (mut vad, handle) = accel_vad(Vec::new());
+        let prob = vad
+            .process_chunk(&[0.0f32; 256], VadSampleRate::Rate8kHz)
+            .unwrap();
+        assert!((0.0..=1.0).contains(&prob));
+        assert_eq!(calls(&handle), 0);
+        assert!(vad.is_accelerated());
+    }
+
+    #[test]
+    fn clearing_the_accelerator_returns_to_cpu() {
+        let (mut vad, handle) = accel_vad(vec![Ok(Some(VadStep {
+            prob: 0.7,
+            h: [1.0; 128],
+            c: [2.0; 128],
+        }))]);
+        vad.clear_accelerator();
+        assert!(!vad.is_accelerated());
+        let chunk = [0.0f32; 512];
+        let prob = vad.process_chunk(&chunk, VadSampleRate::Rate16kHz).unwrap();
+        let cpu = scripted_vad()
+            .process_chunk(&chunk, VadSampleRate::Rate16kHz)
+            .unwrap();
+        assert_eq!(prob, cpu);
+        assert_eq!(calls(&handle), 0);
     }
 }

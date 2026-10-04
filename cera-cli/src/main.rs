@@ -4283,6 +4283,14 @@ fn main() -> Result<()> {
                 ),
             };
 
+            // `--npu` fails closed: 8 kHz windows never consult the accelerator, so an 8 kHz
+            // --npu run would compute everything on the CPU and exit 0 looking like an NPU run.
+            if npu && vad_rate == cera::vad::VadSampleRate::Rate8kHz {
+                anyhow::bail!(
+                    "--npu accelerates 16 kHz windows only; 8 kHz input would run entirely on the CPU (re-run with --sample-rate 16000)"
+                );
+            }
+
             let config = cera::vad::VadConfig {
                 threshold,
                 neg_threshold,
@@ -4312,6 +4320,14 @@ fn main() -> Result<()> {
             }
 
             let timestamps = vad.get_speech_timestamps(&pcm, vad_rate, &config)?;
+
+            // `--npu` fails closed at enable time; fail closed here too if the DSP dropped out
+            // mid-run, or a benchmarking user mistakes CPU-computed timestamps for NPU ones.
+            if npu && !vad.is_accelerated() {
+                anyhow::bail!(
+                    "the NPU dropped out mid-run; results were computed on the CPU (see the log above)"
+                );
+            }
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&timestamps)?);

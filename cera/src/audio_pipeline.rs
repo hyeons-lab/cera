@@ -133,6 +133,8 @@ pub struct AudioPipelineConfig {
     pub hotword_config: Option<HotwordConfig>,
     /// Whisper transcription options.
     pub whisper_opts: Option<WhisperTranscribeOpts>,
+    /// Keep the VAD on the CPU even in `hexagon` builds (default false: try the NPU).
+    pub vad_on_cpu: bool,
 }
 
 impl Default for AudioPipelineConfig {
@@ -145,6 +147,7 @@ impl Default for AudioPipelineConfig {
             vad_config: VadConfig::default(),
             hotword_config: None,
             whisper_opts: None,
+            vad_on_cpu: false,
         }
     }
 }
@@ -160,6 +163,7 @@ impl AudioPipelineConfig {
             vad_config: self.vad_config.sanitized(),
             hotword_config: self.hotword_config.as_ref().map(|c| c.sanitized()),
             whisper_opts: self.whisper_opts.clone(),
+            vad_on_cpu: self.vad_on_cpu,
         }
     }
 }
@@ -181,6 +185,31 @@ pub struct AudioPipelineBuilder {
     labeler_config: Option<SpeakerLabelerConfig>,
 }
 
+/// What [`AudioPipelineBuilder::build`] does with an attached VAD.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VadBackendAction {
+    /// Opted out: drop any accelerator the VAD already carries.
+    ForceCpu,
+    /// Default: try the NPU when the VAD has no accelerator yet.
+    TryHexagon,
+    /// No VAD attached, or already accelerated: leave it alone.
+    Keep,
+}
+
+/// The pure `build` decision behind [`AudioPipelineBuilder::with_vad_on_cpu`], truth-tabled in
+/// `tests` so the wiring (not just the flag) is pinned.
+fn vad_backend_action(vad_on_cpu: bool, has_vad: bool, accelerated: bool) -> VadBackendAction {
+    if !has_vad {
+        VadBackendAction::Keep
+    } else if vad_on_cpu {
+        VadBackendAction::ForceCpu
+    } else if accelerated {
+        VadBackendAction::Keep
+    } else {
+        VadBackendAction::TryHexagon
+    }
+}
+
 impl AudioPipelineBuilder {
     /// Create a new empty audio pipeline builder.
     pub fn new() -> Self {
@@ -193,13 +222,18 @@ impl AudioPipelineBuilder {
         self
     }
 
-    /// Keep the VAD on the CPU. In a build with the `hexagon` feature the pipeline otherwise runs
-    /// the VAD's 16 kHz windows on the Hexagon NPU when one is available: the VAD runs for every
+    /// Keep the VAD on the CPU (`true`) or let [`Self::build`] move it to the NPU (the
+    /// default, `false`). In a build with the `hexagon` feature the pipeline otherwise runs the
+    /// VAD's 16 kHz windows on the Hexagon NPU when one is available: the VAD runs for every
     /// 32 ms of audio, speech or not, so it is the model an always-on service keeps busiest, and
-    /// on the NPU it costs the CPU about a sixth of what it does on the CPU (and escapes
-    /// Android's demotion of background CPU work).
-    pub fn with_vad_on_cpu(mut self) -> Self {
-        self.vad_on_cpu = true;
+    /// on the NPU it costs the CPU on the order of a tenth of what it does on the CPU (S25 Ultra,
+    /// release build; re-measure on your SoC with `cera/examples/hexagon_vad_probe.rs`) while
+    /// escaping Android's demotion of background CPU work. Opting out also drops an accelerator
+    /// a [`Self::with_vad`] session already carries. Equivalent to setting
+    /// [`AudioPipelineConfig::vad_on_cpu`]; either opts out, so [`AudioPipeline::from_files`]
+    /// callers (who only carry the config) can opt out too.
+    pub fn with_vad_on_cpu(mut self, on_cpu: bool) -> Self {
+        self.vad_on_cpu = on_cpu;
         self
     }
 
@@ -403,19 +437,25 @@ impl AudioPipelineBuilder {
                 iterator
             }
         });
-        #[cfg(feature = "hexagon")]
         let vad = {
             let mut vad = self.vad;
-            if !self.vad_on_cpu
-                && let Some(v) = vad.as_mut()
-                && !v.is_accelerated()
-            {
-                v.try_enable_hexagon();
+            // Either the builder flag or the config opts out (fail-safe); `from_files` only
+            // carries the config, so the knob must live in both.
+            let action = vad_backend_action(
+                self.vad_on_cpu || config.vad_on_cpu,
+                vad.is_some(),
+                vad.as_ref().is_some_and(|v| v.is_accelerated()),
+            );
+            match (vad.as_mut(), action) {
+                (Some(v), VadBackendAction::ForceCpu) => v.clear_accelerator(),
+                #[cfg(feature = "hexagon")]
+                (Some(v), VadBackendAction::TryHexagon) => {
+                    v.try_enable_hexagon();
+                }
+                _ => {}
             }
             vad
         };
-        #[cfg(not(feature = "hexagon"))]
-        let vad = self.vad;
         let vad_sample_rate = self.vad_sample_rate.unwrap_or(VadSampleRate::Rate16kHz);
         let vad_iter = if vad.is_some() {
             Some(VadIterator::new(vad_sample_rate, vad_config))

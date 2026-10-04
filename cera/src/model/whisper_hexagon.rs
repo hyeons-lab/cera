@@ -2598,10 +2598,7 @@ pub fn init_hexagon_whisper(
         CeraError::Backend(format!("Hexagon context creation failed: {e}"))
     })?;
 
-    let arch_override = std::env::var("CERA_HEXAGON_ARCH")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .and_then(HexagonArch::from_u32);
+    let arch_override = crate::backend::hexagon::arch_override();
 
     let dev = crate::backend::hexagon::probe_device(context.driver(), arch_override)
         .map_err(|e| CeraError::Backend(format!("Hexagon DSP device probe failed: {e}")))?;
