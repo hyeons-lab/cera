@@ -2298,6 +2298,79 @@ fn transcript_labeler_config(threshold: f32) -> cera::speaker_labeler::SpeakerLa
     }
 }
 
+/// One `UtteranceLabeled` event as a `diarize --json` row (`None` for any other
+/// event). The event travels as one reference, not seven positionals, so a
+/// `start_ms`/`end_ms` or `speaker`/`overlapping` swap cannot compile silently.
+/// Pure so the `dropped` key stays pinned: a dropped key would silently
+/// un-surface the stall-vs-silence signal.
+fn labeled_json_row(ev: &cera::audio_pipeline::AudioPipelineEvent) -> Option<serde_json::Value> {
+    let cera::audio_pipeline::AudioPipelineEvent::UtteranceLabeled {
+        text,
+        start_ms,
+        end_ms,
+        speaker,
+        confidence,
+        overlapping,
+        dropped,
+    } = ev
+    else {
+        return None;
+    };
+    Some(serde_json::json!({
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "speaker": speaker,
+        "confidence": confidence,
+        "overlapping": overlapping,
+        "dropped": dropped,
+        "text": text,
+    }))
+}
+
+/// One `UtteranceLabeled` event as a `diarize` text line (`None` for any other
+/// event). Pure for the same pin as [`labeled_json_row`]: the ` [dropped]`
+/// suffix must survive on dropped utterances only.
+fn labeled_text_line(ev: &cera::audio_pipeline::AudioPipelineEvent) -> Option<String> {
+    let cera::audio_pipeline::AudioPipelineEvent::UtteranceLabeled {
+        text,
+        start_ms,
+        end_ms,
+        speaker,
+        confidence,
+        overlapping,
+        dropped,
+    } = ev
+    else {
+        return None;
+    };
+    // The match borrows the event, so the `Copy` fields arrive by reference.
+    let (start_ms, end_ms, speaker, confidence, overlapping, dropped) = (
+        *start_ms,
+        *end_ms,
+        *speaker,
+        *confidence,
+        *overlapping,
+        *dropped,
+    );
+    let who = speaker.map_or("?".to_string(), |s| s.to_string());
+    let extra = match (confidence, overlapping) {
+        (Some(c), Some(o)) => format!(" ({:.0}%, overlaps {o})", c * 100.0),
+        (Some(c), None) => format!(" ({:.0}%)", c * 100.0),
+        _ => String::new(),
+    };
+    let extra = if dropped {
+        format!("{extra} [dropped]")
+    } else {
+        extra
+    };
+    Some(format!(
+        "[{:7.2}s - {:7.2}s] speaker {who}{extra}: {}",
+        start_ms / 1000.0,
+        end_ms / 1000.0,
+        text.trim()
+    ))
+}
+
 /// `cera diarize --vad .. --whisper ..`: the audio pipeline (VAD, Whisper and the Sortformer
 /// diarizer) hears the audio piece by piece, as a background service would. Each utterance is
 /// printed with its speaker as soon as the diarizer has covered it.
@@ -2314,7 +2387,8 @@ fn diarize_with_transcript(
 ) -> Result<()> {
     use cera::audio_pipeline::AudioPipelineEvent;
 
-    let latency_s = (params.chunk_len + params.right_context) as f64 * 0.08;
+    let latency_s =
+        (params.chunk_len + params.right_context) as f64 * cera::speaker_labeler::FRAME_MS / 1000.0;
     let mut pipeline = cera::AudioPipeline::builder()
         .with_vad_from_file(vad)
         .with_context(|| format!("loading VAD from `{vad}`"))?
@@ -2326,39 +2400,12 @@ fn diarize_with_transcript(
 
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let mut emit = |ev: AudioPipelineEvent| {
-        let AudioPipelineEvent::UtteranceLabeled {
-            text,
-            start_ms,
-            end_ms,
-            speaker,
-            confidence,
-            overlapping,
-        } = ev
-        else {
-            return;
-        };
         if json {
-            rows.push(serde_json::json!({
-                "start_ms": start_ms,
-                "end_ms": end_ms,
-                "speaker": speaker,
-                "confidence": confidence,
-                "overlapping": overlapping,
-                "text": text,
-            }));
-        } else {
-            let who = speaker.map_or("?".to_string(), |s| s.to_string());
-            let extra = match (confidence, overlapping) {
-                (Some(c), Some(o)) => format!(" ({:.0}%, overlaps {o})", c * 100.0),
-                (Some(c), None) => format!(" ({:.0}%)", c * 100.0),
-                _ => String::new(),
-            };
-            println!(
-                "[{:7.2}s - {:7.2}s] speaker {who}{extra}: {}",
-                start_ms / 1000.0,
-                end_ms / 1000.0,
-                text.trim()
-            );
+            if let Some(row) = labeled_json_row(&ev) {
+                rows.push(row);
+            }
+        } else if let Some(line) = labeled_text_line(&ev) {
+            println!("{line}");
         }
     };
 
@@ -5756,10 +5803,11 @@ mod tests {
 
     use super::{
         BundleQuantPair, Cli, CliSamplingArgs, Command, convert_history_to_chat_messages,
-        display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono, resample_linear,
-        resolve_engine, simulate_truncate_oldest_turn_pairs, split_at_marker,
-        transcript_labeler_config, truncate_oldest_turn_pair, whisper_catalog_cached_path,
-        whisper_catalog_unloadable_path, whisper_gguf_is_loadable, write_transcript, write_wav,
+        display_bundle_id, labeled_json_row, labeled_text_line, normalize_bundle_id,
+        read_wav_pcm16_mono, resample_linear, resolve_engine, simulate_truncate_oldest_turn_pairs,
+        split_at_marker, transcript_labeler_config, truncate_oldest_turn_pair,
+        whisper_catalog_cached_path, whisper_catalog_unloadable_path, whisper_gguf_is_loadable,
+        write_transcript, write_wav,
     };
     use cera::tokenizer::ChatMessage;
     use clap::Parser;
@@ -7378,6 +7426,36 @@ mod tests {
                 assert_eq!((mode.as_str(), preset.as_str()), ("live", "default"));
             }
             _ => panic!("expected Diarize command"),
+        }
+    }
+
+    /// Both `diarize` renderings carry the `dropped` flag in both polarities: a stalled
+    /// diarizer must stay distinguishable from silence in JSON and text alike.
+    #[test]
+    fn diarize_rendering_pins_dropped_in_both_polarities() {
+        use cera::audio_pipeline::AudioPipelineEvent;
+        let ev = |dropped: bool| AudioPipelineEvent::UtteranceLabeled {
+            text: "hi".to_string(),
+            start_ms: 0.0,
+            end_ms: 900.0,
+            speaker: None,
+            confidence: None,
+            overlapping: None,
+            dropped,
+        };
+        for dropped in [true, false] {
+            let row = labeled_json_row(&ev(dropped)).expect("a labeled event renders");
+            assert_eq!(
+                row.get("dropped").and_then(serde_json::Value::as_bool),
+                Some(dropped),
+                "JSON row lost the flag"
+            );
+            let line = labeled_text_line(&ev(dropped)).expect("a labeled event renders");
+            assert_eq!(
+                line.contains("[dropped]"),
+                dropped,
+                "text line suffix mismatch: {line:?}"
+            );
         }
     }
 

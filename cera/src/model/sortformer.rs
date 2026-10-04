@@ -327,7 +327,17 @@ pub(crate) struct SortformerWeights {
     /// Set once by [`SortformerModel::set_accelerator`].
     accel: OnceLock<Arc<dyn SortformerAccelerator>>,
     /// Whether an accelerator failure has been logged, once per [`AccelStage`].
-    accel_warned: [AtomicBool; 3],
+    accel_warned: AccelWarned,
+}
+
+/// One warn-once latch per [`AccelStage`]. Named fields, not an indexed array, so adding a
+/// stage fails the build (in `warned`) instead of panicking with an out-of-bounds index on
+/// the first warning.
+#[derive(Default)]
+struct AccelWarned {
+    log_mel: AtomicBool,
+    stem: AtomicBool,
+    predict: AtomicBool,
 }
 
 /// One stage of the accelerated diarization step. Each stage warns once, independently: a
@@ -348,11 +358,12 @@ impl AccelStage {
         }
     }
 
-    fn index(self) -> usize {
+    /// This stage's warn-once latch. Exhaustive: a new variant fails the build here.
+    fn warned(self, latched: &AccelWarned) -> &AtomicBool {
         match self {
-            AccelStage::LogMel => 0,
-            AccelStage::Stem => 1,
-            AccelStage::Predict => 2,
+            AccelStage::LogMel => &latched.log_mel,
+            AccelStage::Stem => &latched.stem,
+            AccelStage::Predict => &latched.predict,
         }
     }
 }
@@ -641,11 +652,7 @@ impl SortformerWeights {
             window,
             mel_fb,
             accel: OnceLock::new(),
-            accel_warned: [
-                AtomicBool::new(false),
-                AtomicBool::new(false),
-                AtomicBool::new(false),
-            ],
+            accel_warned: AccelWarned::default(),
         })
     }
 }
@@ -2175,7 +2182,10 @@ impl SortformerWeights {
 
     /// Log a stage's accelerator fault once (later faults of the same stage stay quiet).
     fn warn_once(&self, stage: AccelStage, detail: &str) {
-        if !self.accel_warned[stage.index()].swap(true, Ordering::Relaxed) {
+        if !stage
+            .warned(&self.accel_warned)
+            .swap(true, Ordering::Relaxed)
+        {
             tracing::warn!("sortformer: {} {detail}", stage.label());
             // No `tracing` subscriber on the shipping mobile/FFI platforms; without this
             // the warning is invisible exactly where the fallback runs.
@@ -2837,5 +2847,219 @@ mod tests {
             .to_string();
         assert!(err.contains("7501") && err.contains("offline"), "{err}");
         assert!(ensure_offline_len(0).is_ok());
+    }
+
+    #[derive(Clone, Copy)]
+    enum TwinMode {
+        Delegate,
+        Decline,
+        Fail,
+        Short,
+        Long,
+    }
+    struct TwinDouble(TwinMode);
+    impl TwinDouble {
+        fn out(&self) -> Result<Option<Vec<f32>>> {
+            match self.0 {
+                TwinMode::Delegate => Ok(Some(vec![1.0; 4])),
+                TwinMode::Decline => Ok(None),
+                TwinMode::Fail => anyhow::bail!("the accelerator is gone"),
+                TwinMode::Short => Ok(Some(vec![1.0; 3])),
+                TwinMode::Long => Ok(Some(vec![1.0; 5])),
+            }
+        }
+    }
+    impl SortformerAccelerator for TwinDouble {
+        fn pre_encode(&self, _mel: &[f32], _n: usize) -> Result<Option<Vec<f32>>> {
+            self.out()
+        }
+        fn predict(&self, _emb: &[f32], _t: usize) -> Result<Option<Vec<f32>>> {
+            self.out()
+        }
+        fn log_mel(&self, _samples: &[f32], _n: usize) -> Result<Option<Vec<f32>>> {
+            self.out()
+        }
+    }
+
+    /// Weightless `SortformerWeights` with a scripted accelerator: the fallback contract
+    /// touches no weights, so twins built here run in CI.
+    fn twin_weights(mode: TwinMode) -> SortformerWeights {
+        let accel = OnceLock::new();
+        assert!(
+            accel
+                .set(Arc::new(TwinDouble(mode)) as Arc<dyn SortformerAccelerator>)
+                .is_ok()
+        );
+        SortformerWeights {
+            config: SortformerConfig {
+                n_layer: 0,
+                n_embd: 0,
+                n_ff: 0,
+                n_head: 0,
+                eps: 0.0,
+                n_mel_bins: 0,
+                tf_layers: 0,
+                tf_d: 0,
+                tf_heads: 0,
+                tf_inner: 0,
+                tf_eps: 0.0,
+                n_spk: 0,
+                subsampling: 0,
+                xscaling: false,
+                pad_to: 0,
+            },
+            streaming: params(24),
+            enc_cfg: AudioEncoderConfig {
+                n_layer: 0,
+                n_embd: 0,
+                n_ff: 0,
+                n_head: 0,
+                eps: 0.0,
+                n_mel_bins: 0,
+                llm_hidden_size: 0,
+            },
+            conv_stem: ConvStemWeights {
+                layers: vec![],
+                pre_encode_out_w: MmapWeight::from_owned_f32(vec![], 0, 0),
+                pre_encode_out_b: vec![],
+            },
+            layers: vec![],
+            proj_w: MmapWeight::from_owned_f32(vec![], 0, 0),
+            proj_b: vec![],
+            tf: vec![],
+            head_hidden_w: MmapWeight::from_owned_f32(vec![], 0, 0),
+            head_hidden_b: vec![],
+            head_out_w: MmapWeight::from_owned_f32(vec![], 0, 0),
+            head_out_b: vec![],
+            window: vec![],
+            mel_fb: vec![],
+            accel,
+            accel_warned: AccelWarned::default(),
+        }
+    }
+
+    /// The fallback contract without a model: a well-formed output is taken, a decline, an
+    /// error, or a wrong-length output (short or long) falls back to `None`, and each faulty
+    /// stage latches its own warn-once bit. The guard touches no weights, so this twin runs
+    /// in CI where the model-gated parity suite skips.
+    #[test]
+    fn accelerated_checked_routes_decline_fail_and_wrong_lengths_to_none() {
+        use std::sync::atomic::Ordering;
+
+        let latched = |w: &SortformerWeights| {
+            [
+                w.accel_warned.log_mel.load(Ordering::Relaxed),
+                w.accel_warned.stem.load(Ordering::Relaxed),
+                w.accel_warned.predict.load(Ordering::Relaxed),
+            ]
+        };
+
+        let w = twin_weights(TwinMode::Delegate);
+        assert_eq!(
+            w.accelerated_checked(AccelStage::Stem, 4, |a| a.pre_encode(&[], 0)),
+            Some(vec![1.0; 4])
+        );
+        assert_eq!(latched(&w), [false, false, false]);
+
+        let w = twin_weights(TwinMode::Decline);
+        assert_eq!(
+            w.accelerated_checked(AccelStage::Stem, 4, |a| a.pre_encode(&[], 0)),
+            None
+        );
+        assert_eq!(latched(&w), [false, false, false]);
+
+        for mode in [TwinMode::Fail, TwinMode::Short, TwinMode::Long] {
+            let w = twin_weights(mode);
+            assert_eq!(
+                w.accelerated_checked(AccelStage::LogMel, 4, |a| a.log_mel(&[], 0)),
+                None
+            );
+            assert_eq!(latched(&w), [true, false, false]);
+            // A second fault of the same stage stays quiet but still falls back.
+            assert_eq!(
+                w.accelerated_checked(AccelStage::LogMel, 4, |a| a.log_mel(&[], 0)),
+                None
+            );
+            // ...while each other stage still gets its own first warning.
+            assert_eq!(
+                w.accelerated_checked(AccelStage::Stem, 4, |a| a.pre_encode(&[], 0)),
+                None
+            );
+            assert_eq!(latched(&w), [true, true, false]);
+            assert_eq!(
+                w.accelerated_checked(AccelStage::Predict, 4, |a| a.predict(&[], 0)),
+                None
+            );
+            assert_eq!(latched(&w), [true, true, true]);
+        }
+    }
+
+    /// Child leg of [`warn_once_faults_reach_stderr_without_a_subscriber`]: faults one stage
+    /// and returns. Harmless under the normal suite; the parent runs it in a subprocess.
+    #[test]
+    fn warn_once_stderr_child_emits_one_fault() {
+        let w = twin_weights(TwinMode::Fail);
+        assert_eq!(
+            w.accelerated_checked(AccelStage::Predict, 4, |a| a.predict(&[], 0)),
+            None
+        );
+    }
+
+    /// The warn-once fault line reaches stderr with no subscriber installed: the `eprintln!`
+    /// is the only accelerator-fault signal visible on shipping mobile, so deleting it must
+    /// fail this test, not pass silently. A subprocess with `--nocapture` carries the proof:
+    /// the harness captures `eprintln!` in-process, so only a subprocess's real fd 2 shows
+    /// the emission.
+    #[test]
+    fn warn_once_faults_reach_stderr_without_a_subscriber() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("model::sortformer::tests::warn_once_stderr_child_emits_one_fault")
+            .arg("--nocapture")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.lines()
+                .any(|l| l.starts_with("cera-sortformer: predict ")
+                    && l.contains("the accelerator is gone")),
+            "stderr must carry the fault: {err:?}"
+        );
+    }
+
+    /// Child leg of [`warn_once_length_faults_reach_stderr_without_a_subscriber`]: feeds a
+    /// short stage output through the length check and returns. Harmless under the normal
+    /// suite; the parent runs it in a subprocess.
+    #[test]
+    fn warn_once_length_stderr_child_emits_one_fault() {
+        let w = twin_weights(TwinMode::Short);
+        assert_eq!(
+            w.accelerated_checked(AccelStage::Predict, 4, |a| a.predict(&[], 0)),
+            None
+        );
+    }
+
+    /// The length-mismatch fault line reaches stderr too: silently returning `None` from
+    /// the wrong-length arm of `accelerated_checked` would pass the fail-path test above,
+    /// so this pins the arm's own warning. Same subprocess proof.
+    #[test]
+    fn warn_once_length_faults_reach_stderr_without_a_subscriber() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("model::sortformer::tests::warn_once_length_stderr_child_emits_one_fault")
+            .arg("--nocapture")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.lines()
+                .any(|l| l.starts_with("cera-sortformer: predict ")
+                    && l.contains("returned 3 values, want 4")),
+            "stderr must carry the length fault: {err:?}"
+        );
     }
 }

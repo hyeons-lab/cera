@@ -90,12 +90,16 @@ pub enum FfiAudioPipelineEvent {
         /// End timestamp of the utterance in milliseconds.
         end_ms: f32,
         /// The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
-        /// span or the labeler had to give the utterance up.
+        /// span or the labeler had to give the utterance up (see `dropped`).
         speaker: Option<u32>,
         /// The speaker's share of all speakers' active time over the span, in (0, 1].
         confidence: Option<f32>,
         /// A second speaker who was also clearly active over the span, if any.
         overlapping: Option<u32>,
+        /// True when the labeler gave the utterance up instead of labeling it (history expiry,
+        /// queue overflow, or non-finite times): `None` speaker with `dropped` set is a stalled
+        /// diarizer, not silence.
+        dropped: bool,
     },
 }
 
@@ -145,6 +149,7 @@ impl From<cera::audio_pipeline::AudioPipelineEvent> for FfiAudioPipelineEvent {
                 speaker,
                 confidence,
                 overlapping,
+                dropped,
             } => Self::UtteranceLabeled {
                 text,
                 start_ms,
@@ -152,6 +157,7 @@ impl From<cera::audio_pipeline::AudioPipelineEvent> for FfiAudioPipelineEvent {
                 speaker,
                 confidence,
                 overlapping,
+                dropped,
             },
         }
     }

@@ -10040,14 +10040,19 @@ public enum FfiAudioPipelineEvent: Equatable, Hashable {
          */endMs: Float, 
         /**
          * The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
-         * span or the labeler had to give the utterance up.
+         * span or the labeler had to give the utterance up (see `dropped`).
          */speaker: UInt32?, 
         /**
          * The speaker's share of all speakers' active time over the span, in (0, 1].
          */confidence: Float?, 
         /**
          * A second speaker who was also clearly active over the span, if any.
-         */overlapping: UInt32?
+         */overlapping: UInt32?, 
+        /**
+         * True when the labeler gave the utterance up instead of labeling it (history expiry,
+         * queue overflow, or non-finite times): `None` speaker with `dropped` set is a stalled
+         * diarizer, not silence.
+         */dropped: Bool
     )
 
 
@@ -10082,7 +10087,7 @@ public struct FfiConverterTypeFfiAudioPipelineEvent: FfiConverterRustBuffer {
         case 4: return .utteranceTranscribed(text: try FfiConverterString.read(from: &buf), startMs: try FfiConverterFloat.read(from: &buf), endMs: try FfiConverterFloat.read(from: &buf), sampleCount: try FfiConverterUInt64.read(from: &buf)
         )
         
-        case 5: return .utteranceLabeled(text: try FfiConverterString.read(from: &buf), startMs: try FfiConverterFloat.read(from: &buf), endMs: try FfiConverterFloat.read(from: &buf), speaker: try FfiConverterOptionUInt32.read(from: &buf), confidence: try FfiConverterOptionFloat.read(from: &buf), overlapping: try FfiConverterOptionUInt32.read(from: &buf)
+        case 5: return .utteranceLabeled(text: try FfiConverterString.read(from: &buf), startMs: try FfiConverterFloat.read(from: &buf), endMs: try FfiConverterFloat.read(from: &buf), speaker: try FfiConverterOptionUInt32.read(from: &buf), confidence: try FfiConverterOptionFloat.read(from: &buf), overlapping: try FfiConverterOptionUInt32.read(from: &buf), dropped: try FfiConverterBool.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -10123,7 +10128,7 @@ public struct FfiConverterTypeFfiAudioPipelineEvent: FfiConverterRustBuffer {
             FfiConverterUInt64.write(sampleCount, into: &buf)
             
         
-        case let .utteranceLabeled(text,startMs,endMs,speaker,confidence,overlapping):
+        case let .utteranceLabeled(text,startMs,endMs,speaker,confidence,overlapping,dropped):
             writeInt(&buf, Int32(5))
             FfiConverterString.write(text, into: &buf)
             FfiConverterFloat.write(startMs, into: &buf)
@@ -10131,6 +10136,7 @@ public struct FfiConverterTypeFfiAudioPipelineEvent: FfiConverterRustBuffer {
             FfiConverterOptionUInt32.write(speaker, into: &buf)
             FfiConverterOptionFloat.write(confidence, into: &buf)
             FfiConverterOptionUInt32.write(overlapping, into: &buf)
+            FfiConverterBool.write(dropped, into: &buf)
             
         }
     }

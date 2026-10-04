@@ -31,7 +31,9 @@ use std::collections::HashMap;
 use std::path::PathBuf;
 
 use cera::convert::safetensors::SafeTensorsHeader;
-use cera::model::sortformer::{SortformerAccelerator, SortformerModel, StreamingParams};
+use cera::model::sortformer::{
+    SortformerAccelerator, SortformerModel, StreamingParams, stem_frames,
+};
 
 fn models_dir() -> Option<PathBuf> {
     match std::env::var_os("SORTFORMER_MODELS_DIR") {
@@ -1383,6 +1385,12 @@ struct CpuDouble {
     stems: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     predicts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     mels: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Widest `predict` step observed: every staging call sizes DSP scratch from
+    /// `window_frames()`, so a step past the window would silently decline the NPU.
+    max_t: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Widest `pre_encode` batch observed, in mel frames: the stem declines past
+    /// `stem_frames(n) > max_frames` with no warning, the same silent shape as `predict`.
+    max_n: std::sync::Arc<std::sync::atomic::AtomicUsize>,
     /// The model's window and `[n_mel x 257]` filterbank, read from its GGUF.
     mel_tables: (Vec<f32>, Vec<f32>),
 }
@@ -1426,6 +1434,8 @@ impl SortformerAccelerator for CpuDouble {
     fn pre_encode(&self, mel: &[f32], n: usize) -> anyhow::Result<Option<Vec<f32>>> {
         self.stems
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.max_n
+            .fetch_max(n, std::sync::atomic::Ordering::Relaxed);
         match self.mode {
             Mode::Delegate => Ok(Some(self.cpu.pre_encode(mel, n).0)),
             Mode::Decline => Ok(None),
@@ -1437,6 +1447,8 @@ impl SortformerAccelerator for CpuDouble {
     fn predict(&self, emb: &[f32], t: usize) -> anyhow::Result<Option<Vec<f32>>> {
         self.predicts
             .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.max_t
+            .fetch_max(t, std::sync::atomic::Ordering::Relaxed);
         match self.mode {
             Mode::Delegate => Ok(Some(self.cpu.predict_cpu(emb, t))),
             Mode::Decline => Ok(None),
@@ -1508,16 +1520,19 @@ fn an_accelerator_is_used_by_the_stream_and_never_changes_the_answer() {
         (window, g.get_tensor("sf.mel.fb").unwrap().to_f32_vec())
     };
     let counter = || Arc::new(AtomicUsize::new(0));
-    let double = |mode, c: &[Arc<AtomicUsize>; 3]| {
-        Arc::new(CpuDouble {
-            cpu: model(file).unwrap(),
-            mode,
-            stems: c[0].clone(),
-            predicts: c[1].clone(),
-            mels: c[2].clone(),
-            mel_tables: tables(),
-        })
-    };
+    let double =
+        |mode, c: &[Arc<AtomicUsize>; 3], max_t: &Arc<AtomicUsize>, max_n: &Arc<AtomicUsize>| {
+            Arc::new(CpuDouble {
+                cpu: model(file).unwrap(),
+                mode,
+                stems: c[0].clone(),
+                predicts: c[1].clone(),
+                mels: c[2].clone(),
+                max_t: max_t.clone(),
+                max_n: max_n.clone(),
+                mel_tables: tables(),
+            })
+        };
     let pushes = pcm.len().div_ceil(1600);
 
     for (name, mode, want_warns) in [
@@ -1528,7 +1543,9 @@ fn an_accelerator_is_used_by_the_stream_and_never_changes_the_answer() {
     ] {
         let m = model(file).unwrap();
         let c = [counter(), counter(), counter()];
-        m.set_accelerator(double(mode, &c)).unwrap();
+        let max_t = counter();
+        let max_n = counter();
+        m.set_accelerator(double(mode, &c, &max_t, &max_n)).unwrap();
         // Scoped to this thread: sibling tests on other threads keep their own subscriber.
         // The `sortformer: ` prefix is the model's own fault tag, so warnings from any
         // other target cannot move this count.
@@ -1571,6 +1588,24 @@ fn an_accelerator_is_used_by_the_stream_and_never_changes_the_answer() {
                     got, want,
                     "{name}: the streaming path ignored the accelerator mel"
                 );
+                // Every staging call sizes DSP scratch from the window; a step past it would
+                // silently decline the NPU while the flag still claims it.
+                let widest = max_t.load(Ordering::Relaxed);
+                assert!(
+                    widest <= params.window_frames(),
+                    "{name}: staging bound undercounts a real step ({widest} > {})",
+                    params.window_frames()
+                );
+                // Same for the stem, which declines past `stem_frames(n)` frames with no
+                // warning either.
+                let widest_stem = max_n.load(Ordering::Relaxed);
+                assert!(
+                    stem_frames(widest_stem) <= params.window_frames(),
+                    "{name}: staging bound undercounts a real stem batch ({widest_stem} mel \
+                     frames -> {} > {})",
+                    stem_frames(widest_stem),
+                    params.window_frames()
+                );
             }
             _ => assert_eq!(got, want, "{name}: predictions differ from the CPU run"),
         }
@@ -1585,7 +1620,12 @@ fn an_accelerator_is_used_by_the_stream_and_never_changes_the_answer() {
             "{name}: {mels} mel calls for {pushes} pushes"
         );
         // A second accelerator is refused rather than silently replacing the first.
-        let again = m.set_accelerator(double(mode, &[counter(), counter(), counter()]));
+        let again = m.set_accelerator(double(
+            mode,
+            &[counter(), counter(), counter()],
+            &counter(),
+            &counter(),
+        ));
         assert!(again.is_err(), "{name}: a second accelerator was accepted");
     }
 }

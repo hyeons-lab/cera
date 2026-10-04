@@ -14978,7 +14978,7 @@ sealed class FfiAudioPipelineEvent {
         val `endMs`: kotlin.Float,
         /**
          * The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
-         * span or the labeler had to give the utterance up.
+         * span or the labeler had to give the utterance up (see `dropped`).
          */
         val `speaker`: kotlin.UInt?,
         /**
@@ -14989,6 +14989,12 @@ sealed class FfiAudioPipelineEvent {
          * A second speaker who was also clearly active over the span, if any.
          */
         val `overlapping`: kotlin.UInt?,
+        /**
+         * True when the labeler gave the utterance up instead of labeling it (history expiry,
+         * queue overflow, or non-finite times): `None` speaker with `dropped` set is a stalled
+         * diarizer, not silence.
+         */
+        val `dropped`: kotlin.Boolean,
     ) : FfiAudioPipelineEvent() {
         companion object
     }
@@ -15044,6 +15050,7 @@ public object FfiConverterTypeFfiAudioPipelineEvent : FfiConverterRustBuffer<Ffi
                     FfiConverterOptionalUInt.read(buf),
                     FfiConverterOptionalFloat.read(buf),
                     FfiConverterOptionalUInt.read(buf),
+                    FfiConverterBoolean.read(buf),
                 )
             }
 
@@ -15105,7 +15112,8 @@ public object FfiConverterTypeFfiAudioPipelineEvent : FfiConverterRustBuffer<Ffi
                         FfiConverterFloat.allocationSize(value.`endMs`) +
                         FfiConverterOptionalUInt.allocationSize(value.`speaker`) +
                         FfiConverterOptionalFloat.allocationSize(value.`confidence`) +
-                        FfiConverterOptionalUInt.allocationSize(value.`overlapping`)
+                        FfiConverterOptionalUInt.allocationSize(value.`overlapping`) +
+                        FfiConverterBoolean.allocationSize(value.`dropped`)
                 )
             }
         }
@@ -15157,6 +15165,7 @@ public object FfiConverterTypeFfiAudioPipelineEvent : FfiConverterRustBuffer<Ffi
                 FfiConverterOptionalUInt.write(value.`speaker`, buf)
                 FfiConverterOptionalFloat.write(value.`confidence`, buf)
                 FfiConverterOptionalUInt.write(value.`overlapping`, buf)
+                FfiConverterBoolean.write(value.`dropped`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

@@ -8836,7 +8836,7 @@ class FfiAudioPipelineEvent:
         the default preset). Needs a pipeline built with `from_files_with_diarizer`.
 """
         
-        def __init__(self, text:str, start_ms:float, end_ms:float, speaker:typing.Optional[int], confidence:typing.Optional[float], overlapping:typing.Optional[int]):
+        def __init__(self, text:str, start_ms:float, end_ms:float, speaker:typing.Optional[int], confidence:typing.Optional[float], overlapping:typing.Optional[int], dropped:bool):
             self.text = text
             
             """
@@ -8859,7 +8859,7 @@ class FfiAudioPipelineEvent:
             
             """
         The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
-        span or the labeler had to give the utterance up.
+        span or the labeler had to give the utterance up (see `dropped`).
 """
         
             self.confidence = confidence
@@ -8874,6 +8874,14 @@ class FfiAudioPipelineEvent:
         A second speaker who was also clearly active over the span, if any.
 """
         
+            self.dropped = dropped
+            
+            """
+        True when the labeler gave the utterance up instead of labeling it (history expiry,
+        queue overflow, or non-finite times): `None` speaker with `dropped` set is a stalled
+        diarizer, not silence.
+"""
+        
             pass
 
     
@@ -8881,7 +8889,7 @@ class FfiAudioPipelineEvent:
             
     
         def __str__(self):
-            return "FfiAudioPipelineEvent.UTTERANCE_LABELED(text={}, start_ms={}, end_ms={}, speaker={}, confidence={}, overlapping={})".format(self.text, self.start_ms, self.end_ms, self.speaker, self.confidence, self.overlapping)
+            return "FfiAudioPipelineEvent.UTTERANCE_LABELED(text={}, start_ms={}, end_ms={}, speaker={}, confidence={}, overlapping={}, dropped={})".format(self.text, self.start_ms, self.end_ms, self.speaker, self.confidence, self.overlapping, self.dropped)
         def __eq__(self, other):
             if not isinstance(other, FfiAudioPipelineEvent):
                 return NotImplemented
@@ -8898,6 +8906,8 @@ class FfiAudioPipelineEvent:
             if self.confidence != other.confidence:
                 return False
             if self.overlapping != other.overlapping:
+                return False
+            if self.dropped != other.dropped:
                 return False
             return True
 
@@ -8977,6 +8987,7 @@ class _UniffiFfiConverterTypeFfiAudioPipelineEvent(_UniffiConverterRustBuffer):
                 _UniffiFfiConverterOptionalUInt32.read(buf),
                 _UniffiFfiConverterOptionalFloat32.read(buf),
                 _UniffiFfiConverterOptionalUInt32.read(buf),
+                _UniffiFfiConverterBoolean.read(buf),
             )
         raise InternalError("Raw enum value doesn't match any cases")
 
@@ -9011,6 +9022,7 @@ class _UniffiFfiConverterTypeFfiAudioPipelineEvent(_UniffiConverterRustBuffer):
             _UniffiFfiConverterOptionalUInt32.check_lower(value.speaker)
             _UniffiFfiConverterOptionalFloat32.check_lower(value.confidence)
             _UniffiFfiConverterOptionalUInt32.check_lower(value.overlapping)
+            _UniffiFfiConverterBoolean.check_lower(value.dropped)
             return
         raise ValueError(value)
 
@@ -9046,6 +9058,7 @@ class _UniffiFfiConverterTypeFfiAudioPipelineEvent(_UniffiConverterRustBuffer):
             _UniffiFfiConverterOptionalUInt32.write(value.speaker, buf)
             _UniffiFfiConverterOptionalFloat32.write(value.confidence, buf)
             _UniffiFfiConverterOptionalUInt32.write(value.overlapping, buf)
+            _UniffiFfiConverterBoolean.write(value.dropped, buf)
 
 
 

@@ -25,6 +25,12 @@ fn read_wav(path: &str) -> Vec<f32> {
         bytes.len()
     );
     let mut pos = 12;
+    // As `cera/tests/common/mod.rs::read_wav_f32`: `data` before a validated `fmt` is
+    // refused (decoding stereo 48 kHz bytes as mono 16 kHz would still print plausible
+    // numbers). The probe keeps its own copy: sharing the whole `common` module would drag
+    // the feature-gated (`gpu`/`remote`) helpers into a `cargo ndk` device example for one
+    // reader.
+    let mut fmt_ok = false;
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
         let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
@@ -52,7 +58,9 @@ fn read_wav(path: &str) -> Vec<f32> {
                 (1, 1, 16_000, 16),
                 "need mono 16 kHz s16"
             );
+            fmt_ok = true;
         } else if id == b"data" {
+            assert!(fmt_ok, "data before fmt in {path}");
             return body
                 .as_chunks::<2>()
                 .0
@@ -72,7 +80,9 @@ fn main() {
     use cera::backend::hexagon::{FastRpcDriver, probe_device};
     use cera::model::audio_encoder_hexagon::HexagonAudioEncoder;
     use cera::model::sortformer::SortformerModel;
-    use cera::model::sortformer_hexagon::{HexagonSortformerTail, TailStage};
+    use cera::model::sortformer_hexagon::{
+        HexagonSortformerTail, TailStage, try_hexagon_sortformer,
+    };
 
     let mut args = std::env::args().skip(1);
     let model_path = args
@@ -87,16 +97,17 @@ fn main() {
     let n = (seconds * 16_000.0) as usize;
     let pcm: Vec<f32> = (0..n).map(|i| wav[i % wav.len()]).collect();
 
-    // The checkpoint's default streaming step encodes up to 608 frames (speaker cache 188,
-    // FIFO 188, chunk 188 and its contexts); the low-latency preset needs about 390.
+    // DSP-memory cap for one staging; the fit against the checkpoint's own window is
+    // checked below, so a checkpoint change fails loud instead of declining silent.
     const MAX_FRAMES: usize = 608;
     let model = SortformerModel::from_file(&model_path).expect("load Sortformer");
+    let window = model.default_streaming().window_frames();
     let (mel, n_frames) = model.log_mel(&pcm);
     let (emb, t) = model.pre_encode(&mel, n_frames);
     println!("clip {seconds:.1} s -> {n_frames} mel frames -> {t} encoder frames");
     assert!(
-        t <= MAX_FRAMES,
-        "{t} frames exceed the NPU encoder's {MAX_FRAMES}"
+        t <= MAX_FRAMES && window <= MAX_FRAMES,
+        "clip t={t} or checkpoint window={window} exceeds staging {MAX_FRAMES}"
     );
 
     // CPU reference: the FastConformer output after block 0 and after the last block, from
@@ -246,8 +257,7 @@ fn main() {
     // The log-mel front end, and a whole live run, on a second model with the NPU as its
     // accelerator (mel, stem, blocks and tail) against the CPU model above.
     let npu_model = SortformerModel::from_file(&model_path).expect("load Sortformer again");
-    let _npu = cera::model::sortformer_hexagon::try_hexagon_sortformer(&npu_model, MAX_FRAMES)
-        .expect("stage the NPU diarizer");
+    let _npu = try_hexagon_sortformer(&npu_model, MAX_FRAMES).expect("stage the NPU diarizer");
     let (npu_mel, npu_n) = npu_model.log_mel(&pcm);
     assert_eq!(npu_n, n_frames);
     let worst = mel

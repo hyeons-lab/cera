@@ -187,11 +187,14 @@ old audio while preserving unexpired cooldown.
 With a Sortformer diarizer attached (`AudioPipelineBuilder::with_diarizer`,
 `FfiAudioPipeline.fromFilesWithDiarizer`) the pipeline feeds it every sample it
 sees and follows each `UtteranceTranscribed` with an `UtteranceLabeled`
-(`speaker`, `confidence`, `overlapping`) once the diarizer has covered the
+(`speaker`, `confidence`, `overlapping`, `dropped`) once the diarizer has covered the
 utterance, a chunk plus its lookahead later. `add_utterance` registers text
 transcribed elsewhere. `flush` ends the diarizer's session and starts a new one,
 so speaker slots are per session; `reset` starts a new stream. A diarizer that
-fails stops with a warning and the pipeline keeps transcribing.
+fails stops with a warning and the pipeline keeps transcribing. The event's
+`dropped` flag marks utterances the labeler gave up on (utterances labeled
+while the diarizer stalled carry a `None` speaker with `dropped` set, so they
+stay distinguishable from genuine silence).
 
 `AudioPipelineConfig.hotword_config` supplies detector configuration unless an
 explicit builder/attached-iterator configuration takes precedence. The Flutter

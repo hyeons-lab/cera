@@ -102,12 +102,16 @@ pub enum AudioPipelineEvent {
         /// End of the utterance in milliseconds.
         end_ms: f32,
         /// The most active speaker's slot (`0..4`), or `None` when the diarizer found no speaker
-        /// active over the span, or the labeler had to give the utterance up.
+        /// active over the span, or the labeler had to give the utterance up (see `dropped`).
         speaker: Option<u32>,
         /// The speaker's share of all speakers' active time over the span, in `(0, 1]`.
         confidence: Option<f32>,
         /// A second speaker who was also clearly active over the span, if any.
         overlapping: Option<u32>,
+        /// True when the labeler gave the utterance up instead of labeling it (history expiry,
+        /// queue overflow, or non-finite times): `None` speaker with `dropped` set is a stalled
+        /// diarizer, not silence.
+        dropped: bool,
     },
 }
 
@@ -462,7 +466,14 @@ struct PipelineDiarizer {
 
 /// Pipeline-clock `ms` in session-local time: an utterance that began before this session
 /// did (the span straddles a flush) starts at the session's first frame.
+///
+/// Non-finite times pass through untouched: `f64::max` maps NaN and `-inf` to `0.0`,
+/// which would smuggle an unplaceable utterance past the labeler's non-finite guard and
+/// emit it `dropped=false` with NaN timestamps instead of `dropped`.
 fn session_local_ms(ms: f32, origin_ms: f64) -> f64 {
+    if !ms.is_finite() {
+        return ms as f64;
+    }
     (ms as f64 - origin_ms).max(0.0)
 }
 
@@ -476,6 +487,7 @@ fn labeled_event(p: PendingUtterance, u: &LabeledUtterance) -> AudioPipelineEven
         speaker: label.map(|l| l.speaker as u32),
         confidence: label.map(|l| l.confidence),
         overlapping: label.and_then(|l| l.overlapping).map(|o| o as u32),
+        dropped: u.dropped,
     }
 }
 

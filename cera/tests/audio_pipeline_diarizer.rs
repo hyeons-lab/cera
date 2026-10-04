@@ -39,6 +39,36 @@ fn clip() -> Vec<f32> {
     )
 }
 
+/// A `data` chunk before the validated `fmt` chunk is refused, even when the `fmt`
+/// chunk itself is well-formed: decoding stereo 48 kHz bytes as mono 16 kHz would
+/// still print plausible numbers. This pins the shared `fmt_ok` predicate that the
+/// `hexagon_sortformer_probe` twin mirrors textually (a device-only example whose
+/// own reader cannot run under host CI).
+#[test]
+#[should_panic(expected = "data before fmt")]
+fn wav_reader_refuses_data_before_fmt() {
+    let mut wav = Vec::new();
+    wav.extend_from_slice(b"RIFF");
+    wav.extend_from_slice(&0u32.to_le_bytes()); // Length is unchecked; chunks bound it.
+    wav.extend_from_slice(b"WAVE");
+    wav.extend_from_slice(b"data");
+    wav.extend_from_slice(&2u32.to_le_bytes());
+    wav.extend_from_slice(&[0, 0]);
+    wav.extend_from_slice(b"fmt ");
+    wav.extend_from_slice(&16u32.to_le_bytes());
+    wav.extend_from_slice(&1u16.to_le_bytes()); // PCM
+    wav.extend_from_slice(&1u16.to_le_bytes()); // mono
+    wav.extend_from_slice(&16_000u32.to_le_bytes());
+    wav.extend_from_slice(&32_000u32.to_le_bytes()); // Byte rate.
+    wav.extend_from_slice(&2u16.to_le_bytes()); // Block align.
+    wav.extend_from_slice(&16u16.to_le_bytes());
+    // Fixed name: every run writes identical bytes, so concurrent runs are benign and
+    // no per-run litter accumulates (`should_panic` unwinds before cleanup could run).
+    let path = std::env::temp_dir().join("cera-wav-data-before-fmt.wav");
+    std::fs::write(&path, wav).unwrap();
+    common::read_wav_f32(&path);
+}
+
 /// Without a VAD the pipeline treats the stream as one utterance and transcribes nothing, so
 /// the test registers the utterances itself, as a caller with its own recognizer would.
 fn pipeline(m: &SortformerModel) -> AudioPipeline {
@@ -159,6 +189,47 @@ fn a_failing_diarizer_does_not_stop_the_pipeline() {
     let more = p.process_chunk(&vec![0.0f32; 1600]).unwrap();
     assert!(labeled(&more).is_empty());
     assert_eq!(p.current_sample(), 3200);
+}
+
+/// Child leg of [`a_failing_diarizer_warns_on_stderr_without_a_subscriber`]: fails the
+/// diarizer once and returns. Harmless under the normal suite; the parent runs it in a
+/// subprocess.
+#[test]
+fn failing_diarizer_stderr_child_fails_once() {
+    let Some(m) = model() else { return };
+    let mut p = pipeline(&m);
+    let mut bad = vec![0.0f32; 1600];
+    bad[10] = 2e9; // finite, so the pipeline passes it on; the mel front end refuses it
+    p.process_chunk(&bad).expect("the pipeline itself is fine");
+    assert!(!p.has_diarizer());
+}
+
+/// The diarizer-failure line reaches stderr with no subscriber installed: `fail()` clears
+/// the session and pending utterances, and the `eprintln!` is the only on-device record
+/// of why labels stopped, so deleting it must fail this test, not pass silently. A
+/// subprocess with `--nocapture` carries the proof: the harness captures `eprintln!`
+/// in-process, so only a subprocess's real fd 2 shows the emission.
+#[test]
+fn a_failing_diarizer_warns_on_stderr_without_a_subscriber() {
+    if model().is_none() {
+        return;
+    }
+    let exe = std::env::current_exe().unwrap();
+    let out = std::process::Command::new(exe)
+        .arg("--exact")
+        .arg("failing_diarizer_stderr_child_fails_once")
+        .arg("--nocapture")
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let err = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        err.lines().any(
+            |l| l.starts_with("cera-audio-pipeline: speaker diarizer audio failed")
+                && l.contains("continuing without speaker labels")
+        ),
+        "stderr must carry the diarizer failure: {err:?}"
+    );
 }
 
 /// `reset` starts a new stream: pending utterances are forgotten and the clock restarts at zero.

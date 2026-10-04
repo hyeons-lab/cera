@@ -1010,17 +1010,31 @@ mod tests {
     }
 
     /// Q and K reach the score matmul in the 32-lane layout (24 real lanes), the softmax runs
-    /// once per layer without a mask, and the head ends in a sigmoid over the 4 speakers.
+    /// once per layer without a mask, and the head ends in a sigmoid over the 4 speakers. The
+    /// full opcode sequence is pinned: op counts alone pass a within-layer swap, and at `t=10`
+    /// the contraction-key pin collapses onto the lane pins (`pad32(10) == HEAD_LANES`), so
+    /// this emits at `t=40` where the 64-wide contraction separates from the 32-wide lanes.
     #[test]
     fn a_layer_pads_the_heads_and_the_head_ends_in_a_sigmoid() {
-        let (s, out, so) = emit(TailStage::Full, 2, 10);
-        let ops = s.opcodes();
-        let count = |c: HtpOpCode| ops.iter().filter(|&&o| o == c as u32).count();
-        assert_eq!(count(HtpOpCode::Softmax), 2);
-        assert_eq!(count(HtpOpCode::Norm), 4);
-        assert_eq!(count(HtpOpCode::UnarySigmoid), 1);
-        // Per layer: 6 projection linears are tiled, plus 2 attention matmuls (F32).
-        assert_eq!(ops.last().copied(), Some(HtpOpCode::UnarySigmoid as u32));
+        use HtpOpCode::*;
+        let (s, out, so) = emit(TailStage::Full, 2, 40);
+        let proj = [MulMat, Add];
+        let qkv = [MulMat, Add, MulMat, Add, MulMat, Add];
+        let body = [
+            Cpy, Cpy, MulMat, Softmax, Cpy, Cpy, MulMat, MulMat, Add, Add, Norm, Mul, Add, MulMat,
+            Add, UnaryRelu, MulMat, Add, Add, Norm, Mul, Add,
+        ];
+        let head = [UnaryRelu, MulMat, Add, UnaryRelu, MulMat, Add, UnarySigmoid];
+        let expect: Vec<u32> = proj
+            .iter()
+            .chain(&qkv)
+            .chain(&body)
+            .chain(&qkv)
+            .chain(&body)
+            .chain(&head)
+            .map(|o| *o as u32)
+            .collect();
+        assert_eq!(s.opcodes(), expect);
         // Every F32 score matmul reads 32-lane operands.
         let f32_mm: Vec<usize> = (0..s.ops.len())
             .filter(|&i| {
@@ -1034,10 +1048,10 @@ mod tests {
         for pair in f32_mm.chunks(2) {
             assert_eq!(s.src(pair[0], 0).ne[0], HEAD_LANES as u32, "K lanes");
             assert_eq!(s.src(pair[0], 1).ne[0], HEAD_LANES as u32, "Q lanes");
-            // attn @ V contracts over the padded key count.
-            assert_eq!(s.src(pair[1], 0).ne[0], pad32(10) as u32);
+            // attn @ V contracts over the padded key count (64 here, not the 32 lanes).
+            assert_eq!(s.src(pair[1], 0).ne[0], pad32(40) as u32);
         }
-        assert_eq!(out, (so.pred, 10 * 4));
+        assert_eq!(out, (so.pred, 40 * 4));
     }
 
     /// The layer norm's output buffer becomes the next sub-block's input, so a whole layer

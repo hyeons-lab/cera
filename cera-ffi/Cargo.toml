@@ -96,6 +96,10 @@ serde_json.workspace = true
 # stay minimal.
 tokio = { version = "1", features = ["full"] }
 tempfile.workspace = true
+# Zero-fallback assert in the ignored NPU device test: push/flush run under a capturing
+# subscriber that fails on any `sortformer: ` warning. Already workspace deps via cera.
+tracing.workspace = true
+tracing-subscriber.workspace = true
 
 # No `[build-dependencies]` block: the proc-macro path doesn't need
 # UDL-scaffolding generation at build time, so `uniffi = { features =

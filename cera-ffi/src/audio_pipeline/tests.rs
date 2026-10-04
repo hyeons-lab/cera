@@ -2,6 +2,95 @@
 
 use super::*;
 
+/// Collects the `message` field of every `WARN` and `ERROR` event. Textual port of
+/// `cera/tests/common/mod.rs::WarnCapture` (this crate cannot import those helpers): the
+/// shared name promises identical semantics, so the predicate is copied, not rewritten.
+/// `tracing::Level`'s ordering is by verbosity and reads backwards: `ERROR` is the
+/// *smallest* level, so `> WARN` keeps exactly WARN and ERROR.
+#[derive(Clone, Default)]
+struct WarnCapture(std::sync::Arc<std::sync::Mutex<Vec<String>>>);
+
+impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
+    fn on_event(
+        &self,
+        event: &tracing::Event<'_>,
+        _ctx: tracing_subscriber::layer::Context<'_, S>,
+    ) {
+        if *event.metadata().level() > tracing::Level::WARN {
+            return;
+        }
+        struct Visit(Option<String>);
+        impl tracing::field::Visit for Visit {
+            fn record_debug(&mut self, field: &tracing::field::Field, value: &dyn std::fmt::Debug) {
+                if field.name() == "message" {
+                    self.0 = Some(format!("{value:?}"));
+                }
+            }
+        }
+        let mut v = Visit(None);
+        event.record(&mut v);
+        // Events with no `message` field still matter: an ERROR-level `sortformer: ` fault
+        // with no message must still trip the zero-fallback pin below.
+        let msg =
+            v.0.unwrap_or_else(|| format!("<no message> target={}", event.metadata().target()));
+        match self.0.lock() {
+            Ok(mut g) => g.push(msg),
+            Err(p) => p.into_inner().push(msg),
+        }
+    }
+}
+
+impl WarnCapture {
+    fn messages(&self) -> Vec<String> {
+        match self.0.lock() {
+            Ok(g) => g.clone(),
+            Err(p) => p.into_inner().clone(),
+        }
+    }
+}
+
+/// The capture port keeps WARN and ERROR events and drops everything quieter, like the
+/// canonical capture: an ERROR-level fault must trip the zero-fallback pin, not slip past.
+#[test]
+fn warn_capture_keeps_warn_and_error_only() {
+    use tracing_subscriber::layer::SubscriberExt;
+    let warns = WarnCapture::default();
+    let sub = tracing_subscriber::registry().with(warns.clone());
+    tracing::subscriber::with_default(sub, || {
+        tracing::error!("kept-error");
+        tracing::warn!("kept-warn");
+        tracing::info!("dropped-info");
+    });
+    let got = warns.messages();
+    assert_eq!(got.len(), 2, "expected exactly ERROR and WARN, got {got:?}");
+    assert!(
+        got.iter().any(|m| m.contains("kept-error")),
+        "ERROR was dropped, so the level comparison is wrong: {got:?}"
+    );
+    assert!(
+        got.iter().any(|m| m.contains("kept-warn")),
+        "WARN was dropped, so the level comparison is wrong: {got:?}"
+    );
+}
+
+/// Sortformer model path, or `None` (skip the test) when it is absent. One home per
+/// crate's unit tests; the cera unit tests, `model/sortformer_hexagon.rs`, and the
+/// integration suites resolve the same file on their own, so keep them in sync on a rename.
+fn sortformer_model_or_skip() -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf");
+    if !path.exists() {
+        assert!(
+            std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
+            "CERA_REQUIRE_MODEL=1 but {} is absent",
+            path.display()
+        );
+        eprintln!("{} not found, skipping", path.display());
+        return None;
+    }
+    Some(path)
+}
+
 #[test]
 fn test_ffi_audio_pipeline_defaults() {
     let pipeline = FfiAudioPipeline::from_bytes(None, None, None, None)
@@ -128,17 +217,9 @@ fn test_diarizer_on_npu_is_false_without_a_running_diarizer() {
 /// sample the front end refuses). Skipped when the model is absent.
 #[test]
 fn test_diarizer_on_npu_follows_a_failing_diarizer() {
-    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf");
-    if !path.exists() {
-        assert!(
-            std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
-            "CERA_REQUIRE_MODEL=1 but {} is absent",
-            path.display()
-        );
-        eprintln!("{} not found, skipping", path.display());
+    let Some(path) = sortformer_model_or_skip() else {
         return;
-    }
+    };
     let model = cera::model::sortformer::SortformerModel::from_file(&path).unwrap();
     let params = model.default_streaming().clone();
     let pipeline = cera::audio_pipeline::AudioPipeline::builder()
@@ -161,42 +242,42 @@ fn test_diarizer_on_npu_follows_a_failing_diarizer() {
 
 #[test]
 fn test_ffi_utterance_labeled_event_conversion() {
-    let core = cera::audio_pipeline::AudioPipelineEvent::UtteranceLabeled {
-        text: "hello".into(),
-        start_ms: 480.0,
-        end_ms: 4160.0,
-        speaker: Some(2),
-        confidence: Some(0.75),
-        overlapping: Some(1),
-    };
-    assert_eq!(
-        FfiAudioPipelineEvent::from(core),
-        FfiAudioPipelineEvent::UtteranceLabeled {
-            text: "hello".into(),
-            start_ms: 480.0,
-            end_ms: 4160.0,
-            speaker: Some(2),
-            confidence: Some(0.75),
-            overlapping: Some(1),
+    // Both axes crossed: the stalled-diarizer event is `None` + `dropped`, so a leg with
+    // a labeled speaker alone would pass a mapping that gates the flag on speaker presence.
+    for speaker in [Some(2), None] {
+        for dropped in [true, false] {
+            let core = cera::audio_pipeline::AudioPipelineEvent::UtteranceLabeled {
+                text: "hello".into(),
+                start_ms: 480.0,
+                end_ms: 4160.0,
+                speaker,
+                confidence: Some(0.75),
+                overlapping: Some(1),
+                dropped,
+            };
+            assert_eq!(
+                FfiAudioPipelineEvent::from(core),
+                FfiAudioPipelineEvent::UtteranceLabeled {
+                    text: "hello".into(),
+                    start_ms: 480.0,
+                    end_ms: 4160.0,
+                    speaker,
+                    confidence: Some(0.75),
+                    overlapping: Some(1),
+                    dropped,
+                }
+            );
         }
-    );
+    }
 }
 
 /// With a Sortformer model (skipped when it is absent) the pipeline labels a registered
 /// utterance; the NPU is only used when asked for and available, so on a host it is `false`.
 #[test]
 fn test_ffi_audio_pipeline_with_a_diarizer() {
-    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf");
-    if !path.exists() {
-        assert!(
-            std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
-            "CERA_REQUIRE_MODEL=1 but {} is absent",
-            path.display()
-        );
-        eprintln!("{} not found, skipping", path.display());
+    let Some(path) = sortformer_model_or_skip() else {
         return;
-    }
+    };
     let config = FfiAudioPipelineConfig {
         auto_transcribe: false,
         ..audio_pipeline_default_config()
@@ -207,12 +288,31 @@ fn test_ffi_audio_pipeline_with_a_diarizer() {
         None,
         path.to_string_lossy().into_owned(),
         false,
-        Some(config),
+        Some(config.clone()),
     )
     .expect("pipeline with a diarizer");
     assert!(pipeline.has_diarizer().unwrap());
     assert!(!pipeline.diarizer_on_npu());
     assert!(pipeline.add_utterance("a".into(), 0.0, 300.0).unwrap());
+    // `prefer_npu` degrades gracefully when staging fails: a CPU diarizer, not an error and
+    // not a stuck on-NPU flag. (On Android staging may legitimately succeed, so the flag
+    // assert only holds off-device; the graceful-build asserts hold everywhere.)
+    let cpu = FfiAudioPipeline::from_files_with_diarizer(
+        None,
+        None,
+        None,
+        path.to_string_lossy().into_owned(),
+        true,
+        Some(config),
+    )
+    .expect("prefer_npu degrades gracefully when staging fails");
+    assert!(cpu.has_diarizer().unwrap());
+    if !cfg!(target_os = "android") {
+        assert!(
+            !cpu.diarizer_on_npu(),
+            "staging failed on host yet the flag claims the NPU"
+        );
+    }
     // A missing model is an error that names the file, not a pipeline without a diarizer.
     let Err(err) = FfiAudioPipeline::from_files_with_diarizer(
         None,
@@ -234,28 +334,44 @@ fn test_ffi_audio_pipeline_with_a_diarizer() {
 /// the model is absent); on a host the NPU flag stays `false`.
 #[test]
 fn test_ffi_audio_pipeline_with_a_diarizer_from_bytes() {
-    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf");
-    if !path.exists() {
-        assert!(
-            std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
-            "CERA_REQUIRE_MODEL=1 but {} is absent",
-            path.display()
-        );
-        eprintln!("{} not found, skipping", path.display());
+    let Some(path) = sortformer_model_or_skip() else {
         return;
-    }
+    };
     let config = FfiAudioPipelineConfig {
         auto_transcribe: false,
         ..audio_pipeline_default_config()
     };
     let bytes = std::fs::read(&path).unwrap();
-    let pipeline =
-        FfiAudioPipeline::from_bytes_with_diarizer(None, None, None, bytes, false, Some(config))
-            .expect("pipeline with a diarizer from bytes");
+    let pipeline = FfiAudioPipeline::from_bytes_with_diarizer(
+        None,
+        None,
+        None,
+        bytes,
+        false,
+        Some(config.clone()),
+    )
+    .expect("pipeline with a diarizer from bytes");
     assert!(pipeline.has_diarizer().unwrap());
     assert!(!pipeline.diarizer_on_npu());
     assert!(pipeline.add_utterance("a".into(), 0.0, 300.0).unwrap());
+    // `prefer_npu` degrades gracefully when staging fails: a CPU diarizer, not an error and
+    // not a stuck on-NPU flag (the flag assert only holds off-Android; see the file test).
+    let cpu = FfiAudioPipeline::from_bytes_with_diarizer(
+        None,
+        None,
+        None,
+        std::fs::read(&path).unwrap(),
+        true,
+        Some(config),
+    )
+    .expect("prefer_npu degrades gracefully when staging fails");
+    assert!(cpu.has_diarizer().unwrap());
+    if !cfg!(target_os = "android") {
+        assert!(
+            !cpu.diarizer_on_npu(),
+            "staging failed on host yet the flag claims the NPU"
+        );
+    }
     // Garbage bytes are an error, not a pipeline without a diarizer.
     let Err(err) =
         FfiAudioPipeline::from_bytes_with_diarizer(None, None, None, vec![0u8; 64], false, None)
@@ -396,11 +512,29 @@ fn test_ffi_audio_pipeline_diarizer_on_the_npu() {
     ] {
         assert!(pipeline.add_utterance(text.into(), start, end).unwrap());
     }
+    // Zero-fallback pin: per-call CPU fallback reproduces these labels bit-identically
+    // while leaving the flag set, so without this an NPU that fails every step passes as
+    // "NPU verified". Scoped to this thread; the `sortformer: ` prefix is the model's own
+    // fault tag. This catches faults, not silent declines: a declined step returns Ok(None)
+    // with no warning by design, so a step the NPU declines still passes here. Width
+    // declines are pinned instead by the parity suite's staging-bound asserts (`max_t` for
+    // predict steps, `max_n` for stem batches against `window_frames()`); other decline
+    // reasons remain a known residual until the staged tail exposes per-stage call counts.
+    use tracing_subscriber::layer::SubscriberExt;
+    let warns = WarnCapture::default();
+    let sub = tracing_subscriber::registry().with(warns.clone());
     let mut events = Vec::new();
-    for piece in pcm.chunks(1600) {
-        events.extend(pipeline.process_chunk(piece.to_vec()).unwrap());
-    }
-    events.extend(pipeline.flush().unwrap());
+    tracing::subscriber::with_default(sub, || {
+        for piece in pcm.chunks(1600) {
+            events.extend(pipeline.process_chunk(piece.to_vec()).unwrap());
+        }
+        events.extend(pipeline.flush().unwrap());
+    });
+    assert!(
+        warns.messages().iter().all(|m| !m.contains("sortformer: ")),
+        "NPU steps fell back to the CPU: {:?}",
+        warns.messages()
+    );
     let labeled: Vec<(String, Option<u32>)> = events
         .into_iter()
         .filter_map(|e| match e {

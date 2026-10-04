@@ -5,6 +5,45 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use super::*;
 
+/// Sortformer model path, or `None` (skip the test) when it is absent. One home per
+/// crate's unit tests; `model/sortformer_hexagon.rs` and the integration suites resolve
+/// the same file on their own, so keep them in sync on a rename.
+///
+/// `mmap`-gated like every caller: in no-`mmap` builds the helper would be dead code and
+/// fail the `-D warnings` clippy legs.
+#[cfg(feature = "mmap")]
+fn sortformer_model_or_skip() -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
+        .join(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf");
+    // Same `== Ok("1")` require idiom as the FFI twin and the other inline skip sites
+    // (`require_model_or_skip` fails loud on any non-empty value instead).
+    if !path.exists() {
+        assert!(
+            std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
+            "CERA_REQUIRE_MODEL=1 but {} is absent",
+            path.display()
+        );
+        eprintln!("{} not found, skipping", path.display());
+        return None;
+    }
+    Some(path)
+}
+
+/// Session-local conversion keeps its clamp for finite times (pre-session starts at the
+/// first frame) but passes non-finite times through: clamping NaN or -inf to 0.0 would
+/// smuggle an unplaceable utterance past the labeler's non-finite guard.
+#[test]
+fn session_local_ms_passes_non_finite_times_through() {
+    assert_eq!(session_local_ms(1500.0, 1000.0), 500.0);
+    assert_eq!(session_local_ms(500.0, 1000.0), 0.0);
+    assert!(session_local_ms(f32::NAN, 1000.0).is_nan());
+    assert_eq!(
+        session_local_ms(f32::NEG_INFINITY, 1000.0),
+        f64::NEG_INFINITY
+    );
+    assert_eq!(session_local_ms(f32::INFINITY, 1000.0), f64::INFINITY);
+}
+
 #[test]
 fn test_audio_pipeline_builder_defaults() {
     let pipeline = AudioPipelineBuilder::new()
@@ -565,11 +604,9 @@ fn test_audio_pipeline_flush_clamps_speech_end_to_utterance_start_sample() {
 #[cfg(feature = "mmap")]
 #[test]
 fn reset_drops_the_utterances_waiting_on_the_old_diarizer_session() {
-    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf");
-    if !crate::model::transformer::require_model_or_skip(&path) {
+    let Some(path) = sortformer_model_or_skip() else {
         return;
-    }
+    };
     let model = crate::model::sortformer::SortformerModel::from_file(&path).unwrap();
     let mut pipeline = AudioPipelineBuilder::new()
         .with_auto_transcribe(false)
@@ -590,11 +627,9 @@ fn reset_drops_the_utterances_waiting_on_the_old_diarizer_session() {
 #[cfg(feature = "mmap")]
 #[test]
 fn register_refuses_utterances_past_max_pending() {
-    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf");
-    if !crate::model::transformer::require_model_or_skip(&path) {
+    let Some(path) = sortformer_model_or_skip() else {
         return;
-    }
+    };
     let model = crate::model::sortformer::SortformerModel::from_file(&path).unwrap();
     let cfg = crate::speaker_labeler::SpeakerLabelerConfig {
         max_pending: 2,
@@ -615,15 +650,41 @@ fn register_refuses_utterances_past_max_pending() {
     assert_eq!(pipeline.diarizer.as_ref().unwrap().pending.len(), 2);
 }
 
+/// An utterance with non-finite times is granted, then flushed as `dropped`: the labeler
+/// cannot place it on the clock, so it must read as a give-up, not as silence.
+#[cfg(feature = "mmap")]
+#[test]
+fn non_finite_utterance_times_flush_as_dropped() {
+    let Some(path) = sortformer_model_or_skip() else {
+        return;
+    };
+    let model = crate::model::sortformer::SortformerModel::from_file(&path).unwrap();
+    let mut pipeline = AudioPipelineBuilder::new()
+        .with_auto_transcribe(false)
+        .with_diarizer(model.clone(), model.default_streaming().clone())
+        .build()
+        .unwrap();
+    assert!(pipeline.add_utterance("when".into(), f32::NAN, f32::NAN));
+    let events = pipeline.flush().unwrap();
+    assert_eq!(events.len(), 1, "{events:?}");
+    match &events[0] {
+        AudioPipelineEvent::UtteranceLabeled {
+            speaker, dropped, ..
+        } => {
+            assert_eq!(*speaker, None);
+            assert!(*dropped, "{events:?}");
+        }
+        other => panic!("wrong event: {other:?}"),
+    }
+}
+
 /// The bytes loader attaches the same checkpoint as the file loader.
 #[cfg(feature = "mmap")]
 #[test]
 fn with_diarizer_from_bytes_matches_from_file() {
-    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf");
-    if !crate::model::transformer::require_model_or_skip(&path) {
+    let Some(path) = sortformer_model_or_skip() else {
         return;
-    }
+    };
     let bytes = std::fs::read(&path).unwrap();
     let pipeline = AudioPipelineBuilder::new()
         .with_auto_transcribe(false)
@@ -698,12 +759,34 @@ fn take_labeled_event_maps_speaker_and_consumes_pending() {
             speaker,
             confidence,
             overlapping,
+            dropped,
         } => {
             assert_eq!(text, "hello");
             assert_eq!((start_ms, end_ms), (100.0, 900.0));
             assert_eq!(speaker, Some(2));
             assert_eq!(confidence, Some(0.75));
             assert_eq!(overlapping, Some(1));
+            assert!(!dropped);
+        }
+        other => panic!("wrong event: {other:?}"),
+    }
+}
+
+/// A dropped utterance keeps its dropped flag through the event: silence (`None` speaker,
+/// not dropped) and a stalled diarizer (`None` speaker, dropped) stay distinguishable.
+#[test]
+fn take_labeled_event_carries_the_dropped_flag() {
+    let (id, p) = pending_utterance();
+    let mut pending = std::collections::HashMap::from([(id, p)]);
+    let mut u = labeled(id, None);
+    u.dropped = true;
+    let ev = take_labeled_event(&mut pending, u).expect("registered id labels");
+    match ev {
+        AudioPipelineEvent::UtteranceLabeled {
+            speaker, dropped, ..
+        } => {
+            assert_eq!(speaker, None);
+            assert!(dropped);
         }
         other => panic!("wrong event: {other:?}"),
     }
@@ -721,12 +804,14 @@ fn take_labeled_event_without_a_label_keeps_text_and_span() {
             confidence,
             overlapping,
             text,
+            dropped,
             ..
         } => {
             assert_eq!(text, "hello");
             assert_eq!(speaker, None);
             assert_eq!(confidence, None);
             assert_eq!(overlapping, None);
+            assert!(!dropped, "covered silence is not a give-up");
         }
         other => panic!("wrong event: {other:?}"),
     }

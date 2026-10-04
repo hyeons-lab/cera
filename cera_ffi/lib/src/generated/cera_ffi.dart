@@ -3501,12 +3501,16 @@ final class FfiAudioPipelineEventUtteranceLabeled extends FfiAudioPipelineEvent 
     /// End timestamp of the utterance in milliseconds.
     required this.endMs,
     /// The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
-    /// span or the labeler had to give the utterance up.
+    /// span or the labeler had to give the utterance up (see `dropped`).
     required this.speaker,
     /// The speaker's share of all speakers' active time over the span, in (0, 1].
     required this.confidence,
     /// A second speaker who was also clearly active over the span, if any.
     required this.overlapping,
+    /// True when the labeler gave the utterance up instead of labeling it (history expiry,
+    /// queue overflow, or non-finite times): `None` speaker with `dropped` set is a stalled
+    /// diarizer, not silence.
+    required this.dropped,
   });
   /// The utterance text, as in its `UtteranceTranscribed` event.
   final String text;
@@ -3515,25 +3519,29 @@ final class FfiAudioPipelineEventUtteranceLabeled extends FfiAudioPipelineEvent 
   /// End timestamp of the utterance in milliseconds.
   final double endMs;
   /// The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
-  /// span or the labeler had to give the utterance up.
+  /// span or the labeler had to give the utterance up (see `dropped`).
   final int? speaker;
   /// The speaker's share of all speakers' active time over the span, in (0, 1].
   final double? confidence;
   /// A second speaker who was also clearly active over the span, if any.
   final int? overlapping;
+  /// True when the labeler gave the utterance up instead of labeling it (history expiry,
+  /// queue overflow, or non-finite times): `None` speaker with `dropped` set is a stalled
+  /// diarizer, not silence.
+  final bool dropped;
 
   @override
   String toString() {
-    return 'FfiAudioPipelineEventUtteranceLabeled(text: $text, startMs: $startMs, endMs: $endMs, speaker: $speaker, confidence: $confidence, overlapping: $overlapping)';
+    return 'FfiAudioPipelineEventUtteranceLabeled(text: $text, startMs: $startMs, endMs: $endMs, speaker: $speaker, confidence: $confidence, overlapping: $overlapping, dropped: $dropped)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is FfiAudioPipelineEventUtteranceLabeled && text == other.text && startMs == other.startMs && endMs == other.endMs && speaker == other.speaker && confidence == other.confidence && overlapping == other.overlapping;
+      other is FfiAudioPipelineEventUtteranceLabeled && text == other.text && startMs == other.startMs && endMs == other.endMs && speaker == other.speaker && confidence == other.confidence && overlapping == other.overlapping && dropped == other.dropped;
 
   @override
-  int get hashCode => Object.hash(text, startMs, endMs, speaker, confidence, overlapping);
+  int get hashCode => Object.hash(text, startMs, endMs, speaker, confidence, overlapping, dropped);
 }
 
 /// Active state of the streaming audio pipeline.
@@ -5319,6 +5327,7 @@ String _encodeFfiAudioPipelineEvent(FfiAudioPipelineEvent value) {
       'speaker': value.speaker,
       'confidence': value.confidence,
       'overlapping': value.overlapping,
+      'dropped': value.dropped,
     });
   }
   throw StateError('Unknown FfiAudioPipelineEvent variant instance: $value');
@@ -5362,6 +5371,7 @@ FfiAudioPipelineEvent _decodeFfiAudioPipelineEvent(String raw) {
         speaker: map['speaker'] == null ? null : (map['speaker'] as num).toInt(),
         confidence: map['confidence'] == null ? null : (map['confidence'] as num).toDouble(),
         overlapping: map['overlapping'] == null ? null : (map['overlapping'] as num).toInt(),
+        dropped: map['dropped'] as bool,
       );
     default:
       throw StateError('Unknown FfiAudioPipelineEvent variant tag: $tag');
@@ -8356,6 +8366,7 @@ void _uniffiWriteFfiAudioPipelineEvent(FfiAudioPipelineEvent value, _UniFfiBinar
       writer.writeI8(1);
       writer.writeU32(value.overlapping!);
     }
+    writer.writeBool(value.dropped);
   }
   else {
     throw StateError('Unknown FfiAudioPipelineEvent variant instance: $value');
@@ -8405,6 +8416,7 @@ FfiAudioPipelineEvent _uniffiReadFfiAudioPipelineEvent(_UniFfiBinaryReader reade
         speaker: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readU32(); })(),
         confidence: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readF32(); })(),
         overlapping: (() { final int __tag = reader.readI8(); if (__tag == 0) return null; if (__tag != 1) throw StateError('invalid optional tag: $__tag'); return reader.readU32(); })(),
+        dropped: reader.readBool(),
       );
     default:
       throw StateError('Unknown FfiAudioPipelineEvent variant tag: $tag');
