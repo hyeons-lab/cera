@@ -541,6 +541,50 @@ pub(crate) fn sigmoid<S: OpSink>(
     )
 }
 
+/// `Argmax` over one row of `vocab` F32 values at `in_offset`: the index of the largest, as an
+/// I32 at `out_offset`. Greedy sampling on the DSP reads 4 bytes instead of the whole row.
+pub(crate) fn argmax_row<S: OpSink>(
+    session: &mut S,
+    buf: &S::Buf,
+    in_offset: usize,
+    out_offset: usize,
+    vocab: usize,
+) -> Result<(), CeraError> {
+    let in_ti = session.add_tensor(
+        buf,
+        in_offset,
+        vocab * 4,
+        HTP_TENSOR_COMPUTE,
+        HtpDataType::F32 as u32,
+        [vocab as u32, 1, 1, 1],
+        [
+            4,
+            (vocab * 4) as u32,
+            (vocab * 4) as u32,
+            (vocab * 4) as u32,
+        ],
+    )?;
+    let out_ti = session.add_tensor(
+        buf,
+        out_offset,
+        4,
+        HTP_TENSOR_COMPUTE,
+        HtpDataType::I32 as u32,
+        [1, 1, 1, 1],
+        [4, 4, 4, 4],
+    )?;
+    session
+        .enqueue_op(
+            HtpOpCode::Argmax as u32,
+            &[in_ti],
+            &[out_ti],
+            [0i32; 16],
+            [0i32; 32],
+        )
+        .map_err(|e| op_err("argmax", e))?;
+    session.end_group().map_err(|e| op_err("argmax", e))
+}
+
 /// In-place ReLU: `buf = max(buf, 0)`.
 pub(crate) fn relu<S: OpSink>(
     session: &mut S,
@@ -1126,6 +1170,7 @@ mod tests {
 
     const OP_MUL: u32 = HtpOpCode::Mul as u32;
     const OP_ADD: u32 = HtpOpCode::Add as u32;
+    const OP_ARGMAX: u32 = HtpOpCode::Argmax as u32;
     const OP_NORM: u32 = HtpOpCode::Norm as u32;
     const OP_MULMAT: u32 = HtpOpCode::MulMat as u32;
     const OP_SILU: u32 = HtpOpCode::UnarySilu as u32;
@@ -1191,6 +1236,25 @@ mod tests {
         assert_eq!(s.dst(4).size, 2 * 96 * 4);
         // Bias add targets the tile's dst tensor and the shared bias tensor.
         assert_eq!(s.ops[5].src, vec![s.ops[4].dst[0], 1]);
+    }
+
+    #[test]
+    fn argmax_row_emits_one_argmax_over_an_f32_row_to_an_i32_scalar() {
+        let mut s = RecordingSink::default();
+        argmax_row(&mut s, &"b", 100, 200, 128).unwrap();
+        assert_eq!(s.opcodes(), vec![OP_ARGMAX]);
+        assert_eq!(s.group_ends, vec![1]);
+        let (src, dst) = (s.src(0, 0), s.dst(0));
+        assert_eq!(src.buf, "b");
+        assert_eq!(src.offset, 100);
+        assert_eq!(
+            (src.ne, src.nb, src.size),
+            ([128, 1, 1, 1], [4, 512, 512, 512], 128 * 4)
+        );
+        assert_eq!(src.dtype, HtpDataType::F32 as u32);
+        assert_eq!(dst.offset, 200);
+        assert_eq!((dst.ne, dst.nb, dst.size), ([1, 1, 1, 1], [4, 4, 4, 4], 4));
+        assert_eq!(dst.dtype, HtpDataType::I32 as u32);
     }
 
     #[test]

@@ -10,7 +10,7 @@
 //! convolutions, LayerNorm, linear GEMM, unmasked FlashAttention, and token
 //! sampling on the NPU for background execution on Android.
 
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTile};
@@ -18,10 +18,12 @@ use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
     HexagonContext, HexagonDevice, HexagonQueueSession, HexagonWeightFormat, HtpDataType,
     HtpOpCode, RpcmemBuffer, align128, build_binary_kernel_params, build_flash_attn_kernel_params,
-    build_mul_mat_kernel_params, quantize_f32_to_q8_0, repack_q4_0, repack_q8_0,
+    build_mul_mat_kernel_params, hexagon_warn, quantize_f32_to_q8_0, repack_q4_0, repack_q8_0,
     repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
-use crate::backend::hexagon::{LockOrRecover, lock_reporting_poison, report_poison};
+use crate::backend::hexagon::{
+    LockOrRecover, lock_or_discard, lock_reporting_poison, report_poison,
+};
 use crate::model::weights::MmapWeight;
 use crate::model::whisper::{
     Conv1dWeights, WhisperConfig, WhisperSpecialTokens, WhisperTranscribeOpts, WhisperWeights,
@@ -641,6 +643,11 @@ pub struct HexagonWhisperScratchOffsets {
     pub dec_mlp_mid_off: usize,
     pub dec_mlp_out_off: usize,
     pub logits_off: usize,
+    /// `[n_vocab]` F32 added to the logits before the on-DSP argmax: `-1e30` for the tokens a
+    /// greedy step must not pick (see `decode_step_greedy`), 0 elsewhere.
+    pub greedy_mask_off: usize,
+    /// The on-DSP argmax result, one I32.
+    pub argmax_off: usize,
     /// Scratch the tanh GELU works through, `gelu_tmp_rows` rows of the widest
     /// MLP activation.
     pub gelu_tmp_off: usize,
@@ -703,6 +710,8 @@ impl HexagonWhisperScratchOffsets {
 
         // Decoder logits [n_vocab]
         let logits_off = plan_vec_f32(&mut cur_off, cfg.n_vocab);
+        let greedy_mask_off = plan_vec_f32(&mut cur_off, cfg.n_vocab);
+        let argmax_off = plan_vec_f32(&mut cur_off, 1);
 
         // The tanh GELU's intermediate: a few rows of the widest activation.
         let gelu_tmp_rows = dispatch::GELU_TMP_ROWS;
@@ -732,11 +741,52 @@ impl HexagonWhisperScratchOffsets {
             dec_mlp_mid_off,
             dec_mlp_out_off,
             logits_off,
+            greedy_mask_off,
+            argmax_off,
             gelu_tmp_off,
             gelu_tmp_rows,
             total_bytes: cur_off,
         }
     }
+}
+
+/// The logit added to a token a greedy step must not pick (finite, so the DSP never sees an
+/// infinity; far below any real logit).
+const GREEDY_SUPPRESSED: f32 = -1e30;
+
+/// The little-endian `i32` at `at` in a DSP readback. Fallible indexing: on a short
+/// scratch (driver fault, planning bug) this returns a recoverable error instead of
+/// panicking the phone.
+fn readback_i32_le(scratch: &[u8], at: usize) -> Result<i32, CeraError> {
+    let Some(&bytes) = scratch.get(at..).and_then(|tail| tail.first_chunk::<4>()) else {
+        return Err(CeraError::Backend(format!(
+            "the DSP argmax read back a short row (offset {at} + 4 over scratch len {})",
+            scratch.len()
+        )));
+    };
+    Ok(i32::from_le_bytes(bytes))
+}
+
+/// The additive logit mask of a greedy step: `GREEDY_SUPPRESSED` for the tokens the host's
+/// `suppress_whisper_special_tokens` sets to `-inf`, 0 for the rest. Derived from the host
+/// function itself, so the two cannot drift apart.
+fn greedy_mask(t: &WhisperSpecialTokens, n_vocab: usize, timestamps: bool) -> Vec<f32> {
+    let mut mask = vec![0.0f32; n_vocab];
+    crate::model::whisper::suppress_whisper_special_tokens(&mut mask, t, timestamps);
+    for v in &mut mask {
+        if *v == f32::NEG_INFINITY {
+            *v = GREEDY_SUPPRESSED;
+        }
+    }
+    mask
+}
+
+/// What a decoder step hands back.
+enum StepOut<'a> {
+    /// The full logits row, copied to the caller's buffer.
+    Logits(&'a mut [f32]),
+    /// The next token, picked on the DSP.
+    Greedy { timestamps: bool },
 }
 
 /// Native Qualcomm Hexagon NPU Whisper speech recognition model.
@@ -753,6 +803,14 @@ pub struct HexagonWhisperModel {
     token_embeddings: MmapWeight,
     positional_embedding: Vec<f32>,
     session_lock: Mutex<()>,
+    /// The queue session's wait mode before [`Self::new`] put it to sleep, restored by [`Drop`].
+    blocking_wait_prev: bool,
+    /// The `timestamps` setting the greedy suppression mask in scratch was staged for.
+    greedy_mask_for: Mutex<Option<bool>>,
+    /// The log-mel front end on the DSP; `None` runs it on the host.
+    mel: Option<crate::model::whisper_mel_hexagon::WhisperMelDsp>,
+    /// How often [`Self::log_mel`] fell back to the host after a DSP failure.
+    mel_fallbacks: AtomicU64,
     /// True once `encode_audio` has fully rewritten `state_buf`.
     encoded_ok: AtomicBool,
 }
@@ -761,11 +819,19 @@ impl Drop for HexagonWhisperModel {
     /// Let the DSP let go of every buffer before the host unmaps them.
     fn drop(&mut self) {
         let mut device = self.device.lock_or_recover();
-        device.queue_session_mut().release_dsp_references([
-            &self.weights_buf,
-            &*self.state_buf.lock_or_recover(),
-            &*self.scratch_buf.lock_or_recover(),
-        ]);
+        let state = self.state_buf.lock_or_recover();
+        let scratch = self.scratch_buf.lock_or_recover();
+        let mel = self.mel.as_ref().map(|m| m.buffers());
+        let mut held = vec![&self.weights_buf, &*state, &*scratch];
+        if let Some((weights, mel_scratch)) = &mel {
+            held.push(weights);
+            held.push(mel_scratch);
+        }
+        device.queue_session_mut().release_dsp_references(held);
+        // The release above is the model's last wait: leave the session as it was found.
+        device
+            .queue_session_mut()
+            .set_blocking_wait(self.blocking_wait_prev);
     }
 }
 
@@ -782,6 +848,16 @@ impl std::fmt::Debug for HexagonWhisperModel {
 
 impl HexagonWhisperModel {
     /// Initialize a Hexagon Whisper model by allocating and staging shared DMA memory buffers.
+    ///
+    /// Puts `device`'s queue-session waits to sleep in the kernel from here on (restored on
+    /// drop), so pass a device this model does not share (as [`init_hexagon_whisper`] does).
+    /// The driver's default wait spins
+    /// a core for as long as the DSP runs: an encoder window is about 3,800 ops in five batches
+    /// and 340 ms of DSP time, and with the default wait the NPU path cost the CPU as much time
+    /// as the DSP took (336 ms per utterance on an S25 Ultra, 2 ms asleep), which is what moving
+    /// Whisper to the NPU for a background service is meant to avoid. The queue also flushes by
+    /// itself whenever a batch fills, so the setting has to hold for the whole call, not just the
+    /// final flush. A sleeping wake-up costs about a scheduler tick per batch.
     pub fn new(
         driver: Arc<FastRpcDriver>,
         device: Arc<Mutex<HexagonDevice>>,
@@ -802,6 +878,21 @@ impl HexagonWhisperModel {
             RpcmemBuffer::alloc(Arc::clone(&driver), scratch_offsets.total_bytes, true)?;
 
         let special_tokens = WhisperSpecialTokens::from_tokenizer(tokenizer);
+        // The 80- and 128-bin windows are the ones the host front end supports too.
+        let mel = if matches!(weights.config.n_audio_mel_bins, 80 | 128) {
+            crate::model::whisper_mel_hexagon::WhisperMelDsp::new(
+                Arc::clone(&driver),
+                weights.config.n_audio_mel_bins,
+            )
+            .inspect_err(|e| hexagon_warn!("whisper: log-mel stays on the host ({e})"))
+            .ok()
+        } else {
+            None
+        };
+        let blocking_wait_prev = device
+            .lock_or_recover()
+            .queue_session_mut()
+            .set_blocking_wait(true);
 
         Ok(Self {
             device,
@@ -816,6 +907,10 @@ impl HexagonWhisperModel {
             token_embeddings: weights.decoder.token_embeddings.clone(),
             positional_embedding: weights.decoder.positional_embedding.clone(),
             session_lock: Mutex::new(()),
+            blocking_wait_prev,
+            greedy_mask_for: Mutex::new(None),
+            mel,
+            mel_fallbacks: AtomicU64::new(0),
             encoded_ok: AtomicBool::new(false),
         })
     }
@@ -1763,6 +1858,33 @@ impl HexagonWhisperModel {
         pos: usize,
         logits_out: &mut [f32],
     ) -> Result<(), CeraError> {
+        self.decode_step_impl(token_id, pos, StepOut::Logits(logits_out))
+            .map(|_| ())
+    }
+
+    /// [`Self::decode_step`] that picks the next token on the DSP: the control tokens (and the
+    /// timestamp tokens unless `timestamps`) are masked out of the logits and an `Argmax` runs
+    /// over them, so the host reads 4 bytes instead of the whole 207 KB row and never scans it.
+    /// The same token as suppressing and taking the argmax on the host (greedy decoding,
+    /// temperature 0), assuming the DSP `Argmax` breaks exact ties toward the lowest index
+    /// like the host's `argmax` and the logits contain no NaN (the on-device probe asserts
+    /// the greedy comparison).
+    pub fn decode_step_greedy(
+        &self,
+        token_id: u32,
+        pos: usize,
+        timestamps: bool,
+    ) -> Result<u32, CeraError> {
+        self.decode_step_impl(token_id, pos, StepOut::Greedy { timestamps })?
+            .ok_or_else(|| CeraError::Backend("greedy step returned no token".into()))
+    }
+
+    fn decode_step_impl(
+        &self,
+        token_id: u32,
+        pos: usize,
+        mut out: StepOut<'_>,
+    ) -> Result<Option<u32>, CeraError> {
         if token_id as usize >= self.config.n_vocab {
             return Err(CeraError::Backend(format!(
                 "token_id {token_id} out of bounds for vocab size {}",
@@ -1775,7 +1897,9 @@ impl HexagonWhisperModel {
                 self.config.n_text_ctx
             )));
         }
-        if logits_out.len() < self.config.n_vocab {
+        if let StepOut::Logits(logits_out) = &out
+            && logits_out.len() < self.config.n_vocab
+        {
             return Err(CeraError::Backend(format!(
                 "logits_out buffer length {} smaller than vocab size {}",
                 logits_out.len(),
@@ -1804,6 +1928,9 @@ impl HexagonWhisperModel {
             ));
         };
 
+        if let StepOut::Greedy { timestamps } = &out {
+            self.stage_greedy_mask(&mut scratch, *timestamps);
+        }
         // 1. Stage input embedding + positional embedding into scratch.dec_x_off
         let scratch_slice = scratch.as_mut_slice();
         let dec_x_off = self.scratch_offsets.dec_x_off;
@@ -2148,19 +2275,117 @@ impl HexagonWhisperModel {
             WHISPER_TILE,
         )?;
 
+        if let StepOut::Greedy { .. } = &out {
+            // Mask the tokens a greedy step must not pick, then argmax the row on the DSP.
+            dispatch::add_residual(
+                session,
+                &scratch,
+                logits_off,
+                &scratch,
+                self.scratch_offsets.greedy_mask_off,
+                TokenShape {
+                    dim: self.config.n_vocab,
+                    n_tokens: 1,
+                },
+                WHISPER_TILE,
+            )?;
+            dispatch::argmax_row(
+                session,
+                &scratch,
+                logits_off,
+                self.scratch_offsets.argmax_off,
+                self.config.n_vocab,
+            )?;
+        }
+
         // Submit DSP queue and wait
         session.flush()?;
 
-        // 6. Invalidate CPU cache and copy logits out
-        let vocab_bytes = self.config.n_vocab * 4;
-        scratch.invalidate_cpu_cache(logits_off, vocab_bytes);
+        match &mut out {
+            StepOut::Logits(logits_out) => {
+                // 6. Invalidate CPU cache and copy logits out
+                let vocab_bytes = self.config.n_vocab * 4;
+                scratch.invalidate_cpu_cache(logits_off, vocab_bytes);
 
-        let scratch_slice = scratch.as_slice();
-        let logits_slice: &[f32] =
-            bytemuck::cast_slice(&scratch_slice[logits_off..logits_off + vocab_bytes]);
-        logits_out[..self.config.n_vocab].copy_from_slice(logits_slice);
+                let scratch_slice = scratch.as_slice();
+                let logits_slice: &[f32] =
+                    bytemuck::cast_slice(&scratch_slice[logits_off..logits_off + vocab_bytes]);
+                logits_out[..self.config.n_vocab].copy_from_slice(logits_slice);
+                Ok(None)
+            }
+            StepOut::Greedy { .. } => {
+                let at = self.scratch_offsets.argmax_off;
+                scratch.invalidate_cpu_cache(at, 4);
+                let token = readback_i32_le(scratch.as_slice(), at)?;
+                u32::try_from(token)
+                    .ok()
+                    .filter(|&t| (t as usize) < self.config.n_vocab)
+                    .map(Some)
+                    .ok_or_else(|| {
+                        CeraError::Backend(format!("the DSP argmax returned token {token}"))
+                    })
+            }
+        }
+    }
 
-        Ok(())
+    /// Stage the greedy suppression mask for `timestamps` unless it already is: `-1e30` for the
+    /// control tokens between `sot` and `no_timestamps` (except `eot`) and, without timestamps,
+    /// for every token from `timestamp_begin` on; the host's `suppress_whisper_special_tokens`.
+    fn stage_greedy_mask(&self, scratch: &mut RpcmemBuffer, timestamps: bool) {
+        // The staged mask persists across calls: on poison the flag is discarded, so the mask
+        // is restaged rather than trusted torn.
+        let mut staged = lock_or_discard(&self.greedy_mask_for);
+        if *staged == Some(timestamps) {
+            return;
+        }
+        let n = self.config.n_vocab;
+        let mask = greedy_mask(&self.special_tokens, n, timestamps);
+        let at = self.scratch_offsets.greedy_mask_off;
+        scratch.as_mut_slice()[at..at + n * 4].copy_from_slice(bytemuck::cast_slice(&mask));
+        scratch.flush_cpu_cache(at, n * 4);
+        *staged = Some(timestamps);
+    }
+
+    /// Whether the log-mel front end is staged on the DSP. This pins staging only: a staged
+    /// call can still fall back per call (see [`Self::mel_fallbacks`]), so a caller timing the
+    /// NPU path proves the timed calls ran on the DSP with the counter, not this predicate.
+    #[doc(hidden)]
+    pub fn mel_on_dsp(&self) -> bool {
+        self.mel.is_some()
+    }
+
+    /// How often [`Self::log_mel`] fell back to the host after a DSP failure. A caller timing
+    /// the NPU path captures this before its calls and asserts it is unchanged after.
+    #[doc(hidden)]
+    pub fn mel_fallbacks(&self) -> u64 {
+        self.mel_fallbacks.load(Ordering::Relaxed)
+    }
+
+    /// Whisper's log-mel for `pcm`: the DFT and the filterbank on the DSP when they are staged,
+    /// the host's FFT otherwise (and if the DSP call fails, with a warning).
+    #[doc(hidden)]
+    pub fn log_mel(&self, pcm: &[f32]) -> Vec<f32> {
+        use crate::model::whisper_preprocessor::{
+            active_frames, extract_whisper_mel, finish_whisper_mel, padded_whisper_audio_upto,
+            samples_for_frames,
+        };
+        let n_mels = self.config.n_audio_mel_bins;
+        if let Some(dsp) = &self.mel {
+            let n_active = active_frames(pcm.len());
+            let padded = padded_whisper_audio_upto(pcm, samples_for_frames(n_active));
+            let energies = {
+                let mut device = self.device.lock_or_recover();
+                dsp.energies(device.queue_session_mut(), &padded, n_active)
+            };
+            match energies {
+                Ok(e) => return finish_whisper_mel(&e, n_mels, n_active),
+                Err(e) => {
+                    self.mel_fallbacks.fetch_add(1, Ordering::Relaxed);
+                    hexagon_warn!("whisper: log-mel failed on the DSP ({e}); using the host")
+                }
+            }
+        }
+        extract_whisper_mel(pcm, n_mels)
     }
 
     /// Transcribe PCM audio samples completely on Qualcomm Hexagon NPU.
@@ -2185,10 +2410,7 @@ impl HexagonWhisperModel {
         }
 
         // 1. Audio preprocessor: PCM -> log-mel spectrogram [n_mels x 3000]
-        let mel = crate::model::whisper_preprocessor::extract_whisper_mel(
-            pcm,
-            self.config.n_audio_mel_bins,
-        );
+        let mel = self.log_mel(pcm);
 
         if opts
             .cancel
@@ -2311,6 +2533,9 @@ impl HexagonWhisperModel {
             ..Default::default()
         });
 
+        // Temperature 0 is greedy decoding: the argmax is taken on the DSP.
+        let greedy = !opts.temperature.is_finite() || opts.temperature <= 0.0;
+
         for pos in start_pos..max_pos {
             if opts
                 .cancel
@@ -2320,16 +2545,20 @@ impl HexagonWhisperModel {
                 return Err(CeraError::Cancelled);
             }
 
-            self.decode_step(current_token, pos, &mut logits)?;
+            let next_token = if greedy {
+                self.decode_step_greedy(current_token, pos, opts.timestamps)?
+            } else {
+                self.decode_step(current_token, pos, &mut logits)?;
 
-            // Suppress special control tokens during autoregressive generation
-            crate::model::whisper::suppress_whisper_special_tokens(
-                &mut logits,
-                &self.special_tokens,
-                opts.timestamps,
-            );
+                // Suppress special control tokens during autoregressive generation
+                crate::model::whisper::suppress_whisper_special_tokens(
+                    &mut logits,
+                    &self.special_tokens,
+                    opts.timestamps,
+                );
 
-            let next_token = sampler.sample(&mut logits);
+                sampler.sample(&mut logits)
+            };
             if next_token == self.special_tokens.eot {
                 break;
             }
@@ -2383,11 +2612,31 @@ pub fn init_hexagon_whisper(
     Ok(Arc::new(model))
 }
 
+/// Why `weights` cannot run on the NPU, or `None` when their formats are all supported. The NPU
+/// reads Q8_0, Q4_0, F16 and F32 matrices; the K-quants (`cera transcribe` converts to Q4_K_M
+/// on CPU paths unless told otherwise) are not among them.
+fn npu_weight_problem(weights: &WhisperWeights) -> Option<String> {
+    HexagonWhisperWeightOffsets::plan(weights).err().map(|e| {
+        format!(
+            "these weights cannot run on the Hexagon NPU ({e}); reconvert the model to Q8_0 \
+             (for a catalog model: `cera transcribe --model <alias> --quant q8_0 \
+             --download-model`; a local GGUF must be reconverted from its source; Q8_0 is \
+             the more accurate of the two quantized formats it reads (Q8_0 and Q4_0))"
+        )
+    })
+}
+
 /// Probe for Qualcomm Hexagon DSP and instantiate `HexagonWhisperModel` if available.
 pub fn try_hexagon_whisper(
     weights: &WhisperWeights,
     tokenizer: &crate::tokenizer::BpeTokenizer,
 ) -> Option<Arc<HexagonWhisperModel>> {
+    // A weight format the NPU cannot read is worth a warning, not a debug line: the model then
+    // quietly runs on the CPU at about ten times the CPU time, and nothing says why.
+    if let Some(problem) = npu_weight_problem(weights) {
+        hexagon_warn!("whisper: {problem}; running on the CPU instead");
+        return None;
+    }
     match init_hexagon_whisper(weights, tokenizer) {
         Ok(model) => Some(model),
         Err(e) => {
@@ -2592,8 +2841,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn test_whisper_weight_planning_and_staging() {
+    /// A one-layer, 64-wide Whisper with Q8_0 weights: small enough to stage on the fake driver.
+    fn tiny_whisper_weights() -> WhisperWeights {
         let d_model = 64;
         let n_vocab = 128;
         let config = WhisperConfig {
@@ -2700,18 +2949,184 @@ mod tests {
             proj_w: make_q8(n_vocab, d_model),
         };
 
-        let weights = WhisperWeights {
+        WhisperWeights {
             config,
             encoder,
             decoder,
-        };
+        }
+    }
 
+    #[test]
+    fn test_whisper_weight_planning_and_staging() {
+        let weights = tiny_whisper_weights();
         let offsets = HexagonWhisperWeightOffsets::plan(&weights).unwrap();
         assert!(offsets.total_bytes > 0);
 
         let mut staged_bytes = vec![0u8; offsets.total_bytes];
         stage_whisper_weights(&weights, &offsets, &mut staged_bytes).unwrap();
         assert!(staged_bytes.iter().any(|&b| b != 0));
+    }
+
+    /// The greedy mask suppresses exactly the tokens the host's `suppress_whisper_special_tokens`
+    /// does, with and without timestamps, and leaves `eot` alone. `eot` sits inside the control
+    /// range, so the carve-out is exercised rather than passing trivially.
+    #[test]
+    fn the_greedy_mask_matches_the_host_suppression() {
+        let t = WhisperSpecialTokens {
+            sot: 10,
+            eot: 12,
+            transcribe: 12,
+            translate: 11,
+            no_timestamps: 14,
+            sot_prev: 13,
+            sot_lm: 15,
+            no_speech: 16,
+            timestamp_begin: 17,
+        };
+        for timestamps in [false, true] {
+            let mut host = vec![0.0f32; 40];
+            crate::model::whisper::suppress_whisper_special_tokens(&mut host, &t, timestamps);
+            let mask = greedy_mask(&t, 40, timestamps);
+            for (i, (&h, &m)) in host.iter().zip(&mask).enumerate() {
+                assert_eq!(
+                    h == f32::NEG_INFINITY,
+                    m == GREEDY_SUPPRESSED,
+                    "token {i}, timestamps {timestamps}"
+                );
+                assert!(m == 0.0 || m == GREEDY_SUPPRESSED);
+            }
+            assert_eq!(mask[t.eot as usize], 0.0, "eot stays selectable");
+        }
+    }
+
+    /// The DSP readback returns the row's `i32` in bounds and a recoverable error (never a
+    /// panic) on a short scratch, including `at` past the end or at `usize::MAX`.
+    #[test]
+    fn readback_i32_le_reads_in_bounds_and_errors_out_of_them() {
+        let scratch: Vec<u8> = (0..32).collect();
+        assert_eq!(readback_i32_le(&scratch, 0).unwrap(), 0x0302_0100);
+        assert_eq!(readback_i32_le(&scratch, 28).unwrap(), 0x1f1e_1d1c);
+        for at in [29, 30, 31, 32, 33, 1000, usize::MAX] {
+            assert!(
+                readback_i32_le(&scratch, at).is_err(),
+                "at={at} should err, not panic"
+            );
+        }
+        // The error associates each value with its label (presence alone would pass a
+        // swapped message), so the failure is debuggable from the log as printed.
+        let msg = format!("{}", readback_i32_le(&scratch, 29).unwrap_err());
+        assert!(
+            msg.contains("offset 29") && msg.contains("len 32"),
+            "short-row error must label offset and len: {msg}"
+        );
+        let empty: &[u8] = &[];
+        assert!(readback_i32_le(empty, 0).is_err());
+    }
+
+    /// The log-mel fallback counter starts at 0, stays there while the DSP answers, and
+    /// counts host fallbacks (which stay bit-identical to the host front end). The on-device
+    /// probe asserts both before trusting NPU mel timings.
+    #[test]
+    fn log_mel_counts_host_fallbacks() {
+        use crate::backend::hexagon::sys::fake;
+        fake::reset();
+        let (driver, device) = crate::backend::hexagon::op_capture::fresh_device();
+        let device = Arc::new(Mutex::new(device));
+        let tokenizer = crate::tokenizer::BpeTokenizer::empty_for_test();
+        let model = HexagonWhisperModel::new(
+            driver,
+            Arc::clone(&device),
+            &tiny_whisper_weights(),
+            &tokenizer,
+        )
+        .expect("stage the tiny model on the fake driver");
+        assert!(model.mel_on_dsp());
+        assert_eq!(model.mel_fallbacks(), 0);
+        let pcm = vec![0.1f32; 16_000];
+        model.log_mel(&pcm);
+        assert_eq!(
+            model.mel_fallbacks(),
+            0,
+            "the DSP answered, nothing fell back"
+        );
+        fake::with(|s| s.fail_write = true);
+        let fell_back = model.log_mel(&pcm);
+        assert_eq!(
+            fell_back,
+            crate::model::whisper_preprocessor::extract_whisper_mel(&pcm, 80)
+        );
+        assert_eq!(model.mel_fallbacks(), 1);
+        fake::reset();
+
+        // An unstaged front end (unsupported bin count) runs on the host without counting:
+        // the probe asserts the staging predicate first for exactly this reason.
+        let mut unstaged = tiny_whisper_weights();
+        unstaged.config.n_audio_mel_bins = 64;
+        let (driver, device) = crate::backend::hexagon::op_capture::fresh_device();
+        let model =
+            HexagonWhisperModel::new(driver, Arc::new(Mutex::new(device)), &unstaged, &tokenizer)
+                .expect("stage the tiny model on the fake driver");
+        assert!(!model.mel_on_dsp());
+        model.log_mel(&pcm);
+        assert_eq!(model.mel_fallbacks(), 0);
+    }
+
+    /// A K-quant weight (what `cera transcribe` converts to by default) is reported with the way
+    /// to convert the model; Q8_0 weights are fine.
+    #[test]
+    fn a_weight_format_the_npu_cannot_read_is_explained() {
+        let mut weights = tiny_whisper_weights();
+        assert_eq!(npu_weight_problem(&weights), None);
+        let (rows, cols) = (64, 256);
+        weights.encoder.blocks[0].attn_q_w =
+            MmapWeight::from_owned_bytes(vec![0u8; rows * 144], DType::Q4KM, rows, cols);
+        let problem = npu_weight_problem(&weights).expect("a Q4_K weight is not supported");
+        assert!(
+            problem.contains("Q4KM")
+                && problem.contains("--quant q8_0")
+                && problem.contains("--model <alias>")
+                && problem.contains("--download-model"),
+            "{problem}"
+        );
+    }
+
+    /// The model puts its own session's waits to sleep (see [`HexagonWhisperModel::new`]):
+    /// `set_blocking_wait` returns the previous setting, which must already be `true`. Dropping
+    /// the model restores the previous setting.
+    #[test]
+    fn a_whisper_model_makes_its_session_waits_sleep() {
+        let (driver, device) = crate::backend::hexagon::op_capture::fresh_device();
+        let device = Arc::new(Mutex::new(device));
+        assert!(
+            !device
+                .lock_or_recover()
+                .queue_session_mut()
+                .set_blocking_wait(false),
+            "a fresh session spins by default"
+        );
+        let tokenizer = crate::tokenizer::BpeTokenizer::empty_for_test();
+        let model = HexagonWhisperModel::new(
+            driver,
+            Arc::clone(&device),
+            &tiny_whisper_weights(),
+            &tokenizer,
+        )
+        .expect("stage the tiny model on the fake driver");
+        assert!(
+            device
+                .lock_or_recover()
+                .queue_session_mut()
+                .set_blocking_wait(true),
+            "the model left its session spinning"
+        );
+        drop(model);
+        assert!(
+            !device
+                .lock_or_recover()
+                .queue_session_mut()
+                .set_blocking_wait(false),
+            "dropping the model did not restore the wait"
+        );
     }
 
     #[test]

@@ -38,19 +38,33 @@ pub const N_FFT_BINS: usize = N_FFT / 2 + 1; // 201
 /// Output layout: `[n_mels x 3000]` row-major (channel-major outer, time inner).
 /// Element `[m, t]` is at index `m * CHUNK_FRAMES + t`.
 pub fn extract_whisper_mel(pcm: &[f32], n_mels: usize) -> Vec<f32> {
-    if n_mels != 80 && n_mels != 128 {
-        return Vec::new();
-    }
+    extract_whisper_mel_frames(pcm, n_mels, active_frames(pcm.len()))
+}
 
-    // Center padding by N_FFT / 2 = 200 samples on each side directly into CHUNK_SAMPLES buffer
+/// Frames of the 30 s window that can hold audio: a frame `f` reads `padded[f * HOP_LEN ..
+/// f * HOP_LEN + N_FFT]`, and audio (after the left reflection) ends at `N_FFT / 2 + len`. Every
+/// later frame reads zeros only, so its power is exactly 0 and its log-mel exactly the floor.
+pub(crate) fn active_frames(pcm_len: usize) -> usize {
+    let len = pcm_len.min(CHUNK_SAMPLES);
+    if len == CHUNK_SAMPLES {
+        // The right flank reflects audio too.
+        return CHUNK_FRAMES;
+    }
+    (N_FFT / 2 + len).div_ceil(HOP_LEN).min(CHUNK_FRAMES)
+}
+
+/// The first `out_len` samples of `pcm` padded to the 30 s window the way Whisper's STFT sees it:
+/// `N_FFT / 2` samples of reflection on the left, zeros past the end of the audio (or the
+/// reflection of the last samples when the audio fills the window), non-finite samples as zeros.
+/// `out_len` is at most `CHUNK_SAMPLES + N_FFT`, the whole window, and at least `N_FFT`.
+pub(crate) fn padded_whisper_audio_upto(pcm: &[f32], out_len: usize) -> Vec<f32> {
     let pad = N_FFT / 2;
-    let mut padded_audio = vec![0.0f32; CHUNK_SAMPLES + 2 * pad];
+    let out_len = out_len.clamp(N_FFT, CHUNK_SAMPLES + 2 * pad);
+    let mut padded_audio = vec![0.0f32; out_len];
     let copy_len = pcm.len().min(CHUNK_SAMPLES);
     if copy_len > 0 {
-        for (dst, &src) in padded_audio[pad..pad + copy_len]
-            .iter_mut()
-            .zip(&pcm[..copy_len])
-        {
+        let n = copy_len.min(out_len.saturating_sub(pad));
+        for (dst, &src) in padded_audio[pad..pad + n].iter_mut().zip(&pcm[..n]) {
             *dst = if src.is_finite() { src } else { 0.0 };
         }
         // PyTorch reflect padding on left flank (mirrors without duplicating audio[0])
@@ -61,7 +75,7 @@ pub fn extract_whisper_mel(pcm: &[f32], n_mels: usize) -> Vec<f32> {
             }
         }
         // Right flank reflection around the 30s (CHUNK_SAMPLES) boundary
-        if copy_len == CHUNK_SAMPLES {
+        if copy_len == CHUNK_SAMPLES && out_len == CHUNK_SAMPLES + 2 * pad {
             for i in 0..pad {
                 let src_idx = CHUNK_SAMPLES.saturating_sub(2 + i);
                 let v = pcm[src_idx];
@@ -71,6 +85,22 @@ pub fn extract_whisper_mel(pcm: &[f32], n_mels: usize) -> Vec<f32> {
         // When copy_len < CHUNK_SAMPLES, samples at the 30s chunk boundary are 0.0,
         // so right-flank padding correctly remains 0.0.
     }
+    padded_audio
+}
+
+/// Samples the first `n_active` frames read from the padded window.
+pub(crate) fn samples_for_frames(n_active: usize) -> usize {
+    (n_active.max(1) - 1) * HOP_LEN + N_FFT
+}
+
+/// [`extract_whisper_mel`] computing the FFT and the filterbank for the first `n_active` frames
+/// only; the others are taken to be silent (see [`active_frames`]).
+fn extract_whisper_mel_frames(pcm: &[f32], n_mels: usize, n_active: usize) -> Vec<f32> {
+    if n_mels != 80 && n_mels != 128 {
+        return Vec::new();
+    }
+    let n_active = n_active.min(CHUNK_FRAMES);
+    let padded_audio = padded_whisper_audio_upto(pcm, samples_for_frames(n_active));
 
     let hann = build_hann_window(N_FFT);
     let mel_filters = build_mel_filterbank(n_mels, N_FFT, SAMPLE_RATE);
@@ -82,10 +112,10 @@ pub fn extract_whisper_mel(pcm: &[f32], n_mels: usize) -> Vec<f32> {
     let fft = FFT_PLANNER.with(|p| p.borrow_mut().plan_fft_forward(N_FFT));
     let mut fft_buf = vec![Complex32::new(0.0, 0.0); N_FFT];
 
-    // Temporary storage for power spectrogram [CHUNK_FRAMES x N_FFT_BINS]
-    let mut power_spec = vec![0.0f32; CHUNK_FRAMES * N_FFT_BINS];
+    // Power spectrogram [n_active x N_FFT_BINS]
+    let mut power_spec = vec![0.0f32; n_active * N_FFT_BINS];
 
-    for frame in 0..CHUNK_FRAMES {
+    for frame in 0..n_active {
         let start = frame * HOP_LEN;
         for i in 0..N_FFT {
             fft_buf[i] = Complex32::new(padded_audio[start + i] * hann[i], 0.0);
@@ -99,11 +129,9 @@ pub fn extract_whisper_mel(pcm: &[f32], n_mels: usize) -> Vec<f32> {
         }
     }
 
-    // Multiply with mel filterbank and apply log10:
-    // mel_spec[m, t] = sum_k filter[m, k] * power[t, k]
-    let mut log_mel = vec![0.0f32; n_mels * CHUNK_FRAMES];
-    let mut max_val = f32::NEG_INFINITY;
-
+    // Mel energies [n_active x n_mels], time-major:
+    // energy[t, m] = sum_k filter[m, k] * power[t, k]
+    let mut energies = vec![0.0f32; n_active * n_mels];
     for m in 0..n_mels {
         let filter_row = &mel_filters[m * N_FFT_BINS..(m + 1) * N_FFT_BINS];
         let k_first = filter_row.iter().position(|&v| v > 0.0).unwrap_or(0);
@@ -113,19 +141,42 @@ pub fn extract_whisper_mel(pcm: &[f32], n_mels: usize) -> Vec<f32> {
             .map_or(0, |i| i + 1);
         let active_filter = &filter_row[k_first..k_last];
 
-        for t in 0..CHUNK_FRAMES {
+        for t in 0..n_active {
             let power_row = &power_spec[t * N_FFT_BINS..(t + 1) * N_FFT_BINS];
-            let sum = if !active_filter.is_empty() {
+            energies[t * n_mels + m] = if !active_filter.is_empty() {
                 crate::backend::cpu::dot_f32(active_filter, &power_row[k_first..k_last])
             } else {
                 0.0
             };
+        }
+    }
+
+    finish_whisper_mel(&energies, n_mels, n_active)
+}
+
+/// From the mel energies of the first `n_active` frames (`[n_active, n_mels]`, time-major) to
+/// the `[n_mels x 3000]` channel-major log-mel Whisper's stem reads: `log10` with a `1e-10`
+/// floor, the dynamic range clamped to 8 below the maximum, then `(x + 4) / 4`. The frames past
+/// `n_active` are silent: energy 0, so exactly the floor.
+pub(crate) fn finish_whisper_mel(energies: &[f32], n_mels: usize, n_active: usize) -> Vec<f32> {
+    debug_assert_eq!(energies.len(), n_active * n_mels);
+    let silent = 0.0f32.max(1e-10).log10();
+    let mut log_mel = vec![silent; n_mels * CHUNK_FRAMES];
+    let mut max_val = if n_active < CHUNK_FRAMES {
+        silent
+    } else {
+        f32::NEG_INFINITY
+    };
+
+    for m in 0..n_mels {
+        let row = &mut log_mel[m * CHUNK_FRAMES..m * CHUNK_FRAMES + n_active];
+        for (t, slot) in row.iter_mut().enumerate() {
             // clamp(min = 1e-10) and log10
-            let val = (sum.max(1e-10)).log10();
+            let val = energies[t * n_mels + m].max(1e-10).log10();
             if val > max_val {
                 max_val = val;
             }
-            log_mel[m * CHUNK_FRAMES + t] = val;
+            *slot = val;
         }
     }
 
@@ -144,6 +195,55 @@ pub fn extract_whisper_mel(pcm: &[f32], n_mels: usize) -> Vec<f32> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Computing only the frames that can hold audio is bit-identical to computing all 3000:
+    /// the others read zeros, so their power is exactly 0 and their log-mel exactly the floor.
+    /// The mel count is orthogonal to the framing branches pinned here, so every size runs at 80
+    /// mels and only the boundary sizes repeat at 128 (each leg costs a full 3000-frame oracle).
+    #[test]
+    fn computing_only_the_active_frames_changes_nothing() {
+        let tone = |n: usize| -> Vec<f32> {
+            (0..n)
+                .map(|i| {
+                    let t = i as f32 / 16_000.0;
+                    (t * 440.0 * std::f32::consts::TAU).sin() * 0.3
+                        + (t * 1830.0 * std::f32::consts::TAU).sin() * 0.1
+                })
+                .collect()
+        };
+        let check = |n: usize, n_mels: usize| {
+            let pcm = tone(n);
+            let fast = extract_whisper_mel(&pcm, n_mels);
+            let full = extract_whisper_mel_frames(&pcm, n_mels, CHUNK_FRAMES);
+            assert_eq!(fast.len(), full.len());
+            assert!(
+                fast.iter()
+                    .zip(&full)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{n} samples, {n_mels} mels: not bit-identical"
+            );
+        };
+        for n in [
+            0usize,
+            1,
+            199,
+            200,
+            1600,
+            48_000,
+            129_999,
+            479_999,
+            CHUNK_SAMPLES,
+        ] {
+            check(n, 80);
+        }
+        for n in [0usize, 200, CHUNK_SAMPLES] {
+            check(n, 128);
+        }
+        // A short clip really does skip most frames.
+        assert_eq!(active_frames(48_000), (200 + 48_000usize).div_ceil(160));
+        assert_eq!(active_frames(CHUNK_SAMPLES), CHUNK_FRAMES);
+        assert_eq!(active_frames(10 * CHUNK_SAMPLES), CHUNK_FRAMES);
+    }
 
     #[test]
     fn test_extract_whisper_mel_silence() {
