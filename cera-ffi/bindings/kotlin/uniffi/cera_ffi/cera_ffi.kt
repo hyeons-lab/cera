@@ -1076,13 +1076,19 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_session_recovery_status(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance(): Int
+
     external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu(): Int
+
     external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush(): Int
+
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer(): Int
 
     external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword(): Int
 
@@ -1218,7 +1224,11 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes(): Int
 
+    external fun uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer(): Int
+
     external fun uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_chatsession_from_session(): Int
 
@@ -2066,6 +2076,16 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Long
 
+    external fun uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer(
+        `vadBytes`: RustBuffer.ByValue,
+        `hotwordBytes`: RustBuffer.ByValue,
+        `whisperBytes`: RustBuffer.ByValue,
+        `diarizerBytes`: RustBuffer.ByValue,
+        `preferNpu`: Byte,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
     external fun uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files(
         `vadPath`: RustBuffer.ByValue,
         `hotwordPath`: RustBuffer.ByValue,
@@ -2073,6 +2093,24 @@ internal object UniffiLib {
         `config`: RustBuffer.ByValue,
         uniffi_out_err: UniffiRustCallStatus,
     ): Long
+
+    external fun uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer(
+        `vadPath`: RustBuffer.ByValue,
+        `hotwordPath`: RustBuffer.ByValue,
+        `whisperPath`: RustBuffer.ByValue,
+        `diarizerPath`: RustBuffer.ByValue,
+        `preferNpu`: Byte,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_add_utterance(
+        `ptr`: Long,
+        `text`: RustBuffer.ByValue,
+        `startMs`: Float,
+        `endMs`: Float,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
 
     external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_cancel(
         `ptr`: Long,
@@ -2089,10 +2127,20 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Long
 
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_diarizer_on_npu(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+
     external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush(
         `ptr`: Long,
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
+
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_has_diarizer(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
 
     external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_listening_for_hotword(
         `ptr`: Long,
@@ -3028,6 +3076,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance() != 27373) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 57820) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
@@ -3037,7 +3088,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 47716) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu() != 39954) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 1087) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer() != 11141) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() != 57051) {
@@ -3241,7 +3298,13 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 42076) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer() != 59328) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer() != 56903) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996) {
@@ -6780,6 +6843,17 @@ public object FfiConverterTypeDownloadProgressSink : FfiConverter<DownloadProgre
  */
 public interface FfiAudioPipelineInterface {
     /**
+     * Register an utterance transcribed outside the pipeline so it gets an `UtteranceLabeled`
+     * event too. `start_ms` and `end_ms` are on the pipeline's clock, as in
+     * `UtteranceTranscribed`. Returns whether a diarizer will label it.
+     */
+    fun `addUtterance`(
+        `text`: kotlin.String,
+        `startMs`: kotlin.Float,
+        `endMs`: kotlin.Float,
+    ): kotlin.Boolean
+
+    /**
      * Cooperatively cancel any active transcription.
      *
      * Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
@@ -6798,9 +6872,21 @@ public interface FfiAudioPipelineInterface {
     fun `currentSample`(): kotlin.ULong
 
     /**
+     * Whether the diarizer was staged on the Hexagon NPU and has not stopped (false: the
+     * CPU, or no diarizer). Steps the NPU declines or that fail there still run on the CPU.
+     */
+    fun `diarizerOnNpu`(): kotlin.Boolean
+
+    /**
      * Flush any in-flight speech segment at the end of the audio stream.
      */
     fun `flush`(): List<FfiAudioPipelineEvent>
+
+    /**
+     * Whether a speaker diarizer is attached and running. It stops, with a warning in the log,
+     * if it fails; the pipeline then keeps transcribing without speaker labels.
+     */
+    fun `hasDiarizer`(): kotlin.Boolean
 
     /**
      * Whether the pipeline is currently awaiting a wake word trigger.
@@ -6953,6 +7039,31 @@ open class FfiAudioPipeline :
     }
 
     /**
+     * Register an utterance transcribed outside the pipeline so it gets an `UtteranceLabeled`
+     * event too. `start_ms` and `end_ms` are on the pipeline's clock, as in
+     * `UtteranceTranscribed`. Returns whether a diarizer will label it.
+     */
+    @Throws(FfiException::class)
+    override fun `addUtterance`(
+        `text`: kotlin.String,
+        `startMs`: kotlin.Float,
+        `endMs`: kotlin.Float,
+    ): kotlin.Boolean =
+        FfiConverterBoolean.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_add_utterance(
+                        it,
+                        FfiConverterString.lower(`text`),
+                        FfiConverterFloat.lower(`startMs`),
+                        FfiConverterFloat.lower(`endMs`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Cooperatively cancel any active transcription.
      *
      * Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
@@ -7000,6 +7111,22 @@ open class FfiAudioPipeline :
         )
 
     /**
+     * Whether the diarizer was staged on the Hexagon NPU and has not stopped (false: the
+     * CPU, or no diarizer). Steps the NPU declines or that fail there still run on the CPU.
+     */
+    override fun `diarizerOnNpu`(): kotlin.Boolean =
+        FfiConverterBoolean.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_diarizer_on_npu(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
      * Flush any in-flight speech segment at the end of the audio stream.
      */
     @Throws(FfiException::class)
@@ -7008,6 +7135,23 @@ open class FfiAudioPipeline :
             callWithHandle {
                 uniffiRustCallWithError(FfiException) { _status ->
                     UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Whether a speaker diarizer is attached and running. It stops, with a warning in the log,
+     * if it fails; the pipeline then keeps transcribing without speaker labels.
+     */
+    @Throws(FfiException::class)
+    override fun `hasDiarizer`(): kotlin.Boolean =
+        FfiConverterBoolean.lift(
+            callWithHandle {
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_has_diarizer(
                         it,
                         _status,
                     )
@@ -7183,6 +7327,38 @@ open class FfiAudioPipeline :
             )
 
         /**
+         * Construct a pipeline from in-memory GGUF byte buffers with a Sortformer speaker
+         * diarizer (`diarizer_bytes`, a converted Sortformer GGUF). Every transcribed utterance
+         * then gets an `UtteranceLabeled` event with its speaker, once the diarizer covers it.
+         *
+         * With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+         * device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+         * otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+         */
+        @Throws(FfiException::class)
+        fun `fromBytesWithDiarizer`(
+            `vadBytes`: kotlin.ByteArray?,
+            `hotwordBytes`: kotlin.ByteArray?,
+            `whisperBytes`: kotlin.ByteArray?,
+            `diarizerBytes`: kotlin.ByteArray,
+            `preferNpu`: kotlin.Boolean,
+            `config`: FfiAudioPipelineConfig?,
+        ): FfiAudioPipeline =
+            FfiConverterTypeFfiAudioPipeline.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer(
+                        FfiConverterOptionalByteArray.lower(`vadBytes`),
+                        FfiConverterOptionalByteArray.lower(`hotwordBytes`),
+                        FfiConverterOptionalByteArray.lower(`whisperBytes`),
+                        FfiConverterByteArray.lower(`diarizerBytes`),
+                        FfiConverterBoolean.lower(`preferNpu`),
+                        FfiConverterOptionalTypeFfiAudioPipelineConfig.lower(`config`),
+                        _status,
+                    )
+                },
+            )
+
+        /**
          * Construct a pipeline from filesystem model paths.
          */
         @Throws(FfiException::class)
@@ -7198,6 +7374,38 @@ open class FfiAudioPipeline :
                         FfiConverterOptionalString.lower(`vadPath`),
                         FfiConverterOptionalString.lower(`hotwordPath`),
                         FfiConverterOptionalString.lower(`whisperPath`),
+                        FfiConverterOptionalTypeFfiAudioPipelineConfig.lower(`config`),
+                        _status,
+                    )
+                },
+            )
+
+        /**
+         * Construct a pipeline from filesystem model paths with a Sortformer speaker diarizer
+         * (`diarizer_path`, a converted Sortformer GGUF). Every transcribed utterance then gets an
+         * `UtteranceLabeled` event with its speaker, once the diarizer has covered it.
+         *
+         * With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+         * device offers it (the GGUF must have been converted with `--tail-outtype q8_0`); otherwise,
+         * or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+         */
+        @Throws(FfiException::class)
+        fun `fromFilesWithDiarizer`(
+            `vadPath`: kotlin.String?,
+            `hotwordPath`: kotlin.String?,
+            `whisperPath`: kotlin.String?,
+            `diarizerPath`: kotlin.String,
+            `preferNpu`: kotlin.Boolean,
+            `config`: FfiAudioPipelineConfig?,
+        ): FfiAudioPipeline =
+            FfiConverterTypeFfiAudioPipeline.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer(
+                        FfiConverterOptionalString.lower(`vadPath`),
+                        FfiConverterOptionalString.lower(`hotwordPath`),
+                        FfiConverterOptionalString.lower(`whisperPath`),
+                        FfiConverterString.lower(`diarizerPath`),
+                        FfiConverterBoolean.lower(`preferNpu`),
                         FfiConverterOptionalTypeFfiAudioPipelineConfig.lower(`config`),
                         _status,
                     )
@@ -14750,6 +14958,47 @@ sealed class FfiAudioPipelineEvent {
         companion object
     }
 
+    /**
+     * The attached speaker diarizer has covered an utterance and assigned it a speaker. One per
+     * utterance, after its `UtteranceTranscribed`: a chunk plus its lookahead later (seconds with
+     * the default preset). Needs a pipeline built with `from_files_with_diarizer`.
+     */
+    data class UtteranceLabeled(
+        /**
+         * The utterance text, as in its `UtteranceTranscribed` event.
+         */
+        val `text`: kotlin.String,
+        /**
+         * Start timestamp of the utterance in milliseconds.
+         */
+        val `startMs`: kotlin.Float,
+        /**
+         * End timestamp of the utterance in milliseconds.
+         */
+        val `endMs`: kotlin.Float,
+        /**
+         * The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
+         * span or the labeler had to give the utterance up (see `dropped`).
+         */
+        val `speaker`: kotlin.UInt?,
+        /**
+         * The speaker's share of all speakers' active time over the span, in (0, 1].
+         */
+        val `confidence`: kotlin.Float?,
+        /**
+         * A second speaker who was also clearly active over the span, if any.
+         */
+        val `overlapping`: kotlin.UInt?,
+        /**
+         * True when the labeler gave the utterance up instead of labeling it (history expiry,
+         * queue overflow, or non-finite times): `None` speaker with `dropped` set is a stalled
+         * diarizer, not silence.
+         */
+        val `dropped`: kotlin.Boolean,
+    ) : FfiAudioPipelineEvent() {
+        companion object
+    }
+
     companion object
 }
 
@@ -14790,6 +15039,18 @@ public object FfiConverterTypeFfiAudioPipelineEvent : FfiConverterRustBuffer<Ffi
                     FfiConverterFloat.read(buf),
                     FfiConverterFloat.read(buf),
                     FfiConverterULong.read(buf),
+                )
+            }
+
+            5 -> {
+                FfiAudioPipelineEvent.UtteranceLabeled(
+                    FfiConverterString.read(buf),
+                    FfiConverterFloat.read(buf),
+                    FfiConverterFloat.read(buf),
+                    FfiConverterOptionalUInt.read(buf),
+                    FfiConverterOptionalFloat.read(buf),
+                    FfiConverterOptionalUInt.read(buf),
+                    FfiConverterBoolean.read(buf),
                 )
             }
 
@@ -14841,6 +15102,20 @@ public object FfiConverterTypeFfiAudioPipelineEvent : FfiConverterRustBuffer<Ffi
                         FfiConverterULong.allocationSize(value.`sampleCount`)
                 )
             }
+
+            is FfiAudioPipelineEvent.UtteranceLabeled -> {
+                // Add the size for the Int that specifies the variant plus the size needed for all fields
+                (
+                    4UL +
+                        FfiConverterString.allocationSize(value.`text`) +
+                        FfiConverterFloat.allocationSize(value.`startMs`) +
+                        FfiConverterFloat.allocationSize(value.`endMs`) +
+                        FfiConverterOptionalUInt.allocationSize(value.`speaker`) +
+                        FfiConverterOptionalFloat.allocationSize(value.`confidence`) +
+                        FfiConverterOptionalUInt.allocationSize(value.`overlapping`) +
+                        FfiConverterBoolean.allocationSize(value.`dropped`)
+                )
+            }
         }
 
     override fun write(
@@ -14879,6 +15154,18 @@ public object FfiConverterTypeFfiAudioPipelineEvent : FfiConverterRustBuffer<Ffi
                 FfiConverterFloat.write(value.`startMs`, buf)
                 FfiConverterFloat.write(value.`endMs`, buf)
                 FfiConverterULong.write(value.`sampleCount`, buf)
+                Unit
+            }
+
+            is FfiAudioPipelineEvent.UtteranceLabeled -> {
+                buf.putInt(5)
+                FfiConverterString.write(value.`text`, buf)
+                FfiConverterFloat.write(value.`startMs`, buf)
+                FfiConverterFloat.write(value.`endMs`, buf)
+                FfiConverterOptionalUInt.write(value.`speaker`, buf)
+                FfiConverterOptionalFloat.write(value.`confidence`, buf)
+                FfiConverterOptionalUInt.write(value.`overlapping`, buf)
+                FfiConverterBoolean.write(value.`dropped`, buf)
                 Unit
             }
         }.let { /* this makes the `when` an expression, which ensures it is exhaustive */ }

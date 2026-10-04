@@ -454,6 +454,25 @@ pub(crate) fn gelu_tanh<S: OpSink>(
     Ok(())
 }
 
+/// In-place natural logarithm: `buf = ln(buf)` (the inputs must be positive).
+pub(crate) fn log_inplace<S: OpSink>(
+    session: &mut S,
+    buf: &S::Buf,
+    offset: usize,
+    shape: TokenShape,
+    tile: TokenTile,
+) -> Result<(), CeraError> {
+    unary_inplace(
+        session,
+        HtpOpCode::UnaryLog,
+        "log",
+        buf,
+        offset,
+        shape,
+        tile,
+    )
+}
+
 /// In-place SiLU: `buf = silu(buf)`.
 pub(crate) fn silu<S: OpSink>(
     session: &mut S,

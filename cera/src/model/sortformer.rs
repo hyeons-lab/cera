@@ -42,18 +42,21 @@
 
 #[cfg(feature = "mmap")]
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, OnceLock};
 
 use anyhow::{Context, Result, ensure};
 
 use crate::backend::cpu;
 use crate::gguf::GgufFile;
 use crate::model::audio_encoder::{
-    AudioEncoderConfig, ConformerLayerWeights, ConvStemWeights, HOP_LEN, LOG_MEL_EPS, N_FFT,
-    POS_EMB_DIM, PREEMPH, SAMPLE_RATE, WINDOW_LEN, conformer_block_forward, conv_stem_forward,
-    load_conformer_block, load_conv_layer, load_vec_f32, relative_pos_emb,
+    AudioEncoderConfig, ConformerLayerWeights, ConvStemWeights, EncoderParts, HOP_LEN, LOG_MEL_EPS,
+    N_FFT, POS_EMB_DIM, PREEMPH, SAMPLE_RATE, WINDOW_LEN, conformer_block_forward,
+    conv_stem_forward, load_conformer_block, load_conv_layer, load_vec_f32, relative_pos_emb,
 };
-use crate::model::audio_preprocessor::{MelFrameComputer, N_FFT_BINS, log_mel_with_tables};
+use crate::model::audio_preprocessor::{
+    MelFrameComputer, N_FFT_BINS, log_mel_with_tables, n_frames_for, padded_preemphasized,
+};
 use crate::model::weights::MmapWeight;
 use crate::tensor::DType;
 
@@ -129,6 +132,12 @@ impl StreamingParams {
     /// Return the recommended low-latency preset (0.48 s chunk, 1.04 s latency).
     pub fn low_latency(&self) -> Self {
         self.with_chunking(6, 1, 7, 188, 188, 144)
+    }
+
+    /// Encoder frames one step attends over at most: both contexts, the chunk, the FIFO and
+    /// the speaker cache. What an accelerator has to be staged for.
+    pub fn window_frames(&self) -> usize {
+        self.left_context + self.chunk_len + self.right_context + self.fifo_len + self.spkcache_len
     }
 
     fn validate(&self) -> Result<()> {
@@ -211,6 +220,33 @@ impl StreamingParams {
     }
 }
 
+/// An accelerator (the Hexagon NPU) for the two heavy parts of a diarization step. Set once per
+/// model with [`SortformerModel::set_accelerator`]; every stream and live diarizer made from the
+/// model then uses it. Each method returns `Ok(None)` to decline an input it cannot take (for
+/// example one longer than the window it was staged for), and an `Err` is a failure: both fall
+/// back to the CPU, the failure with a one-time warning, so a diarizer never stops because the
+/// accelerator did. An output of the wrong length is treated like a failure of that stage (CPU
+/// fallback with a one-time warning), never trusted.
+pub trait SortformerAccelerator: Send + Sync {
+    /// The conv stem and `pre_encode.out` over `n_frames` of `[n_frames x n_mel]` mel:
+    /// `[stem_frames(n_frames) x n_embd]`, like [`SortformerModel::pre_encode`].
+    fn pre_encode(&self, mel: &[f32], n_frames: usize) -> Result<Option<Vec<f32>>>;
+
+    /// The x-scale, FastConformer, `encoder_proj`, Transformer and speaker head over `t`
+    /// pre-encode embeddings: `[t x n_spk]` sigmoid activities, like [`SortformerModel::predict`].
+    fn predict(&self, emb: &[f32], t: usize) -> Result<Option<Vec<f32>>>;
+
+    /// Log-mel of `n_frames` frames over pre-emphasised, centre-padded samples: frame `f` is
+    /// `samples[f * 160 .. f * 160 + 512]`, windowed with the model's own window, projected with
+    /// its own filterbank, and `ln(energy + 2^-24)` of the result. `[n_frames x n_mel]`,
+    /// time-major, the values [`SortformerModel::log_mel`] returns. Optional: the default
+    /// declines, leaving the mel on the CPU.
+    fn log_mel(&self, samples: &[f32], n_frames: usize) -> Result<Option<Vec<f32>>> {
+        let _ = (samples, n_frames);
+        Ok(None)
+    }
+}
+
 // ── Config and weights ─────────────────────────────────────────────────────
 
 /// Architecture constants read from the GGUF.
@@ -248,23 +284,23 @@ pub struct SortformerConfig {
     pub pad_to: usize,
 }
 
-struct TransformerLayer {
-    ln1_w: Vec<f32>,
-    ln1_b: Vec<f32>,
-    q_w: MmapWeight,
-    q_b: Vec<f32>,
-    k_w: MmapWeight,
-    k_b: Vec<f32>,
-    v_w: MmapWeight,
-    v_b: Vec<f32>,
-    o_w: MmapWeight,
-    o_b: Vec<f32>,
-    ln2_w: Vec<f32>,
-    ln2_b: Vec<f32>,
-    up_w: MmapWeight,
-    up_b: Vec<f32>,
-    down_w: MmapWeight,
-    down_b: Vec<f32>,
+pub(crate) struct TransformerLayer {
+    pub(crate) ln1_w: Vec<f32>,
+    pub(crate) ln1_b: Vec<f32>,
+    pub(crate) q_w: MmapWeight,
+    pub(crate) q_b: Vec<f32>,
+    pub(crate) k_w: MmapWeight,
+    pub(crate) k_b: Vec<f32>,
+    pub(crate) v_w: MmapWeight,
+    pub(crate) v_b: Vec<f32>,
+    pub(crate) o_w: MmapWeight,
+    pub(crate) o_b: Vec<f32>,
+    pub(crate) ln2_w: Vec<f32>,
+    pub(crate) ln2_b: Vec<f32>,
+    pub(crate) up_w: MmapWeight,
+    pub(crate) up_b: Vec<f32>,
+    pub(crate) down_w: MmapWeight,
+    pub(crate) down_b: Vec<f32>,
 }
 
 /// Every Sortformer tensor, loaded from a converted GGUF. Held by [`SortformerModel`] and its
@@ -277,17 +313,59 @@ pub(crate) struct SortformerWeights {
     enc_cfg: AudioEncoderConfig,
     conv_stem: ConvStemWeights,
     layers: Vec<ConformerLayerWeights>,
-    proj_w: MmapWeight,
-    proj_b: Vec<f32>,
-    tf: Vec<TransformerLayer>,
-    head_hidden_w: MmapWeight,
-    head_hidden_b: Vec<f32>,
-    head_out_w: MmapWeight,
-    head_out_b: Vec<f32>,
+    pub(crate) proj_w: MmapWeight,
+    pub(crate) proj_b: Vec<f32>,
+    pub(crate) tf: Vec<TransformerLayer>,
+    pub(crate) head_hidden_w: MmapWeight,
+    pub(crate) head_hidden_b: Vec<f32>,
+    pub(crate) head_out_w: MmapWeight,
+    pub(crate) head_out_b: Vec<f32>,
     /// `N_FFT`-long window with the `WINDOW_LEN` taps centered in it.
-    window: Vec<f32>,
+    pub(crate) window: Vec<f32>,
     /// `[n_mel_bins × N_FFT_BINS]`.
-    mel_fb: Vec<f32>,
+    pub(crate) mel_fb: Vec<f32>,
+    /// Set once by [`SortformerModel::set_accelerator`].
+    accel: OnceLock<Arc<dyn SortformerAccelerator>>,
+    /// Whether an accelerator failure has been logged, once per [`AccelStage`].
+    accel_warned: AccelWarned,
+}
+
+/// One warn-once latch per [`AccelStage`]. Named fields, not an indexed array, so adding a
+/// stage fails the build (in `warned`) instead of panicking with an out-of-bounds index on
+/// the first warning.
+#[derive(Default)]
+struct AccelWarned {
+    log_mel: AtomicBool,
+    stem: AtomicBool,
+    predict: AtomicBool,
+}
+
+/// One stage of the accelerated diarization step. Each stage warns once, independently: a
+/// transient failure in one must not suppress the first warning of another.
+#[derive(Clone, Copy)]
+enum AccelStage {
+    LogMel,
+    Stem,
+    Predict,
+}
+
+impl AccelStage {
+    fn label(self) -> &'static str {
+        match self {
+            AccelStage::LogMel => "log-mel",
+            AccelStage::Stem => "conv stem",
+            AccelStage::Predict => "predict",
+        }
+    }
+
+    /// This stage's warn-once latch. Exhaustive: a new variant fails the build here.
+    fn warned(self, latched: &AccelWarned) -> &AtomicBool {
+        match self {
+            AccelStage::LogMel => &latched.log_mel,
+            AccelStage::Stem => &latched.stem,
+            AccelStage::Predict => &latched.predict,
+        }
+    }
 }
 
 fn req_u32(g: &GgufFile, key: &str) -> Result<usize> {
@@ -573,6 +651,8 @@ impl SortformerWeights {
             head_out_b,
             window,
             mel_fb,
+            accel: OnceLock::new(),
+            accel_warned: AccelWarned::default(),
         })
     }
 }
@@ -834,9 +914,42 @@ impl SortformerModel {
         Self::from_gguf(&g)
     }
 
+    /// Load a converted Sortformer GGUF from in-memory bytes.
+    pub fn from_bytes(bytes: impl Into<Arc<[u8]>>) -> Result<Self> {
+        let g = Arc::new(GgufFile::from_bytes(bytes.into())?);
+        Self::from_gguf(&g)
+    }
+
+    /// The loaded weights, for backends that stage them (the Hexagon tail).
+    #[cfg(feature = "hexagon")]
+    pub(crate) fn weights(&self) -> &SortformerWeights {
+        &self.w
+    }
+
     /// Architecture constants.
     pub fn config(&self) -> &SortformerConfig {
         &self.w.config
+    }
+
+    /// The FastConformer weights an accelerated encoder stages (stem and blocks; there is no
+    /// MLP adapter, the diarizer continues with `encoder_proj`).
+    pub fn encoder_parts(&self) -> EncoderParts<'_> {
+        EncoderParts {
+            config: &self.w.enc_cfg,
+            conv_stem: &self.w.conv_stem,
+            layers: &self.w.layers,
+            adapter: None,
+        }
+    }
+
+    /// The factor applied to the pre-encode embeddings before the first FastConformer block
+    /// (`sqrt(d_model)` when the checkpoint trains with NeMo's `xscaling`, else 1).
+    pub fn encoder_input_scale(&self) -> f32 {
+        if self.w.config.xscaling {
+            (self.w.config.n_embd as f64).sqrt() as f32
+        } else {
+            1.0
+        }
     }
 
     /// The checkpoint's streaming defaults.
@@ -856,6 +969,9 @@ impl SortformerModel {
     /// `n / 160`, and the last STFT frame (the one that reaches into the trailing center
     /// padding) is masked out of everything downstream. This returns only the valid frames.
     pub fn log_mel(&self, pcm: &[f32]) -> (Vec<f32>, usize) {
+        if let Some(done) = self.log_mel_accelerated(pcm) {
+            return done;
+        }
         let (mut mel, n) = log_mel_with_tables(
             pcm,
             self.w.config.n_mel_bins,
@@ -868,6 +984,22 @@ impl SortformerModel {
         (mel, valid)
     }
 
+    /// [`Self::log_mel`] on the accelerator, or `None` when there is none, it declines, or the
+    /// clip has no frame.
+    fn log_mel_accelerated(&self, pcm: &[f32]) -> Option<(Vec<f32>, usize)> {
+        self.w.accel.get()?;
+        let valid = n_frames_for(pcm.len()).min(pcm.len() / HOP_LEN);
+        if valid == 0 {
+            return None;
+        }
+        let samples = padded_preemphasized(pcm)?;
+        let want = valid * self.w.config.n_mel_bins;
+        let mel = self.w.accelerated_checked(AccelStage::LogMel, want, |a| {
+            a.log_mel(&samples[..(valid - 1) * HOP_LEN + N_FFT], valid)
+        })?;
+        Some((mel, valid))
+    }
+
     /// Conv stem plus `pre_encode.out`: `[frames × 128]` mel to `[ceil(frames/8) × 512]` embeddings.
     /// These are what the speaker cache and FIFO store.
     ///
@@ -875,7 +1007,12 @@ impl SortformerModel {
     ///
     /// If `mel` is not `[n_frames x 128]`.
     pub fn pre_encode(&self, mel: &[f32], n_frames: usize) -> (Vec<f32>, usize) {
-        conv_stem_forward(mel, n_frames, &self.w.conv_stem, &self.w.enc_cfg)
+        assert_eq!(
+            mel.len(),
+            n_frames * self.w.config.n_mel_bins,
+            "pre_encode: mel must be [n_frames x n_mel_bins]"
+        );
+        self.w.conv_stem_for(mel)
     }
 
     /// Everything after the stem: x-scale, FastConformer, `encoder_proj`, Transformer and the
@@ -887,7 +1024,41 @@ impl SortformerModel {
     /// If `emb` is not `[t x 512]`, or `t` is past the 7500-frame attention window the other
     /// entry points enforce (attention memory is quadratic in `t`).
     pub fn predict(&self, emb: &[f32], t: usize) -> Vec<f32> {
+        let c = &self.w.config;
+        assert_eq!(emb.len(), t * c.n_embd, "predict: emb must be [t x n_embd]");
+        assert!(
+            t <= MAX_OFFLINE_FRAMES,
+            "predict: {t} frames exceeds the {MAX_OFFLINE_FRAMES}-frame attention window"
+        );
+        let want = t * c.n_spk;
+        if t > 0
+            && let Some(preds) = self
+                .w
+                .accelerated_checked(AccelStage::Predict, want, |a| a.predict(emb, t))
+        {
+            return preds;
+        }
         self.predict_with_taps(emb, t, &mut |_, _| {})
+    }
+
+    /// [`Self::predict`] on the CPU whatever accelerator is set: the reference the accelerated
+    /// path is compared against.
+    pub fn predict_cpu(&self, emb: &[f32], t: usize) -> Vec<f32> {
+        self.predict_with_taps(emb, t, &mut |_, _| {})
+    }
+
+    /// Run the stem and the prediction on `accel` from here on (one accelerator per model,
+    /// shared by every stream and live diarizer made from it, including clones).
+    pub fn set_accelerator(&self, accel: Arc<dyn SortformerAccelerator>) -> Result<()> {
+        self.w
+            .accel
+            .set(accel)
+            .map_err(|_| anyhow::anyhow!("this Sortformer model already has an accelerator"))
+    }
+
+    /// Whether [`Self::set_accelerator`] already installed an accelerator.
+    pub fn has_accelerator(&self) -> bool {
+        self.w.accel.get().is_some()
     }
 
     /// [`Self::predict`] that reports intermediates to `tap` as it goes: `"xscaled"`,
@@ -1058,6 +1229,8 @@ fn ensure_finite_pcm(pcm: &[f32]) -> Result<()> {
 /// across calls (the offline path leaves the first sample untouched, which is the same thing
 /// with a previous sample of 0).
 pub struct MelStream {
+    /// The model's weights, for its accelerator (absent for the weight-free test streams).
+    weights: Option<Arc<SortformerWeights>>,
     computer: MelFrameComputer,
     n_mel_bins: usize,
     /// Pre-emphasized samples in padded coordinates (256 zeros of left padding, then audio);
@@ -1071,14 +1244,17 @@ pub struct MelStream {
 }
 
 impl MelStream {
-    fn new(w: &SortformerWeights) -> Self {
-        Self::from_tables(w.config.n_mel_bins, &w.window, &w.mel_fb)
+    fn new(w: &Arc<SortformerWeights>) -> Self {
+        let mut stream = Self::from_tables(w.config.n_mel_bins, &w.window, &w.mel_fb);
+        stream.weights = Some(Arc::clone(w));
+        stream
     }
 
     /// A front end over the given window (`N_FFT` long) and filterbank; weight-free, so the
     /// hermetic tests can drive it with synthetic tables.
     fn from_tables(n_mel_bins: usize, window: &[f32], mel_fb: &[f32]) -> Self {
         Self {
+            weights: None,
             computer: MelFrameComputer::new(n_mel_bins, window, mel_fb),
             n_mel_bins,
             buf: vec![0.0; N_FFT / 2],
@@ -1109,6 +1285,13 @@ impl MelStream {
     /// Append mono 16 kHz PCM. Returns the newly completed mel frames, `[k x 128]` time-major.
     /// Fails, consuming nothing, if the stream has finished or a sample is NaN or infinite.
     pub fn push(&mut self, pcm: &[f32]) -> Result<Vec<f32>> {
+        self.push_samples(pcm)?;
+        Ok(self.emit())
+    }
+
+    /// [`Self::push`] without computing any frame: the samples are pre-emphasised and held, and
+    /// [`Self::ready_frames`] / [`Self::compute_ready`] take the frames later, in one batch.
+    fn push_samples(&mut self, pcm: &[f32]) -> Result<()> {
         ensure!(!self.finished, "MelStream: push after finish");
         // One NaN would ride through the FFT into every later frame's attention, so refuse the
         // whole piece (nothing is consumed) instead of poisoning the stream.
@@ -1126,7 +1309,7 @@ impl MelStream {
             self.prev_raw = x;
             self.n_in += 1;
         }
-        Ok(self.emit())
+        Ok(())
     }
 
     /// End of audio: add the trailing center padding and return the remaining frames.
@@ -1139,19 +1322,51 @@ impl MelStream {
         self.emit()
     }
 
-    fn emit(&mut self) -> Vec<f32> {
-        let mut out = Vec::new();
-        let mut row = vec![0.0f32; self.n_mel_bins];
+    /// Frames that can be computed from the samples held now.
+    fn ready_frames(&self) -> usize {
         // NeMo's length is n / hop: the STFT's extra last frame is masked, never produced.
-        while self.next_frame < self.n_in / HOP_LEN {
-            let start = self.next_frame * HOP_LEN;
-            if start + N_FFT > self.base + self.buf.len() {
-                break;
+        let by_length = self.n_in / HOP_LEN;
+        let held = self.base + self.buf.len();
+        let by_samples = if held >= N_FFT {
+            (held - N_FFT) / HOP_LEN + 1
+        } else {
+            0
+        };
+        by_length.min(by_samples).saturating_sub(self.next_frame)
+    }
+
+    fn emit(&mut self) -> Vec<f32> {
+        self.compute_ready()
+    }
+
+    /// Compute every ready frame, in one accelerator batch when the model has an accelerator
+    /// that takes it, else one by one on the CPU.
+    fn compute_ready(&mut self) -> Vec<f32> {
+        let k = self.ready_frames();
+        let mut out = Vec::new();
+        if k > 0 {
+            let lo = self.next_frame * HOP_LEN - self.base;
+            let span = (k - 1) * HOP_LEN + N_FFT;
+            let want = k * self.n_mel_bins;
+            let logged = self.weights.as_ref().and_then(|w| {
+                w.accelerated_checked(AccelStage::LogMel, want, |a| {
+                    a.log_mel(&self.buf[lo..lo + span], k)
+                })
+            });
+            match logged {
+                Some(e) => out.extend_from_slice(&e),
+                None => {
+                    // Declined or faulty (a wrong-length `Some` warns inside
+                    // `accelerated_checked`): compute the frames on the CPU.
+                    let mut row = vec![0.0f32; self.n_mel_bins];
+                    for f in 0..k {
+                        let at = lo + f * HOP_LEN;
+                        self.computer.frame(&self.buf[at..at + N_FFT], &mut row);
+                        out.extend_from_slice(&row);
+                    }
+                }
             }
-            let lo = start - self.base;
-            self.computer.frame(&self.buf[lo..lo + N_FFT], &mut row);
-            out.extend_from_slice(&row);
-            self.next_frame += 1;
+            self.next_frame += k;
         }
         // Frames before `next_frame` are done with.
         let keep_from = self.next_frame * HOP_LEN;
@@ -1242,8 +1457,23 @@ impl SortformerLive {
     /// call this from an audio callback.
     pub fn push_audio(&mut self, pcm: &[f32]) -> Result<Vec<f32>> {
         ensure!(!self.finished, "SortformerLive: push_audio after finish");
-        let rows = self.mel.push(pcm)?;
-        self.accept(&rows);
+        if self.stream.w.accel.get().is_some() {
+            // With an accelerator the mel is computed a chunk at a time: a batch per chunk
+            // instead of one tiny accelerator call per push, which would cost the host more than
+            // the FFTs it replaces. The result is the same frames, computed when a chunk needs
+            // them.
+            self.mel.push_samples(pcm)?;
+            let ss = self.stream.w.config.subsampling;
+            let needed =
+                self.stt + (self.stream.params.chunk_len + self.stream.params.right_context) * ss;
+            if self.mel.frames() + self.mel.ready_frames() >= needed {
+                let rows = self.mel.compute_ready();
+                self.accept(&rows);
+            }
+        } else {
+            let rows = self.mel.push(pcm)?;
+            self.accept(&rows);
+        }
         self.drain(false)
     }
 
@@ -1896,10 +2126,71 @@ fn compress_spkcache(
 }
 
 impl SortformerWeights {
-    /// The stem on an already-validated slice of mel frames.
+    /// The stem on an already-validated slice of mel frames: on the accelerator when one is
+    /// set and takes it, else on the CPU.
     fn conv_stem_for(&self, mel: &[f32]) -> (Vec<f32>, usize) {
         let n = mel.len() / self.config.n_mel_bins;
+        let want = stem_frames(n) * self.config.n_embd;
+        if let Some(emb) =
+            self.accelerated_checked(AccelStage::Stem, want, |a| a.pre_encode(mel, n))
+        {
+            return (emb, stem_frames(n));
+        }
         conv_stem_forward(mel, n, &self.conv_stem, &self.enc_cfg)
+    }
+
+    /// Run `call` on the accelerator if one is set. `None` means "use the CPU": nothing is set,
+    /// the accelerator declined, or it failed (logged once per stage, then quiet).
+    fn accelerated<T>(
+        &self,
+        stage: AccelStage,
+        call: impl FnOnce(&dyn SortformerAccelerator) -> Result<Option<T>>,
+    ) -> Option<T> {
+        let accel = self.accel.get()?;
+        match call(accel.as_ref()) {
+            Ok(out) => out,
+            Err(e) => {
+                self.warn_once(
+                    stage,
+                    &format!("failed on the accelerator ({e:#}); using the CPU"),
+                );
+                None
+            }
+        }
+    }
+
+    /// Run `call` on the accelerator and take its output only at the expected length. A
+    /// wrong-length `Some` is a faulty stage, not a decline: warn once, then `None` so the
+    /// caller falls back to the CPU. Every `Vec<f32>` stage output goes through here so a
+    /// future stage cannot forget the length check and consume a short output as valid.
+    fn accelerated_checked(
+        &self,
+        stage: AccelStage,
+        want: usize,
+        call: impl FnOnce(&dyn SortformerAccelerator) -> Result<Option<Vec<f32>>>,
+    ) -> Option<Vec<f32>> {
+        let out = self.accelerated(stage, call)?;
+        if out.len() == want {
+            return Some(out);
+        }
+        self.warn_once(
+            stage,
+            &format!("returned {} values, want {want}; using the CPU", out.len()),
+        );
+        None
+    }
+
+    /// Log a stage's accelerator fault once (later faults of the same stage stay quiet).
+    fn warn_once(&self, stage: AccelStage, detail: &str) {
+        if !stage
+            .warned(&self.accel_warned)
+            .swap(true, Ordering::Relaxed)
+        {
+            tracing::warn!("sortformer: {} {detail}", stage.label());
+            // No `tracing` subscriber on the shipping mobile/FFI platforms; without this
+            // the warning is invisible exactly where the fallback runs.
+            eprintln!("cera-sortformer: {} {detail}", stage.label());
+        }
     }
 }
 
@@ -2556,5 +2847,219 @@ mod tests {
             .to_string();
         assert!(err.contains("7501") && err.contains("offline"), "{err}");
         assert!(ensure_offline_len(0).is_ok());
+    }
+
+    #[derive(Clone, Copy)]
+    enum TwinMode {
+        Delegate,
+        Decline,
+        Fail,
+        Short,
+        Long,
+    }
+    struct TwinDouble(TwinMode);
+    impl TwinDouble {
+        fn out(&self) -> Result<Option<Vec<f32>>> {
+            match self.0 {
+                TwinMode::Delegate => Ok(Some(vec![1.0; 4])),
+                TwinMode::Decline => Ok(None),
+                TwinMode::Fail => anyhow::bail!("the accelerator is gone"),
+                TwinMode::Short => Ok(Some(vec![1.0; 3])),
+                TwinMode::Long => Ok(Some(vec![1.0; 5])),
+            }
+        }
+    }
+    impl SortformerAccelerator for TwinDouble {
+        fn pre_encode(&self, _mel: &[f32], _n: usize) -> Result<Option<Vec<f32>>> {
+            self.out()
+        }
+        fn predict(&self, _emb: &[f32], _t: usize) -> Result<Option<Vec<f32>>> {
+            self.out()
+        }
+        fn log_mel(&self, _samples: &[f32], _n: usize) -> Result<Option<Vec<f32>>> {
+            self.out()
+        }
+    }
+
+    /// Weightless `SortformerWeights` with a scripted accelerator: the fallback contract
+    /// touches no weights, so twins built here run in CI.
+    fn twin_weights(mode: TwinMode) -> SortformerWeights {
+        let accel = OnceLock::new();
+        assert!(
+            accel
+                .set(Arc::new(TwinDouble(mode)) as Arc<dyn SortformerAccelerator>)
+                .is_ok()
+        );
+        SortformerWeights {
+            config: SortformerConfig {
+                n_layer: 0,
+                n_embd: 0,
+                n_ff: 0,
+                n_head: 0,
+                eps: 0.0,
+                n_mel_bins: 0,
+                tf_layers: 0,
+                tf_d: 0,
+                tf_heads: 0,
+                tf_inner: 0,
+                tf_eps: 0.0,
+                n_spk: 0,
+                subsampling: 0,
+                xscaling: false,
+                pad_to: 0,
+            },
+            streaming: params(24),
+            enc_cfg: AudioEncoderConfig {
+                n_layer: 0,
+                n_embd: 0,
+                n_ff: 0,
+                n_head: 0,
+                eps: 0.0,
+                n_mel_bins: 0,
+                llm_hidden_size: 0,
+            },
+            conv_stem: ConvStemWeights {
+                layers: vec![],
+                pre_encode_out_w: MmapWeight::from_owned_f32(vec![], 0, 0),
+                pre_encode_out_b: vec![],
+            },
+            layers: vec![],
+            proj_w: MmapWeight::from_owned_f32(vec![], 0, 0),
+            proj_b: vec![],
+            tf: vec![],
+            head_hidden_w: MmapWeight::from_owned_f32(vec![], 0, 0),
+            head_hidden_b: vec![],
+            head_out_w: MmapWeight::from_owned_f32(vec![], 0, 0),
+            head_out_b: vec![],
+            window: vec![],
+            mel_fb: vec![],
+            accel,
+            accel_warned: AccelWarned::default(),
+        }
+    }
+
+    /// The fallback contract without a model: a well-formed output is taken, a decline, an
+    /// error, or a wrong-length output (short or long) falls back to `None`, and each faulty
+    /// stage latches its own warn-once bit. The guard touches no weights, so this twin runs
+    /// in CI where the model-gated parity suite skips.
+    #[test]
+    fn accelerated_checked_routes_decline_fail_and_wrong_lengths_to_none() {
+        use std::sync::atomic::Ordering;
+
+        let latched = |w: &SortformerWeights| {
+            [
+                w.accel_warned.log_mel.load(Ordering::Relaxed),
+                w.accel_warned.stem.load(Ordering::Relaxed),
+                w.accel_warned.predict.load(Ordering::Relaxed),
+            ]
+        };
+
+        let w = twin_weights(TwinMode::Delegate);
+        assert_eq!(
+            w.accelerated_checked(AccelStage::Stem, 4, |a| a.pre_encode(&[], 0)),
+            Some(vec![1.0; 4])
+        );
+        assert_eq!(latched(&w), [false, false, false]);
+
+        let w = twin_weights(TwinMode::Decline);
+        assert_eq!(
+            w.accelerated_checked(AccelStage::Stem, 4, |a| a.pre_encode(&[], 0)),
+            None
+        );
+        assert_eq!(latched(&w), [false, false, false]);
+
+        for mode in [TwinMode::Fail, TwinMode::Short, TwinMode::Long] {
+            let w = twin_weights(mode);
+            assert_eq!(
+                w.accelerated_checked(AccelStage::LogMel, 4, |a| a.log_mel(&[], 0)),
+                None
+            );
+            assert_eq!(latched(&w), [true, false, false]);
+            // A second fault of the same stage stays quiet but still falls back.
+            assert_eq!(
+                w.accelerated_checked(AccelStage::LogMel, 4, |a| a.log_mel(&[], 0)),
+                None
+            );
+            // ...while each other stage still gets its own first warning.
+            assert_eq!(
+                w.accelerated_checked(AccelStage::Stem, 4, |a| a.pre_encode(&[], 0)),
+                None
+            );
+            assert_eq!(latched(&w), [true, true, false]);
+            assert_eq!(
+                w.accelerated_checked(AccelStage::Predict, 4, |a| a.predict(&[], 0)),
+                None
+            );
+            assert_eq!(latched(&w), [true, true, true]);
+        }
+    }
+
+    /// Child leg of [`warn_once_faults_reach_stderr_without_a_subscriber`]: faults one stage
+    /// and returns. Harmless under the normal suite; the parent runs it in a subprocess.
+    #[test]
+    fn warn_once_stderr_child_emits_one_fault() {
+        let w = twin_weights(TwinMode::Fail);
+        assert_eq!(
+            w.accelerated_checked(AccelStage::Predict, 4, |a| a.predict(&[], 0)),
+            None
+        );
+    }
+
+    /// The warn-once fault line reaches stderr with no subscriber installed: the `eprintln!`
+    /// is the only accelerator-fault signal visible on shipping mobile, so deleting it must
+    /// fail this test, not pass silently. A subprocess with `--nocapture` carries the proof:
+    /// the harness captures `eprintln!` in-process, so only a subprocess's real fd 2 shows
+    /// the emission.
+    #[test]
+    fn warn_once_faults_reach_stderr_without_a_subscriber() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("model::sortformer::tests::warn_once_stderr_child_emits_one_fault")
+            .arg("--nocapture")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.lines()
+                .any(|l| l.starts_with("cera-sortformer: predict ")
+                    && l.contains("the accelerator is gone")),
+            "stderr must carry the fault: {err:?}"
+        );
+    }
+
+    /// Child leg of [`warn_once_length_faults_reach_stderr_without_a_subscriber`]: feeds a
+    /// short stage output through the length check and returns. Harmless under the normal
+    /// suite; the parent runs it in a subprocess.
+    #[test]
+    fn warn_once_length_stderr_child_emits_one_fault() {
+        let w = twin_weights(TwinMode::Short);
+        assert_eq!(
+            w.accelerated_checked(AccelStage::Predict, 4, |a| a.predict(&[], 0)),
+            None
+        );
+    }
+
+    /// The length-mismatch fault line reaches stderr too: silently returning `None` from
+    /// the wrong-length arm of `accelerated_checked` would pass the fail-path test above,
+    /// so this pins the arm's own warning. Same subprocess proof.
+    #[test]
+    fn warn_once_length_faults_reach_stderr_without_a_subscriber() {
+        let exe = std::env::current_exe().unwrap();
+        let out = std::process::Command::new(exe)
+            .arg("--exact")
+            .arg("model::sortformer::tests::warn_once_length_stderr_child_emits_one_fault")
+            .arg("--nocapture")
+            .output()
+            .unwrap();
+        assert!(out.status.success());
+        let err = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            err.lines()
+                .any(|l| l.starts_with("cera-sortformer: predict ")
+                    && l.contains("returned 3 values, want 4")),
+            "stderr must carry the length fault: {err:?}"
+        );
     }
 }

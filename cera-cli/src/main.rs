@@ -1229,6 +1229,12 @@ enum Command {
         /// Output the segments and timing as JSON.
         #[arg(long)]
         json: bool,
+
+        /// Run the network on the Hexagon NPU (builds with the `hexagon` feature, Qualcomm
+        /// devices). Needs a GGUF converted with `--tail-outtype q8_0`; steps the NPU cannot take
+        /// fall back to the CPU.
+        #[arg(long)]
+        npu: bool,
     },
 
     /// Transcribe speech in audio using Whisper or LFM2-Audio ASR.
@@ -2292,9 +2298,82 @@ fn transcript_labeler_config(threshold: f32) -> cera::speaker_labeler::SpeakerLa
     }
 }
 
-/// `cera diarize --vad .. --whisper ..`: the VAD plus Whisper pipeline and the live diarizer
-/// hear the same audio, piece by piece, as a background service would. Each utterance is printed
-/// with its speaker as soon as the diarizer has covered it.
+/// One `UtteranceLabeled` event as a `diarize --json` row (`None` for any other
+/// event). The event travels as one reference, not seven positionals, so a
+/// `start_ms`/`end_ms` or `speaker`/`overlapping` swap cannot compile silently.
+/// Pure so the `dropped` key stays pinned: a dropped key would silently
+/// un-surface the stall-vs-silence signal.
+fn labeled_json_row(ev: &cera::audio_pipeline::AudioPipelineEvent) -> Option<serde_json::Value> {
+    let cera::audio_pipeline::AudioPipelineEvent::UtteranceLabeled {
+        text,
+        start_ms,
+        end_ms,
+        speaker,
+        confidence,
+        overlapping,
+        dropped,
+    } = ev
+    else {
+        return None;
+    };
+    Some(serde_json::json!({
+        "start_ms": start_ms,
+        "end_ms": end_ms,
+        "speaker": speaker,
+        "confidence": confidence,
+        "overlapping": overlapping,
+        "dropped": dropped,
+        "text": text,
+    }))
+}
+
+/// One `UtteranceLabeled` event as a `diarize` text line (`None` for any other
+/// event). Pure for the same pin as [`labeled_json_row`]: the ` [dropped]`
+/// suffix must survive on dropped utterances only.
+fn labeled_text_line(ev: &cera::audio_pipeline::AudioPipelineEvent) -> Option<String> {
+    let cera::audio_pipeline::AudioPipelineEvent::UtteranceLabeled {
+        text,
+        start_ms,
+        end_ms,
+        speaker,
+        confidence,
+        overlapping,
+        dropped,
+    } = ev
+    else {
+        return None;
+    };
+    // The match borrows the event, so the `Copy` fields arrive by reference.
+    let (start_ms, end_ms, speaker, confidence, overlapping, dropped) = (
+        *start_ms,
+        *end_ms,
+        *speaker,
+        *confidence,
+        *overlapping,
+        *dropped,
+    );
+    let who = speaker.map_or("?".to_string(), |s| s.to_string());
+    let extra = match (confidence, overlapping) {
+        (Some(c), Some(o)) => format!(" ({:.0}%, overlaps {o})", c * 100.0),
+        (Some(c), None) => format!(" ({:.0}%)", c * 100.0),
+        _ => String::new(),
+    };
+    let extra = if dropped {
+        format!("{extra} [dropped]")
+    } else {
+        extra
+    };
+    Some(format!(
+        "[{:7.2}s - {:7.2}s] speaker {who}{extra}: {}",
+        start_ms / 1000.0,
+        end_ms / 1000.0,
+        text.trim()
+    ))
+}
+
+/// `cera diarize --vad .. --whisper ..`: the audio pipeline (VAD, Whisper and the Sortformer
+/// diarizer) hears the audio piece by piece, as a background service would. Each utterance is
+/// printed with its speaker as soon as the diarizer has covered it.
 #[allow(clippy::too_many_arguments)]
 fn diarize_with_transcript(
     model: &cera::model::sortformer::SortformerModel,
@@ -2307,86 +2386,38 @@ fn diarize_with_transcript(
     json: bool,
 ) -> Result<()> {
     use cera::audio_pipeline::AudioPipelineEvent;
-    use cera::live_diarizer::LiveDiarizer;
-    use cera::speaker_labeler::LabeledUtterance;
-    use std::collections::HashMap;
 
+    let latency_s =
+        (params.chunk_len + params.right_context) as f64 * cera::speaker_labeler::FRAME_MS / 1000.0;
     let mut pipeline = cera::AudioPipeline::builder()
         .with_vad_from_file(vad)
         .with_context(|| format!("loading VAD from `{vad}`"))?
         .with_whisper_from_file(whisper)
         .with_context(|| format!("loading Whisper from `{whisper}`"))?
+        .with_diarizer(model.clone(), params)
+        .with_speaker_labeler_config(transcript_labeler_config(threshold))
         .build()?;
-    let mut diarizer = LiveDiarizer::new(model, params, transcript_labeler_config(threshold))?;
-    let latency_s = (diarizer.latency_frames() as f64 * cera::speaker_labeler::FRAME_MS) / 1000.0;
 
-    let mut texts: HashMap<u64, String> = HashMap::new();
-    let mut next_id = 0u64;
     let mut rows: Vec<serde_json::Value> = Vec::new();
-    let mut emit = |u: LabeledUtterance, texts: &mut HashMap<u64, String>| {
-        let text = texts.remove(&u.id).unwrap_or_default();
-        let (speaker, confidence, overlapping) = match &u.label {
-            Some(l) => (Some(l.speaker), Some(l.confidence), l.overlapping),
-            None => (None, None, None),
-        };
+    let mut emit = |ev: AudioPipelineEvent| {
         if json {
-            rows.push(serde_json::json!({
-                "id": u.id,
-                "start_ms": u.start_ms,
-                "end_ms": u.end_ms,
-                "speaker": speaker,
-                "confidence": confidence,
-                "overlapping": overlapping,
-                "dropped": u.dropped,
-                "text": text,
-            }));
-        } else {
-            let who = speaker.map_or("?".to_string(), |s| s.to_string());
-            let extra = match (confidence, overlapping) {
-                (Some(c), Some(o)) => format!(" ({:.0}%, overlaps {o})", c * 100.0),
-                (Some(c), None) => format!(" ({:.0}%)", c * 100.0),
-                _ => String::new(),
-            };
-            println!(
-                "[{:7.2}s - {:7.2}s] speaker {who}{extra}: {}",
-                u.start_ms / 1000.0,
-                u.end_ms / 1000.0,
-                text.trim()
-            );
-        }
-    };
-    let mut register = |events: Vec<AudioPipelineEvent>,
-                        diarizer: &mut LiveDiarizer,
-                        texts: &mut HashMap<u64, String>| {
-        for ev in events {
-            if let AudioPipelineEvent::UtteranceTranscribed {
-                text,
-                start_ms,
-                end_ms,
-                ..
-            } = ev
-            {
-                texts.insert(next_id, text);
-                diarizer.add_utterance(next_id, start_ms as f64, end_ms as f64);
-                next_id += 1;
+            if let Some(row) = labeled_json_row(&ev) {
+                rows.push(row);
             }
+        } else if let Some(line) = labeled_text_line(&ev) {
+            println!("{line}");
         }
     };
 
     let started = std::time::Instant::now();
     let piece = (piece_ms * 16).max(1);
     for part in pcm.chunks(piece) {
-        let events = pipeline.process_chunk(part)?;
-        diarizer.push_audio(part)?;
-        register(events, &mut diarizer, &mut texts);
-        for u in diarizer.poll() {
-            emit(u, &mut texts);
+        for ev in pipeline.process_chunk(part)? {
+            emit(ev);
         }
     }
-    let events = pipeline.flush()?;
-    register(events, &mut diarizer, &mut texts);
-    for u in diarizer.finish()? {
-        emit(u, &mut texts);
+    for ev in pipeline.flush()? {
+        emit(ev);
     }
     let wall_s = started.elapsed().as_secs_f64();
     let audio_s = pcm.len() as f64 / 16_000.0;
@@ -4178,6 +4209,7 @@ fn main() -> Result<()> {
             merge_gap_ms,
             min_ms,
             json,
+            npu,
         } => {
             use cera::model::sortformer::SortformerModel;
             use cera::speaker_labeler::{FRAME_MS, speaker_segments};
@@ -4227,6 +4259,16 @@ fn main() -> Result<()> {
                 "low-latency" => m.low_latency_streaming(),
                 _ => unreachable!(),
             };
+            if npu {
+                #[cfg(feature = "hexagon")]
+                cera::model::sortformer_hexagon::try_hexagon_sortformer(&m, params.window_frames())
+                    .context(
+                        "the Hexagon NPU is not available or could not stage this model (it needs \
+                         a GGUF converted with `--tail-outtype q8_0`, see scripts/sortformer/README.md)",
+                    )?;
+                #[cfg(not(feature = "hexagon"))]
+                anyhow::bail!("--npu needs a build with the `hexagon` feature");
+            }
 
             if let (Some(vad), Some(whisper)) = (&vad, &whisper) {
                 return diarize_with_transcript(
@@ -5761,10 +5803,11 @@ mod tests {
 
     use super::{
         BundleQuantPair, Cli, CliSamplingArgs, Command, convert_history_to_chat_messages,
-        display_bundle_id, normalize_bundle_id, read_wav_pcm16_mono, resample_linear,
-        resolve_engine, simulate_truncate_oldest_turn_pairs, split_at_marker,
-        transcript_labeler_config, truncate_oldest_turn_pair, whisper_catalog_cached_path,
-        whisper_catalog_unloadable_path, whisper_gguf_is_loadable, write_transcript, write_wav,
+        display_bundle_id, labeled_json_row, labeled_text_line, normalize_bundle_id,
+        read_wav_pcm16_mono, resample_linear, resolve_engine, simulate_truncate_oldest_turn_pairs,
+        split_at_marker, transcript_labeler_config, truncate_oldest_turn_pair,
+        whisper_catalog_cached_path, whisper_catalog_unloadable_path, whisper_gguf_is_loadable,
+        write_transcript, write_wav,
     };
     use cera::tokenizer::ChatMessage;
     use clap::Parser;
@@ -7325,8 +7368,10 @@ mod tests {
                 merge_gap_ms,
                 min_ms,
                 json,
+                npu,
             } => {
                 assert_eq!((vad, whisper), (None, None));
+                assert!(!npu, "the NPU is opt-in");
                 assert_eq!(
                     (model.as_str(), audio.as_str()),
                     ("sortformer.gguf", "meeting.wav")
@@ -7368,6 +7413,12 @@ mod tests {
             }
             _ => panic!("expected Diarize command"),
         }
+        let cli = Cli::try_parse_from(["cera", "diarize", "-m", "m.gguf", "-a", "a.wav", "--npu"])
+            .unwrap();
+        match cli.command {
+            Command::Diarize { npu, .. } => assert!(npu),
+            _ => panic!("expected Diarize command"),
+        }
         // Defaults: the live mode with the checkpoint's own preset.
         let cli = Cli::try_parse_from(["cera", "diarize", "-m", "m.gguf", "-a", "a.wav"]).unwrap();
         match cli.command {
@@ -7375,6 +7426,36 @@ mod tests {
                 assert_eq!((mode.as_str(), preset.as_str()), ("live", "default"));
             }
             _ => panic!("expected Diarize command"),
+        }
+    }
+
+    /// Both `diarize` renderings carry the `dropped` flag in both polarities: a stalled
+    /// diarizer must stay distinguishable from silence in JSON and text alike.
+    #[test]
+    fn diarize_rendering_pins_dropped_in_both_polarities() {
+        use cera::audio_pipeline::AudioPipelineEvent;
+        let ev = |dropped: bool| AudioPipelineEvent::UtteranceLabeled {
+            text: "hi".to_string(),
+            start_ms: 0.0,
+            end_ms: 900.0,
+            speaker: None,
+            confidence: None,
+            overlapping: None,
+            dropped,
+        };
+        for dropped in [true, false] {
+            let row = labeled_json_row(&ev(dropped)).expect("a labeled event renders");
+            assert_eq!(
+                row.get("dropped").and_then(serde_json::Value::as_bool),
+                Some(dropped),
+                "JSON row lost the flag"
+            );
+            let line = labeled_text_line(&ev(dropped)).expect("a labeled event renders");
+            assert_eq!(
+                line.contains("[dropped]"),
+                dropped,
+                "text line suffix mismatch: {line:?}"
+            );
         }
     }
 

@@ -1029,9 +1029,24 @@ void uniffi_cera_ffi_fn_free_ffiaudiopipeline(uint64_t handle, RustCallStatus *_
 uint64_t uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes(RustBuffer vad_bytes, RustBuffer hotword_bytes, RustBuffer whisper_bytes, RustBuffer config, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFIAUDIOPIPELINE_FROM_BYTES_WITH_DIARIZER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFIAUDIOPIPELINE_FROM_BYTES_WITH_DIARIZER
+uint64_t uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer(RustBuffer vad_bytes, RustBuffer hotword_bytes, RustBuffer whisper_bytes, RustBuffer diarizer_bytes, int8_t prefer_npu, RustBuffer config, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFIAUDIOPIPELINE_FROM_FILES
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFIAUDIOPIPELINE_FROM_FILES
 uint64_t uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files(RustBuffer vad_path, RustBuffer hotword_path, RustBuffer whisper_path, RustBuffer config, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFIAUDIOPIPELINE_FROM_FILES_WITH_DIARIZER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CONSTRUCTOR_FFIAUDIOPIPELINE_FROM_FILES_WITH_DIARIZER
+uint64_t uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer(RustBuffer vad_path, RustBuffer hotword_path, RustBuffer whisper_path, RustBuffer diarizer_path, int8_t prefer_npu, RustBuffer config, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_ADD_UTTERANCE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_ADD_UTTERANCE
+int8_t uniffi_cera_ffi_fn_method_ffiaudiopipeline_add_utterance(uint64_t ptr, RustBuffer text, float start_ms, float end_ms, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_CANCEL
@@ -1049,9 +1064,19 @@ void uniffi_cera_ffi_fn_method_ffiaudiopipeline_clear_cancel(uint64_t ptr, RustC
 uint64_t uniffi_cera_ffi_fn_method_ffiaudiopipeline_current_sample(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_DIARIZER_ON_NPU
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_DIARIZER_ON_NPU
+int8_t uniffi_cera_ffi_fn_method_ffiaudiopipeline_diarizer_on_npu(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_FLUSH
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_FLUSH
 RustBuffer uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_HAS_DIARIZER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_HAS_DIARIZER
+int8_t uniffi_cera_ffi_fn_method_ffiaudiopipeline_has_diarizer(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_IS_LISTENING_FOR_HOTWORD
@@ -2383,6 +2408,12 @@ uint16_t uniffi_cera_ffi_checksum_method_session_recovery_status(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_ADD_UTTERANCE
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_ADD_UTTERANCE
+uint16_t uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_CANCEL
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_CANCEL
 uint16_t uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel(void
@@ -2401,9 +2432,21 @@ uint16_t uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_DIARIZER_ON_NPU
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_DIARIZER_ON_NPU
+uint16_t uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_FLUSH
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_FLUSH
 uint16_t uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_HAS_DIARIZER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_HAS_DIARIZER
+uint16_t uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer(void
     
 );
 #endif
@@ -2809,9 +2852,21 @@ uint16_t uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes(void
     
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIAUDIOPIPELINE_FROM_BYTES_WITH_DIARIZER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIAUDIOPIPELINE_FROM_BYTES_WITH_DIARIZER
+uint16_t uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer(void
+    
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIAUDIOPIPELINE_FROM_FILES
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIAUDIOPIPELINE_FROM_FILES
 uint16_t uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIAUDIOPIPELINE_FROM_FILES_WITH_DIARIZER
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_CONSTRUCTOR_FFIAUDIOPIPELINE_FROM_FILES_WITH_DIARIZER
+uint16_t uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer(void
     
 );
 #endif

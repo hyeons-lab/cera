@@ -41,7 +41,13 @@ Regeneration is reproducible: two runs give identical JSON.
 * Transformer head, `encoder_proj`, the speaker head and the mel window/filterbank go in under
   `sf.*`. NeMo's `hidden_to_spks` is not exported (unused by `forward_speaker_sigmoids`).
 * `--outtype` quantizes only the FastConformer matrices. Everything on the path to the sigmoids
-  (head, `encoder_proj`) is F16 at most.
+  (head, `encoder_proj`) is F16 at most by default.
+* `--tail-outtype q8_0` also quantizes `encoder_proj`, the Transformer and the speaker head to
+  Q8_0. The Hexagon NPU's matmul reads only Q8_0 or Q4_0, so the NPU port
+  (`model::sortformer_hexagon`) needs this variant:
+  `... --outtype q8_0 --tail-outtype q8_0 --out $M/sortformer-4spk-v2.1-q8_0-npu.gguf`.
+  On the committed clip the CPU gives the same six segments with either file, and on an S25 Ultra
+  the NPU tail matches the CPU on the same file to cosine 0.999996 (all 772 speaker decisions agree).
 
 ## Results on the committed clip (NeMo as the executor)
 

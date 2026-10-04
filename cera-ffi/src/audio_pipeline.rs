@@ -79,6 +79,28 @@ pub enum FfiAudioPipelineEvent {
         /// Number of 16 kHz audio samples transcribed.
         sample_count: u64,
     },
+    /// The attached speaker diarizer has covered an utterance and assigned it a speaker. One per
+    /// utterance, after its `UtteranceTranscribed`: a chunk plus its lookahead later (seconds with
+    /// the default preset). Needs a pipeline built with `from_files_with_diarizer`.
+    UtteranceLabeled {
+        /// The utterance text, as in its `UtteranceTranscribed` event.
+        text: String,
+        /// Start timestamp of the utterance in milliseconds.
+        start_ms: f32,
+        /// End timestamp of the utterance in milliseconds.
+        end_ms: f32,
+        /// The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
+        /// span or the labeler had to give the utterance up (see `dropped`).
+        speaker: Option<u32>,
+        /// The speaker's share of all speakers' active time over the span, in (0, 1].
+        confidence: Option<f32>,
+        /// A second speaker who was also clearly active over the span, if any.
+        overlapping: Option<u32>,
+        /// True when the labeler gave the utterance up instead of labeling it (history expiry,
+        /// queue overflow, or non-finite times): `None` speaker with `dropped` set is a stalled
+        /// diarizer, not silence.
+        dropped: bool,
+    },
 }
 
 impl From<cera::audio_pipeline::AudioPipelineEvent> for FfiAudioPipelineEvent {
@@ -119,6 +141,23 @@ impl From<cera::audio_pipeline::AudioPipelineEvent> for FfiAudioPipelineEvent {
                 start_ms,
                 end_ms,
                 sample_count: sample_count as u64,
+            },
+            cera::audio_pipeline::AudioPipelineEvent::UtteranceLabeled {
+                text,
+                start_ms,
+                end_ms,
+                speaker,
+                confidence,
+                overlapping,
+                dropped,
+            } => Self::UtteranceLabeled {
+                text,
+                start_ms,
+                end_ms,
+                speaker,
+                confidence,
+                overlapping,
+                dropped,
             },
         }
     }
@@ -182,26 +221,36 @@ pub fn audio_pipeline_default_config() -> FfiAudioPipelineConfig {
 pub struct FfiAudioPipeline {
     pub(crate) inner: Mutex<cera::audio_pipeline::AudioPipeline>,
     pub(crate) cancel: Arc<AtomicBool>,
+    /// Whether the diarizer was staged on the Hexagon NPU (false: the CPU, or no diarizer).
+    pub(crate) diarizer_on_npu: bool,
 }
 
 impl FfiAudioPipeline {
-    fn lock_inner(
-        &self,
-    ) -> Result<std::sync::MutexGuard<'_, cera::audio_pipeline::AudioPipeline>, FfiError> {
-        self.inner.lock().map_err(|_| FfiError::Backend {
-            detail: "FfiAudioPipeline inner mutex poisoned".to_string(),
-        })
+    /// Stage `model` on the Hexagon NPU when asked and possible; reports whether it runs
+    /// there (false on builds without the `hexagon` feature, or when staging fails).
+    fn stage_diarizer(
+        model: &cera::model::sortformer::SortformerModel,
+        window_frames: usize,
+        prefer_npu: bool,
+    ) -> bool {
+        #[cfg(feature = "hexagon")]
+        {
+            prefer_npu
+                && cera::model::sortformer_hexagon::try_hexagon_sortformer(model, window_frames)
+                    .is_some()
+        }
+        #[cfg(not(feature = "hexagon"))]
+        {
+            let _ = (model, window_frames, prefer_npu);
+            false
+        }
     }
-}
 
-#[uniffi::export]
-impl FfiAudioPipeline {
-    /// Construct a pipeline from filesystem model paths.
-    #[uniffi::constructor]
-    pub fn from_files(
+    fn build_from_files(
         vad_path: Option<String>,
         hotword_path: Option<String>,
         whisper_path: Option<String>,
+        diarizer: Option<(String, bool)>,
         config: Option<FfiAudioPipelineConfig>,
     ) -> Result<Arc<Self>, FfiError> {
         let mut builder = cera::audio_pipeline::AudioPipelineBuilder::new();
@@ -229,6 +278,23 @@ impl FfiAudioPipeline {
                     detail: format!("failed to load Whisper model from {wp}: {e}"),
                 })?;
         }
+        let diarizer_on_npu = match diarizer {
+            None => false,
+            Some((dp, prefer_npu)) => {
+                let model =
+                    cera::model::sortformer::SortformerModel::from_file(&dp).map_err(|e| {
+                        FfiError::Backend {
+                            detail: format!(
+                                "failed to load the Sortformer diarizer from {dp}: {e:#}"
+                            ),
+                        }
+                    })?;
+                let params = model.default_streaming().clone();
+                let on_npu = Self::stage_diarizer(&model, params.window_frames(), prefer_npu);
+                builder = builder.with_diarizer(model, params);
+                on_npu
+            }
+        };
         let pipeline = builder.build().map_err(|e| FfiError::Backend {
             detail: format!("failed to build audio pipeline: {e}"),
         })?;
@@ -236,15 +302,15 @@ impl FfiAudioPipeline {
         Ok(Arc::new(Self {
             inner: Mutex::new(pipeline),
             cancel,
+            diarizer_on_npu,
         }))
     }
 
-    /// Construct a pipeline from in-memory GGUF byte buffers.
-    #[uniffi::constructor]
-    pub fn from_bytes(
+    fn build_from_bytes(
         vad_bytes: Option<Vec<u8>>,
         hotword_bytes: Option<Vec<u8>>,
         whisper_bytes: Option<Vec<u8>>,
+        diarizer: Option<(Vec<u8>, bool)>,
         config: Option<FfiAudioPipelineConfig>,
     ) -> Result<Arc<Self>, FfiError> {
         let mut builder = cera::audio_pipeline::AudioPipelineBuilder::new();
@@ -272,6 +338,23 @@ impl FfiAudioPipeline {
                     detail: format!("failed to load Whisper model from bytes: {e}"),
                 })?;
         }
+        let diarizer_on_npu = match diarizer {
+            None => false,
+            Some((db, prefer_npu)) => {
+                let model =
+                    cera::model::sortformer::SortformerModel::from_bytes(db).map_err(|e| {
+                        FfiError::Backend {
+                            detail: format!(
+                                "failed to load the Sortformer diarizer from bytes: {e:#}"
+                            ),
+                        }
+                    })?;
+                let params = model.default_streaming().clone();
+                let on_npu = Self::stage_diarizer(&model, params.window_frames(), prefer_npu);
+                builder = builder.with_diarizer(model, params);
+                on_npu
+            }
+        };
         let pipeline = builder.build().map_err(|e| FfiError::Backend {
             detail: format!("failed to build audio pipeline: {e}"),
         })?;
@@ -279,7 +362,91 @@ impl FfiAudioPipeline {
         Ok(Arc::new(Self {
             inner: Mutex::new(pipeline),
             cancel,
+            diarizer_on_npu,
         }))
+    }
+
+    fn lock_inner(
+        &self,
+    ) -> Result<std::sync::MutexGuard<'_, cera::audio_pipeline::AudioPipeline>, FfiError> {
+        self.inner.lock().map_err(|_| FfiError::Backend {
+            detail: "FfiAudioPipeline inner mutex poisoned".to_string(),
+        })
+    }
+}
+
+#[uniffi::export]
+impl FfiAudioPipeline {
+    /// Construct a pipeline from filesystem model paths.
+    #[uniffi::constructor]
+    pub fn from_files(
+        vad_path: Option<String>,
+        hotword_path: Option<String>,
+        whisper_path: Option<String>,
+        config: Option<FfiAudioPipelineConfig>,
+    ) -> Result<Arc<Self>, FfiError> {
+        Self::build_from_files(vad_path, hotword_path, whisper_path, None, config)
+    }
+
+    /// Construct a pipeline from filesystem model paths with a Sortformer speaker diarizer
+    /// (`diarizer_path`, a converted Sortformer GGUF). Every transcribed utterance then gets an
+    /// `UtteranceLabeled` event with its speaker, once the diarizer has covered it.
+    ///
+    /// With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+    /// device offers it (the GGUF must have been converted with `--tail-outtype q8_0`); otherwise,
+    /// or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+    #[uniffi::constructor]
+    pub fn from_files_with_diarizer(
+        vad_path: Option<String>,
+        hotword_path: Option<String>,
+        whisper_path: Option<String>,
+        diarizer_path: String,
+        prefer_npu: bool,
+        config: Option<FfiAudioPipelineConfig>,
+    ) -> Result<Arc<Self>, FfiError> {
+        Self::build_from_files(
+            vad_path,
+            hotword_path,
+            whisper_path,
+            Some((diarizer_path, prefer_npu)),
+            config,
+        )
+    }
+
+    /// Construct a pipeline from in-memory GGUF byte buffers.
+    #[uniffi::constructor]
+    pub fn from_bytes(
+        vad_bytes: Option<Vec<u8>>,
+        hotword_bytes: Option<Vec<u8>>,
+        whisper_bytes: Option<Vec<u8>>,
+        config: Option<FfiAudioPipelineConfig>,
+    ) -> Result<Arc<Self>, FfiError> {
+        Self::build_from_bytes(vad_bytes, hotword_bytes, whisper_bytes, None, config)
+    }
+
+    /// Construct a pipeline from in-memory GGUF byte buffers with a Sortformer speaker
+    /// diarizer (`diarizer_bytes`, a converted Sortformer GGUF). Every transcribed utterance
+    /// then gets an `UtteranceLabeled` event with its speaker, once the diarizer covers it.
+    ///
+    /// With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+    /// device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+    /// otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+    #[uniffi::constructor]
+    pub fn from_bytes_with_diarizer(
+        vad_bytes: Option<Vec<u8>>,
+        hotword_bytes: Option<Vec<u8>>,
+        whisper_bytes: Option<Vec<u8>>,
+        diarizer_bytes: Vec<u8>,
+        prefer_npu: bool,
+        config: Option<FfiAudioPipelineConfig>,
+    ) -> Result<Arc<Self>, FfiError> {
+        Self::build_from_bytes(
+            vad_bytes,
+            hotword_bytes,
+            whisper_bytes,
+            Some((diarizer_bytes, prefer_npu)),
+            config,
+        )
     }
 
     /// Current lifecycle state of the pipeline.
@@ -375,5 +542,33 @@ impl FfiAudioPipeline {
     pub fn pop_event(&self) -> Result<Option<FfiAudioPipelineEvent>, FfiError> {
         let mut pipeline = self.lock_inner()?;
         Ok(pipeline.pop_event().map(Into::into))
+    }
+
+    /// Whether a speaker diarizer is attached and running. It stops, with a warning in the log,
+    /// if it fails; the pipeline then keeps transcribing without speaker labels.
+    pub fn has_diarizer(&self) -> Result<bool, FfiError> {
+        let pipeline = self.lock_inner()?;
+        Ok(pipeline.has_diarizer())
+    }
+
+    /// Whether the diarizer was staged on the Hexagon NPU and has not stopped (false: the
+    /// CPU, or no diarizer). Steps the NPU declines or that fail there still run on the CPU.
+    pub fn diarizer_on_npu(&self) -> bool {
+        // A stopped diarizer reports false even when staging succeeded: the flag alone would
+        // claim the NPU exactly when the labels stop. A poisoned mutex reads as no diarizer.
+        self.diarizer_on_npu && self.inner.lock().is_ok_and(|p| p.has_diarizer())
+    }
+
+    /// Register an utterance transcribed outside the pipeline so it gets an `UtteranceLabeled`
+    /// event too. `start_ms` and `end_ms` are on the pipeline's clock, as in
+    /// `UtteranceTranscribed`. Returns whether a diarizer will label it.
+    pub fn add_utterance(
+        &self,
+        text: String,
+        start_ms: f32,
+        end_ms: f32,
+    ) -> Result<bool, FfiError> {
+        let mut pipeline = self.lock_inner()?;
+        Ok(pipeline.add_utterance(text, start_ms, end_ms))
     }
 }

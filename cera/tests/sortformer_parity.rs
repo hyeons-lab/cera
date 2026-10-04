@@ -25,11 +25,15 @@
 
 #![cfg(feature = "mmap")] // `SortformerModel::from_file`
 
+mod common;
+
 use std::collections::HashMap;
 use std::path::PathBuf;
 
 use cera::convert::safetensors::SafeTensorsHeader;
-use cera::model::sortformer::{SortformerModel, StreamingParams};
+use cera::model::sortformer::{
+    SortformerAccelerator, SortformerModel, StreamingParams, stem_frames,
+};
 
 fn models_dir() -> Option<PathBuf> {
     match std::env::var_os("SORTFORMER_MODELS_DIR") {
@@ -78,35 +82,7 @@ fn model(file: &str) -> Option<SortformerModel> {
 
 /// 16-bit mono PCM WAV to f32, the way `soundfile.read(dtype="float32")` does it.
 fn read_clip() -> Vec<f32> {
-    let bytes = std::fs::read(fixtures_dir().join("clip.wav")).expect("clip.wav");
-    assert_eq!(&bytes[..4], b"RIFF");
-    let mut pos = 12;
-    let mut fmt_ok = false;
-    while pos + 8 <= bytes.len() {
-        let id = &bytes[pos..pos + 4];
-        let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
-        let body = &bytes[pos + 8..pos + 8 + len];
-        if id == b"fmt " {
-            let (tag, ch, rate, bits) = (
-                u16::from_le_bytes(body[0..2].try_into().unwrap()),
-                u16::from_le_bytes(body[2..4].try_into().unwrap()),
-                u32::from_le_bytes(body[4..8].try_into().unwrap()),
-                u16::from_le_bytes(body[14..16].try_into().unwrap()),
-            );
-            assert_eq!((tag, ch, rate, bits), (1, 1, 16_000, 16), "clip.wav format");
-            fmt_ok = true;
-        } else if id == b"data" {
-            assert!(fmt_ok, "data before fmt");
-            return body
-                .as_chunks::<2>()
-                .0
-                .iter()
-                .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
-                .collect();
-        }
-        pos += 8 + len + (len & 1);
-    }
-    panic!("no data chunk in clip.wav");
+    common::read_wav_f32(&fixtures_dir().join("clip.wav"))
 }
 
 struct Golden {
@@ -1381,4 +1357,275 @@ fn live_diarizer_labels_utterances_as_the_audio_arrives() {
         "first utterance released at {} ms",
         first.2
     );
+}
+
+/// What an accelerator test double does with the work it is handed.
+#[derive(Clone, Copy)]
+enum Mode {
+    /// Compute it on the CPU (a stand-in for a correct accelerator).
+    Delegate,
+    /// Return `Ok(None)`: not taken.
+    Decline,
+    /// Return an error.
+    Fail,
+    /// Return one value short: a faulty stage the model must survive.
+    Short,
+}
+
+/// Drop the last value: a wrong-length output the model must refuse.
+fn truncate(mut v: Vec<f32>) -> Vec<f32> {
+    v.pop();
+    v
+}
+
+/// A double that delegates to an independent CPU model and counts the calls it gets.
+struct CpuDouble {
+    cpu: SortformerModel,
+    mode: Mode,
+    stems: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    predicts: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    mels: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Widest `predict` step observed: every staging call sizes DSP scratch from
+    /// `window_frames()`, so a step past the window would silently decline the NPU.
+    max_t: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// Widest `pre_encode` batch observed, in mel frames: the stem declines past
+    /// `stem_frames(n) > max_frames` with no warning, the same silent shape as `predict`.
+    max_n: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    /// The model's window and `[n_mel x 257]` filterbank, read from its GGUF.
+    mel_tables: (Vec<f32>, Vec<f32>),
+}
+
+/// An independent mel front end: a direct f64 DFT of the windowed frames and the filterbank
+/// projection, standing in for the NPU's matmuls. `samples` is pre-emphasised and centre-padded.
+fn naive_mel_energies(window: &[f32], fb: &[f32], samples: &[f32], n_frames: usize) -> Vec<f32> {
+    let n_mel = fb.len() / 257;
+    let (cos, sin): (Vec<f64>, Vec<f64>) = (0..512)
+        .map(|j| {
+            let a = std::f64::consts::TAU * j as f64 / 512.0;
+            (a.cos(), a.sin())
+        })
+        .unzip();
+    let mut out = Vec::with_capacity(n_frames * n_mel);
+    let mut power = vec![0f64; 257];
+    for f in 0..n_frames {
+        let frame = &samples[f * 160..f * 160 + 512];
+        for (k, p) in power.iter_mut().enumerate() {
+            let (mut re, mut im) = (0f64, 0f64);
+            for (n, (&w, &x)) in window.iter().zip(frame).enumerate() {
+                let v = w as f64 * x as f64;
+                re += v * cos[(k * n) % 512];
+                im -= v * sin[(k * n) % 512];
+            }
+            *p = re * re + im * im;
+        }
+        for m in 0..n_mel {
+            let e: f64 = fb[m * 257..(m + 1) * 257]
+                .iter()
+                .zip(&power)
+                .map(|(&w, &p)| w as f64 * p)
+                .sum();
+            out.push(e as f32);
+        }
+    }
+    out
+}
+
+impl SortformerAccelerator for CpuDouble {
+    fn pre_encode(&self, mel: &[f32], n: usize) -> anyhow::Result<Option<Vec<f32>>> {
+        self.stems
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.max_n
+            .fetch_max(n, std::sync::atomic::Ordering::Relaxed);
+        match self.mode {
+            Mode::Delegate => Ok(Some(self.cpu.pre_encode(mel, n).0)),
+            Mode::Decline => Ok(None),
+            Mode::Fail => anyhow::bail!("the accelerator is gone"),
+            Mode::Short => Ok(Some(truncate(self.cpu.pre_encode(mel, n).0))),
+        }
+    }
+
+    fn predict(&self, emb: &[f32], t: usize) -> anyhow::Result<Option<Vec<f32>>> {
+        self.predicts
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.max_t
+            .fetch_max(t, std::sync::atomic::Ordering::Relaxed);
+        match self.mode {
+            Mode::Delegate => Ok(Some(self.cpu.predict_cpu(emb, t))),
+            Mode::Decline => Ok(None),
+            Mode::Fail => anyhow::bail!("the accelerator is gone"),
+            Mode::Short => Ok(Some(truncate(self.cpu.predict_cpu(emb, t)))),
+        }
+    }
+
+    fn log_mel(&self, samples: &[f32], n_frames: usize) -> anyhow::Result<Option<Vec<f32>>> {
+        self.mels.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        match self.mode {
+            Mode::Delegate => Ok(Some(
+                naive_mel_energies(&self.mel_tables.0, &self.mel_tables.1, samples, n_frames)
+                    .into_iter()
+                    .map(|e| (e as f64 + 2f64.powi(-24)).ln() as f32)
+                    .collect(),
+            )),
+            Mode::Decline => Ok(None),
+            Mode::Fail => anyhow::bail!("the accelerator is gone"),
+            Mode::Short => Ok(Some(truncate(
+                naive_mel_energies(&self.mel_tables.0, &self.mel_tables.1, samples, n_frames)
+                    .into_iter()
+                    .map(|e| (e as f64 + 2f64.powi(-24)).ln() as f32)
+                    .collect(),
+            ))),
+        }
+    }
+}
+
+/// Stream the clip live and return every prediction, with the accelerator (if any) set first.
+fn live_run(m: &SortformerModel, params: &StreamingParams, pcm: &[f32]) -> Vec<f32> {
+    let mut live = m.new_live(params.clone()).unwrap();
+    let mut out = Vec::new();
+    for piece in pcm.chunks(1600) {
+        out.extend(live.push_audio(piece).unwrap());
+    }
+    out.extend(live.finish().unwrap());
+    out
+}
+
+/// The accelerator hook sits under `step` and the mel front end. A delegating accelerator is
+/// called for every stem and prediction and, with an independent f64 mel, gives the same
+/// activities to within the mel's rounding; one that declines or fails leaves the CPU result
+/// bit-identical (the failure is survived, not propagated), as does one whose outputs are one
+/// value short (wrong lengths fall back to the CPU, never trusted). The mel is computed a
+/// chunk at a time, not once per push. Each faulty stage warns once: a failing or short
+/// accelerator warns 3 times (log-mel, stem, predict), a healthy one never. One model per
+/// case, since a model takes an accelerator once.
+#[test]
+fn an_accelerator_is_used_by_the_stream_and_never_changes_the_answer() {
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use tracing_subscriber::layer::SubscriberExt;
+    let file = "sortformer-4spk-v2.1-f32.gguf";
+    let (Some(reference), Some(golden)) = (model(file), Golden::load()) else {
+        return;
+    };
+    let pcm = read_clip();
+    let params = preset(&reference, &golden, "tiny");
+    let want = live_run(&reference, &params, &pcm);
+    assert!(!want.is_empty());
+    let g = cera::gguf::GgufFile::open_arc(&local(file).unwrap()).unwrap();
+    let tables = || {
+        // The checkpoint ships the 400-tap window; the front end centers it in the 512-sample FFT.
+        let taps = g.get_tensor("sf.mel.window").unwrap().to_f32_vec();
+        assert_eq!(taps.len(), 400);
+        let mut window = vec![0.0f32; 512];
+        window[56..456].copy_from_slice(&taps);
+        (window, g.get_tensor("sf.mel.fb").unwrap().to_f32_vec())
+    };
+    let counter = || Arc::new(AtomicUsize::new(0));
+    let double =
+        |mode, c: &[Arc<AtomicUsize>; 3], max_t: &Arc<AtomicUsize>, max_n: &Arc<AtomicUsize>| {
+            Arc::new(CpuDouble {
+                cpu: model(file).unwrap(),
+                mode,
+                stems: c[0].clone(),
+                predicts: c[1].clone(),
+                mels: c[2].clone(),
+                max_t: max_t.clone(),
+                max_n: max_n.clone(),
+                mel_tables: tables(),
+            })
+        };
+    let pushes = pcm.len().div_ceil(1600);
+
+    for (name, mode, want_warns) in [
+        ("delegate", Mode::Delegate, 0),
+        ("decline", Mode::Decline, 0),
+        ("fail", Mode::Fail, 3),
+        ("short", Mode::Short, 3),
+    ] {
+        let m = model(file).unwrap();
+        let c = [counter(), counter(), counter()];
+        let max_t = counter();
+        let max_n = counter();
+        m.set_accelerator(double(mode, &c, &max_t, &max_n)).unwrap();
+        // Scoped to this thread: sibling tests on other threads keep their own subscriber.
+        // The `sortformer: ` prefix is the model's own fault tag, so warnings from any
+        // other target cannot move this count.
+        let warns = common::WarnCapture::default();
+        let sub = tracing_subscriber::registry().with(warns.clone());
+        let got = tracing::subscriber::with_default(sub, || live_run(&m, &params, &pcm));
+        let n = warns
+            .messages()
+            .iter()
+            .filter(|m| m.contains("sortformer: "))
+            .count();
+        assert_eq!(n, want_warns, "{name}: one warning per faulty stage");
+        assert_eq!(got.len(), want.len(), "{name}: frame count");
+        match mode {
+            Mode::Delegate => {
+                // The mel itself, offline and through the accelerator, against the CPU's.
+                let (cpu_mel, n) = reference.log_mel(&pcm);
+                let (acc_mel, n2) = m.log_mel(&pcm);
+                assert_eq!(n, n2);
+                let mel_worst = cpu_mel
+                    .iter()
+                    .zip(&acc_mel)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(mel_worst < 1e-2, "{name}: log-mel worst diff {mel_worst}");
+                // Consumption, not just invocation: the Delegate mel comes from an
+                // independent f64 path, so bit equality means the accelerator output was
+                // dropped and the CPU value used instead.
+                assert_ne!(
+                    acc_mel, cpu_mel,
+                    "{name}: the offline path ignored the accelerator mel"
+                );
+                let worst = got
+                    .iter()
+                    .zip(&want)
+                    .map(|(a, b)| (a - b).abs())
+                    .fold(0f32, f32::max);
+                assert!(worst < 1e-3, "{name}: worst activity diff {worst}");
+                assert_ne!(
+                    got, want,
+                    "{name}: the streaming path ignored the accelerator mel"
+                );
+                // Every staging call sizes DSP scratch from the window; a step past it would
+                // silently decline the NPU while the flag still claims it.
+                let widest = max_t.load(Ordering::Relaxed);
+                assert!(
+                    widest <= params.window_frames(),
+                    "{name}: staging bound undercounts a real step ({widest} > {})",
+                    params.window_frames()
+                );
+                // Same for the stem, which declines past `stem_frames(n)` frames with no
+                // warning either.
+                let widest_stem = max_n.load(Ordering::Relaxed);
+                assert!(
+                    stem_frames(widest_stem) <= params.window_frames(),
+                    "{name}: staging bound undercounts a real stem batch ({widest_stem} mel \
+                     frames -> {} > {})",
+                    stem_frames(widest_stem),
+                    params.window_frames()
+                );
+            }
+            _ => assert_eq!(got, want, "{name}: predictions differ from the CPU run"),
+        }
+        let [stems, predicts, mels] = [0, 1, 2].map(|i| c[i].load(Ordering::Relaxed));
+        assert!(
+            stems > 1 && predicts > 1,
+            "{name}: {stems} stems, {predicts} predicts"
+        );
+        // One mel batch per chunk, far fewer than the pushes (a chunk is about a second here).
+        assert!(
+            mels >= 1 && mels < pushes / 2,
+            "{name}: {mels} mel calls for {pushes} pushes"
+        );
+        // A second accelerator is refused rather than silently replacing the first.
+        let again = m.set_accelerator(double(
+            mode,
+            &[counter(), counter(), counter()],
+            &counter(),
+            &counter(),
+        ));
+        assert!(again.is_err(), "{name}: a second accelerator was accepted");
+    }
 }

@@ -2744,6 +2744,13 @@ public func FfiConverterTypeDownloadProgressSink_lower(_ value: DownloadProgress
 public protocol FfiAudioPipelineProtocol: AnyObject, Sendable {
     
     /**
+     * Register an utterance transcribed outside the pipeline so it gets an `UtteranceLabeled`
+     * event too. `start_ms` and `end_ms` are on the pipeline's clock, as in
+     * `UtteranceTranscribed`. Returns whether a diarizer will label it.
+     */
+    func addUtterance(text: String, startMs: Float, endMs: Float) throws  -> Bool
+    
+    /**
      * Cooperatively cancel any active transcription.
      *
      * Cancellation is sticky across utterances. Call `clear_cancel()` or `reset()`
@@ -2762,9 +2769,21 @@ public protocol FfiAudioPipelineProtocol: AnyObject, Sendable {
     func currentSample() throws  -> UInt64
     
     /**
+     * Whether the diarizer was staged on the Hexagon NPU and has not stopped (false: the
+     * CPU, or no diarizer). Steps the NPU declines or that fail there still run on the CPU.
+     */
+    func diarizerOnNpu()  -> Bool
+    
+    /**
      * Flush any in-flight speech segment at the end of the audio stream.
      */
     func flush() throws  -> [FfiAudioPipelineEvent]
+    
+    /**
+     * Whether a speaker diarizer is attached and running. It stops, with a warning in the log,
+     * if it fails; the pipeline then keeps transcribing without speaker labels.
+     */
+    func hasDiarizer() throws  -> Bool
     
     /**
      * Whether the pipeline is currently awaiting a wake word trigger.
@@ -2881,6 +2900,28 @@ public static func fromBytes(vadBytes: Data?, hotwordBytes: Data?, whisperBytes:
 }
     
     /**
+     * Construct a pipeline from in-memory GGUF byte buffers with a Sortformer speaker
+     * diarizer (`diarizer_bytes`, a converted Sortformer GGUF). Every transcribed utterance
+     * then gets an `UtteranceLabeled` event with its speaker, once the diarizer covers it.
+     *
+     * With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+     * device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+     * otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+     */
+public static func fromBytesWithDiarizer(vadBytes: Data?, hotwordBytes: Data?, whisperBytes: Data?, diarizerBytes: Data, preferNpu: Bool, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
+    return try  FfiConverterTypeFfiAudioPipeline_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer(
+        FfiConverterOptionData.lower(vadBytes),
+        FfiConverterOptionData.lower(hotwordBytes),
+        FfiConverterOptionData.lower(whisperBytes),
+        FfiConverterData.lower(diarizerBytes),
+        FfiConverterBool.lower(preferNpu),
+        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),$0
+    )
+})
+}
+    
+    /**
      * Construct a pipeline from filesystem model paths.
      */
 public static func fromFiles(vadPath: String?, hotwordPath: String?, whisperPath: String?, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
@@ -2894,7 +2935,45 @@ public static func fromFiles(vadPath: String?, hotwordPath: String?, whisperPath
 })
 }
     
+    /**
+     * Construct a pipeline from filesystem model paths with a Sortformer speaker diarizer
+     * (`diarizer_path`, a converted Sortformer GGUF). Every transcribed utterance then gets an
+     * `UtteranceLabeled` event with its speaker, once the diarizer has covered it.
+     *
+     * With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+     * device offers it (the GGUF must have been converted with `--tail-outtype q8_0`); otherwise,
+     * or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+     */
+public static func fromFilesWithDiarizer(vadPath: String?, hotwordPath: String?, whisperPath: String?, diarizerPath: String, preferNpu: Bool, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
+    return try  FfiConverterTypeFfiAudioPipeline_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer(
+        FfiConverterOptionString.lower(vadPath),
+        FfiConverterOptionString.lower(hotwordPath),
+        FfiConverterOptionString.lower(whisperPath),
+        FfiConverterString.lower(diarizerPath),
+        FfiConverterBool.lower(preferNpu),
+        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),$0
+    )
+})
+}
+    
 
+    
+    /**
+     * Register an utterance transcribed outside the pipeline so it gets an `UtteranceLabeled`
+     * event too. `start_ms` and `end_ms` are on the pipeline's clock, as in
+     * `UtteranceTranscribed`. Returns whether a diarizer will label it.
+     */
+open func addUtterance(text: String, startMs: Float, endMs: Float)throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_add_utterance(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(text),
+        FfiConverterFloat.lower(startMs),
+        FfiConverterFloat.lower(endMs),$0
+    )
+})
+}
     
     /**
      * Cooperatively cancel any active transcription.
@@ -2931,11 +3010,35 @@ open func currentSample()throws  -> UInt64  {
 }
     
     /**
+     * Whether the diarizer was staged on the Hexagon NPU and has not stopped (false: the
+     * CPU, or no diarizer). Steps the NPU declines or that fail there still run on the CPU.
+     */
+open func diarizerOnNpu() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_diarizer_on_npu(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
      * Flush any in-flight speech segment at the end of the audio stream.
      */
 open func flush()throws  -> [FfiAudioPipelineEvent]  {
     return try  FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush(
+            self.uniffiCloneHandle(),$0
+    )
+})
+}
+    
+    /**
+     * Whether a speaker diarizer is attached and running. It stops, with a warning in the log,
+     * if it fails; the pipeline then keeps transcribing without speaker labels.
+     */
+open func hasDiarizer()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_has_diarizer(
             self.uniffiCloneHandle(),$0
     )
 })
@@ -9920,6 +10023,37 @@ public enum FfiAudioPipelineEvent: Equatable, Hashable {
          * Number of 16 kHz audio samples transcribed.
          */sampleCount: UInt64
     )
+    /**
+     * The attached speaker diarizer has covered an utterance and assigned it a speaker. One per
+     * utterance, after its `UtteranceTranscribed`: a chunk plus its lookahead later (seconds with
+     * the default preset). Needs a pipeline built with `from_files_with_diarizer`.
+     */
+    case utteranceLabeled(
+        /**
+         * The utterance text, as in its `UtteranceTranscribed` event.
+         */text: String, 
+        /**
+         * Start timestamp of the utterance in milliseconds.
+         */startMs: Float, 
+        /**
+         * End timestamp of the utterance in milliseconds.
+         */endMs: Float, 
+        /**
+         * The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
+         * span or the labeler had to give the utterance up (see `dropped`).
+         */speaker: UInt32?, 
+        /**
+         * The speaker's share of all speakers' active time over the span, in (0, 1].
+         */confidence: Float?, 
+        /**
+         * A second speaker who was also clearly active over the span, if any.
+         */overlapping: UInt32?, 
+        /**
+         * True when the labeler gave the utterance up instead of labeling it (history expiry,
+         * queue overflow, or non-finite times): `None` speaker with `dropped` set is a stalled
+         * diarizer, not silence.
+         */dropped: Bool
+    )
 
 
 
@@ -9951,6 +10085,9 @@ public struct FfiConverterTypeFfiAudioPipelineEvent: FfiConverterRustBuffer {
         )
         
         case 4: return .utteranceTranscribed(text: try FfiConverterString.read(from: &buf), startMs: try FfiConverterFloat.read(from: &buf), endMs: try FfiConverterFloat.read(from: &buf), sampleCount: try FfiConverterUInt64.read(from: &buf)
+        )
+        
+        case 5: return .utteranceLabeled(text: try FfiConverterString.read(from: &buf), startMs: try FfiConverterFloat.read(from: &buf), endMs: try FfiConverterFloat.read(from: &buf), speaker: try FfiConverterOptionUInt32.read(from: &buf), confidence: try FfiConverterOptionFloat.read(from: &buf), overlapping: try FfiConverterOptionUInt32.read(from: &buf), dropped: try FfiConverterBool.read(from: &buf)
         )
         
         default: throw UniffiInternalError.unexpectedEnumCase
@@ -9989,6 +10126,17 @@ public struct FfiConverterTypeFfiAudioPipelineEvent: FfiConverterRustBuffer {
             FfiConverterFloat.write(startMs, into: &buf)
             FfiConverterFloat.write(endMs, into: &buf)
             FfiConverterUInt64.write(sampleCount, into: &buf)
+            
+        
+        case let .utteranceLabeled(text,startMs,endMs,speaker,confidence,overlapping,dropped):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(text, into: &buf)
+            FfiConverterFloat.write(startMs, into: &buf)
+            FfiConverterFloat.write(endMs, into: &buf)
+            FfiConverterOptionUInt32.write(speaker, into: &buf)
+            FfiConverterOptionFloat.write(confidence, into: &buf)
+            FfiConverterOptionUInt32.write(overlapping, into: &buf)
+            FfiConverterBool.write(dropped, into: &buf)
             
         }
     }
@@ -13605,6 +13753,9 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance() != 27373) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 57820) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -13614,7 +13765,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 47716) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu() != 39954) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 1087) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer() != 11141) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() != 57051) {
@@ -13818,7 +13975,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 42076) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer() != 59328) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer() != 56903) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996) {

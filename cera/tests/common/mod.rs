@@ -34,6 +34,10 @@
 //! [`fail_closed_passthrough_skip`] is the fail-closed SPIR-V passthrough
 //! skip gate shared by the integration suites (lib unit tests share the
 //! canonical `backend::wgpu::require_passthrough_or_skip` copy instead).
+//!
+//! [`read_wav_f32`] parses a 16-bit mono PCM WAV to f32, bounds-checked:
+//! one home for the fixture-clip reader so the copies stop drifting (the
+//! last-but-one copy never checked the format at all).
 
 #![allow(dead_code)]
 
@@ -413,6 +417,68 @@ impl<S: tracing::Subscriber> tracing_subscriber::Layer<S> for WarnCapture {
             Err(p) => p.into_inner().push(msg),
         }
     }
+}
+
+/// 16-bit mono PCM WAV to f32, the way `soundfile.read(dtype="float32")` does it.
+///
+/// Fully bounds-checked: a truncated header, chunk, or `fmt` body fails naming the file
+/// and what was missing instead of an index panic, and anything but mono 16 kHz 16-bit PCM
+/// is refused. One definition for all suites (a copy per file is how one suite ended up
+/// with no format check at all).
+///
+/// Callers: `sortformer_parity` (`read_clip`), `audio_pipeline_diarizer` (`clip`).
+pub fn read_wav_f32(path: &std::path::Path) -> Vec<f32> {
+    let bytes = std::fs::read(path).unwrap_or_else(|e| panic!("read {}: {e}", path.display()));
+    assert!(
+        bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WAVE",
+        "{}: {} bytes with no RIFF/WAVE header",
+        path.display(),
+        bytes.len()
+    );
+    let mut pos = 12;
+    let mut fmt_ok = false;
+    while pos + 8 <= bytes.len() {
+        let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let end = pos + 8 + len;
+        assert!(
+            end <= bytes.len(),
+            "{}: chunk at {pos} runs past the file ({} bytes)",
+            path.display(),
+            bytes.len()
+        );
+        let body = &bytes[pos + 8..end];
+        if &bytes[pos..pos + 4] == b"fmt " {
+            assert!(
+                body.len() >= 16,
+                "{}: fmt chunk holds {} bytes, need 16",
+                path.display(),
+                body.len()
+            );
+            let (tag, ch, rate, bits) = (
+                u16::from_le_bytes(body[0..2].try_into().unwrap()),
+                u16::from_le_bytes(body[2..4].try_into().unwrap()),
+                u32::from_le_bytes(body[4..8].try_into().unwrap()),
+                u16::from_le_bytes(body[14..16].try_into().unwrap()),
+            );
+            assert_eq!(
+                (tag, ch, rate, bits),
+                (1, 1, 16_000, 16),
+                "{}: WAV format",
+                path.display()
+            );
+            fmt_ok = true;
+        } else if &bytes[pos..pos + 4] == b"data" {
+            assert!(fmt_ok, "{}: data before fmt", path.display());
+            return body
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
+                .collect();
+        }
+        pos = end + (len & 1);
+    }
+    panic!("{}: no data chunk", path.display());
 }
 
 /// Append a GGUF length-prefixed string.

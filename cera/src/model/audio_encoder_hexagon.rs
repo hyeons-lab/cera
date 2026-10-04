@@ -38,7 +38,8 @@ use crate::backend::hexagon::{
     repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };
 use crate::model::audio_encoder::{
-    AudioEncoderConfig, AudioEncoderWeights, ConformerLayerWeights, POS_EMB_DIM, relative_pos_emb,
+    AudioEncoderConfig, AudioEncoderWeights, ConformerLayerWeights, EncoderParts, POS_EMB_DIM,
+    relative_pos_emb,
 };
 use crate::model::audio_encoder_gpu::AudioGpuEncode;
 use crate::model::audio_mel_hexagon::{
@@ -186,7 +187,7 @@ pub(crate) struct AdapterOffsets {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct WeightOffsets {
     pub layers: Vec<LayerOffsets>,
-    pub adapter: AdapterOffsets,
+    pub adapter: Option<AdapterOffsets>,
     pub stem: StemWeightOffsets,
     pub mel: MelWeightOffsets,
     /// A `[n_embd]` vector of 0.5: the macaron residual scale.
@@ -202,10 +203,10 @@ pub(crate) struct WeightOffsets {
 }
 
 impl WeightOffsets {
-    pub(crate) fn plan(weights: &AudioEncoderWeights) -> Result<Self, CeraError> {
+    pub(crate) fn plan(weights: &EncoderParts<'_>) -> Result<Self, CeraError> {
         let mut cur = 0;
         let mut layers = Vec::with_capacity(weights.layers.len());
-        for l in &weights.layers {
+        for l in weights.layers {
             let mut ffn = |norm_w: &[f32],
                            norm_b: &[f32],
                            up_w: &MmapWeight,
@@ -287,32 +288,36 @@ impl WeightOffsets {
             });
         }
         let n = weights.config.n_embd;
-        let ad = &weights.mlp_adapter;
-        // The adapter's activations live in scratch sized for the encoder's own
-        // widths; a file whose adapter is wider would be written past it.
-        if ad.up_w.cols != n
-            || ad.up_w.rows > weights.config.n_ff
-            || ad.down_w.cols != ad.up_w.rows
-            || ad.norm_w.len() != n
-            || ad.norm_b.len() != n
-            || ad.up_b.len() != ad.up_w.rows
-            || ad.down_b.len() != ad.down_w.rows
-            || ad.down_w.rows != weights.config.llm_hidden_size
-        {
-            return Err(CeraError::Backend(format!(
-                "audio adapter shapes up {}x{}, down {}x{} do not fit the encoder (width {n}, ffn {})",
-                ad.up_w.rows, ad.up_w.cols, ad.down_w.rows, ad.down_w.cols, weights.config.n_ff
-            )));
-        }
-        let adapter = AdapterOffsets {
-            norm_w: plan_vec(&mut cur, ad.norm_w.len()),
-            norm_b: plan_vec(&mut cur, ad.norm_b.len()),
-            up_w: plan_linear(&mut cur, &ad.up_w)?,
-            up_b: plan_vec(&mut cur, ad.up_b.len()),
-            down_w: plan_linear(&mut cur, &ad.down_w)?,
-            down_b: plan_vec(&mut cur, ad.down_b.len()),
-        };
-        let stem = StemWeightOffsets::plan(&mut cur, &weights.conv_stem, &weights.config)?;
+        let adapter = weights
+            .adapter
+            .map(|ad| -> Result<AdapterOffsets, CeraError> {
+                // The adapter's activations live in scratch sized for the encoder's own
+                // widths; a file whose adapter is wider would be written past it.
+                if ad.up_w.cols != n
+                    || ad.up_w.rows > weights.config.n_ff
+                    || ad.down_w.cols != ad.up_w.rows
+                    || ad.norm_w.len() != n
+                    || ad.norm_b.len() != n
+                    || ad.up_b.len() != ad.up_w.rows
+                    || ad.down_b.len() != ad.down_w.rows
+                    || ad.down_w.rows != weights.config.llm_hidden_size
+                {
+                    return Err(CeraError::Backend(format!(
+                        "audio adapter shapes up {}x{}, down {}x{} do not fit the encoder (width {n}, ffn {})",
+                        ad.up_w.rows, ad.up_w.cols, ad.down_w.rows, ad.down_w.cols, weights.config.n_ff
+                    )));
+                }
+                Ok(AdapterOffsets {
+                    norm_w: plan_vec(&mut cur, ad.norm_w.len()),
+                    norm_b: plan_vec(&mut cur, ad.norm_b.len()),
+                    up_w: plan_linear(&mut cur, &ad.up_w)?,
+                    up_b: plan_vec(&mut cur, ad.up_b.len()),
+                    down_w: plan_linear(&mut cur, &ad.down_w)?,
+                    down_b: plan_vec(&mut cur, ad.down_b.len()),
+                })
+            })
+            .transpose()?;
+        let stem = StemWeightOffsets::plan(&mut cur, weights.conv_stem, weights.config)?;
         let mel = MelWeightOffsets::plan(&mut cur, weights.config.n_mel_bins);
         let kernel = weights.layers.first().map_or(9, |l| l.conv_dw_w.len() / n);
         let half_off = plan_vec(&mut cur, n);
@@ -996,19 +1001,44 @@ pub struct AttentionDump {
     pub out: Vec<f32>,
 }
 
+/// The relative position embedding of the most recent sequence length. It depends only on that
+/// length, and an encoder usually runs the same one call after call (a diarizer's step in steady
+/// state, an utterance cap), so recomputing its `2t - 1` rows of sines and cosines (hundreds of
+/// thousands of them) each time is wasted host work.
+#[derive(Default)]
+struct PosEmbCache(Mutex<Option<(usize, Arc<Vec<f32>>)>>);
+
+impl PosEmbCache {
+    fn get(&self, t: usize) -> Arc<Vec<f32>> {
+        let mut slot = self.0.lock_or_recover();
+        match &*slot {
+            Some((cached, emb)) if *cached == t => Arc::clone(emb),
+            _ => {
+                let emb = Arc::new(relative_pos_emb(t));
+                *slot = Some((t, Arc::clone(&emb)));
+                emb
+            }
+        }
+    }
+}
+
 /// LFM2-Audio's Conformer encoder on the Hexagon NPU. Work in progress: see
 /// the module docs for what is implemented.
 pub struct HexagonAudioEncoder {
     driver: Arc<FastRpcDriver>,
     device: Arc<Mutex<HexagonDevice>>,
-    /// Kept for the CPU conv stem fallback.
-    weights: Arc<AudioEncoderWeights>,
+    /// Output channels of the conv stem (the NPU stem's geometry).
+    stem_channels: usize,
     config: AudioEncoderConfig,
     weights_buf: RpcmemBuffer,
     offsets: WeightOffsets,
     scratch: Mutex<RpcmemBuffer>,
     scratch_offsets: ScratchOffsets,
     max_frames: usize,
+    /// Whether LFM2-Audio's log-mel tables are staged (see [`Self::from_parts`]).
+    lfm_mel: bool,
+    /// The relative position embedding of the last sequence length (see [`PosEmbCache`]).
+    pos_cache: PosEmbCache,
 }
 
 // SAFETY: the rpcmem buffers are only touched while holding `device` and
@@ -1164,7 +1194,7 @@ fn settle(session: &mut HexagonQueueSession) -> Result<(), CeraError> {
 /// idle, so a late batch cannot overwrite what it staged. The write cannot be
 /// reached without the wait: this is the only way [`HexagonAudioEncoder`] runs
 /// its `prepare` step.
-fn settled<R>(
+pub(crate) fn settled<R>(
     session: &mut HexagonQueueSession,
     stage: impl FnOnce() -> R,
 ) -> Result<R, CeraError> {
@@ -1175,7 +1205,7 @@ fn settled<R>(
 /// A per-call buffer of `bytes`, allocated only once the queue is idle
 /// ([`settle`]): a hung DSP fails the call before it allocates anything a stale
 /// batch could still reference.
-fn alloc_settled(
+pub(crate) fn alloc_settled(
     session: &mut HexagonQueueSession,
     driver: &Arc<FastRpcDriver>,
     bytes: usize,
@@ -1188,7 +1218,7 @@ fn alloc_settled(
 /// Leaked instead, with a warning, when a batch is still unanswered: the DSP
 /// may be running it against the buffer, and freeing it would let the next
 /// allocation reuse the address under that batch. Returns whether it leaked.
-fn release_or_leak(session: &HexagonQueueSession, st: RpcmemBuffer) -> bool {
+pub(crate) fn release_or_leak(session: &HexagonQueueSession, st: RpcmemBuffer) -> bool {
     if session.outstanding_batches() > 0 {
         hexagon_warn!(
             "audio encoder: leaking a {} B buffer, a batch is still unanswered",
@@ -1206,7 +1236,7 @@ fn release_or_leak(session: &HexagonQueueSession, st: RpcmemBuffer) -> bool {
 /// kernel instead of keeping a core spinning: spinning was most of the
 /// encoder's CPU time (143 of 145 ms for the blocks of 10 s of audio on the
 /// S25 Ultra).
-fn run_on_queue(
+pub(crate) fn run_on_queue(
     what: &str,
     session: &mut HexagonQueueSession,
     emit: impl FnOnce(&mut HexagonQueueSession) -> Result<(), CeraError>,
@@ -1231,19 +1261,38 @@ impl HexagonAudioEncoder {
         weights: &Arc<AudioEncoderWeights>,
         max_frames: usize,
     ) -> Result<Self, CeraError> {
-        let config = weights.config.clone();
-        let offsets = WeightOffsets::plan(weights)?;
+        Self::from_parts(driver, device, &weights.parts(), max_frames, true)
+    }
+
+    /// Stage the weights in `parts` on the device. `lfm_mel` stages LFM2-Audio's own
+    /// log-mel tables for [`Self::log_mel_npu`]; a model with another front end (Sortformer
+    /// computes its mel on the host from tables in its GGUF) passes `false`, and the mel
+    /// entry points then refuse to run. With `parts.adapter == None` only the stem and the
+    /// blocks run ([`Self::run_blocks`], [`Self::stem_output`]).
+    pub fn from_parts(
+        driver: Arc<FastRpcDriver>,
+        device: Arc<Mutex<HexagonDevice>>,
+        parts: &EncoderParts<'_>,
+        max_frames: usize,
+        lfm_mel: bool,
+    ) -> Result<Self, CeraError> {
+        let config = parts.config.clone();
+        let offsets = WeightOffsets::plan(parts)?;
         let scratch_offsets = ScratchOffsets::new(&config, max_frames, offsets.kernel);
         let scratch = RpcmemBuffer::alloc(Arc::clone(&driver), scratch_offsets.total_bytes, true)?;
         let mut weights_buf = RpcmemBuffer::alloc(Arc::clone(&driver), offsets.total_bytes, true)?;
 
         let dst = weights_buf.as_mut_slice();
-        for (o, l) in offsets.layers.iter().zip(&weights.layers) {
+        for (o, l) in offsets.layers.iter().zip(parts.layers) {
             put_layer(dst, o, l)?;
         }
-        put_adapter(dst, &offsets.adapter, &weights.mlp_adapter)?;
-        put_stem(dst, &offsets.stem, &weights.conv_stem)?;
-        put_mel(dst, &offsets.mel, config.n_mel_bins);
+        if let (Some(o), Some(ad)) = (&offsets.adapter, parts.adapter) {
+            put_adapter(dst, o, ad)?;
+        }
+        put_stem(dst, &offsets.stem, parts.conv_stem)?;
+        if lfm_mel {
+            put_mel(dst, &offsets.mel, config.n_mel_bins);
+        }
         put_vec(dst, offsets.half_off, &vec![0.5f32; config.n_embd]);
         let d_head = config.n_embd / config.n_head.max(1);
         put_vec(
@@ -1261,14 +1310,39 @@ impl HexagonAudioEncoder {
         Ok(Self {
             driver,
             device,
-            weights: Arc::clone(weights),
+            stem_channels: parts.conv_stem.layers.first().map_or(0, |l| l.bias.len()),
             config,
             weights_buf,
             offsets,
             scratch: Mutex::new(scratch),
             scratch_offsets,
             max_frames,
+            lfm_mel,
+            pos_cache: PosEmbCache::default(),
         })
+    }
+
+    /// [`relative_pos_emb`] of `t`, cached for the last length.
+    fn pos_emb(&self, t: usize) -> Arc<Vec<f32>> {
+        self.pos_cache.get(t)
+    }
+
+    /// The adapter's offsets, or an error for an encoder staged without one.
+    fn adapter(&self) -> Result<&AdapterOffsets, CeraError> {
+        self.offsets.adapter.as_ref().ok_or_else(|| {
+            CeraError::Backend("this audio encoder was staged without an MLP adapter".into())
+        })
+    }
+
+    /// Refuse the LFM2-Audio log-mel entry points on an encoder that did not stage its tables.
+    fn require_lfm_mel(&self) -> Result<(), CeraError> {
+        if self.lfm_mel {
+            Ok(())
+        } else {
+            Err(CeraError::Backend(
+                "this audio encoder was staged without LFM2-Audio's log-mel tables".into(),
+            ))
+        }
     }
 
     /// Run `emit` over the `t`-frame sequence `x` (`[t, n_embd]`) on the NPU
@@ -1412,7 +1486,7 @@ impl HexagonAudioEncoder {
     /// device.
     pub fn run_attention(&self, layer: usize, x: &[f32], t: usize) -> Result<Vec<f32>, CeraError> {
         let attn = &self.layer("run_attention", layer)?.attn;
-        let pos = relative_pos_emb(t.max(1));
+        let pos = self.pos_emb(t.max(1));
         self.run_stage_with(
             "run_attention",
             x,
@@ -1421,7 +1495,7 @@ impl HexagonAudioEncoder {
                 self.clear_attention_padding(scratch, t);
                 let bytes = pos.len() * 4;
                 scratch.as_mut_slice()[so.attn_pos..so.attn_pos + bytes]
-                    .copy_from_slice(bytemuck::cast_slice(&pos));
+                    .copy_from_slice(bytemuck::cast_slice(&pos[..]));
                 scratch.flush_cpu_cache(so.attn_pos, bytes);
             },
             |session, weights, scratch, so| {
@@ -1504,7 +1578,7 @@ impl HexagonAudioEncoder {
                 self.offsets.layers.len()
             )));
         }
-        let pos = relative_pos_emb(t.max(1));
+        let pos = self.pos_emb(t.max(1));
         let cfg = &self.config;
         let bytes = t * cfg.n_embd * 4;
         self.run_stage_with(
@@ -1515,7 +1589,7 @@ impl HexagonAudioEncoder {
                 self.clear_attention_padding(scratch, t);
                 let pos_bytes = pos.len() * 4;
                 scratch.as_mut_slice()[so.attn_pos..so.attn_pos + pos_bytes]
-                    .copy_from_slice(bytemuck::cast_slice(&pos));
+                    .copy_from_slice(bytemuck::cast_slice(&pos[..]));
                 scratch.flush_cpu_cache(so.attn_pos, pos_bytes);
             },
             |session, weights, scratch, so| {
@@ -1533,8 +1607,10 @@ impl HexagonAudioEncoder {
     /// Run every Conformer block and the adapter over the conv stem's output
     /// `x` (`[t, n_embd]`), returning the `[t, llm_hidden_size]` embeddings:
     /// everything after the stem, in one call, one DSP batch per block.
+    /// Errors when staged without an MLP adapter (see [`Self::from_parts`]).
     pub fn encode_stem_output(&self, x: &[f32], t: usize) -> Result<Vec<f32>, CeraError> {
-        let pos = relative_pos_emb(t.max(1));
+        let adapter = self.adapter()?;
+        let pos = self.pos_emb(t.max(1));
         let cfg = &self.config;
         let out = (self.scratch_offsets.adapter_out, t * cfg.llm_hidden_size);
         self.run_stage_with(
@@ -1545,7 +1621,7 @@ impl HexagonAudioEncoder {
                 self.clear_attention_padding(scratch, t);
                 let pos_bytes = pos.len() * 4;
                 scratch.as_mut_slice()[so.attn_pos..so.attn_pos + pos_bytes]
-                    .copy_from_slice(bytemuck::cast_slice(&pos));
+                    .copy_from_slice(bytemuck::cast_slice(&pos[..]));
                 scratch.flush_cpu_cache(so.attn_pos, pos_bytes);
             },
             |session, weights, scratch, so| {
@@ -1553,7 +1629,7 @@ impl HexagonAudioEncoder {
                     emit_block(session, weights, scratch, layer, &self.offsets, so, cfg, t)?;
                     session.flush()?;
                 }
-                emit_adapter(session, weights, scratch, &self.offsets.adapter, so, cfg, t)?;
+                emit_adapter(session, weights, scratch, adapter, so, cfg, t)?;
                 session.flush()
             },
             out,
@@ -1576,7 +1652,9 @@ impl HexagonAudioEncoder {
 
     /// Log-mel for `pcm` (`n_frames` frames, [`n_frames_for`]): the DFT and
     /// the filterbank on the DSP, the log and the normalization on the host.
+    /// Errors when staged without LFM2-Audio's log-mel tables (see [`Self::from_parts`]).
     pub fn log_mel_npu(&self, pcm: &[f32], n_frames: usize) -> Result<Vec<f32>, CeraError> {
+        self.require_lfm_mel()?;
         check_n_frames(pcm.len(), n_frames)?;
         let n_mel = self.config.n_mel_bins;
         let samples = padded_preemphasized(pcm)
@@ -1611,7 +1689,7 @@ impl HexagonAudioEncoder {
     /// The stem's geometry for `n_frames` mel frames, refused when the
     /// sequence it produces is longer than the NPU encoder stages.
     fn stem_geom(&self, n_frames: usize) -> Result<StemGeom, CeraError> {
-        let ch = self.weights.conv_stem.layers[0].bias.len();
+        let ch = self.stem_channels;
         let g = StemGeom::new(n_frames, self.config.n_mel_bins, ch)
             .ok_or_else(|| CeraError::Backend(format!("conv stem: {n_frames} mel frames")))?;
         if g.t_out() > self.max_frames {
@@ -1641,7 +1719,7 @@ impl HexagonAudioEncoder {
 
     /// Geometry of a stem slice of `mel_rows` mel rows.
     fn chunk_geom(&self, mel_rows: usize) -> Result<StemGeom, CeraError> {
-        let ch = self.weights.conv_stem.layers[0].bias.len();
+        let ch = self.stem_channels;
         StemGeom::new(mel_rows, self.config.n_mel_bins, ch)
             .ok_or_else(|| CeraError::Backend(format!("conv stem: {mel_rows} mel rows")))
     }
@@ -1684,14 +1762,16 @@ impl HexagonAudioEncoder {
     /// Log-mel in, embeddings out, with the stem on the NPU. The stem runs in
     /// time chunks (`STEM_CHUNK_ROWS` output frames each) through a buffer
     /// that exists only for this call, so its memory does not grow with the clip.
+    /// Errors when staged without an MLP adapter (see [`Self::from_parts`]).
     pub fn encode_mel(&self, mel: &[f32], n_frames: usize) -> Result<(Vec<f32>, usize), CeraError> {
+        let adapter = self.adapter()?;
         check_mel_len(mel.len(), n_frames, self.config.n_mel_bins)?;
         let g = self.stem_geom(n_frames)?;
         let t = g.t_out();
         let cfg = &self.config;
         let chunks = plan_chunks(n_frames, cfg.n_mel_bins, STEM_CHUNK_ROWS);
         let (mut st, st_so) = self.stem_buffer(&chunks, false)?;
-        let pos = relative_pos_emb(t.max(1));
+        let pos = self.pos_emb(t.max(1));
         let out = (self.scratch_offsets.adapter_out, t * cfg.llm_hidden_size);
         let run = self.run_with_scratch(
             "encode",
@@ -1699,7 +1779,7 @@ impl HexagonAudioEncoder {
                 self.clear_attention_padding(scratch, t);
                 let pos_bytes = pos.len() * 4;
                 scratch.as_mut_slice()[so.attn_pos..so.attn_pos + pos_bytes]
-                    .copy_from_slice(bytemuck::cast_slice(&pos));
+                    .copy_from_slice(bytemuck::cast_slice(&pos[..]));
                 scratch.flush_cpu_cache(so.attn_pos, pos_bytes);
             },
             |session, weights, scratch, so| {
@@ -1710,7 +1790,7 @@ impl HexagonAudioEncoder {
                     emit_block(session, weights, scratch, layer, &self.offsets, so, cfg, t)?;
                     session.flush()?;
                 }
-                emit_adapter(session, weights, scratch, &self.offsets.adapter, so, cfg, t)?;
+                emit_adapter(session, weights, scratch, adapter, so, cfg, t)?;
                 session.flush()
             },
             out,
@@ -2266,6 +2346,27 @@ mod tests {
         assert!(check_mel_len(0, 0, 128).is_ok(), "empty clip");
     }
 
+    /// The position embedding is computed once per length and shared afterwards; a new length
+    /// replaces it.
+    #[test]
+    fn the_position_embedding_is_cached_for_the_last_length() {
+        let cache = PosEmbCache::default();
+        let a = cache.get(7);
+        assert_eq!(a.len(), (2 * 7 - 1) * POS_EMB_DIM);
+        assert!(
+            Arc::ptr_eq(&a, &cache.get(7)),
+            "the same length is not recomputed"
+        );
+        let b = cache.get(9);
+        assert_eq!(b.len(), (2 * 9 - 1) * POS_EMB_DIM);
+        assert!(!Arc::ptr_eq(&a, &b));
+        assert_eq!(
+            *cache.get(7),
+            relative_pos_emb(7),
+            "the cached values are the real ones"
+        );
+    }
+
     /// The adapter's activations live in scratch sized for the encoder, and its
     /// vectors are read at the matrices' widths, so a file whose adapter does not
     /// line up with them is refused at planning, before anything is written.
@@ -2302,7 +2403,7 @@ mod tests {
                     down_b: vec![0.0; down_b],
                 },
             };
-            match WeightOffsets::plan(&w) {
+            match WeightOffsets::plan(&w.parts()) {
                 Ok(_) => String::new(),
                 Err(e) => e.to_string(),
             }
@@ -2349,6 +2450,52 @@ mod tests {
             !refused(plan(ff, n, ff, n, n, ff, h, h)),
             "a matching adapter passes"
         );
+    }
+
+    /// Without an adapter (the Sortformer path) planning skips the adapter offsets instead
+    /// of failing: the pure prefix runs identically on host, so a mutant on the `None` leg
+    /// must fail here, not only on device. The stem is whole (5 conv layers plus a Q8_0
+    /// output projection over the flattened width) so planning reaches the end.
+    #[test]
+    fn planning_without_an_adapter_skips_the_adapter_offsets() {
+        use crate::model::audio_encoder::{ConvLayerWeights, ConvStemWeights, EncoderParts};
+        let c = cfg();
+        let ch = 4usize;
+        let layer = |shape: [usize; 4]| ConvLayerWeights {
+            name: "a.conv1d".into(),
+            weight: vec![0.0; shape.iter().product()],
+            bias: vec![0.0; ch],
+            shape: shape.to_vec(),
+        };
+        let shapes = [
+            [3, 3, 1, ch],
+            [3, 3, 1, ch],
+            [1, 1, ch, ch],
+            [3, 3, 1, ch],
+            [1, 1, ch, ch],
+        ];
+        // `flat_dim` for one frame over `n_mel_bins`: three halvings of the bin count.
+        let flat = ch * ((c.n_mel_bins - 1) / 8 + 1);
+        let stem = ConvStemWeights {
+            layers: shapes.iter().map(|s| layer(*s)).collect(),
+            pre_encode_out_w: MmapWeight::from_owned_bytes(
+                vec![0u8; 64 * flat],
+                DType::Q8_0,
+                c.n_embd,
+                flat,
+            ),
+            pre_encode_out_b: vec![0.0; c.n_embd],
+        };
+        let layers = vec![];
+        let parts = EncoderParts {
+            config: &c,
+            conv_stem: &stem,
+            layers: &layers,
+            adapter: None,
+        };
+        let off = WeightOffsets::plan(&parts).unwrap();
+        assert!(off.adapter.is_none());
+        assert!(off.layers.is_empty());
     }
 
     /// A session with one batch a read timeout left unanswered, and a buffer.
