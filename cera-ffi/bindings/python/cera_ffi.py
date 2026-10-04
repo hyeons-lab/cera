@@ -699,7 +699,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 51228:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 54575:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes() != 51326:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -14754,7 +14754,7 @@ class FfiAudioPipeline(FfiAudioPipelineProtocol):
             self._uniffi_clone_handle(),
         )
         _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
-        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_error_converter = None
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu,

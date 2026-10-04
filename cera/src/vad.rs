@@ -1565,14 +1565,14 @@ mod tests {
             let (mut vad, _) = accel_vad(vec![Ok(Some(step))]);
             let chunk = [0.0f32; 512];
             let prob = vad.process_chunk(&chunk, VadSampleRate::Rate16kHz).unwrap();
-            let cpu = scripted_vad()
+            let mut control = scripted_vad();
+            let cpu = control
                 .process_chunk(&chunk, VadSampleRate::Rate16kHz)
                 .unwrap();
             assert_eq!(prob, cpu);
             assert!(!vad.is_accelerated());
-            let (h, c) = vad.hidden_states();
-            assert!(h.iter().all(|v| v.is_finite()));
-            assert!(c.iter().all(|v| v.is_finite()));
+            // Unpoisoned means identical to the CPU run, not merely finite.
+            assert_eq!(vad.hidden_states(), control.hidden_states());
         }
     }
 

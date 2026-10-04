@@ -10435,8 +10435,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu != 51228) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu`: expected 51228, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu != 54575) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu`: expected 54575, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_cancel;
     try {
@@ -27034,10 +27034,6 @@ class CeraFfiFfi {
           ..len = (returnBuf + 3).ref.u64
           ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
         rustRetBufferPtrs.add(errBufPtr);
-        if (statusCode == _uniFfiRustCallStatusError) {
-          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
-          throw _uniffiLiftFfiErrorException(errBytes);
-        }
         throw StateError('UniFFI ffibuffer call failed with status $statusCode');
       }
       return (returnBuf + 0).ref.i8 == 1;

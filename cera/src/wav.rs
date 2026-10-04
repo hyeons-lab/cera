@@ -59,6 +59,10 @@ pub fn read_wav_mono_16k(path: &str) -> anyhow::Result<Vec<f32>> {
 }
 
 /// The complete `size`-sample windows of `pcm`, dropping a trailing partial window.
+///
+/// # Panics
+///
+/// Panics if `size` is zero.
 pub fn full_windows(pcm: &[f32], size: usize) -> Vec<&[f32]> {
     pcm.chunks_exact(size).collect()
 }
@@ -174,6 +178,14 @@ mod tests {
             assert!(err.contains("need mono 16 kHz s16"), "{err}");
             assert!(err.contains(field), "{err}");
         }
+    }
+
+    #[test]
+    fn fmt_without_data_refused() {
+        let bytes = wav_bytes(Some(MONO_16K), None, &[]);
+        let (_f, path) = write_temp(&bytes);
+        let err = read_wav_mono_16k(&path).unwrap_err().to_string();
+        assert!(err.contains("no data chunk"), "{err}");
     }
 
     #[test]

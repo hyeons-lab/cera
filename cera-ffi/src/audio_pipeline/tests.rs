@@ -241,6 +241,31 @@ fn test_diarizer_on_npu_follows_a_failing_diarizer() {
 }
 
 #[test]
+fn test_vad_on_cpu_flag_reaches_the_core_config() {
+    let ffi = FfiAudioPipelineConfig {
+        vad_on_cpu: true,
+        ..audio_pipeline_default_config()
+    };
+    let core = cera::audio_pipeline::AudioPipelineConfig::from(ffi);
+    assert!(core.vad_on_cpu);
+}
+
+/// A bare pipeline reports the VAD off the NPU. Needs no models.
+#[test]
+fn test_vad_on_npu_is_false_without_a_vad() {
+    let pipeline = cera::audio_pipeline::AudioPipeline::builder()
+        .build()
+        .expect("pipeline");
+    let cancel = pipeline.cancel_handle();
+    let ffi = FfiAudioPipeline {
+        inner: Mutex::new(pipeline),
+        cancel,
+        diarizer_on_npu: false,
+    };
+    assert!(!ffi.vad_on_npu());
+}
+
+#[test]
 fn test_ffi_utterance_labeled_event_conversion() {
     // Both axes crossed: the stalled-diarizer event is `None` + `dropped`, so a leg with
     // a labeled speaker alone would pass a mapping that gates the flag on speaker presence.

@@ -706,6 +706,22 @@ fn build_with_vad_on_cpu_drops_a_pre_attached_accelerator() {
 }
 
 #[test]
+fn build_with_config_vad_on_cpu_drops_a_pre_attached_accelerator() {
+    let mut vad = synthetic_vad();
+    vad.set_accelerator(Arc::new(FakeAccel));
+    let config = AudioPipelineConfig {
+        vad_on_cpu: true,
+        ..Default::default()
+    };
+    let pipeline = AudioPipelineBuilder::new()
+        .with_vad(vad)
+        .with_config(config)
+        .build()
+        .unwrap();
+    assert!(!pipeline.vad().unwrap().is_accelerated());
+}
+
+#[test]
 fn build_without_opt_out_keeps_a_pre_attached_accelerator() {
     // The Keep arm never touches the DSP, so this runs on every host in every build.
     let mut vad = synthetic_vad();

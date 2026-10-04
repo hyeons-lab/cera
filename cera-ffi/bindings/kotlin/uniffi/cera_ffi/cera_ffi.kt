@@ -3131,7 +3131,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 51228) {
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 54575) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090) {
@@ -7323,11 +7323,10 @@ open class FfiAudioPipeline :
      * Whether the VAD runs on the Hexagon NPU (false: the CPU, or no VAD). Read live: the VAD
      * drops back to the CPU if the NPU fails mid-run.
      */
-    @Throws(FfiException::class)
     override fun `vadOnNpu`(): kotlin.Boolean =
         FfiConverterBoolean.lift(
             callWithHandle {
-                uniffiRustCallWithError(FfiException) { _status ->
+                uniffiRustCall { _status ->
                     UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu(
                         it,
                         _status,

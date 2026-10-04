@@ -566,9 +566,11 @@ impl FfiAudioPipeline {
 
     /// Whether the VAD runs on the Hexagon NPU (false: the CPU, or no VAD). Read live: the VAD
     /// drops back to the CPU if the NPU fails mid-run.
-    pub fn vad_on_npu(&self) -> Result<bool, FfiError> {
-        let pipeline = self.lock_inner()?;
-        Ok(pipeline.vad().is_some_and(|v| v.is_accelerated()))
+    pub fn vad_on_npu(&self) -> bool {
+        // A poisoned mutex reads as no VAD, like `diarizer_on_npu`.
+        self.inner
+            .lock()
+            .is_ok_and(|p| p.vad().is_some_and(|v| v.is_accelerated()))
     }
 
     /// Register an utterance transcribed outside the pipeline so it gets an `UtteranceLabeled`

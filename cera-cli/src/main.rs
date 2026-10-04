@@ -1235,11 +1235,16 @@ enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Run the network on the Hexagon NPU (builds with the `hexagon` feature, Qualcomm
-        /// devices). Needs a GGUF converted with `--tail-outtype q8_0`; steps the NPU cannot take
-        /// fall back to the CPU.
+        /// Run the Sortformer network on the Hexagon NPU (builds with the `hexagon`
+        /// feature, Qualcomm devices). Needs a GGUF converted with `--tail-outtype q8_0`;
+        /// steps the NPU cannot take fall back to the CPU. The `--vad` VAD auto-uses the NPU
+        /// unless `--vad-on-cpu` is passed.
         #[arg(long)]
         npu: bool,
+
+        /// Keep the `--vad` VAD on the CPU (default: try the Hexagon NPU in `hexagon` builds).
+        #[arg(long)]
+        vad_on_cpu: bool,
     },
 
     /// Transcribe speech in audio using Whisper or LFM2-Audio ASR.
@@ -2398,6 +2403,7 @@ fn diarize_with_transcript(
     threshold: f32,
     audio: &str,
     json: bool,
+    vad_on_cpu: bool,
 ) -> Result<()> {
     use cera::audio_pipeline::AudioPipelineEvent;
 
@@ -2406,6 +2412,7 @@ fn diarize_with_transcript(
     let mut pipeline = cera::AudioPipeline::builder()
         .with_vad_from_file(vad)
         .with_context(|| format!("loading VAD from `{vad}`"))?
+        .with_vad_on_cpu(vad_on_cpu)
         .with_whisper_from_file(whisper)
         .with_context(|| format!("loading Whisper from `{whisper}`"))?
         .with_diarizer(model.clone(), params)
@@ -3017,6 +3024,26 @@ fn parse_shape_list<const N: usize>(raw: &str, what: &str) -> Result<Vec<[u32; N
     }
     anyhow::ensure!(!out.is_empty(), "no shapes parsed");
     Ok(out)
+}
+
+/// `--npu` fails closed: 8 kHz windows never consult the accelerator, so an 8 kHz `--npu`
+/// run would compute everything on the CPU and exit 0 looking like an NPU run.
+fn check_vad_npu_rate(npu: bool, rate: cera::vad::VadSampleRate) -> Result<()> {
+    anyhow::ensure!(
+        !(npu && rate == cera::vad::VadSampleRate::Rate8kHz),
+        "--npu accelerates 16 kHz windows only; 8 kHz input would run entirely on the CPU (re-run with --sample-rate 16000)"
+    );
+    Ok(())
+}
+
+/// `--npu` fails closed at enable time; fail closed here too if the DSP dropped out
+/// mid-run, or a benchmarking user mistakes CPU-computed timestamps for NPU ones.
+fn check_vad_npu_dropout(npu: bool, accelerated: bool) -> Result<()> {
+    anyhow::ensure!(
+        !(npu && !accelerated),
+        "the NPU dropped out mid-run; results were computed on the CPU (see the log above)"
+    );
+    Ok(())
 }
 
 fn main() -> Result<()> {
@@ -4283,13 +4310,7 @@ fn main() -> Result<()> {
                 ),
             };
 
-            // `--npu` fails closed: 8 kHz windows never consult the accelerator, so an 8 kHz
-            // --npu run would compute everything on the CPU and exit 0 looking like an NPU run.
-            if npu && vad_rate == cera::vad::VadSampleRate::Rate8kHz {
-                anyhow::bail!(
-                    "--npu accelerates 16 kHz windows only; 8 kHz input would run entirely on the CPU (re-run with --sample-rate 16000)"
-                );
-            }
+            check_vad_npu_rate(npu, vad_rate)?;
 
             let config = cera::vad::VadConfig {
                 threshold,
@@ -4321,13 +4342,7 @@ fn main() -> Result<()> {
 
             let timestamps = vad.get_speech_timestamps(&pcm, vad_rate, &config)?;
 
-            // `--npu` fails closed at enable time; fail closed here too if the DSP dropped out
-            // mid-run, or a benchmarking user mistakes CPU-computed timestamps for NPU ones.
-            if npu && !vad.is_accelerated() {
-                anyhow::bail!(
-                    "the NPU dropped out mid-run; results were computed on the CPU (see the log above)"
-                );
-            }
+            check_vad_npu_dropout(npu, vad.is_accelerated())?;
 
             if json {
                 println!("{}", serde_json::to_string_pretty(&timestamps)?);
@@ -4364,6 +4379,7 @@ fn main() -> Result<()> {
             min_ms,
             json,
             npu,
+            vad_on_cpu,
         } => {
             use cera::model::sortformer::SortformerModel;
             use cera::speaker_labeler::{FRAME_MS, speaker_segments};
@@ -4434,6 +4450,7 @@ fn main() -> Result<()> {
                     threshold,
                     &audio,
                     json,
+                    vad_on_cpu,
                 );
             }
 
@@ -5988,13 +6005,14 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        BundleQuantPair, Cli, CliSamplingArgs, Command, convert_history_to_chat_messages,
-        default_target_quant, display_bundle_id, doomed_run_error, is_liquid_model_spelling,
-        labeled_json_row, labeled_text_line, normalize_bundle_id, quant_warning_kind,
-        read_wav_pcm16_mono, resample_linear, resolve_engine, simulate_truncate_oldest_turn_pairs,
-        split_at_marker, transcript_labeler_config, truncate_oldest_turn_pair,
-        whisper_catalog_cached_path, whisper_catalog_unloadable_path, whisper_gguf_is_loadable,
-        whisper_transcribe_is_doomed, write_transcript, write_wav,
+        BundleQuantPair, Cli, CliSamplingArgs, Command, check_vad_npu_dropout, check_vad_npu_rate,
+        convert_history_to_chat_messages, default_target_quant, display_bundle_id,
+        doomed_run_error, is_liquid_model_spelling, labeled_json_row, labeled_text_line,
+        normalize_bundle_id, quant_warning_kind, read_wav_pcm16_mono, resample_linear,
+        resolve_engine, simulate_truncate_oldest_turn_pairs, split_at_marker,
+        transcript_labeler_config, truncate_oldest_turn_pair, whisper_catalog_cached_path,
+        whisper_catalog_unloadable_path, whisper_gguf_is_loadable, whisper_transcribe_is_doomed,
+        write_transcript, write_wav,
     };
     use cera::tokenizer::ChatMessage;
     use clap::Parser;
@@ -7540,6 +7558,24 @@ mod tests {
     }
 
     #[test]
+    fn vad_npu_rate_check_fails_closed_on_8khz() {
+        let err = check_vad_npu_rate(true, cera::vad::VadSampleRate::Rate8kHz)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("16 kHz windows only"), "{err}");
+        assert!(check_vad_npu_rate(true, cera::vad::VadSampleRate::Rate16kHz).is_ok());
+        assert!(check_vad_npu_rate(false, cera::vad::VadSampleRate::Rate8kHz).is_ok());
+    }
+
+    #[test]
+    fn vad_npu_dropout_check_fails_closed() {
+        let err = check_vad_npu_dropout(true, false).unwrap_err().to_string();
+        assert!(err.contains("dropped out mid-run"), "{err}");
+        assert!(check_vad_npu_dropout(true, true).is_ok());
+        assert!(check_vad_npu_dropout(false, false).is_ok());
+    }
+
+    #[test]
     fn diarize_command_parses_flags() {
         let cli = Cli::try_parse_from([
             "cera",
@@ -7573,9 +7609,11 @@ mod tests {
                 min_ms,
                 json,
                 npu,
+                vad_on_cpu,
             } => {
                 assert_eq!((vad, whisper), (None, None));
                 assert!(!npu, "the NPU is opt-in");
+                assert!(!vad_on_cpu, "the VAD auto-uses the NPU by default");
                 assert_eq!(
                     (model.as_str(), audio.as_str()),
                     ("sortformer.gguf", "meeting.wav")
@@ -7621,6 +7659,20 @@ mod tests {
             .unwrap();
         match cli.command {
             Command::Diarize { npu, .. } => assert!(npu),
+            _ => panic!("expected Diarize command"),
+        }
+        let cli = Cli::try_parse_from([
+            "cera",
+            "diarize",
+            "-m",
+            "m.gguf",
+            "-a",
+            "a.wav",
+            "--vad-on-cpu",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Diarize { vad_on_cpu, .. } => assert!(vad_on_cpu),
             _ => panic!("expected Diarize command"),
         }
         // Defaults: the live mode with the checkpoint's own preset.

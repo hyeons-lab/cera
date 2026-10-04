@@ -2834,7 +2834,7 @@ public protocol FfiAudioPipelineProtocol: AnyObject, Sendable {
      * Whether the VAD runs on the Hexagon NPU (false: the CPU, or no VAD). Read live: the VAD
      * drops back to the CPU if the NPU fails mid-run.
      */
-    func vadOnNpu() throws  -> Bool
+    func vadOnNpu()  -> Bool
     
 }
 /**
@@ -3154,8 +3154,8 @@ open func transcribePcm(pcm: [Float])throws  -> String  {
      * Whether the VAD runs on the Hexagon NPU (false: the CPU, or no VAD). Read live: the VAD
      * drops back to the CPU if the NPU fails mid-run.
      */
-open func vadOnNpu()throws  -> Bool  {
-    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+open func vadOnNpu() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu(
             self.uniffiCloneHandle(),$0
     )
@@ -13831,7 +13831,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 51228) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 54575) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090) {

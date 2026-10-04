@@ -8,7 +8,7 @@
 //!
 //! A window is the same graph every time (fixed shapes, fixed buffers), so it is built once,
 //! serialized, and replayed: per window the host writes the 640 input samples and the LSTM state,
-//! submits the batch and sleeps until the DSP answers. Building 50 ops each window would cost the
+//! submits the batch and sleeps until the DSP answers. Building 49 ops each window would cost the
 //! host as much as the CPU forward pass it replaces.
 //!
 //! ```text
@@ -742,6 +742,62 @@ mod tests {
         assert_eq!((x.offset, x.ne[0], x.ne[1]), (so.enc2, 64, 1));
         let d = s.dst(centre[0]);
         assert_eq!((d.offset, d.ne[0], d.ne[1]), (so.enc3, 128, 1));
+    }
+
+    /// The LSTM, head and gate ops read their own operands: each op's (weight, input, dst)
+    /// triple is observed in the full `emit_window` recording, so swapping `w_ih` with `w_hh`
+    /// (identical shapes), shifting a gate, or repointing the head input fails here rather
+    /// than silently changing NPU numerics. Each conv layer's tap-0 input likewise, pinning
+    /// the `emit_window` call-site args the unit test above restates.
+    #[test]
+    fn lstm_head_gates_and_conv_call_sites_read_their_own_operands() {
+        let (wo, so) = (WeightOffsets::plan(), Scratch::plan());
+        let mut s = RecordingSink::default();
+        emit_window(&mut s, &"w", &"b", &wo, &so).unwrap();
+        // The op reading a weight is found by offset scan, so the pin survives reordering.
+        let mulmat_reading = |weight: usize| {
+            let found: Vec<usize> = (0..s.ops.len())
+                .filter(|&i| s.ops[i].opcode == MulMat as u32 && s.src(i, 0).offset == weight)
+                .collect();
+            assert_eq!(found.len(), 1, "one op reads the weight at {weight}");
+            found[0]
+        };
+        // LSTM: W_ih x enc3 -> gates, W_hh x h_in -> gates2.
+        let ih = mulmat_reading(wo.w_ih);
+        assert_eq!(s.src(ih, 1).offset, so.enc3);
+        assert_eq!(s.dst(ih).offset, so.gates);
+        let hh = mulmat_reading(wo.w_hh);
+        assert_eq!(s.src(hh, 1).offset, so.h_in);
+        assert_eq!(s.dst(hh).offset, so.gates2);
+        // Head: head_w x t128 -> head.
+        let head = mulmat_reading(wo.head_w);
+        assert_eq!(s.src(head, 1).offset, so.t128);
+        assert_eq!(s.dst(head).offset, so.head);
+        // Gates (unary, in place): i+f in one op, then o, then the head sigmoid.
+        let (gi, gg, go) = (so.gates, so.gates + 2 * HID * 4, so.gates + 3 * HID * 4);
+        let sigmoids: Vec<usize> = (0..s.ops.len())
+            .filter(|&i| s.ops[i].opcode == UnarySigmoid as u32)
+            .collect();
+        assert_eq!(sigmoids.len(), 3);
+        assert_eq!(s.dst(sigmoids[0]).offset, gi);
+        assert_eq!(s.dst(sigmoids[1]).offset, go);
+        assert_eq!(s.dst(sigmoids[2]).offset, so.head);
+        let tanhs: Vec<usize> = (0..s.ops.len())
+            .filter(|&i| s.ops[i].opcode == UnaryTanh as u32)
+            .collect();
+        assert_eq!(tanhs.len(), 2);
+        assert_eq!(s.dst(tanhs[0]).offset, gg);
+        assert_eq!(s.dst(tanhs[1]).offset, so.t128);
+        // Conv call sites: tap-0 of layer L reads src_L into dst_L.
+        for (layer, src, dst) in [
+            (&wo.conv[0], so.pad0, so.pad1 + 128 * 4),
+            (&wo.conv[1], so.pad1, so.pad2 + 64 * 4),
+            (&wo.conv[2], so.pad2, so.enc2),
+        ] {
+            let tap0 = mulmat_reading(layer.taps[0]);
+            assert_eq!(s.src(tap0, 1).offset, src, "tap-0 input");
+            assert_eq!(s.dst(tap0).offset, dst, "tap-0 dst");
+        }
     }
 
     /// Tap `k` of `[out, in, 3]` lands at `[out, in_pad]` with zero padded channels.
