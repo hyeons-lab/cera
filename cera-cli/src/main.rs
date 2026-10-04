@@ -2282,9 +2282,6 @@ fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
     cera::model::audio_encoder::resample_linear(samples, sr_in, sr_out)
 }
 
-/// `cera diarize --vad .. --whisper ..`: the VAD plus Whisper pipeline and the live diarizer
-/// hear the same audio, piece by piece, as a background service would. Each utterance is printed
-/// with its speaker as soon as the diarizer has covered it.
 /// The transcript path labels Whisper's utterances, whose spans are fixed: the only
 /// diarizer knob that applies is the activity threshold (`merge_gap_ms`/`min_ms` reshape
 /// segment runs and are segment output only).
@@ -2295,6 +2292,9 @@ fn transcript_labeler_config(threshold: f32) -> cera::speaker_labeler::SpeakerLa
     }
 }
 
+/// `cera diarize --vad .. --whisper ..`: the VAD plus Whisper pipeline and the live diarizer
+/// hear the same audio, piece by piece, as a background service would. Each utterance is printed
+/// with its speaker as soon as the diarizer has covered it.
 #[allow(clippy::too_many_arguments)]
 fn diarize_with_transcript(
     model: &cera::model::sortformer::SortformerModel,
