@@ -55,4 +55,18 @@ class AudioModelsTest {
         assertEquals(listOf("vad"), AudioModels.find(listOf(private, external))!!.stages)
         assertEquals(private, AudioModels.find(listOf(private, external))!!.vad.parentFile)
     }
+
+    @Test
+    fun the_summary_names_each_stage_with_its_size_in_megabytes() {
+        val dir = tmp.newFolder()
+        touch(dir, AudioModels.VAD, bytes = 2_183_520)
+        touch(dir, AudioModels.WHISPER, bytes = 82_172_352)
+        touch(dir, AudioModels.DIARIZER, bytes = 126_828_608)
+        assertEquals(
+            "vad + whisper (82 MB) + diarizer (127 MB)",
+            AudioModels.find(listOf(dir))!!.summary,
+        )
+        File(dir, AudioModels.WHISPER).delete()
+        assertEquals("vad + diarizer (127 MB)", AudioModels.find(listOf(dir))!!.summary)
+    }
 }

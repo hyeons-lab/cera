@@ -106,7 +106,26 @@ demote when the app is in the background (it does demote background CPU work).
   would be refused), so reopen the app.
 - Models are read from `audio-models/` under the app's `filesDir` (or the external files dir):
   `vad.gguf` (required), `whisper.gguf`, `diarizer.gguf`, `hotword.gguf`. Whisper must be Q8_0 or
-  Q4_0 and the diarizer a `--tail-outtype q8_0` GGUF to run on the NPU.
+  Q4_0 and the diarizer a `--tail-outtype q8_0` GGUF to run on the NPU. The startup log line names
+  each stage and its file size (`pipeline ready: vad + whisper (82 MB) + diarizer (127 MB); ...`),
+  which is how to tell which Whisper is loaded.
+- **Use Whisper `base` at Q8_0 (recommended).** Make the file with
+  `cera transcribe --model base --quant q8_0 --download-model` (it lands in
+  `~/.cache/cera/huggingface.co/openai/whisper-base/quantized/Q8_0/model.gguf`) and push it as
+  `whisper.gguf`.
+
+  | Whisper (Q8_0) | Size | Time for 61 s of dense speech | CPU per audio second | Notes |
+  |----------------|------|-------------------------------|----------------------|-------|
+  | tiny | 44 MB | 17 s | 0.0093 | mishears words and invents fragments on noise |
+  | **base** | 82 MB | 27 s | 0.0099 | clean on live speech; the default to use |
+  | small | 265 MB | 73 s | 0.0115 | most accurate and consistent, but **slower than real time** on continuous speech |
+
+  Measured on a Galaxy S25 Ultra by replaying a 61 s clip (the same 15 s passage four times, in
+  English and Japanese) through the service at 4x. `small` got the Japanese phrase right where
+  `tiny` and `base` did not and gave identical English transcripts on all four repeats, but at
+  about 3.5 s per utterance it cannot keep up with continuous talking, and the capture buffer is
+  only 2 s, so a live microphone would drop audio while it transcribes. It suits sparse speech.
+  `medium` and `large` are larger still and were not tried.
 - Transcripts, with speaker labels, are appended to `filesDir/transcript.jsonl` (one `transcript`
   record when Whisper finishes an utterance, then an `utterance` record with its speaker once the
   diarizer has covered it, about 15 s later). Whisper's bracketed non-speech tags such as

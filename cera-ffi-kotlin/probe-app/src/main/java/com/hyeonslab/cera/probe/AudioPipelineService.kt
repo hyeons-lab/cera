@@ -116,7 +116,7 @@ class AudioPipelineService : Service() {
                 ?: error("no ${AudioModels.VAD} in ${modelDirs().joinToString { it.path }}")
             pipeline = buildPipeline(models, requireHotword)
             val onNpu = if (models.diarizer != null) pipeline.diarizerOnNpu() else null
-            val detail = "${models.stages.joinToString(" + ")}; $npuSetup" +
+            val detail = "${models.summary}; $npuSetup" +
                 (onNpu?.let { "; diarizer on ${if (it) "NPU" else "CPU"}" } ?: "")
             Log.i(TAG, "pipeline ready: $detail; chunk ${chunkSamples * 1000 / SAMPLE_RATE} ms")
             source = if (wavPath != null) {
