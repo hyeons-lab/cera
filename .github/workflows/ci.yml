@@ -1192,6 +1192,13 @@ jobs:
             echo "::error::expected 7 Kotlin unit tests, found $count (did a test get dropped or renamed? Update the count in this job)." >&2
             exit 1
           fi
+      - name: Compile JVM bindings
+        # The Android tests above resolve JNA only as the `@aar`
+        # artifact. The JVM module consumes the plain `jar` via
+        # `api(libs.jna)` and nothing else on a PR builds it, so
+        # compile it here to cover the JVM variant of every bump.
+        working-directory: cera-ffi-kotlin
+        run: ./gradlew --no-daemon :cera-ffi-jvm:compileKotlin
   dart-bindings-drift:
     # Same idea as ffi-bindings-drift, for the committed Dart bindings under
     # cera_ffi/lib/src/generated/.
