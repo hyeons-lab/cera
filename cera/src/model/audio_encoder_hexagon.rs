@@ -2452,6 +2452,52 @@ mod tests {
         );
     }
 
+    /// Without an adapter (the Sortformer path) planning skips the adapter offsets instead
+    /// of failing: the pure prefix runs identically on host, so a mutant on the `None` leg
+    /// must fail here, not only on device. The stem is whole (5 conv layers plus a Q8_0
+    /// output projection over the flattened width) so planning reaches the end.
+    #[test]
+    fn planning_without_an_adapter_skips_the_adapter_offsets() {
+        use crate::model::audio_encoder::{ConvLayerWeights, ConvStemWeights, EncoderParts};
+        let c = cfg();
+        let ch = 4usize;
+        let layer = |shape: [usize; 4]| ConvLayerWeights {
+            name: "a.conv1d".into(),
+            weight: vec![0.0; shape.iter().product()],
+            bias: vec![0.0; ch],
+            shape: shape.to_vec(),
+        };
+        let shapes = [
+            [3, 3, 1, ch],
+            [3, 3, 1, ch],
+            [1, 1, ch, ch],
+            [3, 3, 1, ch],
+            [1, 1, ch, ch],
+        ];
+        // `flat_dim` for one frame over `n_mel_bins`: three halvings of the bin count.
+        let flat = ch * ((c.n_mel_bins - 1) / 8 + 1);
+        let stem = ConvStemWeights {
+            layers: shapes.iter().map(|s| layer(*s)).collect(),
+            pre_encode_out_w: MmapWeight::from_owned_bytes(
+                vec![0u8; 64 * flat],
+                DType::Q8_0,
+                c.n_embd,
+                flat,
+            ),
+            pre_encode_out_b: vec![0.0; c.n_embd],
+        };
+        let layers = vec![];
+        let parts = EncoderParts {
+            config: &c,
+            conv_stem: &stem,
+            layers: &layers,
+            adapter: None,
+        };
+        let off = WeightOffsets::plan(&parts).unwrap();
+        assert!(off.adapter.is_none());
+        assert!(off.layers.is_empty());
+    }
+
     /// A session with one batch a read timeout left unanswered, and a buffer.
     fn session_with_an_unanswered_batch() -> (HexagonDevice, RpcmemBuffer) {
         unanswered_batch_on(false)

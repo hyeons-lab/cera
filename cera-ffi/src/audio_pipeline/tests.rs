@@ -265,6 +265,106 @@ fn test_ffi_audio_pipeline_with_a_diarizer_from_bytes() {
     assert!(format!("{err:?}").contains("from bytes"), "{err:?}");
 }
 
+/// Mono 16 kHz s16 WAV bytes to f32 samples. Mirrors `cera/tests/common/mod.rs::read_wav_f32`
+/// (this crate cannot import the `cera` test helpers): chunks are walked with their declared
+/// lengths, `fmt` is validated before `data` is trusted, and the `data` slice is bounded by
+/// its declared length, so a `data` byte run inside an earlier chunk or a corrupt length
+/// cannot mislead the parse.
+fn wav_bytes_to_f32(clip: &[u8]) -> Vec<f32> {
+    assert!(
+        clip.len() >= 12 && &clip[0..4] == b"RIFF" && &clip[8..12] == b"WAVE",
+        "{} bytes with no RIFF/WAVE header",
+        clip.len()
+    );
+    let mut pos = 12;
+    let mut fmt_ok = false;
+    while pos + 8 <= clip.len() {
+        let len = u32::from_le_bytes(clip[pos + 4..pos + 8].try_into().unwrap()) as usize;
+        let end = pos + 8 + len;
+        assert!(
+            end <= clip.len(),
+            "chunk at {pos} runs past the file ({} bytes)",
+            clip.len()
+        );
+        let body = &clip[pos + 8..end];
+        if &clip[pos..pos + 4] == b"fmt " {
+            assert!(
+                body.len() >= 16,
+                "fmt chunk holds {} bytes, need 16",
+                body.len()
+            );
+            let (tag, ch, rate, bits) = (
+                u16::from_le_bytes(body[0..2].try_into().unwrap()),
+                u16::from_le_bytes(body[2..4].try_into().unwrap()),
+                u32::from_le_bytes(body[4..8].try_into().unwrap()),
+                u16::from_le_bytes(body[14..16].try_into().unwrap()),
+            );
+            assert_eq!((tag, ch, rate, bits), (1, 1, 16_000, 16), "WAV format");
+            fmt_ok = true;
+        } else if &clip[pos..pos + 4] == b"data" {
+            assert!(fmt_ok, "data before fmt");
+            return body
+                .as_chunks::<2>()
+                .0
+                .iter()
+                .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
+                .collect();
+        }
+        pos = end + (len & 1);
+    }
+    panic!("no data chunk");
+}
+
+fn wav_bytes(extra_chunks: &[(&[u8; 4], &[u8])], data: &[u8]) -> Vec<u8> {
+    let mut wav = b"RIFF....WAVE".to_vec();
+    let mut body = vec![1, 0, 1, 0, 0x80, 0x3e, 0, 0, 0, 0x7d, 0, 0, 2, 0, 16, 0];
+    let mut chunks = extra_chunks.to_vec();
+    chunks.push((b"data", data));
+    for (id, chunk) in chunks {
+        // `fmt` first: the parser trusts `data` only after validating the format.
+        if id == b"data" {
+            wav.extend_from_slice(b"fmt ");
+            wav.extend_from_slice(&(body.len() as u32).to_le_bytes());
+            wav.append(&mut body);
+        }
+        wav.extend_from_slice(id);
+        wav.extend_from_slice(&(chunk.len() as u32).to_le_bytes());
+        wav.extend_from_slice(chunk);
+        if chunk.len() % 2 == 1 {
+            wav.push(0);
+        }
+    }
+    let len = (wav.len() - 8) as u32;
+    wav[4..8].copy_from_slice(&len.to_le_bytes());
+    wav
+}
+
+/// A `data` byte run inside an earlier chunk does not fool the parser: chunks are walked by
+/// their declared lengths, not by scanning for the tag.
+#[test]
+fn wav_bytes_to_f32_ignores_a_data_run_inside_an_earlier_chunk() {
+    let pcm = wav_bytes_to_f32(&wav_bytes(&[(b"JUNK", b"xxdatayy")], &[0, 0, 255, 127]));
+    assert_eq!(pcm, vec![0.0, 32767.0 / 32768.0]);
+}
+
+/// A corrupt chunk length is refused, and only the declared `data` bytes are decoded.
+#[test]
+fn wav_bytes_to_f32_bounds_every_slice() {
+    let good = wav_bytes(&[], &[1, 0, 2, 0]);
+    assert_eq!(wav_bytes_to_f32(&good), vec![1.0 / 32768.0, 2.0 / 32768.0]);
+    // Overlong `data` length: the chunk runs past the file.
+    let mut bad = good.clone();
+    let at = bad.len() - 4 - 8;
+    bad[at + 4..at + 8].copy_from_slice(&1_000_000u32.to_le_bytes());
+    let err = std::panic::catch_unwind(|| wav_bytes_to_f32(&bad)).unwrap_err();
+    let msg = err
+        .downcast_ref::<String>()
+        .cloned()
+        .or_else(|| err.downcast_ref::<&str>().map(|s| s.to_string()))
+        .unwrap_or_default();
+    assert!(msg.contains("runs past the file"), "{msg}");
+}
+
 /// Device test, run with `--ignored` on a Qualcomm phone: `from_files_with_diarizer` with
 /// `prefer_npu` puts the diarizer on the NPU, and a registered utterance gets the speaker the
 /// CPU gives it. Needs `SORTFORMER_GGUF` (a model converted with `--tail-outtype q8_0`) and
@@ -276,16 +376,7 @@ fn test_ffi_audio_pipeline_diarizer_on_the_npu() {
     let gguf = std::env::var("SORTFORMER_GGUF").expect("SORTFORMER_GGUF");
     let clip = std::fs::read(std::env::var("SORTFORMER_CLIP").expect("SORTFORMER_CLIP"))
         .expect("read the clip");
-    let data = clip
-        .windows(4)
-        .position(|w| w == b"data")
-        .expect("data chunk");
-    let pcm: Vec<f32> = clip[data + 8..]
-        .as_chunks::<2>()
-        .0
-        .iter()
-        .map(|b| i16::from_le_bytes(*b) as f32 / 32768.0)
-        .collect();
+    let pcm: Vec<f32> = wav_bytes_to_f32(&clip);
     let config = FfiAudioPipelineConfig {
         auto_transcribe: false,
         ..audio_pipeline_default_config()

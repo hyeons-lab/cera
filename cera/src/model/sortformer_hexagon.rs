@@ -24,10 +24,9 @@ use crate::backend::hexagon::{
     RpcmemBuffer, align128,
 };
 use crate::model::audio_encoder::{HOP_LEN, LOG_MEL_EPS, N_FFT};
-use crate::model::audio_encoder_hexagon::HexagonAudioEncoder;
 use crate::model::audio_encoder_hexagon::{
-    alloc_settled, pad32, plan_linear, plan_vec, put_linear, put_vec, release_or_leak,
-    run_on_queue, settled,
+    HexagonAudioEncoder, alloc_settled, pad32, plan_linear, plan_vec, put_linear, put_vec,
+    release_or_leak, run_on_queue, settled,
 };
 use crate::model::audio_mel_hexagon::{
     MelScratch, MelWeightOffsets, emit_mel, put_mel_tables, stage_samples,
@@ -278,7 +277,8 @@ impl Scratch {
 pub enum TailStage {
     /// `encoder_proj` only: `[t, d]`.
     Proj,
-    /// `encoder_proj` and the first `n` Transformer layers: `[t, d]`.
+    /// `encoder_proj` and the first `n` Transformer layers: `[t, d]`. Clamped to the staged
+    /// layers, so an overlarge `n` runs all of them.
     Layers(usize),
     /// Everything: the speaker activities, `[t, n_spk]`.
     Full,
@@ -956,7 +956,7 @@ mod tests {
         );
     }
 
-    /// Sortformer's real widths, two layers.
+    /// Sortformer's real widths, `layers` Transformer layers.
     fn fixture(layers: usize) -> (TailOffsets, Dims) {
         let dims = Dims {
             enc_d: 512,

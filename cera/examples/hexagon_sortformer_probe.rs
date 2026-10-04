@@ -28,7 +28,15 @@ fn read_wav(path: &str) -> Vec<f32> {
     while pos + 8 <= bytes.len() {
         let id = &bytes[pos..pos + 4];
         let len = u32::from_le_bytes(bytes[pos + 4..pos + 8].try_into().unwrap()) as usize;
-        let body = &bytes[pos + 8..(pos + 8 + len).min(bytes.len())];
+        // As `cera/tests/common/mod.rs::read_wav_f32`: a corrupt length is refused, never
+        // silently truncated (short audio would loop and still print plausible numbers).
+        let end = pos + 8 + len;
+        assert!(
+            end <= bytes.len(),
+            "chunk at {pos} runs past the file ({} bytes)",
+            bytes.len()
+        );
+        let body = &bytes[pos + 8..end];
         if id == b"fmt " {
             assert!(
                 body.len() >= 16,
