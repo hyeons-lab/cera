@@ -57,6 +57,32 @@ class AudioModelsTest {
     }
 
     @Test
+    fun an_empty_vad_is_a_failed_copy_like_an_empty_optional() {
+        val private = tmp.newFolder()
+        val external = tmp.newFolder()
+        touch(private, AudioModels.VAD, bytes = 0)
+        touch(external, AudioModels.VAD)
+        touch(external, AudioModels.WHISPER)
+        // The private directory is skipped, so the good external copy wins.
+        assertEquals(listOf("vad", "whisper"), AudioModels.find(listOf(private, external))!!.stages)
+        assertEquals(external, AudioModels.find(listOf(private, external))!!.vad.parentFile)
+    }
+
+    @Test
+    fun dirs_lists_private_before_external() {
+        val private = tmp.newFolder()
+        val external = tmp.newFolder()
+        assertEquals(
+            listOf(File(private, AudioModels.DIR_NAME), File(external, AudioModels.DIR_NAME)),
+            AudioModels.dirs(private, external),
+        )
+        assertEquals(
+            listOf(File(private, AudioModels.DIR_NAME)),
+            AudioModels.dirs(private, null),
+        )
+    }
+
+    @Test
     fun the_summary_names_each_stage_with_its_size_in_megabytes() {
         val dir = tmp.newFolder()
         touch(dir, AudioModels.VAD, bytes = 2_183_520)

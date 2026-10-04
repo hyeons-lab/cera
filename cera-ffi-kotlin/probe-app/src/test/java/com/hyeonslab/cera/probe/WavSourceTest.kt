@@ -3,8 +3,12 @@ package com.hyeonslab.cera.probe
 import org.junit.Assert.assertArrayEquals
 import org.junit.Assert.assertEquals
 import org.junit.Assert.assertThrows
+import org.junit.Assert.assertTrue
+import org.junit.Rule
 import org.junit.Test
+import org.junit.rules.TemporaryFolder
 import java.io.ByteArrayOutputStream
+import java.io.FileOutputStream
 
 private fun le16(v: Int) = byteArrayOf(v.toByte(), (v shr 8).toByte())
 
@@ -26,6 +30,9 @@ private fun wav(vararg chunks: ByteArray): ByteArray {
 private fun samplesBytes(vararg s: Int) = s.fold(byteArrayOf()) { acc, v -> acc + le16(v) }
 
 class WavSourceTest {
+    @get:Rule
+    val tmp = TemporaryFolder()
+
     @Test
     fun a_plain_wav_yields_its_samples() {
         val file = wav(fmt(), chunk("data", samplesBytes(1, -2, 300)))
@@ -64,6 +71,46 @@ class WavSourceTest {
         assertThrows(IllegalArgumentException::class.java) { WavSource.parse(wav(fmt())) }
         assertThrows(IllegalArgumentException::class.java) {
             WavSource.parse(wav(chunk("data", samplesBytes(1))))
+        }
+    }
+
+    @Test
+    fun a_chunk_declaring_more_than_remains_is_refused() {
+        // 0x7FFFFFF0 narrowed to a negative step and threw an index crash; 0xFFFFFFF8 never
+        // advanced the walker at all and hung. Both must refuse loudly now.
+        for (declared in listOf(0x7FFFFFF0L, 0xFFFFFFF8L)) {
+            val junk = "JUNK".toByteArray() + le32(declared) + ByteArray(4)
+            val e = assertThrows(IllegalArgumentException::class.java) {
+                WavSource.parse(wav(fmt(), junk))
+            }
+            assertTrue("$declared", e.message!!.contains("declares $declared bytes"))
+        }
+    }
+
+    @Test
+    fun a_file_past_the_replay_cap_is_refused() {
+        val big = tmp.newFile("big.wav")
+        // Just over the 64 MB cap, in 1 MB writes. Zeros would fail RIFF parsing anyway, so
+        // the cap message is what proves the refusal came from the cap.
+        FileOutputStream(big).use { out ->
+            val mb = ByteArray(1024 * 1024)
+            repeat(64) { out.write(mb) }
+            out.write(0)
+        }
+        val e = assertThrows(IllegalArgumentException::class.java) { WavSource.open(big) }
+        assertTrue(e.message!!, e.message!!.contains("replay cap"))
+    }
+
+    @Test
+    fun a_negative_or_non_finite_speed_is_refused() {
+        assertThrows(IllegalArgumentException::class.java) {
+            WavSource(ShortArray(10), speed = -1.0)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            WavSource(ShortArray(10), speed = Double.NaN)
+        }
+        assertThrows(IllegalArgumentException::class.java) {
+            WavSource(ShortArray(10), speed = Double.POSITIVE_INFINITY)
         }
     }
 

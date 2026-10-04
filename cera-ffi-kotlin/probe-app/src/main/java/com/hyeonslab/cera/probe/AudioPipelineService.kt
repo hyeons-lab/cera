@@ -18,6 +18,7 @@ import com.hyeonslab.cera.android.HexagonNpu
 import uniffi.cera_ffi.FfiAudioPipeline
 import uniffi.cera_ffi.audioPipelineDefaultConfig
 import java.io.File
+import java.util.Locale
 import java.util.concurrent.atomic.AtomicBoolean
 
 /**
@@ -40,10 +41,21 @@ class AudioPipelineService : Service() {
     private var worker: Thread? = null
     private var wakeLock: PowerManager.WakeLock? = null
 
+    /**
+     * True once the worker thread has finished its cleanup and asked to stop: a start that
+     * arrives between that moment and onDestroy may replace it instead of being swallowed.
+     */
+    private val workerDone = AtomicBoolean(true)
+
+    /** The source the worker is reading, so onDestroy can unblock a read stuck in the driver. */
+    @Volatile
+    private var currentSource: AudioSource? = null
+
     override fun onBind(intent: Intent?): IBinder? = null
 
     override fun onCreate() {
         super.onCreate()
+        running = true
         // HexagonNpu.setup writes the process environment, and setenv is not thread-safe: do it
         // here, once, on the main thread, before the worker thread exists.
         npuSetup = runCatching { HexagonNpu.setup(this) }
@@ -73,7 +85,8 @@ class AudioPipelineService : Service() {
             stopSelf()
             return START_NOT_STICKY
         }
-        if (worker == null) {
+        if (worker == null || workerDone.get()) {
+            workerDone.set(false)
             stopRequested.set(false)
             AudioServiceState.status(AudioServiceState.Status.STARTING, "loading models")
             acquireWakeLock(intent?.getBooleanExtra(EXTRA_WAKE_LOCK, true) ?: true)
@@ -85,16 +98,26 @@ class AudioPipelineService : Service() {
             val wavPath = intent?.getStringExtra(EXTRA_WAV)
             val wavSpeed = intent?.getDoubleExtra(EXTRA_WAV_SPEED, 1.0) ?: 1.0
             worker = Thread(
-                { work(requireHotword, chunkSamples, wavPath, wavSpeed) },
+                { work(startId, requireHotword, chunkSamples, wavPath, wavSpeed) },
                 "cera-audio",
             ).also { it.start() }
+        } else {
+            Log.i(TAG, "start ignored: service already running (new extras are not re-applied)")
         }
         return START_NOT_STICKY
     }
 
     override fun onDestroy() {
+        running = false
         stopRequested.set(true)
+        // Unblock a worker stuck in a microphone read: closing the AudioRecord fails the read,
+        // which the runner treats as a clean stop. An in-flight FFI call still cannot be hurried
+        // (UniFFI has no cancellation), so a worker past this point is logged, not silent.
+        runCatching { currentSource?.close() }
         worker?.join(STOP_JOIN_MS)
+        if (worker?.isAlive == true) {
+            Log.e(TAG, "worker still alive after ${STOP_JOIN_MS}ms; it keeps the mic and pipeline past onDestroy")
+        }
         releaseWakeLock()
         if (AudioServiceState.state.value.status != AudioServiceState.Status.FAILED) {
             AudioServiceState.status(AudioServiceState.Status.STOPPED, "")
@@ -108,16 +131,25 @@ class AudioPipelineService : Service() {
         return START_NOT_STICKY
     }
 
-    private fun work(requireHotword: Boolean, chunkSamples: Int, wavPath: String?, wavSpeed: Double) {
+    private fun work(
+        startId: Int,
+        requireHotword: Boolean,
+        chunkSamples: Int,
+        wavPath: String?,
+        wavSpeed: Double,
+    ) {
         var pipeline: FfiAudioPipeline? = null
         var source: AudioSource? = null
         try {
-            val models = AudioModels.find(modelDirs())
-                ?: error("no ${AudioModels.VAD} in ${modelDirs().joinToString { it.path }}")
+            val dirs = modelDirs()
+            val models = AudioModels.find(dirs)
+                ?: error("no ${AudioModels.VAD} in ${dirs.joinToString { it.path }}")
             pipeline = buildPipeline(models, requireHotword)
-            val onNpu = if (models.diarizer != null) pipeline.diarizerOnNpu() else null
+            val livePipeline = pipeline
+            val onNpu = if (models.diarizer != null) livePipeline.diarizerOnNpu() else null
             val detail = "${models.summary}; $npuSetup" +
-                (onNpu?.let { "; diarizer on ${if (it) "NPU" else "CPU"}" } ?: "")
+                (onNpu?.let { "; diarizer on ${if (it) "NPU" else "CPU"}" } ?: "") +
+                (if (requireHotword && models.hotword == null) "; require_hotword ignored (no hotword.gguf)" else "")
             Log.i(TAG, "pipeline ready: $detail; chunk ${chunkSamples * 1000 / SAMPLE_RATE} ms")
             source = if (wavPath != null) {
                 Log.i(TAG, "replaying $wavPath at ${wavSpeed}x instead of the microphone")
@@ -125,12 +157,17 @@ class AudioPipelineService : Service() {
             } else {
                 MicSource.open()
             }
+            currentSource = source
             AudioServiceState.status(AudioServiceState.Status.RUNNING, detail)
             val meter = CpuMeter { Process.getElapsedCpuTime() }
             val log = File(filesDir, TRANSCRIPT_FILE)
+            if (log.exists() && log.length() > MAX_TRANSCRIPT_BYTES) {
+                log.renameTo(File(filesDir, "$TRANSCRIPT_FILE.1"))
+            }
+            var diarizerLostLogged = false
             val runner = PipelineRunner(
                 source = source,
-                pipeline = FfiPipeline(pipeline, chunkSamples),
+                pipeline = FfiPipeline(livePipeline, chunkSamples),
                 onEvent = { event ->
                     eventLine(event)?.let {
                         Log.i(TAG, it)
@@ -140,12 +177,20 @@ class AudioPipelineService : Service() {
                 },
                 chunkSamples = chunkSamples,
                 onProgress = { audio, peak ->
+                    if (models.diarizer != null && !diarizerLostLogged && !livePipeline.hasDiarizer()) {
+                        diarizerLostLogged = true
+                        Log.w(TAG, "diarizer stopped; continuing without speaker labels")
+                        AudioServiceState.status(
+                            AudioServiceState.Status.RUNNING,
+                            "$detail; diarizer stopped",
+                        )
+                    }
                     val lap = meter.lap(audio)
                     Log.i(
                         TAG,
-                        "stats audio=${"%.0f".format(audio)}s " +
-                            "interval_cpu=${lap.cpuMs}ms/${"%.0f".format(lap.audioSeconds)}s " +
-                            "cpu_per_audio_s=${"%.4f".format(lap.cpuSecondsPerAudioSecond)} " +
+                        "stats audio=${String.format(Locale.US, "%.0f", audio)}s " +
+                            "interval_cpu=${lap.cpuMs}ms/${String.format(Locale.US, "%.0f", lap.audioSeconds)}s " +
+                            "cpu_per_audio_s=${String.format(Locale.US, "%.4f", lap.cpuSecondsPerAudioSecond)} " +
                             "total_cpu=${meter.totalCpuMs()}ms " +
                             "peak=$peak silenced=${micSilenced()}",
                     )
@@ -160,9 +205,12 @@ class AudioPipelineService : Service() {
                 "${e.javaClass.simpleName}: ${e.message}",
             )
         } finally {
-            runCatching { source?.close() }
-            runCatching { pipeline?.close() }
-            stopSelf()
+            currentSource = null
+            runCatching { source?.close() }.onFailure { Log.w(TAG, "close failed", it) }
+            runCatching { pipeline?.close() }.onFailure { Log.w(TAG, "close failed", it) }
+            workerDone.set(true)
+            // Scoped to this start: a no-op when a replacement start arrived while we finished.
+            stopSelfResult(startId)
         }
     }
 
@@ -176,6 +224,9 @@ class AudioPipelineService : Service() {
             .any { it.isClientSilenced }
 
     private fun buildPipeline(models: AudioModels, requireHotword: Boolean): FfiAudioPipeline {
+        if (requireHotword && models.hotword == null) {
+            Log.w(TAG, "require_hotword was requested but no hotword.gguf was found; transcribing without wake-word gating")
+        }
         val config = audioPipelineDefaultConfig().copy(
             requireHotword = requireHotword && models.hotword != null,
             autoTranscribe = models.whisper != null,
@@ -185,16 +236,13 @@ class AudioPipelineService : Service() {
         val whisper = models.whisper?.absolutePath
         val diarizer = models.diarizer?.absolutePath
         return if (diarizer != null) {
-            FfiAudioPipeline.fromFilesWithDiarizer(vad, hotword, whisper, diarizer, true, config)
+            FfiAudioPipeline.fromFilesWithDiarizer(vad, hotword, whisper, diarizer, preferNpu = true, config)
         } else {
             FfiAudioPipeline.fromFiles(vad, hotword, whisper, config)
         }
     }
 
-    private fun modelDirs(): List<File> = listOfNotNull(
-        File(filesDir, AudioModels.DIR_NAME),
-        getExternalFilesDir(null)?.let { File(it, AudioModels.DIR_NAME) },
-    )
+    private fun modelDirs(): List<File> = AudioModels.dirs(filesDir, getExternalFilesDir(null))
 
     private fun enterForeground() {
         val open = PendingIntent.getActivity(
@@ -241,6 +289,12 @@ class AudioPipelineService : Service() {
         private const val CHANNEL_ID = "cera-transcription"
         private const val NOTIFICATION_ID = 1
         private const val STOP_JOIN_MS = 5_000L
+
+        /**
+         * The transcript is rotated aside at startup past this size: an always-on service would
+         * otherwise append to one file for the life of the install.
+         */
+        private const val MAX_TRANSCRIPT_BYTES = 10_000_000L
         const val TRANSCRIPT_FILE = "transcript.jsonl"
         const val ACTION_STOP = "com.hyeonslab.cera.probe.STOP"
 
@@ -266,12 +320,23 @@ class AudioPipelineService : Service() {
         @Volatile
         private var npuSetup: String = ""
 
-        /** Start the service. Call from a visible activity with RECORD_AUDIO granted. */
+        // Same-process guard so stop() while idle does not create the service just to stop it
+        // (which would pay NPU setup in onCreate). Sound because the service and its callers
+        // share a process, like AudioServiceState.
+        @Volatile
+        private var running = false
+
+        /**
+         * Start the service. Call from a visible activity with RECORD_AUDIO granted.
+         *
+         * @param chunkMs milliseconds of audio per pipeline call, null for the 500 ms default;
+         * clamped to 100..2000.
+         */
         fun start(
             context: Context,
             wakeLock: Boolean = true,
             requireHotword: Boolean = false,
-            chunkMs: Int = 0,
+            chunkMs: Int? = null,
             wavPath: String? = null,
             wavSpeed: Double = 1.0,
         ) {
@@ -279,13 +344,14 @@ class AudioPipelineService : Service() {
                 Intent(context, AudioPipelineService::class.java)
                     .putExtra(EXTRA_WAKE_LOCK, wakeLock)
                     .putExtra(EXTRA_REQUIRE_HOTWORD, requireHotword)
-                    .putExtra(EXTRA_CHUNK_MS, chunkMs)
+                    .putExtra(EXTRA_CHUNK_MS, chunkMs ?: 0)
                     .putExtra(EXTRA_WAV, wavPath)
                     .putExtra(EXTRA_WAV_SPEED, wavSpeed),
             )
         }
 
         fun stop(context: Context) {
+            if (!running) return
             context.startService(
                 Intent(context, AudioPipelineService::class.java).setAction(ACTION_STOP),
             )

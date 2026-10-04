@@ -4,6 +4,7 @@ import android.annotation.SuppressLint
 import android.media.AudioFormat
 import android.media.AudioRecord
 import android.media.MediaRecorder
+import java.util.concurrent.atomic.AtomicBoolean
 
 /** A blocking source of 16 kHz mono PCM16. */
 interface AudioSource : AutoCloseable {
@@ -25,10 +26,15 @@ interface AudioSource : AutoCloseable {
  * service of type `microphone` that was started while the app was visible.
  */
 class MicSource private constructor(private val record: AudioRecord) : AudioSource {
+    // onDestroy closes the source to unblock a stuck read, and the worker's finally closes it
+    // again: exactly one of them must release the recorder.
+    private val closed = AtomicBoolean(false)
+
     override fun read(buffer: ShortArray, offset: Int, length: Int): Int =
         record.read(buffer, offset, length)
 
     override fun close() {
+        if (!closed.compareAndSet(false, true)) return
         runCatching { record.stop() }
         record.release()
     }

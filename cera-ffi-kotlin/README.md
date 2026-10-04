@@ -129,7 +129,10 @@ demote when the app is in the background (it does demote background CPU work).
 - Transcripts, with speaker labels, are appended to `filesDir/transcript.jsonl` (one `transcript`
   record when Whisper finishes an utterance, then an `utterance` record with its speaker once the
   diarizer has covered it, about 15 s later). Whisper's bracketed non-speech tags such as
-  `[BLANK_AUDIO]` are dropped.
+  `[BLANK_AUDIO]` are dropped. The record shapes are `{"type":"transcript","start_ms":…,
+  "end_ms":…,"text":…}`, `{"type":"utterance","start_ms":…,"end_ms":…,"speaker":…,
+  "overlapping":…,"confidence":…,"text":…}` and `{"type":"wake_word","start_ms":…,"keyword":…,
+  "confidence":…} (`null` where a speaker or confidence is unknown).
 - It logs CPU seconds per audio second every minute, with the input peak and whether Android is
   silencing the recorder: `adb logcat -s CeraAudio`.
 - Intent extras (on `AudioServiceActivity`, forwarded to the service):

@@ -1146,11 +1146,13 @@ jobs:
         run: just bindings-check
 
   kotlin-unit-tests:
-    # Runs the junit suite for the Android helper (`mergeAdspPaths`, the
-    # `ADSP_LIBRARY_PATH` merge `HexagonNpu.setup` performs). Plain JVM
-    # tests (no device, no emulator), but the module still compiles against
-    # the Android SDK, so the job installs the compileSdk platform. Without
-    # this leg the tests only run on machines with the SDK.
+    # Runs the junit suites for the Android helper (`mergeAdspPaths`, the
+    # `ADSP_LIBRARY_PATH` merge `HexagonNpu.setup` performs) and for the
+    # probe-app audio service (model discovery, PCM conversion, the capture
+    # loop, event formatting, CPU metering). Plain JVM tests (no device, no
+    # emulator), but the modules still compile against the Android SDK, so
+    # the job installs the compileSdk platform. Without this leg the tests
+    # only run on machines with the SDK.
     name: Kotlin Unit Tests
     needs: check
     runs-on: ubuntu-latest
@@ -1174,7 +1176,7 @@ jobs:
           yes | sdkmanager --licenses > /dev/null
       - name: Run Android unit tests
         working-directory: cera-ffi-kotlin
-        run: ./gradlew --no-daemon :cera-ffi-android:testDebugUnitTest
+        run: ./gradlew --no-daemon :cera-ffi-android:testDebugUnitTest :probe-app:testDebugUnitTest
       - name: Assert unit-test count
         # Gradle exits 0 with zero discovered test classes, so a source-set
         # or AGP-convention regression would silently unrun the suite. Same
@@ -1182,14 +1184,16 @@ jobs:
         working-directory: cera-ffi-kotlin
         run: |
           set -euo pipefail
-          files=(cera-ffi-android/build/test-results/testDebugUnitTest/TEST-*.xml)
-          if [ ! -f "${files[0]}" ]; then
-            echo "::error::no Kotlin test-result XML found; suite did not run?" >&2
-            exit 1
-          fi
+          files=(cera-ffi-android/build/test-results/testDebugUnitTest/TEST-*.xml probe-app/build/test-results/testDebugUnitTest/TEST-*.xml)
+          for f in "${files[@]}"; do
+            if [ ! -f "$f" ]; then
+              echo "::error::no Kotlin test-result XML found for a suite; suite did not run?" >&2
+              exit 1
+            fi
+          done
           count=$(grep -ho 'tests="[0-9]*"' "${files[@]}" | grep -o '[0-9]*' | awk '{s+=$1} END {print s+0}')
-          if [ "$count" -ne 7 ]; then
-            echo "::error::expected 7 Kotlin unit tests, found $count (did a test get dropped or renamed? Update the count in this job)." >&2
+          if [ "$count" -ne 51 ]; then
+            echo "::error::expected 51 Kotlin unit tests (7 android-helper plus 44 probe-app), found $count (did a test get dropped or renamed? Update the count in this job)." >&2
             exit 1
           fi
       - name: Compile JVM bindings

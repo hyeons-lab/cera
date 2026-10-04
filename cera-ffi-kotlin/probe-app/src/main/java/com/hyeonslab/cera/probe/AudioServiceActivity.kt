@@ -16,7 +16,6 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.cancel
 import kotlinx.coroutines.launch
-import java.io.File
 
 /**
  * Starts and stops [AudioPipelineService] and shows what it hears. The service has to be started
@@ -132,10 +131,7 @@ class AudioServiceActivity : Activity() {
     }
 
     private fun modelStatus(): String {
-        val dirs = listOfNotNull(
-            File(filesDir, AudioModels.DIR_NAME),
-            getExternalFilesDir(null)?.let { File(it, AudioModels.DIR_NAME) },
-        )
+        val dirs = AudioModels.dirs(filesDir, getExternalFilesDir(null))
         return AudioModels.find(dirs)?.let { "models: ${it.stages.joinToString(" + ")}" }
             ?: "no ${AudioModels.VAD} in ${dirs.joinToString { it.path }}"
     }

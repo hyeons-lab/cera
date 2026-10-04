@@ -17,9 +17,11 @@ class FfiPipeline(
     private val pipeline: FfiAudioPipeline,
     chunkSamples: Int = CHUNK_SAMPLES,
 ) : AudioPipelinePort {
-    private val bytes = ByteArray(chunkSamples * 2)
+    private var bytes = ByteArray(chunkSamples * 2)
 
     override fun process(pcm: ShortArray, count: Int): List<FfiAudioPipelineEvent> {
+        // The runner sets the chunk length; grow rather than assume it matches this hint.
+        if (bytes.size < count * 2) bytes = ByteArray(count * 2)
         pcm16ToLeBytes(pcm, count, bytes)
         // The exact length: the binding copies the whole array.
         return pipeline.processChunkPcm16(if (count * 2 == bytes.size) bytes else bytes.copyOf(count * 2))
@@ -55,8 +57,10 @@ class PipelineRunner(
 
     /**
      * Run until [shouldStop] returns true, then flush. [shouldStop] is checked between chunks, so
-     * a stop takes effect within one read. Throws if the source fails; the pipeline is not
-     * flushed then, because a capture error says nothing about the audio already processed.
+     * a stop takes effect within one read. Throws if the source fails while running; the pipeline
+     * is not flushed then, because a capture error says nothing about the audio already
+     * processed. A failure that lands after a stop was requested (the service closes the source
+     * to unblock a stuck read) instead finishes like end-of-stream: it is the stop, not an error.
      */
     fun run(shouldStop: () -> Boolean) {
         val pcm = ShortArray(chunkSamples)
@@ -66,8 +70,9 @@ class PipelineRunner(
             var filled = 0
             while (filled < chunkSamples) {
                 val n = source.read(pcm, filled, chunkSamples - filled)
-                if (n == AudioSource.END_OF_STREAM) {
-                    // A finite source ran out: process the partial chunk, then flush.
+                if (n == AudioSource.END_OF_STREAM || (n < 0 && shouldStop())) {
+                    // The source ran out, or a stop closed it mid-read: process the partial
+                    // chunk, then flush.
                     if (filled > 0) {
                         for (i in 0 until filled) peak = maxOf(peak, abs(pcm[i].toInt()))
                         pipeline.process(pcm, filled).forEach(onEvent)

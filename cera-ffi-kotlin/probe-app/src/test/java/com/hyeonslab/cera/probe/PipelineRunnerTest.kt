@@ -1,7 +1,6 @@
 package com.hyeonslab.cera.probe
 
 import org.junit.Assert.assertEquals
-import org.junit.Assert.assertFalse
 import org.junit.Assert.assertThrows
 import org.junit.Assert.assertTrue
 import org.junit.Test
@@ -19,7 +18,6 @@ private class FakeSource(
     private val endCode: Int = -1,
     private val onDrained: () -> Unit = {},
 ) : AudioSource {
-    var closed = false
     private var left = chunks * CHUNK_SAMPLES
 
     override fun read(buffer: ShortArray, offset: Int, length: Int): Int {
@@ -31,9 +29,7 @@ private class FakeSource(
         return n
     }
 
-    override fun close() {
-        closed = true
-    }
+    override fun close() {}
 }
 
 private class FakePipeline : AudioPipelinePort {
@@ -97,6 +93,32 @@ class PipelineRunnerTest {
     }
 
     @Test
+    fun a_capture_error_after_a_stop_finishes_cleanly_like_end_of_stream() {
+        val pipeline = FakePipeline()
+        var stop = false
+        // The service asked to stop, then closed the source mid-read: the read fails with the
+        // stop already requested, which is the stop, not an error.
+        val source = object : AudioSource {
+            var reads = 0
+            override fun read(buffer: ShortArray, offset: Int, length: Int): Int {
+                reads++
+                if (reads > 1) return -3
+                for (i in 0 until 100) buffer[offset + i] = 5
+                stop = true
+                return 100
+            }
+
+            override fun close() {}
+        }
+        val runner = PipelineRunner(source, pipeline, onEvent = {})
+        runner.run { stop }
+        assertEquals(1, pipeline.chunks.size)
+        assertEquals(100, pipeline.chunks[0].size)
+        assertEquals(1, pipeline.flushed)
+        assertEquals(100L, runner.samples)
+    }
+
+    @Test
     fun a_stop_before_any_audio_flushes_without_processing() {
         val pipeline = FakePipeline()
         PipelineRunner(FakeSource(chunks = 5), pipeline, onEvent = {}).run { true }
@@ -124,7 +146,6 @@ class PipelineRunnerTest {
         assertEquals(listOf(1.0, 2.0), progress)
         // The fake plays a constant 16384; the peak is per interval, not a running maximum.
         assertEquals(listOf(16384, 16384), peaks)
-        assertFalse(progress.isEmpty())
     }
 
     @Test

@@ -39,6 +39,9 @@ class PcmTest {
         assertThrows(IllegalArgumentException::class.java) {
             pcm16ToLeBytes(ShortArray(3), 3, ByteArray(5))
         }
+        assertThrows(IllegalArgumentException::class.java) {
+            pcm16ToLeBytes(ShortArray(2), -1, ByteArray(4))
+        }
     }
 
     @Test

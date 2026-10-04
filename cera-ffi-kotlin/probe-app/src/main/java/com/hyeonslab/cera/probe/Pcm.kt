@@ -25,7 +25,9 @@ fun chunkSamplesForMs(ms: Int): Int = ms.coerceIn(MIN_CHUNK_MS, MAX_CHUNK_MS) * 
  * CPU-seconds per audio second on a phone.
  */
 fun pcm16ToLeBytes(src: ShortArray, count: Int, dst: ByteArray) {
-    require(count <= src.size && count * 2 <= dst.size) { "count $count exceeds the buffers" }
+    require(count >= 0 && count <= src.size && count * 2 <= dst.size) {
+        "count $count exceeds the buffers"
+    }
     for (i in 0 until count) {
         val v = src[i].toInt()
         dst[2 * i] = v.toByte()

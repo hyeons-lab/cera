@@ -57,10 +57,20 @@ data class AudioModels(
          * are searched in order so the app's private storage wins over a copy pushed to the
          * external files directory.
          */
+        /**
+         * The directories to search, in order: the app's private storage first so it wins over a
+         * copy pushed to the external files directory.
+         */
+        fun dirs(filesDir: File, externalFilesDir: File?): List<File> = listOfNotNull(
+            File(filesDir, DIR_NAME),
+            externalFilesDir?.let { File(it, DIR_NAME) },
+        )
+
         fun find(dirs: List<File>): AudioModels? {
             for (dir in dirs) {
                 val vad = File(dir, VAD)
-                if (!vad.isFile) continue
+                // A 0-byte VAD is a failed copy like an empty optional, not a model.
+                if (!vad.isFile || vad.length() == 0L) continue
                 fun optional(name: String) = File(dir, name).takeIf { it.isFile && it.length() > 0 }
                 return AudioModels(vad, optional(HOTWORD), optional(WHISPER), optional(DIARIZER))
             }
