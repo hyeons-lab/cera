@@ -121,7 +121,14 @@ These are AMD's own validation kernels (the `validate_*` and `gemm_*` `.xclbin`s
 
 The driver package ships GEMM overlays named `aie2p_gemm_strix_4x2_bf16`, `aie2p_gemm_vm_strix_4x4` and `aieml_gemm_*` (`aieml` and `phx` are Phoenix-generation names), each with a JSON metadata file. The metadata describes the tile graph (ports, rows, columns) but names no data types. A string search of every `.xclbin` and `.json` in the package for `bfp16`, `bfp8`, `bfp4`, `mx4`, `mx6`, `mx9`, `mxfp4`, `int4`, `int8`, `bf16` and similar found **no matches** inside the files; "bf16" appears only in filenames. So nothing on the machine supports a "native BFP4" weight path.
 
-In IRON (mlir-aie `v1.4.3`), the AIE2P matmul kernels (`aie_kernels/aie2p/mm.cc`, `mm_bfp.cc`, `mm_bfp_mixed.cc`) use `bfloat16` inputs with `accfloat` accumulation, and `bfp16ebs8`: block floating point with one shared exponent per 8 elements and 8-bit mantissas, so roughly 9 bits per weight. No 4-bit type appears in these kernels. Q4_0 weights at 4 bits in memory would therefore need a custom kernel that unpacks 4-bit blocks on the core; with the shipped kernel types, the weights widen to about 8 or 9 bits, roughly doubling the bytes streamed per token. The weight-format decision for the 0b exit criteria is still open.
+In IRON (mlir-aie `v1.4.3`), the AIE2P matmul kernels (`aie_kernels/aie2p/mm.cc`, `mm_bfp.cc`, `mm_bfp_mixed.cc`) use `bfloat16` inputs with `accfloat` accumulation, and `bfp16ebs8`: block floating point with one shared exponent per 8 elements and 8-bit mantissas, so roughly 9 bits per weight. No 4-bit type appears in these kernels. With those kernel types, the weights widen to about 8 or 9 bits, roughly doubling the bytes streamed per token.
+
+**4-bit support in the AIE2P ISA and `aie_api`**, read from the headers that ship with the toolchain (`aie_api` in mlir-aie `v1.4.3`, Peano `22.0.0.2026090701`):
+
+- `aie_api` supports `int4` and `uint4` vectors (32 to 256 lanes) on XDNA2 (`aie_api/aie_doc.hpp` type table) and defines `aie::mmul<M, K, N, int8, int4, 32>`, plus the unsigned mixes, for AIE2P (`aie_api/detail/aie2p/mmul_8_4.hpp`, under `__AIE_ARCH__ == 21`; arch 21 is AIE2P per `detail/config.hpp`, and our kernels compile for `aie2p`). The AIE2P path calls `::mac_4x16_16x16_conf` with the 4-bit operand passed directly.
+- In Peano's `aie2p/aie2p_vmult.h`, that intrinsic (`mac_4x16_16x16(v64int8 a, v256int4 b, v64acc32 acc)`) is **not a native 4-bit multiply**. It unpacks the int4 vector to int8 (`unpack(extract_v128int4(b, ...))`) and issues two `mac_4x8_8x16` int8 multiplies. So int4 is a native storage and load type on AIE2P, with a hardware unpack, but the arithmetic runs at the int8 rate.
+- What that means: Q4 weights **can stay at 4 bits in DDR** and feed the stock `aie::mmul<int8, int4>` without a hand-written unpack. The cost is int8-rate compute, which a bandwidth-bound GEMV can afford. Two constraints follow: activations must be int8 (there is no `bf16 x int4` mmul), and Q4_0's per-32-element f16 block scales must be applied per block after the int8 x int4 dot products, which a stock mmul does not do. Nothing here was run on the NPU; it is read from the headers.
+- The weight-format decision for the 0b exit criteria is still open, but the 4-bit option no longer depends on a custom unpack kernel.
 
 ## 3c. Spike
 
@@ -227,27 +234,55 @@ The ceiling comes from two copy designs that use the full array differently (64 
 
 Two designs with different column counts, channel usage and core involvement land within 1.5% of each other. So **about 62 to 64 GB/s of combined DDR traffic is the NPU's ceiling** on this machine (inferred from the agreement, not from a datasheet).
 
-What this does **not** settle: whether reads alone, with no write stream, can exceed 31 GB/s. GEMV traffic is almost all reads, so the read-only ceiling is the number that matters. It lies between 31 and about 64 GB/s and needs a read-dominant test.
+**Read-only ceiling.** GEMV traffic is almost all reads, so a read-dominant design settles the number that matters (`tools/xdna-spike/iron/readbw.py`). One worker per (column, shim channel) pair, 16 in all, each consumes its slice of the input. For every tile it adds the tile's first word into a 16-word output, so the host can check every tile arrived and output traffic is 1 KB in total. Every run verified.
 
-For scale, using the per-token weight traffic of Llama-3.2-1B Q4_0 (about 773 MB):
+| Read size | Tile (int32 words) | p50 (us) | p90 (us) | GB/s at p50 | GB/s at p90 | Best GB/s |
+|---|---|---|---|---|---|---|
+| 64 MB | 1024 | 1781.2, 1600.3, 1615.9, 1760.0, 1815.8 | 1800.6, 1782.7, 1808.0, 1792.6, 1842.9 | 37.0 to 41.9 | 36.4 to 37.6 | 42.4 |
+| 64 MB | 2048 | 1615.2, 1738.8 | 1801.4, 1799.9 | 38.6 to 41.6 | 37.3 | 42.3 |
+| 64 MB | 4096 | 1604.6, 1790.8 | 1791.0, 1826.7 | 37.5 to 41.8 | 36.7 to 37.5 | 42.4 |
+| 256 MB | 4096 | 5743.8, 5745.0, 6059.5, 5916.1 | 6127.6, 6151.8, 6584.3, 6261.1 | 44.3 to 46.7 | 40.8 to 43.8 | 49.3 |
+
+n = 50 per row at 64 MB, and 50 or 30 at 256 MB; one process per entry. Tile size makes no difference. At 64 MB the timings fall into two clusters (about 1600 and about 1780 us), like the latency runs. A two-point fit through the faster cluster (64 MB at about 1600 us, 256 MB at about 5745 us) gives about 220 us of fixed cost per run and a streaming rate of **about 48.6 GB/s**.
+
+The 256 MB copy, run interleaved with the 256 MB read-only design, stays at 62.2 and 64.2 GB/s combined (best 66.9 and 68.1), 31.1 and 32.1 GB/s per direction. So **reads alone peak at about 45 to 49 GB/s**, and the copy's higher combined figure comes from writes using separate capacity. This is the best a deliberately simple design reached, so it is a lower bound on the hardware's read ceiling, but it is the rate a GEMV-shaped kernel can plan around.
+
+For scale, using the per-token weight traffic of Llama-3.2-1B Q4_0 (about 773 MB, which includes the block scales):
 
 | Read bandwidth | Weight streaming per token | Decode ceiling from weights alone |
 |---|---|---|
-| 31 GB/s | 24.9 ms | about 40 tok/s |
-| 62 GB/s | 12.5 ms | about 80 tok/s |
+| 45 GB/s (read-only, typical p50) | 17.2 ms | about 58 tok/s |
+| 49 GB/s (read-only, best) | 15.8 ms | about 63 tok/s |
 
-That is at 4 bits per weight. With weights widened to the 8 to 9 bit `bfp16ebs8` (see 3b), bytes and time double, so the ceilings halve to about 20 and 40 tok/s. The iGPU's bandwidth is not measured yet (section 2), so the comparison checklist 3c.4 asks for is still open. The board's theoretical peak (256-bit LPDDR5X-8000, about 256 GB/s) is a specification, not a measurement.
+That keeps the weights at 4 bits, which the `int8 x int4` path in 3b allows. With weights widened to the 8 to 9 bit `bfp16ebs8`, bytes and time roughly double, and the ceilings fall to about 28 to 32 tok/s. The iGPU's bandwidth is not measured yet (section 2), so the comparison checklist 3c.4 asks for is still open. The board's theoretical peak (256-bit LPDDR5X-8000, about 256 GB/s) is a specification, not a measurement.
+
+### Dependent GEMV chains
+
+Run i+1 takes run i's output buffer as its input vector B (`spike gemvchain`). Ordering comes only from in-order execution on one hardware context, which is what a backend would rely on. The values after the first link are meaningless; only link 0 is checked against the CPU, and it verified. Each length is timed as one `xrt::runlist` and as L back-to-back `start()` calls followed by L waits. Per-run p50 (p90) in us, one process per design:
+
+| Design | L = 1 | L = 8 | L = 32 | L = 112 |
+|---|---|---|---|---|
+| 288 x 288, 1 core, runlist | 131.3 (159.5) | 59.5 (65.5) | 49.7 (60.5) | 45.9 (48.9) |
+| 288 x 288, 1 core, stream | 110.9 (120.7) | 69.0 (70.9) | 59.7 (60.8) | 53.4 (58.7) |
+| 8192 x 2048, 8 cores, runlist | 2086.7 (2129.7) | 1901.7 (1932.8) | 1861.3 (1925.0) | 1843.4 (1864.3) |
+| 8192 x 2048, 8 cores, stream | 1928.8 (1974.8) | 1839.9 (1861.1) | 1834.0 (1848.5) | 1834.7 (1885.4) |
+
+n = 200 chains per length for the small design and 20 for the large one.
+
+What this says:
+
+- For a **small** dependent GEMV, each link costs about 46 us (runlist, L = 112), about twice the 22 us nop floor. The kernel's own device time was not measured separately, so this does not say how much of the 46 us is overhead. Unlike the nops, the runlist beats plain submission here, by about 15%.
+- For a **large** dependent GEMV, chaining saves about 90 to 250 us per link against an isolated run, and the per-link cost settles at about 1834 to 1843 us. The 22 us per-command cost is about 1% of a link this size. Whether it overlaps the link's own DMA cannot be separated without the kernel's pure device time.
+- For decode: a token is about 112 dependent matmuls, most of them small for a 1B model. A floor of about 46 us per small dependent link is about 5 ms per token, comparable to the 15.8 to 17.2 ms of weight streaming. Fusing several matmuls into one run therefore matters as much as raw bandwidth does.
 
 ### Still open in 3c
 
-- A chain of **dependent** GEMVs (each one's output feeds the next) at L = 1, 8, 32 and 112, compared with the nop floor.
-- A read-dominant bandwidth test.
-- Whether dispatch cost overlaps with compute and DMA in a real kernel.
+- How much per-command cost a real fused kernel hides behind its DMA (needs device-side timestamps or the kernel's isolated device time).
 
 ## 3d. Decision
 
 **Provisionally (a): raw XRT works on Windows.** Our own unsigned IRON xclbins load and run correctly through the XRT that ships with the NPU driver, driven from our own MSVC binary, with no Ryzen AI Software. The license audit (3a) allows shipping IRON and Peano-built kernels.
 
-The go/no-go bar is not decided. It needs the section 2 baselines (iGPU decode tok/s and power), and the evidence so far points the hard way on raw speed. The NPU's measured DDR ceiling (about 62 GB/s combined, 31 GB/s per direction) caps 1B-model decode at roughly 40 to 80 tok/s at 4-bit weights, before any compute or dispatch cost. Clearing "50% of iGPU decode" therefore depends on how fast the iGPU actually is, and the case for the NPU will likely rest on tokens per joule. Both need HWiNFO.
+The go/no-go bar is not decided. It needs the section 2 baselines (iGPU decode tok/s and power), and the evidence so far points the hard way on raw speed. The NPU reads from DDR at about 45 to 49 GB/s, which caps 1B-model decode at about 58 to 63 tok/s at 4-bit weights before any compute or dispatch cost, and at about 28 to 32 tok/s with `bfp16ebs8` weights. Small dependent dispatches add a floor of about 5 ms per token unless matmuls are fused. Clearing "50% of iGPU decode" therefore depends on how fast the iGPU actually is, and the case for the NPU will likely rest on tokens per joule. Both need HWiNFO. A fair comparison weighs bytes honestly: NPU `bfp16ebs8` (about 9 bits per weight) against the iGPU on Q8_0 (about 8.5 bits), and NPU `int8 x int4` against the iGPU's best Q4_0 configuration, with tokens per joule for each.
 
-The other 0b exit criteria remain open: the weight format (4-bit custom kernel versus `bfp16ebs8`), activation quantization, and the parity-tolerance policy.
+The other 0b exit criteria remain open: the weight format (`int8 x int4` with a per-block scale epilogue, versus `bfp16ebs8`), activation quantization (int8 if 4-bit weights are kept), and the parity-tolerance policy.

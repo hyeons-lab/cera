@@ -12,6 +12,8 @@
 //   spike load    <any.xclbin>
 //   spike gemv    <xclbin> <insts.bin> <M> <K> [iters]   (IRON int16 GEMV, verified)
 //   spike memcpy  <xclbin> <insts.bin> <n_int32> [iters] (IRON memcpy, verified)
+//   spike gemvchain <xclbin> <insts.bin> <M> <K> <iters> <L> [<L>...] (dependent GEMV chains)
+//   spike readbw  <xclbin> <insts.bin> <n_int32> <workers> [tile] [iters] (read-dominant, verified)
 
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_device.h"
@@ -327,7 +329,199 @@ static int cmd_memcpy(const char* xclbin_path, const char* insts_path, size_t n,
   return bad ? 1 : 0;
 }
 
+// Run iron/readbw.py: n int32 words in, `workers` x 16 words out. Worker w
+// sums the first word of each tile of its contiguous slice into its
+// output word 0. Reports bytes read per unit time (writes are negligible).
+static int cmd_readbw(const char* xclbin_path, const char* insts_path, size_t n, int workers, size_t tile, int iters) {
+  const size_t out_words = 16;
+  FILE* f = std::fopen(insts_path, "rb");
+  if (!f) throw std::runtime_error("cannot open insts file");
+  std::vector<uint32_t> instr;
+  uint32_t w;
+  while (std::fread(&w, 4, 1, f) == 1) instr.push_back(w);
+  std::fclose(f);
+
+  auto dev = xrt::device(0);
+  xrt::xclbin x{std::string(xclbin_path)};
+  std::string kname;
+  for (auto& k : x.get_kernels())
+    if (k.get_name().rfind("MLIR_AIE", 0) == 0) kname = k.get_name();
+  if (kname.empty()) throw std::runtime_error("no MLIR_AIE kernel in xclbin");
+  dev.register_xclbin(x);
+  xrt::hw_context ctx(dev, x.get_uuid());
+  xrt::kernel kernel(ctx, kname);
+
+  size_t n_out = size_t(workers) * out_words;
+  auto bo_instr = xrt::bo(dev, instr.size() * 4, XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
+  auto bo_in = xrt::bo(dev, n * 4, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
+  auto bo_out = xrt::bo(dev, n_out * 4, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
+  std::memcpy(bo_instr.map<void*>(), instr.data(), instr.size() * 4);
+  auto* in = bo_in.map<int32_t*>();
+  auto* out = bo_out.map<int32_t*>();
+  for (size_t i = 0; i < n; ++i) in[i] = int32_t((i * 2654435761u) >> 8);
+  std::memset(out, 0, n_out * 4);
+  bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  bo_in.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  bo_out.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+  auto run = xrt::run(kernel);
+  run.set_arg(0, uint64_t(3));
+  run.set_arg(1, bo_instr);
+  run.set_arg(2, uint32_t(instr.size()));
+  run.set_arg(3, bo_in);
+  run.set_arg(4, bo_out);
+  run.start();
+  auto state = run.wait();
+  bo_out.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+  size_t per_worker = n / workers;
+  int bad = 0;
+  for (int wk = 0; wk < workers; ++wk) {
+    uint32_t ref = 0;  // int32 wraparound, matching the core's add
+    for (size_t t = 0; t < per_worker; t += tile) ref += uint32_t(in[wk * per_worker + t]);
+    if (int32_t(ref) != out[wk * out_words] && bad++ < 4)
+      std::printf("  worker %d: npu=%d ref=%d\n", wk, out[wk * out_words], int32_t(ref));
+  }
+  std::printf("kernel %s, state=%d, verify: %d of %d workers wrong -> %s\n", kname.c_str(), int(state), bad, workers,
+              bad ? "FAIL" : "PASS");
+
+  std::vector<double> t;
+  for (int i = 0; i < iters + 3; ++i) {
+    auto t0 = clk::now();
+    run.start();
+    run.wait2();
+    if (i >= 3) t.push_back(us_since(t0));
+  }
+  report("readbw start+wait", t, 1.0);
+  std::sort(t.begin(), t.end());
+  double p50 = t[t.size() / 2], p90 = t[size_t(0.9 * (t.size() - 1) + 0.5)];
+  std::printf("%.1f MB read: %.2f GB/s at p50, %.2f GB/s at p90, best %.2f GB/s\n", n * 4 / 1048576.0,
+              n * 4 / (p50 * 1e3), n * 4 / (p90 * 1e3), n * 4 / (t.front() * 1e3));
+  return bad ? 1 : 0;
+}
+
+// Chains of L dependent IRON GEMVs: run i+1 reads run i's output buffer as
+// its input vector B (the first K int16 of the int32 C buffer; needs 4M >= 2K).
+// Order comes only from in-order execution on one hardware context, which is
+// what a backend would rely on. Each chain length is timed as one runlist and
+// as L back-to-back start() calls. Only the first link's result is checked.
+static int cmd_gemvchain(const char* xclbin_path, const char* insts_path, int M, int K, int iters,
+                         const std::vector<int>& lens) {
+  if (size_t(M) * 4 < size_t(K) * 2) throw std::runtime_error("need 4*M >= 2*K to chain C into B");
+  FILE* f = std::fopen(insts_path, "rb");
+  if (!f) throw std::runtime_error("cannot open insts file");
+  std::vector<uint32_t> instr;
+  uint32_t w;
+  while (std::fread(&w, 4, 1, f) == 1) instr.push_back(w);
+  std::fclose(f);
+
+  auto dev = xrt::device(0);
+  xrt::xclbin x{std::string(xclbin_path)};
+  std::string kname;
+  for (auto& k : x.get_kernels())
+    if (k.get_name().rfind("MLIR_AIE", 0) == 0) kname = k.get_name();
+  if (kname.empty()) throw std::runtime_error("no MLIR_AIE kernel in xclbin");
+  dev.register_xclbin(x);
+  xrt::hw_context ctx(dev, x.get_uuid());
+  xrt::kernel kernel(ctx, kname);
+
+  auto bo_instr = xrt::bo(dev, instr.size() * 4, XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
+  auto bo_a = xrt::bo(dev, size_t(M) * K * 2, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
+  auto bo_b0 = xrt::bo(dev, size_t(K) * 2, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
+  std::memcpy(bo_instr.map<void*>(), instr.data(), instr.size() * 4);
+  auto* a = bo_a.map<int16_t*>();
+  auto* b0 = bo_b0.map<int16_t*>();
+  uint32_t s = 12345;
+  auto rnd = [&]() { s = s * 1103515245u + 12345u; return int16_t(int((s >> 16) % 2001) - 1000); };
+  for (size_t i = 0; i < size_t(M) * K; ++i) a[i] = rnd();
+  for (int i = 0; i < K; ++i) b0[i] = rnd();
+  bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  bo_a.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  bo_b0.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+  int max_len = *std::max_element(lens.begin(), lens.end());
+  std::vector<xrt::bo> bo_c;
+  for (int i = 0; i < max_len; ++i) {
+    bo_c.push_back(xrt::bo(dev, size_t(M) * 4, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(5)));
+    std::memset(bo_c.back().map<void*>(), 0, size_t(M) * 4);
+    bo_c.back().sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  }
+  auto make = [&](int i) {
+    xrt::run r(kernel);
+    r.set_arg(0, uint64_t(3));
+    r.set_arg(1, bo_instr);
+    r.set_arg(2, uint32_t(instr.size()));
+    r.set_arg(3, bo_a);
+    if (i == 0) r.set_arg(4, bo_b0);
+    else r.set_arg(4, bo_c[i - 1]);  // input vector = previous link's output
+    r.set_arg(5, bo_c[i]);
+    return r;
+  };
+
+  {  // check link 0
+    auto r = make(0);
+    r.start();
+    r.wait2();
+    bo_c[0].sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+    auto* c = bo_c[0].map<int32_t*>();
+    int bad = 0;
+    for (int i = 0; i < M; ++i) {
+      int32_t ref = 0;
+      for (int k = 0; k < K; ++k) ref += int32_t(a[size_t(i) * K + k]) * b0[k];
+      bad += ref != c[i];
+    }
+    std::printf("link 0 verify: %d of %d wrong -> %s\n", bad, M, bad ? "FAIL" : "PASS");
+  }
+
+  for (int len : lens) {
+    std::vector<xrt::run> runs;
+    for (int i = 0; i < len; ++i) runs.push_back(make(i));
+    xrt::runlist rl(ctx);
+    for (auto& r : runs) rl.add(r);
+    std::vector<double> t_rl, t_st;
+    for (int it = 0; it < iters + 3; ++it) {
+      auto t0 = clk::now();
+      rl.execute();
+      rl.wait();
+      if (it >= 3) t_rl.push_back(us_since(t0));
+    }
+    // Plain submission needs fresh run objects; a run in a runlist is owned by it.
+    std::vector<xrt::run> runs2;
+    for (int i = 0; i < len; ++i) runs2.push_back(make(i));
+    for (int it = 0; it < iters + 3; ++it) {
+      auto t0 = clk::now();
+      for (auto& r : runs2) r.start();
+      for (auto& r : runs2) r.wait2();
+      if (it >= 3) t_st.push_back(us_since(t0));
+    }
+    char label[64];
+    std::snprintf(label, sizeof label, "dep runlist L=%d (per run)", len);
+    report(label, t_rl, len);
+    std::snprintf(label, sizeof label, "dep stream L=%d (per run)", len);
+    report(label, t_st, len);
+  }
+  return 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc >= 8 && std::string(argv[1]) == "gemvchain") {
+    try {
+      std::vector<int> lens;
+      for (int i = 7; i < argc; ++i) lens.push_back(std::atoi(argv[i]));
+      return cmd_gemvchain(argv[2], argv[3], std::atoi(argv[4]), std::atoi(argv[5]), std::atoi(argv[6]), lens);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: %s\n", e.what());
+      return 1;
+    }
+  }
+  if (argc >= 6 && std::string(argv[1]) == "readbw") {
+    try {
+      return cmd_readbw(argv[2], argv[3], std::strtoull(argv[4], nullptr, 10), std::atoi(argv[5]),
+                        argc > 6 ? std::strtoull(argv[6], nullptr, 10) : 1024, argc > 7 ? std::atoi(argv[7]) : 50);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: %s\n", e.what());
+      return 1;
+    }
+  }
   if (argc >= 5 && std::string(argv[1]) == "memcpy") {
     try {
       return cmd_memcpy(argv[2], argv[3], std::strtoull(argv[4], nullptr, 10), argc > 5 ? std::atoi(argv[5]) : 50);
