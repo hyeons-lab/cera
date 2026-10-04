@@ -15,9 +15,9 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTile};
 use crate::backend::hexagon::{
-    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
-    HexagonContext, HexagonDevice, HexagonQueueSession, HexagonWeightFormat, HtpDataType,
-    HtpOpCode, RpcmemBuffer, align128, build_binary_kernel_params, build_flash_attn_kernel_params,
+    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonContext,
+    HexagonDevice, HexagonQueueSession, HexagonWeightFormat, HtpDataType, HtpOpCode, RpcmemBuffer,
+    align128, build_binary_kernel_params, build_flash_attn_kernel_params,
     build_mul_mat_kernel_params, hexagon_warn, quantize_f32_to_q8_0, repack_q4_0, repack_q8_0,
     repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
 };

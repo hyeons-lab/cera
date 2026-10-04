@@ -510,10 +510,10 @@ pub trait VadAccelerator: Send + Sync {
     /// window (the CPU takes it) and must leave no observable state behind: declining a window
     /// and then accepting the next must equal accepting directly. Implementations must be
     /// thread-safe: one accelerator may be shared across sessions and threads via `Arc`. An
-    /// `Err` is a failure, after which the VAD stops using the accelerator (with a warning),
-    /// never calls that accelerator again, and carries on on the CPU; `window_16k` must therefore
-    /// fail safe (no partial state a later call could observe). A later `set_accelerator` starts
-    /// over with a new one.
+    /// `Err` is a failure, after which the VAD stops using the accelerator (with a warning):
+    /// that VAD never calls it again (sessions sharing the `Arc` make their own drop decisions),
+    /// and carries on on the CPU; `window_16k` must therefore fail safe (no partial state a
+    /// later call could observe). A later `set_accelerator` starts over with a new one.
     fn window_16k(
         &self,
         padded: &[f32; 640],
