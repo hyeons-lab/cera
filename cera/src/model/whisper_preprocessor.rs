@@ -198,6 +198,8 @@ mod tests {
 
     /// Computing only the frames that can hold audio is bit-identical to computing all 3000:
     /// the others read zeros, so their power is exactly 0 and their log-mel exactly the floor.
+    /// The mel count is orthogonal to the framing branches pinned here, so every size runs at 80
+    /// mels and only the boundary sizes repeat at 128 (each leg costs a full 3000-frame oracle).
     #[test]
     fn computing_only_the_active_frames_changes_nothing() {
         let tone = |n: usize| -> Vec<f32> {
@@ -208,6 +210,18 @@ mod tests {
                         + (t * 1830.0 * std::f32::consts::TAU).sin() * 0.1
                 })
                 .collect()
+        };
+        let check = |n: usize, n_mels: usize| {
+            let pcm = tone(n);
+            let fast = extract_whisper_mel(&pcm, n_mels);
+            let full = extract_whisper_mel_frames(&pcm, n_mels, CHUNK_FRAMES);
+            assert_eq!(fast.len(), full.len());
+            assert!(
+                fast.iter()
+                    .zip(&full)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "{n} samples, {n_mels} mels: not bit-identical"
+            );
         };
         for n in [
             0usize,
@@ -220,18 +234,10 @@ mod tests {
             479_999,
             CHUNK_SAMPLES,
         ] {
-            for n_mels in [80usize, 128] {
-                let pcm = tone(n);
-                let fast = extract_whisper_mel(&pcm, n_mels);
-                let full = extract_whisper_mel_frames(&pcm, n_mels, CHUNK_FRAMES);
-                assert_eq!(fast.len(), full.len());
-                assert!(
-                    fast.iter()
-                        .zip(&full)
-                        .all(|(a, b)| a.to_bits() == b.to_bits()),
-                    "{n} samples, {n_mels} mels: not bit-identical"
-                );
-            }
+            check(n, 80);
+        }
+        for n in [0usize, 200, CHUNK_SAMPLES] {
+            check(n, 128);
         }
         // A short clip really does skip most frames.
         assert_eq!(active_frames(48_000), (200 + 48_000usize).div_ceil(160));

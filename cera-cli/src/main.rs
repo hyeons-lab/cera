@@ -1284,9 +1284,11 @@ enum Command {
         device: String,
 
         /// Quantization of an official Whisper model converted on the fly (`q4_k_m`, `q8_0`,
-        /// `q4_0`, `f16`). Defaults to `q8_0` with `--device hexagon` and in a build with the
-        /// `hexagon` feature, `q4_k_m` otherwise: the Hexagon NPU reads only Q8_0, Q4_0 and F16
-        /// weights, and a model in any other format runs on the CPU.
+        /// `q4_0`, `f16`, `q5_k_m`, `q6_k`, `f32`). Defaults to `q8_0` with `--device hexagon`
+        /// or `--device npu`, and with `--device auto` in a build with the `hexagon` feature;
+        /// `q4_k_m` otherwise. The Hexagon NPU reads Q8_0, Q4_0, F16 and F32 weights; with
+        /// `--device auto` a model in any other format runs on the CPU, while an explicit
+        /// `--device hexagon` or `--device npu` request fails instead.
         #[arg(long)]
         quant: Option<String>,
     },
@@ -2525,8 +2527,64 @@ fn whisper_catalog_unloadable_path(
         .find(|p| p.exists() && !whisper_gguf_is_loadable(p))
 }
 
-fn print_asr_catalog(cache_dir: &Path) {
-    println!("Available ASR Models in Cera Catalog:");
+/// The quantization a transcribe run converts to: an explicit `--quant` wins, otherwise Q8_0
+/// on NPU paths (`hexagon`/`npu`, or `auto` in a hexagon-enabled build) and Q4_K_M elsewhere.
+/// The Hexagon NPU reads Q8_0, not the K-quants.
+fn default_target_quant(
+    explicit: Option<cera::convert::TargetQuant>,
+    backend: BackendPreference,
+    hexagon_build: bool,
+) -> cera::convert::TargetQuant {
+    if let Some(q) = explicit {
+        return q;
+    }
+    if matches!(backend, BackendPreference::Hexagon | BackendPreference::Npu)
+        || (hexagon_build && matches!(backend, BackendPreference::Auto))
+    {
+        cera::convert::TargetQuant::Q8_0
+    } else {
+        cera::convert::TargetQuant::Q4_K_M
+    }
+}
+
+/// Whether `model_str` names an existing local `.gguf` file (which wins over a catalog spelling
+/// that happens to match it).
+fn is_local_gguf_path(model_str: &str) -> bool {
+    let path = Path::new(model_str);
+    path.is_file()
+        && path
+            .extension()
+            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
+}
+
+/// Whether a transcribe run is doomed before it starts: an NPU request on a build without
+/// the NPU, or a GPU request (Whisper has no GPU path on any build), cannot transcribe a
+/// catalog model, so resolving first can only waste time (a download and convert on a
+/// cache miss). Pure so the matrix below pins every conjunct, including the local-file
+/// guard (no model string is both an existing file and a catalog spelling in a test).
+/// Mirrors the catalog/HF branch of `resolve_asr_model`: local files, Liquid models and
+/// `--download-model` are exempt.
+fn whisper_transcribe_is_doomed(
+    backend: BackendPreference,
+    hexagon_build: bool,
+    download_model: bool,
+    is_local_gguf: bool,
+    model_str: &str,
+) -> bool {
+    !download_model
+        && !is_local_gguf
+        && (cera::find_whisper_catalog_entry(model_str).is_some()
+            || model_str.starts_with("openai/whisper"))
+        && (matches!(backend, BackendPreference::Gpu | BackendPreference::Metal)
+            || (!hexagon_build
+                && matches!(backend, BackendPreference::Hexagon | BackendPreference::Npu)))
+}
+
+fn print_asr_catalog(cache_dir: &Path, quant: cera::convert::TargetQuant) {
+    println!(
+        "Available ASR Models in Cera Catalog (cache status for {}):",
+        quant.as_str()
+    );
     println!("{:-<100}", "");
     println!(
         "{:<16} {:<12} {:<12} {:<15} {:<10} {:<30}",
@@ -2535,9 +2593,7 @@ fn print_asr_catalog(cache_dir: &Path) {
     println!("{:-<100}", "");
 
     for entry in cera::WHISPER_CATALOG {
-        let is_cached =
-            whisper_catalog_cached_path(cache_dir, entry, cera::convert::TargetQuant::Q4_K_M)
-                .is_some();
+        let is_cached = whisper_catalog_cached_path(cache_dir, entry, quant).is_some();
         let status = if is_cached { "[cached]" } else { "-" };
         println!(
             "{:<16} {:<12} {:<12} {:<15} {:<10} {:<30}",
@@ -2580,12 +2636,16 @@ fn resolve_asr_model(
     repo: &cera::bundle::BundleRepo,
     progress: &Arc<CliDownloadProgress>,
     quant: cera::convert::TargetQuant,
+    explicit_quant: bool,
 ) -> Result<AsrResolvedModel> {
     // Check if it is a Liquid LFM2-Audio model
     if model_str.eq_ignore_ascii_case("lfm2-audio")
         || model_str.eq_ignore_ascii_case("liquid")
         || model_str.contains("LFM2-Audio")
     {
+        if explicit_quant {
+            eprintln!("cera: warning: --quant is not supported for Liquid ASR models");
+        }
         let bundle_id = if model_str.eq_ignore_ascii_case("lfm2-audio")
             || model_str.eq_ignore_ascii_case("liquid")
         {
@@ -2617,11 +2677,7 @@ fn resolve_asr_model(
     // cached GGUF is reused; otherwise the official SafeTensors are streamed from Hugging Face
     // and converted, which always yields a layout the loader reads. (The catalog's community
     // GGUFs are not used: see `whisper_gguf_is_loadable`.)
-    // An existing `.gguf` path wins over a catalog spelling that happens to match it.
-    let is_local_gguf = Path::new(model_str).is_file()
-        && Path::new(model_str)
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"));
+    let is_local_gguf = is_local_gguf_path(model_str);
     let whisper_entry = if is_local_gguf {
         None
     } else {
@@ -2667,13 +2723,17 @@ fn resolve_asr_model(
         ));
     }
 
-    // Check if user specified a local file path
+    // Check if user specified a local file path (`exists` covers non-GGUF files too,
+    // which load as engines below; the GGUF check itself is the shared helper).
     let path = Path::new(model_str);
     if path.exists() {
-        if path
-            .extension()
-            .is_some_and(|ext| ext.eq_ignore_ascii_case("gguf"))
-        {
+        if explicit_quant {
+            eprintln!(
+                "cera: warning: --quant is ignored for local model files; \
+                 it applies only to models converted on the fly"
+            );
+        }
+        if is_local_gguf_path(model_str) {
             let gguf = Arc::new(cera::gguf::GgufFile::open(path)?);
             if cera::is_whisper_gguf(&gguf) {
                 return Ok(AsrResolvedModel::Whisper(path.to_path_buf(), Some(gguf)));
@@ -4401,8 +4461,24 @@ fn main() -> Result<()> {
                 .map(PathBuf::from)
                 .unwrap_or_else(default_cache_dir);
 
+            // Parsed before the `--list-models` early return: the listing reports the cache
+            // status for the quantization this run would use, so the same `--device`/`--quant`
+            // apply to it (and invalid values fail fast there too).
+            let backend_pref = BackendPreference::parse_str(&device)
+                .map_err(|e| anyhow::anyhow!("invalid --device `{device}`: {e}"))?;
+            let explicit = quant
+                .map(|q| {
+                    cera::convert::TargetQuant::parse_str(&q).ok_or_else(|| {
+                        anyhow::anyhow!(
+                            "unknown --quant `{q}` (supported: q4_k_m, q5_k_m, q6_k, q8_0, q4_0, f16, f32)"
+                        )
+                    })
+                })
+                .transpose()?;
+            let quant = default_target_quant(explicit, backend_pref, cfg!(feature = "hexagon"));
+
             if list_models {
-                print_asr_catalog(&cache_path);
+                print_asr_catalog(&cache_path, quant);
                 return Ok(());
             }
 
@@ -4424,29 +4500,44 @@ fn main() -> Result<()> {
                 );
             }
 
-            let backend_pref = BackendPreference::parse_str(&device)
-                .map_err(|e| anyhow::anyhow!("invalid --device `{device}`: {e}"))?;
-
             let progress = Arc::new(CliDownloadProgress::default());
             let repo = cera::bundle::BundleRepo::with_progress(
                 &cache_path,
                 progress.clone() as Arc<dyn cera::bundle::DownloadProgress>,
             );
 
-            let quant = match quant {
-                Some(q) => cera::convert::TargetQuant::parse_str(&q)
-                    .ok_or_else(|| anyhow::anyhow!("unknown --quant `{q}`"))?,
-                // The Hexagon NPU reads Q8_0, not the K-quants: a build that has the NPU (the
-                // `hexagon` feature) converts to Q8_0 unless told otherwise.
-                None if matches!(backend_pref, BackendPreference::Hexagon)
-                    || (cfg!(feature = "hexagon")
-                        && matches!(backend_pref, BackendPreference::Auto)) =>
-                {
-                    cera::convert::TargetQuant::Q8_0
+            // Bail before resolving, so a catalog model is not downloaded and converted for
+            // a doomed run (local files keep the loader's own error below).
+            if whisper_transcribe_is_doomed(
+                backend_pref,
+                cfg!(feature = "hexagon"),
+                download_model,
+                is_local_gguf_path(&model_str),
+                &model_str,
+            ) {
+                if matches!(
+                    backend_pref,
+                    BackendPreference::Gpu | BackendPreference::Metal
+                ) {
+                    anyhow::bail!(
+                        "--device `{device}` requests a GPU backend, but Whisper has no GPU \
+                         path; not resolving the model for a run that cannot transcribe"
+                    );
                 }
-                None => cera::convert::TargetQuant::Q4_K_M,
-            };
-            let resolved = resolve_asr_model(&model_str, &cache_path, &repo, &progress, quant)?;
+                anyhow::bail!(
+                    "--device `{device}` requests the NPU, but this build has no NPU backend; \
+                     not resolving the model for a run that cannot transcribe \
+                     (rebuild with the `hexagon` feature for NPU transcription)"
+                );
+            }
+            let resolved = resolve_asr_model(
+                &model_str,
+                &cache_path,
+                &repo,
+                &progress,
+                quant,
+                explicit.is_some(),
+            )?;
 
             if download_model {
                 match resolved {
@@ -5831,10 +5922,11 @@ mod tests {
 
     use super::{
         BundleQuantPair, Cli, CliSamplingArgs, Command, convert_history_to_chat_messages,
-        display_bundle_id, labeled_json_row, labeled_text_line, normalize_bundle_id,
-        read_wav_pcm16_mono, resample_linear, resolve_engine, simulate_truncate_oldest_turn_pairs,
-        split_at_marker, transcript_labeler_config, truncate_oldest_turn_pair,
-        whisper_catalog_cached_path, whisper_catalog_unloadable_path, whisper_gguf_is_loadable,
+        default_target_quant, display_bundle_id, labeled_json_row, labeled_text_line,
+        normalize_bundle_id, read_wav_pcm16_mono, resample_linear, resolve_engine,
+        simulate_truncate_oldest_turn_pairs, split_at_marker, transcript_labeler_config,
+        truncate_oldest_turn_pair, whisper_catalog_cached_path, whisper_catalog_unloadable_path,
+        whisper_gguf_is_loadable, whisper_transcribe_is_doomed,
         write_transcript, write_wav,
     };
     use cera::tokenizer::ChatMessage;
@@ -7575,6 +7667,161 @@ mod tests {
             }
             _ => panic!("expected Transcribe command"),
         }
+    }
+
+    #[test]
+    fn quant_defaults_to_q8_0_on_npu_paths_and_q4_k_m_elsewhere() {
+        use cera::BackendPreference;
+        use cera::convert::TargetQuant;
+        // An explicit --quant always wins, for every value on every backend and build.
+        for q in [
+            TargetQuant::Q4_0,
+            TargetQuant::Q8_0,
+            TargetQuant::Q4_K_M,
+            TargetQuant::Q5_K_M,
+            TargetQuant::Q6_K,
+            TargetQuant::F16,
+            TargetQuant::F32,
+        ] {
+            for backend in [
+                BackendPreference::Auto,
+                BackendPreference::Cpu,
+                BackendPreference::Gpu,
+                BackendPreference::Metal,
+                BackendPreference::Hexagon,
+                BackendPreference::Npu,
+            ] {
+                for hexagon_build in [false, true] {
+                    assert_eq!(
+                        default_target_quant(Some(q), backend, hexagon_build),
+                        q,
+                        "{q:?} {backend:?} hexagon_build={hexagon_build}"
+                    );
+                }
+            }
+        }
+        // NPU paths convert to Q8_0, which the NPU reads; `npu` is an NPU path too.
+        for backend in [BackendPreference::Hexagon, BackendPreference::Npu] {
+            for hexagon_build in [false, true] {
+                assert_eq!(
+                    default_target_quant(None, backend, hexagon_build),
+                    TargetQuant::Q8_0,
+                    "{backend:?} hexagon_build={hexagon_build}"
+                );
+            }
+        }
+        assert_eq!(
+            default_target_quant(None, BackendPreference::Auto, true),
+            TargetQuant::Q8_0
+        );
+        // Non-NPU paths convert to Q4_K_M, even in a hexagon-enabled build.
+        for backend in [
+            BackendPreference::Auto,
+            BackendPreference::Cpu,
+            BackendPreference::Gpu,
+            BackendPreference::Metal,
+        ] {
+            for hexagon_build in [false, true] {
+                if backend == BackendPreference::Auto && hexagon_build {
+                    continue;
+                }
+                assert_eq!(
+                    default_target_quant(None, backend, hexagon_build),
+                    TargetQuant::Q4_K_M,
+                    "{backend:?} hexagon_build={hexagon_build}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn doomed_whisper_runs_bail_before_downloading_and_nothing_else_bails() {
+        use cera::BackendPreference;
+        let npuish = [BackendPreference::Hexagon, BackendPreference::Npu];
+        let gpuish = [BackendPreference::Gpu, BackendPreference::Metal];
+        // A catalog model with an NPU request on a build without the NPU is doomed. The
+        // "not-a-model" leg isolates the HF-prefix disjunct: "openai/whisper-tiny" is a
+        // catalog hit (hf_repo), so without it the prefix arm is dead weight in the matrix.
+        for backend in npuish {
+            for model in ["tiny", "openai/whisper-tiny", "openai/whisper-not-a-model"] {
+                assert!(
+                    whisper_transcribe_is_doomed(backend, false, false, false, model),
+                    "{backend:?} {model}"
+                );
+            }
+        }
+        // A GPU request is doomed on every build: Whisper has no GPU path.
+        for backend in gpuish {
+            for hexagon_build in [false, true] {
+                for model in ["tiny", "openai/whisper-not-a-model"] {
+                    assert!(
+                        whisper_transcribe_is_doomed(backend, hexagon_build, false, false, model),
+                        "{backend:?} hexagon_build={hexagon_build} {model}"
+                    );
+                }
+            }
+        }
+        // Everything else is exempt: a hexagon build, --download-model, a local file, a
+        // Liquid model, an unknown model (which resolve rejects itself), and Auto/Cpu.
+        for backend in npuish {
+            assert!(!whisper_transcribe_is_doomed(
+                backend, true, false, false, "tiny"
+            ));
+            assert!(!whisper_transcribe_is_doomed(
+                backend, false, true, false, "tiny"
+            ));
+            // The local-file guard flips even a prefix-matching spelling (a relative
+            // openai/*.gguf path is both local and prefix-matching).
+            assert!(!whisper_transcribe_is_doomed(
+                backend,
+                false,
+                false,
+                true,
+                "openai/whisper-not-a-model"
+            ));
+        }
+        for backend in [BackendPreference::Auto, BackendPreference::Cpu] {
+            for hexagon_build in [false, true] {
+                assert!(
+                    !whisper_transcribe_is_doomed(backend, hexagon_build, false, false, "tiny"),
+                    "{backend:?} hexagon_build={hexagon_build}"
+                );
+            }
+        }
+        assert!(!whisper_transcribe_is_doomed(
+            BackendPreference::Hexagon,
+            false,
+            false,
+            false,
+            "liquid"
+        ));
+        assert!(!whisper_transcribe_is_doomed(
+            BackendPreference::Hexagon,
+            false,
+            false,
+            false,
+            "no-such-model"
+        ));
+    }
+
+    #[test]
+    fn local_gguf_paths_win_over_catalog_spellings() {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let gguf = dir.path().join("tiny.gguf");
+        std::fs::write(&gguf, [0u8; 4]).expect("write scratch gguf");
+        assert!(super::is_local_gguf_path(
+            gguf.to_str().expect("utf-8 scratch path")
+        ));
+        assert!(!super::is_local_gguf_path("tiny"));
+        assert!(!super::is_local_gguf_path(
+            dir.path().join("missing.gguf").to_str().unwrap()
+        ));
+        // An existing file without the extension is not a local GGUF.
+        let other = dir.path().join("tiny.bin");
+        std::fs::write(&other, [0u8; 4]).expect("write scratch bin");
+        assert!(!super::is_local_gguf_path(
+            other.to_str().expect("utf-8 scratch path")
+        ));
     }
 
     #[test]

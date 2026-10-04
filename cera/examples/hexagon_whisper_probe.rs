@@ -77,7 +77,7 @@ fn main() {
     let text = model
         .transcribe(&tokenizer, pcm, &opts)
         .expect("transcribe");
-    println!("text ({} tokens): {text}", tokenizer.encode(&text).len());
+    println!("text (~{} tokens): {text}", tokenizer.encode(&text).len());
     measure("token_to_id", &mut || {
         let _ = tokenizer.token_to_id("<|transcribe|>");
     });
@@ -94,11 +94,17 @@ fn main() {
         drop(extract_whisper_mel(pcm, n_mel))
     });
 
-    // The NPU model's two phases on their own: the encoder window and one decoder step.
+    // The NPU-side costs on their own (log-mel, encoder window, decoder steps, greedy
+    // sampling) against the host work around them.
     if model.is_hexagon() {
         use cera::model::whisper_hexagon::init_hexagon_whisper;
         let hex = init_hexagon_whisper(&model.weights, &tokenizer).expect("stage the NPU model");
+        assert!(
+            hex.mel_on_dsp(),
+            "log-mel is not staged on the DSP (stays on the host); the NPU timings below would measure the host"
+        );
         let mel = extract_whisper_mel(pcm, n_mel);
+        let mel_fb = hex.mel_fallbacks();
         let npu_mel = hex.log_mel(pcm);
         let worst = mel
             .iter()
@@ -110,6 +116,11 @@ fn main() {
             mel.len()
         );
         measure("log-mel (NPU)", &mut || drop(hex.log_mel(pcm)));
+        assert_eq!(
+            hex.mel_fallbacks(),
+            mel_fb,
+            "log-mel fell back to the host mid-probe; the NPU timings measured the host"
+        );
         measure("encoder window (NPU)", &mut || {
             hex.encode_audio(&mel).expect("encode")
         });
@@ -148,13 +159,8 @@ fn main() {
         for pos in prompt.len() - 1..prompt.len() + 40 {
             hex.decode_step(cur, pos, &mut logits).expect("decode");
             cera::model::whisper::suppress_whisper_special_tokens(&mut logits, &special, false);
-            let host = cera::sampler::Sampler::new(cera::sampler::SamplerConfig {
-                temperature: 0.0,
-                top_p: 1.0,
-                top_k: 0,
-                ..Default::default()
-            })
-            .sample(&mut logits);
+            // Greedy sampling is stateless, so the sampler above is reused per step.
+            let host = sampler.sample(&mut logits);
             let dsp = hex.decode_step_greedy(cur, pos, false).expect("greedy");
             steps += 1;
             mismatches += usize::from(host != dsp);
@@ -164,6 +170,10 @@ fn main() {
             cur = host;
         }
         println!("greedy on the DSP vs the host: {mismatches} of {steps} tokens differ");
+        assert_eq!(
+            mismatches, 0,
+            "DSP greedy diverged from host suppress+argmax"
+        );
         let mut gpos = 0usize;
         measure("one greedy step (NPU)", &mut || {
             let _ = hex

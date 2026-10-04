@@ -164,12 +164,7 @@ fn emit_mel<S: OpSink>(
     dispatch::matmul_f32(
         s,
         basis(wo.dft_re, BINS_PAD, K_PAD),
-        View::new(
-            b,
-            so.frames,
-            [K_PAD, n_frames, 1],
-            [4, K_PAD * 4, n_frames * K_PAD * 4],
-        ),
+        frames,
         plane(so.re, BINS_PAD),
     )?;
     dispatch::matmul_f32(
@@ -235,7 +230,8 @@ impl WhisperMelDsp {
 
     /// Mel energies `[n_frames, n_mels]` (time-major, before the log) for the first `n_frames`
     /// frames of `padded`, the window's samples as far as `samples_for_frames(n_frames)`.
-    /// The session must already wait asleep.
+    /// The session must already wait asleep. Queued-but-unflushed session work is discarded
+    /// first, so call only with an empty batch.
     pub(crate) fn energies(
         &self,
         session: &mut HexagonQueueSession,
