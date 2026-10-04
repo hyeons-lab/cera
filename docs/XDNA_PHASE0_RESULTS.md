@@ -181,7 +181,7 @@ What this says:
 - A list of L nop runs costs about **60 us fixed plus about 22 us per run** (L=128: 2854 us p50). The per-run cost approaches a floor of about 20 to 23 us from L of about 32 up.
 - **The runlist is no faster than plain back-to-back submission** at any length measured. The roughly 22 us per run therefore looks like a per-command cost on the device or firmware side, not host overhead that chaining removes. That is an inference from these two curves only; it was not checked with device-side timestamps.
 - **These are nop runs.** They carry no data dependencies and do no compute. A real GEMV adds its own compute and DMA time on top, and dependent runs may not overlap the way independent ones can.
-- For planning: if a Llama-3.2-1B token takes about 112 separate matmul dispatches, the dispatch floor alone is about 112 x 22 us = 2.5 ms when they are queued together (at most about 400 tok/s from dispatch cost), and about 112 x 80 us = 9 ms if each waits for the previous one to finish on the host. "One dispatch per token" remains unmeasured; fusing several matmuls into one run is what would lower the floor.
+- For planning: if a Llama-3.2-1B token takes about 112 separate matmul dispatches, the dispatch floor alone is about 112 x 22 us = 2.5 ms when they are queued together (a ceiling of about 400 tok/s from dispatch cost alone, not demonstrated), and about 112 x 80 us = 9 ms if each waits for the previous one to finish on the host. "One dispatch per token" remains unmeasured; fusing several matmuls into one run is what would lower the floor.
 
 ### Step 1b: do other shipped xclbins load?
 
@@ -247,14 +247,14 @@ n = 50 per row at 64 MB, and 50 or 30 at 256 MB; one process per entry. Tile siz
 
 The 256 MB copy, run interleaved with the 256 MB read-only design, stays at 62.2 and 64.2 GB/s combined (best 66.9 and 68.1), 31.1 and 32.1 GB/s per direction. So **reads alone peak at about 45 to 49 GB/s**, and the copy's higher combined figure comes from writes using separate capacity. This is the best a deliberately simple design reached, so it is a lower bound on the hardware's read ceiling, but it is the rate a GEMV-shaped kernel can plan around.
 
-For scale, using the per-token weight traffic of Llama-3.2-1B Q4_0 (about 773 MB, which includes the block scales):
+For scale, using the per-token weight traffic of Llama-3.2-1B Q4_0 (about 773 MB, which includes the block scales). These are **ceilings, not demonstrated rates**: the read bandwidth comes from a trivial reduction kernel, and the only real GEMV so far reaches 16.8 to 18.3 GB/s (16.8 isolated, about 18.3 per link in a chain):
 
-| Read bandwidth | Weight streaming per token | Decode ceiling from weights alone |
+| Read bandwidth | Weight streaming per token | Decode ceiling from weights alone (not demonstrated) |
 |---|---|---|
 | 45 GB/s (read-only, typical p50) | 17.2 ms | about 58 tok/s |
 | 49 GB/s (read-only, best) | 15.8 ms | about 63 tok/s |
 
-That keeps the weights at 4 bits, which the `int8 x int4` path in 3b allows. With weights widened to the 8 to 9 bit `bfp16ebs8`, bytes and time roughly double, and the ceilings fall to about 28 to 32 tok/s. The iGPU's bandwidth is not measured yet (section 2), so the comparison checklist 3c.4 asks for is still open. The board's theoretical peak (256-bit LPDDR5X-8000, about 256 GB/s) is a specification, not a measurement.
+That keeps the weights at 4 bits, which the `int8 x int4` path in 3b would allow; that path was read from the toolchain headers and has not been run. With weights widened to the 8 to 9 bit `bfp16ebs8`, bytes and time roughly double, and the ceilings fall to about 28 to 32 tok/s (also not demonstrated). The iGPU's bandwidth is not measured yet (section 2), so the comparison checklist 3c.4 asks for is still open. The board's theoretical peak (256-bit LPDDR5X-8000, about 256 GB/s) is a specification, not a measurement.
 
 ### Dependent GEMV chains
 
@@ -283,6 +283,6 @@ What this says:
 
 **Provisionally (a): raw XRT works on Windows.** Our own unsigned IRON xclbins load and run correctly through the XRT that ships with the NPU driver, driven from our own MSVC binary, with no Ryzen AI Software. The license audit (3a) allows shipping IRON and Peano-built kernels.
 
-The go/no-go bar is not decided. It needs the section 2 baselines (iGPU decode tok/s and power), and the evidence so far points the hard way on raw speed. The NPU reads from DDR at about 45 to 49 GB/s, which caps 1B-model decode at about 58 to 63 tok/s at 4-bit weights before any compute or dispatch cost, and at about 28 to 32 tok/s with `bfp16ebs8` weights. Small dependent dispatches add a floor of about 5 ms per token unless matmuls are fused. Clearing "50% of iGPU decode" therefore depends on how fast the iGPU actually is, and the case for the NPU will likely rest on tokens per joule. Both need HWiNFO. A fair comparison weighs bytes honestly: NPU `bfp16ebs8` (about 9 bits per weight) against the iGPU on Q8_0 (about 8.5 bits), and NPU `int8 x int4` against the iGPU's best Q4_0 configuration, with tokens per joule for each.
+The go/no-go bar is not decided. It needs the section 2 baselines (iGPU decode tok/s and power), and the evidence so far points the hard way on raw speed. A trivial read kernel pulls about 45 to 49 GB/s from DDR, which puts a ceiling (not demonstrated) on 1B-model decode of about 58 to 63 tok/s at 4-bit weights before any compute or dispatch cost, and about 28 to 32 tok/s with `bfp16ebs8` weights. The only real GEMV so far reaches 16.8 to 18.3 GB/s, and the 4-bit `int8 x int4` path is read from headers, not run, so whether a real kernel gets near the ceiling is the main open question on the NPU side. Small dependent dispatches add a floor of about 5 ms per token unless matmuls are fused. Clearing "50% of iGPU decode" therefore depends on how fast the iGPU actually is, and the case for the NPU will likely rest on tokens per joule. Both need HWiNFO. A fair comparison weighs bytes honestly: NPU `bfp16ebs8` (about 9 bits per weight) against the iGPU on Q8_0 (about 8.5 bits), and NPU `int8 x int4` against the iGPU's best Q4_0 configuration, with tokens per joule for each.
 
 The other 0b exit criteria remain open: the weight format (`int8 x int4` with a per-block scale epilogue, versus `bfp16ebs8`), activation quantization (int8 if 4-bit weights are kept), and the parity-tolerance policy.
