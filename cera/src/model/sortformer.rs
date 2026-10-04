@@ -126,6 +126,11 @@ impl StreamingParams {
         }
     }
 
+    /// Return the recommended low-latency preset (0.48 s chunk, 1.04 s latency).
+    pub fn low_latency(&self) -> Self {
+        self.with_chunking(6, 1, 7, 188, 188, 144)
+    }
+
     fn validate(&self) -> Result<()> {
         ensure!(self.chunk_len > 0, "chunk_len must be > 0");
         ensure!(self.update_period > 0, "update_period must be > 0");
@@ -170,6 +175,31 @@ impl StreamingParams {
             self.pred_score_threshold > 0.0 && self.pred_score_threshold <= 1.0,
             "pred_score_threshold {} must be in (0, 1]",
             self.pred_score_threshold
+        );
+        ensure!(
+            self.scores_boost_latest.is_finite() && self.scores_boost_latest >= 0.0,
+            "scores_boost_latest {} must be a finite non-negative number",
+            self.scores_boost_latest
+        );
+        ensure!(
+            self.sil_threshold.is_finite() && self.sil_threshold >= 0.0,
+            "sil_threshold {} must be a finite non-negative number",
+            self.sil_threshold
+        );
+        ensure!(
+            self.strong_boost_rate.is_finite() && self.strong_boost_rate >= 0.0,
+            "strong_boost_rate {} must be a finite non-negative number",
+            self.strong_boost_rate
+        );
+        ensure!(
+            self.weak_boost_rate.is_finite() && self.weak_boost_rate >= 0.0,
+            "weak_boost_rate {} must be a finite non-negative number",
+            self.weak_boost_rate
+        );
+        ensure!(
+            self.min_pos_scores_rate.is_finite() && (0.0..=1.0).contains(&self.min_pos_scores_rate),
+            "min_pos_scores_rate {} must be in [0, 1]",
+            self.min_pos_scores_rate
         );
         ensure!(
             self.spkcache_len / MAX_SPEAKERS > self.sil_frames_per_spk,
@@ -353,9 +383,15 @@ impl SortformerWeights {
         expect_eq("max_speakers", n_spk, MAX_SPEAKERS)?;
         expect_eq("fc_d_model", req_u32(g, "sortformer.fc_d_model")?, n_embd)?;
         ensure!(
-            tf_heads > 0 && tf_d % tf_heads == 0,
-            "sortformer.tf_head_count {tf_heads} must be > 0 and divide sortformer.tf_d_model {tf_d}"
+            tf_d > 0 && tf_heads > 0 && tf_d % tf_heads == 0,
+            "sortformer.tf_d_model {tf_d} must be > 0 and divisible by sortformer.tf_head_count {tf_heads}"
         );
+        ensure!(
+            tf_d / tf_heads <= 64,
+            "sortformer head dimension {} ({tf_d} / {tf_heads}) exceeds maximum supported accumulator width 64",
+            tf_d / tf_heads
+        );
+        ensure!(tf_inner > 0, "sortformer.tf_inner_size must be > 0");
         ensure!(
             n_head > 0 && n_embd % n_head == 0,
             "clip.audio.attention.head_count {n_head} must be > 0 and divide \
@@ -371,6 +407,25 @@ impl SortformerWeights {
         let xscaling = g
             .get_bool("sortformer.xscaling")
             .context("missing GGUF key `sortformer.xscaling`")?;
+        let kernel = req_u32(g, "sortformer.conv_kernel_size")?;
+
+        let streaming = StreamingParams {
+            chunk_len: req_u32(g, "sortformer.stream.chunk_len")?,
+            left_context: req_u32(g, "sortformer.stream.chunk_left_context")?,
+            right_context: req_u32(g, "sortformer.stream.chunk_right_context")?,
+            fifo_len: req_u32(g, "sortformer.stream.fifo_len")?,
+            spkcache_len: req_u32(g, "sortformer.stream.spkcache_len")?,
+            update_period: req_u32(g, "sortformer.stream.spkcache_update_period")?,
+            sil_frames_per_spk: req_u32(g, "sortformer.stream.spkcache_sil_frames_per_spk")?,
+            pred_score_threshold: req_f32(g, "sortformer.stream.pred_score_threshold")?,
+            scores_boost_latest: req_f32(g, "sortformer.stream.scores_boost_latest")?,
+            sil_threshold: req_f32(g, "sortformer.stream.sil_threshold")?,
+            strong_boost_rate: req_f32(g, "sortformer.stream.strong_boost_rate")?,
+            weak_boost_rate: req_f32(g, "sortformer.stream.weak_boost_rate")?,
+            min_pos_scores_rate: req_f32(g, "sortformer.stream.min_pos_scores_rate")?,
+            max_index: req_u32(g, "sortformer.stream.max_index")?,
+        };
+        streaming.validate()?;
 
         // Encoder: the stem and blocks reuse the audio-encoder loaders.
         let mut stem_layers = Vec::new();
@@ -388,7 +443,6 @@ impl SortformerWeights {
             layers.push(load_conformer_block(g, il)?);
         }
         let n_ff = layers[0].ffn_up_w.rows;
-        let kernel = req_u32(g, "sortformer.conv_kernel_size")?;
         for (il, l) in layers.iter().enumerate() {
             check_encoder_block(il, l, n_embd, n_ff, kernel)?;
         }
@@ -487,24 +541,6 @@ impl SortformerWeights {
             "sf.mel.fb has {} values, expected {n_mel_bins} x {N_FFT_BINS}",
             mel_fb.len()
         );
-
-        let streaming = StreamingParams {
-            chunk_len: req_u32(g, "sortformer.stream.chunk_len")?,
-            left_context: req_u32(g, "sortformer.stream.chunk_left_context")?,
-            right_context: req_u32(g, "sortformer.stream.chunk_right_context")?,
-            fifo_len: req_u32(g, "sortformer.stream.fifo_len")?,
-            spkcache_len: req_u32(g, "sortformer.stream.spkcache_len")?,
-            update_period: req_u32(g, "sortformer.stream.spkcache_update_period")?,
-            sil_frames_per_spk: req_u32(g, "sortformer.stream.spkcache_sil_frames_per_spk")?,
-            pred_score_threshold: req_f32(g, "sortformer.stream.pred_score_threshold")?,
-            scores_boost_latest: req_f32(g, "sortformer.stream.scores_boost_latest")?,
-            sil_threshold: req_f32(g, "sortformer.stream.sil_threshold")?,
-            strong_boost_rate: req_f32(g, "sortformer.stream.strong_boost_rate")?,
-            weak_boost_rate: req_f32(g, "sortformer.stream.weak_boost_rate")?,
-            min_pos_scores_rate: req_f32(g, "sortformer.stream.min_pos_scores_rate")?,
-            max_index: req_u32(g, "sortformer.stream.max_index")?,
-        };
-        streaming.validate()?;
 
         Ok(Self {
             config: SortformerConfig {
@@ -806,6 +842,11 @@ impl SortformerModel {
     /// The checkpoint's streaming defaults.
     pub fn default_streaming(&self) -> &StreamingParams {
         &self.w.streaming
+    }
+
+    /// The checkpoint's recommended low-latency streaming parameters.
+    pub fn low_latency_streaming(&self) -> StreamingParams {
+        self.default_streaming().low_latency()
     }
 
     /// Log-mel features of mono 16 kHz PCM, `[frames × 128]` time-major, with NeMo's
@@ -1285,6 +1326,7 @@ fn transformer_layer_forward(x: &mut [f32], l: &TransformerLayer, t: usize, c: &
     let d = c.tf_d;
     let heads = c.tf_heads;
     let dh = d / heads;
+    debug_assert!(dh <= 64, "head dimension {dh} exceeds accumulator size 64");
     let scale = 1.0 / (dh as f64).sqrt();
 
     let mut q = vec![0.0f32; t * d];
@@ -1315,11 +1357,16 @@ fn transformer_layer_forward(x: &mut [f32], l: &TransformerLayer, t: usize, c: &
                 *s = (dot * scale) as f32;
             }
             cpu::softmax_inplace(&mut scores);
+            let mut acc = [0.0f64; 64];
+            for j in 0..t {
+                let s = scores[j] as f64;
+                let v_row = &v[j * d + off..j * d + off + dh];
+                for dd in 0..dh {
+                    acc[dd] += s * v_row[dd] as f64;
+                }
+            }
             for dd in 0..dh {
-                let acc: f64 = (0..t)
-                    .map(|j| scores[j] as f64 * v[j * d + off + dd] as f64)
-                    .sum();
-                ctx[i * d + off + dd] = acc as f32;
+                ctx[i * d + off + dd] = acc[dd] as f32;
             }
         }
     }
@@ -1618,12 +1665,13 @@ impl StreamState {
         // The forward covers [spkcache, fifo, chunk]: every slice below lands inside it.
         debug_assert!((base + chunk_len) * s <= preds.len());
         debug_assert!((lc + chunk_len) * d <= chunk_emb.len());
-        let fifo_preds_now = preds[n_sc * s..(n_sc + n_fifo) * s].to_vec();
         let chunk_slice = &chunk_emb[lc * d..(lc + chunk_len) * d];
         let chunk_preds = preds[base * s..(base + chunk_len) * s].to_vec();
 
         self.fifo.extend_from_slice(chunk_slice);
-        self.fifo_preds = fifo_preds_now;
+        self.fifo_preds.clear();
+        self.fifo_preds
+            .extend_from_slice(&preds[n_sc * s..(n_sc + n_fifo) * s]);
         self.fifo_preds.extend_from_slice(&chunk_preds);
 
         if n_fifo + chunk_len > fifo_cap {
@@ -1631,22 +1679,28 @@ impl StreamState {
                 .max((chunk_len + n_fifo).saturating_sub(fifo_cap))
                 .min(n_fifo + chunk_len);
 
-            let pop_embs = self.fifo[..pop * d].to_vec();
-            let pop_preds = self.fifo_preds[..pop * s].to_vec();
-            self.update_silence_profile(p, (d, s), &pop_embs, &pop_preds, pop);
-            self.fifo.drain(..pop * d);
-            self.fifo_preds.drain(..pop * s);
+            let pop_embs = &self.fifo[..pop * d];
+            let pop_preds = &self.fifo_preds[..pop * s];
+            Self::update_silence_profile_fields(
+                &mut self.mean_sil_emb,
+                &mut self.n_sil_frames,
+                p,
+                (d, s),
+                pop_embs,
+                pop_preds,
+                pop,
+            );
 
-            self.spkcache.extend_from_slice(&pop_embs);
+            self.spkcache.extend_from_slice(pop_embs);
             if let Some(sp) = self.spkcache_preds.as_mut() {
-                sp.extend_from_slice(&pop_preds);
+                sp.extend_from_slice(pop_preds);
             }
             let cache_rows = self.spkcache.len() / d;
             if cache_rows > cache_cap {
                 if self.spkcache_preds.is_none() {
                     // First compression: the cache's own predictions come from this step's forward.
                     let mut sp = preds[..n_sc * s].to_vec();
-                    sp.extend_from_slice(&pop_preds);
+                    sp.extend_from_slice(pop_preds);
                     self.spkcache_preds = Some(sp);
                 }
                 // Always `Some` here (set just above when missing, or already present);
@@ -1665,13 +1719,36 @@ impl StreamState {
                     self.spkcache_preds = Some(pr);
                 }
             }
+            self.fifo.drain(..pop * d);
+            self.fifo_preds.drain(..pop * s);
         }
         chunk_preds
     }
 
     /// NeMo `_get_silence_profile`: fold the silent frames of `embs` into the running mean.
+    #[cfg(test)]
     fn update_silence_profile(
         &mut self,
+        p: &StreamingParams,
+        (d, s): (usize, usize),
+        embs: &[f32],
+        preds: &[f32],
+        n: usize,
+    ) {
+        Self::update_silence_profile_fields(
+            &mut self.mean_sil_emb,
+            &mut self.n_sil_frames,
+            p,
+            (d, s),
+            embs,
+            preds,
+            n,
+        );
+    }
+
+    fn update_silence_profile_fields(
+        mean_sil_emb: &mut [f32],
+        n_sil_frames: &mut usize,
         p: &StreamingParams,
         (d, s): (usize, usize),
         embs: &[f32],
@@ -1692,12 +1769,12 @@ impl StreamState {
         if count == 0 {
             return;
         }
-        let upd = self.n_sil_frames + count;
+        let upd = *n_sil_frames + count;
         let denom = upd as f32;
-        for (m, add) in self.mean_sil_emb.iter_mut().zip(&sum) {
-            *m = (*m * self.n_sil_frames as f32 + add) / denom;
+        for (m, add) in mean_sil_emb.iter_mut().zip(&sum) {
+            *m = (*m * *n_sil_frames as f32 + add) / denom;
         }
-        self.n_sil_frames = upd;
+        *n_sil_frames = upd;
     }
 }
 
@@ -1722,16 +1799,19 @@ fn compress_spkcache(
 
     // _get_log_pred_scores
     let mut scores = vec![0.0f32; n * s];
+    let half_ln = (0.5f64).ln() as f32;
     for f in 0..n {
         let row = &preds[f * s..(f + 1) * s];
-        let log_1p: Vec<f32> = row
-            .iter()
-            .map(|&x| (1.0 - x).max(p.pred_score_threshold).ln())
-            .collect();
-        let log_1p_sum: f32 = log_1p.iter().sum();
+        let mut log_1p = [0.0f32; MAX_SPEAKERS];
+        let mut log_1p_sum = 0.0f32;
+        for k in 0..s {
+            let val = (1.0 - row[k]).max(p.pred_score_threshold).ln();
+            log_1p[k] = val;
+            log_1p_sum += val;
+        }
         for k in 0..s {
             let log_p = row[k].max(p.pred_score_threshold).ln();
-            scores[f * s + k] = log_p - log_1p[k] + log_1p_sum - (0.5f64).ln() as f32;
+            scores[f * s + k] = log_p - log_1p[k] + log_1p_sum - half_ln;
         }
     }
 
@@ -2454,7 +2534,8 @@ mod tests {
         }
         let mut ms = MelStream::from_tables(nm, &window, &fb);
         ms.finish();
-        assert!(ms.push(&[0.0]).is_err(), "no audio after finish");
+        let err = ms.push(&[0.0]).unwrap_err().to_string();
+        assert!(err.contains("push after finish"), "unexpected error: {err}");
     }
 
     #[test]

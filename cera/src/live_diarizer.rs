@@ -58,9 +58,16 @@ impl LiveDiarizer {
     /// End of audio: flush the diarizer, then label every utterance still waiting with the
     /// frames that exist (see [`SpeakerLabeler::flush`]).
     pub fn finish(&mut self) -> Result<Vec<LabeledUtterance>> {
+        let (_, utterances) = self.finish_with_frames()?;
+        Ok(utterances)
+    }
+
+    /// End of audio: flush the diarizer and return both the final frames and the final labeled utterances.
+    pub fn finish_with_frames(&mut self) -> Result<(Vec<f32>, Vec<LabeledUtterance>)> {
         let frames = self.live.finish()?;
         self.labeler.push_frames(&frames);
-        Ok(self.labeler.flush())
+        let utterances = self.labeler.flush();
+        Ok((frames, utterances))
     }
 
     /// Worst-case delay in 80 ms frames before a frame's activity is final.

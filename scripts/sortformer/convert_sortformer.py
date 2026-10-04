@@ -259,9 +259,13 @@ def main():
             and round(pre["window_stride"] * pre["sample_rate"]) == 160 and pre["sample_rate"] == 16000,
             "mel front end is not 16 kHz, n_fft 512, 400-sample window, 160-sample hop")
     require(1 <= n_layer <= 256 and 1 <= tf_layers <= 256, f"layer counts {n_layer} / {tf_layers} outside 1..256")
+    require(d_model == 512, f"d_model {d_model} != 512 (this build requires embedding_length 512)")
     require(enc["n_heads"] > 0 and d_model % enc["n_heads"] == 0, f"{enc['n_heads']} heads do not divide d_model {d_model}")
     require(tf["num_attention_heads"] > 0 and tf_d % tf["num_attention_heads"] == 0,
             f"{tf['num_attention_heads']} heads do not divide transformer hidden size {tf_d}")
+    require(tf_d // tf["num_attention_heads"] <= 64,
+            f"head dimension {tf_d // tf['num_attention_heads']} exceeds maximum supported accumulator width 64")
+    require(tf["inner_size"] > 0, "transformer inner_size must be > 0")
     require(sm["spkcache_len"] // 4 > sm["spkcache_sil_frames_per_spk"],
             "spkcache_len leaves no room for speakers beside their silence frames")
     flat = 4 * (sm["spkcache_len"] + sm["fifo_len"] + sm["chunk_len"] + sm["spkcache_sil_frames_per_spk"])

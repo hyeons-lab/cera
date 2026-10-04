@@ -31,8 +31,20 @@ use std::path::PathBuf;
 use cera::convert::safetensors::SafeTensorsHeader;
 use cera::model::sortformer::{SortformerModel, StreamingParams};
 
-fn models_dir() -> PathBuf {
-    PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(".leap/models/sortformer")
+fn models_dir() -> Option<PathBuf> {
+    match std::env::var_os("SORTFORMER_MODELS_DIR") {
+        Some(dir) => Some(PathBuf::from(dir)),
+        None => match std::env::var("HOME") {
+            Ok(home) => Some(PathBuf::from(home).join(".leap/models/sortformer")),
+            Err(_) => {
+                assert!(
+                    std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
+                    "CERA_REQUIRE_MODEL=1 but HOME is unset and SORTFORMER_MODELS_DIR not provided"
+                );
+                None
+            }
+        },
+    }
 }
 
 /// The committed fixtures. `SORTFORMER_FIXTURES` overrides the compile-time path so a test binary
@@ -46,7 +58,7 @@ fn fixtures_dir() -> PathBuf {
 
 /// A model-backed file, or `None` to skip.
 fn local(rel: &str) -> Option<PathBuf> {
-    let path = models_dir().join(rel);
+    let path = models_dir()?.join(rel);
     if !path.exists() {
         assert!(
             std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
@@ -678,7 +690,8 @@ fn live_refuses_non_finite_pcm_without_consuming_it() {
     let err = dirty.push_audio(&bad).unwrap_err().to_string();
     assert!(err.contains("non-finite") && err.contains("8100"), "{err}");
     bad[100] = f32::INFINITY;
-    assert!(dirty.push_audio(&bad).is_err());
+    let err = dirty.push_audio(&bad).unwrap_err().to_string();
+    assert!(err.contains("non-finite") && err.contains("8100"), "{err}");
     got.extend(dirty.push_audio(b).unwrap());
     got.extend(dirty.finish().unwrap());
     assert_eq!(got, want, "a refused piece must leave no trace");
@@ -957,7 +970,11 @@ fn a_bare_mel_stream_refuses_audio_after_finish() {
     let mut ms = m.new_mel_stream();
     ms.push(&pcm[..4_000]).unwrap();
     ms.finish();
-    assert!(ms.push(&pcm[..160]).is_err(), "no audio after finish");
+    let err = ms.push(&pcm[..160]).unwrap_err().to_string();
+    assert!(
+        err.contains("push after finish"),
+        "expected push after finish error, got: {err}"
+    );
     assert!(ms.finish().is_empty(), "finish is idempotent");
 }
 
@@ -1047,7 +1064,8 @@ fn absurdly_large_pcm_is_refused_and_a_live_stream_carries_on() {
     for (i, x) in bad[5_000..5_100].iter_mut().enumerate() {
         *x = if i % 2 == 0 { 3e38 } else { -3e38 };
     }
-    assert!(m.diarize_offline(&bad).is_err());
+    let err = m.diarize_offline(&bad).unwrap_err().to_string();
+    assert!(err.contains("non-finite"), "{err}");
 
     let params = m.default_streaming().with_chunking(12, 1, 1, 20, 40, 12);
     let mut clean = m.new_live(params.clone()).unwrap();
@@ -1058,7 +1076,8 @@ fn absurdly_large_pcm_is_refused_and_a_live_stream_carries_on() {
         want.extend(clean.push_audio(piece).unwrap());
         let mut with_garbage = piece.to_vec();
         with_garbage[0] = f32::MAX;
-        assert!(dirty.push_audio(&with_garbage).is_err());
+        let err = dirty.push_audio(&with_garbage).unwrap_err().to_string();
+        assert!(err.contains("non-finite"), "{err}");
         got.extend(dirty.push_audio(piece).unwrap());
     }
     want.extend(clean.finish().unwrap());
@@ -1326,7 +1345,12 @@ fn live_diarizer_labels_utterances_as_the_audio_arrives() {
             released.push((u.id, label.speaker, now_ms));
         }
     }
-    for u in d.finish().unwrap() {
+    let (tail_frames, tail_utterances) = d.finish_with_frames().unwrap();
+    assert!(
+        tail_frames.len() % cera::speaker_labeler::SPEAKERS == 0,
+        "tail frames length must be a multiple of speaker count"
+    );
+    for u in tail_utterances {
         let label = u
             .label
             .as_ref()

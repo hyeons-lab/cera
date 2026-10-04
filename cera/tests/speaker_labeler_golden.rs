@@ -19,9 +19,14 @@
 use cera::speaker_labeler::{FRAME_MS, SPEAKERS, SpeakerLabeler, SpeakerLabelerConfig};
 
 fn golden_frames() -> Vec<f32> {
-    let path = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-        .join("tests/fixtures/sortformer/golden.json");
-    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(path).unwrap()).unwrap();
+    let dir = match std::env::var_os("SORTFORMER_FIXTURES") {
+        Some(dir) => std::path::PathBuf::from(dir),
+        None => {
+            std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("tests/fixtures/sortformer")
+        }
+    };
+    let path = dir.join("golden.json");
+    let json: serde_json::Value = serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
     let frames: Vec<f32> = json["preds_offline"]
         .as_array()
         .unwrap()

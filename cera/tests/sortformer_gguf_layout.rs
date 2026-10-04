@@ -36,9 +36,20 @@ const TD: usize = 192;
 const TFF: usize = 768;
 
 fn model_path(file: &str) -> Option<PathBuf> {
-    let path = PathBuf::from(std::env::var("HOME").ok()?)
-        .join(".leap/models/sortformer")
-        .join(file);
+    let base = match std::env::var_os("SORTFORMER_MODELS_DIR") {
+        Some(dir) => PathBuf::from(dir),
+        None => match std::env::var("HOME") {
+            Ok(home) => PathBuf::from(home).join(".leap/models/sortformer"),
+            Err(_) => {
+                assert!(
+                    std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
+                    "CERA_REQUIRE_MODEL=1 but HOME is unset and SORTFORMER_MODELS_DIR not provided"
+                );
+                return None;
+            }
+        },
+    };
+    let path = base.join(file);
     if !path.exists() {
         assert!(
             std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),

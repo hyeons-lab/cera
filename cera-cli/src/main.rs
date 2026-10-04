@@ -1212,7 +1212,7 @@ enum Command {
         #[arg(long, requires = "whisper")]
         vad: Option<String>,
 
-        /// Whisper `.gguf`. Needs `--vad`; implies `--mode live`.
+        /// Whisper `.gguf`. Needs `--vad`; requires `--mode live`.
         #[arg(long, requires = "vad")]
         whisper: Option<String>,
 
@@ -2318,7 +2318,7 @@ fn diarize_with_transcript(
         .with_context(|| format!("loading Whisper from `{whisper}`"))?
         .build()?;
     let mut diarizer = LiveDiarizer::new(model, params, transcript_labeler_config(threshold))?;
-    let latency_s = diarizer.latency_frames() as f64 * 0.08;
+    let latency_s = (diarizer.latency_frames() as f64 * cera::speaker_labeler::FRAME_MS) / 1000.0;
 
     let mut texts: HashMap<u64, String> = HashMap::new();
     let mut next_id = 0u64;
@@ -4182,6 +4182,37 @@ fn main() -> Result<()> {
             use cera::model::sortformer::SortformerModel;
             use cera::speaker_labeler::{FRAME_MS, speaker_segments};
 
+            anyhow::ensure!(
+                threshold.is_finite() && (0.0..=1.0).contains(&threshold),
+                "--threshold must be a finite probability in [0.0, 1.0], got {threshold}"
+            );
+            anyhow::ensure!(piece_ms > 0, "--piece-ms must be > 0");
+            anyhow::ensure!(
+                matches!(preset.as_str(), "default" | "low-latency"),
+                "unknown preset `{preset}`; use `default` or `low-latency`"
+            );
+            anyhow::ensure!(
+                matches!(mode.as_str(), "live" | "streaming" | "offline"),
+                "unknown mode `{mode}`; use `live`, `streaming` or `offline`"
+            );
+
+            match (&vad, &whisper) {
+                (Some(_), Some(_)) => {
+                    if mode != "live" {
+                        anyhow::bail!(
+                            "transcript-aligned diarization (`--vad` and `--whisper`) requires `--mode live`, found `--mode {mode}`"
+                        );
+                    }
+                }
+                (Some(_), None) => {
+                    anyhow::bail!("`--vad` requires `--whisper` for transcript diarization")
+                }
+                (None, Some(_)) => {
+                    anyhow::bail!("`--whisper` requires `--vad` for transcript diarization")
+                }
+                (None, None) => {}
+            }
+
             let m = SortformerModel::from_file(&model)
                 .with_context(|| format!("loading Sortformer model from `{model}`"))?;
             let (mut pcm, sr_in) = read_wav_pcm16_mono(&audio)
@@ -4190,10 +4221,11 @@ fn main() -> Result<()> {
                 pcm = resample_linear(&pcm, sr_in, 16_000);
             }
             let audio_s = pcm.len() as f64 / 16_000.0;
+
             let params = match preset.as_str() {
                 "default" => m.default_streaming().clone(),
-                "low-latency" => m.default_streaming().with_chunking(6, 1, 7, 188, 188, 144),
-                other => anyhow::bail!("unknown preset `{other}`; use `default` or `low-latency`"),
+                "low-latency" => m.low_latency_streaming(),
+                _ => unreachable!(),
             };
 
             if let (Some(vad), Some(whisper)) = (&vad, &whisper) {

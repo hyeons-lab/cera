@@ -27,6 +27,7 @@
 //! heard anyone). `confidence` is that speaker's share of all active time; a runner-up whose active
 //! fraction reaches `overlap_threshold` of the winner's is reported as an overlap.
 
+use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
 /// Milliseconds per diarizer frame (the FastConformer's 8x subsampling of 10 ms mel frames).
@@ -36,7 +37,7 @@ pub const FRAME_MS: f64 = 80.0;
 pub const SPEAKERS: usize = crate::model::sortformer::MAX_SPEAKERS;
 
 /// One stretch of one speaker slot's activity, from [`speaker_segments`].
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SpeakerSegment {
     /// The speaker slot (`0..4`).
     pub speaker: usize,
@@ -107,7 +108,7 @@ pub fn speaker_segments(
 /// How the label is decided and how long frames are kept. Thresholds are probabilities in
 /// `[0, 1]`; `history_ms` should be at least a few diarizer chunks (a NaN, zero or negative value
 /// keeps a one-frame history); `max_pending` of 0 releases every utterance at once, unlabeled.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpeakerLabelerConfig {
     /// A speaker is active in a frame when their probability reaches this.
     pub active_threshold: f32,
@@ -140,7 +141,7 @@ impl Default for SpeakerLabelerConfig {
 }
 
 /// Who spoke during a span.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SpeakerLabel {
     /// The most active speaker's slot (`0..4`).
     pub speaker: usize,
@@ -155,7 +156,7 @@ pub struct SpeakerLabel {
 }
 
 /// An utterance and the speaker the diarizer assigned it.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct LabeledUtterance {
     /// The id the caller registered the utterance with.
     pub id: u64,
@@ -253,7 +254,12 @@ impl SpeakerLabeler {
         // An utterance the diarizer still has not reached after a whole history window is stuck
         // (an end past the audio, a wrong clock): give up on it rather than let it pin frames.
         let covered = self.covered_ms();
-        let horizon = covered - self.cfg.history_ms;
+        let history_ms = if self.cfg.history_ms.is_finite() && self.cfg.history_ms > 0.0 {
+            self.cfg.history_ms
+        } else {
+            FRAME_MS
+        };
+        let horizon = covered - history_ms;
         let mut i = 0;
         while i < self.pending.len() {
             if self.pending[i].end_ms > covered && self.pending[i].start_ms < horizon {
@@ -269,7 +275,7 @@ impl SpeakerLabeler {
             }
         }
         // Keep the history window; pending utterances keep their frames alive until released.
-        let keep = (self.cfg.history_ms / FRAME_MS).ceil().max(1.0) as usize;
+        let keep = (history_ms / FRAME_MS).ceil().max(1.0) as usize;
         let oldest_needed = self
             .pending
             .iter()
@@ -372,7 +378,11 @@ impl SpeakerLabeler {
     /// overlaps the span (not yet received, or older than the history) or nobody reaches
     /// `min_active`.
     pub fn label(&self, start_ms: f64, end_ms: f64) -> Option<SpeakerLabel> {
-        if start_ms.is_nan() || end_ms.is_nan() {
+        if start_ms.is_nan()
+            || end_ms.is_nan()
+            || start_ms.is_infinite()
+            || end_ms == f64::NEG_INFINITY
+        {
             return None;
         }
         let (start_ms, end_ms) = (start_ms.max(0.0), end_ms.max(start_ms.max(0.0)));
@@ -417,7 +427,7 @@ impl SpeakerLabeler {
             activity[k] = (sum[k] / weight) as f32;
             active[k] = (active_w[k] / weight) as f32;
         }
-        let mut order: Vec<usize> = (0..SPEAKERS).collect();
+        let mut order = [0, 1, 2, 3];
         order.sort_by(|&a, &b| {
             active[b]
                 .total_cmp(&active[a])
@@ -898,6 +908,19 @@ mod tests {
         let done = l.poll();
         assert_eq!(done.len(), 1);
         assert!(done[0].dropped);
+    }
+
+    #[test]
+    fn label_refuses_non_finite_spans() {
+        let mut l = labeler();
+        l.push_frames(&solo(0, 10));
+        assert!(l.label(f64::NAN, 800.0).is_none());
+        assert!(l.label(0.0, f64::NAN).is_none());
+        assert!(l.label(f64::INFINITY, 800.0).is_none());
+        assert!(l.label(0.0, f64::INFINITY).is_some());
+        assert!(l.label(f64::NEG_INFINITY, 800.0).is_none());
+        assert!(l.label(0.0, f64::NEG_INFINITY).is_none());
+        assert!(l.label(0.0, 800.0).is_some());
     }
 
     fn seg(speaker: usize, a: f64, b: f64) -> SpeakerSegment {

@@ -3,9 +3,12 @@
 ### Pillar 1: Functional Correctness, Logic & Edge Cases
 <!-- Loops append bullets here. -->
 - **Rewind Claims Match State**: Overriding a rewind or checkpoint check on a backend with hidden recurrent state (short-conv, SSM): reporting Ok because the counters can move, while the device-side state cannot; refuse partial rewinds unless every stateful component is checkpointed, and verify by asserting the check errors for a stateful layer.
+- **NaN Eviction Horizon Pinning**: Calculating a retention horizon by subtracting a duration from elapsed time (`covered - history_ms`): a non-finite, NaN, or non-positive value leaves floating point comparisons (`start_ms < horizon`) permanently false, preventing items from expiring and pinning buffers indefinitely; normalize duration to a valid positive default before subtraction, and verify with a test passing NaN that items still expire.
 
 ### Pillar 2: Security, Authentication & Input Sanitization
 <!-- Loops append bullets here. -->
+- **Upfront Metadata Before Allocation**: Validating container metadata (GGUF, Safetensors) after or interleaved with tensor loading: malformed hyperparameters allocate hundreds of megabytes of weight memory before failing, and fail-fast header-only mock tests in CI cannot exercise the guards; validate all dimensions, strides, and runtime configurations upfront before reading or allocating tensors, and test with header-only mocks.
+- **Upfront Head Dimension Accumulator Bounds**: A loader checking head divisibility (`tf_d % tf_heads == 0`) without bounding head dimension (`tf_d / tf_heads <= MAX_ACCUMULATOR_WIDTH`): valid-looking metadata loads hundreds of megabytes of weight tensors before tripping fixed stack-accumulator assertions during inference; validate head dimension upfront before weight allocations, and test with a metadata mock.
 
 ### Pillar 3: Concurrency, Asynchrony & Lifecycle Management
 <!-- Loops append bullets here. -->
@@ -26,17 +29,22 @@
 - **Docs Feed Generated Checksums**: Editing a doc comment on an exported FFI item: generated bindings embed the doc text and the interface checksum, so the drift job fails and native and binding checksums disagree; regenerate every binding target (including the separately generated ones) in the same change, and verify with the drift check.
 - **Plumb Opt-In Flags**: Renaming a constructor parameter to `_unused` while adding a new default: the config flag becomes dead and the experimental path turns on for everyone; keep the flag live end to end and test with a stub where support is true and the default is false.
 - **Hermetic Knob Seams**: A new `CERA_*` env knob read straight from `std::env` in a constructor: a stray variable in the developer's shell flips the golden tests, and the parse rule drifts from the sibling knobs; give it a `from_lookup` seam, make the constructor ignore the environment under `cfg(test)`, parse opt-ins like the existing ones, warn on garbage, and document it in the env table.
+- **Multi-Model Mode Implication Conflicts**: Documenting that helper model flags imply a specific execution mode (e.g. transcript flags imply live mode): users passing conflicting modes or an incomplete subset of required models get silent fallbacks or overridden options; reject conflicting modes with an explicit error and require paired model dependencies atomically.
+- **Producer Validates Consumer Contract**: A converter or export script omitting structural checks that the downstream engine strictly enforces: unsupported models succeed through minutes of conversion and quantization only to fail at load time; mirror consumer invariants in the producer script upfront to fail fast before long-running tasks.
 
 ### Pillar 6: Performance, Resource Efficiency & Scalability
 <!-- Loops append bullets here. -->
 - **Unaligned By-Value Descriptors**: Casting a byte buffer (align 1) to a struct reference to patch DSP or wire descriptors: relies on allocator alignment and is UB or a panic otherwise; read and write the descriptor by value with unaligned accessors behind a range check, and verify with a test that patches at a deliberately odd offset.
 - **Derive Margins From Inputs**: A fit-or-page decision using a fixed slack for something sized later (KV cache by context length): a long context passes the check and then fails at allocation; compute the margin from the same inputs the later allocation uses.
+- **Contiguous Attention Context Loop Inversion**: Evaluating attention context `ctx[i, dd] = sum_j scores[j] * v[j, dd]` with head dimension `dd` in the outer loop and timestep `j` in the inner loop: strides across memory by full embedding width `d` on every inner iteration, causing cache misses; invert the loop order to scan `j` contiguously in the outer loop while accumulating into a fixed-size stack buffer `acc[dd]`, achieving contiguous cache line access without altering summation order.
+- **Disjoint Borrows Avoid Buffer Cloning**: Calling a helper on `&mut self` that only mutates specific fields while passing slices of sibling container buffers: cloning the slices to owned vectors (`.to_vec()`) merely to satisfy the borrow checker generates unnecessary heap churn in streaming loops; split the helper into a function borrowing only the mutated fields so caller slices can be passed directly without allocation.
 
 ### Pillar 7: Code Simplification, Clean Architecture & Maintainability
 <!-- Loops append bullets here. -->
 - **Doc Comment Theft**: Inserting an item between a doc comment and its item, or a `use` under one: the doc silently reattaches to the wrong item; after every insertion read the lines directly above each touched item.
 - **Stale Limit Claims**: Lifting a limit with a new mechanism (paging past the DSP map ceiling): error strings, hints, doc comments and a docs bullet still say the old limit is absolute; grep the old claim everywhere and keep the message at the call site that still means it.
 - **Estimates Assert Their Plan**: A second copy of a planning loop that feeds a decision (KV bytes for the paging choice): it drifts silently and zeroing it is caught by nothing; `debug_assert_eq!` it against the real plan's total after planning, and scope an error suffix ("these weights cannot run") to the call site that means it, not the shared allocator.
+- **Hoisting Validation Ahead of Heavy Resource IO**: Validating CLI arguments or configuration parameters after loading model weights and decoding audio: invalid user inputs trigger disk I/O, linear resampling, and large tensor allocations before rejecting the command; hoist pure option constraints to function entry before loading resources.
 
 ### Pillar 8: Testing, Observability & Verification Invariants
 <!-- Loops append bullets here. -->
@@ -44,3 +52,4 @@
 - **Throttles Vacate No-Op Tests**: Adding a rate limiter or cache in front of an entry point: a test asserting the no-op result passes without running the checked logic when another test consumed the window; test the unthrottled core directly and unit-test the limiter with an injected clock.
 - **Untested Fix Is Unfixed**: Fixing a defect in code needing a device or driver: the fix regresses silently; extract the pure decision (counter, chunk split, validation) so a host test can pin it, and mutate production once to prove the test fails.
 - **Fakes Must Be Able To Refuse**: A fix that depends on call order or a refusal (release before unmap, munmap error 1): a fake driver that always succeeds, answers every buffer with one fd and ignores arguments cannot fail the test; give each call the fix depends on a refusal knob and an event with its fd, assert the order, and mutate production once to see the test fail.
+- **Exercising Dual Return Signatures**: Adding a richer return variant (`finish_with_frames`) while existing integration suites only call the default wrapper (`finish`): the added vector and its formatting remain untested in realistic end-to-end flows; update end-to-end tests to exercise the dual return and assert buffer invariants on the auxiliary output.

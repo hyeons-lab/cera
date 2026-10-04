@@ -483,13 +483,22 @@ pub(crate) fn log_mel_with_tables(
         return (Vec::new(), 0);
     }
 
+    let mut frame_fn = MelFrameComputer::new(n_mel_bins, hann, filters);
+    if !normalize {
+        let mut mel = vec![0.0f32; n_frames * n_mel_bins];
+        for ti in 0..n_frames {
+            let offset = ti * HOP_LEN;
+            let dst = &mut mel[ti * n_mel_bins..(ti + 1) * n_mel_bins];
+            frame_fn.frame(&samples[offset..offset + N_FFT], dst);
+        }
+        return (mel, n_frames);
+    }
+
     // Compute mel spectrogram in mel-major layout (per-feature
-    // norm walks per-mel-bin slices of consecutive timesteps —
+    // norm walks per-mel-bin slices of consecutive timesteps;
     // contiguous in this layout). Transpose to time-major at the
     // end for the conv_stem_forward consumer.
     let mut mel = vec![0.0f32; n_mel_bins * n_frames];
-    // FFT planner and scratch (one per call; encoder runs per chunk so this is amortized).
-    let mut frame_fn = MelFrameComputer::new(n_mel_bins, hann, filters);
     let mut row = vec![0.0f32; n_mel_bins];
     for ti in 0..n_frames {
         // `n_frames` is sized so `offset + N_FFT - 1` always falls within `samples` (no
@@ -501,12 +510,10 @@ pub(crate) fn log_mel_with_tables(
         }
     }
 
-    let out = if normalize {
-        finish_log_mel(mel, n_mel_bins, n_frames, n_samples_in)
-    } else {
-        mel_to_time_major(&mel, n_mel_bins, n_frames)
-    };
-    (out, n_frames)
+    (
+        finish_log_mel(mel, n_mel_bins, n_frames, n_samples_in),
+        n_frames,
+    )
 }
 
 #[cfg(test)]

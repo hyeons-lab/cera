@@ -49,6 +49,21 @@ fn baseline() -> Vec<(&'static str, Val)> {
         ("sortformer.fc_d_model", U(512)),
         ("sortformer.subsampling_factor", U(8)),
         ("sortformer.xscaling", B(true)),
+        ("sortformer.conv_kernel_size", U(31)),
+        ("sortformer.stream.chunk_len", U(188)),
+        ("sortformer.stream.chunk_left_context", U(0)),
+        ("sortformer.stream.chunk_right_context", U(0)),
+        ("sortformer.stream.fifo_len", U(188)),
+        ("sortformer.stream.spkcache_len", U(188)),
+        ("sortformer.stream.spkcache_update_period", U(188)),
+        ("sortformer.stream.spkcache_sil_frames_per_spk", U(3)),
+        ("sortformer.stream.pred_score_threshold", F(0.25)),
+        ("sortformer.stream.scores_boost_latest", F(0.5)),
+        ("sortformer.stream.sil_threshold", F(0.1)),
+        ("sortformer.stream.strong_boost_rate", F(0.5)),
+        ("sortformer.stream.weak_boost_rate", F(0.2)),
+        ("sortformer.stream.min_pos_scores_rate", F(0.2)),
+        ("sortformer.stream.max_index", U(4000)),
     ]
 }
 
@@ -112,11 +127,38 @@ fn hostile_or_foreign_metadata_is_refused_by_name() {
         ("clip.audio.embedding_length", U(256), "embedding_length"),
         ("clip.audio.attention.head_count", U(0), "head_count 0"),
         ("clip.audio.attention.head_count", U(3), "head_count 3"),
+        (
+            "sortformer.tf_d_model",
+            U(0),
+            "sortformer.tf_d_model 0 must be > 0",
+        ),
+        (
+            "sortformer.tf_inner_size",
+            U(0),
+            "sortformer.tf_inner_size must be > 0",
+        ),
         ("sortformer.tf_head_count", U(0), "tf_head_count 0"),
+        ("sortformer.tf_head_count", U(2), "head dimension"),
         ("sortformer.tf_head_count", U(5), "tf_head_count 5"),
         ("sortformer.max_speakers", U(8), "max_speakers"),
         ("sortformer.fc_d_model", U(256), "fc_d_model"),
         ("sortformer.subsampling_factor", U(4), "subsampling_factor"),
+        ("sortformer.stream.chunk_len", U(0), "chunk_len must be > 0"),
+        (
+            "sortformer.stream.pred_score_threshold",
+            F(0.0),
+            "pred_score_threshold 0 must be in (0, 1]",
+        ),
+        (
+            "sortformer.stream.scores_boost_latest",
+            F(-1.0),
+            "scores_boost_latest -1 must be a finite non-negative number",
+        ),
+        (
+            "sortformer.stream.min_pos_scores_rate",
+            F(1.5),
+            "min_pos_scores_rate 1.5 must be in [0, 1]",
+        ),
     ];
     for (key, v, want) in cases {
         let err = load(&[(key, v.clone())]);
