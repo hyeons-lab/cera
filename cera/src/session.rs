@@ -30,6 +30,44 @@ mod decode;
 mod recovery;
 pub use checkpoint::{ChatCheckpoint, SessionCheckpoint};
 use decode::{DecodeObservation, ObservedGeneration};
+
+/// Wall time per phase of the most recent image ingest on this thread, for comparing the
+/// vision path against other runtimes slice by slice. Filled by
+/// [`Session::append_chat_with_images`] and [`Session::append_image`]; read with
+/// [`last_vl_timing`].
+#[derive(Debug, Clone, Copy, Default)]
+pub struct VlTiming {
+    /// JPEG/PNG decode, resize and normalization.
+    pub preprocess_ms: f64,
+    /// Vision tower plus projector (the encoder call only).
+    pub tower_ms: f64,
+    /// LM prefill of the image embeddings.
+    pub image_prefill_ms: f64,
+    /// LM prefill of the template and prompt tokens around the image.
+    pub text_prefill_ms: f64,
+    /// Image embedding rows prefilled.
+    pub image_tokens: usize,
+    /// Text tokens prefilled.
+    pub text_tokens: usize,
+}
+
+thread_local! {
+    static VL_TIMING: std::cell::Cell<VlTiming> = std::cell::Cell::new(VlTiming::default());
+}
+
+/// The phase times of the most recent image ingest on the calling thread.
+pub fn last_vl_timing() -> VlTiming {
+    VL_TIMING.with(|t| t.get())
+}
+
+#[cfg(feature = "vl-preprocess")]
+fn vl_timing_update(f: impl FnOnce(&mut VlTiming)) {
+    VL_TIMING.with(|t| {
+        let mut v = t.get();
+        f(&mut v);
+        t.set(v);
+    });
+}
 pub use recovery::{IngestRecovery, RecoveryOutcome};
 
 // ---------------------------------------------------------------------------
@@ -616,6 +654,56 @@ pub(crate) fn splice_image_markers(
         });
     }
     segments
+}
+
+/// A chat prompt spliced into one embedding sequence: the embedding rows in prompt order, the
+/// number of rows, and the text token ids among them (for the drafting history).
+#[cfg(feature = "vl-preprocess")]
+struct ChatRows {
+    rows: Vec<f32>,
+    n_rows: usize,
+    text_ids: Vec<u32>,
+}
+
+/// Splice a chat template's text segments (as rows from `embed`), `<|image_start|>` and
+/// `<|image_end|>` around each image, and the images' own rows into one sequence in prompt
+/// order. `None` when `embed` cannot produce rows for some text, so the caller keeps the
+/// per-segment route.
+#[cfg(feature = "vl-preprocess")]
+fn splice_chat_rows(
+    segments: &[ChatTemplateSegment],
+    tokens: &[u32],
+    (img_start, img_end): (u32, u32),
+    images: &[(Vec<f32>, usize)],
+    embed: impl Fn(&[u32]) -> Option<Vec<f32>>,
+) -> Option<ChatRows> {
+    let mut out = ChatRows {
+        rows: Vec::new(),
+        n_rows: 0,
+        text_ids: Vec::new(),
+    };
+    let text = |ids: &[u32], out: &mut ChatRows| -> Option<()> {
+        let rows = embed(ids)?;
+        out.n_rows += ids.len();
+        out.rows.extend_from_slice(&rows);
+        out.text_ids.extend_from_slice(ids);
+        Some(())
+    };
+    let mut img_idx = 0;
+    for seg in segments {
+        match *seg {
+            ChatTemplateSegment::Text { start, end } => text(&tokens[start..end], &mut out)?,
+            ChatTemplateSegment::Image => {
+                text(&[img_start], &mut out)?;
+                let (rows, n) = images.get(img_idx)?;
+                out.rows.extend_from_slice(rows);
+                out.n_rows += n;
+                text(&[img_end], &mut out)?;
+                img_idx += 1;
+            }
+        }
+    }
+    Some(out)
 }
 
 /// Stateful inference session. Owns refcounted handles to the model
@@ -2217,6 +2305,20 @@ impl Session {
         max_long_size: Option<u32>,
     ) -> Result<(), CeraError> {
         self.ensure_usable()?;
+        let (rows, n_tokens) = self.encode_image_rows(bytes, max_long_size)?;
+        self.append_image_rows(&rows, n_tokens)
+    }
+
+    /// Decode, preprocess and encode an image into LLM-width embedding rows
+    /// (`n_tokens` rows of `hidden_size` floats) without touching the session:
+    /// the half of [`Self::append_image_with_opts`] that does not prefill.
+    #[cfg(feature = "vl-preprocess")]
+    fn encode_image_rows(
+        &self,
+        bytes: &[u8],
+        max_long_size: Option<u32>,
+    ) -> Result<(Vec<f32>, usize), CeraError> {
+        self.ensure_usable()?;
         if !self.capabilities.image_in {
             return Err(CeraError::UnsupportedModality);
         }
@@ -2241,12 +2343,15 @@ impl Session {
             }
             std::sync::Arc::clone(encoder)
         };
+        let preprocess_start = Instant::now();
         let pre = crate::model::vision_preprocessor::preprocess_image_with_opts(
             bytes,
             &encoder.config,
             max_long_size,
         )?;
-        self.encode_and_append_preprocessed_image(&pre, &encoder)
+        let preprocess_ms = preprocess_start.elapsed().as_secs_f64() * 1000.0;
+        vl_timing_update(|t| t.preprocess_ms += preprocess_ms);
+        self.encode_preprocessed_image(&pre, &encoder)
     }
 
     /// Stub `append_image_with_opts` for builds without `vl-preprocess`.
@@ -2343,12 +2448,25 @@ impl Session {
         pre: &crate::model::vision_preprocessor::PreprocessedImage,
         encoder: &crate::model::vision_encoder::VisionEncoderWeights,
     ) -> Result<(), CeraError> {
+        let (rows, n_tokens) = self.encode_preprocessed_image(pre, encoder)?;
+        self.append_image_rows(&rows, n_tokens)
+    }
+
+    /// Run the vision tower and projector over a preprocessed image: `n_tokens`
+    /// rows of `hidden_size` floats, with the session untouched.
+    #[cfg(feature = "vl-preprocess")]
+    fn encode_preprocessed_image(
+        &self,
+        pre: &crate::model::vision_preprocessor::PreprocessedImage,
+        encoder: &crate::model::vision_encoder::VisionEncoderWeights,
+    ) -> Result<(Vec<f32>, usize), CeraError> {
         let proj_dim = encoder.config.projection_dim;
         let grid_tokens = pre.grid_w.saturating_mul(pre.grid_h);
         let gpu = self
             .gpu_vision_encoder
             .as_ref()
             .filter(|_| grid_tokens <= crate::model::vision_encoder_gpu::MAX_VIT_TOKENS);
+        let tower_start = Instant::now();
         let img_tokens = if let Some(gpu) = gpu {
             match gpu.encode_image(&pre.pixels, pre.grid_w, pre.grid_h) {
                 Ok(tokens) => tokens,
@@ -2381,7 +2499,22 @@ impl Session {
                     .into(),
             ));
         }
-        self.append_embeddings(&img_tokens, n_tokens)
+        let tower_ms = tower_start.elapsed().as_secs_f64() * 1000.0;
+        vl_timing_update(|t| {
+            t.tower_ms += tower_ms;
+            t.image_tokens += n_tokens;
+        });
+        Ok((img_tokens, n_tokens))
+    }
+
+    /// Prefill already-encoded image rows into the context.
+    #[cfg(feature = "vl-preprocess")]
+    fn append_image_rows(&mut self, rows: &[f32], n_tokens: usize) -> Result<(), CeraError> {
+        let prefill_start = Instant::now();
+        let result = self.append_embeddings(rows, n_tokens);
+        let image_prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+        vl_timing_update(|t| t.image_prefill_ms += image_prefill_ms);
+        result
     }
 
     /// Append a multimodal chat conversation in one call: render the
@@ -2483,18 +2616,69 @@ impl Session {
             )));
         }
 
-        // 5. Walk segments and feed the session. Past this point
-        //    state is mutated; failures propagate.
+        vl_timing_update(|t| *t = VlTiming::default());
+
+        // 5. One prefill forward for the whole prompt when the backend can hand out its token
+        //    rows (`CERA_VL_SPLIT_PREFILL` forces the per-segment route below): text, image
+        //    and text are one batch instead of three forwards, each with a fixed cost. Every
+        //    image is encoded before the session is touched, so a bad image leaves it as it was.
+        let fused = std::env::var_os("CERA_VL_SPLIT_PREFILL").is_none()
+            && self.model.supports_embedding_input()
+            && self.model.embed_token_rows(&[img_start]).is_some();
+        if fused {
+            let mut encoded = Vec::with_capacity(images.len());
+            for image in images {
+                encoded.push(self.encode_image_rows(image, self.image_max_long_size)?);
+            }
+            let model = Arc::clone(&self.model);
+            if let Some(chat) =
+                splice_chat_rows(&segments, &tokens, (img_start, img_end), &encoded, |ids| {
+                    model.embed_token_rows(ids)
+                })
+            {
+                let prefill_start = Instant::now();
+                self.append_embeddings(&chat.rows, chat.n_rows)?;
+                let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+                // The template's text is what drafting looks up; the image rows have no ids.
+                self.token_history.extend_from_slice(&chat.text_ids);
+                vl_timing_update(|t| {
+                    // One forward covers both: its time is reported as the image prefill.
+                    t.image_prefill_ms = prefill_ms;
+                    t.text_prefill_ms = 0.0;
+                    t.text_tokens = chat.text_ids.len();
+                });
+                return Ok(());
+            }
+            // Rows for some text were refused: fall through to the per-segment route (the
+            // images are encoded again there, which is rare and harmless).
+            vl_timing_update(|t| *t = VlTiming::default());
+        }
+
+        // 5b. Per-segment route. Past this point state is mutated; failures propagate.
         let mut img_idx = 0;
         for seg in &segments {
             match *seg {
                 ChatTemplateSegment::Text { start, end } => {
+                    let text_start = Instant::now();
                     self.append_tokens(&tokens[start..end])?;
+                    let text_ms = text_start.elapsed().as_secs_f64() * 1000.0;
+                    vl_timing_update(|t| {
+                        t.text_prefill_ms += text_ms;
+                        t.text_tokens += end - start;
+                    });
                 }
                 ChatTemplateSegment::Image => {
+                    let text_start = Instant::now();
                     self.append_tokens(&[img_start])?;
+                    let start_ms = text_start.elapsed().as_secs_f64() * 1000.0;
                     self.append_image(images[img_idx])?;
+                    let text_start = Instant::now();
                     self.append_tokens(&[img_end])?;
+                    let end_ms = text_start.elapsed().as_secs_f64() * 1000.0;
+                    vl_timing_update(|t| {
+                        t.text_prefill_ms += start_ms + end_ms;
+                        t.text_tokens += 2;
+                    });
                     img_idx += 1;
                 }
             }
@@ -3960,6 +4144,82 @@ mod tests {
     // `cera/tests/session_chain.rs` (gated behind `#[ignore]` and a
     // `find_model()` helper so they skip silently when no GGUF is
     // available locally). Unit tests here stay dep-free.
+
+    /// The spliced prompt is the template's text, `<|image_start|>`, the image's rows and
+    /// `<|image_end|>`, then the rest of the text, in order, with one row per token; a text run
+    /// the backend refuses, or a missing image, declines the whole splice.
+    #[cfg(feature = "vl-preprocess")]
+    #[test]
+    fn splice_chat_rows_orders_text_and_image_rows_into_one_sequence() {
+        const HS: usize = 3;
+        let tokens = [10, 11, 99, 12, 13];
+        let segs = splice_image_markers(&tokens, 99);
+        let embed = |ids: &[u32]| -> Option<Vec<f32>> {
+            Some(ids.iter().flat_map(|&t| [t as f32; HS]).collect())
+        };
+        let image = (vec![7.0, 7.0, 7.0, 8.0, 8.0, 8.0], 2usize);
+
+        let chat = splice_chat_rows(
+            &segs,
+            &tokens,
+            (1000, 1001),
+            std::slice::from_ref(&image),
+            embed,
+        )
+        .unwrap();
+        let order: Vec<f32> = chat.rows.chunks(HS).map(|r| r[0]).collect();
+        assert_eq!(
+            order,
+            vec![10.0, 11.0, 1000.0, 7.0, 8.0, 1001.0, 12.0, 13.0]
+        );
+        assert_eq!(chat.n_rows, 8);
+        assert_eq!(chat.rows.len(), chat.n_rows * HS);
+        assert_eq!(chat.text_ids, vec![10, 11, 1000, 1001, 12, 13]);
+
+        // Two images keep their own rows in marker order.
+        let tokens2 = [10, 99, 11, 99, 12];
+        let segs2 = splice_image_markers(&tokens2, 99);
+        let other = (vec![5.0; HS], 1usize);
+        let two = splice_chat_rows(
+            &segs2,
+            &tokens2,
+            (1000, 1001),
+            &[image.clone(), other],
+            embed,
+        )
+        .unwrap();
+        let order: Vec<f32> = two.rows.chunks(HS).map(|r| r[0]).collect();
+        assert_eq!(
+            order,
+            vec![
+                10.0, 1000.0, 7.0, 8.0, 1001.0, 11.0, 1000.0, 5.0, 1001.0, 12.0
+            ]
+        );
+
+        // A backend that refuses some text, or too few images, yields no splice.
+        assert!(
+            splice_chat_rows(
+                &segs,
+                &tokens,
+                (1000, 1001),
+                std::slice::from_ref(&image),
+                |_| None
+            )
+            .is_none()
+        );
+        let refuse_img_start = |ids: &[u32]| if ids == [1000] { None } else { embed(ids) };
+        assert!(
+            splice_chat_rows(
+                &segs,
+                &tokens,
+                (1000, 1001),
+                std::slice::from_ref(&image),
+                refuse_img_start
+            )
+            .is_none()
+        );
+        assert!(splice_chat_rows(&segs, &tokens, (1000, 1001), &[], embed).is_none());
+    }
 
     /// Token stream with no `<image>` markers collapses to a single
     /// `Text` segment covering the whole range.
