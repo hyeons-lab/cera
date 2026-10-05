@@ -35,6 +35,17 @@ use crate::tensor::DType;
 /// one op). The ViT and detokenizer run whole (`VIT_TILE`, `DETOK_TILE`).
 const WHISPER_TILE: TokenTile = TokenTile::Tiles(64);
 
+/// Tensors per batch for the encoder, from `CERA_WHISPER_FLUSH_TENSORS`; unset means one
+/// batch per layer.
+fn encoder_flush_cap() -> Option<usize> {
+    static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
+    *CAP.get_or_init(|| {
+        std::env::var("CERA_WHISPER_FLUSH_TENSORS")
+            .ok()
+            .and_then(|v| v.parse().ok())
+    })
+}
+
 fn plan_vec_f32(cur_off: &mut usize, len: usize) -> usize {
     let off = *cur_off;
     *cur_off += align128(len * 4);
@@ -1501,6 +1512,9 @@ impl HexagonWhisperModel {
         let mut dev_guard = self.device.lock_or_recover();
         let session = dev_guard.queue_session_mut();
         session.drop_pending_batch();
+        // A cap on tensors per batch ends a batch at an op-group boundary, so
+        // another model's batch can run between two of this encoder's.
+        session.set_max_tensors_per_flush(encoder_flush_cap());
 
         // Conv1: mel_in -> conv1_out (rows 1..=3000)
         let conv1_dst_off = conv1_base + d_model * 4;
@@ -1841,6 +1855,7 @@ impl HexagonWhisperModel {
         }
 
         // Submit DSP batch queue
+        session.set_max_tensors_per_flush(None);
         session.flush()?;
         self.encoded_ok.store(true, Ordering::SeqCst);
         Ok(())
@@ -1956,6 +1971,7 @@ impl HexagonWhisperModel {
         // 2. Build DSP command queue
         let mut dev_guard = self.device.lock_or_recover();
         let session = dev_guard.queue_session_mut();
+        session.set_max_tensors_per_flush(None);
         session.drop_pending_batch();
 
         let norm_off = self.scratch_offsets.dec_norm_off;
