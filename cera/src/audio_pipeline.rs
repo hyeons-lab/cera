@@ -628,13 +628,13 @@ trait PipelineDiarizerDriver: Send {
     /// Whether the diarizer is still running (it stops, with a warning, if it fails).
     fn is_live(&self) -> bool;
     /// Test introspection: utterances waiting on a poll.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "mmap"))]
     fn debug_pending_len(&self) -> usize;
     /// Test introspection: pipeline-clock time of the session's sample 0.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "mmap"))]
     fn debug_origin_ms(&self) -> f64;
     /// Test introspection: debug rendering of the streaming parameters.
-    #[cfg(test)]
+    #[cfg(all(test, feature = "mmap"))]
     fn debug_params(&self) -> String;
 }
 
@@ -836,17 +836,17 @@ where
         self.session.is_some()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "mmap"))]
     fn debug_pending_len(&self) -> usize {
         self.pending.len()
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "mmap"))]
     fn debug_origin_ms(&self) -> f64 {
         self.origin_ms
     }
 
-    #[cfg(test)]
+    #[cfg(all(test, feature = "mmap"))]
     fn debug_params(&self) -> String {
         format!("{:?}", self.params)
     }

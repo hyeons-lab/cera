@@ -875,7 +875,7 @@ impl SortformerAccelerator for HexagonSortformer {
 /// weights cannot be staged (for example a GGUF whose tail is not Q8_0), or the model already
 /// has an accelerator (a repeat call stages nothing and keeps the first); in the first two
 /// cases the model keeps running on the CPU. Call once during setup; concurrent staging is
-/// not supported (see [`stage_diarizer_accelerator`](crate::backend::hexagon::stage_diarizer_accelerator)).
+/// not supported (see `stage_diarizer_accelerator`).
 pub fn try_hexagon_sortformer(
     model: &SortformerModel,
     max_frames: usize,

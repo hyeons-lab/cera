@@ -3501,7 +3501,9 @@ final class FfiAudioPipelineEventUtteranceTranscribed extends FfiAudioPipelineEv
 
 /// The attached speaker diarizer has covered an utterance and assigned it a speaker. One per
 /// utterance, after its `UtteranceTranscribed`: a chunk plus its lookahead later (seconds with
-/// the default preset). Needs a pipeline built with `from_files_with_diarizer`.
+/// the default preset). Needs a pipeline built with a diarizer constructor
+/// (`from_files_with_diarizer`, `from_files_with_diarizer_nemotron3`, or the `from_bytes`
+/// twins).
 final class FfiAudioPipelineEventUtteranceLabeled extends FfiAudioPipelineEvent {
   const FfiAudioPipelineEventUtteranceLabeled({
     /// The utterance text, as in its `UtteranceTranscribed` event.
@@ -3510,8 +3512,9 @@ final class FfiAudioPipelineEventUtteranceLabeled extends FfiAudioPipelineEvent 
     required this.startMs,
     /// End timestamp of the utterance in milliseconds.
     required this.endMs,
-    /// The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
-    /// span or the labeler had to give the utterance up (see `dropped`).
+    /// The most active speaker's slot (0 to 3 for Sortformer, 0 to 7 for Nemotron-3), or
+    /// `None` when no speaker was active over the span or the labeler had to give the
+    /// utterance up (see `dropped`).
     required this.speaker,
     /// The speaker's share of all speakers' active time over the span, in (0, 1].
     required this.confidence,
@@ -3528,8 +3531,9 @@ final class FfiAudioPipelineEventUtteranceLabeled extends FfiAudioPipelineEvent 
   final double startMs;
   /// End timestamp of the utterance in milliseconds.
   final double endMs;
-  /// The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
-  /// span or the labeler had to give the utterance up (see `dropped`).
+  /// The most active speaker's slot (0 to 3 for Sortformer, 0 to 7 for Nemotron-3), or
+  /// `None` when no speaker was active over the span or the labeler had to give the
+  /// utterance up (see `dropped`).
   final int? speaker;
   /// The speaker's share of all speakers' active time over the span, in (0, 1].
   final double? confidence;
@@ -11038,6 +11042,16 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer != 59328) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer`: expected 59328, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3');
+      _checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3 = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3 != 19665) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3`: expected 19665, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3');
+    }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files;
     try {
       final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files');
@@ -11057,6 +11071,16 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer != 56903) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer`: expected 56903, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3');
+      _checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3 = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3 != 34038) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3`: expected 34038, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_chatsession_from_session;
     try {
@@ -25324,6 +25348,246 @@ class CeraFfiFfi {
     }
   }
 
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ffiAudioPipelineCtorFromBytesWithDiarizerNemotron3FfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3');
+
+  FfiAudioPipeline ffiAudioPipelineCreateFromBytesWithDiarizerNemotron3(Uint8List? vadBytes, Uint8List? hotwordBytes, Uint8List? whisperBytes, Uint8List diarizerBytes, bool preferNpu, FfiAudioPipelineConfig? config) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(16);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final vadBytesWriter = _UniFfiBinaryWriter();
+      if (vadBytes == null) {
+        vadBytesWriter.writeI8(0);
+      } else {
+        vadBytesWriter.writeI8(1);
+        vadBytesWriter.writeI32(vadBytes!.length);
+        vadBytesWriter.writeBytes(vadBytes!);
+      }
+      final Uint8List vadBytesBytes = vadBytesWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> vadBytesPtr = vadBytesBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(vadBytesBytes.length);
+      if (vadBytesBytes.isNotEmpty) { vadBytesPtr.asTypedList(vadBytesBytes.length).setAll(0, vadBytesBytes); }
+      foreignArgPtrs.add(vadBytesPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> vadBytesFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      vadBytesFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      vadBytesFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> vadBytesForeignPtr = calloc<_UniFfiForeignBytes>();
+      vadBytesForeignPtr.ref
+        ..len = vadBytesBytes.length
+        ..data = vadBytesPtr;
+      final _UniFfiRustBuffer vadBytesRustBuffer = _uniFfiRustBufferFromBytes(vadBytesForeignPtr.ref, vadBytesFromBytesStatusPtr);
+      calloc.free(vadBytesForeignPtr);
+      final int vadBytesFromBytesCode = vadBytesFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer vadBytesFromBytesErrBuf = vadBytesFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(vadBytesFromBytesStatusPtr);
+      if (vadBytesFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> vadBytesFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        vadBytesFromBytesErrBufPtr.ref
+          ..capacity = vadBytesFromBytesErrBuf.capacity
+          ..len = vadBytesFromBytesErrBuf.len
+          ..data = vadBytesFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(vadBytesFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $vadBytesFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = vadBytesRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = vadBytesRustBuffer.len;
+      (argBuf + 2).ref.ptr = vadBytesRustBuffer.data.cast<ffi.Void>();
+      final hotwordBytesWriter = _UniFfiBinaryWriter();
+      if (hotwordBytes == null) {
+        hotwordBytesWriter.writeI8(0);
+      } else {
+        hotwordBytesWriter.writeI8(1);
+        hotwordBytesWriter.writeI32(hotwordBytes!.length);
+        hotwordBytesWriter.writeBytes(hotwordBytes!);
+      }
+      final Uint8List hotwordBytesBytes = hotwordBytesWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> hotwordBytesPtr = hotwordBytesBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(hotwordBytesBytes.length);
+      if (hotwordBytesBytes.isNotEmpty) { hotwordBytesPtr.asTypedList(hotwordBytesBytes.length).setAll(0, hotwordBytesBytes); }
+      foreignArgPtrs.add(hotwordBytesPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> hotwordBytesFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      hotwordBytesFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      hotwordBytesFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> hotwordBytesForeignPtr = calloc<_UniFfiForeignBytes>();
+      hotwordBytesForeignPtr.ref
+        ..len = hotwordBytesBytes.length
+        ..data = hotwordBytesPtr;
+      final _UniFfiRustBuffer hotwordBytesRustBuffer = _uniFfiRustBufferFromBytes(hotwordBytesForeignPtr.ref, hotwordBytesFromBytesStatusPtr);
+      calloc.free(hotwordBytesForeignPtr);
+      final int hotwordBytesFromBytesCode = hotwordBytesFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer hotwordBytesFromBytesErrBuf = hotwordBytesFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(hotwordBytesFromBytesStatusPtr);
+      if (hotwordBytesFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> hotwordBytesFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        hotwordBytesFromBytesErrBufPtr.ref
+          ..capacity = hotwordBytesFromBytesErrBuf.capacity
+          ..len = hotwordBytesFromBytesErrBuf.len
+          ..data = hotwordBytesFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(hotwordBytesFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $hotwordBytesFromBytesCode');
+      }
+      (argBuf + 3).ref.u64 = hotwordBytesRustBuffer.capacity;
+      (argBuf + 4).ref.u64 = hotwordBytesRustBuffer.len;
+      (argBuf + 5).ref.ptr = hotwordBytesRustBuffer.data.cast<ffi.Void>();
+      final whisperBytesWriter = _UniFfiBinaryWriter();
+      if (whisperBytes == null) {
+        whisperBytesWriter.writeI8(0);
+      } else {
+        whisperBytesWriter.writeI8(1);
+        whisperBytesWriter.writeI32(whisperBytes!.length);
+        whisperBytesWriter.writeBytes(whisperBytes!);
+      }
+      final Uint8List whisperBytesBytes = whisperBytesWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> whisperBytesPtr = whisperBytesBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(whisperBytesBytes.length);
+      if (whisperBytesBytes.isNotEmpty) { whisperBytesPtr.asTypedList(whisperBytesBytes.length).setAll(0, whisperBytesBytes); }
+      foreignArgPtrs.add(whisperBytesPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> whisperBytesFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      whisperBytesFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      whisperBytesFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> whisperBytesForeignPtr = calloc<_UniFfiForeignBytes>();
+      whisperBytesForeignPtr.ref
+        ..len = whisperBytesBytes.length
+        ..data = whisperBytesPtr;
+      final _UniFfiRustBuffer whisperBytesRustBuffer = _uniFfiRustBufferFromBytes(whisperBytesForeignPtr.ref, whisperBytesFromBytesStatusPtr);
+      calloc.free(whisperBytesForeignPtr);
+      final int whisperBytesFromBytesCode = whisperBytesFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer whisperBytesFromBytesErrBuf = whisperBytesFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(whisperBytesFromBytesStatusPtr);
+      if (whisperBytesFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> whisperBytesFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        whisperBytesFromBytesErrBufPtr.ref
+          ..capacity = whisperBytesFromBytesErrBuf.capacity
+          ..len = whisperBytesFromBytesErrBuf.len
+          ..data = whisperBytesFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(whisperBytesFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $whisperBytesFromBytesCode');
+      }
+      (argBuf + 6).ref.u64 = whisperBytesRustBuffer.capacity;
+      (argBuf + 7).ref.u64 = whisperBytesRustBuffer.len;
+      (argBuf + 8).ref.ptr = whisperBytesRustBuffer.data.cast<ffi.Void>();
+      final diarizerBytesWriter = _UniFfiBinaryWriter();
+      diarizerBytesWriter.writeI32(diarizerBytes.length);
+      diarizerBytesWriter.writeBytes(diarizerBytes);
+      final Uint8List diarizerBytesBytes = diarizerBytesWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> diarizerBytesPtr = diarizerBytesBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(diarizerBytesBytes.length);
+      if (diarizerBytesBytes.isNotEmpty) { diarizerBytesPtr.asTypedList(diarizerBytesBytes.length).setAll(0, diarizerBytesBytes); }
+      foreignArgPtrs.add(diarizerBytesPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> diarizerBytesFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      diarizerBytesFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      diarizerBytesFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> diarizerBytesForeignPtr = calloc<_UniFfiForeignBytes>();
+      diarizerBytesForeignPtr.ref
+        ..len = diarizerBytesBytes.length
+        ..data = diarizerBytesPtr;
+      final _UniFfiRustBuffer diarizerBytesRustBuffer = _uniFfiRustBufferFromBytes(diarizerBytesForeignPtr.ref, diarizerBytesFromBytesStatusPtr);
+      calloc.free(diarizerBytesForeignPtr);
+      final int diarizerBytesFromBytesCode = diarizerBytesFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer diarizerBytesFromBytesErrBuf = diarizerBytesFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(diarizerBytesFromBytesStatusPtr);
+      if (diarizerBytesFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> diarizerBytesFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        diarizerBytesFromBytesErrBufPtr.ref
+          ..capacity = diarizerBytesFromBytesErrBuf.capacity
+          ..len = diarizerBytesFromBytesErrBuf.len
+          ..data = diarizerBytesFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(diarizerBytesFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $diarizerBytesFromBytesCode');
+      }
+      (argBuf + 9).ref.u64 = diarizerBytesRustBuffer.capacity;
+      (argBuf + 10).ref.u64 = diarizerBytesRustBuffer.len;
+      (argBuf + 11).ref.ptr = diarizerBytesRustBuffer.data.cast<ffi.Void>();
+      (argBuf + 12).ref.i8 = preferNpu ? 1 : 0;
+      final configWriter = _UniFfiBinaryWriter();
+      if (config == null) {
+        configWriter.writeI8(0);
+      } else {
+        configWriter.writeI8(1);
+        _uniffiWriteFfiAudioPipelineConfig(config!, configWriter);
+      }
+      final Uint8List configBytes = configWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> configPtr = configBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(configBytes.length);
+      if (configBytes.isNotEmpty) { configPtr.asTypedList(configBytes.length).setAll(0, configBytes); }
+      foreignArgPtrs.add(configPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> configFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      configFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      configFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> configForeignPtr = calloc<_UniFfiForeignBytes>();
+      configForeignPtr.ref
+        ..len = configBytes.length
+        ..data = configPtr;
+      final _UniFfiRustBuffer configRustBuffer = _uniFfiRustBufferFromBytes(configForeignPtr.ref, configFromBytesStatusPtr);
+      calloc.free(configForeignPtr);
+      final int configFromBytesCode = configFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer configFromBytesErrBuf = configFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(configFromBytesStatusPtr);
+      if (configFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> configFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        configFromBytesErrBufPtr.ref
+          ..capacity = configFromBytesErrBuf.capacity
+          ..len = configFromBytesErrBuf.len
+          ..data = configFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(configFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $configFromBytesCode');
+      }
+      (argBuf + 13).ref.u64 = configRustBuffer.capacity;
+      (argBuf + 14).ref.u64 = configRustBuffer.len;
+      (argBuf + 15).ref.ptr = configRustBuffer.data.cast<ffi.Void>();
+      _ffiAudioPipelineCtorFromBytesWithDiarizerNemotron3FfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final int handle = (returnBuf + 0).ref.u64;
+      return FfiAudioPipeline._(this, handle);
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ffiAudioPipelineCtorFromFilesFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_constructor_ffiaudiopipeline_from_files');
 
   FfiAudioPipeline ffiAudioPipelineCreateFromFiles(String? vadPath, String? hotwordPath, String? whisperPath, FfiAudioPipelineConfig? config) {
@@ -25719,6 +25983,240 @@ class CeraFfiFfi {
       (argBuf + 14).ref.u64 = configRustBuffer.len;
       (argBuf + 15).ref.ptr = configRustBuffer.data.cast<ffi.Void>();
       _ffiAudioPipelineCtorFromFilesWithDiarizerFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final int handle = (returnBuf + 0).ref.u64;
+      return FfiAudioPipeline._(this, handle);
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _ffiAudioPipelineCtorFromFilesWithDiarizerNemotron3FfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3');
+
+  FfiAudioPipeline ffiAudioPipelineCreateFromFilesWithDiarizerNemotron3(String? vadPath, String? hotwordPath, String? whisperPath, String diarizerPath, bool preferNpu, FfiAudioPipelineConfig? config) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(16);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final vadPathWriter = _UniFfiBinaryWriter();
+      if (vadPath == null) {
+        vadPathWriter.writeI8(0);
+      } else {
+        vadPathWriter.writeI8(1);
+        vadPathWriter.writeString(vadPath!);
+      }
+      final Uint8List vadPathBytes = vadPathWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> vadPathPtr = vadPathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(vadPathBytes.length);
+      if (vadPathBytes.isNotEmpty) { vadPathPtr.asTypedList(vadPathBytes.length).setAll(0, vadPathBytes); }
+      foreignArgPtrs.add(vadPathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> vadPathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      vadPathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      vadPathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> vadPathForeignPtr = calloc<_UniFfiForeignBytes>();
+      vadPathForeignPtr.ref
+        ..len = vadPathBytes.length
+        ..data = vadPathPtr;
+      final _UniFfiRustBuffer vadPathRustBuffer = _uniFfiRustBufferFromBytes(vadPathForeignPtr.ref, vadPathFromBytesStatusPtr);
+      calloc.free(vadPathForeignPtr);
+      final int vadPathFromBytesCode = vadPathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer vadPathFromBytesErrBuf = vadPathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(vadPathFromBytesStatusPtr);
+      if (vadPathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> vadPathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        vadPathFromBytesErrBufPtr.ref
+          ..capacity = vadPathFromBytesErrBuf.capacity
+          ..len = vadPathFromBytesErrBuf.len
+          ..data = vadPathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(vadPathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $vadPathFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = vadPathRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = vadPathRustBuffer.len;
+      (argBuf + 2).ref.ptr = vadPathRustBuffer.data.cast<ffi.Void>();
+      final hotwordPathWriter = _UniFfiBinaryWriter();
+      if (hotwordPath == null) {
+        hotwordPathWriter.writeI8(0);
+      } else {
+        hotwordPathWriter.writeI8(1);
+        hotwordPathWriter.writeString(hotwordPath!);
+      }
+      final Uint8List hotwordPathBytes = hotwordPathWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> hotwordPathPtr = hotwordPathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(hotwordPathBytes.length);
+      if (hotwordPathBytes.isNotEmpty) { hotwordPathPtr.asTypedList(hotwordPathBytes.length).setAll(0, hotwordPathBytes); }
+      foreignArgPtrs.add(hotwordPathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> hotwordPathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      hotwordPathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      hotwordPathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> hotwordPathForeignPtr = calloc<_UniFfiForeignBytes>();
+      hotwordPathForeignPtr.ref
+        ..len = hotwordPathBytes.length
+        ..data = hotwordPathPtr;
+      final _UniFfiRustBuffer hotwordPathRustBuffer = _uniFfiRustBufferFromBytes(hotwordPathForeignPtr.ref, hotwordPathFromBytesStatusPtr);
+      calloc.free(hotwordPathForeignPtr);
+      final int hotwordPathFromBytesCode = hotwordPathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer hotwordPathFromBytesErrBuf = hotwordPathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(hotwordPathFromBytesStatusPtr);
+      if (hotwordPathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> hotwordPathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        hotwordPathFromBytesErrBufPtr.ref
+          ..capacity = hotwordPathFromBytesErrBuf.capacity
+          ..len = hotwordPathFromBytesErrBuf.len
+          ..data = hotwordPathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(hotwordPathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $hotwordPathFromBytesCode');
+      }
+      (argBuf + 3).ref.u64 = hotwordPathRustBuffer.capacity;
+      (argBuf + 4).ref.u64 = hotwordPathRustBuffer.len;
+      (argBuf + 5).ref.ptr = hotwordPathRustBuffer.data.cast<ffi.Void>();
+      final whisperPathWriter = _UniFfiBinaryWriter();
+      if (whisperPath == null) {
+        whisperPathWriter.writeI8(0);
+      } else {
+        whisperPathWriter.writeI8(1);
+        whisperPathWriter.writeString(whisperPath!);
+      }
+      final Uint8List whisperPathBytes = whisperPathWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> whisperPathPtr = whisperPathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(whisperPathBytes.length);
+      if (whisperPathBytes.isNotEmpty) { whisperPathPtr.asTypedList(whisperPathBytes.length).setAll(0, whisperPathBytes); }
+      foreignArgPtrs.add(whisperPathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> whisperPathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      whisperPathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      whisperPathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> whisperPathForeignPtr = calloc<_UniFfiForeignBytes>();
+      whisperPathForeignPtr.ref
+        ..len = whisperPathBytes.length
+        ..data = whisperPathPtr;
+      final _UniFfiRustBuffer whisperPathRustBuffer = _uniFfiRustBufferFromBytes(whisperPathForeignPtr.ref, whisperPathFromBytesStatusPtr);
+      calloc.free(whisperPathForeignPtr);
+      final int whisperPathFromBytesCode = whisperPathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer whisperPathFromBytesErrBuf = whisperPathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(whisperPathFromBytesStatusPtr);
+      if (whisperPathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> whisperPathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        whisperPathFromBytesErrBufPtr.ref
+          ..capacity = whisperPathFromBytesErrBuf.capacity
+          ..len = whisperPathFromBytesErrBuf.len
+          ..data = whisperPathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(whisperPathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $whisperPathFromBytesCode');
+      }
+      (argBuf + 6).ref.u64 = whisperPathRustBuffer.capacity;
+      (argBuf + 7).ref.u64 = whisperPathRustBuffer.len;
+      (argBuf + 8).ref.ptr = whisperPathRustBuffer.data.cast<ffi.Void>();
+      final Uint8List diarizerPathBytes = Uint8List.fromList(utf8.encode(diarizerPath));
+      final ffi.Pointer<ffi.Uint8> diarizerPathPtr = diarizerPathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(diarizerPathBytes.length);
+      if (diarizerPathBytes.isNotEmpty) { diarizerPathPtr.asTypedList(diarizerPathBytes.length).setAll(0, diarizerPathBytes); }
+      foreignArgPtrs.add(diarizerPathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> diarizerPathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      diarizerPathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      diarizerPathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> diarizerPathForeignPtr = calloc<_UniFfiForeignBytes>();
+      diarizerPathForeignPtr.ref
+        ..len = diarizerPathBytes.length
+        ..data = diarizerPathPtr;
+      final _UniFfiRustBuffer diarizerPathRustBuffer = _uniFfiRustBufferFromBytes(diarizerPathForeignPtr.ref, diarizerPathFromBytesStatusPtr);
+      calloc.free(diarizerPathForeignPtr);
+      final int diarizerPathFromBytesCode = diarizerPathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer diarizerPathFromBytesErrBuf = diarizerPathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(diarizerPathFromBytesStatusPtr);
+      if (diarizerPathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> diarizerPathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        diarizerPathFromBytesErrBufPtr.ref
+          ..capacity = diarizerPathFromBytesErrBuf.capacity
+          ..len = diarizerPathFromBytesErrBuf.len
+          ..data = diarizerPathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(diarizerPathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $diarizerPathFromBytesCode');
+      }
+      (argBuf + 9).ref.u64 = diarizerPathRustBuffer.capacity;
+      (argBuf + 10).ref.u64 = diarizerPathRustBuffer.len;
+      (argBuf + 11).ref.ptr = diarizerPathRustBuffer.data.cast<ffi.Void>();
+      (argBuf + 12).ref.i8 = preferNpu ? 1 : 0;
+      final configWriter = _UniFfiBinaryWriter();
+      if (config == null) {
+        configWriter.writeI8(0);
+      } else {
+        configWriter.writeI8(1);
+        _uniffiWriteFfiAudioPipelineConfig(config!, configWriter);
+      }
+      final Uint8List configBytes = configWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> configPtr = configBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(configBytes.length);
+      if (configBytes.isNotEmpty) { configPtr.asTypedList(configBytes.length).setAll(0, configBytes); }
+      foreignArgPtrs.add(configPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> configFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      configFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      configFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> configForeignPtr = calloc<_UniFfiForeignBytes>();
+      configForeignPtr.ref
+        ..len = configBytes.length
+        ..data = configPtr;
+      final _UniFfiRustBuffer configRustBuffer = _uniFfiRustBufferFromBytes(configForeignPtr.ref, configFromBytesStatusPtr);
+      calloc.free(configForeignPtr);
+      final int configFromBytesCode = configFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer configFromBytesErrBuf = configFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(configFromBytesStatusPtr);
+      if (configFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> configFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        configFromBytesErrBufPtr.ref
+          ..capacity = configFromBytesErrBuf.capacity
+          ..len = configFromBytesErrBuf.len
+          ..data = configFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(configFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $configFromBytesCode');
+      }
+      (argBuf + 13).ref.u64 = configRustBuffer.capacity;
+      (argBuf + 14).ref.u64 = configRustBuffer.len;
+      (argBuf + 15).ref.ptr = configRustBuffer.data.cast<ffi.Void>();
+      _ffiAudioPipelineCtorFromFilesWithDiarizerNemotron3FfiBuffer(argBuf, returnBuf);
       final int statusCode = (returnBuf + 1).ref.i8;
       if (statusCode != _uniFfiRustCallStatusSuccess) {
         final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
@@ -33174,6 +33672,18 @@ final class FfiAudioPipeline {
     return _bindings().ffiAudioPipelineCreateFromBytesWithDiarizer(vadBytes, hotwordBytes, whisperBytes, diarizerBytes, preferNpu, config);
   }
 
+  /// Construct a pipeline from in-memory GGUF byte buffers with a Nemotron-3-Diarization
+  /// speaker diarizer (`diarizer_bytes`, a converted Nemotron-3 GGUF: 8 speakers, 10 ms
+  /// frames). Every transcribed utterance then gets an `UtteranceLabeled` event with its
+  /// speaker, once the diarizer covers it.
+  ///
+  /// With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+  /// device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+  /// otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+  static FfiAudioPipeline fromBytesWithDiarizerNemotron3(Uint8List? vadBytes, Uint8List? hotwordBytes, Uint8List? whisperBytes, Uint8List diarizerBytes, bool preferNpu, FfiAudioPipelineConfig? config) {
+    return _bindings().ffiAudioPipelineCreateFromBytesWithDiarizerNemotron3(vadBytes, hotwordBytes, whisperBytes, diarizerBytes, preferNpu, config);
+  }
+
   /// Construct a pipeline from filesystem model paths.
   static FfiAudioPipeline fromFiles(String? vadPath, String? hotwordPath, String? whisperPath, FfiAudioPipelineConfig? config) {
     return _bindings().ffiAudioPipelineCreateFromFiles(vadPath, hotwordPath, whisperPath, config);
@@ -33188,6 +33698,18 @@ final class FfiAudioPipeline {
   /// or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
   static FfiAudioPipeline fromFilesWithDiarizer(String? vadPath, String? hotwordPath, String? whisperPath, String diarizerPath, bool preferNpu, FfiAudioPipelineConfig? config) {
     return _bindings().ffiAudioPipelineCreateFromFilesWithDiarizer(vadPath, hotwordPath, whisperPath, diarizerPath, preferNpu, config);
+  }
+
+  /// Construct a pipeline from filesystem model paths with a Nemotron-3-Diarization
+  /// speaker diarizer (`diarizer_path`, a converted Nemotron-3 GGUF: 8 speakers, 10 ms
+  /// frames). Every transcribed utterance then gets an `UtteranceLabeled` event with its
+  /// speaker, once the diarizer has covered it.
+  ///
+  /// With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+  /// device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+  /// otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+  static FfiAudioPipeline fromFilesWithDiarizerNemotron3(String? vadPath, String? hotwordPath, String? whisperPath, String diarizerPath, bool preferNpu, FfiAudioPipelineConfig? config) {
+    return _bindings().ffiAudioPipelineCreateFromFilesWithDiarizerNemotron3(vadPath, hotwordPath, whisperPath, diarizerPath, preferNpu, config);
   }
 
   /// Register an utterance transcribed outside the pipeline so it gets an `UtteranceLabeled`

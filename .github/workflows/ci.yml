@@ -1205,8 +1205,8 @@ jobs:
             echo "::error::$skipped Kotlin unit test(s) skipped; executed $((count - skipped)) of $count. Remove the @Ignore or update this gate." >&2
             exit 1
           fi
-          if [ "$helper" -ne 7 ] || [ "$probe" -ne 69 ]; then
-            echo "::error::expected 76 Kotlin unit tests (7 android-helper plus 69 probe-app), found $count (helper=$helper probe=$probe; did a test get dropped or renamed? Update the counts in this job)." >&2
+          if [ "$helper" -ne 7 ] || [ "$probe" -ne 73 ]; then
+            echo "::error::expected 80 Kotlin unit tests (7 android-helper plus 73 probe-app), found $count (helper=$helper probe=$probe; did a test get dropped or renamed? Update the counts in this job)." >&2
             exit 1
           fi
       - name: Assemble probe-app field build

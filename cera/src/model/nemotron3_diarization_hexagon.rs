@@ -3,7 +3,7 @@
 //!
 //! The network maps onto the DSP almost directly: the 31 encoder blocks are pre-norm
 //! `x += Attn(LN(x)); x += FFN(LN(x))` with RoPE positions restarting at 0 every step, a
-//! tanh GELU feed-forward (what [`dispatch::gelu_tanh`] computes; the Phase 3 spike showed
+//! tanh GELU feed-forward (what `dispatch::gelu_tanh` computes; the Phase 3 spike showed
 //! the erf/tanh swap costs no speaker decision on the clip), and a key mask over the pad
 //! groups. The mask is folded into the scores with an in-place row-broadcast add of a
 //! host-filled bias row (0 for valid keys, `-1e30` past them) between the QK matmul and the
@@ -1240,7 +1240,7 @@ impl Nemotron3Accelerator for HexagonNemotron3 {
 
 /// Stage the model on the Hexagon NPU for steps of up to `max_frames` encoder frames and
 /// install the staging as its accelerator, sharing the loader with Sortformer (see
-/// [`stage_diarizer_accelerator`](crate::backend::hexagon::stage_diarizer_accelerator)).
+/// `stage_diarizer_accelerator`).
 /// `None` (with a log line) when the model already has an accelerator, the DSP is
 /// unavailable, or staging fails: the caller keeps the CPU. Call once during setup;
 /// concurrent staging is not supported.
