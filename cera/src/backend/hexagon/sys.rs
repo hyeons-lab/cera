@@ -23,6 +23,17 @@ const GIB: usize = 1 << 30;
 /// succeed; one under it may still be refused by the DSP, which
 /// [`FastRpcDriver::fastrpc_mmap`] reports.
 pub const DSP_MAP_CEILING: usize = GIB / 10 * 39;
+
+/// Bytes mapped into the CDSP through every [`FastRpcDriver`] in this process. Each
+/// `HexagonContext` loads its own driver with its own count, so the per-driver number says
+/// nothing about how much of the shared address space a process with several NPU models has used.
+static PROCESS_MAPPED_BYTES: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+/// Bytes currently mapped into the CDSP by this process across all its NPU models.
+pub fn process_mapped_bytes() -> usize {
+    PROCESS_MAPPED_BYTES.load(std::sync::atomic::Ordering::SeqCst)
+}
 pub const FASTRPC_MAP_FD: u32 = 2;
 pub const FASTRPC_MAP_FD_DELAYED: u32 = 3;
 pub const DSPQUEUE_TIMEOUT_US: u32 = 1_000_000;
@@ -350,6 +361,7 @@ impl FastRpcDriver {
         if ret == 0 {
             self.mapped_bytes
                 .fetch_add(length, std::sync::atomic::Ordering::SeqCst);
+            PROCESS_MAPPED_BYTES.fetch_add(length, std::sync::atomic::Ordering::SeqCst);
         }
         if ret != 0 {
             // The CDSP unsigned PD has a 32-bit address space shared by every
@@ -379,14 +391,16 @@ impl FastRpcDriver {
             // outside this accounting. (A CAS loop: `fetch_update` is
             // deprecated on current toolchains and its replacement is newer
             // than the MSRV.)
-            let mut cur = self.mapped_bytes.load(std::sync::atomic::Ordering::SeqCst);
-            while let Err(seen) = self.mapped_bytes.compare_exchange_weak(
-                cur,
-                cur.saturating_sub(length),
-                std::sync::atomic::Ordering::SeqCst,
-                std::sync::atomic::Ordering::SeqCst,
-            ) {
-                cur = seen;
+            for counter in [&self.mapped_bytes, &PROCESS_MAPPED_BYTES] {
+                let mut cur = counter.load(std::sync::atomic::Ordering::SeqCst);
+                while let Err(seen) = counter.compare_exchange_weak(
+                    cur,
+                    cur.saturating_sub(length),
+                    std::sync::atomic::Ordering::SeqCst,
+                    std::sync::atomic::Ordering::SeqCst,
+                ) {
+                    cur = seen;
+                }
             }
         }
         if ret != 0 {
