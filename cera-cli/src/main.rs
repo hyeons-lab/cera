@@ -3714,6 +3714,16 @@ fn main() -> Result<()> {
                     "Image prefill: {kv_after_prefill} KV tokens, {:.1} ms",
                     prefill_elapsed.as_secs_f64() * 1000.0
                 );
+                let vl = cera::session::last_vl_timing();
+                eprintln!(
+                    "VL phases: preprocess {:.1} ms | tower {:.1} ms | image prefill {:.1} ms ({} tok) | text prefill {:.1} ms ({} tok)",
+                    vl.preprocess_ms,
+                    vl.tower_ms,
+                    vl.image_prefill_ms,
+                    vl.image_tokens,
+                    vl.text_prefill_ms,
+                    vl.text_tokens
+                );
 
                 // `--audio-in` answers in text (there is no audio sink here), so never let
                 // a bundle's vocoder cut the answer into audio rounds.

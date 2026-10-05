@@ -14,9 +14,9 @@
 use super::{
     HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonQueueSession,
     HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode, MulMatF32Shape, RpcmemBuffer,
-    build_binary_kernel_params, build_layer_norm_params, build_mul_mat_f32_kernel_params,
-    build_mul_mat_kernel_params, build_softmax_kernel_params, build_ssm_conv_kernel_params,
-    build_unary_kernel_params,
+    build_binary_kernel_params, build_hmx_mm_kernel_params, build_layer_norm_params,
+    build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params, build_softmax_kernel_params,
+    build_ssm_conv_kernel_params, build_unary_kernel_params, mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::session::CeraError;
 
@@ -189,6 +189,13 @@ fn enqueue_broadcast_add<S: OpSink>(
         .map_err(|e| op_err(name, e))
 }
 
+/// Opt-in HMX matmul for [`linear_m_with`]: the VTCM budget the HMX chunking is
+/// solved against. A caller passes it only for a device whose DSP has HMX.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HmxMm {
+    pub vtcm_budget: usize,
+}
+
 /// Linear layer `dst[tokens, rows] = x[tokens, cols] . Wt (+ bias)`.
 ///
 /// `bias_offset` is `None` for bias-free projections. With
@@ -206,6 +213,42 @@ pub(crate) fn linear_m<S: OpSink>(
     n_tokens: usize,
     tile: TokenTile,
 ) -> Result<(), CeraError> {
+    linear_m_with(
+        session,
+        x,
+        x_offset,
+        weights,
+        w_desc,
+        bias_offset,
+        dst,
+        dst_offset,
+        n_tokens,
+        tile,
+        None,
+    )
+}
+
+/// [`linear_m`] that may run the matmul on the HMX matrix unit.
+///
+/// With `hmx` set, a whole-batch (`TokenTile::Whole`) projection whose dims are 32
+/// aligned and whose batch has at least [`mm_is_hmx_eligible`]'s minimum rows runs the
+/// DSP's HMX matmul, as the LFM2 prefill does: the same repacked weights feed both
+/// kernels and only the dim-1 weight stride differs. Anything else, or a chunking
+/// that does not fit the budget, keeps the HVX matmul.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn linear_m_with<S: OpSink>(
+    session: &mut S,
+    x: &S::Buf,
+    x_offset: usize,
+    weights: &S::Buf,
+    w_desc: HexagonWeightDesc,
+    bias_offset: impl Into<Option<usize>>,
+    dst: &S::Buf,
+    dst_offset: usize,
+    n_tokens: usize,
+    tile: TokenTile,
+    hmx: Option<HmxMm>,
+) -> Result<(), CeraError> {
     let (w_dtype, block_bytes, tile_size) = match w_desc.format {
         HexagonWeightFormat::RepackedQ8_0 => (HtpDataType::Q8_0, 34usize, 32 * 34usize),
         HexagonWeightFormat::RepackedQ4_0 => (HtpDataType::Q4_0, 18usize, 32 * 18usize),
@@ -213,6 +256,27 @@ pub(crate) fn linear_m<S: OpSink>(
     let (cols, rows) = (w_desc.cols, w_desc.rows);
     let tiled_row_bytes = cols.div_ceil(32) * tile_size;
     let w_tot = rows.div_ceil(32) * tiled_row_bytes;
+    // One whole-batch run only: the weight tensor's stride is registered once and the
+    // HMX kernel reads it differently from the HVX one.
+    let hmx_kparams = match (hmx, tile) {
+        (Some(h), TokenTile::Whole) if mm_is_hmx_eligible(w_dtype, cols, rows, n_tokens) => {
+            build_hmx_mm_kernel_params(
+                w_dtype,
+                cols,
+                rows,
+                n_tokens.next_multiple_of(32),
+                n_tokens,
+                session.dsp_threads(),
+                h.vtcm_budget,
+            )
+        }
+        _ => None,
+    };
+    let w_nb1 = if hmx_kparams.is_some() {
+        mm_hmx_nb1(w_dtype, cols)
+    } else {
+        tiled_row_bytes
+    };
     let w_ti = session.add_tensor(
         weights,
         w_desc.offset,
@@ -220,12 +284,7 @@ pub(crate) fn linear_m<S: OpSink>(
         HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
         w_dtype as u32,
         [cols as u32, rows as u32, 1, 1],
-        [
-            block_bytes as u32,
-            tiled_row_bytes as u32,
-            w_tot as u32,
-            w_tot as u32,
-        ],
+        [block_bytes as u32, w_nb1 as u32, w_tot as u32, w_tot as u32],
     )?;
     let b_ti = match bias_offset.into() {
         Some(b_off) => Some(add_f32_vector(session, weights, b_off, rows)?),
@@ -235,15 +294,17 @@ pub(crate) fn linear_m<S: OpSink>(
     for (start, run) in token_runs(n_tokens, tile) {
         let x_ti = add_f32_rows(session, x, x_offset + start * cols * 4, cols, run)?;
         let dst_ti = add_f32_rows(session, dst, dst_offset + start * rows * 4, rows, run)?;
-        let kparams = build_mul_mat_kernel_params(
-            w_dtype,
-            cols,
-            run as u32,
-            1,
-            rows * 4,
-            session.dsp_threads(),
-            VTCM_BUDGET,
-        );
+        let kparams = hmx_kparams.unwrap_or_else(|| {
+            build_mul_mat_kernel_params(
+                w_dtype,
+                cols,
+                run as u32,
+                1,
+                rows * 4,
+                session.dsp_threads(),
+                VTCM_BUDGET,
+            )
+        });
         session
             .enqueue_op(
                 HtpOpCode::MulMat as u32,
@@ -403,8 +464,11 @@ pub(crate) fn gelu_tmp_rows(bytes: usize, dim: usize) -> Result<usize, CeraError
 /// Computed as
 /// `x * sigmoid(2 sqrt(2/pi) * x * (1 + 0.044715 x^2))`, since
 /// `0.5 (1 + tanh z) = sigmoid(2 z)`. The DSP has no tanh GELU, so this is
-/// seven ops over `tmp`, a scratch region of `tmp_rows` rows of `shape.dim`
-/// elements that the rows are processed through, `tmp_rows` at a time.
+/// five ops over `tmp`, a scratch region of `tmp_rows` rows of `shape.dim`
+/// elements that the rows are processed through, `tmp_rows` at a time. The ops
+/// are memory bound, so the count is the cost: the first multiply writes `x * x`
+/// straight into `tmp` (no copy pass), and the two scales fold into one,
+/// `tmp * (2c * 0.044715) + 2c` with `c = sqrt(2/pi)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gelu_tanh<S: OpSink>(
     session: &mut S,
@@ -419,35 +483,19 @@ pub(crate) fn gelu_tanh<S: OpSink>(
     for (start, run) in token_runs(n_tokens, TokenTile::Tiles(tmp_rows)) {
         let x_off = offset + start * dim * 4;
         let rows = TokenShape { dim, n_tokens: run };
-        fn whole<B>(buf: &B, off: usize, dim: usize, run: usize) -> View<'_, B> {
-            View::new(buf, off, [dim, run, 1], [4, dim * 4, run * dim * 4])
-        }
-        // tmp = x; tmp = x * x
-        copy_view(
-            session,
-            whole(buf, x_off, dim, run),
-            whole(tmp, tmp_offset, dim, run),
-        )?;
-        mul_inplace(session, tmp, tmp_offset, buf, x_off, rows, TokenTile::Whole)?;
-        // tmp = x * (1 + 0.044715 x^2)
+        // tmp = x * x
+        mul_to(session, tmp, tmp_offset, buf, x_off, buf, x_off, rows)?;
+        // tmp = 2c * (1 + 0.044715 x^2)
         scale_offset(
             session,
             tmp,
             tmp_offset,
             rows,
             TokenTile::Whole,
-            (0.044_715, 1.0),
+            (GELU_TANH_SIGMOID_SCALE * 0.044_715, GELU_TANH_SIGMOID_SCALE),
         )?;
+        // tmp = 2c * x * (1 + 0.044715 x^2); x = x * sigmoid(tmp)
         mul_inplace(session, tmp, tmp_offset, buf, x_off, rows, TokenTile::Whole)?;
-        // x = x * sigmoid(2 sqrt(2/pi) * tmp)
-        scale_offset(
-            session,
-            tmp,
-            tmp_offset,
-            rows,
-            TokenTile::Whole,
-            (GELU_TANH_SIGMOID_SCALE, 0.0),
-        )?;
         sigmoid(session, tmp, tmp_offset, rows, TokenTile::Whole)?;
         mul_inplace(session, buf, x_off, tmp, tmp_offset, rows, TokenTile::Whole)?;
     }
@@ -680,6 +728,46 @@ pub(crate) fn mul_inplace<S: OpSink>(
             .map_err(|e| op_err("mul_inplace", e))?;
     }
     session.end_group().map_err(|e| op_err("mul_inplace", e))
+}
+
+/// `dst = a * b`, elementwise over `shape.n_tokens` rows of `shape.dim` f32, with `dst`
+/// distinct from the sources (one pass, where a copy then [`mul_inplace`] is two).
+/// `a` and `b` may be the same rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mul_to<S: OpSink>(
+    session: &mut S,
+    dst: &S::Buf,
+    dst_offset: usize,
+    a: &S::Buf,
+    a_offset: usize,
+    b: &S::Buf,
+    b_offset: usize,
+    shape: TokenShape,
+) -> Result<(), CeraError> {
+    let TokenShape { dim, n_tokens } = shape;
+    let dst_ti = add_f32_rows(session, dst, dst_offset, dim, n_tokens)?;
+    let a_ti = add_f32_rows(session, a, a_offset, dim, n_tokens)?;
+    let b_ti = add_f32_rows(session, b, b_offset, dim, n_tokens)?;
+    let kparams = build_binary_kernel_params(
+        dim,
+        dim,
+        n_tokens,
+        1,
+        1,
+        4,
+        VTCM_BUDGET,
+        session.dsp_threads(),
+    );
+    session
+        .enqueue_op(
+            HtpOpCode::Mul as u32,
+            &[a_ti, b_ti],
+            &[dst_ti],
+            [0i32; 16],
+            kparams,
+        )
+        .map_err(|e| op_err("mul_to", e))?;
+    session.end_group().map_err(|e| op_err("mul_to", e))
 }
 
 /// A source for [`concat_time_inner`]: `rows` positions of `dim` channels,
@@ -1268,6 +1356,64 @@ mod tests {
         assert_eq!(s.ops[5].src, vec![s.ops[4].dst[0], 1]);
     }
 
+    /// `kparams[6]` is the DSP's `n_hmx` word: 1 on the HMX matmul, 0 on the HVX one.
+    const KPARAMS_N_HMX: usize = 6;
+
+    #[test]
+    fn linear_m_with_hmx_runs_the_hmx_matmul_with_its_own_weight_stride() {
+        let hmx = Some(HmxMm {
+            vtcm_budget: 8 * 1024 * 1024,
+        });
+        let run = |tokens: usize, rows: usize, cols: usize, tile: TokenTile, hmx| {
+            let mut s = RecordingSink::default();
+            linear_m_with(
+                &mut s,
+                &"x",
+                0,
+                &"w",
+                desc(rows, cols),
+                None,
+                &"y",
+                0,
+                tokens,
+                tile,
+                hmx,
+            )
+            .unwrap();
+            s
+        };
+
+        let s = run(280, 96, 64, TokenTile::Whole, hmx);
+        assert_eq!(s.opcodes(), vec![OP_MULMAT]);
+        assert_eq!(s.ops[0].kparams[KPARAMS_N_HMX], 1, "HMX kernel params");
+        // The same weight bytes, addressed per N tile instead of per N row of K tiles.
+        assert_eq!(
+            s.tensors[0].nb[1] as usize,
+            mm_hmx_nb1(HtpDataType::Q8_0, 64)
+        );
+
+        let hvx = run(280, 96, 64, TokenTile::Whole, None);
+        assert_eq!(hvx.ops[0].kparams[KPARAMS_N_HMX], 0, "no option, HVX");
+        assert_eq!(
+            hvx.tensors[0].nb[1] as usize,
+            64usize.div_ceil(32) * 32 * 34
+        );
+
+        // Too few rows for the matrix unit, unaligned dims and a tiled batch stay HVX.
+        for (tokens, rows, cols, tile) in [
+            (4, 96, 64, TokenTile::Whole),
+            (280, 96, 48, TokenTile::Whole),
+            (280, 90, 64, TokenTile::Whole),
+            (280, 96, 64, TokenTile::Tiles(64)),
+        ] {
+            let s = run(tokens, rows, cols, tile, hmx);
+            assert!(
+                s.ops.iter().all(|o| o.kparams[KPARAMS_N_HMX] == 0),
+                "{tokens} tokens {rows}x{cols} {tile:?}"
+            );
+        }
+    }
+
     #[test]
     fn argmax_row_emits_one_argmax_over_an_f32_row_to_an_i32_scalar() {
         let mut s = RecordingSink::default();
@@ -1643,10 +1789,10 @@ mod tests {
         assert_eq!(s.opcodes(), expect);
     }
 
-    /// The tanh GELU is seven ops per row tile through a scratch region, and its
-    /// two `Scale` ops carry the constants in their parameters.
+    /// The tanh GELU is five ops per row tile through a scratch region, and its
+    /// scale constants are folded (see [`gelu_tanh`]).
     #[test]
-    fn gelu_tanh_emits_seven_ops_per_tile_with_the_scale_constants() {
+    fn gelu_tanh_emits_five_ops_per_tile_with_the_folded_constants() {
         use HtpOpCode::*;
         let mut s = RecordingSink::default();
         let shape = TokenShape {
@@ -1654,7 +1800,7 @@ mod tests {
             n_tokens: 130,
         };
         gelu_tanh(&mut s, &"x", 0, &"t", 4096, 64, shape).unwrap();
-        let tile = [Cpy, Mul, Scale, Mul, Scale, UnarySigmoid, Mul].map(|o| o as u32);
+        let tile = [Mul, Scale, Mul, UnarySigmoid, Mul].map(|o| o as u32);
         let want: Vec<u32> = (0..3).flat_map(|_| tile).collect();
         assert_eq!(
             s.opcodes(),
@@ -1673,13 +1819,20 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            scales[..2],
-            [(0.044_715, 1.0), (GELU_TANH_SIGMOID_SCALE, 0.0)]
+            scales[0],
+            (GELU_TANH_SIGMOID_SCALE * 0.044_715, GELU_TANH_SIGMOID_SCALE)
         );
+        // The first multiply squares x into the scratch: both sources are x.
+        assert_eq!(s.src(0, 0).offset, s.src(0, 1).offset);
+        assert_eq!(s.src(0, 0).buf, "x");
+        assert_eq!(s.dst(0).offset, 4096);
         // The last tile is the 2-row remainder, and it works in the scratch.
-        let last_copy = s.ops.iter().rposition(|o| o.opcode == Cpy as u32).unwrap();
-        assert_eq!(s.dst(last_copy).ne[1], 2);
-        assert_eq!(s.dst(last_copy).offset, 4096);
+        let last_sq = s.ops.len() - 5;
+        assert_eq!(s.dst(last_sq).ne[1], 2);
+        assert_eq!(s.dst(last_sq).offset, 4096);
+        // The final multiply writes the activation back in place.
+        assert_eq!(s.dst(s.ops.len() - 1).offset, 96 * 64 * 2 * 4);
+        assert_eq!(s.tensors[s.ops[s.ops.len() - 1].dst[0] as usize].buf, "x");
     }
 
     /// The sequence computes the tanh GELU (not the DSP's quick GELU, which is
@@ -1690,9 +1843,8 @@ mod tests {
         let sigmoid = |z: f32| 1.0 / (1.0 + (-z).exp());
         let sequence = |x: f32| {
             let t = x * x;
-            let t = t * 0.044_715 + 1.0;
+            let t = t * (GELU_TANH_SIGMOID_SCALE * 0.044_715) + GELU_TANH_SIGMOID_SCALE;
             let t = t * x;
-            let t = t * GELU_TANH_SIGMOID_SCALE;
             x * sigmoid(t)
         };
         let quick = |x: f32| x * sigmoid(1.702 * x);

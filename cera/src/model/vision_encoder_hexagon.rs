@@ -33,6 +33,15 @@ const VIT_TILE: TokenTile = TokenTile::Whole;
 
 pub use crate::backend::hexagon::types::HexagonWeightDesc as HexagonVitWeightDesc;
 
+/// The HMX matmul option for a ViT projection: on when the DSP has HMX, off with
+/// `CERA_HEXAGON_VIT_MM=hvx` to compare against the HVX matmul.
+fn vit_hmx(session: &HexagonQueueSession) -> Option<dispatch::HmxMm> {
+    let hvx_only = std::env::var("CERA_HEXAGON_VIT_MM").is_ok_and(|v| v == "hvx");
+    (!hvx_only && session.dsp_hmx() > 0).then(|| dispatch::HmxMm {
+        vtcm_budget: session.dsp_vtcm_bytes(),
+    })
+}
+
 /// Whether `n_tokens` rows fit the fused Q/K/V kernel's VTCM layout. That
 /// kernel cannot chunk its activation rows, so past this the three projections
 /// run on their own, each chunking itself.
@@ -492,7 +501,16 @@ impl HexagonVisionEncoder {
         // VTCM layout holds the three projections run on their own (each
         // chunks itself): a few hundred tokens of a large image.
         let fits_fused = qkv_fits_fused(fused_dtype, q_w.cols, n_tokens, session.dsp_threads());
+        // The HMX matmul beats the fused HVX kernel once there are rows to feed it.
+        let hmx_matmul = vit_hmx(session).is_some()
+            && crate::backend::hexagon::mm_is_hmx_eligible(
+                fused_dtype,
+                q_w.cols,
+                q_w.rows,
+                n_tokens,
+            );
         if !(fits_fused
+            && !hmx_matmul
             && q_w.cols == k_w.cols
             && k_w.cols == v_w.cols
             && q_w.rows == k_w.rows
@@ -500,14 +518,44 @@ impl HexagonVisionEncoder {
             && q_w.format == k_w.format
             && k_w.format == v_w.format)
         {
-            dispatch::linear_m(
-                session, x, x_offset, weights, q_w, q_b_off, dst, q_dst_off, n_tokens, VIT_TILE,
+            dispatch::linear_m_with(
+                session,
+                x,
+                x_offset,
+                weights,
+                q_w,
+                q_b_off,
+                dst,
+                q_dst_off,
+                n_tokens,
+                VIT_TILE,
+                vit_hmx(session),
             )?;
-            dispatch::linear_m(
-                session, x, x_offset, weights, k_w, k_b_off, dst, k_dst_off, n_tokens, VIT_TILE,
+            dispatch::linear_m_with(
+                session,
+                x,
+                x_offset,
+                weights,
+                k_w,
+                k_b_off,
+                dst,
+                k_dst_off,
+                n_tokens,
+                VIT_TILE,
+                vit_hmx(session),
             )?;
-            dispatch::linear_m(
-                session, x, x_offset, weights, v_w, v_b_off, dst, v_dst_off, n_tokens, VIT_TILE,
+            dispatch::linear_m_with(
+                session,
+                x,
+                x_offset,
+                weights,
+                v_w,
+                v_b_off,
+                dst,
+                v_dst_off,
+                n_tokens,
+                VIT_TILE,
+                vit_hmx(session),
             )?;
             return Ok(());
         }
@@ -711,16 +759,39 @@ impl HexagonVisionEncoder {
         let mut params = [0i32; 16];
         params[0] = scale.to_bits() as i32;
 
-        let kparams = crate::backend::hexagon::build_flash_attn_kernel_params(
-            head_dim,
-            n_heads,
-            n_heads,
-            n_tokens,
-            n_tokens,
-            scale,
-            session.dsp_threads(),
-            false,
-        );
+        // Many query rows against the same K/V: run the HMX kernel when the DSP has one
+        // and a tiling fits VTCM, as the LFM2 prefill does; `CERA_HEXAGON_VIT_FA=hvx`
+        // keeps the row-at-a-time HVX kernel for comparison.
+        let hvx_only = std::env::var("CERA_HEXAGON_VIT_FA").is_ok_and(|v| v == "hvx");
+        let hmx_kparams = if !hvx_only
+            && session.dsp_hmx() > 0
+            && crate::backend::hexagon::fa_is_hmx_eligible(head_dim, n_tokens)
+        {
+            crate::backend::hexagon::build_hmx_fa_kernel_params(
+                head_dim,
+                n_heads,
+                n_heads,
+                n_tokens,
+                n_tokens,
+                scale,
+                session.dsp_threads(),
+                session.dsp_vtcm_bytes(),
+            )
+        } else {
+            None
+        };
+        let kparams = hmx_kparams.unwrap_or_else(|| {
+            crate::backend::hexagon::build_flash_attn_kernel_params(
+                head_dim,
+                n_heads,
+                n_heads,
+                n_tokens,
+                n_tokens,
+                scale,
+                session.dsp_threads(),
+                false,
+            )
+        });
 
         session
             .enqueue_op(
@@ -811,8 +882,11 @@ impl HexagonVisionEncoder {
             "encode_image: {n_patches} patches exceeds MAX_VIT_TOKENS ({MAX_VIT_TOKENS})"
         );
 
+        let vit_timing = std::env::var_os("CERA_HEXAGON_VIT_TIMING").is_some();
+        let host_start = std::time::Instant::now();
         // 1. Patch embedding on host CPU
         let mut tokens = patch_embed_compute(pixels, &self.patch_embed, cfg, grid_w, grid_h);
+        let patch_embed_ms = host_start.elapsed().as_secs_f64() * 1000.0;
 
         // 2. Add interpolated position embeddings
         let trained_side = (cfg.n_trained_patches as f64).sqrt().round() as usize;
@@ -842,6 +916,7 @@ impl HexagonVisionEncoder {
             *t += *p;
         }
 
+        let host_pre_ms = host_start.elapsed().as_secs_f64() * 1000.0;
         let mut dump = dump;
         if let Some(d) = dump.as_deref_mut() {
             d.x0 = tokens.clone();
@@ -960,7 +1035,7 @@ impl HexagonVisionEncoder {
                 )?;
 
                 // Out projection + bias: attn_out -> proj_out
-                dispatch::linear_m(
+                dispatch::linear_m_with(
                     session,
                     scratch_guard,
                     so.attn_out_off,
@@ -971,6 +1046,7 @@ impl HexagonVisionEncoder {
                     so.proj_out_off,
                     n_patches,
                     VIT_TILE,
+                    vit_hmx(session),
                 )?;
 
                 // Residual add: tokens += proj_out
@@ -1008,7 +1084,7 @@ impl HexagonVisionEncoder {
                 )?;
 
                 // FFN up projection: pre_norm -> ffn_mid
-                dispatch::linear_m(
+                dispatch::linear_m_with(
                     session,
                     scratch_guard,
                     so.pre_norm_off,
@@ -1019,6 +1095,7 @@ impl HexagonVisionEncoder {
                     so.ffn_mid_off,
                     n_patches,
                     VIT_TILE,
+                    vit_hmx(session),
                 )?;
 
                 // GELU activation on ffn_mid
@@ -1036,7 +1113,7 @@ impl HexagonVisionEncoder {
                 )?;
 
                 // FFN down projection: ffn_mid -> ffn_out
-                dispatch::linear_m(
+                dispatch::linear_m_with(
                     session,
                     scratch_guard,
                     so.ffn_mid_off,
@@ -1047,6 +1124,7 @@ impl HexagonVisionEncoder {
                     so.ffn_out_off,
                     n_patches,
                     VIT_TILE,
+                    vit_hmx(session),
                 )?;
 
                 // Residual add: tokens += ffn_out
@@ -1091,7 +1169,10 @@ impl HexagonVisionEncoder {
             Ok(())
         };
 
+        let blocks_start = std::time::Instant::now();
         let vit_res = run_vit_blocks(session, &mut scratch_guard);
+        let blocks_ms = blocks_start.elapsed().as_secs_f64() * 1000.0;
+        let post_start = std::time::Instant::now();
         if vit_res.is_err() {
             session.drop_pending_batch();
         }
@@ -1142,7 +1223,7 @@ impl HexagonVisionEncoder {
                 scratch_guard.flush_cpu_cache(so.tokens_off, in_bytes);
 
                 let proj_res = (|| -> Result<(), CeraError> {
-                    dispatch::linear_m(
+                    dispatch::linear_m_with(
                         session,
                         &scratch_guard,
                         so.tokens_off,
@@ -1153,6 +1234,7 @@ impl HexagonVisionEncoder {
                         so.proj_mid_off,
                         n_tokens,
                         VIT_TILE,
+                        vit_hmx(session),
                     )?;
                     dispatch::gelu_tanh(
                         session,
@@ -1166,7 +1248,7 @@ impl HexagonVisionEncoder {
                             n_tokens,
                         },
                     )?;
-                    dispatch::linear_m(
+                    dispatch::linear_m_with(
                         session,
                         &scratch_guard,
                         so.proj_mid_off,
@@ -1177,6 +1259,7 @@ impl HexagonVisionEncoder {
                         so.proj_final_off,
                         n_tokens,
                         VIT_TILE,
+                        vit_hmx(session),
                     )?;
                     session.flush()?;
                     Ok(())
@@ -1189,6 +1272,12 @@ impl HexagonVisionEncoder {
                             &scratch_guard.as_slice()
                                 [so.proj_final_off..so.proj_final_off + out_bytes],
                         );
+                        if vit_timing {
+                            eprintln!(
+                                "ViT timing: patch_embed {patch_embed_ms:.1} ms | host_pre {host_pre_ms:.1} ms | dsp_blocks {blocks_ms:.1} ms | post (readback, pixel shuffle, projector) {:.1} ms",
+                                post_start.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
                         return Ok(out_slice.to_vec());
                     }
                     Err(e) => {

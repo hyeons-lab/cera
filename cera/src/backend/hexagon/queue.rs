@@ -297,6 +297,10 @@ pub struct HexagonQueueSession {
     /// kparams thread counts derive from this; the default is llama's
     /// hwinfo-failure fallback until `HexagonDevice` overwrites it.
     dsp_threads: u32,
+    /// HMX units reported by `htp_iface_hwinfo` (0 until the device probe records them).
+    dsp_hmx: u32,
+    /// VTCM bytes reported by `htp_iface_hwinfo`.
+    dsp_vtcm_bytes: usize,
     resident_staged_id: Option<u64>,
     /// Sleep in the kernel for each batch response instead of polling for it,
     /// whatever the driver's default. Polling wakes sooner but keeps a host
@@ -361,6 +365,8 @@ impl HexagonQueueSession {
             prof_dsp_us: 0,
             prof_flushes: 0,
             dsp_threads: 8,
+            dsp_hmx: 0,
+            dsp_vtcm_bytes: 8 * 1024 * 1024,
             resident_staged_id: None,
             blocking_wait: false,
             step_mode: step_enabled(),
@@ -373,6 +379,24 @@ impl HexagonQueueSession {
     /// DSP worker threads for kparams (from `htp_iface_hwinfo`).
     pub fn dsp_threads(&self) -> u32 {
         self.dsp_threads.max(1)
+    }
+
+    /// HMX units on the DSP; 0 when unknown, which keeps HMX-only kernels off.
+    pub fn dsp_hmx(&self) -> u32 {
+        self.dsp_hmx
+    }
+
+    /// VTCM bytes on the DSP, the budget an op's kernel params are sized against.
+    pub fn dsp_vtcm_bytes(&self) -> usize {
+        self.dsp_vtcm_bytes
+    }
+
+    /// Record the `htp_iface_hwinfo` HMX count and VTCM size (0 keeps the defaults).
+    pub fn set_dsp_hw(&mut self, n_hmx: u32, vtcm_bytes: usize) {
+        self.dsp_hmx = n_hmx;
+        if vtcm_bytes > 0 {
+            self.dsp_vtcm_bytes = vtcm_bytes;
+        }
     }
 
     /// Record the `htp_iface_hwinfo` thread count (0 keeps the default).
