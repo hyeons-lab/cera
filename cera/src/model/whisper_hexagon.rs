@@ -10,7 +10,7 @@
 //! convolutions, LayerNorm, linear GEMM, unmasked FlashAttention, and token
 //! sampling on the NPU for background execution on Android.
 
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
 use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTile};
@@ -18,8 +18,9 @@ use crate::backend::hexagon::{
     FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonContext,
     HexagonDevice, HexagonQueueSession, HexagonWeightFormat, HtpDataType, HtpOpCode, RpcmemBuffer,
     align128, build_binary_kernel_params, build_flash_attn_kernel_params,
-    build_mul_mat_kernel_params, hexagon_warn, quantize_f32_to_q8_0, repack_q4_0, repack_q8_0,
-    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+    build_hmx_fa_kernel_params, build_mul_mat_kernel_params, fa_is_hmx_eligible, hexagon_warn,
+    quantize_f32_to_q8_0, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0,
+    repacked_matrix_size_q8_0,
 };
 use crate::backend::hexagon::{
     LockOrRecover, lock_or_discard, lock_reporting_poison, report_poison,
@@ -35,16 +36,55 @@ use crate::tensor::DType;
 /// one op). The ViT and detokenizer run whole (`VIT_TILE`, `DETOK_TILE`).
 const WHISPER_TILE: TokenTile = TokenTile::Tiles(64);
 
-/// Tensors per batch for the encoder, from `CERA_WHISPER_FLUSH_TENSORS`; unset means one
-/// batch per layer.
+/// Tensors per NPU batch for the encoder. A cap ends a batch at an op-group boundary, so
+/// another model's batch can run between two of Whisper's; without one a whole layer is one
+/// batch that a decoding model waits behind. On the S25 Ultra, with a concurrent LLM decoding,
+/// a cap of 16 held its longest token gap to 89 ms (151 ms uncapped) for a Whisper call 25%
+/// slower than uncapped. `CERA_WHISPER_FLUSH_TENSORS` overrides it; `0` restores one batch per
+/// layer.
+const DEFAULT_ENCODER_FLUSH_TENSORS: usize = 16;
+
 fn encoder_flush_cap() -> Option<usize> {
     static CAP: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     *CAP.get_or_init(|| {
-        std::env::var("CERA_WHISPER_FLUSH_TENSORS")
+        let cap = std::env::var("CERA_WHISPER_FLUSH_TENSORS")
             .ok()
             .and_then(|v| v.parse().ok())
+            .unwrap_or(DEFAULT_ENCODER_FLUSH_TENSORS);
+        (cap > 0).then_some(cap)
     })
 }
+
+/// How many encoder rows to run for `n_samples` of 16 kHz audio, from
+/// `CERA_WHISPER_AUDIO_CTX`: unset runs the full 30 s window (1500 rows); `auto` runs the clip
+/// plus [`AUDIO_CTX_MARGIN_ROWS`], rounded up to 64 rows; a number runs that many rows. Rows
+/// are 20 ms each.
+fn audio_ctx_rows(n_samples: usize, n_audio_ctx: usize) -> usize {
+    let mode = std::env::var("CERA_WHISPER_AUDIO_CTX").ok();
+    let rows = match mode.as_deref() {
+        None | Some("") | Some("full") => return n_audio_ctx,
+        Some("auto") => (n_samples / 320 + AUDIO_CTX_MARGIN_ROWS).max(64),
+        Some(n) => n.parse().unwrap_or(n_audio_ctx),
+    };
+    rows.next_multiple_of(64).min(n_audio_ctx)
+}
+
+/// The HMX matmul for the encoder's projections when the DSP has HMX; `CERA_HEXAGON_WHISPER_MM=hvx`
+/// keeps the HVX matmul for comparison.
+fn encoder_hmx(session: &HexagonQueueSession) -> Option<dispatch::HmxMm> {
+    let hvx_only = std::env::var("CERA_HEXAGON_WHISPER_MM").is_ok_and(|v| v == "hvx");
+    (!hvx_only && session.dsp_hmx() > 0).then(|| dispatch::HmxMm {
+        vtcm_budget: session.dsp_vtcm_bytes(),
+    })
+}
+
+/// Whether `n_ctx` encoder rows can run: the full window, or a multiple of 64 within it.
+fn valid_encoder_ctx(n_ctx: usize, n_audio_ctx: usize) -> bool {
+    n_ctx == n_audio_ctx || (n_ctx > 0 && n_ctx.is_multiple_of(64) && n_ctx < n_audio_ctx)
+}
+
+/// Rows of context kept beyond the end of the clip: one second.
+const AUDIO_CTX_MARGIN_ROWS: usize = 50;
 
 fn plan_vec_f32(cur_off: &mut usize, len: usize) -> usize {
     let off = *cur_off;
@@ -824,6 +864,8 @@ pub struct HexagonWhisperModel {
     mel_fallbacks: AtomicU64,
     /// True once `encode_audio` has fully rewritten `state_buf`.
     encoded_ok: AtomicBool,
+    /// Encoder rows the last encode produced; the decoder's cross-attention spans these.
+    enc_ctx: AtomicUsize,
 }
 
 impl Drop for HexagonWhisperModel {
@@ -923,6 +965,7 @@ impl HexagonWhisperModel {
             mel,
             mel_fallbacks: AtomicU64::new(0),
             encoded_ok: AtomicBool::new(false),
+            enc_ctx: AtomicUsize::new(0),
         })
     }
 
@@ -1252,16 +1295,37 @@ impl HexagonWhisperModel {
         let mut params = [0i32; 16];
         params[0] = scale.to_bits() as i32;
 
-        let kparams = build_flash_attn_kernel_params(
-            head_dim,
-            n_heads,
-            n_heads,
-            n_tokens,
-            n_tokens,
-            scale,
-            session.dsp_threads(),
-            false,
-        );
+        // Many query rows against the same K/V: the HMX kernel when the DSP has one and a
+        // tiling fits VTCM (as the LFM2 prefill and the vision tower do), else the
+        // row-at-a-time HVX kernel. `CERA_HEXAGON_WHISPER_FA=hvx` forces the HVX one.
+        let hvx_only = std::env::var("CERA_HEXAGON_WHISPER_FA").is_ok_and(|v| v == "hvx");
+        let hmx_kparams =
+            if !hvx_only && session.dsp_hmx() > 0 && fa_is_hmx_eligible(head_dim, n_tokens) {
+                build_hmx_fa_kernel_params(
+                    head_dim,
+                    n_heads,
+                    n_heads,
+                    n_tokens,
+                    n_tokens,
+                    scale,
+                    session.dsp_threads(),
+                    session.dsp_vtcm_bytes(),
+                )
+            } else {
+                None
+            };
+        let kparams = hmx_kparams.unwrap_or_else(|| {
+            build_flash_attn_kernel_params(
+                head_dim,
+                n_heads,
+                n_heads,
+                n_tokens,
+                n_tokens,
+                scale,
+                session.dsp_threads(),
+                false,
+            )
+        });
 
         session.enqueue_op(
             HtpOpCode::FlashAttnExt as u32,
@@ -1448,6 +1512,25 @@ impl HexagonWhisperModel {
     /// A failed or panicked encode leaves the model needing a fresh one:
     /// `decode_step` fails closed until this succeeds.
     pub fn encode_audio(&self, mel: &[f32]) -> Result<(), CeraError> {
+        self.encode_audio_ctx(mel, self.config.n_audio_ctx)
+    }
+
+    /// [`Self::encode_audio`] over only the first `n_ctx` encoder rows (`2 * n_ctx` mel frames),
+    /// as whisper.cpp's `audio_ctx` does: an utterance shorter than the 30 s window then costs
+    /// the DSP in proportion to its length. The decoder attends to those `n_ctx` rows only.
+    /// `n_ctx` must be the model's full `n_audio_ctx` or a multiple of 64 below it.
+    ///
+    /// # Errors
+    ///
+    /// `Backend` if the mel size is wrong or `n_ctx` is not a valid context length.
+    pub fn encode_audio_ctx(&self, mel: &[f32], n_ctx: usize) -> Result<(), CeraError> {
+        if !valid_encoder_ctx(n_ctx, self.config.n_audio_ctx) {
+            return Err(CeraError::Backend(format!(
+                "whisper encoder context {n_ctx} must be {} or a multiple of 64 below it",
+                self.config.n_audio_ctx
+            )));
+        }
+        let n_frames = 2 * n_ctx;
         let n_mels = self.config.n_audio_mel_bins;
         if mel.len() != n_mels * 3000 {
             return Err(CeraError::Backend(format!(
@@ -1482,13 +1565,13 @@ impl HexagonWhisperModel {
         let scratch_slice = scratch.as_mut_slice();
         let mel_base = self.scratch_offsets.mel_in_off;
 
-        // Zero out row 0 and row 3001
+        // Zero out row 0 and the row after the last frame
         scratch_slice[mel_base..mel_base + padded_mels * 4].fill(0);
-        let last_row_off = mel_base + 3001 * padded_mels * 4;
+        let last_row_off = mel_base + (n_frames + 1) * padded_mels * 4;
         scratch_slice[last_row_off..last_row_off + padded_mels * 4].fill(0);
 
-        // Copy frames 0..3000 into rows 1..=3000
-        for t in 0..3000 {
+        // Copy the first `n_frames` frames into rows 1..=n_frames
+        for t in 0..n_frames {
             let row_off = mel_base + (t + 1) * padded_mels * 4;
             let row_bytes = &mut scratch_slice[row_off..row_off + padded_mels * 4];
             let row_floats: &mut [f32] = bytemuck::cast_slice_mut(row_bytes);
@@ -1501,10 +1584,10 @@ impl HexagonWhisperModel {
         // Zero out boundary rows for Conv1 output (padding for Conv2)
         let conv1_base = self.scratch_offsets.conv1_out_off;
         scratch_slice[conv1_base..conv1_base + d_model * 4].fill(0);
-        let conv1_last_off = conv1_base + 3001 * d_model * 4;
+        let conv1_last_off = conv1_base + (n_frames + 1) * d_model * 4;
         scratch_slice[conv1_last_off..conv1_last_off + d_model * 4].fill(0);
 
-        scratch.flush_cpu_cache(mel_base, 3002 * padded_mels * 4);
+        scratch.flush_cpu_cache(mel_base, (n_frames + 2) * padded_mels * 4);
         scratch.flush_cpu_cache(conv1_base, d_model * 4);
         scratch.flush_cpu_cache(conv1_last_off, d_model * 4);
 
@@ -1515,6 +1598,7 @@ impl HexagonWhisperModel {
         // A cap on tensors per batch ends a batch at an op-group boundary, so
         // another model's batch can run between two of this encoder's.
         session.set_max_tensors_per_flush(encoder_flush_cap());
+        let hmx = encoder_hmx(session);
 
         // Conv1: mel_in -> conv1_out (rows 1..=3000)
         let conv1_dst_off = conv1_base + d_model * 4;
@@ -1526,7 +1610,7 @@ impl HexagonWhisperModel {
             mel_base,
             padded_mels,
             1,
-            3000,
+            n_frames,
             d_model,
             &scratch,
             conv1_dst_off,
@@ -1534,7 +1618,7 @@ impl HexagonWhisperModel {
             self.scratch_offsets.conv_tmp_off,
         )?;
 
-        // Conv2: conv1_out -> enc_x (rows 0..1500)
+        // Conv2: conv1_out -> enc_x (rows 0..n_ctx)
         let enc_x_off = self.scratch_offsets.enc_x_off;
         Self::dispatch_conv1d_3tap(
             session,
@@ -1544,7 +1628,7 @@ impl HexagonWhisperModel {
             conv1_base,
             d_model,
             2,
-            1500,
+            n_ctx,
             d_model,
             &scratch,
             enc_x_off,
@@ -1564,7 +1648,7 @@ impl HexagonWhisperModel {
             pos_off,
             TokenShape {
                 dim: d_model,
-                n_tokens: 1500,
+                n_tokens: n_ctx,
             },
             WHISPER_TILE,
         )?;
@@ -1593,7 +1677,7 @@ impl HexagonWhisperModel {
                     b_offset: blk.attn_ln_b_off,
                     shape: TokenShape {
                         dim: d_model,
-                        n_tokens: 1500,
+                        n_tokens: n_ctx,
                     },
                     eps: 1e-5,
                     tile: WHISPER_TILE,
@@ -1601,7 +1685,7 @@ impl HexagonWhisperModel {
             )?;
 
             // Q, K, V projections
-            dispatch::linear_m(
+            dispatch::linear_m_with(
                 session,
                 &scratch,
                 norm_off,
@@ -1610,10 +1694,11 @@ impl HexagonWhisperModel {
                 blk.q_b_off,
                 &scratch,
                 q_off,
-                1500,
-                WHISPER_TILE,
+                n_ctx,
+                TokenTile::Whole,
+                hmx,
             )?;
-            dispatch::linear_m(
+            dispatch::linear_m_with(
                 session,
                 &scratch,
                 norm_off,
@@ -1622,8 +1707,9 @@ impl HexagonWhisperModel {
                 blk.k_b_off,
                 &scratch,
                 tmp_off,
-                1500,
-                WHISPER_TILE,
+                n_ctx,
+                TokenTile::Whole,
+                hmx,
             )?;
             dispatch::cpy_f32_to_f16(
                 session,
@@ -1633,11 +1719,11 @@ impl HexagonWhisperModel {
                 k_f16_off,
                 TokenShape {
                     dim: d_model,
-                    n_tokens: 1500,
+                    n_tokens: n_ctx,
                 },
             )?;
 
-            dispatch::linear_m(
+            dispatch::linear_m_with(
                 session,
                 &scratch,
                 norm_off,
@@ -1646,8 +1732,9 @@ impl HexagonWhisperModel {
                 blk.v_b_off,
                 &scratch,
                 tmp_off,
-                1500,
-                WHISPER_TILE,
+                n_ctx,
+                TokenTile::Whole,
+                hmx,
             )?;
             dispatch::cpy_f32_to_f16(
                 session,
@@ -1657,7 +1744,7 @@ impl HexagonWhisperModel {
                 v_f16_off,
                 TokenShape {
                     dim: d_model,
-                    n_tokens: 1500,
+                    n_tokens: n_ctx,
                 },
             )?;
 
@@ -1674,12 +1761,12 @@ impl HexagonWhisperModel {
                 attn_out_off,
                 head_dim,
                 n_heads,
-                1500,
+                n_ctx,
                 scale,
             )?;
 
             // Attention out projection + residual add
-            dispatch::linear_m(
+            dispatch::linear_m_with(
                 session,
                 &scratch,
                 attn_out_off,
@@ -1688,8 +1775,9 @@ impl HexagonWhisperModel {
                 blk.o_b_off,
                 &scratch,
                 attn_out_off,
-                1500,
-                WHISPER_TILE,
+                n_ctx,
+                TokenTile::Whole,
+                hmx,
             )?;
             dispatch::add_residual(
                 session,
@@ -1699,7 +1787,7 @@ impl HexagonWhisperModel {
                 attn_out_off,
                 TokenShape {
                     dim: d_model,
-                    n_tokens: 1500,
+                    n_tokens: n_ctx,
                 },
                 WHISPER_TILE,
             )?;
@@ -1717,7 +1805,7 @@ impl HexagonWhisperModel {
                     b_offset: blk.mlp_ln_b_off,
                     shape: TokenShape {
                         dim: d_model,
-                        n_tokens: 1500,
+                        n_tokens: n_ctx,
                     },
                     eps: 1e-5,
                     tile: WHISPER_TILE,
@@ -1725,7 +1813,7 @@ impl HexagonWhisperModel {
             )?;
 
             // MLP: MLP0 -> GELU -> MLP2 + residual add
-            dispatch::linear_m(
+            dispatch::linear_m_with(
                 session,
                 &scratch,
                 norm_off,
@@ -1734,8 +1822,9 @@ impl HexagonWhisperModel {
                 blk.mlp_0_b_off,
                 &scratch,
                 mlp_mid_off,
-                1500,
-                WHISPER_TILE,
+                n_ctx,
+                TokenTile::Whole,
+                hmx,
             )?;
             dispatch::gelu_tanh(
                 session,
@@ -1746,10 +1835,10 @@ impl HexagonWhisperModel {
                 self.scratch_offsets.gelu_tmp_rows,
                 TokenShape {
                     dim: blk.mlp_0_w.rows,
-                    n_tokens: 1500,
+                    n_tokens: n_ctx,
                 },
             )?;
-            dispatch::linear_m(
+            dispatch::linear_m_with(
                 session,
                 &scratch,
                 mlp_mid_off,
@@ -1758,8 +1847,9 @@ impl HexagonWhisperModel {
                 blk.mlp_2_b_off,
                 &scratch,
                 mlp_out_off,
-                1500,
-                WHISPER_TILE,
+                n_ctx,
+                TokenTile::Whole,
+                hmx,
             )?;
             dispatch::add_residual(
                 session,
@@ -1769,7 +1859,7 @@ impl HexagonWhisperModel {
                 mlp_out_off,
                 TokenShape {
                     dim: d_model,
-                    n_tokens: 1500,
+                    n_tokens: n_ctx,
                 },
                 WHISPER_TILE,
             )?;
@@ -1792,7 +1882,7 @@ impl HexagonWhisperModel {
                 b_offset: self.weights_offsets.encoder_ln_post_b_off,
                 shape: TokenShape {
                     dim: d_model,
-                    n_tokens: 1500,
+                    n_tokens: n_ctx,
                 },
                 eps: 1e-5,
                 tile: WHISPER_TILE,
@@ -1804,7 +1894,7 @@ impl HexagonWhisperModel {
             let (cross_k_off, cross_v_off) = self.state_offsets.cross_kv[l];
 
             // Cross-K projection -> F16 Cpy
-            dispatch::linear_m(
+            dispatch::linear_m_with(
                 session,
                 &state,
                 enc_hidden_off,
@@ -1813,8 +1903,9 @@ impl HexagonWhisperModel {
                 dec_blk.cross_attn_k_b_off,
                 &scratch,
                 tmp_off,
-                1500,
-                WHISPER_TILE,
+                n_ctx,
+                TokenTile::Whole,
+                hmx,
             )?;
             dispatch::cpy_f32_to_f16(
                 session,
@@ -1824,12 +1915,12 @@ impl HexagonWhisperModel {
                 cross_k_off,
                 TokenShape {
                     dim: d_model,
-                    n_tokens: 1500,
+                    n_tokens: n_ctx,
                 },
             )?;
 
             // Cross-V projection -> F16 Cpy
-            dispatch::linear_m(
+            dispatch::linear_m_with(
                 session,
                 &state,
                 enc_hidden_off,
@@ -1838,8 +1929,9 @@ impl HexagonWhisperModel {
                 dec_blk.cross_attn_v_b_off,
                 &scratch,
                 tmp_off,
-                1500,
-                WHISPER_TILE,
+                n_ctx,
+                TokenTile::Whole,
+                hmx,
             )?;
             dispatch::cpy_f32_to_f16(
                 session,
@@ -1849,7 +1941,7 @@ impl HexagonWhisperModel {
                 cross_v_off,
                 TokenShape {
                     dim: d_model,
-                    n_tokens: 1500,
+                    n_tokens: n_ctx,
                 },
             )?;
         }
@@ -1857,6 +1949,7 @@ impl HexagonWhisperModel {
         // Submit DSP batch queue
         session.set_max_tensors_per_flush(None);
         session.flush()?;
+        self.enc_ctx.store(n_ctx, Ordering::SeqCst);
         self.encoded_ok.store(true, Ordering::SeqCst);
         Ok(())
     }
@@ -1943,6 +2036,7 @@ impl HexagonWhisperModel {
             ));
         };
 
+        let enc_ctx = self.enc_ctx.load(Ordering::SeqCst);
         if let StepOut::Greedy { timestamps } = &out {
             self.stage_greedy_mask(&mut scratch, *timestamps);
         }
@@ -2156,8 +2250,8 @@ impl HexagonWhisperModel {
                 cross_out_off,
                 head_dim,
                 n_heads,
-                1500,
-                1500,
+                enc_ctx,
+                self.config.n_audio_ctx,
                 scale,
             )?;
 
@@ -2437,7 +2531,7 @@ impl HexagonWhisperModel {
         }
 
         // 2. Encode audio and precompute cross-attention on Hexagon DSP
-        self.encode_audio(&mel)?;
+        self.encode_audio_ctx(&mel, audio_ctx_rows(pcm.len(), self.config.n_audio_ctx))?;
 
         // 3. Assemble prompt tokens with dynamic language detection when language is unset or "auto"
         let is_multilingual = tokenizer.token_to_id("<|transcribe|>").is_some();
@@ -2718,6 +2812,16 @@ fn conv_tap_matrix(conv: &Conv1dWeights, k: usize, padded_in_ch: usize) -> Vec<f
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn encoder_ctx_accepts_the_full_window_and_multiples_of_64_below_it() {
+        assert!(valid_encoder_ctx(1500, 1500));
+        assert!(valid_encoder_ctx(64, 1500));
+        assert!(valid_encoder_ctx(1472, 1500));
+        assert!(!valid_encoder_ctx(0, 1500));
+        assert!(!valid_encoder_ctx(100, 1500));
+        assert!(!valid_encoder_ctx(1536, 1500));
+    }
+
     use super::*;
     use crate::model::whisper::*;
 
