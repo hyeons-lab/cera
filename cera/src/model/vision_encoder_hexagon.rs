@@ -711,16 +711,39 @@ impl HexagonVisionEncoder {
         let mut params = [0i32; 16];
         params[0] = scale.to_bits() as i32;
 
-        let kparams = crate::backend::hexagon::build_flash_attn_kernel_params(
-            head_dim,
-            n_heads,
-            n_heads,
-            n_tokens,
-            n_tokens,
-            scale,
-            session.dsp_threads(),
-            false,
-        );
+        // Many query rows against the same K/V: run the HMX kernel when the DSP has one
+        // and a tiling fits VTCM, as the LFM2 prefill does; `CERA_HEXAGON_VIT_FA=hvx`
+        // keeps the row-at-a-time HVX kernel for comparison.
+        let hvx_only = std::env::var("CERA_HEXAGON_VIT_FA").is_ok_and(|v| v == "hvx");
+        let hmx_kparams = if !hvx_only
+            && session.dsp_hmx() > 0
+            && crate::backend::hexagon::fa_is_hmx_eligible(head_dim, n_tokens)
+        {
+            crate::backend::hexagon::build_hmx_fa_kernel_params(
+                head_dim,
+                n_heads,
+                n_heads,
+                n_tokens,
+                n_tokens,
+                scale,
+                session.dsp_threads(),
+                session.dsp_vtcm_bytes(),
+            )
+        } else {
+            None
+        };
+        let kparams = hmx_kparams.unwrap_or_else(|| {
+            crate::backend::hexagon::build_flash_attn_kernel_params(
+                head_dim,
+                n_heads,
+                n_heads,
+                n_tokens,
+                n_tokens,
+                scale,
+                session.dsp_threads(),
+                false,
+            )
+        });
 
         session
             .enqueue_op(

@@ -229,6 +229,7 @@ impl HexagonDevice {
             }
         };
         queue_session.set_dsp_threads(hw_info.n_threads);
+        queue_session.set_dsp_hw(hw_info.n_hmx, hw_info.vtcm_size as usize);
         tracing::debug!(
             target: "cera::hexagon",
             "hwinfo: threads={} hvx={} hmx={} vtcm={}MB",
