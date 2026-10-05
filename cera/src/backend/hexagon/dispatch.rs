@@ -541,6 +541,36 @@ pub(crate) fn sigmoid<S: OpSink>(
     )
 }
 
+/// In-place square root: `buf = sqrt(buf)` (the inputs must not be negative).
+pub(crate) fn sqrt<S: OpSink>(
+    session: &mut S,
+    buf: &S::Buf,
+    offset: usize,
+    shape: TokenShape,
+    tile: TokenTile,
+) -> Result<(), CeraError> {
+    unary_inplace(session, HtpOpCode::Sqrt, "sqrt", buf, offset, shape, tile)
+}
+
+/// In-place hyperbolic tangent: `buf = tanh(buf)`.
+pub(crate) fn tanh<S: OpSink>(
+    session: &mut S,
+    buf: &S::Buf,
+    offset: usize,
+    shape: TokenShape,
+    tile: TokenTile,
+) -> Result<(), CeraError> {
+    unary_inplace(
+        session,
+        HtpOpCode::UnaryTanh,
+        "tanh",
+        buf,
+        offset,
+        shape,
+        tile,
+    )
+}
+
 /// `Argmax` over one row of `vocab` F32 values at `in_offset`: the index of the largest, as an
 /// I32 at `out_offset`. Greedy sampling on the DSP reads 4 bytes instead of the whole row.
 pub(crate) fn argmax_row<S: OpSink>(

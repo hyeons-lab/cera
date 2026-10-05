@@ -1124,6 +1124,11 @@ RustBuffer uniffi_cera_ffi_fn_method_ffiaudiopipeline_take_last_utterance(uint64
 RustBuffer uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm(uint64_t ptr, RustBuffer pcm, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_VAD_ON_NPU
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_FFIAUDIOPIPELINE_VAD_ON_NPU
+int8_t uniffi_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_CHATSESSION
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_CLONE_CHATSESSION
 uint64_t uniffi_cera_ffi_fn_clone_chatsession(uint64_t handle, RustCallStatus *_Nonnull out_status
@@ -2501,6 +2506,12 @@ uint16_t uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance(vo
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_TRANSCRIBE_PCM
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_TRANSCRIBE_PCM
 uint16_t uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_VAD_ON_NPU
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_FFIAUDIOPIPELINE_VAD_ON_NPU
+uint16_t uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu(void
     
 );
 #endif

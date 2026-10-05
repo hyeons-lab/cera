@@ -1108,6 +1108,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu(): Int
+
     external fun uniffi_cera_ffi_checksum_method_chatsession_cancel(): Int
 
     external fun uniffi_cera_ffi_checksum_method_chatsession_clear_cancel(): Int
@@ -2189,6 +2191,11 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Byte
+
     external fun uniffi_cera_ffi_fn_clone_chatsession(
         `handle`: Long,
         uniffi_out_err: UniffiRustCallStatus,
@@ -3122,6 +3129,9 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 54575) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090) {
@@ -6933,6 +6943,12 @@ public interface FfiAudioPipelineInterface {
      */
     fun `transcribePcm`(`pcm`: List<kotlin.Float>): kotlin.String
 
+    /**
+     * Whether the VAD runs on the Hexagon NPU (false: the CPU, or no VAD). Read live: the VAD
+     * drops back to the CPU if the NPU fails mid-run.
+     */
+    fun `vadOnNpu`(): kotlin.Boolean
+
     companion object
 }
 
@@ -7297,6 +7313,22 @@ open class FfiAudioPipeline :
                     UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm(
                         it,
                         FfiConverterSequenceFloat.lower(`pcm`),
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Whether the VAD runs on the Hexagon NPU (false: the CPU, or no VAD). Read live: the VAD
+     * drops back to the CPU if the NPU fails mid-run.
+     */
+    override fun `vadOnNpu`(): kotlin.Boolean =
+        FfiConverterBoolean.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu(
+                        it,
                         _status,
                     )
                 }
@@ -13070,6 +13102,11 @@ data class FfiAudioPipelineConfig(
      * Whisper transcription options.
      */
     var `whisperOpts`: FfiWhisperTranscribeOpts?,
+    /**
+     * Keep the VAD on the CPU. In a build with the `hexagon` feature the pipeline otherwise
+     * runs the VAD's 16 kHz windows on the Hexagon NPU when one is available.
+     */
+    var `vadOnCpu`: kotlin.Boolean,
 ) {
     companion object
 }
@@ -13087,6 +13124,7 @@ public object FfiConverterTypeFfiAudioPipelineConfig : FfiConverterRustBuffer<Ff
             FfiConverterOptionalTypeFfiVadConfig.read(buf),
             FfiConverterOptionalTypeFfiHotwordConfig.read(buf),
             FfiConverterOptionalTypeFfiWhisperTranscribeOpts.read(buf),
+            FfiConverterBoolean.read(buf),
         )
 
     override fun allocationSize(value: FfiAudioPipelineConfig) =
@@ -13097,7 +13135,8 @@ public object FfiConverterTypeFfiAudioPipelineConfig : FfiConverterRustBuffer<Ff
                 FfiConverterUInt.allocationSize(value.`maxUtteranceMs`) +
                 FfiConverterOptionalTypeFfiVadConfig.allocationSize(value.`vadConfig`) +
                 FfiConverterOptionalTypeFfiHotwordConfig.allocationSize(value.`hotwordConfig`) +
-                FfiConverterOptionalTypeFfiWhisperTranscribeOpts.allocationSize(value.`whisperOpts`)
+                FfiConverterOptionalTypeFfiWhisperTranscribeOpts.allocationSize(value.`whisperOpts`) +
+                FfiConverterBoolean.allocationSize(value.`vadOnCpu`)
         )
 
     override fun write(
@@ -13111,6 +13150,7 @@ public object FfiConverterTypeFfiAudioPipelineConfig : FfiConverterRustBuffer<Ff
         FfiConverterOptionalTypeFfiVadConfig.write(value.`vadConfig`, buf)
         FfiConverterOptionalTypeFfiHotwordConfig.write(value.`hotwordConfig`, buf)
         FfiConverterOptionalTypeFfiWhisperTranscribeOpts.write(value.`whisperOpts`, buf)
+        FfiConverterBoolean.write(value.`vadOnCpu`, buf)
     }
 }
 

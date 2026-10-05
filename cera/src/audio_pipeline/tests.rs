@@ -599,6 +599,137 @@ fn test_audio_pipeline_flush_clamps_speech_end_to_utterance_start_sample() {
     }
 }
 
+/// The pipeline tries the NPU for its VAD by default (in a build that has one) and
+/// `with_vad_on_cpu(true)` opts out; the `build` branch behind the flag is truth-tabled so the
+/// wiring, not just the flag, is pinned.
+#[test]
+fn test_audio_pipeline_builder_vad_on_cpu_opt_out() {
+    assert!(!AudioPipelineBuilder::new().vad_on_cpu);
+    assert!(AudioPipelineBuilder::new().with_vad_on_cpu(true).vad_on_cpu);
+    assert!(
+        !AudioPipelineBuilder::new()
+            .with_vad_on_cpu(false)
+            .vad_on_cpu
+    );
+}
+
+#[test]
+fn vad_backend_action_truth_table() {
+    use super::{VadBackendAction::*, vad_backend_action};
+    for (on_cpu, has_vad, accelerated, want) in [
+        (false, false, false, Keep),
+        (false, false, true, Keep),
+        (false, true, false, TryHexagon),
+        (false, true, true, Keep),
+        (true, false, false, Keep),
+        (true, false, true, Keep),
+        (true, true, false, ForceCpu),
+        (true, true, true, ForceCpu),
+    ] {
+        assert_eq!(
+            vad_backend_action(on_cpu, has_vad, accelerated),
+            want,
+            "on_cpu={on_cpu} has_vad={has_vad} accelerated={accelerated}"
+        );
+    }
+}
+
+/// A VAD over zero weights built from synthetic GGUF bytes: no model file, so the `build`
+/// backend wiring is pinned on every host.
+fn synthetic_vad() -> crate::vad::SileroVad {
+    let tensors = [
+        ("stft.16k.basis", 258 * 256),
+        ("encoder.16k.0.weight", 128 * 129 * 3),
+        ("encoder.16k.0.bias", 128),
+        ("encoder.16k.1.weight", 64 * 128 * 3),
+        ("encoder.16k.1.bias", 64),
+        ("encoder.16k.2.weight", 64 * 64 * 3),
+        ("encoder.16k.2.bias", 64),
+        ("encoder.16k.3.weight", 128 * 64 * 3),
+        ("encoder.16k.3.bias", 128),
+        ("decoder.16k.rnn.weight_ih", 512 * 128),
+        ("decoder.16k.rnn.weight_hh", 512 * 128),
+        ("decoder.16k.rnn.bias_ih", 512),
+        ("decoder.16k.rnn.bias_hh", 512),
+        ("decoder.16k.head.weight", 128),
+        ("decoder.16k.head.bias", 1),
+        ("stft.8k.basis", 130 * 128),
+        ("encoder.8k.0.weight", 128 * 65 * 3),
+        ("encoder.8k.0.bias", 128),
+        ("encoder.8k.1.weight", 64 * 128 * 3),
+        ("encoder.8k.1.bias", 64),
+        ("encoder.8k.2.weight", 64 * 64 * 3),
+        ("encoder.8k.2.bias", 64),
+        ("encoder.8k.3.weight", 128 * 64 * 3),
+        ("encoder.8k.3.bias", 128),
+        ("decoder.8k.rnn.weight_ih", 512 * 128),
+        ("decoder.8k.rnn.weight_hh", 512 * 128),
+        ("decoder.8k.rnn.bias_ih", 512),
+        ("decoder.8k.rnn.bias_hh", 512),
+        ("decoder.8k.head.weight", 128),
+        ("decoder.8k.head.bias", 1),
+    ];
+    let mut gguf = crate::gguf::GgufBuilder::new();
+    for (name, numel) in tensors {
+        gguf = gguf.tensor_f32(name, &[numel], &vec![0.0f32; numel]);
+    }
+    crate::vad::SileroVad::from_bytes(gguf.build_bytes()).unwrap()
+}
+
+struct FakeAccel;
+
+impl crate::vad::VadAccelerator for FakeAccel {
+    fn window_16k(
+        &self,
+        _: &[f32; 640],
+        _: &[f32; 128],
+        _: &[f32; 128],
+    ) -> anyhow::Result<Option<crate::vad::VadStep>> {
+        Ok(Some(crate::vad::VadStep {
+            prob: 0.5,
+            h: [0.0; 128],
+            c: [0.0; 128],
+        }))
+    }
+}
+
+#[test]
+fn build_with_vad_on_cpu_drops_a_pre_attached_accelerator() {
+    let mut vad = synthetic_vad();
+    vad.set_accelerator(Arc::new(FakeAccel));
+    let pipeline = AudioPipelineBuilder::new()
+        .with_vad(vad)
+        .with_vad_on_cpu(true)
+        .build()
+        .unwrap();
+    assert!(!pipeline.vad().unwrap().is_accelerated());
+}
+
+#[test]
+fn build_with_config_vad_on_cpu_drops_a_pre_attached_accelerator() {
+    let mut vad = synthetic_vad();
+    vad.set_accelerator(Arc::new(FakeAccel));
+    let config = AudioPipelineConfig {
+        vad_on_cpu: true,
+        ..Default::default()
+    };
+    let pipeline = AudioPipelineBuilder::new()
+        .with_vad(vad)
+        .with_config(config)
+        .build()
+        .unwrap();
+    assert!(!pipeline.vad().unwrap().is_accelerated());
+}
+
+#[test]
+fn build_without_opt_out_keeps_a_pre_attached_accelerator() {
+    // The Keep arm never touches the DSP, so this runs on every host in every build.
+    let mut vad = synthetic_vad();
+    vad.set_accelerator(Arc::new(FakeAccel));
+    let pipeline = AudioPipelineBuilder::new().with_vad(vad).build().unwrap();
+    assert!(pipeline.vad().unwrap().is_accelerated());
+}
+
 /// Utterances still waiting on the diarizer are forgotten with the session on `reset`: nothing
 /// outside can see them (the new session never returns them), so they would only pile up.
 #[cfg(feature = "mmap")]

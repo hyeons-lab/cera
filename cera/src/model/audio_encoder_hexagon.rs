@@ -1950,10 +1950,7 @@ pub fn try_hexagon_audio_encoder(
             crate::backend::hexagon::log_context_unavailable("HexagonAudioEncoder", e);
         })
         .ok()?;
-    let arch_override = std::env::var("CERA_HEXAGON_ARCH")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .and_then(crate::backend::hexagon::HexagonArch::from_u32);
+    let arch_override = crate::backend::hexagon::arch_override();
     let dev = match crate::backend::hexagon::probe_device(context.driver(), arch_override) {
         Ok(d) => d,
         Err(e) => {

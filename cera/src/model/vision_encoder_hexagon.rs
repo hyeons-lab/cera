@@ -12,10 +12,10 @@ use std::sync::{Arc, Mutex};
 
 use crate::backend::hexagon::dispatch::{self, LayerNormArgs, TokenShape, TokenTile};
 use crate::backend::hexagon::{
-    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
-    HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, LockOrRecover,
-    RpcmemBuffer, align128, build_binary_kernel_params, repack_q4_0, repack_q8_0,
-    repacked_matrix_size_q4_0, repacked_matrix_size_q8_0,
+    FastRpcDriver, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonContext,
+    HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, LockOrRecover, RpcmemBuffer,
+    align128, build_binary_kernel_params, repack_q4_0, repack_q8_0, repacked_matrix_size_q4_0,
+    repacked_matrix_size_q8_0,
 };
 use crate::model::vision_encoder::{
     PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionEncoderWeights, VitStageDump,
@@ -1231,10 +1231,7 @@ pub fn try_new_hexagon_vision_encoder(
         })
         .ok()?;
 
-    let arch_override = std::env::var("CERA_HEXAGON_ARCH")
-        .ok()
-        .and_then(|s| s.parse::<u32>().ok())
-        .and_then(HexagonArch::from_u32);
+    let arch_override = crate::backend::hexagon::arch_override();
 
     let dev = match crate::backend::hexagon::probe_device(context.driver(), arch_override) {
         Ok(d) => d,

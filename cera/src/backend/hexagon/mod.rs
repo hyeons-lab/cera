@@ -49,6 +49,7 @@ pub mod types;
 
 pub use adpf::AdpfSession;
 pub use device::{HexagonArch, HexagonDevice, probe_device};
+pub(crate) use device::{arch_override, arch_override_with};
 pub use params::*;
 pub use queue::{BufferIndexMap, HexagonQueueSession, StagedBatch};
 pub use repack::*;

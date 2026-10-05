@@ -2830,6 +2830,12 @@ public protocol FfiAudioPipelineProtocol: AnyObject, Sendable {
      */
     func transcribePcm(pcm: [Float]) throws  -> String
     
+    /**
+     * Whether the VAD runs on the Hexagon NPU (false: the CPU, or no VAD). Read live: the VAD
+     * drops back to the CPU if the NPU fails mid-run.
+     */
+    func vadOnNpu()  -> Bool
+    
 }
 /**
  * Unified audio facade coordinating VAD, Hotword, and Whisper ASR.
@@ -3140,6 +3146,18 @@ open func transcribePcm(pcm: [Float])throws  -> String  {
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm(
             self.uniffiCloneHandle(),
         FfiConverterSequenceFloat.lower(pcm),$0
+    )
+})
+}
+    
+    /**
+     * Whether the VAD runs on the Hexagon NPU (false: the CPU, or no VAD). Read live: the VAD
+     * drops back to the CPU if the NPU fails mid-run.
+     */
+open func vadOnNpu() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+    uniffi_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu(
+            self.uniffiCloneHandle(),$0
     )
 })
 }
@@ -7143,6 +7161,11 @@ public struct FfiAudioPipelineConfig: Equatable, Hashable {
      * Whisper transcription options.
      */
     public var whisperOpts: FfiWhisperTranscribeOpts?
+    /**
+     * Keep the VAD on the CPU. In a build with the `hexagon` feature the pipeline otherwise
+     * runs the VAD's 16 kHz windows on the Hexagon NPU when one is available.
+     */
+    public var vadOnCpu: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -7167,7 +7190,11 @@ public struct FfiAudioPipelineConfig: Equatable, Hashable {
          */hotwordConfig: FfiHotwordConfig?, 
         /**
          * Whisper transcription options.
-         */whisperOpts: FfiWhisperTranscribeOpts?) {
+         */whisperOpts: FfiWhisperTranscribeOpts?, 
+        /**
+         * Keep the VAD on the CPU. In a build with the `hexagon` feature the pipeline otherwise
+         * runs the VAD's 16 kHz windows on the Hexagon NPU when one is available.
+         */vadOnCpu: Bool) {
         self.requireHotword = requireHotword
         self.autoTranscribe = autoTranscribe
         self.preRollMs = preRollMs
@@ -7175,6 +7202,7 @@ public struct FfiAudioPipelineConfig: Equatable, Hashable {
         self.vadConfig = vadConfig
         self.hotwordConfig = hotwordConfig
         self.whisperOpts = whisperOpts
+        self.vadOnCpu = vadOnCpu
     }
 
     
@@ -7199,7 +7227,8 @@ public struct FfiConverterTypeFfiAudioPipelineConfig: FfiConverterRustBuffer {
                 maxUtteranceMs: FfiConverterUInt32.read(from: &buf), 
                 vadConfig: FfiConverterOptionTypeFfiVadConfig.read(from: &buf), 
                 hotwordConfig: FfiConverterOptionTypeFfiHotwordConfig.read(from: &buf), 
-                whisperOpts: FfiConverterOptionTypeFfiWhisperTranscribeOpts.read(from: &buf)
+                whisperOpts: FfiConverterOptionTypeFfiWhisperTranscribeOpts.read(from: &buf), 
+                vadOnCpu: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -7211,6 +7240,7 @@ public struct FfiConverterTypeFfiAudioPipelineConfig: FfiConverterRustBuffer {
         FfiConverterOptionTypeFfiVadConfig.write(value.vadConfig, into: &buf)
         FfiConverterOptionTypeFfiHotwordConfig.write(value.hotwordConfig, into: &buf)
         FfiConverterOptionTypeFfiWhisperTranscribeOpts.write(value.whisperOpts, into: &buf)
+        FfiConverterBool.write(value.vadOnCpu, into: &buf)
     }
 }
 
@@ -13799,6 +13829,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 54575) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090) {

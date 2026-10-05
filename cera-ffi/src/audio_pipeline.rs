@@ -180,6 +180,9 @@ pub struct FfiAudioPipelineConfig {
     pub hotword_config: Option<FfiHotwordConfig>,
     /// Whisper transcription options.
     pub whisper_opts: Option<FfiWhisperTranscribeOpts>,
+    /// Keep the VAD on the CPU. In a build with the `hexagon` feature the pipeline otherwise
+    /// runs the VAD's 16 kHz windows on the Hexagon NPU when one is available.
+    pub vad_on_cpu: bool,
 }
 
 impl Default for FfiAudioPipelineConfig {
@@ -192,6 +195,7 @@ impl Default for FfiAudioPipelineConfig {
             vad_config: Some(FfiVadConfig::default()),
             hotword_config: None,
             whisper_opts: None,
+            vad_on_cpu: false,
         }
     }
 }
@@ -206,6 +210,7 @@ impl From<FfiAudioPipelineConfig> for cera::audio_pipeline::AudioPipelineConfig 
             vad_config: cfg.vad_config.map(Into::into).unwrap_or_default(),
             hotword_config: cfg.hotword_config.map(Into::into),
             whisper_opts: cfg.whisper_opts.map(Into::into),
+            vad_on_cpu: cfg.vad_on_cpu,
         }
     }
 }
@@ -557,6 +562,15 @@ impl FfiAudioPipeline {
         // A stopped diarizer reports false even when staging succeeded: the flag alone would
         // claim the NPU exactly when the labels stop. A poisoned mutex reads as no diarizer.
         self.diarizer_on_npu && self.inner.lock().is_ok_and(|p| p.has_diarizer())
+    }
+
+    /// Whether the VAD runs on the Hexagon NPU (false: the CPU, or no VAD). Read live: the VAD
+    /// drops back to the CPU if the NPU fails mid-run.
+    pub fn vad_on_npu(&self) -> bool {
+        // A poisoned mutex reads as no VAD, like `diarizer_on_npu`.
+        self.inner
+            .lock()
+            .is_ok_and(|p| p.vad().is_some_and(|v| v.is_accelerated()))
     }
 
     /// Register an utterance transcribed outside the pipeline so it gets an `UtteranceLabeled`
