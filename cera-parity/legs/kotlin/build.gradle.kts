@@ -30,7 +30,7 @@ dependencies {
     // both compile + runtime to call the loaded `libcera_ffi.so`.
     // Pin a version recent enough to support all the JNA features
     // UniFFI 0.31's Kotlin generator emits.
-    implementation("net.java.dev.jna:jna:5.15.0")
+    implementation("net.java.dev.jna:jna:5.19.1")
 
     // The generated binding compiles against kotlinx.coroutines for
     // the `async fn` exports (`Session.generateAsync` and friends).

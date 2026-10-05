@@ -691,6 +691,8 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() != 51752:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16() != 58081:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() != 13673:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state() != 59212:
@@ -1951,6 +1953,12 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk_pcm16.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk_pcm16.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_reset.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2783,6 +2791,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event.restype = 
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset.restype = ctypes.c_uint16
@@ -14297,6 +14308,20 @@ class FfiAudioPipelineProtocol(typing.Protocol):
         Process a streaming chunk of 16 kHz mono PCM audio samples.
 """
         raise NotImplementedError
+    def process_chunk_pcm16(self, pcm: bytes) -> typing.List[FfiAudioPipelineEvent]:
+        """
+        `process_chunk` for 16-bit signed little-endian PCM, as a capture API such as Android's
+        `AudioRecord` delivers it: two bytes per sample, converted to float here.
+
+        Prefer this over `process_chunk` from Kotlin, Swift and Dart. A `Vec<f32>` crosses the FFI
+        as a list of boxed floats that the generated code walks twice per call; at 16 kHz that
+        conversion cost about 0.05 CPU-seconds per audio second on a phone, ten times the whole
+        NPU pipeline. A byte array is copied in one call.
+
+        An odd byte count is an error: it can only be a torn read, and dropping the stray byte would
+        shift every later sample.
+"""
+        raise NotImplementedError
     def reset(self, ) -> None:
         """
         Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
@@ -14679,6 +14704,33 @@ class FfiAudioPipeline(FfiAudioPipelineProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def process_chunk_pcm16(self, pcm: bytes) -> typing.List[FfiAudioPipelineEvent]:
+        """
+        `process_chunk` for 16-bit signed little-endian PCM, as a capture API such as Android's
+        `AudioRecord` delivers it: two bytes per sample, converted to float here.
+
+        Prefer this over `process_chunk` from Kotlin, Swift and Dart. A `Vec<f32>` crosses the FFI
+        as a list of boxed floats that the generated code walks twice per call; at 16 kHz that
+        conversion cost about 0.05 CPU-seconds per audio second on a phone, ten times the whole
+        NPU pipeline. A byte array is copied in one call.
+
+        An odd byte count is an error: it can only be a torn read, and dropping the stray byte would
+        shift every later sample.
+"""
+        
+        _UniffiFfiConverterBytes.check_lower(pcm)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterBytes.lower(pcm),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterSequenceTypeFfiAudioPipelineEvent.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk_pcm16,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)

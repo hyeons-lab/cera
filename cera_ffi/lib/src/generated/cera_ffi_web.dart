@@ -7407,6 +7407,18 @@ final class FfiAudioPipeline {
   /// Process a streaming chunk of 16 kHz mono PCM audio samples.
   List<FfiAudioPipelineEvent> processChunk(List<double> chunk) => _unsupportedOnWeb('FfiAudioPipeline.processChunk');
 
+  /// `process_chunk` for 16-bit signed little-endian PCM, as a capture API such as Android's
+  /// `AudioRecord` delivers it: two bytes per sample, converted to float here.
+  ///
+  /// Prefer this over `process_chunk` from Kotlin, Swift and Dart. A `Vec<f32>` crosses the FFI
+  /// as a list of boxed floats that the generated code walks twice per call; at 16 kHz that
+  /// conversion cost about 0.05 CPU-seconds per audio second on a phone, ten times the whole
+  /// NPU pipeline. A byte array is copied in one call.
+  ///
+  /// An odd byte count is an error: it can only be a torn read, and dropping the stray byte would
+  /// shift every later sample.
+  List<FfiAudioPipelineEvent> processChunkPcm16(Uint8List pcm) => _unsupportedOnWeb('FfiAudioPipeline.processChunkPcm16');
+
   /// Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
   void reset() => _unsupportedOnWeb('FfiAudioPipeline.reset');
 

@@ -196,6 +196,11 @@ fails stops with a warning and the pipeline keeps transcribing. The event's
 while the diarizer stalled carry a `None` speaker with `dropped` set, so they
 stay distinguishable from genuine silence).
 
+From a foreign language feed the pipeline with `processChunkPcm16`, which takes 16-bit signed
+little-endian PCM bytes (what `AudioRecord` delivers) and converts in Rust. `processChunk` takes a
+`Vec<f32>`, which the generated code lowers as a list of boxed floats; at 16 kHz that alone cost
+about 0.05 CPU-seconds per audio second on a phone, ten times the whole NPU pipeline.
+
 `AudioPipelineConfig.hotword_config` supplies detector configuration unless an
 explicit builder/attached-iterator configuration takes precedence. The Flutter
 example's voice controller and portable `Cera` facade are separate from this
