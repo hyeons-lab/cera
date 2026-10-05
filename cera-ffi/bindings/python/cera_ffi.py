@@ -663,9 +663,13 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer() != 59328:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3() != 19665:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer() != 56903:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3() != 34038:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance() != 27373:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1871,6 +1875,16 @@ _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diari
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_int8,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files.argtypes = (
     _UniffiRustBuffer,
     _UniffiRustBuffer,
@@ -1889,6 +1903,16 @@ _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diari
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_int8,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_add_utterance.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2749,12 +2773,18 @@ _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes.rest
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance.restype = ctypes.c_uint16
@@ -8860,7 +8890,9 @@ class FfiAudioPipelineEvent:
         """
         The attached speaker diarizer has covered an utterance and assigned it a speaker. One per
         utterance, after its `UtteranceTranscribed`: a chunk plus its lookahead later (seconds with
-        the default preset). Needs a pipeline built with `from_files_with_diarizer`.
+        the default preset). Needs a pipeline built with a diarizer constructor
+        (`from_files_with_diarizer`, `from_files_with_diarizer_nemotron3`, or the `from_bytes`
+        twins).
 """
         
         def __init__(self, text:str, start_ms:float, end_ms:float, speaker:typing.Optional[int], confidence:typing.Optional[float], overlapping:typing.Optional[int], dropped:bool):
@@ -8885,8 +8917,9 @@ class FfiAudioPipelineEvent:
             self.speaker = speaker
             
             """
-        The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
-        span or the labeler had to give the utterance up (see `dropped`).
+        The most active speaker's slot (0 to 3 for Sortformer, 0 to 7 for Nemotron-3), or
+        `None` when no speaker was active over the span or the labeler had to give the
+        utterance up (see `dropped`).
 """
         
             self.confidence = confidence
@@ -14422,6 +14455,46 @@ class FfiAudioPipeline(FfiAudioPipelineProtocol):
         )
         return cls._uniffi_make_instance(_uniffi_ffi_result)
     @classmethod
+    def from_bytes_with_diarizer_nemotron3(cls, vad_bytes: typing.Optional[bytes],hotword_bytes: typing.Optional[bytes],whisper_bytes: typing.Optional[bytes],diarizer_bytes: bytes,prefer_npu: bool,config: typing.Optional[FfiAudioPipelineConfig]) -> FfiAudioPipeline:
+        """
+        Construct a pipeline from in-memory GGUF byte buffers with a Nemotron-3-Diarization
+        speaker diarizer (`diarizer_bytes`, a converted Nemotron-3 GGUF: 8 speakers, 10 ms
+        frames). Every transcribed utterance then gets an `UtteranceLabeled` event with its
+        speaker, once the diarizer covers it.
+
+        With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+        device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+        otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+"""
+        
+        _UniffiFfiConverterOptionalBytes.check_lower(vad_bytes)
+
+        _UniffiFfiConverterOptionalBytes.check_lower(hotword_bytes)
+
+        _UniffiFfiConverterOptionalBytes.check_lower(whisper_bytes)
+
+        _UniffiFfiConverterBytes.check_lower(diarizer_bytes)
+
+        _UniffiFfiConverterBoolean.check_lower(prefer_npu)
+
+        _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig.check_lower(config)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterOptionalBytes.lower(vad_bytes),
+            _UniffiFfiConverterOptionalBytes.lower(hotword_bytes),
+            _UniffiFfiConverterOptionalBytes.lower(whisper_bytes),
+            _UniffiFfiConverterBytes.lower(diarizer_bytes),
+            _UniffiFfiConverterBoolean.lower(prefer_npu),
+            _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig.lower(config),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeFfiAudioPipeline.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    @classmethod
     def from_files(cls, vad_path: typing.Optional[str],hotword_path: typing.Optional[str],whisper_path: typing.Optional[str],config: typing.Optional[FfiAudioPipelineConfig]) -> FfiAudioPipeline:
         """
         Construct a pipeline from filesystem model paths.
@@ -14484,6 +14557,46 @@ class FfiAudioPipeline(FfiAudioPipelineProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    @classmethod
+    def from_files_with_diarizer_nemotron3(cls, vad_path: typing.Optional[str],hotword_path: typing.Optional[str],whisper_path: typing.Optional[str],diarizer_path: str,prefer_npu: bool,config: typing.Optional[FfiAudioPipelineConfig]) -> FfiAudioPipeline:
+        """
+        Construct a pipeline from filesystem model paths with a Nemotron-3-Diarization
+        speaker diarizer (`diarizer_path`, a converted Nemotron-3 GGUF: 8 speakers, 10 ms
+        frames). Every transcribed utterance then gets an `UtteranceLabeled` event with its
+        speaker, once the diarizer has covered it.
+
+        With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+        device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+        otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+"""
+        
+        _UniffiFfiConverterOptionalString.check_lower(vad_path)
+
+        _UniffiFfiConverterOptionalString.check_lower(hotword_path)
+
+        _UniffiFfiConverterOptionalString.check_lower(whisper_path)
+
+        _UniffiFfiConverterString.check_lower(diarizer_path)
+
+        _UniffiFfiConverterBoolean.check_lower(prefer_npu)
+
+        _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig.check_lower(config)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterOptionalString.lower(vad_path),
+            _UniffiFfiConverterOptionalString.lower(hotword_path),
+            _UniffiFfiConverterOptionalString.lower(whisper_path),
+            _UniffiFfiConverterString.lower(diarizer_path),
+            _UniffiFfiConverterBoolean.lower(prefer_npu),
+            _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig.lower(config),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeFfiAudioPipeline.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3,
             *_uniffi_lowered_args,
         )
         return cls._uniffi_make_instance(_uniffi_ffi_result)

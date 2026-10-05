@@ -161,6 +161,11 @@ required-features = ["hexagon", "mmap"]
 name = "hexagon_sortformer_probe"
 required-features = ["hexagon", "mmap"]
 
+# The NPU Nemotron-3 diarizer, stage by stage against the CPU one (device only).
+[[example]]
+name = "hexagon_nemotron3_probe"
+required-features = ["hexagon", "mmap"]
+
 # wgpu parity/oracle tests: bodies are `#[cfg(feature = "gpu")]` and load
 # fixtures via `GgufFile::open` / `open_arc`, which are `#[cfg(feature =
 # "mmap")]`. Without `required-features` the `--no-default-features

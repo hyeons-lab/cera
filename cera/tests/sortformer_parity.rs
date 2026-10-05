@@ -35,22 +35,6 @@ use cera::model::sortformer::{
     SortformerAccelerator, SortformerModel, StreamingParams, stem_frames,
 };
 
-fn models_dir() -> Option<PathBuf> {
-    match std::env::var_os("SORTFORMER_MODELS_DIR") {
-        Some(dir) => Some(PathBuf::from(dir)),
-        None => match std::env::var("HOME") {
-            Ok(home) => Some(PathBuf::from(home).join(".leap/models/sortformer")),
-            Err(_) => {
-                assert!(
-                    std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
-                    "CERA_REQUIRE_MODEL=1 but HOME is unset and SORTFORMER_MODELS_DIR not provided"
-                );
-                None
-            }
-        },
-    }
-}
-
 /// The committed fixtures. `SORTFORMER_FIXTURES` overrides the compile-time path so a test binary
 /// cross-built for a device (where the source tree does not exist) can run against pushed copies.
 fn fixtures_dir() -> PathBuf {
@@ -62,17 +46,7 @@ fn fixtures_dir() -> PathBuf {
 
 /// A model-backed file, or `None` to skip.
 fn local(rel: &str) -> Option<PathBuf> {
-    let path = models_dir()?.join(rel);
-    if !path.exists() {
-        assert!(
-            std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
-            "CERA_REQUIRE_MODEL=1 but {} is absent",
-            path.display()
-        );
-        eprintln!("{} not found, skipping", path.display());
-        return None;
-    }
-    Some(path)
+    common::local_file("SORTFORMER_MODELS_DIR", "sortformer", rel)
 }
 
 fn model(file: &str) -> Option<SortformerModel> {

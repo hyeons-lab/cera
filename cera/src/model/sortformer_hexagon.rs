@@ -874,45 +874,19 @@ impl SortformerAccelerator for HexagonSortformer {
 /// model's accelerator. `None` (with the reason logged) when there is no usable NPU, the
 /// weights cannot be staged (for example a GGUF whose tail is not Q8_0), or the model already
 /// has an accelerator (a repeat call stages nothing and keeps the first); in the first two
-/// cases the model keeps running on the CPU.
+/// cases the model keeps running on the CPU. Call once during setup; concurrent staging is
+/// not supported (see [`stage_diarizer_accelerator`](crate::backend::hexagon::stage_diarizer_accelerator)).
 pub fn try_hexagon_sortformer(
     model: &SortformerModel,
     max_frames: usize,
 ) -> Option<Arc<HexagonSortformer>> {
-    if model.has_accelerator() {
-        tracing::info!("HexagonSortformer: the model already has an accelerator; keeping it");
-        return None;
-    }
-    let context = crate::backend::hexagon::HexagonContext::new()
-        .inspect_err(|e| {
-            crate::backend::hexagon::log_context_unavailable("HexagonSortformer", e);
-        })
-        .ok()?;
-    let arch_override = crate::backend::hexagon::arch_override();
-    let dev = match crate::backend::hexagon::probe_device(context.driver(), arch_override) {
-        Ok(d) => d,
-        Err(e) => {
-            tracing::info!("HexagonSortformer: DSP device unavailable ({e}), using the CPU");
-            return None;
-        }
-    };
-    let device = Arc::new(Mutex::new(dev));
-    let staged =
-        match HexagonSortformer::new(Arc::clone(context.driver()), device, model, max_frames) {
-            Ok(s) => Arc::new(s),
-            Err(e) => {
-                crate::backend::hexagon::hexagon_error!(
-                    "failed to stage Sortformer on the NPU: {e}"
-                );
-                return None;
-            }
-        };
-    if let Err(e) = model.set_accelerator(staged.clone()) {
-        crate::backend::hexagon::hexagon_warn!("HexagonSortformer: {e:#}");
-        return None;
-    }
-    tracing::info!("sortformer: using the Hexagon NPU ({max_frames} encoder frames)");
-    Some(staged)
+    crate::backend::hexagon::stage_diarizer_accelerator(
+        "Sortformer",
+        model.has_accelerator(),
+        max_frames,
+        |driver, device| HexagonSortformer::new(driver, device, model, max_frames),
+        |staged| model.set_accelerator(staged),
+    )
 }
 
 #[cfg(test)]

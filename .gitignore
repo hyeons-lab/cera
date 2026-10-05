@@ -49,6 +49,7 @@ training/**/__pycache__/
 
 # Environment
 .env
+.venv/
 
 # Benchmark artifacts
 benchmark_results.csv

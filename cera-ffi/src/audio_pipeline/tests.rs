@@ -73,12 +73,12 @@ fn warn_capture_keeps_warn_and_error_only() {
     );
 }
 
-/// Sortformer model path, or `None` (skip the test) when it is absent. One home per
-/// crate's unit tests; the cera unit tests, `model/sortformer_hexagon.rs`, and the
-/// integration suites resolve the same file on their own, so keep them in sync on a rename.
-fn sortformer_model_or_skip() -> Option<std::path::PathBuf> {
-    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default())
-        .join(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf");
+/// Model path under `~/.leap/models`, or `None` (skip the test) when it is absent. One
+/// home for this crate's unit tests; the cera unit tests, `model/sortformer_hexagon.rs`,
+/// `model/nemotron3_diarization_hexagon.rs`, and the integration suites resolve the same
+/// files on their own, so keep them in sync on a rename.
+fn model_or_skip(rel: &str) -> Option<std::path::PathBuf> {
+    let path = std::path::PathBuf::from(std::env::var("HOME").unwrap_or_default()).join(rel);
     if !path.exists() {
         assert!(
             std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
@@ -89,6 +89,14 @@ fn sortformer_model_or_skip() -> Option<std::path::PathBuf> {
         return None;
     }
     Some(path)
+}
+
+fn nemotron3_model_or_skip() -> Option<std::path::PathBuf> {
+    model_or_skip(".leap/models/nemotron3-diarization/nemotron3-diarization-q8_0-npu.gguf")
+}
+
+fn sortformer_model_or_skip() -> Option<std::path::PathBuf> {
+    model_or_skip(".leap/models/sortformer/sortformer-4spk-v2.1-q8_0.gguf")
 }
 
 #[test]
@@ -401,6 +409,121 @@ fn test_ffi_audio_pipeline_with_a_diarizer_from_bytes() {
     let Err(err) =
         FfiAudioPipeline::from_bytes_with_diarizer(None, None, None, vec![0u8; 64], false, None)
     else {
+        panic!("garbage diarizer bytes were accepted");
+    };
+    assert!(format!("{err:?}").contains("from bytes"), "{err:?}");
+}
+
+/// The Nemotron-3 file constructor attaches a running diarizer (skipped when the model
+/// is absent).
+#[test]
+fn test_ffi_audio_pipeline_with_a_nemotron3_diarizer() {
+    let Some(path) = nemotron3_model_or_skip() else {
+        return;
+    };
+    let config = FfiAudioPipelineConfig {
+        auto_transcribe: false,
+        ..audio_pipeline_default_config()
+    };
+    let pipeline = FfiAudioPipeline::from_files_with_diarizer_nemotron3(
+        None,
+        None,
+        None,
+        path.to_string_lossy().into_owned(),
+        false,
+        Some(config.clone()),
+    )
+    .expect("pipeline with a Nemotron-3 diarizer");
+    assert!(pipeline.has_diarizer().unwrap());
+    assert!(!pipeline.diarizer_on_npu());
+    assert!(pipeline.add_utterance("a".into(), 0.0, 300.0).unwrap());
+    // `prefer_npu` degrades gracefully when staging fails: a CPU diarizer, not an error and
+    // not a stuck on-NPU flag. (On Android staging may legitimately succeed, so the flag
+    // assert only holds off-device; the graceful-build asserts hold everywhere.)
+    let cpu = FfiAudioPipeline::from_files_with_diarizer_nemotron3(
+        None,
+        None,
+        None,
+        path.to_string_lossy().into_owned(),
+        true,
+        Some(config),
+    )
+    .expect("prefer_npu degrades gracefully when staging fails");
+    assert!(cpu.has_diarizer().unwrap());
+    if !cfg!(target_os = "android") {
+        assert!(
+            !cpu.diarizer_on_npu(),
+            "staging failed on host yet the flag claims the NPU"
+        );
+    }
+    // A missing model is an error that names the file, not a pipeline without a diarizer.
+    let Err(err) = FfiAudioPipeline::from_files_with_diarizer_nemotron3(
+        None,
+        None,
+        None,
+        "/nonexistent/nemotron3.gguf".into(),
+        false,
+        None,
+    ) else {
+        panic!("a missing diarizer model was accepted");
+    };
+    assert!(
+        format!("{err:?}").contains("/nonexistent/nemotron3.gguf"),
+        "{err:?}"
+    );
+}
+
+/// The Nemotron-3 bytes constructor attaches the same diarizer as the file constructor
+/// (skipped when the model is absent); the NPU flag stays `false`.
+#[test]
+fn test_ffi_audio_pipeline_with_a_nemotron3_diarizer_from_bytes() {
+    let Some(path) = nemotron3_model_or_skip() else {
+        return;
+    };
+    let config = FfiAudioPipelineConfig {
+        auto_transcribe: false,
+        ..audio_pipeline_default_config()
+    };
+    let bytes = std::fs::read(&path).unwrap();
+    let pipeline = FfiAudioPipeline::from_bytes_with_diarizer_nemotron3(
+        None,
+        None,
+        None,
+        bytes,
+        false,
+        Some(config.clone()),
+    )
+    .expect("pipeline with a Nemotron-3 diarizer from bytes");
+    assert!(pipeline.has_diarizer().unwrap());
+    assert!(!pipeline.diarizer_on_npu());
+    assert!(pipeline.add_utterance("a".into(), 0.0, 300.0).unwrap());
+    // `prefer_npu` degrades gracefully when staging fails: a CPU diarizer, not an error and
+    // not a stuck on-NPU flag (the flag assert only holds off-Android; see the file test).
+    let cpu = FfiAudioPipeline::from_bytes_with_diarizer_nemotron3(
+        None,
+        None,
+        None,
+        std::fs::read(&path).unwrap(),
+        true,
+        Some(config),
+    )
+    .expect("prefer_npu degrades gracefully when staging fails");
+    assert!(cpu.has_diarizer().unwrap());
+    if !cfg!(target_os = "android") {
+        assert!(
+            !cpu.diarizer_on_npu(),
+            "staging failed on host yet the flag claims the NPU"
+        );
+    }
+    // Garbage bytes are an error, not a pipeline without a diarizer.
+    let Err(err) = FfiAudioPipeline::from_bytes_with_diarizer_nemotron3(
+        None,
+        None,
+        None,
+        vec![0u8; 64],
+        false,
+        None,
+    ) else {
         panic!("garbage diarizer bytes were accepted");
     };
     assert!(format!("{err:?}").contains("from bytes"), "{err:?}");

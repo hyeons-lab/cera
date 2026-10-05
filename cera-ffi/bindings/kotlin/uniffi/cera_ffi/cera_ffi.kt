@@ -1230,9 +1230,13 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer(): Int
 
+    external fun uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3(): Int
+
     external fun uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer(): Int
+
+    external fun uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3(): Int
 
     external fun uniffi_cera_ffi_checksum_constructor_chatsession_from_session(): Int
 
@@ -2090,6 +2094,16 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): Long
 
+    external fun uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3(
+        `vadBytes`: RustBuffer.ByValue,
+        `hotwordBytes`: RustBuffer.ByValue,
+        `whisperBytes`: RustBuffer.ByValue,
+        `diarizerBytes`: RustBuffer.ByValue,
+        `preferNpu`: Byte,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
     external fun uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files(
         `vadPath`: RustBuffer.ByValue,
         `hotwordPath`: RustBuffer.ByValue,
@@ -2099,6 +2113,16 @@ internal object UniffiLib {
     ): Long
 
     external fun uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer(
+        `vadPath`: RustBuffer.ByValue,
+        `hotwordPath`: RustBuffer.ByValue,
+        `whisperPath`: RustBuffer.ByValue,
+        `diarizerPath`: RustBuffer.ByValue,
+        `preferNpu`: Byte,
+        `config`: RustBuffer.ByValue,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): Long
+
+    external fun uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3(
         `vadPath`: RustBuffer.ByValue,
         `hotwordPath`: RustBuffer.ByValue,
         `whisperPath`: RustBuffer.ByValue,
@@ -3322,10 +3346,16 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer() != 59328) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
+    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3() != 19665) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
     if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer() != 56903) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3() != 34038) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if (lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996) {
@@ -7442,6 +7472,39 @@ open class FfiAudioPipeline :
             )
 
         /**
+         * Construct a pipeline from in-memory GGUF byte buffers with a Nemotron-3-Diarization
+         * speaker diarizer (`diarizer_bytes`, a converted Nemotron-3 GGUF: 8 speakers, 10 ms
+         * frames). Every transcribed utterance then gets an `UtteranceLabeled` event with its
+         * speaker, once the diarizer covers it.
+         *
+         * With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+         * device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+         * otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+         */
+        @Throws(FfiException::class)
+        fun `fromBytesWithDiarizerNemotron3`(
+            `vadBytes`: kotlin.ByteArray?,
+            `hotwordBytes`: kotlin.ByteArray?,
+            `whisperBytes`: kotlin.ByteArray?,
+            `diarizerBytes`: kotlin.ByteArray,
+            `preferNpu`: kotlin.Boolean,
+            `config`: FfiAudioPipelineConfig?,
+        ): FfiAudioPipeline =
+            FfiConverterTypeFfiAudioPipeline.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3(
+                        FfiConverterOptionalByteArray.lower(`vadBytes`),
+                        FfiConverterOptionalByteArray.lower(`hotwordBytes`),
+                        FfiConverterOptionalByteArray.lower(`whisperBytes`),
+                        FfiConverterByteArray.lower(`diarizerBytes`),
+                        FfiConverterBoolean.lower(`preferNpu`),
+                        FfiConverterOptionalTypeFfiAudioPipelineConfig.lower(`config`),
+                        _status,
+                    )
+                },
+            )
+
+        /**
          * Construct a pipeline from filesystem model paths.
          */
         @Throws(FfiException::class)
@@ -7484,6 +7547,39 @@ open class FfiAudioPipeline :
             FfiConverterTypeFfiAudioPipeline.lift(
                 uniffiRustCallWithError(FfiException) { _status ->
                     UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer(
+                        FfiConverterOptionalString.lower(`vadPath`),
+                        FfiConverterOptionalString.lower(`hotwordPath`),
+                        FfiConverterOptionalString.lower(`whisperPath`),
+                        FfiConverterString.lower(`diarizerPath`),
+                        FfiConverterBoolean.lower(`preferNpu`),
+                        FfiConverterOptionalTypeFfiAudioPipelineConfig.lower(`config`),
+                        _status,
+                    )
+                },
+            )
+
+        /**
+         * Construct a pipeline from filesystem model paths with a Nemotron-3-Diarization
+         * speaker diarizer (`diarizer_path`, a converted Nemotron-3 GGUF: 8 speakers, 10 ms
+         * frames). Every transcribed utterance then gets an `UtteranceLabeled` event with its
+         * speaker, once the diarizer has covered it.
+         *
+         * With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+         * device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+         * otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+         */
+        @Throws(FfiException::class)
+        fun `fromFilesWithDiarizerNemotron3`(
+            `vadPath`: kotlin.String?,
+            `hotwordPath`: kotlin.String?,
+            `whisperPath`: kotlin.String?,
+            `diarizerPath`: kotlin.String,
+            `preferNpu`: kotlin.Boolean,
+            `config`: FfiAudioPipelineConfig?,
+        ): FfiAudioPipeline =
+            FfiConverterTypeFfiAudioPipeline.lift(
+                uniffiRustCallWithError(FfiException) { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3(
                         FfiConverterOptionalString.lower(`vadPath`),
                         FfiConverterOptionalString.lower(`hotwordPath`),
                         FfiConverterOptionalString.lower(`whisperPath`),
@@ -15052,7 +15148,9 @@ sealed class FfiAudioPipelineEvent {
     /**
      * The attached speaker diarizer has covered an utterance and assigned it a speaker. One per
      * utterance, after its `UtteranceTranscribed`: a chunk plus its lookahead later (seconds with
-     * the default preset). Needs a pipeline built with `from_files_with_diarizer`.
+     * the default preset). Needs a pipeline built with a diarizer constructor
+     * (`from_files_with_diarizer`, `from_files_with_diarizer_nemotron3`, or the `from_bytes`
+     * twins).
      */
     data class UtteranceLabeled(
         /**
@@ -15068,8 +15166,9 @@ sealed class FfiAudioPipelineEvent {
          */
         val `endMs`: kotlin.Float,
         /**
-         * The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
-         * span or the labeler had to give the utterance up (see `dropped`).
+         * The most active speaker's slot (0 to 3 for Sortformer, 0 to 7 for Nemotron-3), or
+         * `None` when no speaker was active over the span or the labeler had to give the
+         * utterance up (see `dropped`).
          */
         val `speaker`: kotlin.UInt?,
         /**

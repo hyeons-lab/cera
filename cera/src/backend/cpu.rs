@@ -8543,6 +8543,48 @@ pub fn apply_rope_to_head(head: &mut [f32], pos: usize, head_dim: usize, freq_ba
     }
 }
 
+/// Precompute the (sin, cos) pairs [`apply_rope_from_table`] consumes: `positions` rows of
+/// `head_dim / 2` pairs, `[((pos * half) + i) * 2]` = sin, `+ 1` = cos. The theta schedule
+/// is exactly [`apply_rope_to_head`]'s (iterative multiply from `pos`), so applying the
+/// table is bit-identical to the per-call computation while paying the `powf` once and each
+/// `sin_cos` once per position instead of once per layer per query/key head.
+pub fn rope_table(positions: usize, head_dim: usize, freq_base: f32) -> Vec<f32> {
+    let half_dim = head_dim / 2;
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+    let mut table = vec![0.0f32; positions * half_dim * 2];
+    for pos in 0..positions {
+        let mut theta = pos as f32;
+        for i in 0..half_dim {
+            let (sin_t, cos_t) = theta.sin_cos();
+            table[(pos * half_dim + i) * 2] = sin_t;
+            table[(pos * half_dim + i) * 2 + 1] = cos_t;
+            theta *= theta_scale;
+        }
+    }
+    table
+}
+
+/// [`apply_rope_to_head`] with the trig read from a [`rope_table`] instead of recomputed.
+/// Bit-identical to [`apply_rope_to_head`] for the `(pos, head_dim, freq_base)` the table
+/// was built with.
+///
+/// # Panics
+///
+/// If `table` holds fewer than `pos + 1` positions for `head_dim`.
+pub fn apply_rope_from_table(head: &mut [f32], pos: usize, head_dim: usize, table: &[f32]) {
+    let half_dim = head_dim / 2;
+    let row = &table[pos * half_dim * 2..(pos + 1) * half_dim * 2];
+    for i in 0..half_dim {
+        let sin_t = row[i * 2];
+        let cos_t = row[i * 2 + 1];
+
+        let x0 = head[i];
+        let x1 = head[i + half_dim];
+        head[i] = x0 * cos_t - x1 * sin_t;
+        head[i + half_dim] = x0 * sin_t + x1 * cos_t;
+    }
+}
+
 /// Compose an additional RoPE rotation onto an already-rotated head
 /// vector (Q or K). Given a head that was previously rotated for
 /// position `p_old` — so `head = R(p_old) · raw` — calling this with
@@ -11009,6 +11051,24 @@ mod tests {
 
         // q should have been rotated — not identical anymore
         assert!((q[0] - 1.0).abs() > 1e-3 || (q[2]).abs() > 1e-3);
+    }
+
+    #[test]
+    fn test_rope_table_matches_direct() {
+        // The precomputed table must be bit-identical to the per-call computation, or the
+        // streaming encoder (which shares one table across all layers) diverges from it.
+        for dh in [8, 16, 32, 64] {
+            let table = rope_table(300, dh, 10_000.0);
+            assert_eq!(table.len(), 300 * (dh / 2) * 2);
+            for pos in [0, 1, 7, 63, 299] {
+                let base: Vec<f32> = (0..dh).map(|i| i as f32 * 0.37 - 3.0).collect();
+                let mut a = base.clone();
+                let mut b = base;
+                apply_rope_to_head(&mut a, pos, dh, 10_000.0);
+                apply_rope_from_table(&mut b, pos, dh, &table);
+                assert_eq!(a, b, "pos {pos} dh {dh}");
+            }
+        }
     }
 
     #[test]

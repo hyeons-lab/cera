@@ -9,13 +9,14 @@
 //! whole span the diarizer has now covered. The text can be shown at once; the speaker follows.
 //!
 //! Both sides must count time from the same audio origin: frame `i` covers
-//! `[i * 80, (i + 1) * 80)` ms of the audio pushed to the diarizer, and an utterance's
-//! `start_ms`/`end_ms` are on that same clock (the pipeline's sample counter, if the same PCM is
-//! fed to both from the start).
+//! `[i * frame_ms, (i + 1) * frame_ms)` ms of the audio pushed to the diarizer, and an
+//! utterance's `start_ms`/`end_ms` are on that same clock (the pipeline's sample counter, if the
+//! same PCM is fed to both from the start). `frame_ms` is 80 for the 4-speaker Sortformer and 10
+//! for Nemotron-3-Diarization (see [`SpeakerLabelerConfig::frame_ms`]).
 //!
-//! **Speaker ids** are Sortformer's output slots, `0..4`. They are arrival ordered and stable for
-//! a session (the speaker cache keeps a speaker in its slot), but they are not names, and they
-//! restart when the diarizer does.
+//! **Speaker ids** are the diarizer's output slots, `0..S`. They are arrival ordered and stable
+//! for a session (the speaker cache keeps a speaker in its slot), but they are not names, and
+//! they restart when the diarizer does.
 //!
 //! **Rule.** A speaker counts as active in a frame when their probability reaches
 //! `active_threshold` (0.5, the usual diarization decision). Over an utterance's span, a
@@ -30,16 +31,17 @@
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
 
-/// Milliseconds per diarizer frame (the FastConformer's 8x subsampling of 10 ms mel frames).
+/// Milliseconds per diarizer frame of the 4-speaker Sortformer (the FastConformer's 8x
+/// subsampling of 10 ms mel frames); also the default [`SpeakerLabelerConfig::frame_ms`].
 pub const FRAME_MS: f64 = 80.0;
 
-/// Speaker slots the diarizer predicts.
+/// Speaker slots the 4-speaker Sortformer predicts.
 pub const SPEAKERS: usize = crate::model::sortformer::MAX_SPEAKERS;
 
 /// One stretch of one speaker slot's activity, from [`speaker_segments`].
 #[derive(Debug, Clone, Copy, PartialEq, Serialize, Deserialize)]
 pub struct SpeakerSegment {
-    /// The speaker slot (`0..4`).
+    /// The speaker slot (`0..S`).
     pub speaker: usize,
     /// Start, ms from the audio origin.
     pub start_ms: f64,
@@ -47,8 +49,8 @@ pub struct SpeakerSegment {
     pub end_ms: f64,
 }
 
-/// Turn per-frame speaker activities (`[k x 4]`, 80 ms frames, as the diarizer returns them)
-/// into contiguous per-speaker segments, ordered by start time.
+/// Turn per-frame speaker activities (`[k x S]`, `frame_ms` ms frames, as the diarizer returns
+/// them) into contiguous per-speaker segments, ordered by start time.
 ///
 /// A slot is active in a frame when its probability reaches `threshold`. Runs separated by at
 /// most `max_gap_frames` inactive frames are joined, and joined runs shorter than `min_frames`
@@ -56,21 +58,23 @@ pub struct SpeakerSegment {
 /// is how overlapped speech shows up).
 ///
 /// # Panics
-/// If `frames.len()` is not a multiple of 4.
-pub fn speaker_segments(
+/// If `S` is 0, or `frames.len()` is not a multiple of `S`.
+pub fn speaker_segments<const S: usize>(
     frames: &[f32],
     threshold: f32,
     max_gap_frames: usize,
     min_frames: usize,
+    frame_ms: f64,
 ) -> Vec<SpeakerSegment> {
+    assert!(S > 0, "speaker_segments needs at least one speaker slot");
     assert_eq!(
-        frames.len() % SPEAKERS,
+        frames.len() % S,
         0,
-        "frames must be [k x {SPEAKERS}] speaker activities"
+        "frames must be [k x {S}] speaker activities"
     );
-    let rows = frames.as_chunks::<SPEAKERS>().0;
+    let rows = frames.as_chunks::<S>().0;
     let mut out = Vec::new();
-    for speaker in 0..SPEAKERS {
+    for speaker in 0..S {
         // (first active frame, one past the last active frame) of the run being built.
         let mut run: Option<(usize, usize)> = None;
         let flush = |run: Option<(usize, usize)>, out: &mut Vec<SpeakerSegment>| {
@@ -79,8 +83,8 @@ pub fn speaker_segments(
             {
                 out.push(SpeakerSegment {
                     speaker,
-                    start_ms: a as f64 * FRAME_MS,
-                    end_ms: b as f64 * FRAME_MS,
+                    start_ms: a as f64 * frame_ms,
+                    end_ms: b as f64 * frame_ms,
                 });
             }
         };
@@ -126,6 +130,15 @@ pub struct SpeakerLabelerConfig {
     /// [`LabeledUtterance::dropped`] set), oldest first, so a stalled diarizer cannot grow the
     /// queue without bound.
     pub max_pending: usize,
+    /// Milliseconds per diarizer frame: 80 for the 4-speaker Sortformer, 10 for
+    /// Nemotron-3-Diarization. A NaN, zero or negative value falls back to [`FRAME_MS`].
+    /// Newer than the other fields: old persisted configs load with [`FRAME_MS`].
+    #[serde(default = "default_frame_ms")]
+    pub frame_ms: f64,
+}
+
+fn default_frame_ms() -> f64 {
+    FRAME_MS
 }
 
 impl Default for SpeakerLabelerConfig {
@@ -136,28 +149,29 @@ impl Default for SpeakerLabelerConfig {
             overlap_threshold: 0.5,
             history_ms: 10.0 * 60.0 * 1000.0,
             max_pending: 1024,
+            frame_ms: FRAME_MS,
         }
     }
 }
 
-/// Who spoke during a span.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct SpeakerLabel {
-    /// The most active speaker's slot (`0..4`).
+/// Who spoke during a span, over `S` speaker slots.
+#[derive(Debug, Clone, PartialEq)]
+pub struct SpeakerLabel<const S: usize> {
+    /// The most active speaker's slot (`0..S`).
     pub speaker: usize,
     /// That speaker's share of all speakers' active time over the span, in `(0, 1]`.
     pub confidence: f32,
     /// A second speaker who was also clearly active over the span, if any.
     pub overlapping: Option<usize>,
     /// Fraction of the span each slot was active (probability at or above `active_threshold`).
-    pub active: [f32; SPEAKERS],
+    pub active: [f32; S],
     /// Mean probability of each slot over the span.
-    pub activity: [f32; SPEAKERS],
+    pub activity: [f32; S],
 }
 
 /// An utterance and the speaker the diarizer assigned it.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct LabeledUtterance {
+#[derive(Debug, Clone, PartialEq)]
+pub struct LabeledUtterance<const S: usize> {
     /// The id the caller registered the utterance with.
     pub id: u64,
     /// Utterance start, ms from the audio origin.
@@ -165,7 +179,7 @@ pub struct LabeledUtterance {
     /// Utterance end, ms from the audio origin.
     pub end_ms: f64,
     /// `None` when the diarizer found no speaker active over the span (or had no frames for it).
-    pub label: Option<SpeakerLabel>,
+    pub label: Option<SpeakerLabel<S>>,
     /// The labeler gave up on this utterance without asking the diarizer: the queue overflowed
     /// (`max_pending`), the diarizer never reached its end within `history_ms`, or its times were
     /// not finite. A stalled diarizer therefore shows up as `dropped`, not as silence.
@@ -178,23 +192,169 @@ struct Pending {
     end_ms: f64,
 }
 
+// serde implements `Serialize`/`Deserialize` for arrays only up to fixed sizes, so the generic
+// `[f32; S]` fields need manual impls. The JSON shape is exactly what the derives produced for
+// 4 slots (a map with the fields in declaration order), pinned by `labels_round_trip_as_json`.
+impl<const S: usize> Serialize for SpeakerLabel<S> {
+    fn serialize<Se: serde::Serializer>(&self, s: Se) -> Result<Se::Ok, Se::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("SpeakerLabel", 5)?;
+        st.serialize_field("speaker", &self.speaker)?;
+        st.serialize_field("confidence", &self.confidence)?;
+        st.serialize_field("overlapping", &self.overlapping)?;
+        st.serialize_field("active", &self.active.as_slice())?;
+        st.serialize_field("activity", &self.activity.as_slice())?;
+        st.end()
+    }
+}
+
+impl<const S: usize> Serialize for LabeledUtterance<S> {
+    fn serialize<Se: serde::Serializer>(&self, s: Se) -> Result<Se::Ok, Se::Error> {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("LabeledUtterance", 5)?;
+        st.serialize_field("id", &self.id)?;
+        st.serialize_field("start_ms", &self.start_ms)?;
+        st.serialize_field("end_ms", &self.end_ms)?;
+        st.serialize_field("label", &self.label)?;
+        st.serialize_field("dropped", &self.dropped)?;
+        st.end()
+    }
+}
+
+impl<'de, const S: usize> Deserialize<'de> for SpeakerLabel<S> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, Visitor};
+        struct LabelVisitor<const S: usize>;
+        impl<'de, const S: usize> Visitor<'de> for LabelVisitor<S> {
+            type Value = SpeakerLabel<S>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a SpeakerLabel map")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let (mut speaker, mut confidence, mut overlapping, mut active, mut activity) =
+                    (None, None, None, None, None);
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "speaker" => {
+                            check_dup(speaker.replace(map.next_value()?), "speaker")?;
+                        }
+                        "confidence" => {
+                            check_dup(confidence.replace(map.next_value()?), "confidence")?;
+                        }
+                        "overlapping" => {
+                            check_dup(overlapping.replace(map.next_value()?), "overlapping")?;
+                        }
+                        "active" => {
+                            check_dup(active.replace(read_slots(&mut map)?), "active")?;
+                        }
+                        "activity" => {
+                            check_dup(activity.replace(read_slots(&mut map)?), "activity")?;
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(SpeakerLabel {
+                    speaker: missing(speaker, "speaker")?,
+                    confidence: missing(confidence, "confidence")?,
+                    overlapping: missing(overlapping, "overlapping")?,
+                    active: missing(active, "active")?,
+                    activity: missing(activity, "activity")?,
+                })
+            }
+        }
+        d.deserialize_map(LabelVisitor::<S>)
+    }
+}
+
+impl<'de, const S: usize> Deserialize<'de> for LabeledUtterance<S> {
+    fn deserialize<D: serde::Deserializer<'de>>(d: D) -> Result<Self, D::Error> {
+        use serde::de::{MapAccess, Visitor};
+        struct UtteranceVisitor<const S: usize>;
+        impl<'de, const S: usize> Visitor<'de> for UtteranceVisitor<S> {
+            type Value = LabeledUtterance<S>;
+            fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+                f.write_str("a LabeledUtterance map")
+            }
+            fn visit_map<A: MapAccess<'de>>(self, mut map: A) -> Result<Self::Value, A::Error> {
+                let (mut id, mut start_ms, mut end_ms, mut label, mut dropped) =
+                    (None, None, None, None, None);
+                while let Some(key) = map.next_key::<String>()? {
+                    match key.as_str() {
+                        "id" => {
+                            check_dup(id.replace(map.next_value()?), "id")?;
+                        }
+                        "start_ms" => {
+                            check_dup(start_ms.replace(map.next_value()?), "start_ms")?;
+                        }
+                        "end_ms" => {
+                            check_dup(end_ms.replace(map.next_value()?), "end_ms")?;
+                        }
+                        "label" => {
+                            check_dup(label.replace(map.next_value()?), "label")?;
+                        }
+                        "dropped" => {
+                            check_dup(dropped.replace(map.next_value()?), "dropped")?;
+                        }
+                        _ => {
+                            let _ = map.next_value::<serde::de::IgnoredAny>()?;
+                        }
+                    }
+                }
+                Ok(LabeledUtterance {
+                    id: missing(id, "id")?,
+                    start_ms: missing(start_ms, "start_ms")?,
+                    end_ms: missing(end_ms, "end_ms")?,
+                    label: missing(label, "label")?,
+                    dropped: missing(dropped, "dropped")?,
+                })
+            }
+        }
+        d.deserialize_map(UtteranceVisitor::<S>)
+    }
+}
+
+fn check_dup<T, E: serde::de::Error>(was: Option<T>, field: &'static str) -> Result<(), E> {
+    if was.is_some() {
+        return Err(E::duplicate_field(field));
+    }
+    Ok(())
+}
+
+fn missing<T, E: serde::de::Error>(v: Option<T>, field: &'static str) -> Result<T, E> {
+    v.ok_or_else(|| E::missing_field(field))
+}
+
+fn read_slots<'de, A: serde::de::MapAccess<'de>, const S: usize>(
+    map: &mut A,
+) -> Result<[f32; S], A::Error> {
+    use serde::de::Error;
+    let v: Vec<f32> = map.next_value()?;
+    v.try_into()
+        .map_err(|v: Vec<f32>| Error::invalid_length(v.len(), &"S speaker slots"))
+}
+
 /// Matches utterances with the diarizer's per-frame speaker activity. See the module docs.
-pub struct SpeakerLabeler {
+pub struct SpeakerLabeler<const S: usize> {
     cfg: SpeakerLabelerConfig,
     /// Frames from `first_frame` on.
-    frames: VecDeque<[f32; SPEAKERS]>,
+    frames: VecDeque<[f32; S]>,
     /// Absolute index of `frames[0]`.
     first_frame: usize,
     pending: VecDeque<Pending>,
     /// Utterances given up on (see [`LabeledUtterance::dropped`]), handed out by the next poll.
     /// At most `max_pending` are parked; older ones are counted in `lost`.
-    dropped: VecDeque<LabeledUtterance>,
+    dropped: VecDeque<LabeledUtterance<S>>,
     lost: u64,
 }
 
-impl SpeakerLabeler {
+impl<const S: usize> SpeakerLabeler<S> {
     /// A labeler with `cfg`.
+    /// # Panics
+    /// If `S` is 0.
     pub fn new(cfg: SpeakerLabelerConfig) -> Self {
+        assert!(S > 0, "a speaker labeler needs at least one speaker slot");
         Self {
             cfg,
             frames: VecDeque::new(),
@@ -205,14 +365,23 @@ impl SpeakerLabeler {
         }
     }
 
-    /// Frames received so far (80 ms each), including any already dropped from the history.
+    /// Milliseconds per frame, falling back to [`FRAME_MS`] for a bad configuration.
+    fn frame_ms(&self) -> f64 {
+        if self.cfg.frame_ms.is_finite() && self.cfg.frame_ms > 0.0 {
+            self.cfg.frame_ms
+        } else {
+            FRAME_MS
+        }
+    }
+
+    /// Frames received so far, including any already dropped from the history.
     pub fn frames_received(&self) -> usize {
         self.first_frame + self.frames.len()
     }
 
     /// Audio the diarizer has covered, in ms.
     pub fn covered_ms(&self) -> f64 {
-        self.frames_received() as f64 * FRAME_MS
+        self.frames_received() as f64 * self.frame_ms()
     }
 
     /// Utterances registered and not yet released.
@@ -227,7 +396,7 @@ impl SpeakerLabeler {
         self.lost
     }
 
-    fn park(&mut self, u: LabeledUtterance) {
+    fn park(&mut self, u: LabeledUtterance<S>) {
         self.dropped.push_back(u);
         while self.dropped.len() > self.cfg.max_pending.max(1) {
             self.dropped.pop_front();
@@ -235,22 +404,21 @@ impl SpeakerLabeler {
         }
     }
 
-    /// Append the diarizer's next frames, `[k x 4]` row-major, in order (the output of
-    /// `SortformerLive::push_audio` / `finish`).
+    /// Append the diarizer's next frames, `[k x S]` row-major, in order (the output of a
+    /// live diarizer's `push_audio` / `finish`).
     ///
     /// Poll between pushes: an utterance the diarizer has covered but nobody has polled still
     /// holds every frame since its start, so a caller that never polls keeps the whole history.
     ///
     /// # Panics
-    /// If `preds.len()` is not a multiple of 4.
+    /// If `preds.len()` is not a multiple of `S`.
     pub fn push_frames(&mut self, preds: &[f32]) {
         assert_eq!(
-            preds.len() % SPEAKERS,
+            preds.len() % S,
             0,
-            "frames must be [k x {SPEAKERS}] speaker activities"
+            "frames must be [k x {S}] speaker activities"
         );
-        self.frames
-            .extend(preds.as_chunks::<SPEAKERS>().0.iter().copied());
+        self.frames.extend(preds.as_chunks::<S>().0.iter().copied());
         // An utterance the diarizer still has not reached after a whole history window is stuck
         // (an end past the audio, a wrong clock): give up on it rather than let it pin frames.
         let covered = self.covered_ms();
@@ -275,11 +443,12 @@ impl SpeakerLabeler {
             }
         }
         // Keep the history window; pending utterances keep their frames alive until released.
-        let keep = (history_ms / FRAME_MS).ceil().max(1.0) as usize;
+        let frame_ms = self.frame_ms();
+        let keep = (history_ms / frame_ms).ceil().max(1.0) as usize;
         let oldest_needed = self
             .pending
             .iter()
-            .map(|p| (p.start_ms / FRAME_MS).floor().max(0.0) as usize)
+            .map(|p| (p.start_ms / frame_ms).floor().max(0.0) as usize)
             .min()
             .unwrap_or(usize::MAX);
         while self.frames.len() > keep && self.first_frame < oldest_needed {
@@ -326,8 +495,8 @@ impl SpeakerLabeler {
 
     /// Utterances whose whole span the diarizer has covered, in registration order, labeled.
     /// Utterances the labeler gave up on come first, unlabeled and `dropped`.
-    pub fn poll(&mut self) -> Vec<LabeledUtterance> {
-        let mut out: Vec<LabeledUtterance> = std::mem::take(&mut self.dropped).into();
+    pub fn poll(&mut self) -> Vec<LabeledUtterance<S>> {
+        let mut out: Vec<LabeledUtterance<S>> = std::mem::take(&mut self.dropped).into();
         // Utterances finish in order, but a long one can end after a shorter later one; release
         // every covered one, not only the head.
         let covered = self.covered_ms();
@@ -352,7 +521,7 @@ impl SpeakerLabeler {
 
     /// End of stream: label every remaining utterance with the frames that exist (the diarizer
     /// has been flushed), whether or not they reach the utterance's end.
-    pub fn flush(&mut self) -> Vec<LabeledUtterance> {
+    pub fn flush(&mut self) -> Vec<LabeledUtterance<S>> {
         let mut out = self.poll();
         while let Some(p) = self.pending.pop_front() {
             out.push(self.release(p, true));
@@ -360,7 +529,7 @@ impl SpeakerLabeler {
         out
     }
 
-    fn release(&self, p: Pending, label: bool) -> LabeledUtterance {
+    fn release(&self, p: Pending, label: bool) -> LabeledUtterance<S> {
         LabeledUtterance {
             id: p.id,
             start_ms: p.start_ms,
@@ -377,7 +546,7 @@ impl SpeakerLabeler {
     /// Who spoke over `[start_ms, end_ms)`, from the frames received so far. `None` if no frame
     /// overlaps the span (not yet received, or older than the history) or nobody reaches
     /// `min_active`.
-    pub fn label(&self, start_ms: f64, end_ms: f64) -> Option<SpeakerLabel> {
+    pub fn label(&self, start_ms: f64, end_ms: f64) -> Option<SpeakerLabel<S>> {
         if start_ms.is_nan()
             || end_ms.is_nan()
             || start_ms.is_infinite()
@@ -389,19 +558,20 @@ impl SpeakerLabeler {
         // A zero-length span is a point: it takes the whole frame it falls in.
         let point = end_ms <= start_ms;
 
-        let first = (start_ms / FRAME_MS).floor() as usize;
+        let frame_ms = self.frame_ms();
+        let first = (start_ms / frame_ms).floor() as usize;
         let last = if point {
             first.saturating_add(1)
         } else {
-            ((end_ms / FRAME_MS).ceil() as usize).max(first.saturating_add(1))
+            ((end_ms / frame_ms).ceil() as usize).max(first.saturating_add(1))
         }; // exclusive
-        let mut sum = [0.0f64; SPEAKERS];
-        let mut active_w = [0.0f64; SPEAKERS];
+        let mut sum = [0.0f64; S];
+        let mut active_w = [0.0f64; S];
         let mut weight = 0.0f64;
         for f in first.max(self.first_frame)..last.min(self.frames_received()) {
-            let (f_lo, f_hi) = (f as f64 * FRAME_MS, (f + 1) as f64 * FRAME_MS);
+            let (f_lo, f_hi) = (f as f64 * frame_ms, (f + 1) as f64 * frame_ms);
             let w = if point {
-                FRAME_MS
+                frame_ms
             } else {
                 (end_ms.min(f_hi) - start_ms.max(f_lo)).max(0.0)
             };
@@ -409,7 +579,7 @@ impl SpeakerLabeler {
                 continue;
             }
             let row = &self.frames[f - self.first_frame];
-            for k in 0..SPEAKERS {
+            for k in 0..S {
                 sum[k] += w * row[k] as f64;
                 if row[k] >= self.cfg.active_threshold {
                     active_w[k] += w;
@@ -421,28 +591,33 @@ impl SpeakerLabeler {
             return None;
         }
 
-        let mut activity = [0.0f32; SPEAKERS];
-        let mut active = [0.0f32; SPEAKERS];
-        for k in 0..SPEAKERS {
+        let mut activity = [0.0f32; S];
+        let mut active = [0.0f32; S];
+        for k in 0..S {
             activity[k] = (sum[k] / weight) as f32;
             active[k] = (active_w[k] / weight) as f32;
         }
-        let mut order = [0, 1, 2, 3];
+        let mut order = [0usize; S];
+        for (i, o) in order.iter_mut().enumerate() {
+            *o = i;
+        }
         order.sort_by(|&a, &b| {
             active[b]
                 .total_cmp(&active[a])
                 .then(activity[b].total_cmp(&activity[a]))
                 .then(a.cmp(&b))
         });
-        let (best, second) = (order[0], order[1]);
+        let best = order[0];
         let total: f32 = active.iter().sum();
         // `total` is 0 only if nobody is active; that is silence even with a `min_active` of 0.
         if active[best] < self.cfg.min_active || total <= 0.0 {
             return None;
         }
-        let overlapping = (active[second] >= self.cfg.overlap_threshold * active[best]
-            && active[second] >= self.cfg.min_active)
-            .then_some(second);
+        // A single slot has no runner-up (`order[1]` would panic for `S == 1`).
+        let overlapping = order.get(1).copied().filter(|&second| {
+            active[second] >= self.cfg.overlap_threshold * active[best]
+                && active[second] >= self.cfg.min_active
+        });
         Some(SpeakerLabel {
             speaker: best,
             confidence: active[best] / total,
@@ -472,8 +647,8 @@ mod tests {
         vec![0.01; n * SPEAKERS]
     }
 
-    fn labeler() -> SpeakerLabeler {
-        SpeakerLabeler::new(SpeakerLabelerConfig::default())
+    fn labeler() -> SpeakerLabeler<4> {
+        SpeakerLabeler::<4>::new(SpeakerLabelerConfig::default())
     }
 
     #[test]
@@ -556,7 +731,7 @@ mod tests {
     fn a_zero_max_pending_still_hands_out_the_newest_dropped_utterance() {
         // `max_pending: 0` releases every utterance at once; the parked list keeps one, so the
         // newest comes out of the next poll and the others are counted as lost.
-        let mut l = SpeakerLabeler::new(SpeakerLabelerConfig {
+        let mut l = SpeakerLabeler::<4>::new(SpeakerLabelerConfig {
             max_pending: 0,
             ..Default::default()
         });
@@ -637,7 +812,7 @@ mod tests {
             history_ms: 800.0, // 10 frames
             ..Default::default()
         };
-        let mut l = SpeakerLabeler::new(cfg);
+        let mut l = SpeakerLabeler::<4>::new(cfg);
         l.add_utterance(1, 0.0, 400.0);
         l.push_frames(&solo(3, 100));
         // The pending utterance pins frame 0, so nothing was dropped yet.
@@ -655,7 +830,7 @@ mod tests {
 
     #[test]
     fn a_stalled_diarizer_cannot_grow_the_queue() {
-        let mut l = SpeakerLabeler::new(SpeakerLabelerConfig {
+        let mut l = SpeakerLabeler::<4>::new(SpeakerLabelerConfig {
             max_pending: 2,
             ..Default::default()
         });
@@ -694,7 +869,7 @@ mod tests {
     fn a_point_span_late_in_a_long_stream_still_takes_its_frame() {
         // f32 milliseconds lose a 1 ms nudge past about 33 s, which used to give a zero-length
         // span no weight at all.
-        let mut l = SpeakerLabeler::new(SpeakerLabelerConfig {
+        let mut l = SpeakerLabeler::<4>::new(SpeakerLabelerConfig {
             history_ms: 1e12,
             ..Default::default()
         });
@@ -724,7 +899,7 @@ mod tests {
 
     #[test]
     fn nobody_active_is_unlabeled_even_with_no_minimum() {
-        let mut l = SpeakerLabeler::new(SpeakerLabelerConfig {
+        let mut l = SpeakerLabeler::<4>::new(SpeakerLabelerConfig {
             min_active: 0.0,
             ..Default::default()
         });
@@ -751,7 +926,7 @@ mod tests {
 
     #[test]
     fn the_queue_is_bounded_at_registration_not_only_at_poll() {
-        let mut l = SpeakerLabeler::new(SpeakerLabelerConfig {
+        let mut l = SpeakerLabeler::<4>::new(SpeakerLabelerConfig {
             max_pending: 3,
             ..Default::default()
         });
@@ -805,7 +980,7 @@ mod tests {
 
     #[test]
     fn an_utterance_the_diarizer_never_reaches_cannot_pin_the_history() {
-        let mut l = SpeakerLabeler::new(SpeakerLabelerConfig {
+        let mut l = SpeakerLabeler::<4>::new(SpeakerLabelerConfig {
             history_ms: 10_000.0, // 125 frames
             ..Default::default()
         });
@@ -851,7 +1026,7 @@ mod tests {
     #[test]
     fn a_non_positive_or_nan_history_keeps_one_frame() {
         for history_ms in [0.0, -5.0, f64::NAN] {
-            let mut l = SpeakerLabeler::new(SpeakerLabelerConfig {
+            let mut l = SpeakerLabeler::<4>::new(SpeakerLabelerConfig {
                 history_ms,
                 ..Default::default()
             });
@@ -896,7 +1071,7 @@ mod tests {
 
     #[test]
     fn a_stuck_utterance_expires_only_once_strictly_older_than_the_history() {
-        let mut l = SpeakerLabeler::new(SpeakerLabelerConfig {
+        let mut l = SpeakerLabeler::<4>::new(SpeakerLabelerConfig {
             history_ms: 800.0, // 10 frames
             ..Default::default()
         });
@@ -935,11 +1110,11 @@ mod tests {
     fn segments_follow_each_speakers_activity() {
         let frames = [solo(0, 5), silence(2), solo(2, 3)].concat();
         assert_eq!(
-            speaker_segments(&frames, 0.5, 0, 1),
+            speaker_segments::<4>(&frames, 0.5, 0, 1, 80.0),
             vec![seg(0, 0.0, 400.0), seg(2, 560.0, 800.0)]
         );
-        assert!(speaker_segments(&[], 0.5, 0, 1).is_empty());
-        assert!(speaker_segments(&silence(10), 0.5, 0, 1).is_empty());
+        assert!(speaker_segments::<4>(&[], 0.5, 0, 1, 80.0).is_empty());
+        assert!(speaker_segments::<4>(&silence(10), 0.5, 0, 1, 80.0).is_empty());
     }
 
     #[test]
@@ -958,15 +1133,15 @@ mod tests {
         }
         // A 2-frame gap is not joined at max_gap 1, and is at max_gap 2.
         assert_eq!(
-            speaker_segments(&frames, 0.5, 1, 2),
+            speaker_segments::<4>(&frames, 0.5, 1, 2, 80.0),
             vec![seg(0, 0.0, 240.0), seg(0, 400.0, 640.0)]
         );
         assert_eq!(
-            speaker_segments(&frames, 0.5, 2, 2),
+            speaker_segments::<4>(&frames, 0.5, 2, 2, 80.0),
             vec![seg(0, 0.0, 640.0)]
         );
         // With a minimum of 1 frame the blip survives; overlapping speakers both appear.
-        let all = speaker_segments(&frames, 0.5, 1, 1);
+        let all = speaker_segments::<4>(&frames, 0.5, 1, 1, 80.0);
         assert!(all.contains(&seg(1, 480.0, 560.0)), "{all:?}");
     }
 
@@ -974,8 +1149,131 @@ mod tests {
     fn a_probability_at_the_threshold_is_active() {
         let frames = [0.5, 0.0, 0.0, 0.0].repeat(2);
         assert_eq!(
-            speaker_segments(&frames, 0.5, 0, 1),
+            speaker_segments::<4>(&frames, 0.5, 0, 1, 80.0),
             vec![seg(0, 0.0, 160.0)]
         );
+    }
+
+    /// The hand-rolled `SpeakerLabel` serde keeps the shape the derives produced for 4
+    /// slots: exact string, round trip, unknown-field tolerance, duplicate/missing rejection.
+    #[test]
+    fn labels_round_trip_as_json() {
+        let label = SpeakerLabel::<4> {
+            speaker: 2,
+            confidence: 0.75,
+            overlapping: Some(1),
+            active: [0.0, 0.25, 1.0, 0.5],
+            activity: [0.1, 0.2, 0.9, 0.4],
+        };
+        let json = serde_json::to_string(&label).unwrap();
+        assert_eq!(
+            json,
+            r#"{"speaker":2,"confidence":0.75,"overlapping":1,"active":[0.0,0.25,1.0,0.5],"activity":[0.1,0.2,0.9,0.4]}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<SpeakerLabel<4>>(&json).unwrap(),
+            label
+        );
+        // Unknown fields are tolerated (forward-compatible reads).
+        let extra = json.replace(r#""speaker":2"#, r#""zzz":true,"speaker":2"#);
+        assert_eq!(
+            serde_json::from_str::<SpeakerLabel<4>>(&extra).unwrap(),
+            label
+        );
+        // Duplicates name the field (what the derive gave).
+        let dup = json.replace(r#""speaker":2"#, r#""speaker":2,"speaker":3"#);
+        let err = serde_json::from_str::<SpeakerLabel<4>>(&dup)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate field `speaker`"), "{err}");
+        // Missing fields are rejected.
+        let missing =
+            r#"{"speaker":2,"confidence":0.75,"overlapping":1,"active":[0.0,0.25,1.0,0.5]}"#;
+        let err = serde_json::from_str::<SpeakerLabel<4>>(missing)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("missing field `activity`"), "{err}");
+    }
+
+    #[test]
+    fn labeled_utterances_round_trip_as_json() {
+        let u = LabeledUtterance::<4> {
+            id: 7,
+            start_ms: 480.0,
+            end_ms: 4160.0,
+            label: Some(SpeakerLabel {
+                speaker: 0,
+                confidence: 1.0,
+                overlapping: None,
+                active: [1.0, 0.0, 0.0, 0.0],
+                activity: [0.9, 0.0, 0.0, 0.0],
+            }),
+            dropped: false,
+        };
+        let json = serde_json::to_string(&u).unwrap();
+        assert_eq!(
+            json,
+            r#"{"id":7,"start_ms":480.0,"end_ms":4160.0,"label":{"speaker":0,"confidence":1.0,"overlapping":null,"active":[1.0,0.0,0.0,0.0],"activity":[0.9,0.0,0.0,0.0]},"dropped":false}"#
+        );
+        assert_eq!(
+            serde_json::from_str::<LabeledUtterance<4>>(&json).unwrap(),
+            u
+        );
+        let dup = json.replace(r#""id":7"#, r#""id":7,"id":8"#);
+        let err = serde_json::from_str::<LabeledUtterance<4>>(&dup)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("duplicate field `id`"), "{err}");
+    }
+
+    #[test]
+    fn old_configs_without_frame_ms_load_with_the_default() {
+        let json = r#"{"active_threshold":0.5,"min_active":0.2,"overlap_threshold":0.5,"history_ms":600000.0,"max_pending":1024}"#;
+        let cfg: SpeakerLabelerConfig = serde_json::from_str(json).unwrap();
+        assert_eq!(cfg, SpeakerLabelerConfig::default());
+        assert_eq!(cfg.frame_ms, FRAME_MS);
+    }
+
+    /// A single slot labels (no `order[1]` panic) and never reports an overlap.
+    #[test]
+    fn a_single_slot_labels_without_a_runner_up() {
+        let mut l = SpeakerLabeler::<1>::new(SpeakerLabelerConfig::default());
+        l.push_frames(&[0.95; 10]);
+        let label = l.label(0.0, 800.0).unwrap();
+        assert_eq!(label.speaker, 0);
+        assert_eq!(label.overlapping, None);
+        assert!((label.confidence - 1.0).abs() < 1e-6, "{label:?}");
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one speaker slot")]
+    fn zero_slots_panic_readably_on_construction() {
+        let _ = SpeakerLabeler::<0>::new(SpeakerLabelerConfig::default());
+    }
+
+    #[test]
+    #[should_panic(expected = "at least one speaker slot")]
+    fn zero_slot_segments_panic_readably() {
+        let _ = speaker_segments::<0>(&[], 0.5, 1, 1, 80.0);
+    }
+
+    /// Eight slots at 10 ms frames (the Nemotron-3 path): slots past 3 are real slots.
+    #[test]
+    fn eight_slots_label_at_ten_ms_frames() {
+        let cfg = SpeakerLabelerConfig {
+            frame_ms: 10.0,
+            ..SpeakerLabelerConfig::default()
+        };
+        let mut l = SpeakerLabeler::<8>::new(cfg);
+        let frames: Vec<f32> = (0..200)
+            .flat_map(|f| {
+                let mut row = [0.02f32; 8];
+                row[if f < 100 { 5 } else { 7 }] = 0.95;
+                row
+            })
+            .collect();
+        l.push_frames(&frames);
+        assert_eq!(l.label(0.0, 1000.0).unwrap().speaker, 5);
+        assert_eq!(l.label(1000.0, 2000.0).unwrap().speaker, 7);
     }
 }

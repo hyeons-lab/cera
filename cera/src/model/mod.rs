@@ -11,6 +11,7 @@ pub mod gemma4;
 pub mod hybrid;
 pub mod lfm2;
 pub mod llama;
+pub mod nemotron3_diarization;
 pub mod pii;
 pub mod qwen35;
 mod session_gate;
@@ -72,6 +73,8 @@ pub(crate) mod audio_mel_hexagon;
 pub(crate) mod audio_stem_hexagon;
 #[cfg(feature = "hexagon")]
 pub mod hexagon_lfm2;
+#[cfg(feature = "hexagon")]
+pub mod nemotron3_diarization_hexagon;
 #[cfg(feature = "hexagon")]
 pub mod sortformer_hexagon;
 #[cfg(feature = "hexagon")]

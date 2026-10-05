@@ -81,7 +81,9 @@ pub enum FfiAudioPipelineEvent {
     },
     /// The attached speaker diarizer has covered an utterance and assigned it a speaker. One per
     /// utterance, after its `UtteranceTranscribed`: a chunk plus its lookahead later (seconds with
-    /// the default preset). Needs a pipeline built with `from_files_with_diarizer`.
+    /// the default preset). Needs a pipeline built with a diarizer constructor
+    /// (`from_files_with_diarizer`, `from_files_with_diarizer_nemotron3`, or the `from_bytes`
+    /// twins).
     UtteranceLabeled {
         /// The utterance text, as in its `UtteranceTranscribed` event.
         text: String,
@@ -89,8 +91,9 @@ pub enum FfiAudioPipelineEvent {
         start_ms: f32,
         /// End timestamp of the utterance in milliseconds.
         end_ms: f32,
-        /// The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
-        /// span or the labeler had to give the utterance up (see `dropped`).
+        /// The most active speaker's slot (0 to 3 for Sortformer, 0 to 7 for Nemotron-3), or
+        /// `None` when no speaker was active over the span or the labeler had to give the
+        /// utterance up (see `dropped`).
         speaker: Option<u32>,
         /// The speaker's share of all speakers' active time over the span, in (0, 1].
         confidence: Option<f32>,
@@ -230,32 +233,66 @@ pub struct FfiAudioPipeline {
     pub(crate) diarizer_on_npu: bool,
 }
 
-impl FfiAudioPipeline {
-    /// Stage `model` on the Hexagon NPU when asked and possible; reports whether it runs
-    /// there (false on builds without the `hexagon` feature, or when staging fails).
-    fn stage_diarizer(
-        model: &cera::model::sortformer::SortformerModel,
-        window_frames: usize,
-        prefer_npu: bool,
-    ) -> bool {
+/// Which speaker-diarizer model the `build_from_*` helpers attach.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum DiarizerKind {
+    Sortformer,
+    Nemotron3,
+}
+
+/// Try staging a diarizer model on the Hexagon NPU: true when it runs there, false on
+/// builds without the `hexagon` feature or when staging fails. One impl per model type (the
+/// `try_hexagon_*` paths exist only with the feature); the `prefer_npu` gate lives in
+/// [`FfiAudioPipeline::stage_diarizer_on_npu`].
+trait TryStageNpu {
+    fn try_stage_npu(&self, window_frames: usize) -> bool;
+}
+
+impl TryStageNpu for cera::model::sortformer::SortformerModel {
+    fn try_stage_npu(&self, window_frames: usize) -> bool {
         #[cfg(feature = "hexagon")]
         {
-            prefer_npu
-                && cera::model::sortformer_hexagon::try_hexagon_sortformer(model, window_frames)
-                    .is_some()
+            cera::model::sortformer_hexagon::try_hexagon_sortformer(self, window_frames).is_some()
         }
         #[cfg(not(feature = "hexagon"))]
         {
-            let _ = (model, window_frames, prefer_npu);
+            let _ = window_frames;
             false
         }
+    }
+}
+
+impl TryStageNpu for cera::model::nemotron3_diarization::Nemotron3Model {
+    fn try_stage_npu(&self, window_frames: usize) -> bool {
+        #[cfg(feature = "hexagon")]
+        {
+            cera::model::nemotron3_diarization_hexagon::try_hexagon_nemotron3(self, window_frames)
+                .is_some()
+        }
+        #[cfg(not(feature = "hexagon"))]
+        {
+            let _ = window_frames;
+            false
+        }
+    }
+}
+
+impl FfiAudioPipeline {
+    /// Stage `model` on the Hexagon NPU when asked and possible; reports whether it runs
+    /// there (false on builds without the `hexagon` feature, or when staging fails).
+    fn stage_diarizer_on_npu<M: TryStageNpu>(
+        model: &M,
+        window_frames: usize,
+        prefer_npu: bool,
+    ) -> bool {
+        prefer_npu && model.try_stage_npu(window_frames)
     }
 
     fn build_from_files(
         vad_path: Option<String>,
         hotword_path: Option<String>,
         whisper_path: Option<String>,
-        diarizer: Option<(String, bool)>,
+        diarizer: Option<(DiarizerKind, String, bool)>,
         config: Option<FfiAudioPipelineConfig>,
     ) -> Result<Arc<Self>, FfiError> {
         let mut builder = cera::audio_pipeline::AudioPipelineBuilder::new();
@@ -285,7 +322,7 @@ impl FfiAudioPipeline {
         }
         let diarizer_on_npu = match diarizer {
             None => false,
-            Some((dp, prefer_npu)) => {
+            Some((DiarizerKind::Sortformer, dp, prefer_npu)) => {
                 let model =
                     cera::model::sortformer::SortformerModel::from_file(&dp).map_err(|e| {
                         FfiError::Backend {
@@ -295,8 +332,20 @@ impl FfiAudioPipeline {
                         }
                     })?;
                 let params = model.default_streaming().clone();
-                let on_npu = Self::stage_diarizer(&model, params.window_frames(), prefer_npu);
+                let on_npu =
+                    Self::stage_diarizer_on_npu(&model, params.window_frames(), prefer_npu);
                 builder = builder.with_diarizer(model, params);
+                on_npu
+            }
+            Some((DiarizerKind::Nemotron3, dp, prefer_npu)) => {
+                let model = cera::model::nemotron3_diarization::Nemotron3Model::from_file(&dp)
+                    .map_err(|e| FfiError::Backend {
+                        detail: format!("failed to load the Nemotron-3 diarizer from {dp}: {e:#}"),
+                    })?;
+                let params = model.default_streaming().clone();
+                let on_npu =
+                    Self::stage_diarizer_on_npu(&model, params.window_frames(), prefer_npu);
+                builder = builder.with_diarizer_nemotron3(model, params);
                 on_npu
             }
         };
@@ -315,7 +364,7 @@ impl FfiAudioPipeline {
         vad_bytes: Option<Vec<u8>>,
         hotword_bytes: Option<Vec<u8>>,
         whisper_bytes: Option<Vec<u8>>,
-        diarizer: Option<(Vec<u8>, bool)>,
+        diarizer: Option<(DiarizerKind, Vec<u8>, bool)>,
         config: Option<FfiAudioPipelineConfig>,
     ) -> Result<Arc<Self>, FfiError> {
         let mut builder = cera::audio_pipeline::AudioPipelineBuilder::new();
@@ -345,7 +394,7 @@ impl FfiAudioPipeline {
         }
         let diarizer_on_npu = match diarizer {
             None => false,
-            Some((db, prefer_npu)) => {
+            Some((DiarizerKind::Sortformer, db, prefer_npu)) => {
                 let model =
                     cera::model::sortformer::SortformerModel::from_bytes(db).map_err(|e| {
                         FfiError::Backend {
@@ -355,8 +404,20 @@ impl FfiAudioPipeline {
                         }
                     })?;
                 let params = model.default_streaming().clone();
-                let on_npu = Self::stage_diarizer(&model, params.window_frames(), prefer_npu);
+                let on_npu =
+                    Self::stage_diarizer_on_npu(&model, params.window_frames(), prefer_npu);
                 builder = builder.with_diarizer(model, params);
+                on_npu
+            }
+            Some((DiarizerKind::Nemotron3, db, prefer_npu)) => {
+                let model = cera::model::nemotron3_diarization::Nemotron3Model::from_bytes(db)
+                    .map_err(|e| FfiError::Backend {
+                        detail: format!("failed to load the Nemotron-3 diarizer from bytes: {e:#}"),
+                    })?;
+                let params = model.default_streaming().clone();
+                let on_npu =
+                    Self::stage_diarizer_on_npu(&model, params.window_frames(), prefer_npu);
+                builder = builder.with_diarizer_nemotron3(model, params);
                 on_npu
             }
         };
@@ -430,7 +491,33 @@ impl FfiAudioPipeline {
             vad_path,
             hotword_path,
             whisper_path,
-            Some((diarizer_path, prefer_npu)),
+            Some((DiarizerKind::Sortformer, diarizer_path, prefer_npu)),
+            config,
+        )
+    }
+
+    /// Construct a pipeline from filesystem model paths with a Nemotron-3-Diarization
+    /// speaker diarizer (`diarizer_path`, a converted Nemotron-3 GGUF: 8 speakers, 10 ms
+    /// frames). Every transcribed utterance then gets an `UtteranceLabeled` event with its
+    /// speaker, once the diarizer has covered it.
+    ///
+    /// With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+    /// device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+    /// otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+    #[uniffi::constructor]
+    pub fn from_files_with_diarizer_nemotron3(
+        vad_path: Option<String>,
+        hotword_path: Option<String>,
+        whisper_path: Option<String>,
+        diarizer_path: String,
+        prefer_npu: bool,
+        config: Option<FfiAudioPipelineConfig>,
+    ) -> Result<Arc<Self>, FfiError> {
+        Self::build_from_files(
+            vad_path,
+            hotword_path,
+            whisper_path,
+            Some((DiarizerKind::Nemotron3, diarizer_path, prefer_npu)),
             config,
         )
     }
@@ -466,7 +553,33 @@ impl FfiAudioPipeline {
             vad_bytes,
             hotword_bytes,
             whisper_bytes,
-            Some((diarizer_bytes, prefer_npu)),
+            Some((DiarizerKind::Sortformer, diarizer_bytes, prefer_npu)),
+            config,
+        )
+    }
+
+    /// Construct a pipeline from in-memory GGUF byte buffers with a Nemotron-3-Diarization
+    /// speaker diarizer (`diarizer_bytes`, a converted Nemotron-3 GGUF: 8 speakers, 10 ms
+    /// frames). Every transcribed utterance then gets an `UtteranceLabeled` event with its
+    /// speaker, once the diarizer covers it.
+    ///
+    /// With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+    /// device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+    /// otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+    #[uniffi::constructor]
+    pub fn from_bytes_with_diarizer_nemotron3(
+        vad_bytes: Option<Vec<u8>>,
+        hotword_bytes: Option<Vec<u8>>,
+        whisper_bytes: Option<Vec<u8>>,
+        diarizer_bytes: Vec<u8>,
+        prefer_npu: bool,
+        config: Option<FfiAudioPipelineConfig>,
+    ) -> Result<Arc<Self>, FfiError> {
+        Self::build_from_bytes(
+            vad_bytes,
+            hotword_bytes,
+            whisper_bytes,
+            Some((DiarizerKind::Nemotron3, diarizer_bytes, prefer_npu)),
             config,
         )
     }

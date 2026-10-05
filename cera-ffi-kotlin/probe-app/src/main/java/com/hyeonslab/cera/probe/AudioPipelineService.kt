@@ -23,8 +23,8 @@ import java.util.concurrent.atomic.AtomicBoolean
 
 /**
  * Always-on transcription with speaker labels: a foreground service of type `microphone` that
- * feeds the microphone to a cera `AudioPipeline` (VAD, Whisper, Sortformer diarizer, optional wake
- * word), all on the Hexagon NPU where the device has one. Android demotes background CPU work and
+ * feeds the microphone to a cera `AudioPipeline` (VAD, Whisper, a speaker diarizer, optional
+ * wake word), all on the Hexagon NPU where the device has one. Android demotes background CPU work and
  * does not demote the NPU, so the CPU time the service itself spends is the number to watch: it
  * logs CPU seconds per audio second to logcat (`CeraAudio`) every minute.
  *
@@ -339,7 +339,12 @@ class AudioPipelineService : Service() {
         val whisper = models.whisper?.absolutePath
         val diarizer = models.diarizer?.absolutePath
         return if (diarizer != null) {
-            FfiAudioPipeline.fromFilesWithDiarizer(vad, hotword, whisper, diarizer, preferNpu = true, config)
+            when (models.diarizerKind) {
+                DiarizerKind.NEMOTRON3 ->
+                    FfiAudioPipeline.fromFilesWithDiarizerNemotron3(vad, hotword, whisper, diarizer, preferNpu = true, config)
+                DiarizerKind.SORTFORMER ->
+                    FfiAudioPipeline.fromFilesWithDiarizer(vad, hotword, whisper, diarizer, preferNpu = true, config)
+            }
         } else {
             FfiAudioPipeline.fromFiles(vad, hotword, whisper, config)
         }
