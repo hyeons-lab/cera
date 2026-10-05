@@ -26,8 +26,32 @@ thread_local! {
 
 #[cfg(has_blas)]
 thread_local! {
-    static PAR_EXPERT_GATE_UP_ROWS: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
-    static PAR_EXPERT_DEQUANT_SCRATCH: std::cell::RefCell<Vec<f32>> = const { std::cell::RefCell::new(Vec::new()) };
+    static PAR_EXPERT_GATE_UP_ROWS: std::cell::Cell<Option<Vec<f32>>> =
+        const { std::cell::Cell::new(None) };
+    static PAR_EXPERT_DEQUANT_SCRATCH: std::cell::Cell<Option<Vec<f32>>> =
+        const { std::cell::Cell::new(None) };
+}
+
+/// Run `f` with the TLS expert scratch buffer held by `tls`.
+///
+/// `Cell::take()`, not `with_borrow_mut`: the expert closure calls the
+/// `dequantize_*_matrix` helpers, which fan out over rayon themselves, and
+/// a worker waiting in the inner join steals outer expert tasks — so the
+/// expert closure re-enters on one thread and a `RefCell` borrow panics
+/// ("already borrowed", flaky). A nested call finds the slot empty and
+/// degrades to one temporary allocation. Mirrors `with_gemv_scratch`.
+#[cfg(has_blas)]
+#[inline]
+fn with_par_expert_scratch<R>(
+    tls: &'static std::thread::LocalKey<std::cell::Cell<Option<Vec<f32>>>>,
+    f: impl FnOnce(&mut Vec<f32>) -> R,
+) -> R {
+    tls.with(|cell| {
+        let mut buf = cell.take().unwrap_or_default();
+        let res = f(&mut buf);
+        cell.set(Some(buf));
+        res
+    })
 }
 
 // ── Pre-resolved weight reference ───────────────────────────────────────────
@@ -1107,17 +1131,22 @@ impl LfmModel {
         let ff = moe.expert_ff_len;
 
         let mut all_router_logits = vec![0.0f32; n * n_expert];
+        // Gate first: `try_blas_prefill_gemm_rowmajor` reports (and debug-panics
+        // on) a dtype it cannot run, e.g. an F32 router, even though this caller
+        // checks the bool and falls back to GEMV. The dense prefill blocks gate
+        // the same way; the gate, not the bool, is the decline path.
         #[cfg(has_blas)]
-        let blas_ok = transformer::try_blas_prefill_gemm_rowmajor(
-            &self.gguf,
-            &moe.router,
-            ffn_input,
-            &mut all_router_logits,
-            n,
-            n_expert,
-            hs,
-            &mut state.scratch.dequant_weight_scratch,
-        );
+        let blas_ok = transformer::batched_gemm_supports(moe.router.dtype, hs)
+            && transformer::try_blas_prefill_gemm_rowmajor(
+                &self.gguf,
+                &moe.router,
+                ffn_input,
+                &mut all_router_logits,
+                n,
+                n_expert,
+                hs,
+                &mut state.scratch.dequant_weight_scratch,
+            );
         #[cfg(not(has_blas))]
         let blas_ok = false;
 
@@ -1192,7 +1221,7 @@ impl LfmModel {
                     let dq_g = transformer::blas_dequantizer(moe.gate[e].dtype);
                     let dq_u = transformer::blas_dequantizer(moe.up[e].dtype);
                     let gate_up_ok = if let (Some(dq_g), Some(dq_u)) = (dq_g, dq_u) {
-                        PAR_EXPERT_GATE_UP_ROWS.with_borrow_mut(|rows| {
+                        with_par_expert_scratch(&PAR_EXPERT_GATE_UP_ROWS, |rows| {
                             if rows.len() < 2 * ff * hs {
                                 rows.resize(2 * ff * hs, 0.0);
                             }
@@ -1240,18 +1269,22 @@ impl LfmModel {
                         }
                     }
 
-                    let computed = PAR_EXPERT_DEQUANT_SCRATCH.with_borrow_mut(|scratch| {
-                        transformer::try_blas_prefill_gemm_rowmajor(
-                            &self.gguf,
-                            &moe.down[e],
-                            &exp_gate,
-                            &mut exp_down,
-                            k_e,
-                            hs,
-                            ff,
-                            scratch,
-                        )
-                    });
+                    // Gate first, as for the router above: calling the try-path
+                    // with a dtype it cannot run debug-panics instead of
+                    // declining to the GEMV fallback below.
+                    let computed = transformer::batched_gemm_supports(moe.down[e].dtype, ff)
+                        && with_par_expert_scratch(&PAR_EXPERT_DEQUANT_SCRATCH, |scratch| {
+                            transformer::try_blas_prefill_gemm_rowmajor(
+                                &self.gguf,
+                                &moe.down[e],
+                                &exp_gate,
+                                &mut exp_down,
+                                k_e,
+                                hs,
+                                ff,
+                                scratch,
+                            )
+                        });
                     if !computed {
                         transformer::warn_unbatchable("moe_down", moe.down[e].dtype);
                         for slot in 0..k_e {
