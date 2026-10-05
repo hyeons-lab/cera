@@ -23,10 +23,7 @@
 //! (the CPU takes them) and `t * 8` sub-frames past the valid groups are zeroed on the host
 //! after readback, like NeMo's masked output.
 
-use std::sync::{
-    Arc, Mutex,
-    atomic::{AtomicUsize, Ordering},
-};
+use std::sync::{Arc, Mutex};
 
 use crate::backend::cpu::RopeType;
 use crate::backend::hexagon::dispatch::{self, LayerNormArgs, OpSink, TokenShape, TokenTile, View};
@@ -790,6 +787,41 @@ fn emit_predict<S: OpSink>(
     Ok((so.pred, n10 * dims.n_spk))
 }
 
+/// Stage one predict call's host-written inputs into `buf` (the scratch bytes): the
+/// embedder frames at `so.xin`, the key bias (0 over the valid keys, suppressing past
+/// them), and zeroed padded-softmax / V-transpose boxes for the current `t`.
+///
+/// The sm/vt boxes are zeroed on EVERY call. The DSP's per-layer copies write only
+/// rows/cols `[0..t)` while the contraction reads the full `pad32(t)` stride, and a
+/// high-water mark that skips growth re-zeroing is wrong: when `t` grows across a
+/// 32-lane boundary the stride remap turns previously written valid lanes into padding
+/// lanes, and the contraction then reads stale data. Zeroing
+/// `O(heads * t * pad32(t))` bytes is negligible next to the DSP matmuls.
+fn stage_predict_input(
+    buf: &mut [u8],
+    so: &Scratch,
+    dims: &Dims,
+    emb: &[f32],
+    t: usize,
+    valid: usize,
+) {
+    let bytes = t * dims.d * 4;
+    buf[so.xin..so.xin + bytes].copy_from_slice(bytemuck::cast_slice(emb));
+    // The key bias: 0 for valid keys, suppressing past them.
+    let bias: &mut [f32] = bytemuck::cast_slice_mut(&mut buf[so.keybias..so.keybias + t * 4]);
+    bias.fill(0.0);
+    for b in &mut bias[valid.min(t)..t] {
+        *b = KEY_BIAS_SUPPRESSED;
+    }
+    let tp = pad32(t);
+    for (off, len) in [
+        (so.sm, dims.heads * t * tp * 4),
+        (so.vt, dims.heads * dims.dh * tp * 4),
+    ] {
+        buf[off..off + len].fill(0);
+    }
+}
+
 /// The input norm, encoder blocks, final norm, `proj`, subpixel upsampler and speaker head
 /// on the Hexagon NPU.
 ///
@@ -802,9 +834,6 @@ pub struct HexagonNemotron3Predict {
     so: Scratch,
     dims: Dims,
     max_frames: usize,
-    /// Largest `t` any `run` has staged: only a shrink below it can expose stale sm/vt
-    /// lanes (see `run`). Monotonic, so a stale read only ever re-zeroes.
-    staged_hi: AtomicUsize,
 }
 
 // SAFETY: once shared, the rpcmem buffers are only touched while holding `device` and
@@ -913,7 +942,6 @@ impl HexagonNemotron3Predict {
             so,
             dims,
             max_frames,
-            staged_hi: AtomicUsize::new(0),
         })
     }
 
@@ -971,49 +999,11 @@ impl HexagonNemotron3Predict {
         settled(dev.queue_session_mut(), || {
             let bytes = t * dims.d * 4;
             let buf = scratch.as_mut_slice();
-            buf[so.xin..so.xin + bytes].copy_from_slice(bytemuck::cast_slice(emb));
-            // The key bias: 0 for valid keys, suppressing past them.
-            let bias: &mut [f32] =
-                bytemuck::cast_slice_mut(&mut buf[so.keybias..so.keybias + t * 4]);
-            bias.fill(0.0);
-            for b in &mut bias[valid.min(t)..t] {
-                *b = KEY_BIAS_SUPPRESSED;
-            }
-            // The padded softmax and V^T layouts must read as zero where the DSP's copies
-            // do not write. The DSP only ever writes rows/cols `[0..t)` of them (the
-            // per-layer `copy_view`s), so:
-            // - the first call zeroes the whole max-frames regions (rpcmem is not zeroed
-            //   at alloc, so nothing else establishes it),
-            // - a shrink step (`t` below the high-water mark) re-zeroes the `t`-sized
-            //   regions, since bigger calls may have written stale lanes,
-            // - same-size and growth steps skip both (their unread lanes were zeroed
-            //   before and untouched since) and only advance the mark.
-            // `keybias` is fully rewritten every call, so it has no staleness.
-            let hi = self.staged_hi.load(Ordering::Relaxed);
-            let zero_now = hi == 0 || t < hi;
-            let (zt, ztp) = if hi == 0 {
-                (self.max_frames, pad32(self.max_frames))
-            } else {
-                (t, tp)
-            };
-            if zero_now {
-                let zero = [
-                    (so.sm, dims.heads * zt * ztp * 4),
-                    (so.vt, dims.heads * dims.dh * ztp * 4),
-                ];
-                for (off, len) in zero {
-                    buf[off..off + len].fill(0);
-                }
-            }
+            stage_predict_input(buf, &so, dims, emb, t, valid);
             scratch.flush_cpu_cache(so.xin, bytes);
             scratch.flush_cpu_cache(so.keybias, t * 4);
-            if zero_now {
-                scratch.flush_cpu_cache(so.sm, dims.heads * zt * ztp * 4);
-                scratch.flush_cpu_cache(so.vt, dims.heads * dims.dh * ztp * 4);
-            }
-            if t > hi {
-                self.staged_hi.store(t, Ordering::Relaxed);
-            }
+            scratch.flush_cpu_cache(so.sm, dims.heads * t * tp * 4);
+            scratch.flush_cpu_cache(so.vt, dims.heads * dims.dh * tp * 4);
         })
         .map_err(|e| CeraError::Backend(format!("nemotron3: {e}")))?;
 
@@ -1408,13 +1398,11 @@ mod tests {
             Add, // ln2
             MulMat,
             Add, // up
-            Cpy,
             Mul,
             Scale,
             Mul,
-            Scale,
             UnarySigmoid,
-            Mul, // tanh GELU
+            Mul, // tanh GELU (five ops: no copy pass, folded scales)
             MulMat,
             Add,
             Add, // down, residual
@@ -2020,5 +2008,53 @@ mod tests {
         // The declined model still diarizes on the CPU (1 s of silence).
         let out = model.diarize_offline(&vec![0.0; 16_000]).unwrap();
         assert!(!out.is_empty());
+    }
+
+    /// Growth across a `pad32` boundary re-zeroes the sm/vt boxes. The DSP's copies
+    /// write only `[0..t)` lanes while the contraction reads the full stride, and the
+    /// stride remap turns previously written valid lanes into padding lanes, so a
+    /// high-water mark that skips growth zeroing reads stale data. The trigger is
+    /// growth above the mark with a stride change (32 -> 33): a shrink (64 -> 32 ->
+    /// 33) re-zeroes as a shrink step and never trips it.
+    #[test]
+    fn growth_across_pad32_rezeroes_the_quadratic_scratch() {
+        let (_, dims) = fixture(1);
+        let so = Scratch::new(&dims, 64);
+        // Poisoned, like rpcmem at alloc: any skipped zeroing stays visible.
+        let mut buf = vec![0xA5u8; so.total_bytes];
+        let emb32 = vec![0.5f32; 32 * dims.d];
+        stage_predict_input(&mut buf, &so, &dims, &emb32, 32, 32);
+        // What the DSP's per-layer copies wrote under the old stride: valid lanes
+        // dense with nonzero data (pad32(32) == 32, so the whole box is valid).
+        let sm32: &mut [f32] =
+            bytemuck::cast_slice_mut(&mut buf[so.sm..so.sm + dims.heads * 32 * 32 * 4]);
+        sm32.fill(1.0);
+        let vt32: &mut [f32] =
+            bytemuck::cast_slice_mut(&mut buf[so.vt..so.vt + dims.heads * dims.dh * 32 * 4]);
+        vt32.fill(2.0);
+        // Grow across the boundary: stride 32 -> 64, with two suppressed keys.
+        let emb33 = vec![0.25f32; 33 * dims.d];
+        stage_predict_input(&mut buf, &so, &dims, &emb33, 33, 31);
+        // The whole current box reads zero, padding lanes included (the DSP rewrites
+        // the valid lanes of each call itself).
+        let sm: &[f32] = bytemuck::cast_slice(&buf[so.sm..so.sm + dims.heads * 33 * 64 * 4]);
+        assert!(
+            sm.iter().all(|&v| v == 0.0),
+            "stale sm lanes after growth across pad32"
+        );
+        let vt: &[f32] = bytemuck::cast_slice(&buf[so.vt..so.vt + dims.heads * dims.dh * 64 * 4]);
+        assert!(
+            vt.iter().all(|&v| v == 0.0),
+            "stale vt lanes after growth across pad32"
+        );
+        // Staging writes only the current box: past it the poison survives (the kernel
+        // never reads past the box, so the smaller zero is sufficient).
+        assert_eq!(buf[so.vt + dims.heads * dims.dh * 64 * 4], 0xA5);
+        // The frames echo and the bias suppresses past the valid keys.
+        let xin: &[f32] = bytemuck::cast_slice(&buf[so.xin..so.xin + 33 * dims.d * 4]);
+        assert!(xin.iter().all(|&v| v == 0.25));
+        let bias: &[f32] = bytemuck::cast_slice(&buf[so.keybias..so.keybias + 33 * 4]);
+        assert!(bias[..31].iter().all(|&v| v == 0.0));
+        assert!(bias[31..].iter().all(|&v| v == KEY_BIAS_SUPPRESSED));
     }
 }
