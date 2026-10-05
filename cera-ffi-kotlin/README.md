@@ -93,6 +93,100 @@ downloader.download("LFM2-1.2B-GGUF", "Q4_0").collect { state ->
 AndroidBundleRepo.download(context, "LFM2-1.2B-GGUF", "Q4_0").collect { ... }
 ```
 
+## Always-on transcription service (probe-app)
+
+`probe-app` contains a reference foreground service, `AudioPipelineService`, that feeds the
+microphone to a cera `AudioPipeline` (VAD, Whisper, Sortformer speaker diarizer, optional wake
+word). In a build with the `hexagon` feature every stage runs on the NPU, which Android does not
+demote when the app is in the background (it does demote background CPU work).
+
+- A microphone foreground service (`foregroundServiceType="microphone"`). Android 14+ only starts
+  one from a visible activity with `RECORD_AUDIO` already granted, so `AudioServiceActivity` starts
+  it; the service does not restart itself after the system kills it (a restart from the background
+  would be refused), so reopen the app.
+- Models are read from `audio-models/` under the app's `filesDir` (or the external files dir):
+  `vad.gguf` (required), `whisper.gguf`, `diarizer.gguf`, `hotword.gguf`. Whisper runs on the NPU
+  from Q8_0, Q4_0, F16, or F32 weights (the engine repacks F16/F32 to Q8_0 at load), and the
+  diarizer needs a `--tail-outtype q8_0` GGUF to run on the NPU; anything else falls back to the
+  CPU. The startup log line names each stage and its file size
+  (`pipeline ready: vad + whisper (82 MB) + diarizer (127 MB); ...`), which is how to tell which
+  Whisper is loaded.
+- **Use Whisper `base` at Q8_0 (recommended).** Make the file with
+  `cera transcribe --model base --quant q8_0 --download-model` (it lands in
+  `~/.cache/cera/huggingface.co/openai/whisper-base/quantized/Q8_0/model.gguf`) and push it as
+  `whisper.gguf`.
+
+  | Whisper (Q8_0) | Size | Time for 61 s of dense speech | CPU per audio second | Notes |
+  |----------------|------|-------------------------------|----------------------|-------|
+  | tiny | 44 MB | 17 s | 0.0093 | mishears words and invents fragments on noise |
+  | **base** | 82 MB | 27 s | 0.0099 | clean on live speech; the default to use |
+  | small | 265 MB | 73 s | 0.0115 | most accurate and consistent, but **slower than real time** on continuous speech |
+
+  Measured on a Galaxy S25 Ultra by replaying a 61 s clip (the same 15 s passage four times, in
+  English and Japanese) through the service at 4x. `tiny` at 17 s sits just above the 15.25 s
+  pace floor, so its Time cell reflects the replay pace while `base` and `small` are
+  compute-bound. The CPU column is comparable within this table only: the run config (build
+  type, chunk size, diarizer loaded or not) is not recorded here, so do not compare it against
+  the main table below. `small` got the Japanese phrase right where `tiny` and `base` did not
+  and gave identical English transcripts on all four repeats, but at 73 s for 61 s of audio
+  it cannot keep up with continuous talking, and the capture buffer is only 2 s, so a live
+  microphone would drop audio while it transcribes. It suits sparse speech. `medium` and
+  `large` are larger still and were not tried.
+- Transcripts, with speaker labels, are appended to `filesDir/transcript.jsonl` (one `transcript`
+  record when Whisper finishes an utterance, then an `utterance` record with its speaker once the
+  diarizer has covered it, about 15 s later). Whisper's bracketed non-speech tags such as
+  `[BLANK_AUDIO]` are dropped. The record shapes are `{"type":"transcript","start_ms":…,
+  "end_ms":…,"text":…}`, `{"type":"utterance","start_ms":…,"end_ms":…,"speaker":…,
+  "overlapping":…,"confidence":…,"text":…}` and `{"type":"wake_word","start_ms":…,"keyword":…,
+  "confidence":…} (`null` where a speaker or confidence is unknown). `speaker` and `overlapping`
+  are the diarizer's zero-based ids; the logcat and on-screen lines show the same speakers
+  one-based (`S1`, `S2`, …). Past 10 MB the file is rotated aside to `transcript.jsonl.1`, with
+  only one generation kept (a second rotation overwrites the first).
+- It logs CPU seconds per audio second every minute, with the input peak and whether Android is
+  silencing the recorder: `adb logcat -s CeraAudio`.
+- Intent extras (on `AudioServiceActivity`, forwarded to the service):
+
+  | Extra | Default | Meaning |
+  |-------|---------|---------|
+  | `autostart` (activity only) | false | start the service once the permissions are granted |
+  | `wake_lock` | true | hold a partial wake lock while running |
+  | `require_hotword` | false | wait for the wake word before transcribing; without `hotword.gguf` it transcribes unguarded and the status line says so |
+  | `chunk_ms` | 500 | audio per pipeline call, clamped to 100..2000 |
+  | `wav` | none | replay a 16 kHz mono 16-bit WAV instead of the microphone, then stop |
+  | `wav_speed` | 1.0 | replay rate for `wav` (0 = as fast as possible; refused unless 0 or >= 0.1) |
+
+Two things matter for the CPU numbers the service is built to minimise:
+
+- **Measure with the `field` build** (`./gradlew :probe-app:assembleField`), not `debug`. A
+  debuggable app runs its managed code in a deoptimizable interpreter, which made the service look
+  about 1.7x more expensive. The `field` build is non-debuggable but `profileable`, so
+  `simpleperf record --app` still works; push models to the external files dir
+  (`/sdcard/Android/data/com.hyeonslab.cera.probe/files/audio-models/`) because `run-as` needs a
+  debuggable app.
+- **Feed it PCM16 bytes and big chunks.** `processChunkPcm16` takes the bytes `AudioRecord`
+  delivers; `processChunk` lowers a `List<Float>` element by element (about a third of the
+  service's CPU at 100 ms chunks: 0.052 vs 0.035 CPU-s per audio-s in the table below).
+  And every FFI call pays a fixed JNA cost for its call-status and buffer structures, so the
+  per-call share at 500 ms chunks is a fifth of what it is at 100 ms (about half the total:
+  0.0095 vs 0.020 CPU-s per audio-s in the table below).
+
+Measured on a Galaxy S25 Ultra (VAD, Whisper tiny Q8_0 and the Sortformer diarizer, all on the
+NPU), CPU seconds per second of audio, whole process:
+
+| Configuration | CPU-s per audio-s |
+|---------------|-------------------|
+| debug build, `processChunk` floats, 100 ms chunks | 0.052 |
+| debug build, `processChunkPcm16`, 100 ms | 0.035 |
+| `field` build, 100 ms | 0.020 |
+| `field` build, 500 ms (default), quiet room | 0.0095 |
+| same, backgrounded with the screen off | 0.0093 to 0.0107 |
+| same, replaying 61 s of speech (Whisper and diarizer active) | 0.0112 |
+
+That is about 34 to 40 CPU-seconds per hour of audio, about 1% of one core.
+
+The pure parts (model discovery, PCM conversion, the capture loop, event formatting, CPU metering)
+have JVM unit tests: `./gradlew :probe-app:testDebugUnitTest`.
+
 ## Hexagon NPU (Android)
 
 `cera-ffi-android` can run inference on Qualcomm Hexagon NPUs from a
