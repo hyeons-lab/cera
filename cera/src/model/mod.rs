@@ -738,6 +738,20 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// The token-embedding rows this backend's token prefill feeds its first layer, row-major
+    /// `[tokens.len() * hidden_size]`, or `None` when it cannot hand them out (the default) or a
+    /// token id is out of range.
+    ///
+    /// Lets a caller splice token rows and non-token rows (an image between text segments)
+    /// into ONE [`Self::forward_prefill_from_embeddings`] instead of one prefill forward per
+    /// segment, which on a backend with a fixed cost per forward is most of a short prompt's
+    /// time. Only a backend whose token prefill is exactly a row lookup into an embedding table
+    /// (no scaling, no per-token transform) may implement it, so the two routes agree.
+    fn embed_token_rows(&self, tokens: &[u32]) -> Option<Vec<f32>> {
+        let _ = tokens;
+        None
+    }
+
     /// Forward pass with a float embedding as input (instead of a token ID).
     /// Used to feed audio codec embeddings back into the LLM after an audio frame.
     /// Default: panics (must be overridden by backends that support audio).

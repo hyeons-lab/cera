@@ -882,8 +882,11 @@ impl HexagonVisionEncoder {
             "encode_image: {n_patches} patches exceeds MAX_VIT_TOKENS ({MAX_VIT_TOKENS})"
         );
 
+        let vit_timing = std::env::var_os("CERA_HEXAGON_VIT_TIMING").is_some();
+        let host_start = std::time::Instant::now();
         // 1. Patch embedding on host CPU
         let mut tokens = patch_embed_compute(pixels, &self.patch_embed, cfg, grid_w, grid_h);
+        let patch_embed_ms = host_start.elapsed().as_secs_f64() * 1000.0;
 
         // 2. Add interpolated position embeddings
         let trained_side = (cfg.n_trained_patches as f64).sqrt().round() as usize;
@@ -913,6 +916,7 @@ impl HexagonVisionEncoder {
             *t += *p;
         }
 
+        let host_pre_ms = host_start.elapsed().as_secs_f64() * 1000.0;
         let mut dump = dump;
         if let Some(d) = dump.as_deref_mut() {
             d.x0 = tokens.clone();
@@ -1165,7 +1169,10 @@ impl HexagonVisionEncoder {
             Ok(())
         };
 
+        let blocks_start = std::time::Instant::now();
         let vit_res = run_vit_blocks(session, &mut scratch_guard);
+        let blocks_ms = blocks_start.elapsed().as_secs_f64() * 1000.0;
+        let post_start = std::time::Instant::now();
         if vit_res.is_err() {
             session.drop_pending_batch();
         }
@@ -1265,6 +1272,12 @@ impl HexagonVisionEncoder {
                             &scratch_guard.as_slice()
                                 [so.proj_final_off..so.proj_final_off + out_bytes],
                         );
+                        if vit_timing {
+                            eprintln!(
+                                "ViT timing: patch_embed {patch_embed_ms:.1} ms | host_pre {host_pre_ms:.1} ms | dsp_blocks {blocks_ms:.1} ms | post (readback, pixel shuffle, projector) {:.1} ms",
+                                post_start.elapsed().as_secs_f64() * 1000.0
+                            );
+                        }
                         return Ok(out_slice.to_vec());
                     }
                     Err(e) => {

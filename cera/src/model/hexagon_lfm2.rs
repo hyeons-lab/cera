@@ -3196,6 +3196,25 @@ impl Model for HexagonLfmModel {
         true
     }
 
+    /// The same table rows `try_forward_prefill_chunk_input` copies for `PrefillInput::Tokens`
+    /// (a plain row lookup, nothing applied afterwards), so a prefill from these rows is the
+    /// token prefill.
+    fn embed_token_rows(&self, tokens: &[u32]) -> Option<Vec<f32>> {
+        let hs = self.config.hidden_size;
+        if tokens
+            .iter()
+            .any(|&t| (t as usize) >= self.config.vocab_size)
+        {
+            return None;
+        }
+        let mut rows = vec![0.0f32; tokens.len() * hs];
+        for (i, &t) in tokens.iter().enumerate() {
+            self.token_embd
+                .row_into(t as usize, &mut rows[i * hs..(i + 1) * hs]);
+        }
+        Some(rows)
+    }
+
     fn forward_from_embedding(
         &self,
         embedding: &[f32],
