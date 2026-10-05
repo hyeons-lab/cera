@@ -170,6 +170,7 @@ jobs:
         if: success()
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GEMINI_MODEL: 'gemini-3.8-flash'
           PR_NUMBER: ${{ inputs.pull_number || github.event.issue.number || github.event.pull_request.number }}
           RESPONSE: ${{ steps.gemini.outputs.gemini_response || steps.gemini.outputs.response }}
           EFFORT_LEVEL: ${{ steps.review_config.outputs.effort }}
