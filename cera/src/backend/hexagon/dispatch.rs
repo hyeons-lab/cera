@@ -14,9 +14,9 @@
 use super::{
     HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonQueueSession,
     HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode, MulMatF32Shape, RpcmemBuffer,
-    build_binary_kernel_params, build_layer_norm_params, build_mul_mat_f32_kernel_params,
-    build_mul_mat_kernel_params, build_softmax_kernel_params, build_ssm_conv_kernel_params,
-    build_unary_kernel_params,
+    build_binary_kernel_params, build_hmx_mm_kernel_params, build_layer_norm_params,
+    build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params, build_softmax_kernel_params,
+    build_ssm_conv_kernel_params, build_unary_kernel_params, mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::session::CeraError;
 
@@ -189,6 +189,13 @@ fn enqueue_broadcast_add<S: OpSink>(
         .map_err(|e| op_err(name, e))
 }
 
+/// Opt-in HMX matmul for [`linear_m_with`]: the VTCM budget the HMX chunking is
+/// solved against. A caller passes it only for a device whose DSP has HMX.
+#[derive(Debug, Clone, Copy)]
+pub(crate) struct HmxMm {
+    pub vtcm_budget: usize,
+}
+
 /// Linear layer `dst[tokens, rows] = x[tokens, cols] . Wt (+ bias)`.
 ///
 /// `bias_offset` is `None` for bias-free projections. With
@@ -206,6 +213,42 @@ pub(crate) fn linear_m<S: OpSink>(
     n_tokens: usize,
     tile: TokenTile,
 ) -> Result<(), CeraError> {
+    linear_m_with(
+        session,
+        x,
+        x_offset,
+        weights,
+        w_desc,
+        bias_offset,
+        dst,
+        dst_offset,
+        n_tokens,
+        tile,
+        None,
+    )
+}
+
+/// [`linear_m`] that may run the matmul on the HMX matrix unit.
+///
+/// With `hmx` set, a whole-batch (`TokenTile::Whole`) projection whose dims are 32
+/// aligned and whose batch has at least [`mm_is_hmx_eligible`]'s minimum rows runs the
+/// DSP's HMX matmul, as the LFM2 prefill does: the same repacked weights feed both
+/// kernels and only the dim-1 weight stride differs. Anything else, or a chunking
+/// that does not fit the budget, keeps the HVX matmul.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn linear_m_with<S: OpSink>(
+    session: &mut S,
+    x: &S::Buf,
+    x_offset: usize,
+    weights: &S::Buf,
+    w_desc: HexagonWeightDesc,
+    bias_offset: impl Into<Option<usize>>,
+    dst: &S::Buf,
+    dst_offset: usize,
+    n_tokens: usize,
+    tile: TokenTile,
+    hmx: Option<HmxMm>,
+) -> Result<(), CeraError> {
     let (w_dtype, block_bytes, tile_size) = match w_desc.format {
         HexagonWeightFormat::RepackedQ8_0 => (HtpDataType::Q8_0, 34usize, 32 * 34usize),
         HexagonWeightFormat::RepackedQ4_0 => (HtpDataType::Q4_0, 18usize, 32 * 18usize),
@@ -213,6 +256,27 @@ pub(crate) fn linear_m<S: OpSink>(
     let (cols, rows) = (w_desc.cols, w_desc.rows);
     let tiled_row_bytes = cols.div_ceil(32) * tile_size;
     let w_tot = rows.div_ceil(32) * tiled_row_bytes;
+    // One whole-batch run only: the weight tensor's stride is registered once and the
+    // HMX kernel reads it differently from the HVX one.
+    let hmx_kparams = match (hmx, tile) {
+        (Some(h), TokenTile::Whole) if mm_is_hmx_eligible(w_dtype, cols, rows, n_tokens) => {
+            build_hmx_mm_kernel_params(
+                w_dtype,
+                cols,
+                rows,
+                n_tokens.next_multiple_of(32),
+                n_tokens,
+                session.dsp_threads(),
+                h.vtcm_budget,
+            )
+        }
+        _ => None,
+    };
+    let w_nb1 = if hmx_kparams.is_some() {
+        mm_hmx_nb1(w_dtype, cols)
+    } else {
+        tiled_row_bytes
+    };
     let w_ti = session.add_tensor(
         weights,
         w_desc.offset,
@@ -220,12 +284,7 @@ pub(crate) fn linear_m<S: OpSink>(
         HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
         w_dtype as u32,
         [cols as u32, rows as u32, 1, 1],
-        [
-            block_bytes as u32,
-            tiled_row_bytes as u32,
-            w_tot as u32,
-            w_tot as u32,
-        ],
+        [block_bytes as u32, w_nb1 as u32, w_tot as u32, w_tot as u32],
     )?;
     let b_ti = match bias_offset.into() {
         Some(b_off) => Some(add_f32_vector(session, weights, b_off, rows)?),
@@ -235,15 +294,17 @@ pub(crate) fn linear_m<S: OpSink>(
     for (start, run) in token_runs(n_tokens, tile) {
         let x_ti = add_f32_rows(session, x, x_offset + start * cols * 4, cols, run)?;
         let dst_ti = add_f32_rows(session, dst, dst_offset + start * rows * 4, rows, run)?;
-        let kparams = build_mul_mat_kernel_params(
-            w_dtype,
-            cols,
-            run as u32,
-            1,
-            rows * 4,
-            session.dsp_threads(),
-            VTCM_BUDGET,
-        );
+        let kparams = hmx_kparams.unwrap_or_else(|| {
+            build_mul_mat_kernel_params(
+                w_dtype,
+                cols,
+                run as u32,
+                1,
+                rows * 4,
+                session.dsp_threads(),
+                VTCM_BUDGET,
+            )
+        });
         session
             .enqueue_op(
                 HtpOpCode::MulMat as u32,
@@ -1266,6 +1327,64 @@ mod tests {
         assert_eq!(s.dst(4).size, 2 * 96 * 4);
         // Bias add targets the tile's dst tensor and the shared bias tensor.
         assert_eq!(s.ops[5].src, vec![s.ops[4].dst[0], 1]);
+    }
+
+    /// `kparams[6]` is the DSP's `n_hmx` word: 1 on the HMX matmul, 0 on the HVX one.
+    const KPARAMS_N_HMX: usize = 6;
+
+    #[test]
+    fn linear_m_with_hmx_runs_the_hmx_matmul_with_its_own_weight_stride() {
+        let hmx = Some(HmxMm {
+            vtcm_budget: 8 * 1024 * 1024,
+        });
+        let run = |tokens: usize, rows: usize, cols: usize, tile: TokenTile, hmx| {
+            let mut s = RecordingSink::default();
+            linear_m_with(
+                &mut s,
+                &"x",
+                0,
+                &"w",
+                desc(rows, cols),
+                None,
+                &"y",
+                0,
+                tokens,
+                tile,
+                hmx,
+            )
+            .unwrap();
+            s
+        };
+
+        let s = run(280, 96, 64, TokenTile::Whole, hmx);
+        assert_eq!(s.opcodes(), vec![OP_MULMAT]);
+        assert_eq!(s.ops[0].kparams[KPARAMS_N_HMX], 1, "HMX kernel params");
+        // The same weight bytes, addressed per N tile instead of per N row of K tiles.
+        assert_eq!(
+            s.tensors[0].nb[1] as usize,
+            mm_hmx_nb1(HtpDataType::Q8_0, 64)
+        );
+
+        let hvx = run(280, 96, 64, TokenTile::Whole, None);
+        assert_eq!(hvx.ops[0].kparams[KPARAMS_N_HMX], 0, "no option, HVX");
+        assert_eq!(
+            hvx.tensors[0].nb[1] as usize,
+            64usize.div_ceil(32) * 32 * 34
+        );
+
+        // Too few rows for the matrix unit, unaligned dims and a tiled batch stay HVX.
+        for (tokens, rows, cols, tile) in [
+            (4, 96, 64, TokenTile::Whole),
+            (280, 96, 48, TokenTile::Whole),
+            (280, 90, 64, TokenTile::Whole),
+            (280, 96, 64, TokenTile::Tiles(64)),
+        ] {
+            let s = run(tokens, rows, cols, tile, hmx);
+            assert!(
+                s.ops.iter().all(|o| o.kparams[KPARAMS_N_HMX] == 0),
+                "{tokens} tokens {rows}x{cols} {tile:?}"
+            );
+        }
     }
 
     #[test]

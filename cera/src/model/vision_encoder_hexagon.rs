@@ -33,6 +33,15 @@ const VIT_TILE: TokenTile = TokenTile::Whole;
 
 pub use crate::backend::hexagon::types::HexagonWeightDesc as HexagonVitWeightDesc;
 
+/// The HMX matmul option for a ViT projection: on when the DSP has HMX, off with
+/// `CERA_HEXAGON_VIT_MM=hvx` to compare against the HVX matmul.
+fn vit_hmx(session: &HexagonQueueSession) -> Option<dispatch::HmxMm> {
+    let hvx_only = std::env::var("CERA_HEXAGON_VIT_MM").is_ok_and(|v| v == "hvx");
+    (!hvx_only && session.dsp_hmx() > 0).then(|| dispatch::HmxMm {
+        vtcm_budget: session.dsp_vtcm_bytes(),
+    })
+}
+
 /// Whether `n_tokens` rows fit the fused Q/K/V kernel's VTCM layout. That
 /// kernel cannot chunk its activation rows, so past this the three projections
 /// run on their own, each chunking itself.
@@ -492,7 +501,16 @@ impl HexagonVisionEncoder {
         // VTCM layout holds the three projections run on their own (each
         // chunks itself): a few hundred tokens of a large image.
         let fits_fused = qkv_fits_fused(fused_dtype, q_w.cols, n_tokens, session.dsp_threads());
+        // The HMX matmul beats the fused HVX kernel once there are rows to feed it.
+        let hmx_matmul = vit_hmx(session).is_some()
+            && crate::backend::hexagon::mm_is_hmx_eligible(
+                fused_dtype,
+                q_w.cols,
+                q_w.rows,
+                n_tokens,
+            );
         if !(fits_fused
+            && !hmx_matmul
             && q_w.cols == k_w.cols
             && k_w.cols == v_w.cols
             && q_w.rows == k_w.rows
@@ -500,14 +518,44 @@ impl HexagonVisionEncoder {
             && q_w.format == k_w.format
             && k_w.format == v_w.format)
         {
-            dispatch::linear_m(
-                session, x, x_offset, weights, q_w, q_b_off, dst, q_dst_off, n_tokens, VIT_TILE,
+            dispatch::linear_m_with(
+                session,
+                x,
+                x_offset,
+                weights,
+                q_w,
+                q_b_off,
+                dst,
+                q_dst_off,
+                n_tokens,
+                VIT_TILE,
+                vit_hmx(session),
             )?;
-            dispatch::linear_m(
-                session, x, x_offset, weights, k_w, k_b_off, dst, k_dst_off, n_tokens, VIT_TILE,
+            dispatch::linear_m_with(
+                session,
+                x,
+                x_offset,
+                weights,
+                k_w,
+                k_b_off,
+                dst,
+                k_dst_off,
+                n_tokens,
+                VIT_TILE,
+                vit_hmx(session),
             )?;
-            dispatch::linear_m(
-                session, x, x_offset, weights, v_w, v_b_off, dst, v_dst_off, n_tokens, VIT_TILE,
+            dispatch::linear_m_with(
+                session,
+                x,
+                x_offset,
+                weights,
+                v_w,
+                v_b_off,
+                dst,
+                v_dst_off,
+                n_tokens,
+                VIT_TILE,
+                vit_hmx(session),
             )?;
             return Ok(());
         }
@@ -983,7 +1031,7 @@ impl HexagonVisionEncoder {
                 )?;
 
                 // Out projection + bias: attn_out -> proj_out
-                dispatch::linear_m(
+                dispatch::linear_m_with(
                     session,
                     scratch_guard,
                     so.attn_out_off,
@@ -994,6 +1042,7 @@ impl HexagonVisionEncoder {
                     so.proj_out_off,
                     n_patches,
                     VIT_TILE,
+                    vit_hmx(session),
                 )?;
 
                 // Residual add: tokens += proj_out
@@ -1031,7 +1080,7 @@ impl HexagonVisionEncoder {
                 )?;
 
                 // FFN up projection: pre_norm -> ffn_mid
-                dispatch::linear_m(
+                dispatch::linear_m_with(
                     session,
                     scratch_guard,
                     so.pre_norm_off,
@@ -1042,6 +1091,7 @@ impl HexagonVisionEncoder {
                     so.ffn_mid_off,
                     n_patches,
                     VIT_TILE,
+                    vit_hmx(session),
                 )?;
 
                 // GELU activation on ffn_mid
@@ -1059,7 +1109,7 @@ impl HexagonVisionEncoder {
                 )?;
 
                 // FFN down projection: ffn_mid -> ffn_out
-                dispatch::linear_m(
+                dispatch::linear_m_with(
                     session,
                     scratch_guard,
                     so.ffn_mid_off,
@@ -1070,6 +1120,7 @@ impl HexagonVisionEncoder {
                     so.ffn_out_off,
                     n_patches,
                     VIT_TILE,
+                    vit_hmx(session),
                 )?;
 
                 // Residual add: tokens += ffn_out
@@ -1165,7 +1216,7 @@ impl HexagonVisionEncoder {
                 scratch_guard.flush_cpu_cache(so.tokens_off, in_bytes);
 
                 let proj_res = (|| -> Result<(), CeraError> {
-                    dispatch::linear_m(
+                    dispatch::linear_m_with(
                         session,
                         &scratch_guard,
                         so.tokens_off,
@@ -1176,6 +1227,7 @@ impl HexagonVisionEncoder {
                         so.proj_mid_off,
                         n_tokens,
                         VIT_TILE,
+                        vit_hmx(session),
                     )?;
                     dispatch::gelu_tanh(
                         session,
@@ -1189,7 +1241,7 @@ impl HexagonVisionEncoder {
                             n_tokens,
                         },
                     )?;
-                    dispatch::linear_m(
+                    dispatch::linear_m_with(
                         session,
                         &scratch_guard,
                         so.proj_mid_off,
@@ -1200,6 +1252,7 @@ impl HexagonVisionEncoder {
                         so.proj_final_off,
                         n_tokens,
                         VIT_TILE,
+                        vit_hmx(session),
                     )?;
                     session.flush()?;
                     Ok(())
