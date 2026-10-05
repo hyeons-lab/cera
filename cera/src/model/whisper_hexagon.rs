@@ -1759,7 +1759,7 @@ impl HexagonWhisperModel {
                 },
                 WHISPER_TILE,
             )?;
-            // One batch per layer: the tanh GELU is seven ops a tile, and a whole
+            // One batch per layer: the tanh GELU is five ops a tile, and a whole
             // deep encoder in one batch would not fit the staging buffer.
             session.flush()?;
         }

@@ -464,8 +464,11 @@ pub(crate) fn gelu_tmp_rows(bytes: usize, dim: usize) -> Result<usize, CeraError
 /// Computed as
 /// `x * sigmoid(2 sqrt(2/pi) * x * (1 + 0.044715 x^2))`, since
 /// `0.5 (1 + tanh z) = sigmoid(2 z)`. The DSP has no tanh GELU, so this is
-/// seven ops over `tmp`, a scratch region of `tmp_rows` rows of `shape.dim`
-/// elements that the rows are processed through, `tmp_rows` at a time.
+/// five ops over `tmp`, a scratch region of `tmp_rows` rows of `shape.dim`
+/// elements that the rows are processed through, `tmp_rows` at a time. The ops
+/// are memory bound, so the count is the cost: the first multiply writes `x * x`
+/// straight into `tmp` (no copy pass), and the two scales fold into one,
+/// `tmp * (2c * 0.044715) + 2c` with `c = sqrt(2/pi)`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn gelu_tanh<S: OpSink>(
     session: &mut S,
@@ -480,35 +483,19 @@ pub(crate) fn gelu_tanh<S: OpSink>(
     for (start, run) in token_runs(n_tokens, TokenTile::Tiles(tmp_rows)) {
         let x_off = offset + start * dim * 4;
         let rows = TokenShape { dim, n_tokens: run };
-        fn whole<B>(buf: &B, off: usize, dim: usize, run: usize) -> View<'_, B> {
-            View::new(buf, off, [dim, run, 1], [4, dim * 4, run * dim * 4])
-        }
-        // tmp = x; tmp = x * x
-        copy_view(
-            session,
-            whole(buf, x_off, dim, run),
-            whole(tmp, tmp_offset, dim, run),
-        )?;
-        mul_inplace(session, tmp, tmp_offset, buf, x_off, rows, TokenTile::Whole)?;
-        // tmp = x * (1 + 0.044715 x^2)
+        // tmp = x * x
+        mul_to(session, tmp, tmp_offset, buf, x_off, buf, x_off, rows)?;
+        // tmp = 2c * (1 + 0.044715 x^2)
         scale_offset(
             session,
             tmp,
             tmp_offset,
             rows,
             TokenTile::Whole,
-            (0.044_715, 1.0),
+            (GELU_TANH_SIGMOID_SCALE * 0.044_715, GELU_TANH_SIGMOID_SCALE),
         )?;
+        // tmp = 2c * x * (1 + 0.044715 x^2); x = x * sigmoid(tmp)
         mul_inplace(session, tmp, tmp_offset, buf, x_off, rows, TokenTile::Whole)?;
-        // x = x * sigmoid(2 sqrt(2/pi) * tmp)
-        scale_offset(
-            session,
-            tmp,
-            tmp_offset,
-            rows,
-            TokenTile::Whole,
-            (GELU_TANH_SIGMOID_SCALE, 0.0),
-        )?;
         sigmoid(session, tmp, tmp_offset, rows, TokenTile::Whole)?;
         mul_inplace(session, buf, x_off, tmp, tmp_offset, rows, TokenTile::Whole)?;
     }
@@ -741,6 +728,46 @@ pub(crate) fn mul_inplace<S: OpSink>(
             .map_err(|e| op_err("mul_inplace", e))?;
     }
     session.end_group().map_err(|e| op_err("mul_inplace", e))
+}
+
+/// `dst = a * b`, elementwise over `shape.n_tokens` rows of `shape.dim` f32, with `dst`
+/// distinct from the sources (one pass, where a copy then [`mul_inplace`] is two).
+/// `a` and `b` may be the same rows.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn mul_to<S: OpSink>(
+    session: &mut S,
+    dst: &S::Buf,
+    dst_offset: usize,
+    a: &S::Buf,
+    a_offset: usize,
+    b: &S::Buf,
+    b_offset: usize,
+    shape: TokenShape,
+) -> Result<(), CeraError> {
+    let TokenShape { dim, n_tokens } = shape;
+    let dst_ti = add_f32_rows(session, dst, dst_offset, dim, n_tokens)?;
+    let a_ti = add_f32_rows(session, a, a_offset, dim, n_tokens)?;
+    let b_ti = add_f32_rows(session, b, b_offset, dim, n_tokens)?;
+    let kparams = build_binary_kernel_params(
+        dim,
+        dim,
+        n_tokens,
+        1,
+        1,
+        4,
+        VTCM_BUDGET,
+        session.dsp_threads(),
+    );
+    session
+        .enqueue_op(
+            HtpOpCode::Mul as u32,
+            &[a_ti, b_ti],
+            &[dst_ti],
+            [0i32; 16],
+            kparams,
+        )
+        .map_err(|e| op_err("mul_to", e))?;
+    session.end_group().map_err(|e| op_err("mul_to", e))
 }
 
 /// A source for [`concat_time_inner`]: `rows` positions of `dim` channels,
@@ -1762,10 +1789,10 @@ mod tests {
         assert_eq!(s.opcodes(), expect);
     }
 
-    /// The tanh GELU is seven ops per row tile through a scratch region, and its
-    /// two `Scale` ops carry the constants in their parameters.
+    /// The tanh GELU is five ops per row tile through a scratch region, and its
+    /// scale constants are folded (see [`gelu_tanh`]).
     #[test]
-    fn gelu_tanh_emits_seven_ops_per_tile_with_the_scale_constants() {
+    fn gelu_tanh_emits_five_ops_per_tile_with_the_folded_constants() {
         use HtpOpCode::*;
         let mut s = RecordingSink::default();
         let shape = TokenShape {
@@ -1773,7 +1800,7 @@ mod tests {
             n_tokens: 130,
         };
         gelu_tanh(&mut s, &"x", 0, &"t", 4096, 64, shape).unwrap();
-        let tile = [Cpy, Mul, Scale, Mul, Scale, UnarySigmoid, Mul].map(|o| o as u32);
+        let tile = [Mul, Scale, Mul, UnarySigmoid, Mul].map(|o| o as u32);
         let want: Vec<u32> = (0..3).flat_map(|_| tile).collect();
         assert_eq!(
             s.opcodes(),
@@ -1792,13 +1819,20 @@ mod tests {
             })
             .collect();
         assert_eq!(
-            scales[..2],
-            [(0.044_715, 1.0), (GELU_TANH_SIGMOID_SCALE, 0.0)]
+            scales[0],
+            (GELU_TANH_SIGMOID_SCALE * 0.044_715, GELU_TANH_SIGMOID_SCALE)
         );
+        // The first multiply squares x into the scratch: both sources are x.
+        assert_eq!(s.src(0, 0).offset, s.src(0, 1).offset);
+        assert_eq!(s.src(0, 0).buf, "x");
+        assert_eq!(s.dst(0).offset, 4096);
         // The last tile is the 2-row remainder, and it works in the scratch.
-        let last_copy = s.ops.iter().rposition(|o| o.opcode == Cpy as u32).unwrap();
-        assert_eq!(s.dst(last_copy).ne[1], 2);
-        assert_eq!(s.dst(last_copy).offset, 4096);
+        let last_sq = s.ops.len() - 5;
+        assert_eq!(s.dst(last_sq).ne[1], 2);
+        assert_eq!(s.dst(last_sq).offset, 4096);
+        // The final multiply writes the activation back in place.
+        assert_eq!(s.dst(s.ops.len() - 1).offset, 96 * 64 * 2 * 4);
+        assert_eq!(s.tensors[s.ops[s.ops.len() - 1].dst[0] as usize].buf, "x");
     }
 
     /// The sequence computes the tanh GELU (not the DSP's quick GELU, which is
@@ -1809,9 +1843,8 @@ mod tests {
         let sigmoid = |z: f32| 1.0 / (1.0 + (-z).exp());
         let sequence = |x: f32| {
             let t = x * x;
-            let t = t * 0.044_715 + 1.0;
+            let t = t * (GELU_TANH_SIGMOID_SCALE * 0.044_715) + GELU_TANH_SIGMOID_SCALE;
             let t = t * x;
-            let t = t * GELU_TANH_SIGMOID_SCALE;
             x * sigmoid(t)
         };
         let quick = |x: f32| x * sigmoid(1.702 * x);

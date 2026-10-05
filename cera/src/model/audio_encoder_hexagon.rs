@@ -2302,12 +2302,10 @@ mod tests {
                 op(HtpOpCode::Add),
                 op(HtpOpCode::MulMat),
                 op(HtpOpCode::Add),
-                // the tanh GELU: copy, x*x, scale+1, *x, scale, sigmoid, *x
-                op(HtpOpCode::Cpy),
+                // the tanh GELU: x*x into the scratch, scale, *x, sigmoid, *x
                 op(HtpOpCode::Mul),
                 op(HtpOpCode::Scale),
                 op(HtpOpCode::Mul),
-                op(HtpOpCode::Scale),
                 op(HtpOpCode::UnarySigmoid),
                 op(HtpOpCode::Mul),
                 op(HtpOpCode::MulMat),
@@ -2317,8 +2315,8 @@ mod tests {
         assert_eq!(s.dst(3).ne, [128, 10, 1, 1]);
         // The tanh GELU works in its own scratch region, not the activation's.
         assert_eq!(s.dst(5).offset, so.gelu_tmp);
-        assert_eq!(s.dst(12).ne, [96, 10, 1, 1]);
-        assert_eq!(s.dst(12).offset, so.adapter_out);
+        assert_eq!(s.dst(10).ne, [96, 10, 1, 1]);
+        assert_eq!(s.dst(10).offset, so.adapter_out);
     }
 
     /// Sequences past what the scratch was sized for are refused before any op
