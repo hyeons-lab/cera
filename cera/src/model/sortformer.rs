@@ -137,7 +137,13 @@ impl StreamingParams {
     /// Encoder frames one step attends over at most: both contexts, the chunk, the FIFO and
     /// the speaker cache. What an accelerator has to be staged for.
     pub fn window_frames(&self) -> usize {
-        self.left_context + self.chunk_len + self.right_context + self.fifo_len + self.spkcache_len
+        // Saturating: the fields are public and `with_chunking` skips validation, so a
+        // hand-made config could otherwise wrap (release) or panic (debug) here.
+        self.left_context
+            .saturating_add(self.chunk_len)
+            .saturating_add(self.right_context)
+            .saturating_add(self.fifo_len)
+            .saturating_add(self.spkcache_len)
     }
 
     fn validate(&self) -> Result<()> {
@@ -1425,7 +1431,11 @@ impl SortformerLive {
     /// preset's latency), on top of the 16 ms (256 samples) the mel front end needs after a
     /// frame's center.
     pub fn latency_frames(&self) -> usize {
-        self.stream.params.chunk_len + self.stream.params.right_context
+        // Saturating: the params may be hand-made (`with_chunking` skips validation).
+        self.stream
+            .params
+            .chunk_len
+            .saturating_add(self.stream.params.right_context)
     }
 
     /// Prediction frames returned so far (80 ms each).

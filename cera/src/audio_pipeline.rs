@@ -24,7 +24,10 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
 use crate::hotword::{HotwordConfig, HotwordDetector, HotwordIterator};
-use crate::live_diarizer::LiveDiarizer;
+use crate::live_diarizer::{LiveDiarizer, LiveDiarizerSession, Nemotron3LiveDiarizer};
+use crate::model::nemotron3_diarization::{
+    Nemotron3Model, StreamingParams as Nemotron3StreamingParams,
+};
 use crate::model::sortformer::{SortformerModel, StreamingParams};
 use crate::model::whisper::{WhisperModel, WhisperTranscribeOpts};
 use crate::speaker_labeler::{LabeledUtterance, SpeakerLabelerConfig};
@@ -101,7 +104,8 @@ pub enum AudioPipelineEvent {
         start_ms: f32,
         /// End of the utterance in milliseconds.
         end_ms: f32,
-        /// The most active speaker's slot (`0..4`), or `None` when the diarizer found no speaker
+        /// The most active speaker's slot (`0..4` for the Sortformer diarizer, `0..8` for
+        /// Nemotron-3), or `None` when the diarizer found no speaker
         /// active over the span, or the labeler had to give the utterance up (see `dropped`).
         speaker: Option<u32>,
         /// The speaker's share of all speakers' active time over the span, in `(0, 1]`.
@@ -182,8 +186,15 @@ pub struct AudioPipelineBuilder {
     config: Option<AudioPipelineConfig>,
     cancel: Option<Arc<AtomicBool>>,
     vad_on_cpu: bool,
-    diarizer: Option<(SortformerModel, StreamingParams)>,
+    diarizer: Option<DiarizerKind>,
     labeler_config: Option<SpeakerLabelerConfig>,
+}
+
+/// Which speaker diarizer a pipeline attaches. Only one: the second `with_diarizer*` call
+/// replaces the first.
+enum DiarizerKind {
+    Sortformer(SortformerModel, StreamingParams),
+    Nemotron3(Nemotron3Model, Nemotron3StreamingParams),
 }
 
 /// What [`AudioPipelineBuilder::build`] does with an attached VAD.
@@ -333,8 +344,39 @@ impl AudioPipelineBuilder {
     /// [`SortformerModel::default_streaming`]; they set the delay before a label (see
     /// [`SortformerLive::latency_frames`](crate::model::sortformer::SortformerLive::latency_frames)).
     pub fn with_diarizer(mut self, model: SortformerModel, params: StreamingParams) -> Self {
-        self.diarizer = Some((model, params));
+        self.diarizer = Some(DiarizerKind::Sortformer(model, params));
         self
+    }
+
+    /// Attach a Nemotron-3-Diarization speaker diarizer (8 speakers, 10 ms frames). Behaves
+    /// like [`Self::with_diarizer`]; `params` are usually
+    /// [`Nemotron3Model::default_streaming`](crate::model::nemotron3_diarization::Nemotron3Model::default_streaming).
+    pub fn with_diarizer_nemotron3(
+        mut self,
+        model: Nemotron3Model,
+        params: Nemotron3StreamingParams,
+    ) -> Self {
+        self.diarizer = Some(DiarizerKind::Nemotron3(model, params));
+        self
+    }
+
+    /// Load a converted Nemotron-3 GGUF and attach it with the checkpoint's own streaming
+    /// parameters (see [`Self::with_diarizer_nemotron3`]).
+    #[cfg(all(not(target_arch = "wasm32"), feature = "mmap"))]
+    pub fn with_diarizer_nemotron3_from_file<P: AsRef<Path>>(self, path: P) -> Result<Self> {
+        let model = Nemotron3Model::from_file(path)
+            .context("failed to load the Nemotron-3 diarizer from file")?;
+        let params = model.default_streaming().clone();
+        Ok(self.with_diarizer_nemotron3(model, params))
+    }
+
+    /// Load a converted Nemotron-3 GGUF from in-memory bytes and attach it with the
+    /// checkpoint's own streaming parameters (see [`Self::with_diarizer_nemotron3`]).
+    pub fn with_diarizer_nemotron3_from_bytes(self, bytes: impl Into<Arc<[u8]>>) -> Result<Self> {
+        let model = Nemotron3Model::from_bytes(bytes)
+            .context("failed to load the Nemotron-3 diarizer from bytes")?;
+        let params = model.default_streaming().clone();
+        Ok(self.with_diarizer_nemotron3(model, params))
     }
 
     /// Load a converted Sortformer GGUF and attach it with the checkpoint's own streaming
@@ -358,7 +400,8 @@ impl AudioPipelineBuilder {
     }
 
     /// How utterances are matched with the diarizer's speaker activity (see
-    /// [`SpeakerLabelerConfig`]). Only used with [`Self::with_diarizer`].
+    /// [`SpeakerLabelerConfig`]). Only used with [`Self::with_diarizer`] or
+    /// [`Self::with_diarizer_nemotron3`].
     pub fn with_speaker_labeler_config(mut self, config: SpeakerLabelerConfig) -> Self {
         self.labeler_config = Some(config);
         self
@@ -491,10 +534,26 @@ impl AudioPipelineBuilder {
         let cancel = self
             .cancel
             .unwrap_or_else(|| Arc::new(AtomicBool::new(false)));
-        let diarizer = self
+        let labeler_config = self.labeler_config.unwrap_or_default();
+        let diarizer: Option<Box<dyn PipelineDiarizerDriver>> = self
             .diarizer
-            .map(|(model, params)| {
-                PipelineDiarizer::new(model, params, self.labeler_config.unwrap_or_default())
+            .map(|kind| -> Result<Box<dyn PipelineDiarizerDriver>> {
+                Ok(match kind {
+                    DiarizerKind::Sortformer(model, params) => {
+                        Box::new(PipelineDiarizer::<LiveDiarizer>::new(
+                            model,
+                            params,
+                            labeler_config.clone(),
+                        )?)
+                    }
+                    DiarizerKind::Nemotron3(model, params) => {
+                        Box::new(PipelineDiarizer::<Nemotron3LiveDiarizer>::new(
+                            model,
+                            params,
+                            labeler_config.clone(),
+                        )?)
+                    }
+                })
             })
             .transpose()
             .context("failed to start the speaker diarizer")?;
@@ -528,20 +587,72 @@ struct PendingUtterance {
     end_ms: f32,
 }
 
+/// A labeled utterance with the speaker-slot count erased: everything the pipeline's events
+/// carry, whichever diarizer labeled it.
+struct PipelineLabeledUtterance {
+    id: u64,
+    label: Option<(usize, f32, Option<usize>)>,
+    dropped: bool,
+}
+
+impl PipelineLabeledUtterance {
+    fn from_labeled<const S: usize>(u: LabeledUtterance<S>) -> Self {
+        Self {
+            id: u.id,
+            label: u.label.map(|l| (l.speaker, l.confidence, l.overlapping)),
+            dropped: u.dropped,
+        }
+    }
+}
+
+impl<const S: usize> From<LabeledUtterance<S>> for PipelineLabeledUtterance {
+    fn from(u: LabeledUtterance<S>) -> Self {
+        Self::from_labeled(u)
+    }
+}
+
+/// What the pipeline drives a diarizer with, whichever model it runs. The two structs below
+/// implement it; the pipeline never sees which one it holds. `Send` because the FFI
+/// pipeline crosses threads behind a mutex.
+trait PipelineDiarizerDriver: Send {
+    /// Feed audio; on failure the diarizer stops and the pipeline continues without labels.
+    fn push_audio(&mut self, pcm: &[f32]);
+    /// Register an utterance for labeling. Returns whether a diarizer will label it.
+    fn register(&mut self, text: String, start_ms: f32, end_ms: f32) -> bool;
+    /// Poll covered utterances into `events`.
+    fn poll(&mut self, events: &mut Vec<AudioPipelineEvent>);
+    /// End of audio at `at_sample`: label everything waiting, then restart the session there.
+    fn finish_and_restart(&mut self, events: &mut Vec<AudioPipelineEvent>, at_sample: u64);
+    /// Drop the session and everything waiting on it.
+    fn reset(&mut self);
+    /// Whether the diarizer is still running (it stops, with a warning, if it fails).
+    fn is_live(&self) -> bool;
+    /// Test introspection: utterances waiting on a poll.
+    #[cfg(all(test, feature = "mmap"))]
+    fn debug_pending_len(&self) -> usize;
+    /// Test introspection: pipeline-clock time of the session's sample 0.
+    #[cfg(all(test, feature = "mmap"))]
+    fn debug_origin_ms(&self) -> f64;
+    /// Test introspection: debug rendering of the streaming parameters.
+    #[cfg(all(test, feature = "mmap"))]
+    fn debug_params(&self) -> String;
+}
+
 /// The diarizer attached to a pipeline and the bookkeeping that ties its labels back to the
-/// pipeline's events.
+/// pipeline's events, written once over the session type: [`LiveDiarizer`] (4 slots, 80 ms
+/// frames) or [`Nemotron3LiveDiarizer`] (8 slots, 10 ms frames).
 ///
 /// The diarizer counts time from the first sample it was fed. After a [`flush`](AudioPipeline::flush)
 /// (end of audio for the diarizer, which then labels everything still waiting) a fresh session
 /// starts at the pipeline's current sample, so `origin_ms` is the pipeline-clock time of that
 /// session's sample 0. Speaker slots are per session: a slot after a flush is not the same
 /// speaker as before it.
-struct PipelineDiarizer {
-    model: SortformerModel,
-    params: StreamingParams,
+struct PipelineDiarizer<S: LiveDiarizerSession> {
+    model: S::Model,
+    params: S::Params,
     cfg: SpeakerLabelerConfig,
     /// `None` after a failure: the pipeline keeps transcribing without labels.
-    session: Option<LiveDiarizer>,
+    session: Option<S>,
     origin_ms: f64,
     next_id: u64,
     pending: HashMap<u64, PendingUtterance>,
@@ -561,15 +672,17 @@ fn session_local_ms(ms: f32, origin_ms: f64) -> f64 {
 }
 
 /// The `UtteranceLabeled` event for a registered utterance the diarizer has covered.
-fn labeled_event(p: PendingUtterance, u: &LabeledUtterance) -> AudioPipelineEvent {
-    let label = u.label.as_ref();
+fn labeled_event(p: PendingUtterance, u: &PipelineLabeledUtterance) -> AudioPipelineEvent {
     AudioPipelineEvent::UtteranceLabeled {
         text: p.text,
         start_ms: p.start_ms,
         end_ms: p.end_ms,
-        speaker: label.map(|l| l.speaker as u32),
-        confidence: label.map(|l| l.confidence),
-        overlapping: label.and_then(|l| l.overlapping).map(|o| o as u32),
+        speaker: u.label.map(|(speaker, _, _)| speaker as u32),
+        confidence: u.label.map(|(_, confidence, _)| confidence),
+        overlapping: u
+            .label
+            .and_then(|(_, _, overlapping)| overlapping)
+            .map(|o| o as u32),
         dropped: u.dropped,
     }
 }
@@ -578,19 +691,18 @@ fn labeled_event(p: PendingUtterance, u: &LabeledUtterance) -> AudioPipelineEven
 /// never registered) yield nothing.
 fn take_labeled_event(
     pending: &mut HashMap<u64, PendingUtterance>,
-    u: LabeledUtterance,
+    u: PipelineLabeledUtterance,
 ) -> Option<AudioPipelineEvent> {
     let p = pending.remove(&u.id)?;
     Some(labeled_event(p, &u))
 }
 
-impl PipelineDiarizer {
-    fn new(
-        model: SortformerModel,
-        params: StreamingParams,
-        cfg: SpeakerLabelerConfig,
-    ) -> Result<Self> {
-        let session = LiveDiarizer::new(&model, params.clone(), cfg.clone())?;
+impl<S: LiveDiarizerSession> PipelineDiarizer<S>
+where
+    S::Labeled: Into<PipelineLabeledUtterance>,
+{
+    fn new(model: S::Model, params: S::Params, cfg: SpeakerLabelerConfig) -> Result<Self> {
+        let session = S::open(&model, params.clone(), cfg.clone())?;
         Ok(Self {
             model,
             params,
@@ -652,8 +764,8 @@ impl PipelineDiarizer {
         true
     }
 
-    fn labeled(&mut self, u: LabeledUtterance) -> Option<AudioPipelineEvent> {
-        take_labeled_event(&mut self.pending, u)
+    fn labeled(&mut self, u: S::Labeled) -> Option<AudioPipelineEvent> {
+        take_labeled_event(&mut self.pending, u.into())
     }
 
     /// Utterances the diarizer has covered by now.
@@ -679,7 +791,7 @@ impl PipelineDiarizer {
             }
         }
         self.origin_ms = sample_ms(at_sample) as f64;
-        match LiveDiarizer::new(&self.model, self.params.clone(), self.cfg.clone()) {
+        match S::open(&self.model, self.params.clone(), self.cfg.clone()) {
             Ok(fresh) => self.session = Some(fresh),
             Err(e) => self.fail("restart", &e),
         }
@@ -689,10 +801,54 @@ impl PipelineDiarizer {
     fn reset(&mut self) {
         self.pending.clear();
         self.origin_ms = 0.0;
-        match LiveDiarizer::new(&self.model, self.params.clone(), self.cfg.clone()) {
+        match S::open(&self.model, self.params.clone(), self.cfg.clone()) {
             Ok(fresh) => self.session = Some(fresh),
             Err(e) => self.fail("reset", &e),
         }
+    }
+}
+
+impl<S: LiveDiarizerSession> PipelineDiarizerDriver for PipelineDiarizer<S>
+where
+    S::Labeled: Into<PipelineLabeledUtterance>,
+{
+    fn push_audio(&mut self, pcm: &[f32]) {
+        PipelineDiarizer::<S>::push_audio(self, pcm);
+    }
+
+    fn register(&mut self, text: String, start_ms: f32, end_ms: f32) -> bool {
+        PipelineDiarizer::<S>::register(self, text, start_ms, end_ms)
+    }
+
+    fn poll(&mut self, events: &mut Vec<AudioPipelineEvent>) {
+        PipelineDiarizer::<S>::poll(self, events);
+    }
+
+    fn finish_and_restart(&mut self, events: &mut Vec<AudioPipelineEvent>, at_sample: u64) {
+        PipelineDiarizer::<S>::finish_and_restart(self, events, at_sample);
+    }
+
+    fn reset(&mut self) {
+        PipelineDiarizer::<S>::reset(self);
+    }
+
+    fn is_live(&self) -> bool {
+        self.session.is_some()
+    }
+
+    #[cfg(all(test, feature = "mmap"))]
+    fn debug_pending_len(&self) -> usize {
+        self.pending.len()
+    }
+
+    #[cfg(all(test, feature = "mmap"))]
+    fn debug_origin_ms(&self) -> f64 {
+        self.origin_ms
+    }
+
+    #[cfg(all(test, feature = "mmap"))]
+    fn debug_params(&self) -> String {
+        format!("{:?}", self.params)
     }
 }
 
@@ -717,7 +873,7 @@ pub struct AudioPipeline {
     current_utterance_start_sample: u64,
     pending_events: VecDeque<AudioPipelineEvent>,
     cancel: Arc<AtomicBool>,
-    diarizer: Option<PipelineDiarizer>,
+    diarizer: Option<Box<dyn PipelineDiarizerDriver>>,
 }
 
 impl AudioPipeline {
@@ -934,7 +1090,7 @@ impl AudioPipeline {
     /// Whether a speaker diarizer is attached and running (it stops, with a warning, if it
     /// fails; the pipeline then keeps going without labels).
     pub fn has_diarizer(&self) -> bool {
-        self.diarizer.as_ref().is_some_and(|d| d.session.is_some())
+        self.diarizer.as_ref().is_some_and(|d| d.is_live())
     }
 
     /// Register an utterance transcribed outside the pipeline (a custom recognizer, or

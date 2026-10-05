@@ -83,6 +83,50 @@ class AudioModelsTest {
     }
 
     @Test
+    fun a_nemotron3_diarizer_file_selects_the_nemotron3_stage() {
+        val dir = tmp.newFolder()
+        touch(dir, AudioModels.VAD)
+        touch(dir, AudioModels.DIARIZER_NEMOTRON3)
+        val models = AudioModels.find(listOf(dir))!!
+        assertEquals(DiarizerKind.NEMOTRON3, models.diarizerKind)
+        assertEquals(listOf("vad", "diarizer-nemotron3"), models.stages)
+    }
+
+    @Test
+    fun a_nemotron3_diarizer_file_wins_over_the_sortformer_one() {
+        val dir = tmp.newFolder()
+        touch(dir, AudioModels.VAD)
+        touch(dir, AudioModels.DIARIZER)
+        touch(dir, AudioModels.DIARIZER_NEMOTRON3)
+        val models = AudioModels.find(listOf(dir))!!
+        assertEquals(DiarizerKind.NEMOTRON3, models.diarizerKind)
+        assertEquals(AudioModels.DIARIZER_NEMOTRON3, models.diarizer!!.name)
+        assertEquals(listOf("vad", "diarizer-nemotron3"), models.stages)
+    }
+
+    @Test
+    fun a_sortformer_diarizer_file_alone_stays_sortformer() {
+        val dir = tmp.newFolder()
+        touch(dir, AudioModels.VAD)
+        touch(dir, AudioModels.DIARIZER)
+        val models = AudioModels.find(listOf(dir))!!
+        assertEquals(DiarizerKind.SORTFORMER, models.diarizerKind)
+        assertEquals(listOf("vad", "diarizer"), models.stages)
+    }
+
+    @Test
+    fun an_empty_nemotron3_diarizer_file_falls_back_to_the_sortformer_one() {
+        val dir = tmp.newFolder()
+        touch(dir, AudioModels.VAD)
+        touch(dir, AudioModels.DIARIZER)
+        touch(dir, AudioModels.DIARIZER_NEMOTRON3, bytes = 0)
+        val models = AudioModels.find(listOf(dir))!!
+        assertEquals(DiarizerKind.SORTFORMER, models.diarizerKind)
+        assertEquals(AudioModels.DIARIZER, models.diarizer!!.name)
+        assertEquals(listOf("vad", "diarizer"), models.stages)
+    }
+
+    @Test
     fun the_summary_names_each_stage_with_its_size_in_megabytes() {
         val dir = tmp.newFolder()
         touch(dir, AudioModels.VAD, bytes = 2_183_520)

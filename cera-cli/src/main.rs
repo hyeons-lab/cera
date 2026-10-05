@@ -1179,15 +1179,28 @@ enum Command {
         npu: bool,
     },
 
-    /// Diarize audio (who spoke when) with Streaming Sortformer 4spk on the CPU.
+    /// Diarize audio (who spoke when) with Streaming Sortformer 4spk or Nemotron-3 on the CPU.
     ///
-    /// Prints one line per speaker segment (slots 0..4, arrival ordered, not names). Overlapped
-    /// speech shows as overlapping segments. Convert the checkpoint with
-    /// `scripts/sortformer/convert_sortformer.py` first.
+    /// Prints one line per speaker segment (slots arrival ordered, not names). Overlapped
+    /// speech shows as overlapping segments. Convert the checkpoint first: Sortformer with
+    /// `scripts/sortformer/convert_sortformer.py`, Nemotron-3 with
+    /// `scripts/nemotron3_diarization/convert.py`.
     Diarize {
-        /// Path to the converted Sortformer `.gguf`.
+        /// Which diarizer `--model` is: `sortformer` (4 speakers, 80 ms frames) or
+        /// `nemotron3` (8 speakers, 10 ms frames).
+        #[arg(long, default_value = "sortformer")]
+        diarizer: String,
+
+        /// Path to the converted diarizer `.gguf` (of the `--diarizer` kind).
         #[arg(short, long)]
         model: String,
+
+        /// Side-by-side comparison: path to the *other* diarizer kind's `.gguf`. Runs both
+        /// over the same audio and reports wall times plus speaker agreement under the
+        /// overlap-maximizing slot assignment. Segment output only (not with
+        /// `--vad`/`--whisper`).
+        #[arg(long)]
+        compare: Option<String>,
 
         /// Path to an input WAV file (resampled to 16 kHz if needed).
         #[arg(short, long)]
@@ -1199,8 +1212,9 @@ enum Command {
         #[arg(long, default_value = "live")]
         mode: String,
 
-        /// Streaming preset: `default` (the checkpoint's: 15 s chunks, about 15 s latency) or
-        /// `low-latency` (the model card's: 0.48 s chunks, 1.04 s latency, a much heavier step).
+        /// Streaming preset: `default` (the checkpoint's chunking: ~15 s chunks for
+        /// Sortformer, ~21 s for Nemotron-3) or `low-latency` (the model card's: 1.04 s
+        /// latency both; 0.48 s chunks Sortformer, 0.72 s Nemotron-3, a much heavier step).
         #[arg(long, default_value = "default")]
         preset: String,
 
@@ -1235,7 +1249,7 @@ enum Command {
         #[arg(long)]
         json: bool,
 
-        /// Run the Sortformer network on the Hexagon NPU (builds with the `hexagon`
+        /// Run the diarizer network on the Hexagon NPU (builds with the `hexagon`
         /// feature, Qualcomm devices). Needs a GGUF converted with `--tail-outtype q8_0`;
         /// steps the NPU cannot take fall back to the CPU. The `--vad` VAD auto-uses the NPU
         /// unless `--vad-on-cpu` is passed.
@@ -2390,34 +2404,415 @@ fn labeled_text_line(ev: &cera::audio_pipeline::AudioPipelineEvent) -> Option<St
     ))
 }
 
-/// `cera diarize --vad .. --whisper ..`: the audio pipeline (VAD, Whisper and the Sortformer
-/// diarizer) hears the audio piece by piece, as a background service would. Each utterance is
-/// printed with its speaker as soon as the diarizer has covered it.
-#[allow(clippy::too_many_arguments)]
-fn diarize_with_transcript(
-    model: &cera::model::sortformer::SortformerModel,
-    params: cera::model::sortformer::StreamingParams,
+/// Which diarizer a `diarize` run loads `--model` as.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum DiarizerKind {
+    Sortformer,
+    Nemotron3,
+}
+
+impl DiarizerKind {
+    fn parse(s: &str) -> Result<Self> {
+        match s {
+            "sortformer" => Ok(Self::Sortformer),
+            "nemotron3" => Ok(Self::Nemotron3),
+            _ => anyhow::bail!("unknown --diarizer `{s}`; use `sortformer` or `nemotron3`"),
+        }
+    }
+
+    /// The other kind, for `--compare`.
+    fn other(self) -> Self {
+        match self {
+            Self::Sortformer => Self::Nemotron3,
+            Self::Nemotron3 => Self::Sortformer,
+        }
+    }
+
+    fn id(self) -> &'static str {
+        match self {
+            Self::Sortformer => "sortformer",
+            Self::Nemotron3 => "nemotron3",
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Sortformer => "Sortformer",
+            Self::Nemotron3 => "Nemotron-3",
+        }
+    }
+
+    fn slots(self) -> usize {
+        match self {
+            Self::Sortformer => 4,
+            Self::Nemotron3 => 8,
+        }
+    }
+
+    fn frame_ms(self) -> f64 {
+        match self {
+            Self::Sortformer => cera::speaker_labeler::FRAME_MS,
+            Self::Nemotron3 => cera::model::nemotron3_diarization::FRAME_MS,
+        }
+    }
+}
+
+/// One diarizer's output over a clip: flat `[n_frames x slots]` posteriors plus timing.
+struct DiarizeRun {
+    kind: DiarizerKind,
+    frames: Vec<f32>,
+    wall_s: f64,
+    first_output_ms: Option<f64>,
+}
+
+/// A diarizer model with its streaming parameters, loaded and (when asked) NPU-staged.
+enum LoadedDiarizer {
+    Sortformer(
+        cera::model::sortformer::SortformerModel,
+        cera::model::sortformer::StreamingParams,
+    ),
+    Nemotron3(
+        cera::model::nemotron3_diarization::Nemotron3Model,
+        cera::model::nemotron3_diarization::StreamingParams,
+    ),
+}
+
+/// Stage on the NPU with the kind's `try_hexagon_*` (those paths exist only with the
+/// `hexagon` feature, so the caller gates the call and this stays a plain generic).
+#[cfg(feature = "hexagon")]
+fn stage_on_npu<M, T>(
+    model: &M,
+    window_frames: usize,
+    readme: &str,
+    stage: impl FnOnce(&M, usize) -> Option<T>,
+) -> Result<()> {
+    stage(model, window_frames).context(format!(
+        "the Hexagon NPU is not available or could not stage this model (it needs \
+         a GGUF converted with `--tail-outtype q8_0`, see {readme})"
+    ))?;
+    Ok(())
+}
+
+/// Load `kind`'s model with the named `preset`, staging it on the NPU when `npu` is set.
+/// The one home for the load/preset/stage sequence the run fns and the transcript arms share.
+fn load_diarizer(
+    kind: DiarizerKind,
+    model_path: &str,
+    preset: &str,
+    npu: bool,
+) -> Result<LoadedDiarizer> {
+    match kind {
+        DiarizerKind::Sortformer => {
+            use cera::model::sortformer::SortformerModel;
+            let m = SortformerModel::from_file(model_path)
+                .with_context(|| format!("loading Sortformer model from `{model_path}`"))?;
+            let params = match preset {
+                "default" => m.default_streaming().clone(),
+                "low-latency" => m.low_latency_streaming(),
+                _ => unreachable!("preset validated by the caller"),
+            };
+            if npu {
+                #[cfg(feature = "hexagon")]
+                stage_on_npu(
+                    &m,
+                    params.window_frames(),
+                    "scripts/sortformer/README.md",
+                    cera::model::sortformer_hexagon::try_hexagon_sortformer,
+                )?;
+                #[cfg(not(feature = "hexagon"))]
+                anyhow::bail!("--npu needs a build with the `hexagon` feature");
+            }
+            Ok(LoadedDiarizer::Sortformer(m, params))
+        }
+        DiarizerKind::Nemotron3 => {
+            use cera::model::nemotron3_diarization::Nemotron3Model;
+            let m = Nemotron3Model::from_file(model_path)
+                .with_context(|| format!("loading Nemotron-3 model from `{model_path}`"))?;
+            let params = match preset {
+                "default" => m.default_streaming().clone(),
+                "low-latency" => m.low_latency_streaming(),
+                _ => unreachable!("preset validated by the caller"),
+            };
+            if npu {
+                #[cfg(feature = "hexagon")]
+                stage_on_npu(
+                    &m,
+                    params.window_frames(),
+                    "scripts/nemotron3_diarization/README.md",
+                    cera::model::nemotron3_diarization_hexagon::try_hexagon_nemotron3,
+                )?;
+                #[cfg(not(feature = "hexagon"))]
+                anyhow::bail!("--npu needs a build with the `hexagon` feature");
+            }
+            Ok(LoadedDiarizer::Nemotron3(m, params))
+        }
+    }
+}
+
+/// Run the Sortformer diarizer over `pcm` in `mode` (`live`/`streaming`/`offline`) with the
+/// named `preset`.
+fn run_sortformer_diarize(
+    model_path: &str,
     pcm: &[f32],
-    (vad, whisper): (&str, &str),
+    mode: &str,
+    preset: &str,
     piece_ms: usize,
+    npu: bool,
+) -> Result<DiarizeRun> {
+    let LoadedDiarizer::Sortformer(m, params) =
+        load_diarizer(DiarizerKind::Sortformer, model_path, preset, npu)?
+    else {
+        unreachable!("load_diarizer returns the requested kind")
+    };
+
+    let started = std::time::Instant::now();
+    let mut first_output_ms: Option<f64> = None;
+    let frames = match mode {
+        "live" => {
+            let mut live = m.new_live(params)?;
+            let piece = piece_ms.saturating_mul(16).max(1);
+            let mut out = Vec::new();
+            let mut pushed = 0usize;
+            for part in pcm.chunks(piece) {
+                let got = live.push_audio(part)?;
+                pushed += part.len();
+                if first_output_ms.is_none() && !got.is_empty() {
+                    // Audio time (not wall time) pushed when the first frames came out.
+                    first_output_ms = Some(pushed as f64 / 16.0);
+                }
+                out.extend(got);
+            }
+            out.extend(live.finish()?);
+            out
+        }
+        "streaming" => m.diarize_streaming(pcm, params)?,
+        "offline" => m.diarize_offline(pcm)?,
+        _ => unreachable!("mode validated by the caller"),
+    };
+    Ok(DiarizeRun {
+        kind: DiarizerKind::Sortformer,
+        frames,
+        wall_s: started.elapsed().as_secs_f64(),
+        first_output_ms,
+    })
+}
+
+/// Run the Nemotron-3 diarizer over `pcm` in `mode` with the named `preset`.
+fn run_nemotron3_diarize(
+    model_path: &str,
+    pcm: &[f32],
+    mode: &str,
+    preset: &str,
+    piece_ms: usize,
+    npu: bool,
+) -> Result<DiarizeRun> {
+    let LoadedDiarizer::Nemotron3(m, params) =
+        load_diarizer(DiarizerKind::Nemotron3, model_path, preset, npu)?
+    else {
+        unreachable!("load_diarizer returns the requested kind")
+    };
+
+    let started = std::time::Instant::now();
+    let mut first_output_ms: Option<f64> = None;
+    let frames = match mode {
+        "live" => {
+            let mut live = m.new_live(params)?;
+            let piece = piece_ms.saturating_mul(16).max(1);
+            let mut out = Vec::new();
+            let mut pushed = 0usize;
+            for part in pcm.chunks(piece) {
+                let got = live.push_audio(part)?;
+                pushed += part.len();
+                if first_output_ms.is_none() && !got.is_empty() {
+                    first_output_ms = Some(pushed as f64 / 16.0);
+                }
+                out.extend(got);
+            }
+            out.extend(live.finish()?);
+            out
+        }
+        "streaming" => m.diarize_streaming(pcm, params)?,
+        "offline" => m.diarize_offline(pcm)?,
+        _ => unreachable!("mode validated by the caller"),
+    };
+    Ok(DiarizeRun {
+        kind: DiarizerKind::Nemotron3,
+        frames,
+        wall_s: started.elapsed().as_secs_f64(),
+        first_output_ms,
+    })
+}
+
+fn run_diarize(
+    kind: DiarizerKind,
+    model_path: &str,
+    pcm: &[f32],
+    mode: &str,
+    preset: &str,
+    piece_ms: usize,
+    npu: bool,
+) -> Result<DiarizeRun> {
+    match kind {
+        DiarizerKind::Sortformer => {
+            run_sortformer_diarize(model_path, pcm, mode, preset, piece_ms, npu)
+        }
+        DiarizerKind::Nemotron3 => {
+            run_nemotron3_diarize(model_path, pcm, mode, preset, piece_ms, npu)
+        }
+    }
+}
+
+/// Speaker segments for one run, clipped to the audio (both diarizers pad the clip's tail).
+fn segments_for_run(
+    run: &DiarizeRun,
     threshold: f32,
+    merge_gap_ms: usize,
+    min_ms: usize,
+    audio_ms: f64,
+) -> Vec<cera::speaker_labeler::SpeakerSegment> {
+    use cera::speaker_labeler::speaker_segments;
+
+    let to_frames = |ms: usize| ms.div_ceil(run.kind.frame_ms() as usize);
+    let mut segments = match run.kind {
+        DiarizerKind::Sortformer => speaker_segments::<4>(
+            &run.frames,
+            threshold,
+            to_frames(merge_gap_ms),
+            to_frames(min_ms),
+            run.kind.frame_ms(),
+        ),
+        DiarizerKind::Nemotron3 => speaker_segments::<8>(
+            &run.frames,
+            threshold,
+            to_frames(merge_gap_ms),
+            to_frames(min_ms),
+            run.kind.frame_ms(),
+        ),
+    };
+    segments.retain(|s| s.start_ms < audio_ms);
+    for s in &mut segments {
+        s.end_ms = s.end_ms.min(audio_ms);
+    }
+    segments
+}
+
+/// How a 4-slot/80 ms Sortformer run and an 8-slot/10 ms Nemotron-3 run agree, under the
+/// overlap-maximizing assignment of old slots to new slots. Slots are arrival-ordered on
+/// both sides, so a naive per-channel diff would read a renumbering as disagreement.
+struct DiarizeComparison {
+    /// Old slot -> new slot, maximizing co-active time.
+    assignment: [usize; 4],
+    /// Seconds where either side has speech (both silent counts as neither).
+    speech_s: f64,
+    /// Of those, seconds where the mapped active sets match exactly.
+    agree_s: f64,
+    sortformer_speech_s: f64,
+    nemotron3_speech_s: f64,
+}
+
+fn compare_diarize_runs(
+    sortformer: &DiarizeRun,
+    nemotron3: &DiarizeRun,
+    threshold: f32,
+) -> DiarizeComparison {
+    debug_assert_eq!(sortformer.kind, DiarizerKind::Sortformer);
+    debug_assert_eq!(nemotron3.kind, DiarizerKind::Nemotron3);
+    // Both sides on the 10 ms grid: each 80 ms Sortformer frame covers 8 Nemotron-3 frames.
+    let n_new = nemotron3.frames.len() / nemotron3.kind.slots();
+    let n_old = sortformer.frames.len() / sortformer.kind.slots();
+    let n = n_new.min(8 * n_old);
+    let mut overlap = [[0u64; 8]; 4];
+    let mut old_speech = 0u64;
+    let mut new_speech = 0u64;
+    for t in 0..n {
+        let old = &sortformer.frames[4 * (t / 8)..][..4];
+        let new = &nemotron3.frames[8 * t..][..8];
+        let old_active = old.iter().any(|&p| p >= threshold);
+        let new_active = new.iter().any(|&p| p >= threshold);
+        old_speech += u64::from(old_active);
+        new_speech += u64::from(new_active);
+        for (i, &po) in old.iter().enumerate() {
+            if po < threshold {
+                continue;
+            }
+            for (j, &pn) in new.iter().enumerate() {
+                if pn >= threshold {
+                    overlap[i][j] += 1;
+                }
+            }
+        }
+    }
+    // The assignment: 8P4 = 1680 candidates, exhaustive, maximizing co-active frames.
+    let mut best = [0, 1, 2, 3];
+    let mut best_score = 0u64;
+    for a in 0..8 {
+        for b in 0..8 {
+            if b == a {
+                continue;
+            }
+            for c in 0..8 {
+                if c == a || c == b {
+                    continue;
+                }
+                for d in 0..8 {
+                    if d == a || d == b || d == c {
+                        continue;
+                    }
+                    let score = overlap[0][a] + overlap[1][b] + overlap[2][c] + overlap[3][d];
+                    if score > best_score {
+                        best_score = score;
+                        best = [a, b, c, d];
+                    }
+                }
+            }
+        }
+    }
+    let mut agree = 0u64;
+    let mut speech = 0u64;
+    for t in 0..n {
+        let old = &sortformer.frames[4 * (t / 8)..][..4];
+        let new = &nemotron3.frames[8 * t..][..8];
+        let mut mapped = 0u8;
+        let mut old_active = false;
+        for (i, &p) in old.iter().enumerate() {
+            if p >= threshold {
+                old_active = true;
+                mapped |= 1 << best[i];
+            }
+        }
+        let mut new_mask = 0u8;
+        for (j, &p) in new.iter().enumerate() {
+            if p >= threshold {
+                new_mask |= 1 << j;
+            }
+        }
+        if old_active || new_mask != 0 {
+            speech += 1;
+            agree += u64::from(mapped == new_mask);
+        }
+    }
+    DiarizeComparison {
+        assignment: best,
+        speech_s: speech as f64 * 0.01,
+        agree_s: agree as f64 * 0.01,
+        sortformer_speech_s: old_speech as f64 * 0.01,
+        nemotron3_speech_s: new_speech as f64 * 0.01,
+    }
+}
+
+/// `cera diarize --vad .. --whisper ..`: the audio pipeline (VAD, Whisper and a speaker
+/// diarizer) hears the audio piece by piece, as a background service would. Each utterance is
+/// printed with its speaker as soon as the diarizer has covered it. The caller builds the
+/// pipeline with whichever diarizer `--diarizer` names.
+fn diarize_with_transcript(
+    mut pipeline: cera::AudioPipeline,
+    latency_s: f64,
+    pcm: &[f32],
+    piece_ms: usize,
     audio: &str,
     json: bool,
-    vad_on_cpu: bool,
 ) -> Result<()> {
     use cera::audio_pipeline::AudioPipelineEvent;
-
-    let latency_s =
-        (params.chunk_len + params.right_context) as f64 * cera::speaker_labeler::FRAME_MS / 1000.0;
-    let mut pipeline = cera::AudioPipeline::builder()
-        .with_vad_from_file(vad)
-        .with_context(|| format!("loading VAD from `{vad}`"))?
-        .with_vad_on_cpu(vad_on_cpu)
-        .with_whisper_from_file(whisper)
-        .with_context(|| format!("loading Whisper from `{whisper}`"))?
-        .with_diarizer(model.clone(), params)
-        .with_speaker_labeler_config(transcript_labeler_config(threshold))
-        .build()?;
 
     let mut rows: Vec<serde_json::Value> = Vec::new();
     let mut emit = |ev: AudioPipelineEvent| {
@@ -2431,7 +2826,7 @@ fn diarize_with_transcript(
     };
 
     let started = std::time::Instant::now();
-    let piece = (piece_ms * 16).max(1);
+    let piece = piece_ms.saturating_mul(16).max(1);
     for part in pcm.chunks(piece) {
         for ev in pipeline.process_chunk(part)? {
             emit(ev);
@@ -4377,7 +4772,9 @@ fn main() -> Result<()> {
             }
         }
         Command::Diarize {
+            diarizer,
             model,
+            compare,
             audio,
             mode,
             preset,
@@ -4391,8 +4788,7 @@ fn main() -> Result<()> {
             npu,
             vad_on_cpu,
         } => {
-            use cera::model::sortformer::SortformerModel;
-            use cera::speaker_labeler::{FRAME_MS, speaker_segments};
+            let kind = DiarizerKind::parse(&diarizer)?;
 
             anyhow::ensure!(
                 threshold.is_finite() && (0.0..=1.0).contains(&threshold),
@@ -4415,6 +4811,11 @@ fn main() -> Result<()> {
                             "transcript-aligned diarization (`--vad` and `--whisper`) requires `--mode live`, found `--mode {mode}`"
                         );
                     }
+                    if compare.is_some() {
+                        anyhow::bail!(
+                            "`--compare` is segment output only, not with `--vad`/`--whisper`"
+                        );
+                    }
                 }
                 (Some(_), None) => {
                     anyhow::bail!("`--vad` requires `--whisper` for transcript diarization")
@@ -4425,90 +4826,60 @@ fn main() -> Result<()> {
                 (None, None) => {}
             }
 
-            let m = SortformerModel::from_file(&model)
-                .with_context(|| format!("loading Sortformer model from `{model}`"))?;
             let (mut pcm, sr_in) = read_wav_pcm16_mono(&audio)
                 .with_context(|| format!("reading audio file `{audio}`"))?;
             if sr_in != 16_000 {
                 pcm = resample_linear(&pcm, sr_in, 16_000);
             }
             let audio_s = pcm.len() as f64 / 16_000.0;
-
-            let params = match preset.as_str() {
-                "default" => m.default_streaming().clone(),
-                "low-latency" => m.low_latency_streaming(),
-                _ => unreachable!(),
-            };
-            if npu {
-                #[cfg(feature = "hexagon")]
-                cera::model::sortformer_hexagon::try_hexagon_sortformer(&m, params.window_frames())
-                    .context(
-                        "the Hexagon NPU is not available or could not stage this model (it needs \
-                         a GGUF converted with `--tail-outtype q8_0`, see scripts/sortformer/README.md)",
-                    )?;
-                #[cfg(not(feature = "hexagon"))]
-                anyhow::bail!("--npu needs a build with the `hexagon` feature");
-            }
+            let audio_ms = audio_s * 1000.0;
 
             if let (Some(vad), Some(whisper)) = (&vad, &whisper) {
+                // Both diarizers count chunks in 80 ms encoder frames, so the latency formula
+                // is the same; only the model load and the attach call differ.
+                debug_assert_eq!(
+                    cera::model::nemotron3_diarization::ENC_FRAME_MS,
+                    cera::speaker_labeler::FRAME_MS,
+                    "both diarizers count chunks in the same encoder frames"
+                );
+                let latency_of = |chunk_len: usize, right_context: usize| {
+                    (chunk_len + right_context) as f64
+                        * cera::model::nemotron3_diarization::ENC_FRAME_MS
+                        / 1000.0
+                };
+                let mut builder = cera::AudioPipeline::builder()
+                    .with_vad_from_file(vad)
+                    .with_context(|| format!("loading VAD from `{vad}`"))?
+                    .with_vad_on_cpu(vad_on_cpu)
+                    .with_whisper_from_file(whisper)
+                    .with_context(|| format!("loading Whisper from `{whisper}`"))?
+                    .with_speaker_labeler_config(transcript_labeler_config(threshold));
+                let latency_s = match load_diarizer(kind, &model, &preset, npu)? {
+                    LoadedDiarizer::Sortformer(m, params) => {
+                        let latency_s = latency_of(params.chunk_len, params.right_context);
+                        builder = builder.with_diarizer(m, params);
+                        latency_s
+                    }
+                    LoadedDiarizer::Nemotron3(m, params) => {
+                        let latency_s = latency_of(params.chunk_len, params.right_context);
+                        builder = builder.with_diarizer_nemotron3(m, params);
+                        latency_s
+                    }
+                };
                 return diarize_with_transcript(
-                    &m,
-                    params,
+                    builder.build()?,
+                    latency_s,
                     &pcm,
-                    (vad, whisper),
                     piece_ms,
-                    threshold,
                     &audio,
                     json,
-                    vad_on_cpu,
                 );
             }
 
-            let started = std::time::Instant::now();
-            let mut first_output_ms: Option<f64> = None;
-            let frames = match mode.as_str() {
-                "live" => {
-                    let mut live = m.new_live(params)?;
-                    let piece = (piece_ms * 16).max(1);
-                    let mut out = Vec::new();
-                    let mut pushed = 0usize;
-                    for part in pcm.chunks(piece) {
-                        let got = live.push_audio(part)?;
-                        pushed += part.len();
-                        if first_output_ms.is_none() && !got.is_empty() {
-                            // Audio time (not wall time) pushed when the first frames came out.
-                            first_output_ms = Some(pushed as f64 / 16.0);
-                        }
-                        out.extend(got);
-                    }
-                    out.extend(live.finish()?);
-                    out
-                }
-                "streaming" => m.diarize_streaming(&pcm, params)?,
-                "offline" => m.diarize_offline(&pcm)?,
-                other => {
-                    anyhow::bail!("unknown mode `{other}`; use `live`, `streaming` or `offline`")
-                }
-            };
-            let wall_s = started.elapsed().as_secs_f64();
-
-            let to_frames = |ms: usize| ms.div_ceil(FRAME_MS as usize);
-            let mut segments = speaker_segments(
-                &frames,
-                threshold,
-                to_frames(merge_gap_ms),
-                to_frames(min_ms),
-            );
-            // The streaming loop pads the clip to a multiple of 16 mel frames with zeros;
-            // clip anything past the audio.
-            let audio_ms = audio_s * 1000.0;
-            segments.retain(|s| s.start_ms < audio_ms);
-            for s in &mut segments {
-                s.end_ms = s.end_ms.min(audio_ms);
-            }
-
-            if json {
-                let segs: Vec<_> = segments
+            let run = run_diarize(kind, &model, &pcm, &mode, &preset, piece_ms, npu)?;
+            let segments = segments_for_run(&run, threshold, merge_gap_ms, min_ms, audio_ms);
+            let segs_json = |segments: &[cera::speaker_labeler::SpeakerSegment]| {
+                segments
                     .iter()
                     .map(|s| {
                         serde_json::json!({
@@ -4517,37 +4888,111 @@ fn main() -> Result<()> {
                             "end_ms": s.end_ms,
                         })
                     })
-                    .collect();
+                    .collect::<Vec<_>>()
+            };
+            let print_run =
+                |run: &DiarizeRun, segments: &[cera::speaker_labeler::SpeakerSegment]| {
+                    println!(
+                        "{}: {} segment(s) in `{}` ({:.2}s audio, {:.2}s wall, {:.2}x real time)",
+                        run.kind.label(),
+                        segments.len(),
+                        audio,
+                        audio_s,
+                        run.wall_s,
+                        run.wall_s / audio_s.max(1e-9)
+                    );
+                    if let Some(ms) = run.first_output_ms {
+                        println!("  first predictions after {ms:.0} ms of audio");
+                    }
+                    for s in segments {
+                        println!(
+                            "  speaker {}  {:8.2}ms - {:8.2}ms",
+                            s.speaker, s.start_ms, s.end_ms
+                        );
+                    }
+                };
+
+            if let Some(other_path) = &compare {
+                let other_kind = kind.other();
+                let other =
+                    run_diarize(other_kind, other_path, &pcm, &mode, &preset, piece_ms, npu)?;
+                let other_segments =
+                    segments_for_run(&other, threshold, merge_gap_ms, min_ms, audio_ms);
+                let (old, new) = match kind {
+                    DiarizerKind::Sortformer => (&run, &other),
+                    DiarizerKind::Nemotron3 => (&other, &run),
+                };
+                let cmp = compare_diarize_runs(old, new, threshold);
+                // No speech on either side is full agreement, not 0/0 disagreement.
+                let agreement = if cmp.speech_s > 0.0 {
+                    cmp.agree_s / cmp.speech_s
+                } else {
+                    1.0
+                };
+                if json {
+                    println!(
+                        "{}",
+                        serde_json::to_string_pretty(&serde_json::json!({
+                            "audio_s": audio_s,
+                            "mode": mode,
+                            "preset": preset,
+                            kind.id(): {
+                                "wall_s": run.wall_s,
+                                "realtime_factor": run.wall_s / audio_s.max(1e-9),
+                                "first_output_audio_ms": run.first_output_ms,
+                                "segments": segs_json(&segments),
+                            },
+                            other_kind.id(): {
+                                "wall_s": other.wall_s,
+                                "realtime_factor": other.wall_s / audio_s.max(1e-9),
+                                "first_output_audio_ms": other.first_output_ms,
+                                "segments": segs_json(&other_segments),
+                            },
+                            "comparison": {
+                                "slot_assignment_sortformer_to_nemotron3": cmp.assignment,
+                                "speech_s": cmp.speech_s,
+                                "agree_s": cmp.agree_s,
+                                "agreement": agreement,
+                                "sortformer_speech_s": cmp.sortformer_speech_s,
+                                "nemotron3_speech_s": cmp.nemotron3_speech_s,
+                            },
+                        }))?
+                    );
+                } else {
+                    print_run(&run, &segments);
+                    print_run(&other, &other_segments);
+                    println!(
+                        "comparison (slots {:?} -> {:?}; {:.2}s speech either side): {:.2}s agree ({:.1}%)",
+                        [0, 1, 2, 3],
+                        cmp.assignment,
+                        cmp.speech_s,
+                        cmp.agree_s,
+                        100.0 * agreement,
+                    );
+                    println!(
+                        "  speech: Sortformer {:.2}s, Nemotron-3 {:.2}s",
+                        cmp.sortformer_speech_s, cmp.nemotron3_speech_s,
+                    );
+                }
+                return Ok(());
+            }
+
+            if json {
                 println!(
                     "{}",
                     serde_json::to_string_pretty(&serde_json::json!({
+                        "diarizer": kind.id(),
                         "audio_s": audio_s,
-                        "wall_s": wall_s,
-                        "realtime_factor": wall_s / audio_s.max(1e-9),
-                        "first_output_audio_ms": first_output_ms,
+                        "wall_s": run.wall_s,
+                        "realtime_factor": run.wall_s / audio_s.max(1e-9),
+                        "first_output_audio_ms": run.first_output_ms,
                         "mode": mode,
                         "preset": preset,
-                        "segments": segs,
+                        "segments": segs_json(&segments),
                     }))?
                 );
             } else {
-                println!(
-                    "Sortformer: {} segment(s) in `{}` ({:.2}s audio, {:.2}s wall, {:.2}x real time)",
-                    segments.len(),
-                    audio,
-                    audio_s,
-                    wall_s,
-                    wall_s / audio_s.max(1e-9)
-                );
-                if let Some(ms) = first_output_ms {
-                    println!("  first predictions after {ms:.0} ms of audio");
-                }
-                for s in &segments {
-                    println!(
-                        "  speaker {}  {:8.2}ms - {:8.2}ms",
-                        s.speaker, s.start_ms, s.end_ms
-                    );
-                }
+                print_run(&run, &segments);
             }
         }
         Command::Transcribe {
@@ -6015,7 +6460,8 @@ mod tests {
     use std::sync::Arc;
 
     use super::{
-        BundleQuantPair, Cli, CliSamplingArgs, Command, check_vad_npu_dropout, check_vad_npu_rate,
+        BundleQuantPair, Cli, CliSamplingArgs, Command, DiarizeRun, DiarizerKind,
+        check_vad_npu_dropout, check_vad_npu_rate, compare_diarize_runs,
         convert_history_to_chat_messages, default_target_quant, display_bundle_id,
         doomed_run_error, is_liquid_model_spelling, labeled_json_row, labeled_text_line,
         normalize_bundle_id, quant_warning_kind, read_wav_pcm16_mono, resample_linear,
@@ -7607,6 +8053,8 @@ mod tests {
         .expect("diarize subcommand should parse");
         match cli.command {
             Command::Diarize {
+                diarizer,
+                compare,
                 model,
                 audio,
                 mode,
@@ -7624,6 +8072,11 @@ mod tests {
                 assert_eq!((vad, whisper), (None, None));
                 assert!(!npu, "the NPU is opt-in");
                 assert!(!vad_on_cpu, "the VAD auto-uses the NPU by default");
+                assert_eq!(
+                    diarizer, "sortformer",
+                    "Sortformer stays the default diarizer"
+                );
+                assert_eq!(compare, None, "comparison is opt-in");
                 assert_eq!(
                     (model.as_str(), audio.as_str()),
                     ("sortformer.gguf", "meeting.wav")
@@ -7693,6 +8146,143 @@ mod tests {
             }
             _ => panic!("expected Diarize command"),
         }
+        // The Nemotron-3 kind and the comparison model are explicit opt-ins.
+        let cli = Cli::try_parse_from([
+            "cera",
+            "diarize",
+            "--diarizer",
+            "nemotron3",
+            "-m",
+            "n.gguf",
+            "-a",
+            "a.wav",
+            "--compare",
+            "s.gguf",
+        ])
+        .unwrap();
+        match cli.command {
+            Command::Diarize {
+                diarizer, compare, ..
+            } => {
+                assert_eq!(diarizer, "nemotron3");
+                assert_eq!(compare.as_deref(), Some("s.gguf"));
+            }
+            _ => panic!("expected Diarize command"),
+        }
+    }
+
+    /// `DiarizerKind` parses exactly the two supported spellings.
+    #[test]
+    fn diarize_kind_parses_both_spellings() {
+        assert_eq!(
+            DiarizerKind::parse("sortformer").unwrap(),
+            DiarizerKind::Sortformer
+        );
+        assert_eq!(
+            DiarizerKind::parse("nemotron3").unwrap(),
+            DiarizerKind::Nemotron3
+        );
+        assert!(DiarizerKind::parse("NeMo").is_err());
+        assert_eq!(DiarizerKind::Sortformer.other(), DiarizerKind::Nemotron3);
+        assert_eq!(DiarizerKind::Nemotron3.other(), DiarizerKind::Sortformer);
+        assert_eq!(
+            (
+                DiarizerKind::Sortformer.slots(),
+                DiarizerKind::Nemotron3.slots()
+            ),
+            (4, 8)
+        );
+    }
+
+    /// The comparison assigns renumbered slots before scoring: old slot 1 active where new
+    /// slot 5 is active must agree, not disagree.
+    #[test]
+    fn diarize_comparison_aligns_slots_before_scoring() {
+        // 16 old frames (80 ms) all with slot 1 active; 128 new frames (10 ms) all with
+        // slot 5 active. Same speech, different numbering.
+        let old_frames = [0.0f32, 0.9, 0.0, 0.0].repeat(16);
+        let mut new_frames = vec![0.0f32; 128 * 8];
+        for t in 0..128 {
+            new_frames[8 * t + 5] = 0.9;
+        }
+        let old = DiarizeRun {
+            kind: DiarizerKind::Sortformer,
+            frames: old_frames,
+            wall_s: 1.0,
+            first_output_ms: None,
+        };
+        let new = DiarizeRun {
+            kind: DiarizerKind::Nemotron3,
+            frames: new_frames,
+            wall_s: 1.0,
+            first_output_ms: None,
+        };
+        let cmp = compare_diarize_runs(&old, &new, 0.5);
+        assert_eq!(cmp.assignment[1], 5);
+        assert_eq!(cmp.speech_s, 1.28);
+        assert_eq!(cmp.agree_s, cmp.speech_s);
+    }
+
+    /// The comparison scores the common window only: Nemotron-3 frames past the last
+    /// Sortformer frame are ignored, not counted as one-sided speech.
+    #[test]
+    fn diarize_comparison_scores_the_common_window_only() {
+        // 8 old frames with slot 0 active; 128 new frames with slot 2 active throughout
+        // (twice as many: the second half hangs past the Sortformer output).
+        let old_frames = [0.9f32, 0.0, 0.0, 0.0].repeat(8);
+        let mut new_frames = vec![0.0f32; 128 * 8];
+        for t in 0..128 {
+            new_frames[8 * t + 2] = 0.9;
+        }
+        let old = DiarizeRun {
+            kind: DiarizerKind::Sortformer,
+            frames: old_frames,
+            wall_s: 1.0,
+            first_output_ms: None,
+        };
+        let new = DiarizeRun {
+            kind: DiarizerKind::Nemotron3,
+            frames: new_frames,
+            wall_s: 1.0,
+            first_output_ms: None,
+        };
+        let cmp = compare_diarize_runs(&old, &new, 0.5);
+        assert_eq!(cmp.assignment[0], 2);
+        // The common window is the 64 new frames the 8 old frames cover; both sides active
+        // there under the assignment, so the window fully agrees.
+        assert_eq!(cmp.speech_s, 0.64);
+        assert_eq!(cmp.agree_s, 0.64);
+        assert_eq!(cmp.sortformer_speech_s, 0.64);
+        assert_eq!(cmp.nemotron3_speech_s, 0.64);
+    }
+
+    /// One-sided speech inside the window counts as speech but not agreement.
+    #[test]
+    fn diarize_comparison_counts_in_window_one_sided_speech_as_disagreement() {
+        // 8 old frames with slot 0 active; 64 new frames with slot 2 active for the first
+        // half only (the second half is Sortformer-only speech).
+        let old_frames = [0.9f32, 0.0, 0.0, 0.0].repeat(8);
+        let mut new_frames = vec![0.0f32; 64 * 8];
+        for t in 0..32 {
+            new_frames[8 * t + 2] = 0.9;
+        }
+        let old = DiarizeRun {
+            kind: DiarizerKind::Sortformer,
+            frames: old_frames,
+            wall_s: 1.0,
+            first_output_ms: None,
+        };
+        let new = DiarizeRun {
+            kind: DiarizerKind::Nemotron3,
+            frames: new_frames,
+            wall_s: 1.0,
+            first_output_ms: None,
+        };
+        let cmp = compare_diarize_runs(&old, &new, 0.5);
+        assert_eq!(cmp.assignment[0], 2);
+        assert_eq!(cmp.speech_s, 0.64);
+        assert_eq!(cmp.agree_s, 0.32);
+        assert_eq!(cmp.nemotron3_speech_s, 0.32);
     }
 
     /// Both `diarize` renderings carry the `dropped` flag in both polarities: a stalled

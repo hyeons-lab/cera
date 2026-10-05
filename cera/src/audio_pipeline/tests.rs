@@ -746,11 +746,11 @@ fn reset_drops_the_utterances_waiting_on_the_old_diarizer_session() {
         .unwrap();
     assert!(pipeline.add_utterance("a".into(), 0.0, 100.0));
     assert!(pipeline.add_utterance("b".into(), 200.0, 300.0));
-    assert_eq!(pipeline.diarizer.as_ref().unwrap().pending.len(), 2);
+    assert_eq!(pipeline.diarizer.as_ref().unwrap().debug_pending_len(), 2);
     pipeline.reset();
     assert!(pipeline.has_diarizer());
-    assert!(pipeline.diarizer.as_ref().unwrap().pending.is_empty());
-    assert_eq!(pipeline.diarizer.as_ref().unwrap().origin_ms, 0.0);
+    assert_eq!(pipeline.diarizer.as_ref().unwrap().debug_pending_len(), 0);
+    assert_eq!(pipeline.diarizer.as_ref().unwrap().debug_origin_ms(), 0.0);
 }
 
 /// Past `max_pending` waiting utterances `register` refuses instead of returning true for
@@ -778,7 +778,7 @@ fn register_refuses_utterances_past_max_pending() {
         !pipeline.add_utterance("c".into(), 400.0, 500.0),
         "the third utterance past max_pending 2 must be refused"
     );
-    assert_eq!(pipeline.diarizer.as_ref().unwrap().pending.len(), 2);
+    assert_eq!(pipeline.diarizer.as_ref().unwrap().debug_pending_len(), 2);
 }
 
 /// An utterance with non-finite times is granted, then flushed as `dropped`: the labeler
@@ -826,8 +826,8 @@ fn with_diarizer_from_bytes_matches_from_file() {
     assert!(pipeline.has_diarizer());
     let from_file = crate::model::sortformer::SortformerModel::from_file(&path).unwrap();
     assert_eq!(
-        pipeline.diarizer.as_ref().unwrap().params,
-        *from_file.default_streaming(),
+        pipeline.diarizer.as_ref().unwrap().debug_params(),
+        format!("{:?}", from_file.default_streaming()),
         "the bytes loader uses the checkpoint's own streaming parameters"
     );
 }
@@ -853,17 +853,20 @@ fn pending_utterance() -> (u64, PendingUtterance) {
     )
 }
 
-fn labeled(id: u64, label: Option<crate::speaker_labeler::SpeakerLabel>) -> LabeledUtterance {
-    LabeledUtterance {
+fn labeled(
+    id: u64,
+    label: Option<crate::speaker_labeler::SpeakerLabel<4>>,
+) -> PipelineLabeledUtterance {
+    PipelineLabeledUtterance::from_labeled(LabeledUtterance {
         id,
         start_ms: 100.0,
         end_ms: 900.0,
         label,
         dropped: false,
-    }
+    })
 }
 
-fn speaker_label() -> crate::speaker_labeler::SpeakerLabel {
+fn speaker_label() -> crate::speaker_labeler::SpeakerLabel<4> {
     crate::speaker_labeler::SpeakerLabel {
         speaker: 2,
         confidence: 0.75,

@@ -249,6 +249,60 @@ impl HexagonContext {
     }
 }
 
+/// Stage a diarizer accelerator on the Hexagon NPU and install it on the model
+/// (`stage` builds the accelerator in DSP memory, `set` installs it). The two
+/// diarizers shared this body line for line, so it lives here; `name` is the
+/// model name (`"Sortformer"`, `"Nemotron3"`), from which the log tags derive.
+///
+/// Returns `None` (with a log line naming the reason) when the model already
+/// has an accelerator, the DSP is unavailable, staging fails, or installing
+/// fails: the caller keeps the CPU. On success returns the staged accelerator
+/// (the same `Arc` the model holds).
+///
+/// Call once during setup, from one thread; concurrent staging of two
+/// accelerators on the same model is not supported. A losing race would
+/// double-stage DSP memory and report `None` while another staging won.
+pub(crate) fn stage_diarizer_accelerator<T>(
+    name: &'static str,
+    has_accelerator: bool,
+    max_frames: usize,
+    stage: impl FnOnce(Arc<FastRpcDriver>, Arc<Mutex<HexagonDevice>>) -> Result<T, CeraError>,
+    set: impl FnOnce(Arc<T>) -> anyhow::Result<()>,
+) -> Option<Arc<T>> {
+    if has_accelerator {
+        tracing::info!("Hexagon{name}: the model already has an accelerator; keeping it");
+        return None;
+    }
+    let context = HexagonContext::new()
+        .inspect_err(|e| {
+            log_context_unavailable(&format!("Hexagon{name}"), e);
+        })
+        .ok()?;
+    let arch_override = arch_override();
+    let dev = match probe_device(context.driver(), arch_override) {
+        Ok(d) => d,
+        Err(e) => {
+            tracing::info!("Hexagon{name}: DSP device unavailable ({e}), using the CPU");
+            return None;
+        }
+    };
+    let device = Arc::new(Mutex::new(dev));
+    let staged = match stage(Arc::clone(context.driver()), device) {
+        Ok(s) => Arc::new(s),
+        Err(e) => {
+            hexagon_error!("failed to stage {name} on the NPU: {e}");
+            return None;
+        }
+    };
+    if let Err(e) = set(staged.clone()) {
+        hexagon_warn!("Hexagon{name}: {e:#}");
+        return None;
+    }
+    let lower = name.to_lowercase();
+    tracing::info!("{lower}: using the Hexagon NPU ({max_frames} encoder frames)");
+    Some(staged)
+}
+
 #[cfg(test)]
 mod poison_tests {
     use super::*;

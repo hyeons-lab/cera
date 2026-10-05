@@ -9,9 +9,10 @@
 //!
 //! Both paths use F32 dequantized weights, but the GPU attention reads an
 //! f16 KV cache (the only dtype the Metal flash-attention kernel accepts —
-//! same as the production LLM decode path), so the per-frame cosine gate is
-//! 0.98 rather than 0.99. The log-magnitude `max_diff` gate is the primary
-//! correctness check. If the GPU path's precision changes again, re-evaluate.
+//! same as the production LLM decode path), so the per-frame gate is a
+//! magnitude-weighted complex cosine at 0.95 rather than a raw cosine near
+//! 1.0. The log-magnitude `max_diff` gate is the primary correctness check.
+//! If the GPU path's precision changes again, re-evaluate.
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
 
@@ -37,6 +38,35 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
         .fold(0.0f32, f32::max)
 }
 
+/// Magnitude-weighted complex cosine between two spectrum frames.
+///
+/// Each frame is `[log_abs (641 bins), phase (641 bins)]`, and the ISTFT
+/// consumes bins as `exp(log_abs + i * phase)`. A raw cosine over the
+/// concatenated vector mixes log-magnitude units with unwrapped-radian
+/// units, so benign f16 phase noise on high-gain frames can tank it (one
+/// measured frame dipped to 0.961 while every other frame sat above
+/// 0.9998). Weighting the phase agreement by bin magnitude measures what
+/// the ISTFT actually hears. Returns 0.0 when either frame is silent.
+fn complex_cosine(log_abs_a: &[f32], ph_a: &[f32], log_abs_b: &[f32], ph_b: &[f32]) -> f64 {
+    assert_eq!(log_abs_a.len(), log_abs_b.len());
+    assert_eq!(ph_a.len(), ph_b.len());
+    assert_eq!(log_abs_a.len(), ph_a.len());
+    let mut dot = 0.0f64;
+    let mut ea = 0.0f64;
+    let mut eb = 0.0f64;
+    for i in 0..log_abs_a.len() {
+        let ma = (log_abs_a[i] as f64).exp();
+        let mb = (log_abs_b[i] as f64).exp();
+        dot += ma * mb * ((ph_a[i] - ph_b[i]) as f64).cos();
+        ea += ma * ma;
+        eb += mb * mb;
+    }
+    if ea == 0.0 || eb == 0.0 {
+        return 0.0;
+    }
+    dot / (ea.sqrt() * eb.sqrt())
+}
+
 fn band_energy(log_abs: &[f32], start: usize, end: usize) -> f64 {
     log_abs[start..end].iter().map(|&v| (v as f64).exp()).sum()
 }
@@ -50,6 +80,39 @@ fn load_vocoder() -> Option<(std::sync::Arc<cera::gguf::GgufFile>, std::path::Pa
     }
     let gguf = cera::gguf::GgufFile::open_arc(&path).unwrap();
     Some((gguf, path))
+}
+
+// ── Test 0: Metric sanity (no vocoder needed) ──────────────────────────────────
+
+/// Pins `complex_cosine` non-vacuous: identical frames score 1.0, a uniform
+/// 0.5-rad phase shift scores cos(0.5) < 0.95 (below the spectrum gate), a
+/// sign flip on half the energy collapses toward 0, and silence scores 0.
+#[test]
+fn complex_cosine_metric_sanity() {
+    let log_abs = vec![0.5f32; 64];
+    let phase = vec![0.3f32; 64];
+    assert!((complex_cosine(&log_abs, &phase, &log_abs, &phase) - 1.0).abs() < 1e-12);
+
+    let shifted: Vec<f32> = phase.iter().map(|p| p + 0.5).collect();
+    let c = complex_cosine(&log_abs, &phase, &log_abs, &shifted);
+    assert!(
+        (c - 0.5f64.cos()).abs() < 1e-6,
+        "uniform 0.5-rad shift should score cos(0.5), got {c:.6}"
+    );
+    assert!(c < 0.95, "metric must be sensitive below the 0.95 gate");
+
+    let mut flipped = phase.clone();
+    for p in flipped.iter_mut().take(32) {
+        *p += std::f32::consts::PI;
+    }
+    let c = complex_cosine(&log_abs, &phase, &log_abs, &flipped);
+    assert!(
+        c.abs() < 1e-6,
+        "half-energy sign flip should collapse, got {c:.6}"
+    );
+
+    let silent = vec![f32::NEG_INFINITY; 64];
+    assert_eq!(complex_cosine(&silent, &phase, &silent, &phase), 0.0);
 }
 
 // ── Test 1: Spectrum parity ─────────────────────────────────────────────────
@@ -115,23 +178,26 @@ fn spectrum_parity() {
                 "code set {ci}, frame {f}: GPU has NaN/Inf"
             );
 
-            // Cosine similarity
-            let cos = cosine_sim(cpu_frame, gpu_frame);
-            // Log-magnitude max diff
+            // Log-magnitude max diff (the primary correctness gate)
             let log_abs_cpu = &cpu_frame[..n_fft_bins];
             let log_abs_gpu = &gpu_frame[..n_fft_bins];
             let max_diff = max_abs_diff(log_abs_cpu, log_abs_gpu);
-            eprintln!("  code_set={ci} frame={f}: cos={cos:.6} max_diff={max_diff:.4}");
-            // 0.98, not 0.99: the GPU attention uses an f16 KV cache (the only
+            let ph_cpu = &cpu_frame[n_fft_bins..];
+            let ph_gpu = &gpu_frame[n_fft_bins..];
+            // Magnitude-weighted complex cosine: the quantity the ISTFT
+            // consumes. The GPU attention uses an f16 KV cache (the only
             // dtype the Metal flash-attention kernel accepts, matching the
-            // production LLM decode path), while the CPU reference keeps K/V in
-            // f32. On low-energy frames the f16 phase bins make the full-vector
-            // cosine dip to ~0.987 even though the log-magnitude max_diff stays
-            // tiny (the assert below, the real correctness gate). A genuine
-            // regression collapses the cosine far below this.
+            // production LLM decode path), while the CPU reference keeps K/V
+            // in f32. On high-gain frames the f16 phase noise reaches ~0.3
+            // rad on peak bins (measured worst frame: 0.980, every other
+            // frame above 0.9998, full recovery the next frame), so the gate
+            // sits at 0.95. A genuine regression (wrong weights, broken
+            // kernel) collapses both this and max_diff far below the gates.
+            let ccos = complex_cosine(log_abs_cpu, ph_cpu, log_abs_gpu, ph_gpu);
+            eprintln!("  code_set={ci} frame={f}: complex_cos={ccos:.6} max_diff={max_diff:.4}");
             assert!(
-                cos > 0.98,
-                "code set {ci}, frame {f}: cosine {cos:.6} < 0.98"
+                ccos > 0.95,
+                "code set {ci}, frame {f}: complex cosine {ccos:.6} < 0.95"
             );
             assert!(
                 max_diff < 0.5,

@@ -35,6 +35,9 @@
 //! skip gate shared by the integration suites (lib unit tests share the
 //! canonical `backend::wgpu::require_passthrough_or_skip` copy instead).
 //!
+//! [`leap_models_dir`] and [`local_file`] resolve model-backed files for the
+//! diarizer parity suites (`sortformer_parity`, `nemotron3_parity`).
+//!
 //! [`read_wav_f32`] parses a 16-bit mono PCM WAV to f32, bounds-checked:
 //! one home for the fixture-clip reader so the copies stop drifting (the
 //! last-but-one copy never checked the format at all).
@@ -81,6 +84,53 @@ pub fn oracle_fixture(rel: &str) -> Option<std::path::PathBuf> {
 /// skips. One definition for all suites (a copy per file is how the
 /// copies (and the fail-closed policy) drift).
 ///
+/// Model directory for the diarizer parity suites: `$ENV_VAR` when set, else
+/// `$HOME/.leap/models/<subpath>`. `None` (skip the test) when neither resolves, unless
+/// `CERA_REQUIRE_MODEL=1`, which turns the skip into a failure. Shared by the Sortformer
+/// and Nemotron-3 parity suites (a copy per file is how the skip semantics drift).
+///
+/// Named apart from [`models_dir`]: that one already serves the oracle suites with
+/// different roots and a different require-flag spelling.
+///
+/// Callers: `sortformer_parity`, `nemotron3_parity`.
+pub fn leap_models_dir(env_var: &str, subpath: &str) -> Option<std::path::PathBuf> {
+    match std::env::var_os(env_var) {
+        Some(dir) => Some(std::path::PathBuf::from(dir)),
+        None => match std::env::var("HOME") {
+            Ok(home) => Some(
+                std::path::PathBuf::from(home)
+                    .join(".leap/models")
+                    .join(subpath),
+            ),
+            Err(_) => {
+                assert!(
+                    std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
+                    "CERA_REQUIRE_MODEL=1 but HOME is unset and {env_var} not provided"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// A model-backed file under [`leap_models_dir`], or `None` to skip (same require-flag
+/// rule as the dir itself).
+///
+/// Callers: `sortformer_parity`, `nemotron3_parity`.
+pub fn local_file(env_var: &str, subpath: &str, rel: &str) -> Option<std::path::PathBuf> {
+    let path = leap_models_dir(env_var, subpath)?.join(rel);
+    if !path.exists() {
+        assert!(
+            std::env::var("CERA_REQUIRE_MODEL").as_deref() != Ok("1"),
+            "CERA_REQUIRE_MODEL=1 but {} is absent",
+            path.display()
+        );
+        eprintln!("{} not found, skipping", path.display());
+        return None;
+    }
+    Some(path)
+}
+
 /// Callers: the `gpu_lfm2_*` suites and `qwen35_oracle_parity`.
 pub fn fixture_or_skip(fixture: &str, tag: &str) -> Option<std::path::PathBuf> {
     let p = models_dir().join(fixture);

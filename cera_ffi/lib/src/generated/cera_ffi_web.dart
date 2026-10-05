@@ -3433,7 +3433,9 @@ final class FfiAudioPipelineEventUtteranceTranscribed extends FfiAudioPipelineEv
 
 /// The attached speaker diarizer has covered an utterance and assigned it a speaker. One per
 /// utterance, after its `UtteranceTranscribed`: a chunk plus its lookahead later (seconds with
-/// the default preset). Needs a pipeline built with `from_files_with_diarizer`.
+/// the default preset). Needs a pipeline built with a diarizer constructor
+/// (`from_files_with_diarizer`, `from_files_with_diarizer_nemotron3`, or the `from_bytes`
+/// twins).
 final class FfiAudioPipelineEventUtteranceLabeled extends FfiAudioPipelineEvent {
   const FfiAudioPipelineEventUtteranceLabeled({
     /// The utterance text, as in its `UtteranceTranscribed` event.
@@ -3442,8 +3444,9 @@ final class FfiAudioPipelineEventUtteranceLabeled extends FfiAudioPipelineEvent 
     required this.startMs,
     /// End timestamp of the utterance in milliseconds.
     required this.endMs,
-    /// The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
-    /// span or the labeler had to give the utterance up (see `dropped`).
+    /// The most active speaker's slot (0 to 3 for Sortformer, 0 to 7 for Nemotron-3), or
+    /// `None` when no speaker was active over the span or the labeler had to give the
+    /// utterance up (see `dropped`).
     required this.speaker,
     /// The speaker's share of all speakers' active time over the span, in (0, 1].
     required this.confidence,
@@ -3460,8 +3463,9 @@ final class FfiAudioPipelineEventUtteranceLabeled extends FfiAudioPipelineEvent 
   final double startMs;
   /// End timestamp of the utterance in milliseconds.
   final double endMs;
-  /// The most active speaker's slot (0 to 3), or `None` when no speaker was active over the
-  /// span or the labeler had to give the utterance up (see `dropped`).
+  /// The most active speaker's slot (0 to 3 for Sortformer, 0 to 7 for Nemotron-3), or
+  /// `None` when no speaker was active over the span or the labeler had to give the
+  /// utterance up (see `dropped`).
   final int? speaker;
   /// The speaker's share of all speakers' active time over the span, in (0, 1].
   final double? confidence;
@@ -7352,6 +7356,16 @@ final class FfiAudioPipeline {
   /// otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
   static FfiAudioPipeline fromBytesWithDiarizer(Uint8List? vadBytes, Uint8List? hotwordBytes, Uint8List? whisperBytes, Uint8List diarizerBytes, bool preferNpu, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromBytesWithDiarizer');
 
+  /// Construct a pipeline from in-memory GGUF byte buffers with a Nemotron-3-Diarization
+  /// speaker diarizer (`diarizer_bytes`, a converted Nemotron-3 GGUF: 8 speakers, 10 ms
+  /// frames). Every transcribed utterance then gets an `UtteranceLabeled` event with its
+  /// speaker, once the diarizer covers it.
+  ///
+  /// With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+  /// device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+  /// otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+  static FfiAudioPipeline fromBytesWithDiarizerNemotron3(Uint8List? vadBytes, Uint8List? hotwordBytes, Uint8List? whisperBytes, Uint8List diarizerBytes, bool preferNpu, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromBytesWithDiarizerNemotron3');
+
   /// Construct a pipeline from filesystem model paths.
   static FfiAudioPipeline fromFiles(String? vadPath, String? hotwordPath, String? whisperPath, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromFiles');
 
@@ -7363,6 +7377,16 @@ final class FfiAudioPipeline {
   /// device offers it (the GGUF must have been converted with `--tail-outtype q8_0`); otherwise,
   /// or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
   static FfiAudioPipeline fromFilesWithDiarizer(String? vadPath, String? hotwordPath, String? whisperPath, String diarizerPath, bool preferNpu, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromFilesWithDiarizer');
+
+  /// Construct a pipeline from filesystem model paths with a Nemotron-3-Diarization
+  /// speaker diarizer (`diarizer_path`, a converted Nemotron-3 GGUF: 8 speakers, 10 ms
+  /// frames). Every transcribed utterance then gets an `UtteranceLabeled` event with its
+  /// speaker, once the diarizer has covered it.
+  ///
+  /// With `prefer_npu` the diarizer runs on the Hexagon NPU when this build has it and the
+  /// device offers it (the GGUF must have been converted with `--tail-outtype q8_0`);
+  /// otherwise, or if staging fails, it runs on the CPU. `diarizer_on_npu()` says which.
+  static FfiAudioPipeline fromFilesWithDiarizerNemotron3(String? vadPath, String? hotwordPath, String? whisperPath, String diarizerPath, bool preferNpu, FfiAudioPipelineConfig? config) => _unsupportedOnWeb('FfiAudioPipeline.fromFilesWithDiarizerNemotron3');
 
   /// Register an utterance transcribed outside the pipeline so it gets an `UtteranceLabeled`
   /// event too. `start_ms` and `end_ms` are on the pipeline's clock, as in

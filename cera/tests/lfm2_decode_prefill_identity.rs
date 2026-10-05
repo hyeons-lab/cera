@@ -182,8 +182,15 @@ fn assert_prefill_matches_decode(
 
     if !exact {
         let scale = decode_logits.iter().fold(1.0f32, |m, x| m.max(x.abs()));
+        // 2%, not 1%: under BLAS, prefill is exact-f32 SGEMM while decode is
+        // int8 GEMV, so the gap is the activation-quantization error
+        // accumulated over the layers. It measures 1.24% on the seeded
+        // synthetic model since #467 reworked activation quantization (spread
+        // smoothly over all logits, mean 0.4%: noise, not a broken layer). A
+        // skipped matmul or layout bug diverges by ~100%, so this still
+        // catches genuine corruption with wide margin.
         assert!(
-            max_abs_diff(&prefill_logits, &decode_logits) < 1e-2 * scale,
+            max_abs_diff(&prefill_logits, &decode_logits) < 2e-2 * scale,
             "{label}: prefill and decode logits differ"
         );
         return;

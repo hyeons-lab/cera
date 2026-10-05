@@ -184,9 +184,11 @@ detector boundaries, and caps buffered utterances and pre-roll. Duration-driven
 splits preserve ongoing VAD state. Resuming wake listening clears discontinuous
 old audio while preserving unexpired cooldown.
 
-With a Sortformer diarizer attached (`AudioPipelineBuilder::with_diarizer`,
-`FfiAudioPipeline.fromFilesWithDiarizer`) the pipeline feeds it every sample it
-sees and follows each `UtteranceTranscribed` with an `UtteranceLabeled`
+With a diarizer attached — Sortformer (`AudioPipelineBuilder::with_diarizer`,
+`FfiAudioPipeline.fromFilesWithDiarizer`; 4 slots) or Nemotron-3-Diarization
+(`with_diarizer_nemotron3` / `fromFilesWithDiarizerNemotron3`; 8 slots) — the pipeline
+feeds it every sample it sees and follows each `UtteranceTranscribed` with an
+`UtteranceLabeled`
 (`speaker`, `confidence`, `overlapping`, `dropped`) once the diarizer has covered the
 utterance, a chunk plus its lookahead later. `add_utterance` registers text
 transcribed elsewhere. `flush` ends the diarizer's session and starts a new one,

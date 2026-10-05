@@ -184,12 +184,21 @@ def get_formatted_timestamps(now_utc: datetime.datetime | None = None) -> str:
     return f"{now_pt.strftime('%Y-%m-%d %I:%M:%S %p')} {tz_name} ({now_utc.strftime('%H:%M:%S UTC')})"
 
 
+def format_model_label(model: str) -> str:
+    """`gemini-3.8-flash` reads as `Gemini 3.8 Flash`; unknown shapes pass through."""
+    parts = (model or "").strip().split("-")
+    if len(parts) < 3:
+        return model or "Gemini"
+    return " ".join(p if p[:1].isdigit() else p.capitalize() for p in parts)
+
+
 def build_comment_body(
     review_text: str,
     effort: str,
     repo: str,
     head_sha: str,
     now_utc: datetime.datetime | None = None,
+    model: str = "gemini-3.8-flash",
 ) -> str:
     review_text = review_text.strip()
 
@@ -213,7 +222,9 @@ def build_comment_body(
     if commit_link:
         meta_parts.append(f"Reviewed commit {commit_link}")
     meta_parts.append(timestamp_str)
-    meta_parts.append(f"Antigravity Deep Reasoning Audit (Gemini 3.7 Flash • {effort} effort)")
+    meta_parts.append(
+        f"Antigravity Deep Reasoning Audit ({format_model_label(model)} • {effort} effort)"
+    )
 
     meta_header = f"> *{' • '.join(meta_parts)}*"
     full_body = f"{COMMENT_TAG}\n## 🪐 Antigravity Code Review\n{meta_header}\n\n{review_text}"
@@ -321,8 +332,9 @@ def main() -> None:
     effort = os.environ.get("EFFORT_LEVEL", "high") or "high"
     repo = os.environ.get("GITHUB_REPOSITORY", "hyeons-lab/cera") or "hyeons-lab/cera"
     head_sha = resolve_head_sha(os.environ.get("HEAD_SHA", "").strip())
+    model = os.environ.get("GEMINI_MODEL", "gemini-3.8-flash") or "gemini-3.8-flash"
 
-    final_body = build_comment_body(review_text, effort, repo, head_sha)
+    final_body = build_comment_body(review_text, effort, repo, head_sha, model=model)
 
     # Replace/upsert comment: if an existing review comment is found, PATCH/replace it in place
     success = False
