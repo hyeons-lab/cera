@@ -12,13 +12,13 @@
 // The mobile-consumer story for these bindings lives elsewhere.
 
 plugins {
-    kotlin("jvm") version "2.1.10"
-    kotlin("plugin.serialization") version "2.1.10"
+    kotlin("jvm") version "2.4.0"
+    kotlin("plugin.serialization") version "2.4.0"
     application
     // Shadow packs all runtime classpath deps (binding + JNA + kotlinx
     // libs) into a single self-contained jar. Subprocess invocation is
     // simpler when there's exactly one artifact to point `java -jar` at.
-    id("com.gradleup.shadow") version "8.3.5"
+    id("com.gradleup.shadow") version "9.6.1"
 }
 
 repositories {
