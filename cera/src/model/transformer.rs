@@ -156,6 +156,18 @@ impl std::fmt::Debug for RepackedWeight {
     }
 }
 
+/// A Q4_0 weight in the decode repack layout (`cpu::repack_q4_0_dec4`), kept alongside the mmap weight and
+/// the prefill repack. Its `Debug` prints the length, never the bytes (they can be hundreds of MiB).
+#[cfg(all(target_arch = "aarch64", not(has_blas)))]
+pub struct Dec4Packed(pub Vec<u8>);
+
+#[cfg(all(target_arch = "aarch64", not(has_blas)))]
+impl std::fmt::Debug for Dec4Packed {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "Dec4Packed({} bytes)", self.0.len())
+    }
+}
+
 /// Pre-resolved reference to a quantized weight in the mmap. Computed once at
 /// load time to avoid HashMap lookups during inference. Semantics match
 /// `lfm2::WeightRef`.
@@ -181,6 +193,12 @@ pub struct WeightRef {
     /// construct via `WeightRef::new`). Same cfg as `repacked`.
     #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
     pub repack_loader_skipped: bool,
+    /// Set by `with_repack_if` for a Q4_0 weight on a dot-product host: the 4-row interleaved layout the
+    /// decode GEMVs read, 72 bytes per four rows and block (the standard layout's size). Decode uses it
+    /// when present and the standard mmap layout otherwise. Arithmetic is the repacked prefill's, so the
+    /// two phases agree bit for bit on a weight that has it.
+    #[cfg(all(target_arch = "aarch64", not(has_blas)))]
+    pub dec4: Option<std::sync::Arc<Dec4Packed>>,
     #[cfg(has_blas)]
     pub cached_f32: std::sync::Arc<std::sync::OnceLock<Vec<f32>>>,
     #[cfg(has_blas)]
@@ -188,6 +206,22 @@ pub struct WeightRef {
 }
 
 impl WeightRef {
+    /// The decode-repacked bytes of this Q4_0 weight, if it has them (see [`WeightRef::dec4`]). Only the
+    /// aarch64 decode kernels read it, so it exists only there; it is always `None` in a BLAS build,
+    /// where the layout is not built.
+    #[cfg(target_arch = "aarch64")]
+    #[inline]
+    pub(crate) fn dec4_bytes(&self) -> Option<&[u8]> {
+        #[cfg(not(has_blas))]
+        {
+            self.dec4.as_ref().map(|d| d.0.as_slice())
+        }
+        #[cfg(has_blas)]
+        {
+            None
+        }
+    }
+
     pub fn new(start: u64, size: usize, dtype: DType, m: usize, k: usize) -> Self {
         Self {
             start,
@@ -199,6 +233,8 @@ impl WeightRef {
             repacked: None,
             #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
             repack_loader_skipped: false,
+            #[cfg(all(target_arch = "aarch64", not(has_blas)))]
+            dec4: None,
             #[cfg(has_blas)]
             cached_f32: std::sync::Arc::new(std::sync::OnceLock::new()),
             #[cfg(has_blas)]
@@ -378,6 +414,17 @@ impl WeightRef {
                 })
             });
             self.repack_loader_skipped = false;
+            #[cfg(target_arch = "aarch64")]
+            {
+                self.dec4 = (self.dtype == DType::Q4_0 && cpu::q4_0_dec4_supported(self.m, self.k))
+                    .then(|| {
+                        std::sync::Arc::new(Dec4Packed(cpu::repack_q4_0_dec4(
+                            weight_data(gguf, &self),
+                            self.m,
+                            self.k,
+                        )))
+                    });
+            }
         }
         self
     }
@@ -689,6 +736,12 @@ pub(crate) fn gemv_preq(
     q8q: &[i8],
     y: &mut [f32],
 ) {
+    if let Some(dec4) = wref.dec4_bytes()
+        && y.len() >= wref.m
+    {
+        cpu::gemv_q4_0_dec4_with_q8(dec4, q8s, q8q, y, wref.m, wref.k);
+        return;
+    }
     let data = weight_data(gguf, wref);
     cpu::gemv_with_preq(wref.dtype, data, q8s, q8q, x_f32, y, wref.m, wref.k);
 }
@@ -2034,10 +2087,26 @@ pub(crate) fn decode_attention(
     // One head per row *and* per steal unit: there are only `n_heads` of them and
     // each is heavy, so the default steal floor would hand them all to a couple
     // of workers.
-    cpu::par_rows_n_chunked_decode(scratch, stride, 1, 1, |(h, row)| {
-        let (scores, head_out) = row.split_at_mut(d.seq_len);
-        decode_attn_head(q, kv, d, h, scores, head_out);
-    });
+    //
+    // When there are at least as many KV heads as workers, the unit is instead a whole GQA group: the
+    // query heads that share a KV head run back to back on one worker, so the second one reads that
+    // head's keys and values from L2 where, as separate tasks on different workers, each would fetch
+    // them from memory (at 1,800 tokens of context that is the difference between 2.7 and about 1.6 ms
+    // of attention per token on the S25 Ultra). Each head's arithmetic is unchanged.
+    let group = d.group_size();
+    if group > 1 && d.n_kv_heads >= cpu::decode_par_threads() {
+        cpu::par_rows_n_chunked_decode(scratch, stride * group, 1, 1, |(g, rows)| {
+            for (j, row) in rows.chunks_mut(stride).enumerate() {
+                let (scores, head_out) = row.split_at_mut(d.seq_len);
+                decode_attn_head(q, kv, d, g * group + j, scores, head_out);
+            }
+        });
+    } else {
+        cpu::par_rows_n_chunked_decode(scratch, stride, 1, 1, |(h, row)| {
+            let (scores, head_out) = row.split_at_mut(d.seq_len);
+            decode_attn_head(q, kv, d, h, scores, head_out);
+        });
+    }
     for h in 0..d.n_heads {
         let src = h * stride + d.seq_len;
         attn_out[h * d.head_dim..(h + 1) * d.head_dim]
@@ -2508,6 +2577,18 @@ pub(crate) fn forward_ffn_block(
                 cpu::gemv_q4k_gate_up_swiglu_with_q8(
                     g_data,
                     u_data,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    &mut state.scratch.gate[..intermediate_size],
+                    intermediate_size,
+                    hidden_size,
+                );
+            } else if let (Some(g4), Some(u4)) =
+                (weights.ffn_gate.dec4_bytes(), weights.ffn_up.dec4_bytes())
+            {
+                cpu::gemv_q4_0_dec4_gate_up_swiglu_with_q8(
+                    g4,
+                    u4,
                     &state.scratch.q8_scales,
                     &state.scratch.q8_quants,
                     &mut state.scratch.gate[..intermediate_size],

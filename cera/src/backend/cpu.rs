@@ -48,9 +48,10 @@
 /// reaches a `RowPool`, through [`par_rows`] for decode GEMVs and
 /// [`par_rows_n`], [`par_rows_n_chunked`] or [`par_rows_n_work`] for the
 /// batched paths; the four aarch64 i8mm kernels were the last exception and
-/// moved across when the two-pool oversubscription they caused was fixed. The vision and audio
-/// encoders still fan their own matmuls out on rayon, so `RAYON_NUM_THREADS`
-/// can still move a VL or audio prefill.
+/// moved across when the two-pool oversubscription they caused was fixed. The vision tower's
+/// matmuls moved to the RowPool as well (with its int8 GEMM); the audio encoders still fan their own
+/// matmuls out on rayon, so `RAYON_NUM_THREADS` can still move an audio prefill (and the ViT patch
+/// embed).
 ///
 /// When this was written the aarch64 i8mm prefill GEMM was still on rayon, and
 /// measuring it was easy: on a Pixel 10 Pro Fold (LFM2.5-350M-Q4_K_M, 512
@@ -1689,6 +1690,99 @@ pub(crate) fn q8_0_smmla_repack_supported(m: usize, k: usize) -> bool {
         let _ = (m, k);
         false
     }
+}
+
+// ── Q4_0 decode repack (4-row interleave, aarch64) ───────────────────────────
+//
+// Decode streams every Q4_0 weight once per token, so its cost is the instructions spent per 32-weight
+// block. The standard layout makes each row's block its own 16 nibble bytes, so a row needs its own
+// unpack, two dots, a scalar scale and a convert-and-accumulate. This layout interleaves four rows at
+// 4-byte granularity so one `vdotq_laneq_s32` against four activation bytes produces one partial dot for
+// each of the four rows in the four lanes, the whole block's integer dot accumulates in one vector (lane =
+// row), and the scale, convert and fused accumulate run four rows wide with no horizontal sum.
+//
+// The arithmetic is exactly the repacked prefill GEMMs': per output, `acc = fma(float(blockdot),
+// d * xs, acc)` in block order, with the block's integer dot exact. So decode and repacked prefill are
+// bit-identical, which the standard-layout decode kernels were not (they accumulate per element group in
+// even/odd float accumulators).
+
+/// Bytes per (4-row group, block) record of the [`repack_q4_0_dec4`] layout: 64 nibble bytes and the four
+/// rows' f16 scales.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(has_blas, allow(dead_code))]
+pub const Q4_0_DEC4_RECORD: usize = 72;
+
+/// Whether a Q4_0 `m x k` weight gets the decode repack on this host: rows in whole 16-row groups (the
+/// prefill repack's own condition, so a weight is on the repacked numerics in both phases or in neither),
+/// 32-aligned `k`, the dot-product and f16-convert features, and not switched off with
+/// `CERA_Q4_DEC4=0`.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(has_blas, allow(dead_code))]
+pub fn q4_0_dec4_supported(m: usize, k: usize) -> bool {
+    let f = super::cpu_features::cpu_features();
+    f.dotprod
+        && f.fp16
+        && m != 0
+        && m.is_multiple_of(16)
+        && k != 0
+        && k.is_multiple_of(32)
+        && !super::cpu_features::env_disabled("CERA_Q4_DEC4")
+}
+
+/// Repack `m x k` standard Q4_0 rows (`m % 4 == 0`, `k % 32 == 0`) for the decode GEMVs.
+///
+/// Record `(g * nb + b)` (4-row group `g`, block `b`, `nb = k / 32`) starts at `(g * nb + b) * 72`:
+/// bytes `c*16 + r*4 + j` for `c, r, j` in `0..4` hold row `4g + r`'s `qs[4c + j]` (low nibble = element
+/// `4c + j`, high nibble = element `16 + 4c + j`), then eight bytes of the four rows' f16 scales,
+/// little-endian, rows in order. The nibbles stay packed, so the weight bytes streamed per token are the
+/// standard layout's (72 per four rows, as 4 x 18).
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(has_blas, allow(dead_code))]
+pub fn repack_q4_0_dec4(src: &[u8], m: usize, k: usize) -> Vec<u8> {
+    assert!(
+        m.is_multiple_of(4),
+        "repack_q4_0_dec4: m must be a multiple of 4"
+    );
+    assert!(
+        k.is_multiple_of(32),
+        "repack_q4_0_dec4: k must be a multiple of 32"
+    );
+    let nb = k / 32;
+    let bsz = size_of::<crate::quant::BlockQ4_0>();
+    assert_eq!(
+        src.len(),
+        m * nb * bsz,
+        "repack_q4_0_dec4: src is {} bytes, need {} for {m}x{k}",
+        src.len(),
+        m * nb * bsz,
+    );
+    let groups = m / 4;
+    let mut out = vec![0u8; groups * nb * Q4_0_DEC4_RECORD];
+    let one_group = |g: usize, dst: &mut [u8]| {
+        for b in 0..nb {
+            let rec = &mut dst[b * Q4_0_DEC4_RECORD..(b + 1) * Q4_0_DEC4_RECORD];
+            for r in 0..4 {
+                let blk = ((4 * g + r) * nb + b) * bsz;
+                rec[64 + 2 * r..64 + 2 * r + 2].copy_from_slice(&src[blk..blk + 2]);
+                for c in 0..4 {
+                    rec[c * 16 + r * 4..c * 16 + r * 4 + 4]
+                        .copy_from_slice(&src[blk + 2 + 4 * c..blk + 2 + 4 * c + 4]);
+                }
+            }
+        }
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        out.par_chunks_mut(nb * Q4_0_DEC4_RECORD)
+            .enumerate()
+            .for_each(|(g, dst)| one_group(g, dst));
+    }
+    #[cfg(not(feature = "parallel"))]
+    for (g, dst) in out.chunks_mut(nb * Q4_0_DEC4_RECORD).enumerate() {
+        one_group(g, dst);
+    }
+    out
 }
 
 /// Repack `m x k` Q4_0 weights into 8-row-interleaved layout for x86_64 prefill.
@@ -3649,6 +3743,145 @@ pub fn gemv_q4_0_concat3_with_q8(
     }
 }
 
+/// Q4_0 GEMV from the decode repack ([`repack_q4_0_dec4`]) against pre-quantized Q8_0 input. `m % 16 == 0`.
+/// Bit-identical to the repacked prefill GEMM at one column. Only call for a weight whose
+/// [`q4_0_dec4_supported`] held at repack time.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(has_blas, allow(dead_code))]
+pub fn gemv_q4_0_dec4_with_q8(
+    packed: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    y: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    let nb = k / 32;
+    if k == 0
+        || !k.is_multiple_of(32)
+        || !m.is_multiple_of(16)
+        || packed.len() < m / 4 * nb * Q4_0_DEC4_RECORD
+        || x_scales.len() < nb
+        || x_quants.len() < k
+        || y.len() < m
+    {
+        debug_assert!(
+            false,
+            "gemv_q4_0_dec4_with_q8: dimension or buffer underflow"
+        );
+        return;
+    }
+    // SAFETY: a decode-repacked weight exists only where `q4_0_dec4_supported` saw dotprod and fp16.
+    unsafe {
+        crate::backend::simd::neon::gemv_q4_0_dec4_neon(
+            packed,
+            x_scales,
+            x_quants,
+            &mut y[..m],
+            m,
+            k,
+        )
+    }
+}
+
+/// Fused gate + up Q4_0 GEMV with in-register SwiGLU from the decode repack: `out[r] = silu(g) * u`.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(has_blas, allow(dead_code))]
+pub fn gemv_q4_0_dec4_gate_up_swiglu_with_q8(
+    gate: &[u8],
+    up: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    k: usize,
+) {
+    let nb = k / 32;
+    if k == 0
+        || !k.is_multiple_of(32)
+        || !m.is_multiple_of(16)
+        || gate.len() < m / 4 * nb * Q4_0_DEC4_RECORD
+        || up.len() < m / 4 * nb * Q4_0_DEC4_RECORD
+        || x_scales.len() < nb
+        || x_quants.len() < k
+        || out.len() < m
+    {
+        debug_assert!(
+            false,
+            "gemv_q4_0_dec4_gate_up_swiglu_with_q8: dimension or buffer underflow"
+        );
+        return;
+    }
+    // SAFETY: as `gemv_q4_0_dec4_with_q8`.
+    unsafe {
+        crate::backend::simd::neon::gemv_q4_0_dec4_gate_up_swiglu_neon(
+            gate,
+            up,
+            x_scales,
+            x_quants,
+            &mut out[..m],
+            m,
+            k,
+        )
+    }
+}
+
+/// Q, K and V Q4_0 GEMVs from the decode repack in one dispatch.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(has_blas, allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_q4_0_dec4_concat3_with_q8(
+    a1: &[u8],
+    a2: &[u8],
+    a3: &[u8],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    y1: &mut [f32],
+    y2: &mut [f32],
+    y3: &mut [f32],
+    m1: usize,
+    m2: usize,
+    m3: usize,
+    k: usize,
+) {
+    let nb = k / 32;
+    if k == 0
+        || !k.is_multiple_of(32)
+        || !(m1.is_multiple_of(16) && m2.is_multiple_of(16) && m3.is_multiple_of(16))
+        || a1.len() < m1 / 4 * nb * Q4_0_DEC4_RECORD
+        || a2.len() < m2 / 4 * nb * Q4_0_DEC4_RECORD
+        || a3.len() < m3 / 4 * nb * Q4_0_DEC4_RECORD
+        || x_scales.len() < nb
+        || x_quants.len() < k
+        || y1.len() < m1
+        || y2.len() < m2
+        || y3.len() < m3
+    {
+        debug_assert!(
+            false,
+            "gemv_q4_0_dec4_concat3_with_q8: dimension or buffer underflow"
+        );
+        return;
+    }
+    // SAFETY: as `gemv_q4_0_dec4_with_q8`.
+    unsafe {
+        crate::backend::simd::neon::gemv_q4_0_dec4_concat3_neon(
+            a1,
+            a2,
+            a3,
+            x_scales,
+            x_quants,
+            &mut y1[..m1],
+            &mut y2[..m2],
+            &mut y3[..m3],
+            m1,
+            m2,
+            m3,
+            k,
+        )
+    }
+}
+
 /// Unified 3-matrix Q4_K GEMV with pre-quantized Q8_0 input (for Q, K, V projections).
 /// Computes y1 = A1 @ x, y2 = A2 @ x, and y3 = A3 @ x in a single threadpool dispatch with a single barrier.
 #[cfg(target_arch = "aarch64")]
@@ -5220,7 +5453,9 @@ unsafe fn gelu_inplace_neon(x: &mut [f32]) -> usize {
         let n4 = x.len() / 4 * 4;
         let mut i = 0;
         while i < n4 {
-            let v = vld1q_f32(x.as_ptr().add(i));
+            // Below -10 the result is 0 (the scalar returns it exactly); clamping keeps the polynomial
+            // away from 0.5 * -inf * (1 + tanh = 0) = NaN. A NaN input stays NaN through `vmaxq`.
+            let v = vmaxq_f32(vld1q_f32(x.as_ptr().add(i)), vdupq_n_f32(-10.0));
             // 2 * sqrt(2/pi) * (x + COEF * x^3)
             let v2 = vmulq_f32(v, v);
             let inner2 = vmulq_f32(k_sqrt, vmulq_f32(v, vaddq_f32(one, vmulq_f32(k_coef, v2))));
@@ -9504,6 +9739,169 @@ mod tests {
         data
     }
 
+    /// The decode repack (`repack_q4_0_dec4`) and its GEMVs run the repacked prefill GEMMs' arithmetic, so on a
+    /// weight that has it decode and prefill agree bit for bit (the standard-layout decode kernels do not
+    /// on the i8mm tier: they accumulate per element group in even/odd float accumulators).
+    #[cfg(all(target_arch = "aarch64", not(has_blas)))]
+    mod dec4_identity {
+        use super::*;
+
+        fn quantized_cols(k: usize, n: usize, st: &mut u64) -> (Vec<f32>, Vec<i8>) {
+            let nb = k / 32;
+            let mut scales = vec![0.0f32; n * nb];
+            let mut quants = vec![0i8; n * k];
+            for j in 0..n {
+                let x: Vec<f32> = (0..k)
+                    .map(|_| (lcg(st) % 4000) as f32 / 1000.0 - 2.0)
+                    .collect();
+                quantize_f32_to_q8_0_into(
+                    &x,
+                    &mut scales[j * nb..(j + 1) * nb],
+                    &mut quants[j * k..(j + 1) * k],
+                );
+            }
+            (scales, quants)
+        }
+
+        /// Each column of the repacked prefill GEMM for this host's tier, `out[row * n + col]`.
+        fn prefill(data: &[u8], bs: &[f32], bq: &[i8], m: usize, n: usize, k: usize) -> Vec<f32> {
+            let mut out = vec![0.0f32; m * n];
+            let i8mm = crate::backend::cpu_features::cpu_features().tier
+                == crate::backend::cpu_features::CpuTier::NeonI8mm;
+            let ran = if i8mm {
+                let (p, s) = repack_q4_0_smmla_8x8(data, m, k);
+                gemm_preq_repacked_q4_0_smmla_dispatch(&p, &s, bs, bq, &mut out, m, n, k)
+            } else {
+                let (p, s) = repack_q4_0_8x8(data, m, k);
+                gemm_preq_repacked_q4_0_dispatch(&p, &s, bs, bq, &mut out, m, n, k)
+            };
+            assert!(ran, "no repacked prefill kernel on this host");
+            out
+        }
+
+        /// Whether the decode repack runs on this host. A host without it skips the tests below
+        /// quietly, unless `CERA_REQUIRE_SIMD` lists `dotprod`: then a missing repack (the feature
+        /// detection regressing, or `CERA_Q4_DEC4=0` left in the environment) fails instead of
+        /// leaving the identity between decode and the repacked prefill unchecked.
+        fn dec4_or_skip() -> bool {
+            // The repack needs dotprod and fp16 and is off under `CERA_Q4_DEC4=0`, so "dotprod" is only the
+            // first suspect when a required leg fails here.
+            crate::backend::simd::require_simd_or_skip("dotprod", q4_0_dec4_supported(16, 32))
+        }
+
+        #[test]
+        fn dec4_gemv_is_bit_identical_to_the_repacked_prefill_gemm() {
+            if !dec4_or_skip() {
+                return;
+            }
+            for &(m, k) in &[(16usize, 32usize), (48, 96), (64, 1024), (32, 4608)] {
+                let nb = k / 32;
+                for &n in &[1usize, 3, 4, 5] {
+                    let mut st = 0xdec4_0000u64 ^ (m as u64) << 24 ^ (k as u64) << 8 ^ n as u64;
+                    let data = weights(DType::Q4_0, m, k, &mut st);
+                    let packed = repack_q4_0_dec4(&data, m, k);
+                    let (bs, bq) = quantized_cols(k, n, &mut st);
+                    let want = prefill(&data, &bs, &bq, m, n, k);
+                    for j in 0..n {
+                        let mut y = vec![0.0f32; m];
+                        gemv_q4_0_dec4_with_q8(
+                            &packed,
+                            &bs[j * nb..(j + 1) * nb],
+                            &bq[j * k..(j + 1) * k],
+                            &mut y,
+                            m,
+                            k,
+                        );
+                        for (i, &got) in y.iter().enumerate() {
+                            assert_eq!(
+                                got.to_bits(),
+                                want[i * n + j].to_bits(),
+                                "m={m} k={k} n={n} col {j} row {i}: decode {got:e} vs prefill {:e}",
+                                want[i * n + j]
+                            );
+                        }
+                    }
+                }
+            }
+        }
+
+        /// The fused gate/up SwiGLU and the Q/K/V concat give exactly the plain GEMV's rows.
+        #[test]
+        fn dec4_fused_kernels_match_the_plain_gemv() {
+            if !dec4_or_skip() {
+                return;
+            }
+            let (m, k) = (48usize, 1024usize);
+            let nb = k / 32;
+            let mut st = 0xdec4_f00du64;
+            let gate = repack_q4_0_dec4(&weights(DType::Q4_0, m, k, &mut st), m, k);
+            let up = repack_q4_0_dec4(&weights(DType::Q4_0, m, k, &mut st), m, k);
+            let third = repack_q4_0_dec4(&weights(DType::Q4_0, 32, k, &mut st), 32, k);
+            let (bs, bq) = quantized_cols(k, 1, &mut st);
+            let plain = |w: &[u8], rows: usize| {
+                let mut y = vec![0.0f32; rows];
+                gemv_q4_0_dec4_with_q8(w, &bs[..nb], &bq[..k], &mut y, rows, k);
+                y
+            };
+            let (g, u) = (plain(&gate, m), plain(&up, m));
+
+            let mut out = vec![0.0f32; m];
+            gemv_q4_0_dec4_gate_up_swiglu_with_q8(&gate, &up, &bs, &bq, &mut out, m, k);
+            for r in 0..m {
+                let want = (g[r] / (1.0 + ggml_expf(-g[r]))) * u[r];
+                assert_eq!(out[r].to_bits(), want.to_bits(), "swiglu row {r}");
+            }
+
+            let (mut y1, mut y2, mut y3) = (vec![0.0f32; m], vec![0.0f32; m], vec![0.0f32; 32]);
+            gemv_q4_0_dec4_concat3_with_q8(
+                &gate, &up, &third, &bs, &bq, &mut y1, &mut y2, &mut y3, m, m, 32, k,
+            );
+            assert_eq!(
+                y1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                g.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "concat3 first matrix"
+            );
+            assert_eq!(
+                y2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                u.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "concat3 second matrix"
+            );
+            let t = plain(&third, 32);
+            assert_eq!(
+                y3.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                t.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "concat3 third matrix"
+            );
+        }
+
+        /// Against the standard-layout decode GEMV the results differ only by float summation order.
+        #[test]
+        fn dec4_gemv_is_close_to_the_standard_layout_gemv() {
+            if !dec4_or_skip() {
+                return;
+            }
+            let (m, k) = (64usize, 4608usize);
+            let mut st = 0xdec4_c105eu64;
+            let data = weights(DType::Q4_0, m, k, &mut st);
+            let packed = repack_q4_0_dec4(&data, m, k);
+            let (bs, bq) = quantized_cols(k, 1, &mut st);
+            let x: Vec<f32> = vec![0.0; k];
+            let mut want = vec![0.0f32; m];
+            gemv_with_preq(DType::Q4_0, &data, &bs, &bq, &x, &mut want, m, k);
+            let mut got = vec![0.0f32; m];
+            gemv_q4_0_dec4_with_q8(&packed, &bs, &bq, &mut got, m, k);
+            let scale = want.iter().fold(0.0f32, |a, v| a.max(v.abs())).max(1.0);
+            for r in 0..m {
+                assert!(
+                    (got[r] - want[r]).abs() <= 1e-4 * scale,
+                    "row {r}: dec4 {} vs standard {}",
+                    got[r],
+                    want[r]
+                );
+            }
+        }
+    }
+
     /// Decode and batched prefill must run the *same* arithmetic on this host:
     /// `gemv_dispatch` has to equal `gemm_preq_dispatch` at `n = 1`, bit for bit,
     /// for every dtype whose dispatchers claim it.
@@ -11049,6 +11447,38 @@ mod tests {
         assert!((x[1] - 0.8413).abs() < 5e-3, "gelu(1) = {}", x[1]);
         assert!((x[2] + 0.1587).abs() < 5e-3, "gelu(-1) = {}", x[2]);
         assert!((x[3] - 1.9545).abs() < 5e-3, "gelu(2) = {}", x[3]);
+    }
+
+    /// Infinities, a value below the cutoff and NaN in the first lanes, so the vector loop (not the
+    /// scalar tail) handles them: `gelu(-inf)` is 0 as in the scalar, not `0.5 * -inf * 0 = NaN`. Only
+    /// the NEON loop has the clamp; elsewhere `gelu_inplace` is the scalar and this checks it against
+    /// itself.
+    #[test]
+    fn test_gelu_vector_handles_infinities_and_cutoff() {
+        let xs = [
+            f32::NEG_INFINITY,
+            f32::INFINITY,
+            -1e30,
+            -12.0,
+            f32::NEG_INFINITY,
+            0.5,
+            f32::NAN,
+            3.0,
+        ];
+        let mut got = xs;
+        gelu_inplace(&mut got);
+        for (&g, &x) in got.iter().zip(&xs) {
+            if x.is_nan() {
+                assert!(g.is_nan(), "gelu(NaN) = {g}");
+            } else if x.is_infinite() || x <= -10.0 {
+                assert_eq!(g, gelu_approx_f32(x), "gelu({x})");
+            } else {
+                assert!(
+                    (g - gelu_approx_f32(x)).abs() <= 1e-6 * g.abs().max(1.0),
+                    "gelu({x})"
+                );
+            }
+        }
     }
 
     /// The NEON GELU matches the scalar `gelu_approx_f32` across a wide range, including the saturation

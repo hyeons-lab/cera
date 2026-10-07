@@ -1984,23 +1984,42 @@ impl LfmModel {
                 && k_ref.dtype == DType::Q4_0
                 && v_ref.dtype == DType::Q4_0
             {
-                let q_data = self.weight_data(q_ref);
-                let k_data = self.weight_data(k_ref);
-                let v_data = self.weight_data(v_ref);
-                cpu::gemv_q4_0_concat3_with_q8(
-                    q_data,
-                    k_data,
-                    v_data,
-                    &state.scratch.q8_scales,
-                    &state.scratch.q8_quants,
-                    q,
-                    k,
-                    v,
-                    cfg.hidden_size,
-                    kv_dim,
-                    kv_dim,
-                    cfg.hidden_size,
-                );
+                if let (Some(q4), Some(k4), Some(v4)) =
+                    (q_ref.dec4_bytes(), k_ref.dec4_bytes(), v_ref.dec4_bytes())
+                {
+                    cpu::gemv_q4_0_dec4_concat3_with_q8(
+                        q4,
+                        k4,
+                        v4,
+                        &state.scratch.q8_scales,
+                        &state.scratch.q8_quants,
+                        q,
+                        k,
+                        v,
+                        cfg.hidden_size,
+                        kv_dim,
+                        kv_dim,
+                        cfg.hidden_size,
+                    );
+                } else {
+                    let q_data = self.weight_data(q_ref);
+                    let k_data = self.weight_data(k_ref);
+                    let v_data = self.weight_data(v_ref);
+                    cpu::gemv_q4_0_concat3_with_q8(
+                        q_data,
+                        k_data,
+                        v_data,
+                        &state.scratch.q8_scales,
+                        &state.scratch.q8_quants,
+                        q,
+                        k,
+                        v,
+                        cfg.hidden_size,
+                        kv_dim,
+                        kv_dim,
+                        cfg.hidden_size,
+                    );
+                }
             } else if valid_dims
                 && q_ref.dtype == DType::Q4KM
                 && k_ref.dtype == DType::Q4KM
