@@ -198,12 +198,22 @@ fn assert_close_relative(label: &str, got: f32, want: f32, rel_tol: f32) {
 }
 
 fn assert_close_per_element(label: &str, got: f32, want: f32) {
-    // Tolerance: max(0.5 absolute, 25% relative). The absolute
+    // Tolerance: max(0.75 absolute, 25% relative). The absolute
     // floor handles values near zero where relative tolerance is
     // meaningless; the relative bound handles large-magnitude
     // outliers (e.g. the -120 / -324 values in the captured
-    // reference) where 0.5 absolute would be unreasonably tight.
-    let abs_floor = 0.5_f32;
+    // reference) where a fixed absolute bound would be unreasonably
+    // tight.
+    //
+    // The floor was 0.5 before the tower's linears took the int8 GEMM
+    // path. This input is solid red, so a few channels are huge
+    // (min -324) and inflate the Q8_0 scale of the 32-wide activation
+    // blocks they sit in; the int8 path moved one sampled value by
+    // 0.53 (0.5 allowed). llama.cpp quantizes activations to Q8_0 for
+    // this mmproj too, and the aggregate stats above still agree to
+    // 0.2%. A structural bug (transpose, GELU, norm) shows as 50%+
+    // drift, still far outside 0.75.
+    let abs_floor = 0.75_f32;
     let rel_tol = 0.25_f32;
     let abs_diff = (got - want).abs();
     let limit = abs_floor.max(want.abs() * rel_tol);

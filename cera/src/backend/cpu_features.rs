@@ -554,14 +554,30 @@ pub(crate) fn env_usize(name: &str) -> Option<usize> {
 /// Ungated, unlike most of the pool plumbing: [`pinning_disabled`] calls it and
 /// is itself reachable from `detect_topology`, which every target builds.
 pub(crate) fn env_disabled(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| {
-            let v = v.trim();
-            ["0", "false", "off"]
-                .iter()
-                .any(|d| v.eq_ignore_ascii_case(d))
-        })
-        .unwrap_or(false)
+    std::env::var(name).is_ok_and(|v| is_off_spelling(&v))
+}
+
+/// The spellings [`env_disabled`] and [`env_enabled`] read as off: `0`, `false`, `off`, trimmed, any
+/// case. Switches that read their variable directly (`== "1"`, `!= "0"`) keep their own rule.
+fn is_off_spelling(v: &str) -> bool {
+    let v = v.trim();
+    ["0", "false", "off"]
+        .iter()
+        .any(|d| v.eq_ignore_ascii_case(d))
+}
+
+/// Whether an environment variable switches a diagnostic **on**: set, non-empty and not one of the
+/// spellings [`env_disabled`] reads as off (`0` / `false` / `off`). The opt-in twin of
+/// [`env_disabled`], for diagnostics that default to off and read their variable through this helper
+/// (today `CERA_VIT_PROFILE`: `=1` and `=true` enable it; `=0`, `=false` and `=off` do not).
+pub(crate) fn env_enabled(name: &str) -> bool {
+    std::env::var(name).is_ok_and(|v| value_enables(&v))
+}
+
+/// The value rule behind [`env_enabled`], split out so it can be tested without touching the process
+/// environment.
+fn value_enables(v: &str) -> bool {
+    !v.trim().is_empty() && !is_off_spelling(v)
 }
 
 /// Whether `CERA_PIN` switches worker pinning off, resolved once.
@@ -1430,6 +1446,18 @@ fn macos_sysctl_usize(name: &std::ffi::CStr) -> Option<usize> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// An opt-in switch is on for any set value except the spellings that mean off, matching how the
+    /// opt-out switches read them: `CERA_VIT_PROFILE=false` must not turn profiling on.
+    #[test]
+    fn opt_in_switches_read_off_spellings_as_off() {
+        for on in ["1", "true", "yes", "TRUE", " 1 ", "2"] {
+            assert!(value_enables(on), "{on:?} should enable");
+        }
+        for off in ["", "  ", "0", "false", "False", "OFF", "off", " 0 "] {
+            assert!(!value_enables(off), "{off:?} should not enable");
+        }
+    }
 
     #[test]
     fn topology_has_at_least_one_thread() {

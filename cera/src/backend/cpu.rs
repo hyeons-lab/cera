@@ -1584,6 +1584,113 @@ pub(crate) fn repack_q4_0_smmla_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>,
     (packed, scales)
 }
 
+/// Repack `m x k` standard Q8_0 weight rows into the same smmla-ready 8-row layout
+/// [`repack_q4_0_smmla_8x8`] builds, so the Q4_0 smmla kernels run Q8_0 weights unchanged: a Q8_0
+/// block's quants are already the signed int8 values a recentered Q4_0 nibble decodes to. Requires
+/// `m % 8 == 0` and `k % 32 == 0`.
+///
+/// Returns `(packed, scales)`: byte `c*64 + p*16 + rr*8 + e` of super-row block `(sr*nb + b)` (at
+/// `(sr*nb + b)*256`) holds row `8*sr + 2*p + rr`'s quant at k-element `8*c + e`, and
+/// `scales[(sr*nb + b)*8 + r]` is row `8*sr + r`'s f32 scale for block `b`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(has_blas, allow(dead_code))]
+pub(crate) fn repack_q8_0_smmla_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
+    assert!(
+        m.is_multiple_of(8),
+        "repack_q8_0_smmla_8x8: m must be a multiple of 8"
+    );
+    assert!(
+        k.is_multiple_of(32),
+        "repack_q8_0_smmla_8x8: k must be a multiple of 32"
+    );
+    let nb = k / 32;
+    let bsz = size_of::<crate::quant::BlockQ8_0>();
+    assert_eq!(
+        src.len(),
+        m * nb * bsz,
+        "repack_q8_0_smmla_8x8: src is {} bytes, need {} for {m}x{k}",
+        src.len(),
+        m * nb * bsz,
+    );
+    let sr_count = m / 8;
+    let mut packed = vec![0u8; sr_count * nb * 256];
+    let mut scales = vec![0.0f32; sr_count * nb * 8];
+
+    let one_super_row = |sr: usize, packed: &mut [u8], scales: &mut [f32]| {
+        for b in 0..nb {
+            for r in 0..8 {
+                let off = ((8 * sr + r) * nb + b) * bsz;
+                scales[b * 8 + r] = f16_to_f32(u16::from_le_bytes([src[off], src[off + 1]]));
+            }
+            for c in 0..4usize {
+                for p in 0..4usize {
+                    for rr in 0..2usize {
+                        let q = ((8 * sr + 2 * p + rr) * nb + b) * bsz + 2 + 8 * c;
+                        let d = b * 256 + c * 64 + p * 16 + rr * 8;
+                        packed[d..d + 8].copy_from_slice(&src[q..q + 8]);
+                    }
+                }
+            }
+        }
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        packed
+            .par_chunks_mut(nb * 256)
+            .zip(scales.par_chunks_mut(nb * 8))
+            .enumerate()
+            .for_each(|(sr, (pk, sc))| one_super_row(sr, pk, sc));
+    }
+    #[cfg(not(feature = "parallel"))]
+    for (sr, (pk, sc)) in packed
+        .chunks_mut(nb * 256)
+        .zip(scales.chunks_mut(nb * 8))
+        .enumerate()
+    {
+        one_super_row(sr, pk, sc);
+    }
+    (packed, scales)
+}
+
+/// Run the smmla-repacked Q8_0 GEMM writing row-major `out[n, m]`: [`repack_q8_0_smmla_8x8`]'s layout
+/// is the one `gemm_q4_0_smmla_8x4_q8_0_rowmajor` reads (int8 weights, f32 row scales), so this is that
+/// kernel. Same contract as [`gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch`]; returns `false`
+/// off the i8mm tier.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q8_0_smmla_rowmajor_dispatch(
+    packed: &[u8],
+    scales: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    n: usize,
+    m: usize,
+    k: usize,
+) -> bool {
+    gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
+        packed, scales, b_scales, b_quants, out, n, m, k,
+    )
+}
+
+/// Whether the repacked Q8_0 smmla path can run for an `m x k` weight on this host: the i8mm tier,
+/// whole 8-row super-rows and 32-aligned `k`.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+pub(crate) fn q8_0_smmla_repack_supported(m: usize, k: usize) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm
+            && m.is_multiple_of(8)
+            && k.is_multiple_of(32)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = (m, k);
+        false
+    }
+}
+
 /// Repack `m x k` Q4_0 weights into 8-row-interleaved layout for x86_64 prefill.
 #[cfg(target_arch = "x86_64")]
 #[cfg_attr(has_blas, allow(dead_code))]
@@ -5077,8 +5184,53 @@ pub fn gelu_erf_inplace(x: &mut [f32]) {
 /// wrong variant degrades downstream output noticeably even though
 /// each individual call looks fine.
 pub fn gelu_inplace(x: &mut [f32]) {
+    #[cfg(target_arch = "aarch64")]
+    {
+        // SAFETY: NEON is mandatory on aarch64.
+        let done = unsafe { gelu_inplace_neon(x) };
+        for v in x[done..].iter_mut() {
+            *v = gelu_approx_f32(*v);
+        }
+    }
+    #[cfg(not(target_arch = "aarch64"))]
     for v in x.iter_mut() {
         *v = gelu_approx_f32(*v);
+    }
+}
+
+/// [`gelu_inplace`] four lanes at a time over the leading multiple of four elements; returns how many
+/// it did. `tanh(u)` is `1 - 2 / (exp(2u) + 1)` with the lane-exact exp twin, which saturates to +-1
+/// without a branch (exp overflows to inf, 2/inf is 0) so the scalar's `x <= -10 -> 0` and
+/// `x >= 10 -> x` cases fall out. The scalar `tanh` is a libm call per element, about 12 ns, which made
+/// the ViT's GELU 55 ms of a 550 ms tower. Agrees with the scalar to about 1e-7 relative.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn gelu_inplace_neon(x: &mut [f32]) -> usize {
+    use std::arch::aarch64::*;
+    // SAFETY: NEON is enabled for this function; every access is below `n4 <= x.len()`.
+    unsafe {
+        const SQRT_2_OVER_PI: f32 = 0.797_884_6;
+        const COEF: f32 = 0.044_715;
+        let c = ExpConsts::new();
+        let k_sqrt = vdupq_n_f32(2.0 * SQRT_2_OVER_PI);
+        let k_coef = vdupq_n_f32(COEF);
+        let one = vdupq_n_f32(1.0);
+        let two = vdupq_n_f32(2.0);
+        let half = vdupq_n_f32(0.5);
+        let n4 = x.len() / 4 * 4;
+        let mut i = 0;
+        while i < n4 {
+            let v = vld1q_f32(x.as_ptr().add(i));
+            // 2 * sqrt(2/pi) * (x + COEF * x^3)
+            let v2 = vmulq_f32(v, v);
+            let inner2 = vmulq_f32(k_sqrt, vmulq_f32(v, vaddq_f32(one, vmulq_f32(k_coef, v2))));
+            let e = ggml_expf_neon4(inner2, &c);
+            let tanh = vsubq_f32(one, vdivq_f32(two, vaddq_f32(e, one)));
+            let y = vmulq_f32(vmulq_f32(half, v), vaddq_f32(one, tanh));
+            vst1q_f32(x.as_mut_ptr().add(i), y);
+            i += 4;
+        }
+        n4
     }
 }
 
@@ -7107,6 +7259,216 @@ unsafe fn flash_attention_gqa_avx512_opt(
                     _mm512_storeu_ps(out_ptr.add(out_off + i * 16), r);
                 }
             }
+        }
+    }
+}
+
+/// One head's keys transposed for [`vit_attention_chunk_neon`]: `kt[d * npad + t] = k[t * n_embd +
+/// head_off + d]` for `t < n_tokens`, zero for the padding up to `npad`. Done once per head and block, so
+/// the attention tiles stream keys along the key axis instead of re-transposing them for every group of
+/// queries.
+#[cfg(target_arch = "aarch64")]
+pub fn vit_transpose_keys(
+    k: &[f32],
+    kt: &mut [f32],
+    n_tokens: usize,
+    npad: usize,
+    n_embd: usize,
+    head_off: usize,
+    head_dim: usize,
+) {
+    assert!(npad >= n_tokens && head_dim.is_multiple_of(4));
+    assert!(kt.len() >= head_dim * npad);
+    assert!(n_tokens == 0 || k.len() >= (n_tokens - 1) * n_embd + head_off + head_dim);
+    kt[..head_dim * npad].fill(0.0);
+    let mut t = 0;
+    // SAFETY: NEON is baseline on aarch64; every access is bounds-checked by the asserts above.
+    unsafe {
+        use std::arch::aarch64::*;
+        while t + 4 <= n_tokens {
+            let mut d = 0;
+            while d < head_dim {
+                let r0 = vld1q_f32(k.as_ptr().add(t * n_embd + head_off + d));
+                let r1 = vld1q_f32(k.as_ptr().add((t + 1) * n_embd + head_off + d));
+                let r2 = vld1q_f32(k.as_ptr().add((t + 2) * n_embd + head_off + d));
+                let r3 = vld1q_f32(k.as_ptr().add((t + 3) * n_embd + head_off + d));
+                let c = transpose4_f32(r0, r1, r2, r3);
+                for (j, col) in c.iter().enumerate() {
+                    vst1q_f32(kt.as_mut_ptr().add((d + j) * npad + t), *col);
+                }
+                d += 4;
+            }
+            t += 4;
+        }
+    }
+    for t in t..n_tokens {
+        for d in 0..head_dim {
+            kt[d * npad + t] = k[t * n_embd + head_off + d];
+        }
+    }
+}
+
+/// Non-causal attention for `nq` consecutive queries of one head of a vision transformer, writing
+/// `out[nq][head_dim]`.
+///
+/// Built for the ViT, where every query sees every key and the whole `[queries x keys]` score block
+/// fits in L1, which the LLM flash kernel (`flash_attention_gqa_neon_opt`) is not shaped for. Per
+/// 8 queries: scores are an 8 x 8 register tile over the transposed keys ([`vit_transpose_keys`]; 16
+/// accumulators, 64 `vfmaq_laneq_f32` per 16 loads), then an exact softmax over the full score rows (no
+/// online rescaling), then the weighted sum of values as another 8 x 8 tile. `q` and `v` are
+/// `[n_tokens][n_embd]`; the head's slice starts at column `head_off`; `kt` is this head's
+/// `[head_dim][npad]` transpose. `head_dim` must be a multiple of 8 (at most 128) and `npad` a multiple
+/// of 8 at least `n_tokens`.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+pub fn vit_attention_chunk_neon(
+    q: &[f32],
+    kt: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    q0: usize,
+    nq: usize,
+    n_tokens: usize,
+    npad: usize,
+    n_embd: usize,
+    head_off: usize,
+    head_dim: usize,
+    scale: f32,
+) {
+    assert!(head_dim.is_multiple_of(8) && head_dim <= 128);
+    assert!(npad.is_multiple_of(8) && npad >= n_tokens && n_tokens > 0);
+    assert!(q0 + nq <= n_tokens && head_off + head_dim <= n_embd);
+    assert!(kt.len() >= head_dim * npad && out.len() >= nq * head_dim);
+    assert!(q.len() >= n_tokens * n_embd && v.len() >= n_tokens * n_embd);
+    // SAFETY: NEON is baseline on aarch64; the asserts above bound every pointer access below.
+    unsafe {
+        use std::arch::aarch64::*;
+        let exp_c = ExpConsts::new();
+        let zeros = [0.0f32; 128];
+        let mut s = vec![0.0f32; 8 * npad];
+        let s_ptr = s.as_mut_ptr();
+        let kt_ptr = kt.as_ptr();
+        let v_ptr = v.as_ptr();
+
+        let mut sb = 0;
+        while sb < nq {
+            let rows = (nq - sb).min(8);
+            let qrow: [*const f32; 8] = std::array::from_fn(|qi| {
+                if qi < rows {
+                    q.as_ptr().add((q0 + sb + qi) * n_embd + head_off)
+                } else {
+                    zeros.as_ptr()
+                }
+            });
+
+            // Scores: S[qi][kb..kb+8] = scale * sum_d Q[qi][d] * K[kb + j][d].
+            let mut kb = 0;
+            while kb < npad {
+                let mut acc = [[vdupq_n_f32(0.0); 2]; 8];
+                let mut d4 = 0;
+                while d4 < head_dim {
+                    let qv: [float32x4_t; 8] =
+                        std::array::from_fn(|qi| vld1q_f32(qrow[qi].add(d4)));
+                    macro_rules! dd {
+                        ($lane:literal) => {{
+                            let kt0 = vld1q_f32(kt_ptr.add((d4 + $lane) * npad + kb));
+                            let kt1 = vld1q_f32(kt_ptr.add((d4 + $lane) * npad + kb + 4));
+                            for qi in 0..8 {
+                                acc[qi][0] = vfmaq_laneq_f32::<$lane>(acc[qi][0], kt0, qv[qi]);
+                                acc[qi][1] = vfmaq_laneq_f32::<$lane>(acc[qi][1], kt1, qv[qi]);
+                            }
+                        }};
+                    }
+                    dd!(0);
+                    dd!(1);
+                    dd!(2);
+                    dd!(3);
+                    d4 += 4;
+                }
+                for (qi, a) in acc.iter().enumerate() {
+                    vst1q_f32(s_ptr.add(qi * npad + kb), vmulq_n_f32(a[0], scale));
+                    vst1q_f32(s_ptr.add(qi * npad + kb + 4), vmulq_n_f32(a[1], scale));
+                }
+                kb += 8;
+            }
+
+            // Softmax over each valid row (padding keys masked out); padded query rows are zeroed so the
+            // value tile below reads defined numbers.
+            let mut inv = [0.0f32; 8];
+            for qi in 0..8 {
+                let row = s_ptr.add(qi * npad);
+                if qi >= rows {
+                    for t in 0..npad {
+                        *row.add(t) = 0.0;
+                    }
+                    continue;
+                }
+                for t in n_tokens..npad {
+                    *row.add(t) = f32::NEG_INFINITY;
+                }
+                let mut m4 = vdupq_n_f32(f32::NEG_INFINITY);
+                let mut t = 0;
+                while t < npad {
+                    m4 = vmaxq_f32(m4, vld1q_f32(row.add(t)));
+                    t += 4;
+                }
+                let nm = vdupq_n_f32(vmaxvq_f32(m4));
+                let mut sum4 = vdupq_n_f32(0.0);
+                let mut t = 0;
+                while t < npad {
+                    let e = ggml_expf_neon4(vsubq_f32(vld1q_f32(row.add(t)), nm), &exp_c);
+                    vst1q_f32(row.add(t), e);
+                    sum4 = vaddq_f32(sum4, e);
+                    t += 4;
+                }
+                inv[qi] = 1.0 / vaddvq_f32(sum4);
+            }
+
+            // Values: O[qi][dc..dc+8] = inv[qi] * sum_k P[qi][k] * V[k][dc..dc+8].
+            let mut dc = 0;
+            while dc < head_dim {
+                let mut acc = [[vdupq_n_f32(0.0); 2]; 8];
+                let mut k4 = 0;
+                while k4 + 4 <= n_tokens {
+                    let p: [float32x4_t; 8] =
+                        std::array::from_fn(|qi| vld1q_f32(s_ptr.add(qi * npad + k4)));
+                    macro_rules! kk {
+                        ($lane:literal) => {{
+                            let base = v_ptr.add((k4 + $lane) * n_embd + head_off + dc);
+                            let v0 = vld1q_f32(base);
+                            let v1 = vld1q_f32(base.add(4));
+                            for qi in 0..8 {
+                                acc[qi][0] = vfmaq_laneq_f32::<$lane>(acc[qi][0], v0, p[qi]);
+                                acc[qi][1] = vfmaq_laneq_f32::<$lane>(acc[qi][1], v1, p[qi]);
+                            }
+                        }};
+                    }
+                    kk!(0);
+                    kk!(1);
+                    kk!(2);
+                    kk!(3);
+                    k4 += 4;
+                }
+                // Up to three trailing keys when `n_tokens` is not a multiple of 4.
+                while k4 < n_tokens {
+                    let base = v_ptr.add(k4 * n_embd + head_off + dc);
+                    let v0 = vld1q_f32(base);
+                    let v1 = vld1q_f32(base.add(4));
+                    for qi in 0..8 {
+                        let pk = *s_ptr.add(qi * npad + k4);
+                        acc[qi][0] = vfmaq_n_f32(acc[qi][0], v0, pk);
+                        acc[qi][1] = vfmaq_n_f32(acc[qi][1], v1, pk);
+                    }
+                    k4 += 1;
+                }
+                for (qi, a) in acc.iter().enumerate().take(rows) {
+                    let o = out.as_mut_ptr().add((sb + qi) * head_dim + dc);
+                    vst1q_f32(o, vmulq_n_f32(a[0], inv[qi]));
+                    vst1q_f32(o.add(4), vmulq_n_f32(a[1], inv[qi]));
+                }
+                dc += 8;
+            }
+            sb += 8;
         }
     }
 }
@@ -10687,6 +11049,74 @@ mod tests {
         assert!((x[1] - 0.8413).abs() < 5e-3, "gelu(1) = {}", x[1]);
         assert!((x[2] + 0.1587).abs() < 5e-3, "gelu(-1) = {}", x[2]);
         assert!((x[3] - 1.9545).abs() < 5e-3, "gelu(2) = {}", x[3]);
+    }
+
+    /// The NEON GELU matches the scalar `gelu_approx_f32` across a wide range, including the saturation
+    /// regions, a ragged tail, and NaN.
+    #[test]
+    fn test_gelu_vector_matches_scalar() {
+        let mut xs: Vec<f32> = (-6000..=6000).map(|i| i as f32 * 0.01).collect();
+        xs.extend([
+            1e4, -1e4, 1e30, -1e30, 9.999, -9.999, 10.0, -10.0, 0.0, -0.0,
+        ]);
+        xs.push(f32::NAN);
+        for len in [
+            xs.len(),
+            xs.len() - 1,
+            xs.len() - 2,
+            xs.len() - 3,
+            3,
+            4,
+            5,
+            0,
+        ] {
+            let mut got = xs[..len].to_vec();
+            gelu_inplace(&mut got);
+            for (i, (&g, &x)) in got.iter().zip(xs[..len].iter()).enumerate() {
+                let want = gelu_approx_f32(x);
+                if x.is_nan() {
+                    assert!(g.is_nan(), "gelu(NaN) = {g} at {i}");
+                    continue;
+                }
+                assert!(
+                    (g - want).abs() <= 1e-6 * want.abs().max(1.0),
+                    "gelu({x}) = {g}, scalar {want} (len {len}, idx {i})"
+                );
+            }
+        }
+    }
+
+    /// The Q8_0 smmla repack is the Q4_0 one with int8 quants copied through: a Q4_0 weight whose
+    /// recentered nibbles equal a Q8_0 weight's quants must repack to identical bytes and scales.
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    #[test]
+    fn test_q8_0_smmla_repack_matches_q4_0_layout() {
+        let (m, k) = (16usize, 96usize);
+        let nb = k / 32;
+        let mut q8 = Vec::new();
+        let mut q4 = Vec::new();
+        let mut st = 12345u32;
+        let mut next = || {
+            st = st.wrapping_mul(1664525).wrapping_add(1013904223);
+            st >> 8
+        };
+        for _row in 0..m {
+            for _b in 0..nb {
+                let scale = half::f16::from_f32(0.01 * (1 + next() % 50) as f32).to_bits();
+                let vals: Vec<i8> = (0..32).map(|_| (next() % 16) as i8 - 8).collect();
+                q8.extend_from_slice(&scale.to_le_bytes());
+                q8.extend(vals.iter().map(|&v| v as u8));
+                q4.extend_from_slice(&scale.to_le_bytes());
+                // Q4_0: element e < 16 in the low nibble of qs[e], e + 16 in the high nibble.
+                for e in 0..16 {
+                    q4.push(((vals[e] + 8) as u8) | (((vals[e + 16] + 8) as u8) << 4));
+                }
+            }
+        }
+        let (p8, s8) = repack_q8_0_smmla_8x8(&q8, m, k);
+        let (p4, s4) = repack_q4_0_smmla_8x8(&q4, m, k);
+        assert_eq!(p8, p4, "packed quants");
+        assert_eq!(s8, s4, "row scales");
     }
 
     #[test]

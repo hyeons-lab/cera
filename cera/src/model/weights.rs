@@ -51,6 +51,9 @@ enum Storage {
     Owned(Vec<u8>),
 }
 
+/// A weight repacked for the smmla GEMM: the packed int8 quants and the per-row f32 scales.
+type SmmlaPacked = (Vec<u8>, Vec<f32>);
+
 /// A weight tensor referenced directly in a mmap'd GGUF (or, for
 /// tests, owned bytes). The mmap variant clones via `Arc::clone`
 /// (O(1) — no byte copy); the owned variant clones via
@@ -76,6 +79,13 @@ pub struct MmapWeight {
     /// Input dim. For dense matmul `[rows × cols] · [cols] →
     /// [rows]`.
     pub cols: usize,
+    /// Lazily built smmla-ready copy of a Q8_0 weight (see [`Self::smmla_repacked`]), shared by
+    /// clones.
+    #[cfg_attr(
+        any(has_blas, not(any(target_arch = "x86_64", target_arch = "aarch64"))),
+        allow(dead_code)
+    )]
+    smmla: Arc<std::sync::OnceLock<Option<SmmlaPacked>>>,
 }
 
 impl std::fmt::Debug for MmapWeight {
@@ -111,6 +121,7 @@ impl MmapWeight {
             dtype,
             rows,
             cols,
+            smmla: Arc::default(),
         })
     }
 
@@ -134,6 +145,7 @@ impl MmapWeight {
             dtype: DType::F32,
             rows,
             cols,
+            smmla: Arc::default(),
         }
     }
 
@@ -149,6 +161,29 @@ impl MmapWeight {
             dtype,
             rows,
             cols,
+            smmla: Arc::default(),
+        }
+    }
+
+    /// The weight repacked for the smmla (i8mm) GEMM, built on first call and kept: `(packed,
+    /// scales)` in the layout `repack_q8_0_smmla_8x8` documents. `None` for anything that is not a
+    /// Q8_0 weight the i8mm tier can run (wrong dtype, rows not a multiple of 8, a host without
+    /// i8mm), in which case callers keep the standard layout. Costs one extra copy of the weight.
+    pub(crate) fn smmla_repacked(&self) -> Option<(&[u8], &[f32])> {
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+        {
+            let cached = self.smmla.get_or_init(|| {
+                (self.dtype == DType::Q8_0
+                    && crate::backend::cpu::q8_0_smmla_repack_supported(self.rows, self.cols))
+                .then(|| {
+                    crate::backend::cpu::repack_q8_0_smmla_8x8(self.data(), self.rows, self.cols)
+                })
+            });
+            cached.as_ref().map(|(p, s)| (p.as_slice(), s.as_slice()))
+        }
+        #[cfg(not(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas))))]
+        {
+            None
         }
     }
 
