@@ -433,6 +433,19 @@ impl GpuContext {
         }
     }
 
+    /// Submit a command buffer that was finished earlier, counting the submit like
+    /// [`Self::submit_encoder`] (which does the `finish` and this in one step).
+    pub(crate) fn submit_command_buffer(&self, cmd: wgpu::CommandBuffer) {
+        if self.device_is_lost() {
+            return;
+        }
+        io_stats::record_submit();
+        #[cfg(test)]
+        self.submit_count
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        self.queue.submit(Some(cmd));
+    }
+
     /// Initialize the GPU: request a high-performance adapter + device
     /// (blocking). Native convenience wrapper around [`Self::new_async`].
     /// Not available on wasm32 — the WebGPU backend can only be driven from
@@ -2060,7 +2073,7 @@ impl GpuContext {
     /// Register-tiled Q4_0 GEMM over the resident stream layout
     /// (`spirv/mul_mat_reg_tile_q4_0_stream.slang`, entry `main`): the
     /// prefill fallthrough for resident weights the streaming kernel
-    /// declines (n < 32, strided B). Same 64x64 tiling as
+    /// declines (strided B, or an n below `CERA_WGPU_STREAM_MIN_N`, which is 1 by default). Same 64x64 tiling as
     /// `mul_mat_reg_tile_q4_0`, only the shmem dequant loader differs.
     /// 5-binding interface (q, d, x, y, params). SPIR-V-only, like the
     /// layout it reads.
@@ -2689,6 +2702,10 @@ pub mod shaders {
     pub const ROPE: &str = include_str!(concat!(env!("OUT_DIR"), "/rope.wgsl"));
     pub const KV_SHIFT: &str = include_str!("shaders/kv_shift.wgsl");
     pub const FLASH_ATTENTION: &str = include_str!("shaders/flash_attention.wgsl");
+    /// Split-K decode attention (phase 1: partial softmax state per key split) and its merge. Used for
+    /// `head_dim == 64` at any context length; see `flash_attention_split.wgsl`.
+    pub const FLASH_ATTENTION_SPLIT: &str = include_str!("shaders/flash_attention_split.wgsl");
+    pub const FLASH_ATTENTION_MERGE: &str = include_str!("shaders/flash_attention_merge.wgsl");
     /// F32-KV twin of [`FLASH_ATTENTION`] for the audio
     /// detokenizer (`wgpu_audio_decoder`): same math/grid/params, bindings 1/2
     /// stay `array<f32>` so its exact CPU/GPU parity test keeps passing.
@@ -5353,6 +5370,156 @@ mod tests {
                 expected[i],
                 result[i]
             );
+        }
+    }
+
+    /// The split-K decode attention (`flash_attention_split` + `flash_attention_merge`) against a CPU
+    /// softmax attention: context lengths around the 256-key tile, the 16 x 256 = 4096-key point where
+    /// each split starts looping over several tiles, and far past it; grouped-query layouts; the grid
+    /// is the fixed (n_heads, 16) the decode path uses whatever the length.
+    #[test]
+    fn test_gpu_split_flash_attention_matches_cpu() {
+        let Some(ctx) = gpu_or_skip() else {
+            return;
+        };
+        const SPLITS: u32 = 16;
+        const REC: usize = 66;
+        let split = ctx.create_pipeline(
+            shaders::FLASH_ATTENTION_SPLIT,
+            "flash_attention_split",
+            "flash_attention_split",
+        );
+        let merge = ctx.create_pipeline(
+            shaders::FLASH_ATTENTION_MERGE,
+            "flash_attention_merge",
+            "flash_attention_merge",
+        );
+        let bind = |pipeline: &wgpu::ComputePipeline, bindings: &[&wgpu::Buffer]| {
+            let entries: Vec<wgpu::BindGroupEntry> = bindings
+                .iter()
+                .enumerate()
+                .map(|(i, b)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: b.as_entire_binding(),
+                })
+                .collect();
+            ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &entries,
+            })
+        };
+
+        // (n_heads, n_kv_heads, seq_len); head_dim is 64, the only size this path takes.
+        let head_dim = 64u32;
+        let configs = [
+            (4u32, 4u32, 1u32),
+            (8, 2, 7),
+            (16, 8, 255),
+            (16, 8, 256),
+            (16, 8, 257),
+            (16, 8, 1000),
+            (16, 8, 1795),
+            (8, 2, 4096),
+            (8, 2, 4097),
+            (4, 2, 9000),
+        ];
+        for (n_heads, n_kv_heads, seq_len) in configs {
+            let kv_dim = n_kv_heads * head_dim;
+            let scale = 1.0f32 / (head_dim as f32).sqrt();
+            let q: Vec<f32> = (0..n_heads * head_dim)
+                .map(|i| ((i * 7 + 3) % 17) as f32 * 0.1 - 0.8)
+                .collect();
+            // K and V scale with the 256-key tile a row falls in, so each split sees its own score
+            // maximum and its own mean value. A periodic fixture repeats the same tile everywhere, and
+            // a merge that ignored the per-split max or the cross-tile rescale would still match.
+            let tile = |i: u32| ((i / kv_dim / 256) % 7) as f32;
+            let k: Vec<f32> = (0..seq_len * kv_dim)
+                .map(|i| (((i * 13 + 5) % 23) as f32 * 0.05 - 0.55) * (1.0 + tile(i) * 0.6))
+                .collect();
+            let v: Vec<f32> = (0..seq_len * kv_dim)
+                .map(|i| ((i * 11 + 1) % 19) as f32 * 0.05 - 0.45 + tile(i) * 0.3)
+                .collect();
+            let round_f16 = |x: &[f32]| -> Vec<f32> {
+                x.iter().map(|v| half::f16::from_f32(*v).to_f32()).collect()
+            };
+            let (k_r, v_r) = (round_f16(&k), round_f16(&v));
+            let params: [u32; 8] = [
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_dim,
+                seq_len,
+                scale.to_bits(),
+                0,
+                0,
+            ];
+
+            let q_buf = ctx.upload_f32(&q, "q");
+            let k_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_f16_pairs(&k)), "k");
+            let v_buf = ctx.upload_storage(bytemuck::cast_slice(&pack_f16_pairs(&v)), "v");
+            let params_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+            let out_len = (n_heads * head_dim) as usize;
+            // Poisoned so a split that fails to write its partial shows up as garbage, not a stale zero.
+            let part = ctx.upload_f32(
+                &vec![f32::NAN; n_heads as usize * SPLITS as usize * REC],
+                "part",
+            );
+            let out_buf = ctx.create_storage_rw(out_len as u64 * 4, "out_split");
+
+            let split_bg = bind(&split, &[&q_buf, &k_buf, &v_buf, &part, &params_buf]);
+            let merge_bg = bind(&merge, &[&part, &out_buf, &params_buf]);
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&split);
+                pass.set_bind_group(0, &split_bg, &[]);
+                pass.dispatch_workgroups(n_heads, SPLITS, 1);
+                pass.set_pipeline(&merge);
+                pass.set_bind_group(0, &merge_bg, &[]);
+                pass.dispatch_workgroups(n_heads, 1, 1);
+            }
+            ctx.submit_encoder(enc);
+            let got = ctx.download_f32(&out_buf, out_len);
+
+            let gs = (n_heads / n_kv_heads) as usize;
+            let (hd, kvd, sl) = (head_dim as usize, kv_dim as usize, seq_len as usize);
+            let mut want = vec![0.0f32; out_len];
+            for h in 0..n_heads as usize {
+                let kvo = (h / gs) * hd;
+                let mut scores = vec![0.0f32; sl];
+                let mut mx = f32::NEG_INFINITY;
+                for (t, sc) in scores.iter_mut().enumerate() {
+                    let mut dot = 0.0f32;
+                    for d in 0..hd {
+                        dot += q[h * hd + d] * k_r[t * kvd + kvo + d];
+                    }
+                    *sc = dot * scale;
+                    mx = mx.max(*sc);
+                }
+                let mut sum = 0.0f32;
+                for sc in scores.iter_mut() {
+                    *sc = (*sc - mx).exp();
+                    sum += *sc;
+                }
+                for d in 0..hd {
+                    let mut a = 0.0f32;
+                    for (t, sc) in scores.iter().enumerate() {
+                        a += sc * v_r[t * kvd + kvo + d];
+                    }
+                    want[h * hd + d] = a / sum;
+                }
+            }
+            for i in 0..out_len {
+                let diff = (got[i] - want[i]).abs();
+                let tol = 5e-3 + 1e-3 * want[i].abs();
+                assert!(
+                    diff <= tol,
+                    "split≠cpu at (h={n_heads},kv={n_kv_heads},seq={seq_len}) idx {i}: cpu={}, split={}, diff={diff}",
+                    want[i],
+                    got[i],
+                );
+            }
         }
     }
 

@@ -549,6 +549,11 @@ enum Command {
     /// host (no model required). Same line `inspect` shows under "CPU Backend".
     Cpu,
 
+    /// Print the device's thermal headroom now and as a forecast (Android API 30+),
+    /// one line, for annotating benchmark runs: `0.0` cool, `1.0` the throttling
+    /// threshold, above `1.0` already throttling. Prints `unavailable` elsewhere.
+    Thermal,
+
     /// Interactive multi-turn chat REPL.
     ///
     /// Reads user messages from stdin one line at a time, renders
@@ -4462,6 +4467,29 @@ fn main() -> Result<()> {
         Command::Cpu => {
             println!("{}", cera::cpu_features().report());
             println!("{}", cera::backend::cpu_features::core_topology().report());
+        }
+        Command::Thermal => {
+            match thermal::ThermalMonitor::new() {
+                Some(t) => {
+                    // The service needs a moment after the manager is acquired before it has a value.
+                    let mut now = None;
+                    for _ in 0..30 {
+                        now = t.headroom(0);
+                        if now.is_some() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    let f = |v: Option<f32>| v.map_or("n/a".to_string(), |h| format!("{h:.2}"));
+                    println!(
+                        "thermal headroom now {} | +10s {} | +30s {} (0 cool, 1.0 throttling)",
+                        f(now),
+                        f(t.headroom(10)),
+                        f(t.headroom(30))
+                    );
+                }
+                None => println!("thermal headroom unavailable"),
+            }
         }
         Command::Tokenize { model, text } => {
             let gguf = cera::gguf::GgufFile::open(Path::new(&model))?;
