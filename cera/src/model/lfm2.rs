@@ -5793,6 +5793,21 @@ impl Model for LfmModel {
         Ok(())
     }
 
+    /// The rows the token prefill feeds the first layer: a dequantized embedding-table row per token,
+    /// with no scaling (see `forward_prefill_inner`). Offered for the image markers of a tiled image only;
+    /// this model keeps its per-segment prompt route, so `embed_token_rows` stays unimplemented.
+    fn embed_image_marker_rows(&self, tokens: &[u32]) -> Option<Vec<f32>> {
+        let hs = self.config.hidden_size;
+        if tokens.iter().any(|&t| t as usize >= self.embd_ref.m) {
+            return None;
+        }
+        let mut rows = vec![0.0f32; tokens.len() * hs];
+        for (j, &t) in tokens.iter().enumerate() {
+            self.dequantize_row_into(&self.embd_ref, t as usize, &mut rows[j * hs..(j + 1) * hs]);
+        }
+        Some(rows)
+    }
+
     fn forward_prefill_from_embeddings(
         &self,
         embeddings: &[f32],
@@ -6431,6 +6446,42 @@ pub(crate) mod release_tests {
             state.prefill_scratch.capacity_bytes(),
             0,
             "the first decode step must release the prefill working set"
+        );
+    }
+
+    /// The marker rows a tiled image splices into its prompt are the rows a token prefill would stage:
+    /// feeding them through the embedding-seeded prefill gives the logits of prefilling the token
+    /// ids. A scaling or table-lookup slip here still yields a fluent but wrong tiled prompt, and no
+    /// other host test would notice. Out-of-vocabulary ids are refused, not looked up.
+    #[test]
+    fn marker_rows_reproduce_the_token_prefill() {
+        use crate::model::Model;
+        let model = LfmModel::from_gguf(synthetic_lfm2_gguf(), 256).unwrap();
+        let tokens: Vec<u32> = vec![3, 17, 42, 5];
+        let rows = model
+            .embed_image_marker_rows(&tokens)
+            .expect("in-vocabulary ids must give rows");
+        assert_eq!(rows.len(), tokens.len() * model.config().hidden_size);
+        assert!(rows.iter().all(|v| v.is_finite()));
+        assert!(model.embed_image_marker_rows(&[u32::MAX]).is_none());
+
+        let mut by_tokens = InferenceState::from_config(model.config()).unwrap();
+        let want = model.forward_prefill(&tokens, 0, &mut by_tokens);
+        let mut by_rows = InferenceState::from_config(model.config()).unwrap();
+        let got = model.forward_prefill_from_embeddings(&rows, tokens.len(), 0, &mut by_rows);
+        assert_eq!(want.len(), got.len());
+        let max_abs = want
+            .iter()
+            .zip(&got)
+            .map(|(a, b)| {
+                // A NaN difference is a failure: `f32::max` would drop it.
+                let d = (a - b).abs();
+                if d.is_nan() { f32::INFINITY } else { d }
+            })
+            .fold(0.0f32, f32::max);
+        assert!(
+            max_abs < 1e-3,
+            "marker rows diverge from the token prefill by {max_abs:.2e}"
         );
     }
 

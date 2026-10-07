@@ -438,10 +438,16 @@ enum Command {
 
         /// Cap the longest side (in pixels) of each `--image` input's
         /// *encoded* resolution. Smaller = fewer image tokens, faster
-        /// prefill, less detail; larger (or unset) = full model
-        /// resolution. The cap only shrinks and takes precedence over
-        /// the model's minimum-resolution floor. Applies to every image
-        /// in the turn via `Session::set_image_max_long_size`.
+        /// prefill, less detail. Unset follows the model's reference
+        /// processing: an image within about twice the single-image
+        /// budget (roughly 724x724) is resized to one image of up to 256
+        /// tokens, and a larger one is split into a grid of 512 px tiles
+        /// (up to 10, 256 tokens each) plus a thumbnail, so a big photo
+        /// costs many times more tokens and tower time. Setting a cap
+        /// disables tiling (one image, never larger than the cap). The cap
+        /// only shrinks and takes precedence over the model's
+        /// minimum-resolution floor. Applies to every image in the turn
+        /// via `Session::set_image_max_long_size`.
         #[arg(long, value_name = "PIXELS")]
         max_long_size: Option<u32>,
 

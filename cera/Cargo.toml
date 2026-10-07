@@ -158,6 +158,11 @@ name = "pool_dispatch_bench"
 [[example]]
 name = "q6k_gemv_bench"
 
+# Per-chunk vision embeddings, in llama.cpp mtmd's debug format, for parity checks.
+[[example]]
+name = "vit_tile_probe"
+required-features = ["mmap", "vl-preprocess"]
+
 # The CPU vision tower on a real image: speed and int8-vs-f32 error.
 [[example]]
 name = "vit_cpu_probe"

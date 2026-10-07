@@ -2363,49 +2363,33 @@ impl Session {
         self.append_image_rows(&rows, n_tokens)
     }
 
-    /// Decode, preprocess and encode an image into LLM-width embedding rows
-    /// (`n_tokens` rows of `hidden_size` floats) without touching the session:
-    /// the half of [`Self::append_image_with_opts`] that does not prefill.
+    /// The attached vision encoder, after checking the session accepts images and that the
+    /// encoder's projection width matches the LLM's hidden size. `caller` names the public method
+    /// in the error text.
     #[cfg(feature = "vl-preprocess")]
-    fn encode_image_rows(
+    fn checked_vision_encoder(
         &self,
-        bytes: &[u8],
-        max_long_size: Option<u32>,
-    ) -> Result<(Vec<f32>, usize), CeraError> {
+        caller: &str,
+    ) -> Result<std::sync::Arc<crate::model::vision_encoder::VisionEncoderWeights>, CeraError> {
         self.ensure_usable()?;
         if !self.capabilities.image_in {
             return Err(CeraError::UnsupportedModality);
         }
-        let encoder = {
-            let Some(encoder) = self.vision_encoder.as_ref() else {
-                return Err(CeraError::Backend(
-                    "Session::append_image: no vision encoder attached. \
-                     Construct via CeraEngine on a VL bundle so the \
-                     encoder is auto-attached, or call \
-                     attach_vision_encoder(...) in test setup."
-                        .into(),
-                ));
-            };
-            let llm_hidden = self.model.config().hidden_size;
-            let proj_dim = encoder.config.projection_dim;
-            if proj_dim != llm_hidden {
-                return Err(CeraError::Backend(format!(
-                    "Session::append_image: vision encoder's projection_dim \
-                     ({proj_dim}) does not match LLM hidden_size ({llm_hidden}). \
-                     The mmproj must pair with the LLM it was trained against."
-                )));
-            }
-            std::sync::Arc::clone(encoder)
+        let Some(encoder) = self.vision_encoder.as_ref() else {
+            return Err(CeraError::Backend(format!(
+                "{caller}: no vision encoder attached. Construct via CeraEngine on a VL bundle so \
+                 the encoder is auto-attached, or call attach_vision_encoder(...) in test setup."
+            )));
         };
-        let preprocess_start = Instant::now();
-        let pre = crate::model::vision_preprocessor::preprocess_image_with_opts(
-            bytes,
-            &encoder.config,
-            max_long_size,
-        )?;
-        let preprocess_ms = preprocess_start.elapsed().as_secs_f64() * 1000.0;
-        vl_timing_update(|t| t.preprocess_ms += preprocess_ms);
-        self.encode_preprocessed_image(&pre, &encoder)
+        let llm_hidden = self.model.config().hidden_size;
+        let proj_dim = encoder.config.projection_dim;
+        if proj_dim != llm_hidden {
+            return Err(CeraError::Backend(format!(
+                "{caller}: vision encoder's projection_dim ({proj_dim}) does not match LLM \
+                 hidden_size ({llm_hidden}). The mmproj must pair with the LLM it was trained against."
+            )));
+        }
+        Ok(std::sync::Arc::clone(encoder))
     }
 
     /// Stub `append_image_with_opts` for builds without `vl-preprocess`.
@@ -2422,8 +2406,9 @@ impl Session {
     /// Append an uncompressed raw image to the conversation context.
     ///
     /// `pixels` is an uncompressed pixel buffer in the given [`crate::model::PixelFormat`].
-    /// Automatically applies aspect-preserving resizing and normalization,
-    /// then encodes with the vision encoder and appends image tokens.
+    /// Automatically applies aspect-preserving resizing and normalization (and the tiled layout
+    /// for a large image, as [`Self::append_image`] does), then encodes with the vision encoder
+    /// and appends image tokens.
     pub fn append_raw_image(
         &mut self,
         pixels: &[u8],
@@ -2446,32 +2431,9 @@ impl Session {
         format: crate::model::PixelFormat,
         max_long_size: Option<u32>,
     ) -> Result<(), CeraError> {
-        self.ensure_usable()?;
-        if !self.capabilities.image_in {
-            return Err(CeraError::UnsupportedModality);
-        }
-        let encoder = {
-            let Some(encoder) = self.vision_encoder.as_ref() else {
-                return Err(CeraError::Backend(
-                    "Session::append_raw_image: no vision encoder attached. \
-                     Construct via CeraEngine on a VL bundle so the \
-                     encoder is auto-attached, or call \
-                     attach_vision_encoder(...) in test setup."
-                        .into(),
-                ));
-            };
-            let llm_hidden = self.model.config().hidden_size;
-            let proj_dim = encoder.config.projection_dim;
-            if proj_dim != llm_hidden {
-                return Err(CeraError::Backend(format!(
-                    "Session::append_raw_image: vision encoder's projection_dim \
-                     ({proj_dim}) does not match LLM hidden_size ({llm_hidden}). \
-                     The mmproj must pair with the LLM it was trained against."
-                )));
-            }
-            std::sync::Arc::clone(encoder)
-        };
-        let pre = crate::model::vision_preprocessor::preprocess_raw_pixels(
+        let encoder = self.checked_vision_encoder("Session::append_raw_image")?;
+        let preprocess_start = Instant::now();
+        let layout = crate::model::vision_preprocessor::preprocess_raw_layout(
             pixels,
             width as usize,
             height as usize,
@@ -2479,7 +2441,10 @@ impl Session {
             &encoder.config,
             max_long_size,
         )?;
-        self.encode_and_append_preprocessed_image(&pre, &encoder)
+        let preprocess_ms = preprocess_start.elapsed().as_secs_f64() * 1000.0;
+        vl_timing_update(|t| t.preprocess_ms += preprocess_ms);
+        let (rows, n_tokens) = self.encode_layout_rows(&layout, &encoder)?;
+        self.append_image_rows(&rows, n_tokens)
     }
 
     /// Stub `append_raw_image_with_opts` for builds without `vl-preprocess`.
@@ -2496,14 +2461,116 @@ impl Session {
         Err(CeraError::UnsupportedModality)
     }
 
+    /// Decode, preprocess and encode an image into LLM-width embedding rows
+    /// (`n_tokens` rows of `hidden_size` floats) without touching the session:
+    /// the half of [`Self::append_image_with_opts`] that does not prefill.
     #[cfg(feature = "vl-preprocess")]
-    fn encode_and_append_preprocessed_image(
-        &mut self,
-        pre: &crate::model::vision_preprocessor::PreprocessedImage,
+    fn encode_image_rows(
+        &self,
+        bytes: &[u8],
+        max_long_size: Option<u32>,
+    ) -> Result<(Vec<f32>, usize), CeraError> {
+        let encoder = self.checked_vision_encoder("Session::append_image")?;
+        let preprocess_start = Instant::now();
+        let layout = crate::model::vision_preprocessor::preprocess_image_layout(
+            bytes,
+            &encoder.config,
+            max_long_size,
+        )?;
+        let preprocess_ms = preprocess_start.elapsed().as_secs_f64() * 1000.0;
+        vl_timing_update(|t| t.preprocess_ms += preprocess_ms);
+        self.encode_layout_rows(&layout, &encoder)
+    }
+
+    /// Encode a preprocessed image layout into the rows that go between `<|image_start|>` and
+    /// `<|image_end|>`.
+    ///
+    /// A single image is its tower rows. A tiled one (a large image, see
+    /// [`crate::model::vision_preprocessor::lfm2_should_tile`]) is, as the reference processor lays
+    /// it out, each tile in row-major order preceded by its `<|img_row_R_col_C|>` marker, then
+    /// `<|img_thumbnail|>` and the thumbnail's rows. The markers are embedded like any text token.
+    /// When the model cannot embed them (or the vocabulary lacks them) the tiles are dropped and only
+    /// the thumbnail is encoded, which is what every large image used to get.
+    #[cfg(feature = "vl-preprocess")]
+    fn encode_layout_rows(
+        &self,
+        layout: &crate::model::vision_preprocessor::PreprocessedLayout,
         encoder: &crate::model::vision_encoder::VisionEncoderWeights,
-    ) -> Result<(), CeraError> {
-        let (rows, n_tokens) = self.encode_preprocessed_image(pre, encoder)?;
-        self.append_image_rows(&rows, n_tokens)
+    ) -> Result<(Vec<f32>, usize), CeraError> {
+        use crate::model::vision_preprocessor::PreprocessedLayout;
+        match layout {
+            PreprocessedLayout::Single(pre) => self.encode_preprocessed_image(pre, encoder),
+            PreprocessedLayout::Tiled(t) => {
+                let (tile_markers, thumb_marker) = match self.tile_marker_rows(t.cols, t.rows) {
+                    Ok(m) => m,
+                    Err(why) => {
+                        tracing::warn!(
+                            "large image needs {} tiles but their markers are unavailable ({why}); \
+                             encoding the thumbnail only",
+                            t.tiles.len()
+                        );
+                        return self.encode_preprocessed_image(&t.thumbnail, encoder);
+                    }
+                };
+                let mut rows = Vec::new();
+                let mut n_rows = 0usize;
+                for (tile, marker) in t.tiles.iter().zip(&tile_markers) {
+                    rows.extend_from_slice(marker);
+                    n_rows += 1;
+                    let (tile_rows, n) = self.encode_preprocessed_image(tile, encoder)?;
+                    rows.extend_from_slice(&tile_rows);
+                    n_rows += n;
+                }
+                rows.extend_from_slice(&thumb_marker);
+                n_rows += 1;
+                let (thumb_rows, n) = self.encode_preprocessed_image(&t.thumbnail, encoder)?;
+                rows.extend_from_slice(&thumb_rows);
+                n_rows += n;
+                Ok((rows, n_rows))
+            }
+        }
+    }
+
+    /// The embedding rows of the `<|img_row_R_col_C|>` marker for each tile of a `cols x rows` grid
+    /// (row-major) and of `<|img_thumbnail|>`, or why they are unavailable: the vocabulary lacks a
+    /// marker or the model cannot hand out token rows.
+    #[cfg(feature = "vl-preprocess")]
+    fn tile_marker_rows(
+        &self,
+        cols: usize,
+        rows: usize,
+    ) -> Result<(Vec<Vec<f32>>, Vec<f32>), String> {
+        // Resolved the way `<image>` is: encode the marker text and require exactly one token, which
+        // also parses it as the special token it is.
+        let single = |text: String| -> Result<u32, String> {
+            let ids = self.tokenizer.encode(&text);
+            match ids[..] {
+                [id] => Ok(id),
+                _ => Err(format!("`{text}` is {} tokens, not one", ids.len())),
+            }
+        };
+        let mut ids = Vec::with_capacity(cols * rows + 1);
+        for y in 1..=rows {
+            for x in 1..=cols {
+                ids.push(single(format!("<|img_row_{y}_col_{x}|>"))?);
+            }
+        }
+        ids.push(single("<|img_thumbnail|>".to_string())?);
+        let hidden = self.model.config().hidden_size;
+        let all = self
+            .model
+            .embed_image_marker_rows(&ids)
+            .ok_or_else(|| "the model cannot hand out token embedding rows".to_string())?;
+        if all.len() != ids.len() * hidden {
+            return Err(format!(
+                "embedding rows are {} floats, expected {}",
+                all.len(),
+                ids.len() * hidden
+            ));
+        }
+        let mut chunks: Vec<Vec<f32>> = all.chunks_exact(hidden).map(<[f32]>::to_vec).collect();
+        let thumb = chunks.pop().ok_or_else(|| "no marker rows".to_string())?;
+        Ok((chunks, thumb))
     }
 
     /// Run the vision tower and projector over a preprocessed image: `n_tokens`
