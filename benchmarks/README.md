@@ -13,6 +13,10 @@ profiles live alongside this file:
   number carries its build ID; check both before quoting one. It also lists the
   measurement traps, which are worth reading before taking a number: the
   prefill-with-decode one silently costs ~10% and 8x the variance.
+- [`ANDROID_VL_IMAGE.md`](ANDROID_VL_IMAGE.md): LFM2.5-VL-450M with an image on a
+  Snapdragon 8 Elite phone, Cera vs llama.cpp on CPU, GPU and NPU, with a phase
+  breakdown (vision tower, image prefill, text prefill, decode) and the ranked
+  perf gaps. Raw runs in [`android_vl_image_raw/`](android_vl_image_raw/).
 - [`GPU_FINDINGS_CORRECTION.md`](GPU_FINDINGS_CORRECTION.md): five rounds of
   wrong GPU conclusions and what each one cost. Worth reading before starting a
   GPU perf task; it is mostly a catalogue of ways to over-read a number, and

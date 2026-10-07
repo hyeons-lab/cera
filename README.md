@@ -111,7 +111,7 @@ Cera provides a native backend for Qualcomm Hexagon NPUs and Compute DSPs on Sna
 - **Zero-Copy Shared Memory**: Allocates model weights, activations, and KV cache buffers in shared `rpcmem` (DMA-BUF / ION) mapped into both CPU and DSP address spaces, eliminating bus copying.
 - **Embedded Skeleton Libraries**: Embeds prebuilt, 16 KB page-aligned DSP worker libraries (`libggml-htp-v{73,75,79,81}.so`) into the host binary and extracts them automatically at startup. Skeletons incorporate extended operators (`Conv1D`, `ConvTranspose1D`, `Snake`, `UnaryStep`, `Sum`).
 - **Accelerated Kernels**:
-  - **LLM Text Generation**: 32x32 tiled Q4_0 and Q8_0 matrix repacking for HTP matrix units, forward decode batched to eliminate most synchronization boundaries (a single flush per token and a static batch template are available with `CERA_HEXAGON_BATCH_TENSORS=0`; the default caps each batch at 32 tensors for run-to-run reproducibility), ping-pong scratch memory isolation, FastRPC latency QoS (`FASTRPC_CONTROL_LATENCY = 100 µs`), FastRPC driver wakelock (`FASTRPC_CONTROL_WAKELOCK`), and Q8_0 quantized KV cache (~47% memory reduction over F16).
+  - **LLM Text Generation**: 32x32 tiled Q4_0 and Q8_0 matrix repacking for HTP matrix units, forward decode batched to eliminate most synchronization boundaries (the default is one uncapped batch per token with a static batch template, and `CERA_HEXAGON_BATCH_TENSORS=<n>` caps each batch at `n` tensors for bisection), ping-pong scratch memory isolation, FastRPC latency QoS (`FASTRPC_CONTROL_LATENCY = 100 µs`), FastRPC driver wakelock (`FASTRPC_CONTROL_WAKELOCK`), and Q8_0 quantized KV cache (~47% memory reduction over F16).
   - **On-DSP Argmax**: Offloads greedy token argmax reduction directly to Hexagon HTP (`HtpOpCode::Argmax`, opcode 62), reading only 4 bytes of token ID from rpcmem rather than copying or invalidating 128 to 256 KB of float32 logits, eliminating host CPU allocations and memory traffic during greedy decode.
   - **Speculative Decoding Verification**: Batches LM-head projections across all draft token rows via parallel HTP matrix dispatch (`forward_prefill_logits_all`). When paired with prompt-lookup drafting (`ngram=2`, `k=4`), speculative decoding lifts 350M decode throughput from 164.0 tok/s to 259.5 tok/s (peak 260.2 tok/s) and 2.6B decode from 26.7 tok/s to 47.7 tok/s (peak 48.5 tok/s) on Snapdragon 8 Elite.
   - **Multimodal Vision (ViT)**: Dispatches all 24 Vision Transformer blocks in a single batched submission with on-NPU Flash Attention, F16 KV scratch handling, and quantized MLP projector execution.
@@ -341,7 +341,11 @@ LFM2, compressing the KV cache to **~3 bits/key + ~2 bits/value (~12× vs f32)**
 with near-lossless quality and **no calibration**. On a 1.6B LFM2 model at 4K
 tokens that's ~192 MB → ~16 MB of KV, with decode staying within ±5% of f32.
 
-Enable it on the CLI:
+The default KV cache is **f16** on the CPU backend (llama.cpp's default cache type; `--kv-cache-keys auto`),
+which halves the bytes a decode streams at depth; `--kv-cache-keys f32` keeps full precision. Backends that
+keep their own cache (wgpu, Metal, Hexagon) are unaffected.
+
+Enable TurboQuant on the CLI:
 
 ```bash
 cera run -m lfm2.gguf -p "Hello" --kv-cache-keys tq3 --device cpu
@@ -601,6 +605,13 @@ optimal on any one. The knobs below override them.
 | `CERA_POOL_STATS=1` | Annotates each `cera bench` run with pool fan-out health: how many dispatches wanted more than one worker, and how many of those silently ran serially because the pool was busy. The counts are exact; the work percentage mixes units across dispatch kinds, so read the counts. |
 | `CERA_CPU_TIER=<tier>` | Caps the SIMD tier (e.g. `avx2`, `avx512`). May only downgrade, useful for A/B-ing a kernel path. |
 | `CERA_LM_HEAD_NO_GEMM=1` | Puts the LM-head projection in `forward_prefill_logits_all` back on the per-row loop the batched GEMM replaced, so both halves of a speculative-decoding A/B run from the same binary. Measurement lever only: both paths compute the same projection, to within f32 accumulation order. |
+| `CERA_Q4_DEC4=off` | Disables the 4-row interleaved Q4_0 decode repack (`0` / `false` / `off`), which costs one extra copy of each repacked weight (about +155 MB resident on the 450M, measured on a Galaxy S25 Ultra and not seen on an Apple-silicon Mac) and decodes bit-identically to the repacked prefill GEMMs. A memory/A-B lever. |
+| `CERA_VIT_INT8=off` | Runs the CPU vision tower's linears on the f32 path instead of the int8 GEMM (roughly 2 to 3x slower, measured on an Apple-silicon Mac; `0` / `false` / `off`). |
+| `CERA_VIT_PROFILE=1` | Prints per-phase wall time of each vision-tower encode (CPU and GPU). Off by default and free when off. |
+| `CERA_GPU_PREBUILD=off` | wgpu decode: stops finishing the next token's command buffer while the current one executes (`0` / `false` / `off`). A/B lever; decode is about 20% slower with it off on Adreno 830. |
+| `CERA_GPU_ATTN_SPLIT=off` | wgpu decode: uses the single-kernel attention instead of the split-K attention (head_dim 64 only; `0` / `false` / `off`). |
+| `CERA_WGPU_STREAM_MIN_N=<n>` | wgpu prefill: smallest batch size routed to the streaming Q4_0 GEMM (default 1, i.e. every batch). |
+| `CERA_VIT_STREAM=off` / `CERA_VIT_WARMUP=off` | wgpu vision tower: `CERA_VIT_STREAM=off` restores the generic kernels instead of the fp16 streaming GEMMs and attention; `CERA_VIT_WARMUP=off` skips the blank-image warm-up encode at load (about 190 ms once). |
 | `RUST_LOG=<filter>` | Log level. Defaults to `warn`, which surfaces things like prefill falling back to the slow per-token path. |
 
 ### How the decode thread count is chosen
