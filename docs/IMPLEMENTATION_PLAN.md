@@ -632,12 +632,12 @@ Image → text via a CLIP-family ViT encoder with a 2-layer MLP projector
   stay on the CPU (small, data-dependent rearrangement).
 
 Remaining:
-- No image slicing/tiling: high-res input is downscaled to a single tile, so
-  `maxLongSize` lowers cost/resolution but can't raise effective resolution
-  above the single-tile budget (≈512²). Slicing is the high-res path.
+- Tiling is implemented for the CPU, wgpu and Hexagon sessions (a large image becomes up to 10
+  tiles plus a thumbnail, as the LFM2-VL reference does). Native Metal falls back to the single
+  thumbnail (no `embed_image_marker_rows`), and the WebGPU wasm session does not tile.
 - Single projector family (`LFM2`); other VL projector types not mapped.
-- wasm: `cera-wasm` builds with `cera` default features off (no `image` crate),
-  so image input is intentionally not exposed there (binary-size choice).
+- wasm: `cera-wasm` exposes `appendImage` when built with the `vl` feature (the `image` decoders
+  are dropped with `--no-default-features`, which then reports "modality not supported").
 
 ### V2.16: Audio + TTS (LFM2-Audio), ✅ core shipped
 Full duplex: PCM in (ASR / audio understanding) and PCM out (speech

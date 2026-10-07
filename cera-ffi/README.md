@@ -1166,7 +1166,7 @@ see [Sharing a loaded GPU model](#sharing-a-loaded-gpu-model) for foreign lifeti
 
 | Method | Signature | Notes |
 |---|---|---|
-| `engine.newSession(config)` | `(SessionConfig) -> Result<Arc<Session>, FfiError>` | Per-session knobs (`seed`, `nKeep`, `ubatchSize`, `maxSeqLen`, `kvCompression`, `disableSpec`). Returns `Busy` if another session owns the model's device context, or `OutOfMemory` when the KV cache can't be allocated. |
+| `engine.newSession(config)` | `(SessionConfig) -> Result<Arc<Session>, FfiError>` | Per-session knobs (`seed`, `nKeep`, `ubatchSize`, `maxSeqLen`, `kvCompression`, `disableSpec`). An omitted `kvCompression` takes the core default, f16 where the model honors it (CPU LFM2 and dense transformers) and the backend's own cache otherwise; pass `KvCompression.None` for the backend's own full-precision cache. Returns `Busy` if another session owns the model's device context, or `OutOfMemory` when the KV cache can't be allocated. |
 | `session.intoChat()` | `() -> Result<Arc<ChatSession>, FfiError>` | Transition the raw session into a transactional chat coordinator. Moves ownership out of Session. |
 | `session.appendText(text)` | `(String) -> Result<(), FfiError>` | Tokenize + push into KV. Convenience over `appendTokens(encodeText(text))`. |
 | `session.appendTokens(tokens)` | `(Vec<u32>) -> Result<(), FfiError>` | Push pre-tokenized IDs. Use when you need explicit BOS/EOS framing. |
@@ -1285,8 +1285,11 @@ do {
   per-call `maxLongSize` caps the longest side of the *encoded* image
   (aspect-preserving): smaller = fewer image tokens, faster, less
   detail. It only shrinks (never upscales) and takes precedence over
-  the model's minimum-resolution floor; `null` applies no cap for that
-  call. Returns `UnsupportedModality` on a non-VL model and `Backend`
+  the model's minimum-resolution floor; `null` uses the session default
+  (no cap if none is set), `0` forces no cap for the call, and with no cap in effect a large image is tiled as the LFM2-VL reference
+  does (up to 10 tiles of 256 tokens plus a thumbnail: about 1,800 tokens
+  for a 4:3 photo and up to about 2,800 for a 5:2 panorama; set a cap to
+  keep one tile; native Metal falls back to the single thumbnail). Returns `UnsupportedModality` on a non-VL model and `Backend`
   on a decode / encoder mismatch. The ViT encode runs on the GPU
   (native Metal or wgpu, per the engine's backend) with a CPU fallback.
 - **`setImageMaxLongSize(maxLongSize)`** sets a session-default cap

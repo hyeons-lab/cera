@@ -1,0 +1,9 @@
+Loaded image: /data/local/tmp/cmp-pug_512.jpg (94977 bytes)
+Using wgpu backend (lfm2)
+Model: lfm2 | 16 layers | hidden=1024
+Image prefill: 210 KV tokens, 4738.0 ms
+VL phases: preprocess 2.8 ms | tower 2261.3 ms | image prefill 1568.4 ms (192 tok) | text prefill 900.6 ms (18 tok)
+A pug dog with a wrinkled face and dark eyes is lying on a textured carpet, its tongue playfully sticking out. The dog's ears are floppy, and it appears to be in a relaxed state. In the background, a pair of black flip-flops is visible, suggesting a casual, home
+---
+Generated tokens: 64
+Decode: 118.7 tok/s
