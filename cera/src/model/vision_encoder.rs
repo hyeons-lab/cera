@@ -269,32 +269,23 @@ impl ProjectorWeights {
         let mut mid = vec![0f32; n_tokens * mid_dim];
         let mut out = vec![0f32; n_tokens * out_dim];
 
-        self.mm1_w.batched_matmul(pooled, &mut mid, n_tokens);
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            mid.par_chunks_mut(mid_dim).for_each(|mid_row| {
-                crate::backend::cpu::add_inplace(mid_row, &self.mm1_b);
-                crate::backend::cpu::gelu_inplace(mid_row);
-            });
-            self.mm2_w.batched_matmul(&mid, &mut out, n_tokens);
-            out.par_chunks_mut(out_dim).for_each(|out_row| {
-                crate::backend::cpu::add_inplace(out_row, &self.mm2_b);
-            });
+        // The same int8 GEMM the ViT blocks use; the f32 path stays as the fallback.
+        let mut q8 = Q8Act::for_dims(&[in_dim, mid_dim], n_tokens);
+        q8.quantize(pooled, in_dim, n_tokens);
+        if !q8.matmul(&self.mm1_w, &mut mid) {
+            self.mm1_w.batched_matmul(pooled, &mut mid, n_tokens);
         }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for t in 0..n_tokens {
-                let mid_row = &mut mid[t * mid_dim..(t + 1) * mid_dim];
-                crate::backend::cpu::add_inplace(mid_row, &self.mm1_b);
-                crate::backend::cpu::gelu_inplace(mid_row);
-            }
+        par_rows_n(&mut mid, mid_dim, |_, mid_row| {
+            crate::backend::cpu::add_inplace(mid_row, &self.mm1_b);
+            crate::backend::cpu::gelu_inplace(mid_row);
+        });
+        q8.quantize(&mid, mid_dim, n_tokens);
+        if !q8.matmul(&self.mm2_w, &mut out) {
             self.mm2_w.batched_matmul(&mid, &mut out, n_tokens);
-            for t in 0..n_tokens {
-                let out_row = &mut out[t * out_dim..(t + 1) * out_dim];
-                crate::backend::cpu::add_inplace(out_row, &self.mm2_b);
-            }
         }
+        par_rows_n(&mut out, out_dim, |_, out_row| {
+            crate::backend::cpu::add_inplace(out_row, &self.mm2_b);
+        });
         out
     }
 }
@@ -518,7 +509,7 @@ impl VisionEncoderWeights {
             mm2_b,
         };
 
-        Ok(Self {
+        let weights = Self {
             config,
             patch_embed,
             position_embed,
@@ -526,7 +517,26 @@ impl VisionEncoderWeights {
             post_ln_w,
             post_ln_b,
             projector,
-        })
+        };
+        weights.prepare_int8();
+        Ok(weights)
+    }
+
+    /// Build the smmla-repacked copy of every Q8_0 linear now, so the first image does not pay for
+    /// it. A no-op unless the int8 path is on and the host has i8mm.
+    fn prepare_int8(&self) {
+        let cfg = &self.config;
+        let dims = [cfg.n_embd, cfg.n_ff];
+        if !Q8Act::for_dims(&dims, 0).enabled {
+            return;
+        }
+        for b in &self.blocks {
+            for w in [&b.q_w, &b.k_w, &b.v_w, &b.o_w, &b.ffn_up_w, &b.ffn_down_w] {
+                let _ = w.smmla_repacked();
+            }
+        }
+        let _ = self.projector.mm1_w.smmla_repacked();
+        let _ = self.projector.mm2_w.smmla_repacked();
     }
 
     /// Run the vision encoder + projector on a preprocessed image
@@ -581,10 +591,11 @@ impl VisionEncoderWeights {
         let n_patches = grid_w
             .checked_mul(grid_h)
             .ok_or_else(|| anyhow::anyhow!("grid_w·grid_h overflow"))?;
-
+        let mut prof = Prof::new();
         // 1. Patch embed: [3, H, W] → [n_patches, n_embd]
+        let t = prof.start();
         let mut tokens = patch_embed_compute(pixels, &self.patch_embed, cfg, grid_w, grid_h);
-
+        prof.stop("patch_embed", t);
         // 2. Add position embeddings — interpolate from the trained
         //    grid when the dynamic grid differs.
         let pos = self.resolved_position_embed(grid_w, grid_h);
@@ -597,42 +608,27 @@ impl VisionEncoderWeights {
         //    grid and reuse across blocks.
         let mut scratch = VitScratch::new(cfg, n_patches);
         for block in &self.blocks {
-            self.vit_block_forward(&mut tokens, block, &mut scratch, n_patches);
+            self.vit_block_forward(&mut tokens, block, &mut scratch, n_patches, &mut prof);
         }
 
         // 4. post_ln (per token).
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            tokens.par_chunks_mut(cfg.n_embd).for_each(|row| {
-                crate::backend::cpu::layer_norm_inplace(
-                    row,
-                    &self.post_ln_w,
-                    &self.post_ln_b,
-                    cfg.eps,
-                );
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for t in 0..n_patches {
-                let row = &mut tokens[t * cfg.n_embd..(t + 1) * cfg.n_embd];
-                crate::backend::cpu::layer_norm_inplace(
-                    row,
-                    &self.post_ln_w,
-                    &self.post_ln_b,
-                    cfg.eps,
-                );
-            }
-        }
+        let t = prof.start();
+        par_rows_n(&mut tokens, cfg.n_embd, |_, row| {
+            crate::backend::cpu::layer_norm_inplace(row, &self.post_ln_w, &self.post_ln_b, cfg.eps);
+        });
 
         // 5. Pixel-shuffle scale_factor² over the dynamic grid →
         //    `(grid_w/sf) · (grid_h/sf)` tokens with sf² channel
         //    inflation.
         let pooled = pixel_shuffle(&tokens, cfg, grid_w, grid_h);
+        prof.stop("post_ln_shuffle", t);
 
         // 6. Projector: mm.1 + GELU + mm.2.
-        Ok(self.projector_forward(&pooled, cfg))
+        let t = prof.start();
+        let out = self.projector_forward(&pooled, cfg);
+        prof.stop("projector", t);
+        prof.report();
+        Ok(out)
     }
 
     /// The `[patches, n_embd]` tokens after patch embedding, the position
@@ -661,7 +657,13 @@ impl VisionEncoderWeights {
         }
         let mut scratch = VitScratch::new(cfg, n_patches);
         for block in self.blocks.iter().take(n_blocks) {
-            self.vit_block_forward(&mut tokens, block, &mut scratch, n_patches);
+            self.vit_block_forward(
+                &mut tokens,
+                block,
+                &mut scratch,
+                n_patches,
+                &mut Prof::off(),
+            );
         }
         Ok(tokens)
     }
@@ -692,7 +694,13 @@ impl VisionEncoderWeights {
             .blocks
             .first()
             .ok_or_else(|| anyhow::anyhow!("no ViT blocks"))?;
-        self.vit_block_forward(&mut tokens, block, &mut scratch, n_patches);
+        self.vit_block_forward(
+            &mut tokens,
+            block,
+            &mut scratch,
+            n_patches,
+            &mut Prof::off(),
+        );
         Ok(VitStageDump {
             x0,
             q: scratch.q,
@@ -752,6 +760,7 @@ impl VisionEncoderWeights {
         block: &VitBlockWeights,
         scratch: &mut VitScratch,
         n_tokens: usize,
+        prof: &mut Prof,
     ) {
         let cfg = &self.config;
         let n_embd = cfg.n_embd;
@@ -759,233 +768,156 @@ impl VisionEncoderWeights {
         let head_dim = n_embd / n_head;
         let scale = 1.0f32 / (head_dim as f32).sqrt();
 
-        // ── Pre-attention ──
-        // Copy tokens into `pre_norm` so we can LN it without
-        // clobbering the residual.
-        scratch.pre_norm.copy_from_slice(tokens);
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            scratch.pre_norm.par_chunks_mut(n_embd).for_each(|row| {
-                crate::backend::cpu::layer_norm_inplace(row, &block.ln1_w, &block.ln1_b, cfg.eps);
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for t in 0..n_tokens {
-                let row = &mut scratch.pre_norm[t * n_embd..(t + 1) * n_embd];
-                crate::backend::cpu::layer_norm_inplace(row, &block.ln1_w, &block.ln1_b, cfg.eps);
-            }
-        }
+        // Every parallel section below runs on the `RowPool` the int8 GEMM uses (`par_rows_n`), not
+        // rayon: the pool's workers spin between dispatches, and a rayon fork-join issued right after
+        // one pays a park/unpark against them (about 35 ms of extra tower time when only the
+        // transpose was moved).
 
-        // Q/K/V projections batched across all tokens: weight rows dequantized once into reusable scratch
-        block.q_w.batched_matmul_with_scratch(
+        // ── Pre-attention ──
+        // Copy tokens into `pre_norm` so we can LN it without clobbering the residual.
+        let t = prof.start();
+        scratch.pre_norm.copy_from_slice(tokens);
+        par_rows_n(&mut scratch.pre_norm, n_embd, |_, row| {
+            crate::backend::cpu::layer_norm_inplace(row, &block.ln1_w, &block.ln1_b, cfg.eps);
+        });
+        prof.stop("ln", t);
+        // Q/K/V projections batched across all tokens. The three share one input, so it is
+        // quantized to Q8_0 once.
+        let t = prof.start();
+        scratch.q8.quantize(&scratch.pre_norm, n_embd, n_tokens);
+        prof.stop("quant", t);
+        let t = prof.start();
+        vit_linear(
+            &block.q_w,
             &scratch.pre_norm,
             &mut scratch.q,
             n_tokens,
-            Some(&mut scratch.dequant_scratch),
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
         );
-        block.k_w.batched_matmul_with_scratch(
+        vit_linear(
+            &block.k_w,
             &scratch.pre_norm,
             &mut scratch.k,
             n_tokens,
-            Some(&mut scratch.dequant_scratch),
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
         );
-        block.v_w.batched_matmul_with_scratch(
+        vit_linear(
+            &block.v_w,
             &scratch.pre_norm,
             &mut scratch.v,
             n_tokens,
-            Some(&mut scratch.dequant_scratch),
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
         );
+        prof.stop("gemm_qkv", t);
 
-        #[cfg(feature = "parallel")]
+        let t = prof.start();
         {
-            use rayon::prelude::*;
-            scratch
-                .q
-                .par_chunks_mut(n_embd)
-                .zip(scratch.k.par_chunks_mut(n_embd))
-                .zip(scratch.v.par_chunks_mut(n_embd))
-                .for_each(|((q_row, k_row), v_row)| {
-                    crate::backend::cpu::add_inplace(q_row, &block.q_b);
-                    crate::backend::cpu::add_inplace(k_row, &block.k_b);
-                    crate::backend::cpu::add_inplace(v_row, &block.v_b);
-                });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for t in 0..n_tokens {
-                let q_row = &mut scratch.q[t * n_embd..(t + 1) * n_embd];
-                let k_row = &mut scratch.k[t * n_embd..(t + 1) * n_embd];
-                let v_row = &mut scratch.v[t * n_embd..(t + 1) * n_embd];
+            // Bias for all three; k and v are reached through raw pointers because `par_rows_n`
+            // splits one slice, and each task touches only its own token row of each.
+            let k_ptr = scratch.k.as_mut_ptr() as usize;
+            let v_ptr = scratch.v.as_mut_ptr() as usize;
+            par_rows_n(&mut scratch.q, n_embd, |t, q_row| {
+                // SAFETY: row `t` of `k` and `v` is touched by this task alone.
+                let (k_row, v_row) = unsafe {
+                    (
+                        core::slice::from_raw_parts_mut(
+                            (k_ptr as *mut f32).add(t * n_embd),
+                            n_embd,
+                        ),
+                        core::slice::from_raw_parts_mut(
+                            (v_ptr as *mut f32).add(t * n_embd),
+                            n_embd,
+                        ),
+                    )
+                };
                 crate::backend::cpu::add_inplace(q_row, &block.q_b);
                 crate::backend::cpu::add_inplace(k_row, &block.k_b);
                 crate::backend::cpu::add_inplace(v_row, &block.v_b);
-            }
+            });
         }
+        prof.stop("qkv_bias", t);
 
         // Multi-head scaled dot-product attention.
-        // Q/K/V are [n_tokens × (n_head·head_dim)]; we view them
-        // as [n_head, n_tokens, head_dim] by indexing into the
-        // contiguous buffer.
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            let q_slice = scratch.q.as_slice();
-            let k_slice = scratch.k.as_slice();
-            let v_slice = scratch.v.as_slice();
-            scratch
-                .attn_out
-                .par_chunks_mut(n_embd)
-                .enumerate()
-                .for_each_init(
-                    || vec![0.0f32; n_tokens],
-                    |scores, (q_idx, out_row)| {
-                        for h in 0..n_head {
-                            let q_off = q_idx * n_embd + h * head_dim;
-                            let q = &q_slice[q_off..q_off + head_dim];
-                            for (k_idx, score) in scores.iter_mut().enumerate() {
-                                let k_off = k_idx * n_embd + h * head_dim;
-                                let k = &k_slice[k_off..k_off + head_dim];
-                                let dot = crate::backend::cpu::dot_f32(q, k);
-                                *score = dot * scale;
-                            }
-                            crate::backend::cpu::softmax_inplace(scores);
-                            let out_head = &mut out_row[h * head_dim..(h + 1) * head_dim];
-                            out_head.iter_mut().for_each(|v| *v = 0.0);
-                            for (k_idx, &s) in scores.iter().enumerate() {
-                                let v_off = k_idx * n_embd + h * head_dim;
-                                let v = &v_slice[v_off..v_off + head_dim];
-                                for (o, vv) in out_head.iter_mut().zip(v) {
-                                    *o += s * vv;
-                                }
-                            }
-                        }
-                    },
-                );
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for h in 0..n_head {
-                for q_idx in 0..n_tokens {
-                    let q_off = q_idx * n_embd + h * head_dim;
-                    let q = &scratch.q[q_off..q_off + head_dim];
-                    for (k_idx, score) in scratch.scores.iter_mut().enumerate() {
-                        let k_off = k_idx * n_embd + h * head_dim;
-                        let k = &scratch.k[k_off..k_off + head_dim];
-                        let dot = crate::backend::cpu::dot_f32(q, k);
-                        *score = dot * scale;
-                    }
-                    crate::backend::cpu::softmax_inplace(&mut scratch.scores);
-                    let out_off = q_idx * n_embd + h * head_dim;
-                    let out_slice = &mut scratch.attn_out[out_off..out_off + head_dim];
-                    out_slice.iter_mut().for_each(|v| *v = 0.0);
-                    for (k_idx, &s) in scratch.scores.iter().enumerate() {
-                        let v_off = k_idx * n_embd + h * head_dim;
-                        let v = &scratch.v[v_off..v_off + head_dim];
-                        for (o, vv) in out_slice.iter_mut().zip(v) {
-                            *o += s * vv;
-                        }
-                    }
-                }
-            }
-        }
+        let t = prof.start();
+        vit_attention(
+            &scratch.q,
+            &scratch.k,
+            &scratch.v,
+            &mut scratch.attn_out,
+            &mut scratch.attn_heads,
+            &mut scratch.attn_kt,
+            n_tokens,
+            n_head,
+            head_dim,
+            scale,
+        );
+        prof.stop("attention", t);
 
         // Output projection + bias + residual add.
-        block.o_w.batched_matmul_with_scratch(
+        let t = prof.start();
+        scratch.q8.quantize(&scratch.attn_out, n_embd, n_tokens);
+        prof.stop("quant", t);
+        let t = prof.start();
+        vit_linear(
+            &block.o_w,
             &scratch.attn_out,
             &mut scratch.attn_proj,
             n_tokens,
-            Some(&mut scratch.dequant_scratch),
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
         );
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            tokens
-                .par_chunks_mut(n_embd)
-                .zip(scratch.attn_proj.par_chunks_mut(n_embd))
-                .for_each(|(tok_row, proj_row)| {
-                    crate::backend::cpu::add_inplace(proj_row, &block.o_b);
-                    crate::backend::cpu::add_inplace(tok_row, proj_row);
-                });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for t in 0..n_tokens {
-                let proj_row = &mut scratch.attn_proj[t * n_embd..(t + 1) * n_embd];
-                crate::backend::cpu::add_inplace(proj_row, &block.o_b);
-                let tok_row = &mut tokens[t * n_embd..(t + 1) * n_embd];
-                crate::backend::cpu::add_inplace(tok_row, proj_row);
-            }
-        }
+        prof.stop("gemm_o", t);
+        let t = prof.start();
+        add_bias_residual(tokens, &mut scratch.attn_proj, &block.o_b, n_embd);
+        prof.stop("bias_res", t);
 
         // ── MLP ──
+        let t = prof.start();
         scratch.pre_norm.copy_from_slice(tokens);
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            scratch.pre_norm.par_chunks_mut(n_embd).for_each(|row| {
-                crate::backend::cpu::layer_norm_inplace(row, &block.ln2_w, &block.ln2_b, cfg.eps);
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for t in 0..n_tokens {
-                let row = &mut scratch.pre_norm[t * n_embd..(t + 1) * n_embd];
-                crate::backend::cpu::layer_norm_inplace(row, &block.ln2_w, &block.ln2_b, cfg.eps);
-            }
-        }
+        par_rows_n(&mut scratch.pre_norm, n_embd, |_, row| {
+            crate::backend::cpu::layer_norm_inplace(row, &block.ln2_w, &block.ln2_b, cfg.eps);
+        });
+        prof.stop("ln", t);
 
         let n_ff = cfg.n_ff;
-        block.ffn_up_w.batched_matmul_with_scratch(
+        let t = prof.start();
+        scratch.q8.quantize(&scratch.pre_norm, n_embd, n_tokens);
+        prof.stop("quant", t);
+        let t = prof.start();
+        vit_linear(
+            &block.ffn_up_w,
             &scratch.pre_norm,
             &mut scratch.ffn_mid,
             n_tokens,
-            Some(&mut scratch.dequant_scratch),
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
         );
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            scratch.ffn_mid.par_chunks_mut(n_ff).for_each(|ff_row| {
-                crate::backend::cpu::add_inplace(ff_row, &block.ffn_up_b);
-                crate::backend::cpu::gelu_inplace(ff_row);
-            });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for t in 0..n_tokens {
-                let ff_row = &mut scratch.ffn_mid[t * n_ff..(t + 1) * n_ff];
-                crate::backend::cpu::add_inplace(ff_row, &block.ffn_up_b);
-                crate::backend::cpu::gelu_inplace(ff_row);
-            }
-        }
-
-        block.ffn_down_w.batched_matmul_with_scratch(
+        prof.stop("gemm_up", t);
+        let t = prof.start();
+        par_rows_n(&mut scratch.ffn_mid, n_ff, |_, ff_row| {
+            crate::backend::cpu::add_inplace(ff_row, &block.ffn_up_b);
+            crate::backend::cpu::gelu_inplace(ff_row);
+        });
+        prof.stop("gelu", t);
+        let t = prof.start();
+        scratch.q8.quantize(&scratch.ffn_mid, n_ff, n_tokens);
+        prof.stop("quant", t);
+        let t = prof.start();
+        vit_linear(
+            &block.ffn_down_w,
             &scratch.ffn_mid,
             &mut scratch.ffn_out,
             n_tokens,
-            Some(&mut scratch.dequant_scratch),
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
         );
-        #[cfg(feature = "parallel")]
-        {
-            use rayon::prelude::*;
-            tokens
-                .par_chunks_mut(n_embd)
-                .zip(scratch.ffn_out.par_chunks_mut(n_embd))
-                .for_each(|(tok_row, down_row)| {
-                    crate::backend::cpu::add_inplace(down_row, &block.ffn_down_b);
-                    crate::backend::cpu::add_inplace(tok_row, down_row);
-                });
-        }
-        #[cfg(not(feature = "parallel"))]
-        {
-            for t in 0..n_tokens {
-                let down_row = &mut scratch.ffn_out[t * n_embd..(t + 1) * n_embd];
-                crate::backend::cpu::add_inplace(down_row, &block.ffn_down_b);
-                let tok_row = &mut tokens[t * n_embd..(t + 1) * n_embd];
-                crate::backend::cpu::add_inplace(tok_row, down_row);
-            }
-        }
+        prof.stop("gemm_down", t);
+        let t = prof.start();
+        add_bias_residual(tokens, &mut scratch.ffn_out, &block.ffn_down_b, n_embd);
+        prof.stop("bias_res", t);
     }
 
     /// Projector forward: pixel-shuffled `[64, 3072]` → `mm.1`
@@ -993,6 +925,54 @@ impl VisionEncoderWeights {
     /// `[64, 1024]` flattened.
     fn projector_forward(&self, pooled: &[f32], cfg: &VisionEncoderConfig) -> Vec<f32> {
         self.projector.forward(pooled, cfg.projection_dim)
+    }
+}
+
+/// Per-phase wall time of one `encode_image` call, on with `CERA_VIT_PROFILE=1` and printed to stderr
+/// when the call ends. Off, `start` returns `None` and costs nothing.
+struct Prof {
+    on: bool,
+    acc: Vec<(&'static str, std::time::Duration)>,
+}
+
+impl Prof {
+    fn new() -> Self {
+        Self {
+            on: crate::backend::cpu_features::env_enabled("CERA_VIT_PROFILE"),
+            acc: Vec::new(),
+        }
+    }
+
+    fn off() -> Self {
+        Self {
+            on: false,
+            acc: Vec::new(),
+        }
+    }
+
+    fn start(&self) -> Option<crate::time::Instant> {
+        self.on.then(crate::time::Instant::now)
+    }
+
+    fn stop(&mut self, key: &'static str, t: Option<crate::time::Instant>) {
+        let Some(t) = t else { return };
+        let d = t.elapsed();
+        match self.acc.iter_mut().find(|(k, _)| *k == key) {
+            Some((_, a)) => *a += d,
+            None => self.acc.push((key, d)),
+        }
+    }
+
+    fn report(&self) {
+        if !self.on {
+            return;
+        }
+        let total: std::time::Duration = self.acc.iter().map(|(_, d)| *d).sum();
+        let mut line = format!("vit profile (sum {:.1} ms):", total.as_secs_f64() * 1e3);
+        for (k, d) in &self.acc {
+            line.push_str(&format!(" {k} {:.1}", d.as_secs_f64() * 1e3));
+        }
+        eprintln!("{line}");
     }
 }
 
@@ -1008,17 +988,19 @@ struct VitScratch {
     /// Attention output `[n_tokens × n_embd]` — reused across all
     /// 12 blocks (was previously allocated per block).
     attn_out: Vec<f32>,
-    /// Per-query attention scores `[n_tokens]` used in serial attention.
-    /// The `parallel` build gives each rayon worker its own scores buffer,
-    /// so the field (and its allocation) exists only without that feature.
-    #[cfg(not(feature = "parallel"))]
-    scores: Vec<f32>,
+    /// Per-head attention output in the flash kernel's `[head][token][head_dim]` layout.
+    attn_heads: Vec<f32>,
+    /// The keys of every head transposed to `[head][head_dim][token]` (tokens padded to a multiple of 8)
+    /// for `cpu::vit_attention_chunk_neon`; empty where that kernel is not used.
+    attn_kt: Vec<f32>,
     attn_proj: Vec<f32>,
     ffn_mid: Vec<f32>,
     ffn_out: Vec<f32>,
     /// Reusable row dequantization buffer sized to `max(n_embd, n_ff)`
     /// to avoid per-matmul heap allocations across all blocks.
     dequant_scratch: Vec<f32>,
+    /// Int8 activation buffers for the Q8_0 linears.
+    q8: Q8Act,
 }
 
 impl VitScratch {
@@ -1032,13 +1014,339 @@ impl VitScratch {
             k: vec![0.0; n_pe],
             v: vec![0.0; n_pe],
             attn_out: vec![0.0; n_pe],
-            #[cfg(not(feature = "parallel"))]
-            scores: vec![0.0; n_tokens],
+            attn_heads: vec![0.0; attn_heads_len(n_tokens, cfg.n_head, cfg.n_embd / cfg.n_head)],
+            attn_kt: vec![0.0; attn_kt_len(n_tokens, cfg.n_head, cfg.n_embd / cfg.n_head)],
             attn_proj: vec![0.0; n_pe],
             ffn_mid: vec![0.0; n_pf],
             ffn_out: vec![0.0; n_pe],
             dequant_scratch: vec![0.0; max_dim],
+            q8: Q8Act::new(cfg, n_tokens),
         }
+    }
+}
+
+/// Int8 activations for the tower's Q8_0 linears.
+///
+/// Every linear in the tower is a Q8_0 weight applied to f32 activations. The scalar path
+/// dequantizes each weight row to f32 and runs one `dot_f32` per (row, token) pair, which is
+/// compute-bound at about 130 GFLOP/s on the phone. This quantizes the activations to Q8_0 once per
+/// distinct input (the same step llama.cpp's CPU backend takes for a Q8_0 weight) and runs the
+/// batched int8 GEMM the LLM prefill uses (`i8mm` on cores that have it).
+///
+/// The kernel writes `[rows][tokens]`; the tower wants `[tokens][rows]`, so the result is
+/// transposed on the way out. `CERA_VIT_INT8=0` forces the f32 path, for A/B runs.
+struct Q8Act {
+    enabled: bool,
+    /// Feature dim and token count of the activations last passed to [`Self::quantize`].
+    dim: usize,
+    n: usize,
+    scales: Vec<f32>,
+    quants: Vec<i8>,
+    /// GEMM output `[rows][tokens]`, before the transpose into the caller's `[tokens][rows]`.
+    out_t: Vec<f32>,
+}
+
+impl Q8Act {
+    fn new(cfg: &VisionEncoderConfig, n_tokens: usize) -> Self {
+        Self::for_dims(&[cfg.n_embd, cfg.n_ff], n_tokens)
+    }
+
+    /// An int8 activation buffer for token rows of any of `dims` floats.
+    fn for_dims(dims: &[usize], n_tokens: usize) -> Self {
+        let max_dim = dims.iter().copied().max().unwrap_or(0);
+        let enabled = crate::backend::cpu::int8_gemm_available()
+            && dims.iter().all(|d| d.is_multiple_of(32))
+            && !crate::backend::cpu_features::env_disabled("CERA_VIT_INT8");
+        let (n_scales, n_quants, n_out) = if enabled {
+            (
+                n_tokens * (max_dim / 32),
+                n_tokens * max_dim,
+                n_tokens * max_dim,
+            )
+        } else {
+            (0, 0, 0)
+        };
+        Self {
+            enabled,
+            dim: 0,
+            n: 0,
+            scales: vec![0.0; n_scales],
+            quants: vec![0; n_quants],
+            out_t: vec![0.0; n_out],
+        }
+    }
+
+    /// Quantize `n` token rows of `dim` floats each. Call once per distinct input, before the
+    /// [`vit_linear`] calls that consume it.
+    fn quantize(&mut self, x: &[f32], dim: usize, n: usize) {
+        if !self.enabled {
+            return;
+        }
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+        {
+            crate::model::transformer::quantize_rows(x, dim, n, &mut self.scales, &mut self.quants);
+            self.dim = dim;
+            self.n = n;
+        }
+        #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+        let _ = (x, dim, n);
+    }
+
+    /// `y[tokens][rows] = x · wᵀ` from the activations last quantized. Returns `false` (and leaves
+    /// `y` untouched) when this weight or host cannot take the int8 path.
+    fn matmul(&mut self, w: &MmapWeight, y: &mut [f32]) -> bool {
+        if !self.enabled
+            || w.dtype != crate::tensor::DType::Q8_0
+            || w.cols != self.dim
+            || self.n == 0
+        {
+            return false;
+        }
+        let (rows, n, dim) = (w.rows, self.n, self.dim);
+        debug_assert_eq!(y.len(), rows * n);
+        // Repacked smmla kernel (i8mm hosts): 8 weight rows by 4 tokens per tile, written straight
+        // into `y` row-major, so there is no transpose pass either.
+        #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+        if let Some((packed, scales)) = w.smmla_repacked()
+            && crate::backend::cpu::gemm_preq_repacked_q8_0_smmla_rowmajor_dispatch(
+                packed,
+                scales,
+                &self.scales[..n * (dim / 32)],
+                &self.quants[..n * dim],
+                y,
+                n,
+                rows,
+                dim,
+            )
+        {
+            return true;
+        }
+        let out_t = &mut self.out_t[..rows * n];
+        let ran = crate::backend::cpu::gemm_preq_dispatch(
+            crate::tensor::DType::Q8_0,
+            w.data(),
+            &self.scales[..n * (dim / 32)],
+            &self.quants[..n * dim],
+            out_t,
+            rows,
+            n,
+            dim,
+        );
+        if ran {
+            transpose_rows_tokens(out_t, y, rows, n);
+        }
+        ran
+    }
+}
+
+/// `dst[t][r] = src[r][t]` for `src` `[rows][n]`, one destination row (token) per task on the
+/// same `RowPool` the GEMM runs on. A rayon fan-out here costs a park/unpark per call while the
+/// GEMM's workers are still spinning, which measured about 0.7 ms for a 2 MB transpose.
+fn transpose_rows_tokens(src: &[f32], dst: &mut [f32], rows: usize, n: usize) {
+    crate::backend::cpu::par_rows_n(dst, rows, 16, |(t, dst_row)| {
+        for (r, d) in dst_row.iter_mut().enumerate() {
+            *d = src[r * n + t];
+        }
+    });
+}
+
+/// Queries per attention task: the flash kernel's own query block of 32, so each task runs whole
+/// blocks. The kernel reads Q as stride-`n_queries` columns whenever `q_stride == n_queries`, and Q
+/// here is token-major with `q_stride == n_embd`, so a chunk must never hold exactly `n_embd`
+/// queries; a (test-sized) embedding of 32 or fewer gets a chunk one smaller than it.
+fn attn_q_chunk(n_embd: usize) -> usize {
+    assert!(n_embd > 1, "vit_attention: n_embd must be at least 2");
+    n_embd.saturating_sub(1).min(32)
+}
+
+/// Size of the transposed-keys scratch the NEON attention kernel needs, or 0 where it is not used.
+fn attn_kt_len(n_tokens: usize, n_head: usize, head_dim: usize) -> usize {
+    if cfg!(target_arch = "aarch64") && head_dim.is_multiple_of(8) && head_dim <= 128 {
+        n_head * head_dim * n_tokens.next_multiple_of(8)
+    } else {
+        0
+    }
+}
+
+/// `[heads][padded tokens][head_dim]` scratch length for [`vit_attention`].
+fn attn_heads_len(n_tokens: usize, n_head: usize, head_dim: usize) -> usize {
+    n_head * n_tokens.next_multiple_of(attn_q_chunk(n_head * head_dim)) * head_dim
+}
+
+/// Bidirectional multi-head attention over `n_tokens` tokens. `q`, `k`, `v` and `out` are
+/// `[n_tokens][n_head * head_dim]`; head `h` of token `t` is the `head_dim` slice at
+/// `t * n_embd + h * head_dim`.
+///
+/// Runs the CPU flash-attention kernel (queries in blocks that share one pass over K and V, online
+/// softmax) once per (head, 32-query chunk) on the `RowPool`. The previous per-query loop re-read a
+/// head's whole K and V (about 400 KB) from L2 for every query, which made attention memory-bound at
+/// about 90 GFLOP/s. `heads` receives each head's output in the kernel's `[head][token][head_dim]`
+/// layout before it is scattered into `out`.
+#[allow(clippy::too_many_arguments)]
+fn vit_attention(
+    q: &[f32],
+    k: &[f32],
+    v: &[f32],
+    out: &mut [f32],
+    heads: &mut [f32],
+    #[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))] kt: &mut [f32],
+    n_tokens: usize,
+    n_head: usize,
+    head_dim: usize,
+    scale: f32,
+) {
+    let n_embd = n_head * head_dim;
+    let chunk_q = attn_q_chunk(n_embd);
+    let padded = n_tokens.next_multiple_of(chunk_q);
+    let n_chunks = padded / chunk_q;
+    let heads = &mut heads[..attn_heads_len(n_tokens, n_head, head_dim)];
+
+    // The ViT-shaped NEON kernel where it applies: keys transposed once per head, then 8-query tiles.
+    #[cfg(target_arch = "aarch64")]
+    if attn_kt_len(n_tokens, n_head, head_dim) > 0 {
+        let npad = n_tokens.next_multiple_of(8);
+        let kt = &mut kt[..n_head * head_dim * npad];
+        par_rows_n(kt, head_dim * npad, |h, kt_h| {
+            crate::backend::cpu::vit_transpose_keys(
+                k,
+                kt_h,
+                n_tokens,
+                npad,
+                n_embd,
+                h * head_dim,
+                head_dim,
+            );
+        });
+        let kt = &*kt;
+        par_rows_n(heads, chunk_q * head_dim, |r, chunk| {
+            let (h, c) = (r / n_chunks, r % n_chunks);
+            let t0 = c * chunk_q;
+            let nq = (n_tokens - t0).min(chunk_q);
+            crate::backend::cpu::vit_attention_chunk_neon(
+                q,
+                &kt[h * head_dim * npad..(h + 1) * head_dim * npad],
+                v,
+                &mut chunk[..nq * head_dim],
+                t0,
+                nq,
+                n_tokens,
+                npad,
+                n_embd,
+                h * head_dim,
+                head_dim,
+                scale,
+            );
+        });
+        scatter_heads(heads, out, padded, n_tokens, n_head, head_dim);
+        return;
+    }
+
+    par_rows_n(heads, chunk_q * head_dim, |r, chunk| {
+        let (h, c) = (r / n_chunks, r % n_chunks);
+        let t0 = c * chunk_q;
+        let nq = (n_tokens - t0).min(chunk_q);
+        // Non-causal: the kernel attends to `start_pos + n_queries` keys, so this chunk sees all of them.
+        #[cfg(target_arch = "aarch64")]
+        crate::backend::cpu::flash_attention_gqa_cpu_opt(
+            &q[t0 * n_embd..],
+            k,
+            v,
+            &mut chunk[..nq * head_dim],
+            h,
+            1,
+            nq,
+            n_embd,
+            n_embd,
+            h * head_dim,
+            head_dim,
+            scale,
+            n_tokens - nq,
+            false,
+        );
+        // Only the NEON kernel reads a row-major Q (`q[token * q_stride + dim]`). The scalar, AVX2 and
+        // AVX-512 kernels take the column layout `q[dim * q_stride + token]` with `q_stride == nq`, so
+        // hand them this head's queries transposed, with the head at row 0 and K and V still offset.
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            let mut q_t = vec![0.0f32; head_dim * nq];
+            for j in 0..nq {
+                let src = &q[(t0 + j) * n_embd + h * head_dim..][..head_dim];
+                for (d, &x) in src.iter().enumerate() {
+                    q_t[d * nq + j] = x;
+                }
+            }
+            crate::backend::cpu::flash_attention_gqa_cpu_opt(
+                &q_t,
+                k,
+                v,
+                &mut chunk[..nq * head_dim],
+                0,
+                1,
+                nq,
+                nq,
+                n_embd,
+                h * head_dim,
+                head_dim,
+                scale,
+                n_tokens - nq,
+                false,
+            );
+        }
+    });
+
+    scatter_heads(heads, out, padded, n_tokens, n_head, head_dim);
+}
+
+/// Interleave the per-head attention results (`[head][padded token][head_dim]`) into token-major rows of
+/// `n_head * head_dim`. The one definition of that layout, shared by the NEON and the generic paths.
+fn scatter_heads(
+    heads: &[f32],
+    out: &mut [f32],
+    padded: usize,
+    n_tokens: usize,
+    n_head: usize,
+    head_dim: usize,
+) {
+    let n_embd = n_head * head_dim;
+    par_rows_n(&mut out[..n_tokens * n_embd], n_embd, |t, row| {
+        for h in 0..n_head {
+            let src = (h * padded + t) * head_dim;
+            row[h * head_dim..(h + 1) * head_dim].copy_from_slice(&heads[src..src + head_dim]);
+        }
+    });
+}
+
+/// `par_rows_n` with the closure shaped `(row, slice)` and a floor of 8 rows per task.
+fn par_rows_n(y: &mut [f32], width: usize, f: impl Fn(usize, &mut [f32]) + Sync + Send) {
+    crate::backend::cpu::par_rows_n(y, width, 8, |(i, row)| f(i, row));
+}
+
+/// `tokens[t] += proj[t] + bias` for every token row; `proj` is clobbered (it holds the bias-added
+/// projection afterwards), as it was when this was written inline.
+fn add_bias_residual(tokens: &mut [f32], proj: &mut [f32], bias: &[f32], width: usize) {
+    let proj_ptr = proj.as_mut_ptr() as usize;
+    par_rows_n(tokens, width, |t, tok_row| {
+        // SAFETY: row `t` of `proj` is touched by this task alone.
+        let proj_row = unsafe {
+            core::slice::from_raw_parts_mut((proj_ptr as *mut f32).add(t * width), width)
+        };
+        crate::backend::cpu::add_inplace(proj_row, bias);
+        crate::backend::cpu::add_inplace(tok_row, proj_row);
+    });
+}
+
+/// One tower linear: the int8 GEMM when `q8` holds this input's quantization and the weight
+/// qualifies, else the f32 path.
+fn vit_linear(
+    w: &MmapWeight,
+    x: &[f32],
+    y: &mut [f32],
+    n_tokens: usize,
+    q8: &mut Q8Act,
+    dequant_scratch: &mut [f32],
+) {
+    if !q8.matmul(w, y) {
+        w.batched_matmul_with_scratch(x, y, n_tokens, Some(dequant_scratch));
     }
 }
 
@@ -1698,6 +2006,259 @@ mod tests {
         assert!((out[3 * 6] - 3.0).abs() < 1e-5);
         // out[3, 5] = bottom-right (4.0).
         assert!((out[3 * 6 + 5] - 4.0).abs() < 1e-5);
+    }
+
+    /// Deterministic pseudo-random f32 in `[-1, 1)`.
+    fn lcg_vec(seed: u64, n: usize) -> Vec<f32> {
+        let mut st = seed;
+        (0..n)
+            .map(|_| {
+                st = st
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                ((st >> 33) as f32 / (1u64 << 31) as f32) - 1.0
+            })
+            .collect()
+    }
+
+    /// A `rows x cols` Q8_0 `MmapWeight` quantized from deterministic random f32.
+    fn q8_weight(rows: usize, cols: usize, seed: u64) -> MmapWeight {
+        let mut bytes = Vec::new();
+        for row in lcg_vec(seed, rows * cols).chunks(cols) {
+            let mut scales = vec![0.0f32; row.len() / 32];
+            let mut quants = vec![0i8; row.len()];
+            crate::backend::cpu::quantize_f32_to_q8_0_into(row, &mut scales, &mut quants);
+            for (b, d) in scales.iter().enumerate() {
+                bytes.extend_from_slice(&half::f16::from_f32(*d).to_bits().to_le_bytes());
+                bytes.extend_from_slice(bytemuck::cast_slice::<i8, u8>(
+                    &quants[b * 32..(b + 1) * 32],
+                ));
+            }
+        }
+        MmapWeight::from_owned_bytes(bytes, crate::tensor::DType::Q8_0, rows, cols)
+    }
+
+    fn enabled_q8act() -> Q8Act {
+        Q8Act {
+            enabled: crate::backend::cpu::int8_gemm_available(),
+            dim: 0,
+            n: 0,
+            scales: vec![0.0; 4096 * 8],
+            quants: vec![0; 4096 * 8 * 32],
+            out_t: vec![0.0; 4096 * 256],
+        }
+    }
+
+    /// The int8 path must agree with the f32 path to within activation-quantization error, including
+    /// odd row and token counts (the GEMM's remainder paths), and must write `[token][row]`.
+    #[test]
+    fn int8_linear_matches_f32_path() {
+        if !crate::backend::cpu::int8_gemm_available() {
+            return;
+        }
+        for &(rows, cols, n) in &[(72usize, 96usize, 40usize), (71, 64, 37), (96, 128, 16)] {
+            let w = q8_weight(rows, cols, 7);
+            let x = lcg_vec(11, n * cols);
+            let mut want = vec![0.0f32; n * rows];
+            w.batched_matmul_with_scratch(&x, &mut want, n, None);
+
+            let mut q8 = enabled_q8act();
+            q8.quantize(&x, cols, n);
+            let mut got = vec![0.0f32; n * rows];
+            let mut dq = vec![0.0f32; cols];
+            vit_linear(&w, &x, &mut got, n, &mut q8, &mut dq);
+            assert!(
+                q8.matmul(&w, &mut vec![0.0; n * rows]),
+                "int8 path declined a Q8_0 weight at {rows}x{cols}x{n}"
+            );
+
+            let num: f32 = got.iter().zip(&want).map(|(a, b)| (a - b) * (a - b)).sum();
+            let den: f32 = want.iter().map(|b| b * b).sum();
+            let rel = (num / den).sqrt();
+            assert!(
+                rel < 0.01,
+                "int8 vs f32 relative RMS error {rel} at {rows}x{cols}x{n}"
+            );
+            // Layout: a transposed result would be far off in RMS, but pin one element exactly.
+            let (t, r) = (n - 1, rows - 1);
+            assert!(
+                (got[t * rows + r] - want[t * rows + r]).abs()
+                    < 0.05 * want[t * rows + r].abs().max(1.0)
+            );
+        }
+    }
+
+    /// The smmla-repacked kernel and the standard Q8_0 kernel compute the same integer dot per block, so
+    /// they differ only in float summation order. Runs where the host has i8mm and the weight repacks.
+    #[test]
+    fn smmla_repacked_matches_standard_gemm() {
+        let mut ran = false;
+        for &(rows, cols, n) in &[
+            (64usize, 96usize, 40usize),
+            (72, 128, 37),
+            (24, 64, 4),
+            (16, 32, 1),
+        ] {
+            let w = q8_weight(rows, cols, 3);
+            if w.smmla_repacked().is_none() {
+                continue;
+            }
+            ran = true;
+            let x = lcg_vec(5, n * cols);
+            let mut q8 = enabled_q8act();
+            q8.quantize(&x, cols, n);
+            let mut got = vec![0.0f32; n * rows];
+            assert!(q8.matmul(&w, &mut got));
+
+            let mut want_t = vec![0.0f32; rows * n];
+            assert!(crate::backend::cpu::gemm_preq_dispatch(
+                crate::tensor::DType::Q8_0,
+                w.data(),
+                &q8.scales[..n * (cols / 32)],
+                &q8.quants[..n * cols],
+                &mut want_t,
+                rows,
+                n,
+                cols,
+            ));
+            for t in 0..n {
+                for r in 0..rows {
+                    let (g, e) = (got[t * rows + r], want_t[r * n + t]);
+                    assert!(
+                        (g - e).abs() <= 1e-4 * e.abs().max(1.0),
+                        "smmla {g} vs standard {e} at token {t} row {r} ({rows}x{cols}x{n})"
+                    );
+                }
+            }
+        }
+        if !ran {
+            // A host without the repack skips quietly, unless the CI leg that is supposed to have
+            // i8mm says so: then a never-run comparison is a failure, not a pass (the message names
+            // i8mm, the usual cause; a BLAS build also returns no repack).
+            #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+            crate::backend::simd::require_simd_or_skip("i8mm", false);
+            eprintln!("smmla_repacked_matches_standard_gemm: no i8mm on this host, skipped");
+        }
+    }
+
+    /// Large score magnitudes (a softmax that is nearly one-hot) must not overflow or lose the winner:
+    /// the exact softmax subtracts each row's maximum before exponentiating.
+    #[test]
+    fn vit_attention_is_stable_for_large_scores() {
+        let (n_tokens, n_head, head_dim) = (40usize, 2usize, 32usize);
+        let n_embd = n_head * head_dim;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let q: Vec<f32> = lcg_vec(5, n_tokens * n_embd)
+            .iter()
+            .map(|x| x * 60.0)
+            .collect();
+        let k = lcg_vec(6, n_tokens * n_embd);
+        let v = lcg_vec(7, n_tokens * n_embd);
+        let mut got = vec![f32::NAN; n_tokens * n_embd];
+        let mut heads = vec![0.0f32; attn_heads_len(n_tokens, n_head, head_dim)];
+        let mut kt = vec![0.0f32; attn_kt_len(n_tokens, n_head, head_dim)];
+        vit_attention(
+            &q, &k, &v, &mut got, &mut heads, &mut kt, n_tokens, n_head, head_dim, scale,
+        );
+        assert!(
+            got.iter().all(|x| x.is_finite()),
+            "non-finite attention output"
+        );
+        // Each output row is a convex combination of value rows, so it stays within their range.
+        let (lo, hi) = v
+            .iter()
+            .fold((f32::MAX, f32::MIN), |(l, h), &x| (l.min(x), h.max(x)));
+        assert!(
+            got.iter().all(|&x| x >= lo - 1e-4 && x <= hi + 1e-4),
+            "outside the value range"
+        );
+    }
+
+    /// A weight the int8 path cannot take (here F32) must fall back to the f32 kernel unchanged.
+    #[test]
+    fn int8_linear_falls_back_for_non_q8_weights() {
+        let (rows, cols, n) = (24usize, 64usize, 20usize);
+        let w = MmapWeight::from_owned_f32(lcg_vec(3, rows * cols), rows, cols);
+        let x = lcg_vec(5, n * cols);
+        let mut want = vec![0.0f32; n * rows];
+        w.batched_matmul_with_scratch(&x, &mut want, n, None);
+
+        let mut q8 = enabled_q8act();
+        q8.quantize(&x, cols, n);
+        let mut got = vec![0.0f32; n * rows];
+        let mut dq = vec![0.0f32; cols];
+        vit_linear(&w, &x, &mut got, n, &mut q8, &mut dq);
+        assert_eq!(got, want, "fallback must be the f32 kernel's exact result");
+    }
+
+    /// The flash attention path must match the per-query softmax loop it replaced, including a
+    /// token count that is not a multiple of the 32-query chunk.
+    #[test]
+    fn vit_attention_matches_naive() {
+        for &(n_tokens, n_head, head_dim) in &[
+            (70usize, 3usize, 32usize),
+            (96, 4, 16),
+            (33, 2, 64),
+            (40, 4, 8),
+            (32, 2, 16),
+            // Token counts that are not a multiple of 4 or 8, a single token, a head_dim of 24, and
+            // enough queries for a ragged last 8-query tile.
+            (37, 3, 16),
+            (1, 1, 8),
+            (9, 2, 24),
+            // A head_dim that is not a multiple of 8 takes the generic flash-attention path on every
+            // target (the NEON ViT kernel needs a multiple of 8), so that arm runs on aarch64 too.
+            (21, 2, 12),
+            (101, 2, 64),
+        ] {
+            let n_embd = n_head * head_dim;
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let (q, k, v) = (
+                lcg_vec(1, n_tokens * n_embd),
+                lcg_vec(2, n_tokens * n_embd),
+                lcg_vec(3, n_tokens * n_embd),
+            );
+            let mut want = vec![0.0f32; n_tokens * n_embd];
+            for t in 0..n_tokens {
+                for h in 0..n_head {
+                    let qh = &q[t * n_embd + h * head_dim..][..head_dim];
+                    let mut scores: Vec<f32> = (0..n_tokens)
+                        .map(|j| {
+                            crate::backend::cpu::dot_f32(
+                                qh,
+                                &k[j * n_embd + h * head_dim..][..head_dim],
+                            ) * scale
+                        })
+                        .collect();
+                    crate::backend::cpu::softmax_inplace(&mut scores);
+                    for (j, &sc) in scores.iter().enumerate() {
+                        let vh = &v[j * n_embd + h * head_dim..][..head_dim];
+                        for (o, vv) in want[t * n_embd + h * head_dim..][..head_dim]
+                            .iter_mut()
+                            .zip(vh)
+                        {
+                            *o += sc * vv;
+                        }
+                    }
+                }
+            }
+
+            let mut got = vec![f32::NAN; n_tokens * n_embd];
+            let mut heads = vec![0.0f32; attn_heads_len(n_tokens, n_head, head_dim)];
+            let mut kt = vec![0.0f32; attn_kt_len(n_tokens, n_head, head_dim)];
+            vit_attention(
+                &q, &k, &v, &mut got, &mut heads, &mut kt, n_tokens, n_head, head_dim, scale,
+            );
+            let max_err = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                max_err < 1e-4,
+                "attention max abs error {max_err} at n={n_tokens} heads={n_head} hd={head_dim}"
+            );
+        }
     }
 
     /// Non-square pixel-shuffle: 4×6 grid → 2×3 token grid with

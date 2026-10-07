@@ -50,7 +50,7 @@ use crate::quant::{BlockQ4_0, BlockQ4KM, BlockQ5K, BlockQ6K, BlockQ8_0};
 /// per-module copies this replaced were cfg'd out of. Only `cargo check
 /// --profile test` on such a target shows it, which CI does not run.
 #[cfg(all(test, any(target_arch = "aarch64", target_arch = "x86_64")))]
-fn require_simd_or_skip(feature: &str, detected: bool) -> bool {
+pub(crate) fn require_simd_or_skip(feature: &str, detected: bool) -> bool {
     if detected {
         return true;
     }
