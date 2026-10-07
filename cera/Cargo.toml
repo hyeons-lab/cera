@@ -146,6 +146,18 @@ required-features = ["mmap", "parallel"]
 name = "vit_gpu_probe"
 required-features = ["gpu", "mmap", "vl-preprocess"]
 
+# The Q4_0 decode GEMV, standard layout against the decode repack (aarch64).
+[[example]]
+name = "q4_0_gemv_bench"
+
+# What one decode-pool fork-join costs (device only).
+[[example]]
+name = "pool_dispatch_bench"
+
+# The Q6_K lm_head GEMV on its own: GB/s of the decode output projection.
+[[example]]
+name = "q6k_gemv_bench"
+
 # The CPU vision tower on a real image: speed and int8-vs-f32 error.
 [[example]]
 name = "vit_cpu_probe"
