@@ -706,6 +706,11 @@ impl HexagonLfmModel {
         let scratch = &self.scratch_buf;
         let hs = self.config.hidden_size;
         let eps = self.config.rms_norm_eps;
+        // This layer's `b*x` row lives in a slot no other conv layer uses. The state writeback below
+        // reads it with strided scalar loads, and when it shared one address with every other conv
+        // layer in a long batch those loads returned the previous layer's row (see
+        // `ScratchOffsets::conv_stage`).
+        let bx = so.conv_stage_at(layer_idx);
         // Conv RMS norm
         Self::dispatch_rms_norm_mul(
             session,
@@ -758,7 +763,7 @@ impl HexagonLfmModel {
                 so.conv_in + 2 * hs * 4,
                 HTP_TENSOR_COMPUTE,
                 scratch,
-                so.conv_bx,
+                bx,
                 hs,
             )?;
             // State prepend: CONCAT([s0; s1] + bx-as-[1, hs])
@@ -770,7 +775,7 @@ impl HexagonLfmModel {
                 conv.state_offset,
                 2,
                 scratch,
-                so.conv_bx,
+                bx,
                 1,
                 hs * 4,
                 4,
@@ -826,7 +831,7 @@ impl HexagonLfmModel {
             Self::dispatch_cpy_2d(
                 session,
                 scratch,
-                so.conv_bx,
+                bx,
                 hs,
                 1,
                 4,
@@ -847,10 +852,10 @@ impl HexagonLfmModel {
                 so.conv_in + 2 * hs * 4,
                 HTP_TENSOR_COMPUTE,
                 scratch,
-                so.conv_bx,
+                bx,
                 hs,
             )?;
-            self.dump_hidden(session, scratch, layer_idx, "(conv) bx", so.conv_bx, hs);
+            self.dump_hidden(session, scratch, layer_idx, "(conv) bx", bx, hs);
 
             // De-interleave [s0; s1] into conv_x rows 0-1
             // (conv_x is unused on the manual path); the MUL
@@ -912,7 +917,7 @@ impl HexagonLfmModel {
                 conv.conv_w2_offset,
                 HTP_TENSOR_WEIGHT,
                 scratch,
-                so.conv_bx,
+                bx,
                 HTP_TENSOR_COMPUTE,
                 scratch,
                 so.conv_y,
@@ -957,7 +962,7 @@ impl HexagonLfmModel {
             Self::dispatch_cpy_2d(
                 session,
                 scratch,
-                so.conv_bx,
+                bx,
                 hs,
                 1,
                 4,
@@ -1046,6 +1051,8 @@ impl HexagonLfmModel {
         let scratch = &self.scratch_buf;
         let hs = self.config.hidden_size;
         let eps = self.config.rms_norm_eps;
+        // Private slot for the rows the state writeback reads (see `emit_conv_decode`).
+        let stage = so.conv_stage_at(layer_idx);
         // Block norm + in_proj over M rows.
         Self::dispatch_rms_norm_mul(
             session,
@@ -1147,10 +1154,19 @@ impl HexagonLfmModel {
         // (slot t at `state + c*8 + t*4`): last two bx rows
         // when m>=2, else shift + insert.
         if m >= 2 {
-            Self::dispatch_cpy_2d(
+            // The last two rows are adjacent: one contiguous copy into this layer's slot.
+            Self::dispatch_cpy(
                 session,
                 scratch,
                 so.conv_bx + (m - 2) * hs * 4,
+                scratch,
+                stage,
+                2 * hs,
+            )?;
+            Self::dispatch_cpy_2d(
+                session,
+                scratch,
+                stage,
                 hs,
                 1,
                 4,
@@ -1163,7 +1179,7 @@ impl HexagonLfmModel {
             Self::dispatch_cpy_2d(
                 session,
                 scratch,
-                so.conv_bx + (m - 1) * hs * 4,
+                stage + hs * 4,
                 hs,
                 1,
                 4,
@@ -1174,6 +1190,7 @@ impl HexagonLfmModel {
                 8,
             )?;
         } else {
+            Self::dispatch_cpy(session, scratch, so.conv_bx, scratch, stage, hs)?;
             // Shift via scratch temp: odd->even overlaps in
             // the state slab, and CPY has memcpy (not
             // memmove) semantics.
@@ -1206,7 +1223,7 @@ impl HexagonLfmModel {
             Self::dispatch_cpy_2d(
                 session,
                 scratch,
-                so.conv_bx,
+                stage,
                 hs,
                 1,
                 4,

@@ -430,6 +430,48 @@ fn assert_model(label: &str, model: &HexagonLfmModel, expected: (u64, u64)) {
     op_capture::assert_golden(label, got, expected, &batches);
 }
 
+/// A fake device with every knob at its default, including the tensor cap that `backend()` zeroes.
+fn default_backend() -> Backend {
+    let (driver, device) = op_capture::fresh_device();
+    Backend::with_device(driver, device, HexagonKnobs::from_lookup(|_| None))
+}
+
+/// The constructors refuse a model whose conv layers would share a staging slot (the layer index
+/// wraps past `CONV_STAGE_SLOTS`), instead of building one whose conv state silently corrupts. The
+/// helper's own test cannot see a constructor that stops calling it.
+#[test]
+fn constructor_refuses_conv_layers_that_share_a_stage_slot() {
+    let err = HexagonLfmModel::from_gguf_on(
+        default_backend(),
+        lfm2_gguf_layers(false, CONV_STAGE_SLOTS + 2),
+        64,
+    )
+    .err()
+    .expect("a model with conv layers that share a stage slot must be refused");
+    assert!(err.to_string().contains("conv stage slot"), "{err}");
+}
+
+/// No model runs with a tensor cap by default. Long batches were irreproducible until the conv state
+/// writeback stopped reading a row every conv layer shares; the dense LFM2, the routed-expert LFM2,
+/// a plain Llama and Qwen 3.5 (DeltaNet) were then verified bit-exact uncapped on a device. Runs
+/// hermetically: `default_backend()` takes its knobs from `from_lookup`, not the environment.
+#[test]
+fn default_batch_cap_is_off_for_every_model() {
+    let lfm2 = HexagonLfmModel::from_gguf_on(default_backend(), lfm2_gguf(false), 64).unwrap();
+    let moe = HexagonLfmModel::from_gguf_on(default_backend(), lfm2_gguf(true), 64).unwrap();
+    let dense = HexagonLfmModel::from_llama_on(default_backend(), dense_gguf(), None, 64).unwrap();
+    let cpu = crate::model::qwen35::Qwen35Model::from_gguf(qwen35_gguf(), 64).unwrap();
+    let qwen35 = HexagonLfmModel::from_qwen35_model_on(default_backend(), &cpu, 64).unwrap();
+    for (name, m) in [
+        ("lfm2", lfm2),
+        ("moe", moe),
+        ("dense", dense),
+        ("qwen35", qwen35),
+    ] {
+        assert_eq!(m.batch_tensor_cap, None, "{name} runs uncapped");
+    }
+}
+
 /// Constructor digests, pinned; regenerate with `CERA_UPDATE_GOLDEN=1`. A
 /// mismatch means planning, copying or setup changed.
 #[test]
@@ -438,26 +480,26 @@ fn constructors_build_pinned_models() {
     assert_model(
         "ctor_dense",
         &dense,
-        (9971761572292188524, 4083050957091022688),
+        (10317313580434608420, 6924304762287210518),
     );
     let lfm2 = HexagonLfmModel::from_gguf_on(backend(), lfm2_gguf(false), 64).unwrap();
     assert_model(
         "ctor_lfm2",
         &lfm2,
-        (638103007121440144, 1102571476056680706),
+        (15220232286802701492, 14446016696410420473),
     );
     let moe = HexagonLfmModel::from_gguf_on(backend(), lfm2_gguf(true), 64).unwrap();
     assert_model(
         "ctor_moe",
         &moe,
-        (12884050336261203091, 11398544486494475589),
+        (16215642563083024140, 4804469880719854202),
     );
     let cpu = crate::model::qwen35::Qwen35Model::from_gguf(qwen35_gguf(), 64).unwrap();
     let qwen35 = HexagonLfmModel::from_qwen35_model_on(backend(), &cpu, 64).unwrap();
     assert_model(
         "ctor_qwen35",
         &qwen35,
-        (10692481320036848051, 7392097742996743327),
+        (12673569012008980868, 3251192684939851827),
     );
 }
 
