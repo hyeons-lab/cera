@@ -488,8 +488,9 @@ enum Command {
         #[arg(long)]
         no_cache: bool,
 
-        /// KV cache mode: f32 (default), f16 (half-precision), or tq3 (TurboQuant 3-bit).
-        #[arg(long, default_value = "f32")]
+        /// KV cache mode: auto (default: f16 where the model honors it, else the backend's own),
+        /// f32, f16 (half-precision), or tq3 (TurboQuant 3-bit).
+        #[arg(long, default_value = "auto")]
         kv_cache_keys: String,
 
         /// Prefill chunk size (ubatch). Long prompts split into chunks of
@@ -1060,8 +1061,9 @@ enum Command {
         #[arg(long)]
         no_cache: bool,
 
-        /// KV cache mode: f32 (default), f16 (half-precision), or tq3 (TurboQuant 3-bit).
-        #[arg(long, default_value = "f32")]
+        /// KV cache mode: auto (default: f16 where the model honors it, else the backend's own),
+        /// f32, f16 (half-precision), or tq3 (TurboQuant 3-bit).
+        #[arg(long, default_value = "auto")]
         kv_cache_keys: String,
 
         /// Prefill chunk size (ubatch). Lower = more cancel-responsive
@@ -3363,7 +3365,10 @@ fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
 /// Parse a CLI KV-cache-compression flag value into a `KvCompression`.
 ///
 /// Modes:
-/// - `f32` / `none`: uncompressed (default)
+/// - `auto` (default): `f16` when the model honors it (CPU LFM2 and dense
+///   transformers, as llama.cpp's default cache type), otherwise the backend's own
+///   uncompressed KV. Quiet: it only reports when it picks f16.
+/// - `f32` / `none`: uncompressed
 /// - `f16`: half-precision KV cache (2 bytes/elem, ~2× less KV bandwidth at
 ///   decode). CPU LFM2 and dense-transformer paths; a model that doesn't
 ///   implement it falls back to the backend's uncompressed KV.
@@ -3384,6 +3389,13 @@ fn setup_kv_compression(
 
     let (keys, values) = match kv_cache_mode {
         "f32" | "none" => return Ok(KvCompression::None),
+        "auto" => {
+            if model.f16_kv_supported() {
+                eprintln!("f16 KV cache (default; --kv-cache-keys f32 for full precision)");
+                return Ok(KvCompression::F16);
+            }
+            return Ok(KvCompression::None);
+        }
         "f16" => {
             if model.f16_kv_supported() {
                 eprintln!("f16 KV cache enabled (half-precision keys + values)");
@@ -3399,7 +3411,7 @@ fn setup_kv_compression(
         "tq3-keys" => (true, false),
         "tq3-values" => (false, true),
         other => anyhow::bail!(
-            "unknown --kv-cache-keys mode: {other} (use f32, f16, tq3, tq3-keys, or tq3-values)"
+            "unknown --kv-cache-keys mode: {other} (use auto, f32, f16, tq3, tq3-keys, or tq3-values)"
         ),
     };
 
@@ -3867,7 +3879,8 @@ fn main() -> Result<()> {
                 // it when the user's flags are compatible with that exact behavior. Otherwise fall
                 // through to the chat-template flow below, which honors `--max-tokens`,
                 // `--temperature`, `--kv-cache-keys`, and appends `--prompt` before the marker.
-                // (256 / "f32" mirror the `Run` clap defaults; `transcribe` uses the same budget.)
+                // ("auto" and 256 mirror the `Run` clap defaults; `transcribe` uses the same budget. An explicit
+                // `f32`, `f16` or `tq3` falls through: `transcribe` builds a default session, whose KV is f16.)
                 let prompt_is_empty = prompt.as_deref().unwrap_or("").trim().is_empty();
                 let effective_opts = build_opts(&engine, None, Vec::new());
                 let has_sampling_overrides = top_p.is_some()
@@ -3878,7 +3891,7 @@ fn main() -> Result<()> {
                     && effective_opts.temperature <= 0.0
                     && !has_sampling_overrides
                     && max_tokens == 256
-                    && kv_cache_keys == "f32"
+                    && kv_cache_keys == "auto"
                     // `engine.transcribe` bypasses the session, so a LoRA adapter
                     // could never be attached — fall through to the session path.
                     && lora.is_none();

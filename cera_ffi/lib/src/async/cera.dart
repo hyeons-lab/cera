@@ -188,7 +188,9 @@ class CeraOptions {
   /// KV-cache compression mode: none, f16, or turboQuant.
   ///
   /// Takes precedence over [turboQuant]. Defaults to [CeraKvCompression.none]
-  /// unless [turboQuant] is true.
+  /// unless [turboQuant] is true. This wrapper always sends an explicit mode, so
+  /// the engine's own default (f16 where the model honors it) does not apply
+  /// here: choose [CeraKvCompression.f16] to opt into the half-precision cache.
   final CeraKvCompression? kvCompression;
 
   /// Effective KV-cache compression mode.
@@ -734,7 +736,10 @@ abstract interface class Cera {
   ///
   /// `maxLongSize` caps the longer edge in pixels before encoding, trading
   /// detail for tokens and time. Omit it for the model's own default; pass 0 to
-  /// disable the cap entirely.
+  /// disable the cap entirely. With no cap, a large image is tiled as the
+  /// LFM2-VL reference does: up to 10 tiles of 256 tokens plus a thumbnail
+  /// (about 1,800 tokens for a 4:3 photo, up to about 2,800 for a panorama), so
+  /// set a cap to keep an image to one tile and a predictable token cost.
   ///
   /// Throws if this model has no vision encoder, i.e. whenever
   /// [capabilities] reports `imageIn: false`. Serialized against [generate] the

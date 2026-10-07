@@ -19,7 +19,6 @@ import uniffi.cera_ffi.BackendPreference
 import uniffi.cera_ffi.BundleRepo
 import uniffi.cera_ffi.EngineConfig
 import uniffi.cera_ffi.GenerateOpts
-import uniffi.cera_ffi.KvCompression
 import uniffi.cera_ffi.SessionConfig
 import uniffi.cera_ffi.CeraEngine
 import kotlin.system.exitProcess
@@ -124,7 +123,7 @@ private fun runOnce(args: RunArgsOwned): List<UInt> {
     // job is to catch silent divergences — keep the configs aligned.
     val sessionCfg = SessionConfig(
         maxSeqLen = null,
-        kvCompression = KvCompression.None,
+        kvCompression = null, // omitted == the core default (f16), as in the Rust, FFI and Swift legs
         nKeep = 0u,
         seed = args.seed,
         ubatchSize = 512u,
