@@ -168,6 +168,11 @@ pub trait VitGpuOps {
     /// this with `device.poll(Wait)`. Only the env-gated `VitProfiler` calls
     /// `sync` — the normal forward path never does, so wgpu keeps its pipelining.
     fn sync(&self) {}
+
+    /// Called before and after one image's forward pass. The wgpu ops use them to reset and resolve
+    /// the per-kernel GPU timestamps (`CERA_GPU_PROFILE=1`); default no-ops.
+    fn begin_encode(&self) {}
+    fn end_encode(&self) {}
 }
 
 /// One ViT block's weights, uploaded to GPU buffers. Linear weights are
@@ -312,7 +317,7 @@ fn im2col_patches(
 
 /// Env-gated per-op wall-clock profiler for [`encode_image_gpu`].
 ///
-/// Enabled by setting `CERA_VIT_PROFILE` to a non-empty, non-`0` value. When
+/// Enabled by setting `CERA_VIT_PROFILE` to a non-empty value other than `0`, `false` or `off`. When
 /// unset the profiler is `None` and the forward pass runs with zero overhead
 /// (no timers, no `sync` calls). When set, each GPU op is followed by
 /// `ops.sync()` so its wall-clock isolates that op — accurate on Metal (ops
@@ -328,14 +333,12 @@ struct VitProfiler {
 }
 
 impl VitProfiler {
-    /// Whether `CERA_VIT_PROFILE` is set to a non-empty, non-`0` value. Read
+    /// Whether `CERA_VIT_PROFILE` is set to a non-empty value other than `0`, `false` or `off`. Read
     /// from the environment once and cached, so the disabled hot path is a
     /// single atomic load (the env var is a process-lifetime toggle anyway).
     fn enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| {
-            std::env::var("CERA_VIT_PROFILE").is_ok_and(|v| !v.is_empty() && v != "0")
-        })
+        *ENABLED.get_or_init(|| crate::backend::cpu_features::env_enabled("CERA_VIT_PROFILE"))
     }
 
     /// `Some` iff profiling is [`enabled`](Self::enabled).
@@ -429,6 +432,9 @@ pub fn encode_image_gpu<O: VitGpuOps>(
         "encode_image_gpu: {n_patches} patches exceeds GPU MAX_VIT_TOKENS ({MAX_VIT_TOKENS}); \
          caller should fall back to CPU",
     );
+    // Only now touch the GPU context (flush the pending encoder, reset the profiler): a rejected
+    // input must leave it as it was.
+    ops.begin_encode();
 
     // Env-gated profiler (`CERA_VIT_PROFILE`). `None` → zero overhead.
     let prof = VitProfiler::from_env();
@@ -610,6 +616,7 @@ pub fn encode_image_gpu<O: VitGpuOps>(
     );
 
     let result = timed!("download", ops.download(&out, n_out * proj_dim));
+    ops.end_encode();
     if let Some(p) = &prof {
         p.report(n_patches, gpu_w.blocks.len());
     }
@@ -737,6 +744,7 @@ pub async fn encode_image_gpu_wgpu_async(
     );
 
     // 5. Pixel-shuffle on CPU (async readback).
+    ops.flush();
     let tok_cpu = ops
         .ctx
         .download_f32_async(&tokens, n_patches * n_embd)
@@ -755,6 +763,7 @@ pub async fn encode_image_gpu_wgpu_async(
     let out = ops.linear(&mid, &gpu_w.mm2_w, n_out, proj_dim, mid_dim);
     ops.bias_add(&out, &gpu_w.mm2_b, n_out, proj_dim);
 
+    ops.flush();
     let result = ops.ctx.download_f32_async(&out, n_out * proj_dim).await?;
     Ok(result)
 }
@@ -863,6 +872,48 @@ pub enum WgpuVitWeight {
         buf: wgpu::Buffer,
         dtype: crate::tensor::DType,
     },
+    /// Q8_0 repacked into the streaming-GEMM layout (see `repack_q8_0_stream`): int8 words `q`
+    /// and paired f16 scales `d`. Runs on the fp16 streaming kernel, which is an order of
+    /// magnitude faster than the generic register-tile kernel on Adreno.
+    QuantStream { q: wgpu::Buffer, d: wgpu::Buffer },
+}
+
+/// Repack Q8_0 GGUF bytes into the streaming-GEMM layout of `gemm_stream_q8_0_k64.slang`.
+/// Returns `(q, d)`: `q[(k/4) * m + row]` is the row's weights `k..k+3` as four little-endian int8
+/// bytes, and `d[(k/64) * m + row]` is `half(scale of block 2s) | half(scale of block 2s+1) << 16`.
+/// Requires `k % 64 == 0`. Same bytes as the GGUF (34 per 32 weights), transposed.
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn repack_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
+    assert_eq!(
+        k % 64,
+        0,
+        "q8_0 streaming repack needs k % 64 == 0, got k={k}"
+    );
+    let blocks_per_row = k / 32;
+    assert_eq!(
+        data.len(),
+        m * blocks_per_row * 34,
+        "q8_0 repack: wrong byte count"
+    );
+    let mut q = vec![0u32; m * k / 4];
+    let mut d = vec![0u32; m * (k / 64)];
+    for row in 0..m {
+        for b in 0..blocks_per_row {
+            let base = (row * blocks_per_row + b) * 34;
+            let scale_bits = u16::from_le_bytes([data[base], data[base + 1]]) as u32;
+            let pair = b / 2;
+            if b % 2 == 0 {
+                d[pair * m + row] = scale_bits;
+            } else {
+                d[pair * m + row] |= scale_bits << 16;
+            }
+            for w in 0..8 {
+                let src = &data[base + 2 + w * 4..base + 2 + w * 4 + 4];
+                q[(b * 8 + w) * m + row] = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+            }
+        }
+    }
+    (q, d)
 }
 
 /// Whether an adapter attends with the register-tiled flash kernel
@@ -906,7 +957,107 @@ pub struct WgpuVitOps {
     p_attn_tiled: wgpu::ComputePipeline,
     p_attn_flash: wgpu::ComputePipeline,
     p_add: wgpu::ComputePipeline,
+    /// Streaming Q8_0 GEMM and the activation transpose-cast it reads through; `None` where SPIR-V
+    /// passthrough is unavailable (anything but Vulkan) or `CERA_VIT_STREAM=0`.
+    p_gemm_q8_stream: Option<wgpu::ComputePipeline>,
+    p_transpose_f16: Option<wgpu::ComputePipeline>,
+    /// The fp16 GEMM attention (scores, column softmax, P·V) and the V cast it needs; same gating.
+    p_attn_scores: Option<wgpu::ComputePipeline>,
+    p_attn_softmax: Option<wgpu::ComputePipeline>,
+    p_attn_pv: Option<wgpu::ComputePipeline>,
+    p_cast_f16: Option<wgpu::ComputePipeline>,
+    /// Passes recorded since the last submit. Every op used to build and submit its own encoder
+    /// (about 700 submits per image, which left the GPU idle for half the tower's wall time); ops now
+    /// append passes here and [`Self::flush`] submits them in groups.
+    pending: std::sync::Mutex<PendingPasses>,
+    /// Read-only parameter buffers keyed by their bytes. The same shapes recur in every layer, so
+    /// this turns about 700 buffer creations per image into a few dozen.
+    param_cache: std::sync::Mutex<std::collections::HashMap<Vec<u8>, wgpu::Buffer>>,
+    /// Recycled intermediate buffers (see [`BufPool`]).
+    pool: std::sync::Arc<BufPool>,
 }
+
+/// Free storage buffers by `(size in bytes, purpose)`. Allocating a fresh Vulkan buffer costs about
+/// 0.45 ms on Adreno 830 (600 of them per image was 280 ms of host time, with the GPU idle), while
+/// every layer asks for the same shapes, so buffers are recycled instead. Sizes are rounded up to a
+/// power of two ([`pool_bucket`]), so images of similar size, and a warm-up encode, share buffers.
+#[cfg(feature = "gpu")]
+#[derive(Default)]
+struct BufPool {
+    free: std::sync::Mutex<std::collections::HashMap<(u64, &'static str), Vec<wgpu::Buffer>>>,
+}
+
+/// The size a pooled buffer is allocated at: `len` rounded up to a power of two (at least 256 bytes).
+/// Shaders index by their own parameters, never by buffer length, so a larger buffer is harmless, and
+/// the zeroed variant clears the whole of it.
+#[cfg(feature = "gpu")]
+fn pool_bucket(len: u64) -> u64 {
+    len.max(256).next_power_of_two()
+}
+
+/// A storage buffer that goes back to its `BufPool` when dropped. Dereferences to the raw buffer.
+///
+/// Recycling is safe against in-flight GPU work: commands run in submission order and wgpu inserts the
+/// hazard barriers between passes that touch the same buffer, so a later pass may reuse a buffer an
+/// earlier, still-queued pass wrote.
+#[cfg(feature = "gpu")]
+pub struct VitBuf {
+    buf: Option<wgpu::Buffer>,
+    key: (u64, &'static str),
+    pool: Option<std::sync::Arc<BufPool>>,
+}
+
+#[cfg(feature = "gpu")]
+impl VitBuf {
+    /// A buffer that is not pooled (inputs and one-off uploads).
+    fn owned(buf: wgpu::Buffer) -> Self {
+        Self {
+            buf: Some(buf),
+            key: (0, ""),
+            pool: None,
+        }
+    }
+
+    fn raw(&self) -> &wgpu::Buffer {
+        self.buf.as_ref().expect("VitBuf used after drop")
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl std::ops::Deref for VitBuf {
+    type Target = wgpu::Buffer;
+    fn deref(&self) -> &wgpu::Buffer {
+        self.raw()
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl Drop for VitBuf {
+    fn drop(&mut self) {
+        if let (Some(buf), Some(pool)) = (self.buf.take(), self.pool.as_ref()) {
+            pool.free
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .entry(self.key)
+                .or_default()
+                .push(buf);
+        }
+    }
+}
+
+/// An encoder under construction and the number of compute passes already recorded into it.
+#[cfg(feature = "gpu")]
+#[derive(Default)]
+struct PendingPasses {
+    enc: Option<wgpu::CommandEncoder>,
+    passes: u32,
+}
+
+/// Passes recorded before the pending encoder is submitted: about one layer's worth, so the GPU can
+/// start layer i while the CPU encodes layer i+1 (batching a whole image idles the GPU through the
+/// encode, which the decode path measured as a loss).
+#[cfg(feature = "gpu")]
+const VIT_PASSES_PER_SUBMIT: u32 = 24;
 
 #[cfg(feature = "gpu")]
 impl WgpuVitOps {
@@ -945,7 +1096,24 @@ impl WgpuVitOps {
             let mk_quant = |label: &str, init_src0: &str| mk_mul_mat(label, "u32", init_src0);
             let p_mul_mat_q8_0 = mk_quant("vit_mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0");
             let p_mul_mat_q4_0 = mk_quant("vit_mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0");
+            let stream = ctx.supports_spirv_passthrough()
+                && !crate::backend::cpu_features::env_disabled("CERA_VIT_STREAM");
+            let p_gemm_q8_stream = stream.then(|| ctx.gemm_stream_q8_0_k64_passthrough());
+            let p_transpose_f16 = stream.then(|| ctx.transpose_cast_f16_passthrough());
+            let p_attn_scores = stream.then(|| ctx.vit_attn_scores_f16_passthrough());
+            let p_attn_softmax = stream.then(|| ctx.vit_attn_softmax_t_passthrough());
+            let p_attn_pv = stream.then(|| ctx.vit_attn_pv_f16_passthrough());
+            let p_cast_f16 = stream.then(|| ctx.cast_f32_f16_passthrough());
             Self {
+                pending: Default::default(),
+                param_cache: Default::default(),
+                pool: Default::default(),
+                p_gemm_q8_stream,
+                p_transpose_f16,
+                p_attn_scores,
+                p_attn_softmax,
+                p_attn_pv,
+                p_cast_f16,
                 p_bias: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "vit_bias_add"),
                 p_layernorm: ctx.create_pipeline(
                     shaders::LAYERNORM_BATCH,
@@ -981,11 +1149,24 @@ impl WgpuVitOps {
         })
     }
 
+    /// Attend with the flash kernel in f32 instead of the fp16 GEMM pipeline the streaming path
+    /// prefers. The fp16 pipeline rounds Q, K, V and the probabilities to half precision, which an
+    /// image tower tolerates and the decision head (whose scores are compared to the host's to
+    /// 2e-3) does not.
+    #[must_use]
+    pub fn with_f32_attention(mut self) -> Self {
+        self.p_attn_scores = None;
+        self.p_attn_softmax = None;
+        self.p_attn_pv = None;
+        self
+    }
+
     /// Like [`Self::dispatch`], binding each buffer over `(offset_bytes, size_bytes)` of it
     /// (`size_bytes == 0` binds from the offset to the end). Offsets must be multiples of the
     /// storage-offset alignment (256 bytes).
     pub(crate) fn dispatch_ranges(
         &self,
+        label: &str,
         pipeline: &wgpu::ComputePipeline,
         bufs: &[(&wgpu::Buffer, u64, u64)],
         workgroups: (u32, u32, u32),
@@ -1014,59 +1195,148 @@ impl WgpuVitOps {
                 layout: &pipeline.get_bind_group_layout(0),
                 entries: &entries,
             });
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
+        // recorded into the pending encoder like every other pass, so it runs after the passes
+        // already queued and before the ones that follow
+        self.record(1, |enc| {
+            let mut pass = self.ctx.begin_pass(enc, label);
             pass.set_pipeline(pipeline);
             pass.set_bind_group(0, &bind_group, &[]);
             pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
-        }
-        self.ctx.submit_encoder(enc);
+        });
     }
 
     /// Encode one bind group from `bufs` (in binding order) and dispatch.
     pub(crate) fn dispatch(
         &self,
+        label: &str,
         pipeline: &wgpu::ComputePipeline,
         bufs: &[&wgpu::Buffer],
         workgroups: (u32, u32, u32),
     ) {
-        let entries: Vec<wgpu::BindGroupEntry> = bufs
+        self.dispatch_seq(&[(label, pipeline, bufs, workgroups)]);
+    }
+
+    /// Append `passes` compute passes to the pending encoder, submitting it once it holds a layer's
+    /// worth.
+    fn record(&self, passes: u32, f: impl FnOnce(&mut wgpu::CommandEncoder)) {
+        let full = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            let enc = pending.enc.get_or_insert_with(|| {
+                self.ctx
+                    .device
+                    .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None })
+            });
+            f(enc);
+            pending.passes += passes;
+            pending.passes >= VIT_PASSES_PER_SUBMIT
+        };
+        if full {
+            self.flush();
+        }
+    }
+
+    /// Submit whatever has been recorded. Must run before anything reads results back or waits.
+    pub(crate) fn flush(&self) {
+        let enc = {
+            let mut pending = self.pending.lock().unwrap_or_else(|e| e.into_inner());
+            pending.passes = 0;
+            pending.enc.take()
+        };
+        if let Some(enc) = enc {
+            self.ctx.submit_encoder(enc);
+        }
+    }
+
+    /// A storage buffer of `len` bytes for `label`'s purpose, recycled when one is free. Contents are
+    /// whatever the last user left; use [`Self::rw_buf_zeroed`] where padding must read as zero.
+    pub(crate) fn rw_buf(&self, len: u64, label: &'static str) -> VitBuf {
+        self.rw_buf_reused(len, label).0
+    }
+
+    /// [`Self::rw_buf`] and whether the buffer came out of the pool (dirty) rather than being created
+    /// (all zeros). The pop and the answer come from one lock acquisition, so a buffer another thread
+    /// returns in between cannot be handed out as fresh.
+    fn rw_buf_reused(&self, len: u64, label: &'static str) -> (VitBuf, bool) {
+        let len = pool_bucket(len);
+        let reused = self
+            .pool
+            .free
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get_mut(&(len, label))
+            .and_then(|v| v.pop());
+        let was_reused = reused.is_some();
+        let buf = VitBuf {
+            buf: Some(reused.unwrap_or_else(|| self.ctx.create_storage_rw(len, label))),
+            key: (len, label),
+            pool: Some(std::sync::Arc::clone(&self.pool)),
+        };
+        (buf, was_reused)
+    }
+
+    /// [`Self::rw_buf`] that is all zeros on return: fresh buffers already are, a recycled one is
+    /// cleared by a command in the pending encoder, ahead of the passes that use it.
+    fn rw_buf_zeroed(&self, len: u64, label: &'static str) -> VitBuf {
+        let (buf, was_reused) = self.rw_buf_reused(len, label);
+        if was_reused {
+            self.record(0, |enc| enc.clear_buffer(buf.raw(), 0, None));
+        }
+        buf
+    }
+
+    /// A read-only parameter buffer holding `params`, created once per distinct content.
+    fn params_buf(&self, params: &[u32], label: &str) -> wgpu::Buffer {
+        let key: Vec<u8> = bytemuck::cast_slice(params).to_vec();
+        let mut cache = self.param_cache.lock().unwrap_or_else(|e| e.into_inner());
+        if cache.len() >= 4096 {
+            cache.clear();
+        }
+        cache
+            .entry(key)
+            .or_insert_with_key(|k| self.ctx.upload_storage(k, label))
+            .clone()
+    }
+
+    /// Several dependent dispatches in one encoder and one submit, as consecutive compute passes
+    /// (wgpu orders them, so a later pass reads an earlier one's output).
+    #[allow(clippy::type_complexity)]
+    fn dispatch_seq(
+        &self,
+        steps: &[(
+            &str,
+            &wgpu::ComputePipeline,
+            &[&wgpu::Buffer],
+            (u32, u32, u32),
+        )],
+    ) {
+        let groups: Vec<wgpu::BindGroup> = steps
             .iter()
-            .enumerate()
-            .map(|(i, b)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: b.as_entire_binding(),
+            .map(|(_, pipeline, bufs, _)| {
+                let entries: Vec<wgpu::BindGroupEntry> = bufs
+                    .iter()
+                    .enumerate()
+                    .map(|(i, b)| wgpu::BindGroupEntry {
+                        binding: i as u32,
+                        resource: b.as_entire_binding(),
+                    })
+                    .collect();
+                self.ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &pipeline.get_bind_group_layout(0),
+                        entries: &entries,
+                    })
             })
             .collect();
-        let bind_group = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &pipeline.get_bind_group_layout(0),
-                entries: &entries,
-            });
-        let mut enc = self
-            .ctx
-            .device
-            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-        {
-            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                label: None,
-                timestamp_writes: None,
-            });
-            pass.set_pipeline(pipeline);
-            pass.set_bind_group(0, &bind_group, &[]);
-            pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
-        }
-        self.ctx.submit_encoder(enc);
+        self.record(steps.len() as u32, |enc| {
+            for ((label, pipeline, _, workgroups), bind_group) in steps.iter().zip(&groups) {
+                let mut pass = self.ctx.begin_pass(enc, label);
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, bind_group, &[]);
+                pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+            }
+        });
     }
 
     /// An elementwise kernel over `len` elements, one thread each, split into dispatches of at
@@ -1078,6 +1348,7 @@ impl WgpuVitOps {
     /// index by `i % dim`.
     fn dispatch_elements(
         &self,
+        label: &str,
         pipeline: &wgpu::ComputePipeline,
         binds: &[ElementBind<'_>],
         len: usize,
@@ -1093,10 +1364,7 @@ impl WgpuVitOps {
         let mut offset = 0usize;
         while offset < len {
             let n = chunk.min(len - offset);
-            let p_buf = self.ctx.upload_storage(
-                bytemuck::cast_slice(&params(n as u32)),
-                "vit_elementwise_params",
-            );
+            let p_buf = self.params_buf(&params(n as u32), "vit_elementwise_params");
             let entries: Vec<wgpu::BindGroupEntry> = binds
                 .iter()
                 .enumerate()
@@ -1123,20 +1391,12 @@ impl WgpuVitOps {
                     layout: &pipeline.get_bind_group_layout(0),
                     entries: &entries,
                 });
-            let mut enc = self
-                .ctx
-                .device
-                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
-            {
-                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
-                    label: None,
-                    timestamp_writes: None,
-                });
+            self.record(1, |enc| {
+                let mut pass = self.ctx.begin_pass(enc, label);
                 pass.set_pipeline(pipeline);
                 pass.set_bind_group(0, &bind_group, &[]);
                 pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
-            }
-            self.ctx.submit_encoder(enc);
+            });
             offset += n;
         }
     }
@@ -1167,38 +1427,54 @@ impl WgpuVitOps {
             in_dim as u32,
             out_dim as u32,
         ];
-        let p_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&params), "vit_mul_mat_params");
+        let p_buf = self.params_buf(&params, "vit_mul_mat_params");
         let wg_m = (out_dim as u32).div_ceil(VIT_MM_WG_M * VIT_MM_TILE_M);
         let wg_n = (tokens as u32).div_ceil(VIT_MM_WG_N * VIT_MM_TILE_N);
-        self.dispatch(pipe, &[wq, x, y, &p_buf], (wg_m, wg_n, 1));
+        self.dispatch(
+            "vit_linear_tiled",
+            pipe,
+            &[wq, x, y, &p_buf],
+            (wg_m, wg_n, 1),
+        );
     }
 }
 
 #[cfg(feature = "gpu")]
 impl VitGpuOps for WgpuVitOps {
-    type Buf = wgpu::Buffer;
+    type Buf = VitBuf;
     type Weight = WgpuVitWeight;
 
     fn upload(&self, data: &[f32]) -> Self::Buf {
         let pad_len = data.len().next_multiple_of(32);
         if pad_len == data.len() {
-            self.ctx.upload_f32(data, "vit")
+            VitBuf::owned(self.ctx.upload_f32(data, "vit"))
         } else {
             let mut padded = data.to_vec();
             padded.resize(pad_len, 0.0);
-            self.ctx.upload_f32(&padded, "vit")
+            VitBuf::owned(self.ctx.upload_f32(&padded, "vit"))
         }
     }
 
     fn download(&self, buf: &Self::Buf, len: usize) -> Vec<f32> {
+        self.flush();
         self.ctx.download_f32(buf, len)
     }
 
     fn upload_weight(&self, w: &MmapWeight) -> Self::Weight {
         use crate::tensor::DType;
         match w.dtype {
+            // Streaming layout when the fp16 kernel can take it (k in whole 64-slices).
+            DType::Q8_0 if self.p_gemm_q8_stream.is_some() && w.cols.is_multiple_of(64) => {
+                let (q, d) = repack_q8_0_stream(w.data(), w.rows, w.cols);
+                WgpuVitWeight::QuantStream {
+                    q: self
+                        .ctx
+                        .upload_storage(bytemuck::cast_slice(&q), "vit_wq_stream"),
+                    d: self
+                        .ctx
+                        .upload_storage(bytemuck::cast_slice(&d), "vit_wd_stream"),
+                }
+            }
             // Keep packed → quantized GEMM straight from the bytes.
             DType::Q8_0 | DType::Q4_0 => WgpuVitWeight::Quant {
                 buf: self.ctx.upload_storage(w.data(), "vit_wq"),
@@ -1223,9 +1499,7 @@ impl VitGpuOps for WgpuVitOps {
     ) -> Self::Buf {
         let pad_tokens = tokens.next_multiple_of(32);
         let pad_out = out_dim.next_multiple_of(32);
-        let y = self
-            .ctx
-            .create_storage_rw((pad_tokens * pad_out * 4) as u64, "vit_linear_out");
+        let y = self.rw_buf((pad_tokens * pad_out * 4) as u64, "vit_linear_out");
         match w {
             WgpuVitWeight::Quant { buf, dtype } => {
                 // `upload_weight` only builds `Quant` for Q8_0/Q4_0, so those
@@ -1239,6 +1513,46 @@ impl VitGpuOps for WgpuVitOps {
                 };
                 self.run_mul_mat_tiled(pipe, buf, x, &y, tokens, out_dim, in_dim);
             }
+            WgpuVitWeight::QuantStream { q, d } => {
+                let (gemm, transpose) = (
+                    self.p_gemm_q8_stream
+                        .as_ref()
+                        .expect("stream weight without a pipeline"),
+                    self.p_transpose_f16
+                        .as_ref()
+                        .expect("stream weight without a pipeline"),
+                );
+                // Activations become f16 k-major `[k][pad_tokens]` for the GEMM's 32-wide fibers.
+                let b16 = self.rw_buf((in_dim * pad_tokens * 2) as u64, "vit_b16");
+                let t_params: [u32; 4] = [tokens as u32, pad_tokens as u32, in_dim as u32, 0];
+                let g_params: [u32; 5] = [
+                    out_dim as u32,
+                    in_dim as u32,
+                    tokens as u32,
+                    pad_tokens as u32,
+                    out_dim as u32,
+                ];
+                let t_buf = self.params_buf(&t_params, "vit_t_params");
+                let g_buf = self.params_buf(&g_params, "vit_g_params");
+                self.dispatch_seq(&[
+                    (
+                        "vit_transpose_x",
+                        transpose,
+                        &[x, &b16, &t_buf][..],
+                        (pad_tokens as u32 / 32, (in_dim as u32).div_ceil(32), 1),
+                    ),
+                    (
+                        "vit_gemm_q8_stream",
+                        gemm,
+                        &[q, d, &b16, &y, &g_buf][..],
+                        (
+                            (out_dim as u32).div_ceil(256),
+                            (tokens as u32).div_ceil(32),
+                            1,
+                        ),
+                    ),
+                ]);
+            }
             WgpuVitWeight::Dense(buf) => {
                 // MulMatParams: m, k, n, x_stride, y_stride.
                 let params: [u32; 5] = [
@@ -1248,14 +1562,17 @@ impl VitGpuOps for WgpuVitOps {
                     in_dim as u32,
                     out_dim as u32,
                 ];
-                let p_buf = self
-                    .ctx
-                    .upload_storage(bytemuck::cast_slice(&params), "vit_linear_params");
+                let p_buf = self.params_buf(&params, "vit_linear_params");
                 // Derived from the constants, not a hardcoded tile size: this
                 // dispatch and `mul_mat`'s below share one pipeline geometry.
                 let wg_m = (out_dim as u32).div_ceil(VIT_MM_WG_M * VIT_MM_TILE_M);
                 let wg_n = (tokens as u32).div_ceil(VIT_MM_WG_N * VIT_MM_TILE_N);
-                self.dispatch(&self.p_linear, &[buf, x, &y, &p_buf], (wg_m, wg_n, 1));
+                self.dispatch(
+                    "vit_linear_dense",
+                    &self.p_linear,
+                    &[buf, x, &y, &p_buf],
+                    (wg_m, wg_n, 1),
+                );
             }
         }
         y
@@ -1263,6 +1580,7 @@ impl VitGpuOps for WgpuVitOps {
 
     fn bias_add(&self, x: &Self::Buf, bias: &Self::Buf, rows: usize, dim: usize) {
         self.dispatch_elements(
+            "vit_bias",
             &self.p_bias,
             &[
                 ElementBind::Ranged(x),
@@ -1286,14 +1604,11 @@ impl VitGpuOps for WgpuVitOps {
     ) -> Self::Buf {
         let pad_rows = rows.next_multiple_of(32);
         let pad_dim = dim.next_multiple_of(32);
-        let dst = self
-            .ctx
-            .create_storage_rw((pad_rows * pad_dim * 4) as u64, "vit_ln_out");
+        let dst = self.rw_buf((pad_rows * pad_dim * 4) as u64, "vit_ln_out");
         let params: [u32; 4] = [dim as u32, eps.to_bits(), dim as u32, dim as u32];
-        let p_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&params), "vit_ln_params");
+        let p_buf = self.params_buf(&params, "vit_ln_params");
         self.dispatch(
+            "vit_layernorm",
             &self.p_layernorm,
             &[src, &dst, weight, bias, &p_buf],
             (rows as u32, 1, 1),
@@ -1303,6 +1618,7 @@ impl VitGpuOps for WgpuVitOps {
 
     fn gelu(&self, x: &Self::Buf, len: usize) {
         self.dispatch_elements(
+            "vit_gelu",
             &self.p_gelu,
             &[ElementBind::Ranged(x), ElementBind::Params],
             len,
@@ -1313,6 +1629,7 @@ impl VitGpuOps for WgpuVitOps {
 
     fn relu(&self, x: &Self::Buf, len: usize) {
         self.dispatch_elements(
+            "vit_relu",
             &self.p_relu,
             &[ElementBind::Ranged(x), ElementBind::Params],
             len,
@@ -1349,9 +1666,7 @@ impl VitGpuOps for WgpuVitOps {
         let dim = n_head * head_dim;
         let pad_tokens = tokens.next_multiple_of(32);
         let pad_dim = dim.next_multiple_of(32);
-        let out = self
-            .ctx
-            .create_storage_rw((pad_tokens * pad_dim * 4) as u64, "vit_attn_out");
+        let out = self.rw_buf((pad_tokens * pad_dim * 4) as u64, "vit_attn_out");
         let scale = 1.0f32 / (head_dim as f32).sqrt();
         let params: [u32; 4] = [
             tokens as u32,
@@ -1359,9 +1674,87 @@ impl VitGpuOps for WgpuVitOps {
             head_dim as u32,
             scale.to_bits(),
         ];
-        let p_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&params), "vit_attn_params");
+        let p_buf = self.params_buf(&params, "vit_attn_params");
+        if let (Some(scores), Some(softmax), Some(pv), Some(cast), Some(transpose)) = (
+            &self.p_attn_scores,
+            &self.p_attn_softmax,
+            &self.p_attn_pv,
+            &self.p_cast_f16,
+            &self.p_transpose_f16,
+        ) && head_dim == 64
+        {
+            // Attention as fp16 GEMMs (see `vit_attn_*.slang`): the generic kernels below run at
+            // about 19 GFLOP/s on Adreno 830, 58% of the whole tower.
+            let key_pad = tokens.next_multiple_of(64);
+            let plain = |len: usize, label: &'static str| self.rw_buf(len as u64, label);
+            let zeroed = |len: usize, label: &'static str| self.rw_buf_zeroed(len as u64, label);
+            let qt = plain(dim * pad_tokens * 2, "vit_attn_qt");
+            let kt = plain(dim * pad_tokens * 2, "vit_attn_kt");
+            let v16 = zeroed(key_pad * dim * 2, "vit_attn_v16");
+            let st = plain(n_head * tokens * pad_tokens * 4, "vit_attn_st");
+            let pt = zeroed(n_head * key_pad * pad_tokens * 2, "vit_attn_pt");
+            let lsum = plain(n_head * pad_tokens * 4, "vit_attn_l");
+            let up = |p: &[u32], label: &str| self.params_buf(p, label);
+            let t_params = up(
+                &[tokens as u32, pad_tokens as u32, dim as u32, 0],
+                "vit_attn_tp",
+            );
+            let cast_params = up(&[(tokens * dim) as u32], "vit_attn_cp");
+            let scale_log2e = scale * std::f32::consts::LOG2_E;
+            let s_params = up(
+                &[tokens as u32, pad_tokens as u32, scale_log2e.to_bits()],
+                "vit_attn_sp",
+            );
+            let m_params = up(
+                &[tokens as u32, pad_tokens as u32, key_pad as u32],
+                "vit_attn_mp",
+            );
+            let pv_params = up(
+                &[tokens as u32, pad_tokens as u32, key_pad as u32, dim as u32],
+                "vit_attn_vp",
+            );
+            let tile_cols = (pad_tokens / 32) as u32;
+            let steps_all = [
+                (
+                    "attn_transpose_q",
+                    transpose,
+                    &[q, &qt, &t_params][..],
+                    (tile_cols, (dim as u32).div_ceil(32), 1),
+                ),
+                (
+                    "attn_transpose_k",
+                    transpose,
+                    &[k, &kt, &t_params][..],
+                    (tile_cols, (dim as u32).div_ceil(32), 1),
+                ),
+                (
+                    "attn_cast_v",
+                    cast,
+                    &[v, &v16, &cast_params][..],
+                    (((tokens * dim) as u32).div_ceil(256), 1, 1),
+                ),
+                (
+                    "attn_scores",
+                    scores,
+                    &[&qt, &kt, &st, &s_params][..],
+                    ((tokens as u32).div_ceil(256), tile_cols, n_head as u32),
+                ),
+                (
+                    "attn_softmax",
+                    softmax,
+                    &[&st, &pt, &lsum, &m_params][..],
+                    ((tokens as u32).div_ceil(256), n_head as u32, 1),
+                ),
+                (
+                    "attn_pv",
+                    pv,
+                    &[&v16, &pt, &lsum, &out, &pv_params][..],
+                    (n_head as u32, tile_cols, 1),
+                ),
+            ];
+            self.dispatch_seq(&steps_all);
+            return out;
+        }
         // Query-tiled flash attention (one workgroup per Q_TILE=256 queries,
         // reusing K/V tiles in shared memory) when head_dim fits its shared/
         // register sizing; else the scalar per-query kernel.
@@ -1394,6 +1787,7 @@ impl VitGpuOps for WgpuVitOps {
                     .ctx
                     .upload_storage(bytemuck::cast_slice(&flash), "vit_attn_flash_params");
                 self.dispatch(
+                    "vit_attn_flash",
                     &self.p_attn_flash,
                     &[q, k, v, &out, &flash_buf],
                     (count, n_head as u32, 1),
@@ -1402,12 +1796,14 @@ impl VitGpuOps for WgpuVitOps {
             }
         } else if use_tiled {
             self.dispatch(
+                "vit_attn_tiled",
                 &self.p_attn_tiled,
                 &[q, k, v, &out, &p_buf],
                 ((tokens as u32).div_ceil(VIT_ATTN_TILED_Q), n_head as u32, 1),
             );
         } else {
             self.dispatch(
+                "vit_attn_scalar",
                 &self.p_attn,
                 &[q, k, v, &out, &p_buf],
                 (tokens as u32, n_head as u32, 1),
@@ -1418,6 +1814,7 @@ impl VitGpuOps for WgpuVitOps {
 
     fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize) {
         self.dispatch_elements(
+            "vit_add",
             &self.p_add,
             &[
                 ElementBind::Ranged(dst),
@@ -1433,7 +1830,18 @@ impl VitGpuOps for WgpuVitOps {
     /// wgpu's `dispatch` only submits — block here so the profiler can attribute
     /// per-op GPU time. Off the profiled path this is never called.
     fn sync(&self) {
+        self.flush();
         self.ctx.device.poll_wait();
+    }
+
+    fn begin_encode(&self) {
+        self.flush();
+        self.ctx.reset_profiler();
+    }
+
+    fn end_encode(&self) {
+        self.flush();
+        self.ctx.finish_profiler();
     }
 }
 
@@ -1704,7 +2112,9 @@ pub trait VisionGpuEncode: Send + Sync {
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>>;
 
     /// Async variant for environments (like browser WebGPU on wasm32) where
-    /// GPU readbacks cannot block the main/worker thread.
+    /// GPU readbacks cannot block the main/worker thread. It is single-threaded by contract: only the
+    /// wasm worker calls it, and unlike [`Self::encode_image`] the wgpu implementation does not take the
+    /// encoder's serialization lock, so a native caller must not drive two at once.
     fn encode_image_async<'a>(
         &'a self,
         pixels: &'a [f32],
@@ -1719,11 +2129,18 @@ pub trait VisionGpuEncode: Send + Sync {
 struct WgpuVisionEncoder {
     ops: WgpuVitOps,
     weights: GpuVitWeights<WgpuVitOps>,
+    /// Serializes `encode_image`. The engine shares one encoder across every session, and an encode
+    /// records its passes into the encoder-wide `pending` encoder and draws from the encoder-wide buffer
+    /// pool: two concurrent encodes would flush each other's half-recorded passes and reuse buffers the
+    /// other has not finished with, returning wrong embeddings as `Ok`. The wasm async path is
+    /// single-threaded and flushes before every await, so it does not take this lock.
+    encode_lock: std::sync::Mutex<()>,
 }
 
 #[cfg(feature = "gpu")]
 impl VisionGpuEncode for WgpuVisionEncoder {
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
+        let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Drain the readback slot around the encode (mirrors Session's
         // discard-at-entry/drain-after-work discipline): a map/range fault
         // mid-encode otherwise returns Ok(zero embeddings) that the
@@ -1757,11 +2174,16 @@ impl VisionGpuEncode for WgpuVisionEncoder {
 struct MetalVisionEncoder {
     ops: MetalVitOps,
     weights: GpuVitWeights<MetalVitOps>,
+    /// One encode at a time, as in `WgpuVisionEncoder`: the engine shares this encoder across sessions
+    /// and the command-error slot drained around each encode belongs to the whole context, so a second
+    /// encode's entry drain could swallow the first one's commit fault.
+    encode_lock: std::sync::Mutex<()>,
 }
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 impl VisionGpuEncode for MetalVisionEncoder {
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
+        let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Drain the command-error slot around the encode (mirrors
         // Session's discard-at-entry/drain-after-work discipline): a
         // commit fault mid-encode otherwise returns Ok(stale embeddings)
@@ -2051,6 +2473,12 @@ fn try_wgpu_stack(spec: &VitStackSpec, need_flash: bool) -> Option<std::sync::Ar
         return None;
     }
     let ops = WgpuVitOps::new(ctx).ok()?;
+    // A caller that needs the flash kernel needs its f32 precision too.
+    let ops = if need_flash {
+        ops.with_f32_attention()
+    } else {
+        ops
+    };
     Some(std::sync::Arc::new(GpuStack::build(ops, spec)))
 }
 
@@ -2061,8 +2489,8 @@ fn try_wgpu_stack(_spec: &VitStackSpec, _need_flash: bool) -> Option<std::sync::
 
 /// Build a cached GPU vision encoder for `weights`, honoring `backend`.
 /// Returns `None` for `Cpu`, when the chosen backend's feature isn't compiled,
-/// or when the device/context can't be created: the caller then falls back to
-/// the CPU encoder. `Auto` prefers Metal, then Hexagon, then wgpu.
+/// when the device/context can't be created, or (wgpu, native only) when the blank-image warm-up
+/// encode fails: the caller then falls back to the CPU encoder. `Auto` prefers Metal, then Hexagon, then wgpu.
 pub fn build_gpu_vision_encoder(
     weights: &VisionEncoderWeights,
     backend: crate::engine::BackendPreference,
@@ -2106,11 +2534,65 @@ pub fn build_wgpu_vision_encoder_with_context(
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
     let ops = WgpuVitOps::new(ctx).ok()?;
     let gpu_w = GpuVitWeights::build(&ops, weights);
-    tracing::info!("vision encoder: using wgpu GPU backend");
-    Some(std::sync::Arc::new(WgpuVisionEncoder {
+    let encoder = WgpuVisionEncoder {
         ops,
         weights: gpu_w,
-    }))
+        encode_lock: std::sync::Mutex::new(()),
+    };
+    // Not on wasm32: the warm-up encode ends in a blocking `download_f32`, which waits on a map
+    // callback that only the JS event loop can run, so it would hang the worker at load.
+    #[cfg(not(target_arch = "wasm32"))]
+    if !warm_up(&encoder, &weights.config) {
+        return None;
+    }
+    tracing::info!("vision encoder: using wgpu GPU backend");
+    Some(std::sync::Arc::new(encoder))
+}
+
+/// Encode a blank 512x384 image once, so the first real image does not pay for one-time setup: driver
+/// work on first use of each pipeline and the pooled buffers' first allocation, together about 80 ms on
+/// Adreno 830. llama.cpp's mtmd runs a warm-up encode for the same reason. Costs about 190 ms once, at
+/// load; `CERA_VIT_WARMUP=0` skips it. Under `CERA_VIT_PROFILE` its own profile report is printed
+/// first. Returns `false` when the encode fails: a tower that cannot encode a blank image will fail every
+/// real one, so the caller drops the GPU encoder and the session uses the CPU one, instead of paying a
+/// failed GPU attempt (and a warning) for each tile of each image.
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+fn warm_up(encoder: &WgpuVisionEncoder, cfg: &VisionEncoderConfig) -> bool {
+    if crate::backend::cpu_features::env_disabled("CERA_VIT_WARMUP") {
+        return true;
+    }
+    warm_up_with(cfg, |pixels, grid_w, grid_h| {
+        encoder.encode_image(pixels, grid_w, grid_h)
+    })
+}
+
+/// The decision behind [`warm_up`], with the encode passed in so it can be tested without a GPU:
+/// `true` to keep the encoder (the blank image encoded, or the grid does not fit this config so no
+/// warm-up ran), `false` to drop it (the encode failed).
+#[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+fn warm_up_with(
+    cfg: &VisionEncoderConfig,
+    encode: impl FnOnce(&[f32], usize, usize) -> Result<Vec<f32>>,
+) -> bool {
+    let (grid_w, grid_h) = (32usize, 24usize);
+    if !grid_w.is_multiple_of(cfg.scale_factor) || !grid_h.is_multiple_of(cfg.scale_factor) {
+        return true;
+    }
+    let pixels = vec![0.0f32; 3 * grid_w * cfg.patch_size * grid_h * cfg.patch_size];
+    let start = crate::time::Instant::now();
+    match encode(&pixels, grid_w, grid_h) {
+        Ok(_) => {
+            tracing::debug!(
+                "vision encoder warm-up took {:.0} ms",
+                start.elapsed().as_secs_f64() * 1e3
+            );
+            true
+        }
+        Err(e) => {
+            tracing::warn!("vision encoder warm-up failed, using the CPU vision encoder: {e:#}");
+            false
+        }
+    }
 }
 
 #[cfg(feature = "gpu")]
@@ -2139,6 +2621,7 @@ fn try_metal_vision_encoder(
     Some(std::sync::Arc::new(MetalVisionEncoder {
         ops,
         weights: gpu_w,
+        encode_lock: std::sync::Mutex::new(()),
     }))
 }
 
@@ -2222,6 +2705,41 @@ mod tests {
     /// everything f32.
     fn synth_encoder() -> VisionEncoderWeights {
         synth_encoder_quant(None)
+    }
+
+    /// A failed warm-up encode drops the encoder (the session then uses the CPU one); a successful one
+    /// keeps it, and a config whose scale factor does not divide the warm-up grid skips the encode and
+    /// keeps it. The encode is a stand-in, so no GPU is needed.
+    #[cfg(all(feature = "gpu", not(target_arch = "wasm32")))]
+    #[test]
+    fn warm_up_drops_the_encoder_only_when_the_encode_fails() {
+        let mut cfg = synth_encoder().config;
+        let calls = std::cell::Cell::new(0usize);
+        let seen = std::cell::Cell::new((0usize, 0usize, 0usize));
+        let ok = |p: &[f32], w: usize, h: usize| {
+            calls.set(calls.get() + 1);
+            seen.set((p.len(), w, h));
+            Ok(vec![0.0f32])
+        };
+        assert!(warm_up_with(&cfg, ok));
+        assert_eq!(calls.get(), 1);
+        let (len, w, h) = seen.get();
+        assert_eq!(
+            (w, h, len),
+            (32, 24, 3 * 32 * cfg.patch_size * 24 * cfg.patch_size)
+        );
+
+        let fail = |_: &[f32], _: usize, _: usize| Err(anyhow::anyhow!("device lost"));
+        assert!(
+            !warm_up_with(&cfg, fail),
+            "a failed encode must drop the encoder"
+        );
+
+        // 5 divides neither 32 nor 24: no warm-up runs and the encoder is kept.
+        cfg.scale_factor = 5;
+        calls.set(0);
+        assert!(warm_up_with(&cfg, ok));
+        assert_eq!(calls.get(), 0);
     }
 
     fn synth_encoder_quant(quant: Option<DType>) -> VisionEncoderWeights {
@@ -2379,7 +2897,9 @@ mod tests {
             );
             return;
         }
-        let ops = WgpuVitOps::new(ctx).expect("build wgpu vit ops");
+        let ops = WgpuVitOps::new(ctx)
+            .expect("build wgpu vit ops")
+            .with_f32_attention();
         let (heads, hd) = (4usize, 64usize);
         let dim = heads * hd;
         // 2100 tokens is 66 query tiles: past the 64 one dispatch covers, so the call splits
@@ -2484,6 +3004,62 @@ mod tests {
         assert!(!gpu_out.iter().all(|&x| x == 0.0));
     }
 
+    /// The engine hands one GPU vision encoder to every session, so concurrent encodes must not see
+    /// each other: the pending-pass encoder and the buffer pool are per encoder, not per call. Without
+    /// serialization a second thread flushes while the first still has passes recorded, or pops a
+    /// buffer the first has not finished with, and gets plausible garbage back as `Ok`. Each thread
+    /// encodes its own input many times against a sequential reference.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_wgpu_encoder_is_safe_to_share_across_threads() {
+        use crate::engine::BackendPreference as BP;
+        let enc = synth_encoder();
+        let Some(encoder) = build_gpu_vision_encoder(&enc, BP::Gpu) else {
+            // No GPU, or the warm-up encode failed: a leg that requires a GPU must not pass silently.
+            assert!(
+                std::env::var("CERA_REQUIRE_GPU")
+                    .unwrap_or_default()
+                    .is_empty(),
+                "CERA_REQUIRE_GPU is set but no GPU vision encoder was built"
+            );
+            return;
+        };
+        let cfg = &enc.config;
+        let (gw, gh) = (8usize, 8usize);
+        let len = 3 * gw * cfg.patch_size * gh * cfg.patch_size;
+        let inputs: Vec<Vec<f32>> = (0..4).map(|t| rnd(len, 500 + t)).collect();
+        let want: Vec<Vec<f32>> = inputs
+            .iter()
+            .map(|p| encoder.encode_image(p, gw, gh).unwrap())
+            .collect();
+        std::thread::scope(|scope| {
+            let handles: Vec<_> = (0..inputs.len())
+                .map(|t| {
+                    let (encoder, inputs, want) = (&encoder, &inputs, &want);
+                    scope.spawn(move || {
+                        for i in 0..40 {
+                            let got = encoder.encode_image(&inputs[t], gw, gh).unwrap();
+                            assert_eq!(got.len(), want[t].len());
+                            let diff = got
+                                .iter()
+                                .zip(&want[t])
+                                .map(|(a, b)| {
+                                    // A NaN difference is a failure: `f32::max` would drop it.
+                                    let d = (a - b).abs();
+                                    if d.is_nan() { f32::INFINITY } else { d }
+                                })
+                                .fold(0.0f32, f32::max);
+                            assert!(diff < 1e-3, "thread {t} encode {i}: max abs diff {diff}");
+                        }
+                    })
+                })
+                .collect();
+            for h in handles {
+                h.join().unwrap();
+            }
+        });
+    }
+
     /// Metal twin of `test_wgpu_encode_wrapper_happy_path` (same
     /// discard/drain wrapper shape over `take_cmd_error`).
     #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -2565,5 +3141,56 @@ mod tests {
         #[cfg(not(target_os = "android"))]
         assert!(result.is_none());
         let _ = result;
+    }
+}
+
+#[cfg(test)]
+mod q8_stream_repack_tests {
+    use super::repack_q8_0_stream;
+
+    /// Every weight must be recoverable from the packed words and scales exactly as the kernel reads
+    /// them: byte `j` of `q[(k/4) * m + row]` times the half scale of its 32-block.
+    #[test]
+    fn repack_q8_0_stream_round_trips_through_the_kernel_layout() {
+        let (m, k) = (7usize, 192usize);
+        let blocks = k / 32;
+        let mut st = 0x1234_5678_9abc_def0u64;
+        let mut next = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (st >> 33) as u32
+        };
+        let mut data = Vec::new();
+        for _ in 0..m * blocks {
+            let scale = half::f16::from_f32(((next() % 1000) as f32 + 1.0) / 4000.0);
+            data.extend_from_slice(&scale.to_bits().to_le_bytes());
+            for _ in 0..32 {
+                data.push(next() as u8);
+            }
+        }
+        let (q, d) = repack_q8_0_stream(&data, m, k);
+        assert_eq!(q.len(), m * k / 4);
+        assert_eq!(d.len(), m * (k / 64));
+
+        let mut want = vec![0.0f32; k];
+        for row in 0..m {
+            crate::quant::dequantize_q8_0_row(
+                &data[row * blocks * 34..(row + 1) * blocks * 34],
+                &mut want,
+            );
+            for kk in 0..k {
+                let word = q[(kk / 4) * m + row];
+                let w = ((word >> (8 * (kk % 4))) as u8 as i8) as f32;
+                let pair = d[(kk / 64) * m + row];
+                let bits = if (kk / 32) % 2 == 0 {
+                    pair & 0xFFFF
+                } else {
+                    pair >> 16
+                };
+                let got = w * half::f16::from_bits(bits as u16).to_f32();
+                assert_eq!(got, want[kk], "row {row} k {kk}");
+            }
+        }
     }
 }

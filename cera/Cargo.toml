@@ -141,6 +141,11 @@ required-features = ["mmap", "parallel"]
 name = "audio_encoder_bench"
 required-features = ["mmap", "parallel"]
 
+# The GPU vision tower on a real image: wall time and distance from the CPU encoder.
+[[example]]
+name = "vit_gpu_probe"
+required-features = ["gpu", "mmap", "vl-preprocess"]
+
 # The CPU vision tower on a real image: speed and int8-vs-f32 error.
 [[example]]
 name = "vit_cpu_probe"

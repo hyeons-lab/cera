@@ -70,6 +70,24 @@ use crate::tensor::DType;
 /// scratch, so the worst-case scratch footprint is bounded.
 const MAX_PREFILL_TOKENS: usize = 2048;
 
+/// What a batched prefill chunk starts from: token ids (gathered from the embedding table, with the
+/// model's embedding multiplier) or hidden-size embedding rows supplied by the caller (an image's
+/// projected patches, which have no token id and take no multiplier, as in the per-token seeded path).
+#[derive(Clone, Copy)]
+enum PrefillInput<'a> {
+    Tokens(&'a [u32]),
+    Embeddings { rows: &'a [f32], n: usize },
+}
+
+impl PrefillInput<'_> {
+    fn len(&self) -> usize {
+        match self {
+            PrefillInput::Tokens(t) => t.len(),
+            PrefillInput::Embeddings { n, .. } => *n,
+        }
+    }
+}
+
 /// Maximum token batch size for full-vocabulary all-logits speculative verification.
 const MAX_ALL_LOGITS_TOKENS: usize = 64;
 
@@ -252,6 +270,25 @@ fn use_stream_layout(ctx: &GpuContext) -> bool {
 fn stream_layout_eligible(dtype: DType, k: usize) -> bool {
     (dtype == DType::Q4_0 && k.is_multiple_of(32))
         || (dtype == DType::Q4KM && k.is_multiple_of(256))
+}
+
+/// Smallest batch routed to the streaming Q4_0 GEMM (`CERA_WGPU_STREAM_MIN_N`, default 1: every batch).
+///
+/// The streaming kernel pads `n` up to a multiple of 32 columns internally, and this used to send
+/// `n < 32` to the generic register-tile kernel on the grounds that the idle columns were waste. On
+/// Adreno 830 that kernel costs about 167 ms per forward at `n = 1` to 12 (92 matmuls at about 1.8 ms
+/// each, roughly 1 GB/s of weight traffic), against about 30 ms for the streaming one, so every short
+/// prompt paid for it: an 18-token VL text prompt took 735 ms in three calls, and a 15-token text
+/// prompt prefilled at 62 tok/s against 170. The padded columns are free because the kernel is bound
+/// by streaming the weights, not by arithmetic.
+fn stream_gemm_min_n() -> u32 {
+    static MIN_N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MIN_N.get_or_init(|| {
+        std::env::var("CERA_WGPU_STREAM_MIN_N")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(1)
+    })
 }
 
 /// Whether the k-slice-64 streaming GEMM twin is enabled: on by default
@@ -5405,7 +5442,7 @@ impl GpuLfmModel {
     ) {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _lora_guard = self.resolve_lora(state);
-        self.seed_embeddings_locked(embeddings, n_tokens, start_pos, state);
+        self.seed_embeddings_locked(embeddings, n_tokens, start_pos, state, false);
     }
 
     /// [`Self::seed_embeddings`] with `infer_lock` and the LoRA guard already
@@ -5417,7 +5454,8 @@ impl GpuLfmModel {
         n_tokens: usize,
         start_pos: usize,
         state: &mut InferenceState,
-    ) {
+        download_logits: bool,
+    ) -> Vec<f32> {
         let hidden_size = self.config.hidden_size;
         assert!(n_tokens > 0, "seed_embeddings requires at least one frame");
         assert_eq!(
@@ -5438,6 +5476,12 @@ impl GpuLfmModel {
             self.zero_conv_buffers_locked();
         }
 
+        if let Some(logits) =
+            self.prefill_embeddings_batched_locked(embeddings, n_tokens, state, download_logits)
+        {
+            return logits;
+        }
+
         for i in 0..n_tokens {
             let frame = &embeddings[i * hidden_size..(i + 1) * hidden_size];
             // `state.seq_len`, not `start_pos + i`: the compute tail advances it
@@ -5445,6 +5489,12 @@ impl GpuLfmModel {
             // keeps a spliced image landing where the caller's state says.
             let pos = state.seq_len;
             self.forward_inner_compute_from_embedding(frame, pos, state);
+        }
+        if download_logits {
+            self.ctx
+                .download_f32(&self.logits_buf, self.config.vocab_size)
+        } else {
+            Vec::new()
         }
     }
 
@@ -6824,7 +6874,7 @@ impl GpuLfmModel {
     /// resident repack (`stream_q`/`stream_d`) plus B16. Grid
     /// `(ceil(m/256), ceil(n/32))` — each fiber covers 1 row x 32 columns
     /// in 256-thread workgroups; columns past `n` idle inside the fiber, so
-    /// callers route n < 32 to the reg-tile kernel instead. Requires packed
+    /// callers may route small n to the reg-tile kernel instead (see `stream_gemm_min_n`). Requires packed
     /// B (`x_stride == k`); strided-B callers stay on reg-tile.
     fn encode_gemm_stream_q4_0<'a>(
         &'a self,
@@ -7141,7 +7191,7 @@ impl GpuLfmModel {
     ) {
         // Streaming fp16 fast path:
         // - Q4_K_M: gemm_stream_q4_k handles any n (bounds-checked per column)
-        // - Q4_0: gemm_stream_q4_0 handles n >= 32; n < 32 rides mul_mat_reg_tile_q4_0_stream
+        // - Q4_0: gemm_stream_q4_0 handles every n (padding to 32 columns); the register-tile kernel only below `stream_gemm_min_n()`
         if w.tensor.dtype == DType::Q4KM
             && k.is_multiple_of(32)
             && x_stride == k
@@ -7154,7 +7204,7 @@ impl GpuLfmModel {
             return;
         }
         if w.tensor.dtype == DType::Q4_0
-            && n >= 32
+            && n >= stream_gemm_min_n()
             && k.is_multiple_of(32)
             && x_stride == k
             && self.pipelines.gemm_stream_q4_0.is_some()
@@ -7671,14 +7721,14 @@ impl GpuLfmModel {
     /// reference for the dispatch order + buffer assignment.
     fn encode_prefill_batched_locked(
         &self,
-        tokens: &[u32],
+        input: PrefillInput<'_>,
         start_pos: usize,
         _state: &mut InferenceState,
         all_logits: bool,
         need_logits: bool,
     ) -> wgpu::CommandEncoder {
-        debug_assert!(!tokens.is_empty());
-        let n = tokens.len();
+        let n = input.len();
+        debug_assert!(n > 0);
         // Bounds checks — make a misuse fail deterministically rather
         // than show up later as a wgpu validation error during a buffer
         // copy or as silent out-of-bounds attention reads.
@@ -7733,23 +7783,39 @@ impl GpuLfmModel {
         // mmap'd table and dequantize on the fly (one reusable row buffer,
         // ~µs per token); the embedding multiplier folds in here, input
         // only — the projection copy stays unscaled.
-        let mut staged: Vec<f32> = Vec::with_capacity(n * hs);
-        let mut row = vec![0.0f32; hs];
-        let emb_scale = self.scalars.embedding;
-        for &t in tokens {
-            self.gpu_state
-                .embedding
-                .dequantize_row(t as usize, &mut row);
-            if emb_scale != 1.0 {
-                for v in row.iter_mut() {
-                    *v *= emb_scale;
+        match input {
+            PrefillInput::Tokens(tokens) => {
+                let mut staged: Vec<f32> = Vec::with_capacity(n * hs);
+                let mut row = vec![0.0f32; hs];
+                let emb_scale = self.scalars.embedding;
+                for &t in tokens {
+                    self.gpu_state
+                        .embedding
+                        .dequantize_row(t as usize, &mut row);
+                    if emb_scale != 1.0 {
+                        for v in row.iter_mut() {
+                            *v *= emb_scale;
+                        }
+                    }
+                    staged.extend_from_slice(&row);
                 }
+                self.ctx.queue.write_buffer(
+                    &self.prefill_batch_buf,
+                    0,
+                    bytemuck::cast_slice(&staged),
+                );
             }
-            staged.extend_from_slice(&row);
+            PrefillInput::Embeddings { rows, n: rows_n } => {
+                assert_eq!(
+                    rows.len(),
+                    rows_n * hs,
+                    "prefill embeddings must be n * hidden_size floats"
+                );
+                self.ctx
+                    .queue
+                    .write_buffer(&self.prefill_batch_buf, 0, bytemuck::cast_slice(rows));
+            }
         }
-        self.ctx
-            .queue
-            .write_buffer(&self.prefill_batch_buf, 0, bytemuck::cast_slice(&staged));
 
         // Reset the batched-LoRA params pool cursor — only when an adapter is
         // active (the base path encodes no LoRA dispatches, so it needn't touch
@@ -8464,18 +8530,18 @@ impl GpuLfmModel {
 
     fn forward_prefill_batched_locked(
         &self,
-        tokens: &[u32],
+        input: PrefillInput<'_>,
         start_pos: usize,
         state: &mut InferenceState,
         all_logits: bool,
         need_logits: bool,
     ) -> Vec<f32> {
-        let n = tokens.len();
+        let n = input.len();
         let host_prof = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
         let passes_before = crate::backend::wgpu::io_stats::snapshot().passes;
         let t_enc = crate::time::Instant::now();
         let enc =
-            self.encode_prefill_batched_locked(tokens, start_pos, state, all_logits, need_logits);
+            self.encode_prefill_batched_locked(input, start_pos, state, all_logits, need_logits);
         if host_prof {
             let passes = crate::backend::wgpu::io_stats::snapshot().passes - passes_before;
             eprintln!(
@@ -8500,6 +8566,66 @@ impl GpuLfmModel {
         }
     }
 
+    /// Append `n_tokens` embedding rows (an image's projected patches) through the batched prefill
+    /// kernels, in chunks of at most `min(max_seq_len, MAX_PREFILL_TOKENS)`. Returns `None` when this
+    /// model has no batched path for its weights, so the caller falls back to one frame at a time.
+    ///
+    /// The per-frame fallback is a full decode pass per row (about 7.5 ms each on Adreno 830, so an
+    /// image of 192 patches cost about 1.5 s) and reaches the register-tile GEMM at `n = 1`; a batch
+    /// of at least 32 rows takes the tuned streaming GEMM instead.
+    ///
+    /// Leaves the last row's logits in `logits_buf` (the final chunk runs the output head) and reads
+    /// them back only when `download_logits` is set, which keeps this safe to call on wasm.
+    fn prefill_embeddings_batched_locked(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        state: &mut InferenceState,
+        download_logits: bool,
+    ) -> Option<Vec<f32>> {
+        if !self.batched_prefill || self.unbatchable_matmul_weight().is_some() {
+            return None;
+        }
+        let hs = self.config.hidden_size;
+        let chunk = self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS);
+        let host_prof = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
+        let mut done = 0usize;
+        while done < n_tokens {
+            let end = (done + chunk).min(n_tokens);
+            let is_last = end == n_tokens;
+            let rows = &embeddings[done * hs..end * hs];
+            // `state.seq_len`, as the per-frame path: a spliced image lands where the caller's
+            // state says, whatever `start_pos` was passed in.
+            let pos = state.seq_len;
+            let n = end - done;
+            let t_enc = crate::time::Instant::now();
+            let enc = self.encode_prefill_batched_locked(
+                PrefillInput::Embeddings { rows, n },
+                pos,
+                state,
+                false,
+                is_last,
+            );
+            if host_prof {
+                eprintln!(
+                    "[GPU-HOST] embeddings_encode={:.0}µs n={n}",
+                    t_enc.elapsed().as_secs_f64() * 1e6
+                );
+            }
+            self.submit_and_wait(enc);
+            self.gpu_state.seq_len.store(pos + n, Ordering::Relaxed);
+            state.seq_len = pos + n;
+            self.ctx.finish_profiler();
+            done = end;
+        }
+        Some(if download_logits {
+            self.ctx
+                .download_f32(&self.logits_buf, self.config.vocab_size)
+        } else {
+            Vec::new()
+        })
+    }
+
     /// Async (wasm/WebGPU) batched prefill step returning all logits rows `[n x vocab_size]`,
     /// used for zero-allocation speculative verification on WebGPU.
     pub async fn forward_prefill_logits_all_async(
@@ -8522,7 +8648,13 @@ impl GpuLfmModel {
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
             let _lora_guard = self.resolve_lora(state);
-            let enc = self.encode_prefill_batched_locked(tokens, start_pos, state, true, true);
+            let enc = self.encode_prefill_batched_locked(
+                PrefillInput::Tokens(tokens),
+                start_pos,
+                state,
+                true,
+                true,
+            );
             self.gpu_state
                 .seq_len
                 .store(start_pos + n, Ordering::Relaxed);
@@ -8569,7 +8701,13 @@ impl GpuLfmModel {
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
             let _lora_guard = self.resolve_lora(state);
-            let mut enc = self.encode_prefill_batched_locked(tokens, start_pos, state, true, true);
+            let mut enc = self.encode_prefill_batched_locked(
+                PrefillInput::Tokens(tokens),
+                start_pos,
+                state,
+                true,
+                true,
+            );
             self.gpu_state
                 .seq_len
                 .store(start_pos + n, Ordering::Relaxed);
@@ -9649,7 +9787,13 @@ impl Model for GpuLfmModel {
             n <= MAX_ALL_LOGITS_TOKENS,
             "forward_prefill_logits_all token count ({n}) exceeds MAX_ALL_LOGITS_TOKENS ({MAX_ALL_LOGITS_TOKENS})"
         );
-        self.forward_prefill_batched_locked(tokens, start_pos, state, true, true)
+        self.forward_prefill_batched_locked(
+            PrefillInput::Tokens(tokens),
+            start_pos,
+            state,
+            true,
+            true,
+        )
     }
 
     fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
@@ -9819,6 +9963,31 @@ impl Model for GpuLfmModel {
         true
     }
 
+    /// The rows the batched token prefill stages (a table lookup, then the embedding multiplier), so a
+    /// prefill seeded from these rows is the token prefill. This is what lets a VL prompt (text, image,
+    /// text) run as ONE prefill forward instead of one per segment, each with a fixed cost.
+    fn embed_token_rows(&self, tokens: &[u32]) -> Option<Vec<f32>> {
+        let hs = self.config.hidden_size;
+        if tokens
+            .iter()
+            .any(|&t| (t as usize) >= self.config.vocab_size)
+        {
+            return None;
+        }
+        let emb_scale = self.scalars.embedding;
+        let mut rows = vec![0.0f32; tokens.len() * hs];
+        for (i, &t) in tokens.iter().enumerate() {
+            let row = &mut rows[i * hs..(i + 1) * hs];
+            self.gpu_state.embedding.dequantize_row(t as usize, row);
+            if emb_scale != 1.0 {
+                for v in row.iter_mut() {
+                    *v *= emb_scale;
+                }
+            }
+        }
+        Some(rows)
+    }
+
     fn forward_from_embedding(
         &self,
         embedding: &[f32],
@@ -9916,9 +10085,7 @@ impl Model for GpuLfmModel {
     ) -> Vec<f32> {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _lora_guard = self.resolve_lora(state);
-        self.seed_embeddings_locked(embeddings, n_tokens, start_pos, state);
-        self.ctx
-            .download_f32(&self.logits_buf, self.config.vocab_size)
+        self.seed_embeddings_locked(embeddings, n_tokens, start_pos, state, true)
     }
 
     fn forward_prefill(
@@ -10079,7 +10246,7 @@ impl Model for GpuLfmModel {
                 let end = (pos + chunk_size).min(tokens.len());
                 let is_last = end >= tokens.len();
                 logits = self.forward_prefill_batched_locked(
-                    &tokens[pos..end],
+                    PrefillInput::Tokens(&tokens[pos..end]),
                     start_pos + pos,
                     state,
                     false,

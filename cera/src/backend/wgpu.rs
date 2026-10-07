@@ -1755,6 +1755,74 @@ impl GpuContext {
             })
     }
 
+    /// Streaming Q8_0 GEMM (k-slice-64) via SPIR-V passthrough: the 8-bit twin of
+    /// [`Self::gemm_stream_q4_0_k64_passthrough`], with the same five bindings
+    /// (0 = repacked int8 words, 1 = repacked scales, 2 = f16 activations, 3 =
+    /// dst, 4 = params) and grid. Needs k % 64 == 0.
+    ///
+    /// # Safety
+    /// `desc` must be a spirv-val-clean compute module whose binding
+    /// interface matches the layout above (our slangc-compiled
+    /// `gemm_stream_q8_0_k64.slang`). Only call when
+    /// `supports_spirv_passthrough()` is true.
+    pub fn gemm_stream_q8_0_k64_passthrough(&self) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
+            binding,
+            visibility: wgpu::ShaderStages::COMPUTE,
+            ty: wgpu::BindingType::Buffer {
+                ty: wgpu::BufferBindingType::Storage { read_only },
+                has_dynamic_offset: false,
+                min_binding_size: None,
+            },
+            count: None,
+        };
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some("gemm_stream_q8_0_k64_passthrough_bgl"),
+                entries: &[
+                    storage(0, true),
+                    storage(1, true),
+                    storage(2, true),
+                    storage(3, false),
+                    storage(4, true),
+                ],
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some("gemm_stream_q8_0_k64_passthrough_layout"),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: slangc-compiled from gemm_stream_q8_0_k64.slang, spirv-val clean.
+        let module = unsafe {
+            self.device
+                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemm_stream_q8_0_k64.spv"
+                )))
+        };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some("gemm_stream_q8_0_k64_passthrough"),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
     /// Transpose + f32->f16 cast feeding the streaming GEMM. Three bindings
     /// (0 = f32 token-major activations, 1 = f16 k-major scratch, 2 =
     /// params). Same passthrough gating as `gemm_stream_q4_0_passthrough`.
@@ -1814,6 +1882,107 @@ impl GpuContext {
                 },
                 cache: None,
             })
+    }
+
+    /// A compute pipeline over one raw SPIR-V module (entry `main`) whose storage-buffer bindings
+    /// are `0..read_only.len()` in order, `read_only[i]` marking binding `i` as read-only.
+    ///
+    /// # Safety contract
+    /// `desc` must be a spirv-val-clean compute module whose binding interface matches `read_only`
+    /// (our slangc-compiled kernels). Only call when `supports_spirv_passthrough()` is true.
+    fn passthrough_pipeline(
+        &self,
+        label: &str,
+        desc: wgpu::ShaderModuleDescriptorPassthrough<'_>,
+        read_only: &[bool],
+    ) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = read_only
+            .iter()
+            .enumerate()
+            .map(|(i, &read_only)| wgpu::BindGroupLayoutEntry {
+                binding: i as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(label),
+                entries: &entries,
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        // SAFETY: the caller's contract above.
+        let module = unsafe { self.device.create_shader_module_passthrough(desc) };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
+    /// ViT attention scores GEMM (`vit_attn_scores_f16.slang`): bindings 0 = Kt f16, 1 = Qt f16,
+    /// 2 = S^T f32, 3 = params. Passthrough only.
+    pub fn vit_attn_scores_f16_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "vit_attn_scores_f16",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/vit_attn_scores_f16.spv")),
+            &[true, true, false, true],
+        )
+    }
+
+    /// ViT attention column softmax (`vit_attn_softmax_t.slang`): bindings 0 = S^T f32, 1 = P^T f16,
+    /// 2 = row sums f32, 3 = params. Passthrough only.
+    pub fn vit_attn_softmax_t_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "vit_attn_softmax_t",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/vit_attn_softmax_t.spv")),
+            &[true, false, false, true],
+        )
+    }
+
+    /// ViT attention P·V GEMM (`vit_attn_pv_f16.slang`): bindings 0 = V f16, 1 = P^T f16, 2 = row
+    /// sums f32, 3 = out f32, 4 = params. Passthrough only.
+    pub fn vit_attn_pv_f16_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "vit_attn_pv_f16",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/vit_attn_pv_f16.spv")),
+            &[true, true, true, false, true],
+        )
+    }
+
+    /// Elementwise f32 -> f16 cast (`cast_f32_f16.slang`): bindings 0 = src f32, 1 = dst f16,
+    /// 2 = params. Passthrough only.
+    pub fn cast_f32_f16_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "cast_f32_f16",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/cast_f32_f16.spv")),
+            &[true, false, true],
+        )
     }
 
     /// Q4_0 decode GEMV over the resident stream layout
@@ -2297,7 +2466,15 @@ impl GpuContext {
                     .unwrap_or(std::cmp::Ordering::Equal)
             });
             let total_us: f64 = sorted.iter().map(|(_, (us, _))| us).sum();
-            eprintln!("── GPU Profile ({total_us:.0}µs total) ──");
+            // First pass start to last pass end. When it exceeds the sum of pass durations the GPU
+            // was idle between passes (waiting on the host, or draining between dependent passes).
+            let first = spans.iter().map(|(_, b, _)| timestamps[*b as usize]).min();
+            let last = spans.iter().map(|(_, _, e)| timestamps[*e as usize]).max();
+            let span_us = match (first, last) {
+                (Some(f), Some(l)) => l.wrapping_sub(f) as f64 * period_ns / 1000.0,
+                _ => 0.0,
+            };
+            eprintln!("── GPU Profile ({total_us:.0}µs total, {span_us:.0}µs first-to-last) ──");
             for (label, (us, count)) in &sorted {
                 let pct = us / total_us * 100.0;
                 eprintln!("  {label:20} {us:8.0}µs ({count:3}×) {pct:5.1}%");
