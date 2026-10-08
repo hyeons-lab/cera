@@ -217,7 +217,7 @@ them and the CPU is the reference.
 |---|---|---|---|---|
 | CPU | yes | yes | yes | yes |
 | Metal | yes | yes | yes | yes |
-| wgpu | yes | yes | yes | yes (head_dim 64, not Android) |
+| wgpu | yes | yes | yes | yes (head_dim 64, desktop adapters and Adreno) |
 | Hexagon NPU | refused | not run | falls back to the CPU | CPU |
 
 The trunk is bidirectional, which the GPU LFM2 graphs were not: they are causal and ignored the
@@ -289,12 +289,43 @@ the batched GEMM. Use Q8_0 or Q4_0 for Metal.
 A single pass needs buffers of `rows x width` floats: on wgpu the largest binding must fit the
 adapter's storage-binding limit (about 128 MB on common adapters, so roughly 32k rows).
 
+### Android (Galaxy S25 Ultra, Adreno 830, Vulkan)
+
+Checked on a device through `cera decide --device gpu` (Q8_0). The flash attention kernel is
+correct there (against a direct reference to 1e-6 up to 8192 rows, grouped-query heads and the
+prefix window included) and runs at about 0.22 TFLOPS, against 0.016 for the scalar kernel Android
+used before at 300 tokens (the query-tiled one was 0.002 and is why Android excluded it). The
+answers match the Mac: the text example's refund probability is 0.99837 on the phone's GPU and the
+Mac's CPU, a 1.5k-token prompt 0.10545 against 0.10546, a 27,000-token prompt 0.24406 against 0.24405.
+The phone's own CPU gives other numbers for the longer prompts (0.0917 and 0.2439 where the GPU and
+the Mac say 0.1055 and 0.2509); I did not look into that.
+
+| Request | phone CPU | phone GPU |
+|---|---|---|
+| 1.5k-token state | 4.0 s | 7.1 s |
+| 6.8k-token state | 31 s | 28 s |
+| 27,000-token state (two questions) | not run | 128 s |
+| tiled 2048x1536 image | 49 s | 20 s |
+| 30 s clip | 10.5 s | 6.5 s |
+
+(The short prompt is dominated by the GPU's fixed start-up cost, building its pipelines; the
+GPU pulls ahead as the work grows, except that the phone's attention is far slower than a Mac's.)
+
+Two things the phone does that a desktop does not, and the code now respects both. A mobile GPU's
+hang detector kills a dispatch, or a submission, that runs for seconds: one 13.5k-row attention
+call (about 3.3 s) lost the device, and so did a 13.5k-row pass built as a single command buffer
+(tens of seconds of work). A flash-attention call is therefore issued as several dispatches of at
+most 2048 queries and 2^25 query-key pairs, and a trunk pass over more than 1024 rows submits
+after each chunk phase and each attention dispatch. The flash kernel is on for Adreno and for
+every desktop adapter (`GpuContext::supports_flash_attention`); other Android GPUs keep the older
+kernels until someone checks them.
+
 ## Not done yet
 
 * The Hexagon NPU refuses a bidirectional checkpoint (so `--device npu` reports why), and no
   bidirectional pass is written for it.
-* The flash kernel is head_dim 64 only and is not enabled on Android, where its workgroup memory
-  and register use have not been tried; other head widths and Android use the older kernels.
+* The flash kernel is head_dim 64 only, and on Android only Adreno has been checked (an Adreno
+  830); other head widths and other mobile GPUs use the older kernels.
 * The media prefix (an image's or a clip's) is recomputed through the trunk for every question; it
   depends only on the media, so it could be computed once.
 * `cera run --hf` and the other streaming conversions refuse a d1 checkpoint: download the

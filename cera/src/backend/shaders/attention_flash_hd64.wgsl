@@ -30,16 +30,18 @@
 //   2 v       array<vec4<f32>>   [tokens, n_kv_head * 64]
 //   3 out     array<vec4<f32>>   [tokens, n_head * 64], read_write
 //   4 params  array<u32, 8>      tokens, n_head, head_dim (64), scale_bits, n_kv_head,
-//                                bidir, prefix_rows, 0
+//                                bidir, prefix_rows, first_query_tile
 //
 // A query reads the first `window(row)` keys: all `tokens` of them, or with `bidir` set and a
 // non-zero `prefix_rows`, a query inside the prefix reads only the prefix (a media prefix is a
 // function of the media alone). A causal window is not offered: the causal prefill reads a
 // packed f16 cache and has its own kernel (`attention_prefill.wgsl`).
 //
-// Dispatch: (ceil(tokens / 32), n_head, 1) workgroups of 128 threads. Workgroup memory is about
+// Dispatch: (ceil(tokens / 32), n_head, 1) workgroups of 128 threads, or any run of query tiles
+// of that grid starting at `first_query_tile`. Workgroup memory is about
 // 30 KB, so it is the one workgroup resident per core on Apple GPUs; the staging is cheap enough
-// that this has not mattered.
+// that this has not mattered. On an Adreno 830 it runs at about 0.22 TFLOPS and is correct to 1e-6;
+// a call of seconds there loses the device, so the host issues long calls in short pieces.
 
 const QT: u32 = 32u;
 const KT: u32 = 32u;
@@ -88,7 +90,9 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
     let kv_head = head / (n_head / n_kv);
     let q_stride4 = n_head * 16u;
     let kv_stride4 = n_kv * 16u;
-    let q0 = wid.x * QT;
+    // `params[7]` is the first query tile this dispatch covers, so one attention can be issued as
+    // several short dispatches (a mobile GPU kills a dispatch that runs for seconds)
+    let q0 = (wid.x + params[7]) * QT;
     let last_row = min(q0 + QT - 1u, tokens - 1u);
     let wg_limit = window(last_row, tokens, bidir, prefix);
 

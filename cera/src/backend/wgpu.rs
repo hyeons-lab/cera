@@ -718,6 +718,28 @@ impl GpuContext {
         );
     }
 
+    /// How many 32-query tiles of one flash-attention call to issue per dispatch.
+    ///
+    /// A dispatch that runs for seconds is killed by a mobile GPU's hang detector (an Adreno 830
+    /// lost the device on one 13.5k-row call, about 3.3 s, though 8k rows at 1.2 s was fine), so
+    /// a long call is issued as several short ones. The work of a dispatch is its queries times
+    /// the keys it reads, which is capped at 2^25 (about 0.15 s there), and at most 2048 queries.
+    pub fn flash_attention_tiles_per_dispatch(tokens: usize) -> u32 {
+        const MAX_PAIRS: usize = 1 << 25;
+        const MAX_QUERIES: usize = 2048;
+        let queries = (MAX_PAIRS / tokens.max(1)).clamp(32, MAX_QUERIES);
+        (queries / 32) as u32
+    }
+
+    /// Whether the register-tiled flash attention kernel (`attention_flash_hd64.wgsl`) is known
+    /// to run correctly and fast on this adapter. It is on every desktop adapter; on Android it
+    /// is on for Qualcomm Adreno only, where it was checked on an Adreno 830 (correct to 1e-6
+    /// against a reference up to 8192 rows, about 0.2 TFLOPS), because its 30 KB of workgroup
+    /// memory and register use are not known to suit the other mobile drivers.
+    pub fn supports_flash_attention(&self) -> bool {
+        cfg!(not(target_os = "android")) || self.adapter_name.contains("Adreno")
+    }
+
     /// Create a zeroed GPU buffer with read-write storage usage.
     pub fn create_storage_rw(&self, size: u64, label: &str) -> wgpu::Buffer {
         self.assert_within_max_buffer(size, label);
