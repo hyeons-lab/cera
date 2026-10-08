@@ -9020,60 +9020,104 @@ impl GpuLfmModel {
     ) {
         let head_dim = self.config.head_dim as f32;
         let scale = self.scalars.attn.unwrap_or_else(|| 1.0 / head_dim.sqrt());
-        let params: [u32; 8] = [
-            n,
-            n_heads,
-            self.config.head_dim as u32,
-            scale.to_bits(),
-            n_kv_heads,
-            1,
-            prefix,
-            0,
-        ];
-        let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
-        let entries = [
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: q.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: k.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 2,
-                resource: v.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 3,
-                resource: out.as_entire_binding(),
-            },
-            wgpu::BindGroupEntry {
-                binding: 4,
-                resource: p_buf.as_entire_binding(),
-            },
-        ];
-        let bg = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: Some("attention_flash_hd64"),
-                layout: &self.pipelines.attention_flash_hd64.get_bind_group_layout(0),
-                entries: &entries,
-            });
-        Self::push_prefill_dispatch(
-            cmds,
-            &self.pipelines.attention_flash_hd64,
-            bg,
-            (n.div_ceil(32), n_heads, 1),
-            "attention_flash_hd64",
-        );
+        // one call is several short dispatches over runs of query tiles (see
+        // `GpuContext::flash_attention_tiles_per_dispatch`)
+        let tiles = n.div_ceil(32);
+        let per = GpuContext::flash_attention_tiles_per_dispatch(n as usize);
+        let mut first = 0;
+        while first < tiles {
+            let count = per.min(tiles - first);
+            let params: [u32; 8] = [
+                n,
+                n_heads,
+                self.config.head_dim as u32,
+                scale.to_bits(),
+                n_kv_heads,
+                1,
+                prefix,
+                first,
+            ];
+            let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
+            let entries = [
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: k.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: v.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ];
+            let bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("attention_flash_hd64"),
+                    layout: &self.pipelines.attention_flash_hd64.get_bind_group_layout(0),
+                    entries: &entries,
+                });
+            Self::push_prefill_dispatch(
+                cmds,
+                &self.pipelines.attention_flash_hd64,
+                bg,
+                (count, n_heads, 1),
+                "attention_flash_hd64",
+            );
+            first += count;
+        }
     }
 
-    /// Whether the bidirectional trunk attends with the flash kernel: head_dim 64, and not
-    /// Android (see `use_flash_attention` in the ViT ops).
+    /// Submit what `enc` holds and start a new encoder, when `split` is set.
+    ///
+    /// A long bidirectional pass is tens of seconds of GPU work, and a mobile GPU kills a
+    /// submission that runs for seconds (an Adreno 830 lost the device on a 13.5k-row pass built
+    /// as one command buffer). Submitting in pieces keeps each piece short; the pieces still run
+    /// back to back, in order, on the one queue.
+    fn flush_submit(&self, enc: &mut wgpu::CommandEncoder, split: bool) {
+        if split {
+            let full = std::mem::replace(enc, self.new_encoder());
+            self.ctx.submit_encoder(full);
+        }
+    }
+
+    /// [`Self::emit_prefill_cmds`] for `cmds`, one submission per command when `split` is set:
+    /// for a run of long attention dispatches, each of which is already as long as a submission
+    /// should be.
+    fn emit_each<'a>(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        label: &str,
+        n: u32,
+        split: bool,
+    ) {
+        if !split {
+            self.emit_prefill_cmds(enc, cmds, label, n);
+            return;
+        }
+        for cmd in std::mem::take(cmds) {
+            cmds.push(cmd);
+            self.emit_prefill_cmds(enc, cmds, label, n);
+            self.flush_submit(enc, true);
+        }
+    }
+
+    /// Whether the bidirectional trunk attends with the flash kernel: head_dim 64 on an adapter
+    /// that runs it (see `GpuContext::supports_flash_attention`).
     fn uses_flash_attention(&self) -> bool {
-        self.config.head_dim == 64 && cfg!(not(target_os = "android"))
+        self.config.head_dim == 64 && self.ctx.supports_flash_attention()
     }
 
     /// Dispatch a `bidirectional.wgsl` kernel over `elements` threads (a 2-D grid, since a
@@ -9229,6 +9273,8 @@ impl GpuLfmModel {
         let mut enc = self.new_encoder();
         let mut cmds: Vec<PrefillCmd> = Vec::new();
         let (hs_u, is_u) = (hs as u32, is as u32);
+        // past a thousand rows a pass is long enough to need submitting in pieces
+        let split = n > 1024;
         let chunks: Vec<(usize, usize)> = (0..n)
             .step_by(chunk_cap)
             .map(|r0| (r0, chunk_cap.min(n - r0)))
@@ -9350,6 +9396,7 @@ impl GpuLfmModel {
                     cmds.push(copy_rows(&self.prefill_proj_buf, 0, &buf_a, r0, m, q_dim));
                 }
                 self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("{label}a"), m_u);
+                self.flush_submit(&mut enc, split);
             }
 
             // Across rows.
@@ -9402,7 +9449,7 @@ impl GpuLfmModel {
                     );
                 }
             }
-            self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("{label}x"), n as u32);
+            self.emit_each(&mut enc, &mut cmds, &format!("{label}x"), n as u32, split);
 
             // Per chunk: output projection, residual, feed-forward.
             for &(r0, m) in &chunks {
@@ -9480,6 +9527,7 @@ impl GpuLfmModel {
                 );
                 cmds.push(copy_rows(&self.prefill_batch_buf, 0, &h_big, r0, m, hs));
                 self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("{label}b"), m_u);
+                self.flush_submit(&mut enc, split);
             }
         }
 
@@ -9503,6 +9551,7 @@ impl GpuLfmModel {
                 (r0 * hs) as u64,
                 (m * hs) as u64,
             );
+            self.flush_submit(&mut enc, split);
         }
         self.submit_and_wait(enc);
         self.ctx.download_f32(&buf_a, n * hs)

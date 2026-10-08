@@ -865,12 +865,12 @@ pub enum WgpuVitWeight {
     },
 }
 
-/// Whether [`WgpuVitOps`] attends with the register-tiled flash kernel
-/// (`attention_flash_hd64.wgsl`): head_dim 64, and not Android, where its workgroup memory and
-/// register use have not been validated on the Adreno and Mali drivers.
+/// Whether an adapter attends with the register-tiled flash kernel
+/// (`attention_flash_hd64.wgsl`): head_dim 64 on an adapter that is known to run it
+/// ([`crate::backend::wgpu::GpuContext::supports_flash_attention`]).
 #[cfg(feature = "gpu")]
-fn use_flash_attention(head_dim: usize) -> bool {
-    head_dim == 64 && cfg!(not(target_os = "android"))
+fn use_flash_attention(ctx: &crate::backend::wgpu::GpuContext, head_dim: usize) -> bool {
+    head_dim == 64 && ctx.supports_flash_attention()
 }
 
 /// How [`WgpuVitOps::dispatch_elements`] binds one buffer of an elementwise kernel.
@@ -1324,7 +1324,9 @@ impl VitGpuOps for WgpuVitOps {
     fn attention_token_limit(&self, head_dim: usize) -> usize {
         // the flash and query-tiled kernels (every desktop adapter) stream K/V; the scalar one
         // does not
-        if use_flash_attention(head_dim) || (cfg!(not(target_os = "android")) && head_dim <= 64) {
+        if use_flash_attention(&self.ctx, head_dim)
+            || (cfg!(not(target_os = "android")) && head_dim <= 64)
+        {
             usize::MAX
         } else {
             MAX_VIT_TOKENS
@@ -1370,26 +1372,34 @@ impl VitGpuOps for WgpuVitOps {
         const VIT_ATTN_TILED_Q: u32 = 256;
         const VIT_ATTN_TILED_MAX_HEAD_DIM: usize = 64;
         let use_tiled = cfg!(not(target_os = "android")) && head_dim <= VIT_ATTN_TILED_MAX_HEAD_DIM;
-        if use_flash_attention(head_dim) {
-            // tokens, n_head, head_dim, scale, n_kv_head (every head has its own), no window
-            let flash: [u32; 8] = [
-                tokens as u32,
-                n_head as u32,
-                head_dim as u32,
-                scale.to_bits(),
-                n_head as u32,
-                0,
-                0,
-                0,
-            ];
-            let flash_buf = self
-                .ctx
-                .upload_storage(bytemuck::cast_slice(&flash), "vit_attn_flash_params");
-            self.dispatch(
-                &self.p_attn_flash,
-                &[q, k, v, &out, &flash_buf],
-                ((tokens as u32).div_ceil(32), n_head as u32, 1),
-            );
+        if use_flash_attention(&self.ctx, head_dim) {
+            // tokens, n_head, head_dim, scale, n_kv_head (every head has its own), no window, and
+            // the first query tile of the dispatch; a long call is several short dispatches
+            let tiles = (tokens as u32).div_ceil(32);
+            let per = crate::backend::wgpu::GpuContext::flash_attention_tiles_per_dispatch(tokens);
+            let mut first = 0;
+            while first < tiles {
+                let count = per.min(tiles - first);
+                let flash: [u32; 8] = [
+                    tokens as u32,
+                    n_head as u32,
+                    head_dim as u32,
+                    scale.to_bits(),
+                    n_head as u32,
+                    0,
+                    0,
+                    first,
+                ];
+                let flash_buf = self
+                    .ctx
+                    .upload_storage(bytemuck::cast_slice(&flash), "vit_attn_flash_params");
+                self.dispatch(
+                    &self.p_attn_flash,
+                    &[q, k, v, &out, &flash_buf],
+                    (count, n_head as u32, 1),
+                );
+                first += count;
+            }
         } else if use_tiled {
             self.dispatch(
                 &self.p_attn_tiled,
@@ -1997,31 +2007,26 @@ pub fn build_vit_stack(
     let _ = spec;
     match backend {
         BP::Metal => try_metal_stack(spec),
-        BP::Gpu => try_wgpu_stack(spec),
-        BP::Auto => try_metal_stack(spec).or_else(|| try_wgpu_stack(spec)),
+        BP::Gpu => try_wgpu_stack(spec, false),
+        BP::Auto => try_metal_stack(spec).or_else(|| try_wgpu_stack(spec, false)),
         BP::Cpu | BP::Hexagon | BP::Npu => None,
     }
 }
 
 /// [`build_vit_stack`] for a stack that sees long sequences, which only pays on a GPU whose
-/// attention is fast: Metal, or wgpu where it has the register-tiled flash kernel (head_dim 64,
-/// not Android). The scalar wgpu attention kernels are slower than the host's blocked kernel on a
-/// long sequence, so there this returns `None` and the caller stays on the host.
+/// attention is fast: Metal, or wgpu where the adapter runs the register-tiled flash kernel
+/// (head_dim 64, see [`crate::backend::wgpu::GpuContext::supports_flash_attention`]). The scalar
+/// wgpu attention kernels are slower than the host's blocked kernel on a long sequence, so
+/// elsewhere this returns `None` and the caller stays on the host.
 pub fn build_vit_stack_fast(
     spec: &VitStackSpec,
     backend: crate::engine::BackendPreference,
 ) -> Option<std::sync::Arc<dyn VitStack>> {
     use crate::engine::BackendPreference as BP;
-    #[cfg(feature = "gpu")]
-    let wgpu_is_fast = use_flash_attention(spec.width / spec.heads.max(1));
-    #[cfg(not(feature = "gpu"))]
-    let wgpu_is_fast = false;
     match backend {
         BP::Metal => try_metal_stack(spec),
-        BP::Gpu => wgpu_is_fast.then(|| try_wgpu_stack(spec)).flatten(),
-        BP::Auto => {
-            try_metal_stack(spec).or_else(|| wgpu_is_fast.then(|| try_wgpu_stack(spec)).flatten())
-        }
+        BP::Gpu => try_wgpu_stack(spec, true),
+        BP::Auto => try_metal_stack(spec).or_else(|| try_wgpu_stack(spec, true)),
         BP::Cpu | BP::Hexagon | BP::Npu => None,
     }
 }
@@ -2038,15 +2043,19 @@ fn try_metal_stack(_spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>>
     None
 }
 
+/// A wgpu stack; with `need_flash`, only on an adapter that attends with the flash kernel.
 #[cfg(feature = "gpu")]
-fn try_wgpu_stack(spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
+fn try_wgpu_stack(spec: &VitStackSpec, need_flash: bool) -> Option<std::sync::Arc<dyn VitStack>> {
     let ctx = crate::backend::wgpu::GpuContext::new().ok()?;
+    if need_flash && !use_flash_attention(&ctx, spec.width / spec.heads.max(1)) {
+        return None;
+    }
     let ops = WgpuVitOps::new(ctx).ok()?;
     Some(std::sync::Arc::new(GpuStack::build(ops, spec)))
 }
 
 #[cfg(not(feature = "gpu"))]
-fn try_wgpu_stack(_spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
+fn try_wgpu_stack(_spec: &VitStackSpec, _need_flash: bool) -> Option<std::sync::Arc<dyn VitStack>> {
     None
 }
 
@@ -2356,17 +2365,25 @@ mod tests {
 
     /// The register-tiled flash kernel (head_dim 64) against a direct f64 softmax-attention, over
     /// token counts that are and are not a multiple of its 32-query and 32-key tiles.
-    #[cfg(all(feature = "gpu", not(target_os = "android")))]
+    #[cfg(feature = "gpu")]
     #[test]
     fn wgpu_flash_attention_matches_the_definition() {
         let ctx = match crate::backend::wgpu::GpuContext::new() {
             Ok(ctx) => ctx,
             Err(_) => return, // no GPU (CI)
         };
+        if !ctx.supports_flash_attention() {
+            eprintln!(
+                "SKIPPED: {} does not run the flash kernel",
+                ctx.adapter_name
+            );
+            return;
+        }
         let ops = WgpuVitOps::new(ctx).expect("build wgpu vit ops");
-        let (heads, hd) = (16usize, 64usize);
+        let (heads, hd) = (4usize, 64usize);
         let dim = heads * hd;
-        for n in [1usize, 5, 31, 32, 33, 257, 1100] {
+        // 2100 tokens is 66 query tiles: past the 64 one dispatch covers, so the call splits
+        for n in [1usize, 5, 31, 32, 33, 257, 1100, 2100] {
             let (q, k, v) = (rnd(n * dim, 1), rnd(n * dim, 2), rnd(n * dim, 3));
             let want = {
                 let scale = (hd as f64).powf(-0.5);
