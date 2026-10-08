@@ -231,11 +231,13 @@ impl D1Model {
         })
     }
 
-    /// Run the vision and speech towers on the GPU `backend` names, where there is one. The
-    /// trunk follows the session's own backend; this is for the encoders in front of it, which
-    /// are most of the time of a request that carries media. Does nothing for the CPU, for a
+    /// Run the decision head and the vision and speech towers on the GPU `backend` names, where
+    /// there is one. The trunk follows the session's own backend; this is for the encoders in
+    /// front of it, which are most of the time of a request that carries media, and the head
+    /// behind it, which is most of the time of a long text prompt. Does nothing for the CPU, for a
     /// device that will not open, or for a tower the model lacks.
     pub fn accelerate(&mut self, gguf: &Arc<GgufFile>, backend: BackendPreference) {
+        self.head.accelerate(gguf, backend);
         if let Some(vision) = &mut self.vision {
             vision.accelerate(gguf, backend);
         }

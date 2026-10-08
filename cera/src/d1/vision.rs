@@ -19,7 +19,9 @@ use crate::backend::cpu;
 use crate::engine::BackendPreference;
 use crate::gguf::GgufFile;
 use crate::model::pii::matmul_nt_f32;
-use crate::model::vision_encoder_gpu::{VitStack, VitStackBlock, VitStackSpec, build_vit_stack};
+use crate::model::vision_encoder_gpu::{
+    VitStack, VitStackActivation, VitStackBlock, VitStackSpec, build_vit_stack,
+};
 use crate::model::weights::MmapWeight;
 use crate::par::*;
 
@@ -548,9 +550,9 @@ impl VisionTower {
             heads: self.heads,
             ffn: ff,
             eps: self.eps,
+            activation: VitStackActivation::GeluTanh,
             blocks,
-            post_w: self.post_w.clone(),
-            post_b: self.post_b.clone(),
+            post: Some((self.post_w.clone(), self.post_b.clone())),
         })
     }
 

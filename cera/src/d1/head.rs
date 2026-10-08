@@ -21,9 +21,16 @@
 
 use anyhow::{Context, Result, ensure};
 
+use std::sync::Arc;
+
 use crate::backend::cpu;
+use crate::engine::BackendPreference;
 use crate::gguf::GgufFile;
 use crate::model::pii::matmul_nt_f32;
+use crate::model::vision_encoder_gpu::{
+    VitStack, VitStackActivation, VitStackBlock, VitStackSpec, build_vit_stack_native,
+};
+use crate::model::weights::MmapWeight;
 use crate::par::*;
 
 /// Number of question types (`choice`, `score`, `noul`).
@@ -60,6 +67,8 @@ pub struct Head {
     cls_b: Vec<f32>,
     out_w: Vec<f32>,
     out_b: f32,
+    /// The transformer layers on a GPU, when [`Head::accelerate`] found one.
+    gpu: Option<Arc<dyn VitStack>>,
 }
 
 fn tensor(gguf: &GgufFile, name: &str, elements: usize) -> Result<Vec<f32>> {
@@ -135,6 +144,94 @@ impl Head {
             cls_b: tensor(gguf, "d1.cls.bias", d)?,
             out_w: tensor(gguf, "d1.cls.output.weight", d)?,
             out_b,
+            gpu: None,
+        })
+    }
+
+    /// Run the transformer layers on the GPU `backend` names, when it is Metal (see
+    /// [`build_vit_stack_native`]: on wgpu the host is faster). The scorer (a LayerNorm, one linear
+    /// and a GELU on a handful of rows) stays on the host. A pass the device cannot take (more
+    /// rows than its buffers hold) runs on the host as before.
+    pub fn accelerate(&mut self, gguf: &Arc<GgufFile>, backend: BackendPreference) {
+        if backend == BackendPreference::Cpu || self.layers.is_empty() {
+            return;
+        }
+        let from_file = |i: usize, name: &str, rows: usize, cols: usize| -> Result<MmapWeight> {
+            let tensor = format!("d1.blk.{i}.{name}.weight");
+            let w = MmapWeight::from_gguf(gguf, &tensor)
+                .with_context(|| format!("the head needs the tensor `{tensor}`"))?;
+            ensure!(
+                w.rows == rows && w.cols == cols,
+                "`{tensor}` is {} x {}, expected {rows} x {cols}",
+                w.rows,
+                w.cols
+            );
+            Ok(w)
+        };
+        match self.stack_spec(from_file) {
+            Ok(spec) => self.gpu = build_vit_stack_native(&spec, backend),
+            Err(e) => tracing::warn!("the d1 head stays on the CPU: {e:#}"),
+        }
+    }
+
+    /// Whether the transformer layers run on a GPU.
+    pub fn is_accelerated(&self) -> bool {
+        self.gpu.is_some()
+    }
+
+    /// The layers as a GPU stack takes them. The packed `in_proj` becomes three linears (the
+    /// query, key and value rows of one tensor, copied out whole so a quantized tensor stays
+    /// quantized); `weight(layer, name)` supplies a layer's linear weight.
+    fn stack_spec(
+        &self,
+        weight: impl Fn(usize, &str, usize, usize) -> Result<MmapWeight>,
+    ) -> Result<VitStackSpec> {
+        let (d, ff) = (self.n_embd, self.ffn);
+        // rows `from..to` of a row-major tensor, as a weight of their own
+        let rows_of = |w: &MmapWeight, from: usize, to: usize| -> Result<MmapWeight> {
+            ensure!(
+                w.cols.is_multiple_of(w.dtype.block_size()),
+                "a {:?} row is not a whole number of blocks",
+                w.dtype
+            );
+            let row_bytes = w.cols / w.dtype.block_size() * w.dtype.block_bytes();
+            Ok(MmapWeight::from_owned_bytes(
+                w.data()[from * row_bytes..to * row_bytes].to_vec(),
+                w.dtype,
+                to - from,
+                w.cols,
+            ))
+        };
+        let mut blocks = Vec::with_capacity(self.layers.len());
+        for (i, l) in self.layers.iter().enumerate() {
+            let qkv = weight(i, "attn_qkv", 3 * d, d)?;
+            blocks.push(VitStackBlock {
+                ln1_w: l.attn_norm_w.clone(),
+                ln1_b: l.attn_norm_b.clone(),
+                q: rows_of(&qkv, 0, d)?,
+                q_b: l.qkv_b[..d].to_vec(),
+                k: rows_of(&qkv, d, 2 * d)?,
+                k_b: l.qkv_b[d..2 * d].to_vec(),
+                v: rows_of(&qkv, 2 * d, 3 * d)?,
+                v_b: l.qkv_b[2 * d..].to_vec(),
+                o: weight(i, "attn_output", d, d)?,
+                o_b: l.out_b.clone(),
+                ln2_w: l.ffn_norm_w.clone(),
+                ln2_b: l.ffn_norm_b.clone(),
+                up: weight(i, "ffn_up", ff, d)?,
+                up_b: l.up_b.clone(),
+                down: weight(i, "ffn_down", d, ff)?,
+                down_b: l.down_b.clone(),
+            });
+        }
+        Ok(VitStackSpec {
+            width: d,
+            heads: self.n_heads,
+            ffn: ff,
+            eps: self.eps,
+            activation: VitStackActivation::Relu,
+            blocks,
+            post: None,
         })
     }
 
@@ -169,15 +266,27 @@ impl Head {
                 *v += t;
             }
         }
-        // every layer but the last continues over all rows; the last keeps the markers alone
-        for (li, layer) in self.layers.iter().enumerate() {
-            let only = (li + 1 == self.layers.len()).then_some(markers);
-            self.layer(layer, &mut x, n, only);
+        let mut on_gpu = None;
+        if let Some(gpu) = &self.gpu {
+            match gpu.run(&x, n) {
+                Ok(y) => on_gpu = Some(y),
+                Err(e) => tracing::warn!("the d1 head runs on the CPU for {n} rows: {e:#}"),
+            }
         }
-        let rows: Vec<&[f32]> = if self.layers.is_empty() {
-            markers.iter().map(|&m| &x[m * d..(m + 1) * d]).collect()
+        let rows: Vec<&[f32]> = if let Some(y) = &on_gpu {
+            // the GPU ran every layer over every row
+            markers.iter().map(|&m| &y[m * d..(m + 1) * d]).collect()
         } else {
-            x.chunks_exact(d).collect()
+            // every layer but the last continues over all rows; the last keeps the markers alone
+            for (li, layer) in self.layers.iter().enumerate() {
+                let only = (li + 1 == self.layers.len()).then_some(markers);
+                self.layer(layer, &mut x, n, only);
+            }
+            if self.layers.is_empty() {
+                markers.iter().map(|&m| &x[m * d..(m + 1) * d]).collect()
+            } else {
+                x.chunks_exact(d).collect()
+            }
         };
         let mut scores = Vec::with_capacity(markers.len());
         for row in rows {
@@ -453,6 +562,7 @@ mod tests {
             cls_b: zeros(d),
             out_w: ones(d),
             out_b: 0.25,
+            gpu: None,
         }
     }
 
@@ -477,6 +587,97 @@ mod tests {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
             assert!(worst < 2e-4, "n={n}: worst {worst}");
+        }
+    }
+
+    fn noise(n: usize, seed: usize, scale: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| ((((i + seed) * 1_103_515_245 + 12_345) % 2000) as f32 / 1000.0 - 1.0) * scale)
+            .collect()
+    }
+
+    /// A head with two real layers: 128 wide, two heads of 64, deterministic weights.
+    fn busy_head() -> Head {
+        let (d, ffn) = (2 * HEAD_DIM, 256usize);
+        let layer = |s: usize| Layer {
+            attn_norm_w: noise(d, s, 0.1).iter().map(|v| v + 1.0).collect(),
+            attn_norm_b: noise(d, s + 1, 0.1),
+            qkv_w: noise(3 * d * d, s + 2, 0.15),
+            qkv_b: noise(3 * d, s + 3, 0.1),
+            out_w: noise(d * d, s + 4, 0.15),
+            out_b: noise(d, s + 5, 0.1),
+            ffn_norm_w: noise(d, s + 6, 0.1).iter().map(|v| v + 1.0).collect(),
+            ffn_norm_b: noise(d, s + 7, 0.1),
+            up_w: noise(ffn * d, s + 8, 0.15),
+            up_b: noise(ffn, s + 9, 0.1),
+            down_w: noise(d * ffn, s + 10, 0.15),
+            down_b: noise(d, s + 11, 0.1),
+        };
+        Head {
+            n_embd: d,
+            n_heads: 2,
+            ffn,
+            eps: 1e-5,
+            types: noise(TYPES * d, 7, 0.2),
+            layers: vec![layer(100), layer(200)],
+            cls_norm_w: noise(d, 8, 0.1).iter().map(|v| v + 1.0).collect(),
+            cls_norm_b: noise(d, 9, 0.1),
+            cls_w: noise(d * d, 10, 0.15),
+            cls_b: noise(d, 11, 0.1),
+            out_w: noise(d, 12, 0.3),
+            out_b: 0.1,
+            gpu: None,
+        }
+    }
+
+    /// The layers on a GPU score what the host layers do, over a row count that is not a
+    /// multiple of the attention tile and with markers anywhere (the host skips all but the
+    /// markers in the last layer, the GPU computes every row).
+    #[test]
+    fn the_gpu_layers_match_the_host_layers() {
+        let mut head = busy_head();
+        let d = head.n_embd;
+        let owned = |w: &[f32], rows: usize, cols: usize| {
+            MmapWeight::from_owned_bytes(
+                w.iter().flat_map(|v| v.to_le_bytes()).collect(),
+                crate::tensor::DType::F32,
+                rows,
+                cols,
+            )
+        };
+        let spec = head
+            .stack_spec(|i, name, rows, cols| {
+                let l = &head.layers[i];
+                let w = match name {
+                    "attn_qkv" => &l.qkv_w,
+                    "attn_output" => &l.out_w,
+                    "ffn_up" => &l.up_w,
+                    "ffn_down" => &l.down_w,
+                    other => panic!("{other}"),
+                };
+                assert_eq!(w.len(), rows * cols);
+                Ok(owned(w, rows, cols))
+            })
+            .unwrap();
+        let Some(gpu) = build_vit_stack_native(&spec, BackendPreference::Auto) else {
+            eprintln!("SKIPPED: no Metal device is available");
+            return;
+        };
+        for n in [3usize, 40, 300, 777] {
+            let hidden = noise(n * d, 5, 1.0);
+            let markers = [0, n / 3, n - 1];
+            for kind in 0..TYPES {
+                head.gpu = None;
+                let want = head.scores(&hidden, n, kind, &markers).unwrap();
+                head.gpu = Some(gpu.clone());
+                let got = head.scores(&hidden, n, kind, &markers).unwrap();
+                for (w, g) in want.iter().zip(&got) {
+                    assert!(
+                        (w - g).abs() < 2e-3 * (1.0 + w.abs()),
+                        "n={n} type={kind}: {w} vs {g}"
+                    );
+                }
+            }
         }
     }
 

@@ -143,6 +143,20 @@ pub trait VitGpuOps {
         head_dim: usize,
     ) -> Self::Buf;
 
+    /// In-place ReLU over `len` elements.
+    fn relu(&self, x: &Self::Buf, len: usize);
+
+    /// The most tokens [`Self::attention`] takes at this `head_dim`. The flash kernels have no
+    /// limit; the scalar fallbacks keep one query's scores in workgroup memory.
+    fn attention_token_limit(&self, _head_dim: usize) -> usize {
+        MAX_VIT_TOKENS
+    }
+
+    /// The largest single buffer a pass may ask for, in bytes.
+    fn max_buffer_bytes(&self) -> u64 {
+        u64::MAX
+    }
+
     /// In-place residual add: `dst[i] += src[i]` over `len` elements.
     fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize);
 
@@ -913,6 +927,7 @@ impl WgpuVitOps {
                     "vit_layernorm",
                 ),
                 p_gelu: ctx.create_pipeline(shaders::GELU, "gelu_inplace", "vit_gelu"),
+                p_relu: ctx.create_pipeline(shaders::ACTIVATIONS, "relu_inplace", "vit_relu"),
                 p_attn: ctx.create_pipeline(
                     shaders::VIT_ATTENTION,
                     "vit_attention",
@@ -972,6 +987,78 @@ impl WgpuVitOps {
             pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
         }
         self.ctx.submit_encoder(enc);
+    }
+
+    /// An elementwise kernel over `len` elements, one thread each, split into dispatches of at
+    /// most 65535 workgroups (the per-dimension limit) when it is longer than 16.7M elements:
+    /// the feed-forward intermediate of a few thousand tokens already is. `binds` are in binding
+    /// order; a `Ranged` buffer is bound at the chunk's element offset (a multiple of 64
+    /// elements, the storage-offset alignment), a `Whole` one as is, and `Params` takes
+    /// `params(chunk_elements)`. `unit` keeps chunk boundaries on whole rows for kernels that
+    /// index by `i % dim`.
+    fn dispatch_elements(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        binds: &[ElementBind<'_>],
+        len: usize,
+        unit: usize,
+        params: impl Fn(u32) -> Vec<u32>,
+    ) {
+        const MAX_GROUPS: usize = 65535;
+        const OFFSET_ALIGN_ELEMS: usize = 64;
+        let unit = unit.max(1);
+        let step = unit.div_ceil(gcd(unit, OFFSET_ALIGN_ELEMS)) * OFFSET_ALIGN_ELEMS;
+        // the largest chunk that is a whole number of steps and fits the dispatch limit
+        let chunk = ((MAX_GROUPS * 256) / step).max(1) * step;
+        let mut offset = 0usize;
+        while offset < len {
+            let n = chunk.min(len - offset);
+            let p_buf = self.ctx.upload_storage(
+                bytemuck::cast_slice(&params(n as u32)),
+                "vit_elementwise_params",
+            );
+            let entries: Vec<wgpu::BindGroupEntry> = binds
+                .iter()
+                .enumerate()
+                .map(|(i, b)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: match b {
+                        ElementBind::Whole(buf) => buf.as_entire_binding(),
+                        ElementBind::Ranged(buf) => {
+                            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: buf,
+                                offset: (offset * 4) as u64,
+                                size: wgpu::BufferSize::new(((n * 4) as u64).max(4)),
+                            })
+                        }
+                        ElementBind::Params => p_buf.as_entire_binding(),
+                    },
+                })
+                .collect();
+            let bind_group = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &pipeline.get_bind_group_layout(0),
+                    entries: &entries,
+                });
+            let mut enc = self
+                .ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+            {
+                let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                    label: None,
+                    timestamp_writes: None,
+                });
+                pass.set_pipeline(pipeline);
+                pass.set_bind_group(0, &bind_group, &[]);
+                pass.dispatch_workgroups((n as u32).div_ceil(256), 1, 1);
+            }
+            self.ctx.submit_encoder(enc);
+            offset += n;
+        }
     }
 
     /// Quantized `y[tokens, out_dim] = x[tokens, in_dim] · wᵀ` via the
@@ -1095,15 +1182,16 @@ impl VitGpuOps for WgpuVitOps {
     }
 
     fn bias_add(&self, x: &Self::Buf, bias: &Self::Buf, rows: usize, dim: usize) {
-        let total = (rows * dim) as u32;
-        let params: [u32; 2] = [total, dim as u32];
-        let p_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&params), "vit_bias_params");
-        self.dispatch(
+        self.dispatch_elements(
             &self.p_bias,
-            &[x, bias, &p_buf],
-            (total.div_ceil(256), 1, 1),
+            &[
+                ElementBind::Ranged(x),
+                ElementBind::Whole(bias),
+                ElementBind::Params,
+            ],
+            rows * dim,
+            dim,
+            |n| vec![n, dim as u32],
         );
     }
 
@@ -1134,15 +1222,36 @@ impl VitGpuOps for WgpuVitOps {
     }
 
     fn gelu(&self, x: &Self::Buf, len: usize) {
-        let params: [u32; 2] = [len as u32, 0];
-        let p_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&params), "vit_gelu_params");
-        self.dispatch(
+        self.dispatch_elements(
             &self.p_gelu,
-            &[x, &p_buf],
-            ((len as u32).div_ceil(256), 1, 1),
+            &[ElementBind::Ranged(x), ElementBind::Params],
+            len,
+            1,
+            |n| vec![n, 0],
         );
+    }
+
+    fn relu(&self, x: &Self::Buf, len: usize) {
+        self.dispatch_elements(
+            &self.p_relu,
+            &[ElementBind::Ranged(x), ElementBind::Params],
+            len,
+            1,
+            |n| vec![n, 0],
+        );
+    }
+
+    fn attention_token_limit(&self, head_dim: usize) -> usize {
+        // the query-tiled kernel (every desktop adapter) streams K/V; the scalar one does not
+        if cfg!(not(target_os = "android")) && head_dim <= 64 {
+            usize::MAX
+        } else {
+            MAX_VIT_TOKENS
+        }
+    }
+
+    fn max_buffer_bytes(&self) -> u64 {
+        self.ctx.max_storage_buffer_binding_size
     }
 
     fn attention(
@@ -1197,14 +1306,16 @@ impl VitGpuOps for WgpuVitOps {
     }
 
     fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize) {
-        let params: [u32; 2] = [len as u32, 0];
-        let p_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&params), "vit_add_params");
-        self.dispatch(
+        self.dispatch_elements(
             &self.p_add,
-            &[dst, src, &p_buf],
-            ((len as u32).div_ceil(256), 1, 1),
+            &[
+                ElementBind::Ranged(dst),
+                ElementBind::Ranged(src),
+                ElementBind::Params,
+            ],
+            len,
+            1,
+            |n| vec![n, 0],
         );
     }
 
@@ -1246,6 +1357,7 @@ pub struct MetalVitOps {
     p_bias: metal::ComputePipelineState,
     p_layernorm: metal::ComputePipelineState,
     p_gelu: metal::ComputePipelineState,
+    p_relu: metal::ComputePipelineState,
     p_attn: metal::ComputePipelineState,
     p_attn_mma: metal::ComputePipelineState,
     p_attn_mma_hd64: metal::ComputePipelineState,
@@ -1261,6 +1373,7 @@ impl MetalVitOps {
             p_bias: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add")?,
             p_layernorm: ctx.create_pipeline(shaders::LAYERNORM_BATCH, "layernorm_batch")?,
             p_gelu: ctx.create_pipeline(shaders::GELU, "gelu_inplace")?,
+            p_relu: ctx.create_pipeline(shaders::ACTIVATIONS, "relu_inplace")?,
             p_attn: ctx.create_pipeline(shaders::VIT_ATTENTION, "vit_attention")?,
             p_attn_mma: ctx.create_pipeline(shaders::VIT_ATTENTION_MMA, "vit_attention_mma")?,
             p_attn_mma_hd64: ctx
@@ -1396,6 +1509,29 @@ impl VitGpuOps for MetalVitOps {
             metal::MTLSize::new((len as u64).div_ceil(256), 1, 1),
             metal::MTLSize::new(256, 1, 1),
         );
+    }
+
+    fn relu(&self, x: &Self::Buf, len: usize) {
+        self.ctx.run_kernel(
+            &self.p_relu,
+            &[x],
+            &ElementwiseParams::new(len as u32),
+            metal::MTLSize::new((len as u64).div_ceil(256), 1, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+    }
+
+    fn attention_token_limit(&self, head_dim: usize) -> usize {
+        // the flash MMA kernel streams K/V; the scalar fallback does not
+        if head_dim.is_multiple_of(8) && head_dim <= 128 {
+            usize::MAX
+        } else {
+            MAX_VIT_TOKENS
+        }
+    }
+
+    fn max_buffer_bytes(&self) -> u64 {
+        self.ctx.device.max_buffer_length()
     }
 
     fn attention(
@@ -1553,28 +1689,40 @@ pub struct VitStackBlock {
     pub down_b: Vec<f32>,
 }
 
-/// A stack of ViT blocks and the final LayerNorm: everything between the position-embedded patch
-/// tokens and the tokens the projector reads. The tanh GELU, LayerNorm and unmasked attention
-/// are those of [`encode_image_gpu`]; only where the weights come from differs, so a model whose
-/// patch embedding, positions or projector differ from LFM2-VL's can still use it.
+/// A stack of pre-norm transformer blocks and an optional final LayerNorm: for the ViT, everything
+/// between the position-embedded patch tokens and the tokens the projector reads. LayerNorm and
+/// unmasked attention are those of [`encode_image_gpu`]; only where the weights come from and the
+/// feed-forward activation differ, so a model whose patch embedding, positions or projector
+/// differ from LFM2-VL's can still use it, and so can a decision head with ReLU blocks.
 pub struct VitStackSpec {
     pub width: usize,
     pub heads: usize,
     pub ffn: usize,
     pub eps: f32,
+    /// What sits between a block's two feed-forward projections.
+    pub activation: VitStackActivation,
     pub blocks: Vec<VitStackBlock>,
-    pub post_w: Vec<f32>,
-    pub post_b: Vec<f32>,
+    /// The final LayerNorm's weight and bias, when the stack ends in one.
+    pub post: Option<(Vec<f32>, Vec<f32>)>,
+}
+
+/// The feed-forward activation of a [`VitStackSpec`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VitStackActivation {
+    /// The tanh approximation SigLIP and the other ViTs use.
+    GeluTanh,
+    /// The plain rectifier of `torch.nn.TransformerEncoderLayer`'s default.
+    Relu,
 }
 
 /// A [`VitStackSpec`] uploaded to a GPU, ready to run.
 pub trait VitStack: Send + Sync {
-    /// Run the blocks and the final LayerNorm over `tokens` rows of `x` (`[tokens, width]`).
+    /// Run the blocks (and the final LayerNorm, if any) over `tokens` rows of `x` (`[tokens, width]`).
     ///
     /// # Errors
     ///
-    /// Fails when `tokens` is over what the attention kernel holds ([`MAX_VIT_TOKENS`]) or the
-    /// device faults; the caller falls back to the CPU.
+    /// Fails when `tokens` is over what the attention kernel holds or a pass needs a buffer the
+    /// device cannot make, or the device faults; the caller falls back to the CPU.
     fn run(&self, x: &[f32], tokens: usize) -> Result<Vec<f32>>;
 }
 
@@ -1611,9 +1759,9 @@ struct GpuStack<O: VitGpuOps> {
     heads: usize,
     ffn: usize,
     eps: f32,
+    activation: VitStackActivation,
     blocks: Vec<StackBlock<O>>,
-    post_w: O::Buf,
-    post_b: O::Buf,
+    post: Option<(O::Buf, O::Buf)>,
 }
 
 #[cfg(any(
@@ -1649,9 +1797,12 @@ impl<O: VitGpuOps> GpuStack<O> {
             heads: spec.heads,
             ffn: spec.ffn,
             eps: spec.eps,
+            activation: spec.activation,
             blocks,
-            post_w: ops.upload(&spec.post_w),
-            post_b: ops.upload(&spec.post_b),
+            post: spec
+                .post
+                .as_ref()
+                .map(|(w, b)| (ops.upload(w), ops.upload(b))),
             ops,
         }
     }
@@ -1664,9 +1815,18 @@ impl<O: VitGpuOps> GpuStack<O> {
             "{} values are not {n} tokens of {d}",
             x.len()
         );
+        let limit = ops.attention_token_limit(d / self.heads);
         anyhow::ensure!(
-            n <= MAX_VIT_TOKENS,
-            "{n} tokens exceeds GPU MAX_VIT_TOKENS ({MAX_VIT_TOKENS}); caller should fall back to CPU"
+            n <= limit,
+            "{n} tokens exceeds the GPU attention limit ({limit}); caller should fall back to CPU"
+        );
+        // the widest tensor of a pass is the feed-forward's intermediate
+        let widest = (n * ff.max(3 * d) * 4) as u64;
+        anyhow::ensure!(
+            widest <= ops.max_buffer_bytes(),
+            "a {n}-token pass needs a {widest} byte buffer, more than the device allows ({}); \
+             caller should fall back to CPU",
+            ops.max_buffer_bytes()
         );
         let tokens = ops.upload(x);
         for b in &self.blocks {
@@ -1684,12 +1844,18 @@ impl<O: VitGpuOps> GpuStack<O> {
             let normed = ops.layernorm(&tokens, &b.ln2_w, &b.ln2_b, self.eps, n, d);
             let mid = ops.linear(&normed, &b.up, n, ff, d);
             ops.bias_add(&mid, &b.up_b, n, ff);
-            ops.gelu(&mid, n * ff);
+            match self.activation {
+                VitStackActivation::GeluTanh => ops.gelu(&mid, n * ff),
+                VitStackActivation::Relu => ops.relu(&mid, n * ff),
+            }
             let down = ops.linear(&mid, &b.down, n, d, ff);
             ops.bias_add(&down, &b.down_b, n, d);
             ops.add(&tokens, &down, n * d);
         }
-        let out = ops.layernorm(&tokens, &self.post_w, &self.post_b, self.eps, n, d);
+        let out = match &self.post {
+            Some((w, b)) => ops.layernorm(&tokens, w, b, self.eps, n, d),
+            None => tokens,
+        };
         Ok(ops.download(&out, n * d))
     }
 }
@@ -1733,6 +1899,20 @@ pub fn build_vit_stack(
         BP::Gpu => try_wgpu_stack(spec),
         BP::Auto => try_metal_stack(spec).or_else(|| try_wgpu_stack(spec)),
         BP::Cpu | BP::Hexagon | BP::Npu => None,
+    }
+}
+
+/// [`build_vit_stack`] for a stack that only pays on a GPU with matrix units: `Metal`, or `Auto`
+/// where Metal opens. The wgpu attention kernel is a scalar tiled one, and a long sequence through
+/// it takes longer than the host's blocked kernel does, so the decision head does not use it.
+pub fn build_vit_stack_native(
+    spec: &VitStackSpec,
+    backend: crate::engine::BackendPreference,
+) -> Option<std::sync::Arc<dyn VitStack>> {
+    use crate::engine::BackendPreference as BP;
+    match backend {
+        BP::Metal | BP::Auto => try_metal_stack(spec),
+        BP::Gpu | BP::Cpu | BP::Hexagon | BP::Npu => None,
     }
 }
 
