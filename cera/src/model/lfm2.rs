@@ -1593,11 +1593,26 @@ impl LfmModel {
     ///
     /// Returns the post-final-norm hidden state of every token, `[tokens, hidden]`.
     fn hidden_states_float_bidirectional(&self, tokens: &[u32]) -> Vec<f32> {
+        let hs = self.config.hidden_size;
+        let mut h = vec![0f32; tokens.len() * hs];
+        for (i, &token) in tokens.iter().enumerate() {
+            self.dequantize_row_into(&self.embd_ref, token as usize, &mut h[i * hs..(i + 1) * hs]);
+        }
+        self.float_trunk(h, 0)
+    }
+
+    /// The f32 bidirectional trunk over embeddings `h` (`[n, hidden]`) whose first
+    /// `prefix` rows are media embeddings.
+    ///
+    /// A media prefix is a function of the media alone: its rows attend only to each other,
+    /// and the convolution at its last row does not read the first text row. Text rows read
+    /// everything. With `prefix == 0` this is the plain bidirectional trunk.
+    fn float_trunk(&self, mut h: Vec<f32>, prefix: usize) -> Vec<f32> {
         use crate::model::pii::matmul_nt_f32;
         use crate::par::*;
         let cfg = &self.config;
         let hs = cfg.hidden_size;
-        let n = tokens.len();
+        let n = h.len() / hs;
         let weight = |layer: usize, name: &str| -> Vec<f32> {
             self.gguf
                 .get_tensor(&format!("blk.{layer}.{name}.weight"))
@@ -1610,10 +1625,6 @@ impl LfmModel {
             out
         };
 
-        let mut h = vec![0f32; n * hs];
-        for (i, &token) in tokens.iter().enumerate() {
-            self.dequantize_row_into(&self.embd_ref, token as usize, &mut h[i * hs..(i + 1) * hs]);
-        }
         for layer in 0..cfg.n_layers {
             let mut normed = h.clone();
             for row in normed.chunks_exact_mut(hs) {
@@ -1630,7 +1641,8 @@ impl LfmModel {
                 for t in 0..n {
                     for i in 0..hs {
                         let prev = if t > 0 { bx(t - 1, i) } else { 0.0 };
-                        let next = if t + 1 < n { bx(t + 1, i) } else { 0.0 };
+                        let reads_right = t + 1 < n && t + 1 != prefix;
+                        let next = if reads_right { bx(t + 1, i) } else { 0.0 };
                         gated[t * hs + i] = proj[t * 3 * hs + hs + i]
                             * (prev * w0[i] + bx(t, i) * w1[i] + next * w2[i]);
                     }
@@ -1663,7 +1675,9 @@ impl LfmModel {
                 let group = n_heads / n_kv;
                 let mut ctx = vec![0f32; n * hs];
                 ctx.par_chunks_mut(hs).enumerate().for_each(|(t, out)| {
-                    let mut scores = vec![0f32; n];
+                    // a prefix row attends to the prefix only; a text row to everything
+                    let keys = if t < prefix { prefix } else { n };
+                    let mut scores = vec![0f32; keys];
                     for head in 0..n_heads {
                         let kv = head / group;
                         let qh = &q[t * hs + head * head_dim..][..head_dim];
@@ -5173,6 +5187,44 @@ impl Model for LfmModel {
         true
     }
 
+    /// Only a bidirectional model reads a media prefix this way.
+    fn supports_media_prefix(&self) -> bool {
+        !self.config.is_causal
+    }
+
+    fn hidden_states_with_prefix(
+        &self,
+        prefix: &[f32],
+        tokens: &[u32],
+        _state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let hs = self.config.hidden_size;
+        assert!(
+            !self.config.is_causal,
+            "hidden_states_with_prefix needs a bidirectional model"
+        );
+        assert!(
+            prefix.len().is_multiple_of(hs),
+            "the media prefix is not a whole number of rows"
+        );
+        let prefix_rows = prefix.len() / hs;
+        let mut h = Vec::with_capacity(prefix.len() + tokens.len() * hs);
+        h.extend_from_slice(prefix);
+        h.resize(prefix.len() + tokens.len() * hs, 0.0);
+        for (i, &token) in tokens.iter().enumerate() {
+            let row = prefix.len() + i * hs;
+            assert!(
+                (token as usize) < self.config.vocab_size,
+                "token_id {token} out of range (vocab_size={})",
+                self.config.vocab_size
+            );
+            self.dequantize_row_into(&self.embd_ref, token as usize, &mut h[row..row + hs]);
+        }
+        let mut out = self.float_trunk(h, prefix_rows);
+        out.drain(..prefix.len());
+        out
+    }
+
     /// The CPU path is the one backend with routed-FFN LoRA hooks: the router
     /// delta feeds `select_experts` and the per-expert factors are applied to
     /// the selected expert's projections, both pinned by `moe_lora_parity`.
@@ -6561,6 +6613,83 @@ mod bidirectional_float_tests {
 
     /// The float path computes the function the batched quantized path does: the same
     /// weights, once as F32 and once as Q8_0, agree to the quantization error.
+    /// Deterministic embeddings, `rows` of `HS`, for a seed.
+    fn embeddings(rows: usize, seed: f32) -> Vec<f32> {
+        (0..rows * HS)
+            .map(|i| ((i as f32 * 0.37 + seed).sin()) * 0.8)
+            .collect()
+    }
+
+    fn trunk(prefix_rows: usize, prefix_seed: f32, text_seed: f32, text_rows: usize) -> Vec<f32> {
+        let model = LfmModel::from_gguf(bidirectional_gguf(false), 256).unwrap();
+        let mut h = embeddings(prefix_rows, prefix_seed);
+        h.extend(embeddings(text_rows, text_seed));
+        model.float_trunk(h, prefix_rows)
+    }
+
+    /// A media prefix is a function of the media alone: its rows attend only to each other and
+    /// the convolution at its last row does not read the first text row.
+    #[test]
+    fn a_media_prefix_does_not_depend_on_the_text() {
+        let a = trunk(4, 0.1, 1.0, 5);
+        let b = trunk(4, 0.1, 7.0, 5);
+        assert_eq!(
+            a[..4 * HS],
+            b[..4 * HS],
+            "the prefix rows moved with the text"
+        );
+        let moved = a[4 * HS..]
+            .iter()
+            .zip(&b[4 * HS..])
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(moved > 1e-3, "the text rows ignored their own text");
+    }
+
+    /// Text rows read everything, the prefix included.
+    #[test]
+    fn text_rows_read_the_media_prefix() {
+        let a = trunk(4, 0.1, 1.0, 5);
+        let b = trunk(4, 3.0, 1.0, 5);
+        let moved = a[4 * HS..]
+            .iter()
+            .zip(&b[4 * HS..])
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(moved > 1e-3, "the text rows ignored the media prefix");
+    }
+
+    /// Without a prefix the trunk is the plain bidirectional one, and a prefix of rows that
+    /// are the embeddings of tokens is not the same thing as those tokens being text.
+    #[test]
+    fn a_prefix_of_zero_rows_is_the_plain_trunk() {
+        let model = LfmModel::from_gguf(bidirectional_gguf(false), 256).unwrap();
+        let tokens = [3u32, 7, 9, 12];
+        let mut embedded = vec![0f32; tokens.len() * HS];
+        for (i, &t) in tokens.iter().enumerate() {
+            model.dequantize_row_into(
+                &model.embd_ref,
+                t as usize,
+                &mut embedded[i * HS..(i + 1) * HS],
+            );
+        }
+        assert_eq!(
+            model.float_trunk(embedded, 0),
+            model.hidden_states_float_bidirectional(&tokens)
+        );
+    }
+
+    /// Both text and media forms of the same positions differ: with a prefix, the last prefix
+    /// row's convolution cannot see the first text row, so the result is not the plain trunk.
+    #[test]
+    fn a_prefix_changes_how_the_same_rows_are_read() {
+        let model = LfmModel::from_gguf(bidirectional_gguf(false), 256).unwrap();
+        let h = embeddings(6, 0.5);
+        let plain = model.float_trunk(h.clone(), 0);
+        let split = model.float_trunk(h, 3);
+        assert_ne!(plain, split);
+    }
+
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
     #[test]
     fn the_float_path_agrees_with_the_batched_quantized_path() {

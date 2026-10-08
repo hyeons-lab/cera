@@ -936,6 +936,11 @@ enum Command {
         /// Longest prompt in tokens. The model supports up to its trained 16384.
         #[arg(long, default_value_t = 16384)]
         context_size: usize,
+
+        /// An image (PNG or JPEG) to read ahead of the text; repeatable, in order. These are
+        /// added to any `images` in the request.
+        #[arg(long = "image")]
+        images: Vec<PathBuf>,
     },
 
     /// Tokenize text and print token IDs (for comparison with HuggingFace).
@@ -4401,6 +4406,7 @@ fn main() -> Result<()> {
             request,
             device,
             context_size,
+            images,
         } => {
             use std::io::Read as _;
             let text = if request == "-" {
@@ -4413,7 +4419,12 @@ fn main() -> Result<()> {
                 std::fs::read_to_string(&request)
                     .with_context(|| format!("reading the request `{request}`"))?
             };
-            let request = cera::d1::D1Request::parse(&text)?;
+            let mut request = cera::d1::D1Request::parse(&text)?;
+            for path in &images {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("reading the image `{}`", path.display()))?;
+                request = request.with_image(bytes);
+            }
             let gguf = cera::gguf::GgufFile::open(Path::new(&model))?;
             let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
             let d1 = cera::d1::D1Model::from_gguf(&gguf, &tokenizer)?;

@@ -146,7 +146,10 @@ fn is_blank(value: &Json) -> bool {
 }
 
 /// The option texts in the model's order. A `noul` is read as `[false, true]`.
-pub fn render_options(q: &Question) -> Vec<String> {
+///
+/// After a media prefix a `noul` without definitions of its own is worded `false: no`,
+/// `true: yes`, as the media questions were trained.
+pub fn render_options(q: &Question, media: bool) -> Vec<String> {
     match q.kind {
         QuestionType::Choice => q
             .criteria
@@ -165,6 +168,9 @@ pub fn render_options(q: &Question) -> Vec<String> {
             .enumerate()
             .map(|(i, (_, level))| format!("level {i}: {}", criterion(level)))
             .collect(),
+        QuestionType::Noul if media && q.criteria.is_empty() => {
+            vec!["false: no".to_string(), "true: yes".to_string()]
+        }
         QuestionType::Noul => {
             let side = |names: [&str; 2]| {
                 names
@@ -277,9 +283,10 @@ pub fn encode(
     state: &Json,
     q: &Question,
     max_len: usize,
+    media: bool,
 ) -> Result<(Vec<u32>, Vec<usize>)> {
     let enc = |s: &str| tok.encode(&escape(s));
-    let options = render_options(q);
+    let options = render_options(q, media);
     let k = options.len();
     let budget = 96.max((k * PER_OPTION + 32).min(max_len / 2));
     let per = 2.max(budget.saturating_sub(3 * k) / k);
@@ -391,20 +398,23 @@ mod tests {
         let q = q(
             r#"{"type":"choice","instructions":"?","criteria":{"a":"Alpha","b":"","c":null,"d":{"x":1}}}"#,
         );
-        assert_eq!(render_options(&q), ["a: Alpha", "b", "c", r#"d: {"x": 1}"#]);
+        assert_eq!(
+            render_options(&q, false),
+            ["a: Alpha", "b", "c", r#"d: {"x": 1}"#]
+        );
     }
 
     #[test]
     fn score_options_are_numbered_levels() {
         let q = q(r#"{"type":"score","instructions":"?","criteria":["low","high"]}"#);
-        assert_eq!(render_options(&q), ["level 0: low", "level 1: high"]);
+        assert_eq!(render_options(&q, false), ["level 0: low", "level 1: high"]);
     }
 
     #[test]
     fn noul_options_take_the_given_definitions_or_the_defaults() {
         let plain = q(r#"{"type":"noul","instructions":"?"}"#);
         assert_eq!(
-            render_options(&plain),
+            render_options(&plain, false),
             [
                 "false: no, the statement does not hold",
                 "true: yes, the statement holds"
@@ -412,8 +422,25 @@ mod tests {
         );
         let defined = q(r#"{"type":"noul","instructions":"?","criteria":{"yes":"Y","false":""}}"#);
         assert_eq!(
-            render_options(&defined),
+            render_options(&defined, false),
             ["false: no, the statement does not hold", "true: Y"]
+        );
+    }
+
+    #[test]
+    fn a_media_noul_is_worded_yes_and_no_unless_it_defines_its_own() {
+        let plain = q(r#"{"type":"noul","instructions":"?"}"#);
+        assert_eq!(render_options(&plain, true), ["false: no", "true: yes"]);
+        let defined = q(r#"{"type":"noul","instructions":"?","criteria":{"true":"Y"}}"#);
+        assert_eq!(
+            render_options(&defined, true),
+            ["false: no, the statement does not hold", "true: Y"]
+        );
+        // other types are worded the same with or without media
+        let choice = q(r#"{"type":"choice","instructions":"?","criteria":{"a":"A","b":"B"}}"#);
+        assert_eq!(
+            render_options(&choice, true),
+            render_options(&choice, false)
         );
     }
 
