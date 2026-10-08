@@ -10,12 +10,12 @@ use anyhow::{Context, Result};
 use metal::{Buffer, ComputePipelineState, MTLResourceOptions, MTLSize, NSUInteger};
 
 use crate::backend::metal::{
-    ArgmaxParams, BiasAddParams, Conv1dBatchParams, Conv1dParams, ElementwiseParams,
-    FlashAttnParams, GemmF32Params, GemvBatchParams, GemvQkvParams, GemvRmsParams,
-    GemvSplitKParams, KvCopyParams, KvShiftKParams, MetalContext, MetalParams, MoeCombineParams,
-    MoeGemvParams, MoeRouteParams, NormParams, PrefillAttnParams, QkNormRopeBatchParams,
-    QkNormRopeParams, QuantGemmParams, RmsNormBatchParams, RopeParams, ScaleParams,
-    SplitAttnParams, shaders,
+    ArgmaxParams, BiasAddParams, BidirConvParams, Conv1dBatchParams, Conv1dParams,
+    ElementwiseParams, FlashAttnParams, GemmF32Params, GemvBatchParams, GemvQkvParams,
+    GemvRmsParams, GemvSplitKParams, KvCopyParams, KvShiftKParams, MetalContext, MetalParams,
+    MoeCombineParams, MoeGemvParams, MoeRouteParams, NormParams, PrefillAttnParams,
+    QkNormRopeBatchParams, QkNormRopeParams, QuantGemmParams, RmsNormBatchParams, RopeParams,
+    ScaleParams, SplitAttnParams, shaders,
 };
 use crate::gguf::GgufFile;
 use crate::kv_cache::{InferenceState, KvCompression, KvPrefixCache};
@@ -334,6 +334,8 @@ struct MetalPipelines {
     mul_inplace: ComputePipelineState,
     mul_out: ComputePipelineState,
     silu_mul_inplace: ComputePipelineState,
+    /// Centred gated convolution for the bidirectional trunk.
+    bidir_conv_centered: ComputePipelineState,
     rmsnorm: ComputePipelineState,
     #[allow(dead_code)]
     per_head_rmsnorm: ComputePipelineState,
@@ -797,6 +799,8 @@ impl MetalLfmModel {
             mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_inplace")?,
             mul_out: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_out")?,
             silu_mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "silu_mul_inplace")?,
+            bidir_conv_centered: ctx
+                .create_pipeline(shaders::BIDIRECTIONAL, "bidir_conv_centered")?,
             rmsnorm: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm")?,
             per_head_rmsnorm: ctx.create_pipeline(shaders::PER_HEAD_RMSNORM, "per_head_rmsnorm")?,
             rope: ctx.create_pipeline(shaders::ROPE, "rope")?,
@@ -3720,6 +3724,10 @@ impl MetalLfmModel {
     /// side for the threadgroup-memory sizing and grid, so both the production
     /// prefill path and the per-phase profiled path stay in sync when the
     /// kernel is tuned.
+    ///
+    /// `bidir_prefix` is `None` for the causal prefill. `Some(p)` reads the whole sequence
+    /// instead (`start_pos` must be 0 and `n` the full length), except that the first `p` rows
+    /// attend only to each other.
     #[allow(clippy::too_many_arguments)]
     fn encode_attention_prefill_batch(
         &self,
@@ -3735,6 +3743,7 @@ impl MetalLfmModel {
         start_pos: u32,
         q_stride: u32,
         out_stride: u32,
+        bidir_prefix: Option<u32>,
     ) {
         // Kernel invariants (attention_prefill.metal, Iter 4 MMA):
         //   - hd <= 256 (final-normalize + write-out loops bound by hd)
@@ -3761,6 +3770,8 @@ impl MetalLfmModel {
             scale_bits: scale.to_bits(),
             q_stride,
             out_stride,
+            bidir: u32::from(bidir_prefix.is_some()),
+            prefix_rows: bidir_prefix.unwrap_or(0),
         };
         // Iter 5/6: dispatch the (head_dim, query-block)-specialized variant.
         // hd=64/128 specialize head_dim (constexpr inner-loop bounds + MMA
@@ -3948,6 +3959,20 @@ impl Model for MetalLfmModel {
             self.state.max_seq_len
         );
 
+        // A bidirectional model reads the whole sequence in one pass: the per-token loop
+        // below is causal by construction.
+        if !self.config.is_causal {
+            let mut embeddings = vec![0.0f32; tokens.len() * hs];
+            for (row, &token) in embeddings.chunks_exact_mut(hs).zip(tokens) {
+                assert!(
+                    (token as usize) < vocab,
+                    "token_id {token} out of range (vocab_size={vocab})"
+                );
+                self.dequant_embedding_row(token as usize, row);
+            }
+            return self.bidirectional_trunk(&embeddings, 0);
+        }
+
         // Build the scratch caches on first use, then zero the scratch conv
         // rolling buffers so each extraction starts from a clean convolution
         // state. The scratch attention caches need no clearing: token `pos` only
@@ -3997,6 +4022,47 @@ impl Model for MetalLfmModel {
             out.extend_from_slice(&self.ctx.read_f32(&self.normed_buf, hs));
         }
         // `_scratch_guard` clears `use_hs_scratch` here on the way out.
+        out
+    }
+
+    /// Only a bidirectional model reads a media prefix this way.
+    fn supports_media_prefix(&self) -> bool {
+        !self.config.is_causal
+    }
+
+    fn hidden_states_with_prefix(
+        &self,
+        prefix: &[f32],
+        tokens: &[u32],
+        _state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let hs = self.config.hidden_size;
+        assert!(
+            !self.config.is_causal,
+            "hidden_states_with_prefix needs a bidirectional model"
+        );
+        assert!(
+            prefix.len().is_multiple_of(hs),
+            "the media prefix is not a whole number of rows"
+        );
+        assert!(
+            !tokens.is_empty(),
+            "hidden_states_with_prefix requires at least one token"
+        );
+        let prefix_rows = prefix.len() / hs;
+        let mut embeddings = vec![0.0f32; prefix.len() + tokens.len() * hs];
+        embeddings[..prefix.len()].copy_from_slice(prefix);
+        for (row, &token) in embeddings[prefix.len()..].chunks_exact_mut(hs).zip(tokens) {
+            assert!(
+                (token as usize) < self.config.vocab_size,
+                "token_id {token} out of range (vocab_size={})",
+                self.config.vocab_size
+            );
+            self.dequant_embedding_row(token as usize, row);
+        }
+        let mut out = self.bidirectional_trunk(&embeddings, prefix_rows);
+        out.drain(..prefix.len());
         out
     }
 
@@ -5480,6 +5546,7 @@ impl MetalLfmModel {
                             start_pos as u32,
                             q_dim as u32, // q_stride
                             q_dim as u32, // out_stride
+                            None,
                         );
                     }
                 }
@@ -5749,6 +5816,299 @@ impl MetalLfmModel {
         } else {
             self.ctx.read_f32(&self.logits_buf, vocab)
         }
+    }
+}
+
+impl MetalLfmModel {
+    /// The bidirectional trunk over embeddings `embeddings` (`[n, hidden]`) whose first
+    /// `prefix` rows are media embeddings; returns the post-final-norm hidden state of every
+    /// row, `[n, hidden]`.
+    ///
+    /// Same block as the CPU `float_trunk` (the reference it is measured against): pre-norm, a
+    /// centred 3-tap gated convolution or full grouped-query attention with no causal mask,
+    /// and a SwiGLU feed-forward. Nothing is cached between calls: the whole sequence is one
+    /// pass, so K and V live in the scratch caches `hidden_states` already owns and the
+    /// activations in buffers sized for this call. Only the feed-forward is split into row
+    /// chunks (its intermediate is the widest tensor); everything else is one dispatch over
+    /// all rows.
+    fn bidirectional_trunk(&self, embeddings: &[f32], prefix: usize) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let n = embeddings.len() / hs;
+        assert!(n > 0 && embeddings.len() == n * hs);
+        assert!(
+            n <= self.state.max_seq_len,
+            "bidirectional pass over {n} rows exceeds max_seq_len ({})",
+            self.state.max_seq_len
+        );
+        assert!(
+            self.loop_norm_interval.is_none(),
+            "the bidirectional Metal trunk has no looped-layer support"
+        );
+        let head_dim = cfg.head_dim;
+        let q_dim = cfg.n_heads * head_dim;
+        let kv_dim_max = cfg
+            .kv_heads_per_layer
+            .iter()
+            .map(|&kv| kv * head_dim)
+            .max()
+            .unwrap_or(0);
+        let is = cfg.intermediate_size;
+        let f32_bytes = |floats: usize| (floats * 4) as u64;
+        let h_buf = self.ctx.create_buffer(f32_bytes(n * hs));
+        let normed = self.ctx.create_buffer(f32_bytes(n * hs.max(q_dim)));
+        let scratch = self.ctx.create_buffer(f32_bytes(n * hs));
+        let proj = self.ctx.create_buffer(f32_bytes(n * (3 * hs).max(q_dim)));
+        let k_buf = self.ctx.create_buffer(f32_bytes(n * kv_dim_max.max(1)));
+        let v_buf = self.ctx.create_buffer(f32_bytes(n * kv_dim_max.max(1)));
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                embeddings.as_ptr(),
+                h_buf.contents() as *mut f32,
+                embeddings.len(),
+            );
+        }
+        let kv_scratch = &self.hs_scratch().kv;
+        // The feed-forward intermediate reuses the prefill gate/up buffers, which hold this
+        // many rows.
+        let ffn_rows = self.state.max_seq_len.min(MAX_PREFILL_TOKENS);
+
+        let cb = self.ctx.queue.new_command_buffer();
+        let enc = cb.new_compute_command_encoder();
+        for (layer, (lw, layer_kv)) in self.layers.iter().zip(kv_scratch).enumerate() {
+            if layer == 0 {
+                self.encode_rmsnorm_batch(
+                    enc,
+                    &h_buf,
+                    0,
+                    &normed,
+                    0,
+                    &lw.attn_norm,
+                    n as u32,
+                    hs as u32,
+                    hs as u32,
+                );
+            } else {
+                // Fold the previous layer's feed-forward output into the residual stream.
+                self.encode_add_rmsnorm_batch(
+                    enc,
+                    &h_buf,
+                    &normed,
+                    &lw.attn_norm,
+                    &scratch,
+                    n as u32,
+                    hs as u32,
+                    self.scalars.residual,
+                );
+            }
+
+            if cfg.block_types[layer] == BlockType::GatedConv {
+                let w_in = lw.conv_in_proj.as_ref().unwrap();
+                let w_out = lw.conv_out_proj.as_ref().unwrap();
+                self.encode_gemm(
+                    enc,
+                    w_in,
+                    &normed,
+                    0,
+                    &proj,
+                    0,
+                    n as u32,
+                    hs as u32,
+                    (3 * hs) as u32,
+                    false,
+                );
+                let params = BidirConvParams {
+                    n: n as u32,
+                    hs: hs as u32,
+                    prefix: prefix as u32,
+                    proj_stride: (3 * hs) as u32,
+                    out_stride: hs as u32,
+                };
+                enc.set_compute_pipeline_state(&self.pipelines.bidir_conv_centered);
+                enc.set_buffer(0, Some(&proj), 0);
+                enc.set_buffer(1, Some(lw.conv_weight.as_ref().unwrap()), 0);
+                enc.set_buffer(2, Some(&normed), 0);
+                params.set(enc, 3);
+                enc.dispatch_thread_groups(sz1d(((n * hs) as u64).div_ceil(256)), sz1d(256));
+                self.encode_gemm(
+                    enc, w_out, &normed, 0, &scratch, 0, n as u32, hs as u32, hs as u32, false,
+                );
+            } else {
+                let n_heads = cfg.n_heads as u32;
+                let n_kv_heads = cfg.kv_heads_per_layer[layer] as u32;
+                let kv_dim = (n_kv_heads as usize) * head_dim;
+                let (k16, v16) = layer_kv.as_ref().expect("attention layer has scratch K/V");
+                let (w_q, w_k, w_v, w_o) = (
+                    lw.attn_q.as_ref().unwrap(),
+                    lw.attn_k.as_ref().unwrap(),
+                    lw.attn_v.as_ref().unwrap(),
+                    lw.attn_output.as_ref().unwrap(),
+                );
+                self.encode_gemm(
+                    enc,
+                    w_q,
+                    &normed,
+                    0,
+                    &proj,
+                    0,
+                    n as u32,
+                    hs as u32,
+                    q_dim as u32,
+                    false,
+                );
+                self.encode_gemm(
+                    enc,
+                    w_k,
+                    &normed,
+                    0,
+                    &k_buf,
+                    0,
+                    n as u32,
+                    hs as u32,
+                    kv_dim as u32,
+                    false,
+                );
+                self.encode_gemm(
+                    enc,
+                    w_v,
+                    &normed,
+                    0,
+                    &v_buf,
+                    0,
+                    n as u32,
+                    hs as u32,
+                    kv_dim as u32,
+                    false,
+                );
+                self.encode_qk_norm_rope_batch(
+                    enc,
+                    &proj,
+                    &k_buf,
+                    lw.attn_q_norm.as_ref(),
+                    lw.attn_k_norm.as_ref(),
+                    0,
+                    n as u32,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim as u32,
+                    q_dim as u32,
+                    kv_dim as u32,
+                );
+                self.encode_cast_f32_to_f16_offsets(enc, &k_buf, 0, k16, 0, (n * kv_dim) as u32);
+                self.encode_cast_f32_to_f16_offsets(enc, &v_buf, 0, v16, 0, (n * kv_dim) as u32);
+                self.encode_attention_prefill_batch(
+                    enc,
+                    &proj,
+                    k16,
+                    v16,
+                    &normed,
+                    n as u32,
+                    n_heads,
+                    n_kv_heads,
+                    head_dim as u32,
+                    0,
+                    q_dim as u32,
+                    q_dim as u32,
+                    Some(prefix as u32),
+                );
+                self.encode_gemm(
+                    enc,
+                    w_o,
+                    &normed,
+                    0,
+                    &scratch,
+                    0,
+                    n as u32,
+                    q_dim as u32,
+                    hs as u32,
+                    false,
+                );
+            }
+
+            // Residual add + feed-forward norm, then the SwiGLU feed-forward in row chunks.
+            self.encode_add_rmsnorm_batch(
+                enc,
+                &h_buf,
+                &normed,
+                &lw.ffn_norm,
+                &scratch,
+                n as u32,
+                hs as u32,
+                self.scalars.residual,
+            );
+            let MetalFfn::Dense(dense) = &lw.ffn else {
+                panic!("the bidirectional Metal trunk has no routed-FFN support");
+            };
+            let mut row = 0;
+            while row < n {
+                let rows = ffn_rows.min(n - row);
+                let x_off = f32_bytes(row * hs);
+                self.encode_gemm(
+                    enc,
+                    &dense.gate,
+                    &normed,
+                    x_off,
+                    &self.prefill_gate_buf,
+                    0,
+                    rows as u32,
+                    hs as u32,
+                    is as u32,
+                    false,
+                );
+                self.encode_gemm(
+                    enc,
+                    &dense.up,
+                    &normed,
+                    x_off,
+                    &self.prefill_up_buf,
+                    0,
+                    rows as u32,
+                    hs as u32,
+                    is as u32,
+                    false,
+                );
+                let total = (rows * is) as u32;
+                enc.set_compute_pipeline_state(&self.pipelines.silu_mul_inplace);
+                enc.set_buffer(0, Some(&self.prefill_gate_buf), 0);
+                enc.set_buffer(1, Some(&self.prefill_up_buf), 0);
+                ElementwiseParams::new(total).set(enc, 2);
+                enc.dispatch_thread_groups(sz1d(total.div_ceil(256) as u64), sz1d(256));
+                self.encode_gemm(
+                    enc,
+                    &dense.down,
+                    &self.prefill_gate_buf,
+                    0,
+                    &scratch,
+                    x_off,
+                    rows as u32,
+                    is as u32,
+                    hs as u32,
+                    false,
+                );
+                row += rows;
+            }
+        }
+        self.encode_scaled_add_inplace(
+            enc,
+            &h_buf,
+            &scratch,
+            (n * hs) as u32,
+            self.scalars.residual,
+        );
+        self.encode_rmsnorm_batch(
+            enc,
+            &h_buf,
+            0,
+            &normed,
+            0,
+            &self.output_norm,
+            n as u32,
+            hs as u32,
+            hs as u32,
+        );
+        enc.end_encoding();
+        self.ctx.commit_and_wait(cb, "bidirectional_trunk");
+        self.ctx.read_f32(&normed, n * hs)
     }
 }
 
@@ -6100,6 +6460,7 @@ impl MetalLfmModel {
                         start_pos as u32,
                         q_dim as u32, // q_stride
                         q_dim as u32, // out_stride
+                        None,
                     );
                 });
 
@@ -7700,5 +8061,91 @@ mod prefill_qpt_tests {
         assert_eq!(resolve_prefill_qpt(32, 16384), 8);
         assert_eq!(resolve_prefill_qpt(16, 16384), 8);
         assert_eq!(resolve_prefill_qpt(8, 16384), 8);
+    }
+}
+
+/// The bidirectional trunk against the CPU one on a tiny non-causal model: one short-conv block
+/// and one attention block, so both the centred convolution and the unmasked attention run.
+#[cfg(test)]
+mod bidirectional_tests {
+    use super::MetalLfmModel;
+    use crate::kv_cache::InferenceState;
+    use crate::model::Model;
+    use crate::model::lfm2::LfmModel;
+    use crate::model::lfm2::bidirectional_float_tests::{HS, bidirectional_gguf, embeddings};
+
+    fn cosine(a: &[f32], b: &[f32]) -> f32 {
+        let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+        let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+        dot / (norm(a) * norm(b))
+    }
+
+    fn models(q8: bool) -> Option<(LfmModel, MetalLfmModel)> {
+        let cpu = LfmModel::from_gguf(bidirectional_gguf(q8), 256).unwrap();
+        let metal = match MetalLfmModel::from_gguf(bidirectional_gguf(q8), None, 256) {
+            Ok(m) => m,
+            Err(e) => {
+                eprintln!("SKIPPED: no Metal device ({e})");
+                return None;
+            }
+        };
+        assert!(
+            !metal.config().is_causal,
+            "the fixture must be bidirectional"
+        );
+        Some((cpu, metal))
+    }
+
+    fn rows_agree(what: &str, cpu: &[f32], metal: &[f32]) {
+        assert_eq!(cpu.len(), metal.len(), "{what}: length");
+        for (t, (c, m)) in cpu.chunks(HS).zip(metal.chunks(HS)).enumerate() {
+            let cos = cosine(c, m);
+            assert!(cos > 0.999, "{what}: row {t} cosine {cos}");
+        }
+    }
+
+    #[test]
+    fn metal_reads_the_whole_sequence_like_the_cpu() {
+        for q8 in [true, false] {
+            let Some((cpu, metal)) = models(q8) else {
+                return;
+            };
+            let tokens = [3u32, 7, 9, 12, 5, 21, 8, 30, 1];
+            let mut state = InferenceState::for_prefill(cpu.config(), tokens.len()).unwrap();
+            let want = cpu.hidden_states(&tokens, &mut state);
+            let mut state = InferenceState::for_prefill(metal.config(), tokens.len()).unwrap();
+            let got = metal.hidden_states(&tokens, &mut state);
+            rows_agree(&format!("q8={q8}"), &want, &got);
+            // a later token moves an earlier row: not the causal answer
+            let mut other = tokens;
+            other[8] = 2;
+            let moved = metal.hidden_states(&other, &mut state);
+            let drift = got[..HS]
+                .iter()
+                .zip(&moved[..HS])
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(drift > 1e-4, "row 0 ignored the last token ({drift})");
+        }
+    }
+
+    #[test]
+    fn metal_reads_a_media_prefix_like_the_cpu() {
+        let Some((cpu, metal)) = models(true) else {
+            return;
+        };
+        let tokens = [3u32, 7, 9, 12, 5];
+        // more prefix rows than one attention query block, so a block spans the boundary
+        for prefix_rows in [1usize, 4, 11] {
+            let prefix = embeddings(prefix_rows, 0.3);
+            let mut state =
+                InferenceState::for_prefill(cpu.config(), prefix_rows + tokens.len()).unwrap();
+            let want = cpu.hidden_states_with_prefix(&prefix, &tokens, &mut state);
+            let mut state =
+                InferenceState::for_prefill(metal.config(), prefix_rows + tokens.len()).unwrap();
+            let got = metal.hidden_states_with_prefix(&prefix, &tokens, &mut state);
+            assert_eq!(got.len(), tokens.len() * HS);
+            rows_agree(&format!("prefix={prefix_rows}"), &want, &got);
+        }
     }
 }
