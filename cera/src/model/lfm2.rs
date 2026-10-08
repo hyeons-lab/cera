@@ -6441,21 +6441,22 @@ pub(crate) mod release_tests {
 /// and the per-token path that used to take them is causal. These tests pin the float path
 /// that runs instead.
 #[cfg(test)]
-mod bidirectional_float_tests {
+pub(crate) mod bidirectional_float_tests {
     use super::*;
     use crate::convert::TargetQuant;
     use crate::convert::writer::GGML_TYPE_Q8_0;
     use crate::model::Model;
 
-    const HS: usize = 64;
-    const INTER: usize = 128;
+    // 128 wide: the batched Q8_0 GEMV on Metal reads in steps of 128 values
+    pub(crate) const HS: usize = 128;
+    const INTER: usize = 256;
     const VOCAB: usize = 32;
-    const N_HEADS: usize = 2;
+    const N_HEADS: usize = 4;
     const HEAD_DIM: usize = 32;
 
     /// A two-layer non-causal LFM2 (one short-conv block, one attention block) with
     /// deterministic weights; the projections are F32, or Q8_0 of the same values.
-    fn bidirectional_gguf(q8_projections: bool) -> GgufFile {
+    pub(crate) fn bidirectional_gguf(q8_projections: bool) -> GgufFile {
         use crate::gguf::GgufBuilder;
         let mut seed = 0x2545_f491u64;
         let mut values = move |n: usize, scale: f32, base: f32| -> Vec<f32> {
@@ -6614,7 +6615,7 @@ mod bidirectional_float_tests {
     /// The float path computes the function the batched quantized path does: the same
     /// weights, once as F32 and once as Q8_0, agree to the quantization error.
     /// Deterministic embeddings, `rows` of `HS`, for a seed.
-    fn embeddings(rows: usize, seed: f32) -> Vec<f32> {
+    pub(crate) fn embeddings(rows: usize, seed: f32) -> Vec<f32> {
         (0..rows * HS)
             .map(|i| ((i as f32 * 0.37 + seed).sin()) * 0.8)
             .collect()

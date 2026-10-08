@@ -16,12 +16,12 @@ use crate::CeraError;
 
 pub mod params;
 pub use params::{
-    ArgmaxParams, BiasAddParams, Conv1dBatchParams, Conv1dParams, ElementwiseParams,
-    FlashAttnParams, GemmF32Params, GemvBatchParams, GemvQkvParams, GemvRmsParams,
-    GemvSplitKParams, KvCopyParams, KvShiftKParams, MetalParams, MoeCombineParams, MoeGemvParams,
-    MoeRouteParams, NormParams, PrefillAttnParams, QkNormRopeBatchParams, QkNormRopeParams,
-    QuantGemmParams, RmsNormBatchParams, RopeParams, ScaleParams, SplitAttnParams, TqAttnParams,
-    TqParams,
+    ArgmaxParams, BiasAddParams, BidirConvParams, Conv1dBatchParams, Conv1dParams,
+    ElementwiseParams, FlashAttnParams, GemmF32Params, GemvBatchParams, GemvQkvParams,
+    GemvRmsParams, GemvSplitKParams, KvCopyParams, KvShiftKParams, MetalParams, MoeCombineParams,
+    MoeGemvParams, MoeRouteParams, NormParams, PrefillAttnParams, QkNormRopeBatchParams,
+    QkNormRopeParams, QuantGemmParams, RmsNormBatchParams, RopeParams, ScaleParams,
+    SplitAttnParams, TqAttnParams, TqParams,
 };
 
 /// Metal compute context: device, command queue, compiled shader library cache.
@@ -572,6 +572,8 @@ pub mod shaders {
     pub const GEMV_Q8_0: &str = include_str!("shaders/gemv_q8_0.metal");
     pub const GEMV_Q8_0_BATCH: &str = include_str!("shaders/gemv_q8_0_batch.metal");
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.metal");
+    /// The centred gated convolution of a bidirectional LFM2 trunk.
+    pub const BIDIRECTIONAL: &str = include_str!("shaders/bidirectional.metal");
     pub const QK_NORM_ROPE_BATCH: &str = include_str!("shaders/qk_norm_rope_batch.metal");
     /// Generated from `shaders/slang/conv1d_fused_batch.slang` by build.rs and
     /// shared with the wgpu backend's

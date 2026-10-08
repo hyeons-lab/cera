@@ -890,8 +890,8 @@ enum Command {
     ///
     /// Reads `config.json`, `tokenizer.json` and the `.safetensors` files of `--input` and
     /// writes one GGUF at `--output`, quantized to `--quant`. The d1 decision models
-    /// (`model_type = "d1_omni"`) convert to a non-causal LFM2 trunk plus their decision head;
-    /// their vision and audio towers are not converted yet.
+    /// (`model_type = "d1_omni"`) convert to a non-causal LFM2 trunk plus their decision head,
+    /// vision tower and speech tower.
     Convert {
         /// SafeTensors model directory.
         #[arg(short, long)]
