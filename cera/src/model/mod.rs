@@ -1146,6 +1146,7 @@ pub fn load_model(
 /// routed `lfm2moe` arch has none anywhere.
 #[cfg(any(
     feature = "gpu",
+    feature = "hexagon",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 fn reject_bidirectional_lfm2(
@@ -1284,6 +1285,7 @@ fn load_model_hexagon_impl(
         .get_str("general.architecture")
         .unwrap_or("unknown")
         .to_string();
+    reject_bidirectional_lfm2(&gguf, &arch, "Hexagon NPU", false)?;
     match arch.as_str() {
         "lfm2" | "lfm2moe" if auto => Ok(Box::new(hexagon_lfm2::HexagonLfmModel::from_gguf_auto(
             gguf,
@@ -1433,6 +1435,7 @@ mod tests {
 
     #[cfg(any(
         feature = "gpu",
+        feature = "hexagon",
         all(feature = "metal", any(target_os = "macos", target_os = "ios"))
     ))]
     #[test]

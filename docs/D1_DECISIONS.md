@@ -218,7 +218,7 @@ them and the CPU is the reference.
 | CPU | yes | yes | yes |
 | Metal | yes | yes | yes |
 | wgpu | yes | yes | CPU (no wgpu audio ops exist) |
-| Hexagon NPU | refused (not checked) | not checked | not checked |
+| Hexagon NPU | refused | not run | falls back to the CPU |
 
 The trunk is bidirectional, which the GPU LFM2 graphs were not: they are causal and ignored the
 model's attention mask, so a d1 model used to load on Metal or wgpu and answer a different question
@@ -226,7 +226,7 @@ model's attention mask, so a d1 model used to load on Metal or wgpu and answer a
 non-causal attention mode (the prefill attention kernel gains a flag and the media-prefix rule), a
 centred 3-tap gated convolution, and a pass that runs all rows at once: the projections and the
 feed-forward in chunks of the prefill buffers, attention and the convolution as one dispatch over
-every row. A loader still refuses a bidirectional checkpoint where it has no such pass (the routed
+every row. A loader refuses a bidirectional checkpoint where it has no such pass (the routed
 `lfm2moe` arch, and the Hexagon NPU), so `--device auto` falls back instead of answering wrongly.
 
 Against the reference, with identical token counts (Q8_0 over the whole corpus, F16 over ten
@@ -270,7 +270,8 @@ adapter's storage-binding limit (about 128 MB on common adapters, so roughly 32k
 
 ## Not done yet
 
-* The Hexagon NPU has not been checked: its loader refuses a bidirectional checkpoint.
+* The Hexagon NPU refuses a bidirectional checkpoint (so `--device npu` reports why), and no
+  bidirectional pass is written for it.
 * The head's first-layer attention and its feed-forward still run on the host.
 * The media prefix (an image's or a clip's) is recomputed through the trunk for every question; it
   depends only on the media, so it could be computed once.
