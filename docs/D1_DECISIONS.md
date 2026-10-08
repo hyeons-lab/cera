@@ -298,7 +298,22 @@ used before at 300 tokens (the query-tiled one was 0.002 and is why Android excl
 answers match the Mac: the text example's refund probability is 0.99837 on the phone's GPU and the
 Mac's CPU, a 1.5k-token prompt 0.10545 against 0.10546, a 27,000-token prompt 0.24406 against 0.24405.
 The phone's own CPU gives other numbers for the longer prompts (0.0917 and 0.2439 where the GPU and
-the Mac say 0.1055 and 0.2509); I did not look into that.
+the Mac say 0.1055 and 0.2509). The cause is which arithmetic the CPU runs, not a kernel bug. `cera`
+on a Mac is built with Accelerate (`blas`): the Q8_0 weights are dequantized and multiplied against
+float activations. The phone, and a Mac build without `blas`, quantize the activations to int8 before
+every GEMM. The int8 path reproduces the phone on the Mac: with `blas` off, k100 gives 0.1084 (default
+tier) or 0.0925 (`CERA_CPU_TIER=neon`) and k450 gives 0.2720 or 0.2456, and the final hidden states
+sit 5.6% from the F16 trunk (the phone's: 5.7%; the `blas` Mac's: 3.9%).
+
+The int8 path is sensitive to float noise. Adding 1e-7 of relative noise before each activation
+quantization (the size of a reordered sum) spreads the answer over ten seeds from 0.091 to 0.110 on
+k100 (standard deviation 0.006) and from 0.224 to 0.267 on k450 (0.013); every phone value falls
+inside those ranges, and the integer kernels themselves match their intended math to 1e-7 on every
+tier. The same noise injected only at layer 0's input moves k100 by 1e-6, so the spread builds up
+across the layers' quantizations. The F16 weights give 0.1111 and 0.2533 and the ten-seed means
+are 0.101 and 0.244. A single int8 CPU run can therefore land a few hundredths from the float answer;
+the `blas` path and the GPU do not have that variance. I did not trace the head's own sensitivity to
+the trunk separately.
 
 | Request | phone CPU | phone GPU |
 |---|---|---|
