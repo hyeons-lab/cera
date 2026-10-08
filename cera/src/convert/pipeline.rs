@@ -21,6 +21,7 @@ use crate::convert::cache::{ConversionReceipt, ConversionRequest, RECEIPT_NAME};
 #[cfg(feature = "remote")]
 use crate::convert::checkpoint::{HashingWriter, hash_prefix};
 use crate::convert::config::HfModelConfig;
+use crate::convert::d1;
 use crate::convert::quantize::{QuantStrategy, TargetQuant, quantize_tensor_data_with_strategy};
 use crate::convert::safetensors::{
     SafeTensorsHeader, decode_safetensor_to_f32_into, gguf_tensor_dims,
@@ -899,10 +900,17 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
     let config = HfModelConfig::parse_from_bytes(&config_bytes)?;
     config.ensure_convertible()?;
     let arch = config.gguf_architecture().to_string();
+    let is_d1 = config.model_type.eq_ignore_ascii_case(d1::MODEL_TYPE);
 
     let mut writer = GgufWriter::new();
     let model_name = dir.file_name().and_then(|n| n.to_str()).unwrap_or("model");
     config.apply_to_gguf_writer(&mut writer, model_name);
+    if is_d1 {
+        let raw: serde_json::Value = serde_json::from_slice(&config_bytes).map_err(|e| {
+            CeraError::Backend(format!("failed to parse `{}`: {e}", config_path.display()))
+        })?;
+        d1::apply_metadata(&raw, &mut writer)?;
+    }
 
     if let Some(tok_bytes) = read_optional_file(&tokenizer_path)? {
         let tokenizer = HfTokenizerJson::parse_from_bytes(&tok_bytes)?;
@@ -979,7 +987,15 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
         })?;
         let header = SafeTensorsHeader::parse_from_reader(&mut file)?;
         for (raw_name, tensor_info) in &header.tensors {
-            let gguf_name = translate_hf_to_gguf_tensor_name_with_arch(raw_name, &arch);
+            let gguf_name = if is_d1 {
+                // the towers are not converted yet, and the batch-norm counters are noise
+                let Some(name) = d1::tensor_name(raw_name) else {
+                    continue;
+                };
+                name
+            } else {
+                translate_hf_to_gguf_tensor_name_with_arch(raw_name, &arch)
+            };
             let num_elements: usize = tensor_info
                 .shape
                 .iter()
@@ -987,13 +1003,17 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
                 .ok_or_else(|| {
                     CeraError::Backend(format!("tensor shape overflow for `{raw_name}`"))
                 })?;
-            let ggml_type = quant.select_ggml_type_with_overrides(
-                &gguf_name,
-                tensor_info.shape.len(),
-                num_elements,
-                tensor_info.shape.last().copied().unwrap_or(1),
-                overrides,
-            );
+            let ggml_type = if is_d1 && d1::keeps_f32(&gguf_name) {
+                crate::convert::writer::GGML_TYPE_F32
+            } else {
+                quant.select_ggml_type_with_overrides(
+                    &gguf_name,
+                    tensor_info.shape.len(),
+                    num_elements,
+                    tensor_info.shape.last().copied().unwrap_or(1),
+                    overrides,
+                )
+            };
 
             let dims = gguf_tensor_dims(&gguf_name, &tensor_info.shape);
             let out_bytes = TargetQuant::compute_tensor_bytes(ggml_type, num_elements);
