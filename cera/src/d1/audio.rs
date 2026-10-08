@@ -17,8 +17,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::backend::cpu;
+use crate::engine::BackendPreference;
 use crate::gguf::GgufFile;
 use crate::model::audio_encoder::{AudioEncoderWeights, audio_encoder_forward, resample_linear};
+use crate::model::audio_encoder_gpu::{AudioGpuEncode, build_gpu_audio_encoder};
 use crate::model::audio_preprocessor::log_mel_spectrogram;
 use crate::model::pii::matmul_nt_f32;
 
@@ -144,7 +146,9 @@ pub fn prepare_clip(samples: &[f32], rate: u32) -> Vec<f32> {
 
 /// The speech encoder and its residual block.
 pub struct AudioTower {
-    encoder: AudioEncoderWeights,
+    encoder: Arc<AudioEncoderWeights>,
+    /// The encoder on a GPU, when [`Self::accelerate`] found one.
+    gpu: Option<Arc<dyn AudioGpuEncode>>,
     width: usize,
     hidden: usize,
     norm_w: Vec<f32>,
@@ -191,7 +195,8 @@ impl AudioTower {
             Ok(v)
         };
         Ok(Self {
-            encoder,
+            encoder: Arc::new(encoder),
+            gpu: None,
             width,
             hidden,
             norm_w: t("d1.a.res.norm.weight", width)?,
@@ -201,6 +206,20 @@ impl AudioTower {
             up_w: t("d1.a.res.up.weight", width * hidden)?,
             up_b: t("d1.a.res.up.bias", width)?,
         })
+    }
+
+    /// Run the encoder on the GPU `backend` names, when there is one; the log-mel front end
+    /// stays on the host so that exactly the reference's frames are read. Does nothing for the
+    /// CPU or when no device opens.
+    pub fn accelerate(&mut self, backend: BackendPreference) {
+        if backend != BackendPreference::Cpu {
+            self.gpu = build_gpu_audio_encoder(&self.encoder, backend);
+        }
+    }
+
+    /// Whether the encoder runs on a GPU.
+    pub fn is_accelerated(&self) -> bool {
+        self.gpu.is_some()
     }
 
     /// `x + up(GELU(down(LayerNorm(x))))` over `rows` embeddings.
@@ -248,8 +267,14 @@ impl AudioTower {
         if frames == 0 {
             return Ok(Vec::new());
         }
+        let mel = &mel[..frames * bins];
+        let on_gpu = self.gpu.as_ref().and_then(|gpu| {
+            gpu.encode_mel(mel, frames)
+                .map_err(|e| tracing::warn!("the speech encoder runs on the CPU: {e:#}"))
+                .ok()
+        });
         let (mut embeddings, rows) =
-            audio_encoder_forward(&mel[..frames * bins], frames, &self.encoder);
+            on_gpu.unwrap_or_else(|| audio_encoder_forward(mel, frames, &self.encoder));
         ensure!(
             rows == prefix_rows(pcm.len()),
             "the speech encoder returned {rows} rows for {} samples, expected {}",

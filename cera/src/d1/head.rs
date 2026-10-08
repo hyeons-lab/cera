@@ -209,7 +209,11 @@ impl Head {
             Some(rows) => rows.to_vec(),
             None => (0..n).collect(),
         };
-        let ctx = self.attend(&qkv, n, &query_rows);
+        let ctx = if only.is_none() {
+            self.attend_all(&qkv, n)
+        } else {
+            self.attend(&qkv, n, &query_rows)
+        };
         let m = query_rows.len();
         let mut attn_out = vec![0f32; m * d];
         matmul_nt_f32(m, d, d, &ctx, &l.out_w, Some(&l.out_b), &mut attn_out);
@@ -239,6 +243,70 @@ impl Head {
             *a += b;
         }
         *x = y;
+    }
+
+    /// [`Self::attend`] for every row as a query, which is what the first layer needs.
+    ///
+    /// The row-at-a-time form re-reads all of K and V for every query, so on a long prompt it
+    /// is bound by memory traffic, not arithmetic. This hands blocks of queries to the blocked
+    /// flash-attention kernel the trunk's CPU prefill uses, which streams each K/V tile once per
+    /// block of queries.
+    fn attend_all(&self, qkv: &[f32], n: usize) -> Vec<f32> {
+        // the kernel reads Q as `[dim, queries]` columns, so each block's Q is transposed once
+        const BLOCK: usize = 256;
+        let d = self.n_embd;
+        let heads = self.n_heads;
+        let blocks = n.div_ceil(BLOCK);
+        let scale = (HEAD_DIM as f32).powf(-0.5);
+        let mut q_cols = vec![0f32; blocks * d * BLOCK];
+        q_cols
+            .par_chunks_mut(d * BLOCK)
+            .enumerate()
+            .for_each(|(b, cols)| {
+                let rows = BLOCK.min(n - b * BLOCK);
+                for r in 0..rows {
+                    let q = &qkv[(b * BLOCK + r) * 3 * d..][..d];
+                    for (c, &v) in q.iter().enumerate() {
+                        cols[c * rows + r] = v;
+                    }
+                }
+            });
+        // one chunk per (block, head); K and V are read in place from the packed projections
+        let mut parts = vec![0f32; blocks * heads * BLOCK * HEAD_DIM];
+        parts
+            .par_chunks_mut(BLOCK * HEAD_DIM)
+            .enumerate()
+            .for_each(|(task, out)| {
+                let (b, h) = (task / heads, task % heads);
+                let rows = BLOCK.min(n - b * BLOCK);
+                cpu::flash_attention_gqa_cpu_opt(
+                    &q_cols[b * d * BLOCK..][..d * rows],
+                    &qkv[d..],
+                    &qkv[2 * d..],
+                    &mut out[..rows * HEAD_DIM],
+                    h,
+                    1,
+                    rows,
+                    rows,
+                    3 * d,
+                    h * HEAD_DIM,
+                    HEAD_DIM,
+                    scale,
+                    // without a causal mask the kernel reads `start_pos + rows` keys: all of them
+                    n - rows,
+                    false,
+                );
+            });
+        let mut ctx = vec![0f32; n * d];
+        let (parts, _) = parts.as_chunks::<{ BLOCK * HEAD_DIM }>();
+        for (task, part) in parts.iter().enumerate() {
+            let (b, h) = (task / heads, task % heads);
+            for r in 0..BLOCK.min(n - b * BLOCK) {
+                ctx[(b * BLOCK + r) * d + h * HEAD_DIM..][..HEAD_DIM]
+                    .copy_from_slice(&part[r * HEAD_DIM..][..HEAD_DIM]);
+            }
+        }
+        ctx
     }
 
     /// Bidirectional multi-head attention for `query_rows` over all `n` rows of `qkv`
@@ -385,6 +453,30 @@ mod tests {
             cls_b: zeros(d),
             out_w: ones(d),
             out_b: 0.25,
+        }
+    }
+
+    /// The blocked kernel the first layer uses computes what the row-at-a-time form does,
+    /// across a block boundary (300 rows is one full block of 256 and a short one).
+    #[test]
+    fn blocked_attention_matches_the_row_form() {
+        let mut h = head(0);
+        h.n_embd = 2 * HEAD_DIM;
+        h.n_heads = 2;
+        for n in [1usize, 5, 256, 300, 513] {
+            let qkv: Vec<f32> = (0..n * 3 * h.n_embd)
+                .map(|i| ((i as f32 * 0.173).sin() + (i as f32 * 0.011).cos()) * 0.7)
+                .collect();
+            let rows: Vec<usize> = (0..n).collect();
+            let want = h.attend(&qkv, n, &rows);
+            let got = h.attend_all(&qkv, n);
+            assert_eq!(got.len(), want.len());
+            let worst = got
+                .iter()
+                .zip(&want)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(worst < 2e-4, "n={n}: worst {worst}");
         }
     }
 

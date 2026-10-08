@@ -1529,6 +1529,237 @@ impl VisionGpuEncode for MetalVisionEncoder {
     }
 }
 
+// ── A ViT block stack with caller-supplied weights ───────────────────────────
+
+/// One pre-norm ViT block as the caller holds it: the norm and bias vectors on the host, the
+/// linear weights as tensors of the model file (kept packed on the GPU when they are Q8_0 or
+/// Q4_0).
+pub struct VitStackBlock {
+    pub ln1_w: Vec<f32>,
+    pub ln1_b: Vec<f32>,
+    pub q: MmapWeight,
+    pub q_b: Vec<f32>,
+    pub k: MmapWeight,
+    pub k_b: Vec<f32>,
+    pub v: MmapWeight,
+    pub v_b: Vec<f32>,
+    pub o: MmapWeight,
+    pub o_b: Vec<f32>,
+    pub ln2_w: Vec<f32>,
+    pub ln2_b: Vec<f32>,
+    pub up: MmapWeight,
+    pub up_b: Vec<f32>,
+    pub down: MmapWeight,
+    pub down_b: Vec<f32>,
+}
+
+/// A stack of ViT blocks and the final LayerNorm: everything between the position-embedded patch
+/// tokens and the tokens the projector reads. The tanh GELU, LayerNorm and unmasked attention
+/// are those of [`encode_image_gpu`]; only where the weights come from differs, so a model whose
+/// patch embedding, positions or projector differ from LFM2-VL's can still use it.
+pub struct VitStackSpec {
+    pub width: usize,
+    pub heads: usize,
+    pub ffn: usize,
+    pub eps: f32,
+    pub blocks: Vec<VitStackBlock>,
+    pub post_w: Vec<f32>,
+    pub post_b: Vec<f32>,
+}
+
+/// A [`VitStackSpec`] uploaded to a GPU, ready to run.
+pub trait VitStack: Send + Sync {
+    /// Run the blocks and the final LayerNorm over `tokens` rows of `x` (`[tokens, width]`).
+    ///
+    /// # Errors
+    ///
+    /// Fails when `tokens` is over what the attention kernel holds ([`MAX_VIT_TOKENS`]) or the
+    /// device faults; the caller falls back to the CPU.
+    fn run(&self, x: &[f32], tokens: usize) -> Result<Vec<f32>>;
+}
+
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+struct StackBlock<O: VitGpuOps> {
+    ln1_w: O::Buf,
+    ln1_b: O::Buf,
+    q: O::Weight,
+    q_b: O::Buf,
+    k: O::Weight,
+    k_b: O::Buf,
+    v: O::Weight,
+    v_b: O::Buf,
+    o: O::Weight,
+    o_b: O::Buf,
+    ln2_w: O::Buf,
+    ln2_b: O::Buf,
+    up: O::Weight,
+    up_b: O::Buf,
+    down: O::Weight,
+    down_b: O::Buf,
+}
+
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+struct GpuStack<O: VitGpuOps> {
+    ops: O,
+    width: usize,
+    heads: usize,
+    ffn: usize,
+    eps: f32,
+    blocks: Vec<StackBlock<O>>,
+    post_w: O::Buf,
+    post_b: O::Buf,
+}
+
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+impl<O: VitGpuOps> GpuStack<O> {
+    fn build(ops: O, spec: &VitStackSpec) -> Self {
+        let blocks = spec
+            .blocks
+            .iter()
+            .map(|b| StackBlock {
+                ln1_w: ops.upload(&b.ln1_w),
+                ln1_b: ops.upload(&b.ln1_b),
+                q: ops.upload_weight(&b.q),
+                q_b: ops.upload(&b.q_b),
+                k: ops.upload_weight(&b.k),
+                k_b: ops.upload(&b.k_b),
+                v: ops.upload_weight(&b.v),
+                v_b: ops.upload(&b.v_b),
+                o: ops.upload_weight(&b.o),
+                o_b: ops.upload(&b.o_b),
+                ln2_w: ops.upload(&b.ln2_w),
+                ln2_b: ops.upload(&b.ln2_b),
+                up: ops.upload_weight(&b.up),
+                up_b: ops.upload(&b.up_b),
+                down: ops.upload_weight(&b.down),
+                down_b: ops.upload(&b.down_b),
+            })
+            .collect();
+        Self {
+            width: spec.width,
+            heads: spec.heads,
+            ffn: spec.ffn,
+            eps: spec.eps,
+            blocks,
+            post_w: ops.upload(&spec.post_w),
+            post_b: ops.upload(&spec.post_b),
+            ops,
+        }
+    }
+
+    fn run(&self, x: &[f32], n: usize) -> Result<Vec<f32>> {
+        let ops = &self.ops;
+        let (d, ff) = (self.width, self.ffn);
+        anyhow::ensure!(
+            n > 0 && x.len() == n * d,
+            "{} values are not {n} tokens of {d}",
+            x.len()
+        );
+        anyhow::ensure!(
+            n <= MAX_VIT_TOKENS,
+            "{n} tokens exceeds GPU MAX_VIT_TOKENS ({MAX_VIT_TOKENS}); caller should fall back to CPU"
+        );
+        let tokens = ops.upload(x);
+        for b in &self.blocks {
+            let normed = ops.layernorm(&tokens, &b.ln1_w, &b.ln1_b, self.eps, n, d);
+            let q = ops.linear(&normed, &b.q, n, d, d);
+            ops.bias_add(&q, &b.q_b, n, d);
+            let k = ops.linear(&normed, &b.k, n, d, d);
+            ops.bias_add(&k, &b.k_b, n, d);
+            let v = ops.linear(&normed, &b.v, n, d, d);
+            ops.bias_add(&v, &b.v_b, n, d);
+            let attn = ops.attention(&q, &k, &v, n, self.heads, d / self.heads);
+            let proj = ops.linear(&attn, &b.o, n, d, d);
+            ops.bias_add(&proj, &b.o_b, n, d);
+            ops.add(&tokens, &proj, n * d);
+            let normed = ops.layernorm(&tokens, &b.ln2_w, &b.ln2_b, self.eps, n, d);
+            let mid = ops.linear(&normed, &b.up, n, ff, d);
+            ops.bias_add(&mid, &b.up_b, n, ff);
+            ops.gelu(&mid, n * ff);
+            let down = ops.linear(&mid, &b.down, n, d, ff);
+            ops.bias_add(&down, &b.down_b, n, d);
+            ops.add(&tokens, &down, n * d);
+        }
+        let out = ops.layernorm(&tokens, &self.post_w, &self.post_b, self.eps, n, d);
+        Ok(ops.download(&out, n * d))
+    }
+}
+
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+impl VitStack for GpuStack<MetalVitOps> {
+    fn run(&self, x: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        // Same fault discipline as `MetalVisionEncoder`: a faulted commit must not return
+        // stale tokens as if they were the result.
+        let _ = self.ops.ctx.take_cmd_error();
+        let out = GpuStack::run(self, x, tokens)?;
+        if let Some(e) = self.ops.ctx.take_cmd_error() {
+            return Err(e.into());
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl VitStack for GpuStack<WgpuVitOps> {
+    fn run(&self, x: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        let _ = self.ops.ctx.take_readback_fault();
+        let out = GpuStack::run(self, x, tokens)?;
+        if let Some(e) = self.ops.ctx.take_readback_fault() {
+            return Err(e.into());
+        }
+        Ok(out)
+    }
+}
+
+/// Upload `spec` to the GPU that `backend` names, or `None` for the CPU: the backend is `Cpu`,
+/// its feature is not compiled, or no device could be opened. `Auto` prefers Metal, then wgpu.
+pub fn build_vit_stack(
+    spec: &VitStackSpec,
+    backend: crate::engine::BackendPreference,
+) -> Option<std::sync::Arc<dyn VitStack>> {
+    use crate::engine::BackendPreference as BP;
+    let _ = spec;
+    match backend {
+        BP::Metal => try_metal_stack(spec),
+        BP::Gpu => try_wgpu_stack(spec),
+        BP::Auto => try_metal_stack(spec).or_else(|| try_wgpu_stack(spec)),
+        BP::Cpu | BP::Hexagon | BP::Npu => None,
+    }
+}
+
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+fn try_metal_stack(spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
+    let ctx = crate::backend::metal::MetalContext::new().ok()?;
+    let ops = MetalVitOps::new(ctx).ok()?;
+    Some(std::sync::Arc::new(GpuStack::build(ops, spec)))
+}
+
+#[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
+fn try_metal_stack(_spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
+    None
+}
+
+#[cfg(feature = "gpu")]
+fn try_wgpu_stack(spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
+    let ctx = crate::backend::wgpu::GpuContext::new().ok()?;
+    let ops = WgpuVitOps::new(ctx).ok()?;
+    Some(std::sync::Arc::new(GpuStack::build(ops, spec)))
+}
+
+#[cfg(not(feature = "gpu"))]
+fn try_wgpu_stack(_spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
+    None
+}
+
 /// Build a cached GPU vision encoder for `weights`, honoring `backend`.
 /// Returns `None` for `Cpu`, when the chosen backend's feature isn't compiled,
 /// or when the device/context can't be created: the caller then falls back to
