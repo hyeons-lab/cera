@@ -1742,6 +1742,15 @@ pub trait AudioGpuEncode: Send + Sync {
     /// LLM-hidden-size embeddings. Output matches
     /// [`super::audio_encoder::encode_audio_pcm`]: `(embeddings, t_out)`.
     fn encode_pcm(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize)>;
+
+    /// [`Self::encode_pcm`] from a host log-mel spectrogram (`[n_frames, n_mel_bins]`).
+    ///
+    /// For a caller that decides how many frames the encoder reads. The PCM entry point reads
+    /// every frame the STFT makes, one more than the reference of a model that drops it (d1
+    /// speech); a backend with no such entry point refuses, and the caller runs the CPU encoder.
+    fn encode_mel(&self, _mel: &[f32], _n_frames: usize) -> Result<(Vec<f32>, usize)> {
+        anyhow::bail!("this audio encoder cannot read a host spectrogram")
+    }
 }
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -1760,6 +1769,15 @@ impl AudioGpuEncode for MetalAudioEncoder {
         // exactly this fault class) never fires.
         let _ = self.ops.ctx.take_cmd_error();
         let out = encode_audio_pcm_gpu(&self.ops, &self.weights, pcm)?;
+        if let Some(e) = self.ops.ctx.take_cmd_error() {
+            return Err(e.into());
+        }
+        Ok(out)
+    }
+
+    fn encode_mel(&self, mel: &[f32], n_frames: usize) -> Result<(Vec<f32>, usize)> {
+        let _ = self.ops.ctx.take_cmd_error();
+        let out = encode_audio_mel_gpu(&self.ops, &self.weights, mel, n_frames)?;
         if let Some(e) = self.ops.ctx.take_cmd_error() {
             return Err(e.into());
         }
