@@ -8092,7 +8092,10 @@ mod bidirectional_tests {
     use crate::kv_cache::InferenceState;
     use crate::model::Model;
     use crate::model::lfm2::LfmModel;
-    use crate::model::lfm2::bidirectional_float_tests::{HS, bidirectional_gguf, embeddings};
+    use crate::model::lfm2::bidirectional_float_tests::{HS, bidirectional_gguf_with, embeddings};
+
+    /// 4 heads of 32 and 2 of 64: the second takes the head_dim 64 attention kernels.
+    const SHAPES: [(usize, usize); 2] = [(4, 32), (2, 64)];
 
     fn cosine(a: &[f32], b: &[f32]) -> f32 {
         let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
@@ -8104,7 +8107,7 @@ mod bidirectional_tests {
     /// non-empty precondition: the contract promises `tokens.len()` rows unconditionally.
     #[test]
     fn empty_prefix_and_tokens_yield_no_rows() {
-        let Some((cpu, metal)) = models(false) else {
+        let Some((cpu, metal)) = models(false, 4, 32) else {
             return;
         };
         let mut cpu_state = InferenceState::for_prefill(cpu.config(), 0).unwrap();
@@ -8120,23 +8123,25 @@ mod bidirectional_tests {
         );
     }
 
-    fn models(q8: bool) -> Option<(LfmModel, MetalLfmModel)> {
+    fn models(q8: bool, heads: usize, head_dim: usize) -> Option<(LfmModel, MetalLfmModel)> {
         // context 4096 (the fixture max): the whole-sequence leg below runs 2600 rows, past one
         // 2048-row FFN chunk, so the chunk loop takes a second iteration with x_off > 0
-        let cpu = LfmModel::from_gguf(bidirectional_gguf(q8), 4096).unwrap();
-        let metal = match MetalLfmModel::from_gguf(bidirectional_gguf(q8), None, 4096) {
-            Ok(m) => m,
-            Err(e) => {
-                // Metal-only tests: only the Metal flag forces them (CERA_REQUIRE_GPU is set
-                // on non-Metal GPU legs too, where skipping is correct).
-                assert!(
-                    std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1"),
-                    "CERA_REQUIRE_METAL=1 is set but no Metal device is available ({e})"
-                );
-                eprintln!("SKIPPED: no Metal device ({e})");
-                return None;
-            }
-        };
+        let cpu = LfmModel::from_gguf(bidirectional_gguf_with(q8, heads, head_dim), 4096).unwrap();
+        let metal =
+            match MetalLfmModel::from_gguf(bidirectional_gguf_with(q8, heads, head_dim), None, 4096)
+            {
+                Ok(m) => m,
+                Err(e) => {
+                    // Metal-only tests: only the Metal flag forces them (CERA_REQUIRE_GPU is set
+                    // on non-Metal GPU legs too, where skipping is correct).
+                    assert!(
+                        std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1"),
+                        "CERA_REQUIRE_METAL=1 is set but no Metal device is available ({e})"
+                    );
+                    eprintln!("SKIPPED: no Metal device ({e})");
+                    return None;
+                }
+            };
         assert!(
             !metal.config().is_causal,
             "the fixture must be bidirectional"
@@ -8154,8 +8159,11 @@ mod bidirectional_tests {
 
     #[test]
     fn metal_reads_the_whole_sequence_like_the_cpu() {
-        for q8 in [true, false] {
-            let Some((cpu, metal)) = models(q8) else {
+        for (q8, (heads, head_dim)) in [true, false]
+            .into_iter()
+            .flat_map(|q8| SHAPES.into_iter().map(move |shape| (q8, shape)))
+        {
+            let Some((cpu, metal)) = models(q8, heads, head_dim) else {
                 return;
             };
             let tokens = [3u32, 7, 9, 12, 5, 21, 8, 30, 1];
@@ -8163,7 +8171,7 @@ mod bidirectional_tests {
             let want = cpu.hidden_states(&tokens, &mut state);
             let mut state = InferenceState::for_prefill(metal.config(), tokens.len()).unwrap();
             let got = metal.hidden_states(&tokens, &mut state);
-            rows_agree(&format!("q8={q8}"), &want, &got);
+            rows_agree(&format!("q8={q8} {heads}x{head_dim}"), &want, &got);
             // a later token moves an earlier row: not the causal answer
             let mut other = tokens;
             other[8] = 2;
@@ -8189,21 +8197,28 @@ mod bidirectional_tests {
 
     #[test]
     fn metal_reads_a_media_prefix_like_the_cpu() {
-        let Some((cpu, metal)) = models(true) else {
-            return;
-        };
-        let tokens = [3u32, 7, 9, 12, 5];
-        // more prefix rows than one attention query block, so a block spans the boundary
-        for prefix_rows in [1usize, 4, 11] {
-            let prefix = embeddings(prefix_rows, 0.3);
-            let mut state =
-                InferenceState::for_prefill(cpu.config(), prefix_rows + tokens.len()).unwrap();
-            let want = cpu.hidden_states_with_prefix(&prefix, &tokens, &mut state);
-            let mut state =
-                InferenceState::for_prefill(metal.config(), prefix_rows + tokens.len()).unwrap();
-            let got = metal.hidden_states_with_prefix(&prefix, &tokens, &mut state);
-            assert_eq!(got.len(), tokens.len() * HS);
-            rows_agree(&format!("prefix={prefix_rows}"), &want, &got);
+        for (heads, head_dim) in SHAPES {
+            let Some((cpu, metal)) = models(true, heads, head_dim) else {
+                return;
+            };
+            let tokens = [3u32, 7, 9, 12, 5];
+            // more prefix rows than one attention query block, so a block spans the boundary
+            for prefix_rows in [1usize, 4, 11] {
+                let prefix = embeddings(prefix_rows, 0.3);
+                let mut state =
+                    InferenceState::for_prefill(cpu.config(), prefix_rows + tokens.len()).unwrap();
+                let want = cpu.hidden_states_with_prefix(&prefix, &tokens, &mut state);
+                let mut state =
+                    InferenceState::for_prefill(metal.config(), prefix_rows + tokens.len())
+                        .unwrap();
+                let got = metal.hidden_states_with_prefix(&prefix, &tokens, &mut state);
+                assert_eq!(got.len(), tokens.len() * HS);
+                rows_agree(
+                    &format!("{heads}x{head_dim} prefix={prefix_rows}"),
+                    &want,
+                    &got,
+                );
+            }
         }
     }
 }
