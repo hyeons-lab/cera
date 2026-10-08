@@ -1183,7 +1183,7 @@ pub fn load_model_gpu(
         .get_str("general.architecture")
         .unwrap_or("unknown")
         .to_string();
-    reject_bidirectional_lfm2(&gguf, &arch, "wgpu", false)?;
+    reject_bidirectional_lfm2(&gguf, &arch, "wgpu", true)?;
     let model_id = path
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
