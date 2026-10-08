@@ -11,15 +11,13 @@
 //! backend-agnostic, so a second backend is a host-side wiring change rather than
 //! a kernel port. [`encode_audio_pcm_gpu`] is the live entry point;
 //! [`encode_audio_mel_gpu`] takes a host spectrogram and exists so the parity
-//! suite can feed the GPU body the CPU front-end's output. Only the Metal
-//! implementation ships here; the wgpu one follows.
-//! Every kernel it will need is already generated for WGSL and exported as
-//! `backend::wgpu::shaders::*`, but nothing dispatches those yet: they are
-//! checked only for generation faults (no subgroup ops, no `enable f16`, entry
-//! points present), not against a numeric reference. The numeric gate in this
-//! change is Metal-only.
+//! suite can feed the GPU body the CPU front-end's output. Two implementations ship: native
+//! Metal ([`MetalAudioOps`]) and wgpu ([`WgpuAudioOps`]), the latter reusing the ViT's wgpu GEMM,
+//! LayerNorm and elementwise kernels and dispatching the WGSL halves of the same Slang sources
+//! the Metal ops do. The Metal numeric gate is `tests/audio_encoder_metal_parity.rs`, the wgpu one
+//! `tests/audio_encoder_wgpu_parity.rs`.
 //!
-//! Numerical reference is the CPU encoder: see `tests/audio_encoder_metal_parity.rs`.
+//! Numerical reference is the CPU encoder: see the two parity suites above.
 //!
 //! The log-mel front-end runs here too, as four kernels below
 //! [`log_mel_spectrogram_gpu`]: framing (with center padding, pre-emphasis and
@@ -48,6 +46,8 @@ use super::audio_encoder::{
     AudioEncoderConfig, AudioEncoderWeights, ConformerLayerWeights, ConvStemWeights, POS_EMB_DIM,
     relative_pos_emb,
 };
+#[cfg(feature = "gpu")]
+use super::vision_encoder_gpu::{VitGpuOps, WgpuVitOps, WgpuVitWeight};
 use crate::model::weights::MmapWeight;
 
 /// Longest post-stem sequence the `audio_xl_attention` kernel supports: its
@@ -1729,6 +1729,469 @@ impl AudioEncoderGpuOps for MetalAudioOps {
     }
 }
 
+// ── wgpu implementation ──────────────────────────────────────────────────────
+
+/// wgpu implementation of [`AudioEncoderGpuOps`].
+///
+/// The linear algebra, norms, bias and residual adds are the ViT's wgpu ops ([`WgpuVitOps`]: the
+/// register-tiled GEMM with in-kernel Q8_0 and Q4_0 decode, the LayerNorm, the elementwise
+/// kernels), so this adds only the kernels the Conformer needs beyond them: SiLU and the erf GELU,
+/// the direct 2-D convolution, the blocked transpose, GLU, the per-channel affine SiLU, the
+/// Transformer-XL attention, and the four log-mel kernels. All of those are the WGSL halves of the
+/// Slang sources the Metal ops dispatch, bound in the same order with the same parameter words.
+///
+/// A dispatch is at most 65535 workgroups wide (16.7M elements), and the first stem
+/// convolution of a clip past about 20 s has more outputs than that, so [`Self::conv2d`] splits it
+/// over output channels. Nothing else the encoder dispatches is anywhere near the limit at the
+/// post-stem length it admits ([`MAX_AUDIO_TOKENS`]).
+#[cfg(feature = "gpu")]
+pub struct WgpuAudioOps {
+    vit: WgpuVitOps,
+    p_silu: wgpu::ComputePipeline,
+    p_gelu_erf: wgpu::ComputePipeline,
+    p_scaled_add: wgpu::ComputePipeline,
+    p_conv2d: wgpu::ComputePipeline,
+    p_transpose: wgpu::ComputePipeline,
+    p_glu: wgpu::ComputePipeline,
+    p_chan_affine: wgpu::ComputePipeline,
+    p_attn: wgpu::ComputePipeline,
+    p_stft: wgpu::ComputePipeline,
+    p_power: wgpu::ComputePipeline,
+    p_mel_project: wgpu::ComputePipeline,
+    p_mel_norm: wgpu::ComputePipeline,
+}
+
+#[cfg(feature = "gpu")]
+impl WgpuAudioOps {
+    /// Most elements one elementwise dispatch covers (65535 workgroups of 256).
+    const MAX_FLAT: usize = 65535 * 256;
+
+    pub fn new(ctx: crate::backend::wgpu::GpuContext) -> Result<Self> {
+        use crate::backend::wgpu::shaders;
+        let vit = WgpuVitOps::new(ctx)?;
+        // `create_pipeline` panics on a shader that fails to compile or validate; surface an `Err`
+        // so the caller degrades to the CPU encoder instead of aborting.
+        let pipelines = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let c = &vit.ctx;
+            [
+                c.create_pipeline(shaders::ACTIVATIONS, "silu_inplace", "audio_silu"),
+                c.create_pipeline(shaders::ACTIVATIONS, "gelu_erf_inplace", "audio_gelu_erf"),
+                c.create_pipeline(
+                    shaders::ELEMENTWISE,
+                    "scaled_add_inplace",
+                    "audio_scaled_add",
+                ),
+                c.create_pipeline(shaders::CONV2D_DIRECT, "conv2d_direct", "audio_conv2d"),
+                c.create_pipeline(
+                    shaders::TRANSPOSE_BLOCKED,
+                    "transpose_blocked",
+                    "audio_transpose",
+                ),
+                c.create_pipeline(shaders::GLU_SPLIT, "glu_split", "audio_glu"),
+                c.create_pipeline(
+                    shaders::CHAN_AFFINE_SILU,
+                    "chan_affine_silu",
+                    "audio_chan_affine",
+                ),
+                c.create_pipeline(
+                    shaders::AUDIO_XL_ATTENTION,
+                    "audio_xl_attention",
+                    "audio_xl_attn",
+                ),
+                c.create_pipeline(shaders::STFT_FRAME, "stft_frame", "audio_stft"),
+                c.create_pipeline(shaders::POWER_SPEC, "power_spec", "audio_power"),
+                c.create_pipeline(shaders::MEL_PROJECT, "mel_project", "audio_mel_project"),
+                c.create_pipeline(shaders::MEL_NORM, "mel_norm", "audio_mel_norm"),
+            ]
+        }))
+        .map_err(|_| {
+            anyhow::anyhow!("wgpu audio pipeline creation failed (shader compile/validation)")
+        })?;
+        let [
+            p_silu,
+            p_gelu_erf,
+            p_scaled_add,
+            p_conv2d,
+            p_transpose,
+            p_glu,
+            p_chan_affine,
+            p_attn,
+            p_stft,
+            p_power,
+            p_mel_project,
+            p_mel_norm,
+        ] = pipelines;
+        Ok(Self {
+            vit,
+            p_silu,
+            p_gelu_erf,
+            p_scaled_add,
+            p_conv2d,
+            p_transpose,
+            p_glu,
+            p_chan_affine,
+            p_attn,
+            p_stft,
+            p_power,
+            p_mel_project,
+            p_mel_norm,
+        })
+    }
+
+    /// An uninitialized buffer of `len` f32, padded to a whole 32 like [`VitGpuOps::upload`].
+    fn alloc(&self, len: usize) -> wgpu::Buffer {
+        self.vit
+            .ctx
+            .create_storage_rw((len.next_multiple_of(32).max(32) * 4) as u64, "audio")
+    }
+
+    /// The parameter words as a buffer, padded to whole `uint4`s as the kernels declare them.
+    fn params(&self, words: &[u32]) -> wgpu::Buffer {
+        let mut padded = words.to_vec();
+        padded.resize(words.len().next_multiple_of(4), 0);
+        self.vit
+            .ctx
+            .upload_storage(bytemuck::cast_slice(&padded), "audio_params")
+    }
+
+    /// One thread per element, 256 to a workgroup: the shape every elementwise kernel here shares.
+    fn flat(
+        &self,
+        pipe: &wgpu::ComputePipeline,
+        bufs: &[&wgpu::Buffer],
+        words: &[u32],
+        len: usize,
+    ) {
+        assert!(
+            len <= Self::MAX_FLAT,
+            "a {len}-element dispatch is over the {} the device allows",
+            Self::MAX_FLAT
+        );
+        let params = self.params(words);
+        let mut all: Vec<&wgpu::Buffer> = bufs.to_vec();
+        all.push(&params);
+        self.vit
+            .dispatch(pipe, &all, ((len as u32).div_ceil(256), 1, 1));
+    }
+
+    fn conv2d_words(spec: &Conv2dSpec) -> [u32; 16] {
+        [
+            spec.in_ch as u32,
+            spec.out_ch as u32,
+            spec.h_in as u32,
+            spec.w_in as u32,
+            spec.kh as u32,
+            spec.kw as u32,
+            spec.stride_h as u32,
+            spec.stride_w as u32,
+            spec.pad_h as u32,
+            spec.pad_w as u32,
+            spec.h_out as u32,
+            spec.w_out as u32,
+            spec.groups as u32,
+            0,
+            0,
+            0,
+        ]
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl AudioEncoderGpuOps for WgpuAudioOps {
+    type Buf = wgpu::Buffer;
+    type Weight = WgpuVitWeight;
+
+    fn upload(&self, data: &[f32]) -> Self::Buf {
+        self.vit.upload(data)
+    }
+
+    fn download(&self, buf: &Self::Buf, len: usize) -> Vec<f32> {
+        self.vit.download(buf, len)
+    }
+
+    fn upload_weight(&self, w: &MmapWeight) -> Self::Weight {
+        self.vit.upload_weight(w)
+    }
+
+    fn linear(
+        &self,
+        x: &Self::Buf,
+        w: &Self::Weight,
+        rows: usize,
+        out_dim: usize,
+        in_dim: usize,
+    ) -> Self::Buf {
+        self.vit.linear(x, w, rows, out_dim, in_dim)
+    }
+
+    fn bias_add(&self, x: &Self::Buf, bias: &Self::Buf, rows: usize, dim: usize) {
+        self.vit.bias_add(x, bias, rows, dim);
+    }
+
+    fn layernorm(
+        &self,
+        src: &Self::Buf,
+        weight: &Self::Buf,
+        bias: &Self::Buf,
+        eps: f32,
+        rows: usize,
+        dim: usize,
+    ) -> Self::Buf {
+        self.vit.layernorm(src, weight, bias, eps, rows, dim)
+    }
+
+    fn relu(&self, x: &Self::Buf, len: usize) {
+        self.vit.relu(x, len);
+    }
+
+    fn silu(&self, x: &Self::Buf, len: usize) {
+        self.flat(&self.p_silu, &[x], &[len as u32, 0], len);
+    }
+
+    fn gelu_erf(&self, x: &Self::Buf, len: usize) {
+        self.flat(&self.p_gelu_erf, &[x], &[len as u32, 0], len);
+    }
+
+    fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize) {
+        self.vit.add(dst, src, len);
+    }
+
+    fn scaled_add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize, scale: f32) {
+        self.flat(
+            &self.p_scaled_add,
+            &[dst, src],
+            &[len as u32, scale.to_bits()],
+            len,
+        );
+    }
+
+    fn conv2d(
+        &self,
+        input: &Self::Buf,
+        weight: &Self::Buf,
+        bias: &Self::Buf,
+        spec: &Conv2dSpec,
+    ) -> Self::Buf {
+        let total = spec.out_len();
+        let out = self.alloc(total);
+        if total <= Self::MAX_FLAT {
+            self.flat(
+                &self.p_conv2d,
+                &[input, weight, bias, &out],
+                &Self::conv2d_words(spec),
+                total,
+            );
+            return out;
+        }
+        // Past one dispatch: split over output channels, in steps of 64 so every sub-buffer
+        // offset is a multiple of the 256-byte storage alignment. A dense convolution reads all
+        // of `input` and its own slice of the weights; a depthwise one also reads its own channels
+        // of `input`.
+        let per_channel = spec.h_out * spec.w_out;
+        let step = (Self::MAX_FLAT / per_channel) / 64 * 64;
+        let dense = spec.groups == 1;
+        let depthwise = spec.groups == spec.in_ch && spec.in_ch == spec.out_ch;
+        assert!(
+            step >= 64 && (dense || depthwise),
+            "cannot split a {}-group convolution of {total} outputs over dispatches",
+            spec.groups
+        );
+        let weights_per_channel = spec.in_ch / spec.groups * spec.kh * spec.kw;
+        for c0 in (0..spec.out_ch).step_by(step) {
+            let cc = step.min(spec.out_ch - c0);
+            let mut sub = *spec;
+            sub.out_ch = cc;
+            if depthwise {
+                sub.in_ch = cc;
+                sub.groups = cc;
+            }
+            let params = self.params(&Self::conv2d_words(&sub));
+            let input_offset = if depthwise {
+                (c0 * spec.h_in * spec.w_in * 4) as u64
+            } else {
+                0
+            };
+            self.vit.dispatch_ranges(
+                &self.p_conv2d,
+                &[
+                    (input, input_offset, 0),
+                    (weight, (c0 * weights_per_channel * 4) as u64, 0),
+                    (bias, (c0 * 4) as u64, 0),
+                    (
+                        &out,
+                        (c0 * per_channel * 4) as u64,
+                        (cc * per_channel * 4) as u64,
+                    ),
+                    (&params, 0, 0),
+                ],
+                (((cc * per_channel) as u32).div_ceil(256), 1, 1),
+            );
+        }
+        out
+    }
+
+    fn transpose_blocked(&self, src: &Self::Buf, a: usize, b: usize, k: usize) -> Self::Buf {
+        let total = a * b * k;
+        let dst = self.alloc(total);
+        self.flat(
+            &self.p_transpose,
+            &[src, &dst],
+            &[a as u32, b as u32, k as u32, 0],
+            total,
+        );
+        dst
+    }
+
+    fn glu_split(&self, src: &Self::Buf, rows: usize, n: usize) -> Self::Buf {
+        let total = rows * n;
+        let dst = self.alloc(total);
+        self.flat(
+            &self.p_glu,
+            &[src, &dst],
+            &[rows as u32, n as u32, 0, 0],
+            total,
+        );
+        dst
+    }
+
+    fn chan_affine_silu(
+        &self,
+        x: &Self::Buf,
+        w: &Self::Buf,
+        b: &Self::Buf,
+        channels: usize,
+        t: usize,
+    ) {
+        self.flat(
+            &self.p_chan_affine,
+            &[x, w, b],
+            &[channels as u32, t as u32, 0, 0],
+            channels * t,
+        );
+    }
+
+    fn xl_attention(
+        &self,
+        q: &Self::Buf,
+        k: &Self::Buf,
+        v: &Self::Buf,
+        p: &Self::Buf,
+        bias_u: &Self::Buf,
+        bias_v: &Self::Buf,
+        tokens: usize,
+        n_head: usize,
+        head_dim: usize,
+    ) -> Self::Buf {
+        let out = self.alloc(tokens * n_head * head_dim);
+        let params = self.params(&[
+            tokens as u32,
+            n_head as u32,
+            head_dim as u32,
+            (1.0f32 / (head_dim as f32).sqrt()).to_bits(),
+        ]);
+        self.vit.dispatch(
+            &self.p_attn,
+            &[q, k, v, p, bias_u, bias_v, &out, &params],
+            (tokens as u32, n_head as u32, 1),
+        );
+        out
+    }
+
+    fn stft_frames(
+        &self,
+        pcm: &Self::Buf,
+        hann: &Self::Buf,
+        n_samples: usize,
+        n_frames: usize,
+    ) -> Self::Buf {
+        use crate::model::audio_encoder::{HOP_LEN, N_FFT, PREEMPH};
+
+        let total = n_frames * N_FFT;
+        let frames = self.alloc(total);
+        self.flat(
+            &self.p_stft,
+            &[pcm, hann, &frames],
+            &[
+                n_frames as u32,
+                N_FFT as u32,
+                HOP_LEN as u32,
+                // `N_FFT / 2` per side, matching the CPU path's librosa `center=True` behaviour
+                (N_FFT / 2) as u32,
+                n_samples as u32,
+                PREEMPH.to_bits(),
+                0,
+                0,
+            ],
+            total,
+        );
+        frames
+    }
+
+    fn power_spec(&self, frames: &Self::Buf, twiddle: &Self::Buf, n_frames: usize) -> Self::Buf {
+        use crate::model::audio_encoder::N_FFT;
+        use crate::model::audio_preprocessor::N_FFT_BINS;
+
+        let total = n_frames * N_FFT_BINS;
+        let power = self.alloc(total);
+        self.flat(
+            &self.p_power,
+            &[frames, twiddle, &power],
+            &[n_frames as u32, N_FFT as u32, N_FFT_BINS as u32, 0],
+            total,
+        );
+        power
+    }
+
+    fn mel_project(
+        &self,
+        power: &Self::Buf,
+        filters: &Self::Buf,
+        n_mel: usize,
+        n_frames: usize,
+    ) -> Self::Buf {
+        use crate::model::audio_encoder::LOG_MEL_EPS;
+        use crate::model::audio_preprocessor::N_FFT_BINS;
+
+        let total = n_mel * n_frames;
+        let mel = self.alloc(total);
+        self.flat(
+            &self.p_mel_project,
+            &[power, filters, &mel],
+            &[
+                n_mel as u32,
+                n_frames as u32,
+                N_FFT_BINS as u32,
+                LOG_MEL_EPS.to_bits(),
+            ],
+            total,
+        );
+        mel
+    }
+
+    fn mel_norm(
+        &self,
+        mel: &Self::Buf,
+        n_mel: usize,
+        n_frames: usize,
+        effective_n_len: usize,
+    ) -> Self::Buf {
+        let dst = self.alloc(n_mel * n_frames);
+        let params = self.params(&[
+            n_mel as u32,
+            n_frames as u32,
+            effective_n_len as u32,
+            (crate::model::audio_encoder::NORM_VAR_EPS as f32).to_bits(),
+        ]);
+        // One workgroup per mel bin: the reduction is over the time axis.
+        self.vit.dispatch(
+            &self.p_mel_norm,
+            &[mel, &dst, &params],
+            (n_mel as u32, 1, 1),
+        );
+        dst
+    }
+}
+
 // ── Cached, object-safe encoder for the live session path ────────────────────
 
 /// Object-safe GPU audio encoder cached in a [`crate::session::Session`].
@@ -1785,25 +2248,83 @@ impl AudioGpuEncode for MetalAudioEncoder {
     }
 }
 
+#[cfg(feature = "gpu")]
+struct WgpuAudioEncoder {
+    ops: WgpuAudioOps,
+    weights: GpuAudioWeights<WgpuAudioOps>,
+}
+
+#[cfg(feature = "gpu")]
+impl AudioGpuEncode for WgpuAudioEncoder {
+    fn encode_pcm(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize)> {
+        // Drain the readback slot around the encode (see `MetalAudioEncoder`): a fault
+        // mid-encode otherwise returns zero embeddings as if they were the result.
+        let _ = self.ops.vit.ctx.take_readback_fault();
+        let out = encode_audio_pcm_gpu(&self.ops, &self.weights, pcm)?;
+        if let Some(e) = self.ops.vit.ctx.take_readback_fault() {
+            return Err(e.into());
+        }
+        Ok(out)
+    }
+
+    fn encode_mel(&self, mel: &[f32], n_frames: usize) -> Result<(Vec<f32>, usize)> {
+        let _ = self.ops.vit.ctx.take_readback_fault();
+        let out = encode_audio_mel_gpu(&self.ops, &self.weights, mel, n_frames)?;
+        if let Some(e) = self.ops.vit.ctx.take_readback_fault() {
+            return Err(e.into());
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "gpu")]
+fn try_wgpu_audio_encoder(
+    weights: &AudioEncoderWeights,
+) -> Option<std::sync::Arc<dyn AudioGpuEncode>> {
+    let ctx = crate::backend::wgpu::GpuContext::new().ok()?;
+    let ops = WgpuAudioOps::new(ctx).ok()?;
+    let gpu_w = match GpuAudioWeights::build(&ops, weights) {
+        Ok(w) => w,
+        Err(e) => {
+            tracing::warn!("audio encoder: wgpu backend unavailable for this model: {e:#}");
+            return None;
+        }
+    };
+    tracing::info!("audio encoder: using wgpu GPU backend");
+    Some(std::sync::Arc::new(WgpuAudioEncoder {
+        ops,
+        weights: gpu_w,
+    }))
+}
+
+#[cfg(not(feature = "gpu"))]
+fn try_wgpu_audio_encoder(
+    _weights: &AudioEncoderWeights,
+) -> Option<std::sync::Arc<dyn AudioGpuEncode>> {
+    None
+}
+
 /// Build a cached GPU audio encoder for `weights`, honoring `backend`.
 ///
 /// Returns `None` for `Cpu`, when the chosen backend's feature isn't compiled,
 /// or when the device/context can't be created. The caller then uses the CPU
-/// encoder. `Auto` prefers Metal. wgpu is not wired yet (its kernels ship and are
-/// parity-tested, but the ops impl does not exist), so `Gpu` yields `None`.
+/// encoder. `Auto` prefers Metal, then the NPU, then wgpu.
 pub fn build_gpu_audio_encoder(
     weights: &std::sync::Arc<AudioEncoderWeights>,
     backend: crate::engine::BackendPreference,
 ) -> Option<std::sync::Arc<dyn AudioGpuEncode>> {
     use crate::engine::BackendPreference as BP;
     match backend {
-        BP::Cpu | BP::Gpu => None,
+        BP::Cpu => None,
+        BP::Gpu => try_wgpu_audio_encoder(weights),
         // Hexagon is the only NPU with an audio encoder today; `Npu` takes the
         // same path and gains other vendors here as they grow one.
         BP::Hexagon | BP::Npu => try_hexagon_audio_encoder(weights),
         BP::Metal => try_metal_audio_encoder(weights),
-        // Metal first, then the NPU (the order the rest of `auto` uses).
-        BP::Auto => try_metal_audio_encoder(weights).or_else(|| try_hexagon_audio_encoder(weights)),
+        // Metal first, then the NPU, then wgpu (the order the rest of `auto` uses).
+        BP::Auto => try_metal_audio_encoder(weights)
+            .or_else(|| try_hexagon_audio_encoder(weights))
+            .or_else(|| try_wgpu_audio_encoder(weights)),
     }
 }
 
