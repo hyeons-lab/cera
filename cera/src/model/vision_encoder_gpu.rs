@@ -865,18 +865,35 @@ pub enum WgpuVitWeight {
     },
 }
 
+/// How [`WgpuVitOps::dispatch_elements`] binds one buffer of an elementwise kernel.
+#[cfg(feature = "gpu")]
+enum ElementBind<'a> {
+    /// Bound whole, every chunk.
+    Whole(&'a wgpu::Buffer),
+    /// Bound at the chunk's element offset: a buffer the kernel walks with the thread index.
+    Ranged(&'a wgpu::Buffer),
+    /// The chunk's parameters.
+    Params,
+}
+
+#[cfg(feature = "gpu")]
+fn gcd(a: usize, b: usize) -> usize {
+    if b == 0 { a } else { gcd(b, a % b) }
+}
+
 /// wgpu implementation of [`VitGpuOps`]. Owns the [`GpuContext`](crate::backend::wgpu::GpuContext) and the compute
 /// pipelines (compiled once) so it can be cached for the session's lifetime.
 /// Bind groups are created per dispatch (cheap relative to the kernel work).
 #[cfg(feature = "gpu")]
 pub struct WgpuVitOps {
-    ctx: crate::backend::wgpu::GpuContext,
+    pub(crate) ctx: crate::backend::wgpu::GpuContext,
     p_linear: wgpu::ComputePipeline,
     p_mul_mat_q8_0: wgpu::ComputePipeline,
     p_mul_mat_q4_0: wgpu::ComputePipeline,
     p_bias: wgpu::ComputePipeline,
     p_layernorm: wgpu::ComputePipeline,
     p_gelu: wgpu::ComputePipeline,
+    p_relu: wgpu::ComputePipeline,
     p_attn: wgpu::ComputePipeline,
     p_attn_tiled: wgpu::ComputePipeline,
     p_add: wgpu::ComputePipeline,
@@ -950,8 +967,57 @@ impl WgpuVitOps {
         })
     }
 
+    /// Like [`Self::dispatch`], binding each buffer over `(offset_bytes, size_bytes)` of it
+    /// (`size_bytes == 0` binds from the offset to the end). Offsets must be multiples of the
+    /// storage-offset alignment (256 bytes).
+    pub(crate) fn dispatch_ranges(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        bufs: &[(&wgpu::Buffer, u64, u64)],
+        workgroups: (u32, u32, u32),
+    ) {
+        let entries: Vec<wgpu::BindGroupEntry> = bufs
+            .iter()
+            .enumerate()
+            .map(|(i, &(buffer, offset, size))| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset,
+                    size: wgpu::BufferSize::new(if size == 0 {
+                        buffer.size().saturating_sub(offset)
+                    } else {
+                        size
+                    }),
+                }),
+            })
+            .collect();
+        let bind_group = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &entries,
+            });
+        let mut enc = self
+            .ctx
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None });
+        {
+            let mut pass = enc.begin_compute_pass(&wgpu::ComputePassDescriptor {
+                label: None,
+                timestamp_writes: None,
+            });
+            pass.set_pipeline(pipeline);
+            pass.set_bind_group(0, &bind_group, &[]);
+            pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
+        }
+        self.ctx.submit_encoder(enc);
+    }
+
     /// Encode one bind group from `bufs` (in binding order) and dispatch.
-    fn dispatch(
+    pub(crate) fn dispatch(
         &self,
         pipeline: &wgpu::ComputePipeline,
         bufs: &[&wgpu::Buffer],

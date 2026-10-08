@@ -22,18 +22,16 @@ pins each one against the CPU reference.
 
 The exceptions, and why:
 
-- **The LFM2A audio tier is Metal-live and WGSL-inert.** Ten kernels: the
-  Conformer body (`conv2d_direct`, `transpose_blocked`, `glu_split`,
-  `chan_affine_silu`, `activations`, `audio_xl_attention`) and the log-mel
-  front-end (`stft_frame`, `power_spec`, `mel_project`, `mel_norm`). All are
-  dispatched by the Metal audio encoder (`model/audio_encoder_gpu.rs`) and pinned
-  numerically by `tests/audio_encoder_metal_parity.rs`. Their WGSL halves are
-  generated, committed and drift-checked like everything else here, but nothing
-  dispatches them yet: the wgpu audio encoder is a later change. So for these
-  ten, `slang_multitarget_parity.rs` carries only generation checks (entry points
-  present, no subgroup ops, no `enable f16`), and wiring wgpu means adding
-  numeric cases, not just an ops impl. They are written as one source rather than
-  handwritten pairs precisely so that is the only work left.
+- **The LFM2A audio tier.** Ten kernels: the Conformer body (`conv2d_direct`,
+  `transpose_blocked`, `glu_split`, `chan_affine_silu`, `activations`, `audio_xl_attention`) and
+  the log-mel front-end (`stft_frame`, `power_spec`, `mel_project`, `mel_norm`). The Metal audio
+  encoder and the wgpu one (`model/audio_encoder_gpu.rs`, `WgpuAudioOps`) both dispatch them, and
+  they are pinned numerically against the CPU by `tests/audio_encoder_metal_parity.rs` and
+  `tests/audio_encoder_wgpu_parity.rs`. `slang_multitarget_parity.rs` still carries only generation
+  checks (entry points present, no subgroup ops, no `enable f16`) for them. One limit the WGSL side
+  has that Metal does not: a dispatch is at most 65535 workgroups, and these kernels index by
+  `SV_DispatchThreadID.x` alone, so a call with more than 16.7M elements has to be split by the
+  host (the wgpu `conv2d` splits over output channels).
 
 - `elementwise.slang` covers all four entry points `elementwise.wgsl` has, but
   only four of the eight in `elementwise.metal`. The other four (`memcpy_f32`,
