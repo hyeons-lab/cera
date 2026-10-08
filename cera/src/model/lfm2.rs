@@ -1546,6 +1546,10 @@ impl LfmModel {
     /// [`Self::hidden_states_float_bidirectional`]: some projection is a dtype the batched
     /// GEMM cannot run (F16, F32), and the per-token path that would take it instead is
     /// causal, so it would answer a different question.
+    ///
+    /// A target with no batched GEMM at all (wasm32, 32-bit ARM and x86) has only that
+    /// per-token path, so there every bidirectional model takes the float path.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
     fn bidirectional_needs_float_path(&self) -> bool {
         const PROJECTIONS: [&str; 9] = [
             "shortconv.in_proj",
@@ -1571,6 +1575,12 @@ impl LfmModel {
                     })
             })
         })
+    }
+
+    /// See the batched-target version: with no batched GEMM on this target, always.
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", has_blas)))]
+    fn bidirectional_needs_float_path(&self) -> bool {
+        true
     }
 
     /// The bidirectional trunk in plain f32, for weights the batched GEMM cannot run.
@@ -6551,6 +6561,7 @@ mod bidirectional_float_tests {
 
     /// The float path computes the function the batched quantized path does: the same
     /// weights, once as F32 and once as Q8_0, agree to the quantization error.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
     #[test]
     fn the_float_path_agrees_with_the_batched_quantized_path() {
         if !transformer::batched_gemm_supports(crate::tensor::DType::Q8_0, HS) {
