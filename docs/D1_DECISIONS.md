@@ -210,8 +210,13 @@ those two images about 10 s (F16).
 
 ## Not done yet
 
-* Metal, wgpu and NPU: the trunk is the ordinary LFM2 model, but the decision head, the vision
-  tower and the speech residual are host-side and only the CPU float path is validated.
+* Metal, wgpu and NPU: d1 runs on the CPU only. The GPU LFM2 graphs are causal and ignore the
+  model's attention mask, so on Metal and wgpu a d1 model used to load and answer wrongly (the
+  refund probability in the text example fell from 0.998 to 0.12, and the chosen team changed).
+  Both loaders now refuse a bidirectional LFM2 checkpoint, so `--device auto` falls back to the
+  CPU and an explicit `--device metal` or `--device gpu` reports why it cannot run. Running the
+  trunk bidirectionally on a GPU needs a non-causal attention kernel and a centred convolution;
+  the NPU loader has not been checked.
 * The media prefix (an image's or a clip's) is recomputed through the trunk for every question; it
   depends only on the media, so it could be computed once.
 * Speech speed has not been measured.
