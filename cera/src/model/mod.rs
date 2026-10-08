@@ -853,6 +853,32 @@ pub trait Model: Send + Sync {
         unimplemented!("hidden_states not supported by this backend")
     }
 
+    /// Static capability probe: does this backend implement
+    /// [`Self::hidden_states_with_prefix`]? Default `false`.
+    fn supports_media_prefix(&self) -> bool {
+        false
+    }
+
+    /// [`Self::hidden_states`] over a media prefix followed by `tokens`.
+    ///
+    /// `prefix` is `[prefix_rows * hidden_size]` embeddings of an image or an audio clip, laid
+    /// ahead of the text. A bidirectional trunk reads it as a prefix: its rows attend only to
+    /// each other, and the convolution at its last row does not read the first text row, so
+    /// the prefix is a function of the media alone. Text rows read everything.
+    ///
+    /// Returns the hidden states of the **text** rows only, `[tokens.len() * hidden_size]`.
+    ///
+    /// Default: panics; gated by [`Self::supports_media_prefix`].
+    fn hidden_states_with_prefix(
+        &self,
+        prefix: &[f32],
+        tokens: &[u32],
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _ = (prefix, tokens, state);
+        unimplemented!("hidden_states_with_prefix not supported by this backend")
+    }
+
     /// Greedy (argmax) fast path. Returns just the selected token id,
     /// avoiding a full logits readback when the caller only needs argmax.
     ///

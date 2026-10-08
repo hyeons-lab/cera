@@ -2,8 +2,9 @@
 
 [`LiquidAI/d1-omni-600M`](https://huggingface.co/LiquidAI/d1-omni-600M) answers named questions
 about a state with **zero output tokens**: every answer is read from the model's distribution over
-the options. cera runs it on the text path today: a state (a string or any JSON) and one or more
-questions in, typed answers out. Images and speech are not wired in yet.
+the options. cera runs it on text and images: a state (a string or any JSON, or none when the
+image is the whole state) and one or more questions in, typed answers out. Speech is not wired in
+yet.
 
 ## Use
 
@@ -27,7 +28,17 @@ cat > request.json <<'EOF'
 }
 EOF
 cera decide --model d1-omni-f16.gguf --request request.json
+
+# 3. Ask about an image: it is read ahead of the text, so the question can be about the picture
+cera decide --model d1-omni-f16.gguf --image cats.png --request - <<'EOF'
+{"questions": {"cats": {"type": "choice", "instructions": "How many cats are there?",
+                        "criteria": {"one": "One", "two": "Two", "more": "Three or more"}}}}
+EOF
 ```
+
+`--image` can be repeated, and images can also be sent inside the request as
+`"images": ["data:image/png;base64,..."]`. They are laid out in the order given. A request carries
+images or (later) speech, not both.
 
 The response has the reference implementation's shape (this is the real output of the request
 above on the F16 model, trimmed to the answers):
@@ -56,14 +67,38 @@ Text answers are calibrated with the per-type temperatures stored in the checkpo
 
 Each question is its own sequence: `<bos> <state> state <q> instructions (<opt> <mask> option
 </opt>)* <decide>`. The trunk is a **non-causal LFM2** (the same architecture as the
-bidirectional LFM2 embedding models) and runs wherever the engine does; the decision head runs on
-the host over the trunk's per-token hidden states and scores the state at each `<mask>`. In the
-head's last layer only the marker rows are computed, which gives the same scores as computing
-every row.
+bidirectional LFM2 embedding models); the decision head runs on the host over the trunk's
+per-token hidden states and scores the state at each `<mask>`. In the head's last layer only the
+marker rows are computed, which gives the same scores as computing every row.
 
 A `<|name|>` in caller text is rewritten to `<¦name¦>` before tokenizing, so a state can never
 forge a delimiter. A state that does not fit is cut on the right; the options are never cut below
 their budget (see `d1/prompt.rs`).
+
+### Images
+
+An image becomes a prefix of embeddings in front of the text:
+
+1. A large image is cut into a grid of up to ten 512 px tiles plus a thumbnail; a small one is read
+   whole (LFM2-VL's smart resize and tiling).
+2. Every crop goes through a SigLIP2 tower that takes any patch grid (the position table is
+   resized to the crop's grid), then a 2x2 pixel unshuffle and a two-layer projector. A crop of
+   `h x w` patches gives `(h / 2) * (w / 2)` embeddings.
+3. The prefix attends only to itself, and the convolution at its last row does not read the first
+   text row, so it depends on the image alone. Text rows read everything.
+
+The resize is part of the model: PyTorch's antialiased bilinear on `uint8`, horizontal pass first,
+each pass rounded to `uint8`, with 16-bit fixed-point weights. An emulation of this algorithm
+has zero differing pixels against the reference's crops on a plain and on a tiled image, and cera
+implements the same arithmetic: its end-to-end answers match the reference to 7e-6 at F32.
+
+With media, the text of a request gets the room the image leaves, and no more than
+`image_text_length` (896) tokens; a `noul` without definitions of its own is worded `false: no` /
+`true: yes`; and answers are the raw softmax, because the calibration temperatures were fitted on
+text only.
+
+The trunk reads a media prefix through the plain-f32 path whatever the weights' precision, and
+the images of a request are encoded once for all its questions.
 
 ## GGUF layout
 
@@ -82,14 +117,24 @@ The scorer and the question-type table stay F32 at every precision. Settings:
 `d1.head.layer_norm_epsilon`, `d1.context_length`, `d1.image_text_length`,
 `d1.audio_text_length`, and `d1.temperature.keys` / `d1.temperature.values`.
 
-The vision tower (`vision.*`) and audio tower (`audio.*`) are left out of the GGUF for now.
+| `vision.tower.vision_model.*` | `d1.v.patch_embd`, `d1.v.position_embd`, `d1.v.blk.N.{ln1,attn_q,attn_k,attn_v,attn_out,ln2,ffn_up,ffn_down}`, `d1.v.post_ln` |
+| `vision.projector.linear_{1,2}` | `d1.v.mm.{1,2}` |
+
+The patch and position tables stay F32 too. Vision settings: `d1.vision.block_count`,
+`d1.vision.embedding_length`, `d1.vision.feed_forward_length`, `d1.vision.attention.head_count`,
+`d1.vision.patch_size`, `d1.vision.position_side`, `d1.vision.layer_norm_epsilon`,
+`d1.vision.projector_hidden_length`.
+
+The audio tower (`audio.*`) is left out of the GGUF for now.
 
 ## Precision
 
-Measured against LiquidAI's reference implementation (`transformers`, float32, CPU) on seven text
-requests (14 questions): plain, two-and-twelve-option questions, a JSON state, options with empty descriptions,
-a state that tries to forge delimiters, an empty state, and a 27,000-token state that is cut.
-Every request used the same number of input tokens as the reference.
+Measured against LiquidAI's reference implementation (`transformers`, float32, CPU). The input-token
+count matched the reference on every request.
+
+Text: 7 requests (14 questions): plain, two-and-twelve-option questions, a JSON state, options with
+empty descriptions, a state that tries to forge delimiters, an empty state, and a 27,000-token state
+that is cut.
 
 | Weights | Largest probability difference | Answers that changed |
 |---|---|---|
@@ -97,16 +142,33 @@ Every request used the same number of input tokens as the reference.
 | F16 | 8e-4 | 0 |
 | Q8_0 | 1.9e-2 | 1 of 14 questions (a near-tie on an 8-level score) |
 
+Images: 4 requests (a 640x480 photo, a 2048x1536 photo that is tiled into 6 tiles and a thumbnail,
+the same photo with state text, and two images), 4 to 8 questions each, PNG input.
+
+| Weights | Largest probability difference | Answers that changed |
+|---|---|---|
+| F32 | 7e-6 | 0 |
+| F16 | 1.7e-3 | 0 |
+| Q8_0 | 4.3e-2 | 0 |
+
 The checkpoint is trained in float32 and the reference recommends float16 on GPUs; bfloat16
 changed the top answer on 0.8% of text rows. Use F16 (or F32) for decisions and Q8_0 where size
-matters more than the last few percent on near-ties.
+matters more than the last few percent.
 
-F16 and F32 trunks run through a plain float path (one layer's weights widened at a time) because
-the batched integer GEMM only exists for quantized weights; Q8_0 uses that batched path. Speed
-has not been measured yet.
+**JPEG input** decodes to slightly different pixels than Pillow's libjpeg (the Rust decoder rounds
+differently), which moves F16 image answers by up to 2e-3 instead of 1.7e-3 on these requests. A
+PNG, or a JPEG decoded by the caller, avoids it.
+
+F16 and F32 text trunks run through a plain float path (one layer's weights widened at a time)
+because the batched integer GEMM only exists for quantized weights; Q8_0 text uses that batched
+path. On this Mac (CPU only, one run each, so indicative): a 640x480 image with one question takes
+about 2 s end to end (F32 and F16), the tiled 2048x1536 image about 8 s (F32), and the pair of
+those two images about 10 s (F16).
 
 ## Not done yet
 
-* Images and speech: the towers are not converted and the request has no media fields.
-* Metal, wgpu and NPU: the trunk is the ordinary LFM2 model, but the decision head is
-  host-side and only the CPU float path is validated for F16/F32 weights.
+* Speech: the audio tower is not converted and the request has no audio field.
+* Metal, wgpu and NPU: the trunk is the ordinary LFM2 model, but the decision head and the vision
+  tower are host-side and only the CPU float path is validated.
+* The image prefix is recomputed through the trunk for every question; it depends only on the
+  image, so it could be computed once.

@@ -405,10 +405,17 @@ impl Parser<'_> {
                 }
                 0..=0x1f => bail!("control character in a string at byte {}", self.pos),
                 _ => {
-                    let rest = std::str::from_utf8(&self.bytes[self.pos..])?;
-                    let c = rest.chars().next().expect("non-empty");
-                    out.push(c);
-                    self.pos += c.len_utf8();
+                    // A run of plain characters up to the next quote, backslash or control
+                    // byte. Those are ASCII, so the run ends on a character boundary and is
+                    // checked once: validating the whole remaining input per character is
+                    // quadratic, and a base64 image is megabytes of plain characters.
+                    let rest = &self.bytes[self.pos..];
+                    let run = rest
+                        .iter()
+                        .position(|b| matches!(b, b'"' | b'\\' | 0..=0x1f))
+                        .unwrap_or(rest.len());
+                    out.push_str(std::str::from_utf8(&rest[..run])?);
+                    self.pos += run;
                 }
             }
         }
@@ -466,6 +473,30 @@ mod tests {
         );
         assert_eq!(Json::parse("1E2").unwrap().dumps(), "100.0");
         assert_eq!(Json::parse("-1.50").unwrap().dumps(), "-1.5");
+    }
+
+    #[test]
+    fn a_megabytes_long_string_parses_in_linear_time() {
+        // an image sent as a base64 data URL is one string of this size; a parser that
+        // re-validates the rest of the input per character needs hours for it
+        let body: String = "aé☕😀z".repeat(600_000);
+        let text = format!("{{\"images\": [\"data:image/png;base64,{body}\"]}}");
+        let started = crate::time::Instant::now();
+        let parsed = Json::parse(&text).unwrap();
+        assert!(started.elapsed() < crate::time::Duration::from_secs(10));
+        let Some(Json::Array(images)) = parsed.get("images") else {
+            panic!("no images array")
+        };
+        assert_eq!(
+            images[0].as_str().unwrap(),
+            format!("data:image/png;base64,{body}")
+        );
+    }
+
+    #[test]
+    fn strings_mix_plain_runs_with_escapes() {
+        let v = Json::parse(r#""ab\ncd\u00e9ef\"gh☕""#).unwrap();
+        assert_eq!(v, Json::Str("ab\ncdéef\"gh☕".into()));
     }
 
     #[test]

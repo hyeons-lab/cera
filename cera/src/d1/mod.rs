@@ -1,10 +1,11 @@
 //! Decisions with the open `d1-omni` models.
 //!
 //! A d1 model answers named questions about a state with zero output tokens: every answer is
-//! read from the model's distribution over the options. The state is text here (images and
-//! speech are not wired in yet); each question is rendered as its own sequence ([`prompt`]), the
-//! bidirectional LFM2 trunk turns it into one hidden state per token, and the head ([`head`])
-//! scores the state at the option markers.
+//! read from the model's distribution over the options. The state is text, optionally with
+//! images (speech is not wired in yet); each question is rendered as its own sequence
+//! ([`prompt`]), the bidirectional LFM2 trunk turns it into one hidden state per token, and the
+//! head ([`head`]) scores the state at the option markers. Images become a prefix of embeddings
+//! in front of the text ([`vision`]).
 //!
 //! The trunk is an ordinary non-causal `lfm2` model, so it runs wherever the engine does: this
 //! module only adds what sits on top of it, reading the `d1.*` tensors and settings of a GGUF
@@ -29,6 +30,7 @@
 pub mod head;
 pub mod json;
 pub mod prompt;
+pub mod vision;
 
 use std::collections::HashMap;
 
@@ -46,11 +48,13 @@ pub use prompt::{Question, QuestionType};
 pub struct D1Request {
     pub state: Json,
     pub questions: Vec<(String, Question)>,
+    /// Encoded images (PNG or JPEG), in the order they are laid out ahead of the text.
+    pub images: Vec<Vec<u8>>,
 }
 
 impl D1Request {
-    /// Parse `{"state": <any JSON>, "questions": {name: {"type", "instructions", "criteria"}}}`.
-    /// A missing or null `state` is the empty state.
+    /// Parse `{"state": <any JSON>, "questions": {name: {"type", "instructions", "criteria"}},
+    /// "images": [<base64 data URL>, ...]}`. A missing or null `state` is the empty state.
     ///
     /// # Errors
     ///
@@ -73,7 +77,31 @@ impl D1Request {
                     .with_context(|| format!("question `{name}`"))
             })
             .collect::<Result<_>>()?;
-        Ok(Self { state, questions })
+        let images = match body.get("images") {
+            None | Some(Json::Null) => Vec::new(),
+            Some(Json::Array(urls)) => urls
+                .iter()
+                .enumerate()
+                .map(|(i, url)| {
+                    let url = url
+                        .as_str()
+                        .with_context(|| format!("images[{i}] must be a base64 data URL"))?;
+                    vision::decode_data_url(url).with_context(|| format!("images[{i}]"))
+                })
+                .collect::<Result<_>>()?,
+            Some(_) => anyhow::bail!("\"images\" must be an array of base64 data URLs"),
+        };
+        Ok(Self {
+            state,
+            questions,
+            images,
+        })
+    }
+
+    /// Add an encoded image after the ones already there.
+    pub fn with_image(mut self, bytes: Vec<u8>) -> Self {
+        self.images.push(bytes);
+        self
     }
 }
 
@@ -108,9 +136,12 @@ impl D1Response {
 /// The d1 half of a loaded model: the head, the calibration and the prompt's token ids.
 pub struct D1Model {
     head: head::Head,
+    vision: Option<vision::VisionTower>,
     temperatures: HashMap<String, f32>,
     ids: prompt::PromptTokens,
     max_length: usize,
+    /// Room an image request leaves its text.
+    image_text_length: usize,
 }
 
 impl D1Model {
@@ -148,11 +179,19 @@ impl D1Model {
             ensure!(value > 0.0, "invalid d1 temperature {key} = {value}");
             temperatures.insert(key.to_string(), value);
         }
+        let vision = vision::VisionTower::is_present(gguf)
+            .then(|| vision::VisionTower::from_gguf(gguf, n_embd))
+            .transpose()?;
+        let image_text_length = gguf
+            .get_u32("d1.image_text_length")
+            .map_or(max_length, |n| n as usize);
         Ok(Self {
             head: head::Head::from_gguf(gguf, n_embd)?,
+            vision,
             temperatures,
             ids: prompt::PromptTokens::from_tokenizer(tokenizer)?,
             max_length,
+            image_text_length,
         })
     }
 
@@ -184,19 +223,57 @@ impl D1Model {
         request: &D1Request,
     ) -> Result<(Vec<Vec<f32>>, usize)> {
         let hidden_size = session.hidden_size();
+        // the images are encoded once for all the questions
+        let prefix = if request.images.is_empty() {
+            Vec::new()
+        } else {
+            let tower = self
+                .vision
+                .as_ref()
+                .context("this model has no vision tower (reconvert it with images)")?;
+            let rgb = request
+                .images
+                .iter()
+                .enumerate()
+                .map(|(i, bytes)| {
+                    vision::decode_image(bytes).with_context(|| format!("images[{i}]"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            tower.encode(&rgb)?
+        };
+        let media = !prefix.is_empty();
+        let prefix_rows = prefix.len() / hidden_size;
+        // with media the text gets what the media leave, and no more than the model was trained on
+        let max_len = if media {
+            let room = self.max_length.saturating_sub(prefix_rows);
+            ensure!(
+                room >= 64,
+                "the images take {prefix_rows} of the {} positions; send fewer or smaller images",
+                self.max_length
+            );
+            room.min(self.image_text_length)
+        } else {
+            self.max_length
+        };
         let mut all = Vec::with_capacity(request.questions.len());
         let mut read = 0;
         for (name, q) in &request.questions {
             let (ids, markers) =
-                prompt::encode(tokenizer, &self.ids, &request.state, q, self.max_length)
+                prompt::encode(tokenizer, &self.ids, &request.state, q, max_len, media)
                     .with_context(|| format!("question `{name}`"))?;
-            let hidden = session.hidden_states_for_tokens(&ids)?;
+            let hidden = if media {
+                session.hidden_states_with_prefix(&prefix, &ids)?
+            } else {
+                session.hidden_states_for_tokens(&ids)?
+            };
             let scores = self
                 .head
                 .scores(&hidden, ids.len(), q.kind as usize, &markers)
                 .with_context(|| format!("question `{name}` (hidden size {hidden_size})"))?;
-            all.push(prompt::probabilities(q, &scores, self.temperature(q)));
-            read += ids.len();
+            // the calibration was fitted on text; media answers are the raw softmax
+            let temperature = if media { 1.0 } else { self.temperature(q) };
+            all.push(prompt::probabilities(q, &scores, temperature));
+            read += prefix_rows + ids.len();
         }
         Ok((all, read))
     }
