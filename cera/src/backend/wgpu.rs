@@ -2495,6 +2495,8 @@ pub mod shaders {
     /// stay `array<f32>` so its exact CPU/GPU parity test keeps passing.
     pub const FLASH_ATTENTION_F32: &str = include_str!("shaders/flash_attention_f32.wgsl");
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
+    /// Register-tiled flash attention for head_dim 64 (f32 Q/K/V, GQA, bidirectional windows).
+    pub const ATTENTION_FLASH_HD64: &str = include_str!("shaders/attention_flash_hd64.wgsl");
     /// The centred gated convolution of a bidirectional LFM2 trunk.
     pub const BIDIRECTIONAL: &str = include_str!("shaders/bidirectional.wgsl");
     /// TurboQuant KV compression: `tq_encode_keys`, `tq_encode_values`,

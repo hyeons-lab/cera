@@ -1417,6 +1417,8 @@ struct GpuPipelines {
     /// Same `None`-unless-streaming convention as `gemm_stream_q4_0`.
     transpose_cast_f16: Option<wgpu::ComputePipeline>,
     attention_prefill: wgpu::ComputePipeline,
+    /// Register-tiled f32 flash attention for head_dim 64 (the bidirectional trunk).
+    attention_flash_hd64: wgpu::ComputePipeline,
     // ── Routed mixture-of-experts (`lfm2moe`) ─────────────────────────────
     // Built for every model, dense or routed: pipeline creation is a shader
     // compile, so making it conditional would trade a fixed load-time cost for a
@@ -2297,6 +2299,11 @@ impl GpuLfmModel {
                 shaders::ATTENTION_PREFILL,
                 "attention_prefill",
                 "attention_prefill",
+            ),
+            attention_flash_hd64: ctx.create_pipeline(
+                shaders::ATTENTION_FLASH_HD64,
+                "main",
+                "attention_flash_hd64",
             ),
             moe_route: ctx.create_pipeline(shaders::MOE_ROUTE, "moe_route", "moe_route"),
             moe_gemv_q4_0: ctx.create_pipeline(
@@ -8996,6 +9003,79 @@ impl GpuLfmModel {
         out
     }
 
+    /// The register-tiled flash attention (`attention_flash_hd64.wgsl`) over `n` rows whose f32
+    /// Q, K and V are `q`, `k` and `v`, with the media-prefix window of a bidirectional trunk.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_attention_flash<'a>(
+        &'a self,
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        q: &wgpu::Buffer,
+        k: &wgpu::Buffer,
+        v: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        n: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        prefix: u32,
+    ) {
+        let head_dim = self.config.head_dim as f32;
+        let scale = self.scalars.attn.unwrap_or_else(|| 1.0 / head_dim.sqrt());
+        let params: [u32; 8] = [
+            n,
+            n_heads,
+            self.config.head_dim as u32,
+            scale.to_bits(),
+            n_kv_heads,
+            1,
+            prefix,
+            0,
+        ];
+        let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
+        let entries = [
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: q.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: k.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: v.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: out.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 4,
+                resource: p_buf.as_entire_binding(),
+            },
+        ];
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("attention_flash_hd64"),
+                layout: &self.pipelines.attention_flash_hd64.get_bind_group_layout(0),
+                entries: &entries,
+            });
+        Self::push_prefill_dispatch(
+            cmds,
+            &self.pipelines.attention_flash_hd64,
+            bg,
+            (n.div_ceil(32), n_heads, 1),
+            "attention_flash_hd64",
+        );
+    }
+
+    /// Whether the bidirectional trunk attends with the flash kernel: head_dim 64, and not
+    /// Android (see `use_flash_attention` in the ViT ops).
+    fn uses_flash_attention(&self) -> bool {
+        self.config.head_dim == 64 && cfg!(not(target_os = "android"))
+    }
+
     /// Dispatch a `bidirectional.wgsl` kernel over `elements` threads (a 2-D grid, since a
     /// single dimension tops out at 65535 workgroups).
     fn push_bidir_dispatch<'a>(
@@ -9118,6 +9198,22 @@ impl GpuLfmModel {
             .queue
             .write_buffer(&h_big, 0, bytemuck::cast_slice(embeddings));
         let kv_scratch = &self.hs_scratch().kv;
+        // The flash kernel reads K and V as f32 for the whole sequence, so they get buffers of
+        // their own instead of the packed-f16 scratch caches the generic kernel reads.
+        let flash = self.uses_flash_attention();
+        let kv_dim_max = cfg
+            .kv_heads_per_layer
+            .iter()
+            .map(|&kv| kv * head_dim)
+            .max()
+            .unwrap_or(0);
+        let kv_big = flash.then(|| {
+            let bytes = (n * kv_dim_max.max(1) * 4) as u64;
+            (
+                self.ctx.create_storage_rw(bytes, "bidir.k"),
+                self.ctx.create_storage_rw(bytes, "bidir.v"),
+            )
+        });
 
         // Same pooled-resource protocol as `encode_prefill_batched_locked`: one encoder, one
         // submit, params and stream-GEMM bind groups handed out in call order from zero.
@@ -9216,22 +9312,41 @@ impl GpuLfmModel {
                         q_dim as u32,
                         kv_dim,
                     );
-                    let off_words = (r0 * kv_dim as usize / 2) as u32;
-                    let floats = m_u * kv_dim;
-                    self.encode_kv_append_prefill(
-                        &mut cmds,
-                        &self.prefill_gate_buf,
-                        k16,
-                        off_words,
-                        floats,
-                    );
-                    self.encode_kv_append_prefill(
-                        &mut cmds,
-                        &self.prefill_up_buf,
-                        v16,
-                        off_words,
-                        floats,
-                    );
+                    if let Some((k_big, v_big)) = &kv_big {
+                        cmds.push(copy_rows(
+                            &self.prefill_gate_buf,
+                            0,
+                            k_big,
+                            r0,
+                            m,
+                            kv_dim as usize,
+                        ));
+                        cmds.push(copy_rows(
+                            &self.prefill_up_buf,
+                            0,
+                            v_big,
+                            r0,
+                            m,
+                            kv_dim as usize,
+                        ));
+                    } else {
+                        let off_words = (r0 * kv_dim as usize / 2) as u32;
+                        let floats = m_u * kv_dim;
+                        self.encode_kv_append_prefill(
+                            &mut cmds,
+                            &self.prefill_gate_buf,
+                            k16,
+                            off_words,
+                            floats,
+                        );
+                        self.encode_kv_append_prefill(
+                            &mut cmds,
+                            &self.prefill_up_buf,
+                            v16,
+                            off_words,
+                            floats,
+                        );
+                    }
                     cmds.push(copy_rows(&self.prefill_proj_buf, 0, &buf_a, r0, m, q_dim));
                 }
                 self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("{label}a"), m_u);
@@ -9249,29 +9364,43 @@ impl GpuLfmModel {
                 );
             } else {
                 let n_kv_heads = cfg.kv_heads_per_layer[layer] as u32;
-                let (k16, v16) = layer_kv.as_ref().unwrap();
-                let scale = self
-                    .scalars
-                    .attn
-                    .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
-                self.encode_attention_prefill(
-                    &mut cmds,
-                    &buf_a,
-                    k16,
-                    v16,
-                    &buf_b,
-                    n as u32,
-                    cfg.n_heads as u32,
-                    n_kv_heads,
-                    head_dim as u32,
-                    n_kv_heads * head_dim as u32,
-                    n as u32,
-                    0,
-                    q_dim as u32,
-                    q_dim as u32,
-                    scale,
-                    Some(prefix as u32),
-                );
+                if let Some((k_big, v_big)) = &kv_big {
+                    self.encode_attention_flash(
+                        &mut cmds,
+                        &buf_a,
+                        k_big,
+                        v_big,
+                        &buf_b,
+                        n as u32,
+                        cfg.n_heads as u32,
+                        n_kv_heads,
+                        prefix as u32,
+                    );
+                } else {
+                    let (k16, v16) = layer_kv.as_ref().unwrap();
+                    let scale = self
+                        .scalars
+                        .attn
+                        .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
+                    self.encode_attention_prefill(
+                        &mut cmds,
+                        &buf_a,
+                        k16,
+                        v16,
+                        &buf_b,
+                        n as u32,
+                        cfg.n_heads as u32,
+                        n_kv_heads,
+                        head_dim as u32,
+                        n_kv_heads * head_dim as u32,
+                        n as u32,
+                        0,
+                        q_dim as u32,
+                        q_dim as u32,
+                        scale,
+                        Some(prefix as u32),
+                    );
+                }
             }
             self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("{label}x"), n as u32);
 
@@ -11106,27 +11235,18 @@ mod tests {
     /// Acquire a GPU context or skip. Under `CERA_REQUIRE_GPU` (the lavapipe CI
     /// job) a missing adapter is a hard failure, mirroring the oracle tests, so
     /// the contract below cannot pass by silently skipping.
-    /// The bidirectional trunk against the CPU one on a tiny non-causal model (one short-conv
-    /// block, one attention block), over lengths that span one chunk, several chunks, and a
-    /// media prefix that is shorter, equal to and longer than an attention query group.
+    /// The bidirectional trunk against the CPU one on a tiny non-causal model (a short-conv block
+    /// and two attention blocks), over lengths that span one chunk, several chunks, and a media
+    /// prefix that is shorter, equal to and longer than an attention query group. Heads of 32
+    /// take the generic prefill kernel and heads of 64 the register-tiled flash kernel.
     #[test]
     fn wgpu_reads_the_whole_sequence_like_the_cpu() {
         use crate::kv_cache::InferenceState;
         use crate::model::Model;
         use crate::model::lfm2::LfmModel;
-        use crate::model::lfm2::bidirectional_float_tests::{HS, bidirectional_gguf, embeddings};
-        let Some(ctx) = gpu_ctx_or_skip() else {
-            return;
+        use crate::model::lfm2::bidirectional_float_tests::{
+            HS, bidirectional_gguf_with, embeddings,
         };
-        let cpu = LfmModel::from_gguf(bidirectional_gguf(true), 4096).unwrap();
-        let gpu = super::GpuLfmModel::from_gguf_with_ctx(
-            bidirectional_gguf(true),
-            4096,
-            "bidir".into(),
-            ctx,
-        )
-        .unwrap();
-        assert!(!gpu.config().is_causal, "the fixture must be bidirectional");
         let cosine = |a: &[f32], b: &[f32]| {
             let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
             let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -11139,24 +11259,43 @@ mod tests {
                 assert!(cos > 0.999, "{what}: row {t} cosine {cos}");
             }
         };
-        for n in [9usize, 300, 700, 2600] {
-            let tokens: Vec<u32> = (0..n).map(|i| ((i * 7 + 3) % 32) as u32).collect();
-            let mut state = InferenceState::for_prefill(cpu.config(), n).unwrap();
-            let want = cpu.hidden_states(&tokens, &mut state);
-            let mut state = InferenceState::for_prefill(gpu.config(), n).unwrap();
-            let got = gpu.hidden_states(&tokens, &mut state);
-            rows_agree(&format!("n={n}"), &want, &got);
-        }
-        let tokens = [3u32, 7, 9, 12, 5];
-        for prefix_rows in [1usize, 4, 11, 600] {
-            let prefix = embeddings(prefix_rows, 0.3);
-            let mut state =
-                InferenceState::for_prefill(cpu.config(), prefix_rows + tokens.len()).unwrap();
-            let want = cpu.hidden_states_with_prefix(&prefix, &tokens, &mut state);
-            let mut state =
-                InferenceState::for_prefill(gpu.config(), prefix_rows + tokens.len()).unwrap();
-            let got = gpu.hidden_states_with_prefix(&prefix, &tokens, &mut state);
-            rows_agree(&format!("prefix={prefix_rows}"), &want, &got);
+        for (heads, head_dim) in [(4usize, 32usize), (2, 64)] {
+            let Some(ctx) = gpu_ctx_or_skip() else {
+                return;
+            };
+            let cpu =
+                LfmModel::from_gguf(bidirectional_gguf_with(true, heads, head_dim), 4096).unwrap();
+            let gpu = super::GpuLfmModel::from_gguf_with_ctx(
+                bidirectional_gguf_with(true, heads, head_dim),
+                4096,
+                "bidir".into(),
+                ctx,
+            )
+            .unwrap();
+            assert!(!gpu.config().is_causal, "the fixture must be bidirectional");
+            for n in [9usize, 300, 700, 2600] {
+                let tokens: Vec<u32> = (0..n).map(|i| ((i * 7 + 3) % 32) as u32).collect();
+                let mut state = InferenceState::for_prefill(cpu.config(), n).unwrap();
+                let want = cpu.hidden_states(&tokens, &mut state);
+                let mut state = InferenceState::for_prefill(gpu.config(), n).unwrap();
+                let got = gpu.hidden_states(&tokens, &mut state);
+                rows_agree(&format!("{heads}x{head_dim} n={n}"), &want, &got);
+            }
+            let tokens = [3u32, 7, 9, 12, 5];
+            for prefix_rows in [1usize, 4, 11, 600] {
+                let prefix = embeddings(prefix_rows, 0.3);
+                let mut state =
+                    InferenceState::for_prefill(cpu.config(), prefix_rows + tokens.len()).unwrap();
+                let want = cpu.hidden_states_with_prefix(&prefix, &tokens, &mut state);
+                let mut state =
+                    InferenceState::for_prefill(gpu.config(), prefix_rows + tokens.len()).unwrap();
+                let got = gpu.hidden_states_with_prefix(&prefix, &tokens, &mut state);
+                rows_agree(
+                    &format!("{heads}x{head_dim} prefix={prefix_rows}"),
+                    &want,
+                    &got,
+                );
+            }
         }
     }
 

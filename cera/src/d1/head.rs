@@ -28,7 +28,7 @@ use crate::engine::BackendPreference;
 use crate::gguf::GgufFile;
 use crate::model::pii::matmul_nt_f32;
 use crate::model::vision_encoder_gpu::{
-    VitStack, VitStackActivation, VitStackBlock, VitStackSpec, build_vit_stack_native,
+    VitStack, VitStackActivation, VitStackBlock, VitStackSpec, build_vit_stack_fast,
 };
 use crate::model::weights::MmapWeight;
 use crate::par::*;
@@ -148,8 +148,8 @@ impl Head {
         })
     }
 
-    /// Run the transformer layers on the GPU `backend` names, when it is Metal (see
-    /// [`build_vit_stack_native`]: on wgpu the host is faster). The scorer (a LayerNorm, one linear
+    /// Run the transformer layers on the GPU `backend` names, when its attention is fast (see
+    /// [`build_vit_stack_fast`]: Metal, or wgpu's flash kernel). The scorer (a LayerNorm, one linear
     /// and a GELU on a handful of rows) stays on the host. A pass the device cannot take (more
     /// rows than its buffers hold) runs on the host as before.
     pub fn accelerate(&mut self, gguf: &Arc<GgufFile>, backend: BackendPreference) {
@@ -169,7 +169,7 @@ impl Head {
             Ok(w)
         };
         match self.stack_spec(from_file) {
-            Ok(spec) => self.gpu = build_vit_stack_native(&spec, backend),
+            Ok(spec) => self.gpu = build_vit_stack_fast(&spec, backend),
             Err(e) => tracing::warn!("the d1 head stays on the CPU: {e:#}"),
         }
     }
@@ -659,23 +659,26 @@ mod tests {
                 Ok(owned(w, rows, cols))
             })
             .unwrap();
-        let Some(gpu) = build_vit_stack_native(&spec, BackendPreference::Auto) else {
-            eprintln!("SKIPPED: no Metal device is available");
-            return;
-        };
-        for n in [3usize, 40, 300, 777] {
-            let hidden = noise(n * d, 5, 1.0);
-            let markers = [0, n / 3, n - 1];
-            for kind in 0..TYPES {
-                head.gpu = None;
-                let want = head.scores(&hidden, n, kind, &markers).unwrap();
-                head.gpu = Some(gpu.clone());
-                let got = head.scores(&hidden, n, kind, &markers).unwrap();
-                for (w, g) in want.iter().zip(&got) {
-                    assert!(
-                        (w - g).abs() < 2e-3 * (1.0 + w.abs()),
-                        "n={n} type={kind}: {w} vs {g}"
-                    );
+        // Metal's matrix-unit attention and wgpu's register-tiled flash kernel
+        for backend in [BackendPreference::Metal, BackendPreference::Gpu] {
+            let Some(gpu) = build_vit_stack_fast(&spec, backend) else {
+                eprintln!("SKIPPED {backend:?}: no GPU with fast attention is available");
+                continue;
+            };
+            for n in [3usize, 40, 300, 777] {
+                let hidden = noise(n * d, 5, 1.0);
+                let markers = [0, n / 3, n - 1];
+                for kind in 0..TYPES {
+                    head.gpu = None;
+                    let want = head.scores(&hidden, n, kind, &markers).unwrap();
+                    head.gpu = Some(gpu.clone());
+                    let got = head.scores(&hidden, n, kind, &markers).unwrap();
+                    for (w, g) in want.iter().zip(&got) {
+                        assert!(
+                            (w - g).abs() < 2e-3 * (1.0 + w.abs()),
+                            "{backend:?} n={n} type={kind}: {w} vs {g}"
+                        );
+                    }
                 }
             }
         }
