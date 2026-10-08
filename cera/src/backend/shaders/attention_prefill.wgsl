@@ -39,12 +39,17 @@
 //   @binding(1) k_cache:   array<u32>    seq_len × kv_dim packed halves
 //   @binding(2) v_cache:   array<u32>    seq_len × kv_dim packed halves
 //   @binding(3) out_batch: array<f32>    n_queries × out_stride floats (rw)
-//   @binding(4) params:    array<u32, 12>
+//   @binding(4) params:    array<u32, 14>
 //
 // K/V are LE f16 halves packed 2-per-u32 (see `flash_attention.wgsl`):
 // kv_dim and head_dim are even (asserted host-side), accumulation stays f32.
 //        ( n_heads, n_kv_heads, head_dim, kv_dim, max_seq, scale_bits,
-//          start_pos, <unused>, q_stride, out_stride, q_base, n_sub )
+//          start_pos, <unused>, q_stride, out_stride, q_base, n_sub, bidir, prefix_rows )
+//
+// `bidir` = 0 is the causal prefill. `bidir` = 1 reads the whole sequence (the `start_pos +
+// n_sub` rows of the dispatch) instead, except that a query in the first `prefix_rows` rows
+// reads only those rows: a media prefix is a function of the media alone. Only a bidirectional
+// LFM2 trunk (the d1 decision models) asks for it.
 //
 // params[7] is NOT read by the shader — the per-dispatch query count comes from
 // params[11] (`n_sub`, authoritative) — edge workgroups mask queries past it.
@@ -60,13 +65,23 @@
 @group(0) @binding(1) var<storage, read> k_cache: array<u32>;
 @group(0) @binding(2) var<storage, read> v_cache: array<u32>;
 @group(0) @binding(3) var<storage, read_write> out_batch: array<f32>;
-@group(0) @binding(4) var<storage, read> params: array<u32, 12>;
+@group(0) @binding(4) var<storage, read> params: array<u32, 14>;
 
 const TILE: u32 = 32u;
 const Q_PER_WG: u32 = 8u;
 const LANES: u32 = 32u;
 const MAX_HEAD_DIM: u32 = 128u;
 const NEG_INF: f32 = -3.402823e+38;
+
+// How many keys the query at global row `row` reads: its causal prefix, or in a bidirectional
+// pass the whole sequence (the prefix, for a query inside it). Plain arithmetic, no barriers.
+fn key_window(row: u32, bidir: u32, prefix_rows: u32, total: u32, max_seq: u32) -> u32 {
+    var w = row + 1u;
+    if bidir != 0u {
+        w = select(total, prefix_rows, row < prefix_rows);
+    }
+    return min(w, max_seq);
+}
 
 var<workgroup> q_shared: array<f32, Q_PER_WG * MAX_HEAD_DIM>;
 var<workgroup> acc: array<f32, Q_PER_WG * MAX_HEAD_DIM>; // per-query output accumulator
@@ -99,6 +114,9 @@ fn attention_prefill(
     let out_stride = params[9];
     let q_base = params[10];
     let n_sub = params[11];
+    let bidir = params[12];
+    let prefix_rows = params[13];
+    let total_rows = start_pos + n_sub;
 
     // Local query index within this dispatch; queries past n_sub are dead:
     // they run the loop (barrier uniformity) on clamped inputs and skip stores.
@@ -114,7 +132,7 @@ fn attention_prefill(
     // caller passing inconsistent params can only cause silent window truncation,
     // never an OOB read of k_cache / v_cache.
     let pos_q = start_pos + q_read;
-    let seq_len = min(pos_q + 1u, max_seq);
+    let seq_len = key_window(pos_q, bidir, prefix_rows, total_rows, max_seq);
 
     let group_size = n_heads / n_kv_heads;
     let kv_head = head / group_size;
@@ -143,14 +161,14 @@ fn attention_prefill(
     // the 8 queries (constant indices keep naga happy).
     let lbase = q_grp * Q_PER_WG;
     var max_seq_all = 0u;
-    max_seq_all = max(max_seq_all, select(0u, min(start_pos + q_base + lbase + 0u + 1u, max_seq), lbase + 0u < n_sub));
-    max_seq_all = max(max_seq_all, select(0u, min(start_pos + q_base + lbase + 1u + 1u, max_seq), lbase + 1u < n_sub));
-    max_seq_all = max(max_seq_all, select(0u, min(start_pos + q_base + lbase + 2u + 1u, max_seq), lbase + 2u < n_sub));
-    max_seq_all = max(max_seq_all, select(0u, min(start_pos + q_base + lbase + 3u + 1u, max_seq), lbase + 3u < n_sub));
-    max_seq_all = max(max_seq_all, select(0u, min(start_pos + q_base + lbase + 4u + 1u, max_seq), lbase + 4u < n_sub));
-    max_seq_all = max(max_seq_all, select(0u, min(start_pos + q_base + lbase + 5u + 1u, max_seq), lbase + 5u < n_sub));
-    max_seq_all = max(max_seq_all, select(0u, min(start_pos + q_base + lbase + 6u + 1u, max_seq), lbase + 6u < n_sub));
-    max_seq_all = max(max_seq_all, select(0u, min(start_pos + q_base + lbase + 7u + 1u, max_seq), lbase + 7u < n_sub));
+    max_seq_all = max(max_seq_all, select(0u, key_window(start_pos + q_base + lbase + 0u, bidir, prefix_rows, total_rows, max_seq), lbase + 0u < n_sub));
+    max_seq_all = max(max_seq_all, select(0u, key_window(start_pos + q_base + lbase + 1u, bidir, prefix_rows, total_rows, max_seq), lbase + 1u < n_sub));
+    max_seq_all = max(max_seq_all, select(0u, key_window(start_pos + q_base + lbase + 2u, bidir, prefix_rows, total_rows, max_seq), lbase + 2u < n_sub));
+    max_seq_all = max(max_seq_all, select(0u, key_window(start_pos + q_base + lbase + 3u, bidir, prefix_rows, total_rows, max_seq), lbase + 3u < n_sub));
+    max_seq_all = max(max_seq_all, select(0u, key_window(start_pos + q_base + lbase + 4u, bidir, prefix_rows, total_rows, max_seq), lbase + 4u < n_sub));
+    max_seq_all = max(max_seq_all, select(0u, key_window(start_pos + q_base + lbase + 5u, bidir, prefix_rows, total_rows, max_seq), lbase + 5u < n_sub));
+    max_seq_all = max(max_seq_all, select(0u, key_window(start_pos + q_base + lbase + 6u, bidir, prefix_rows, total_rows, max_seq), lbase + 6u < n_sub));
+    max_seq_all = max(max_seq_all, select(0u, key_window(start_pos + q_base + lbase + 7u, bidir, prefix_rows, total_rows, max_seq), lbase + 7u < n_sub));
 
     var base = 0u;
     loop {
