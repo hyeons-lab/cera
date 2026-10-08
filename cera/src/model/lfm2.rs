@@ -1542,6 +1542,168 @@ impl LfmModel {
         transformer::dequantize_row_into(&self.gguf, wref, row_idx, out);
     }
 
+    /// Whether a bidirectional pass over this model must take
+    /// [`Self::hidden_states_float_bidirectional`]: some projection is a dtype the batched
+    /// GEMM cannot run (F16, F32), and the per-token path that would take it instead is
+    /// causal, so it would answer a different question.
+    fn bidirectional_needs_float_path(&self) -> bool {
+        const PROJECTIONS: [&str; 9] = [
+            "shortconv.in_proj",
+            "shortconv.out_proj",
+            "attn_q",
+            "attn_k",
+            "attn_v",
+            "attn_output",
+            "ffn_gate",
+            "ffn_up",
+            "ffn_down",
+        ];
+        (0..self.config.n_layers).any(|layer| {
+            PROJECTIONS.iter().any(|name| {
+                self.gguf
+                    .tensors
+                    .get(&format!("blk.{layer}.{name}.weight"))
+                    .is_some_and(|t| {
+                        !transformer::batched_gemm_supports(
+                            t.dtype,
+                            t.shape.first().copied().unwrap_or(0),
+                        )
+                    })
+            })
+        })
+    }
+
+    /// The bidirectional trunk in plain f32, for weights the batched GEMM cannot run.
+    ///
+    /// Each projection is read and widened to f32 as it is used, so only one layer's weights
+    /// are resident at a time and a model is as large as its file, not four times it. It is
+    /// the textbook form of the block, which makes it the reference the quantized path is
+    /// measured against: pre-norm, a centred 3-tap gated convolution or full (non-causal)
+    /// grouped-query attention, and a SwiGLU feed-forward.
+    ///
+    /// Returns the post-final-norm hidden state of every token, `[tokens, hidden]`.
+    fn hidden_states_float_bidirectional(&self, tokens: &[u32]) -> Vec<f32> {
+        use crate::model::pii::matmul_nt_f32;
+        use crate::par::*;
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let n = tokens.len();
+        let weight = |layer: usize, name: &str| -> Vec<f32> {
+            self.gguf
+                .get_tensor(&format!("blk.{layer}.{name}.weight"))
+                .unwrap_or_else(|e| panic!("blk.{layer}.{name}.weight: {e}"))
+                .to_f32_vec()
+        };
+        let project = |x: &[f32], w: &[f32], rows: usize, k: usize| -> Vec<f32> {
+            let mut out = vec![0f32; n * rows];
+            matmul_nt_f32(n, rows, k, x, w, None, &mut out);
+            out
+        };
+
+        let mut h = vec![0f32; n * hs];
+        for (i, &token) in tokens.iter().enumerate() {
+            self.dequantize_row_into(&self.embd_ref, token as usize, &mut h[i * hs..(i + 1) * hs]);
+        }
+        for layer in 0..cfg.n_layers {
+            let mut normed = h.clone();
+            for row in normed.chunks_exact_mut(hs) {
+                cpu::rmsnorm(row, &self.attn_norm_weights[layer], cfg.rms_norm_eps);
+            }
+            let operator = if cfg.block_types[layer] == BlockType::GatedConv {
+                // B, C and x side by side; y = C * conv3(B * x), centred, zero padded
+                let proj = project(&normed, &weight(layer, "shortconv.in_proj"), 3 * hs, hs);
+                let taps = self.conv_weights[layer].as_ref().expect("conv taps");
+                let (w0, rest) = taps.split_at(hs);
+                let (w1, w2) = rest.split_at(hs);
+                let bx = |t: usize, i: usize| proj[t * 3 * hs + i] * proj[t * 3 * hs + 2 * hs + i];
+                let mut gated = vec![0f32; n * hs];
+                for t in 0..n {
+                    for i in 0..hs {
+                        let prev = if t > 0 { bx(t - 1, i) } else { 0.0 };
+                        let next = if t + 1 < n { bx(t + 1, i) } else { 0.0 };
+                        gated[t * hs + i] = proj[t * 3 * hs + hs + i]
+                            * (prev * w0[i] + bx(t, i) * w1[i] + next * w2[i]);
+                    }
+                }
+                project(&gated, &weight(layer, "shortconv.out_proj"), hs, hs)
+            } else {
+                let n_heads = cfg.n_heads;
+                let n_kv = cfg.kv_heads_per_layer[layer];
+                let head_dim = hs / n_heads;
+                let kv_dim = n_kv * head_dim;
+                let mut q = project(&normed, &weight(layer, "attn_q"), hs, hs);
+                let mut k = project(&normed, &weight(layer, "attn_k"), kv_dim, hs);
+                let v = project(&normed, &weight(layer, "attn_v"), kv_dim, hs);
+                let q_norm = self.attn_q_norm_weights[layer].as_ref().expect("q norm");
+                let k_norm = self.attn_k_norm_weights[layer].as_ref().expect("k norm");
+                for t in 0..n {
+                    let (qr, kr) = (
+                        &mut q[t * hs..(t + 1) * hs],
+                        &mut k[t * kv_dim..(t + 1) * kv_dim],
+                    );
+                    for head in qr.chunks_exact_mut(head_dim) {
+                        cpu::rmsnorm(head, q_norm, cfg.rms_norm_eps);
+                    }
+                    for head in kr.chunks_exact_mut(head_dim) {
+                        cpu::rmsnorm(head, k_norm, cfg.rms_norm_eps);
+                    }
+                    cpu::rope(qr, kr, t, n_heads, n_kv, head_dim, cfg.rope_theta);
+                }
+                let scale = (head_dim as f32).powf(-0.5);
+                let group = n_heads / n_kv;
+                let mut ctx = vec![0f32; n * hs];
+                ctx.par_chunks_mut(hs).enumerate().for_each(|(t, out)| {
+                    let mut scores = vec![0f32; n];
+                    for head in 0..n_heads {
+                        let kv = head / group;
+                        let qh = &q[t * hs + head * head_dim..][..head_dim];
+                        for (j, s) in scores.iter_mut().enumerate() {
+                            *s = cpu::dot_f32(qh, &k[j * kv_dim + kv * head_dim..][..head_dim])
+                                * scale;
+                        }
+                        let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                        let mut sum = 0.0f32;
+                        for s in scores.iter_mut() {
+                            *s = (*s - max).exp();
+                            sum += *s;
+                        }
+                        let dst = &mut out[head * head_dim..(head + 1) * head_dim];
+                        for (j, s) in scores.iter().enumerate() {
+                            let w = s / sum;
+                            let vh = &v[j * kv_dim + kv * head_dim..][..head_dim];
+                            for (o, x) in dst.iter_mut().zip(vh) {
+                                *o += w * x;
+                            }
+                        }
+                    }
+                });
+                project(&ctx, &weight(layer, "attn_output"), hs, hs)
+            };
+            for (a, b) in h.iter_mut().zip(&operator) {
+                *a += b;
+            }
+
+            // SwiGLU feed-forward
+            let mut normed = h.clone();
+            for row in normed.chunks_exact_mut(hs) {
+                cpu::rmsnorm(row, &self.ffn_norm_weights[layer], cfg.rms_norm_eps);
+            }
+            let gate_w = weight(layer, "ffn_gate");
+            let ff = gate_w.len() / hs;
+            let mut gate = project(&normed, &gate_w, ff, hs);
+            let up = project(&normed, &weight(layer, "ffn_up"), ff, hs);
+            cpu::silu_mul_inplace(&mut gate, &up);
+            let down = project(&gate, &weight(layer, "ffn_down"), hs, ff);
+            for (a, b) in h.iter_mut().zip(&down) {
+                *a += b;
+            }
+        }
+        for row in h.chunks_exact_mut(hs) {
+            cpu::rmsnorm(row, &self.output_norm_weight, cfg.rms_norm_eps);
+        }
+        h
+    }
+
     /// Process a single conv (recurrent) block using pre-allocated scratch buffers.
     fn forward_conv_block(
         &self,
@@ -5049,6 +5211,11 @@ impl Model for LfmModel {
                     &mut hidden[i * hs..(i + 1) * hs],
                 );
             }
+            // F16 and F32 projections cannot take the batched path, and the per-token path
+            // that would take them is causal: run the trunk in plain f32 instead
+            if state.lora.is_none() && self.bidirectional_needs_float_path() {
+                return self.hidden_states_float_bidirectional(tokens);
+            }
             self.prefill_layers_loop(&mut hidden, n, 0, state);
             for j in 0..n {
                 cpu::rmsnorm(
@@ -6205,5 +6372,202 @@ pub(crate) mod release_tests {
             "a small verify batch must not keep the 512-token working set, got {} bytes",
             state.prefill_scratch.capacity_bytes()
         );
+    }
+}
+
+/// A bidirectional model whose projections are F16 or F32 cannot take the batched GEMM path,
+/// and the per-token path that used to take them is causal. These tests pin the float path
+/// that runs instead.
+#[cfg(test)]
+mod bidirectional_float_tests {
+    use super::*;
+    use crate::convert::TargetQuant;
+    use crate::convert::writer::GGML_TYPE_Q8_0;
+    use crate::model::Model;
+
+    const HS: usize = 64;
+    const INTER: usize = 128;
+    const VOCAB: usize = 32;
+    const N_HEADS: usize = 2;
+    const HEAD_DIM: usize = 32;
+
+    /// A two-layer non-causal LFM2 (one short-conv block, one attention block) with
+    /// deterministic weights; the projections are F32, or Q8_0 of the same values.
+    fn bidirectional_gguf(q8_projections: bool) -> GgufFile {
+        use crate::gguf::GgufBuilder;
+        let mut seed = 0x2545_f491u64;
+        let mut values = move |n: usize, scale: f32, base: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    base + (((seed >> 33) as f32 / (1u64 << 31) as f32) - 0.5) * 2.0 * scale
+                })
+                .collect()
+        };
+        let mut b = GgufBuilder::new()
+            .kv_str("general.architecture", "lfm2")
+            .kv_u32("lfm2.block_count", 2)
+            .kv_u32("lfm2.embedding_length", HS as u32)
+            .kv_u32("lfm2.feed_forward_length", INTER as u32)
+            .kv_u32("lfm2.attention.head_count", N_HEADS as u32)
+            .kv_i32_array("lfm2.attention.head_count_kv", vec![0, 1])
+            .kv_u32("lfm2.shortconv.l_cache", 3)
+            .kv_f32("lfm2.attention.layer_norm_rms_epsilon", 1e-5)
+            .kv_f32("lfm2.rope.freq_base", 10_000.0)
+            .kv_u32("lfm2.context_length", 256)
+            .kv_u32("lfm2.vocab_size", VOCAB as u32)
+            .kv_raw("lfm2.attention.causal", 7, vec![0]);
+        let embd = values(VOCAB * HS, 1.0, 0.0);
+        b = b.tensor_f32("token_embd.weight", &[HS, VOCAB], &embd);
+        let norm = values(HS, 0.1, 1.0);
+        b = b.tensor_f32("token_embd_norm.weight", &[HS], &norm);
+        let projection = |b: GgufBuilder, name: String, dims: [usize; 2], w: Vec<f32>| {
+            if q8_projections {
+                let mut out = vec![0u8; TargetQuant::compute_tensor_bytes(GGML_TYPE_Q8_0, w.len())];
+                crate::convert::quantize_tensor_data(&w, GGML_TYPE_Q8_0, &mut out).unwrap();
+                b.tensor(name, &dims, GGML_TYPE_Q8_0, out)
+            } else {
+                b.tensor_f32(name, &dims, &w)
+            }
+        };
+        for layer in 0..2 {
+            let n = |s: &str| format!("blk.{layer}.{s}");
+            b = b.tensor_f32(n("attn_norm.weight"), &[HS], &values(HS, 0.1, 1.0));
+            b = b.tensor_f32(n("ffn_norm.weight"), &[HS], &values(HS, 0.1, 1.0));
+            if layer == 1 {
+                b = projection(
+                    b,
+                    n("attn_q.weight"),
+                    [HS, N_HEADS * HEAD_DIM],
+                    values(
+                        [HS, N_HEADS * HEAD_DIM][0] * [HS, N_HEADS * HEAD_DIM][1],
+                        0.12,
+                        0.0,
+                    ),
+                );
+                b = projection(
+                    b,
+                    n("attn_k.weight"),
+                    [HS, HEAD_DIM],
+                    values([HS, HEAD_DIM][0] * [HS, HEAD_DIM][1], 0.12, 0.0),
+                );
+                b = projection(
+                    b,
+                    n("attn_v.weight"),
+                    [HS, HEAD_DIM],
+                    values([HS, HEAD_DIM][0] * [HS, HEAD_DIM][1], 0.12, 0.0),
+                );
+                b = projection(
+                    b,
+                    n("attn_output.weight"),
+                    [N_HEADS * HEAD_DIM, HS],
+                    values(
+                        [N_HEADS * HEAD_DIM, HS][0] * [N_HEADS * HEAD_DIM, HS][1],
+                        0.12,
+                        0.0,
+                    ),
+                );
+                b = b.tensor_f32(
+                    n("attn_q_norm.weight"),
+                    &[HEAD_DIM],
+                    &values(HEAD_DIM, 0.1, 1.0),
+                );
+                b = b.tensor_f32(
+                    n("attn_k_norm.weight"),
+                    &[HEAD_DIM],
+                    &values(HEAD_DIM, 0.1, 1.0),
+                );
+            } else {
+                b = projection(
+                    b,
+                    n("shortconv.in_proj.weight"),
+                    [HS, 3 * HS],
+                    values([HS, 3 * HS][0] * [HS, 3 * HS][1], 0.12, 0.0),
+                );
+                b = projection(
+                    b,
+                    n("shortconv.out_proj.weight"),
+                    [HS, HS],
+                    values([HS, HS][0] * [HS, HS][1], 0.12, 0.0),
+                );
+                b = b.tensor_f32(
+                    n("shortconv.conv.weight"),
+                    &[3, HS],
+                    &values(3 * HS, 0.3, 0.0),
+                );
+            }
+            b = projection(
+                b,
+                n("ffn_gate.weight"),
+                [HS, INTER],
+                values([HS, INTER][0] * [HS, INTER][1], 0.12, 0.0),
+            );
+            b = projection(
+                b,
+                n("ffn_up.weight"),
+                [HS, INTER],
+                values([HS, INTER][0] * [HS, INTER][1], 0.12, 0.0),
+            );
+            b = projection(
+                b,
+                n("ffn_down.weight"),
+                [INTER, HS],
+                values([INTER, HS][0] * [INTER, HS][1], 0.12, 0.0),
+            );
+        }
+        b.build()
+    }
+
+    fn hidden(gguf: GgufFile, tokens: &[u32]) -> Vec<f32> {
+        let model = LfmModel::from_gguf(gguf, 256).unwrap();
+        assert!(
+            !model.config().is_causal,
+            "the fixture must be bidirectional"
+        );
+        let mut state = InferenceState::for_prefill(model.config(), tokens.len()).unwrap();
+        model.hidden_states(tokens, &mut state)
+    }
+
+    #[test]
+    fn f32_weights_take_the_float_path() {
+        let model = LfmModel::from_gguf(bidirectional_gguf(false), 256).unwrap();
+        assert!(model.bidirectional_needs_float_path());
+    }
+
+    #[test]
+    fn a_later_token_changes_an_earlier_hidden_state() {
+        let a = hidden(bidirectional_gguf(false), &[3, 7, 9, 12, 5]);
+        let b = hidden(bidirectional_gguf(false), &[3, 7, 9, 12, 20]);
+        let first = |h: &[f32]| h[..HS].to_vec();
+        let moved = first(&a)
+            .iter()
+            .zip(first(&b))
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max);
+        assert!(moved > 1e-4, "token 0 ignored the last token ({moved})");
+    }
+
+    /// The float path computes the function the batched quantized path does: the same
+    /// weights, once as F32 and once as Q8_0, agree to the quantization error.
+    #[test]
+    fn the_float_path_agrees_with_the_batched_quantized_path() {
+        if !transformer::batched_gemm_supports(crate::tensor::DType::Q8_0, HS) {
+            eprintln!("SKIPPED: this host has no batched Q8_0 GEMM to compare against");
+            return;
+        }
+        let tokens = [3u32, 7, 9, 12, 5, 21, 8];
+        let float = hidden(bidirectional_gguf(false), &tokens);
+        let quant = hidden(bidirectional_gguf(true), &tokens);
+        assert_eq!(float.len(), tokens.len() * HS);
+        let (float_rows, _) = float.as_chunks::<HS>();
+        let (quant_rows, _) = quant.as_chunks::<HS>();
+        for (t, (f, q)) in float_rows.iter().zip(quant_rows).enumerate() {
+            let dot: f32 = f.iter().zip(q).map(|(a, b)| a * b).sum();
+            let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let cosine = dot / (norm(f) * norm(q));
+            assert!(cosine > 0.995, "token {t}: cosine {cosine}");
+        }
     }
 }
