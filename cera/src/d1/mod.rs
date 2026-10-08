@@ -2,10 +2,10 @@
 //!
 //! A d1 model answers named questions about a state with zero output tokens: every answer is
 //! read from the model's distribution over the options. The state is text, optionally with
-//! images (speech is not wired in yet); each question is rendered as its own sequence
-//! ([`prompt`]), the bidirectional LFM2 trunk turns it into one hidden state per token, and the
-//! head ([`head`]) scores the state at the option markers. Images become a prefix of embeddings
-//! in front of the text ([`vision`]).
+//! images or a speech clip; each question is rendered as its own sequence ([`prompt`]), the
+//! bidirectional LFM2 trunk turns it into one hidden state per token, and the head ([`head`])
+//! scores the state at the option markers. Images ([`vision`]) and speech ([`audio`]) become a
+//! prefix of embeddings in front of the text.
 //!
 //! The trunk is an ordinary non-causal `lfm2` model, so it runs wherever the engine does: this
 //! module only adds what sits on top of it, reading the `d1.*` tensors and settings of a GGUF
@@ -14,7 +14,7 @@
 //! ```no_run
 //! # fn main() -> anyhow::Result<()> {
 //! use cera::d1::{D1Model, D1Request};
-//! # let (gguf, session): (cera::gguf::GgufFile, cera::Session) = todo!();
+//! # let (gguf, session): (std::sync::Arc<cera::gguf::GgufFile>, cera::Session) = todo!();
 //! let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
 //! let model = D1Model::from_gguf(&gguf, &tokenizer)?;
 //! let request = D1Request::parse(
@@ -27,12 +27,14 @@
 //! # Ok(()) }
 //! ```
 
+pub mod audio;
 pub mod head;
 pub mod json;
 pub mod prompt;
 pub mod vision;
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 
@@ -46,25 +48,27 @@ pub use prompt::{Question, QuestionType};
 /// A request: a state and the named questions to answer about it, in order.
 #[derive(Debug, Clone)]
 pub struct D1Request {
+    /// The state; `Json::Null` when the request has none (the media are the whole state).
     pub state: Json,
     pub questions: Vec<(String, Question)>,
     /// Encoded images (PNG or JPEG), in the order they are laid out ahead of the text.
     pub images: Vec<Vec<u8>>,
+    /// An encoded speech clip (WAV). A request carries images or speech, not both.
+    pub audio: Option<Vec<u8>>,
 }
 
 impl D1Request {
     /// Parse `{"state": <any JSON>, "questions": {name: {"type", "instructions", "criteria"}},
-    /// "images": [<base64 data URL>, ...]}`. A missing or null `state` is the empty state.
+    /// "images": [<base64 data URL>, ...], "audio": <base64 data URL of a WAV>}`. A missing or
+    /// null `state` is no state: the empty string, or `{}` after speech, as the model was
+    /// trained.
     ///
     /// # Errors
     ///
     /// Fails on malformed JSON, no questions, or a question the model cannot answer.
     pub fn parse(text: &str) -> Result<Self> {
         let body = Json::parse(text)?;
-        let state = match body.get("state") {
-            None | Some(Json::Null) => Json::Str(String::new()),
-            Some(state) => state.clone(),
-        };
+        let state = body.get("state").cloned().unwrap_or(Json::Null);
         let Some(Json::Object(entries)) = body.get("questions") else {
             anyhow::bail!("\"questions\" must be an object of named questions");
         };
@@ -91,16 +95,36 @@ impl D1Request {
                 .collect::<Result<_>>()?,
             Some(_) => anyhow::bail!("\"images\" must be an array of base64 data URLs"),
         };
+        let audio = match body.get("audio") {
+            None | Some(Json::Null) => None,
+            Some(url) => {
+                let url = url
+                    .as_str()
+                    .context("\"audio\" must be a base64 data URL of a WAV file")?;
+                Some(vision::decode_data_url(url).context("audio")?)
+            }
+        };
+        ensure!(
+            images.is_empty() || audio.is_none(),
+            "a request carries images or audio, not both"
+        );
         Ok(Self {
             state,
             questions,
             images,
+            audio,
         })
     }
 
     /// Add an encoded image after the ones already there.
     pub fn with_image(mut self, bytes: Vec<u8>) -> Self {
         self.images.push(bytes);
+        self
+    }
+
+    /// Set the encoded speech clip (WAV).
+    pub fn with_audio(mut self, bytes: Vec<u8>) -> Self {
+        self.audio = Some(bytes);
         self
     }
 }
@@ -142,6 +166,9 @@ pub struct D1Model {
     max_length: usize,
     /// Room an image request leaves its text.
     image_text_length: usize,
+    audio: Option<audio::AudioTower>,
+    /// Room a speech request leaves its text.
+    audio_text_length: usize,
 }
 
 impl D1Model {
@@ -155,7 +182,7 @@ impl D1Model {
     /// # Errors
     ///
     /// Fails when `gguf` is not a d1 model or lacks a tensor or setting of one.
-    pub fn from_gguf(gguf: &GgufFile, tokenizer: &BpeTokenizer) -> Result<Self> {
+    pub fn from_gguf(gguf: &Arc<GgufFile>, tokenizer: &BpeTokenizer) -> Result<Self> {
         ensure!(Self::is_d1(gguf), "not a d1 model (no d1.head.block_count)");
         let n_embd = gguf
             .get_u32("lfm2.embedding_length")
@@ -185,6 +212,12 @@ impl D1Model {
         let image_text_length = gguf
             .get_u32("d1.image_text_length")
             .map_or(max_length, |n| n as usize);
+        let audio = audio::AudioTower::is_present(gguf)
+            .then(|| audio::AudioTower::from_gguf(gguf, n_embd))
+            .transpose()?;
+        let audio_text_length = gguf
+            .get_u32("d1.audio_text_length")
+            .map_or(max_length, |n| n as usize);
         Ok(Self {
             head: head::Head::from_gguf(gguf, n_embd)?,
             vision,
@@ -192,6 +225,8 @@ impl D1Model {
             ids: prompt::PromptTokens::from_tokenizer(tokenizer)?,
             max_length,
             image_text_length,
+            audio,
+            audio_text_length,
         })
     }
 
@@ -223,10 +258,12 @@ impl D1Model {
         request: &D1Request,
     ) -> Result<(Vec<Vec<f32>>, usize)> {
         let hidden_size = session.hidden_size();
-        // the images are encoded once for all the questions
-        let prefix = if request.images.is_empty() {
-            Vec::new()
-        } else {
+        ensure!(
+            request.images.is_empty() || request.audio.is_none(),
+            "a request carries images or audio, not both"
+        );
+        // the media are encoded once for all the questions
+        let (media, prefix, text_cap) = if !request.images.is_empty() {
             let tower = self
                 .vision
                 .as_ref()
@@ -239,29 +276,52 @@ impl D1Model {
                     vision::decode_image(bytes).with_context(|| format!("images[{i}]"))
                 })
                 .collect::<Result<Vec<_>>>()?;
-            tower.encode(&rgb)?
+            (
+                prompt::Media::Image,
+                tower.encode(&rgb)?,
+                self.image_text_length,
+            )
+        } else if let Some(bytes) = &request.audio {
+            let tower = self
+                .audio
+                .as_ref()
+                .context("this model has no speech tower (reconvert it with speech)")?;
+            let (samples, rate) = audio::decode_wav(bytes).context("audio")?;
+            let pcm = audio::prepare_clip(&samples, rate);
+            (
+                prompt::Media::Audio,
+                tower.encode(&pcm)?,
+                self.audio_text_length,
+            )
+        } else {
+            (prompt::Media::None, Vec::new(), self.max_length)
         };
-        let media = !prefix.is_empty();
+        let has_media = media != prompt::Media::None;
         let prefix_rows = prefix.len() / hidden_size;
         // with media the text gets what the media leave, and no more than the model was trained on
-        let max_len = if media {
+        let max_len = if has_media {
             let room = self.max_length.saturating_sub(prefix_rows);
             ensure!(
                 room >= 64,
-                "the images take {prefix_rows} of the {} positions; send fewer or smaller images",
+                "the media take {prefix_rows} of the {} positions; send less",
                 self.max_length
             );
-            room.min(self.image_text_length)
+            room.min(text_cap)
         } else {
             self.max_length
+        };
+        // no state: nothing for text and images, and the empty object after speech
+        let state = match (&request.state, media) {
+            (Json::Null, prompt::Media::Audio) => Json::Object(Vec::new()),
+            (Json::Null, _) => Json::Str(String::new()),
+            (state, _) => state.clone(),
         };
         let mut all = Vec::with_capacity(request.questions.len());
         let mut read = 0;
         for (name, q) in &request.questions {
-            let (ids, markers) =
-                prompt::encode(tokenizer, &self.ids, &request.state, q, max_len, media)
-                    .with_context(|| format!("question `{name}`"))?;
-            let hidden = if media {
+            let (ids, markers) = prompt::encode(tokenizer, &self.ids, &state, q, max_len, media)
+                .with_context(|| format!("question `{name}`"))?;
+            let hidden = if has_media {
                 session.hidden_states_with_prefix(&prefix, &ids)?
             } else {
                 session.hidden_states_for_tokens(&ids)?
@@ -271,7 +331,7 @@ impl D1Model {
                 .scores(&hidden, ids.len(), q.kind as usize, &markers)
                 .with_context(|| format!("question `{name}` (hidden size {hidden_size})"))?;
             // the calibration was fitted on text; media answers are the raw softmax
-            let temperature = if media { 1.0 } else { self.temperature(q) };
+            let temperature = if has_media { 1.0 } else { self.temperature(q) };
             all.push(prompt::probabilities(q, &scores, temperature));
             read += prefix_rows + ids.len();
         }
@@ -314,7 +374,7 @@ mod tests {
                               "a": {"type": "noul", "instructions": "b"}}}"#,
         )
         .unwrap();
-        assert_eq!(r.state, Json::Str(String::new()));
+        assert_eq!(r.state, Json::Null);
         let names: Vec<_> = r.questions.iter().map(|(n, _)| n.as_str()).collect();
         assert_eq!(names, ["z", "a"]);
     }
