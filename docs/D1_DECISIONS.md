@@ -2,9 +2,8 @@
 
 [`LiquidAI/d1-omni-600M`](https://huggingface.co/LiquidAI/d1-omni-600M) answers named questions
 about a state with **zero output tokens**: every answer is read from the model's distribution over
-the options. cera runs it on text and images: a state (a string or any JSON, or none when the
-image is the whole state) and one or more questions in, typed answers out. Speech is not wired in
-yet.
+the options. cera runs it on text, images and speech: a state (a string or any JSON, or none when
+the image or the clip is the whole state) and one or more questions in, typed answers out.
 
 ## Use
 
@@ -37,8 +36,17 @@ EOF
 ```
 
 `--image` can be repeated, and images can also be sent inside the request as
-`"images": ["data:image/png;base64,..."]`. They are laid out in the order given. A request carries
-images or (later) speech, not both.
+`"images": ["data:image/png;base64,..."]`. They are laid out in the order given.
+
+```bash
+# 4. Ask about speech: one WAV clip (up to 30 s), also sendable as "audio": "data:audio/wav;base64,..."
+cera decide --model d1-omni-f16.gguf --audio note.wav --request - <<'EOF'
+{"questions": {"topic": {"type": "choice", "instructions": "What is the speaker talking about?",
+                         "criteria": {"food": "Food and meals", "travel": "Travel and transport"}}}}
+EOF
+```
+
+A request carries images or speech, not both.
 
 The response has the reference implementation's shape (this is the real output of the request
 above on the F16 model, trimmed to the answers):
@@ -100,6 +108,25 @@ text only.
 The trunk reads a media prefix through the plain-f32 path whatever the weights' precision, and
 the images of a request are encoded once for all its questions.
 
+### Speech
+
+A WAV clip becomes a prefix the same way:
+
+1. The clip is 16 kHz mono, cut to 30 s and padded to 0.5 s. A WAV at another rate is resampled
+   linearly and several channels are averaged; PCM 16, 24 and 32-bit and 32-bit float are read.
+2. 128 log-mel features every 10 ms (NeMo's filterbank front end), then a 17-layer FastConformer
+   that subsamples by 8, an MLP adapter to the trunk's width, and a residual correction
+   `x + up(GELU(down(LayerNorm(x))))`. One embedding comes out per 80 ms.
+3. The encoder reads exactly `samples / 160` mel frames. The STFT produces one more; feeding it
+   changes the last rows and, for some lengths, the number of rows.
+
+The encoder is the FastConformer that `crate::model::audio_encoder` already runs for LFM2-Audio,
+so the converter writes the audio tower in that layout. As with images, the text of a request gets
+the room the clip leaves and at most `audio_text_length` (15,360) tokens, and the answers are the
+raw softmax. After speech the questions are worded as they were trained: a `choice` option is
+`option_000: <description>` (its name when it has none), a `noul` is always `false: no` /
+`true: yes` whatever definitions it carries, and a request with no state has the state `{}`.
+
 ## GGUF layout
 
 The converter writes an ordinary `lfm2` GGUF (non-causal) plus the head. `d1.*` tensors and
@@ -125,7 +152,13 @@ The patch and position tables stay F32 too. Vision settings: `d1.vision.block_co
 `d1.vision.patch_size`, `d1.vision.position_side`, `d1.vision.layer_norm_epsilon`,
 `d1.vision.projector_hidden_length`.
 
-The audio tower (`audio.*`) is left out of the GGUF for now.
+| `audio.encoder.*`, `audio.adapter.*` | the LFM2-Audio encoder layout: `a.conv1d.N`, `a.pre_encode.out`, `a.blk.N.*`, `mm.a.mlp.{0,1,3}` |
+| `audio.residual.{ln,down,up}` | `d1.a.res.{norm,down,up}` |
+
+Two things are rewritten on the way: each conformer layer's batch norm is folded into a scale and
+a shift (`a.blk.N.conv_norm.{weight,bias}`), and the singleton axis of the 1-D convolution kernels
+is dropped. The convolutions, the folded norms and the residual block stay F32. The encoder's
+settings are the `clip.audio.*` keys its loader reads, plus `d1.audio.residual_width`.
 
 ## Precision
 
@@ -151,6 +184,16 @@ the same photo with state text, and two images), 4 to 8 questions each, PNG inpu
 | F16 | 1.7e-3 | 0 |
 | Q8_0 | 4.3e-2 | 0 |
 
+Speech: 12 clips (a 10.4 s recording with and without state text, 3 s, and cuts of 0.2, 1, 2, 2.5,
+3.3, 5.1, 7.8 and 10 s, plus the recording looped to 42 s and cut to 30 s), 2 to 3 questions each.
+The lengths include the ones where the encoder's output length depends on the frame rule above.
+
+| Weights | Largest probability difference | Answers that changed |
+|---|---|---|
+| F32 | 5.7e-6 | 0 |
+| F16 | 1.0e-3 (7 of the clips) | 0 |
+| Q8_0 | 6.2e-2 (7 of the clips) | 0 |
+
 The checkpoint is trained in float32 and the reference recommends float16 on GPUs; bfloat16
 changed the top answer on 0.8% of text rows. Use F16 (or F32) for decisions and Q8_0 where size
 matters more than the last few percent.
@@ -167,8 +210,10 @@ those two images about 10 s (F16).
 
 ## Not done yet
 
-* Speech: the audio tower is not converted and the request has no audio field.
-* Metal, wgpu and NPU: the trunk is the ordinary LFM2 model, but the decision head and the vision
-  tower are host-side and only the CPU float path is validated.
-* The image prefix is recomputed through the trunk for every question; it depends only on the
-  image, so it could be computed once.
+* Metal, wgpu and NPU: the trunk is the ordinary LFM2 model, but the decision head, the vision
+  tower and the speech residual are host-side and only the CPU float path is validated.
+* The media prefix (an image's or a clip's) is recomputed through the trunk for every question; it
+  depends only on the media, so it could be computed once.
+* Speech speed has not been measured.
+* `cera run --hf` and the other streaming conversions refuse a d1 checkpoint: download the
+  repository and use `cera convert` on the directory.

@@ -321,6 +321,15 @@ pub fn stream_quantize_hf_repo(
     let config_bytes = fetch_hf_file_bytes(&client, &config_url, opts.auth_token.as_deref())?;
     let config = HfModelConfig::parse_from_bytes(&config_bytes)?;
     config.ensure_convertible()?;
+    if config.model_type.eq_ignore_ascii_case(d1::MODEL_TYPE) {
+        // the d1 head, towers and batch-norm folds are written by the local conversion only;
+        // streaming would write the trunk under the wrong names and no head
+        return Err(CeraError::Backend(
+            "d1-omni checkpoints convert from a local directory: download the repository and run \
+             `cera convert --input <dir> --output <file.gguf>`"
+                .into(),
+        ));
+    }
 
     let tokenizer_url = pinned_spec.file_download_url("tokenizer.json");
     let tokenizer_bytes = fetch_hf_file_bytes(&client, &tokenizer_url, opts.auth_token.as_deref())?;
@@ -969,6 +978,15 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
         )));
     }
 
+    /// Where a tensor's bytes sit in the checkpoint.
+    #[derive(Clone)]
+    struct SourceRef {
+        file_idx: usize,
+        dtype: String,
+        data_start: usize,
+        data_end: usize,
+    }
+
     struct LocalPendingTensor {
         file_idx: usize,
         expected_elements: usize,
@@ -977,9 +995,17 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
         data_end: usize,
         ggml_type: u32,
         gguf_name: String,
+        /// A tensor derived from several sources (a folded batch norm): the half it holds
+        /// and the weight, bias, running mean and running variance it is computed from.
+        fold: Option<(d1::Fold, Vec<SourceRef>)>,
     }
 
     let mut pending_tensors = Vec::new();
+    // the batch-norm statistics of the d1 conformer, by layer, folded after the scan
+    let mut batch_norms: std::collections::BTreeMap<
+        usize,
+        std::collections::BTreeMap<d1::BatchNormStat, (SourceRef, usize)>,
+    > = std::collections::BTreeMap::new();
 
     for (file_idx, file_path) in safetensors_files.iter().enumerate() {
         let mut file = File::open(file_path).map_err(|e| {
@@ -987,14 +1013,10 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
         })?;
         let header = SafeTensorsHeader::parse_from_reader(&mut file)?;
         for (raw_name, tensor_info) in &header.tensors {
-            let gguf_name = if is_d1 {
-                // the towers are not converted yet, and the batch-norm counters are noise
-                let Some(name) = d1::tensor_name(raw_name) else {
-                    continue;
-                };
-                name
+            let plan = if is_d1 {
+                d1::tensor_plan(raw_name)
             } else {
-                translate_hf_to_gguf_tensor_name_with_arch(raw_name, &arch)
+                d1::TensorPlan::Name(translate_hf_to_gguf_tensor_name_with_arch(raw_name, &arch))
             };
             let num_elements: usize = tensor_info
                 .shape
@@ -1003,6 +1025,29 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
                 .ok_or_else(|| {
                     CeraError::Backend(format!("tensor shape overflow for `{raw_name}`"))
                 })?;
+            let (gguf_name, batch_norm) = match plan {
+                d1::TensorPlan::Skip => continue,
+                d1::TensorPlan::Name(name) => (name, None),
+                d1::TensorPlan::BatchNorm { layer, stat } => (String::new(), Some((layer, stat))),
+            };
+            if let Some((layer, stat)) = batch_norm {
+                let bound = |off: usize| {
+                    header.header_size_bytes.checked_add(off).ok_or_else(|| {
+                        CeraError::Backend(format!("tensor offset overflow for `{raw_name}`"))
+                    })
+                };
+                let source = SourceRef {
+                    file_idx,
+                    dtype: tensor_info.dtype.clone(),
+                    data_start: bound(tensor_info.data_offsets.0)?,
+                    data_end: bound(tensor_info.data_offsets.1)?,
+                };
+                batch_norms
+                    .entry(layer)
+                    .or_default()
+                    .insert(stat, (source, num_elements));
+                continue;
+            }
             let ggml_type = if is_d1 && d1::keeps_f32(&gguf_name) {
                 crate::convert::writer::GGML_TYPE_F32
             } else {
@@ -1015,7 +1060,11 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
                 )
             };
 
-            let dims = gguf_tensor_dims(&gguf_name, &tensor_info.shape);
+            let dims = if is_d1 {
+                d1::tensor_dims(&gguf_name, &tensor_info.shape)
+            } else {
+                gguf_tensor_dims(&gguf_name, &tensor_info.shape)
+            };
             let out_bytes = TargetQuant::compute_tensor_bytes(ggml_type, num_elements);
 
             writer.add_tensor(&gguf_name, dims, ggml_type, out_bytes);
@@ -1041,6 +1090,48 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
                 data_end,
                 ggml_type,
                 gguf_name,
+                fold: None,
+            });
+        }
+    }
+
+    // each conformer layer's batch norm becomes a scale and a shift
+    for (layer, stats) in &batch_norms {
+        use d1::BatchNormStat::{Bias, Mean, Var, Weight};
+        let mut sources = Vec::with_capacity(4);
+        let mut elements = None;
+        for stat in [Weight, Bias, Mean, Var] {
+            let (source, n) = stats.get(&stat).ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "d1-omni conformer layer {layer} has no batch-norm {stat:?} tensor"
+                ))
+            })?;
+            if *elements.get_or_insert(*n) != *n {
+                return Err(CeraError::Backend(format!(
+                    "d1-omni conformer layer {layer}: the batch-norm tensors differ in length"
+                )));
+            }
+            sources.push(source.clone());
+        }
+        let n = elements.unwrap_or(0);
+        for (name, kind) in [("weight", d1::Fold::Scale), ("bias", d1::Fold::Shift)] {
+            let gguf_name = format!("a.blk.{layer}.conv_norm.{name}");
+            let ggml_type = crate::convert::writer::GGML_TYPE_F32;
+            writer.add_tensor(
+                &gguf_name,
+                vec![n as u64],
+                ggml_type,
+                TargetQuant::compute_tensor_bytes(ggml_type, n),
+            );
+            pending_tensors.push(LocalPendingTensor {
+                file_idx: sources[0].file_idx,
+                expected_elements: n,
+                dtype: sources[0].dtype.clone(),
+                data_start: sources[0].data_start,
+                data_end: sources[0].data_end,
+                ggml_type,
+                gguf_name,
+                fold: Some((kind, sources.clone())),
             });
         }
     }
@@ -1072,22 +1163,48 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
             current_file_idx = pt.file_idx;
         }
 
-        let file = current_file
-            .as_mut()
-            .ok_or_else(|| CeraError::Backend("no active safetensors shard file".into()))?;
+        if let Some((kind, sources)) = &pt.fold {
+            // a folded batch norm: read its weight, bias, running mean and running variance
+            let mut stats: Vec<Vec<f32>> = Vec::with_capacity(sources.len());
+            for src in sources {
+                let mut shard = File::open(&safetensors_files[src.file_idx]).map_err(|e| {
+                    CeraError::Backend(format!(
+                        "failed to open `{}`: {e}",
+                        safetensors_files[src.file_idx].display()
+                    ))
+                })?;
+                shard
+                    .seek(SeekFrom::Start(src.data_start as u64))
+                    .map_err(|e| CeraError::Backend(format!("failed to seek in shard: {e}")))?;
+                let mut bytes = vec![0u8; src.data_end.saturating_sub(src.data_start)];
+                shard.read_exact(&mut bytes).map_err(|e| {
+                    CeraError::Backend(format!("failed to read a batch-norm statistic: {e}"))
+                })?;
+                let mut values = Vec::new();
+                decode_safetensor_to_f32_into(&bytes, &src.dtype, &mut values)?;
+                stats.push(values);
+            }
+            f32_data = d1::fold_batch_norm(*kind, &stats[0], &stats[1], &stats[2], &stats[3]);
+        } else {
+            let file = current_file
+                .as_mut()
+                .ok_or_else(|| CeraError::Backend("no active safetensors shard file".into()))?;
 
-        let byte_len = pt.data_end.saturating_sub(pt.data_start);
-        file.seek(SeekFrom::Start(pt.data_start as u64))
-            .map_err(|e| CeraError::Backend(format!("failed to seek in safetensors shard: {e}")))?;
+            let byte_len = pt.data_end.saturating_sub(pt.data_start);
+            file.seek(SeekFrom::Start(pt.data_start as u64))
+                .map_err(|e| {
+                    CeraError::Backend(format!("failed to seek in safetensors shard: {e}"))
+                })?;
 
-        raw_bytes.resize(byte_len, 0);
-        file.read_exact(&mut raw_bytes).map_err(|e| {
-            CeraError::Backend(format!(
-                "failed to read tensor data from safetensors shard: {e}"
-            ))
-        })?;
+            raw_bytes.resize(byte_len, 0);
+            file.read_exact(&mut raw_bytes).map_err(|e| {
+                CeraError::Backend(format!(
+                    "failed to read tensor data from safetensors shard: {e}"
+                ))
+            })?;
 
-        decode_safetensor_to_f32_into(&raw_bytes, &pt.dtype, &mut f32_data)?;
+            decode_safetensor_to_f32_into(&raw_bytes, &pt.dtype, &mut f32_data)?;
+        }
         let num_elements = f32_data.len();
         if num_elements != pt.expected_elements {
             return Err(CeraError::Backend(format!(

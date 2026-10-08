@@ -47,6 +47,18 @@ impl QuestionType {
     }
 }
 
+/// The media a request carries ahead of its text. A question is worded for the kind it was
+/// trained with.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Media {
+    /// Text only.
+    None,
+    /// One or more images.
+    Image,
+    /// A speech clip.
+    Audio,
+}
+
 /// One question, validated.
 #[derive(Debug, Clone, PartialEq)]
 pub struct Question {
@@ -147,10 +159,24 @@ fn is_blank(value: &Json) -> bool {
 
 /// The option texts in the model's order. A `noul` is read as `[false, true]`.
 ///
-/// After a media prefix a `noul` without definitions of its own is worded `false: no`,
-/// `true: yes`, as the media questions were trained.
-pub fn render_options(q: &Question, media: bool) -> Vec<String> {
+/// After an image a `noul` without definitions of its own is worded `false: no`, `true: yes`.
+/// After speech every `noul` is, and a `choice` is written as `option_000: <description>` (its
+/// name when it has no description): the questions were trained that way.
+pub fn render_options(q: &Question, media: Media) -> Vec<String> {
     match q.kind {
+        QuestionType::Choice if media == Media::Audio => q
+            .criteria
+            .iter()
+            .enumerate()
+            .map(|(i, (key, description))| {
+                let text = if is_blank(description) {
+                    key.clone()
+                } else {
+                    criterion(description)
+                };
+                format!("option_{i:03}: {text}")
+            })
+            .collect(),
         QuestionType::Choice => q
             .criteria
             .iter()
@@ -168,7 +194,9 @@ pub fn render_options(q: &Question, media: bool) -> Vec<String> {
             .enumerate()
             .map(|(i, (_, level))| format!("level {i}: {}", criterion(level)))
             .collect(),
-        QuestionType::Noul if media && q.criteria.is_empty() => {
+        QuestionType::Noul
+            if media == Media::Audio || (media == Media::Image && q.criteria.is_empty()) =>
+        {
             vec!["false: no".to_string(), "true: yes".to_string()]
         }
         QuestionType::Noul => {
@@ -283,7 +311,7 @@ pub fn encode(
     state: &Json,
     q: &Question,
     max_len: usize,
-    media: bool,
+    media: Media,
 ) -> Result<(Vec<u32>, Vec<usize>)> {
     let enc = |s: &str| tok.encode(&escape(s));
     let options = render_options(q, media);
@@ -399,7 +427,7 @@ mod tests {
             r#"{"type":"choice","instructions":"?","criteria":{"a":"Alpha","b":"","c":null,"d":{"x":1}}}"#,
         );
         assert_eq!(
-            render_options(&q, false),
+            render_options(&q, Media::None),
             ["a: Alpha", "b", "c", r#"d: {"x": 1}"#]
         );
     }
@@ -407,14 +435,17 @@ mod tests {
     #[test]
     fn score_options_are_numbered_levels() {
         let q = q(r#"{"type":"score","instructions":"?","criteria":["low","high"]}"#);
-        assert_eq!(render_options(&q, false), ["level 0: low", "level 1: high"]);
+        assert_eq!(
+            render_options(&q, Media::None),
+            ["level 0: low", "level 1: high"]
+        );
     }
 
     #[test]
     fn noul_options_take_the_given_definitions_or_the_defaults() {
         let plain = q(r#"{"type":"noul","instructions":"?"}"#);
         assert_eq!(
-            render_options(&plain, false),
+            render_options(&plain, Media::None),
             [
                 "false: no, the statement does not hold",
                 "true: yes, the statement holds"
@@ -422,25 +453,57 @@ mod tests {
         );
         let defined = q(r#"{"type":"noul","instructions":"?","criteria":{"yes":"Y","false":""}}"#);
         assert_eq!(
-            render_options(&defined, false),
+            render_options(&defined, Media::None),
             ["false: no, the statement does not hold", "true: Y"]
         );
     }
 
     #[test]
-    fn a_media_noul_is_worded_yes_and_no_unless_it_defines_its_own() {
+    fn an_image_noul_is_worded_yes_and_no_unless_it_defines_its_own() {
         let plain = q(r#"{"type":"noul","instructions":"?"}"#);
-        assert_eq!(render_options(&plain, true), ["false: no", "true: yes"]);
+        assert_eq!(
+            render_options(&plain, Media::Image),
+            ["false: no", "true: yes"]
+        );
         let defined = q(r#"{"type":"noul","instructions":"?","criteria":{"true":"Y"}}"#);
         assert_eq!(
-            render_options(&defined, true),
+            render_options(&defined, Media::Image),
             ["false: no, the statement does not hold", "true: Y"]
         );
-        // other types are worded the same with or without media
+        // other types are worded the same with or without an image
         let choice = q(r#"{"type":"choice","instructions":"?","criteria":{"a":"A","b":"B"}}"#);
         assert_eq!(
-            render_options(&choice, true),
-            render_options(&choice, false)
+            render_options(&choice, Media::Image),
+            render_options(&choice, Media::None)
+        );
+    }
+
+    #[test]
+    fn speech_questions_are_worded_the_way_they_were_trained() {
+        let choice = q(
+            r#"{"type":"choice","instructions":"?","criteria":{"a":"Alpha","b":"","c":null,"d":{"x":1}}}"#,
+        );
+        assert_eq!(
+            render_options(&choice, Media::Audio),
+            [
+                "option_000: Alpha",
+                "option_001: b",
+                "option_002: c",
+                r#"option_003: {"x": 1}"#
+            ]
+        );
+        // a noul ignores its own definitions after speech
+        let defined =
+            q(r#"{"type":"noul","instructions":"?","criteria":{"true":"Y","false":"N"}}"#);
+        assert_eq!(
+            render_options(&defined, Media::Audio),
+            ["false: no", "true: yes"]
+        );
+        // a score is unchanged
+        let score = q(r#"{"type":"score","instructions":"?","criteria":["low","high"]}"#);
+        assert_eq!(
+            render_options(&score, Media::Audio),
+            render_options(&score, Media::None)
         );
     }
 

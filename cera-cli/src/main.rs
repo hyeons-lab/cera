@@ -941,6 +941,11 @@ enum Command {
         /// added to any `images` in the request.
         #[arg(long = "image")]
         images: Vec<PathBuf>,
+
+        /// A speech clip (WAV) to read ahead of the text. A request carries images or speech,
+        /// not both.
+        #[arg(long = "audio")]
+        audio: Option<PathBuf>,
     },
 
     /// Tokenize text and print token IDs (for comparison with HuggingFace).
@@ -4407,6 +4412,7 @@ fn main() -> Result<()> {
             device,
             context_size,
             images,
+            audio,
         } => {
             use std::io::Read as _;
             let text = if request == "-" {
@@ -4425,7 +4431,12 @@ fn main() -> Result<()> {
                     .with_context(|| format!("reading the image `{}`", path.display()))?;
                 request = request.with_image(bytes);
             }
-            let gguf = cera::gguf::GgufFile::open(Path::new(&model))?;
+            if let Some(path) = &audio {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("reading the clip `{}`", path.display()))?;
+                request = request.with_audio(bytes);
+            }
+            let gguf = std::sync::Arc::new(cera::gguf::GgufFile::open(Path::new(&model))?);
             let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
             let d1 = cera::d1::D1Model::from_gguf(&gguf, &tokenizer)?;
             let engine = resolve_engine(

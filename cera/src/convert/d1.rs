@@ -1,8 +1,7 @@
 //! Conversion of the open `d1-omni` decision checkpoint (`model_type = "d1_omni"`).
 //!
 //! The checkpoint keeps a bidirectional LFM2 trunk, a decision head, a SigLIP2 vision tower with
-//! its projector and (not converted here yet) a FastConformer audio tower in one
-//! `model.safetensors`. It is
+//! its projector and a FastConformer audio tower in one `model.safetensors`. It is
 //! written as an ordinary non-causal `lfm2` GGUF, so the trunk loads and runs as every other
 //! bidirectional LFM2 encoder does, plus the head's tensors and settings under the `d1.` prefix:
 //!
@@ -23,6 +22,14 @@
 //! | `vision.tower.vision_model.encoder.layers.N.mlp.fc{1,2}.*` | `d1.v.blk.N.ffn_{up,down}.*` |
 //! | `vision.tower.vision_model.post_layernorm.*`       | `d1.v.post_ln.*`                 |
 //! | `vision.projector.linear_{1,2}.*`                  | `d1.v.mm.{1,2}.*`                |
+//! | `audio.encoder.*`, `audio.adapter.*`               | the LFM2-Audio encoder layout (`a.*`, `mm.a.mlp.*`) |
+//! | `audio.residual.{ln,down,up}.*`                    | `d1.a.res.{norm,down,up}.*`      |
+//!
+//! The audio tower is written in the layout `crate::model::audio_encoder` already loads (the
+//! same FastConformer lineage as LFM2-Audio), including its `clip.audio.*` settings, so that
+//! encoder runs it unchanged. Two things are rewritten on the way: every batch norm is folded
+//! into a scale and a shift (`a.blk.N.conv_norm.{weight,bias}`), and the singleton axis of the
+//! 1-D convolution kernels is dropped.
 //!
 //! Metadata, all optional for a reader that only wants the trunk:
 //!
@@ -31,6 +38,8 @@
 //! * `d1.vision.block_count`, `d1.vision.embedding_length`, `d1.vision.feed_forward_length`,
 //!   `d1.vision.attention.head_count`, `d1.vision.patch_size`, `d1.vision.position_side`,
 //!   `d1.vision.layer_norm_epsilon`, `d1.vision.projector_hidden_length`: the tower;
+//! * `clip.audio.*`: the audio encoder's depth, width, heads and mel bins, as that loader reads
+//!   them; `d1.audio.residual_width`: the hidden width of the residual block after the adapter;
 //! * `d1.context_length`: the longest prompt, media prefix included;
 //! * `d1.image_text_length`, `d1.audio_text_length`: the room an image or audio request leaves
 //!   its text;
@@ -53,6 +62,171 @@ pub fn keeps_f32(gguf_name: &str) -> bool {
         || gguf_name.starts_with("d1.question_type")
         || gguf_name.starts_with("d1.v.patch_embd")
         || gguf_name.starts_with("d1.v.position_embd")
+        || gguf_name.starts_with("d1.a.res")
+        // the audio convolutions and the folded batch norms are small and numerically touchy
+        || gguf_name.starts_with("a.conv1d.")
+        || gguf_name.contains(".conv_dw.")
+        || gguf_name.contains(".conv_pw")
+        || gguf_name.contains(".conv_norm.")
+}
+
+/// Epsilon of `torch.nn.BatchNorm1d`, which the conformer's convolution module uses.
+pub const BATCH_NORM_EPS: f64 = 1e-5;
+
+/// What to do with a checkpoint tensor.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum TensorPlan {
+    /// Leave it out.
+    Skip,
+    /// Write it under this GGUF name.
+    Name(String),
+    /// One of the four statistics of the batch norm of conformer layer `layer`; the four are
+    /// folded into `a.blk.<layer>.conv_norm.{weight,bias}`.
+    BatchNorm { layer: usize, stat: BatchNormStat },
+}
+
+/// The tensors of a batch norm.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum BatchNormStat {
+    Weight,
+    Bias,
+    Mean,
+    Var,
+}
+
+/// Which half of a folded batch norm a derived tensor holds.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Fold {
+    /// `weight / sqrt(var + eps)`
+    Scale,
+    /// `bias - mean * scale`
+    Shift,
+}
+
+/// Fold a batch norm (`y = (x - mean) / sqrt(var + eps) * weight + bias`) into `y = x * scale +
+/// shift`, in f64.
+pub fn fold_batch_norm(
+    kind: Fold,
+    weight: &[f32],
+    bias: &[f32],
+    mean: &[f32],
+    var: &[f32],
+) -> Vec<f32> {
+    (0..weight.len())
+        .map(|i| {
+            let scale = f64::from(weight[i]) / (f64::from(var[i]) + BATCH_NORM_EPS).sqrt();
+            match kind {
+                Fold::Scale => scale as f32,
+                Fold::Shift => (f64::from(bias[i]) - f64::from(mean[i]) * scale) as f32,
+            }
+        })
+        .collect()
+}
+
+/// The GGUF dimensions of a tensor: the reversed shape, with the singleton axis of the audio
+/// 1-D convolution kernels dropped (a depthwise `[c, 1, k]` becomes `[k, c]`, a pointwise
+/// `[o, i, 1]` becomes `[i, o]`).
+pub fn tensor_dims(gguf_name: &str, shape: &[usize]) -> Vec<u64> {
+    let mut dims: Vec<u64> = shape.iter().rev().map(|&d| d as u64).collect();
+    if shape.len() == 3 {
+        if gguf_name.ends_with(".conv_dw.weight") && shape[1] == 1 {
+            dims.remove(1);
+        } else if (gguf_name.ends_with(".conv_pw1.weight")
+            || gguf_name.ends_with(".conv_pw2.weight"))
+            && shape[2] == 1
+        {
+            dims.remove(0);
+        }
+    }
+    dims
+}
+
+/// An audio tower tensor, or `None` for one that does not belong.
+fn audio_plan(hf_name: &str) -> Option<TensorPlan> {
+    if let Some(rest) = hf_name.strip_prefix("audio.residual.") {
+        let (layer, kind) = rest.split_once('.')?;
+        let name = match layer {
+            "ln" => "norm",
+            "down" | "up" => layer,
+            _ => return None,
+        };
+        return matches!(kind, "weight" | "bias")
+            .then(|| TensorPlan::Name(format!("d1.a.res.{name}.{kind}")));
+    }
+    if let Some(rest) = hf_name.strip_prefix("audio.adapter.") {
+        let (layer, kind) = rest.split_once('.')?;
+        let index = match layer {
+            "norm" => 0,
+            "linear_1" => 1,
+            "linear_2" => 3,
+            _ => return None,
+        };
+        return matches!(kind, "weight" | "bias")
+            .then(|| TensorPlan::Name(format!("mm.a.mlp.{index}.{kind}")));
+    }
+    let rest = hf_name.strip_prefix("audio.encoder.")?;
+    if let Some(rest) = rest.strip_prefix("pre_encode.") {
+        if let Some(conv) = rest.strip_prefix("conv.") {
+            let (index, kind) = conv.split_once('.')?;
+            index.parse::<usize>().ok()?;
+            return matches!(kind, "weight" | "bias")
+                .then(|| TensorPlan::Name(format!("a.conv1d.{index}.{kind}")));
+        }
+        let kind = rest.strip_prefix("out.")?;
+        return matches!(kind, "weight" | "bias")
+            .then(|| TensorPlan::Name(format!("a.pre_encode.out.{kind}")));
+    }
+    let (layer, suffix) = rest.strip_prefix("layers.")?.split_once('.')?;
+    let index: usize = layer.parse().ok()?;
+    // the two positional biases carry no `.weight` suffix
+    if matches!(suffix, "self_attn.pos_bias_u" | "self_attn.pos_bias_v") {
+        let name = suffix.strip_prefix("self_attn.")?;
+        return Some(TensorPlan::Name(format!("a.blk.{layer}.{name}")));
+    }
+    let (module, kind) = suffix.rsplit_once('.')?;
+    if module == "conv.batch_norm" {
+        let stat = match kind {
+            "weight" => BatchNormStat::Weight,
+            "bias" => BatchNormStat::Bias,
+            "running_mean" => BatchNormStat::Mean,
+            "running_var" => BatchNormStat::Var,
+            "num_batches_tracked" => return Some(TensorPlan::Skip),
+            _ => return None,
+        };
+        return Some(TensorPlan::BatchNorm { layer: index, stat });
+    }
+    if !matches!(kind, "weight" | "bias") {
+        return None;
+    }
+    let name = match module {
+        "feed_forward1.linear1" => "ffn_up",
+        "feed_forward1.linear2" => "ffn_down",
+        "norm_feed_forward1" => "ffn_norm",
+        "feed_forward2.linear1" => "ffn_up_1",
+        "feed_forward2.linear2" => "ffn_down_1",
+        "norm_feed_forward2" => "ffn_norm_1",
+        "norm_self_att" => "ln1",
+        "norm_out" => "ln2",
+        "norm_conv" => "norm_conv",
+        "self_attn.linear_q" => "attn_q",
+        "self_attn.linear_k" => "attn_k",
+        "self_attn.linear_v" => "attn_v",
+        "self_attn.linear_out" => "attn_out",
+        "self_attn.linear_pos" => "linear_pos",
+        "conv.pointwise_conv1" => "conv_pw1",
+        "conv.depthwise_conv" => "conv_dw",
+        "conv.pointwise_conv2" => "conv_pw2",
+        _ => return None,
+    };
+    Some(TensorPlan::Name(format!("a.blk.{layer}.{name}.{kind}")))
+}
+
+/// What to do with a d1-omni checkpoint tensor.
+pub fn tensor_plan(hf_name: &str) -> TensorPlan {
+    if hf_name.starts_with("audio.") {
+        return audio_plan(hf_name).unwrap_or(TensorPlan::Skip);
+    }
+    tensor_name(hf_name).map_or(TensorPlan::Skip, TensorPlan::Name)
 }
 
 /// A vision tower or projector tensor under its GGUF name, `None` for one that does not belong.
@@ -88,8 +262,8 @@ fn vision_tensor_name(hf_name: &str) -> Option<String> {
     matches!(kind, "weight" | "bias").then(|| format!("d1.v.blk.{index}.{name}.{kind}"))
 }
 
-/// The GGUF name of a d1-omni checkpoint tensor, or `None` for a tensor this conversion leaves
-/// out (the audio tower).
+/// The GGUF name of a d1-omni trunk, head or vision tensor, or `None` for any other (the audio
+/// tower is planned by [`tensor_plan`]).
 pub fn tensor_name(hf_name: &str) -> Option<String> {
     if hf_name.starts_with("vision.") {
         return vision_tensor_name(hf_name);
@@ -204,6 +378,29 @@ pub fn apply_metadata(config: &Value, writer: &mut GgufWriter) -> Result<(), Cer
             count(config, "projector_hidden_size")?,
         );
     }
+    if let Some(audio) = config.get("audio_config") {
+        let field = |key: &str| {
+            audio
+                .get(key)
+                .and_then(Value::as_u64)
+                .and_then(|n| u32::try_from(n).ok())
+                .ok_or_else(|| {
+                    CeraError::Backend(format!("d1-omni config.json: no `audio_config.{key}`"))
+                })
+        };
+        let width = field("d_model")?;
+        writer.add_bool("clip.has_audio_encoder", true);
+        writer.add_u32("clip.audio.block_count", field("n_layers")?);
+        writer.add_u32("clip.audio.embedding_length", width);
+        writer.add_u32(
+            "clip.audio.feed_forward_length",
+            width * field("ff_expansion_factor")?,
+        );
+        writer.add_u32("clip.audio.attention.head_count", field("n_heads")?);
+        writer.add_f32("clip.audio.attention.layer_norm_epsilon", 1e-5);
+        writer.add_u32("clip.audio.num_mel_bins", field("feat_in")?);
+        writer.add_u32("d1.audio.residual_width", field("residual_width")?);
+    }
     if let Some(temperatures) = config.get("temperatures").and_then(Value::as_object) {
         let mut keys = Vec::new();
         let mut values = Vec::new();
@@ -311,8 +508,6 @@ mod tests {
     #[test]
     fn towers_and_unknown_tensors_are_left_out() {
         for hf in [
-            "audio.encoder.layers.0.conv.batch_norm.num_batches_tracked",
-            "audio.adapter.norm.weight",
             "head.head.layers.0.self_attn.mystery",
             "head.scorer.2.weight",
             "head.head.layers.x.norm1.weight",
@@ -322,11 +517,140 @@ mod tests {
     }
 
     #[test]
+    fn audio_tensors_take_the_encoder_layout() {
+        let name = |hf: &str| match tensor_plan(hf) {
+            TensorPlan::Name(n) => Some(n),
+            _ => None,
+        };
+        let cases = [
+            (
+                "audio.encoder.pre_encode.conv.3.weight",
+                "a.conv1d.3.weight",
+            ),
+            ("audio.encoder.pre_encode.out.bias", "a.pre_encode.out.bias"),
+            (
+                "audio.encoder.layers.4.feed_forward1.linear1.weight",
+                "a.blk.4.ffn_up.weight",
+            ),
+            (
+                "audio.encoder.layers.4.feed_forward2.linear2.bias",
+                "a.blk.4.ffn_down_1.bias",
+            ),
+            (
+                "audio.encoder.layers.4.norm_self_att.weight",
+                "a.blk.4.ln1.weight",
+            ),
+            ("audio.encoder.layers.16.norm_out.bias", "a.blk.16.ln2.bias"),
+            (
+                "audio.encoder.layers.0.self_attn.linear_pos.weight",
+                "a.blk.0.linear_pos.weight",
+            ),
+            (
+                "audio.encoder.layers.2.self_attn.pos_bias_u",
+                "a.blk.2.pos_bias_u",
+            ),
+            (
+                "audio.encoder.layers.2.conv.depthwise_conv.weight",
+                "a.blk.2.conv_dw.weight",
+            ),
+            (
+                "audio.encoder.layers.2.conv.pointwise_conv2.bias",
+                "a.blk.2.conv_pw2.bias",
+            ),
+            ("audio.adapter.norm.weight", "mm.a.mlp.0.weight"),
+            ("audio.adapter.linear_1.bias", "mm.a.mlp.1.bias"),
+            ("audio.adapter.linear_2.weight", "mm.a.mlp.3.weight"),
+            ("audio.residual.ln.weight", "d1.a.res.norm.weight"),
+            ("audio.residual.up.bias", "d1.a.res.up.bias"),
+        ];
+        for (hf, gguf) in cases {
+            assert_eq!(name(hf).as_deref(), Some(gguf), "{hf}");
+        }
+        for skip in [
+            "audio.encoder.layers.0.conv.batch_norm.num_batches_tracked",
+            "audio.encoder.layers.0.conv.mystery.weight",
+            "audio.adapter.linear_3.weight",
+            "audio.residual.gate.weight",
+        ] {
+            assert_eq!(tensor_plan(skip), TensorPlan::Skip, "{skip}");
+        }
+    }
+
+    #[test]
+    fn batch_norm_statistics_are_collected_per_layer() {
+        for (hf, stat) in [
+            ("weight", BatchNormStat::Weight),
+            ("bias", BatchNormStat::Bias),
+            ("running_mean", BatchNormStat::Mean),
+            ("running_var", BatchNormStat::Var),
+        ] {
+            assert_eq!(
+                tensor_plan(&format!("audio.encoder.layers.7.conv.batch_norm.{hf}")),
+                TensorPlan::BatchNorm { layer: 7, stat }
+            );
+        }
+    }
+
+    #[test]
+    fn a_folded_batch_norm_is_the_same_affine_map() {
+        let (w, b, mean, var) = (
+            [2.0f32, 0.5],
+            [0.1f32, -0.3],
+            [1.0f32, -2.0],
+            [3.0f32, 0.25],
+        );
+        let scale = fold_batch_norm(Fold::Scale, &w, &b, &mean, &var);
+        let shift = fold_batch_norm(Fold::Shift, &w, &b, &mean, &var);
+        for i in 0..2 {
+            for x in [-1.5f32, 0.0, 0.7, 4.0] {
+                let direct = (x - mean[i]) / (var[i] + 1e-5).sqrt() * w[i] + b[i];
+                let folded = x * scale[i] + shift[i];
+                assert!((direct - folded).abs() < 1e-5, "{direct} vs {folded}");
+            }
+        }
+    }
+
+    #[test]
+    fn the_singleton_axis_of_audio_kernels_is_dropped() {
+        assert_eq!(
+            tensor_dims("a.blk.0.conv_dw.weight", &[512, 1, 9]),
+            vec![9, 512]
+        );
+        assert_eq!(
+            tensor_dims("a.blk.0.conv_pw1.weight", &[1024, 512, 1]),
+            vec![512, 1024]
+        );
+        assert_eq!(
+            tensor_dims("a.blk.0.conv_pw2.weight", &[512, 512, 1]),
+            vec![512, 512]
+        );
+        // the stem keeps its four axes, and ordinary matrices are just reversed
+        assert_eq!(
+            tensor_dims("a.conv1d.3.weight", &[256, 256, 1, 1]),
+            vec![1, 1, 256, 256]
+        );
+        assert_eq!(
+            tensor_dims("a.conv1d.0.weight", &[256, 1, 3, 3]),
+            vec![3, 3, 1, 256]
+        );
+        assert_eq!(
+            tensor_dims("a.blk.0.ffn_up.weight", &[2048, 512]),
+            vec![512, 2048]
+        );
+    }
+
+    #[test]
     fn the_scorer_and_question_types_stay_f32() {
         assert!(keeps_f32("d1.cls.output.weight"));
         assert!(keeps_f32("d1.cls.weight"));
         assert!(keeps_f32("d1.question_type.weight"));
         assert!(keeps_f32("d1.v.patch_embd.weight"));
+        assert!(keeps_f32("a.conv1d.0.weight"));
+        assert!(keeps_f32("a.blk.3.conv_dw.weight"));
+        assert!(keeps_f32("a.blk.3.conv_norm.bias"));
+        assert!(keeps_f32("d1.a.res.down.weight"));
+        assert!(!keeps_f32("a.blk.3.ffn_up.weight"));
+        assert!(!keeps_f32("mm.a.mlp.1.weight"));
         assert!(keeps_f32("d1.v.position_embd.weight"));
         assert!(!keeps_f32("d1.v.blk.0.ffn_up.weight"));
         assert!(!keeps_f32("d1.blk.0.ffn_up.weight"));
@@ -342,6 +666,10 @@ mod tests {
             "audio_text_length": 15360,
             "projector_hidden_size": 2048,
             "text_config": {"hidden_size": 1024},
+            "audio_config": {
+                "d_model": 512, "ff_expansion_factor": 4, "n_heads": 8, "n_layers": 17,
+                "feat_in": 128, "residual_width": 512
+            },
             "vision_config": {
                 "num_hidden_layers": 12, "hidden_size": 768, "intermediate_size": 3072,
                 "num_attention_heads": 12, "patch_size": 16, "num_patches": 256,
@@ -354,6 +682,8 @@ mod tests {
         assert!(writer.get_metadata("d1.head.block_count").is_some());
         assert!(writer.get_metadata("d1.temperature.keys").is_some());
         assert!(writer.get_metadata("d1.vision.position_side").is_some());
+        assert!(writer.get_metadata("clip.audio.block_count").is_some());
+        assert!(writer.get_metadata("d1.audio.residual_width").is_some());
         assert!(
             apply_metadata(
                 &serde_json::json!({"head_layers": 2}),
