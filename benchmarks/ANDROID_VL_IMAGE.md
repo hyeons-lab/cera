@@ -271,6 +271,39 @@ The full-vocabulary logits are identical to the previous step's and to the `CERA
 (maximum difference 0.0000 on five prompts of 60 to 3,600 characters). At 2,048 tokens the gap that remains is
 attention, which reads more keys per chunk.
 
+### Attention with fp16 math: a spike (not integrated)
+
+`scripts/attn-fp16/gen.py` builds SPIR-V (Slang) variants of the tiled causal prefill attention with fp16 math, and
+`cera/examples/wgpu_attn_bench.rs` times them against the f32 WGSL kernel in the tree and scores each against an f64
+reference, on an LFM2-shaped call (16 query heads, 8 KV heads, head_dim 64, unit-variance Q/K/V; 512 queries at
+position 0 and at position 1536). The variants keep Q (pre-scaled), K^T, V and the probabilities in shared memory as
+half and accumulate QK^T and PV in half, widening a half partial sum into f32 every `S_BLOCK` dims / `PV_BLOCK` keys;
+the softmax statistics and the output accumulator stay f32.
+
+| Kernel | 512 at 1536 | TFLOPS | rms error (unit data) | at 4x score variance | at 9x |
+|---|---:|---:|---:|---:|---:|
+| f32 WGSL (tree) | 16.5 ms | 0.23 | 0.000% | 0.000% | 0.000% |
+| fp16, widen every 8 dims / 4 keys | 13.2 ms | 0.29 | 0.076% | 0.174% | 0.242% |
+| fp16, widen every 32 dims / 16 keys | 13.4 ms | 0.28 | 0.154% | 0.430% | 0.594% |
+
+(Errors are the rms of the difference over the rms of the output.) The findings:
+
+- **fp16 is worth 1.2x here, not 2x.** The kernel is at 4% of the fp16 FMA ceiling, so the arithmetic precision is not
+  what limits it. Removing QK^T alone takes 13.2 ms to 4.2 ms (68% of the time); removing the K and V staging takes
+  about 3 ms (22%); the exp2s cost 0.1 ms. (Removing PV lets the compiler delete the whole kernel, so that ablation
+  is not meaningful.)
+- **Why QK^T is the big piece:** a thread's score tile is 4 queries x 2 keys, so its FMAs are 2 lanes wide, twice the
+  instructions of PV's 4-lane FMAs for the same MACs.
+- **A 4 x 4 tile does not fix it.** Workgroups of 64 threads with a 4-query x 4-key score tile (half4 FMAs, a third
+  fewer instructions per MAC) are slower, 0.20 TFLOPS in fp16 and 0.18 in f32, probably from the larger register
+  footprint and a single wave per workgroup; both are numerically right (the f32 one matches the reference to 7e-7).
+- **A fully unrolled QK^T is a trap:** unrolling all 64 dims in one block ran at 0.01 TFLOPS (the loads are hoisted
+  and the registers spill); the loop over 8-dim blocks is what makes the fp16 kernels fast.
+- **What it would buy:** attention is 14 ms of a 140 ms 512-token chunk and about 220 ms of a 2,048-token prefill, so
+  20% faster attention is about +2% at 512 tokens and +6% at 2,048 (2,644 to about 2,800 tok/s, level with llama.cpp's
+  2,895 within 4%), at an attention-output error of 0.1 to 0.25% of rms. That needs an end-to-end check on real
+  activations before it ships, and a fallback to the f32 kernel.
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
