@@ -137,7 +137,7 @@ and is not needed for it.
 ## Verification gates (run before calling an NPU release done)
 
 1. `just android-libs` green; arm64/x86_64 `.so` contain
-   `libggml-htp-v*` strings, 32-bit don't; all four pass
+   `libcera-htp-v*` strings, 32-bit don't; all four pass
    `assert-ffibuffer.sh`; all four pass `assert-16k-pages.py`.
 2. AAR unzips with `jni/<4 abis>/libcera_ffi.so` (16KB page-aligned) +
    `assets/NOTICE` (byte-identical MIT block to `skels/LICENSE`);

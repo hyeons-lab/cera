@@ -24,11 +24,11 @@ pub enum HexagonArch {
 impl HexagonArch {
     pub fn skel_filename(&self) -> &'static str {
         match self {
-            Self::V73 => "libggml-htp-v73.so",
-            Self::V75 => "libggml-htp-v75.so",
-            Self::V79 => "libggml-htp-v79.so",
-            Self::V81 => "libggml-htp-v81.so",
-            Self::V85 => "libggml-htp-v85.so",
+            Self::V73 => "libcera-htp-v73.so",
+            Self::V75 => "libcera-htp-v75.so",
+            Self::V79 => "libcera-htp-v79.so",
+            Self::V81 => "libcera-htp-v81.so",
+            Self::V85 => "libcera-htp-v85.so",
         }
     }
 

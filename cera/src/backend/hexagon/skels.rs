@@ -1,6 +1,6 @@
 //! Embedded Hexagon DSP skels + device probe.
 //!
-//! The `skels/` directory vendors the five `libggml-htp-vXX.so` DSP
+//! The `skels/` directory vendors the five `libcera-htp-vXX.so` DSP
 //! libraries (see `skels/SOURCE.md` for provenance). They are embedded
 //! in the binary so apps ship one artifact: at runtime the engine writes
 //! the matching skel next to itself (or into an app-provided directory)
@@ -16,11 +16,11 @@ use crate::session::CeraError;
 /// Embedded skel bytes per architecture (see `skels/SOURCE.md`).
 pub fn embedded_skel(arch: HexagonArch) -> &'static [u8] {
     match arch {
-        HexagonArch::V73 => include_bytes!("skels/libggml-htp-v73.so"),
-        HexagonArch::V75 => include_bytes!("skels/libggml-htp-v75.so"),
-        HexagonArch::V79 => include_bytes!("skels/libggml-htp-v79.so"),
-        HexagonArch::V81 => include_bytes!("skels/libggml-htp-v81.so"),
-        HexagonArch::V85 => include_bytes!("skels/libggml-htp-v85.so"),
+        HexagonArch::V73 => include_bytes!("skels/libcera-htp-v73.so"),
+        HexagonArch::V75 => include_bytes!("skels/libcera-htp-v75.so"),
+        HexagonArch::V79 => include_bytes!("skels/libcera-htp-v79.so"),
+        HexagonArch::V81 => include_bytes!("skels/libcera-htp-v81.so"),
+        HexagonArch::V85 => include_bytes!("skels/libcera-htp-v85.so"),
     }
 }
 
@@ -173,6 +173,7 @@ pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
             count += 1;
         }
     }
+    remove_legacy_skels(dir, LEGACY_SKELS);
     // `;`-joined: the separator the FastRPC loader parses (verified with
     // the AAR flow on a retail S25U) and the one `HexagonNpu.setup` writes.
     // A `:`-joined value would reach the loader as one path containing a
@@ -187,6 +188,50 @@ pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
     // race (no in-process primitive can enforce that half).
     unsafe { std::env::set_var("ADSP_LIBRARY_PATH", merged) };
     Ok(count)
+}
+
+/// A skel that earlier cera builds installed under the name llama.cpp's own skels use:
+/// `(file name, length, FNV-1a 64 of the contents)`.
+type LegacySkel = (&'static str, u64, u64);
+
+/// The `libggml-htp-vXX.so` files cera shipped before the skels were renamed (the build before
+/// the Q8 quantizer fix, and the one after it).
+const LEGACY_SKELS: &[LegacySkel] = &[
+    ("libggml-htp-v73.so", 890856, 0x9ff26275dfa72858),
+    ("libggml-htp-v73.so", 890856, 0xd20698d252543138),
+    ("libggml-htp-v75.so", 836680, 0x5086a2b100fe8ead),
+    ("libggml-htp-v75.so", 836680, 0xab2f061fbf9e2e04),
+    ("libggml-htp-v79.so", 853160, 0xd993ac714327ddab),
+    ("libggml-htp-v79.so", 853160, 0x41da0f7f31f74734),
+    ("libggml-htp-v81.so", 881960, 0x09fb2a033ba74d5e),
+    ("libggml-htp-v81.so", 881928, 0x260b85a6333e67f0),
+    ("libggml-htp-v85.so", 881960, 0x09fb2a033ba74d5e),
+    ("libggml-htp-v85.so", 881928, 0x260b85a6333e67f0),
+];
+
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| {
+        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
+    })
+}
+
+/// Delete the previous cera skels left in `dir` under llama.cpp's file names. The loader
+/// searches `dir` before the other entries on `ADSP_LIBRARY_PATH`, so a stale copy there would
+/// answer a coexisting llama.cpp runtime's request for its own skel with cera's old, ABI-skewed
+/// one. Only a regular file whose length and contents match a known cera build goes: an
+/// app-provided directory may legitimately hold llama.cpp's own skels under those names.
+fn remove_legacy_skels(dir: &std::path::Path, known: &[LegacySkel]) {
+    for &(name, len, hash) in known {
+        let path = dir.join(name);
+        let is_ours = std::fs::symlink_metadata(&path)
+            .ok()
+            .filter(|m| m.is_file() && m.len() == len)
+            .and_then(|_| std::fs::read(&path).ok())
+            .is_some_and(|b| fnv1a64(&b) == hash);
+        if is_ours {
+            let _ = std::fs::remove_file(&path);
+        }
+    }
 }
 
 /// Merge a staged path list with the current `ADSP_LIBRARY_PATH` value:
@@ -260,6 +305,67 @@ mod tests {
             0,
             "nothing may be written into a refused dir"
         );
+    }
+
+    #[test]
+    fn legacy_skels_are_removed_only_when_they_are_ours() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let ours = b"a previous cera skel".as_slice();
+        let known: &[LegacySkel] = &[
+            ("libggml-htp-v73.so", ours.len() as u64, fnv1a64(ours)),
+            ("libggml-htp-v75.so", ours.len() as u64, fnv1a64(ours)),
+            ("libggml-htp-v79.so", ours.len() as u64, fnv1a64(ours)),
+        ];
+        std::fs::write(dir.join("libggml-htp-v79.so"), ours).unwrap();
+        // Same name, same length, other contents: llama.cpp's own copy, kept.
+        let theirs = b"A previous cera skel".as_slice();
+        assert_eq!(theirs.len(), ours.len());
+        std::fs::write(dir.join("libggml-htp-v75.so"), theirs).unwrap();
+        // A link to a matching file is never followed or removed (the link is examined before
+        // anything else is deleted, and its target outlives the call).
+        std::fs::write(dir.join("elsewhere.so"), ours).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere.so"), dir.join("libggml-htp-v73.so"))
+            .unwrap();
+        remove_legacy_skels(dir, known);
+        assert!(!dir.join("libggml-htp-v79.so").exists(), "ours is removed");
+        assert!(dir.join("elsewhere.so").exists());
+        assert_eq!(
+            std::fs::read(dir.join("libggml-htp-v75.so")).unwrap(),
+            theirs
+        );
+        assert!(dir.join("libggml-htp-v73.so").symlink_metadata().is_ok());
+    }
+
+    /// The previous builds, as `(name, length, FNV-1a 64)` of the blobs at the commits that
+    /// shipped them (before and after the Q8 quantizer fix). An edit here is deliberate: a wrong
+    /// value silently leaves a stale skel installed.
+    #[test]
+    fn the_legacy_table_pins_the_shipped_builds() {
+        let want: &[LegacySkel] = &[
+            ("libggml-htp-v73.so", 890856, 0x9ff26275dfa72858),
+            ("libggml-htp-v73.so", 890856, 0xd20698d252543138),
+            ("libggml-htp-v75.so", 836680, 0x5086a2b100fe8ead),
+            ("libggml-htp-v75.so", 836680, 0xab2f061fbf9e2e04),
+            ("libggml-htp-v79.so", 853160, 0xd993ac714327ddab),
+            ("libggml-htp-v79.so", 853160, 0x41da0f7f31f74734),
+            ("libggml-htp-v81.so", 881960, 0x09fb2a033ba74d5e),
+            ("libggml-htp-v81.so", 881928, 0x260b85a6333e67f0),
+            ("libggml-htp-v85.so", 881960, 0x09fb2a033ba74d5e),
+            ("libggml-htp-v85.so", 881928, 0x260b85a6333e67f0),
+        ];
+        assert_eq!(LEGACY_SKELS, want);
+    }
+
+    #[test]
+    fn the_legacy_table_names_every_renamed_skel() {
+        for arch in PROBE_ARCHS {
+            let old = arch.skel_filename().replace("libcera-htp", "libggml-htp");
+            assert!(
+                LEGACY_SKELS.iter().any(|&(n, ..)| n == old),
+                "{old} has no legacy entry"
+            );
+        }
     }
 
     #[test]

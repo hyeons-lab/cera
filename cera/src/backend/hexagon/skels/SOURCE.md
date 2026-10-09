@@ -1,6 +1,6 @@
 # Bundled Hexagon DSP skels
 
-`libggml-htp-v{73,75,79,81}.so` are the DSP-side (Hexagon ELF) worker
+`libcera-htp-v{73,75,79,81}.so` are the DSP-side (Hexagon ELF) worker
 libraries the NPU backend loads into the CDSP unsigned PD at runtime.
 They are built from llama.cpp sources plus one patch (`patches/0001-*.patch`, described
 under Provenance); the host side
@@ -33,12 +33,20 @@ vendoring them.
 
 ## Provenance
 
-- Source: llama.cpp (`hyeons-lab/llama.cpp`) at commit `00ccd6970`
-  (`ggml/src/ggml-hexagon/htp/` + `htp_iface.idl`), including extended
-  Conv1D, ConvTranspose1D, Snake, and unary operations.
+- Source: llama.cpp at upstream commit `de7fa0a3c` (2026-10-08) plus three local Hexagon commits on
+  top (`1824e49e4`, `db89d9e20`, `957e73059`: the extended Conv1D, ConvTranspose1D, Snake and unary
+  operations, and the HVX float-clamp fix), then the quantizer patch below as `51c61fce4`.
+  These commits live in a local, unpublished llama.cpp branch
+  (`ggml/src/ggml-hexagon/htp/` + `htp_iface.idl`); the previous skels were built from
+  `hyeons-lab/llama.cpp` commit `00ccd6970`.
+- Host contract: the DSP now answers `NO_SUPPORT` to a `Cpy` or `Concat` whose
+  kernel params the host did not precompute, and the matmul, flash-attention, `get_rows` and
+  `ssm_conv` params changed layout. `params.rs` mirrors them. The Cpy, Concat, GetRows and SsmConv builders and the HMX chunk and
+  2-D solvers are checked word for word against llama.cpp's own code
+  (`scripts/hexagon-golden/gen.py` with `LLAMA_CPP` set to a checkout, `testdata/*_golden.txt`);
+  the matmul and flash-attention words are assembled from those and pinned by the op-sequence
+  hashes only.
 - Patch: `patches/0001-hvx-q8-activation-quantizer-f32-reciprocal.patch`
-  (also the branch `fix/hvx-q8-activation-quantizer` of `hyeons-lab/llama.cpp`,
-  two commits on top of `00ccd6970`, tip `2b2070940`)
   (`hvx-mm-kernels-tiled.h`, the `q8_0` and `q8_1` tiled activation
   quantizers). The upstream quantizer computed the Q8 scale and its
   reciprocal in f16: for a block whose absolute maximum is below about
@@ -54,8 +62,9 @@ vendoring them.
   Galaxy S25 Ultra (v79) against the CPU: full-logit cosine on 2 to 7 row
   chunks went from 0.95..0.99 to 0.9995 or better (LFM2.5-2.6B Q4_0 from
   -0.003..0.99 to 0.991..0.9999), single tokens from as low as 0.377 to
-  0.9995, with unchanged decode throughput. v73, v75 and v81 are the
-  same C code rebuilt; only v79 has been run on hardware.
+  0.9995, with unchanged decode throughput (measured on the previous build; the patch is ported
+  onto the reworked quantizers). v73, v75 and v81 are the same C code rebuilt; only v79 has been
+  run on hardware.
 - Build: Hexagon SDK 6.6.0.0 with Hexagon Tools 19.0.07 (hexagon-clang with
   whole-program LTO), compiling `libggml-htp-v{73,75,79,81}.so` targets with
   `-DDSP_VERSION`.
@@ -64,27 +73,46 @@ vendoring them.
 
 ## Integrity (md5)
 
-- v73: 00e174b04ec625eb54eab8bd5933a816
-- v75: 304baf4b6fedeb47ea05dd6c5172c4e5
-- v79: 8d94eb0467b762dcb01a111c3847a402
-- v81: 1023a904c5bebc6d3b482e21a618c290
+- v73: 8e4244443225ff0bba5479a4d650c6e0
+- v75: d0334de0b516b13d5a3fe205fb0e1ac0
+- v79: fe6dbaddf669fda4e118e6000482fd90
+- v81: 531d875fe26736ad0c6aa33b23ef6b09
 
-(Before the patch: v73 2dd73769..., v75 890dcd26..., v79 7da1d562...,
-v81 43349eab....)
+These are the md5s of the shipped, renamed files. The unrenamed build outputs were
+v73 bb29e473361edaaec976677dbf375813, v75 26c87c573b64443ab74e35b9770c497d,
+v79 d41218ff47b146e6c7afd0870e7975fc, v81 04b17a165e8a01c146e6eceb193bbb2f.
 
 ## Rebuilding
 
 ```bash
-# in a llama.cpp checkout at the pinned commit, with HEXAGON_SDK_ROOT set (Linux):
-git checkout 00ccd6970
-git apply <cera>/cera/src/backend/hexagon/skels/patches/0001-*.patch
-cmake -S . -B build-snapdragon -DGGML_HEXAGON=ON <android preset>
-cmake --build build-snapdragon --target ggml-htp-v73 ggml-htp-v75 ggml-htp-v79 ggml-htp-v81
+# in the llama.cpp checkout described under Source (commit 51c61fce4), Docker toolchain image
+# ghcr.io/snapdragon-toolchain/arm64-android:v0.7 (Hexagon SDK 6.6.0.0, Tools 19.0.07):
+cp docs/backend/snapdragon/CMakeUserPresets.json .
+docker run --rm --platform linux/amd64 -v "$PWD":/workspace -w /workspace <image> bash -lc \
+  'cmake --preset arm64-android-snapdragon-release -B build-snapdragon &&
+   cmake --build build-snapdragon --target htp-v73 htp-v75 htp-v79 htp-v81'
 # outputs: build-snapdragon/ggml/src/ggml-hexagon/libggml-htp-vXX.so
 ```
 
-Skipping the `git apply` reproduces the unpatched skels, whose md5s do not match
-the ones above.
+## Renaming (llama.cpp coexistence)
+
+The build outputs are named `libggml-htp-vXX.so`, the same names llama.cpp's own Hexagon backend
+ships, so an app embedding both would have one overwrite the other in `ADSP_LIBRARY_PATH`, and
+the DSP loader could treat the equal SONAMEs as one library. The shipped files are therefore
+renamed `libcera-htp-vXX.so` (the host opens them by that name, `HexagonArch::skel_filename`)
+and the SONAME in each is patched to match. `ggml` and `cera` are both four characters, so the
+patch is a same-length byte substitution that moves no offsets:
+
+```bash
+for v in 73 75 79 81; do
+  cp libggml-htp-v$v.so libcera-htp-v$v.so
+  perl -0pi -e "s/libggml-htp-v$v\.so/libcera-htp-v$v.so/g" libcera-htp-v$v.so
+done
+# check: llvm-readelf -d libcera-htp-vXX.so | grep SONAME
+```
+
+Without the quantizer patch (the commit before `51c61fce4`) the skels carry the f16-reciprocal
+quantizer bug, and their md5s differ from the ones above.
 
 After replacing any skel: update the md5s above and re-run the full
 on-device determinism matrix (logits m=1..8 x5, greedy md5 2x2x6,

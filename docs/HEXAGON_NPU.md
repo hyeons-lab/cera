@@ -31,7 +31,7 @@ Cera provides a native, hardware-accelerated backend for Qualcomm Hexagon Neural
        v                                      v
 +-----------------------------------------------------------------------------------+
 | Qualcomm CDSP (Unsigned Process Domain)                                            |
-| Worker Library: libggml-htp-v{73,75,79,81,85}.so                                  |
+| Worker Library: libcera-htp-v{73,75,79,81,85}.so                                  |
 | - HTP Matrix Multiplication Engine (HMX)                                          |
 | - HVX 128-byte SIMD Vector Units                                                  |
 | - 8 MB Tightly-Coupled Vector Memory (VTCM)                                       |
@@ -59,16 +59,16 @@ Snapdragon chipsets span multiple Hexagon DSP architecture revisions. Cera probe
 
 | Qualcomm SoC Family | Hexagon Architecture | Bundled Skeleton | Hardware Capabilities | Validation Status |
 |---------------------|----------------------|------------------|------------------------|-------------------|
-| **Snapdragon 8 Elite** (SM8750) | `v79` / `v81` | `libggml-htp-v79.so` / `v81` | HTP GEMV, 8 MB VTCM, dual HVX units | Verified on Samsung Galaxy S25 Ultra |
-| **Snapdragon 8 Gen 3** / 8s Gen 3 (SM8650) | `v75` | `libggml-htp-v75.so` | HTP GEMV, 4 MB VTCM, dual HVX units | Supported (same codebase) |
-| **Snapdragon 8 Gen 2** / 8+ Gen 1 (SM8550) | `v73` | `libggml-htp-v73.so` | HTP GEMV, 2 MB VTCM, dual HVX units | Supported (same codebase) |
-| **Snapdragon X Elite** (Compute) | `v73` | `libggml-htp-v73.so` | HTP compute engine, Windows/Linux on ARM | Supported |
+| **Snapdragon 8 Elite** (SM8750) | `v79` / `v81` | `libcera-htp-v79.so` / `v81` | HTP GEMV, 8 MB VTCM, dual HVX units | Verified on Samsung Galaxy S25 Ultra |
+| **Snapdragon 8 Gen 3** / 8s Gen 3 (SM8650) | `v75` | `libcera-htp-v75.so` | HTP GEMV, 4 MB VTCM, dual HVX units | Supported (same codebase) |
+| **Snapdragon 8 Gen 2** / 8+ Gen 1 (SM8550) | `v73` | `libcera-htp-v73.so` | HTP GEMV, 2 MB VTCM, dual HVX units | Supported (same codebase) |
+| **Snapdragon X Elite** (Compute) | `v73` | `libcera-htp-v73.so` | HTP compute engine, Windows/Linux on ARM | Supported |
 
 ---
 
 ## 3. Skeleton Libraries & DSP Additions
 
-The DSP-side worker libraries (`libggml-htp-v{73,75,79,81}.so`) are precompiled Hexagon ELF shared objects that implement the low-level compute kernels. Cera embeds all four libraries directly into the host binary (`libcera_ffi.so` and the `cera` crate) and extracts them at startup.
+The DSP-side worker libraries (`libcera-htp-v{73,75,79,81}.so`) are precompiled Hexagon ELF shared objects that implement the low-level compute kernels. Cera embeds all four libraries directly into the host binary (`libcera_ffi.so` and the `cera` crate) and extracts them at startup.
 
 ### Additions to the Skeleton Libraries
 1. **Extended Operator Set**:
