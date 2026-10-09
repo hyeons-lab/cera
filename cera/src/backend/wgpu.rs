@@ -2495,6 +2495,8 @@ pub mod shaders {
     /// stay `array<f32>` so its exact CPU/GPU parity test keeps passing.
     pub const FLASH_ATTENTION_F32: &str = include_str!("shaders/flash_attention_f32.wgsl");
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
+    /// The centred gated convolution of a bidirectional LFM2 trunk.
+    pub const BIDIRECTIONAL: &str = include_str!("shaders/bidirectional.wgsl");
     /// TurboQuant KV compression: `tq_encode_keys`, `tq_encode_values`,
     /// `tq_rotate_q` (three entry points in one module).
     pub const TURBOQUANT: &str = include_str!("shaders/turboquant.wgsl");
@@ -7186,7 +7188,7 @@ mod tests {
         let mut q_base = 0u32;
         while q_base < f.n_queries {
             let n_sub = (f.n_queries - q_base).min(tile);
-            let params: [u32; 12] = [
+            let params: [u32; 14] = [
                 f.n_heads,
                 f.n_kv_heads,
                 f.head_dim,
@@ -7199,6 +7201,8 @@ mod tests {
                 f.out_stride,
                 q_base,
                 n_sub,
+                0, // causal
+                0, // prefix_rows
             ];
             let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
             let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -7369,7 +7373,7 @@ mod tests {
         let v_buf = ctx.upload_f32(&vec![0.2f32; kv_dim as usize], "v");
         // Sentinel-filled rw output: the bail must overwrite every element to 0.
         let out_buf = ctx.upload_f32(&vec![7.0f32; out_len], "out");
-        let params: [u32; 12] = [
+        let params: [u32; 14] = [
             n_heads,
             n_kv_heads,
             head_dim,
@@ -7382,6 +7386,8 @@ mod tests {
             out_stride,
             0, // q_base
             n, // n_sub (authoritative live-query count)
+            0, // causal
+            0, // prefix_rows
         ];
         let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
         let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {

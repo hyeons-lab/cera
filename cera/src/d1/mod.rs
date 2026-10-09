@@ -38,6 +38,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 
+use crate::engine::BackendPreference;
 use crate::gguf::GgufFile;
 use crate::session::Session;
 use crate::tokenizer::BpeTokenizer;
@@ -228,6 +229,21 @@ impl D1Model {
             audio,
             audio_text_length,
         })
+    }
+
+    /// Run the decision head and the vision and speech towers on the GPU `backend` names, where
+    /// there is one. The trunk follows the session's own backend; this is for the encoders in
+    /// front of it, which are most of the time of a request that carries media, and the head
+    /// behind it, which is most of the time of a long text prompt. Does nothing for the CPU, for a
+    /// device that will not open, or for a tower the model lacks.
+    pub fn accelerate(&mut self, gguf: &Arc<GgufFile>, backend: BackendPreference) {
+        self.head.accelerate(gguf, backend);
+        if let Some(vision) = &mut self.vision {
+            vision.accelerate(gguf, backend);
+        }
+        if let Some(audio) = &mut self.audio {
+            audio.accelerate(backend);
+        }
     }
 
     /// The longest prompt, in tokens.

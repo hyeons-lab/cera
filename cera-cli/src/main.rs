@@ -890,8 +890,8 @@ enum Command {
     ///
     /// Reads `config.json`, `tokenizer.json` and the `.safetensors` files of `--input` and
     /// writes one GGUF at `--output`, quantized to `--quant`. The d1 decision models
-    /// (`model_type = "d1_omni"`) convert to a non-causal LFM2 trunk plus their decision head;
-    /// their vision and audio towers are not converted yet.
+    /// (`model_type = "d1_omni"`) convert to a non-causal LFM2 trunk plus their decision head,
+    /// vision tower and speech tower.
     Convert {
         /// SafeTensors model directory.
         #[arg(short, long)]
@@ -4438,7 +4438,12 @@ fn main() -> Result<()> {
             }
             let gguf = std::sync::Arc::new(cera::gguf::GgufFile::open(Path::new(&model))?);
             let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
-            let d1 = cera::d1::D1Model::from_gguf(&gguf, &tokenizer)?;
+            let mut d1 = cera::d1::D1Model::from_gguf(&gguf, &tokenizer)?;
+            d1.accelerate(
+                &gguf,
+                cera::engine::BackendPreference::parse_str(&device)
+                    .unwrap_or(cera::engine::BackendPreference::Auto),
+            );
             let engine = resolve_engine(
                 Some(&model),
                 None,

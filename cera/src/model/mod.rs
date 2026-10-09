@@ -1135,6 +1135,40 @@ pub fn load_model(
     Ok(model)
 }
 
+/// Refuse an LFM2 checkpoint whose attention is bidirectional (the d1 decision models, token
+/// classifiers, embedding encoders) on a backend that cannot read it that way.
+///
+/// A GPU LFM2 graph without a bidirectional path is causal and ignores `is_causal`, so such a
+/// model would load and then answer a different question than the one it was trained on, with
+/// no error. Failing the load here makes `--device auto` fall through to a backend that reads
+/// the whole sequence, and makes an explicit request say why it cannot be honoured.
+/// `reads_dense_lfm2` is true for a backend with that path for the dense `lfm2` arch; the
+/// routed `lfm2moe` arch has none anywhere.
+#[cfg(any(
+    feature = "gpu",
+    feature = "hexagon",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+fn reject_bidirectional_lfm2(
+    gguf: &GgufFile,
+    arch: &str,
+    backend: &str,
+    reads_dense_lfm2: bool,
+) -> Result<()> {
+    if !matches!(arch, "lfm2" | "lfm2moe") || (arch == "lfm2" && reads_dense_lfm2) {
+        return Ok(());
+    }
+    let causal = gguf
+        .get_bool(&format!("{arch}.is_causal"))
+        .or_else(|| gguf.get_bool(&format!("{arch}.attention.causal")))
+        .unwrap_or_else(|| gguf.get_tensor("classifier.weight").is_err());
+    ensure!(
+        causal,
+        "the {backend} backend runs {arch} with causal attention only, and this model is bidirectional (CPU only)"
+    );
+    Ok(())
+}
+
 /// Load a model with GPU acceleration.
 ///
 /// `path` (when supplied) is used as the model identifier for prefix-cache
@@ -1150,6 +1184,7 @@ pub fn load_model_gpu(
         .get_str("general.architecture")
         .unwrap_or("unknown")
         .to_string();
+    reject_bidirectional_lfm2(&gguf, &arch, "wgpu", true)?;
     let model_id = path
         .map(|p| p.to_string_lossy().into_owned())
         .unwrap_or_default();
@@ -1193,6 +1228,7 @@ pub fn load_model_metal(
         .get_str("general.architecture")
         .unwrap_or("unknown")
         .to_string();
+    reject_bidirectional_lfm2(&gguf, &arch, "Metal", true)?;
     match arch.as_str() {
         // `lfm2moe` shares the LFM2 loader: same graph, experts in the FFN slot.
         // Both GPU backends dispatch the same three routing / expert kernels,
@@ -1249,6 +1285,7 @@ fn load_model_hexagon_impl(
         .get_str("general.architecture")
         .unwrap_or("unknown")
         .to_string();
+    reject_bidirectional_lfm2(&gguf, &arch, "Hexagon NPU", false)?;
     match arch.as_str() {
         "lfm2" | "lfm2moe" if auto => Ok(Box::new(hexagon_lfm2::HexagonLfmModel::from_gguf_auto(
             gguf,
@@ -1394,5 +1431,44 @@ mod tests {
             (0, None)
         });
         assert_eq!((consumed, logits, ran), (0, None, 1));
+    }
+
+    #[cfg(any(
+        feature = "gpu",
+        feature = "hexagon",
+        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    ))]
+    #[test]
+    fn gpu_loaders_refuse_bidirectional_lfm2_but_not_other_models() {
+        use super::reject_bidirectional_lfm2;
+        use crate::convert::writer::GgufWriter;
+
+        let gguf = |arch: &str, causal: Option<bool>| {
+            let mut writer = GgufWriter::new();
+            writer.add_string("general.architecture", arch);
+            if let Some(causal) = causal {
+                writer.add_bool(format!("{arch}.is_causal"), causal);
+            }
+            let mut bytes = Vec::new();
+            writer.write_header_and_tensor_info(&mut bytes).unwrap();
+            crate::gguf::GgufFile::from_bytes(bytes.into()).unwrap()
+        };
+        assert!(
+            reject_bidirectional_lfm2(&gguf("lfm2", Some(true)), "lfm2", "Metal", false).is_ok()
+        );
+        assert!(reject_bidirectional_lfm2(&gguf("lfm2", None), "lfm2", "Metal", false).is_ok());
+        assert!(
+            reject_bidirectional_lfm2(&gguf("llama", Some(false)), "llama", "Metal", false).is_ok()
+        );
+        let err = reject_bidirectional_lfm2(&gguf("lfm2", Some(false)), "lfm2", "Metal", false)
+            .expect_err("a bidirectional lfm2 must not load on the GPU");
+        assert!(err.to_string().contains("bidirectional"), "{err}");
+        let err = reject_bidirectional_lfm2(&gguf("lfm2moe", Some(false)), "lfm2moe", "wgpu", true)
+            .expect_err("so must a bidirectional routed model");
+        assert!(err.to_string().contains("wgpu"), "{err}");
+        // A backend with a dense bidirectional path still refuses the routed arch.
+        assert!(
+            reject_bidirectional_lfm2(&gguf("lfm2", Some(false)), "lfm2", "Metal", true).is_ok()
+        );
     }
 }
