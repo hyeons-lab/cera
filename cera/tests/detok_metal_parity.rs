@@ -185,14 +185,13 @@ fn spectrum_parity() {
             let ph_cpu = &cpu_frame[n_fft_bins..];
             let ph_gpu = &gpu_frame[n_fft_bins..];
             // Magnitude-weighted complex cosine: the quantity the ISTFT
-            // consumes. The GPU attention uses an f16 KV cache (the only
-            // dtype the Metal flash-attention kernel accepts, matching the
-            // production LLM decode path), while the CPU reference keeps K/V
-            // in f32. On high-gain frames the f16 phase noise reaches ~0.3
-            // rad on peak bins (measured worst frame: 0.980, every other
-            // frame above 0.9998, full recovery the next frame), so the gate
-            // sits at 0.95. A genuine regression (wrong weights, broken
-            // kernel) collapses both this and max_diff far below the gates.
+            // consumes. Measured worst frame: 0.980, every other frame above
+            // 0.9915, so the gate sits at 0.95. This is not the Metal f16 KV
+            // cache: the wgpu decoder reads f32 K/V and agrees with this one
+            // to 0.999998 on every frame, and both sit the same 0.98 from the
+            // CPU reference, which is the outlier on that high-gain frame. A
+            // genuine regression (wrong weights, broken kernel) collapses both
+            // this and max_diff far below the gates.
             let ccos = complex_cosine(log_abs_cpu, ph_cpu, log_abs_gpu, ph_gpu);
             eprintln!("  code_set={ci} frame={f}: complex_cos={ccos:.6} max_diff={max_diff:.4}");
             assert!(
