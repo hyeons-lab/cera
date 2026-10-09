@@ -8521,6 +8521,19 @@ pub fn rope_norm_yarn(
     }
 }
 
+/// `theta.sin_cos()` behind a call boundary, shared by every RoPE function whose results must
+/// agree bit for bit ([`apply_rope_to_head`], [`rope_table`], [`apply_rope_delta_to_head`]).
+///
+/// A bare `sin_cos` is not a stable value: where LLVM sees both halves of one argument it may
+/// fuse them into one combined libm call (`__sincosf_stret` on Apple), and elsewhere it keeps two
+/// calls, and the two can differ by an ulp. Which one a caller gets depends on how that caller
+/// was inlined, so the table and the direct path disagreed in one build and not another. One
+/// out-of-line definition is compiled once and cannot.
+#[inline(never)]
+fn rope_sin_cos(theta: f32) -> (f32, f32) {
+    theta.sin_cos()
+}
+
 /// Apply RoPE rotation to a single head vector.
 /// Uses iterative theta multiplication to match ggml's `ggml_rope_cache_init`.
 ///
@@ -8533,7 +8546,7 @@ pub fn apply_rope_to_head(head: &mut [f32], pos: usize, head_dim: usize, freq_ba
     let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
     let mut theta = pos as f32;
     for i in 0..half_dim {
-        let (sin_t, cos_t) = theta.sin_cos();
+        let (sin_t, cos_t) = rope_sin_cos(theta);
 
         let x0 = head[i];
         let x1 = head[i + half_dim];
@@ -8555,7 +8568,7 @@ pub fn rope_table(positions: usize, head_dim: usize, freq_base: f32) -> Vec<f32>
     for pos in 0..positions {
         let mut theta = pos as f32;
         for i in 0..half_dim {
-            let (sin_t, cos_t) = theta.sin_cos();
+            let (sin_t, cos_t) = rope_sin_cos(theta);
             table[(pos * half_dim + i) * 2] = sin_t;
             table[(pos * half_dim + i) * 2 + 1] = cos_t;
             theta *= theta_scale;
@@ -8604,7 +8617,7 @@ pub fn apply_rope_delta_to_head(head: &mut [f32], delta_pos: i32, head_dim: usiz
     let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
     let mut theta = delta_pos as f32;
     for i in 0..half_dim {
-        let (sin_t, cos_t) = theta.sin_cos();
+        let (sin_t, cos_t) = rope_sin_cos(theta);
 
         let x0 = head[i];
         let x1 = head[i + half_dim];
