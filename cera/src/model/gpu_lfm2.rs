@@ -779,6 +779,27 @@ fn assert_kv_dim_packable(kv_dim: usize, head_dim: usize) {
     );
 }
 
+/// Whether `encode_attention_prefill` runs the register-tiled kernel (`attention_prefill_hd64.wgsl`)
+/// rather than the scalar one: head_dim 64, vec4-aligned Q and output rows, an adapter known to run
+/// the tiled kernels (`GpuContext::supports_flash_attention`), and `CERA_WGPU_ATTN_SCALAR` unset
+/// (the A/B switch for measuring the two on a device).
+fn attention_prefill_tiled(
+    adapter_ok: bool,
+    head_dim: u32,
+    q_stride: u32,
+    out_stride: u32,
+) -> bool {
+    static FORCE_SCALAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let force_scalar = *FORCE_SCALAR.get_or_init(|| {
+        std::env::var("CERA_WGPU_ATTN_SCALAR").is_ok_and(|v| !matches!(v.as_str(), "" | "0"))
+    });
+    adapter_ok
+        && !force_scalar
+        && head_dim == 64
+        && q_stride.is_multiple_of(4)
+        && out_stride.is_multiple_of(4)
+}
+
 /// The most work one `attention_prefill` dispatch may do, in units of one query reading one key
 /// row for one head.
 ///
@@ -793,10 +814,24 @@ const ATTENTION_PREFILL_MAX_WORK: u64 = 1 << 25;
 /// dispatch each, so that no chunk does more than [`ATTENTION_PREFILL_MAX_WORK`].
 ///
 /// A causal chunk reads up to the position of its last query; a bidirectional one reads all
-/// `start_pos + n` rows. Chunks are multiples of the kernel's 8-query workgroup, except the last,
-/// and never smaller than 8 queries however long the keys are.
-fn attention_prefill_chunks(n: u32, n_heads: u32, start_pos: u32, bidir: bool) -> Vec<(u32, u32)> {
-    attention_prefill_chunks_within(n, n_heads, start_pos, bidir, ATTENTION_PREFILL_MAX_WORK)
+/// `start_pos + n` rows. Chunks are multiples of `quantum`, the kernel's queries per workgroup (8
+/// for the scalar kernel, 32 for the tiled one), except the last, and never smaller than `quantum`
+/// queries however long the keys are.
+fn attention_prefill_chunks(
+    n: u32,
+    n_heads: u32,
+    start_pos: u32,
+    bidir: bool,
+    quantum: u32,
+) -> Vec<(u32, u32)> {
+    attention_prefill_chunks_within(
+        n,
+        n_heads,
+        start_pos,
+        bidir,
+        ATTENTION_PREFILL_MAX_WORK,
+        quantum,
+    )
 }
 
 fn attention_prefill_chunks_within(
@@ -805,6 +840,7 @@ fn attention_prefill_chunks_within(
     start_pos: u32,
     bidir: bool,
     max_work: u64,
+    quantum: u32,
 ) -> Vec<(u32, u32)> {
     let mut chunks = Vec::new();
     let mut q_base = 0u32;
@@ -817,8 +853,8 @@ fn attention_prefill_chunks_within(
             })
         };
         let mut len = n - q_base;
-        while len > 8 && u64::from(len) * keys(len) * u64::from(n_heads) > max_work {
-            len = (len / 2 / 8 * 8).max(8);
+        while len > quantum && u64::from(len) * keys(len) * u64::from(n_heads) > max_work {
+            len = (len / 2 / quantum * quantum).max(quantum);
         }
         chunks.push((q_base, len));
         q_base += len;
@@ -1514,6 +1550,8 @@ struct GpuPipelines {
     attention_prefill: wgpu::ComputePipeline,
     /// Register-tiled f32 flash attention for head_dim 64 (the bidirectional trunk).
     attention_flash_hd64: wgpu::ComputePipeline,
+    /// The register-tiled causal prefill over the packed-f16 cache (head_dim 64 only).
+    attention_prefill_hd64: wgpu::ComputePipeline,
     // ── Routed mixture-of-experts (`lfm2moe`) ─────────────────────────────
     // Built for every model, dense or routed: pipeline creation is a shader
     // compile, so making it conditional would trade a fixed load-time cost for a
@@ -2439,6 +2477,11 @@ impl GpuLfmModel {
                 shaders::ATTENTION_FLASH_HD64,
                 "main",
                 "attention_flash_hd64",
+            ),
+            attention_prefill_hd64: ctx.create_pipeline(
+                shaders::ATTENTION_PREFILL_HD64,
+                "main",
+                "attention_prefill_hd64",
             ),
             moe_route: ctx.create_pipeline(shaders::MOE_ROUTE, "moe_route", "moe_route"),
             moe_gemv_q4_0: ctx.create_pipeline(
@@ -7916,13 +7959,33 @@ impl GpuLfmModel {
 
         // One dispatch per chunk of queries (`q_base`/`n_sub`), each short enough for a mobile
         // GPU's hang detector: the kernel's work is queries x keys x heads, so a long call is
-        // quadratic and a single dispatch over it can run for seconds. 8 queries share each
-        // workgroup (and each K/V tile stream); params[11] is the authoritative chunk size edge
-        // workgroups mask against, params[7] the whole call's key rows for a bidirectional pass.
+        // quadratic and a single dispatch over it can run for seconds. 8 queries (32 for the tiled
+        // kernel) share each workgroup and each K/V tile stream; params[11] is the authoritative
+        // chunk size edge workgroups mask against, params[7] the whole call's key rows for a
+        // bidirectional pass.
+        let tiled = attention_prefill_tiled(
+            self.ctx.supports_flash_attention(),
+            head_dim,
+            q_stride,
+            out_stride,
+        );
+        let (pipeline, queries_per_wg, label) = if tiled {
+            (
+                &self.pipelines.attention_prefill_hd64,
+                32,
+                "attention_prefill_hd64",
+            )
+        } else {
+            (&self.pipelines.attention_prefill, 8, "attention_prefill")
+        };
         let total_rows = start_pos + n;
-        for (q_base, n_sub) in
-            attention_prefill_chunks(n, n_heads, start_pos, bidir_prefix.is_some())
-        {
+        for (q_base, n_sub) in attention_prefill_chunks(
+            n,
+            n_heads,
+            start_pos,
+            bidir_prefix.is_some(),
+            queries_per_wg,
+        ) {
             let params: [u32; 14] = [
                 n_heads,
                 n_kv_heads,
@@ -7945,7 +8008,7 @@ impl GpuLfmModel {
                 .device
                 .create_bind_group(&wgpu::BindGroupDescriptor {
                     label: None,
-                    layout: &self.pipelines.attention_prefill.get_bind_group_layout(0),
+                    layout: &pipeline.get_bind_group_layout(0),
                     entries: &[
                         wgpu::BindGroupEntry {
                             binding: 0,
@@ -7969,13 +8032,12 @@ impl GpuLfmModel {
                         },
                     ],
                 });
-            Self::push_prefill_dispatch(
-                cmds,
-                &self.pipelines.attention_prefill,
-                bg,
-                (n_heads, n_sub.div_ceil(8), 1),
-                "attention_prefill",
-            );
+            let groups = if tiled {
+                (n_sub.div_ceil(queries_per_wg), n_heads, 1)
+            } else {
+                (n_heads, n_sub.div_ceil(queries_per_wg), 1)
+            };
+            Self::push_prefill_dispatch(cmds, pipeline, bg, groups, label);
         }
     }
 
@@ -11347,53 +11409,94 @@ mod tests {
     use crate::backend::wgpu::{DevicePollExt, GpuContext};
 
     /// The attention chunk plan covers every query exactly once, in order, keeps each chunk
-    /// within the work cap (down to the 8-query floor), and splits a long call on a phone's
-    /// budget while leaving a short one whole. Pure host check.
+    /// within the work cap (down to the one-workgroup floor), and splits a long call on a phone's
+    /// budget while leaving a short one whole. Holds for both kernels' workgroup sizes (8 queries
+    /// for the scalar kernel, 32 for the tiled one). Pure host check.
     #[test]
     fn attention_prefill_chunks_cover_the_queries_within_the_cap() {
         use super::{
             ATTENTION_PREFILL_MAX_WORK, attention_prefill_chunks, attention_prefill_chunks_within,
         };
-        for &(n, heads, start, bidir) in &[
-            (1u32, 16u32, 0u32, true),
-            (7, 16, 0, true),
-            (257, 16, 0, true),
-            (1534, 16, 0, true),
-            (6784, 16, 0, true),
-            (30_000, 16, 0, true),
-            (6784, 16, 0, false),
-            (4096, 32, 9_000, false),
-            (4096, 32, 9_000, true),
-        ] {
-            let chunks = attention_prefill_chunks(n, heads, start, bidir);
-            let mut next = 0u32;
-            for (i, &(q_base, len)) in chunks.iter().enumerate() {
-                assert_eq!(q_base, next, "chunks are contiguous: {chunks:?}");
-                assert!(len > 0);
-                if i + 1 < chunks.len() {
-                    assert_eq!(len % 8, 0, "only the last chunk may be ragged");
+        for quantum in [8u32, 32] {
+            for &(n, heads, start, bidir) in &[
+                (1u32, 16u32, 0u32, true),
+                (7, 16, 0, true),
+                (257, 16, 0, true),
+                (1534, 16, 0, true),
+                (6784, 16, 0, true),
+                (30_000, 16, 0, true),
+                (6784, 16, 0, false),
+                (4096, 32, 9_000, false),
+                (4096, 32, 9_000, true),
+            ] {
+                let chunks = attention_prefill_chunks(n, heads, start, bidir, quantum);
+                let mut next = 0u32;
+                for (i, &(q_base, len)) in chunks.iter().enumerate() {
+                    assert_eq!(q_base, next, "chunks are contiguous: {chunks:?}");
+                    assert!(len > 0);
+                    if i + 1 < chunks.len() {
+                        assert_eq!(
+                            len % quantum,
+                            0,
+                            "only the last chunk may be ragged (quantum {quantum})"
+                        );
+                    }
+                    let keys = if bidir {
+                        start + n
+                    } else {
+                        start + q_base + len
+                    };
+                    assert!(
+                        len == quantum.min(n - q_base)
+                            || u64::from(len) * u64::from(keys) * u64::from(heads)
+                                <= ATTENTION_PREFILL_MAX_WORK,
+                        "chunk ({q_base}, {len}) of n={n} over the cap (quantum {quantum})"
+                    );
+                    next = q_base + len;
                 }
-                let keys = if bidir {
-                    start + n
-                } else {
-                    start + q_base + len
-                };
-                assert!(
-                    len == 8.min(n - q_base)
-                        || u64::from(len) * u64::from(keys) * u64::from(heads)
-                            <= ATTENTION_PREFILL_MAX_WORK,
-                    "chunk ({q_base}, {len}) of n={n} over the cap"
-                );
-                next = q_base + len;
+                assert_eq!(next, n, "all queries covered for n={n} (quantum {quantum})");
             }
-            assert_eq!(next, n, "all queries covered for n={n}");
+            // a short call stays one dispatch; a long bidirectional one is split many times
+            assert_eq!(
+                attention_prefill_chunks(300, 16, 0, true, quantum),
+                vec![(0, 300)]
+            );
+            assert!(attention_prefill_chunks(6784, 16, 0, true, quantum).len() >= 16);
         }
-        // a short call stays one dispatch; a long bidirectional one is split many times
-        assert_eq!(attention_prefill_chunks(300, 16, 0, true), vec![(0, 300)]);
-        assert!(attention_prefill_chunks(6784, 16, 0, true).len() >= 16);
-        // a tiny cap forces the 8-query floor
-        let tiny = attention_prefill_chunks_within(20, 16, 0, true, 1);
-        assert_eq!(tiny, vec![(0, 8), (8, 8), (16, 4)]);
+        // a tiny cap forces the one-workgroup floor
+        assert_eq!(
+            attention_prefill_chunks_within(20, 16, 0, true, 1, 8),
+            vec![(0, 8), (8, 8), (16, 4)]
+        );
+        assert_eq!(
+            attention_prefill_chunks_within(70, 16, 0, true, 1, 32),
+            vec![(0, 32), (32, 32), (64, 6)]
+        );
+    }
+
+    /// The tiled prefill kernel is chosen only for head_dim 64 with vec4-aligned rows on an
+    /// adapter that runs the tiled kernels; everything else keeps the scalar kernel.
+    #[test]
+    fn attention_prefill_tiled_gate() {
+        use super::attention_prefill_tiled;
+        assert!(attention_prefill_tiled(true, 64, 1024, 1024));
+        assert!(
+            !attention_prefill_tiled(false, 64, 1024, 1024),
+            "unknown adapter"
+        );
+        assert!(
+            !attention_prefill_tiled(true, 128, 2048, 2048),
+            "head_dim 128"
+        );
+        assert!(!attention_prefill_tiled(true, 32, 512, 512), "head_dim 32");
+        assert!(
+            !attention_prefill_tiled(true, 64, 1022, 1024),
+            "unaligned Q rows"
+        );
+        assert!(
+            !attention_prefill_tiled(true, 64, 1024, 1022),
+            "unaligned output rows"
+        );
     }
 
     /// `--spv` bytes are validated before reaching the driver: word

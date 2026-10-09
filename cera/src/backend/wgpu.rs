@@ -2713,6 +2713,7 @@ pub mod shaders {
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
     /// Register-tiled flash attention for head_dim 64 (f32 Q/K/V, GQA, bidirectional windows).
     pub const ATTENTION_FLASH_HD64: &str = include_str!("shaders/attention_flash_hd64.wgsl");
+    pub const ATTENTION_PREFILL_HD64: &str = include_str!("shaders/attention_prefill_hd64.wgsl");
     /// The centred gated convolution of a bidirectional LFM2 trunk.
     pub const BIDIRECTIONAL: &str = include_str!("shaders/bidirectional.wgsl");
     /// TurboQuant KV compression: `tq_encode_keys`, `tq_encode_values`,
@@ -7551,12 +7552,44 @@ mod tests {
         tile: u32,
         bidir_prefix: Option<u32>,
     ) -> Vec<f32> {
+        run_gpu_attention_prefill_kernel(ctx, f, tile, bidir_prefix, PrefillKernel::Scalar)
+    }
+
+    /// The two `attention_prefill` kernels, which share one binding and parameter contract: the
+    /// scalar 8-query kernel and the register-tiled 32-query kernel (head_dim 64 only).
+    #[derive(Clone, Copy, Debug)]
+    enum PrefillKernel {
+        Scalar,
+        Tiled,
+    }
+
+    /// [`run_gpu_attention_prefill_mode`] on a chosen kernel.
+    fn run_gpu_attention_prefill_kernel(
+        ctx: &GpuContext,
+        f: &AttnPrefillFixture,
+        tile: u32,
+        bidir_prefix: Option<u32>,
+        kernel: PrefillKernel,
+    ) -> Vec<f32> {
         assert!(tile > 0, "tile must be > 0 (0 would never advance q_base)");
-        let pipeline = ctx.create_pipeline(
-            shaders::ATTENTION_PREFILL,
-            "attention_prefill",
-            "attention_prefill",
-        );
+        let (pipeline, queries_per_wg) = match kernel {
+            PrefillKernel::Scalar => (
+                ctx.create_pipeline(
+                    shaders::ATTENTION_PREFILL,
+                    "attention_prefill",
+                    "attention_prefill",
+                ),
+                8,
+            ),
+            PrefillKernel::Tiled => (
+                ctx.create_pipeline(
+                    shaders::ATTENTION_PREFILL_HD64,
+                    "main",
+                    "attention_prefill_hd64",
+                ),
+                32,
+            ),
+        };
         // Pack K/V pairs LE (even elem in the low bits), exactly as
         // `kv_append` lays them out; the fixture already holds f16-rounded
         // values.
@@ -7616,7 +7649,14 @@ mod tests {
                 let mut pass = enc.begin_compute_pass(&Default::default());
                 pass.set_pipeline(&pipeline);
                 pass.set_bind_group(0, &bg, &[]);
-                pass.dispatch_workgroups(f.n_heads, n_sub.div_ceil(8), 1);
+                match kernel {
+                    PrefillKernel::Scalar => {
+                        pass.dispatch_workgroups(f.n_heads, n_sub.div_ceil(queries_per_wg), 1)
+                    }
+                    PrefillKernel::Tiled => {
+                        pass.dispatch_workgroups(n_sub.div_ceil(queries_per_wg), f.n_heads, 1)
+                    }
+                }
             }
             ctx.submit_encoder(enc);
             q_base += n_sub;
@@ -7778,43 +7818,8 @@ mod tests {
             Err(_) => return,
         };
         let f = build_attn_prefill_fixture(4, 2, 32, 70, 0);
-        let (hd, kv_dim) = (f.head_dim as usize, f.kv_dim as usize);
-        let group = (f.n_heads / f.n_kv_heads) as usize;
         for prefix in [0u32, 24] {
-            let mut want = vec![0.0f32; f.ref_out.len()];
-            for q in 0..f.n_queries as usize {
-                // a query in the media prefix reads only the prefix; the others read everything
-                let window = if prefix > 0 && (q as u32) < prefix {
-                    prefix as usize
-                } else {
-                    f.n_queries as usize
-                };
-                for h in 0..f.n_heads as usize {
-                    let kv_off = (h / group) * hd;
-                    let q_off = q * f.q_stride as usize + h * hd;
-                    let mut scores: Vec<f32> = (0..window)
-                        .map(|t| {
-                            (0..hd)
-                                .map(|d| f.q_batch[q_off + d] * f.k_cache[t * kv_dim + kv_off + d])
-                                .sum::<f32>()
-                                * f.scale
-                        })
-                        .collect();
-                    let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                    let mut sum = 0.0f32;
-                    for s in &mut scores {
-                        *s = (*s - max_s).exp();
-                        sum += *s;
-                    }
-                    for d in 0..hd {
-                        want[q * f.out_stride as usize + h * hd + d] = scores
-                            .iter()
-                            .enumerate()
-                            .map(|(t, s)| s / sum * f.v_cache[t * kv_dim + kv_off + d])
-                            .sum();
-                    }
-                }
-            }
+            let want = bidirectional_attention_reference(&f, prefix);
             for tile in [70u32, 24, 16, 8] {
                 let got = run_gpu_attention_prefill_mode(&ctx, &f, tile, Some(prefix));
                 for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
@@ -7826,6 +7831,47 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// CPU reference of a bidirectional pass over `f`'s rows: every query reads all rows, except
+    /// that a query inside the media prefix (`prefix` > 0) reads only the prefix.
+    fn bidirectional_attention_reference(f: &AttnPrefillFixture, prefix: u32) -> Vec<f32> {
+        let (hd, kv_dim) = (f.head_dim as usize, f.kv_dim as usize);
+        let group = (f.n_heads / f.n_kv_heads) as usize;
+        let mut want = vec![0.0f32; f.ref_out.len()];
+        for q in 0..f.n_queries as usize {
+            let window = if prefix > 0 && (q as u32) < prefix {
+                prefix as usize
+            } else {
+                f.n_queries as usize
+            };
+            for h in 0..f.n_heads as usize {
+                let kv_off = (h / group) * hd;
+                let q_off = q * f.q_stride as usize + h * hd;
+                let mut scores: Vec<f32> = (0..window)
+                    .map(|t| {
+                        (0..hd)
+                            .map(|d| f.q_batch[q_off + d] * f.k_cache[t * kv_dim + kv_off + d])
+                            .sum::<f32>()
+                            * f.scale
+                    })
+                    .collect();
+                let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                let mut sum = 0.0f32;
+                for s in &mut scores {
+                    *s = (*s - max_s).exp();
+                    sum += *s;
+                }
+                for d in 0..hd {
+                    want[q * f.out_stride as usize + h * hd + d] = scores
+                        .iter()
+                        .enumerate()
+                        .map(|(t, s)| s / sum * f.v_cache[t * kv_dim + kv_off + d])
+                        .sum();
+                }
+            }
+        }
+        want
     }
 
     /// `attention_prefill` parity: batched attention over N queries matches the
@@ -7986,6 +8032,164 @@ mod tests {
         let got = ctx.download_f32(&out_buf, out_len);
         for (i, &g) in got.iter().enumerate() {
             assert_eq!(g, 0.0, "seq_len==0 must zero output at idx {i}, got {g}");
+        }
+    }
+
+    /// The register-tiled kernel (`attention_prefill_hd64.wgsl`) matches the CPU reference on
+    /// head_dim 64 across the shapes that exercise its edges: a ragged last 32-query tile, a
+    /// non-zero `start_pos`, all three GQA group sizes, dispatches split at tile sizes that are
+    /// not multiples of 32 (so `q_base` lands mid-tile), and an LFM2-shaped 16/8-head call.
+    #[test]
+    fn test_gpu_attention_prefill_hd64_parity() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        for &(heads, kv_heads, n, start) in &[
+            (4u32, 2u32, 70u32, 0u32), // group 2, ragged last tile
+            (4, 2, 70, 5),             // start_pos that is not a tile multiple
+            (4, 4, 33, 0),             // MHA, one query past a tile
+            (8, 2, 64, 0),             // group 4, two exact tiles
+            (2, 1, 1, 0),              // a single query reads a single key
+            (16, 8, 512, 0),           // the LFM2-350M attention shape
+        ] {
+            let f = build_attn_prefill_fixture(heads, kv_heads, 64, n, start);
+            for tile in [n, 32, 33, 17, 8] {
+                let tile = tile.min(n);
+                let got =
+                    run_gpu_attention_prefill_kernel(&ctx, &f, tile, None, PrefillKernel::Tiled);
+                assert_attn_prefill_matches(
+                    &f,
+                    &got,
+                    &format!("hd64 heads={heads}/{kv_heads} n={n} start={start} tile={tile}"),
+                );
+            }
+        }
+    }
+
+    /// The tiled kernel over a causal window that spans many 32-key tiles, with the boundary
+    /// mid-tile: the running max and sum are rescaled across the whole sweep.
+    #[test]
+    fn test_gpu_attention_prefill_hd64_long_kv() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        // start_pos 900 + 200 queries: the last query reads 1100 keys, 34 tiles and a bit.
+        let f = build_attn_prefill_fixture(4, 2, 64, 200, 900);
+        assert!(f.max_seq > 34 * 32);
+        for tile in [200u32, 64] {
+            let got = run_gpu_attention_prefill_kernel(&ctx, &f, tile, None, PrefillKernel::Tiled);
+            assert_attn_prefill_matches(&f, &got, &format!("hd64 long-kv tile={tile}"));
+        }
+    }
+
+    /// The tiled kernel on a bidirectional pass split into dispatches, with and without a media
+    /// prefix: the window comes from the whole call's row count (params[7]), as for the scalar
+    /// kernel.
+    #[test]
+    fn test_gpu_attention_prefill_hd64_bidirectional_split_matches_cpu() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let f = build_attn_prefill_fixture(4, 2, 64, 70, 0);
+        for prefix in [0u32, 24, 40] {
+            let want = bidirectional_attention_reference(&f, prefix);
+            for tile in [70u32, 32, 24, 8] {
+                let got = run_gpu_attention_prefill_kernel(
+                    &ctx,
+                    &f,
+                    tile,
+                    Some(prefix),
+                    PrefillKernel::Tiled,
+                );
+                for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 5e-3 + 1e-3 * w.abs(),
+                        "hd64 bidirectional prefix={prefix} tile={tile}: idx {i} (token {}) gpu={g} cpu={w}",
+                        i / f.out_stride as usize
+                    );
+                }
+            }
+        }
+    }
+
+    /// The tiled kernel with an empty key window (`max_seq` 0) writes zeros, not `0 * inf`: the
+    /// output buffer starts at a sentinel so the test sees the write.
+    #[test]
+    fn test_gpu_attention_prefill_hd64_empty_window_writes_zero() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let (n_heads, n_kv_heads, head_dim, n) = (2u32, 1u32, 64u32, 3u32);
+        let kv_dim = n_kv_heads * head_dim;
+        let q_stride = n_heads * head_dim;
+        let out_len = (n * q_stride) as usize;
+        let pipeline = ctx.create_pipeline(
+            shaders::ATTENTION_PREFILL_HD64,
+            "main",
+            "attention_prefill_hd64",
+        );
+        let q_buf = ctx.upload_f32(&vec![0.5f32; (n * q_stride) as usize], "q");
+        // never read when the window is empty; bind one valid row each (64 halves = 32 words)
+        let k_buf = ctx.upload_storage(bytemuck::cast_slice(&[0x3C00_3C00u32; 32]), "k");
+        let v_buf = ctx.upload_storage(bytemuck::cast_slice(&[0x3C00_3C00u32; 32]), "v");
+        let out_buf = ctx.upload_f32(&vec![7.0f32; out_len], "out");
+        let params: [u32; 14] = [
+            n_heads,
+            n_kv_heads,
+            head_dim,
+            kv_dim,
+            0, // max_seq == 0
+            1.0f32.to_bits(),
+            0,
+            n,
+            q_stride,
+            q_stride,
+            0,
+            n,
+            0,
+            0,
+        ];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: k_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: v_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(n.div_ceil(32), n_heads, 1);
+        }
+        ctx.submit_encoder(enc);
+        for (i, &g) in ctx.download_f32(&out_buf, out_len).iter().enumerate() {
+            assert_eq!(g, 0.0, "an empty window must write zeros; idx {i} = {g}");
         }
     }
 }
