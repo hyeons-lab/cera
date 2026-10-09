@@ -6,14 +6,15 @@
 
 use super::types::{HtpDataType, align128, align256};
 
-/// A value for one of the one-byte fields of the matmul params; a count past 255 would wrap
-/// silently into a different kernel configuration.
+/// A value for one of the one-byte fields of the matmul params. Out-of-contract counts
+/// saturate at 255 rather than wrapping: a wrapped count aliases to a plausible but wrong
+/// kernel configuration (`256` threads would enqueue as `0`).
 fn wire_byte(v: usize) -> u8 {
     debug_assert!(
         v <= usize::from(u8::MAX),
         "{v} does not fit a one-byte kernel param"
     );
-    v as u8
+    v.min(usize::from(u8::MAX)) as u8
 }
 
 /// Precomputed integer division constants using Granlund and Montgomery's algorithm.
@@ -398,6 +399,10 @@ pub struct GetRowsShape {
 /// The kernel is `SAMETYPE` when table and output share a type, else `TILED` for a repacked
 /// table, else `FLAT`. One task per gathered row; the thread count starts at
 /// `min(n_threads, rows)` and drops until the VTCM working set fits `vtcm_bytes`.
+///
+/// A zero-thread result with pending tasks mirrors the C++ precompute byte for byte (the
+/// goldens pin it); it is the caller's contract never to enqueue one. Dispatch sites skip
+/// the empty gather instead of sending `n_threads = 0` across the FastRPC boundary.
 ///
 /// Words (`htp_get_rows_kernel_params`): `n_threads, kernel_type, chunks_per_row, chunk_size,
 /// total_tasks, tasks_per_thread, vtcm_size`, then the dividers `ne10, ne10 * ne11,
@@ -2683,6 +2688,18 @@ mod tests {
         assert_eq!((k[0], k[1], k[2], k[3], k[4], k[5]), (4, 0, 1, 2048, 4, 1));
         let k = build_get_rows_f32_kernel_params(1500, 1, 1, 2, 1, 1, 8);
         assert_eq!((k[0], k[2], k[3], k[4]), (2, 1, 1500, 2));
+    }
+
+    /// In-contract counts pass through untouched; 255 is the largest one-byte param.
+    /// (Out-of-contract counts saturate at 255 in release builds; in debug builds the
+    /// `debug_assert` in `wire_byte` fires first, so saturation is verified by inspection
+    /// plus the release-mode check quoted in the fix, not by this test.)
+    #[test]
+    fn wire_byte_passes_through_in_contract_counts() {
+        assert_eq!(wire_byte(0), 0);
+        assert_eq!(wire_byte(1), 1);
+        assert_eq!(wire_byte(8), 8);
+        assert_eq!(wire_byte(255), 255);
     }
 
     fn golden_get_rows(line: &str) -> (GetRowsShape, u32, usize, Vec<i32>) {
