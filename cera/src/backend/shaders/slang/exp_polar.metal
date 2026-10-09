@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 36 "cera/src/backend/shaders/slang/exp_polar.slang"
+#line 18 "cera/src/backend/shaders/slang/exp_polar.slang"
 struct KernelContext_0
 {
     packed_uint2 device* par_buf_0;

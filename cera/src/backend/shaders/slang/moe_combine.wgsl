@@ -31,7 +31,7 @@ fn moe_combine(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgro
     }
     var s_0 : u32 = u32(0);
     var acc_0 : f32 = 0.0f;
-    for(;;)
+    loop
     {
         if(s_0 < _S1)
         {

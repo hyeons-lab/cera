@@ -11,7 +11,7 @@ fn block_sum_0( tid_0 : u32,  v_0 : f32) -> f32
     scratch_0[tid_0] = v_0;
     workgroupBarrier();
     var s_0 : u32 = u32(128);
-    for(;;)
+    loop
     {
         if(s_0 > u32(0))
         {
@@ -41,7 +41,7 @@ fn per_head_rmsnorm(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wo
     var _S2 : u32 = wid_0.x * head_dim_0;
     var i_0 : u32 = tid_1;
     var partial_0 : f32 = 0.0f;
-    for(;;)
+    loop
     {
         if(i_0 < head_dim_0)
         {
@@ -57,7 +57,7 @@ fn per_head_rmsnorm(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wo
     var sum_sq_0 : f32 = block_sum_0(tid_1, partial_0);
     var _S3 : f32 = 1.0f / sqrt(sum_sq_0 / f32(head_dim_0) + eps_0);
     i_0 = tid_1;
-    for(;;)
+    loop
     {
         if(i_0 < head_dim_0)
         {

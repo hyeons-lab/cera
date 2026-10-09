@@ -22,7 +22,7 @@ fn conv1d_depthwise(@builtin(global_invocation_id) gid_0 : vec3<u32>)
     }
     var k_0 : u32 = u32(0);
     var sum_0 : f32 = 0.0f;
-    for(;;)
+    loop
     {
         if(k_0 < d_conv_0)
         {
@@ -39,7 +39,7 @@ fn conv1d_depthwise(@builtin(global_invocation_id) gid_0 : vec3<u32>)
     if(d_conv_0 > u32(1))
     {
         k_0 = u32(0);
-        for(;;)
+        loop
         {
             if(k_0 < (d_conv_0 - u32(1)))
             {

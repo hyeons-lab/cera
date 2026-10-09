@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 32 "cera/src/backend/shaders/slang/bias_add.slang"
+#line 20 "cera/src/backend/shaders/slang/bias_add.slang"
 struct KernelContext_0
 {
     packed_uint2 device* par_buf_0;

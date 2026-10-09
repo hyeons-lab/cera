@@ -11,7 +11,7 @@ fn block_sum_0( tid_0 : u32,  v_0 : f32) -> f32
     scratch_0[tid_0] = v_0;
     workgroupBarrier();
     var s_0 : u32 = u32(128);
-    for(;;)
+    loop
     {
         if(s_0 > u32(0))
         {
@@ -46,7 +46,7 @@ fn mel_norm(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup_
     if(eff_0 <= u32(1))
     {
         t_0 = tid_1;
-        for(;;)
+        loop
         {
             if(t_0 < n_frames_0)
             {
@@ -62,7 +62,7 @@ fn mel_norm(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup_
     }
     t_0 = tid_1;
     var partial_0 : f32 = 0.0f;
-    for(;;)
+    loop
     {
         if(t_0 < eff_0)
         {
@@ -80,7 +80,7 @@ fn mel_norm(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup_
     workgroupBarrier();
     t_0 = tid_1;
     partial_0 = 0.0f;
-    for(;;)
+    loop
     {
         if(t_0 < eff_0)
         {
@@ -97,7 +97,7 @@ fn mel_norm(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup_
     var _S6 : f32 = block_sum_0(tid_1, partial_0);
     var _S7 : f32 = 1.0f / (sqrt(_S6 / f32(eff_0 - u32(1))) + eps_0);
     t_0 = tid_1;
-    for(;;)
+    loop
     {
         if(t_0 < n_frames_0)
         {

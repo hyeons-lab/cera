@@ -38,7 +38,7 @@ fn bert_flash_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builti
     {
         var _S3 : u32 = q_idx_0 * dim_0 + h_0 * head_dim_0;
         d_0 = u32(0);
-        for(;;)
+        loop
         {
             if(d_0 < head_dim_0)
             {
@@ -54,7 +54,7 @@ fn bert_flash_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builti
     else
     {
         d_0 = u32(0);
-        for(;;)
+        loop
         {
             if(d_0 < head_dim_0)
             {
@@ -69,7 +69,7 @@ fn bert_flash_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builti
     }
     var acc_0 : array<f32, i32(64)>;
     d_0 = u32(0);
-    for(;;)
+    loop
     {
         if(d_0 < head_dim_0)
         {
@@ -113,7 +113,7 @@ fn bert_flash_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builti
     var m_prev_0 : f32 = -3.4028234663852886e+38f;
     var l_prev_0 : f32 = 0.0f;
     var kt_0 : u32 = u32(0);
-    for(;;)
+    loop
     {
         if(kt_0 < _S8)
         {
@@ -152,7 +152,7 @@ fn bert_flash_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builti
         }
         var _S10 : u32 = u32(32) * head_dim_0;
         var elem_idx_0 : u32 = tid_0;
-        for(;;)
+        loop
         {
             if(elem_idx_0 < _S10)
             {
@@ -184,7 +184,7 @@ fn bert_flash_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builti
             m_prev_1 = m_prev_0;
             l_prev_1 = l_prev_0;
             var k_pos_0 : u32 = u32(0);
-            for(;;)
+            loop
             {
                 if(k_pos_0 < _S11)
                 {
@@ -214,7 +214,7 @@ fn bert_flash_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builti
                 var _S12 : u32 = k_pos_0 * head_dim_0;
                 d_1 = u32(0);
                 var score_0 : f32 = 0.0f;
-                for(;;)
+                loop
                 {
                     if(d_1 < head_dim_0)
                     {
@@ -241,7 +241,7 @@ fn bert_flash_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builti
                 var beta_0 : f32 = exp(score_2 - _S13);
                 var _S14 : f32 = l_prev_1 * alpha_0 + beta_0;
                 var d_2 : u32 = u32(0);
-                for(;;)
+                loop
                 {
                     if(d_2 < head_dim_0)
                     {
@@ -281,7 +281,7 @@ fn bert_flash_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builti
         }
         var _S15 : u32 = q_idx_0 * dim_0 + h_0 * head_dim_0;
         d_0 = u32(0);
-        for(;;)
+        loop
         {
             if(d_0 < head_dim_0)
             {

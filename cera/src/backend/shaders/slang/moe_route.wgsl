@@ -25,7 +25,7 @@ fn moe_route(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup
     }
     var _S2 : u32 = lid_0.x;
     var e_0 : u32 = _S2;
-    for(;;)
+    loop
     {
         if(e_0 < n_expert_0)
         {
@@ -47,7 +47,7 @@ fn moe_route(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup
     var chosen_0 : array<u32, i32(16)>;
     var unnorm_w_0 : array<f32, i32(16)>;
     var i_0 : u32 = u32(0);
-    for(;;)
+    loop
     {
         if(i_0 < u32(16))
         {
@@ -62,7 +62,7 @@ fn moe_route(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup
     }
     var s_0 : u32 = u32(0);
     var sum_0 : f32 = 0.0f;
-    for(;;)
+    loop
     {
         if(s_0 < _S1)
         {
@@ -75,7 +75,7 @@ fn moe_route(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup
         var best_score_0 : f32 = 0.0f;
         var best_0 : u32 = u32(0);
         e_0 = u32(0);
-        for(;;)
+        loop
         {
             if(e_0 < n_expert_0)
             {
@@ -86,7 +86,7 @@ fn moe_route(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup
             }
             var used_0 : bool = false;
             var t_0 : u32 = u32(0);
-            for(;;)
+            loop
             {
                 if(t_0 < s_0)
                 {
@@ -145,7 +145,7 @@ fn moe_route(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workgroup
     }
     var _S4 : f32 = 1.0f / max(sum_0, 0.00006103515625f);
     s_0 = u32(0);
-    for(;;)
+    loop
     {
         if(s_0 < _S1)
         {

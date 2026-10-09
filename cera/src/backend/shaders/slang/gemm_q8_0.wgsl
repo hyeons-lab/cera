@@ -54,7 +54,7 @@ fn gemm_q8_0(@builtin(workgroup_id) gid_0 : vec3<u32>, @builtin(local_invocation
     var r0_0 : u32 = gid_0.y;
     var r1_0 : u32 = gid_0.x;
     var idx_0 : u32 = tiitg_0;
-    for(;;)
+    loop
     {
         if(idx_0 < u32(2048))
         {
@@ -83,7 +83,7 @@ fn gemm_q8_0(@builtin(workgroup_id) gid_0 : vec3<u32>, @builtin(local_invocation
         var _S7 : u32 = col_0 * _S3.x_stride_0;
         var b_0 : u32 = u32(0);
         var acc_0 : f32 = 0.0f;
-        for(;;)
+        loop
         {
             if(b_0 < nb_0)
             {
@@ -95,7 +95,7 @@ fn gemm_q8_0(@builtin(workgroup_id) gid_0 : vec3<u32>, @builtin(local_invocation
             var blk_0 : u32 = _S6 + b_0 * u32(34);
             var _S8 : f32 = load_f16_0(blk_0);
             var e_0 : u32 = u32(0);
-            for(;;)
+            loop
             {
                 if(e_0 < u32(32))
                 {
