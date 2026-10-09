@@ -144,6 +144,8 @@ fn reference(c: &Case) -> Vec<f32> {
 struct Variant {
     name: String,
     pipeline: wgpu::ComputePipeline,
+    /// Queries per workgroup (the dispatch's X extent is `ceil(n / queries_per_group)`).
+    queries_per_group: u32,
 }
 
 fn load_variant(ctx: &GpuContext, path: &str) -> Variant {
@@ -208,7 +210,13 @@ fn load_variant(ctx: &GpuContext, path: &str) -> Variant {
     let name = std::path::Path::new(path)
         .file_stem()
         .map_or_else(|| path.to_string(), |s| s.to_string_lossy().into_owned());
-    Variant { name, pipeline }
+    // a kernel with "q64" in its file name takes 64 queries per workgroup; the rest take 32
+    let queries_per_group = if name.contains("q64") { 64 } else { 32 };
+    Variant {
+        name,
+        pipeline,
+        queries_per_group,
+    }
 }
 
 fn main() {
@@ -225,6 +233,7 @@ fn main() {
             "main",
             "attention_prefill_hd64",
         ),
+        queries_per_group: 32,
     }];
     for path in std::env::args().skip(1) {
         variants.push(load_variant(&ctx, &path));
@@ -299,7 +308,7 @@ fn main() {
                     pass.set_pipeline(&var.pipeline);
                     pass.set_bind_group(0, &bg, &[]);
                     for _ in 0..reps {
-                        pass.dispatch_workgroups(n.div_ceil(32), N_HEADS, 1);
+                        pass.dispatch_workgroups(n.div_ceil(var.queries_per_group), N_HEADS, 1);
                     }
                 }
                 ctx.queue.submit([enc.finish()]);

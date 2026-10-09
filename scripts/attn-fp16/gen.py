@@ -221,6 +221,146 @@ def gen(s_block, pv_block, skip=()):
     return "\n".join(L) + "\n"
 
 
+def gen_q(qt, s_block=8, pv_block=4):
+    """The 128-thread fp16 kernel with `qt` queries per workgroup (32 or 64; `4 * qt` threads, so every thread
+    keeps the 4 query x 2 key score tile and 4 query x 4 dim output tile). A larger query tile shares each K/V
+    tile load and each barrier among more queries. fp16 only: 64 queries of f32 tiles would not fit in the
+    32 KiB of workgroup memory."""
+    QG = qt // 4          # query groups of 4
+    TH = 4 * qt           # threads
+    H = HEADER.replace("{s}", str(s_block)).replace("{p}", str(pv_block))
+    def sub(a, b):
+        nonlocal H
+        assert a in H, a
+        H = H.replace(a, b)
+    sub("groupshared half4 qs[512];     // [d][8 query groups], 4 queries each", f"groupshared half4 qs[{64 * QG}];")
+    sub("groupshared float ps[1024];    // scores: [32 keys][32 queries]", f"groupshared float ps[{32 * qt}];")
+    sub("groupshared half4 ph[256];     // probabilities: [32 keys][8 query groups], 4 queries each", f"groupshared half4 ph[{32 * QG}];")
+    sub("groupshared float pm[128];", f"groupshared float pm[{4 * qt}];")
+    sub("groupshared float corr[32];", f"groupshared float corr[{qt}];")
+    sub("groupshared float lsum[128];", f"groupshared float lsum[{4 * qt}];")
+    sub("[numthreads(128, 1, 1)]", f"[numthreads({TH}, 1, 1)]")
+    sub("uint q0 = wid.x * 32u;", f"uint q0 = wid.x * {qt}u;")
+    sub("uint last_row = min(q0 + 31u, n_sub - 1u);", f"uint last_row = min(q0 + {qt - 1}u, n_sub - 1u);")
+    sub("    uint sq = t % 32u;\n    uint sp = t / 32u;", f"    uint sq = t % {qt}u;\n    uint sp = t / {qt}u;")
+    # Q staging: one unit (a dv of QG query groups) per thread
+    qi = H.index("    {\n        uint qg = t % 8u;")
+    qj = H.index("    uint lim0")
+    H = H[:qi] + f"""    {{
+        uint qg = t % {QG}u;
+        uint dv = t / {QG}u;
+        float s = scale * LOG2E;
+        float4 r0 = q_batch[(q_base + min(q0 + qg * 4u + 0u, n_sub - 1u)) * q_stride4 + head * 16u + dv] * s;
+        float4 r1 = q_batch[(q_base + min(q0 + qg * 4u + 1u, n_sub - 1u)) * q_stride4 + head * 16u + dv] * s;
+        float4 r2 = q_batch[(q_base + min(q0 + qg * 4u + 2u, n_sub - 1u)) * q_stride4 + head * 16u + dv] * s;
+        float4 r3 = q_batch[(q_base + min(q0 + qg * 4u + 3u, n_sub - 1u)) * q_stride4 + head * 16u + dv] * s;
+        qs[(4u * dv + 0u) * {QG}u + qg] = half4(half(r0.x), half(r1.x), half(r2.x), half(r3.x));
+        qs[(4u * dv + 1u) * {QG}u + qg] = half4(half(r0.y), half(r1.y), half(r2.y), half(r3.y));
+        qs[(4u * dv + 2u) * {QG}u + qg] = half4(half(r0.z), half(r1.z), half(r2.z), half(r3.z));
+        qs[(4u * dv + 3u) * {QG}u + qg] = half4(half(r0.w), half(r1.w), half(r2.w), half(r3.w));
+    }}
+""" + H[qj:]
+    L = [H]
+    for unit in range(256 // TH if TH <= 256 else 1):  # K^T: 256 units of (2 keys x 4 dims)
+        L.append(f"""        {{
+            uint u = t + {TH}u * {unit}u;
+            uint kp = u % 16u;
+            uint dv = u / 16u;
+            uint ra = kb + kp * 2u;
+            half4 a = half4(0.0h);
+            half4 b = half4(0.0h);
+            if (ra < wg_limit) {{ a = half4_of(k_cache[ra * kv_dim4 + kv_head * 16u + dv]); }}
+            if (ra + 1u < wg_limit) {{ b = half4_of(k_cache[(ra + 1u) * kv_dim4 + kv_head * 16u + dv]); }}
+            kt[(4u * dv + 0u) * 16u + kp] = half2(a.x, b.x);
+            kt[(4u * dv + 1u) * 16u + kp] = half2(a.y, b.y);
+            kt[(4u * dv + 2u) * 16u + kp] = half2(a.z, b.z);
+            kt[(4u * dv + 3u) * 16u + kp] = half2(a.w, b.w);
+        }}""")
+    L.append("        GroupMemoryBarrierWithGroupSync();\n")
+    L.append("        float2 sf0 = float2(0.0); float2 sf1 = float2(0.0); float2 sf2 = float2(0.0); float2 sf3 = float2(0.0);")
+    L.append("        [loop] for (uint db = 0u; db < 64u; db += %du) {" % s_block)
+    L.append("            half2 s0 = half2(0.0h); half2 s1 = half2(0.0h); half2 s2 = half2(0.0h); half2 s3 = half2(0.0h);")
+    for j in range(s_block):
+        L.append(f"""            {{
+                half4 qv = qs[(db + {j}u) * {QG}u + ty];
+                half2 kv = kt[(db + {j}u) * 16u + tx];
+                s0 += qv.x * kv; s1 += qv.y * kv; s2 += qv.z * kv; s3 += qv.w * kv;
+            }}""")
+    L.append("            sf0 += float2(s0); sf1 += float2(s1); sf2 += float2(s2); sf3 += float2(s3);")
+    L.append("        }")
+    L.append(f"""        uint key0 = kb + tx * 2u;
+        uint pb0 = (tx * 2u + 0u) * {qt}u + ty * 4u;
+        uint pb1 = (tx * 2u + 1u) * {qt}u + ty * 4u;
+        ps[pb0] = key0 < lim0 ? sf0.x : NEG;
+        ps[pb0 + 1u] = key0 < lim1 ? sf1.x : NEG;
+        ps[pb0 + 2u] = key0 < lim2 ? sf2.x : NEG;
+        ps[pb0 + 3u] = key0 < lim3 ? sf3.x : NEG;
+        ps[pb1] = key0 + 1u < lim0 ? sf0.y : NEG;
+        ps[pb1 + 1u] = key0 + 1u < lim1 ? sf1.y : NEG;
+        ps[pb1 + 2u] = key0 + 1u < lim2 ? sf2.y : NEG;
+        ps[pb1 + 3u] = key0 + 1u < lim3 ? sf3.y : NEG;
+        GroupMemoryBarrierWithGroupSync();
+""")
+    for unit in range(512 // TH):  # V: 512 half4
+        L.append(f"""        {{
+            uint idx = t + {TH}u * {unit}u;
+            uint kj = idx / 16u;
+            uint dv = idx % 16u;
+            uint row = kb + kj;
+            half4 x = half4(0.0h);
+            if (row < wg_limit) {{ x = half4_of(v_cache[row * kv_dim4 + kv_head * 16u + dv]); }}
+            vs[kj * 17u + dv] = x;
+        }}""")
+    L.append("        float pmax = NEG;")
+    for i in range(8):
+        L.append(f"        float x{i} = ps[(sp * 8u + {i}u) * {qt}u + sq]; pmax = max(pmax, x{i});")
+    L.append(f"""        pm[sp * {qt}u + sq] = pmax;
+        GroupMemoryBarrierWithGroupSync();
+        float m_new = max(max(m, max(pm[sq], pm[{qt}u + sq])), max(pm[{2 * qt}u + sq], pm[{3 * qt}u + sq]));
+        float c = exp2(m - m_new);
+        float psum = 0.0;""")
+    for i in range(8):
+        L.append(f"        float p{i} = exp2(x{i} - m_new); psum += p{i};")
+    for i in range(8):
+        L.append(f"        ps[(sp * 8u + {i}u) * {qt}u + sq] = p{i};")
+    L.append(f"""        l = l * c + psum;
+        m = m_new;
+        if (sp == 0u) {{ corr[sq] = c; }}
+        GroupMemoryBarrierWithGroupSync();
+        for (uint z = 0u; z < {32 * QG // TH}u; z++) {{
+            uint e = t + {TH}u * z;
+            uint key = e / {QG}u;
+            uint qg = e % {QG}u;
+            ph[e] = half4(half(ps[key * {qt}u + qg * 4u]), half(ps[key * {qt}u + qg * 4u + 1u]),
+                          half(ps[key * {qt}u + qg * 4u + 2u]), half(ps[key * {qt}u + qg * 4u + 3u]));
+        }}
+        GroupMemoryBarrierWithGroupSync();
+        o0 *= corr[ty * 4u + 0u];
+        o1 *= corr[ty * 4u + 1u];
+        o2 *= corr[ty * 4u + 2u];
+        o3 *= corr[ty * 4u + 3u];""")
+    L.append("        [loop] for (uint jb = 0u; jb < 32u; jb += %du) {" % pv_block)
+    L.append("            half4 a0 = half4(0.0h); half4 a1 = half4(0.0h); half4 a2 = half4(0.0h); half4 a3 = half4(0.0h);")
+    for j in range(pv_block):
+        L.append(f"""            {{
+                half4 pv = ph[(jb + {j}u) * {QG}u + ty];
+                half4 vv = vs[(jb + {j}u) * 17u + tx];
+                a0 += pv.x * vv; a1 += pv.y * vv; a2 += pv.z * vv; a3 += pv.w * vv;
+            }}""")
+    L.append("            o0 += float4(a0); o1 += float4(a1); o2 += float4(a2); o3 += float4(a3);")
+    L.append("        }")
+    tail = TAIL
+    for i in range(4):
+        old = f"float s{i} = lsum[ty * 4u" + ("" if i == 0 else f" + {i}u") + "] + lsum[32u + ty * 4u" + ("" if i == 0 else f" + {i}u") + "] + lsum[64u + ty * 4u" + ("" if i == 0 else f" + {i}u") + "] + lsum[96u + ty * 4u" + ("" if i == 0 else f" + {i}u") + "];"
+        assert old in tail, old
+        add = "" if i == 0 else f" + {i}u"
+        new = f"float s{i} = lsum[ty * 4u{add}] + lsum[{qt}u + ty * 4u{add}] + lsum[{2 * qt}u + ty * 4u{add}] + lsum[{3 * qt}u + ty * 4u{add}];"
+        tail = tail.replace(old, new)
+    tail = tail.replace("lsum[sp * 32u + sq] = l;", f"lsum[sp * {qt}u + sq] = l;")
+    L.append(tail)
+    return "\n".join(L) + "\n"
+
+
 def gen_t44(dt, s_block=8, pv_block=4):
     """The 4 x 4 tile variant: a workgroup of 64 threads (8 query groups x 8 key quads) owns 32 queries; a
     thread's S tile is 4 queries x 4 keys, so the QK^T FMAs are 4 lanes wide (the 128-thread kernels
@@ -390,6 +530,9 @@ if __name__ == "__main__":
     texts = {}
     for name, s_, p_, skip in jobs:
         texts[name] = gen(s_, p_, skip)
+    texts["attn_q32"] = gen_q(32)
+    texts["attn_q64"] = gen_q(64)
+    jobs += [("attn_q32", 0, 0, ()), ("attn_q64", 0, 0, ())]
     texts["attn_t44_half"] = gen_t44("half")
     texts["attn_t44_float"] = gen_t44("float")
     jobs += [("attn_t44_half", 0, 0, ()), ("attn_t44_float", 0, 0, ())]
