@@ -242,6 +242,35 @@ The full-vocabulary logits are identical to the previous kernels' (maximum diffe
 to 3,600 characters) and equally close to the CPU's. What remains at 2,048 tokens is attention, which reads more
 keys per chunk.
 
+### GPU prefill: no transpose pass
+
+Every streaming GEMM was preceded by `transpose_cast_f16`, which rewrote the f32 token-major activations as an f16
+k-major copy for the GEMM to stage from: 76 dispatches and 7.8 ms of a 153 ms chunk. Staging the B tile straight
+from the f32 activations (thread `(k, group)` reads the 4 tokens of its group at consecutive k, so lanes read
+consecutive floats, and converts to f16 on the way into shared memory) needs no transpose at all, and turned out
+faster than staging from the f16 copy: with `cera gemm-bench` on the model's shapes the kernel took 1.79 ms against
+1.95 (4608x512x1024), 2.12 against 2.66 (1024x512x4608), 1.23 against 1.37 and 0.50 against 0.61, with the same
+`cpu_diff` (the numerics are unchanged). The k64 kernel family (one row, two rows, fused gate/up) now takes the
+activations directly; `gemm_stream_q4_0_k64_xf32` is the one-row kernel for small dispatches. A row past the last
+token is clamped onto it, so the last tile never reads outside the buffer. Models and shapes that cannot use the
+k64 family (k not a multiple of 64, Q8_0, Q4_K) keep the transpose, and `CERA_WGPU_GEMM_DIRECT_B=0` restores the
+transposed path everywhere (with the one-row kernel and unfused gate/up, which exist only for the direct path).
+
+Per 512-token chunk under the profiler the GPU time falls from 153 to 140 ms: the transposes (7.7 ms) are gone and
+the GEMMs are 5 ms faster (two-row 58.2 to 55.8, fused gate/up 57.2 to 54.3). Gated like the runs above (AP sensor
+at 28 C or less, rotating order, 3 rounds, medians; `android_vl_image_raw/gemm_direct_b_20261009/`), prefill tok/s
+on the GPU:
+
+| Prompt | before the GEMM work | two-row + fused gate/up | no transpose | llama.cpp (OpenCL) | vs previous step | vs llama.cpp |
+|---|---:|---:|---:|---:|---:|---:|
+| 512 tokens | 2,858 | 3,172 | 3,501 | 3,293 | 1.10 | 1.06 |
+| 1,024 | 2,586 | 2,936 | 3,231 | 3,154 | 1.10 | 1.02 |
+| 2,048 | 2,272 | 2,504 | 2,644 | 2,895 | 1.06 | 0.91 |
+
+The full-vocabulary logits are identical to the previous step's and to the `CERA_WGPU_GEMM_DIRECT_B=0` path's
+(maximum difference 0.0000 on five prompts of 60 to 3,600 characters). At 2,048 tokens the gap that remains is
+attention, which reads more keys per chunk.
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
