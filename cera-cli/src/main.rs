@@ -438,10 +438,16 @@ enum Command {
 
         /// Cap the longest side (in pixels) of each `--image` input's
         /// *encoded* resolution. Smaller = fewer image tokens, faster
-        /// prefill, less detail; larger (or unset) = full model
-        /// resolution. The cap only shrinks and takes precedence over
-        /// the model's minimum-resolution floor. Applies to every image
-        /// in the turn via `Session::set_image_max_long_size`.
+        /// prefill, less detail. Unset follows the model's reference
+        /// processing: an image within about twice the single-image
+        /// budget (roughly 724x724) is resized to one image of up to 256
+        /// tokens, and a larger one is split into a grid of 512 px tiles
+        /// (up to 10, 256 tokens each) plus a thumbnail, so a big photo
+        /// costs many times more tokens and tower time. Setting a cap
+        /// disables tiling (one image, never larger than the cap). The cap
+        /// only shrinks and takes precedence over the model's
+        /// minimum-resolution floor. Applies to every image in the turn
+        /// via `Session::set_image_max_long_size`.
         #[arg(long, value_name = "PIXELS")]
         max_long_size: Option<u32>,
 
@@ -482,8 +488,9 @@ enum Command {
         #[arg(long)]
         no_cache: bool,
 
-        /// KV cache mode: f32 (default), f16 (half-precision), or tq3 (TurboQuant 3-bit).
-        #[arg(long, default_value = "f32")]
+        /// KV cache mode: auto (default: f16 where the model honors it, else the backend's own),
+        /// f32, f16 (half-precision), or tq3 (TurboQuant 3-bit).
+        #[arg(long, default_value = "auto")]
         kv_cache_keys: String,
 
         /// Prefill chunk size (ubatch). Long prompts split into chunks of
@@ -548,6 +555,11 @@ enum Command {
     /// Print the resolved CPU backend tier + detected SIMD features for this
     /// host (no model required). Same line `inspect` shows under "CPU Backend".
     Cpu,
+
+    /// Print the device's thermal headroom now and as a forecast (Android API 30+),
+    /// one line, for annotating benchmark runs: `0.0` cool, `1.0` the throttling
+    /// threshold, above `1.0` already throttling. Prints `unavailable` elsewhere.
+    Thermal,
 
     /// Interactive multi-turn chat REPL.
     ///
@@ -1049,8 +1061,9 @@ enum Command {
         #[arg(long)]
         no_cache: bool,
 
-        /// KV cache mode: f32 (default), f16 (half-precision), or tq3 (TurboQuant 3-bit).
-        #[arg(long, default_value = "f32")]
+        /// KV cache mode: auto (default: f16 where the model honors it, else the backend's own),
+        /// f32, f16 (half-precision), or tq3 (TurboQuant 3-bit).
+        #[arg(long, default_value = "auto")]
         kv_cache_keys: String,
 
         /// Prefill chunk size (ubatch). Lower = more cancel-responsive
@@ -3352,7 +3365,10 @@ fn write_wav(path: &str, samples: &[f32], sample_rate: u32) -> Result<()> {
 /// Parse a CLI KV-cache-compression flag value into a `KvCompression`.
 ///
 /// Modes:
-/// - `f32` / `none`: uncompressed (default)
+/// - `auto` (default): `f16` when the model honors it (CPU LFM2 and dense
+///   transformers, as llama.cpp's default cache type), otherwise the backend's own
+///   uncompressed KV. Quiet: it only reports when it picks f16.
+/// - `f32` / `none`: uncompressed
 /// - `f16`: half-precision KV cache (2 bytes/elem, ~2× less KV bandwidth at
 ///   decode). CPU LFM2 and dense-transformer paths; a model that doesn't
 ///   implement it falls back to the backend's uncompressed KV.
@@ -3373,6 +3389,13 @@ fn setup_kv_compression(
 
     let (keys, values) = match kv_cache_mode {
         "f32" | "none" => return Ok(KvCompression::None),
+        "auto" => {
+            if model.f16_kv_supported() {
+                eprintln!("f16 KV cache (default; --kv-cache-keys f32 for full precision)");
+                return Ok(KvCompression::F16);
+            }
+            return Ok(KvCompression::None);
+        }
         "f16" => {
             if model.f16_kv_supported() {
                 eprintln!("f16 KV cache enabled (half-precision keys + values)");
@@ -3388,7 +3411,7 @@ fn setup_kv_compression(
         "tq3-keys" => (true, false),
         "tq3-values" => (false, true),
         other => anyhow::bail!(
-            "unknown --kv-cache-keys mode: {other} (use f32, f16, tq3, tq3-keys, or tq3-values)"
+            "unknown --kv-cache-keys mode: {other} (use auto, f32, f16, tq3, tq3-keys, or tq3-values)"
         ),
     };
 
@@ -3856,7 +3879,8 @@ fn main() -> Result<()> {
                 // it when the user's flags are compatible with that exact behavior. Otherwise fall
                 // through to the chat-template flow below, which honors `--max-tokens`,
                 // `--temperature`, `--kv-cache-keys`, and appends `--prompt` before the marker.
-                // (256 / "f32" mirror the `Run` clap defaults; `transcribe` uses the same budget.)
+                // ("auto" and 256 mirror the `Run` clap defaults; `transcribe` uses the same budget. An explicit
+                // `f32`, `f16` or `tq3` falls through: `transcribe` builds a default session, whose KV is f16.)
                 let prompt_is_empty = prompt.as_deref().unwrap_or("").trim().is_empty();
                 let effective_opts = build_opts(&engine, None, Vec::new());
                 let has_sampling_overrides = top_p.is_some()
@@ -3867,7 +3891,7 @@ fn main() -> Result<()> {
                     && effective_opts.temperature <= 0.0
                     && !has_sampling_overrides
                     && max_tokens == 256
-                    && kv_cache_keys == "f32"
+                    && kv_cache_keys == "auto"
                     // `engine.transcribe` bypasses the session, so a LoRA adapter
                     // could never be attached — fall through to the session path.
                     && lora.is_none();
@@ -4462,6 +4486,29 @@ fn main() -> Result<()> {
         Command::Cpu => {
             println!("{}", cera::cpu_features().report());
             println!("{}", cera::backend::cpu_features::core_topology().report());
+        }
+        Command::Thermal => {
+            match thermal::ThermalMonitor::new() {
+                Some(t) => {
+                    // The service needs a moment after the manager is acquired before it has a value.
+                    let mut now = None;
+                    for _ in 0..30 {
+                        now = t.headroom(0);
+                        if now.is_some() {
+                            break;
+                        }
+                        std::thread::sleep(std::time::Duration::from_millis(100));
+                    }
+                    let f = |v: Option<f32>| v.map_or("n/a".to_string(), |h| format!("{h:.2}"));
+                    println!(
+                        "thermal headroom now {} | +10s {} | +30s {} (0 cool, 1.0 throttling)",
+                        f(now),
+                        f(t.headroom(10)),
+                        f(t.headroom(30))
+                    );
+                }
+                None => println!("thermal headroom unavailable"),
+            }
         }
         Command::Tokenize { model, text } => {
             let gguf = cera::gguf::GgufFile::open(Path::new(&model))?;

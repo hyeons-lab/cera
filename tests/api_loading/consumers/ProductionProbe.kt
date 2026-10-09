@@ -189,7 +189,14 @@ fun runProduction(
             for (mode in modes) {
                 val config = SessionConfig(8u, mode, 1u, 0uL, 0u, true)
                 model.createSession(config).use { session ->
-                    check(sessionConfigForProbe(session) == config.copy(kvCompression = mode ?: KvCompression.None))
+                    val observed = sessionConfigForProbe(session)
+                    if (mode == null) {
+                        // Omitted means the core default: f16 where the model honors it, else the backend's own cache.
+                        check(observed.kvCompression == KvCompression.F16 || observed.kvCompression == KvCompression.None)
+                        check(observed == config.copy(kvCompression = observed.kvCompression))
+                    } else {
+                        check(observed == config)
+                    }
                     session.appendTokens(listOf(0u, 1u))
                     check(session.generate(GenerateOpts(maxTokens = 1u, temperature = 0f, ignoreEos = true)).tokens.size == 1)
                 }

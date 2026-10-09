@@ -101,8 +101,10 @@ pub mod vision_encoder_gpu;
 pub mod vision_preprocessor;
 #[cfg(feature = "vl-preprocess")]
 pub use vision_preprocessor::{
-    PreprocessedImage, calc_size_preserved_ratio, normalize_rgb8_to_nchw_f32, preprocess_image,
-    preprocess_image_with_opts, preprocess_raw_pixels, resize_bilinear_rgb,
+    LFM2_TILE_SIZE, PreprocessedImage, PreprocessedLayout, TiledImage, calc_size_preserved_ratio,
+    lfm2_should_tile, lfm2_tile_grid, normalize_rgb8_to_nchw_f32, preprocess_image,
+    preprocess_image_layout, preprocess_image_with_opts, preprocess_raw_layout,
+    preprocess_raw_pixels, resize_bilinear_rgb, resize_pillow_bilinear_rgb8,
 };
 
 /// Supported pixel layouts for uncompressed raw image buffers.
@@ -753,6 +755,16 @@ pub trait Model: Send + Sync {
     fn embed_token_rows(&self, tokens: &[u32]) -> Option<Vec<f32>> {
         let _ = tokens;
         None
+    }
+
+    /// The embedding rows of `tokens` for splicing into an *image's* own rows (the `<|img_row_R_col_C|>`
+    /// and `<|img_thumbnail|>` markers of a tiled image), row-major `[tokens.len() * hidden_size]`.
+    ///
+    /// Defaults to [`Self::embed_token_rows`]. A backend that cannot offer the fused text-and-image
+    /// prompt route (so leaves that `None`) but whose token prefill is a plain row lookup can still
+    /// implement this one, which only the image path reads.
+    fn embed_image_marker_rows(&self, tokens: &[u32]) -> Option<Vec<f32>> {
+        self.embed_token_rows(tokens)
     }
 
     /// Forward pass with a float embedding as input (instead of a token ID).

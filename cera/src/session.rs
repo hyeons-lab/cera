@@ -81,7 +81,12 @@ pub use recovery::{IngestRecovery, RecoveryOutcome};
 pub struct SessionConfig {
     /// Cap on total tokens held in KV. `None` → model's default `max_seq_len`.
     pub max_seq_len: Option<u32>,
-    /// KV cache compression mode.
+    /// KV cache compression mode. Defaults to [`KvCompression::F16`] (llama.cpp's default
+    /// cache type; about 1.2x decode at 1,800 tokens of context on CPU, 141.8 to 172.4 tok/s medians), except on wasm32
+    /// where the f16 kernels have no SIMD path. A model that does not honor f16 (the GPU
+    /// and NPU backends, which keep their own cache) falls back to its uncompressed KV when
+    /// the session is built. Pass [`KvCompression::None`] for the backend's own full-precision
+    /// cache.
     pub kv_compression: KvCompression,
     /// Number of tokens pinned at the front on context shift overflow (e.g. system prompt).
     pub n_keep: u32,
@@ -101,7 +106,11 @@ impl Default for SessionConfig {
     fn default() -> Self {
         Self {
             max_seq_len: None,
-            kv_compression: KvCompression::None,
+            kv_compression: if cfg!(target_arch = "wasm32") {
+                KvCompression::None
+            } else {
+                KvCompression::F16
+            },
             n_keep: 0,
             seed: None,
             ubatch_size: 512,
@@ -793,8 +802,9 @@ pub struct Session {
     gpu_vision_encoder: Option<Arc<dyn crate::model::vision_encoder_gpu::VisionGpuEncode>>,
     /// Session-default cap on the longest side of an appended image
     /// (in pixels), honored by every image-append path — including
-    /// [`Self::append_chat_with_images`]. `None` = no cap (native
-    /// resolution within the model's pixel budget). Set via
+    /// [`Self::append_chat_with_images`]. `None` = no cap: an image within about twice the
+    /// single-image budget is resized to fit it, and a larger one is tiled (up to 10 tiles of 256
+    /// rows plus a thumbnail; see [`Self::append_image`]). Set via
     /// [`Self::set_image_max_long_size`]; [`Self::append_image_with_opts`]
     /// takes an explicit per-call override. Preserved across
     /// [`Self::reset`] — it's a preprocessing preference, not KV state.
@@ -831,6 +841,57 @@ pub struct Session {
     model_session_lease: Option<ModelSessionLease>,
 }
 
+/// The text of every marker token a tiled image's prompt uses, in embedding order: one
+/// `<|img_row_R_col_C|>` per tile, rows outermost (the order the tiles are encoded in), then
+/// `<|img_thumbnail|>` last.
+#[cfg(feature = "vl-preprocess")]
+fn tile_marker_texts(cols: usize, rows: usize) -> Vec<String> {
+    let mut texts = Vec::with_capacity(cols * rows + 1);
+    for y in 1..=rows {
+        for x in 1..=cols {
+            texts.push(format!("<|img_row_{y}_col_{x}|>"));
+        }
+    }
+    texts.push("<|img_thumbnail|>".to_string());
+    texts
+}
+
+/// Rows the vision tower returns for one preprocessed image: its patch grid merged `scale_factor`
+/// per axis. Used to refuse an image that cannot fit the context before any tower pass runs.
+#[cfg(feature = "vl-preprocess")]
+fn image_row_estimate(
+    pre: &crate::model::vision_preprocessor::PreprocessedImage,
+    scale_factor: usize,
+) -> usize {
+    let sf = scale_factor.max(1);
+    (pre.grid_w / sf) * (pre.grid_h / sf)
+}
+
+/// Lay a tiled image out as the reference prompt does: each tile's marker row, then that tile's
+/// rows, in order, then the thumbnail's marker row and its rows. `tiles` and `thumb` are
+/// `(rows, row count)` as the vision tower returns them; the result is the same shape, with the
+/// marker rows counted.
+#[cfg(feature = "vl-preprocess")]
+fn splice_tiled_rows(
+    markers: &[Vec<f32>],
+    tiles: &[(Vec<f32>, usize)],
+    thumb_marker: &[f32],
+    thumb: &(Vec<f32>, usize),
+) -> (Vec<f32>, usize) {
+    debug_assert_eq!(markers.len(), tiles.len(), "one marker per tile");
+    let mut rows = Vec::new();
+    let mut n_rows = 0usize;
+    for (marker, (tile_rows, n)) in markers.iter().zip(tiles) {
+        rows.extend_from_slice(marker);
+        rows.extend_from_slice(tile_rows);
+        n_rows += 1 + n;
+    }
+    rows.extend_from_slice(thumb_marker);
+    rows.extend_from_slice(&thumb.0);
+    n_rows += 1 + thumb.1;
+    (rows, n_rows)
+}
+
 impl Session {
     /// Construct a new session backed by an already-loaded model + tokenizer.
     /// Both are taken by `Arc` — in-process callers typically clone from
@@ -852,7 +913,6 @@ impl Session {
         capabilities: ModalityCapabilities,
         config: SessionConfig,
     ) -> Result<Self, CeraError> {
-        #[cfg(not(target_arch = "wasm32"))]
         let mut config = config;
         #[cfg(not(target_arch = "wasm32"))]
         if !config.gpu_depthformer && gpu_depthformer_enabled() {
@@ -863,6 +923,13 @@ impl Session {
         // The local lease releases on every early return or unwinding path.
         let model_session_lease = model.acquire_session()?;
         let model_cfg = model.config();
+        // f16 is the default mode, but only the CPU models read the f16 slots. Every other
+        // model keeps its own cache (the GPU backends hold KV on the model; the NPU backend
+        // rejects any mode but `None`), so resolve it once here and let every later use of
+        // `config.kv_compression` (reset, fingerprint, prefix-cache tag) see the real mode.
+        if matches!(config.kv_compression, KvCompression::F16) && !model.f16_kv_supported() {
+            config.kv_compression = KvCompression::None;
+        }
         let max_seq_len = config
             .max_seq_len
             .map(|v| v as usize)
@@ -1239,7 +1306,8 @@ impl Session {
     /// cost once instead of per call. [`Self::append_image_with_opts`]
     /// takes an explicit per-call override. See that method for the
     /// cap semantics (shrinks the encoded target, never upscales,
-    /// takes precedence over the model's `image_min_pixels` floor).
+    /// takes precedence over the model's `image_min_pixels` floor). With no cap a large image is
+    /// tiled (see [`Self::append_image`]), so a cap is also how to bound its token and tower cost.
     pub fn set_image_max_long_size(&mut self, max_long_size: Option<u32>) {
         self.image_max_long_size = max_long_size;
     }
@@ -1921,32 +1989,16 @@ impl Session {
                 vocab_size: vocab_size as u32,
             });
         }
-        let new_end = self
-            .current_pos
-            .checked_add(tokens.len())
-            .ok_or(CeraError::Backend("position overflow".into()))?;
+        // `n_keep` context shift (Phase 1.5): if the backend supports shift, the session was configured
+        // with `n_keep > 0`, the cache is shiftable (not TurboQuant: compressed caches would corrupt on
+        // the in-place RoPE delta; f16 shifts via widen→rotate→narrow), and the pinned prefix leaves
+        // room to drop, the shift below makes room. Otherwise `ensure_rows_fit` returns the typed
+        // ContextOverflow.
+        self.ensure_rows_fit(tokens.len())?;
+        let new_end = self.current_pos + tokens.len();
         if new_end > self.max_seq_len {
-            // `n_keep` context shift (Phase 1.5): if the backend
-            // supports shift, the session was configured with
-            // `n_keep > 0`, the cache is shiftable (not TurboQuant —
-            // compressed caches would corrupt on the in-place RoPE
-            // delta; f16 shifts via widen→rotate→narrow), and the
-            // pinned prefix leaves room to drop — shift to make room.
-            // Otherwise fall through to the typed ContextOverflow.
             let n_keep = self.config.n_keep as usize;
             let shift_needed = new_end - self.max_seq_len;
-            if !can_shift(
-                self.model.supports_kv_shift(),
-                n_keep,
-                self.state.is_compressed(),
-                self.current_pos,
-                shift_needed,
-            ) {
-                return Err(CeraError::ContextOverflow {
-                    max_seq_len: self.max_seq_len as u32,
-                    by: (new_end - self.max_seq_len) as u32,
-                });
-            }
             self.note_ingest_mutation(true);
             self.model.shift_kv(&mut self.state, n_keep, shift_needed);
             let before = self.current_pos;
@@ -2173,26 +2225,12 @@ impl Session {
             )));
         }
 
-        let new_end = self
-            .current_pos
-            .checked_add(n_tokens)
-            .ok_or(CeraError::Backend("position overflow".into()))?;
+        self.ensure_rows_fit(n_tokens)?;
+        let new_end = self.current_pos + n_tokens;
         if new_end > self.max_seq_len {
             // Same `n_keep` context-shift logic as append_tokens.
             let n_keep = self.config.n_keep as usize;
             let shift_needed = new_end - self.max_seq_len;
-            if !can_shift(
-                self.model.supports_kv_shift(),
-                n_keep,
-                self.state.is_compressed(),
-                self.current_pos,
-                shift_needed,
-            ) {
-                return Err(CeraError::ContextOverflow {
-                    max_seq_len: self.max_seq_len as u32,
-                    by: (new_end - self.max_seq_len) as u32,
-                });
-            }
             self.note_ingest_mutation(true);
             self.model.shift_kv(&mut self.state, n_keep, shift_needed);
             let before = self.current_pos;
@@ -2286,9 +2324,18 @@ impl Session {
     /// Append an image input. Decodes PNG / JPEG bytes, resizes
     /// to the encoder's native input size, normalises with the
     /// encoder's per-channel mean / std, runs the ViT + projector
-    /// forward to produce 64 image tokens × `projection_dim`, and
+    /// forward to produce the image's tokens × `projection_dim`, and
     /// splices them into the LLM prefill stream at the current
     /// position via [`Self::append_embeddings`].
+    ///
+    /// **How many tokens.** A single image is 64 to 256 tokens. With no `max_long_size` cap, an image
+    /// over about twice the single-image budget (roughly 724x724) is tiled the way the LFM2-VL
+    /// reference does: a grid of up to 10 tiles of 256 tokens, each preceded by its
+    /// `<|img_row_R_col_C|>` marker, then `<|img_thumbnail|>` and the thumbnail. The grid follows the
+    /// aspect ratio, so a 4:3 photo is about 1,800 tokens, a large square (over about 1,100 px) about 2,600 and a
+    /// smaller one about 1,300, and a 5:2 panorama about 2,800, with one vision-tower pass per tile. Set a cap to keep one tile. Tiling needs a
+    /// model that can hand out token embedding rows (CPU, wgpu and Hexagon can; native Metal falls
+    /// back to the single thumbnail). The rows are checked against the context before the tower runs.
     ///
     /// **Placement matters.** The model was trained on a specific
     /// surrounding-token envelope (LFM2-VL: `<|image_start|>` /
@@ -2359,53 +2406,37 @@ impl Session {
         max_long_size: Option<u32>,
     ) -> Result<(), CeraError> {
         self.ensure_usable()?;
-        let (rows, n_tokens) = self.encode_image_rows(bytes, max_long_size)?;
+        let (rows, n_tokens) = self.encode_image_rows(bytes, max_long_size, 0)?;
         self.append_image_rows(&rows, n_tokens)
     }
 
-    /// Decode, preprocess and encode an image into LLM-width embedding rows
-    /// (`n_tokens` rows of `hidden_size` floats) without touching the session:
-    /// the half of [`Self::append_image_with_opts`] that does not prefill.
+    /// The attached vision encoder, after checking the session accepts images and that the
+    /// encoder's projection width matches the LLM's hidden size. `caller` names the public method
+    /// in the error text.
     #[cfg(feature = "vl-preprocess")]
-    fn encode_image_rows(
+    fn checked_vision_encoder(
         &self,
-        bytes: &[u8],
-        max_long_size: Option<u32>,
-    ) -> Result<(Vec<f32>, usize), CeraError> {
+        caller: &str,
+    ) -> Result<std::sync::Arc<crate::model::vision_encoder::VisionEncoderWeights>, CeraError> {
         self.ensure_usable()?;
         if !self.capabilities.image_in {
             return Err(CeraError::UnsupportedModality);
         }
-        let encoder = {
-            let Some(encoder) = self.vision_encoder.as_ref() else {
-                return Err(CeraError::Backend(
-                    "Session::append_image: no vision encoder attached. \
-                     Construct via CeraEngine on a VL bundle so the \
-                     encoder is auto-attached, or call \
-                     attach_vision_encoder(...) in test setup."
-                        .into(),
-                ));
-            };
-            let llm_hidden = self.model.config().hidden_size;
-            let proj_dim = encoder.config.projection_dim;
-            if proj_dim != llm_hidden {
-                return Err(CeraError::Backend(format!(
-                    "Session::append_image: vision encoder's projection_dim \
-                     ({proj_dim}) does not match LLM hidden_size ({llm_hidden}). \
-                     The mmproj must pair with the LLM it was trained against."
-                )));
-            }
-            std::sync::Arc::clone(encoder)
+        let Some(encoder) = self.vision_encoder.as_ref() else {
+            return Err(CeraError::Backend(format!(
+                "{caller}: no vision encoder attached. Construct via CeraEngine on a VL bundle so \
+                 the encoder is auto-attached, or call attach_vision_encoder(...) in test setup."
+            )));
         };
-        let preprocess_start = Instant::now();
-        let pre = crate::model::vision_preprocessor::preprocess_image_with_opts(
-            bytes,
-            &encoder.config,
-            max_long_size,
-        )?;
-        let preprocess_ms = preprocess_start.elapsed().as_secs_f64() * 1000.0;
-        vl_timing_update(|t| t.preprocess_ms += preprocess_ms);
-        self.encode_preprocessed_image(&pre, &encoder)
+        let llm_hidden = self.model.config().hidden_size;
+        let proj_dim = encoder.config.projection_dim;
+        if proj_dim != llm_hidden {
+            return Err(CeraError::Backend(format!(
+                "{caller}: vision encoder's projection_dim ({proj_dim}) does not match LLM \
+                 hidden_size ({llm_hidden}). The mmproj must pair with the LLM it was trained against."
+            )));
+        }
+        Ok(std::sync::Arc::clone(encoder))
     }
 
     /// Stub `append_image_with_opts` for builds without `vl-preprocess`.
@@ -2422,8 +2453,9 @@ impl Session {
     /// Append an uncompressed raw image to the conversation context.
     ///
     /// `pixels` is an uncompressed pixel buffer in the given [`crate::model::PixelFormat`].
-    /// Automatically applies aspect-preserving resizing and normalization,
-    /// then encodes with the vision encoder and appends image tokens.
+    /// Automatically applies aspect-preserving resizing and normalization (and the tiled layout
+    /// for a large image, as [`Self::append_image`] does), then encodes with the vision encoder
+    /// and appends image tokens.
     pub fn append_raw_image(
         &mut self,
         pixels: &[u8],
@@ -2446,40 +2478,35 @@ impl Session {
         format: crate::model::PixelFormat,
         max_long_size: Option<u32>,
     ) -> Result<(), CeraError> {
-        self.ensure_usable()?;
-        if !self.capabilities.image_in {
-            return Err(CeraError::UnsupportedModality);
-        }
-        let encoder = {
-            let Some(encoder) = self.vision_encoder.as_ref() else {
-                return Err(CeraError::Backend(
-                    "Session::append_raw_image: no vision encoder attached. \
-                     Construct via CeraEngine on a VL bundle so the \
-                     encoder is auto-attached, or call \
-                     attach_vision_encoder(...) in test setup."
-                        .into(),
-                ));
-            };
-            let llm_hidden = self.model.config().hidden_size;
-            let proj_dim = encoder.config.projection_dim;
-            if proj_dim != llm_hidden {
-                return Err(CeraError::Backend(format!(
-                    "Session::append_raw_image: vision encoder's projection_dim \
-                     ({proj_dim}) does not match LLM hidden_size ({llm_hidden}). \
-                     The mmproj must pair with the LLM it was trained against."
-                )));
-            }
-            std::sync::Arc::clone(encoder)
+        let encoder = self.checked_vision_encoder("Session::append_raw_image")?;
+        let preprocess_start = Instant::now();
+        let layout = if self.tiling_available() {
+            crate::model::vision_preprocessor::preprocess_raw_layout(
+                pixels,
+                width as usize,
+                height as usize,
+                format,
+                &encoder.config,
+                max_long_size,
+            )?
+        } else {
+            // No marker rows to tile with: preprocess the one image that would be encoded, not ten
+            // tiles that would be thrown away.
+            crate::model::vision_preprocessor::PreprocessedLayout::Single(
+                crate::model::vision_preprocessor::preprocess_raw_pixels(
+                    pixels,
+                    width as usize,
+                    height as usize,
+                    format,
+                    &encoder.config,
+                    max_long_size,
+                )?,
+            )
         };
-        let pre = crate::model::vision_preprocessor::preprocess_raw_pixels(
-            pixels,
-            width as usize,
-            height as usize,
-            format,
-            &encoder.config,
-            max_long_size,
-        )?;
-        self.encode_and_append_preprocessed_image(&pre, &encoder)
+        let preprocess_ms = preprocess_start.elapsed().as_secs_f64() * 1000.0;
+        vl_timing_update(|t| t.preprocess_ms += preprocess_ms);
+        let (rows, n_tokens) = self.encode_layout_rows(&layout, &encoder, 0)?;
+        self.append_image_rows(&rows, n_tokens)
     }
 
     /// Stub `append_raw_image_with_opts` for builds without `vl-preprocess`.
@@ -2496,14 +2523,185 @@ impl Session {
         Err(CeraError::UnsupportedModality)
     }
 
+    /// Decode, preprocess and encode an image into LLM-width embedding rows
+    /// (`n_tokens` rows of `hidden_size` floats) without touching the session:
+    /// the half of [`Self::append_image_with_opts`] that does not prefill.
     #[cfg(feature = "vl-preprocess")]
-    fn encode_and_append_preprocessed_image(
-        &mut self,
-        pre: &crate::model::vision_preprocessor::PreprocessedImage,
+    fn encode_image_rows(
+        &self,
+        bytes: &[u8],
+        max_long_size: Option<u32>,
+        reserved: usize,
+    ) -> Result<(Vec<f32>, usize), CeraError> {
+        let encoder = self.checked_vision_encoder("Session::append_image")?;
+        let preprocess_start = Instant::now();
+        let layout = if self.tiling_available() {
+            crate::model::vision_preprocessor::preprocess_image_layout(
+                bytes,
+                &encoder.config,
+                max_long_size,
+            )?
+        } else {
+            // No marker rows to tile with: preprocess the one image that would be encoded, not ten
+            // tiles that would be thrown away.
+            crate::model::vision_preprocessor::PreprocessedLayout::Single(
+                crate::model::vision_preprocessor::preprocess_image_with_opts(
+                    bytes,
+                    &encoder.config,
+                    max_long_size,
+                )?,
+            )
+        };
+        let preprocess_ms = preprocess_start.elapsed().as_secs_f64() * 1000.0;
+        vl_timing_update(|t| t.preprocess_ms += preprocess_ms);
+        self.encode_layout_rows(&layout, &encoder, reserved)
+    }
+
+    /// Whether this session can lay a large image out as tiles: the tokenizer resolves the marker
+    /// tokens and the model hands out their embedding rows (CPU, wgpu and Hexagon; native Metal does
+    /// not). Checked before preprocessing so a model that cannot tile never builds tiles it would drop.
+    #[cfg(feature = "vl-preprocess")]
+    fn tiling_available(&self) -> bool {
+        match self.tile_marker_rows(1, 1) {
+            Ok(_) => true,
+            Err(why) => {
+                // Not a warning: native Metal never has the rows. A vocabulary that lacks the marker
+                // tokens shows up here too, which is why the reason is kept.
+                tracing::debug!(
+                    "tiling unavailable ({why}); large images are encoded as one image"
+                );
+                false
+            }
+        }
+    }
+
+    /// Encode a preprocessed image layout into the rows that go between `<|image_start|>` and
+    /// `<|image_end|>`.
+    ///
+    /// A single image is its tower rows. A tiled one (a large image, see
+    /// [`crate::model::vision_preprocessor::lfm2_should_tile`]) is, as the reference processor lays
+    /// it out, each tile in row-major order preceded by its `<|img_row_R_col_C|>` marker, then
+    /// `<|img_thumbnail|>` and the thumbnail's rows. The markers are embedded like any text token.
+    /// When the model cannot embed them (or the vocabulary lacks them) the tiles are dropped and only
+    /// the thumbnail is encoded, which is what every large image used to get.
+    #[cfg(feature = "vl-preprocess")]
+    fn encode_layout_rows(
+        &self,
+        layout: &crate::model::vision_preprocessor::PreprocessedLayout,
         encoder: &crate::model::vision_encoder::VisionEncoderWeights,
-    ) -> Result<(), CeraError> {
-        let (rows, n_tokens) = self.encode_preprocessed_image(pre, encoder)?;
-        self.append_image_rows(&rows, n_tokens)
+        reserved: usize,
+    ) -> Result<(Vec<f32>, usize), CeraError> {
+        self.encode_layout_rows_with(
+            layout,
+            encoder.config.scale_factor,
+            reserved,
+            |cols, rows| self.tile_marker_rows(cols, rows),
+            |pre| self.encode_preprocessed_image(pre, encoder),
+        )
+    }
+
+    /// [`Self::encode_layout_rows`] with the tile-marker lookup and the vision tower passed in, so the
+    /// order of checks and passes can be tested without a vision encoder or a tokenizer.
+    ///
+    /// The row count follows from the patch grids alone, so a layout that cannot fit the context is
+    /// refused before the tower runs (up to 10 passes for a tiled image), not after the last one.
+    /// `reserved` is the number of rows already committed to the same operation ahead of and around
+    /// this image (the prompt's text and the images encoded before it in a fused chat prefill), so an
+    /// image that fits alone but not after them is refused before its own tower pass.
+    #[cfg(feature = "vl-preprocess")]
+    fn encode_layout_rows_with(
+        &self,
+        layout: &crate::model::vision_preprocessor::PreprocessedLayout,
+        scale_factor: usize,
+        reserved: usize,
+        markers: impl FnOnce(usize, usize) -> Result<(Vec<Vec<f32>>, Vec<f32>), String>,
+        mut tower: impl FnMut(
+            &crate::model::vision_preprocessor::PreprocessedImage,
+        ) -> Result<(Vec<f32>, usize), CeraError>,
+    ) -> Result<(Vec<f32>, usize), CeraError> {
+        use crate::model::vision_preprocessor::PreprocessedLayout;
+        let sf = scale_factor;
+        match layout {
+            PreprocessedLayout::Single(pre) => {
+                self.ensure_rows_fit(reserved.saturating_add(image_row_estimate(pre, sf)))?;
+                tower(pre)
+            }
+            PreprocessedLayout::Tiled(t) => {
+                let (tile_markers, thumb_marker) = match markers(t.cols, t.rows) {
+                    Ok(m) => m,
+                    Err(why) => {
+                        tracing::warn!(
+                            "large image needs {} tiles but their markers are unavailable ({why}); \
+                             encoding the thumbnail only",
+                            t.tiles.len()
+                        );
+                        self.ensure_rows_fit(
+                            reserved.saturating_add(image_row_estimate(&t.thumbnail, sf)),
+                        )?;
+                        return tower(&t.thumbnail);
+                    }
+                };
+                let rows = t
+                    .tiles
+                    .iter()
+                    .map(|p| image_row_estimate(p, sf))
+                    .sum::<usize>()
+                    + image_row_estimate(&t.thumbnail, sf)
+                    + tile_markers.len()
+                    + 1;
+                self.ensure_rows_fit(reserved.saturating_add(rows))?;
+                let mut encoded = Vec::with_capacity(t.tiles.len());
+                for tile in &t.tiles {
+                    encoded.push(tower(tile)?);
+                }
+                let thumb = tower(&t.thumbnail)?;
+                Ok(splice_tiled_rows(
+                    &tile_markers,
+                    &encoded,
+                    &thumb_marker,
+                    &thumb,
+                ))
+            }
+        }
+    }
+
+    /// The embedding rows of the `<|img_row_R_col_C|>` marker for each tile of a `cols x rows` grid
+    /// (row-major) and of `<|img_thumbnail|>`, or why they are unavailable: the vocabulary lacks a
+    /// marker or the model cannot hand out token rows.
+    #[cfg(feature = "vl-preprocess")]
+    fn tile_marker_rows(
+        &self,
+        cols: usize,
+        rows: usize,
+    ) -> Result<(Vec<Vec<f32>>, Vec<f32>), String> {
+        // Resolved the way `<image>` is: encode the marker text and require exactly one token, which
+        // also parses it as the special token it is.
+        let single = |text: String| -> Result<u32, String> {
+            let ids = self.tokenizer.encode(&text);
+            match ids[..] {
+                [id] => Ok(id),
+                _ => Err(format!("`{text}` is {} tokens, not one", ids.len())),
+            }
+        };
+        let ids = tile_marker_texts(cols, rows)
+            .into_iter()
+            .map(single)
+            .collect::<Result<Vec<u32>, String>>()?;
+        let hidden = self.model.config().hidden_size;
+        let all = self
+            .model
+            .embed_image_marker_rows(&ids)
+            .ok_or_else(|| "the model cannot hand out token embedding rows".to_string())?;
+        if all.len() != ids.len() * hidden {
+            return Err(format!(
+                "embedding rows are {} floats, expected {}",
+                all.len(),
+                ids.len() * hidden
+            ));
+        }
+        let mut chunks: Vec<Vec<f32>> = all.chunks_exact(hidden).map(<[f32]>::to_vec).collect();
+        let thumb = chunks.pop().ok_or_else(|| "no marker rows".to_string())?;
+        Ok((chunks, thumb))
     }
 
     /// Run the vision tower and projector over a preprocessed image: `n_tokens`
@@ -2559,6 +2757,32 @@ impl Session {
             t.image_tokens += n_tokens;
         });
         Ok((img_tokens, n_tokens))
+    }
+
+    /// Whether `n_tokens` more positions can be appended: they fit in the context, or an `n_keep`
+    /// context shift makes room. Non-mutating, and the decision `append_tokens` and `append_embeddings`
+    /// act on, so a caller can learn that rows will be refused before it spends time producing them.
+    fn ensure_rows_fit(&self, n_tokens: usize) -> Result<(), CeraError> {
+        let new_end = self
+            .current_pos
+            .checked_add(n_tokens)
+            .ok_or(CeraError::Backend("position overflow".into()))?;
+        if new_end > self.max_seq_len {
+            let shift_needed = new_end - self.max_seq_len;
+            if !can_shift(
+                self.model.supports_kv_shift(),
+                self.config.n_keep as usize,
+                self.state.is_compressed(),
+                self.current_pos,
+                shift_needed,
+            ) {
+                return Err(CeraError::ContextOverflow {
+                    max_seq_len: self.max_seq_len as u32,
+                    by: shift_needed as u32,
+                });
+            }
+        }
+        Ok(())
     }
 
     /// Prefill already-encoded image rows into the context.
@@ -2680,9 +2904,17 @@ impl Session {
             && self.model.supports_embedding_input()
             && self.model.embed_token_rows(&[img_start]).is_some();
         if fused {
+            // Rows already committed to this one prefill: the prompt's text (each `<image>` marker is
+            // replaced by `<|image_start|>`, the image's rows and `<|image_end|>`) plus the images
+            // encoded before this one. Each image is budgeted against that before its own tower pass,
+            // so an image that fits alone but not after the earlier ones is refused without running
+            // the tower for it (earlier images have already been encoded).
+            let mut reserved = tokens.len().saturating_sub(images.len());
             let mut encoded = Vec::with_capacity(images.len());
             for image in images {
-                encoded.push(self.encode_image_rows(image, self.image_max_long_size)?);
+                let rows = self.encode_image_rows(image, self.image_max_long_size, reserved + 2)?;
+                reserved += rows.1 + 2;
+                encoded.push(rows);
             }
             let model = Arc::clone(&self.model);
             if let Some(chat) =
@@ -4109,12 +4341,85 @@ mod tests {
         }
     }
 
+    /// A preprocessed image yields its patch grid merged `scale_factor` per axis, which is what the
+    /// context-fit check is made against before the tower runs.
+    #[cfg(feature = "vl-preprocess")]
+    #[test]
+    fn image_row_estimate_follows_the_merged_patch_grid() {
+        use crate::model::vision_preprocessor::PreprocessedImage;
+        let img = |gw, gh| PreprocessedImage {
+            pixels: Vec::new(),
+            target_w: gw * 16,
+            target_h: gh * 16,
+            grid_w: gw,
+            grid_h: gh,
+        };
+        assert_eq!(image_row_estimate(&img(32, 32), 2), 256);
+        assert_eq!(image_row_estimate(&img(36, 26), 2), 18 * 13);
+        assert_eq!(
+            image_row_estimate(&img(4, 4), 0),
+            16,
+            "a zero factor is treated as 1"
+        );
+    }
+
+    /// The marker tokens of a tiled image are numbered row-major (rows outermost, columns within a
+    /// row) with the thumbnail last, which is the order the tiles are encoded and spliced in. A
+    /// transposed index or a dropped thumbnail marker still produces a plausible prompt, so the
+    /// order is pinned here.
+    #[cfg(feature = "vl-preprocess")]
+    #[test]
+    fn tile_marker_texts_follow_the_reference_order() {
+        assert_eq!(
+            tile_marker_texts(3, 2),
+            [
+                "<|img_row_1_col_1|>",
+                "<|img_row_1_col_2|>",
+                "<|img_row_1_col_3|>",
+                "<|img_row_2_col_1|>",
+                "<|img_row_2_col_2|>",
+                "<|img_row_2_col_3|>",
+                "<|img_thumbnail|>",
+            ]
+        );
+        // 2 columns x 3 rows: the third marker is the first of row 2, not column 3 of row 1.
+        assert_eq!(tile_marker_texts(2, 3)[2], "<|img_row_2_col_1|>");
+        assert_eq!(tile_marker_texts(2, 3).len(), 7);
+    }
+
+    /// Each tile is preceded by its own marker row, the thumbnail by its marker, and the row count
+    /// includes the markers.
+    #[cfg(feature = "vl-preprocess")]
+    #[test]
+    fn tiled_rows_interleave_markers_tiles_and_thumbnail() {
+        // Hidden size 2: marker rows are m0, m1, and the thumbnail marker.
+        let markers = vec![vec![1.0, 1.0], vec![2.0, 2.0]];
+        let tiles = vec![(vec![10.0, 10.0, 11.0, 11.0], 2), (vec![20.0, 20.0], 1)];
+        let thumb_marker = [9.0, 9.0];
+        let thumb = (vec![30.0, 30.0], 1);
+        let (rows, n) = splice_tiled_rows(&markers, &tiles, &thumb_marker, &thumb);
+        assert_eq!(n, 7, "3 marker rows + 2 + 1 tile rows + 1 thumbnail row");
+        assert_eq!(
+            rows,
+            [
+                1.0, 1.0, 10.0, 10.0, 11.0, 11.0, // marker 0, tile 0 (2 rows)
+                2.0, 2.0, 20.0, 20.0, // marker 1, tile 1 (1 row)
+                9.0, 9.0, 30.0, 30.0, // thumbnail marker, thumbnail
+            ]
+        );
+        assert_eq!(rows.len(), n * 2);
+    }
+
     #[test]
     fn session_config_default_is_sane() {
         let c = SessionConfig::default();
         assert_eq!(c.n_keep, 0);
         assert_eq!(c.ubatch_size, 512);
-        assert!(matches!(c.kv_compression, KvCompression::None));
+        if cfg!(target_arch = "wasm32") {
+            assert!(matches!(c.kv_compression, KvCompression::None));
+        } else {
+            assert!(matches!(c.kv_compression, KvCompression::F16));
+        }
     }
 
     /// A non-shiftable KV cache (TurboQuant) must block the shift so the

@@ -141,6 +141,33 @@ required-features = ["mmap", "parallel"]
 name = "audio_encoder_bench"
 required-features = ["mmap", "parallel"]
 
+# The GPU vision tower on a real image: wall time and distance from the CPU encoder.
+[[example]]
+name = "vit_gpu_probe"
+required-features = ["gpu", "mmap", "vl-preprocess"]
+
+# The Q4_0 decode GEMV, standard layout against the decode repack (aarch64).
+[[example]]
+name = "q4_0_gemv_bench"
+
+# What one decode-pool fork-join costs (device only).
+[[example]]
+name = "pool_dispatch_bench"
+
+# The Q6_K lm_head GEMV on its own: GB/s of the decode output projection.
+[[example]]
+name = "q6k_gemv_bench"
+
+# Per-chunk vision embeddings, in llama.cpp mtmd's debug format, for parity checks.
+[[example]]
+name = "vit_tile_probe"
+required-features = ["mmap", "vl-preprocess"]
+
+# The CPU vision tower on a real image: speed and int8-vs-f32 error.
+[[example]]
+name = "vit_cpu_probe"
+required-features = ["mmap", "vl-preprocess"]
+
 # The NPU ViT against the CPU one at several image sizes (device only).
 [[example]]
 name = "hexagon_vit_probe"

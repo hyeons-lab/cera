@@ -1059,6 +1059,11 @@ export class Session {
      * - `0`: force *no* cap for this call, overriding a session default.
      * - `n`: cap at `n` pixels.
      *
+     * With no cap, a large image is tiled the way the LFM2-VL reference does: up to 10 tiles of
+     * 256 tokens plus a thumbnail (about 1,800 tokens for a 4:3 photo, up to about 2,800 for a
+     * panorama), with one vision-tower pass per tile. Set `maxLongSize` to keep one tile. The
+     * `WebGpuSession` does not tile (see its `appendImage`).
+     *
      * Requires a VL bundle (`capabilities.imageIn === true`), which means
      * loading via `CeraEngine.fromGgufParts` with the vision mmproj.
      * Otherwise this throws `"modality not supported by this model"`.
@@ -1619,6 +1624,9 @@ export class WebGpuSession {
      *
      * `maxLongSize` follows the CPU session: `null` uses the session
      * default, `0` forces no cap for this call, `n` caps at `n` pixels.
+     *
+     * Unlike the CPU session, a large image is never tiled here: it is always one image (about
+     * 64 to 256 tokens), so the same photo costs fewer tokens on this session type.
      *
      * Ordering is the caller's to manage, as with `generateTokens`:
      * append the image where the chat template puts its `<image>` marker,
@@ -2271,11 +2279,11 @@ export interface InitOutput {
     readonly turnresult_tokensGenerated: (a: number) => number;
     readonly session_intoChat: (a: number, b: number) => void;
     readonly sessionconfig_set_seed: (a: number, b: number, c: bigint) => void;
-    readonly __wasm_bindgen_func_elem_7733: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6560: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6560_2: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6560_3: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_7748: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_7827: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6654: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6654_2: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6654_3: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_7842: (a: number, b: number, c: number, d: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

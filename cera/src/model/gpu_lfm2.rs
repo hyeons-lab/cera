@@ -64,11 +64,36 @@ use crate::model::weights::MmapWeight;
 use crate::model::{BlockType, Model, ModelConfig, ScalarMultipliers};
 use crate::tensor::DType;
 
+/// Key splits per head in the split-K decode attention. Must match `SPLITS` in
+/// `flash_attention_split.wgsl` and `flash_attention_merge.wgsl`.
+const ATTN_SPLITS: u32 = 16;
+/// Floats per (head, split) partial record: max, sum and 64 accumulator dims. Must match `REC` in the
+/// same two shaders.
+const ATTN_PART_REC: usize = 66;
+
 /// Maximum N for a single batched-prefill dispatch. Mirrors the Metal
 /// backend's `MAX_PREFILL_TOKENS = 2048`. Prompts longer than this are
 /// chunked at the host side; each chunk shares the same prefill batch
 /// scratch, so the worst-case scratch footprint is bounded.
 const MAX_PREFILL_TOKENS: usize = 2048;
+
+/// What a batched prefill chunk starts from: token ids (gathered from the embedding table, with the
+/// model's embedding multiplier) or hidden-size embedding rows supplied by the caller (an image's
+/// projected patches, which have no token id and take no multiplier, as in the per-token seeded path).
+#[derive(Clone, Copy)]
+enum PrefillInput<'a> {
+    Tokens(&'a [u32]),
+    Embeddings { rows: &'a [f32], n: usize },
+}
+
+impl PrefillInput<'_> {
+    fn len(&self) -> usize {
+        match self {
+            PrefillInput::Tokens(t) => t.len(),
+            PrefillInput::Embeddings { n, .. } => *n,
+        }
+    }
+}
 
 /// Maximum token batch size for full-vocabulary all-logits speculative verification.
 const MAX_ALL_LOGITS_TOKENS: usize = 64;
@@ -252,6 +277,23 @@ fn use_stream_layout(ctx: &GpuContext) -> bool {
 fn stream_layout_eligible(dtype: DType, k: usize) -> bool {
     (dtype == DType::Q4_0 && k.is_multiple_of(32))
         || (dtype == DType::Q4KM && k.is_multiple_of(256))
+}
+
+/// Smallest batch routed to the streaming Q4_0 GEMM (`CERA_WGPU_STREAM_MIN_N`, default 1: every batch).
+///
+/// The streaming kernel pads `n` up to a multiple of 32 columns internally, and this used to send
+/// `n < 32` to the generic register-tile kernel on the grounds that the idle columns were waste. On
+/// Adreno 830 that kernel costs about 167 ms per forward at `n = 1` to 12 (92 matmuls at about 1.8 ms
+/// each, roughly 1 GB/s of weight traffic), against about 30 ms for the streaming one, so every short
+/// prompt paid for it: an 18-token VL text prompt took 735 ms in three calls, and a 15-token text
+/// prompt prefilled at 62 tok/s against 170. The padded columns are free because the kernel is bound
+/// by streaming the weights, not by arithmetic.
+fn stream_gemm_min_n() -> u32 {
+    static MIN_N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    *MIN_N.get_or_init(|| {
+        crate::backend::cpu_features::env_usize("CERA_WGPU_STREAM_MIN_N")
+            .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX))
+    })
 }
 
 /// Whether the k-slice-64 streaming GEMM twin is enabled: on by default
@@ -1052,6 +1094,9 @@ struct GpuLayerWeights {
     silu_bg: Option<wgpu::BindGroup>,
     ffn_swiglu_bg: Option<wgpu::BindGroup>,
     attn_bg: Option<wgpu::BindGroup>,
+    /// The split-K attention's group for this layer's KV slabs (`None` where `attn_bg` is, or when the
+    /// split kernel is off).
+    attn_split_bg: Option<wgpu::BindGroup>,
     /// `kv_append` groups (src k/v scratch -> cache slab at the per-token
     /// offset in `kv_append_params`). `None` on conv layers and under
     /// hs_scratch (built inline there, like `attn_bg`).
@@ -1420,6 +1465,9 @@ struct GpuPipelines {
     /// scratch (the memcpy halves use `copy_buffer_to_buffer`). See `shift_kv`.
     kv_shift: wgpu::ComputePipeline,
     flash_attention: wgpu::ComputePipeline,
+    /// Split-K decode attention and its merge (see `flash_attention_split.wgsl`).
+    flash_attention_split: wgpu::ComputePipeline,
+    flash_attention_merge: wgpu::ComputePipeline,
     conv1d_fused: wgpu::ComputePipeline,
     argmax_f32: wgpu::ComputePipeline,
     // ── Batched-prefill pipelines ─────────────────────────────────────
@@ -1744,6 +1792,12 @@ pub struct GpuLfmModel {
     // `shaders/slang/rope.slang`'s wgsl branch.
     rope_params: wgpu::Buffer,
     attn_params: wgpu::Buffer, // [n_heads, n_kv_heads, head_dim, kv_dim, seq_len, scale, 0, 0] — updated per token
+    /// Partial softmax state of the split-K attention: `[n_heads][ATTN_SPLITS][ATTN_PART_REC]` f32.
+    attn_part: wgpu::Buffer,
+    /// Whether decode attention runs the split-K kernels (`head_dim == 64`, not `CERA_GPU_ATTN_SPLIT=0`).
+    attn_split: bool,
+    /// The merge kernel's group (`attn_part` + `attn_out_buf` + `attn_params`), built with the layers'.
+    attn_merge_bg: Option<wgpu::BindGroup>,
     kv_append_params: wgpu::Buffer, // [dst_off_words, n_floats, 0, 0] — updated per token
     gemv_tile_params: Vec<wgpu::Buffer>, // [rows, k, row_base, 0] per output-projection tile
     // Conv scratch
@@ -1837,6 +1891,10 @@ pub struct GpuLfmModel {
     /// on drop so a leaked `Some` can't send a later base-model forward through
     /// the adapter.
     active_lora: Mutex<Option<Arc<WgpuLoraAdapter>>>,
+    /// The next decode token's command buffer, finished ahead of time (see `encode_decode_step`).
+    /// Building one costs about 1.6 ms of host time, during which the GPU would otherwise sit idle;
+    /// it is built while the previous token executes instead.
+    prebuilt_decode: Mutex<Option<(PrebuiltKey, wgpu::CommandBuffer)>>,
     /// Rank-width f32 scratch for the LoRA `tmp = A·x` intermediate. Sized to
     /// `MAX_LORA_RANK` so any accepted adapter fits without reallocation.
     lora_tmp: wgpu::Buffer,
@@ -1865,8 +1923,8 @@ pub struct GpuLfmModel {
     /// weights/scratch never move, and the pooled params buffers are handed
     /// out in deterministic call order after the per-prefill cursor reset —
     /// so only the *contents* need refreshing (which `next_prefill_params`
-    /// still does on every call). Keyed by `n` because n < 32 routes to
-    /// reg-tile and shifts the pool layout, and by `all_logits` because it
+    /// still does on every call). Keyed by `n` because a small n can route to
+    /// reg-tile (`CERA_WGPU_STREAM_MIN_N`) and shifts the pool layout, and by `all_logits` because it
     /// swaps the lm-head output buffer; `start_pos` never appears in these
     /// bind groups. Single entry: chunked prefills reuse one `n` for every
     /// full chunk. Locked under `infer_lock`.
@@ -1929,6 +1987,26 @@ enum DecodeTail {
     HiddenUnsubmitted,
     /// Output norm and logits/argmax, returning the unsubmitted command encoder.
     LogitsUnsubmitted(TailArgmax),
+}
+
+/// What a pre-built decode command buffer was recorded for. The commands are the same from token to
+/// token, so the only things that make one stale are the tail it ends in, whether the compressed KV
+/// cache exists (it changes the attention dispatches), and whether the step is routed to the scratch
+/// KV and conv buffers that `hidden_states` uses (`use_hs_scratch`): those are different buffers, so
+/// a command buffer recorded for one routing and submitted under the other reads and writes the
+/// wrong caches.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct PrebuiltKey {
+    argmax: TailArgmax,
+    tq: bool,
+    hs: bool,
+}
+
+/// Whether decode builds the next token's command buffer while the current one executes
+/// (`CERA_GPU_PREBUILD=0` turns it off).
+fn prebuild_enabled() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| !crate::backend::cpu_features::env_disabled("CERA_GPU_PREBUILD"))
 }
 
 impl GpuLfmModel {
@@ -2233,6 +2311,16 @@ impl GpuLfmModel {
                 shaders::FLASH_ATTENTION,
                 "flash_attention",
                 "flash_attention",
+            ),
+            flash_attention_split: ctx.create_pipeline(
+                shaders::FLASH_ATTENTION_SPLIT,
+                "flash_attention_split",
+                "flash_attention_split",
+            ),
+            flash_attention_merge: ctx.create_pipeline(
+                shaders::FLASH_ATTENTION_MERGE,
+                "flash_attention_merge",
+                "flash_attention_merge",
             ),
             conv1d_fused: ctx.create_pipeline(
                 shaders::CONV1D_FUSED,
@@ -2827,6 +2915,7 @@ impl GpuLfmModel {
                 silu_bg: None,
                 ffn_swiglu_bg: None,
                 attn_bg: None,
+                attn_split_bg: None,
                 k_append_bg: None,
                 v_append_bg: None,
                 qn_bg: None,
@@ -2976,6 +3065,13 @@ impl GpuLfmModel {
             None => ctx.upload_f32(&[1.0f32], "rope_freqs_dummy"),
         };
         let attn_params = ctx.create_storage_rw(8 * 4, "attn_params");
+        let attn_split = head_dim == 64
+            && config.n_heads.is_multiple_of(config.n_kv_heads.max(1))
+            && !crate::backend::cpu_features::env_disabled("CERA_GPU_ATTN_SPLIT");
+        let attn_part = ctx.create_storage_rw(
+            (config.n_heads * ATTN_SPLITS as usize * ATTN_PART_REC * 4) as u64,
+            "attn_part",
+        );
         let kv_append_params = ctx.create_storage_rw(4 * 4, "kv_append_params");
         // Row-tile params for `encode_gemv_f16_tiled`, which only the f16 LM head
         // can reach — the quantized variant binds its weight entire or is not
@@ -3091,6 +3187,9 @@ impl GpuLfmModel {
             per_head_norm_params,
             rope_params,
             attn_params,
+            attn_part,
+            attn_split,
+            attn_merge_bg: None,
             kv_append_params,
             gemv_tile_params,
             conv_proj_buf,
@@ -3114,6 +3213,7 @@ impl GpuLfmModel {
             model_id,
             lora_lru: Mutex::new(Vec::new()),
             active_lora: Mutex::new(None),
+            prebuilt_decode: Mutex::new(None),
             lora_tmp,
             lora_tmp_batched,
             lora_params_pool: Mutex::new((Vec::new(), 0)),
@@ -3456,6 +3556,98 @@ impl GpuLfmModel {
         if let Some(t) = Self::lora_target(lora, layer, target) {
             self.encode_lora_batched(cmds, t, input, output, n);
         }
+    }
+
+    /// The hidden-size rows a prefill stages for `tokens`: a table lookup (dequantized on the fly from
+    /// the mmap'd embedding table), then the model's embedding multiplier. The one definition shared by
+    /// the batched token prefill and `embed_token_rows`, which must stay identical for a prefill seeded
+    /// from those rows to be the token prefill. `None` when a token id is outside the vocabulary.
+    fn embedding_rows(&self, tokens: &[u32]) -> Option<Vec<f32>> {
+        let hs = self.config.hidden_size;
+        if tokens
+            .iter()
+            .any(|&t| (t as usize) >= self.config.vocab_size)
+        {
+            return None;
+        }
+        let emb_scale = self.scalars.embedding;
+        let mut rows = vec![0.0f32; tokens.len() * hs];
+        for (i, &t) in tokens.iter().enumerate() {
+            let row = &mut rows[i * hs..(i + 1) * hs];
+            self.gpu_state.embedding.dequantize_row(t as usize, row);
+            if emb_scale != 1.0 {
+                for v in row.iter_mut() {
+                    *v *= emb_scale;
+                }
+            }
+        }
+        Some(rows)
+    }
+
+    /// The split-K attention's bind group over one layer's KV slabs.
+    fn make_attn_split_bg(
+        &self,
+        k_cache: &wgpu::Buffer,
+        v_cache: &wgpu::Buffer,
+    ) -> wgpu::BindGroup {
+        self.ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("flash_attention_split"),
+                layout: &self
+                    .pipelines
+                    .flash_attention_split
+                    .get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.q_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: k_cache.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: v_cache.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: self.attn_part.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: self.attn_params.as_entire_binding(),
+                    },
+                ],
+            })
+    }
+
+    /// The merge kernel's bind group (it reads `attn_part`, writes `attn_out_buf`).
+    fn make_attn_merge_bg(&self) -> wgpu::BindGroup {
+        self.ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some("flash_attention_merge"),
+                layout: &self
+                    .pipelines
+                    .flash_attention_merge
+                    .get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.attn_part.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.attn_out_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: self.attn_params.as_entire_binding(),
+                    },
+                ],
+            })
     }
 
     /// Create a `kv_append` bind group: src scratch row -> cache slab, slot
@@ -3982,6 +4174,13 @@ impl GpuLfmModel {
                         });
                     let k_bg = self.make_kv_append_bg(&self.k_buf, k_cache);
                     let v_bg = self.make_kv_append_bg(&self.v_buf, v_cache);
+                    if self.attn_split {
+                        let split_bg = self.make_attn_split_bg(k_cache, v_cache);
+                        self.layers[i].attn_split_bg = Some(split_bg);
+                        if self.attn_merge_bg.is_none() {
+                            self.attn_merge_bg = Some(self.make_attn_merge_bg());
+                        }
+                    }
                     self.layers[i].attn_bg = Some(attn_bg);
                     self.layers[i].k_append_bg = Some(k_bg);
                     self.layers[i].v_append_bg = Some(v_bg);
@@ -4257,6 +4456,39 @@ impl GpuLfmModel {
             }
             i = j;
         }
+    }
+
+    /// The key for a decode step recorded now: the tail, what `encode_decode_step` will use for the
+    /// compressed cache (`tq_cache`, which is `None` under `hs`, not the field), and the scratch
+    /// routing.
+    fn prebuilt_key(&self, argmax: TailArgmax) -> PrebuiltKey {
+        PrebuiltKey {
+            argmax,
+            tq: self.tq_cache().is_some(),
+            hs: self.use_hs_scratch.load(Ordering::Relaxed),
+        }
+    }
+
+    /// The pre-built command buffer for `key`, if one is waiting. A buffer built for another key is
+    /// dropped, never submitted.
+    fn take_prebuilt(&self, key: PrebuiltKey) -> Option<wgpu::CommandBuffer> {
+        let stored = self
+            .prebuilt_decode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take();
+        stored.and_then(|(k, cmd)| (k == key).then_some(cmd))
+    }
+
+    fn store_prebuilt(&self, key: PrebuiltKey, cmd: wgpu::CommandBuffer) {
+        *self
+            .prebuilt_decode
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some((key, cmd));
+    }
+
+    fn submit_command_buffer(&self, cmd: wgpu::CommandBuffer) {
+        self.ctx.submit_command_buffer(cmd);
     }
 
     /// Submit encoder and wait for GPU to finish.
@@ -5405,7 +5637,7 @@ impl GpuLfmModel {
     ) {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _lora_guard = self.resolve_lora(state);
-        self.seed_embeddings_locked(embeddings, n_tokens, start_pos, state);
+        self.seed_embeddings_locked(embeddings, n_tokens, start_pos, state, false);
     }
 
     /// [`Self::seed_embeddings`] with `infer_lock` and the LoRA guard already
@@ -5417,7 +5649,8 @@ impl GpuLfmModel {
         n_tokens: usize,
         start_pos: usize,
         state: &mut InferenceState,
-    ) {
+        download_logits: bool,
+    ) -> Vec<f32> {
         let hidden_size = self.config.hidden_size;
         assert!(n_tokens > 0, "seed_embeddings requires at least one frame");
         assert_eq!(
@@ -5438,6 +5671,12 @@ impl GpuLfmModel {
             self.zero_conv_buffers_locked();
         }
 
+        if let Some(logits) =
+            self.prefill_embeddings_batched_locked(embeddings, n_tokens, state, download_logits)
+        {
+            return logits;
+        }
+
         for i in 0..n_tokens {
             let frame = &embeddings[i * hidden_size..(i + 1) * hidden_size];
             // `state.seq_len`, not `start_pos + i`: the compute tail advances it
@@ -5445,6 +5684,12 @@ impl GpuLfmModel {
             // keeps a spliced image landing where the caller's state says.
             let pos = state.seq_len;
             self.forward_inner_compute_from_embedding(frame, pos, state);
+        }
+        if download_logits {
+            self.ctx
+                .download_f32(&self.logits_buf, self.config.vocab_size)
+        } else {
+            Vec::new()
         }
     }
 
@@ -5483,7 +5728,6 @@ impl GpuLfmModel {
     ) -> Option<wgpu::CommandEncoder> {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
-        let hs32 = hs as u32;
         let t_entry = crate::time::Instant::now();
 
         self.ctx.reset_profiler();
@@ -5638,6 +5882,15 @@ impl GpuLfmModel {
         // passes finish no slower than 31), so the second submit's fixed
         // cost eats the overlap saving now that encode is lean (cached bind
         // groups). One submit stands; do not re-split without re-measuring.
+        //
+        // NOTE (pre-build): the cost that split paid twice is `CommandEncoder::finish`, which is
+        // host work (about 1.6 ms per token on Adreno 830, against about 0.3 ms to record) that
+        // keeps the GPU idle at the start of every token. Nothing recorded depends on the position
+        // (it reaches the shaders through the params written above), so the next token's command
+        // buffer is finished while this one executes and submitted as soon as its input is
+        // known: one submit per token still, with the build hidden behind the GPU. Greedy decode
+        // on an Adreno 830, LFM2.5-VL-450M with an image: about 140 to 170 tok/s.
+        // `CERA_GPU_PREBUILD=0` turns it off.
         let host_prof_pre = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
         let t_pre = crate::time::Instant::now();
         if host_prof_pre {
@@ -5646,6 +5899,77 @@ impl GpuLfmModel {
                 t_pre.duration_since(t_entry).as_secs_f64() * 1e6,
             );
         }
+        // The next token's command buffer is built while this one executes (see `PrebuiltKey` and `prebuilt_decode`),
+        // so `finish` (about 1.6 ms of host time on Adreno 830) is off the critical path. Plain
+        // greedy / full-logits decode only: LoRA and profiling record different commands.
+        if let DecodeTail::Logits(argmax) = tail
+            && matches!(argmax, TailArgmax::None | TailArgmax::DispatchAndStage)
+            && lora.is_none()
+            && !self.ctx.profiling()
+            && prebuild_enabled()
+        {
+            let key = self.prebuilt_key(argmax);
+            let cmd = self
+                .take_prebuilt(key)
+                .unwrap_or_else(|| self.encode_decode_step(&lora, tail).finish());
+            self.submit_command_buffer(cmd);
+            self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
+            state.seq_len += 1;
+            let next = self.encode_decode_step(&lora, tail).finish();
+            self.store_prebuilt(key, next);
+            self.ctx.device.poll_wait();
+            return None;
+        }
+
+        let enc = self.encode_decode_step(&lora, tail);
+        match tail {
+            DecodeTail::Hidden => {
+                self.submit_and_wait(enc);
+                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
+                state.seq_len += 1;
+                self.ctx.finish_profiler();
+                None
+            }
+            DecodeTail::HiddenUnsubmitted => {
+                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
+                state.seq_len += 1;
+                self.ctx.finish_profiler();
+                Some(enc)
+            }
+            DecodeTail::Logits(_) | DecodeTail::LogitsUnsubmitted(_) => {
+                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
+                state.seq_len += 1;
+                self.ctx.finish_profiler();
+                if matches!(tail, DecodeTail::LogitsUnsubmitted(_)) {
+                    Some(enc)
+                } else {
+                    self.submit_and_wait(enc);
+                    None
+                }
+            }
+        }
+    }
+
+    /// Record one decode step (every layer plus the tail) into a fresh encoder. A pure function of the
+    /// model's static buffers and bind groups: nothing recorded depends on the position or sequence
+    /// length (those reach the shaders through the params buffers written by the caller), so the
+    /// result stays valid from token to token and can be built ahead of time.
+    fn encode_decode_step(
+        &self,
+        lora: &Option<Arc<WgpuLoraAdapter>>,
+        tail: DecodeTail,
+    ) -> wgpu::CommandEncoder {
+        let cfg = &self.config;
+        let hs32 = cfg.hidden_size as u32;
+        let head_dim = cfg.head_dim as u32;
+        let n_heads = cfg.n_heads as u32;
+        let n_kv_heads = cfg
+            .kv_heads_per_layer
+            .iter()
+            .copied()
+            .find(|&h| h > 0)
+            .unwrap_or(cfg.n_kv_heads) as u32;
+        let kv_dim = n_kv_heads * head_dim;
         let mut enc = self.new_encoder();
         for i in 0..cfg.n_layers {
             let lw = &self.layers[i];
@@ -5739,12 +6063,12 @@ impl GpuLfmModel {
                     // FFN — same pass (dense and MoE both), except on profile
                     // runs, where it gets its own pass below.
                     if !profiling {
-                        self.encode_ffn_decode_into(&mut pass, lw, &lora, i, hs32);
+                        self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
                     }
                 }
                 if profiling {
                     let mut pass = self.ctx.begin_pass(&mut enc, "conv_ffn");
-                    self.encode_ffn_decode_into(&mut pass, lw, &lora, i, hs32);
+                    self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
                 }
             } else {
                 // Attention block — one `layer_attn` pass (uncompressed KV),
@@ -5881,12 +6205,12 @@ impl GpuLfmModel {
                             hs32,
                         );
                         if !profiling {
-                            self.encode_ffn_decode_into(&mut pass, lw, &lora, i, hs32);
+                            self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
                         }
                     }
                     if profiling {
                         let mut pass = self.ctx.begin_pass(&mut enc, "attn_post_ffn");
-                        self.encode_ffn_decode_into(&mut pass, lw, &lora, i, hs32);
+                        self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
                     }
                 } else {
                     // Whole attn layer in ONE pass: the KV cache write is a
@@ -5967,12 +6291,45 @@ impl GpuLfmModel {
                             v_app_bg,
                             append_grid,
                         );
-                        self.dispatch_into(
-                            &mut pass,
-                            &self.pipelines.flash_attention,
-                            flash_bg,
-                            (n_heads, 1, 1),
-                        );
+                        if self.attn_split {
+                            // Split-K: `ATTN_SPLITS` workgroups per head over the keys, then a merge.
+                            // The grid is fixed; the sequence length is read from `attn_params`.
+                            let split_bg_tmp;
+                            let split_bg = if self.use_hs_scratch.load(Ordering::Relaxed) {
+                                let (k_buf, v_buf) = self.active_kv(i);
+                                split_bg_tmp = self.make_attn_split_bg(k_buf, v_buf);
+                                &split_bg_tmp
+                            } else {
+                                lw.attn_split_bg.as_ref().unwrap()
+                            };
+                            let merge_bg_tmp;
+                            let merge_bg = match self.attn_merge_bg.as_ref() {
+                                Some(bg) => bg,
+                                None => {
+                                    merge_bg_tmp = self.make_attn_merge_bg();
+                                    &merge_bg_tmp
+                                }
+                            };
+                            self.dispatch_into(
+                                &mut pass,
+                                &self.pipelines.flash_attention_split,
+                                split_bg,
+                                (n_heads, ATTN_SPLITS, 1),
+                            );
+                            self.dispatch_into(
+                                &mut pass,
+                                &self.pipelines.flash_attention_merge,
+                                merge_bg,
+                                (n_heads, 1, 1),
+                            );
+                        } else {
+                            self.dispatch_into(
+                                &mut pass,
+                                &self.pipelines.flash_attention,
+                                flash_bg,
+                                (n_heads, 1, 1),
+                            );
+                        }
                         self.encode_attn_out_into(
                             &mut pass,
                             out_w,
@@ -5982,12 +6339,12 @@ impl GpuLfmModel {
                             hs32,
                         );
                         if !profiling {
-                            self.encode_ffn_decode_into(&mut pass, lw, &lora, i, hs32);
+                            self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
                         }
                     }
                     if profiling {
                         let mut pass = self.ctx.begin_pass(&mut enc, "attn_ffn");
-                        self.encode_ffn_decode_into(&mut pass, lw, &lora, i, hs32);
+                        self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
                     }
                 }
             }
@@ -6030,89 +6387,60 @@ impl GpuLfmModel {
                 cfg.rms_norm_eps,
             );
         }
-        match tail {
-            DecodeTail::Hidden => {
-                self.submit_and_wait(enc);
-                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
-                state.seq_len += 1;
-                self.ctx.finish_profiler();
-                None
+        if let DecodeTail::Logits(argmax) | DecodeTail::LogitsUnsubmitted(argmax) = tail {
+            // Granite divides the logits by `logits_scaling` (identity
+            // elsewhere). Bind group built before the pass opens.
+            let scale_bg = self
+                .logit_scale_params
+                .as_ref()
+                .map(|params| self.logit_scale_bg(params));
+            let profiling = self.ctx.profiling();
+            {
+                let mut pass = self
+                    .ctx
+                    .begin_pass(&mut enc, if profiling { "tail_norm" } else { "tail" });
+                self.encode_rmsnorm_into(&mut pass, &self.hidden_buf, &self.output_norm);
+                if !profiling {
+                    self.encode_lm_head_into(&mut pass, &self.hidden_buf, &self.logits_buf);
+                    if let Some(scale_bg) = scale_bg.as_ref() {
+                        self.dispatch_into(
+                            &mut pass,
+                            &self.pipelines.scale_f32,
+                            scale_bg,
+                            ((cfg.vocab_size as u32).div_ceil(256), 1, 1),
+                        );
+                    }
+                    if argmax != TailArgmax::None {
+                        self.encode_argmax_into(&mut pass);
+                    }
+                }
             }
-            DecodeTail::HiddenUnsubmitted => {
-                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
-                state.seq_len += 1;
-                self.ctx.finish_profiler();
-                Some(enc)
-            }
-            DecodeTail::Logits(argmax) | DecodeTail::LogitsUnsubmitted(argmax) => {
-                // Granite divides the logits by `logits_scaling` (identity
-                // elsewhere). Bind group built before the pass opens.
-                let scale_bg = self
-                    .logit_scale_params
-                    .as_ref()
-                    .map(|params| self.logit_scale_bg(params));
-                let profiling = self.ctx.profiling();
+            if profiling {
                 {
-                    let mut pass = self
-                        .ctx
-                        .begin_pass(&mut enc, if profiling { "tail_norm" } else { "tail" });
-                    self.encode_rmsnorm_into(&mut pass, &self.hidden_buf, &self.output_norm);
-                    if !profiling {
-                        self.encode_lm_head_into(&mut pass, &self.hidden_buf, &self.logits_buf);
-                        if let Some(scale_bg) = scale_bg.as_ref() {
-                            self.dispatch_into(
-                                &mut pass,
-                                &self.pipelines.scale_f32,
-                                scale_bg,
-                                ((cfg.vocab_size as u32).div_ceil(256), 1, 1),
-                            );
-                        }
-                        if argmax != TailArgmax::None {
-                            self.encode_argmax_into(&mut pass);
-                        }
+                    let mut pass = self.ctx.begin_pass(&mut enc, "tail_lm_head");
+                    self.encode_lm_head_into(&mut pass, &self.hidden_buf, &self.logits_buf);
+                }
+                {
+                    let mut pass = self.ctx.begin_pass(&mut enc, "tail_sample");
+                    if let Some(scale_bg) = scale_bg.as_ref() {
+                        self.dispatch_into(
+                            &mut pass,
+                            &self.pipelines.scale_f32,
+                            scale_bg,
+                            ((cfg.vocab_size as u32).div_ceil(256), 1, 1),
+                        );
+                    }
+                    if argmax != TailArgmax::None {
+                        self.encode_argmax_into(&mut pass);
                     }
                 }
-                if profiling {
-                    {
-                        let mut pass = self.ctx.begin_pass(&mut enc, "tail_lm_head");
-                        self.encode_lm_head_into(&mut pass, &self.hidden_buf, &self.logits_buf);
-                    }
-                    {
-                        let mut pass = self.ctx.begin_pass(&mut enc, "tail_sample");
-                        if let Some(scale_bg) = scale_bg.as_ref() {
-                            self.dispatch_into(
-                                &mut pass,
-                                &self.pipelines.scale_f32,
-                                scale_bg,
-                                ((cfg.vocab_size as u32).div_ceil(256), 1, 1),
-                            );
-                        }
-                        if argmax != TailArgmax::None {
-                            self.encode_argmax_into(&mut pass);
-                        }
-                    }
-                }
-                if argmax == TailArgmax::DispatchAndStage {
-                    // Stage the 4-byte result in this same submission.
-                    enc.copy_buffer_to_buffer(
-                        &self.argmax_out_buf,
-                        0,
-                        &self.argmax_readback_buf,
-                        0,
-                        4,
-                    );
-                }
-                self.gpu_state.seq_len.fetch_add(1, Ordering::Relaxed);
-                state.seq_len += 1;
-                self.ctx.finish_profiler();
-                if matches!(tail, DecodeTail::LogitsUnsubmitted(_)) {
-                    Some(enc)
-                } else {
-                    self.submit_and_wait(enc);
-                    None
-                }
+            }
+            if argmax == TailArgmax::DispatchAndStage {
+                // Stage the 4-byte result in this same submission.
+                enc.copy_buffer_to_buffer(&self.argmax_out_buf, 0, &self.argmax_readback_buf, 0, 4);
             }
         }
+        enc
     }
 
     /// Encode the argmax dispatch into an open pass. Shared by the sync and
@@ -6808,14 +7136,6 @@ impl GpuLfmModel {
         );
     }
 
-    /// Encode batched 2D matmul: y = weight * x.
-    /// Batched prefill supports the five quantized reg-tile dtypes (Q4_0, Q8_0,
-    /// Q4KM, Q5KM, Q6K) plus F32. `upload_weight` stores every other dtype
-    /// (F16/BF16/F32 sources, Q4_1, Q2_K, ...) dequantized to F32, so the F32
-    /// arm is the fallback that keeps any single unsupported-dtype tensor from
-    /// dropping the whole model onto the per-token loop. `x_stride`/`y_stride`
-    /// are measured in f32 elements between consecutive token vectors.
-    #[allow(clippy::too_many_arguments)] // tile geometry + strides; splitting hurts clarity
     /// Streaming fp16 Q4_0 GEMM (`gemm_stream_q4_0`). Same contract as
     /// `encode_mul_mat_reg_tile` for the Q4_0 case: `y[n, m] = x[n, k] @
     /// w[m, k]^T` with token-major strides. Two passes into the same
@@ -6824,8 +7144,9 @@ impl GpuLfmModel {
     /// resident repack (`stream_q`/`stream_d`) plus B16. Grid
     /// `(ceil(m/256), ceil(n/32))` — each fiber covers 1 row x 32 columns
     /// in 256-thread workgroups; columns past `n` idle inside the fiber, so
-    /// callers route n < 32 to the reg-tile kernel instead. Requires packed
+    /// callers may route small n to the reg-tile kernel instead (see `stream_gemm_min_n`). Requires packed
     /// B (`x_stride == k`); strided-B callers stay on reg-tile.
+    #[allow(clippy::too_many_arguments)] // tile geometry + strides; splitting hurts clarity
     fn encode_gemm_stream_q4_0<'a>(
         &'a self,
         cmds: &mut Vec<PrefillCmd<'a>>,
@@ -7126,6 +7447,13 @@ impl GpuLfmModel {
         );
     }
 
+    /// Encode batched 2D matmul: y = weight * x.
+    /// Batched prefill supports the five quantized reg-tile dtypes (Q4_0, Q8_0,
+    /// Q4KM, Q5KM, Q6K) plus F32. `upload_weight` stores every other dtype
+    /// (F16/BF16/F32 sources, Q4_1, Q2_K, ...) dequantized to F32, so the F32
+    /// arm is the fallback that keeps any single unsupported-dtype tensor from
+    /// dropping the whole model onto the per-token loop. `x_stride`/`y_stride`
+    /// are measured in f32 elements between consecutive token vectors.
     #[allow(clippy::too_many_arguments)] // internal prefill plumbing; all 10 load-bearing
     fn encode_mul_mat_reg_tile<'a>(
         &'a self,
@@ -7141,7 +7469,7 @@ impl GpuLfmModel {
     ) {
         // Streaming fp16 fast path:
         // - Q4_K_M: gemm_stream_q4_k handles any n (bounds-checked per column)
-        // - Q4_0: gemm_stream_q4_0 handles n >= 32; n < 32 rides mul_mat_reg_tile_q4_0_stream
+        // - Q4_0: gemm_stream_q4_0 handles every n (padding to 32 columns); the register-tile kernel only below `stream_gemm_min_n()`
         if w.tensor.dtype == DType::Q4KM
             && k.is_multiple_of(32)
             && x_stride == k
@@ -7154,7 +7482,7 @@ impl GpuLfmModel {
             return;
         }
         if w.tensor.dtype == DType::Q4_0
-            && n >= 32
+            && n >= stream_gemm_min_n()
             && k.is_multiple_of(32)
             && x_stride == k
             && self.pipelines.gemm_stream_q4_0.is_some()
@@ -7671,14 +7999,14 @@ impl GpuLfmModel {
     /// reference for the dispatch order + buffer assignment.
     fn encode_prefill_batched_locked(
         &self,
-        tokens: &[u32],
+        input: PrefillInput<'_>,
         start_pos: usize,
         _state: &mut InferenceState,
         all_logits: bool,
         need_logits: bool,
     ) -> wgpu::CommandEncoder {
-        debug_assert!(!tokens.is_empty());
-        let n = tokens.len();
+        let n = input.len();
+        debug_assert!(n > 0);
         // Bounds checks — make a misuse fail deterministically rather
         // than show up later as a wgpu validation error during a buffer
         // copy or as silent out-of-bounds attention reads.
@@ -7733,23 +8061,28 @@ impl GpuLfmModel {
         // mmap'd table and dequantize on the fly (one reusable row buffer,
         // ~µs per token); the embedding multiplier folds in here, input
         // only — the projection copy stays unscaled.
-        let mut staged: Vec<f32> = Vec::with_capacity(n * hs);
-        let mut row = vec![0.0f32; hs];
-        let emb_scale = self.scalars.embedding;
-        for &t in tokens {
-            self.gpu_state
-                .embedding
-                .dequantize_row(t as usize, &mut row);
-            if emb_scale != 1.0 {
-                for v in row.iter_mut() {
-                    *v *= emb_scale;
-                }
+        match input {
+            PrefillInput::Tokens(tokens) => {
+                let staged = self
+                    .embedding_rows(tokens)
+                    .expect("prefill token id outside the vocabulary");
+                self.ctx.queue.write_buffer(
+                    &self.prefill_batch_buf,
+                    0,
+                    bytemuck::cast_slice(&staged),
+                );
             }
-            staged.extend_from_slice(&row);
+            PrefillInput::Embeddings { rows, n: rows_n } => {
+                assert_eq!(
+                    rows.len(),
+                    rows_n * hs,
+                    "prefill embeddings must be n * hidden_size floats"
+                );
+                self.ctx
+                    .queue
+                    .write_buffer(&self.prefill_batch_buf, 0, bytemuck::cast_slice(rows));
+            }
         }
-        self.ctx
-            .queue
-            .write_buffer(&self.prefill_batch_buf, 0, bytemuck::cast_slice(&staged));
 
         // Reset the batched-LoRA params pool cursor — only when an adapter is
         // active (the base path encodes no LoRA dispatches, so it needn't touch
@@ -8464,18 +8797,18 @@ impl GpuLfmModel {
 
     fn forward_prefill_batched_locked(
         &self,
-        tokens: &[u32],
+        input: PrefillInput<'_>,
         start_pos: usize,
         state: &mut InferenceState,
         all_logits: bool,
         need_logits: bool,
     ) -> Vec<f32> {
-        let n = tokens.len();
+        let n = input.len();
         let host_prof = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
         let passes_before = crate::backend::wgpu::io_stats::snapshot().passes;
         let t_enc = crate::time::Instant::now();
         let enc =
-            self.encode_prefill_batched_locked(tokens, start_pos, state, all_logits, need_logits);
+            self.encode_prefill_batched_locked(input, start_pos, state, all_logits, need_logits);
         if host_prof {
             let passes = crate::backend::wgpu::io_stats::snapshot().passes - passes_before;
             eprintln!(
@@ -8500,6 +8833,66 @@ impl GpuLfmModel {
         }
     }
 
+    /// Append `n_tokens` embedding rows (an image's projected patches) through the batched prefill
+    /// kernels, in chunks of at most `min(max_seq_len, MAX_PREFILL_TOKENS)`. Returns `None` when this
+    /// model has no batched path for its weights, so the caller falls back to one frame at a time.
+    ///
+    /// The per-frame fallback is a full decode pass per row (about 7.5 ms each on Adreno 830, so an
+    /// image of 192 patches cost about 1.5 s) and reaches the register-tile GEMM at `n = 1`; a batch
+    /// of at least 32 rows takes the tuned streaming GEMM instead.
+    ///
+    /// Leaves the last row's logits in `logits_buf` (the final chunk runs the output head) and reads
+    /// them back only when `download_logits` is set, which keeps this safe to call on wasm.
+    fn prefill_embeddings_batched_locked(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        state: &mut InferenceState,
+        download_logits: bool,
+    ) -> Option<Vec<f32>> {
+        if !self.batched_prefill || self.unbatchable_matmul_weight().is_some() {
+            return None;
+        }
+        let hs = self.config.hidden_size;
+        let chunk = self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS);
+        let host_prof = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
+        let mut done = 0usize;
+        while done < n_tokens {
+            let end = (done + chunk).min(n_tokens);
+            let is_last = end == n_tokens;
+            let rows = &embeddings[done * hs..end * hs];
+            // `state.seq_len`, as the per-frame path: a spliced image lands where the caller's
+            // state says, whatever `start_pos` was passed in.
+            let pos = state.seq_len;
+            let n = end - done;
+            let t_enc = crate::time::Instant::now();
+            let enc = self.encode_prefill_batched_locked(
+                PrefillInput::Embeddings { rows, n },
+                pos,
+                state,
+                false,
+                is_last,
+            );
+            if host_prof {
+                eprintln!(
+                    "[GPU-HOST] embeddings_encode={:.0}µs n={n}",
+                    t_enc.elapsed().as_secs_f64() * 1e6
+                );
+            }
+            self.submit_and_wait(enc);
+            self.gpu_state.seq_len.store(pos + n, Ordering::Relaxed);
+            state.seq_len = pos + n;
+            self.ctx.finish_profiler();
+            done = end;
+        }
+        Some(if download_logits {
+            self.ctx
+                .download_f32(&self.logits_buf, self.config.vocab_size)
+        } else {
+            Vec::new()
+        })
+    }
+
     /// Async (wasm/WebGPU) batched prefill step returning all logits rows `[n x vocab_size]`,
     /// used for zero-allocation speculative verification on WebGPU.
     pub async fn forward_prefill_logits_all_async(
@@ -8522,7 +8915,13 @@ impl GpuLfmModel {
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
             let _lora_guard = self.resolve_lora(state);
-            let enc = self.encode_prefill_batched_locked(tokens, start_pos, state, true, true);
+            let enc = self.encode_prefill_batched_locked(
+                PrefillInput::Tokens(tokens),
+                start_pos,
+                state,
+                true,
+                true,
+            );
             self.gpu_state
                 .seq_len
                 .store(start_pos + n, Ordering::Relaxed);
@@ -8569,7 +8968,13 @@ impl GpuLfmModel {
         let pending = {
             let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
             let _lora_guard = self.resolve_lora(state);
-            let mut enc = self.encode_prefill_batched_locked(tokens, start_pos, state, true, true);
+            let mut enc = self.encode_prefill_batched_locked(
+                PrefillInput::Tokens(tokens),
+                start_pos,
+                state,
+                true,
+                true,
+            );
             self.gpu_state
                 .seq_len
                 .store(start_pos + n, Ordering::Relaxed);
@@ -9649,7 +10054,13 @@ impl Model for GpuLfmModel {
             n <= MAX_ALL_LOGITS_TOKENS,
             "forward_prefill_logits_all token count ({n}) exceeds MAX_ALL_LOGITS_TOKENS ({MAX_ALL_LOGITS_TOKENS})"
         );
-        self.forward_prefill_batched_locked(tokens, start_pos, state, true, true)
+        self.forward_prefill_batched_locked(
+            PrefillInput::Tokens(tokens),
+            start_pos,
+            state,
+            true,
+            true,
+        )
     }
 
     fn truncate_kv(&self, state: &mut InferenceState, len: usize) {
@@ -9819,6 +10230,13 @@ impl Model for GpuLfmModel {
         true
     }
 
+    /// The rows the batched token prefill stages (a table lookup, then the embedding multiplier), so a
+    /// prefill seeded from these rows is the token prefill. This is what lets a VL prompt (text, image,
+    /// text) run as ONE prefill forward instead of one per segment, each with a fixed cost.
+    fn embed_token_rows(&self, tokens: &[u32]) -> Option<Vec<f32>> {
+        self.embedding_rows(tokens)
+    }
+
     fn forward_from_embedding(
         &self,
         embedding: &[f32],
@@ -9916,9 +10334,7 @@ impl Model for GpuLfmModel {
     ) -> Vec<f32> {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _lora_guard = self.resolve_lora(state);
-        self.seed_embeddings_locked(embeddings, n_tokens, start_pos, state);
-        self.ctx
-            .download_f32(&self.logits_buf, self.config.vocab_size)
+        self.seed_embeddings_locked(embeddings, n_tokens, start_pos, state, true)
     }
 
     fn forward_prefill(
@@ -10079,7 +10495,7 @@ impl Model for GpuLfmModel {
                 let end = (pos + chunk_size).min(tokens.len());
                 let is_last = end >= tokens.len();
                 logits = self.forward_prefill_batched_locked(
-                    &tokens[pos..end],
+                    PrefillInput::Tokens(&tokens[pos..end]),
                     start_pos + pos,
                     state,
                     false,
@@ -11203,6 +11619,82 @@ mod tests {
         assert!(err.to_string().contains("spv_ny must be"), "{err:?}");
     }
 
+    /// `ATTN_SPLITS` and `ATTN_PART_REC` size the host dispatch grid and the partial buffer; the shaders
+    /// carry their own `SPLITS` and `REC`. If either side drifts the grid and the buffer stop matching
+    /// the kernel (and the kernel test, which has its own constants, still passes), so the production
+    /// constants are checked against the shader source.
+    #[test]
+    fn attn_split_constants_match_the_wgsl() {
+        for (name, src) in [
+            (
+                "flash_attention_split.wgsl",
+                include_str!("../backend/shaders/flash_attention_split.wgsl"),
+            ),
+            (
+                "flash_attention_merge.wgsl",
+                include_str!("../backend/shaders/flash_attention_merge.wgsl"),
+            ),
+        ] {
+            let splits = format!("const SPLITS: u32 = {}u;", super::ATTN_SPLITS);
+            let rec = format!("const REC: u32 = {}u;", super::ATTN_PART_REC);
+            assert!(src.contains(&splits), "{name} must declare `{splits}`");
+            assert!(src.contains(&rec), "{name} must declare `{rec}`");
+        }
+    }
+
+    /// A pre-built decode command buffer is only reusable under the exact routing it was recorded for:
+    /// `hidden_states` flips `use_hs_scratch` and runs the same `Logits(None)` tail as plain decode, so a
+    /// key that left the routing out handed a buffer recorded against the generation KV to the scratch
+    /// run (and the reverse). The key a decode step is recorded under follows `use_hs_scratch`, the tail
+    /// and the compressed cache, and `take_prebuilt` drops a buffer stored under another key.
+    #[test]
+    fn prebuilt_key_follows_the_scratch_routing() {
+        use super::TailArgmax;
+        use std::sync::atomic::Ordering;
+        let Some(ctx) = gpu_ctx_or_skip() else {
+            return;
+        };
+        let gguf = crate::model::lfm2::release_tests::synthetic_lfm2_gguf();
+        let model =
+            super::GpuLfmModel::from_gguf_with_ctx(gguf, 256, "key-routing".into(), ctx).unwrap();
+        let plain = model.prebuilt_key(TailArgmax::None);
+        assert!(!plain.hs);
+        assert!(
+            model.prebuilt_key(TailArgmax::DispatchAndStage).argmax == TailArgmax::DispatchAndStage,
+            "the tail is part of the key"
+        );
+        model.use_hs_scratch.store(true, Ordering::Relaxed);
+        let scratch = model.prebuilt_key(TailArgmax::None);
+        model.use_hs_scratch.store(false, Ordering::Relaxed);
+        assert!(scratch.hs, "the key must record the scratch routing");
+        assert!(
+            scratch != plain,
+            "a scratch run must not take a generation buffer"
+        );
+        assert!(
+            model.prebuilt_key(TailArgmax::None) == plain,
+            "routing restored"
+        );
+
+        // A buffer recorded for one routing is dropped, never handed to the other, and a matching key
+        // takes it.
+        let cmd = || {
+            model
+                .ctx
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor { label: None })
+                .finish()
+        };
+        model.store_prebuilt(plain, cmd());
+        assert!(model.take_prebuilt(scratch).is_none(), "mismatched key");
+        assert!(
+            model.take_prebuilt(plain).is_none(),
+            "the mismatched take drops the stored buffer"
+        );
+        model.store_prebuilt(plain, cmd());
+        assert!(model.take_prebuilt(plain).is_some(), "matching key");
+    }
+
     /// `soak_and_measure` ms/iter math, pinned host-side with a fake `run`
     /// (no GPU: the closure never touches one). Takes ~`SOAK_MS` wall.
     #[test]
@@ -12064,8 +12556,8 @@ mod tests {
     }
 
     /// The resident-stream register-tiled fallthrough
-    /// (`mul_mat_reg_tile_q4_0_stream`, production's path for n < 32 /
-    /// strided B) matches the CPU reference. f32 accumulation like the raw
+    /// (`mul_mat_reg_tile_q4_0_stream`, production's path for strided B, or for an
+    /// n below `CERA_WGPU_STREAM_MIN_N`) matches the CPU reference. f32 accumulation like the raw
     /// twin, so the tolerance only absorbs summation-order differences.
     /// Shapes cover packed strides plus one padded case (`x_stride = k+16`,
     /// `y_stride = m+8`), pinning the stride legs of the kernel's address

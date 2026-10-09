@@ -38,8 +38,8 @@
 // Bigger workgroups win monotonically on Adreno 830 (32: 751ms, 64: 180ms,
 // 128: 151ms, 256: 149ms); 256 is the WebGPU-maximum workgroup size and
 // stages the B tile with exactly one half4 load per thread.
-// Constraints (asserted host-side): k % 32 == 0, n_valid >= 32 (a 32-wide
-// fiber idles too much below that; short rows ride the reg-tile kernel).
+// Constraints (asserted host-side): k % 32 == 0. Short batches pad to 32 columns (the
+// padding is free); the host may send n below CERA_WGPU_STREAM_MIN_N to reg-tile.
 // n_pad is the 32-rounded N the B transpose wrote (stride of src_b);
 // columns [n_valid, n_pad) hold zeros. The shmem tile is half4 [32 k][8
 // groups]: staging writes and the MAC loop's broadcast reads are all

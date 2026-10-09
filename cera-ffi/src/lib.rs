@@ -1622,7 +1622,9 @@ pub struct SessionConfig {
     /// `max_seq_len`.
     #[uniffi(default = None)]
     pub max_seq_len: Option<u32>,
-    /// KV cache compression mode. `None` → no compression (the default).
+    /// KV cache compression mode. `None` (omitted) → the core default, f16 where the model
+    /// honors it (CPU LFM2 and dense transformers) and the backend's own cache otherwise.
+    /// `Some(KvCompression::None)` asks for the backend's own full-precision cache.
     #[uniffi(default = None)]
     pub kv_compression: Option<KvCompression>,
     /// Pinned-prefix length for Phase-1.5 context shift on overflow.
@@ -1653,7 +1655,7 @@ impl Default for SessionConfig {
         let core = cera::SessionConfig::default();
         Self {
             max_seq_len: core.max_seq_len,
-            // `None` == "use the default (no) compression" — matches the
+            // `None` == "use the core default" (f16 where the model honors it) — matches the
             // foreign-binding `#[uniffi(default = None)]` and the `From` mapping,
             // so the Rust `Default` and the no-arg `SessionConfig()` agree.
             kv_compression: None,
@@ -1670,9 +1672,14 @@ impl From<SessionConfig> for cera::SessionConfig {
     fn from(c: SessionConfig) -> Self {
         cera::SessionConfig {
             max_seq_len: c.max_seq_len,
-            // `None` → no compression (the core default), so an omitted
-            // `kv_compression` behaves like `KvCompression::None`.
-            kv_compression: c.kv_compression.map(Into::into).unwrap_or_default(),
+            // An omitted `kv_compression` takes `cera::SessionConfig`'s default (f16 where the
+            // model honors it). `unwrap_or_default()` would not: `cera::KvCompression`'s own
+            // default is `None`, the backend's full-precision cache, which is what an explicit
+            // `Some(KvCompression::None)` asks for.
+            kv_compression: c
+                .kv_compression
+                .map(Into::into)
+                .unwrap_or_else(|| cera::SessionConfig::default().kv_compression),
             n_keep: c.n_keep,
             seed: c.seed,
             ubatch_size: c.ubatch_size,
@@ -2783,6 +2790,14 @@ impl Session {
     /// - `Some(n)` (`n > 0`) — cap this call at `n`, overriding the
     ///   session default.
     ///
+    /// With no cap in effect, a large image is tiled the way the LFM2-VL reference does: an image over
+    /// about twice the single-image budget (roughly 724x724) becomes a grid of up to 10 tiles of 256
+    /// tokens plus a thumbnail, with one vision-tower pass per tile. The grid follows the aspect ratio:
+    /// a 4:3 photo is about 1,800 tokens, a large square (over about 1,100 px) about 2,600 and a smaller
+    /// one about 1,300, and the worst case (a 5:2 panorama) about 2,800. Set a cap to keep an image to a single tile. Tiling needs a model that
+    /// can hand out token embedding rows (CPU, wgpu and Hexagon do; native Metal falls back to the
+    /// thumbnail).
+    ///
     /// When a cap applies, the resize target is shrunk
     /// (aspect-preserving) so its longer side is at most `n` pixels,
     /// floored at one aligned patch block (so a very small `n` can still
@@ -2832,8 +2847,11 @@ impl Session {
     /// `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
     /// `width` and `height` specify the source image dimensions in pixels.
     /// `max_long_size` controls edge resizing: `None` uses the session default,
-    /// `Some(0)` disables resizing to keep original dimensions, and `Some(n)`
-    /// constrains the longest edge to at most `n` pixels.
+    /// `Some(0)` applies no cap for this call, and `Some(n)` constrains the longest edge to at most
+    /// `n` pixels. With no cap a large image is tiled exactly as in [`Self::append_image`] (up to 10
+    /// tiles of 256 tokens plus a thumbnail, one vision-tower pass per tile; a 4:3 camera frame is
+    /// about 1,800 tokens), so set a cap to keep one tile. Native Metal falls back to the single
+    /// thumbnail.
     /// Automatically applies aspect-preserving resizing and normalization,
     /// then encodes with the vision encoder and appends image tokens.
     ///
@@ -4987,6 +5005,34 @@ mod tests {
         assert_eq!(core.ubatch_size, default_core.ubatch_size);
         assert_eq!(core.gpu_depthformer, default_core.gpu_depthformer);
         assert_eq!(core.disable_spec, default_core.disable_spec);
+    }
+
+    /// An omitted `kvCompression` is the core default (f16 off wasm32), while an explicit
+    /// `None` stays the backend's own full-precision cache.
+    #[test]
+    fn omitted_kv_compression_takes_the_core_default() {
+        let want = cera::SessionConfig::default().kv_compression.cache_tag();
+        let omitted: cera::SessionConfig = SessionConfig::default().into();
+        assert_eq!(omitted.kv_compression.cache_tag(), want);
+        let no_kv = SessionConfig {
+            kv_compression: None,
+            ..SessionConfig::default()
+        };
+        let omitted: cera::SessionConfig = no_kv.into();
+        assert_eq!(omitted.kv_compression.cache_tag(), want);
+
+        let explicit = SessionConfig {
+            kv_compression: Some(KvCompression::None),
+            ..SessionConfig::default()
+        };
+        let explicit: cera::SessionConfig = explicit.into();
+        assert_eq!(
+            explicit.kv_compression.cache_tag(),
+            cera::kv_cache::KvCompression::None.cache_tag()
+        );
+        if !cfg!(target_arch = "wasm32") {
+            assert_ne!(want, cera::kv_cache::KvCompression::None.cache_tag());
+        }
     }
 
     #[test]

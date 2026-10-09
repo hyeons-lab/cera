@@ -1,0 +1,396 @@
+{
+ "rows": [
+  {
+   "tokens": 210,
+   "ttft_ms": 1654.4,
+   "tower_ms": 1467.8,
+   "decode": 219.2,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 1941.8087591240876,
+   "cell": "cera-cpu@all8",
+   "ok": true,
+   "wall": 2.6
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1684.4,
+   "tower_ms": 1515.2,
+   "decode": 218.4,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 1972.8615384615387,
+   "cell": "cera-cpu@all8",
+   "ok": true,
+   "wall": 2.6
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1719.1,
+   "tower_ms": 1546.3,
+   "decode": 195.1,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2042.0113275243464,
+   "cell": "cera-cpu@all8",
+   "ok": true,
+   "wall": 2.6
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1755.6,
+   "tower_ms": 1582.2,
+   "decode": 206.5,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2060.684745762712,
+   "cell": "cera-cpu@all8",
+   "ok": true,
+   "wall": 2.6
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1756.2,
+   "tower_ms": 1570.6,
+   "decode": 181.3,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2103.6903474903474,
+   "cell": "cera-cpu@mid6",
+   "ok": true,
+   "wall": 3.1
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1759.5,
+   "tower_ms": 1578.0,
+   "decode": 209.8,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2059.785986653956,
+   "cell": "cera-cpu@mid6",
+   "ok": true,
+   "wall": 3.0
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1775.1,
+   "tower_ms": 1588.7,
+   "decode": 201.9,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2087.135661218425,
+   "cell": "cera-cpu@mid6",
+   "ok": true,
+   "wall": 3.0
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1809.3,
+   "tower_ms": 1614.9,
+   "decode": 209.8,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2109.585986653956,
+   "cell": "cera-cpu@mid6",
+   "ok": true,
+   "wall": 3.1
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1853.3,
+   "tower_ms": 1665.9,
+   "decode": 204.5,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2161.368459657702,
+   "cell": "cera-cpu@prime2",
+   "ok": true,
+   "wall": 2.8
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1910.8,
+   "tower_ms": 1721.7,
+   "decode": 201.3,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2223.7657228017883,
+   "cell": "cera-cpu@prime2",
+   "ok": true,
+   "wall": 2.9
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1880.2,
+   "tower_ms": 1687.0,
+   "decode": 198.1,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2198.2212014134275,
+   "cell": "cera-cpu@prime2",
+   "ok": true,
+   "wall": 2.8
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1888.5,
+   "tower_ms": 1697.8,
+   "decode": 193.9,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2213.4097472924186,
+   "cell": "cera-cpu@prime2",
+   "ok": true,
+   "wall": 2.8
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1486.12,
+   "tower_ms": 479.0,
+   "decode": 163.22,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 1872.1021100355347,
+   "cell": "llama-cpu@all8",
+   "ok": true,
+   "wall": 2.3
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1082.65,
+   "tower_ms": 476.0,
+   "decode": 226.9,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 1360.3053547818422,
+   "cell": "llama-cpu@all8",
+   "ok": true,
+   "wall": 1.8
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1125.55,
+   "tower_ms": 490.0,
+   "decode": 222.83,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 1408.2767423596463,
+   "cell": "llama-cpu@all8",
+   "ok": true,
+   "wall": 1.8
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1084.67,
+   "tower_ms": 475.0,
+   "decode": 215.43,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 1377.1083790558419,
+   "cell": "llama-cpu@all8",
+   "ok": true,
+   "wall": 1.8
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1437.0700000000002,
+   "tower_ms": 630.0,
+   "decode": 198.39,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 1754.6263284439742,
+   "cell": "llama-cpu@mid6",
+   "ok": true,
+   "wall": 2.3
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1477.45,
+   "tower_ms": 628.0,
+   "decode": 207.88,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 1780.5094573792574,
+   "cell": "llama-cpu@mid6",
+   "ok": true,
+   "wall": 2.4
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1420.04,
+   "tower_ms": 611.0,
+   "decode": 114.84,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 1968.62934169279,
+   "cell": "llama-cpu@mid6",
+   "ok": true,
+   "wall": 2.6
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 1388.4,
+   "tower_ms": 609.0,
+   "decode": 215.06,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 1681.341504696364,
+   "cell": "llama-cpu@mid6",
+   "ok": true,
+   "wall": 2.3
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 2299.49,
+   "tower_ms": 1038.0,
+   "decode": 201.24,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2612.5490339892663,
+   "cell": "llama-cpu@prime2",
+   "ok": true,
+   "wall": 2.4
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 2289.38,
+   "tower_ms": 1033.0,
+   "decode": 202.37,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2600.690965063992,
+   "cell": "llama-cpu@prime2",
+   "ok": true,
+   "wall": 2.4
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 2299.41,
+   "tower_ms": 1038.0,
+   "decode": 203.19,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2609.4646286726706,
+   "cell": "llama-cpu@prime2",
+   "ok": true,
+   "wall": 2.4
+  },
+  {
+   "tokens": 210,
+   "ttft_ms": 2280.06,
+   "tower_ms": 1029.0,
+   "decode": 203.39,
+   "gen": 64,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "e2e_ms": 2589.809741875215,
+   "cell": "llama-cpu@prime2",
+   "ok": true,
+   "wall": 2.4
+  }
+ ],
+ "summary": {
+  "cera-cpu@all8": {
+   "n_ok": 4,
+   "n": 4,
+   "tokens": [
+    210
+   ],
+   "ttft_ms": 1701.75,
+   "tower_ms": 1530.75,
+   "decode": 212.45,
+   "e2e_ms": 2007.4364329929426,
+   "ttft_min": 1654.4,
+   "ttft_max": 1755.6,
+   "dec_min": 195.1,
+   "dec_max": 219.2,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "errors": []
+  },
+  "cera-cpu@mid6": {
+   "n_ok": 4,
+   "n": 4,
+   "tokens": [
+    210
+   ],
+   "ttft_ms": 1767.3,
+   "tower_ms": 1583.35,
+   "decode": 205.85000000000002,
+   "e2e_ms": 2095.4130043543864,
+   "ttft_min": 1756.2,
+   "ttft_max": 1809.3,
+   "dec_min": 181.3,
+   "dec_max": 209.8,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "errors": []
+  },
+  "cera-cpu@prime2": {
+   "n_ok": 4,
+   "n": 4,
+   "tokens": [
+    210
+   ],
+   "ttft_ms": 1884.35,
+   "tower_ms": 1692.4,
+   "decode": 199.7,
+   "e2e_ms": 2205.815474352923,
+   "ttft_min": 1853.3,
+   "ttft_max": 1910.8,
+   "dec_min": 193.9,
+   "dec_max": 204.5,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "errors": []
+  },
+  "llama-cpu@all8": {
+   "n_ok": 4,
+   "n": 4,
+   "tokens": [
+    210
+   ],
+   "ttft_ms": 1105.1100000000001,
+   "tower_ms": 477.5,
+   "decode": 219.13,
+   "e2e_ms": 1392.6925607077442,
+   "ttft_min": 1082.65,
+   "ttft_max": 1486.12,
+   "dec_min": 163.22,
+   "dec_max": 226.9,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "errors": []
+  },
+  "llama-cpu@mid6": {
+   "n_ok": 4,
+   "n": 4,
+   "tokens": [
+    210
+   ],
+   "ttft_ms": 1428.555,
+   "tower_ms": 619.5,
+   "decode": 203.135,
+   "e2e_ms": 1767.5678929116157,
+   "ttft_min": 1388.4,
+   "ttft_max": 1477.45,
+   "dec_min": 114.84,
+   "dec_max": 215.06,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "errors": []
+  },
+  "llama-cpu@prime2": {
+   "n_ok": 4,
+   "n": 4,
+   "tokens": [
+    210
+   ],
+   "ttft_ms": 2294.395,
+   "tower_ms": 1035.5,
+   "decode": 202.78,
+   "e2e_ms": 2605.0777968683315,
+   "ttft_min": 2280.06,
+   "ttft_max": 2299.49,
+   "dec_min": 201.24,
+   "dec_max": 203.39,
+   "text": "A pug dog with a wrinkled face and dark brown eyes is lying ",
+   "errors": []
+  }
+ }
+}

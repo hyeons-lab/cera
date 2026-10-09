@@ -797,9 +797,9 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 65327:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_image() != 60729:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_image() != 28033:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 27818:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 34040:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -10559,6 +10559,14 @@ class SessionProtocol(typing.Protocol):
         - `Some(n)` (`n > 0`) — cap this call at `n`, overriding the
         session default.
 
+        With no cap in effect, a large image is tiled the way the LFM2-VL reference does: an image over
+        about twice the single-image budget (roughly 724x724) becomes a grid of up to 10 tiles of 256
+        tokens plus a thumbnail, with one vision-tower pass per tile. The grid follows the aspect ratio:
+        a 4:3 photo is about 1,800 tokens, a large square (over about 1,100 px) about 2,600 and a smaller
+        one about 1,300, and the worst case (a 5:2 panorama) about 2,800. Set a cap to keep an image to a single tile. Tiling needs a model that
+        can hand out token embedding rows (CPU, wgpu and Hexagon do; native Metal falls back to the
+        thumbnail).
+
         When a cap applies, the resize target is shrunk
         (aspect-preserving) so its longer side is at most `n` pixels,
         floored at one aligned patch block (so a very small `n` can still
@@ -10594,8 +10602,11 @@ class SessionProtocol(typing.Protocol):
         `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
         `width` and `height` specify the source image dimensions in pixels.
         `max_long_size` controls edge resizing: `None` uses the session default,
-        `Some(0)` disables resizing to keep original dimensions, and `Some(n)`
-        constrains the longest edge to at most `n` pixels.
+        `Some(0)` applies no cap for this call, and `Some(n)` constrains the longest edge to at most
+        `n` pixels. With no cap a large image is tiled exactly as in [`Self::append_image`] (up to 10
+        tiles of 256 tokens plus a thumbnail, one vision-tower pass per tile; a 4:3 camera frame is
+        about 1,800 tokens), so set a cap to keep one tile. Native Metal falls back to the single
+        thumbnail.
         Automatically applies aspect-preserving resizing and normalization,
         then encodes with the vision encoder and appends image tokens.
 
@@ -11127,6 +11138,14 @@ class Session(SessionProtocol):
         - `Some(n)` (`n > 0`) — cap this call at `n`, overriding the
         session default.
 
+        With no cap in effect, a large image is tiled the way the LFM2-VL reference does: an image over
+        about twice the single-image budget (roughly 724x724) becomes a grid of up to 10 tiles of 256
+        tokens plus a thumbnail, with one vision-tower pass per tile. The grid follows the aspect ratio:
+        a 4:3 photo is about 1,800 tokens, a large square (over about 1,100 px) about 2,600 and a smaller
+        one about 1,300, and the worst case (a 5:2 panorama) about 2,800. Set a cap to keep an image to a single tile. Tiling needs a model that
+        can hand out token embedding rows (CPU, wgpu and Hexagon do; native Metal falls back to the
+        thumbnail).
+
         When a cap applies, the resize target is shrunk
         (aspect-preserving) so its longer side is at most `n` pixels,
         floored at one aligned patch block (so a very small `n` can still
@@ -11178,8 +11197,11 @@ class Session(SessionProtocol):
         `pixels` is an uncompressed pixel buffer in the given [`PixelFormat`].
         `width` and `height` specify the source image dimensions in pixels.
         `max_long_size` controls edge resizing: `None` uses the session default,
-        `Some(0)` disables resizing to keep original dimensions, and `Some(n)`
-        constrains the longest edge to at most `n` pixels.
+        `Some(0)` applies no cap for this call, and `Some(n)` constrains the longest edge to at most
+        `n` pixels. With no cap a large image is tiled exactly as in [`Self::append_image`] (up to 10
+        tiles of 256 tokens plus a thumbnail, one vision-tower pass per tile; a 4:3 camera frame is
+        about 1,800 tokens), so set a cap to keep one tile. Native Metal falls back to the single
+        thumbnail.
         Automatically applies aspect-preserving resizing and normalization,
         then encodes with the vision encoder and appends image tokens.
 

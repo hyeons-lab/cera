@@ -159,6 +159,9 @@ pub fn preprocess_image(
 /// `None` (or `0`, or a target already within the cap) behaves
 /// identically to [`preprocess_image`].
 ///
+/// This always produces **one** image, never tiles: for the layout a large image
+/// needs, use [`preprocess_image_layout`].
+///
 /// `max_long_size` caps the encoded resolution, not the *decode*: a
 /// huge source image is still fully decoded (bounded by the
 /// dimension/alloc limits applied below) before the target shrink, so
@@ -168,6 +171,27 @@ pub fn preprocess_image_with_opts(
     cfg: &VisionEncoderConfig,
     max_long_size: Option<u32>,
 ) -> Result<PreprocessedImage, CeraError> {
+    let (rgb, w, h) = decode_rgb8(bytes)?;
+    preprocess_single_rgb8(&rgb, w, h, cfg, max_long_size)
+}
+
+/// Like [`preprocess_image_with_opts`], but follows the LFM2-VL reference processor for large
+/// images: one that is more than twice the single-image pixel budget becomes a grid of 512 px
+/// tiles plus a thumbnail ([`PreprocessedLayout::Tiled`]), anything else a single image.
+/// A caller cap (`max_long_size`) is an explicit request for a smaller image, so with one set
+/// the result is always [`PreprocessedLayout::Single`] and matches
+/// [`preprocess_image_with_opts`].
+pub fn preprocess_image_layout(
+    bytes: &[u8],
+    cfg: &VisionEncoderConfig,
+    max_long_size: Option<u32>,
+) -> Result<PreprocessedLayout, CeraError> {
+    let (rgb, w, h) = decode_rgb8(bytes)?;
+    preprocess_layout_rgb8(&rgb, w, h, cfg, max_long_size)
+}
+
+/// Decode PNG/JPEG bytes to an interleaved RGB8 buffer with its dimensions.
+fn decode_rgb8(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), CeraError> {
     if bytes.is_empty() {
         return Err(CeraError::EmptyInput);
     }
@@ -190,28 +214,34 @@ pub fn preprocess_image_with_opts(
     let img = reader
         .decode()
         .map_err(|e| CeraError::Backend(format!("image decode failed: {e}")))?;
+    // Alpha is dropped, not composited, as `resize_bilinear_rgb` always did.
+    let rgb = img.into_rgb8();
+    let (w, h) = (rgb.width() as usize, rgb.height() as usize);
+    Ok((rgb.into_raw(), w, h))
+}
 
-    // Pick the resize target via llama.cpp's algorithm from the NATIVE
-    // decoded dims. align_size = patch_size · scale_factor guarantees
-    // both grid_w and grid_h are even and the 2× pixel-shuffle works
-    // out.
+/// The single-image resize target for a `w x h` source: llama.cpp's
+/// `calc_size_preserved_ratio` from the NATIVE dims, then the optional caller cap on the longest
+/// side. `align_size = patch_size · scale_factor` keeps both grid dims even so the 2x pixel
+/// shuffle works out.
+fn single_target(
+    w: usize,
+    h: usize,
+    cfg: &VisionEncoderConfig,
+    max_long_size: Option<u32>,
+) -> (usize, usize) {
     let align = cfg.patch_size * cfg.scale_factor;
-    let (mut target_w, mut target_h) = calc_size_preserved_ratio(
-        img.width() as usize,
-        img.height() as usize,
-        align,
-        cfg.image_min_pixels,
-        cfg.image_max_pixels,
-    );
+    let (mut target_w, mut target_h) =
+        calc_size_preserved_ratio(w, h, align, cfg.image_min_pixels, cfg.image_max_pixels);
 
     // Optional caller cap on the longest side of the encoded target.
     // Applied to the TARGET (not a pre-resize of the input) so the
-    // single `resize_exact` below goes straight from native dims to the
-    // final target: one resample, no cascaded downscale-then-upscale.
-    // Shrinks only (`long > cap`), preserves aspect, re-aligns by
-    // flooring, and clamps to at least one aligned block so the patch
-    // grid stays valid. Deliberately takes precedence over
-    // `image_min_pixels` (the caller is trading detail for cost).
+    // single resample goes straight from native dims to the final
+    // target: no cascaded downscale-then-upscale. Shrinks only
+    // (`long > cap`), preserves aspect, re-aligns by flooring, and
+    // clamps to at least one aligned block so the patch grid stays
+    // valid. Deliberately takes precedence over `image_min_pixels`
+    // (the caller is trading detail for cost).
     if let Some(cap) = max_long_size.filter(|&c| c > 0).map(|c| c as usize) {
         let long = target_w.max(target_h);
         if long > cap {
@@ -221,55 +251,35 @@ pub fn preprocess_image_with_opts(
             target_h = floor_align(target_h as f64 * beta);
         }
     }
-
     debug_assert_eq!(target_w % cfg.patch_size, 0);
     debug_assert_eq!(target_h % cfg.patch_size, 0);
+    (target_w, target_h)
+}
 
-    // Fast path: reuse decoded ImageRgb8 raw buffer when dimensions already match target.
-    let rgb_bytes = match img {
-        image::DynamicImage::ImageRgb8(rgb) => {
-            if rgb.width() as usize == target_w && rgb.height() as usize == target_h {
-                rgb.into_raw()
-            } else {
-                resize_bilinear_rgb(
-                    rgb.as_raw(),
-                    rgb.width() as usize,
-                    rgb.height() as usize,
-                    PixelFormat::Rgb8,
-                    target_w,
-                    target_h,
-                )?
-            }
-        }
-        image::DynamicImage::ImageRgba8(rgba) => resize_bilinear_rgb(
-            rgba.as_raw(),
-            rgba.width() as usize,
-            rgba.height() as usize,
-            PixelFormat::Rgba8,
-            target_w,
-            target_h,
-        )?,
-        other => {
-            let rgb = other.to_rgb8();
-            resize_bilinear_rgb(
-                rgb.as_raw(),
-                rgb.width() as usize,
-                rgb.height() as usize,
-                PixelFormat::Rgb8,
-                target_w,
-                target_h,
-            )?
-        }
+/// Resize an RGB8 `w x h` image to `target_w x target_h` (reusing the buffer when it already is that
+/// size) and normalize it into a [`PreprocessedImage`].
+fn finish_image(
+    rgb: &[u8],
+    w: usize,
+    h: usize,
+    target_w: usize,
+    target_h: usize,
+    cfg: &VisionEncoderConfig,
+) -> Result<PreprocessedImage, CeraError> {
+    let resized;
+    let rgb_bytes: &[u8] = if w == target_w && h == target_h {
+        &rgb[..3 * w * h]
+    } else {
+        resized = resize_pillow_bilinear_rgb8(rgb, w, h, target_w, target_h)?;
+        &resized
     };
-
     let pixels = normalize_rgb8_to_nchw_f32(
-        &rgb_bytes,
+        rgb_bytes,
         target_w,
         target_h,
         &cfg.image_mean,
         &cfg.image_std,
     );
-
     Ok(PreprocessedImage {
         pixels,
         target_w,
@@ -279,11 +289,78 @@ pub fn preprocess_image_with_opts(
     })
 }
 
+fn preprocess_single_rgb8(
+    rgb: &[u8],
+    w: usize,
+    h: usize,
+    cfg: &VisionEncoderConfig,
+    max_long_size: Option<u32>,
+) -> Result<PreprocessedImage, CeraError> {
+    let (target_w, target_h) = single_target(w, h, cfg, max_long_size);
+    finish_image(rgb, w, h, target_w, target_h, cfg)
+}
+
+fn preprocess_layout_rgb8(
+    rgb: &[u8],
+    w: usize,
+    h: usize,
+    cfg: &VisionEncoderConfig,
+    max_long_size: Option<u32>,
+) -> Result<PreprocessedLayout, CeraError> {
+    if w == 0 || h == 0 {
+        return Err(CeraError::EmptyInput);
+    }
+    let capped = max_long_size.is_some_and(|c| c > 0);
+    if capped || !lfm2_should_tile(w, h, cfg) {
+        return Ok(PreprocessedLayout::Single(preprocess_single_rgb8(
+            rgb,
+            w,
+            h,
+            cfg,
+            max_long_size,
+        )?));
+    }
+    let (cols, rows) = lfm2_tile_grid(w, h);
+    // The whole image goes to `tile * grid` once, then is cropped into tiles, as the reference does
+    // (`slice_image`): resizing each tile from its own source region would differ at the seams.
+    let refined =
+        resize_pillow_bilinear_rgb8(rgb, w, h, LFM2_TILE_SIZE * cols, LFM2_TILE_SIZE * rows)?;
+    let stride = LFM2_TILE_SIZE * cols * 3;
+    let mut tiles = Vec::with_capacity(cols * rows);
+    let mut tile_rgb = vec![0u8; LFM2_TILE_SIZE * LFM2_TILE_SIZE * 3];
+    for row in 0..rows {
+        for col in 0..cols {
+            for y in 0..LFM2_TILE_SIZE {
+                let src = (row * LFM2_TILE_SIZE + y) * stride + col * LFM2_TILE_SIZE * 3;
+                tile_rgb[y * LFM2_TILE_SIZE * 3..(y + 1) * LFM2_TILE_SIZE * 3]
+                    .copy_from_slice(&refined[src..src + LFM2_TILE_SIZE * 3]);
+            }
+            tiles.push(finish_image(
+                &tile_rgb,
+                LFM2_TILE_SIZE,
+                LFM2_TILE_SIZE,
+                LFM2_TILE_SIZE,
+                LFM2_TILE_SIZE,
+                cfg,
+            )?);
+        }
+    }
+    // The thumbnail is the single-image resize of the original, after the tiles.
+    let thumbnail = preprocess_single_rgb8(rgb, w, h, cfg, None)?;
+    Ok(PreprocessedLayout::Tiled(TiledImage {
+        cols,
+        rows,
+        tiles,
+        thumbnail,
+    }))
+}
+
 /// Preprocess an uncompressed raw pixel buffer (e.g. from an Android Bitmap
 /// or camera frame) into a [`PreprocessedImage`] ready for vision encoding.
 ///
-/// Bypasses all image decompression overhead and applies fast bilinear
-/// resampling and SIMD/parallel NCHW normalization.
+/// Bypasses all image decompression overhead and applies the same resampling
+/// and SIMD/parallel NCHW normalization as the decoded-image path. Always one
+/// image; see [`preprocess_raw_layout`] for the tiled layout.
 pub fn preprocess_raw_pixels(
     pixels: &[u8],
     width: usize,
@@ -292,10 +369,34 @@ pub fn preprocess_raw_pixels(
     cfg: &VisionEncoderConfig,
     max_long_size: Option<u32>,
 ) -> Result<PreprocessedImage, CeraError> {
+    let rgb = raw_to_rgb8(pixels, width, height, format)?;
+    preprocess_single_rgb8(&rgb, width, height, cfg, max_long_size)
+}
+
+/// [`preprocess_raw_pixels`] with the tiled layout for large images; see
+/// [`preprocess_image_layout`].
+pub fn preprocess_raw_layout(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    format: PixelFormat,
+    cfg: &VisionEncoderConfig,
+    max_long_size: Option<u32>,
+) -> Result<PreprocessedLayout, CeraError> {
+    let rgb = raw_to_rgb8(pixels, width, height, format)?;
+    preprocess_layout_rgb8(&rgb, width, height, cfg, max_long_size)
+}
+
+/// Validate a raw pixel buffer and return it as interleaved RGB8 (borrowed when it already is).
+fn raw_to_rgb8(
+    pixels: &[u8],
+    width: usize,
+    height: usize,
+    format: PixelFormat,
+) -> Result<std::borrow::Cow<'_, [u8]>, CeraError> {
     if pixels.is_empty() || width == 0 || height == 0 {
         return Err(CeraError::EmptyInput);
     }
-
     let bpp = format.bytes_per_pixel();
     let min_src_len = width
         .checked_mul(height)
@@ -311,50 +412,291 @@ pub fn preprocess_raw_pixels(
             bpp,
         )));
     }
+    if format == PixelFormat::Rgb8 {
+        return Ok(std::borrow::Cow::Borrowed(&pixels[..3 * width * height]));
+    }
+    let (r_off, g_off, b_off) = format.channel_offsets();
+    let mut rgb = vec![0u8; width * height * 3];
+    for (i, px) in pixels[..min_src_len].chunks_exact(bpp).enumerate() {
+        rgb[i * 3] = px[r_off];
+        rgb[i * 3 + 1] = px[g_off];
+        rgb[i * 3 + 2] = px[b_off];
+    }
+    Ok(std::borrow::Cow::Owned(rgb))
+}
 
-    let align = cfg.patch_size * cfg.scale_factor;
-    let (mut target_w, mut target_h) = calc_size_preserved_ratio(
-        width,
-        height,
-        align,
-        cfg.image_min_pixels,
-        cfg.image_max_pixels,
-    );
+/// LFM2-VL tiling constants, from the model's `processor_config.json` (the same values llama.cpp's
+/// `mtmd_image_preprocessor_lfm2` hard-codes).
+pub const LFM2_TILE_SIZE: usize = 512;
+const LFM2_MIN_TILES: usize = 2;
+const LFM2_MAX_TILES: usize = 10;
+const LFM2_MAX_PIXELS_TOLERANCE: f64 = 2.0;
 
-    if let Some(cap) = max_long_size.filter(|&c| c > 0).map(|c| c as usize) {
-        let long = target_w.max(target_h);
-        if long > cap {
-            let beta = cap as f64 / long as f64;
-            let floor_align = |x: f64| align.max(((x / align as f64).floor() as usize) * align);
-            target_w = floor_align(target_w as f64 * beta);
-            target_h = floor_align(target_h as f64 * beta);
+/// Whether the reference processor tiles a `w x h` image: its aligned area exceeds the
+/// single-image pixel budget times the 2.0 tolerance. Alignment rounds half to even (C's
+/// `nearbyint`), as llama.cpp's `should_tile` does.
+pub fn lfm2_should_tile(w: usize, h: usize, cfg: &VisionEncoderConfig) -> bool {
+    let align = (cfg.patch_size * cfg.scale_factor) as f64;
+    let round_by = |x: usize| ((x as f64 / align).round_ties_even() as usize) * align as usize;
+    let h_bar = cfg.patch_size.max(round_by(h));
+    let w_bar = cfg.patch_size.max(round_by(w));
+    (h_bar as f64) * (w_bar as f64) > cfg.image_max_pixels as f64 * LFM2_MAX_PIXELS_TOLERANCE
+}
+
+/// The tile grid `(cols, rows)` for a `w x h` image: of the grids of 2 to 10 tiles, the one whose
+/// aspect ratio is closest to the image's, preferring the larger grid on a tie when the image fills
+/// more than half of it. A port of llama.cpp's `find_closest_aspect_ratio` (single-precision, as
+/// there).
+pub fn lfm2_tile_grid(w: usize, h: usize) -> (usize, usize) {
+    let aspect = w as f32 / h as f32;
+    let mut ratios: Vec<(usize, usize)> = Vec::new();
+    for n in LFM2_MIN_TILES..=LFM2_MAX_TILES {
+        for cols in 1..=n {
+            for rows in 1..=n {
+                let tiles = cols * rows;
+                if (LFM2_MIN_TILES..=LFM2_MAX_TILES).contains(&tiles)
+                    && !ratios.contains(&(cols, rows))
+                {
+                    ratios.push((cols, rows));
+                }
+            }
         }
     }
+    ratios.sort_by_key(|&(c, r)| c * r);
+    let area = (w * h) as f32;
+    let mut best = (1usize, 1usize);
+    let mut best_diff = f32::MAX;
+    for &(c, r) in &ratios {
+        let diff = (aspect - c as f32 / r as f32).abs();
+        if diff < best_diff {
+            best_diff = diff;
+            best = (c, r);
+        } else if diff == best_diff {
+            let target_area = (LFM2_TILE_SIZE * LFM2_TILE_SIZE * c * r) as f32;
+            if area > 0.5 * target_area {
+                best = (c, r);
+            }
+        }
+    }
+    best
+}
 
-    debug_assert_eq!(target_w % cfg.patch_size, 0);
-    debug_assert_eq!(target_h % cfg.patch_size, 0);
+/// What a source image becomes: one image, or (for a large image, see [`lfm2_should_tile`]) a
+/// grid of tiles followed by a thumbnail.
+#[derive(Debug, Clone, PartialEq)]
+pub enum PreprocessedLayout {
+    Single(PreprocessedImage),
+    Tiled(TiledImage),
+}
 
-    let rgb_bytes = if width == target_w && height == target_h && format == PixelFormat::Rgb8 {
-        pixels[..3 * target_w * target_h].to_vec()
-    } else {
-        resize_bilinear_rgb(pixels, width, height, format, target_w, target_h)?
+/// The tiled layout: `tiles` in row-major order (`cols x rows`, 512 px each) and the thumbnail,
+/// the aspect-preserving single-image resize of the whole picture. The prompt is
+/// `<|img_row_R_col_C|>` + each tile's tokens in that order, then `<|img_thumbnail|>` + the
+/// thumbnail's tokens.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TiledImage {
+    pub cols: usize,
+    pub rows: usize,
+    pub tiles: Vec<PreprocessedImage>,
+    pub thumbnail: PreprocessedImage,
+}
+
+/// Largest working buffer (bytes) one Pillow resize may allocate: 1 GiB, far above any image the model
+/// takes (a 10-tile grid is 5,120 x 2,560) and well inside a 32-bit `usize`.
+const PILLOW_MAX_BUFFER_BYTES: usize = 1 << 30;
+
+/// Pillow-compatible bilinear resize of an interleaved RGB8 image.
+///
+/// A port of llama.cpp's `resize_pillow` (itself Pillow's `Resample.c`, which is what the
+/// reference processor's `resize` calls): two separable passes, horizontal then vertical, with the
+/// triangle filter **widened by the scale factor when shrinking**, so a downscale averages the
+/// source pixels it covers instead of sampling two of them, and 22-bit fixed-point weights
+/// normalized per output pixel. Upscaling is the usual bilinear. Differs from
+/// [`resize_bilinear_rgb`], which always takes the two nearest source pixels.
+pub fn resize_pillow_bilinear_rgb8(
+    src: &[u8],
+    src_w: usize,
+    src_h: usize,
+    target_w: usize,
+    target_h: usize,
+) -> Result<Vec<u8>, CeraError> {
+    if src_w == 0 || src_h == 0 || target_w == 0 || target_h == 0 {
+        return Err(CeraError::EmptyInput);
+    }
+    if target_w > 65_536 || target_h > 65_536 {
+        return Err(CeraError::Backend(format!(
+            "resize target {target_w}x{target_h} is out of range (max 65536)"
+        )));
+    }
+    let need = src_w
+        .checked_mul(src_h)
+        .and_then(|px| px.checked_mul(3))
+        .ok_or_else(|| CeraError::Backend("image dimensions overflow usize".into()))?;
+    if src.len() < need {
+        return Err(CeraError::Backend(format!(
+            "resize_pillow_bilinear_rgb8: source is {} bytes, need {need} ({src_w}x{src_h} RGB)",
+            src.len()
+        )));
+    }
+    // The two working buffers: the horizontal pass keeps every source row at the target width, the
+    // vertical pass produces the output. The 65,536 cap on the target and the source-length check do
+    // not bound their product (a 1 x 400,000 source resized to 65,536 wide would ask for 78 GB, and
+    // wrap `usize` on a 32-bit target), so refuse what is out of range rather than allocate it.
+    for (px_w, px_h) in [(target_w, src_h), (target_w, target_h)] {
+        px_w.checked_mul(px_h)
+            .and_then(|px| px.checked_mul(3))
+            .filter(|&b| b <= PILLOW_MAX_BUFFER_BYTES)
+            .ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "resize {src_w}x{src_h} -> {target_w}x{target_h} needs a working buffer over \
+                     {PILLOW_MAX_BUFFER_BYTES} bytes"
+                ))
+            })?;
+    }
+    // `None` while the image is still the source: an axis already at its target size is skipped.
+    let mut cur: Option<Vec<u8>> = None;
+    let mut w = src_w;
+    if target_w != src_w {
+        let k = pillow_bilinear_kernel(src_w, target_w);
+        cur = Some(pillow_horizontal(&src[..need], src_w, src_h, target_w, &k));
+        w = target_w;
+    }
+    if target_h != src_h {
+        let k = pillow_bilinear_kernel(src_h, target_h);
+        let input = cur.as_deref().unwrap_or(&src[..need]);
+        cur = Some(pillow_vertical(input, w, target_h, &k));
+    }
+    Ok(cur.unwrap_or_else(|| src[..need].to_vec()))
+}
+
+const PILLOW_PRECISION_BITS: u32 = 22;
+
+struct PillowKernel {
+    ksize: usize,
+    /// `(first input index, input count)` per output index.
+    bounds: Vec<(usize, usize)>,
+    /// `ksize` fixed-point weights per output index.
+    weights: Vec<i32>,
+}
+
+/// Filter taps for resampling `in_size` to `out_size` samples (one dimension), as `resize_pillow`
+/// precomputes them.
+fn pillow_bilinear_kernel(in_size: usize, out_size: usize) -> PillowKernel {
+    let scale = in_size as f64 / out_size as f64;
+    let filterscale = scale.max(1.0);
+    let support = filterscale; // the bilinear filter's support is 1.0
+    let ksize = support.ceil() as usize * 2 + 1;
+    let ss = 1.0 / filterscale;
+    let fxp = (1u64 << PILLOW_PRECISION_BITS) as f64;
+    let mut bounds = Vec::with_capacity(out_size);
+    let mut weights = vec![0i32; out_size * ksize];
+    let mut pre = vec![0f64; ksize];
+    for xx in 0..out_size {
+        let center = (xx as f64 + 0.5) * scale;
+        let xmin = ((center - support + 0.5) as i64).max(0);
+        let xmax = (((center + support + 0.5) as i64).min(in_size as i64) - xmin).max(0);
+        let mut ww = 0.0;
+        for x in 0..xmax {
+            let d = ((x + xmin) as f64 - center + 0.5) * ss;
+            let w = (1.0 - d.abs()).max(0.0);
+            pre[x as usize] = w;
+            ww += w;
+        }
+        for x in 0..ksize {
+            let w = if (x as i64) < xmax && ww != 0.0 {
+                pre[x] / ww
+            } else if (x as i64) < xmax {
+                pre[x]
+            } else {
+                0.0
+            };
+            // Pillow adds +/- 0.5 and truncates toward zero (a plain round would round twice).
+            weights[xx * ksize + x] = (w * fxp + if w < 0.0 { -0.5 } else { 0.5 }) as i32;
+        }
+        bounds.push((xmin as usize, xmax as usize));
+    }
+    PillowKernel {
+        ksize,
+        bounds,
+        weights,
+    }
+}
+
+#[inline]
+fn pillow_clip8(v: i32) -> u8 {
+    v.clamp(0, 255) as u8
+}
+
+fn pillow_horizontal(
+    src: &[u8],
+    in_w: usize,
+    in_h: usize,
+    out_w: usize,
+    k: &PillowKernel,
+) -> Vec<u8> {
+    let mut out = vec![0u8; out_w * in_h * 3];
+    let row = |yy: usize, dst: &mut [u8]| {
+        let src_row = &src[yy * in_w * 3..(yy + 1) * in_w * 3];
+        for xx in 0..out_w {
+            let (xmin, xcnt) = k.bounds[xx];
+            let taps = &k.weights[xx * k.ksize..xx * k.ksize + xcnt];
+            let half = 1i32 << (PILLOW_PRECISION_BITS - 1);
+            let (mut s0, mut s1, mut s2) = (half, half, half);
+            for (x, &wt) in taps.iter().enumerate() {
+                let p = &src_row[(xmin + x) * 3..(xmin + x) * 3 + 3];
+                s0 += p[0] as i32 * wt;
+                s1 += p[1] as i32 * wt;
+                s2 += p[2] as i32 * wt;
+            }
+            dst[xx * 3] = pillow_clip8(s0 >> PILLOW_PRECISION_BITS);
+            dst[xx * 3 + 1] = pillow_clip8(s1 >> PILLOW_PRECISION_BITS);
+            dst[xx * 3 + 2] = pillow_clip8(s2 >> PILLOW_PRECISION_BITS);
+        }
     };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        out.par_chunks_mut(out_w * 3)
+            .enumerate()
+            .for_each(|(yy, dst)| row(yy, dst));
+    }
+    #[cfg(not(feature = "parallel"))]
+    for (yy, dst) in out.chunks_mut(out_w * 3).enumerate() {
+        row(yy, dst);
+    }
+    out
+}
 
-    let norm_pixels = normalize_rgb8_to_nchw_f32(
-        &rgb_bytes,
-        target_w,
-        target_h,
-        &cfg.image_mean,
-        &cfg.image_std,
-    );
-
-    Ok(PreprocessedImage {
-        pixels: norm_pixels,
-        target_w,
-        target_h,
-        grid_w: target_w / cfg.patch_size,
-        grid_h: target_h / cfg.patch_size,
-    })
+fn pillow_vertical(src: &[u8], in_w: usize, out_h: usize, k: &PillowKernel) -> Vec<u8> {
+    let row_elems = in_w * 3;
+    let mut out = vec![0u8; row_elems * out_h];
+    let row = |yy: usize, dst: &mut [u8]| {
+        let (ymin, ycnt) = k.bounds[yy];
+        let taps = &k.weights[yy * k.ksize..yy * k.ksize + ycnt];
+        let half = 1i32 << (PILLOW_PRECISION_BITS - 1);
+        let mut acc = vec![half; row_elems];
+        for (y, &wt) in taps.iter().enumerate() {
+            let s = &src[(ymin + y) * row_elems..(ymin + y + 1) * row_elems];
+            for (a, &v) in acc.iter_mut().zip(s) {
+                *a += v as i32 * wt;
+            }
+        }
+        for (d, a) in dst.iter_mut().zip(&acc) {
+            *d = pillow_clip8(a >> PILLOW_PRECISION_BITS);
+        }
+    };
+    #[cfg(feature = "parallel")]
+    {
+        use rayon::prelude::*;
+        out.par_chunks_mut(row_elems)
+            .enumerate()
+            .for_each(|(yy, dst)| row(yy, dst));
+    }
+    #[cfg(not(feature = "parallel"))]
+    for (yy, dst) in out.chunks_mut(row_elems).enumerate() {
+        row(yy, dst);
+    }
+    out
 }
 
 /// Resample an uncompressed pixel buffer in any supported [`PixelFormat`]
@@ -665,6 +1007,19 @@ mod tests {
             // continues to land at 4×4 deterministically.
             image_min_pixels: 16,
             image_max_pixels: 16,
+        }
+    }
+
+    /// The LFM2.5-VL-450M vision config the tiling rules are specified against: patch 16, a 2x2
+    /// merge (so 32 px alignment) and a 65,536 to 262,144 px single-image budget (64 to 256 tokens).
+    fn lfm2_cfg() -> VisionEncoderConfig {
+        VisionEncoderConfig {
+            patch_size: 16,
+            image_size: 512,
+            n_trained_patches: 256,
+            image_min_pixels: 65_536,
+            image_max_pixels: 262_144,
+            ..synth_cfg()
         }
     }
 
@@ -1009,5 +1364,264 @@ mod tests {
             preprocess_raw_pixels(&[0u8; 10], 4, 4, PixelFormat::Rgb8, &cfg, None),
             Err(CeraError::Backend(_))
         ));
+    }
+
+    // ── Pillow-compatible resize, tiling ─────────────────────────────
+
+    fn fnv1a(bytes: &[u8]) -> u64 {
+        bytes.iter().fold(0xcbf2_9ce4_8422_2325u64, |h, &b| {
+            (h ^ b as u64).wrapping_mul(0x0100_0000_01b3)
+        })
+    }
+
+    fn pattern(n: usize) -> Vec<u8> {
+        (0..n)
+            .map(|i| ((i * 37 + (i * i) % 251 + 13) % 256) as u8)
+            .collect()
+    }
+
+    /// A resize whose working buffers would be enormous is refused, not allocated: the target cap
+    /// and the source-length check do not bound `target_w * src_h`.
+    #[test]
+    fn pillow_resize_refuses_oversized_working_buffers() {
+        // 1 x 400,000 to 65,536 wide: the horizontal pass alone is 78 GB.
+        let src = vec![7u8; 400_000 * 3];
+        assert!(matches!(
+            resize_pillow_bilinear_rgb8(&src, 1, 400_000, 65_536, 4),
+            Err(CeraError::Backend(_))
+        ));
+        // The model's largest real case is fine: a 10-tile grid, 5,120 x 2,560.
+        let small = vec![9u8; 64 * 32 * 3];
+        assert!(resize_pillow_bilinear_rgb8(&small, 64, 32, 5_120, 2_560).is_ok());
+    }
+
+    /// Empty and extreme-aspect inputs never reach the grid search with a degenerate ratio, and the
+    /// grid it returns is always a valid one (2 to 10 tiles).
+    #[test]
+    fn tile_layout_handles_empty_and_extreme_shapes() {
+        let cfg = lfm2_cfg();
+        assert!(matches!(
+            preprocess_layout_rgb8(&[], 0, 100_000, &cfg, None),
+            Err(CeraError::EmptyInput)
+        ));
+        assert!(matches!(
+            preprocess_layout_rgb8(&[], 512, 0, &cfg, None),
+            Err(CeraError::EmptyInput)
+        ));
+        for (w, h) in [(1, 20_000), (20_000, 1), (3, 5_000), (4_000, 7)] {
+            let (c, r) = lfm2_tile_grid(w, h);
+            assert!((2..=10).contains(&(c * r)), "{w}x{h} -> {c}x{r}");
+        }
+    }
+
+    /// The resize must reproduce Pillow's (and llama.cpp's port of it) arithmetic exactly. The
+    /// expected values come from an independent implementation of the same algorithm (exact integer
+    /// math in Python), covering a shrink, a grow, a mix, one axis only, and the 1024x771 to 576x416
+    /// thumbnail resize.
+    #[test]
+    fn pillow_resize_matches_the_reference_implementation() {
+        // (src w, src h, dst w, dst h, FNV-1a digest of the output, its first 12 bytes).
+        type Case = (usize, usize, usize, usize, u64, [u8; 12]);
+        let cases: &[Case] = &[
+            (
+                7,
+                5,
+                3,
+                9,
+                0x3686_d435_da0d_2a2c,
+                [65, 108, 153, 104, 160, 113, 116, 95, 166, 113, 86, 145],
+            ),
+            (
+                100,
+                60,
+                30,
+                20,
+                0x40d7_ccde_abc8_94e8,
+                [120, 153, 149, 163, 148, 119, 155, 103, 125, 156, 115, 134],
+            ),
+            (
+                20,
+                30,
+                45,
+                70,
+                0x13d8_0aa1_20b2_d684,
+                [13, 51, 91, 33, 72, 113, 86, 128, 172, 126, 171, 217],
+            ),
+            (
+                64,
+                64,
+                64,
+                16,
+                0x9e01_5940_7ef5_ef39,
+                [80, 93, 87, 157, 130, 111, 133, 139, 119, 73, 195, 135],
+            ),
+            (
+                33,
+                17,
+                33,
+                40,
+                0xddea_fb30_024e_b1ac,
+                [13, 51, 91, 133, 177, 223, 15, 65, 117, 171, 227, 29],
+            ),
+            (
+                1024,
+                771,
+                576,
+                416,
+                0x0c53_8a27_4337_33da,
+                [81, 117, 148, 81, 150, 130, 105, 105, 157, 165, 93, 119],
+            ),
+        ];
+        for &(sw, sh, tw, th, hash, first) in cases {
+            let src = pattern(sw * sh * 3);
+            let out = resize_pillow_bilinear_rgb8(&src, sw, sh, tw, th).unwrap();
+            assert_eq!(out.len(), tw * th * 3, "{sw}x{sh} -> {tw}x{th} length");
+            assert_eq!(&out[..12], &first, "{sw}x{sh} -> {tw}x{th} first pixels");
+            assert_eq!(fnv1a(&out), hash, "{sw}x{sh} -> {tw}x{th} digest");
+        }
+    }
+
+    /// Shrinking averages the source pixels it covers (the filter widens by the scale factor), so a
+    /// single bright pixel still shows up in the smaller image. The two-tap `resize_bilinear_rgb`
+    /// only ever reads the two source pixels nearest each output sample, and for 16 -> 4 it never
+    /// reads source pixel 3, so it loses the pixel entirely.
+    #[test]
+    fn pillow_resize_keeps_every_source_pixel_when_shrinking() {
+        let mut src = vec![0u8; 16 * 3];
+        src[3 * 3..3 * 3 + 3].fill(240);
+        let pillow = resize_pillow_bilinear_rgb8(&src, 16, 1, 4, 1).unwrap();
+        assert!(
+            pillow.iter().any(|&v| v > 20),
+            "the bright pixel vanished: {pillow:?}"
+        );
+        // Weight is conserved: the output mean tracks the input mean (240 / 16 = 15).
+        let mean = pillow.iter().map(|&v| v as f32).sum::<f32>() / pillow.len() as f32;
+        assert!((mean - 15.0).abs() < 2.0, "mean {mean}");
+        let two_tap = resize_bilinear_rgb(&src, 16, 1, PixelFormat::Rgb8, 4, 1).unwrap();
+        assert!(
+            two_tap.iter().all(|&v| v == 0),
+            "two-tap read pixel 3: {two_tap:?}"
+        );
+    }
+
+    #[test]
+    fn pillow_resize_identity_and_errors() {
+        let src = pattern(5 * 4 * 3);
+        assert_eq!(resize_pillow_bilinear_rgb8(&src, 5, 4, 5, 4).unwrap(), src);
+        assert!(resize_pillow_bilinear_rgb8(&src, 5, 4, 0, 4).is_err());
+        assert!(resize_pillow_bilinear_rgb8(&src[..10], 5, 4, 3, 3).is_err());
+    }
+
+    /// Tiling starts once the 32-aligned area exceeds twice the single-image budget (524,288 px):
+    /// 724x724 aligns to 736x736 and tiles, 700x700 aligns to 704x704 and does not. Alignment rounds
+    /// half to even, as the reference does.
+    #[test]
+    fn lfm2_should_tile_follows_the_aligned_area() {
+        let cfg = lfm2_cfg();
+        assert!(!lfm2_should_tile(512, 385, &cfg));
+        assert!(!lfm2_should_tile(700, 700, &cfg));
+        assert!(lfm2_should_tile(724, 724, &cfg));
+        assert!(lfm2_should_tile(1024, 771, &cfg));
+        // 16 is the round-half-even case: 16/32 = 0.5 rounds to 0, floored at one patch (16).
+        assert!(!lfm2_should_tile(16, 16, &cfg));
+    }
+
+    #[test]
+    fn lfm2_tile_grid_picks_the_closest_aspect_ratio() {
+        assert_eq!(lfm2_tile_grid(1024, 771), (3, 2));
+        assert_eq!(lfm2_tile_grid(771, 1024), (2, 3));
+        // An exact 2:1 tie between 2x1 and 4x2 goes to the larger grid when the image fills over
+        // half of it.
+        assert_eq!(lfm2_tile_grid(2000, 1000), (4, 2));
+        assert_eq!(lfm2_tile_grid(2000, 2000), (3, 3));
+        // A square ties between 2x2 and 3x3 (and more): the larger grid wins only once the image fills over
+        // half of it, so a 1000x1000 photo is 4 tiles and a 1200x1200 one is 9.
+        assert_eq!(lfm2_tile_grid(1000, 1000), (2, 2));
+        assert_eq!(lfm2_tile_grid(1200, 1200), (3, 3));
+        // Never fewer than 2 tiles or more than 10.
+        for (w, h) in [(1500, 400), (400, 1500), (3000, 3000), (900, 1400)] {
+            let (c, r) = lfm2_tile_grid(w, h);
+            assert!((2..=10).contains(&(c * r)), "{w}x{h} -> {c}x{r}");
+        }
+    }
+
+    fn png_of(w: u32, h: u32) -> Vec<u8> {
+        let img = image::RgbImage::from_fn(w, h, |x, y| {
+            image::Rgb([
+                (x * 255 / w) as u8,
+                (y * 255 / h) as u8,
+                ((x + y) % 256) as u8,
+            ])
+        });
+        let mut out = Vec::new();
+        image::DynamicImage::ImageRgb8(img)
+            .write_to(&mut std::io::Cursor::new(&mut out), image::ImageFormat::Png)
+            .unwrap();
+        out
+    }
+
+    /// 1024x771 is the worked example from the reference: a 3x2 grid of 512 px tiles (256 tokens
+    /// each) plus a 576x416 thumbnail (234 tokens), and a caller cap turns tiling off.
+    #[test]
+    fn large_image_becomes_tiles_plus_thumbnail() {
+        let cfg = lfm2_cfg();
+        let bytes = png_of(1024, 771);
+        match preprocess_image_layout(&bytes, &cfg, None).unwrap() {
+            PreprocessedLayout::Tiled(t) => {
+                assert_eq!((t.cols, t.rows), (3, 2));
+                assert_eq!(t.tiles.len(), 6);
+                for tile in &t.tiles {
+                    assert_eq!((tile.target_w, tile.target_h), (512, 512));
+                    assert_eq!(tile.pixels.len(), 3 * 512 * 512);
+                }
+                assert_eq!((t.thumbnail.target_w, t.thumbnail.target_h), (576, 416));
+            }
+            other => panic!("expected a tiled layout, got {other:?}"),
+        }
+        assert!(matches!(
+            preprocess_image_layout(&bytes, &cfg, Some(512)).unwrap(),
+            PreprocessedLayout::Single(_)
+        ));
+        // A small image stays single and equals the single-image path.
+        let small = png_of(512, 385);
+        let PreprocessedLayout::Single(one) = preprocess_image_layout(&small, &cfg, None).unwrap()
+        else {
+            panic!("a 512x385 image must not tile");
+        };
+        assert_eq!(one, preprocess_image_with_opts(&small, &cfg, None).unwrap());
+    }
+
+    /// Tiles are cropped from one resize of the whole image (as the reference does), not resized
+    /// from their own source regions: adjacent tiles must meet without a seam.
+    #[test]
+    fn tiles_are_crops_of_one_refined_image() {
+        let cfg = lfm2_cfg();
+        let (w, h) = (1024usize, 771usize);
+        let rgb = pattern(w * h * 3);
+        let PreprocessedLayout::Tiled(t) = preprocess_layout_rgb8(&rgb, w, h, &cfg, None).unwrap()
+        else {
+            panic!("expected tiles");
+        };
+        // The thumbnail is the ordinary single-image preprocess of the whole picture.
+        assert_eq!(
+            t.thumbnail,
+            preprocess_single_rgb8(&rgb, w, h, &cfg, None).unwrap()
+        );
+        let refined = resize_pillow_bilinear_rgb8(&rgb, w, h, 3 * 512, 2 * 512).unwrap();
+        // Tile (row 1, col 2) is the refined image's crop at (x=1024, y=512), channel-major (NCHW).
+        // Every pixel of the tile is compared, so a wrong row stride or a repeated row cannot pass.
+        let (tile_row, tile_col) = (1usize, 2usize);
+        let tile = &t.tiles[tile_row * 3 + tile_col];
+        let side = LFM2_TILE_SIZE;
+        for y in 0..side {
+            for x in 0..side {
+                for c in 0..3 {
+                    let src = (((tile_row * side + y) * 3 * side) + tile_col * side + x) * 3 + c;
+                    let want = (refined[src] as f32 / 255.0 - cfg.image_mean[c]) / cfg.image_std[c];
+                    let got = tile.pixels[c * side * side + y * side + x];
+                    assert!((got - want).abs() < 1e-5, "y{y} x{x} c{c}: {got} vs {want}");
+                }
+            }
+        }
     }
 }

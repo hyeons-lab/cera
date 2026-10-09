@@ -380,10 +380,11 @@ struct HexagonKnobs {
     /// re-verify a chosen cap over long greedy runs.
     decode_ops: Option<usize>,
     /// `CERA_HEXAGON_BATCH_TENSORS`: tensors per batch for decode and every
-    /// prefill chunk. Unset means [`MAX_TENSORS_PER_FLUSH`];
-    /// `0` means unbounded (and brings back the single-batch resident decode
-    /// template, which is nondeterministic on the device); a positive N ends
-    /// the batch at the first op-group boundary at or past N tensors.
+    /// prefill chunk. Unset or `0` means unbounded, which also keeps the
+    /// single-batch resident decode template; a positive N ends the batch at
+    /// the first op-group boundary at or past N tensors (a bisection aid since
+    /// the conv state writeback stopped sharing a scratch row, see
+    /// `ScratchOffsets::conv_stage`).
     batch_tensors: Option<usize>,
 }
 
@@ -421,15 +422,15 @@ impl HexagonKnobs {
                 .and_then(|v| v.trim().parse::<usize>().ok())
                 .filter(|&v| v > 0),
             batch_tensors: match get("CERA_HEXAGON_BATCH_TENSORS") {
-                None => Some(MAX_TENSORS_PER_FLUSH),
+                None => None,
                 Some(raw) => match raw.trim().parse::<usize>() {
                     Ok(0) => None,
                     Ok(n) => Some(n),
                     Err(_) => {
                         hexagon_warn!(
-                            "CERA_HEXAGON_BATCH_TENSORS={raw:?} is not an unsigned integer; using {MAX_TENSORS_PER_FLUSH} (0 disables the cap)"
+                            "CERA_HEXAGON_BATCH_TENSORS={raw:?} is not an unsigned integer; running uncapped"
                         );
-                        Some(MAX_TENSORS_PER_FLUSH)
+                        None
                     }
                 },
             },
@@ -814,31 +815,23 @@ fn ensure_partial_rope_plain(
 /// HMX chunk solvers (HVX fallback covers M <= 4).
 const PREFILL_MAX_ROWS: usize = 512;
 
+/// Conv layers whose state-update source rows get a private scratch slot (see
+/// `ScratchOffsets::conv_stage`). A layer index wraps past this, so it only needs to exceed the
+/// number of conv layers one DSP batch can hold, which no LFM2 model comes near; `check_conv_stage_slots`
+/// refuses a config where two conv layers would still share a slot.
+const CONV_STAGE_SLOTS: usize = 64;
+
 /// Chunks below this many rows cap ops per flush (`MAX_OPS_PER_FLUSH`).
 /// Large single-flush batches compute nondeterministically: run-to-run logit
 /// swings up to ±3.6 at m <= 14 (m >= 15 bit-clean across 1..128) and
 /// greedy-decode flips. The corruption needs a large co-batched window;
 /// 24 ops/flush is verified bit-clean across prefill shapes and prompts
 /// (single and chunked). Every chunk and every decode step is also bounded
-/// by the tensor cap (`MAX_TENSORS_PER_FLUSH`, `CERA_HEXAGON_BATCH_TENSORS`);
+/// by the optional tensor cap (`CERA_HEXAGON_BATCH_TENSORS`);
 /// `HexagonKnobs::decode_ops` is the op-count bisection aid.
 const SMALL_M_FLUSH_CAP_ROWS: usize = 32;
 /// Ops-per-flush cap for small-M prefill chunks (see above).
 const MAX_OPS_PER_FLUSH: usize = 24;
-
-/// Tensors a decode or prefill batch may hold before the next op-group
-/// boundary ends it. A whole token as one batch computes nondeterministically
-/// on the device (different logits on every run, differing by up to 3 from
-/// decode step 1, in prefill chunks of one row too, and a large prefill chunk as
-/// one batch left the recurrent state different from process to process). Over 20 runs of 24 decode
-/// steps, caps of 40 or fewer gave one logit sequence on the 450M, the 2.6B and
-/// the 8B MoE, while 48 did not on the 2.6B and batches of 60 or more tensors
-/// did not on the 450M. The cap is checked at a group boundary, so a batch can
-/// pass it by one group; 32 leaves room for that. It costs decode speed on the
-/// device: about 20% on the 450M (dispatch bound), 8% on the 2.6B and 10% on the
-/// 8B MoE, a third of it from no longer replaying the resident template. See
-/// `HexagonQueueSession::set_max_tensors_per_flush`.
-const MAX_TENSORS_PER_FLUSH: usize = 32;
 
 pub const MAX_ALL_LOGITS_TOKENS: usize = 64;
 
@@ -854,6 +847,14 @@ struct ScratchOffsets {
     attn_out: usize,
     conv_in: usize,
     conv_bx: usize,
+    /// One slot per conv layer (`CONV_STAGE_SLOTS`, `conv_stage_slot` bytes apart) holding the row(s)
+    /// the layer's strided state writeback reads. The shared `conv_bx` cannot be that source: every
+    /// conv layer rewrites it at the same address, and in a long DSP batch the writeback's scalar
+    /// loads of it return the previous conv layer's row (stale cached lines the DSP's range flush does
+    /// not remove), which silently corrupts the rolling state. A private slot is never touched by
+    /// another layer, so there is nothing stale to read. See `emit_conv_decode`.
+    conv_stage: usize,
+    conv_stage_slot: usize,
     conv_t0: usize,
     conv_t1: usize,
     conv_y: usize,
@@ -884,7 +885,34 @@ struct ScratchOffsets {
     total_size: usize,
 }
 
+/// Refuse a model whose conv layers would share a stage slot. The slot is the layer index modulo
+/// [`CONV_STAGE_SLOTS`], and two conv layers on one slot reintroduce the stale-read corruption the
+/// private slots exist to prevent, so what the sizing assumes ("no LFM2 model comes near") is checked
+/// at construction instead of left to hold by luck.
+fn check_conv_stage_slots(config: &ModelConfig) -> Result<(), CeraError> {
+    let mut used = [false; CONV_STAGE_SLOTS];
+    for (i, block) in config.block_types.iter().enumerate() {
+        if *block != BlockType::GatedConv {
+            continue;
+        }
+        let slot = i % CONV_STAGE_SLOTS;
+        if std::mem::replace(&mut used[slot], true) {
+            return Err(CeraError::Backend(format!(
+                "layer {i} shares a conv stage slot with an earlier conv layer \
+                 ({CONV_STAGE_SLOTS} slots): raise CONV_STAGE_SLOTS"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl ScratchOffsets {
+    /// The staging slot for conv layer `layer_idx`: the address its `b*x` row and rolling-state source
+    /// rows live at, shared with no other conv layer.
+    fn conv_stage_at(&self, layer_idx: usize) -> usize {
+        self.conv_stage + (layer_idx % CONV_STAGE_SLOTS) * self.conv_stage_slot
+    }
+
     fn new(
         hidden_size: usize,
         q_dim: usize,
@@ -922,6 +950,9 @@ impl ScratchOffsets {
         cur = align(cur + m * conv_width * 4);
         let conv_bx = cur;
         cur = align(cur + m * hidden_size.max(q_dim) * 4);
+        let conv_stage = cur;
+        let conv_stage_slot = align(2 * hidden_size * 4);
+        cur = align(cur + CONV_STAGE_SLOTS * conv_stage_slot);
         let conv_t0 = cur;
         cur = align(cur + m * hidden_size * 4);
         let conv_t1 = cur;
@@ -1021,6 +1052,8 @@ impl ScratchOffsets {
             attn_out,
             conv_in,
             conv_bx,
+            conv_stage,
+            conv_stage_slot,
             conv_t0,
             conv_t1,
             conv_y,
@@ -1181,7 +1214,7 @@ pub struct HexagonLfmModel {
     has_deltanet: bool,
     /// Debug barriers: flush the DSP queue after every op group (the
     /// bring-up behavior). Default off: a token goes to the DSP in batches
-    /// ended by the tensor cap (`MAX_TENSORS_PER_FLUSH`), not one flush per op
+    /// (unbounded unless `CERA_HEXAGON_BATCH_TENSORS` is set), not one flush per op
     /// group. Set `CERA_HEXAGON_BARRIERS=1` to restore per-group flushes
     /// when localizing a DSP-side failure.
     debug_barriers: bool,
@@ -1514,6 +1547,8 @@ impl HexagonLfmModel {
         let q_dim = n_heads * head_dim;
         let max_kv_dim = max_kv_dim(&config, head_dim);
 
+        check_conv_stage_slots(&config)?;
+
         // Allocate unified shared scratch buffer
         let scratch_offsets = ScratchOffsets::new(
             hidden_size,
@@ -1824,6 +1859,9 @@ impl HexagonLfmModel {
 
         let max_kv_dim = max_kv_dim(&config, head_dim);
 
+        // Defensive: these builders emit no gated-conv blocks today, so this cannot fire; it keeps the
+        // scratch layout checked if one is added.
+        check_conv_stage_slots(&config)?;
         let scratch_offsets = ScratchOffsets::new(
             hidden_size,
             max_q_out_dim,
@@ -2089,6 +2127,9 @@ impl HexagonLfmModel {
 
         let q_dim = n_heads * head_dim;
         let max_kv_dim = max_kv_dim(&config, head_dim);
+
+        // Defensive, as above.
+        check_conv_stage_slots(&config)?;
 
         // Allocate unified shared scratch buffer
         let mut scratch_offsets = ScratchOffsets::new(
@@ -2799,7 +2840,7 @@ impl HexagonLfmModel {
         }
 
         // Decode determinism: cap ops per flush if configured, and tensors per
-        // batch (on by default; see `MAX_TENSORS_PER_FLUSH`).
+        // batch (off by default).
         session.set_max_ops_per_flush(self.decode_ops_cap);
         session.set_max_tensors_per_flush(self.batch_tensor_cap);
 

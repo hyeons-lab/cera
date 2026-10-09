@@ -158,11 +158,12 @@ jobs:
           # way the `simd-i8mm` leg below does for aarch64. Every GitHub-hosted
           # x86 runner has AVX2, and the AVX2 int8 GEMM/GEMV is now the default
           # x86 production path, so a skip here means feature detection broke —
-          # not that the host is incapable. Scoped to the x86 leg because that
-          # is where the requirement means something: on `macos-latest` (arm64)
-          # the `avx2_int8` module is cfg'd out entirely, so nothing would ever
-          # consult the variable and setting it would assert nothing.
-          CERA_REQUIRE_SIMD: ${{ matrix.os == 'ubuntu-latest' && 'avx2' || '' }}
+          # not that the host is incapable. The arm64 leg (`macos-latest`, dotprod
+          # and fp16) requires `dotprod` instead, since the `avx2_int8` module is
+          # cfg'd out there: it arms the Q4_0 decode-repack identity tests, which
+          # would otherwise skip silently if detection regressed or
+          # `CERA_Q4_DEC4=0` leaked in from the environment.
+          CERA_REQUIRE_SIMD: ${{ matrix.os == 'ubuntu-latest' && 'avx2' || 'dotprod' }}
           # Same fail-closed shape for the CPU repack gate: without this, an
           # int8-detection regression degrades `repackless_dispatch_warns_once`
           # to a silent skip. Safe on ubuntu (AVX2 runners repack) and moot on
@@ -252,8 +253,8 @@ jobs:
       # (dotprod, no i8mm), so without this the branch never executes.
       - name: Validate i8mm + NEON fallbacks (fail if i8mm absent)
         env:
-          CERA_REQUIRE_SIMD: i8mm
-        run: cargo test -p cera --lib -- cpu_features fallback_tests decode_prefill_identity
+          CERA_REQUIRE_SIMD: i8mm,dotprod
+        run: cargo test -p cera --lib -- cpu_features fallback_tests decode_prefill_identity smmla_repacked dec4_identity
 
   # Run the wgpu compute kernels on CPU via Mesa's lavapipe (software Vulkan).
   # The `gpu` feature is non-default, so the regular `test` job never compiles
@@ -890,7 +891,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=4032  # 3.94 MB; PR #464 NPU and GPU model coverage
+          BUDGET_KB=4064  # 3.97 MB; PR #483 LFM2-VL image tiling and the Pillow-compatible resize (4054 KB measured on top of the d1 stack)
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           # Display rounds UP to KB, so a 2,621,441-byte file reads as
           # "2561 KB" rather than "2560 KB". That keeps the human-readable
@@ -1056,7 +1057,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}-mt
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=4200  # 4.10 MB; PR #464 NPU and GPU model coverage, PR #486 d1 decision models
+          BUDGET_KB=4232  # 4.13 MB; PR #483 LFM2-VL image tiling and the Pillow-compatible resize (4221 KB measured on top of the d1 stack)
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}

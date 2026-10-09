@@ -50,7 +50,7 @@ let engine = try await CeraEngine.fromBundleIdAsync(
 
 // 2. Open a session and enter conversational chat.
 let session = try engine.newSession(config: SessionConfig(
-    maxSeqLen: nil, kvCompression: .none, nKeep: 0, seed: nil, ubatchSize: 0))
+    maxSeqLen: nil, kvCompression: nil, nKeep: 0, seed: nil, ubatchSize: 0))
 let chat = try session.intoChat()
 
 // 3. Ingest message and stream reply using AsyncThrowingStream.

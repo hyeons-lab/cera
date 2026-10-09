@@ -162,8 +162,16 @@ func runProduction(_ root: URL, bytes: Data) throws -> [String] {
       seed: 0, ubatchSize: 0, gpuDepthformer: true)
     let session = try model.createSession(config: config)
     var expected = config
-    expected.kvCompression = mode ?? loading_native.KvCompression.none
     let observed = try sessionConfigForProbe(session: session)
+    if let mode {
+      expected.kvCompression = mode
+    } else {
+      // Omitted means the core default: f16 where the model honors it, else the backend's own cache.
+      precondition(
+        observed.kvCompression == loading_native.KvCompression.f16
+          || observed.kvCompression == loading_native.KvCompression.none)
+      expected.kvCompression = observed.kvCompression
+    }
     precondition(observed == expected)
     try session.appendTokens(tokens: [0, 1])
     let generated = try session.generate(
