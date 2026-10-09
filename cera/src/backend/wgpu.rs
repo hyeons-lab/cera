@@ -7195,6 +7195,18 @@ mod tests {
         f: &AttnPrefillFixture,
         tile: u32,
     ) -> Vec<f32> {
+        run_gpu_attention_prefill_mode(ctx, f, tile, None)
+    }
+
+    /// [`run_gpu_attention_prefill_tiled`] for a causal pass (`bidir_prefix` `None`) or a
+    /// bidirectional one (`Some(prefix_rows)`): every dispatch gets the whole call's row count in
+    /// params[7], which is what a bidirectional window is read from.
+    fn run_gpu_attention_prefill_mode(
+        ctx: &GpuContext,
+        f: &AttnPrefillFixture,
+        tile: u32,
+        bidir_prefix: Option<u32>,
+    ) -> Vec<f32> {
         assert!(tile > 0, "tile must be > 0 (0 would never advance q_base)");
         let pipeline = ctx.create_pipeline(
             shaders::ATTENTION_PREFILL,
@@ -7220,13 +7232,13 @@ mod tests {
                 f.max_seq,
                 f.scale.to_bits(),
                 f.start_pos,
-                n_sub,
+                f.start_pos + f.n_queries, // total_rows: read by a bidirectional pass only
                 f.q_stride,
                 f.out_stride,
                 q_base,
                 n_sub,
-                0, // causal
-                0, // prefix_rows
+                u32::from(bidir_prefix.is_some()),
+                bidir_prefix.unwrap_or(0),
             ];
             let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
             let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -7409,6 +7421,67 @@ mod tests {
             checked > n * 9 / 10,
             "too many values skipped as ties: {checked} of {n}"
         );
+    }
+
+    /// A bidirectional pass split into several dispatches matches a CPU reference, with and
+    /// without a media prefix. A split dispatch only knows its own share of the queries, so the
+    /// key window has to come from the whole call's row count (params[7]); deriving it from the
+    /// chunk's query count read too few keys and shifted the d1 decision models' answers.
+    #[test]
+    fn test_gpu_attention_prefill_bidirectional_split_matches_cpu() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let f = build_attn_prefill_fixture(4, 2, 32, 70, 0);
+        let (hd, kv_dim) = (f.head_dim as usize, f.kv_dim as usize);
+        let group = (f.n_heads / f.n_kv_heads) as usize;
+        for prefix in [0u32, 24] {
+            let mut want = vec![0.0f32; f.ref_out.len()];
+            for q in 0..f.n_queries as usize {
+                // a query in the media prefix reads only the prefix; the others read everything
+                let window = if prefix > 0 && (q as u32) < prefix {
+                    prefix as usize
+                } else {
+                    f.n_queries as usize
+                };
+                for h in 0..f.n_heads as usize {
+                    let kv_off = (h / group) * hd;
+                    let q_off = q * f.q_stride as usize + h * hd;
+                    let mut scores: Vec<f32> = (0..window)
+                        .map(|t| {
+                            (0..hd)
+                                .map(|d| f.q_batch[q_off + d] * f.k_cache[t * kv_dim + kv_off + d])
+                                .sum::<f32>()
+                                * f.scale
+                        })
+                        .collect();
+                    let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0f32;
+                    for s in &mut scores {
+                        *s = (*s - max_s).exp();
+                        sum += *s;
+                    }
+                    for d in 0..hd {
+                        want[q * f.out_stride as usize + h * hd + d] = scores
+                            .iter()
+                            .enumerate()
+                            .map(|(t, s)| s / sum * f.v_cache[t * kv_dim + kv_off + d])
+                            .sum();
+                    }
+                }
+            }
+            for tile in [70u32, 24, 16, 8] {
+                let got = run_gpu_attention_prefill_mode(&ctx, &f, tile, Some(prefix));
+                for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 5e-3 + 1e-3 * w.abs(),
+                        "bidirectional prefix={prefix} tile={tile}: idx {i} (token {}) gpu={g} cpu={w}",
+                        i / f.out_stride as usize
+                    );
+                }
+            }
+        }
     }
 
     /// `attention_prefill` parity: batched attention over N queries matches the
