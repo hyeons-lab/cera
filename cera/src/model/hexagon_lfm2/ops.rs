@@ -641,7 +641,7 @@ impl HexagonLfmModel {
         Ok(())
     }
 
-    fn dispatch_get_rows(
+    pub(super) fn dispatch_get_rows(
         session: &mut HexagonQueueSession,
         src0: &RpcmemBuffer,
         src0_offset: usize,
@@ -653,6 +653,11 @@ impl HexagonLfmModel {
         n_rows_out: usize,
         dsp_threads: u32,
     ) -> Result<(), CeraError> {
+        // Nothing to gather: the params would carry `n_threads = 0`, which must never cross
+        // the FastRPC boundary, so skip the enqueue instead of emitting a zero-thread op.
+        if n_rows_out == 0 {
+            return Ok(());
+        }
         let src0_ti = session.add_tensor(
             src0,
             src0_offset,
