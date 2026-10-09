@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 43 "cera/src/backend/shaders/slang/glu_split.slang"
+#line 22 "cera/src/backend/shaders/slang/glu_split.slang"
 struct KernelContext_0
 {
     packed_uint4 device* par_buf_0;

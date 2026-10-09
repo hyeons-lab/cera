@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 45 "cera/src/backend/shaders/slang/transpose_blocked.slang"
+#line 22 "cera/src/backend/shaders/slang/transpose_blocked.slang"
 struct KernelContext_0
 {
     packed_uint4 device* par_buf_0;

@@ -95,7 +95,7 @@ fn ffn_swiglu_q4_0(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wor
     var sum_gate_0 : array<f32, i32(4)>;
     var sum_up_0 : array<f32, i32(4)>;
     var r_0 : u32 = u32(0);
-    for(;;)
+    loop
     {
         if(r_0 < u32(4))
         {
@@ -109,7 +109,7 @@ fn ffn_swiglu_q4_0(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wor
         r_0 = r_0 + u32(1);
     }
     var chunk_b_0 : u32 = u32(0);
-    for(;;)
+    loop
     {
         if(chunk_b_0 < nb_0)
         {
@@ -121,7 +121,7 @@ fn ffn_swiglu_q4_0(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wor
         var chunk_k_start_0 : u32 = chunk_b_0 * u32(32);
         var _S12 : u32 = min(u32(512), k_0 - chunk_k_start_0) / u32(4);
         i_0 = tid_0;
-        for(;;)
+        loop
         {
             if(i_0 < _S12)
             {
@@ -140,7 +140,7 @@ fn ffn_swiglu_q4_0(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wor
         }
         workgroupBarrier();
         var ib_local_0 : u32 = _S10;
-        for(;;)
+        loop
         {
             var _S14 : bool;
             if(ib_local_0 < u32(16))
@@ -178,7 +178,7 @@ fn ffn_swiglu_q4_0(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wor
             var _S27 : f32 = x_stage_0[yb_stage_off_0 + u32(23)] / 4096.0f;
             var _S28 : f32 = x_stage_0[yb_stage_off_0] + x_stage_0[yb_stage_off_0 + u32(1)] + (x_stage_0[yb_stage_off_0 + u32(2)] + x_stage_0[yb_stage_off_0 + u32(3)]) + (x_stage_0[yb_stage_off_0 + u32(4)] + x_stage_0[yb_stage_off_0 + u32(5)]) + (x_stage_0[yb_stage_off_0 + u32(6)] + x_stage_0[yb_stage_off_0 + u32(7)]) + (x_stage_0[yb_stage_off_0 + u32(16)] + x_stage_0[yb_stage_off_0 + u32(17)] + (x_stage_0[yb_stage_off_0 + u32(18)] + x_stage_0[yb_stage_off_0 + u32(19)]) + (x_stage_0[yb_stage_off_0 + u32(20)] + x_stage_0[yb_stage_off_0 + u32(21)]) + (x_stage_0[yb_stage_off_0 + u32(22)] + x_stage_0[yb_stage_off_0 + u32(23)]));
             r_0 = u32(0);
-            for(;;)
+            loop
             {
                 if(r_0 < u32(4))
                 {
@@ -217,7 +217,7 @@ fn ffn_swiglu_q4_0(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wor
         chunk_b_0 = chunk_b_0 + u32(16);
     }
     r_0 = u32(0);
-    for(;;)
+    loop
     {
         if(r_0 < u32(4))
         {
@@ -233,7 +233,7 @@ fn ffn_swiglu_q4_0(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wor
     }
     workgroupBarrier();
     i_0 = u32(16);
-    for(;;)
+    loop
     {
         if(i_0 > u32(0))
         {
@@ -245,7 +245,7 @@ fn ffn_swiglu_q4_0(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wor
         if(tid_0 < i_0)
         {
             r_0 = u32(0);
-            for(;;)
+            loop
             {
                 if(r_0 < u32(4))
                 {
@@ -267,7 +267,7 @@ fn ffn_swiglu_q4_0(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wor
     if(tid_0 == u32(0))
     {
         r_0 = u32(0);
-        for(;;)
+        loop
         {
             if(r_0 < u32(4))
             {
