@@ -144,6 +144,28 @@ The gain grows with the context because attention is quadratic; the rest of the 
 kernel's do (cosine 0.9999 or better on six; the seventh, a noisy prompt, is 0.9989 against the scalar kernel's
 0.9957), with the same argmax on every prompt.
 
+#### What the Adreno 830 can do (`wgpu_peak_bench`)
+
+The GPU kernels' TFLOPS mean little without the ceiling, so `cera/examples/wgpu_peak_bench.rs` measures it
+through the same SPIR-V passthrough path as the production GEMMs: dependent-free FMA chains, a packed int8
+dot product, and a coalesced streaming read. Each kernel runs about 25 ms per dispatch, 8 dispatches per
+submit, median of 5 rounds; three runs agree within 1%.
+
+| Ceiling | Measured | Production kernel | Share of ceiling |
+|---|---:|---|---:|
+| fp32 FMA | 3.60 TFLOPS | tiled causal attention, 0.23 TFLOPS | 6% |
+| fp16 FMA | 7.10 TFLOPS | `gemm_stream_q4_0_k64`, 2.2 TFLOPS in the model (2.73 in `gemm-bench`) | 31% (38%) |
+| int8 packed dot (`SPV_KHR_integer_dot_product`) | 6.83 TOPS | none | no gain over fp16 |
+| read bandwidth | 62.5 GB/s | decode: 220 MB of weights per token at 173 tok/s is 38 GB/s | 61% |
+
+fp16 runs at twice the fp32 rate, and the int8 dot product is no faster than fp16 FMA, so an int8
+formulation of the prefill GEMM would buy nothing on this GPU. The GEMM does more than FMAs (it unpacks
+and scales each 4-bit weight, about 5 instructions against 8 half4 FMAs per weight), so its practical
+ceiling is below the 7.1; roughly 60% of it, 4 TFLOPS, is a fair target and would take the 512-token
+chunk's GEMMs from 133 ms to about 70. Attention is the furthest from its ceiling in relative terms (6% of
+fp32, 3% of fp16) but is the smaller block at 512 tokens. fp16 requires a SPIR-V passthrough kernel: wgpu
+does not advertise `SHADER_F16` on this driver, so a WGSL kernel cannot use it.
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
