@@ -1828,9 +1828,28 @@ impl GpuContext {
             })
     }
 
-    /// Two-row twin of [`Self::gemm_stream_q4_0_k64_passthrough`]: the same five bindings, parameter
-    /// block and grid and bit-exact results, but 128 threads per workgroup with two weight rows
-    /// each (`gemm_stream_q4_0_k64_r2.slang`). Faster when the dispatch has enough workgroups to
+    /// Direct-B twin of [`Self::gemm_stream_q4_0_k64_passthrough`] (`gemm_stream_q4_0_k64_xf32.slang`):
+    /// the same five bindings, parameter block and grid and bit-exact results, but binding 2 is the
+    /// f32 token-major activations `x[n][k]` instead of the transposed f16 copy, so no
+    /// `transpose_cast_f16` pass runs before it. Needs k % 64 == 0.
+    pub fn gemm_stream_q4_0_k64_xf32_passthrough(&self) -> wgpu::ComputePipeline {
+        // SAFETY: slangc-compiled from gemm_stream_q4_0_k64_xf32.slang, spirv-val clean, the same
+        // five-binding interface as the transposed-B kernel.
+        unsafe {
+            self.stream_gemm_pipeline(
+                "gemm_stream_q4_0_k64_xf32_passthrough",
+                wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemm_stream_q4_0_k64_xf32.spv"
+                )),
+                &[true, true, true, false, true],
+            )
+        }
+    }
+
+    /// Two-row twin of [`Self::gemm_stream_q4_0_k64_xf32_passthrough`]: the same five bindings,
+    /// parameter block and grid and bit-exact results (binding 2 is the f32 token-major activations),
+    /// but 128 threads per workgroup with two weight rows each (`gemm_stream_q4_0_k64_r2.slang`). Faster when the dispatch has enough workgroups to
     /// fill the GPU; see `gemm_stream_two_row` in `gpu_lfm2.rs`. Needs k % 64 == 0.
     pub fn gemm_stream_q4_0_k64_r2_passthrough(&self) -> wgpu::ComputePipeline {
         // SAFETY: slangc-compiled from gemm_stream_q4_0_k64_r2.slang, spirv-val clean, same
@@ -1845,7 +1864,7 @@ impl GpuContext {
     }
 
     /// Fused gate/up streaming GEMM with a SiLU epilogue (`gemm_stream_q4_0_k64_gateup.slang`):
-    /// bindings 0/1 gate q/d, 2/3 up q/d, 4 f16 activations, 5 dst (read-write), 6 params; grid
+    /// bindings 0/1 gate q/d, 2/3 up q/d, 4 f32 token-major activations, 5 dst (read-write), 6 params; grid
     /// `(ceil(m/128), ceil(n/32))` of 128-thread workgroups (one gate/up row pair per thread). Needs k % 64 == 0.
     pub fn gemm_stream_q4_0_k64_gateup_passthrough(&self) -> wgpu::ComputePipeline {
         // SAFETY: slangc-compiled from gemm_stream_q4_0_k64_gateup.slang, spirv-val clean, seven
