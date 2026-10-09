@@ -79,6 +79,8 @@ const SLANG_KERNELS: &[&str] = &[
     "mul_mat_reg_tile_q6_k",
     "gemm_stream_q4_0",
     "gemm_stream_q4_0_k64",
+    "gemm_stream_q4_0_k64_r2",
+    "gemm_stream_q4_0_k64_gateup",
     "gemm_stream_q8_0_k64",
     "vit_attn_scores_f16",
     "vit_attn_softmax_t",
