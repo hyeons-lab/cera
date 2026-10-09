@@ -456,14 +456,16 @@ pub(crate) fn gelu_tmp_rows(bytes: usize, dim: usize) -> Result<usize, CeraError
 
 /// In-place GELU, tanh form (`gelu_pytorch_tanh`, what the CPU ViT and Whisper
 /// use; the CPU audio adapter uses the erf form, which this stays within about
-/// 5e-4 of, absolute). The DSP's own `UNARY_GELU` is not this: it is the quick approximation
-/// `x * sigmoid(1.702 x)`, up to about 2% per element away, which a wide
-/// down-projection turned into a 20% error in the vision transformer, so no
-/// helper here exposes it.
+/// 5e-4 of, absolute). The `UNARY_GELU` of the skels this crate bundled before the rebuild was
+/// not this: it was the quick approximation `x * sigmoid(1.702 x)`, up to about 2% per element
+/// away, which a wide down-projection turned into a 20% error in the vision transformer. The
+/// bundled skels now implement `UNARY_GELU` as the tanh form (and have `UnaryGeluErf`), so one
+/// native op could replace the sequence below once it is checked on a device against the CPU;
+/// until then this stays the verified path.
 ///
 /// Computed as
 /// `x * sigmoid(2 sqrt(2/pi) * x * (1 + 0.044715 x^2))`, since
-/// `0.5 (1 + tanh z) = sigmoid(2 z)`. The DSP has no tanh GELU, so this is
+/// `0.5 (1 + tanh z) = sigmoid(2 z)`, in
 /// five ops over `tmp`, a scratch region of `tmp_rows` rows of `shape.dim`
 /// elements that the rows are processed through, `tmp_rows` at a time. The ops
 /// are memory bound, so the count is the cost: the first multiply writes `x * x`
@@ -1356,8 +1358,10 @@ mod tests {
         assert_eq!(s.ops[5].src, vec![s.ops[4].dst[0], 1]);
     }
 
-    /// `kparams[6]` is the DSP's `n_hmx` word: 1 on the HMX matmul, 0 on the HVX one.
-    const KPARAMS_N_HMX: usize = 6;
+    /// The DSP's `n_hmx` byte: 1 on the HMX matmul, 0 on the HVX one.
+    fn n_hmx(kparams: &[i32; 32]) -> u8 {
+        crate::backend::hexagon::MmKernelParams::from_words(kparams).n_hmx
+    }
 
     #[test]
     fn linear_m_with_hmx_runs_the_hmx_matmul_with_its_own_weight_stride() {
@@ -1385,7 +1389,7 @@ mod tests {
 
         let s = run(280, 96, 64, TokenTile::Whole, hmx);
         assert_eq!(s.opcodes(), vec![OP_MULMAT]);
-        assert_eq!(s.ops[0].kparams[KPARAMS_N_HMX], 1, "HMX kernel params");
+        assert_eq!(n_hmx(&s.ops[0].kparams), 1, "HMX kernel params");
         // The same weight bytes, addressed per N tile instead of per N row of K tiles.
         assert_eq!(
             s.tensors[0].nb[1] as usize,
@@ -1393,7 +1397,7 @@ mod tests {
         );
 
         let hvx = run(280, 96, 64, TokenTile::Whole, None);
-        assert_eq!(hvx.ops[0].kparams[KPARAMS_N_HMX], 0, "no option, HVX");
+        assert_eq!(n_hmx(&hvx.ops[0].kparams), 0, "no option, HVX");
         assert_eq!(
             hvx.tensors[0].nb[1] as usize,
             64usize.div_ceil(32) * 32 * 34
@@ -1408,7 +1412,7 @@ mod tests {
         ] {
             let s = run(tokens, rows, cols, tile, hmx);
             assert!(
-                s.ops.iter().all(|o| o.kparams[KPARAMS_N_HMX] == 0),
+                s.ops.iter().all(|o| n_hmx(&o.kparams) == 0),
                 "{tokens} tokens {rows}x{cols} {tile:?}"
             );
         }

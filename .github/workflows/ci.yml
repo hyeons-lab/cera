@@ -99,8 +99,8 @@ jobs:
         # others ships an AAR whose setup fails on new hardware, misdiagnosed
         # as no-NPU. The sets must agree exactly.
         run: |
-          skel_pat='libggml-htp-v[0-9]*\.so'
-          skels=$(ls cera/src/backend/hexagon/skels/libggml-htp-v*.so | xargs -n1 basename | sort)
+          skel_pat='libcera-htp-v[0-9]*\.so'
+          skels=$(ls cera/src/backend/hexagon/skels/libcera-htp-v*.so | xargs -n1 basename | sort)
           rust=$(grep -o "$skel_pat" cera/src/backend/hexagon/device.rs | sort -u)
           kt=$(grep -o "$skel_pat" cera-ffi-kotlin/cera-ffi-android/src/main/kotlin/com/hyeonslab/cera/android/HexagonNpu.kt | sort -u)
           if [ -n "$skels" ] && [ "$skels" = "$rust" ] && [ "$skels" = "$kt" ]; then

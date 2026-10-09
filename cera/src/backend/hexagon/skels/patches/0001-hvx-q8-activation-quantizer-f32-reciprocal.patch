@@ -1,11 +1,12 @@
 diff --git a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
-index 4564b1524..1b909973f 100644
+index 580bae4ac..f0ab9bab4 100644
 --- a/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
 +++ b/ggml/src/ggml-hexagon/htp/hvx-mm-kernels-tiled.h
-@@ -1,46 +1,117 @@
- // Dynamic quantizers that produce tiled activations
- 
--static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * restrict y_block) {
+@@ -3,47 +3,118 @@
+ // vector 9: d * sum(q) of the 32 k, replicated (q8_1), or per 16 k for Q2_K (q8_1_s16): k 0..15 in lanes 0..31,
+ // k 16..31 in lanes 32..63, with d the fp16 scale of vector 8
+ __attribute__((always_inline))
+-static inline void quantize_block_f32_q8_1_tiled_impl(float * restrict x, uint8_t * restrict y_block, const bool sums16) {
 -    assert((unsigned long) x % 128 == 0);
 -    assert((unsigned long) y_block % 128 == 0);
 -
@@ -21,6 +22,11 @@ index 4564b1524..1b909973f 100644
 -    HVX_Vector vx1_qf = Q6_Vqf32_vsub_VsfVsf(vx[1], zero);
 -    HVX_Vector vx2_qf = Q6_Vqf32_vsub_VsfVsf(vx[2], zero);
 -    HVX_Vector vx3_qf = Q6_Vqf32_vsub_VsfVsf(vx[3], zero);
+-
+-    HVX_Vector vmax0_qf = Q6_Vqf32_vsub_VsfVsf(vmax0_sf, zero);
+-    HVX_Vector vmax1_qf = Q6_Vqf32_vsub_VsfVsf(vmax1_sf, zero);
+-    HVX_Vector vmax2_qf = Q6_Vqf32_vsub_VsfVsf(vmax2_sf, zero);
+-    HVX_Vector vmax3_qf = Q6_Vqf32_vsub_VsfVsf(vmax3_sf, zero);
 +// f32 -> f16 bits, round to nearest even, with subnormals. Plain integer code, so these two helpers
 +// need no compiler runtime on the DSP.
 +static inline uint16_t htp_q8_f32_to_f16_bits(float f) {
@@ -58,10 +64,8 @@ index 4564b1524..1b909973f 100644
 +    return (uint16_t) (sign | r);
 +}
  
--    HVX_Vector vmax0_qf = Q6_Vqf32_vsub_VsfVsf(vmax0_sf, zero);
--    HVX_Vector vmax1_qf = Q6_Vqf32_vsub_VsfVsf(vmax1_sf, zero);
--    HVX_Vector vmax2_qf = Q6_Vqf32_vsub_VsfVsf(vmax2_sf, zero);
--    HVX_Vector vmax3_qf = Q6_Vqf32_vsub_VsfVsf(vmax3_sf, zero);
+-    HVX_Vector vmax01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vmax1_qf, vmax0_qf)));
+-    HVX_Vector vmax23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vmax3_qf, vmax2_qf)));
 +// f16 bits -> f32, for the non-negative scales produced above (the sign bit is ignored).
 +static inline float htp_q8_f16_bits_to_f32(uint16_t h) {
 +    const uint32_t e = (h >> 10) & 0x1fu;
@@ -74,8 +78,8 @@ index 4564b1524..1b909973f 100644
 +    return v.f;
 +}
  
--    HVX_Vector vmax01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vmax1_qf, vmax0_qf)));
--    HVX_Vector vmax23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vmax3_qf, vmax2_qf)));
+-    HVX_Vector vx01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx1_qf, vx0_qf)));
+-    HVX_Vector vx23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx3_qf, vx2_qf)));
 +// First stage of the Q8 activation quantizers: 128 floats (four groups of 32) to packed int8
 +// values (`vx_i8`, in element order) and the four f16 group scales laid out the way the HVX tail
 +// expects them (group 0 in halfword lanes 0..31 of `vd01_hf`, group 1 in 32..63; groups 2 and 3
@@ -113,8 +117,10 @@ index 4564b1524..1b909973f 100644
 +        const float    inv = d > 0.0f ? 1.0f / d : 0.0f;
 +        d_f32[g]           = d;
  
--    HVX_Vector vx01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx1_qf, vx0_qf)));
--    HVX_Vector vx23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vx3_qf, vx2_qf)));
+-    HVX_Vector vd01_qf16 = Q6_Vqf16_vmpy_VhfVhf(vmax01_hf, Q6_Vh_vsplat_R(0x2008));  // 1.0 / 127.0
+-    HVX_Vector vd23_qf16 = Q6_Vqf16_vmpy_VhfVhf(vmax23_hf, Q6_Vh_vsplat_R(0x2008));  // 1.0 / 127.0
+-    HVX_Vector vd01_hf   = Q6_Vhf_equals_Vqf16(vd01_qf16);
+-    HVX_Vector vd23_hf   = Q6_Vhf_equals_Vqf16(vd23_qf16);
 +        uint32_t * dw = (uint32_t *) (dbits[g >> 1] + (g & 1) * 32);
 +        const uint32_t w = (uint32_t) dh * 0x10001u;
 +        for (int i = 0; i < 16; ++i) {
@@ -126,11 +132,7 @@ index 4564b1524..1b909973f 100644
 +                       Q6_Vqf32_vsub_VsfVsf(hvx_vec_mul_f32_f32(vx[g], hvx_vec_splat_f32(inv)), zero) :
 +                       zero;
 +    }
- 
--    HVX_Vector vd01_qf16 = Q6_Vqf16_vmpy_VhfVhf(vmax01_hf, Q6_Vh_vsplat_R(0x2008));  // 1.0 / 127.0
--    HVX_Vector vd23_qf16 = Q6_Vqf16_vmpy_VhfVhf(vmax23_hf, Q6_Vh_vsplat_R(0x2008));  // 1.0 / 127.0
--    HVX_Vector vd01_hf   = Q6_Vhf_equals_Vqf16(vd01_qf16);
--    HVX_Vector vd23_hf   = Q6_Vhf_equals_Vqf16(vd23_qf16);
++
 +    HVX_Vector vx01_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vq_qf[1], vq_qf[0])));
 +    HVX_Vector vx23_hf = Q6_Vh_vdeal_Vh(Q6_Vhf_equals_Wqf32(Q6_W_vcombine_VV(vq_qf[3], vq_qf[2])));
 +    *vx_i8 = Q6_Vb_vpack_VhVh_sat(hvx_vec_i16_from_hf_rnd_sat(vx23_hf), hvx_vec_i16_from_hf_rnd_sat(vx01_hf));
@@ -142,7 +144,7 @@ index 4564b1524..1b909973f 100644
 -    HVX_Vector vd23_inv_hf = hvx_vec_inverse_f16(vd23_hf);
 -    vx01_hf              = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(vx01_hf, vd01_inv_hf));
 -    vx23_hf              = Q6_Vhf_equals_Vqf16(Q6_Vqf16_vmpy_VhfVhf(vx23_hf, vd23_inv_hf));
-+static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * restrict y_block) {
++static inline void quantize_block_f32_q8_1_tiled_impl(float * restrict x, uint8_t * restrict y_block, const bool sums16) {
 +    assert((unsigned long) x % 128 == 0);
 +    assert((unsigned long) y_block % 128 == 0);
  
@@ -155,9 +157,9 @@ index 4564b1524..1b909973f 100644
  
      const HVX_Vector ones = Q6_Vb_vsplat_R(1);
      HVX_Vector v_sums = Q6_Vw_vrmpy_VbVb(vx_i8, ones);
-@@ -48,11 +119,11 @@ static inline void quantize_block_f32_q8_1_tiled(float * restrict x, uint8_t * r
-     v_sums = Q6_Vw_vadd_VwVw(v_sums, Q6_V_vror_VR(v_sums, 8));
-     v_sums = Q6_Vw_vadd_VwVw(v_sums, Q6_V_vror_VR(v_sums, 16));
+@@ -54,11 +125,11 @@ static inline void quantize_block_f32_q8_1_tiled_impl(float * restrict x, uint8_
+     }
+     // word 8b: sum of block b (sums16: k 0..15, and word 8b + 4: k 16..31)
  
 -    const HVX_Vector v_inv127 = hvx_vec_splat_f32(1.0f / 127.0f);
 -    HVX_Vector vd0_sf = hvx_vec_mul_f32_f32(vmax0_sf, v_inv127);
@@ -171,8 +173,8 @@ index 4564b1524..1b909973f 100644
 +    HVX_Vector vd3_sf = hvx_vec_splat_f32(d_f32[3]);
  
      HVX_Vector v_sums_sf = Q6_Vsf_equals_Vw(v_sums);
-     HVX_Vector voff0_sf = hvx_vec_mul_f32_f32(vd0_sf, v_sums_sf);
-@@ -118,43 +189,9 @@ static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * r
+     if (sums16) {
+@@ -149,43 +220,9 @@ static inline void quantize_block_f32_q8_0_tiled(float * restrict x, uint8_t * r
      assert((unsigned long) x % 128 == 0);
      assert((unsigned long) y_block % 128 == 0);
  

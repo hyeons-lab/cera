@@ -29,11 +29,11 @@ object HexagonNpu {
      * files embedded in `libcera_ffi.so`.
      */
     val skelFiles: List<String> = listOf(
-        "libggml-htp-v73.so",
-        "libggml-htp-v75.so",
-        "libggml-htp-v79.so",
-        "libggml-htp-v81.so",
-        "libggml-htp-v85.so",
+        "libcera-htp-v73.so",
+        "libcera-htp-v75.so",
+        "libcera-htp-v79.so",
+        "libcera-htp-v81.so",
+        "libcera-htp-v85.so",
     )
 
     /**

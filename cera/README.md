@@ -227,13 +227,13 @@ The `hexagon` feature flag activates Cera's native Qualcomm Hexagon NPU backend,
 - **Dynamic Device Probing**: Automatically detects device architecture (`v73`, `v75`, `v79`, `v81`) via `HexagonDevice::probe()` and loads the matching embedded skeleton library.
 
 ### Embedded Skeleton Libraries & Extended Operators
-The backend embeds prebuilt 16 KB page-aligned Hexagon ELF dynamic libraries (`libggml-htp-v{73,75,79,81}.so`) and extracts them to application storage at runtime. Key additions in 0.7.0 include:
+The backend embeds prebuilt 16 KB page-aligned Hexagon ELF dynamic libraries (`libcera-htp-v{73,75,79,81}.so`) and extracts them to application storage at runtime. Key additions in 0.7.0 include:
 - **Extended Operator Set**:
   - `Conv1D`: 1D convolution with configurable dilation, stride, and padding for waveform audio encoding and speech processing.
   - `ConvTranspose1D`: Transposed 1D convolution for speech decoders and vocoder audio reconstruction.
   - `Snake` / `Snake1D`: Sinusoidal activation function ($\sin^2(\alpha x)$) for neural vocoders.
   - `UnaryStep` and `Sum`: Element-wise step activations and reductions executing directly on HVX vector units.
-- **ABI Opcode Alignment**: Realigned `HtpOpCode` discriminants with the upstream DSP firmware ABI (`UnaryStep = 21`, `Sum = 39`, `Scale = 32`, `Cpy = 33`, `Conv1D = 63`, `UnarySnake = 64`), preventing opcode displacement.
+- **ABI Opcode Alignment**: Realigned `HtpOpCode` discriminants with the upstream DSP firmware ABI (`UnaryStep = 21`, `Sum = 39`, `Scale = 32`, `Cpy = 33`, `Conv1D = 68`, `UnarySnake = 69`), preventing opcode displacement.
 
 ### Accelerated Kernels & Subsystems
 - **LLM Text Generation (`HexagonLfmModel`)**: 32x32 tiled Q4_0 and Q8_0 matrix repacking for HTP hardware, forward decode batched to eliminate most synchronization boundaries (a single flush per token and the static batch template are opt-in with `CERA_HEXAGON_BATCH_TENSORS=0`; the default caps each batch at 32 tensors for run-to-run reproducibility), ping-pong scratch memory isolation across layers, FastRPC latency QoS (`FASTRPC_CONTROL_LATENCY = 100 µs`), and Q8_0 quantized KV cache (~47% memory reduction over F16).

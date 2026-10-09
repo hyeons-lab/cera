@@ -6,6 +6,16 @@
 
 use super::types::{HtpDataType, align128, align256};
 
+/// A value for one of the one-byte fields of the matmul params; a count past 255 would wrap
+/// silently into a different kernel configuration.
+fn wire_byte(v: usize) -> u8 {
+    debug_assert!(
+        v <= usize::from(u8::MAX),
+        "{v} does not fit a one-byte kernel param"
+    );
+    v as u8
+}
+
 /// Precomputed integer division constants using Granlund and Montgomery's algorithm.
 ///
 /// Permits the DSP to calculate `n / d` without hardware division via:
@@ -28,6 +38,126 @@ pub fn init_fastdiv(d: u32) -> FastDivValues {
     }
     let mp = (((1u64 << 32) * ((1u64 << l) - (d as u64))) / (d as u64) + 1) as u32;
     FastDivValues { mp, l }
+}
+
+/// The matmul kernel parameters, as `struct htp_mm_kernel_params` (`matmul-ops.h`) lays them out
+/// in the 32-word `kernel_params` blob.
+///
+/// Eight one-byte fields share the first two words (the DSP reads them as `uint8_t`), then the
+/// `int32_t` sizes, then seven `{mp, l}` dividers. Build and patch through this struct rather
+/// than by word index: before llama.cpp packed the bytes, every field had a word of its own, and
+/// code that still indexes the old positions silently scrambles the parameters.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct MmKernelParams {
+    /// `enum htp_mm_kernel_type`.
+    pub kernel_type: u8,
+    /// 1 = pipelined execution.
+    pub pipeline: u8,
+    /// 1 = outer dimensions collapsed into 2-D (llama.cpp's optimization; cera leaves it 0).
+    pub collapse: u8,
+    /// 1 = HMX, 0 = HVX.
+    pub n_hmx: u8,
+    pub n_threads: u8,
+    pub n_act_threads: u8,
+    pub n_prefetch: u8,
+    /// Weight count of a fused `MulMatNx`.
+    pub n_weights: u8,
+    pub m_chunk: i32,
+    pub n_chunk: i32,
+    pub tile_size: i32,
+    pub aligned_tile_size: i32,
+    pub act_row_size: i32,
+    pub vtcm_size: i32,
+    pub vtcm_src0_size: i32,
+    pub vtcm_act_size: i32,
+    /// Bias scratch (fused add only).
+    pub vtcm_bias_size: i32,
+    pub vtcm_dst_size: i32,
+    pub div_ne12_ne1: FastDivValues,
+    pub div_ne1: FastDivValues,
+    pub div_r2: FastDivValues,
+    pub div_r3: FastDivValues,
+    pub div_ne12: FastDivValues,
+    pub div_n_act_threads: FastDivValues,
+    pub div_ne00_padded: FastDivValues,
+}
+
+impl MmKernelParams {
+    /// The `kernel_params` words the DSP reads.
+    pub fn to_words(&self) -> [i32; 32] {
+        let mut w = [0i32; 32];
+        let bytes = |b: [u8; 4]| u32::from_le_bytes(b) as i32;
+        w[0] = bytes([self.kernel_type, self.pipeline, self.collapse, self.n_hmx]);
+        w[1] = bytes([
+            self.n_threads,
+            self.n_act_threads,
+            self.n_prefetch,
+            self.n_weights,
+        ]);
+        w[2] = self.m_chunk;
+        w[3] = self.n_chunk;
+        w[4] = self.tile_size;
+        w[5] = self.aligned_tile_size;
+        w[6] = self.act_row_size;
+        w[7] = self.vtcm_size;
+        w[8] = self.vtcm_src0_size;
+        w[9] = self.vtcm_act_size;
+        w[10] = self.vtcm_bias_size;
+        w[11] = self.vtcm_dst_size;
+        for (i, d) in [
+            self.div_ne12_ne1,
+            self.div_ne1,
+            self.div_r2,
+            self.div_r3,
+            self.div_ne12,
+            self.div_n_act_threads,
+            self.div_ne00_padded,
+        ]
+        .iter()
+        .enumerate()
+        {
+            w[12 + 2 * i] = d.mp as i32;
+            w[13 + 2 * i] = d.l as i32;
+        }
+        w
+    }
+
+    /// Read a blob back, e.g. to patch a field of an already-built set of parameters.
+    pub fn from_words(w: &[i32; 32]) -> Self {
+        let b0 = (w[0] as u32).to_le_bytes();
+        let b1 = (w[1] as u32).to_le_bytes();
+        let div = |i: usize| FastDivValues {
+            mp: w[12 + 2 * i] as u32,
+            l: w[13 + 2 * i] as u32,
+        };
+        Self {
+            kernel_type: b0[0],
+            pipeline: b0[1],
+            collapse: b0[2],
+            n_hmx: b0[3],
+            n_threads: b1[0],
+            n_act_threads: b1[1],
+            n_prefetch: b1[2],
+            n_weights: b1[3],
+            m_chunk: w[2],
+            n_chunk: w[3],
+            tile_size: w[4],
+            aligned_tile_size: w[5],
+            act_row_size: w[6],
+            vtcm_size: w[7],
+            vtcm_src0_size: w[8],
+            vtcm_act_size: w[9],
+            vtcm_bias_size: w[10],
+            vtcm_dst_size: w[11],
+            div_ne12_ne1: div(0),
+            div_ne1: div(1),
+            div_r2: div(2),
+            div_r3: div(3),
+            div_ne12: div(4),
+            div_n_act_threads: div(5),
+            div_ne00_padded: div(6),
+        }
+    }
 }
 
 /// Host-computed parameters for RMS norm.
@@ -200,16 +330,145 @@ pub(crate) fn build_unary_kernel_params_with(
     kparams
 }
 
-/// Host-computed kernel parameters for `GetRows` over an F32 table
-/// (`ggml_hexagon_precompute_get_rows_params`): `src0` is `[ne00, n_rows, ne02,
-/// ne03]`, the I32 indices `[ne10, ne11, ne12]`, the output the same type with
-/// matching row strides. With zero params the DSP's task split is empty and
-/// the output is left untouched.
+/// Which `get_rows` kernel runs (`enum htp_get_rows_kernel_type`).
+const GET_ROWS_SAMETYPE: u32 = 0;
+const GET_ROWS_TILED: u32 = 1;
+
+/// `htp_mm_get_weight_tile_size`: bytes of one repacked weight tile, 0 for a type without one.
+fn mm_weight_tile_size(dtype: u32) -> u64 {
+    match dtype {
+        2 | 20 => 576,  // Q4_0, IQ4_NL
+        3 | 12 => 640,  // Q4_1, Q4_K
+        8 => 1088,      // Q8_0
+        13 => 768,      // Q5_K
+        14 => 896,      // Q6_K
+        11 | 10 => 512, // Q3_K, Q2_K
+        39 => 544,      // MXFP4
+        _ => 0,
+    }
+}
+
+/// `htp_get_rows_vtcm_layout_build(...).total_bytes`.
+fn get_rows_vtcm_total(kernel: u32, dtype: u32, ne00: u32, n_threads: u32) -> u64 {
+    let align256 = |x: u64| (x + 255) & !255;
+    let n = u64::from(n_threads);
+    if kernel == GET_ROWS_SAMETYPE {
+        return 0;
+    }
+    let dst_half = align256(u64::from(ne00) * 4);
+    let src0_half = if kernel == GET_ROWS_TILED {
+        let tile_stride = (mm_weight_tile_size(dtype) + 127) & !127;
+        let n_k_tiles = u64::from(ne00 / 32);
+        align256(if n_k_tiles > 0 {
+            n_k_tiles * tile_stride
+        } else {
+            tile_stride
+        })
+    } else {
+        let row = match dtype {
+            x if x == HtpDataType::F16 as u32 => u64::from(ne00) * 2,
+            x if x == HtpDataType::Q8_0 as u32 => u64::from(ne00 / 32) * 34,
+            _ => 0,
+        };
+        align256(row)
+    };
+    2 * src0_half * n + 2 * dst_half * n
+}
+
+/// What `ggml_hexagon_precompute_get_rows_params` reads of its three tensors.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GetRowsShape {
+    /// `HtpDataType` of the table (`src0`) and of the output.
+    pub src0_dtype: u32,
+    pub dst_dtype: u32,
+    /// The table is stored repacked (a Q4_0 table, or one the host repacks before the op).
+    pub tiled: bool,
+    pub ne00: u32,
+    pub ne02: u32,
+    pub ne03: u32,
+    /// The I32 indices `[ne10, ne11, ne12]`.
+    pub ne10: u32,
+    pub ne11: u32,
+    pub ne12: u32,
+}
+
+/// Kernel parameters for a `GetRows` gather: port of `ggml_hexagon_precompute_get_rows_params`
+/// and `htp_get_rows_vtcm_layout_build`.
 ///
-/// The host precompute also requires `src0.type == dst.type` and equal row
-/// strides before it picks the DMA path; this builder assumes both (a
-/// contiguous F32 table gathered into a contiguous F32 output) and takes no
-/// strides, so it cannot express a strided source.
+/// The kernel is `SAMETYPE` when table and output share a type, else `TILED` for a repacked
+/// table, else `FLAT`. One task per gathered row; the thread count starts at
+/// `min(n_threads, rows)` and drops until the VTCM working set fits `vtcm_bytes`.
+///
+/// Words (`htp_get_rows_kernel_params`): `n_threads, kernel_type, chunks_per_row, chunk_size,
+/// total_tasks, tasks_per_thread, vtcm_size`, then the dividers `ne10, ne10 * ne11,
+/// chunks_per_row, ne02, ne03` (each `mp, l`; `{0, 0}` for a zero divisor).
+pub fn build_get_rows_kernel_params(
+    shape: &GetRowsShape,
+    n_threads: u32,
+    vtcm_bytes: usize,
+) -> [i32; 32] {
+    let nr = shape.ne10.wrapping_mul(shape.ne11).wrapping_mul(shape.ne12);
+    let kernel = if shape.src0_dtype == shape.dst_dtype {
+        GET_ROWS_SAMETYPE
+    } else if shape.tiled || shape.src0_dtype == HtpDataType::Q4_0 as u32 {
+        // a Q4_0 table is always stored tiled; any other type only when the host repacked it
+        GET_ROWS_TILED
+    } else {
+        2 // FLAT
+    };
+    let (chunks_per_row, chunk_size, total_tasks) = (1u32, shape.ne00, nr);
+
+    let mut threads = n_threads.min(total_tasks);
+    let mut total_bytes = 0u64;
+    while threads > 0 {
+        total_bytes = get_rows_vtcm_total(kernel, shape.src0_dtype, shape.ne00, threads);
+        if total_bytes <= vtcm_bytes as u64 {
+            break;
+        }
+        threads -= 1;
+    }
+    if threads == 0 && total_tasks > 0 {
+        total_bytes = get_rows_vtcm_total(kernel, shape.src0_dtype, shape.ne00, 1);
+    }
+    let vtcm_size = if total_tasks == 0 { 0 } else { total_bytes };
+    let tasks_per_thread = if threads > 0 {
+        total_tasks.div_ceil(threads)
+    } else {
+        0
+    };
+
+    let mut k = [0i32; 32];
+    k[0] = threads as i32;
+    k[1] = kernel as i32;
+    k[2] = chunks_per_row as i32;
+    k[3] = chunk_size as i32;
+    k[4] = total_tasks as i32;
+    k[5] = tasks_per_thread as i32;
+    k[6] = vtcm_size as u32 as i32;
+    let div = |d: u32| {
+        if d > 0 {
+            init_fastdiv(d)
+        } else {
+            FastDivValues { mp: 0, l: 0 }
+        }
+    };
+    let dividers = [
+        div(shape.ne10),
+        div(shape.ne10.wrapping_mul(shape.ne11)),
+        div(chunks_per_row),
+        div(shape.ne02),
+        div(shape.ne03),
+    ];
+    for (i, f) in dividers.iter().enumerate() {
+        k[7 + 2 * i] = f.mp as i32;
+        k[8 + 2 * i] = f.l as i32;
+    }
+    k
+}
+
+/// [`build_get_rows_kernel_params`] for the gather cera issues: an F32 table into an F32
+/// output of the same type, so the zero-VTCM `SAMETYPE` kernel. The arguments are the table's
+/// `ne00, ne02, ne03` and the indices' `ne10, ne11, ne12`.
 pub(crate) fn build_get_rows_f32_kernel_params(
     ne00: usize,
     ne02: usize,
@@ -219,54 +478,21 @@ pub(crate) fn build_get_rows_f32_kernel_params(
     ne12: usize,
     dsp_threads: u32,
 ) -> [i32; 32] {
-    const DMA_MIN_ROW_ELEMS: usize = 2048;
-    const MIN_CHUNK_ELEMS: usize = 1024;
-    let sess_threads = dsp_threads.max(1) as usize;
-    let nr = ne10 * ne11 * ne12;
-
-    let use_dma = ne00 >= DMA_MIN_ROW_ELEMS;
-    let mut chunks_per_row = 1;
-    let mut chunk_size = ne00;
-    let mut total_tasks = nr;
-    let (n_threads, tasks_per_thread);
-    if use_dma {
-        n_threads = sess_threads.min(nr).max(1);
-        tasks_per_thread = nr.div_ceil(n_threads);
-    } else {
-        // Few rows over many threads: split each F32 row into chunks. Mirrors
-        // the host precompute; with the 2048-element DMA threshold and the
-        // 1024-element chunk floor it only ever yields one chunk today.
-        if nr < sess_threads {
-            let max_chunks = (ne00 / MIN_CHUNK_ELEMS).max(1);
-            chunks_per_row = sess_threads.div_ceil(nr.max(1)).min(max_chunks);
-            chunk_size = ne00.div_ceil(chunks_per_row);
-            total_tasks = nr * chunks_per_row;
-        }
-        n_threads = total_tasks.min(sess_threads).max(1);
-        tasks_per_thread = total_tasks.div_ceil(n_threads);
-    }
-
-    // Double-buffered src0 and dst rows per thread, 256-byte aligned.
-    let row_aligned = (ne00 * 4 + 255) & !255;
-    let vtcm_size = n_threads * 2 * row_aligned * 2;
-
-    let mut k = [0i32; 32];
-    k[0] = n_threads as i32;
-    k[1] = use_dma as i32;
-    k[2] = chunks_per_row as i32;
-    k[3] = chunk_size as i32;
-    k[4] = total_tasks as i32;
-    k[5] = tasks_per_thread as i32;
-    k[6] = vtcm_size as i32;
-    for (slot, d) in [ne10, ne10 * ne11, chunks_per_row, ne02, ne03]
-        .into_iter()
-        .enumerate()
-    {
-        let f = init_fastdiv(d as u32);
-        k[7 + 2 * slot] = f.mp as i32;
-        k[8 + 2 * slot] = f.l as i32;
-    }
-    k
+    build_get_rows_kernel_params(
+        &GetRowsShape {
+            src0_dtype: HtpDataType::F32 as u32,
+            dst_dtype: HtpDataType::F32 as u32,
+            tiled: false,
+            ne00: ne00 as u32,
+            ne02: ne02 as u32,
+            ne03: ne03 as u32,
+            ne10: ne10 as u32,
+            ne11: ne11 as u32,
+            ne12: ne12 as u32,
+        },
+        dsp_threads.max(1),
+        usize::MAX,
+    )
 }
 
 /// `HTP_BINARY_KERNEL_CHUNKED`: the kernel the DSP runs for a contiguous
@@ -482,10 +708,14 @@ pub fn build_set_rows_kernel_params(
 
 /// Build kernel parameters for SsmConv dispatch.
 ///
-/// Mirrors `ggml_hexagon_precompute_ssm_conv_params`: `d_conv` taps
-/// (src1->ne\[0\], 3 for LFM2 short conv), `d_inner` channels (src0->ne\[1\]),
-/// `n_t` new positions (dst->ne\[1\]), `n_s` sequences (dst->ne\[2\], 1),
-/// `ncs` src0 dim-0 (`d_conv - 1 + n_t`).
+/// Port of `ggml_hexagon_precompute_ssm_conv_params`: `d_conv` taps (src1->ne\[0\], 3 for LFM2
+/// short conv), `d_inner` channels (src0->ne\[1\]), `n_t` new positions (dst->ne\[1\]), `n_s`
+/// sequences (dst->ne\[2\], 1), `ncs` src0 dim-0 (`d_conv - 1 + n_t`). `vtcm_budget == 0` means
+/// unknown and takes the host's 1 MiB default per call.
+///
+/// Words (`htp_ssm_conv_kernel_params`): `n_threads, d_conv, d_inner, n_t, n_s, d_inner_tile,
+/// vtcm_src0_size_per_thread, vtcm_src1_size_per_thread, vtcm_dst_size_per_thread, vtcm_src0_size,
+/// vtcm_src1_size, vtcm_dst_size, vtcm_size`.
 pub fn build_ssm_conv_kernel_params(
     d_conv: usize,
     d_inner: usize,
@@ -495,65 +725,96 @@ pub fn build_ssm_conv_kernel_params(
     sess_threads: u32,
     vtcm_budget: usize,
 ) -> [i32; 32] {
-    let mut kparams = [0i32; 32];
-    let n_threads = (sess_threads as usize).min(d_inner.div_ceil(32)).max(1);
-    kparams[0] = n_threads as i32;
-    kparams[1] = d_conv as i32;
-    kparams[2] = d_inner as i32;
-    kparams[3] = n_t as i32;
-    kparams[4] = n_s as i32;
+    let up128 = |x: u32| x.next_multiple_of(128);
+    let (d_conv, d_inner, n_t, n_s, ncs) = (
+        d_conv as u32,
+        d_inner as u32,
+        n_t as u32,
+        n_s as u32,
+        ncs as u32,
+    );
+    let n_threads = sess_threads.min(d_inner.div_ceil(32)).max(1);
     let d_inner_per_thread = d_inner.div_ceil(n_threads).next_multiple_of(32);
-    kparams[5] = d_inner_per_thread as i32;
-    kparams[7] = align128(ncs * 4) as i32;
-    kparams[8] = align128(d_conv * 4) as i32;
-    kparams[9] = align128(d_inner * 4) as i32;
 
-    // Weight-side VTCM is identical in both branches: raw rows plus the
-    // transposed tile the HVX kernel multiplies from.
-    let src1_raw = align128(d_inner_per_thread * d_conv * 4) + 128;
-    let src1_t = align128(d_conv * d_inner_per_thread * 4);
-    let vtcm_src1_per_thread = src1_raw + src1_t;
-    kparams[11] = vtcm_src1_per_thread as i32;
+    // The weight side is the same in both branches: the raw rows plus the transposed copy the
+    // HVX kernel multiplies from.
+    let src1_raw_bytes = up128(d_inner_per_thread * d_conv * 4) + 128;
+    let src1_t_bytes = up128(d_conv * d_inner_per_thread * 4);
+    let vtcm_src1_per_thread = src1_raw_bytes + src1_t_bytes;
 
-    let (vtcm_src0_per_thread, vtcm_dst_per_thread) = if n_t == 1 {
-        // Scalar path: one position, full per-thread channel range.
-        kparams[6] = d_inner_per_thread as i32;
-        let src0_raw = align128(d_inner_per_thread * d_conv * 4) + 128;
-        let src0_t = align128(d_conv * d_inner_per_thread * 4);
-        (src0_raw + src0_t, align128(d_inner_per_thread * 4))
+    let (d_inner_tile, vtcm_src0_per_thread, vtcm_dst_per_thread);
+    if n_t == 1 {
+        d_inner_tile = d_inner_per_thread;
+        let src0_tile_raw = up128(d_inner_per_thread * d_conv * 4);
+        let src0_t = up128(d_conv * d_inner_per_thread * 4);
+        vtcm_src0_per_thread = 2 * src0_tile_raw + src0_t;
+        vtcm_dst_per_thread = 2 * up128(d_inner_per_thread * 4);
     } else {
-        // Chunk path: tile channels to fit per-thread VTCM budget.
-        let budget_per_thread = if vtcm_budget > 0 {
-            vtcm_budget / n_threads
+        let budget = if vtcm_budget > 0 {
+            (vtcm_budget / n_threads as usize) as u64
         } else {
             1024 * 1024
         };
-        let avail = budget_per_thread
-            .saturating_sub(vtcm_src1_per_thread)
-            .max(128 * 1024);
-        let mut tile = (avail / 2) / (ncs * 4 + n_t * 4 + 1);
+        // the kernel double-buffers the raw src0 tile and the dst tile, and transposes one
+        // 32-channel block at a time
+        let src0_block_t = up128(ncs * 32 * 4);
+        let fixed = u64::from(vtcm_src1_per_thread) + u64::from(src0_block_t);
+        let avail = if budget > fixed {
+            budget - fixed
+        } else {
+            128 * 1024
+        };
+        let target_max = (d_inner_per_thread + 3)
+            .div_euclid(4)
+            .next_multiple_of(32)
+            .clamp(32, 128);
+        let mut tile = (avail / (2 * u64::from((ncs + n_t).max(1)) * 4)) as u32;
         tile = (tile / 32) * 32;
         if tile == 0 {
             tile = 32;
         }
-        let tile = tile.min(d_inner_per_thread);
-        kparams[6] = tile as i32;
-        let src0_raw = align128(tile * ncs * 4) + 128;
-        let src0_t = align128(ncs * tile * 4);
-        (src0_raw + src0_t, align128(tile * n_t * 4))
-    };
-    kparams[10] = vtcm_src0_per_thread as i32;
-    kparams[12] = vtcm_dst_per_thread as i32;
-    kparams[13] = (vtcm_src0_per_thread * n_threads) as i32;
-    kparams[14] = (vtcm_src1_per_thread * n_threads) as i32;
-    kparams[15] = (vtcm_dst_per_thread * n_threads) as i32;
-    kparams[16] = (vtcm_src0_per_thread + vtcm_src1_per_thread + vtcm_dst_per_thread) as i32
-        * n_threads as i32;
-    let div_nt = init_fastdiv(n_threads as u32);
-    kparams[17] = div_nt.mp as i32;
-    kparams[18] = div_nt.l as i32;
-    kparams
+        if tile > target_max {
+            tile = target_max;
+        }
+        if tile > d_inner_per_thread {
+            tile = d_inner_per_thread;
+        }
+        d_inner_tile = tile;
+        let src0_tile_raw = up128(tile * ncs * 4);
+        vtcm_src0_per_thread = 2 * src0_tile_raw + src0_block_t;
+        vtcm_dst_per_thread = 2 * up128(tile * n_t * 4);
+    }
+
+    let vtcm_src0 = vtcm_src0_per_thread * n_threads;
+    let vtcm_src1 = vtcm_src1_per_thread * n_threads;
+    let vtcm_dst = vtcm_dst_per_thread * n_threads;
+    let mut k = [0i32; 32];
+    for (i, v) in [
+        n_threads,
+        d_conv,
+        d_inner,
+        n_t,
+        n_s,
+        d_inner_tile,
+        vtcm_src0_per_thread,
+        vtcm_src1_per_thread,
+        vtcm_dst_per_thread,
+        vtcm_src0,
+        vtcm_src1,
+        vtcm_dst,
+        vtcm_src0 + vtcm_src1 + vtcm_dst,
+    ]
+    .into_iter()
+    .enumerate()
+    {
+        k[i] = v as i32;
+    }
+    k
 }
+
+/// `htp_fa_kernel_params.head_split`: 1 partitions flash attention by KV heads when it runs on
+/// several threads, 0 by tokens. llama.cpp defaults it on (`opt_fa_head_split`).
+const FA_HEAD_SPLIT: u32 = 1;
 
 /// Build kernel parameters for Flash Attention dispatch (HVX path).
 ///
@@ -573,15 +834,16 @@ pub fn build_flash_attn_kernel_params(
     has_mask: bool,
 ) -> [i32; 32] {
     let mut kparams = [0i32; 32];
-    let n_threads = n_threads.max(1) as u8;
+    let n_threads = wire_byte(n_threads.max(1) as usize);
     let g = (n_heads / n_kv_heads.max(1)).max(1);
     let n_kv_blocks = seq_len.div_ceil(64).max(1);
 
     // byte 0: kernel_type = 1 (HTP_FA_KERNEL_HVX)
-    // byte 1: is_q_fp32 = 1
-    // byte 2: is_dst_fp32 = 1
+    // byte 1: head_split (llama.cpp's default: partition by KV heads across threads)
+    // byte 2: flags (reserved, 0)
     // byte 3: n_threads
-    let b0 = 1u32 | (1u32 << 8) | (1u32 << 16) | ((n_threads as u32) << 24);
+    // (These bytes used to be `is_q_fp32` / `is_dst_fp32`; the DSP now reads the tensor types.)
+    let b0 = 1u32 | (FA_HEAD_SPLIT << 8) | ((n_threads as u32) << 24);
     kparams[0] = b0 as i32;
 
     // offset 4..8: Br: u16 = 1, Bc: u16 = 64
@@ -703,6 +965,13 @@ pub fn build_flash_attn_kernel_params_with_softcap(
     has_mask: bool,
     softcap: f32,
 ) -> [i32; 32] {
+    // The DSP computes `tanh(scale * s) * softcap`, so the host divides the scale by the softcap
+    // first (`ggml_hexagon_precompute_flash_attn_params`).
+    let scale = if softcap != 0.0 {
+        scale / softcap
+    } else {
+        scale
+    };
     let mut kparams = build_flash_attn_kernel_params(
         head_dim, n_heads, n_kv_heads, n_tokens, seq_len, scale, n_threads, has_mask,
     );
@@ -912,6 +1181,9 @@ pub(crate) fn mm_hvx_fused_nx_max_rows(
 /// `kparams[11..16]` describe one chunk's layout. The fused `MulMatNx` kernel
 /// cannot chunk, so a caller building it must keep the rows within
 /// `mm_hvx_fused_nx_max_rows` (which implies `kparams[2] == 0`).
+///
+/// The words are the packed [`MmKernelParams`] layout, not the one the earlier skels read: decode
+/// them with [`MmKernelParams::from_words`] instead of indexing.
 pub fn build_mul_mat_kernel_params(
     wtype: HtpDataType,
     ne10: usize,
@@ -921,21 +1193,9 @@ pub fn build_mul_mat_kernel_params(
     n_threads: u32,
     vtcm_budget: usize,
 ) -> [i32; 32] {
-    let mut kparams = [0i32; 32];
     let n_threads = n_threads.max(1) as usize;
     let src1_nrows = (ne11 as usize) * (ne12 as usize);
-
-    // Fewer rows than threads takes the block-partitioned quant path.
-    kparams[0] = if src1_nrows < n_threads { 6 } else { 5 };
-    kparams[1] = 0; // pipeline
-    kparams[3] = 0; // n_chunk (HMX only)
-    kparams[4] = n_threads as i32;
-    kparams[5] = 0; // n_act_threads (HMX only)
-    kparams[6] = 0; // n_hmx
     let (tile_size, aligned_tile_size) = mm_tile_sizes(wtype);
-    kparams[8] = tile_size as i32;
-    kparams[9] = aligned_tile_size as i32;
-    kparams[10] = mm_act_tiled_row_size(wtype, ne10) as i32; // src1_row_size
 
     // Pick the largest prefetch depth that fits the VTCM budget.
     let mut best = 2;
@@ -974,34 +1234,35 @@ pub fn build_mul_mat_kernel_params(
         (None, Some(layout)) => layout,
         _ => mm_hvx_vtcm_layout(wtype, ne10, layout_rows, n_threads, dst_row_size, best),
     };
-    kparams[2] = m_chunk.map_or(0, |m| m as i32);
-    kparams[7] = best as i32; // n_prefetch
-    kparams[11] = layout.total_bytes as i32; // vtcm_size
-    kparams[12] = layout.src0_bytes as i32; // vtcm_src0_size
-    kparams[13] = layout.src1_bytes as i32; // vtcm_src1_size
-    kparams[14] = 0; // vtcm_src2_size (fused only)
-    kparams[15] = 0; // vtcm_src3_size (fused only)
-    kparams[16] = layout.dst_bytes as i32; // vtcm_dst_size
-    kparams[17] = 0; // n_weights (fused NX only)
-
-    // Non-batched decode: ne02 = ne03 = ne13 = 1.
-    let div_ne12_ne11 = init_fastdiv(ne11 * ne12);
-    let div_ne11 = init_fastdiv(ne11.max(1));
-    let div_r2 = init_fastdiv(ne12.max(1));
-    let div_1 = init_fastdiv(1);
-    kparams[18] = div_ne12_ne11.mp as i32;
-    kparams[19] = div_ne12_ne11.l as i32;
-    kparams[20] = div_ne11.mp as i32;
-    kparams[21] = div_ne11.l as i32;
-    kparams[22] = div_r2.mp as i32;
-    kparams[23] = div_r2.l as i32;
-    kparams[24] = div_1.mp as i32;
-    kparams[25] = div_1.l as i32;
-    kparams[26] = div_r2.mp as i32;
-    kparams[27] = div_r2.l as i32;
-    // div_n_act_threads, div_ne00_padded: HMX only, stay zero.
-
-    kparams
+    let (div_ne12_ne11, div_ne11, div_r2, div_1) = (
+        init_fastdiv(ne11 * ne12),
+        init_fastdiv(ne11.max(1)),
+        init_fastdiv(ne12.max(1)),
+        init_fastdiv(1),
+    );
+    // Non-batched decode: ne02 = ne03 = ne13 = 1. div_n_act_threads and div_ne00_padded are HMX
+    // only and stay zero.
+    MmKernelParams {
+        // fewer rows than threads takes the block-partitioned quant path
+        kernel_type: if src1_nrows < n_threads { 6 } else { 5 },
+        n_threads: wire_byte(n_threads),
+        n_prefetch: wire_byte(best),
+        m_chunk: m_chunk.map_or(0, |m| m as i32),
+        tile_size: tile_size as i32,
+        aligned_tile_size: aligned_tile_size as i32,
+        act_row_size: mm_act_tiled_row_size(wtype, ne10) as i32,
+        vtcm_size: layout.total_bytes as i32,
+        vtcm_src0_size: layout.src0_bytes as i32,
+        vtcm_act_size: layout.src1_bytes as i32,
+        vtcm_dst_size: layout.dst_bytes as i32,
+        div_ne12_ne1: div_ne12_ne11,
+        div_ne1: div_ne11,
+        div_r2,
+        div_r3: div_1,
+        div_ne12: div_r2,
+        ..Default::default()
+    }
+    .to_words()
 }
 
 /// Shape of an F32 x F32 matmul, in the strides the host precompute reads.
@@ -1065,6 +1326,9 @@ fn mm_f32_vtcm_layout(
 /// over `ne02 x ne03` weight matrices that `ne12 x ne13` activation batches
 /// are broadcast over (`ne12 / ne02`). `None` when even one activation row
 /// does not fit `vtcm_budget` (the host falls back to the CPU then).
+///
+/// The words are the packed [`MmKernelParams`] layout, not the one the earlier skels read: decode
+/// them with [`MmKernelParams::from_words`] instead of indexing.
 pub fn build_mul_mat_f32_kernel_params(
     shape: MulMatF32Shape,
     n_threads: u32,
@@ -1120,40 +1384,31 @@ pub fn build_mul_mat_f32_kernel_params(
         }
     }
 
-    let mut k = [0i32; 32];
-    k[0] = KERNEL_HVX_F32_F32_VTCM;
-    k[1] = 0; // pipeline
-    k[2] = if m_chunk < src1_nrows {
-        m_chunk as i32
-    } else {
-        0
-    };
-    k[3] = 0; // n_chunk (HMX only)
-    k[4] = n_threads as i32;
-    k[5] = 0; // n_act_threads
-    k[6] = 0; // n_hmx
-    k[7] = N_PREFETCH as i32;
-    k[8] = 0; // tile_size (quantized only)
-    k[9] = 0; // aligned_tile_size
-    k[10] = (ne10 * 4).next_multiple_of(128) as i32; // src1_row_size
-    k[11] = l.total as i32;
-    k[12] = l.src0 as i32;
-    k[13] = l.src1 as i32;
-    k[14] = 0; // src2 (fused only)
-    k[15] = 0; // src3
-    k[16] = l.dst as i32;
-    k[17] = 0; // n_weights
-    let fd = |d: usize, slot: usize, k: &mut [i32; 32]| {
-        let f = init_fastdiv(d as u32);
-        k[slot] = f.mp as i32;
-        k[slot + 1] = f.l as i32;
-    };
-    fd(ne12 * ne11, 18, &mut k); // div_ne12_ne1
-    fd(ne11, 20, &mut k); // div_ne1
-    fd(ne12 / ne02, 22, &mut k); // div_r2
-    fd(ne13 / ne03, 24, &mut k); // div_r3
-    fd(ne12, 26, &mut k); // div_ne12
-    Some(k)
+    let div = |d: usize| init_fastdiv(d as u32);
+    Some(
+        MmKernelParams {
+            kernel_type: KERNEL_HVX_F32_F32_VTCM as u8,
+            n_threads: wire_byte(n_threads),
+            n_prefetch: N_PREFETCH as u8,
+            m_chunk: if m_chunk < src1_nrows {
+                m_chunk as i32
+            } else {
+                0
+            },
+            act_row_size: (ne10 * 4).next_multiple_of(128) as i32,
+            vtcm_size: l.total as i32,
+            vtcm_src0_size: l.src0 as i32,
+            vtcm_act_size: l.src1 as i32,
+            vtcm_dst_size: l.dst as i32,
+            div_ne12_ne1: div(ne12 * ne11),
+            div_ne1: div(ne11),
+            div_r2: div(ne12 / ne02),
+            div_r3: div(ne13 / ne03),
+            div_ne12: div(ne12),
+            ..Default::default()
+        }
+        .to_words(),
+    )
 }
 
 /// Kernel parameters for `Softmax` over F32 rows
@@ -1321,6 +1576,7 @@ fn mm_hmx_compute_chunks(
     }
     let usable = vtcm_total - overhead;
     let mut best_cost = usize::MAX;
+    let mut best_tail_waste = usize::MAX;
     let mut best_mn = 0;
     let mut best = (0, 0);
     let n_max = (n.min(usable / per_n) / HMX_TILE) * HMX_TILE;
@@ -1346,12 +1602,20 @@ fn mm_hmx_compute_chunks(
                 .checked_add(nblocks.checked_mul(n_block_cost)?)?;
             Some((mc, nc, cost, mc.checked_mul(nc)?))
         };
-        if let Some((mc, nc, cost, mn)) = accept()
-            && (cost < best_cost || (cost == best_cost && mn > best_mn))
-        {
-            best_cost = cost;
-            best_mn = mn;
-            best = (mc, nc);
+        if let Some((mc, nc, cost, mn)) = accept() {
+            // Equal cost: prefer the chunk that leaves the fewest columns idle in the last N
+            // block, then the larger one (llama.cpp's tie-break).
+            let rem = n % nc;
+            let tail_waste = if rem == 0 { 0 } else { nc - rem };
+            if cost < best_cost
+                || (cost == best_cost && tail_waste < best_tail_waste)
+                || (cost == best_cost && tail_waste == best_tail_waste && mn > best_mn)
+            {
+                best_cost = cost;
+                best_tail_waste = tail_waste;
+                best_mn = mn;
+                best = (mc, nc);
+            }
         }
         if nc == HMX_TILE {
             break;
@@ -1457,6 +1721,9 @@ pub fn mm_hmx_solve_2d(
 /// unfused) plus the shared `finalize` divs. `k`/`n` are padded to 32,
 /// `m_pad` is M padded to 32, `m` raw rows. Returns `None` when no chunking
 /// fits `vtcm_budget` (caller falls back to HVX).
+///
+/// The words are the packed [`MmKernelParams`] layout, not the one the earlier skels read: decode
+/// them with [`MmKernelParams::from_words`] instead of indexing.
 pub fn build_hmx_mm_kernel_params(
     wtype: HtpDataType,
     k: usize,
@@ -1475,41 +1742,34 @@ pub fn build_hmx_mm_kernel_params(
         n_threads.max(1) as usize,
         vtcm_budget,
     )?;
-    let mut kparams = [0i32; 32];
     let (tile_size, aligned_tile_size) = mm_tile_sizes(wtype);
-    kparams[0] = 1; // HTP_MM_KERNEL_HMX_2D
-    kparams[1] = mm_hmx_pipeline(m) as i32;
-    kparams[2] = mc as i32;
-    kparams[3] = nc as i32;
-    kparams[4] = n_threads.max(1) as i32;
-    kparams[5] = act_threads as i32;
-    kparams[6] = 1; // n_hmx
-    // [7] n_prefetch: HVX-only, stays zero.
-    kparams[8] = tile_size as i32;
-    kparams[9] = aligned_tile_size as i32;
-    kparams[10] = mm_act_tiled_row_size(wtype, k) as i32;
-    kparams[11] = vtcm as i32;
-    // [12..=17] src0/1/2/3/dst sizes + n_weights: zero outside fused NX.
-    // Shared finalize divs for flat [K, M] activations (ne12 = ne02 = 1).
-    let div_m = init_fastdiv(m as u32);
-    let div_1 = init_fastdiv(1);
-    kparams[18] = div_m.mp as i32;
-    kparams[19] = div_m.l as i32;
-    kparams[20] = div_m.mp as i32;
-    kparams[21] = div_m.l as i32;
-    kparams[22] = div_1.mp as i32;
-    kparams[23] = div_1.l as i32;
-    kparams[24] = div_1.mp as i32;
-    kparams[25] = div_1.l as i32;
-    kparams[26] = div_1.mp as i32;
-    kparams[27] = div_1.l as i32;
-    let div_at = init_fastdiv(act_threads as u32);
-    kparams[28] = div_at.mp as i32;
-    kparams[29] = div_at.l as i32;
-    let div_k = init_fastdiv(k as u32);
-    kparams[30] = div_k.mp as i32;
-    kparams[31] = div_k.l as i32;
-    Some(kparams)
+    // Shared finalize dividers for flat [K, M] activations (ne12 = ne02 = 1).
+    let (div_m, div_1) = (init_fastdiv(m as u32), init_fastdiv(1));
+    Some(
+        MmKernelParams {
+            kernel_type: 1, // HTP_MM_KERNEL_HMX_2D
+            pipeline: mm_hmx_pipeline(m) as u8,
+            n_hmx: 1,
+            n_threads: wire_byte(n_threads.max(1) as usize),
+            n_act_threads: wire_byte(act_threads),
+            m_chunk: mc as i32,
+            n_chunk: nc as i32,
+            tile_size: tile_size as i32,
+            aligned_tile_size: aligned_tile_size as i32,
+            act_row_size: mm_act_tiled_row_size(wtype, k) as i32,
+            vtcm_size: vtcm as i32,
+            // the src0/act/bias/dst scratch sizes stay zero outside the fused NX kernel
+            div_ne12_ne1: div_m,
+            div_ne1: div_m,
+            div_r2: div_1,
+            div_r3: div_1,
+            div_ne12: div_1,
+            div_n_act_threads: init_fastdiv(act_threads as u32),
+            div_ne00_padded: init_fastdiv(k as u32),
+            ..Default::default()
+        }
+        .to_words(),
+    )
 }
 
 /// HMX flash-attention VTCM group alignment (`HTP_FA_HMX_TILE_SIZE`).
@@ -1681,6 +1941,46 @@ pub fn build_hmx_fa_kernel_params(
     n_threads: u32,
     vtcm_budget: usize,
 ) -> Option<[i32; 32]> {
+    build_hmx_fa_kernel_params_impl(
+        head_dim,
+        n_heads,
+        n_kv_heads,
+        n_tokens,
+        seq_len,
+        scale,
+        0.0,
+        n_threads,
+        vtcm_budget,
+    )
+}
+
+/// The HMX kernel works in the log2 domain, so the host folds log2(e) into the softmax scale
+/// (no softcap) or into the softcap (when there is one), as llama.cpp's host does: with softcap 0,
+/// `scale * log2(e)`; otherwise `scale / softcap` with `softcap * log2(e)`.
+fn hmx_fa_scale_words(scale: f32, softcap: f32) -> (i32, i32) {
+    use std::f32::consts::LOG2_E;
+    if softcap == 0.0 {
+        ((scale * LOG2_E).to_bits() as i32, 0)
+    } else {
+        (
+            (scale / softcap).to_bits() as i32,
+            (softcap * LOG2_E).to_bits() as i32,
+        )
+    }
+}
+
+#[allow(clippy::too_many_arguments)]
+fn build_hmx_fa_kernel_params_impl(
+    head_dim: usize,
+    n_heads: usize,
+    n_kv_heads: usize,
+    n_tokens: usize,
+    seq_len: usize,
+    scale: f32,
+    softcap: f32,
+    n_threads: u32,
+    vtcm_budget: usize,
+) -> Option<[i32; 32]> {
     let g = (n_heads / n_kv_heads.max(1)).max(1);
     let dk = head_dim.next_multiple_of(64);
     let dv = dk;
@@ -1701,11 +2001,13 @@ pub fn build_hmx_fa_kernel_params(
     let pipelined = n_kv_blocks >= FA_MIN_KV_BLOCKS && nt >= 2;
     let kt = if pipelined { nt } else { 1 };
     let mut kparams = [0i32; 32];
-    kparams[0] = (2u32 | (1u32 << 8) | (1u32 << 16) | ((kt as u32) << 24)) as i32;
+    kparams[0] = (2u32 | (FA_HEAD_SPLIT << 8) | ((kt as u32) << 24)) as i32;
     kparams[1] = (br as u32 | ((bc as u32) << 16)) as i32;
     kparams[2] = ((n_kv_blocks as u32 & 0xffff) | ((g as u32 & 0xffff) << 16)) as i32;
-    kparams[3] = scale.to_bits() as i32;
-    // [4] max_bias, [5] logit_softcap: zero.
+    let (scale_word, softcap_word) = hmx_fa_scale_words(scale, softcap);
+    kparams[3] = scale_word;
+    // [4] max_bias: zero.
+    kparams[5] = softcap_word;
     kparams[6] = fa_hmx_layout_total(g, dk, dv, br, bc, kt, pipelined, true, false, n_heads) as i32;
     // [7] qrows, [8] qrows_per_thread, [9] qrow_start: zero for HMX.
     kparams[10] = 1.0f32.to_bits() as i32;
@@ -1748,22 +2050,496 @@ pub fn build_hmx_fa_kernel_params_with_softcap(
     vtcm_budget: usize,
     softcap: f32,
 ) -> Option<[i32; 32]> {
-    let mut kparams = build_hmx_fa_kernel_params(
+    build_hmx_fa_kernel_params_impl(
         head_dim,
         n_heads,
         n_kv_heads,
         n_tokens,
         seq_len,
         scale,
+        softcap,
         n_threads,
         vtcm_budget,
-    )?;
-    kparams[5] = softcap.to_bits() as i32;
-    Some(kparams)
+    )
+}
+
+/// One side of a `Cpy`, as `ggml_hexagon_precompute_cpy_params` sees it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CopyTensor {
+    /// `HtpDataType` value; only F32, F16 and I32 are copyable.
+    pub dtype: u32,
+    pub ne: [u32; 4],
+    /// Byte strides.
+    pub nb: [u32; 4],
+}
+
+impl From<&super::types::HtpTensor> for CopyTensor {
+    fn from(t: &super::types::HtpTensor) -> Self {
+        Self {
+            dtype: t.dtype,
+            ne: t.ne,
+            nb: t.nb,
+        }
+    }
+}
+
+impl CopyTensor {
+    fn type_size(&self) -> Option<u64> {
+        match self.dtype {
+            x if x == HtpDataType::F32 as u32 || x == HtpDataType::I32 as u32 => Some(4),
+            x if x == HtpDataType::F16 as u32 => Some(2),
+            _ => None,
+        }
+    }
+
+    fn nelements(&self) -> u64 {
+        self.ne.iter().map(|&n| u64::from(n)).product()
+    }
+
+    /// `ggml_is_contiguous` for a type with a block size of 1.
+    fn is_contiguous(&self, type_size: u64) -> bool {
+        if self.ne[0] != 1 && u64::from(self.nb[0]) != type_size {
+            return false;
+        }
+        let mut next_nb = type_size * u64::from(self.ne[0]);
+        for i in 1..4 {
+            if self.ne[i] != 1 && u64::from(self.nb[i]) != next_nb {
+                return false;
+            }
+            next_nb *= u64::from(self.ne[i]);
+        }
+        true
+    }
+}
+
+const COPY_KERNEL_1D_CONTIG: u32 = 1;
+const COPY_KERNEL_SAMESHAPE_SAMETYPE: u32 = 2;
+const COPY_KERNEL_SAMESHAPE_CONVERT: u32 = 3;
+const COPY_KERNEL_RESHAPE: u32 = 4;
+const COPY_KERNEL_SCALAR: u32 = 5;
+
+/// Kernel parameters for a `Cpy`: port of `ggml_hexagon_precompute_cpy_params` and of
+/// `htp_copy_kernel_params` / `htp_copy_convert_vtcm_layout_build` (`cpy-ops.h`).
+///
+/// The DSP's `op_cpy` has no fallback: it dispatches on `kernel_type` and answers
+/// `HTP_STATUS_NO_SUPPORT` for 0, so a copy sent with empty params fails. `None` means the
+/// pair is not a copy the kernels handle (the C++ host runs such a node on the CPU).
+/// `n_threads == 0` means "unknown" and takes the host's default of 4; `vtcm_bytes == 0` skips
+/// the VTCM fit check, as the host does.
+///
+/// Words (`htp_copy_kernel_params`): 0 = `kernel_type | src0_type_size << 8 | dst_type_size << 16
+/// | n_threads << 24`, 1 `total_elems`, 2 `total_rows`, 3 `vtcm_size`, then the union from word 4:
+/// convert = `src0_buf_size, dst_buf_size, spad0_size_per_thread, spad1_size_per_thread,
+/// div_ne01, div_ne02_ne01`; reshape = `div_ne0, div_ne1_ne0, div_ne2_ne1_ne0, div_ne00,
+/// div_ne01_ne00, div_ne02_ne01_ne00` (each divider is `mp, l`).
+pub fn build_copy_kernel_params(
+    src: &CopyTensor,
+    dst: &CopyTensor,
+    n_threads: u32,
+    vtcm_bytes: usize,
+) -> Option<[i32; 32]> {
+    let src_ts = src.type_size()?;
+    let dst_ts = dst.type_size()?;
+    let nelem = src.nelements();
+    if nelem != dst.nelements() {
+        return None;
+    }
+    let pack = |kernel: u32, threads: u32| -> u32 {
+        kernel | ((src_ts as u32) << 8) | ((dst_ts as u32) << 16) | ((threads & 0xff) << 24)
+    };
+    let mut k = [0i32; 32];
+    k[1] = nelem as u32 as i32; // total_elems
+
+    if nelem == 0 {
+        k[0] = pack(COPY_KERNEL_1D_CONTIG, 0) as i32;
+        return Some(k);
+    }
+    if nelem == 1 {
+        let ok = src.dtype == dst.dtype
+            || matches!(
+                (src.dtype, dst.dtype),
+                (a, b) if (a == HtpDataType::F32 as u32 && b == HtpDataType::I32 as u32)
+                    || (a == HtpDataType::I32 as u32 && b == HtpDataType::F32 as u32)
+                    || (a == HtpDataType::F32 as u32 && b == HtpDataType::F16 as u32)
+                    || (a == HtpDataType::F16 as u32 && b == HtpDataType::F32 as u32)
+            );
+        if !ok {
+            return None;
+        }
+        k[0] = pack(COPY_KERNEL_SCALAR, 0) as i32;
+        return Some(k);
+    }
+
+    let sametype = src.dtype == dst.dtype;
+    let same_extents = src.ne == dst.ne;
+    let transposed = src.nb[0] > src.nb[1]
+        || dst.nb[0] > dst.nb[1]
+        || u64::from(src.nb[0]) != src_ts
+        || u64::from(dst.nb[0]) != dst_ts
+        || u64::from(src.nb[1]) < u64::from(src.ne[0]) * src_ts
+        || u64::from(dst.nb[1]) < u64::from(dst.ne[0]) * dst_ts;
+    let sameshape = same_extents && !transposed;
+    let rows = (u64::from(src.ne[1]) * u64::from(src.ne[2]) * u64::from(src.ne[3])) as u32;
+    let threads = if n_threads > 0 { n_threads } else { 4 };
+
+    if sametype {
+        if src.is_contiguous(src_ts) && dst.is_contiguous(dst_ts) {
+            k[0] = pack(COPY_KERNEL_1D_CONTIG, 0) as i32;
+            return Some(k);
+        }
+        if sameshape {
+            k[0] = pack(COPY_KERNEL_SAMESHAPE_SAMETYPE, 0) as i32;
+            k[2] = rows as i32;
+            return Some(k);
+        }
+        k[0] = pack(COPY_KERNEL_RESHAPE, threads) as i32;
+        let d = |x: u64| init_fastdiv(x as u32);
+        let n = |t: &CopyTensor, upto: usize| -> u64 {
+            t.ne[..upto].iter().map(|&v| u64::from(v)).product()
+        };
+        let dividers = [
+            d(n(dst, 1)),
+            d(n(dst, 2)),
+            d(n(dst, 3)),
+            d(n(src, 1)),
+            d(n(src, 2)),
+            d(n(src, 3)),
+        ];
+        for (i, v) in dividers.iter().enumerate() {
+            k[4 + 2 * i] = v.mp as i32;
+            k[5 + 2 * i] = v.l as i32;
+        }
+        return Some(k);
+    }
+
+    if !sameshape {
+        return None;
+    }
+    let (f32t, f16t, i32t) = (
+        HtpDataType::F32 as u32,
+        HtpDataType::F16 as u32,
+        HtpDataType::I32 as u32,
+    );
+    let valid = matches!(
+        (src.dtype, dst.dtype),
+        (a, b) if (a == f32t && b == f16t)
+            || (a == f16t && b == f32t)
+            || (a == f32t && b == i32t)
+            || (a == i32t && b == f32t)
+    );
+    if !valid {
+        return None;
+    }
+
+    // htp_copy_convert_vtcm_layout_build
+    let round256 = |x: u64| x.next_multiple_of(256);
+    let src_buf = round256(u64::from(src.ne[0]) * src_ts);
+    let dst_buf = round256(u64::from(dst.ne[0]) * dst_ts);
+    let spad0 = 2 * src_buf;
+    let spad1 = 2 * dst_buf;
+    let total = u64::from(threads) * (spad0 + spad1);
+    if vtcm_bytes > 0 && total > vtcm_bytes as u64 {
+        return None;
+    }
+    k[0] = pack(COPY_KERNEL_SAMESHAPE_CONVERT, threads) as i32;
+    k[2] = rows as i32;
+    k[3] = total as u32 as i32;
+    k[4] = src_buf as u32 as i32;
+    k[5] = dst_buf as u32 as i32;
+    k[6] = spad0 as u32 as i32;
+    k[7] = spad1 as u32 as i32;
+    let div_ne01 = init_fastdiv(src.ne[1]);
+    let div_ne02_ne01 = init_fastdiv((u64::from(src.ne[2]) * u64::from(src.ne[1])) as u32);
+    k[8] = div_ne01.mp as i32;
+    k[9] = div_ne01.l as i32;
+    k[10] = div_ne02_ne01.mp as i32;
+    k[11] = div_ne02_ne01.l as i32;
+    Some(k)
+}
+
+const CONCAT_KERNEL_REGULAR: u32 = 1;
+const CONCAT_KERNEL_TRANSPOSED: u32 = 2;
+
+/// Kernel parameters for a `Concat` along `dim` (`op_params[0]`): port of
+/// `ggml_hexagon_precompute_concat_params` and `htp_concat_transposed_vtcm_layout_build`
+/// (`concat-ops.h`). `None` when the operands are not a concat the kernels handle.
+///
+/// Words (`htp_concat_kernel_params`): 0 = `kernel_type | dim << 8 | n_threads << 16`,
+/// 1 `vtcm_size`, 2 `spad0_size_per_thread`, 3 `spad1_size_per_thread`. The regular kernel runs
+/// one thread; the transposed one (a transposed `src1` joined along dim 0) takes `n_threads`
+/// (0 means unknown, which the host defaults to 8) and a VTCM working set.
+pub fn build_concat_kernel_params(
+    src0: &CopyTensor,
+    src1: &CopyTensor,
+    dst: &CopyTensor,
+    dim: i32,
+    n_threads: u32,
+    vtcm_bytes: usize,
+) -> Option<[i32; 32]> {
+    if !(0..4).contains(&dim) {
+        return None;
+    }
+    let d = dim as usize;
+    let f32t = HtpDataType::F32 as u32;
+    let f16t = HtpDataType::F16 as u32;
+    let i32t = HtpDataType::I32 as u32;
+    if ![f32t, f16t, i32t].contains(&dst.dtype)
+        || src0.dtype != dst.dtype
+        || src1.dtype != dst.dtype
+    {
+        return None;
+    }
+    let ts = dst.type_size()?;
+    for i in 0..4 {
+        let ne_i = if i == d {
+            u64::from(src0.ne[i]) + u64::from(src1.ne[i])
+        } else {
+            u64::from(src0.ne[i])
+        };
+        if u64::from(dst.ne[i]) != ne_i || (i != d && src1.ne[i] != dst.ne[i]) {
+            return None;
+        }
+    }
+    let pack = |kernel: u32, threads: u32| kernel | ((d as u32) << 8) | ((threads & 0xff) << 16);
+    let mut k = [0i32; 32];
+
+    let nb0 = |t: &CopyTensor| u64::from(t.nb[0]);
+    if nb0(src0) == ts && nb0(src1) == ts && nb0(dst) == ts {
+        k[0] = pack(CONCAT_KERNEL_REGULAR, 1) as i32;
+        return Some(k);
+    }
+
+    let src1_transposed = src1.nb[0] > src1.nb[1];
+    let src0_transposed = src0.nb[0] > src0.nb[1];
+    let rows_ok = nb0(src0) == ts && u64::from(src1.nb[1]) == ts && nb0(dst) == ts;
+    if d == 0 && src1_transposed && !src0_transposed && rows_ok && dst.dtype != i32t {
+        let threads = if n_threads > 0 { n_threads } else { 8 };
+        // htp_concat_transposed_vtcm_layout_build
+        let block_i: u64 = if ts == 4 { 32 } else { 64 };
+        let spad1_stride = block_i * ts;
+        let src1_ne0_padded = u64::from(src1.ne[0]).next_multiple_of(block_i);
+        let spad0_row_bytes =
+            (u64::from(src0.ne[0]) * ts).next_multiple_of(128) + src1_ne0_padded * ts;
+        let spad0 = block_i * spad0_row_bytes;
+        let spad1 = src1_ne0_padded * spad1_stride;
+        let total = u64::from(threads) * (spad0 + spad1);
+        if vtcm_bytes > 0 && total > vtcm_bytes as u64 {
+            return None;
+        }
+        k[0] = pack(CONCAT_KERNEL_TRANSPOSED, threads) as i32;
+        k[1] = total as u32 as i32;
+        k[2] = spad0 as u32 as i32;
+        k[3] = spad1 as u32 as i32;
+        return Some(k);
+    }
+    None
 }
 
 #[cfg(test)]
 mod tests {
+    use super::*;
+
+    /// Every case of `testdata/hmx_solve_golden.txt`: llama.cpp's own `htp_mm_hmx_solve_2d_params`
+    /// (cost model, exact layout check and activation-thread search) for the weight types and
+    /// shapes cera sends, at several thread counts and VTCM budgets.
+    #[test]
+    fn hmx_2d_solver_matches_the_llama_cpp_header() {
+        let golden = include_str!("testdata/hmx_solve_golden.txt");
+        let (mut cases, mut no_fit, mut halved) = (0usize, 0usize, 0usize);
+        for line in golden
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let (inputs, want) = line.split_once("=>").unwrap();
+            let v: Vec<usize> = inputs
+                .split_whitespace()
+                .map(|x| x.parse().unwrap())
+                .collect();
+            let w: Vec<usize> = want
+                .split_whitespace()
+                .map(|x| x.parse().unwrap())
+                .collect();
+            let wtype = match v[0] {
+                2 => HtpDataType::Q4_0,
+                8 => HtpDataType::Q8_0,
+                12 => HtpDataType::Q4K,
+                14 => HtpDataType::Q6K,
+                other => panic!("unexpected weight type {other}"),
+            };
+            // golden fields: wtype k n m_pad m threads vtcm
+            let got = mm_hmx_solve_2d(wtype, v[1], v[2], v[3], v[4], v[5], v[6]);
+            let want = (w[0] == 1).then_some((w[1], w[2], w[3], w[4]));
+            assert_eq!(got, want, "{line}");
+            cases += 1;
+            match want {
+                None => no_fit += 1,
+                Some((_, _, act_threads, _)) if act_threads < v[5] => halved += 1,
+                Some(_) => {}
+            }
+        }
+        assert!(cases > 6000, "golden file looks truncated: {cases} cases");
+        // The grid has to keep reaching the paths a roomy budget never takes.
+        assert!(no_fit > 1000, "only {no_fit} cases do not fit");
+        assert!(
+            halved > 100,
+            "only {halved} cases halve the activation threads"
+        );
+    }
+
+    /// Every case of `testdata/hmx_chunks_golden.txt`: llama.cpp's own `htp_mm_hmx_compute_chunks`
+    /// (`matmul-ops.h`) over a grid of VTCM budgets, costs and ragged N, whose tie-break prefers
+    /// the candidate that wastes the fewest columns in the last N block.
+    #[test]
+    fn hmx_chunk_search_matches_the_llama_cpp_header() {
+        let golden = include_str!("testdata/hmx_chunks_golden.txt");
+        let (mut cases, mut fits) = (0usize, 0usize);
+        for line in golden
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let (inputs, want) = line.split_once("=>").unwrap();
+            let v: Vec<usize> = inputs
+                .split_whitespace()
+                .map(|x| x.parse().unwrap())
+                .collect();
+            let want: Vec<i64> = want
+                .split_whitespace()
+                .map(|x| x.parse().unwrap())
+                .collect();
+            let got = mm_hmx_compute_chunks(v[0], v[1], v[2], v[3], v[4], v[5], v[6], v[7], v[8]);
+            if want[0] == 0 {
+                assert_eq!(got, Some((want[1] as usize, want[2] as usize)), "{line}");
+                fits += 1;
+            } else {
+                assert_eq!(got, None, "{line}");
+            }
+            cases += 1;
+        }
+        assert!(
+            cases > 17000 && fits > 15000,
+            "golden file looks truncated: {cases} cases"
+        );
+    }
+
+    /// Every case of `testdata/ssm_conv_golden.txt` (llama.cpp's own
+    /// `ggml_hexagon_precompute_ssm_conv_params`): the scalar and tiled branches, thread counts
+    /// and VTCM budgets from 64 KiB to unknown.
+    #[test]
+    fn ssm_conv_kernel_params_match_the_llama_cpp_host_code() {
+        let golden = include_str!("testdata/ssm_conv_golden.txt");
+        let mut cases = 0usize;
+        for line in golden
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let (inputs, want) = line.split_once("=>").unwrap();
+            let (shape, run) = inputs.split_once('|').unwrap();
+            let v: Vec<usize> = shape
+                .split_whitespace()
+                .map(|x| x.parse().unwrap())
+                .collect();
+            let mut run = run.split_whitespace();
+            let threads: u32 = run.next().unwrap().parse().unwrap();
+            let vtcm: usize = run.next().unwrap().parse().unwrap();
+            let mut words: Vec<i32> = want
+                .split_whitespace()
+                .map(|w| w.parse::<u32>().unwrap() as i32)
+                .collect();
+            words.resize(32, 0);
+            let got = build_ssm_conv_kernel_params(v[0], v[1], v[2], v[3], v[4], threads, vtcm);
+            assert_eq!(got.to_vec(), words, "{line}");
+            cases += 1;
+        }
+        assert!(cases > 3000, "golden file looks truncated: {cases} cases");
+    }
+
+    /// Parse `ne0..3 nb0..3` after a type id, from a golden-file side.
+    fn golden_tensor(f: &mut std::str::SplitWhitespace<'_>) -> CopyTensor {
+        let mut next = || -> u64 { f.next().unwrap().parse().unwrap() };
+        let dtype = next() as u32;
+        let ne = [next() as u32, next() as u32, next() as u32, next() as u32];
+        let nb = [next() as u32, next() as u32, next() as u32, next() as u32];
+        CopyTensor { dtype, ne, nb }
+    }
+
+    /// Every case of `testdata/concat_golden.txt` (llama.cpp's own
+    /// `ggml_hexagon_precompute_concat_params`, compiled by `scripts/hexagon-golden/gen.py`).
+    #[test]
+    fn concat_kernel_params_match_the_llama_cpp_host_code() {
+        let golden = include_str!("testdata/concat_golden.txt");
+        let (mut cases, mut unsupported) = (0usize, 0usize);
+        for line in golden
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let (inputs, want) = line.split_once("=>").unwrap();
+            let mut sides = inputs.split('|');
+            let a = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let b = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let d = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let mut run = sides.next().unwrap().split_whitespace();
+            let dim: i32 = run.next().unwrap().parse().unwrap();
+            let threads: u32 = run.next().unwrap().parse().unwrap();
+            let vtcm: usize = run.next().unwrap().parse().unwrap();
+            let got = build_concat_kernel_params(&a, &b, &d, dim, threads, vtcm);
+            let want = want.trim();
+            if want == "unsupported" {
+                assert_eq!(got, None, "{line}");
+                unsupported += 1;
+            } else {
+                // the golden file keeps the first 8 words of the blob; the rest must be zero
+                let mut words: Vec<i32> = want
+                    .split_whitespace()
+                    .map(|w| w.parse::<u32>().unwrap() as i32)
+                    .collect();
+                words.resize(32, 0);
+                assert_eq!(got.map(|k| k.to_vec()), Some(words), "{line}");
+            }
+            cases += 1;
+        }
+        assert!(
+            cases > 2000 && unsupported > 100,
+            "golden file looks truncated: {cases} cases"
+        );
+    }
+
+    /// Every case of `testdata/cpy_golden.txt`, which `scripts/hexagon-golden/gen.py` produces by
+    /// compiling llama.cpp's own `ggml_hexagon_precompute_cpy_params`, must come out word for word
+    /// (or as `unsupported`) from the Rust port.
+    #[test]
+    fn copy_kernel_params_match_the_llama_cpp_host_code() {
+        let golden = include_str!("testdata/cpy_golden.txt");
+        let (mut cases, mut unsupported) = (0usize, 0usize);
+        for line in golden
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let (inputs, want) = line.split_once("=>").unwrap();
+            let mut sides = inputs.split('|');
+            let src = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let dst = golden_tensor(&mut sides.next().unwrap().split_whitespace());
+            let mut run = sides.next().unwrap().split_whitespace();
+            let threads: u32 = run.next().unwrap().parse().unwrap();
+            let vtcm: usize = run.next().unwrap().parse().unwrap();
+            let got = build_copy_kernel_params(&src, &dst, threads, vtcm);
+            let want = want.trim();
+            if want == "unsupported" {
+                assert_eq!(got, None, "{line}");
+                unsupported += 1;
+            } else {
+                let words: Vec<i32> = want
+                    .split_whitespace()
+                    .map(|w| w.parse::<u32>().unwrap() as i32)
+                    .collect();
+                assert_eq!(got.map(|k| k.to_vec()), Some(words), "{line}");
+            }
+            cases += 1;
+        }
+        assert!(
+            cases > 2000 && unsupported > 100,
+            "golden file looks truncated: {cases} cases"
+        );
+    }
     /// A per-head attention-score matmul worked out from the host precompute:
     /// K as `[64, 126, 8]` (row stride 2048 B) against 8 batches of 126 query
     /// rows. 1008 activation rows of 256 B, 16 prefetched 2048 B weight rows
@@ -1785,24 +2561,22 @@ mod tests {
             8 << 20,
         )
         .unwrap();
-        assert_eq!(k[0], 4, "HVX_F32_F32_VTCM");
-        assert_eq!((k[4], k[6], k[7]), (8, 0, 16));
-        assert_eq!(k[2], 0, "everything fits: no chunking");
-        assert_eq!(k[10], 256); // round_up(64 * 4, 128) is 256
-        assert_eq!(k[13], 258048); // round_up(256 * 1008, 256)
-        assert_eq!(k[12], 262144); // round_up(16 * 2048, 256) * 8 threads
-        assert_eq!(k[16], 0, "no output slice for more than one row");
-        assert_eq!(k[11], 258048 + 262144);
-        // Divisors: ne12 * ne11, ne11, ne12 / ne02 = 1, ne13 / ne03 = 1, ne12.
-        let fd = |d: u32| {
-            let f = init_fastdiv(d);
-            [f.mp as i32, f.l as i32]
-        };
-        assert_eq!(k[18..20], fd(8 * 126));
-        assert_eq!(k[20..22], fd(126));
-        assert_eq!(k[22..24], fd(1));
-        assert_eq!(k[24..26], fd(1));
-        assert_eq!(k[26..28], fd(8));
+        let m = MmKernelParams::from_words(&k);
+        assert_eq!(m.kernel_type, 4, "HVX_F32_F32_VTCM");
+        assert_eq!((m.n_threads, m.n_hmx, m.n_prefetch), (8, 0, 16));
+        assert_eq!(m.m_chunk, 0, "everything fits: no chunking");
+        assert_eq!(m.act_row_size, 256); // round_up(64 * 4, 128) is 256
+        assert_eq!(m.vtcm_act_size, 258048); // round_up(256 * 1008, 256)
+        assert_eq!(m.vtcm_src0_size, 262144); // round_up(16 * 2048, 256) * 8 threads
+        assert_eq!(m.vtcm_dst_size, 0, "no output slice for more than one row");
+        assert_eq!(m.vtcm_size, 258048 + 262144);
+        // Dividers: ne12 * ne11, ne11, ne12 / ne02 = 1, ne13 / ne03 = 1, ne12.
+        let fd = |d: u32| init_fastdiv(d);
+        assert_eq!(m.div_ne12_ne1, fd(8 * 126));
+        assert_eq!(m.div_ne1, fd(126));
+        assert_eq!(m.div_r2, fd(1));
+        assert_eq!(m.div_r3, fd(1));
+        assert_eq!(m.div_ne12, fd(8));
     }
 
     /// Too little VTCM for all the activation rows: the largest even chunk
@@ -1822,7 +2596,7 @@ mod tests {
         // 262144 for the weights leaves 100000 B: 390 rows of 256 B, made even.
         let k = build_mul_mat_f32_kernel_params(shape, 8, 262144 + 100_000).unwrap();
         assert_eq!(k[2], 390);
-        assert!(k[11] as usize <= 262144 + 100_000);
+        assert!(MmKernelParams::from_words(&k).vtcm_size as usize <= 262144 + 100_000);
         assert!(build_mul_mat_f32_kernel_params(shape, 8, 262144).is_none());
     }
 
@@ -1886,17 +2660,14 @@ mod tests {
         assert_eq!((k[0], k[2]), (3, 1));
     }
 
-    use super::*;
-
-    /// The routed-FFN case: gather 4 unbiased expert weights from a 32-entry
-    /// table (`src0` `[1, 32]`, indices `[4]`), worked out from the host
-    /// precompute: 4 tasks over 4 threads, no DMA, no chunking.
+    /// The routed-FFN case: gather 4 unbiased expert weights from a 32-entry table (`src0`
+    /// `[1, 32]`, indices `[4]`): the same-type kernel, 4 tasks over 4 threads, no VTCM, no
+    /// chunking.
     #[test]
     fn get_rows_kparams_follow_the_host_precompute() {
         let k = build_get_rows_f32_kernel_params(1, 1, 1, 4, 1, 1, 8);
-        // n_threads, use_dma, chunks_per_row, chunk_size, total, per_thread,
-        // vtcm: 4 threads x (2 + 2 double-buffered 256 B rows).
-        assert_eq!(k[..7], [4, 0, 1, 1, 4, 1, 4 * 4 * 256]);
+        // n_threads, kernel_type (SAMETYPE), chunks_per_row, chunk_size, total, per_thread, vtcm
+        assert_eq!(k[..7], [4, 0, 1, 1, 4, 1, 0]);
         let div = |d: u32| {
             let f = init_fastdiv(d);
             [f.mp as i32, f.l as i32]
@@ -1907,13 +2678,59 @@ mod tests {
         assert_eq!(k[13..15], div(1)); // ne02
         assert_eq!(k[15..17], div(1)); // ne03
         assert!(k[17..].iter().all(|&v| v == 0));
-        // A wide row (>= 2048 elements) takes the DMA path, one task per row.
+        // A wide row is still one task per gathered row (no DMA split, no chunking any more).
         let k = build_get_rows_f32_kernel_params(2048, 1, 1, 4, 1, 1, 8);
-        assert_eq!((k[0], k[1], k[3], k[4], k[5]), (4, 1, 2048, 4, 1));
-        // Few rows over many threads split a long row into chunks (only for
-        // rows past 1024 elements: here ne00 = 1500 gives one chunk).
+        assert_eq!((k[0], k[1], k[2], k[3], k[4], k[5]), (4, 0, 1, 2048, 4, 1));
         let k = build_get_rows_f32_kernel_params(1500, 1, 1, 2, 1, 1, 8);
-        assert_eq!((k[2], k[3], k[4]), (1, 1500, 2));
+        assert_eq!((k[0], k[2], k[3], k[4]), (2, 1, 1500, 2));
+    }
+
+    fn golden_get_rows(line: &str) -> (GetRowsShape, u32, usize, Vec<i32>) {
+        let (inputs, want) = line.split_once("=>").unwrap();
+        let (shape, run) = inputs.split_once('|').unwrap();
+        let v: Vec<u64> = shape
+            .split_whitespace()
+            .map(|x| x.parse().unwrap())
+            .collect();
+        let mut run = run.split_whitespace();
+        let threads: u32 = run.next().unwrap().parse().unwrap();
+        let vtcm: usize = run.next().unwrap().parse().unwrap();
+        let words: Vec<i32> = want
+            .split_whitespace()
+            .map(|w| w.parse::<u32>().unwrap() as i32)
+            .collect();
+        let shape = GetRowsShape {
+            src0_dtype: v[0] as u32,
+            dst_dtype: v[1] as u32,
+            ne00: v[2] as u32,
+            ne02: v[3] as u32,
+            ne03: v[4] as u32,
+            ne10: v[5] as u32,
+            ne11: v[6] as u32,
+            ne12: v[7] as u32,
+            tiled: v[8] != 0,
+        };
+        (shape, threads, vtcm, words)
+    }
+
+    /// Every case of `testdata/get_rows_golden.txt` (llama.cpp's own
+    /// `ggml_hexagon_precompute_get_rows_params`), across the same-type, tiled and flat kernels,
+    /// thread counts and VTCM budgets that force the thread count down.
+    #[test]
+    fn get_rows_kernel_params_match_the_llama_cpp_host_code() {
+        let golden = include_str!("testdata/get_rows_golden.txt");
+        let mut cases = 0usize;
+        for line in golden
+            .lines()
+            .filter(|l| !l.starts_with('#') && !l.is_empty())
+        {
+            let (shape, threads, vtcm, mut words) = golden_get_rows(line);
+            words.resize(32, 0);
+            let got = build_get_rows_kernel_params(&shape, threads, vtcm);
+            assert_eq!(got.to_vec(), words, "{line}");
+            cases += 1;
+        }
+        assert!(cases > 5000, "golden file looks truncated: {cases} cases");
     }
 
     /// The scalar-broadcast params the llama.cpp host precompute produces
@@ -2011,20 +2828,22 @@ mod tests {
         assert_eq!(rope[6], (1.0f32).to_bits() as i32);
 
         let mm = build_mul_mat_kernel_params(HtpDataType::Q8_0, 1024, 1, 1, 4096, 4, 8 << 20);
-        assert_eq!(mm[0], 6); // single row: QUANT_BLOCK
-        assert_eq!(mm[4], 4);
-        assert_eq!(mm[8], 1088);
-        assert_eq!(mm[9], 1152);
-        assert!(mm[11] > 0); // vtcm_size
-        assert_eq!(mm[17], 0); // n_weights
-        assert_eq!(mm[18], 1); // div(1).mp
-        assert_eq!(mm[19], 0); // div(1).l
+        let mm = MmKernelParams::from_words(&mm);
+        assert_eq!(mm.kernel_type, 6); // single row: QUANT_BLOCK
+        assert_eq!(mm.n_threads, 4);
+        assert_eq!(mm.tile_size, 1088);
+        assert_eq!(mm.aligned_tile_size, 1152);
+        assert!(mm.vtcm_size > 0);
+        assert_eq!(mm.n_weights, 0);
+        assert_eq!(mm.div_ne12_ne1, init_fastdiv(1)); // mp 1, l 0
     }
 
     #[test]
     fn test_hmx_mm_solver_goldens() {
-        // Oracle: htp_mm_hmx_solve_2d_params compiled from upstream
-        // matmul-ops.h (8MB budget, 4 threads unless noted).
+        // Oracle: htp_mm_hmx_solve_2d_params compiled from llama.cpp's matmul-ops.h
+        // (`scripts/hexagon-golden/gen.py hmx_solve`; 8 MB budget, 4 threads unless noted). The
+        // chunk sizes divide N evenly where they can (the tail-waste tie-break). The full grid is
+        // `hmx_2d_solver_matches_the_llama_cpp_header`.
         let b8 = 8 * 1024 * 1024;
         let q8 = HtpDataType::Q8_0;
         let q4 = HtpDataType::Q4_0;
@@ -2034,20 +2853,20 @@ mod tests {
             (usize, usize, usize, usize),
         );
         let cases: [HmxCase; 15] = [
-            ((q8, 1024, 4608, 5), (32, 2528, 4, 8318976)),
-            ((q8, 1024, 4608, 8), (32, 2528, 4, 8318976)),
-            ((q8, 1024, 4608, 13), (32, 2528, 4, 8318976)),
-            ((q8, 1024, 4608, 32), (32, 2528, 4, 8318976)),
-            ((q8, 4608, 1024, 32), (32, 544, 4, 8165376)),
-            ((q8, 4608, 1024, 13), (32, 544, 4, 8165376)),
-            ((q8, 1024, 3072, 32), (32, 2528, 4, 8318976)),
+            ((q8, 1024, 4608, 5), (32, 2304, 4, 7587840)),
+            ((q8, 1024, 4608, 8), (32, 2304, 4, 7587840)),
+            ((q8, 1024, 4608, 13), (32, 2304, 4, 7587840)),
+            ((q8, 1024, 4608, 32), (32, 2304, 4, 7587840)),
+            ((q8, 4608, 1024, 32), (32, 512, 4, 7702528)),
+            ((q8, 4608, 1024, 13), (32, 512, 4, 7702528)),
+            ((q8, 1024, 3072, 32), (32, 1536, 4, 5081088)),
             ((q8, 1024, 1024, 32), (32, 1024, 4, 3409920)),
             ((q8, 1024, 256, 32), (32, 256, 4, 903168)),
-            ((q8, 1024, 4608, 64), (64, 1216, 4, 8226816)),
-            ((q8, 1024, 4608, 512), (512, 864, 4, 8349696)),
+            ((q8, 1024, 4608, 64), (64, 1152, 4, 7800832)),
+            ((q8, 1024, 4608, 512), (512, 768, 4, 7538688)),
             ((q8, 4608, 1024, 512), (256, 192, 4, 8087552)),
-            ((q4, 1024, 4608, 32), (32, 3008, 4, 8345600)),
-            ((q4, 4608, 1024, 32), (32, 640, 4, 8079360)),
+            ((q4, 1024, 4608, 32), (32, 2304, 4, 6408192)),
+            ((q4, 4608, 1024, 32), (32, 512, 4, 6522880)),
             ((q4, 1024, 1024, 8), (32, 1024, 4, 2885632)),
         ];
         for ((w, k, n, m), want) in cases {
@@ -2069,29 +2888,42 @@ mod tests {
     fn test_hmx_mm_kparams_golden() {
         let kp = build_hmx_mm_kernel_params(HtpDataType::Q8_0, 1024, 4608, 32, 32, 4, 8 << 20)
             .expect("gate m=32 fits");
-        assert_eq!(kp[0], 1); // HMX_2D
-        assert_eq!(kp[1], 0); // pipeline needs M > 32
-        assert_eq!(kp[2], 32); // m_chunk
-        assert_eq!(kp[3], 2528); // n_chunk
-        assert_eq!(kp[4], 4); // n_threads
-        assert_eq!(kp[5], 4); // act_threads
-        assert_eq!(kp[6], 1); // n_hmx
-        assert_eq!(kp[7], 0); // n_prefetch: HVX-only
-        assert_eq!(kp[8], 1088);
-        assert_eq!(kp[9], 1152);
-        assert_eq!(kp[11], 8318976); // vtcm_size
-        assert_eq!(kp[12], 0);
-        assert_eq!(kp[17], 0);
-        let div32 = init_fastdiv(32);
-        assert_eq!((kp[18], kp[19]), (div32.mp as i32, div32.l as i32));
-        assert_eq!((kp[28], kp[29]), (init_fastdiv(4).mp as i32, 2));
-        let div1k = init_fastdiv(1024);
-        assert_eq!((kp[30], kp[31]), (div1k.mp as i32, div1k.l as i32));
+        let m = MmKernelParams::from_words(&kp);
+        assert_eq!(m.kernel_type, 1); // HMX_2D
+        assert_eq!(m.pipeline, 0); // pipeline needs M > 32
+        assert_eq!(m.m_chunk, 32);
+        // 4608 = 2 x 2304: the chunk that divides N evenly wins the tie-break
+        assert_eq!(m.n_chunk, 2304);
+        assert_eq!(m.n_threads, 4);
+        assert_eq!(m.n_act_threads, 4);
+        assert_eq!(m.n_hmx, 1);
+        assert_eq!(m.n_prefetch, 0); // HVX-only
+        assert_eq!((m.collapse, m.n_weights), (0, 0));
+        assert_eq!(m.tile_size, 1088);
+        assert_eq!(m.aligned_tile_size, 1152);
+        assert_eq!(
+            m.act_row_size,
+            mm_act_tiled_row_size(HtpDataType::Q8_0, 1024) as i32
+        );
+        assert_eq!(m.vtcm_size, 7587840);
+        assert_eq!(
+            (
+                m.vtcm_src0_size,
+                m.vtcm_act_size,
+                m.vtcm_bias_size,
+                m.vtcm_dst_size
+            ),
+            (0, 0, 0, 0)
+        );
+        assert_eq!(m.div_ne12_ne1, init_fastdiv(32));
+        assert_eq!(m.div_n_act_threads, init_fastdiv(4));
+        assert_eq!(m.div_ne00_padded, init_fastdiv(1024));
         // Pipelined shape.
         let kp64 = build_hmx_mm_kernel_params(HtpDataType::Q8_0, 1024, 4608, 64, 64, 4, 8 << 20)
             .expect("gate m=64 fits");
-        assert_eq!(kp64[1], 1);
-        assert_eq!((kp64[2], kp64[3]), (64, 1216));
+        let m64 = MmKernelParams::from_words(&kp64);
+        assert_eq!(m64.pipeline, 1);
+        assert_eq!((m64.m_chunk, m64.n_chunk), (64, 1152));
     }
 
     #[test]
@@ -2148,10 +2980,16 @@ mod tests {
         let kp = build_hmx_fa_kernel_params(64, 16, 8, 32, 602, scale, 4, 8 << 20)
             .expect("m=32 kv=602 fits");
         assert_eq!(kp[0] & 0xff, 2); // HMX
+        // bytes 1 and 2 are head_split (on, as in llama.cpp) and reserved flags; they used to be
+        // is_q_fp32 / is_dst_fp32
+        assert_eq!((kp[0] >> 8) & 0xff, 1);
+        assert_eq!((kp[0] >> 16) & 0xff, 0);
         assert_eq!(kp[1], 32 | (192 << 16)); // Br | Bc << 16
         assert_eq!(kp[2] & 0xffff, 4); // n_kv_blocks = ceil(602/192)
         assert_eq!((kp[2] >> 16) & 0xffff, 2); // G
-        assert_eq!(kp[3], scale.to_bits() as i32);
+        // the HMX kernel works in the log2 domain: the host folds log2(e) into the scale
+        assert_eq!(kp[3], (scale * std::f32::consts::LOG2_E).to_bits() as i32);
+        assert_eq!(kp[5], 0);
         assert_eq!(kp[6], 386688); // vtcm_size
         assert_eq!(kp[7], 0);
         assert_eq!(kp[8], 0);
@@ -2206,12 +3044,9 @@ mod tests {
         // SsmConv: scalar (n_t=1) and chunk (n_t=32) branches, LFM2 K=3/C=1024.
         let ssm1 = build_ssm_conv_kernel_params(3, 1024, 1, 1, 3, 4, 8 << 20);
         assert_eq!(ssm1[0], 4); // n_threads
-        assert_eq!(ssm1[5], 256); // d_inner_per_thread
-        assert_eq!(ssm1[6], 256); // d_inner_tile (scalar: full range)
-        assert_eq!(ssm1[16], 54272); // vtcm total
+        assert_eq!(ssm1[5], 256); // d_inner_tile (scalar: the full per-thread range)
         let ssm32 = build_ssm_conv_kernel_params(3, 1024, 32, 1, 34, 4, 8 << 20);
-        assert_eq!(ssm32[6], 256); // tile covers the per-thread range
-        assert_eq!(ssm32[16], 435200);
+        assert_eq!(ssm32[5], 64); // a quarter of the 256 channels per thread, within 32..=128
 
         // Flash attention: decode (M=1) and prefill chunk (M=32).
         let fa1 = build_flash_attn_kernel_params(64, 16, 8, 1, 64, 0.125, 1, true);
@@ -2304,11 +3139,28 @@ mod tests {
     fn test_flash_attn_kernel_params_with_softcap() {
         let p = build_flash_attn_kernel_params_with_softcap(64, 16, 8, 1, 64, 0.125, 1, true, 50.0);
         assert_eq!(p[5], 50.0f32.to_bits() as i32);
+        // HVX: head_split on, no type flags
+        assert_eq!((p[0] >> 8) & 0xff, 1);
+        assert_eq!((p[0] >> 16) & 0xff, 0);
 
+        // The scale is divided by the softcap, as the C++ host does
+        assert_eq!(p[3], (0.125f32 / 50.0).to_bits() as i32);
+        // HMX with a softcap folds log2(e) into the softcap and leaves the (divided) scale alone;
+        // without one it folds it into the scale
         let hmx =
             build_hmx_fa_kernel_params_with_softcap(64, 16, 8, 32, 602, 0.125, 4, 8 << 20, 50.0)
                 .expect("should fit");
-        assert_eq!(hmx[5], 50.0f32.to_bits() as i32);
+        assert_eq!(hmx[3], (0.125f32 / 50.0).to_bits() as i32);
+        assert_eq!(
+            hmx[5],
+            (50.0f32 * std::f32::consts::LOG2_E).to_bits() as i32
+        );
+        let plain = build_hmx_fa_kernel_params(64, 16, 8, 32, 602, 0.125, 4, 8 << 20).unwrap();
+        assert_eq!(
+            plain[3],
+            (0.125f32 * std::f32::consts::LOG2_E).to_bits() as i32
+        );
+        assert_eq!(plain[5], 0);
     }
 
     const VTCM: usize = 8 * 1024 * 1024;
@@ -2328,7 +3180,9 @@ mod tests {
         // The DSP's solver: (VTCM - weight prefetch) / (quantized + raw row),
         // rounded down to an even count: (8 MiB - 1327104) / (110592 + 12288).
         assert_eq!(chunk, 56);
-        assert!(k[11] as usize <= VTCM, "the reported layout is the chunk's");
+        let reported = MmKernelParams::from_words(&k).vtcm_size as usize;
+        assert!(reported <= VTCM, "the reported layout is the chunk's");
+        assert!(reported > 0, "the DSP is told how much VTCM the chunk uses");
     }
 
     /// Over every shape the ViT, Whisper and the LFM2 prefill reach: a chunk
@@ -2349,7 +3203,8 @@ mod tests {
                             n_threads,
                             VTCM,
                         );
-                        let (chunk, prefetch) = (k[2] as usize, k[7] as usize);
+                        let mm = MmKernelParams::from_words(&k);
+                        let (chunk, prefetch) = (mm.m_chunk as usize, mm.n_prefetch as usize);
                         let total = |m: usize| {
                             mm_hvx_dsp_vtcm(wtype, k_dim, m, n_threads as usize, 4096, prefetch)
                         };

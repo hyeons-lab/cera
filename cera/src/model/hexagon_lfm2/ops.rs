@@ -1,6 +1,7 @@
 //! Op emitters: one `dispatch_*` associated function per DSP operation.
 
 use super::*;
+use crate::backend::hexagon::MmKernelParams;
 use crate::backend::hexagon::dispatch::{self, ConcatSrc, TokenShape, TokenTile, View};
 
 impl HexagonLfmModel {
@@ -209,8 +210,8 @@ impl HexagonLfmModel {
 
     /// Dim-0 CONCAT of two 2D f32 tensors:
     /// `[s0_rows, dim] + [s1_rows, dim] -> [s0_rows + s1_rows, dim]`.
-    /// `params[0]` is the concat dim; kparams are zero (the DSP sizes VTCM
-    /// itself). The second source may be a transposed view (`s1_nb0 >
+    /// `params[0]` is the concat dim; kparams are zero, and `enqueue_op` fills them from the
+    /// registered tensors (the DSP answers NO_SUPPORT for empty ones). The second source may be a transposed view (`s1_nb0 >
     /// s1_nb1`), which takes the DSP's specialized 2D-transposed worker:
     /// the conv state prepend (`[s0; s1] + bx-as-[m, hs]`).
     pub(super) fn dispatch_concat_2d(
@@ -1451,9 +1452,10 @@ impl HexagonLfmModel {
         } else {
             None
         };
-        let kparams = if let Some(mut kp) = hmx_built {
-            kp[17] = n as i32; // n_weights
-            kp
+        let kparams = if let Some(kp) = hmx_built {
+            let mut mm = MmKernelParams::from_words(&kp);
+            mm.n_weights = n as u8;
+            mm.to_words()
         } else {
             // HVX path (ineligible or HMX chunking overflow): Q6_K has no
             // fused HVX kernel either way.
@@ -1461,7 +1463,7 @@ impl HexagonLfmModel {
                 unfused(self, session)?;
                 return Ok(());
             }
-            let mut kp = build_mul_mat_kernel_params(
+            let mut mm = MmKernelParams::from_words(&build_mul_mat_kernel_params(
                 wtype,
                 k,
                 n_rows as u32,
@@ -1469,7 +1471,7 @@ impl HexagonLfmModel {
                 w0.out_dim * 4,
                 session.dsp_threads(),
                 self.vtcm_budget,
-            );
+            ));
             // The fused kernel cannot chunk rows: past what its layout holds
             // the separate matmuls (which can) take over. Within the limit the
             // plain layout needs no chunk either.
@@ -1484,12 +1486,12 @@ impl HexagonLfmModel {
                 unfused(self, session)?;
                 return Ok(());
             }
-            debug_assert_eq!(kp[2], 0, "a fused matmul within the row limit chunks");
-            kp[0] = 5; // HTP_MM_KERNEL_HVX_QUANT_ROW
-            kp[17] = n as i32; // n_weights
-            kp
+            debug_assert_eq!(mm.m_chunk, 0, "a fused matmul within the row limit chunks");
+            mm.kernel_type = 5; // HTP_MM_KERNEL_HVX_QUANT_ROW
+            mm.n_weights = n as u8;
+            mm.to_words()
         };
-        let hmx_path = kparams[6] == 1; // n_hmx
+        let hmx_path = MmKernelParams::from_words(&kparams).n_hmx == 1;
         let tiled_row_bytes = (pad32(k) / 32) * w0.tile_size;
         let w_nb1 = if hmx_path {
             mm_hmx_nb1(wtype, pad32(k))
@@ -2244,10 +2246,11 @@ impl HexagonLfmModel {
     /// `[ne0, ne1]` f32 tile between two strided descriptors (same index
     /// space, independent strides). A transpose carries the transposed
     /// shape on the source side; a scatter (interleaved destination)
-    /// strides the destination side. The firmware resolves strides
-    /// device-side (no kparams). NOTE: strided sides take the firmware's
-    /// scalar per-element path: fine for state-sized (hs-scale) tiles,
-    /// prohibitive for m*hs transposes (use CONCAT's transposed worker).
+    /// strides the destination side. kparams are zero and `enqueue_op` fills them from the
+    /// registered tensors, which pick the copy kernel (including the strided ones). Strided
+    /// sides were a scalar per-element path on the previous firmware; the current one has
+    /// threaded strided kernels, but the transposes of m*hs elements still go through CONCAT's
+    /// transposed worker.
     pub(super) fn dispatch_cpy_2d(
         session: &mut HexagonQueueSession,
         src: &RpcmemBuffer,
