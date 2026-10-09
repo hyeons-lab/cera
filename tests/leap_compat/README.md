@@ -27,7 +27,7 @@ The runner requires Python 3.10+, `curl` for downloads, Xcode for Swift, and
 `kotlinc` on PATH (or `--kotlinc /path/to/kotlinc`). Tested with Swift 6.3.3 in
 Swift 5 language mode targeting macOS 15, Kotlin/JVM compiler 2.4.0 and JDK 21.
 The KMP candidate pins Kotlin 2.3.20, SKIE 0.10.11 and coroutines 1.10.2; it
-reuses the repository's Gradle 9.5.1 wrapper. SKIE analytics are disabled.
+reuses the repository's Gradle 9.8.0 wrapper. SKIE analytics are disabled.
 
 `--platform swift` or `--platform kotlin` runs just that reference lane and
 does not require the other compiler. `--with-kmp` requires both platforms and
