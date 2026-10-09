@@ -306,6 +306,35 @@ fn use_gemm_k64() -> bool {
     *ENABLED.get_or_init(|| std::env::var("CERA_WGPU_GEMM_K64").as_deref() != Ok("0"))
 }
 
+/// Rows per workgroup of the fused gate/up kernel (its thread count; `GATEUP_THREADS` in
+/// `scripts/gemm-ablate/gen.py`).
+const GATEUP_ROWS_PER_GROUP: u32 = 128;
+
+/// Workgroups (`ceil(m/256) * n_pad/32`) from which the two-row GEMM beats the one-row one on an
+/// Adreno 830: 5 to 20% faster from 64 up, a tie at 54 and slower below (the 128-thread workgroups
+/// under-fill the GPU), measured with `cera gemm-bench` on the model's shapes.
+const GEMM_TWO_ROW_MIN_GROUPS: u32 = 64;
+
+/// Whether the two-row streaming GEMM (`gemm_stream_q4_0_k64_r2`) takes an `m x n_pad` dispatch.
+/// `CERA_WGPU_GEMM_R1=1` forces the one-row kernel everywhere (the A/B switch). Both kernels give
+/// bit-identical results.
+fn gemm_stream_two_row(m: u32, n_pad: u32) -> bool {
+    static FORCE_ONE_ROW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    let force_one_row = *FORCE_ONE_ROW.get_or_init(|| {
+        std::env::var("CERA_WGPU_GEMM_R1").is_ok_and(|v| !matches!(v.as_str(), "" | "0"))
+    });
+    !force_one_row
+        && u64::from(m.div_ceil(256)) * u64::from(n_pad / 32) >= u64::from(GEMM_TWO_ROW_MIN_GROUPS)
+}
+
+/// Whether the FFN's gate and up projections run as one fused GEMM with a SiLU epilogue (on by
+/// default; `CERA_WGPU_FUSE_GATE_UP=0` turns it off). It saves a transpose pass and the separate
+/// `silu_mul` pass, and reads each activation tile once for two weight rows.
+fn use_fused_gate_up() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CERA_WGPU_FUSE_GATE_UP").as_deref() != Ok("0"))
+}
+
 /// Repack Q4_0 GGUF bytes into the streaming-GEMM layout: feature-major
 /// nibble ushorts and split scales, both packed two per u32 (see
 /// `gemm_stream_q4_0.slang`). Same total bytes as the GGUF, transposed.
@@ -1437,10 +1466,11 @@ enum PrefillCmd<'a> {
     },
 }
 
-/// `(n, all_logits, cursor, slots)` — see `stream_gemm_bg_cache`.
+/// `(n, flags, cursor, slots)` — see `stream_gemm_bg_cache`. `flags` is bit 0 `all_logits`, bit 1
+/// "gate/up GEMMs are fused" (a different call sequence, so a different slot layout).
 type StreamGemmBgCache = (
     u32,
-    bool,
+    u8,
     usize,
     Vec<Option<(wgpu::BindGroup, wgpu::BindGroup)>>,
 );
@@ -1542,6 +1572,11 @@ struct GpuPipelines {
     /// k-slice covers 64 k. Dispatched when k % 64 == 0 (see `use_gemm_k64`).
     /// Same `None`-unless-streaming convention as `gemm_stream_q4_0`.
     gemm_stream_q4_0_k64: Option<wgpu::ComputePipeline>,
+    /// Two-row twin of `gemm_stream_q4_0_k64` (same interface, 128-thread workgroups): chosen when
+    /// the dispatch has enough workgroups (`gemm_stream_two_row`).
+    gemm_stream_q4_0_k64_r2: Option<wgpu::ComputePipeline>,
+    /// Fused gate/up GEMM with a SiLU epilogue (`use_fused_gate_up`).
+    gemm_stream_q4_0_k64_gateup: Option<wgpu::ComputePipeline>,
     /// Streaming fp16 Q4_K prefill GEMM. None unless `use_stream_layout`.
     gemm_stream_q4_k: Option<wgpu::ComputePipeline>,
     /// Transpose + f32->f16 cast feeding the streaming GEMM's B16 scratch.
@@ -1967,6 +2002,9 @@ pub struct GpuLfmModel {
     /// bind groups. Single entry: chunked prefills reuse one `n` for every
     /// full chunk. Locked under `infer_lock`.
     stream_gemm_bg_cache: Mutex<StreamGemmBgCache>,
+    /// Whether the prefill now being encoded fuses gate and up (see `use_fused_gate_up`); part of
+    /// the bind-group cache key, because fusing changes the sequence of cached calls.
+    fuse_gate_up_active: AtomicBool,
 }
 
 /// Where a decode step's initial hidden state comes from.
@@ -2415,6 +2453,18 @@ impl GpuLfmModel {
             gemm_stream_q4_0_k64: if stream_layout {
                 tracing::debug!("gemm_stream_q4_0_k64: SPIR-V passthrough (slang)");
                 Some(ctx.gemm_stream_q4_0_k64_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_0_k64_r2: if stream_layout {
+                tracing::debug!("gemm_stream_q4_0_k64_r2: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_0_k64_r2_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_0_k64_gateup: if stream_layout {
+                tracing::debug!("gemm_stream_q4_0_k64_gateup: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_0_k64_gateup_passthrough())
             } else {
                 None
             },
@@ -3261,7 +3311,8 @@ impl GpuLfmModel {
             lora_tmp_batched,
             lora_params_pool: Mutex::new((Vec::new(), 0)),
             prefill_params_pool: Mutex::new((Vec::new(), 0)),
-            stream_gemm_bg_cache: Mutex::new((u32::MAX, false, 0, Vec::new())),
+            stream_gemm_bg_cache: Mutex::new((u32::MAX, 0, 0, Vec::new())),
+            fuse_gate_up_active: AtomicBool::new(false),
         };
         model.cache_bind_groups();
         Ok(model)
@@ -7207,7 +7258,16 @@ impl GpuLfmModel {
         // static per call (k is fixed per weight, the hatch process-static),
         // so the bind-group cache below stays paired.
         let k64 = k.is_multiple_of(64) && use_gemm_k64();
-        let (gemm, gemm_label) = if k64 {
+        let n_pad = n.next_multiple_of(32);
+        let (gemm, gemm_label) = if k64 && gemm_stream_two_row(m, n_pad) {
+            (
+                self.pipelines
+                    .gemm_stream_q4_0_k64_r2
+                    .as_ref()
+                    .expect("two-row streaming GEMM dispatched without a pipeline"),
+                "gemm_stream_q4_0_k64_r2",
+            )
+        } else if k64 {
             (
                 self.pipelines
                     .gemm_stream_q4_0_k64
@@ -7246,7 +7306,6 @@ impl GpuLfmModel {
             .expect("repack d count exceeds u32");
         debug_assert!(u64::from(nq) * 4 <= sq.size());
         debug_assert!(u64::from(nd) * 4 <= sd.size());
-        let n_pad = n.next_multiple_of(32);
         // Params contents are refreshed every call (pooled buffers are
         // stable, but each prefill rewrites them). The bind groups below
         // bind the pooled buffer *objects*, which is what makes them
@@ -7268,9 +7327,10 @@ impl GpuLfmModel {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let (key_n, key_al, cursor, slots) = &mut *cache;
-            if (*key_n, *key_al) != (n, all_logits) {
+            let flags = self.stream_cache_flags(all_logits);
+            if (*key_n, *key_al) != (n, flags) {
                 *key_n = n;
-                *key_al = all_logits;
+                *key_al = flags;
                 *cursor = 0;
                 slots.clear();
             }
@@ -7355,6 +7415,153 @@ impl GpuLfmModel {
         );
     }
 
+    /// Bind-group cache key flags for the call now being encoded (see `StreamGemmBgCache`).
+    fn stream_cache_flags(&self, all_logits: bool) -> u8 {
+        u8::from(all_logits) | (u8::from(self.fuse_gate_up_active.load(Ordering::Relaxed)) << 1)
+    }
+
+    /// Whether `gate` and `up` can run as the fused streaming GEMM for `n` tokens of width `k`:
+    /// both resident Q4_0 streams of the same height, `k % 64 == 0`, the pipelines built, and the
+    /// fusion not switched off. The same conditions as the unfused streaming path, so a model that
+    /// takes that one takes this one.
+    fn can_fuse_gate_up(&self, gate: &GpuWeight, up: &GpuWeight, n: u32, k: u32) -> bool {
+        use_fused_gate_up()
+            && use_gemm_k64()
+            && k.is_multiple_of(64)
+            && n >= stream_gemm_min_n()
+            && gate.tensor.dtype == DType::Q4_0
+            && up.tensor.dtype == DType::Q4_0
+            && gate.tensor.shape[0] == up.tensor.shape[0]
+            && gate.stream_q.is_some()
+            && gate.stream_d.is_some()
+            && up.stream_q.is_some()
+            && up.stream_d.is_some()
+            && self.pipelines.gemm_stream_q4_0_k64_gateup.is_some()
+            && self.pipelines.transpose_cast_f16.is_some()
+    }
+
+    /// Fused gate/up streaming GEMM: `y[n, m] = silu(x @ gate^T) * (x @ up^T)` in one dispatch,
+    /// after one transpose of `x` (the unfused path transposes it twice). Same layout and
+    /// strides as the gate GEMM's output, so it replaces the gate GEMM, the up GEMM and the
+    /// `silu_mul` pass. Callers check [`Self::can_fuse_gate_up`] and that no LoRA delta needs the
+    /// raw projections. Grid `(ceil(m/GATEUP_ROWS_PER_GROUP), ceil(n/32))`.
+    #[allow(clippy::too_many_arguments)] // tile geometry + strides; splitting hurts clarity
+    fn encode_gemm_stream_q4_0_gate_up<'a>(
+        &'a self,
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        gate: &GpuWeight,
+        up: &GpuWeight,
+        x: &wgpu::Buffer,
+        y: &wgpu::Buffer,
+        n: u32,
+        k: u32,
+        y_stride: u32,
+        all_logits: bool,
+    ) {
+        let m = gate.tensor.shape[0] as u32;
+        let gemm = self
+            .pipelines
+            .gemm_stream_q4_0_k64_gateup
+            .as_ref()
+            .expect("fused gate/up GEMM dispatched without a pipeline");
+        let transpose = self
+            .pipelines
+            .transpose_cast_f16
+            .as_ref()
+            .expect("streaming GEMM dispatched without a transpose pipeline");
+        let b16 = self
+            .stream_b16_buf
+            .as_ref()
+            .expect("streaming GEMM dispatched without B16 scratch");
+        let (gq, gd, uq, ud) = match (&gate.stream_q, &gate.stream_d, &up.stream_q, &up.stream_d) {
+            (Some(gq), Some(gd), Some(uq), Some(ud)) => (gq, gd, uq, ud),
+            _ => panic!("fused gate/up GEMM dispatched without resident (q, d) buffers"),
+        };
+        debug_assert_eq!(k % 64, 0);
+        let nq = m.checked_mul(k / 8).expect("repack q count exceeds u32");
+        let nd = m
+            .checked_mul((k / 32).div_ceil(2))
+            .expect("repack d count exceeds u32");
+        for (q, d) in [(gq, gd), (uq, ud)] {
+            debug_assert!(u64::from(nq) * 4 <= q.size());
+            debug_assert!(u64::from(nd) * 4 <= d.size());
+        }
+        let n_pad = n.next_multiple_of(32);
+        let t_params: [u32; 4] = [n, n_pad, k, 0];
+        let t_buf = self.next_prefill_params(bytemuck::cast_slice(&t_params));
+        let params: [u32; 5] = [m, k, n, n_pad, y_stride];
+        let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
+
+        let (t_bg, bg) = {
+            let mut cache = self
+                .stream_gemm_bg_cache
+                .lock()
+                .unwrap_or_else(|e| e.into_inner());
+            let (key_n, key_al, cursor, slots) = &mut *cache;
+            let flags = self.stream_cache_flags(all_logits);
+            if (*key_n, *key_al) != (n, flags) {
+                *key_n = n;
+                *key_al = flags;
+                *cursor = 0;
+                slots.clear();
+            }
+            let idx = *cursor;
+            *cursor += 1;
+            if slots.len() <= idx {
+                slots.resize_with(idx + 1, || None);
+            }
+            if slots[idx].is_none() {
+                fn entry(binding: u32, buffer: &wgpu::Buffer) -> wgpu::BindGroupEntry<'_> {
+                    wgpu::BindGroupEntry {
+                        binding,
+                        resource: buffer.as_entire_binding(),
+                    }
+                }
+                let fresh_t = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &transpose.get_bind_group_layout(0),
+                        entries: &[entry(0, x), entry(1, b16), entry(2, &t_buf)],
+                    });
+                let fresh_bg = self
+                    .ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &gemm.get_bind_group_layout(0),
+                        entries: &[
+                            entry(0, gq),
+                            entry(1, gd),
+                            entry(2, uq),
+                            entry(3, ud),
+                            entry(4, b16),
+                            entry(5, y),
+                            entry(6, &p_buf),
+                        ],
+                    });
+                slots[idx] = Some((fresh_t, fresh_bg));
+            }
+            slots[idx].as_ref().unwrap().clone()
+        };
+
+        Self::push_prefill_dispatch(
+            cmds,
+            transpose,
+            t_bg,
+            (n_pad / 32, k.div_ceil(32), 1),
+            "transpose_cast_f16",
+        );
+        Self::push_prefill_dispatch(
+            cmds,
+            gemm,
+            bg,
+            (m.div_ceil(GATEUP_ROWS_PER_GROUP), n.div_ceil(32), 1),
+            "gemm_stream_q4_0_k64_gateup",
+        );
+    }
+
     /// Streaming fp16 Q4_K_M GEMM (`gemm_stream_q4_k`). Same contract as
     /// `encode_mul_mat_reg_tile` for the Q4KM case: `y[n, m] = x[n, k] @
     /// w[m, k]^T` with token-major strides. Grid `(ceil(m/256), ceil(n/32))`.
@@ -7407,9 +7614,10 @@ impl GpuLfmModel {
                 .lock()
                 .unwrap_or_else(|e| e.into_inner());
             let (key_n, key_al, cursor, slots) = &mut *cache;
-            if (*key_n, *key_al) != (n, all_logits) {
+            let flags = self.stream_cache_flags(all_logits);
+            if (*key_n, *key_al) != (n, flags) {
                 *key_n = n;
-                *key_al = all_logits;
+                *key_al = flags;
                 *cursor = 0;
                 slots.clear();
             }
@@ -8105,6 +8313,10 @@ impl GpuLfmModel {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
+        // The FFN fuses gate, up and SiLU unless an adapter needs the raw projections; the choice
+        // is part of the stream-GEMM bind-group cache key (the call sequence differs).
+        self.fuse_gate_up_active
+            .store(lora.is_none() && use_fused_gate_up(), Ordering::Relaxed);
 
         // Stage the TurboQuant shader params for every layer in one write, before
         // the encoders below are submitted. `n` rows appended at `start_pos`; Q
@@ -8598,83 +8810,101 @@ impl GpuLfmModel {
                 }
                 GpuFfn::Dense(d) => d,
             };
-            // gate + up GEMMs.
-            self.encode_mul_mat_reg_tile(
-                &mut cmds,
-                &dense.gate,
-                &self.prefill_normed_buf,
-                &self.prefill_gate_buf,
-                n_u,
-                hs_u,
-                hs_u,
-                is_u,
-                all_logits,
-            );
-            self.encode_mul_mat_reg_tile(
-                &mut cmds,
-                &dense.up,
-                &self.prefill_normed_buf,
-                &self.prefill_up_buf,
-                n_u,
-                hs_u,
-                hs_u,
-                is_u,
-                all_logits,
-            );
-            // LoRA gate/up deltas on the raw projections, before silu_mul. Input
-            // is the ffn_norm output in `prefill_normed_buf`; outputs token-major
-            // (gate → gate_buf, up → up_buf). Applies to every layer (conv + attn).
-            self.encode_lora_hook_batched(
-                &mut cmds,
-                lora.as_ref(),
-                layer,
-                LoraTarget::FfnGate,
-                &self.prefill_normed_buf,
-                &self.prefill_gate_buf,
-                n_u,
-            );
-            self.encode_lora_hook_batched(
-                &mut cmds,
-                lora.as_ref(),
-                layer,
-                LoraTarget::FfnUp,
-                &self.prefill_normed_buf,
-                &self.prefill_up_buf,
-                n_u,
-            );
-            // silu_mul over the full N × is buffer.
-            {
-                let total = n_u * is_u;
-                let params: [u32; 2] = [total, 0];
-                let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
-                let bg = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.pipelines.silu_mul_inplace.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.prefill_gate_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: self.prefill_up_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: p_buf.as_entire_binding(),
-                            },
-                        ],
-                    });
-                Self::push_prefill_dispatch(
+            // Fused gate + up + SiLU: no LoRA delta needs the raw projections, so the two GEMMs and
+            // the `silu_mul` pass become one dispatch writing silu(gate) * up into `prefill_gate_buf`.
+            let fuse_gate_up =
+                lora.is_none() && self.can_fuse_gate_up(&dense.gate, &dense.up, n_u, hs_u);
+            if fuse_gate_up {
+                self.encode_gemm_stream_q4_0_gate_up(
                     &mut cmds,
-                    &self.pipelines.silu_mul_inplace,
-                    bg,
-                    (total.div_ceil(256), 1, 1),
-                    "silu_mul_batch",
+                    &dense.gate,
+                    &dense.up,
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    n_u,
+                    hs_u,
+                    is_u,
+                    all_logits,
                 );
+            } else {
+                // gate + up GEMMs.
+                self.encode_mul_mat_reg_tile(
+                    &mut cmds,
+                    &dense.gate,
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    n_u,
+                    hs_u,
+                    hs_u,
+                    is_u,
+                    all_logits,
+                );
+                self.encode_mul_mat_reg_tile(
+                    &mut cmds,
+                    &dense.up,
+                    &self.prefill_normed_buf,
+                    &self.prefill_up_buf,
+                    n_u,
+                    hs_u,
+                    hs_u,
+                    is_u,
+                    all_logits,
+                );
+                // LoRA gate/up deltas on the raw projections, before silu_mul. Input
+                // is the ffn_norm output in `prefill_normed_buf`; outputs token-major
+                // (gate → gate_buf, up → up_buf). Applies to every layer (conv + attn).
+                self.encode_lora_hook_batched(
+                    &mut cmds,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::FfnGate,
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    n_u,
+                );
+                self.encode_lora_hook_batched(
+                    &mut cmds,
+                    lora.as_ref(),
+                    layer,
+                    LoraTarget::FfnUp,
+                    &self.prefill_normed_buf,
+                    &self.prefill_up_buf,
+                    n_u,
+                );
+                // silu_mul over the full N × is buffer.
+                {
+                    let total = n_u * is_u;
+                    let params: [u32; 2] = [total, 0];
+                    let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
+                    let bg = self
+                        .ctx
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &self.pipelines.silu_mul_inplace.get_bind_group_layout(0),
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: self.prefill_gate_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: self.prefill_up_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: p_buf.as_entire_binding(),
+                                },
+                            ],
+                        });
+                    Self::push_prefill_dispatch(
+                        &mut cmds,
+                        &self.pipelines.silu_mul_inplace,
+                        bg,
+                        (total.div_ceil(256), 1, 1),
+                        "silu_mul_batch",
+                    );
+                }
             }
             // FFN down → prefill_up_buf (next layer's residual scratch).
             // The next layer's add_rmsnorm_batch reads from this buffer
@@ -9781,6 +10011,8 @@ impl GpuLfmModel {
         // Same pooled-resource protocol as `encode_prefill_batched_locked`: one encoder, one
         // submit, params and stream-GEMM bind groups handed out in call order from zero.
         self.ctx.reset_profiler();
+        // This trunk keeps gate, up and SiLU as separate passes.
+        self.fuse_gate_up_active.store(false, Ordering::Relaxed);
         self.prefill_params_pool
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -12776,5 +13008,180 @@ mod tests {
             ),
             "the loss must still surface as a typed error"
         );
+    }
+
+    /// A passthrough-capable context, or `None` (the tests below are skipped on adapters without
+    /// SPIR-V passthrough, e.g. Metal; the lavapipe and Android runs exercise them).
+    fn passthrough_ctx() -> Option<GpuContext> {
+        let ctx = GpuContext::new().ok()?;
+        ctx.supports_spirv_passthrough().then_some(ctx)
+    }
+
+    /// Synthetic Q4_0 weights of `m` rows by `k`, as the repacked resident (q, d) streams.
+    fn stream_weight(
+        ctx: &GpuContext,
+        m: usize,
+        k: usize,
+        salt: u32,
+    ) -> (wgpu::Buffer, wgpu::Buffer) {
+        let weights = super::synth_q4_0_vec(m * k, salt);
+        let raw = super::quantize_q4_0_synth(&weights, m, k);
+        let (q, d) = super::repack_q4_0_stream(&raw, m, k);
+        (
+            ctx.upload_storage(bytemuck::cast_slice(&q), "test.q"),
+            ctx.upload_storage(bytemuck::cast_slice(&d), "test.d"),
+        )
+    }
+
+    /// Run a streaming GEMM kernel over `bufs` (its bindings in order, the params last) on a grid
+    /// of `(ceil(m/256), ceil(n/32))` workgroups, and read back `y` (`[n_pad][m]`, sentinel-filled
+    /// beforehand so an unwritten cell shows).
+    fn run_stream_gemm(
+        ctx: &GpuContext,
+        pipe: &wgpu::ComputePipeline,
+        inputs: &[&wgpu::Buffer],
+        (m, n, k): (u32, u32, u32),
+        rows_per_group: u32,
+        b16: &wgpu::Buffer,
+    ) -> Vec<f32> {
+        let n_pad = n.next_multiple_of(32);
+        let y = ctx.upload_f32(&vec![12345.0f32; (n_pad * m) as usize], "test.y");
+        let params = ctx.upload_storage(bytemuck::cast_slice(&[m, k, n, n_pad, m]), "test.params");
+        // weights first, then B, then y, then params: the order of both kernels' bindings
+        let mut all: Vec<&wgpu::Buffer> = inputs.to_vec();
+        all.push(b16);
+        all.push(&y);
+        all.push(&params);
+        let entries: Vec<wgpu::BindGroupEntry> = all
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: b.as_entire_binding(),
+            })
+            .collect();
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipe.get_bind_group_layout(0),
+            entries: &entries,
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(pipe);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups(m.div_ceil(rows_per_group), n.div_ceil(32), 1);
+        }
+        ctx.submit_encoder(enc);
+        ctx.download_f32(&y, (n_pad * m) as usize)
+    }
+
+    /// Activations `[n][k]` as the f16 k-major `[k][n_pad]` buffer the kernels read.
+    fn b16_buffer(ctx: &GpuContext, n: usize, k: usize, salt: u32) -> wgpu::Buffer {
+        let n_pad = n.next_multiple_of(32);
+        let b = super::synth_q4_0_vec(n * k, salt);
+        let mut b16 = vec![0u16; k * n_pad];
+        for kk in 0..k {
+            for nn in 0..n {
+                b16[kk * n_pad + nn] = half::f16::from_f32(b[nn * k + kk]).to_bits();
+            }
+        }
+        ctx.upload_storage(bytemuck::cast_slice(&b16), "test.b16")
+    }
+
+    /// Shapes covering ragged rows (below, across and well past one 128- and 256-row group), ragged
+    /// columns, several k-slices, and the model's own FFN shape.
+    const STREAM_TEST_SHAPES: &[(u32, u32, u32)] = &[
+        (8, 32, 64),
+        (100, 33, 64),
+        (257, 1, 192),
+        (300, 70, 128),
+        (256, 64, 1024),
+        (1030, 96, 256),
+        (4608, 512, 1024),
+    ];
+
+    /// The two-row streaming GEMM equals the one-row kernel bit for bit (same accumulation order
+    /// per row), on every ragged shape: each thread's second row, the row guards and the `rrow`
+    /// clamp are all in play when `m` is not a multiple of 256.
+    #[test]
+    fn two_row_stream_gemm_matches_one_row_bit_for_bit() {
+        let Some(ctx) = passthrough_ctx() else { return };
+        let one = ctx.gemm_stream_q4_0_k64_passthrough();
+        let two = ctx.gemm_stream_q4_0_k64_r2_passthrough();
+        for &(m, n, k) in STREAM_TEST_SHAPES {
+            let (q, d) = stream_weight(&ctx, m as usize, k as usize, super::SYNTH_SALT_WEIGHTS);
+            let b16 = b16_buffer(&ctx, n as usize, k as usize, super::SYNTH_SALT_INPUTS);
+            let want = run_stream_gemm(&ctx, &one, &[&q, &d], (m, n, k), 256, &b16);
+            let got = run_stream_gemm(&ctx, &two, &[&q, &d], (m, n, k), 256, &b16);
+            for c in 0..n as usize {
+                for r in 0..m as usize {
+                    let i = c * m as usize + r;
+                    assert_ne!(
+                        got[i], 12345.0,
+                        "m={m} n={n} k={k}: cell ({c},{r}) never written"
+                    );
+                    assert_eq!(
+                        got[i].to_bits(),
+                        want[i].to_bits(),
+                        "m={m} n={n} k={k}: cell ({c},{r}) two-row {} one-row {}",
+                        got[i],
+                        want[i]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The fused gate/up kernel gives `silu(gate) * up` of the two separate GEMMs (to the last bit
+    /// of the f16 accumulators; the only difference is the GPU's `exp` against the CPU's here).
+    #[test]
+    fn fused_gate_up_matches_separate_gemms_and_silu() {
+        let Some(ctx) = passthrough_ctx() else { return };
+        let one = ctx.gemm_stream_q4_0_k64_passthrough();
+        let fused = ctx.gemm_stream_q4_0_k64_gateup_passthrough();
+        for &(m, n, k) in STREAM_TEST_SHAPES {
+            let (gq, gd) = stream_weight(&ctx, m as usize, k as usize, 0x1111);
+            let (uq, ud) = stream_weight(&ctx, m as usize, k as usize, 0x2222);
+            let b16 = b16_buffer(&ctx, n as usize, k as usize, super::SYNTH_SALT_INPUTS);
+            let gate = run_stream_gemm(&ctx, &one, &[&gq, &gd], (m, n, k), 256, &b16);
+            let up = run_stream_gemm(&ctx, &one, &[&uq, &ud], (m, n, k), 256, &b16);
+            let got = run_stream_gemm(
+                &ctx,
+                &fused,
+                &[&gq, &gd, &uq, &ud],
+                (m, n, k),
+                super::GATEUP_ROWS_PER_GROUP,
+                &b16,
+            );
+            for c in 0..n as usize {
+                for r in 0..m as usize {
+                    let i = c * m as usize + r;
+                    let g = gate[i].clamp(-80.0, 80.0);
+                    let want = g / (1.0 + (-g).exp()) * up[i];
+                    assert_ne!(
+                        got[i], 12345.0,
+                        "m={m} n={n} k={k}: cell ({c},{r}) never written"
+                    );
+                    assert!(
+                        (got[i] - want).abs() <= 1e-5 + 1e-4 * want.abs(),
+                        "m={m} n={n} k={k}: cell ({c},{r}) fused {} separate {want}",
+                        got[i]
+                    );
+                }
+            }
+        }
+    }
+
+    /// The two-row kernel is chosen from 64 workgroups (`ceil(m/256) * n_pad/32`) up.
+    #[test]
+    fn two_row_gemm_is_chosen_from_64_workgroups() {
+        use super::gemm_stream_two_row as two_row;
+        assert!(two_row(4608, 512), "18 x 16 workgroups");
+        assert!(two_row(1024, 512), "4 x 16 = 64 is the threshold");
+        assert!(two_row(2048, 256), "8 x 8 = 64");
+        assert!(!two_row(2048, 224), "8 x 7 = 56");
+        assert!(!two_row(2048, 64), "8 x 2");
+        assert!(!two_row(4608, 32), "18 x 1: a short final chunk");
     }
 }

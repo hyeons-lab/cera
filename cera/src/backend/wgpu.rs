@@ -1768,6 +1768,100 @@ impl GpuContext {
             })
     }
 
+    /// Pipeline over an explicit bind-group layout of storage buffers (`true` = read-only), for the
+    /// streaming GEMM kernels built from `scripts/gemm-ablate/gen.py`.
+    ///
+    /// # Safety
+    /// `desc` must be a spirv-val-clean compute module (entry `main`) whose bindings are exactly
+    /// `bindings`. Only call when `supports_spirv_passthrough()` is true.
+    unsafe fn stream_gemm_pipeline(
+        &self,
+        label: &str,
+        desc: wgpu::ShaderModuleDescriptorPassthrough<'_>,
+        bindings: &[bool],
+    ) -> wgpu::ComputePipeline {
+        assert!(
+            self.supports_spirv_passthrough(),
+            "SPIR-V passthrough pipeline requested on a backend that does not \
+             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
+            self.backend
+        );
+        let entries: Vec<wgpu::BindGroupLayoutEntry> = bindings
+            .iter()
+            .enumerate()
+            .map(|(i, &read_only)| wgpu::BindGroupLayoutEntry {
+                binding: i as u32,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            })
+            .collect();
+        let bgl = self
+            .device
+            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                label: Some(label),
+                entries: &entries,
+            });
+        let layout = self
+            .device
+            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+                label: Some(label),
+                bind_group_layouts: &[Some(&bgl)],
+                immediate_size: 0,
+            });
+        let module = unsafe { self.device.create_shader_module_passthrough(desc) };
+        self.device
+            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                label: Some(label),
+                layout: Some(&layout),
+                module: &module,
+                entry_point: Some("main"),
+                compilation_options: wgpu::PipelineCompilationOptions {
+                    zero_initialize_workgroup_memory: false,
+                    ..Default::default()
+                },
+                cache: None,
+            })
+    }
+
+    /// Two-row twin of [`Self::gemm_stream_q4_0_k64_passthrough`]: the same five bindings, parameter
+    /// block and grid and bit-exact results, but 128 threads per workgroup with two weight rows
+    /// each (`gemm_stream_q4_0_k64_r2.slang`). Faster when the dispatch has enough workgroups to
+    /// fill the GPU; see `gemm_stream_two_row` in `gpu_lfm2.rs`. Needs k % 64 == 0.
+    pub fn gemm_stream_q4_0_k64_r2_passthrough(&self) -> wgpu::ComputePipeline {
+        // SAFETY: slangc-compiled from gemm_stream_q4_0_k64_r2.slang, spirv-val clean, same
+        // five-binding interface as the one-row kernel.
+        unsafe {
+            self.stream_gemm_pipeline(
+                "gemm_stream_q4_0_k64_r2_passthrough",
+                wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemm_stream_q4_0_k64_r2.spv")),
+                &[true, true, true, false, true],
+            )
+        }
+    }
+
+    /// Fused gate/up streaming GEMM with a SiLU epilogue (`gemm_stream_q4_0_k64_gateup.slang`):
+    /// bindings 0/1 gate q/d, 2/3 up q/d, 4 f16 activations, 5 dst (read-write), 6 params; grid
+    /// `(ceil(m/128), ceil(n/32))` of 128-thread workgroups (one gate/up row pair per thread). Needs k % 64 == 0.
+    pub fn gemm_stream_q4_0_k64_gateup_passthrough(&self) -> wgpu::ComputePipeline {
+        // SAFETY: slangc-compiled from gemm_stream_q4_0_k64_gateup.slang, spirv-val clean, seven
+        // bindings as documented above.
+        unsafe {
+            self.stream_gemm_pipeline(
+                "gemm_stream_q4_0_k64_gateup_passthrough",
+                wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/gemm_stream_q4_0_k64_gateup.spv"
+                )),
+                &[true, true, true, true, true, false, true],
+            )
+        }
+    }
+
     /// Streaming Q8_0 GEMM (k-slice-64) via SPIR-V passthrough: the 8-bit twin of
     /// [`Self::gemm_stream_q4_0_k64_passthrough`], with the same five bindings
     /// (0 = repacked int8 words, 1 = repacked scales, 2 = f16 activations, 3 =
