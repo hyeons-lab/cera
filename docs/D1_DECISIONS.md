@@ -246,8 +246,16 @@ wgpu used to drift on long prompts with Q8_0 weights (a 13.5k-token prompt answe
 CPU, Metal and the reference say 0.244, 0.244 and 0.246; its F16 gap was 1.4e-2) and I first put
 that down to wgpu keeping f32 activations where the CPU quantizes them to Q8_0. That was wrong: the
 drift went away when its attention moved to the f32 flash kernel below (0.2441 now), so it came
-from the older generic prefill attention kernel and its packed-f16 K/V, though I have not isolated
-which part.
+from the older generic prefill attention kernel and its packed-f16 K/V. The cause is now isolated:
+the shader that packs K and V into f16 (`kv_append`) added a rounded-up mantissa into the exponent
+with an OR, which only carries when the exponent is even, so about 1 in 4000 values (an odd
+exponent and a mantissa within 2^-12 of the next power of two) came out halved, and it flushed
+half subnormals to zero. On a real prompt's K/V that makes a layer's attention output 4e-3 to 2e-2
+off, against 1.6e-4 to 3e-4 for correct f16 storage. With it fixed, the older kernel answers 0.1056
+and 0.2517 on the Mac for the 1.5k and 6.8k-token examples (it said 0.0839 and 0.2095; the flash kernel says
+0.1055 and 0.2509, and the exact f32 K/V version of the same kernel matches flash to 1e-5). The
+bug was in every wgpu KV cache, chat models included, not only these. I did not rerun the 13.5k
+Q8_0 prompt that gave 0.177 on the older kernel.
 
 Speed (Apple M-series, one run each, so indicative; Q8_0 weights):
 
@@ -293,8 +301,9 @@ adapter's storage-binding limit (about 128 MB on common adapters, so roughly 32k
 
 Checked on a device through `cera decide --device gpu` (Q8_0). The flash attention kernel is
 correct there (against a direct reference to 1e-6 up to 8192 rows, grouped-query heads and the
-prefix window included) and runs at about 0.22 TFLOPS, against 0.016 for the scalar kernel Android
-used before at 300 tokens (the query-tiled one was 0.002 and is why Android excluded it). The
+prefix window included) and runs at about 0.22 TFLOPS, against 0.07 for the scalar kernel Android
+used before (measured alone from 256 to 4000 rows; an earlier figure at 300 tokens was 0.016; the
+query-tiled kernel was 0.002 and is why Android excluded it). The
 answers match the Mac: the text example's refund probability is 0.99837 on the phone's GPU and the
 Mac's CPU, a 1.5k-token prompt 0.10545 against 0.10546, a 27,000-token prompt 0.24406 against 0.24405.
 The phone's own CPU gives other numbers for the longer prompts (0.0917 and 0.2439 where the GPU and
@@ -331,9 +340,13 @@ hang detector kills a dispatch, or a submission, that runs for seconds: one 13.5
 call (about 3.3 s) lost the device, and so did a 13.5k-row pass built as a single command buffer
 (tens of seconds of work). A flash-attention call is therefore issued as several dispatches of at
 most 2048 queries and 2^25 query-key pairs, and a trunk pass over more than 1024 rows submits
-after each chunk phase and each attention dispatch. The flash kernel is on for Adreno and for
-every desktop adapter (`GpuContext::supports_flash_attention`); other Android GPUs keep the older
-kernels until someone checks them.
+after each chunk phase and each attention dispatch. The older scalar attention kernel had the same
+problem and is split the same way (at most 2^25 query-key rows per head per dispatch, about 0.12 s
+here): as one dispatch it lost the device on a 6784-token prompt (about 2.7 s), though 4000 rows
+(0.9 s) was fine. Split, it runs the 6.8k-token example in 40 s (flash 28 s) and a 13.5k-token one
+in 120 s (flash 65 s), answering 0.30685 against 0.30660. The flash kernel is on for Adreno and for
+every desktop adapter (`GpuContext::supports_flash_attention`); other Android GPUs use the scalar
+kernel, which is now safe on long prompts but up to twice as slow.
 
 ## Not done yet
 
