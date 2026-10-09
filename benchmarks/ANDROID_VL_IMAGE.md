@@ -199,6 +199,9 @@ compare within the list.
   4608x2048x1024; it is neutral at 9216x512x1024 and 32% slower at 2048x64x2048, where the smaller workgroups
   under-fill the GPU. Four rows per thread (`r4`) is 60% slower (64 accumulator registers). Weighted by the
   model's shapes `r2` saves about 9% of the GEMM time, 7% of a prefill.
+- **Reading B straight from a storage buffer** (no staging, no barrier, no shared memory) is 2.8x slower than
+  shared memory (0.87 against 2.5 TFLOPS), so only a texture path could beat it. The adapter reports subgroups of
+  64, 32 KiB of workgroup memory and no cooperative matrices.
 - **Tried and not worth it:** a magic-number nibble conversion (`e1`, +/-1%), and 64-bit staging loads (`e2`,
   24% slower). A 128-bit shared-memory read variant lost the GPU context and was dropped.
 - **No hardware matrix unit to use:** `wgpu_coopmat_probe` lists zero cooperative-matrix configurations on this
