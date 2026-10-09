@@ -323,6 +323,48 @@ build is as close to the CPU's logits as the f32 build (for example 0.999944 aga
 are identical on the prompts that produce text. On a Vulkan adapter without passthrough, and for any other head
 size, the f32 kernels are unchanged.
 
+### CPU prefill: interleaved activations for the smmla tile
+
+Profiling a 512-token CPU prefill (`CERA_PROFILE_PREFILL=1`) puts the Q4_0 GEMMs at about 75% of it (FFN gate/up 107 ms,
+down 50 ms, conv input 21 ms), all at 1.45 TOPS on 8 threads and 0.36 on one prime core, against a measured `smmla`
+ceiling of 1.14 TOPS per prime core (4 per cycle; mid cores 0.45). An isolated single-core microbenchmark of the 8x4
+`smmla` tile (`smmla_q4_0_tile_microbench`, an ignored test) reproduced it: 0.40 TOPS, 5.1 ns per 32-k block of the tile,
+about 23 cycles for 32 `smmla` that would take 8 at the ceiling.
+
+The disassembly of the block loop shows why. It is 114 instructions, 32 of them `smmla`; the vector-port instructions
+(the core issues about 4 per cycle) are 32 `smmla`, 8 `movi` (zeroing the int32 accumulators), 24 epilogue ops
+(`scvtf`, `fmul`, `fmla`, 8 each), 8 inserts that combine two 8-byte activation loads into each RHS vector, 8 inserts that
+build the `[db0, db1, db0, db1]` activation-scale vectors, and 4 `zip`s for the weight scales: about 86 ops, 21.5
+cycles, against 22.8 measured. The kernel is bound by the vector ports, not by the multiplies, and the shuffles are
+a quarter of it.
+
+`smmla_q4_0_tile_8x4_il` reads activations interleaved per 4-token tile (the 32 bytes `[tok0 k8][tok1 k8][tok2 k8][tok3 k8]`
+per chunk, and the scales as `[d0, d1, d0, d1, d2, d3, d2, d3]`), so each RHS vector and each scale vector is a plain
+load. Same arithmetic in the same order, so the results are bit-identical; 1.20x on the isolated tile at k=1024 and
+1.11x at k=4608. Two things were tried and dropped: building the vectors with lane loads (`ld1 {v.d}[1]`) on the
+unchanged layout (0.99x, no gain), and also pre-zipping the weight scales (1.28x instead of 1.20x, for 11% more CPU
+weight memory). What is left is the structural ceiling for Q4_0 x Q8_0 with block-32 scales and an f32 epilogue: each
+accumulator vector needs 4 `smmla` and 4 other ops (zero, convert, scale, accumulate), so at best half of the 4 ports'
+cycles go to `smmla`, about 0.57 TOPS per prime core; the tile now runs at 0.48.
+
+The dispatchers interleave the activations into a per-thread scratch on the prefill pool (a pass of about 5% of
+the largest GEMM, and it is shared by every row of the weight matrix) and run the tiled kernels, the plain GEMM and
+the fused gate/up/SiLU one; the `n % 4` tail tokens keep the columnar kernel. `CERA_CPU_SMMLA_TILED=0` restores the
+columnar kernels. Per 512-token chunk under the profiler the FFN gate/up goes from 117 to 96 ms, the down projection
+from 53 to 44 ms and the conv input from 21 to 18 ms. Gated like the GPU runs (AP sensor at 28 C or less before every
+invocation, rotating order, 3 rounds, medians; `android_vl_image_raw/cpu_smmla_tiled_20261009/`), CPU prefill tok/s:
+
+| Prompt | columnar | interleaved | llama.cpp (CPU) | vs columnar | vs llama.cpp |
+|---|---:|---:|---:|---:|---:|
+| 512 tokens | 1,649 | 1,851 | 1,960 | 1.12 | 0.94 |
+| 1,024 | 1,527 | 1,615 | 1,711 | 1.06 | 0.94 |
+| 2,048 | 1,255 | 1,327 | 1,533 | 1.06 | 0.87 |
+
+(The harness runs each measurement after a cooldown, so these are lower than a back-to-back profile run, which showed
+1,849 against 2,141 tok/s on the same binaries.) The full-vocabulary logits are byte-identical with and without the
+tiled kernels on five prompts of 60 to 3,600 characters. The gain shrinks with the context because attention
+(`attn_scores`, 24 ms of a 512-token chunk at about 0.12 TFLOPS) grows and is untouched here.
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
