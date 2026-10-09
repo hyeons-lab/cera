@@ -10,8 +10,8 @@
 // The f32->f16 conversion is manual bit ops, not a `half` cast: WGSL has no
 // f16 storage without SHADER_F16 (withheld on Adreno) and no half values at
 // all in naga's core profile, so a `half` intermediate would not survive to
-// the WGSL output. Round-half-up, subnormals flush to zero, overflow clamps
-// to max-half (never Inf — an Inf K would NaN the softmax).
+// the WGSL output. Round to nearest (ties away from zero), half subnormals
+// are kept, overflow clamps to max-half (never Inf — an Inf K would NaN the softmax).
 //
 //   binding/buffer 0: src     f32, read (n)
 //   binding/buffer 1: dst     u32, read-write (cache slab, packed halves)
@@ -33,12 +33,19 @@ uint to_f16_bits(float v) {
     uint h;
     if (e >= 31) {
         h = 0x7BFFu;
-    } else if (e <= 0) {
+    } else if (e < -10) {
         h = 0u;
+    } else if (e <= 0) {
+        // half subnormal: the implicit leading 1 moves into the mantissa, then round. A round-up
+        // to 0x400 is the smallest normal half, which is exactly what the sum encodes.
+        uint sh = uint(14 - e);
+        h = ((m | 0x800000u) + (1u << (sh - 1u))) >> sh;
     } else {
-        // (m + 0x1000) >> 13 can yield 0x400 on round-up; OR-ing that into
-        // e << 10 carries correctly into (e+1) << 10.
-        h = (uint(e) << 10u) | ((m + 0x1000u) >> 13u);
+        // (m + 0x1000) >> 13 reaches 0x400 when the mantissa rounds up past its top. That has to
+        // be ADDED to e << 10 so it carries into the exponent: OR-ing it in only works for an
+        // even e, and for an odd e (bit 10 already set) it silently halved the value. A carry out
+        // of e == 30 is Inf (0x7C00), so clamp to max-half like the e >= 31 case.
+        h = min((uint(e) << 10u) + ((m + 0x1000u) >> 13u), 0x7BFFu);
     }
     return s | h;
 }
