@@ -119,6 +119,10 @@ required-features = ["gpu"]
 name = "wgpu_peak_bench"
 required-features = ["gpu"]
 
+[[example]]
+name = "wgpu_coopmat_probe"
+required-features = ["gpu"]
+
 # A generated simdgroup GEMM against the hand-tuned one it would replace.
 # Metal-only: the WGSL half is already verified by parity and the only Vulkan
 # device CI can reach is a software rasterizer, so there is nothing to learn
