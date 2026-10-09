@@ -718,6 +718,28 @@ impl GpuContext {
         );
     }
 
+    /// How many 32-query tiles of one flash-attention call to issue per dispatch.
+    ///
+    /// A dispatch that runs for seconds is killed by a mobile GPU's hang detector (an Adreno 830
+    /// lost the device on one 13.5k-row call, about 3.3 s, though 8k rows at 1.2 s was fine), so
+    /// a long call is issued as several short ones. The work of a dispatch is its queries times
+    /// the keys it reads, which is capped at 2^25 (about 0.15 s there), and at most 2048 queries.
+    pub fn flash_attention_tiles_per_dispatch(tokens: usize) -> u32 {
+        const MAX_PAIRS: usize = 1 << 25;
+        const MAX_QUERIES: usize = 2048;
+        let queries = (MAX_PAIRS / tokens.max(1)).clamp(32, MAX_QUERIES);
+        (queries / 32) as u32
+    }
+
+    /// Whether the register-tiled flash attention kernel (`attention_flash_hd64.wgsl`) is known
+    /// to run correctly and fast on this adapter. It is on every desktop adapter; on Android it
+    /// is on for Qualcomm Adreno only, where it was checked on an Adreno 830 (correct to 1e-6
+    /// against a reference up to 8192 rows, about 0.2 TFLOPS), because its 30 KB of workgroup
+    /// memory and register use are not known to suit the other mobile drivers.
+    pub fn supports_flash_attention(&self) -> bool {
+        cfg!(not(target_os = "android")) || self.adapter_name.contains("Adreno")
+    }
+
     /// Create a zeroed GPU buffer with read-write storage usage.
     pub fn create_storage_rw(&self, size: u64, label: &str) -> wgpu::Buffer {
         self.assert_within_max_buffer(size, label);
@@ -2495,6 +2517,8 @@ pub mod shaders {
     /// stay `array<f32>` so its exact CPU/GPU parity test keeps passing.
     pub const FLASH_ATTENTION_F32: &str = include_str!("shaders/flash_attention_f32.wgsl");
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
+    /// Register-tiled flash attention for head_dim 64 (f32 Q/K/V, GQA, bidirectional windows).
+    pub const ATTENTION_FLASH_HD64: &str = include_str!("shaders/attention_flash_hd64.wgsl");
     /// The centred gated convolution of a bidirectional LFM2 trunk.
     pub const BIDIRECTIONAL: &str = include_str!("shaders/bidirectional.wgsl");
     /// TurboQuant KV compression: `tq_encode_keys`, `tq_encode_values`,
@@ -7171,6 +7195,18 @@ mod tests {
         f: &AttnPrefillFixture,
         tile: u32,
     ) -> Vec<f32> {
+        run_gpu_attention_prefill_mode(ctx, f, tile, None)
+    }
+
+    /// [`run_gpu_attention_prefill_tiled`] for a causal pass (`bidir_prefix` `None`) or a
+    /// bidirectional one (`Some(prefix_rows)`): every dispatch gets the whole call's row count in
+    /// params[7], which is what a bidirectional window is read from.
+    fn run_gpu_attention_prefill_mode(
+        ctx: &GpuContext,
+        f: &AttnPrefillFixture,
+        tile: u32,
+        bidir_prefix: Option<u32>,
+    ) -> Vec<f32> {
         assert!(tile > 0, "tile must be > 0 (0 would never advance q_base)");
         let pipeline = ctx.create_pipeline(
             shaders::ATTENTION_PREFILL,
@@ -7196,13 +7232,13 @@ mod tests {
                 f.max_seq,
                 f.scale.to_bits(),
                 f.start_pos,
-                n_sub,
+                f.start_pos + f.n_queries, // total_rows: read by a bidirectional pass only
                 f.q_stride,
                 f.out_stride,
                 q_base,
                 n_sub,
-                0, // causal
-                0, // prefix_rows
+                u32::from(bidir_prefix.is_some()),
+                bidir_prefix.unwrap_or(0),
             ];
             let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
             let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -7267,6 +7303,184 @@ mod tests {
                 (i % f.out_stride as usize) / f.head_dim as usize,
                 i % f.head_dim as usize,
             );
+        }
+    }
+
+    /// `kv_append` packs f32 into f16 pairs with hand-written bit ops, and every wgpu KV cache
+    /// goes through it. It must agree with a correct f32 -> f16 conversion everywhere: a mantissa
+    /// that rounds up past its top has to carry into the exponent for odd and even exponents
+    /// alike (an OR instead of an add halved such values, about 1 in 4000 of the K/V a model
+    /// writes), half subnormals are kept, and an overflow clamps to max-half rather than Inf.
+    /// Exact ties are skipped: the shader rounds them away from zero, `half` to even.
+    #[test]
+    fn test_gpu_kv_append_matches_f16_conversion() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let mut values: Vec<f32> = Vec::new();
+        // Every binade from below the smallest half subnormal to past the overflow, with the
+        // mantissas that sit on a rounding or carry boundary and a spread of others.
+        let mut lcg = 0x2545_F491_4F6C_DD1Du64;
+        for exp in 100u32..=146 {
+            for mant in [
+                0u32, 1, 0x0FFF, 0x1001, 0x1FFF, 0x2000, 0x7F_E000, 0x7F_EFFF, 0x7F_F001,
+                0x7F_F800, 0x7F_FFFF,
+            ] {
+                values.push(f32::from_bits((exp << 23) | mant));
+            }
+            for _ in 0..64 {
+                lcg = lcg
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                values.push(f32::from_bits(
+                    (exp << 23) | ((lcg >> 41) as u32 & 0x7F_FFFF),
+                ));
+            }
+        }
+        values.extend([0.0, 65504.0, 65519.0, 65520.0, 1.0e9]);
+        let values: Vec<f32> = values.iter().flat_map(|&v| [v, -v]).collect();
+        let n = values.len();
+        assert!(n.is_multiple_of(2));
+
+        let expected = |x: f32| -> Option<u16> {
+            let r = half::f16::from_f32(x);
+            let rd = f64::from(r.to_f32());
+            let (xd, mag) = (f64::from(x), r.to_bits() & 0x7FFF);
+            // the neighbour on the other side of x, to detect an exact tie
+            let other_bits = if rd > xd {
+                if x < 0.0 {
+                    r.to_bits() + 1
+                } else {
+                    r.to_bits().wrapping_sub(1)
+                }
+            } else if x < 0.0 {
+                r.to_bits().wrapping_sub(1)
+            } else {
+                r.to_bits() + 1
+            };
+            if (mag != 0 || rd != xd) && rd != xd {
+                let od = f64::from(half::f16::from_bits(other_bits).to_f32());
+                if od.is_finite() && (xd - rd).abs() == (xd - od).abs() {
+                    return None;
+                }
+            }
+            Some(if r.is_infinite() {
+                (r.to_bits() & 0x8000) | 0x7BFF
+            } else {
+                r.to_bits()
+            })
+        };
+
+        let src = ctx.upload_f32(&values, "kv_append.src");
+        let dst = ctx.create_storage_rw((n / 2 * 4) as u64, "kv_append.dst");
+        let params: [u32; 4] = [0, n as u32, 0, 0];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "kv_append.params");
+        let pipeline = ctx.create_pipeline(shaders::KV_APPEND, "kv_append", "kv_append");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: src.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dst.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((n as u32 / 2).div_ceil(256), 1, 1);
+        }
+        ctx.submit_encoder(enc);
+        let words = ctx.download_u32(&dst, n / 2);
+
+        let mut checked = 0usize;
+        for (i, &x) in values.iter().enumerate() {
+            let Some(want) = expected(x) else { continue };
+            let got = ((words[i / 2] >> (16 * (i % 2))) & 0xFFFF) as u16;
+            assert_eq!(
+                got,
+                want,
+                "kv_append({x:e}, bits {:#010x}) = {got:#06x}, want {want:#06x}",
+                x.to_bits()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > n * 9 / 10,
+            "too many values skipped as ties: {checked} of {n}"
+        );
+    }
+
+    /// A bidirectional pass split into several dispatches matches a CPU reference, with and
+    /// without a media prefix. A split dispatch only knows its own share of the queries, so the
+    /// key window has to come from the whole call's row count (params[7]); deriving it from the
+    /// chunk's query count read too few keys and shifted the d1 decision models' answers.
+    #[test]
+    fn test_gpu_attention_prefill_bidirectional_split_matches_cpu() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let f = build_attn_prefill_fixture(4, 2, 32, 70, 0);
+        let (hd, kv_dim) = (f.head_dim as usize, f.kv_dim as usize);
+        let group = (f.n_heads / f.n_kv_heads) as usize;
+        for prefix in [0u32, 24] {
+            let mut want = vec![0.0f32; f.ref_out.len()];
+            for q in 0..f.n_queries as usize {
+                // a query in the media prefix reads only the prefix; the others read everything
+                let window = if prefix > 0 && (q as u32) < prefix {
+                    prefix as usize
+                } else {
+                    f.n_queries as usize
+                };
+                for h in 0..f.n_heads as usize {
+                    let kv_off = (h / group) * hd;
+                    let q_off = q * f.q_stride as usize + h * hd;
+                    let mut scores: Vec<f32> = (0..window)
+                        .map(|t| {
+                            (0..hd)
+                                .map(|d| f.q_batch[q_off + d] * f.k_cache[t * kv_dim + kv_off + d])
+                                .sum::<f32>()
+                                * f.scale
+                        })
+                        .collect();
+                    let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0f32;
+                    for s in &mut scores {
+                        *s = (*s - max_s).exp();
+                        sum += *s;
+                    }
+                    for d in 0..hd {
+                        want[q * f.out_stride as usize + h * hd + d] = scores
+                            .iter()
+                            .enumerate()
+                            .map(|(t, s)| s / sum * f.v_cache[t * kv_dim + kv_off + d])
+                            .sum();
+                    }
+                }
+            }
+            for tile in [70u32, 24, 16, 8] {
+                let got = run_gpu_attention_prefill_mode(&ctx, &f, tile, Some(prefix));
+                for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 5e-3 + 1e-3 * w.abs(),
+                        "bidirectional prefix={prefix} tile={tile}: idx {i} (token {}) gpu={g} cpu={w}",
+                        i / f.out_stride as usize
+                    );
+                }
+            }
         }
     }
 

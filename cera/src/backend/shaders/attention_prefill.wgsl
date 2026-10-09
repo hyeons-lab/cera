@@ -44,20 +44,29 @@
 // K/V are LE f16 halves packed 2-per-u32 (see `flash_attention.wgsl`):
 // kv_dim and head_dim are even (asserted host-side), accumulation stays f32.
 //        ( n_heads, n_kv_heads, head_dim, kv_dim, max_seq, scale_bits,
-//          start_pos, <unused>, q_stride, out_stride, q_base, n_sub, bidir, prefix_rows )
+//          start_pos, total_rows, q_stride, out_stride, q_base, n_sub, bidir, prefix_rows )
 //
 // `bidir` = 0 is the causal prefill. `bidir` = 1 reads the whole sequence (the `start_pos +
 // n_sub` rows of the dispatch) instead, except that a query in the first `prefix_rows` rows
 // reads only those rows: a media prefix is a function of the media alone. Only a bidirectional
 // LFM2 trunk (the d1 decision models) asks for it.
 //
-// params[7] is NOT read by the shader — the per-dispatch query count comes from
-// params[11] (`n_sub`, authoritative) — edge workgroups mask queries past it.
-// `q_base` is the index, within `q_batch` / `out_batch`, of the first query in
-// this dispatch, so a caller may still split the query batch across dispatches;
+// The per-dispatch query count comes from params[11] (`n_sub`, authoritative) —
+// edge workgroups mask queries past it. `q_base` is the index, within `q_batch` /
+// `out_batch`, of the first query in this dispatch, so a caller splits the query
+// batch across dispatches (a long one must: see "Dispatch length" below);
 // `q_global = q_base + q_idx` addresses `q_batch` / `out_batch` and sets the
-// causal position. `q_base = 0` is the single-dispatch case (the default now that
-// the scores slab is gone).
+// causal position. `q_base = 0` with `n_sub` the whole batch is the single-dispatch case.
+//
+// params[7] is `total_rows`, read only when `bidir` = 1: the number of key rows the
+// whole call covers (`start_pos` + the call's query count), which a query reads in
+// full. It cannot be `start_pos + n_sub`, because a split dispatch's `n_sub` is only
+// its share of the queries. A causal pass ignores it.
+//
+// Dispatch length: a mobile GPU kills a dispatch that runs for seconds (an Adreno 830
+// lost the device on 6784 bidirectional rows, about 2.7 s at this kernel's 0.07 TFLOPS).
+// The host therefore splits a call so each dispatch reads at most 2^25 key rows per
+// query-head (see `attention_prefill_chunks`).
 //
 // Dispatch: (n_heads, ceil(n_sub / 8), 1) workgroups of 256 threads.
 
@@ -109,14 +118,15 @@ fn attention_prefill(
     let max_seq = params[4];
     let scale = bitcast<f32>(params[5]);
     let start_pos = params[6];
-    // params[7] is unused (historical batch size; authoritative count is params[11]).
+    // params[7] (total_rows) is read below, for a bidirectional pass only.
     let q_stride = params[8];
     let out_stride = params[9];
     let q_base = params[10];
     let n_sub = params[11];
     let bidir = params[12];
     let prefix_rows = params[13];
-    let total_rows = start_pos + n_sub;
+    // The bidirectional window is the whole call's rows, not this dispatch's share of them.
+    let total_rows = select(start_pos + n_sub, params[7], bidir != 0u);
 
     // Local query index within this dispatch; queries past n_sub are dead:
     // they run the loop (barrier uniformity) on clamped inputs and skip stores.

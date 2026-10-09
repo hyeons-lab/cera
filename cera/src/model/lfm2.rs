@@ -6457,7 +6457,21 @@ pub(crate) mod bidirectional_float_tests {
     /// A three-layer non-causal LFM2 (a short-conv block, then two attention blocks, so that one
     /// layer's attention feeds the next layer's) with deterministic weights; the projections are
     /// F32, or Q8_0 of the same values.
+    /// [`bidirectional_gguf_with`] with 4 heads of 32.
     pub(crate) fn bidirectional_gguf(q8_projections: bool) -> GgufFile {
+        bidirectional_gguf_with(q8_projections, N_HEADS, HEAD_DIM)
+    }
+
+    pub(crate) fn bidirectional_gguf_with(
+        q8_projections: bool,
+        n_heads: usize,
+        head_dim: usize,
+    ) -> GgufFile {
+        assert_eq!(
+            n_heads * head_dim,
+            HS,
+            "the heads must fill the hidden width"
+        );
         use crate::gguf::GgufBuilder;
         let mut seed = 0x2545_f491u64;
         let mut values = move |n: usize, scale: f32, base: f32| -> Vec<f32> {
@@ -6475,7 +6489,7 @@ pub(crate) mod bidirectional_float_tests {
             .kv_u32("lfm2.block_count", 3)
             .kv_u32("lfm2.embedding_length", HS as u32)
             .kv_u32("lfm2.feed_forward_length", INTER as u32)
-            .kv_u32("lfm2.attention.head_count", N_HEADS as u32)
+            .kv_u32("lfm2.attention.head_count", n_heads as u32)
             .kv_i32_array("lfm2.attention.head_count_kv", vec![0, 1, 1])
             .kv_u32("lfm2.shortconv.l_cache", 3)
             .kv_f32("lfm2.attention.layer_norm_rms_epsilon", 1e-5)
@@ -6504,9 +6518,9 @@ pub(crate) mod bidirectional_float_tests {
                 b = projection(
                     b,
                     n("attn_q.weight"),
-                    [HS, N_HEADS * HEAD_DIM],
+                    [HS, n_heads * head_dim],
                     values(
-                        [HS, N_HEADS * HEAD_DIM][0] * [HS, N_HEADS * HEAD_DIM][1],
+                        [HS, n_heads * head_dim][0] * [HS, n_heads * head_dim][1],
                         0.12,
                         0.0,
                     ),
@@ -6514,34 +6528,34 @@ pub(crate) mod bidirectional_float_tests {
                 b = projection(
                     b,
                     n("attn_k.weight"),
-                    [HS, HEAD_DIM],
-                    values([HS, HEAD_DIM][0] * [HS, HEAD_DIM][1], 0.12, 0.0),
+                    [HS, head_dim],
+                    values([HS, head_dim][0] * [HS, head_dim][1], 0.12, 0.0),
                 );
                 b = projection(
                     b,
                     n("attn_v.weight"),
-                    [HS, HEAD_DIM],
-                    values([HS, HEAD_DIM][0] * [HS, HEAD_DIM][1], 0.12, 0.0),
+                    [HS, head_dim],
+                    values([HS, head_dim][0] * [HS, head_dim][1], 0.12, 0.0),
                 );
                 b = projection(
                     b,
                     n("attn_output.weight"),
-                    [N_HEADS * HEAD_DIM, HS],
+                    [n_heads * head_dim, HS],
                     values(
-                        [N_HEADS * HEAD_DIM, HS][0] * [N_HEADS * HEAD_DIM, HS][1],
+                        [n_heads * head_dim, HS][0] * [n_heads * head_dim, HS][1],
                         0.12,
                         0.0,
                     ),
                 );
                 b = b.tensor_f32(
                     n("attn_q_norm.weight"),
-                    &[HEAD_DIM],
-                    &values(HEAD_DIM, 0.1, 1.0),
+                    &[head_dim],
+                    &values(head_dim, 0.1, 1.0),
                 );
                 b = b.tensor_f32(
                     n("attn_k_norm.weight"),
-                    &[HEAD_DIM],
-                    &values(HEAD_DIM, 0.1, 1.0),
+                    &[head_dim],
+                    &values(head_dim, 0.1, 1.0),
                 );
             } else {
                 b = projection(
