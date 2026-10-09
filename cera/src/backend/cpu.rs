@@ -2099,6 +2099,113 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_dispatch(
     false
 }
 
+/// Interleave Q8_0 activations per 4-token tile, for the shuffle-free smmla tile kernel
+/// (`smmla_q4_0_tile_8x4_il`). `quants` / `scales` are the columnar `[n][dim]` / `[n][dim / 32]`
+/// of [`crate::model::transformer::quantize_rows`]; for the `n / 4` full tiles (tail tokens are not
+/// copied) the outputs are
+///
+/// * `out_q` at `((tile * nb + b) * 4 + c) * 32`: the 32 bytes `[tok0 k8][tok1 k8][tok2 k8][tok3 k8]`
+///   of chunk `c` (8 elements) of block `b`;
+/// * `out_s` at `(tile * nb + b) * 8`: `[d0, d1, d0, d1, d2, d3, d2, d3]` of the four tokens' block
+///   scales,
+///
+/// where `nb = dim / 32`. Runs on the prefill pool, in tile chunks.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+pub(crate) fn interleave_q8_tiles(
+    quants: &[i8],
+    scales: &[f32],
+    n: usize,
+    dim: usize,
+    out_q: &mut [i8],
+    out_s: &mut [f32],
+) {
+    let nb = dim / 32;
+    let tiles = n / 4;
+    assert!(dim.is_multiple_of(32), "interleave_q8_tiles: dim % 32 != 0");
+    assert!(
+        quants.len() >= n * dim && scales.len() >= n * nb,
+        "interleave_q8_tiles: activations too small for {n}x{dim}"
+    );
+    assert!(
+        out_q.len() >= tiles * nb * 128 && out_s.len() >= tiles * nb * 8,
+        "interleave_q8_tiles: output too small for {tiles} tiles of {nb} blocks"
+    );
+    let (q_base, s_base) = (quants.as_ptr() as usize, scales.as_ptr() as usize);
+    let (oq_base, os_base) = (out_q.as_mut_ptr() as usize, out_s.as_mut_ptr() as usize);
+    let do_tiles = move |start: usize, count: usize| unsafe {
+        let src_q = q_base as *const i8;
+        let src_s = s_base as *const f32;
+        let dst_q = oq_base as *mut i8;
+        let dst_s = os_base as *mut f32;
+        for tile in start..start + count {
+            for tok in 0..4 {
+                let row_q = src_q.add((tile * 4 + tok) * dim);
+                let row_s = src_s.add((tile * 4 + tok) * nb);
+                for b in 0..nb {
+                    for c in 0..4 {
+                        let from = row_q.add(b * 32 + c * 8) as *const u64;
+                        let to = dst_q.add(((tile * nb + b) * 4 + c) * 32 + tok * 8) as *mut u64;
+                        to.write_unaligned(from.read_unaligned());
+                    }
+                    let d = *row_s.add(b);
+                    let o = dst_s.add((tile * nb + b) * 8);
+                    // [d0, d1, d0, d1, d2, d3, d2, d3]: token t of a pair at offset t % 2 (+4)
+                    let pair = tok / 2;
+                    *o.add(pair * 4 + (tok % 2)) = d;
+                    *o.add(pair * 4 + (tok % 2) + 2) = d;
+                }
+            }
+        }
+    };
+    let max_active = prefill_threads_for_tokens(n);
+    par_range_prefill_active(tiles, 8, max_active, do_tiles);
+}
+
+#[cfg(target_arch = "aarch64")]
+thread_local! {
+    /// The calling thread's scratch for [`with_smmla_tiles`], grown on demand and reused.
+    static SMMLA_TILE_SCRATCH: std::cell::RefCell<(Vec<i8>, Vec<f32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+}
+
+/// Whether the smmla Q4_0 GEMMs run on tile-interleaved activations (on by default;
+/// `CERA_CPU_SMMLA_TILED=0` keeps the columnar kernels, the A/B switch).
+#[cfg(target_arch = "aarch64")]
+fn smmla_tiled_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CERA_CPU_SMMLA_TILED").as_deref() != Ok("0"))
+}
+
+/// Interleave the activations per 4-token tile into the thread's scratch (see
+/// [`interleave_q8_tiles`]) and call `f(tile_scales, tile_quants)`. `None` when there is no full
+/// tile (`n < 4`) or the tiled path is off: the caller then runs the columnar kernel.
+#[cfg(target_arch = "aarch64")]
+fn with_smmla_tiles<R>(
+    b_scales: &[f32],
+    b_quants: &[i8],
+    n: usize,
+    k: usize,
+    f: impl FnOnce(&[f32], &[i8]) -> R,
+) -> Option<R> {
+    if n < 4 || !smmla_tiled_enabled() {
+        return None;
+    }
+    let (nb, tiles) = (k / 32, n / 4);
+    SMMLA_TILE_SCRATCH.with(|cell| {
+        let mut scratch = cell.borrow_mut();
+        let (tq, ts) = &mut *scratch;
+        if tq.len() < tiles * nb * 128 {
+            tq.resize(tiles * nb * 128, 0);
+        }
+        if ts.len() < tiles * nb * 8 {
+            ts.resize(tiles * nb * 8, 0.0);
+        }
+        interleave_q8_tiles(b_quants, b_scales, n, k, tq, ts);
+        Some(f(ts, tq))
+    })
+}
+
 /// Run the smmla-repacked-Q4_0 prefill GEMM writing directly in row-major
 /// `out[n, m]` layout. Same contract as
 /// [`gemm_preq_repacked_q4_0_rowmajor_dispatch`], but consumes the
@@ -2137,10 +2244,32 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
-        unsafe {
-            crate::backend::simd::neon::gemm_q4_0_smmla_8x4_q8_0_rowmajor(
-                packed, scales, b_scales, b_quants, out, n, m, k,
-            );
+        let tiled = with_smmla_tiles(
+            b_scales,
+            b_quants,
+            n,
+            k,
+            |tile_scales, tile_quants| unsafe {
+                crate::backend::simd::neon::gemm_q4_0_smmla_8x4_q8_0_rowmajor_tiled(
+                    packed,
+                    scales,
+                    b_scales,
+                    b_quants,
+                    tile_scales,
+                    tile_quants,
+                    out,
+                    n,
+                    m,
+                    k,
+                );
+            },
+        );
+        if tiled.is_none() {
+            unsafe {
+                crate::backend::simd::neon::gemm_q4_0_smmla_8x4_q8_0_rowmajor(
+                    packed, scales, b_scales, b_quants, out, n, m, k,
+                );
+            }
         }
         return true;
     }
@@ -2196,19 +2325,43 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_gate_up_silu_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
-        unsafe {
-            crate::backend::simd::neon::gemm_q4_0_smmla_gate_up_silu_rowmajor(
-                gate_packed,
-                gate_scales,
-                up_packed,
-                up_scales,
-                b_scales,
-                b_quants,
-                out,
-                n,
-                m,
-                k,
-            );
+        let tiled = with_smmla_tiles(
+            b_scales,
+            b_quants,
+            n,
+            k,
+            |tile_scales, tile_quants| unsafe {
+                crate::backend::simd::neon::gemm_q4_0_smmla_gate_up_silu_rowmajor_tiled(
+                    gate_packed,
+                    gate_scales,
+                    up_packed,
+                    up_scales,
+                    b_scales,
+                    b_quants,
+                    tile_scales,
+                    tile_quants,
+                    out,
+                    n,
+                    m,
+                    k,
+                );
+            },
+        );
+        if tiled.is_none() {
+            unsafe {
+                crate::backend::simd::neon::gemm_q4_0_smmla_gate_up_silu_rowmajor(
+                    gate_packed,
+                    gate_scales,
+                    up_packed,
+                    up_scales,
+                    b_scales,
+                    b_quants,
+                    out,
+                    n,
+                    m,
+                    k,
+                );
+            }
         }
         return true;
     }
