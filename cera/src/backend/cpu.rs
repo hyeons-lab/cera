@@ -2169,6 +2169,14 @@ thread_local! {
         const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
 }
 
+/// Whether the NEON prefill attention uses the register-tiled kernel (on by default;
+/// `CERA_CPU_ATTN_TILED=0` keeps the previous one, the A/B switch).
+#[cfg(target_arch = "aarch64")]
+fn attn_tiled_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| std::env::var("CERA_CPU_ATTN_TILED").as_deref() != Ok("0"))
+}
+
 /// Whether the smmla Q4_0 GEMMs run on tile-interleaved activations (on by default;
 /// `CERA_CPU_SMMLA_TILED=0` keeps the columnar kernels, the A/B switch).
 #[cfg(target_arch = "aarch64")]
@@ -6999,22 +7007,43 @@ pub fn flash_attention_gqa_cpu_opt(
     {
         if head_dim.is_multiple_of(4) && head_dim <= 128 {
             unsafe {
-                flash_attention_gqa_neon_opt(
-                    q_mat,
-                    k_cache,
-                    v_cache,
-                    out,
-                    n_heads_start,
-                    group_size,
-                    n_queries,
-                    q_stride,
-                    kv_dim,
-                    kv_h_offset,
-                    head_dim,
-                    scale,
-                    start_pos,
-                    is_causal,
-                );
+                if attn_tiled_enabled() {
+                    flash_attention_gqa_neon_tiled(
+                        q_mat,
+                        k_cache,
+                        v_cache,
+                        out,
+                        n_heads_start,
+                        group_size,
+                        n_queries,
+                        q_stride,
+                        kv_dim,
+                        kv_h_offset,
+                        head_dim,
+                        scale,
+                        start_pos,
+                        is_causal,
+                        0,
+                        n_queries,
+                    );
+                } else {
+                    flash_attention_gqa_neon_opt(
+                        q_mat,
+                        k_cache,
+                        v_cache,
+                        out,
+                        n_heads_start,
+                        group_size,
+                        n_queries,
+                        q_stride,
+                        kv_dim,
+                        kv_h_offset,
+                        head_dim,
+                        scale,
+                        start_pos,
+                        is_causal,
+                    );
+                }
             }
             return;
         }
@@ -7095,6 +7124,74 @@ pub fn flash_attention_gqa_cpu_opt(
         start_pos,
         is_causal,
     );
+}
+
+/// Whether [`flash_attention_gqa_cpu_opt_range`] is available for this head size: the NEON
+/// register-tiled kernel (on by default, `CERA_CPU_ATTN_TILED=0` turns it off) is the only one that
+/// can run a sub-range of the queries.
+pub fn flash_attention_range_supported(head_dim: usize) -> bool {
+    #[cfg(target_arch = "aarch64")]
+    {
+        head_dim.is_multiple_of(4) && head_dim <= 128 && attn_tiled_enabled()
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        let _ = head_dim;
+        false
+    }
+}
+
+/// [`flash_attention_gqa_cpu_opt`] for queries `q_lo..q_hi` only (`n_queries` still the full count,
+/// it fixes the Q layout and the causal bound). `out` holds `[group_size, q_hi - q_lo, head_dim]`.
+/// Splitting the queries into independent work items lets the pool balance the prefill's attention
+/// across fast and slow cores, which whole heads (16 items over 8 workers) cannot. Each query's
+/// result does not depend on which range it ran in.
+///
+/// Only callable when [`flash_attention_range_supported`] is true.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(not(target_arch = "aarch64"), allow(unused_variables))]
+pub fn flash_attention_gqa_cpu_opt_range(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads_start: usize,
+    group_size: usize,
+    n_queries: usize,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+    is_causal: bool,
+    q_lo: usize,
+    q_hi: usize,
+) {
+    debug_assert!(flash_attention_range_supported(head_dim));
+    #[cfg(target_arch = "aarch64")]
+    unsafe {
+        flash_attention_gqa_neon_tiled(
+            q_mat,
+            k_cache,
+            v_cache,
+            out,
+            n_heads_start,
+            group_size,
+            n_queries,
+            q_stride,
+            kv_dim,
+            kv_h_offset,
+            head_dim,
+            scale,
+            start_pos,
+            is_causal,
+            q_lo,
+            q_hi,
+        );
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    unreachable!("guarded by flash_attention_range_supported");
 }
 
 #[allow(dead_code, clippy::too_many_arguments, clippy::needless_range_loop)]
@@ -8498,6 +8595,433 @@ unsafe fn flash_attention_gqa_neon_opt(
                     let inv_sum = (1.0 / running_sum_b[jq]) as f32;
                     let inv_sum_v = vdupq_n_f32(inv_sum);
                     let out_off = (g * n_queries + j) * head_dim;
+                    for i in 0..n_vecs {
+                        let result = vmulq_f32(acc_blk[jq][i], inv_sum_v);
+                        vst1q_f32(out_ptr.add(out_off + i * 4), result);
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Keys per packed-K block of [`flash_attention_gqa_neon_tiled`]: four
+/// 4-key vectors, so one dim step feeds 16 independent score accumulators.
+#[cfg(target_arch = "aarch64")]
+const FLASH_KB: usize = 16;
+
+/// Repack up to [`FLASH_KB`] keys' `head_dim` values into `dst[d][16]` (dim-major,
+/// the 16 keys of a dim contiguous), zero-padding keys past `klen`. One pass
+/// over the block turns the QK^T inner loop into plain vector loads.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+unsafe fn flash_pack_k_block(
+    k_ptr: *const f32,
+    first_key: usize,
+    klen: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    n_vecs: usize,
+    dst: *mut f32,
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let zero = vdupq_n_f32(0.0);
+        for kg in 0..FLASH_KB / 4 {
+            let key0 = kg * 4;
+            for i in 0..n_vecs {
+                let mut r = [zero; 4];
+                for (c, rc) in r.iter_mut().enumerate() {
+                    if key0 + c < klen {
+                        *rc = vld1q_f32(
+                            k_ptr.add((first_key + key0 + c) * kv_dim + kv_h_offset + i * 4),
+                        );
+                    }
+                }
+                let t = transpose4_f32(r[0], r[1], r[2], r[3]);
+                for (l, tl) in t.iter().enumerate() {
+                    vst1q_f32(dst.add((i * 4 + l) * FLASH_KB + key0), *tl);
+                }
+            }
+        }
+    }
+}
+
+/// `acc[q][..W]` (four queries, `W` 4-dim vectors from `ib`) `+= p[q][key] * V[key]`
+/// over `tmg` keys starting at `kv_start`. The 4 x `W` accumulators stay in
+/// registers across the whole key loop (the per-key form reloaded and
+/// stored every accumulator for each key). Each element's FMA chain runs over
+/// keys in order, exactly like the per-key loop it replaces.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[inline]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+unsafe fn flash_av_block<const W: usize>(
+    acc: &mut [[std::arch::aarch64::float32x4_t; 32]],
+    base: usize,
+    ib: usize,
+    st: &[[f32; FLASH_TILE_KV]; 4],
+    tmg: usize,
+    v_ptr: *const f32,
+    kv_start: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+) {
+    use std::arch::aarch64::*;
+    unsafe {
+        let mut a = [[vdupq_n_f32(0.0); W]; 4];
+        for (q, aq) in a.iter_mut().enumerate() {
+            aq.copy_from_slice(&acc[base + q][ib..ib + W]);
+        }
+        let v_col = v_ptr.add(kv_start * kv_dim + kv_h_offset + ib * 4);
+        let mut ti = 0;
+        while ti + 4 <= tmg {
+            let s0 = vld1q_f32(st[0].as_ptr().add(ti));
+            let s1 = vld1q_f32(st[1].as_ptr().add(ti));
+            let s2 = vld1q_f32(st[2].as_ptr().add(ti));
+            let s3 = vld1q_f32(st[3].as_ptr().add(ti));
+            macro_rules! key {
+                ($l:literal) => {{
+                    let vp = v_col.add((ti + $l) * kv_dim);
+                    for w in 0..W {
+                        let v = vld1q_f32(vp.add(w * 4));
+                        a[0][w] = vfmaq_laneq_f32(a[0][w], v, s0, $l);
+                        a[1][w] = vfmaq_laneq_f32(a[1][w], v, s1, $l);
+                        a[2][w] = vfmaq_laneq_f32(a[2][w], v, s2, $l);
+                        a[3][w] = vfmaq_laneq_f32(a[3][w], v, s3, $l);
+                    }
+                }};
+            }
+            key!(0);
+            key!(1);
+            key!(2);
+            key!(3);
+            ti += 4;
+        }
+        while ti < tmg {
+            let vp = v_col.add(ti * kv_dim);
+            for w in 0..W {
+                let v = vld1q_f32(vp.add(w * 4));
+                for q in 0..4 {
+                    a[q][w] = vfmaq_n_f32(a[q][w], v, st[q][ti]);
+                }
+            }
+            ti += 1;
+        }
+        for (q, aq) in a.iter().enumerate() {
+            acc[base + q][ib..ib + W].copy_from_slice(aq);
+        }
+    }
+}
+
+/// [`flash_attention_gqa_neon_opt`] with a register-tiled QK^T and AV.
+///
+/// Same blocking and numerics (every score and every output element sees the
+/// identical FMA chain, so the result is bit-for-bit the same), different
+/// data movement:
+/// - QK^T: each 16-key block of K is repacked once per tile into dim-major
+///   `[d][16]` ([`flash_pack_k_block`]) and shared by all eight query groups,
+///   then a 4-query x 16-key tile (16 independent accumulators, enough to
+///   cover the FMA latency on all four ports) runs on plain vector loads. The
+///   old tile re-transposed every key vector per group (16 shuffles per 32
+///   FMAs) and kept only 8 accumulators in flight.
+/// - AV: a 4-query x 4-dim-vector block of the output stays in registers over
+///   the whole key tile instead of load/FMA/store per key.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+#[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
+unsafe fn flash_attention_gqa_neon_tiled(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads_start: usize,
+    group_size: usize,
+    n_queries: usize,
+    q_stride: usize,
+    kv_dim: usize,
+    kv_h_offset: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+    is_causal: bool,
+    q_lo: usize,
+    q_hi: usize,
+) {
+    use std::arch::aarch64::*;
+    const { assert!(FLASH_TILE_KV == 2 * FLASH_KB) };
+    unsafe {
+        debug_assert!(
+            (n_queries == 0)
+                || (q_stride == n_queries
+                    && q_mat.len()
+                        >= ((n_heads_start + group_size) * head_dim - 1) * q_stride + n_queries)
+                || (q_stride >= head_dim
+                    && q_mat.len()
+                        >= (n_queries - 1) * q_stride + (n_heads_start + group_size) * head_dim),
+            "q_mat too small for the given head range and q_stride"
+        );
+        debug_assert!(
+            (start_pos + n_queries == 0)
+                || k_cache.len() >= (start_pos + n_queries - 1) * kv_dim + kv_h_offset + head_dim,
+            "k_cache too small"
+        );
+        debug_assert!(
+            (start_pos + n_queries == 0)
+                || v_cache.len() >= (start_pos + n_queries - 1) * kv_dim + kv_h_offset + head_dim,
+            "v_cache too small"
+        );
+        debug_assert!(q_lo <= q_hi && q_hi <= n_queries, "bad query range");
+        debug_assert!(
+            out.len() >= group_size * (q_hi - q_lo) * head_dim,
+            "out buffer too small for contiguous [group_size, q_hi - q_lo, head_dim] output"
+        );
+
+        let q_ptr = q_mat.as_ptr();
+        let k_ptr = k_cache.as_ptr();
+        let v_ptr = v_cache.as_ptr();
+        let out_ptr = out.as_mut_ptr();
+
+        let n_vecs = head_dim / 4;
+        debug_assert!(
+            head_dim.is_multiple_of(4) && n_vecs <= 32,
+            "head_dim must be a multiple of 4 and <= 128"
+        );
+
+        const MAX_VECS: usize = 32;
+        const QBLOCK: usize = 32;
+        const QG: usize = 4;
+        let mut qt = [[vdupq_n_f32(0.0); 128]; QBLOCK / QG];
+        let mut acc_blk = [[vdupq_n_f32(0.0); MAX_VECS]; QBLOCK];
+        // Packed keys of the current tile: two 16-key blocks, `[d][16]` each.
+        let mut kp = [0.0f32; FLASH_TILE_KV * 128];
+        // Scores of one query group: `st[q][key]`; keys past a query's causal
+        // length are zeroed after the softmax so the AV loop stays uniform.
+        let mut st = [[0.0f32; FLASH_TILE_KV]; QG];
+        let mut running_max_b = [f32::NEG_INFINITY; QBLOCK];
+        let mut running_sum_b = [0.0f64; QBLOCK];
+        let mut max_kv_b = [0usize; QBLOCK];
+        let exp_c = ExpConsts::new();
+
+        for g in 0..group_size {
+            let h = n_heads_start + g;
+            let h_off = h * head_dim;
+
+            for j0 in (q_lo..q_hi).step_by(QBLOCK) {
+                let jb = (q_hi - j0).min(QBLOCK);
+                let ng = jb.div_ceil(QG);
+                for gi in 0..ng {
+                    for i in 0..n_vecs {
+                        let jq0 = gi * QG;
+                        let mut qv = [vdupq_n_f32(0.0); QG];
+                        for (c, qc) in qv.iter_mut().enumerate() {
+                            if jq0 + c < jb {
+                                *qc = flash_gather_q_vec(
+                                    q_ptr,
+                                    j0 + jq0 + c,
+                                    h_off,
+                                    i,
+                                    q_stride,
+                                    n_queries,
+                                );
+                            }
+                        }
+                        let t = transpose4_f32(qv[0], qv[1], qv[2], qv[3]);
+                        qt[gi][i * 4] = t[0];
+                        qt[gi][i * 4 + 1] = t[1];
+                        qt[gi][i * 4 + 2] = t[2];
+                        qt[gi][i * 4 + 3] = t[3];
+                    }
+                }
+                for jq in 0..jb {
+                    let j = j0 + jq;
+                    max_kv_b[jq] = if is_causal {
+                        start_pos + j + 1
+                    } else {
+                        start_pos + n_queries
+                    };
+                    running_max_b[jq] = f32::NEG_INFINITY;
+                    running_sum_b[jq] = 0.0;
+                    for i in 0..n_vecs {
+                        acc_blk[jq][i] = vdupq_n_f32(0.0);
+                    }
+                }
+
+                let mut block_kv = 0;
+                for jq in 0..jb {
+                    block_kv = block_kv.max(max_kv_b[jq]);
+                }
+
+                for kv_start in (0..block_kv).step_by(FLASH_TILE_KV) {
+                    // Keys any query of this block sees in the tile.
+                    let tile_keys = (block_kv - kv_start).min(FLASH_TILE_KV);
+                    for kb in 0..tile_keys.div_ceil(FLASH_KB) {
+                        flash_pack_k_block(
+                            k_ptr,
+                            kv_start + kb * FLASH_KB,
+                            (tile_keys - kb * FLASH_KB).min(FLASH_KB),
+                            kv_dim,
+                            kv_h_offset,
+                            n_vecs,
+                            kp.as_mut_ptr().add(kb * FLASH_KB * head_dim),
+                        );
+                    }
+                    for gi in 0..ng {
+                        let mut lens = [0usize; QG];
+                        let mut tmg = 0;
+                        for q in 0..QG {
+                            let jq = gi * QG + q;
+                            if jq < jb && kv_start < max_kv_b[jq] {
+                                lens[q] = (kv_start + FLASH_TILE_KV).min(max_kv_b[jq]) - kv_start;
+                                tmg = tmg.max(lens[q]);
+                            }
+                        }
+                        if tmg == 0 {
+                            continue;
+                        }
+                        // QK: 4 queries x 16 keys per block, 16 accumulators.
+                        for kb in 0..tmg.div_ceil(FLASH_KB) {
+                            let kpb = kp.as_ptr().add(kb * FLASH_KB * head_dim);
+                            let mut s = [[vdupq_n_f32(0.0); 4]; QG];
+                            for d in 0..head_dim {
+                                let kd = kpb.add(d * FLASH_KB);
+                                let k0 = vld1q_f32(kd);
+                                let k1 = vld1q_f32(kd.add(4));
+                                let k2 = vld1q_f32(kd.add(8));
+                                let k3 = vld1q_f32(kd.add(12));
+                                let qv = qt[gi][d];
+                                s[0][0] = vfmaq_laneq_f32(s[0][0], k0, qv, 0);
+                                s[0][1] = vfmaq_laneq_f32(s[0][1], k1, qv, 0);
+                                s[0][2] = vfmaq_laneq_f32(s[0][2], k2, qv, 0);
+                                s[0][3] = vfmaq_laneq_f32(s[0][3], k3, qv, 0);
+                                s[1][0] = vfmaq_laneq_f32(s[1][0], k0, qv, 1);
+                                s[1][1] = vfmaq_laneq_f32(s[1][1], k1, qv, 1);
+                                s[1][2] = vfmaq_laneq_f32(s[1][2], k2, qv, 1);
+                                s[1][3] = vfmaq_laneq_f32(s[1][3], k3, qv, 1);
+                                s[2][0] = vfmaq_laneq_f32(s[2][0], k0, qv, 2);
+                                s[2][1] = vfmaq_laneq_f32(s[2][1], k1, qv, 2);
+                                s[2][2] = vfmaq_laneq_f32(s[2][2], k2, qv, 2);
+                                s[2][3] = vfmaq_laneq_f32(s[2][3], k3, qv, 2);
+                                s[3][0] = vfmaq_laneq_f32(s[3][0], k0, qv, 3);
+                                s[3][1] = vfmaq_laneq_f32(s[3][1], k1, qv, 3);
+                                s[3][2] = vfmaq_laneq_f32(s[3][2], k2, qv, 3);
+                                s[3][3] = vfmaq_laneq_f32(s[3][3], k3, qv, 3);
+                            }
+                            for q in 0..QG {
+                                for c in 0..4 {
+                                    vst1q_f32(
+                                        st[q].as_mut_ptr().add(kb * FLASH_KB + c * 4),
+                                        vmulq_n_f32(s[q][c], scale),
+                                    );
+                                }
+                            }
+                        }
+                        // Online softmax per query + rescale acc (as the
+                        // reference kernel).
+                        for q in 0..QG {
+                            let jq = gi * QG + q;
+                            if jq >= jb {
+                                for ti in 0..tmg {
+                                    st[q][ti] = 0.0;
+                                }
+                                continue;
+                            }
+                            let tile_len = lens[q];
+                            let mut max4 = vdupq_n_f32(f32::NEG_INFINITY);
+                            let mut ti = 0;
+                            while ti + 4 <= tile_len {
+                                let sv = vld1q_f32(st[q].as_ptr().add(ti));
+                                max4 = vmaxq_f32(max4, sv);
+                                ti += 4;
+                            }
+                            let mut tile_max = vmaxvq_f32(max4);
+                            while ti < tile_len {
+                                if st[q][ti] > tile_max {
+                                    tile_max = st[q][ti];
+                                }
+                                ti += 1;
+                            }
+                            let running_max = running_max_b[jq];
+                            let new_max = running_max.max(tile_max);
+                            // `exp(0) == 1` exactly, and scaling by 1.0 is a no-op:
+                            // once the max settles the rescale is skipped outright.
+                            let rescale = if running_max == new_max {
+                                1.0
+                            } else if running_max > f32::NEG_INFINITY {
+                                ggml_expf(running_max - new_max)
+                            } else {
+                                0.0
+                            };
+                            let mut tile_sum = 0.0f64;
+                            let mut sum4 = vdupq_n_f32(0.0);
+                            let nm_v = vdupq_n_f32(new_max);
+                            let stq = st[q].as_mut_ptr();
+                            let mut ti = 0;
+                            while ti + 4 <= tile_len {
+                                let sv = vld1q_f32(stq.add(ti));
+                                let ev = ggml_expf_neon4(vsubq_f32(sv, nm_v), &exp_c);
+                                vst1q_f32(stq.add(ti), ev);
+                                sum4 = vaddq_f32(sum4, ev);
+                                ti += 4;
+                            }
+                            tile_sum += vaddvq_f32(sum4) as f64;
+                            for ti in ti..tile_len {
+                                st[q][ti] = ggml_expf(st[q][ti] - new_max);
+                                tile_sum += st[q][ti] as f64;
+                            }
+                            for ti in tile_len..tmg {
+                                st[q][ti] = 0.0;
+                            }
+                            if rescale != 1.0 {
+                                let rescale_v = vdupq_n_f32(rescale);
+                                for i in 0..n_vecs {
+                                    acc_blk[jq][i] = vmulq_f32(acc_blk[jq][i], rescale_v);
+                                }
+                            }
+                            running_sum_b[jq] = running_sum_b[jq] * rescale as f64 + tile_sum;
+                            running_max_b[jq] = new_max;
+                        }
+                        // AV: 4 queries x 4 dim-vectors stay in registers
+                        // across the tile's keys.
+                        let base = gi * QG;
+                        let mut ib = 0;
+                        while ib + 4 <= n_vecs {
+                            flash_av_block::<4>(
+                                &mut acc_blk,
+                                base,
+                                ib,
+                                &st,
+                                tmg,
+                                v_ptr,
+                                kv_start,
+                                kv_dim,
+                                kv_h_offset,
+                            );
+                            ib += 4;
+                        }
+                        while ib < n_vecs {
+                            flash_av_block::<1>(
+                                &mut acc_blk,
+                                base,
+                                ib,
+                                &st,
+                                tmg,
+                                v_ptr,
+                                kv_start,
+                                kv_dim,
+                                kv_h_offset,
+                            );
+                            ib += 1;
+                        }
+                    }
+                }
+
+                for jq in 0..jb {
+                    let j = j0 + jq;
+                    let inv_sum = (1.0 / running_sum_b[jq]) as f32;
+                    let inv_sum_v = vdupq_n_f32(inv_sum);
+                    let out_off = (g * (q_hi - q_lo) + (j - q_lo)) * head_dim;
                     for i in 0..n_vecs {
                         let result = vmulq_f32(acc_blk[jq][i], inv_sum_v);
                         vst1q_f32(out_ptr.add(out_off + i * 4), result);
@@ -12922,6 +13446,222 @@ mod tests {
         // instead of overrunning their fixed-size arrays.
         check_attn_f32_kernels(256);
         check_attn_f16_kernels(256);
+    }
+
+    /// The register-tiled NEON kernel must reproduce the reference NEON kernel bit for bit
+    /// (same FMA chains), over ragged query/key counts, a prefix (`start_pos`), both masks and
+    /// several head dims (including a non-multiple-of-16 and a 2-block key tail).
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn flash_tiled_matches_reference_bit_for_bit() {
+        let mut seed: u64 = 0x1234_5678;
+        let mut rnd = |n: usize, amp: f32| -> Vec<f32> {
+            (0..n)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    (((seed >> 33) as i32) as f32 / 2147483648.0) * amp
+                })
+                .collect()
+        };
+        for head_dim in [64usize, 40, 128, 20] {
+            for (n, start_pos) in [
+                (1usize, 0usize),
+                (5, 3),
+                (33, 4),
+                (70, 0),
+                (40, 37),
+                (3, 100),
+            ] {
+                for causal in [true, false] {
+                    let n_kv_heads = 2;
+                    let group_size = 2;
+                    let kv_dim = n_kv_heads * head_dim;
+                    let hs = n_kv_heads * group_size * head_dim;
+                    let total = start_pos + n;
+                    let q = rnd(hs * n, 3.0);
+                    let k = rnd(total * kv_dim, 3.0);
+                    let v = rnd(total * kv_dim, 1.0);
+                    let scale = 1.0 / (head_dim as f32).sqrt();
+                    let run = |tiled: bool| {
+                        let chunk = group_size * n * head_dim;
+                        let mut out = vec![0.0f32; n_kv_heads * chunk];
+                        for kv_h in 0..n_kv_heads {
+                            let args = (
+                                &q[..],
+                                &k[..],
+                                &v[..],
+                                kv_h * group_size,
+                                group_size,
+                                n,
+                                n,
+                                kv_dim,
+                                kv_h * head_dim,
+                                head_dim,
+                                scale,
+                                start_pos,
+                                causal,
+                            );
+                            let o = &mut out[kv_h * chunk..(kv_h + 1) * chunk];
+                            unsafe {
+                                if tiled {
+                                    flash_attention_gqa_neon_tiled(
+                                        args.0, args.1, args.2, o, args.3, args.4, args.5, args.6,
+                                        args.7, args.8, args.9, args.10, args.11, args.12, 0, n,
+                                    );
+                                } else {
+                                    flash_attention_gqa_neon_opt(
+                                        args.0, args.1, args.2, o, args.3, args.4, args.5, args.6,
+                                        args.7, args.8, args.9, args.10, args.11, args.12,
+                                    );
+                                }
+                            }
+                        }
+                        out
+                    };
+                    let a = run(false);
+                    let b = run(true);
+                    assert!(
+                        a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                        "hd={head_dim} n={n} start={start_pos} causal={causal}"
+                    );
+                }
+            }
+        }
+    }
+
+    /// Running the queries in independent ranges (the pool's work items) reproduces the whole-range
+    /// result bit for bit, for ranges that do not align with the 32-query block or the 4-query group.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn flash_tiled_query_ranges_match_whole() {
+        let (head_dim, n_heads, n_kv_heads, n, start_pos) =
+            (64usize, 4usize, 2usize, 75usize, 9usize);
+        let kv_dim = n_kv_heads * head_dim;
+        let hs = n_heads * head_dim;
+        let total = start_pos + n;
+        let mut seed: u64 = 99;
+        let mut rnd = |len: usize| -> Vec<f32> {
+            (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((seed >> 33) as i32) as f32 / 2147483648.0 * 3.0
+                })
+                .collect()
+        };
+        let (q, k, v) = (rnd(hs * n), rnd(total * kv_dim), rnd(total * kv_dim));
+        let scale = 0.125;
+        let group_size = n_heads / n_kv_heads;
+        for causal in [true, false] {
+            let mut whole = vec![0.0f32; n_kv_heads * group_size * n * head_dim];
+            let mut parts = vec![0.0f32; whole.len()];
+            for kv_h in 0..n_kv_heads {
+                let c = group_size * n * head_dim;
+                flash_attention_gqa_cpu_opt_range(
+                    &q,
+                    &k,
+                    &v,
+                    &mut whole[kv_h * c..(kv_h + 1) * c],
+                    kv_h * group_size,
+                    group_size,
+                    n,
+                    n,
+                    kv_dim,
+                    kv_h * head_dim,
+                    head_dim,
+                    scale,
+                    start_pos,
+                    causal,
+                    0,
+                    n,
+                );
+                // One work item per (head, range); the single-head output is contiguous.
+                for g in 0..group_size {
+                    let h = kv_h * group_size + g;
+                    for (lo, hi) in [(0, 5), (5, 37), (37, 64), (64, n)] {
+                        let dst = &mut parts[(h * n + lo) * head_dim..(h * n + hi) * head_dim];
+                        flash_attention_gqa_cpu_opt_range(
+                            &q,
+                            &k,
+                            &v,
+                            dst,
+                            h,
+                            1,
+                            n,
+                            n,
+                            kv_dim,
+                            kv_h * head_dim,
+                            head_dim,
+                            scale,
+                            start_pos,
+                            causal,
+                            lo,
+                            hi,
+                        );
+                    }
+                }
+            }
+            assert!(
+                whole
+                    .iter()
+                    .zip(&parts)
+                    .all(|(a, b)| a.to_bits() == b.to_bits()),
+                "causal={causal}"
+            );
+        }
+    }
+
+    /// One core, prefill-shaped (hd 64, one head, stride-n Q): GFLOPS of both NEON kernels.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "microbenchmark: run explicitly on a device, pinned to one core"]
+    fn flash_attention_microbench() {
+        let head_dim = 64usize;
+        let kv_dim = 8 * head_dim;
+        for (n, start_pos) in [(512usize, 0usize), (512, 1536)] {
+            let total = start_pos + n;
+            let q: Vec<f32> = (0..head_dim * n)
+                .map(|i| ((i * 7 % 13) as f32 - 6.0) * 0.1)
+                .collect();
+            let k: Vec<f32> = (0..total * kv_dim)
+                .map(|i| ((i * 5 % 11) as f32 - 5.0) * 0.1)
+                .collect();
+            let v: Vec<f32> = (0..total * kv_dim)
+                .map(|i| ((i * 3 % 7) as f32 - 3.0) * 0.1)
+                .collect();
+            let pairs = (n * (n + 1) / 2 + start_pos * n) as f64;
+            let flops = 4.0 * head_dim as f64 * pairs;
+            let mut out = vec![0.0f32; n * head_dim];
+            for (name, tiled) in [
+                ("ref", false),
+                ("tiled", true),
+                ("ref", false),
+                ("tiled", true),
+            ] {
+                let t = std::time::Instant::now();
+                let reps = 20;
+                for _ in 0..reps {
+                    unsafe {
+                        if tiled {
+                            flash_attention_gqa_neon_tiled(
+                                &q, &k, &v, &mut out, 0, 1, n, n, kv_dim, 0, head_dim, 0.125,
+                                start_pos, true, 0, n,
+                            );
+                        } else {
+                            flash_attention_gqa_neon_opt(
+                                &q, &k, &v, &mut out, 0, 1, n, n, kv_dim, 0, head_dim, 0.125,
+                                start_pos, true,
+                            );
+                        }
+                    }
+                }
+                let dt = t.elapsed().as_secs_f64() / reps as f64;
+                println!(
+                    "flash attn {name:5} n={n} start={start_pos}: {:.2} ms, {:.1} GFLOPS",
+                    dt * 1e3,
+                    flops / dt / 1e9
+                );
+            }
+        }
     }
 
     #[test]
