@@ -7294,6 +7294,123 @@ mod tests {
         }
     }
 
+    /// `kv_append` packs f32 into f16 pairs with hand-written bit ops, and every wgpu KV cache
+    /// goes through it. It must agree with a correct f32 -> f16 conversion everywhere: a mantissa
+    /// that rounds up past its top has to carry into the exponent for odd and even exponents
+    /// alike (an OR instead of an add halved such values, about 1 in 4000 of the K/V a model
+    /// writes), half subnormals are kept, and an overflow clamps to max-half rather than Inf.
+    /// Exact ties are skipped: the shader rounds them away from zero, `half` to even.
+    #[test]
+    fn test_gpu_kv_append_matches_f16_conversion() {
+        let ctx = match GpuContext::new() {
+            Ok(ctx) => ctx,
+            Err(_) => return,
+        };
+        let mut values: Vec<f32> = Vec::new();
+        // Every binade from below the smallest half subnormal to past the overflow, with the
+        // mantissas that sit on a rounding or carry boundary and a spread of others.
+        let mut lcg = 0x2545_F491_4F6C_DD1Du64;
+        for exp in 100u32..=146 {
+            for mant in [
+                0u32, 1, 0x0FFF, 0x1001, 0x1FFF, 0x2000, 0x7F_E000, 0x7F_EFFF, 0x7F_F001,
+                0x7F_F800, 0x7F_FFFF,
+            ] {
+                values.push(f32::from_bits((exp << 23) | mant));
+            }
+            for _ in 0..64 {
+                lcg = lcg
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                values.push(f32::from_bits(
+                    (exp << 23) | ((lcg >> 41) as u32 & 0x7F_FFFF),
+                ));
+            }
+        }
+        values.extend([0.0, 65504.0, 65519.0, 65520.0, 1.0e9]);
+        let values: Vec<f32> = values.iter().flat_map(|&v| [v, -v]).collect();
+        let n = values.len();
+        assert!(n.is_multiple_of(2));
+
+        let expected = |x: f32| -> Option<u16> {
+            let r = half::f16::from_f32(x);
+            let rd = f64::from(r.to_f32());
+            let (xd, mag) = (f64::from(x), r.to_bits() & 0x7FFF);
+            // the neighbour on the other side of x, to detect an exact tie
+            let other_bits = if rd > xd {
+                if x < 0.0 {
+                    r.to_bits() + 1
+                } else {
+                    r.to_bits().wrapping_sub(1)
+                }
+            } else if x < 0.0 {
+                r.to_bits().wrapping_sub(1)
+            } else {
+                r.to_bits() + 1
+            };
+            if (mag != 0 || rd != xd) && rd != xd {
+                let od = f64::from(half::f16::from_bits(other_bits).to_f32());
+                if od.is_finite() && (xd - rd).abs() == (xd - od).abs() {
+                    return None;
+                }
+            }
+            Some(if r.is_infinite() {
+                (r.to_bits() & 0x8000) | 0x7BFF
+            } else {
+                r.to_bits()
+            })
+        };
+
+        let src = ctx.upload_f32(&values, "kv_append.src");
+        let dst = ctx.create_storage_rw((n / 2 * 4) as u64, "kv_append.dst");
+        let params: [u32; 4] = [0, n as u32, 0, 0];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "kv_append.params");
+        let pipeline = ctx.create_pipeline(shaders::KV_APPEND, "kv_append", "kv_append");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: src.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dst.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((n as u32 / 2).div_ceil(256), 1, 1);
+        }
+        ctx.submit_encoder(enc);
+        let words = ctx.download_u32(&dst, n / 2);
+
+        let mut checked = 0usize;
+        for (i, &x) in values.iter().enumerate() {
+            let Some(want) = expected(x) else { continue };
+            let got = ((words[i / 2] >> (16 * (i % 2))) & 0xFFFF) as u16;
+            assert_eq!(
+                got,
+                want,
+                "kv_append({x:e}, bits {:#010x}) = {got:#06x}, want {want:#06x}",
+                x.to_bits()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > n * 9 / 10,
+            "too many values skipped as ties: {checked} of {n}"
+        );
+    }
+
     /// `attention_prefill` parity: batched attention over N queries matches the
     /// CPU reference at every (token, head, dim) cell. Covers GQA, non-zero
     /// start_pos, and a multi-query prefill.
