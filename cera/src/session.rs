@@ -1646,6 +1646,60 @@ impl Session {
         Ok(out)
     }
 
+    /// Per-token hidden states of `tokens` read after a media prefix.
+    ///
+    /// `prefix` is `[rows * hidden_size]` embeddings of an image or an audio clip. The trunk
+    /// must be bidirectional (see [`Model::hidden_states_with_prefix`]). Returns the hidden
+    /// states of the text rows only, `[tokens.len() * hidden_size]`.
+    ///
+    /// # Errors
+    ///
+    /// [`CeraError::UnsupportedModality`] when the backend cannot read a media prefix;
+    /// [`CeraError::InvalidToken`] for an id outside the vocabulary;
+    /// [`CeraError::ContextOverflow`] when prefix and text together exceed the context.
+    pub fn hidden_states_with_prefix(
+        &mut self,
+        prefix: &[f32],
+        tokens: &[u32],
+    ) -> Result<Vec<f32>, CeraError> {
+        self.ensure_usable()?;
+        Self::resize_pools_for_cpuset();
+        self.discard_stale_decode_error();
+        if tokens.is_empty() {
+            return Err(CeraError::EmptyInput);
+        }
+        let model = Arc::clone(&self.model);
+        if !model.supports_media_prefix() {
+            return Err(CeraError::UnsupportedModality);
+        }
+        let hidden = model.config().hidden_size;
+        if !prefix.len().is_multiple_of(hidden) {
+            return Err(CeraError::Backend(format!(
+                "the media prefix has {} values, not a whole number of {hidden}-wide rows",
+                prefix.len()
+            )));
+        }
+        let vocab_size = model.config().vocab_size;
+        if let Some(&bad) = tokens.iter().find(|&&t| t as usize >= vocab_size) {
+            return Err(CeraError::InvalidToken {
+                id: bad,
+                vocab_size: vocab_size as u32,
+            });
+        }
+        let total = prefix.len() / hidden + tokens.len();
+        let max_seq_len = model.config().max_seq_len;
+        if total > max_seq_len {
+            return Err(CeraError::ContextOverflow {
+                max_seq_len: max_seq_len as u32,
+                by: (total - max_seq_len) as u32,
+            });
+        }
+        let mut state = InferenceState::for_prefill(model.config(), total)?;
+        let out = model.hidden_states_with_prefix(prefix, tokens, &mut state);
+        self.check_decode_error()?;
+        Ok(out)
+    }
+
     /// Like [`Self::hidden_states_for_tokens`] but **mean-pools** over tokens,
     /// returning a single `[hidden_size]` vector. This is the common classifier
     /// path (their head consumes the mean-pooled hidden state) and avoids

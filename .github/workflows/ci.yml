@@ -1056,7 +1056,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}-mt
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=4192  # 4.09 MB; PR #464 NPU and GPU model coverage
+          BUDGET_KB=4200  # 4.10 MB; PR #464 NPU and GPU model coverage, PR #486 d1 decision models
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}

@@ -886,6 +886,68 @@ enum Command {
         json: bool,
     },
 
+    /// Convert a SafeTensors model directory to a GGUF file.
+    ///
+    /// Reads `config.json`, `tokenizer.json` and the `.safetensors` files of `--input` and
+    /// writes one GGUF at `--output`, quantized to `--quant`. The d1 decision models
+    /// (`model_type = "d1_omni"`) convert to a non-causal LFM2 trunk plus their decision head;
+    /// their vision and audio towers are not converted yet.
+    Convert {
+        /// SafeTensors model directory.
+        #[arg(short, long)]
+        input: PathBuf,
+
+        /// GGUF file to write.
+        #[arg(short, long)]
+        output: PathBuf,
+
+        /// Target quantization: `f32`, `f16`, `q8_0`, `q4_0`, `q4_k_m`.
+        #[arg(long, default_value = "q8_0")]
+        quant: String,
+
+        /// Quantization strategy (`auto`, `fast-mse`, `hqq`).
+        #[arg(long, default_value = "auto")]
+        strategy: String,
+
+        /// Per-tensor quantization, `pattern=quant` (for example
+        /// `blk.*.ffn_down.weight=q8_0`); repeatable, first match wins.
+        #[arg(long = "tensor-override")]
+        tensor_overrides: Vec<String>,
+    },
+
+    /// Answer named questions about a state with a d1 decision model.
+    ///
+    /// Reads `{"state": ..., "questions": {name: {"type", "instructions", "criteria"}}}` from
+    /// `--request` (a file, or `-` for stdin) and prints the answers as JSON. Each question is
+    /// one forward pass over the bidirectional trunk; nothing is generated.
+    Decide {
+        /// Path to the d1 model `.gguf` (see `convert`).
+        #[arg(short, long)]
+        model: String,
+
+        /// Request JSON file, or `-` to read it from stdin.
+        #[arg(short, long, default_value = "-")]
+        request: String,
+
+        /// Device to use: cpu, gpu, metal, or auto.
+        #[arg(long, default_value = "auto")]
+        device: String,
+
+        /// Longest prompt in tokens. The model supports up to its trained 16384.
+        #[arg(long, default_value_t = 16384)]
+        context_size: usize,
+
+        /// An image (PNG or JPEG) to read ahead of the text; repeatable, in order. These are
+        /// added to any `images` in the request.
+        #[arg(long = "image")]
+        images: Vec<PathBuf>,
+
+        /// A speech clip (WAV) to read ahead of the text. A request carries images or speech,
+        /// not both.
+        #[arg(long = "audio")]
+        audio: Option<PathBuf>,
+    },
+
     /// Tokenize text and print token IDs (for comparison with HuggingFace).
     Tokenize {
         /// Path to the GGUF model file.
@@ -4318,6 +4380,79 @@ fn main() -> Result<()> {
             // Useful in bug reports to know which kernel path actually ran.
             println!("{}", cera::cpu_features().report());
             println!("{}", cera::backend::cpu_features::core_topology().report());
+        }
+        Command::Convert {
+            input,
+            output,
+            quant,
+            strategy,
+            tensor_overrides,
+        } => {
+            let quant = cera::convert::TargetQuant::parse_str(&quant)
+                .ok_or_else(|| anyhow::anyhow!("unknown quant type `{quant}`"))?;
+            let strategy = cera::convert::QuantStrategy::parse_str(&strategy)
+                .ok_or_else(|| anyhow::anyhow!("unknown quant strategy `{strategy}`"))?;
+            let overrides = tensor_overrides
+                .iter()
+                .map(|s| {
+                    cera::convert::parse_tensor_override(s)
+                        .ok_or_else(|| anyhow::anyhow!("bad --tensor-override `{s}`"))
+                })
+                .collect::<anyhow::Result<Vec<_>>>()?;
+            cera::convert::quantize_safetensors_to_gguf_with_strategy(
+                &input, &output, quant, strategy, &overrides,
+            )
+            .context("converting the SafeTensors model")?;
+            let bytes = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
+            println!("{} ({bytes} bytes)", output.display());
+        }
+        Command::Decide {
+            model,
+            request,
+            device,
+            context_size,
+            images,
+            audio,
+        } => {
+            use std::io::Read as _;
+            let text = if request == "-" {
+                let mut text = String::new();
+                std::io::stdin()
+                    .read_to_string(&mut text)
+                    .context("reading the request from stdin")?;
+                text
+            } else {
+                std::fs::read_to_string(&request)
+                    .with_context(|| format!("reading the request `{request}`"))?
+            };
+            let mut request = cera::d1::D1Request::parse(&text)?;
+            for path in &images {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("reading the image `{}`", path.display()))?;
+                request = request.with_image(bytes);
+            }
+            if let Some(path) = &audio {
+                let bytes = std::fs::read(path)
+                    .with_context(|| format!("reading the clip `{}`", path.display()))?;
+                request = request.with_audio(bytes);
+            }
+            let gguf = std::sync::Arc::new(cera::gguf::GgufFile::open(Path::new(&model))?);
+            let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
+            let d1 = cera::d1::D1Model::from_gguf(&gguf, &tokenizer)?;
+            let engine = resolve_engine(
+                Some(&model),
+                None,
+                None,
+                None,
+                None,
+                None,
+                None,
+                &device,
+                context_size.min(d1.max_length()),
+            )?;
+            let mut session = engine.new_session(cera::SessionConfig::default())?;
+            let response = d1.answer(&mut session, &tokenizer, &request)?;
+            println!("{}", response.to_json().dumps());
         }
         Command::Cpu => {
             println!("{}", cera::cpu_features().report());
