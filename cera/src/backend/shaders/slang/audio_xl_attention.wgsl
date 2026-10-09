@@ -27,7 +27,7 @@ fn block_max_0( tid_0 : u32,  v_0 : f32) -> f32
     scratch_0[tid_0] = v_0;
     workgroupBarrier();
     var s_0 : u32 = u32(128);
-    for(;;)
+    loop
     {
         if(s_0 > u32(0))
         {
@@ -52,7 +52,7 @@ fn block_sum_0( tid_1 : u32,  v_1 : f32) -> f32
     scratch_0[tid_1] = v_1;
     workgroupBarrier();
     var s_1 : u32 = u32(128);
-    for(;;)
+    loop
     {
         if(s_1 > u32(0))
         {
@@ -87,7 +87,7 @@ fn audio_xl_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(
     var head_base_0 : u32 = wid_0.y * head_dim_0;
     var _S4 : u32 = q_idx_0 * dim_0 + head_base_0;
     var d_0 : u32 = tid_2;
-    for(;;)
+    loop
     {
         if(d_0 < head_dim_0)
         {
@@ -105,7 +105,7 @@ fn audio_xl_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(
     workgroupBarrier();
     var _S6 : u32 = tokens_0 - u32(1);
     var key_0 : u32 = tid_2;
-    for(;;)
+    loop
     {
         if(key_0 < tokens_0)
         {
@@ -119,7 +119,7 @@ fn audio_xl_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(
         d_0 = u32(0);
         ac_0 = 0.0f;
         bd_0 = 0.0f;
-        for(;;)
+        loop
         {
             if(d_0 < head_dim_0)
             {
@@ -140,7 +140,7 @@ fn audio_xl_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(
     workgroupBarrier();
     ac_0 = -3.4028234663852886e+38f;
     key_0 = tid_2;
-    for(;;)
+    loop
     {
         if(key_0 < tokens_0)
         {
@@ -157,7 +157,7 @@ fn audio_xl_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(
     var _S10 : f32 = block_max_0(tid_2, ac_0);
     key_0 = tid_2;
     bd_0 = 0.0f;
-    for(;;)
+    loop
     {
         if(key_0 < tokens_0)
         {
@@ -176,7 +176,7 @@ fn audio_xl_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(
     var _S11 : f32 = block_sum_0(tid_2, bd_0);
     var _S12 : f32 = 1.0f / _S11;
     d_0 = tid_2;
-    for(;;)
+    loop
     {
         if(d_0 < head_dim_0)
         {
@@ -187,7 +187,7 @@ fn audio_xl_attention(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(
         }
         key_0 = u32(0);
         var acc_0 : f32 = 0.0f;
-        for(;;)
+        loop
         {
             if(key_0 < tokens_0)
             {

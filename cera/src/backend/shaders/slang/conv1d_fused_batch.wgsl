@@ -109,7 +109,7 @@ fn conv1d_fused_batch(@builtin(global_invocation_id) gid_0 : vec3<u32>)
         rb_0[u32(2)] = rbuf_0[u32(2) * hs_0 + ch_0];
     }
     var t_0 : u32 = u32(0);
-    for(;;)
+    loop
     {
         if(t_0 < _S1)
         {

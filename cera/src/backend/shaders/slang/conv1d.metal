@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 49 "cera/src/backend/shaders/slang/conv1d.slang"
+#line 31 "cera/src/backend/shaders/slang/conv1d.slang"
 struct KernelContext_0
 {
     uint device* par_buf_0;

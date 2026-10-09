@@ -14,7 +14,7 @@ float2 rotate_pair_0(float x0_0, float x1_0, float angle_0)
 }
 
 
-#line 72
+#line 25
 struct KernelContext_0
 {
     uint device* params_0;

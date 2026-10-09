@@ -14,7 +14,7 @@ fn block_argmax_0( tid_0 : u32,  val_0 : f32,  idx_0 : u32) -> u32
     scratch_i_0[tid_0] = idx_0;
     workgroupBarrier();
     var stride_0 : u32 = u32(128);
-    for(;;)
+    loop
     {
         if(stride_0 > u32(0))
         {
@@ -66,7 +66,7 @@ fn argmax_f32(@builtin(local_invocation_id) lid_0 : vec3<u32>)
     var local_max_0 : f32 = -3.4028234663852886e+38f;
     var local_idx_0 : u32 = u32(0);
     var i_0 : u32 = tid_1;
-    for(;;)
+    loop
     {
         if(i_0 < _S4)
         {

@@ -35,7 +35,7 @@ fn block_sum_0( tid_0 : u32,  v_0 : f32) -> f32
     scratch_0[tid_0] = v_0;
     workgroupBarrier();
     var s_0 : u32 = u32(16);
-    for(;;)
+    loop
     {
         if(s_0 > u32(0))
         {
@@ -96,7 +96,7 @@ fn moe_gemv_q4_0(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workg
     var _S7 : u32 = lid_0.x;
     var bi_0 : u32 = _S7;
     var sum_0 : f32 = 0.0f;
-    for(;;)
+    loop
     {
         if(bi_0 < nb_0)
         {
@@ -109,7 +109,7 @@ fn moe_gemv_q4_0(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(workg
         var _S8 : u32 = _S5 + bi_0 * u32(32);
         var i_0 : u32 = u32(0);
         var acc_0 : f32 = 0.0f;
-        for(;;)
+        loop
         {
             if(i_0 < u32(16))
             {

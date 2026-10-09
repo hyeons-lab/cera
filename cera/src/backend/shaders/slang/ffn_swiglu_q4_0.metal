@@ -68,7 +68,7 @@ uint q_pair_0(uint device* w_1, uint qs_byte_0)
 }
 
 
-#line 164
+#line 24
 struct KernelContext_0
 {
     packed_uint4 device* params_0;

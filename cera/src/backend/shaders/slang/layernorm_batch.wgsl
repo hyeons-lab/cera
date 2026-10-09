@@ -15,7 +15,7 @@ fn block_sum_0( tid_0 : u32,  v_0 : f32) -> f32
     scratch_0[tid_0] = v_0;
     workgroupBarrier();
     var s_0 : u32 = u32(128);
-    for(;;)
+    loop
     {
         if(s_0 > u32(0))
         {
@@ -47,7 +47,7 @@ fn layernorm_batch(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wor
     var _S3 : u32 = row_0 * par_buf_0[i32(0)].w;
     var i_0 : u32 = tid_1;
     var partial_0 : f32 = 0.0f;
-    for(;;)
+    loop
     {
         if(i_0 < n_0)
         {
@@ -66,7 +66,7 @@ fn layernorm_batch(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wor
     workgroupBarrier();
     i_0 = tid_1;
     partial_0 = 0.0f;
-    for(;;)
+    loop
     {
         if(i_0 < n_0)
         {
@@ -83,7 +83,7 @@ fn layernorm_batch(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(wor
     var _S7 : f32 = block_sum_0(tid_1, partial_0);
     var _S8 : f32 = 1.0f / sqrt(_S7 / _S5 + eps_0);
     i_0 = tid_1;
-    for(;;)
+    loop
     {
         if(i_0 < n_0)
         {
