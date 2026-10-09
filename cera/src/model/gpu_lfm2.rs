@@ -737,6 +737,53 @@ fn assert_kv_dim_packable(kv_dim: usize, head_dim: usize) {
     );
 }
 
+/// The most work one `attention_prefill` dispatch may do, in units of one query reading one key
+/// row for one head.
+///
+/// A mobile GPU kills a dispatch that runs for seconds: an Adreno 830 lost the device on a
+/// 6784-token bidirectional call, which is one dispatch of about 2.7 s at the kernel's measured
+/// 0.07 TFLOPS, though 4000 rows (0.9 s) was fine. 2^25 units of 256 flops each (head_dim 64) is
+/// about 0.12 s there, which leaves a large margin for slower drivers and costs only a few
+/// dozen dispatches on the longest prompt.
+const ATTENTION_PREFILL_MAX_WORK: u64 = 1 << 25;
+
+/// Split `n` queries (at positions `start_pos..start_pos + n`) into `(q_base, n_sub)` chunks, one
+/// dispatch each, so that no chunk does more than [`ATTENTION_PREFILL_MAX_WORK`].
+///
+/// A causal chunk reads up to the position of its last query; a bidirectional one reads all
+/// `start_pos + n` rows. Chunks are multiples of the kernel's 8-query workgroup, except the last,
+/// and never smaller than 8 queries however long the keys are.
+fn attention_prefill_chunks(n: u32, n_heads: u32, start_pos: u32, bidir: bool) -> Vec<(u32, u32)> {
+    attention_prefill_chunks_within(n, n_heads, start_pos, bidir, ATTENTION_PREFILL_MAX_WORK)
+}
+
+fn attention_prefill_chunks_within(
+    n: u32,
+    n_heads: u32,
+    start_pos: u32,
+    bidir: bool,
+    max_work: u64,
+) -> Vec<(u32, u32)> {
+    let mut chunks = Vec::new();
+    let mut q_base = 0u32;
+    while q_base < n {
+        let keys = |len: u32| {
+            u64::from(if bidir {
+                start_pos + n
+            } else {
+                start_pos + q_base + len
+            })
+        };
+        let mut len = n - q_base;
+        while len > 8 && u64::from(len) * keys(len) * u64::from(n_heads) > max_work {
+            len = (len / 2 / 8 * 8).max(8);
+        }
+        chunks.push((q_base, len));
+        q_base += len;
+    }
+    chunks
+}
+
 fn packed_f16_binding(buffer: &wgpu::Buffer, len_floats: u64) -> wgpu::BindingResource<'_> {
     let bytes = len_floats
         .checked_mul(2)
@@ -7539,64 +7586,69 @@ impl GpuLfmModel {
             "attention_prefill live KV",
         );
 
-        // Single dispatch over the whole query batch; `q_base = 0`. The kernel
-        // still honors `q_base`, so a caller could sub-batch queries, but with the
-        // scores slab gone there is no binding-size reason to. 8 queries share
-        // each workgroup (and each K/V tile stream); params[11] is the
-        // authoritative batch size edge workgroups mask against.
-        let params: [u32; 14] = [
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            kv_dim,
-            max_seq,
-            scale.to_bits(),
-            start_pos,
-            n,
-            q_stride,
-            out_stride,
-            0, // q_base
-            n, // n_sub (authoritative; single dispatch so == batch size)
-            u32::from(bidir_prefix.is_some()),
-            bidir_prefix.unwrap_or(0),
-        ];
-        let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
-        let bg = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.pipelines.attention_prefill.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: q_batch.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: packed_f16_binding(k_cache, kv_live_floats),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: packed_f16_binding(v_cache, kv_live_floats),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: out_batch.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: p_buf.as_entire_binding(),
-                    },
-                ],
-            });
-        Self::push_prefill_dispatch(
-            cmds,
-            &self.pipelines.attention_prefill,
-            bg,
-            (n_heads, n.div_ceil(8), 1),
-            "attention_prefill",
-        );
+        // One dispatch per chunk of queries (`q_base`/`n_sub`), each short enough for a mobile
+        // GPU's hang detector: the kernel's work is queries x keys x heads, so a long call is
+        // quadratic and a single dispatch over it can run for seconds. 8 queries share each
+        // workgroup (and each K/V tile stream); params[11] is the authoritative chunk size edge
+        // workgroups mask against, params[7] the whole call's key rows for a bidirectional pass.
+        let total_rows = start_pos + n;
+        for (q_base, n_sub) in
+            attention_prefill_chunks(n, n_heads, start_pos, bidir_prefix.is_some())
+        {
+            let params: [u32; 14] = [
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_dim,
+                max_seq,
+                scale.to_bits(),
+                start_pos,
+                total_rows,
+                q_stride,
+                out_stride,
+                q_base,
+                n_sub,
+                u32::from(bidir_prefix.is_some()),
+                bidir_prefix.unwrap_or(0),
+            ];
+            let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
+            let bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.pipelines.attention_prefill.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: q_batch.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: packed_f16_binding(k_cache, kv_live_floats),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: packed_f16_binding(v_cache, kv_live_floats),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: out_batch.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: p_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+            Self::push_prefill_dispatch(
+                cmds,
+                &self.pipelines.attention_prefill,
+                bg,
+                (n_heads, n_sub.div_ceil(8), 1),
+                "attention_prefill",
+            );
+        }
     }
 
     /// Batched prefill — single-pass over `n` tokens for all layers, then
@@ -10877,6 +10929,56 @@ async fn gemm_q4_0_microbench_async(
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
     use crate::backend::wgpu::{DevicePollExt, GpuContext};
+
+    /// The attention chunk plan covers every query exactly once, in order, keeps each chunk
+    /// within the work cap (down to the 8-query floor), and splits a long call on a phone's
+    /// budget while leaving a short one whole. Pure host check.
+    #[test]
+    fn attention_prefill_chunks_cover_the_queries_within_the_cap() {
+        use super::{
+            ATTENTION_PREFILL_MAX_WORK, attention_prefill_chunks, attention_prefill_chunks_within,
+        };
+        for &(n, heads, start, bidir) in &[
+            (1u32, 16u32, 0u32, true),
+            (7, 16, 0, true),
+            (257, 16, 0, true),
+            (1534, 16, 0, true),
+            (6784, 16, 0, true),
+            (30_000, 16, 0, true),
+            (6784, 16, 0, false),
+            (4096, 32, 9_000, false),
+            (4096, 32, 9_000, true),
+        ] {
+            let chunks = attention_prefill_chunks(n, heads, start, bidir);
+            let mut next = 0u32;
+            for (i, &(q_base, len)) in chunks.iter().enumerate() {
+                assert_eq!(q_base, next, "chunks are contiguous: {chunks:?}");
+                assert!(len > 0);
+                if i + 1 < chunks.len() {
+                    assert_eq!(len % 8, 0, "only the last chunk may be ragged");
+                }
+                let keys = if bidir {
+                    start + n
+                } else {
+                    start + q_base + len
+                };
+                assert!(
+                    len == 8.min(n - q_base)
+                        || u64::from(len) * u64::from(keys) * u64::from(heads)
+                            <= ATTENTION_PREFILL_MAX_WORK,
+                    "chunk ({q_base}, {len}) of n={n} over the cap"
+                );
+                next = q_base + len;
+            }
+            assert_eq!(next, n, "all queries covered for n={n}");
+        }
+        // a short call stays one dispatch; a long bidirectional one is split many times
+        assert_eq!(attention_prefill_chunks(300, 16, 0, true), vec![(0, 300)]);
+        assert!(attention_prefill_chunks(6784, 16, 0, true).len() >= 16);
+        // a tiny cap forces the 8-query floor
+        let tiny = attention_prefill_chunks_within(20, 16, 0, true, 1);
+        assert_eq!(tiny, vec![(0, 8), (8, 8), (16, 4)]);
+    }
 
     /// `--spv` bytes are validated before reaching the driver: word
     /// alignment, the size cap, and the 5-word header shape each fail with
