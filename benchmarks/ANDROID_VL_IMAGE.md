@@ -117,6 +117,33 @@ large image comes from the vision tower (3.1 against 5.1 s) and from that slow m
 faster prefill kernels; CPU decode is level with llama.cpp within the run-to-run spread (a 5 to 10% edge in
 some cells is inside the ranges). Raw data: `android_vl_image_raw/rerun_20261009/`.
 
+### GPU prefill: a register-tiled causal attention kernel
+
+The text-only profile of a 512-token GPU prefill (`CERA_GPU_PROFILE=1`, wgpu timestamps) put 64% of the 205 ms
+in the Q4_0 GEMMs and 22.6% (46 ms, six layers) in `attention_prefill`, which ran at about 0.07 TFLOPS. The
+scalar kernel dates from before the head_dim-64 tiled kernel (`attention_flash_hd64.wgsl`, 0.2 TFLOPS on this
+Adreno), which only handled f32 K/V and bidirectional windows, so the causal prefill over the packed-f16 cache
+never used it. `attention_prefill_hd64.wgsl` is that tiled kernel with the cache's packed-f16 loads and the
+prefill's windows (causal with `start_pos`, bidirectional with a media prefix, split into `q_base`/`n_sub`
+dispatches); it is chosen for head_dim 64 on desktop adapters and Adreno, and `CERA_WGPU_ATTN_SCALAR=1` selects
+the old kernel for an A/B. The attention phase falls from 45.9 to 14.8 ms and the whole 512-token prefill from
+206 to 174 ms under the profiler.
+
+Gated like the text-only runs above (AP sensor at 28 C or less before every invocation, rotating order, 3 rounds,
+medians; `android_vl_image_raw/causal_attention_20261009/`), prefill tok/s on the GPU:
+
+| Prompt | scalar attention | tiled attention | llama.cpp (OpenCL) | tiled / scalar | tiled / llama.cpp |
+|---|---:|---:|---:|---:|---:|
+| 512 tokens | 2,414 | 2,844 | 3,275 | 1.18 | 0.87 |
+| 1,024 | 1,978 | 2,636 | 3,135 | 1.33 | 0.84 |
+| 2,048 | 1,427 | 2,251 | 2,891 | 1.58 | 0.78 |
+
+The gain grows with the context because attention is quadratic; the rest of the gap is the Q4_0 GEMMs
+(about 2.2 TFLOPS) and, at 2,048 tokens, attention again. Accuracy on the device: over seven prompts of 60 to
+3,600 characters the full next-token logits of the tiled kernel agree with the CPU's as closely as the scalar
+kernel's do (cosine 0.9999 or better on six; the seventh, a noisy prompt, is 0.9989 against the scalar kernel's
+0.9957), with the same argmax on every prompt.
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
