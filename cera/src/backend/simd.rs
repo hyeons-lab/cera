@@ -11857,6 +11857,7 @@ pub(crate) mod neon {
         /// Q8_0 weights repacked into the Q4_0 smmla layout (`repack_q8_0_smmla_8x8`) and run through
         /// the column-major dispatch must agree with the standard Q8_0 kernel, and both must sit at
         /// the f32 rounding floor of an f64 reference. Prints the three errors (`--nocapture`).
+        #[cfg(not(has_blas))]
         #[test]
         fn q8_0_smmla_matches_standard_kernel() {
             if !require_i8mm_kernel_or_skip() {
