@@ -11925,6 +11925,70 @@ pub(crate) mod neon {
             }
         }
 
+        /// Decode GEMV timing per weight shape and dtype through `gemv_with_preq`, the entry the
+        /// models' decode uses, with weights rotated through >=64 MB so they stream from DRAM.
+        /// `cera_tests decode_gemv_microbench --ignored --nocapture --test-threads=1` on a device.
+        #[test]
+        #[ignore = "microbenchmark: run explicitly on a device"]
+        fn decode_gemv_microbench() {
+            use crate::tensor::DType;
+            for (name, dtype, m, k) in [
+                ("q8 ffn gate 4608x1024", DType::Q8_0, 4608usize, 1024usize),
+                ("q8 ffn down 1024x4608", DType::Q8_0, 1024, 4608),
+                ("q8 conv in 3072x1024", DType::Q8_0, 3072, 1024),
+                ("q8 out 1024x1024", DType::Q8_0, 1024, 1024),
+                ("q8 lm head 65536x1024", DType::Q8_0, 65536, 1024),
+                ("q4 ffn gate 4608x1024", DType::Q4_0, 4608, 1024),
+            ] {
+                let mut st = 0xdec0_de00u64 ^ (m as u64) ^ ((k as u64) << 20);
+                let nb = k / 32;
+                let row_bytes = match dtype {
+                    DType::Q8_0 => nb * std::mem::size_of::<BlockQ8_0>(),
+                    _ => nb * std::mem::size_of::<BlockQ4_0>(),
+                };
+                let one: Vec<u8> = (0..m * row_bytes)
+                    .map(|_| (lcg(&mut st) * 127.0) as i32 as u8)
+                    .collect();
+                // make scales sane: f16 of a small value at each block's first two bytes
+                let mut one = one;
+                let blk = row_bytes / nb;
+                for b in 0..m * nb {
+                    let h = crate::quant::f32_to_f16(0.01).to_le_bytes();
+                    one[b * blk] = h[0];
+                    one[b * blk + 1] = h[1];
+                }
+                let copies = (64usize << 20).div_ceil(one.len()).max(2);
+                let ws: Vec<Vec<u8>> = (0..copies).map(|_| one.clone()).collect();
+                let x: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+                let (xs, xq) = quantize_col(&x);
+                let mut y = vec![0.0f32; m];
+                let mut times = Vec::new();
+                for i in 0..60 {
+                    let t0 = std::time::Instant::now();
+                    crate::backend::cpu::gemv_with_preq(
+                        dtype,
+                        &ws[i % copies],
+                        &xs,
+                        &xq,
+                        &x,
+                        &mut y,
+                        m,
+                        k,
+                    );
+                    if i >= 10 {
+                        times.push(t0.elapsed().as_secs_f64());
+                    }
+                }
+                times.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                let med = times[times.len() / 2];
+                println!(
+                    "{name:>24}: median {:7.3} ms  {:6.1} GB/s",
+                    med * 1e3,
+                    one.len() as f64 / med / 1e9
+                );
+            }
+        }
+
         /// Accuracy of the Q4_1 smmla path against an f64 reference, next to the standard kernel's,
         /// on weights shaped like a real Q4_1 tensor (`m` near `-8 d`, so the offset term cancels
         /// most of the unsigned-nibble dot) at the Llama down-projection depth.
