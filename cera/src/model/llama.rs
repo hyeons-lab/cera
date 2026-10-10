@@ -225,6 +225,58 @@ fn lm_head_gemm_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var("CERA_LM_HEAD_NO_GEMM").as_deref() == Ok("1"))
 }
 
+/// Per-phase wall time of the dense batched prefill, printed with `CERA_PROFILE_PREFILL=1` (one line per
+/// prefill call). The phases are the `PREFILL_PHASES` names, in the order the layer loop crosses them.
+struct PrefillProf {
+    on: bool,
+    last: std::time::Instant,
+    acc: [std::time::Duration; 8],
+}
+
+const PREFILL_PHASES: [&str; 8] = [
+    "norm",
+    "qkv_gemm",
+    "rope_kv",
+    "attention",
+    "out_proj",
+    "ffn_norm",
+    "gate_up_silu",
+    "down_residual",
+];
+
+impl PrefillProf {
+    fn new() -> Self {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ENABLED.get_or_init(|| std::env::var_os("CERA_PROFILE_PREFILL").is_some());
+        Self {
+            on,
+            last: std::time::Instant::now(),
+            acc: [std::time::Duration::ZERO; 8],
+        }
+    }
+
+    /// Charge the time since the previous lap to `phase`.
+    fn lap(&mut self, phase: usize) {
+        if self.on {
+            let now = std::time::Instant::now();
+            self.acc[phase] += now - self.last;
+            self.last = now;
+        }
+    }
+
+    fn report(&self, n: usize) {
+        if self.on {
+            let total: std::time::Duration = self.acc.iter().sum();
+            let mut line = format!("[PROFILE PREFILL dense] n={n}");
+            for (name, d) in PREFILL_PHASES.iter().zip(&self.acc) {
+                line.push_str(&format!(" | {name}: {:.2}ms", d.as_secs_f64() * 1e3));
+            }
+            line.push_str(&format!(" | total: {:.2}ms", total.as_secs_f64() * 1e3));
+            eprintln!("{line}");
+        }
+    }
+}
+
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 #[inline]
 fn apply_column_major_bias(mat: &mut [f32], bias: &[f32], dim: usize, n: usize) {
@@ -2376,6 +2428,7 @@ impl LlamaModel {
         let mut kv_widen_k: Vec<f32> = Vec::new();
         let mut kv_widen_v: Vec<f32> = Vec::new();
 
+        let mut prof = PrefillProf::new();
         for layer in 0..cfg.n_layers {
             let refs = &self.layer_refs[layer];
 
@@ -2409,6 +2462,7 @@ impl LlamaModel {
                 NormOrder::PostNorm => &hidden,
             };
 
+            prof.lap(0);
             // Batched Q/K/V projections (weight [m×hs] × normed[hs×n] → [m×n]).
             #[cfg(has_blas)]
             {
@@ -2485,6 +2539,7 @@ impl LlamaModel {
                 );
             }
 
+            prof.lap(1);
             // LoRA on Q/K/V: added to the projection outputs before bias/RoPE,
             // input is the normed hidden `[hs×n]` (matches the decode hook order).
             if let Some(lora) = &lora {
@@ -2686,6 +2741,7 @@ impl LlamaModel {
                 }
             }
 
+            prof.lap(2);
             // Pass B: GQA attention over the now-complete KV cache → out_proj_input.
             // In f16 mode, widen the half cache into the reused f32 scratch once
             // per layer so the flash/naive kernels below stay f32-only (prefill
@@ -2844,6 +2900,7 @@ impl LlamaModel {
                 }
             }
 
+            prof.lap(3);
             // Batched output projection GEMM -> block_out[hs * n] (k = q_dim).
             #[cfg(has_blas)]
             {
@@ -2922,6 +2979,7 @@ impl LlamaModel {
             }
             cpu::add_inplace(&mut hidden, &block_out);
 
+            prof.lap(4);
             // FFN pre-norm: rmsnorm each column (PreNorm only).
             let ffn_in: &[f32] = match self.norm_order {
                 NormOrder::PreNorm => {
@@ -2952,6 +3010,7 @@ impl LlamaModel {
                 NormOrder::PostNorm => &hidden,
             };
 
+            prof.lap(5);
             // FFN gate/up GEMM → silu(gate)⊙up → down GEMM.
             #[cfg(has_blas)]
             {
@@ -3046,6 +3105,7 @@ impl LlamaModel {
                     cpu::gelu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
                 }
             }
+            prof.lap(6);
 
             #[cfg(has_blas)]
             {
@@ -3123,6 +3183,7 @@ impl LlamaModel {
             }
             cpu::add_inplace(&mut hidden, &ffn_out);
 
+            prof.lap(7);
             if self
                 .loop_norm_interval
                 .is_some_and(|n_phys| (layer + 1) % n_phys == 0)
@@ -3148,6 +3209,7 @@ impl LlamaModel {
             }
         }
 
+        prof.report(n);
         // Advance seq_len (the block loops appended KV cells without bumping it).
         state.seq_len = start_pos + n;
 
