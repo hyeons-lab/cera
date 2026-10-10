@@ -1534,6 +1534,13 @@ pub(crate) fn gemm_out_to_rows(src: &[f32], rows: usize, n: usize, cols: usize, 
     }
 }
 
+/// Columns per work item in [`quantize_columns`]: one 64-byte cache line of f32.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    feature = "parallel"
+))]
+const QUANT_COL_TILE: usize = 16;
+
 /// Quantize all `n` columns of a column-major `[dim × n]` matrix to Q8_0
 /// (no-`blas` fallback). `col` is a scratch column of length ≥ `dim`;
 /// `scales`/`quants` receive the packed `[n][dim/32]` / `[n][dim]` layout the
@@ -1585,22 +1592,56 @@ pub(crate) fn quantize_columns(
     {
         let min_cols = cpu::prequant_par_min_cols();
         if n >= min_cols {
+            // Work item = `QUANT_COL_TILE` adjacent columns. Gathering one column at a
+            // time touches a fresh cache line per element (stride `n` floats) and the
+            // other columns sharing that line are fetched again by other workers; at
+            // `dim` = 8192 (the FFN down input, 16 MB) that thrashed to 20x the cost of
+            // the 4x smaller `dim` = 2048 case. A tile reads each row's 16 columns as
+            // one 64-byte run into an L1-resident transpose buffer, then quantizes each
+            // column's 32-float block exactly as before (same bytes out).
             let mat_ptr = mat.as_ptr() as usize;
             let quants_ptr = quants.as_mut_ptr() as usize;
-            cpu::par_rows_n(&mut scales[..n * nb], nb, min_cols, move |(j, sc)| {
-                let mat = mat_ptr as *const f32;
-                let qcol = (quants_ptr as *mut i8).wrapping_add(j * dim);
-                let mut blk = [0.0f32; 32];
-                for b in 0..nb {
-                    for (t, bt) in blk.iter_mut().enumerate() {
-                        *bt = unsafe { *mat.add((b * 32 + t) * n + j) };
+            let tile_min = min_cols.div_ceil(QUANT_COL_TILE).max(1);
+            cpu::par_rows_n(
+                &mut scales[..n * nb],
+                QUANT_COL_TILE * nb,
+                tile_min,
+                move |(g, sc)| {
+                    let mat = mat_ptr as *const f32;
+                    let j0 = g * QUANT_COL_TILE;
+                    let ncols = sc.len() / nb;
+                    let mut tile = [[0.0f32; QUANT_COL_TILE]; 32];
+                    let mut blk = [0.0f32; 32];
+                    for b in 0..nb {
+                        for (t, row) in tile.iter_mut().enumerate() {
+                            // SAFETY: row `b * 32 + t < dim`, columns `j0..j0 + ncols <= n`,
+                            // and `mat.len() >= dim * n` was asserted above.
+                            let src = unsafe { mat.add((b * 32 + t) * n + j0) };
+                            for (c, v) in row.iter_mut().enumerate().take(ncols) {
+                                *v = unsafe { *src.add(c) };
+                            }
+                        }
+                        for c in 0..ncols {
+                            for (t, bt) in blk.iter_mut().enumerate() {
+                                *bt = tile[t][c];
+                            }
+                            // SAFETY: column `j0 + c` owns `quants[(j0 + c) * dim..][..dim]`,
+                            // disjoint across columns and across work items.
+                            unsafe {
+                                let qs = core::slice::from_raw_parts_mut(
+                                    (quants_ptr as *mut i8).add((j0 + c) * dim + b * 32),
+                                    32,
+                                );
+                                cpu::quantize_f32_to_q8_0_into(
+                                    &blk,
+                                    &mut sc[c * nb + b..c * nb + b + 1],
+                                    qs,
+                                );
+                            }
+                        }
                     }
-                    unsafe {
-                        let qs = core::slice::from_raw_parts_mut(qcol.add(b * 32), 32);
-                        cpu::quantize_f32_to_q8_0_into(&blk, &mut sc[b..b + 1], qs);
-                    }
-                }
-            });
+                },
+            );
             return;
         }
     }
@@ -2834,8 +2875,15 @@ mod tests {
     /// above `prequant_par_min_cols()`, so the parallel branch is the one exercised.
     #[test]
     fn quantize_columns_parallel_matches_serial() {
-        let dim = 256usize;
-        let n = 64usize; // ≥ prequant_par_min_cols() → the parallel branch runs.
+        // All at or above the 256-column parallel threshold: 256 and 512 fill whole
+        // tiles, 275 leaves a ragged 3-column tail tile.
+        for n in [256usize, 275, 512] {
+            quantize_columns_matches_serial_at(256, n);
+        }
+    }
+
+    fn quantize_columns_matches_serial_at(dim: usize, n: usize) {
+        // `n` ≥ prequant_par_min_cols() → the parallel branch runs.
         let nb = dim / 32;
 
         // Deterministic column-major [dim × n] activation matrix.
