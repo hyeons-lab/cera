@@ -84,7 +84,8 @@ pub enum Repacked {
         packed: Vec<u8>,
         scales: Vec<f32>,
     },
-    /// Smmla (i8mm) twin of [`Repacked::Q40`]: same shapes
+    /// Smmla (i8mm) twin of [`Repacked::Q40`] (also built for Q8_0 weights, whose int8 quants
+    /// repack into the identical layout): same shapes
     /// (`(m/8)*nb*256` packed bytes, `(m/8)*nb*8` f32 scales) but the
     /// [`crate::backend::cpu::repack_q4_0_smmla_8x8`] row-pair × 8-wide
     /// k-chunk interleave instead of the vdot 4-wide one. Built instead of
@@ -353,6 +354,7 @@ impl WeightRef {
             // (a weight that qualified for one can never take the other).
             let qualifies = (self.dtype == DType::Q4_0
                 && cpu::q4_0_repack_supported(self.m, self.k))
+                || (self.dtype == DType::Q8_0 && cpu::q8_0_smmla_repack_supported(self.m, self.k))
                 || (self.dtype == DType::Q4KM && cpu::q4_k_repack_supported(self.m, self.k))
                 || (self.dtype == DType::Q6K && cpu::q6_k_repack_supported(self.m, self.k));
             if !do_repack {
@@ -378,6 +380,16 @@ impl WeightRef {
                         cpu::repack_q4_0_8x8(weight_data(gguf, &self), self.m, self.k);
                     kind = Some(Repacked::Q40 { packed, scales });
                 }
+            }
+            // Q8_0 rides the Q4_0 smmla kernels: `repack_q8_0_smmla_8x8` writes the same int8
+            // super-row layout and f32 row scales (pinned by
+            // `test_q8_0_smmla_repack_matches_q4_0_layout`), so every consumer of
+            // `Repacked::Q40Smmla` (GEMM, fused gate/up, fused QKV) takes it unchanged. The
+            // support check includes the i8mm tier; elsewhere Q8_0 keeps the standard kernel.
+            if qualifies && self.dtype == DType::Q8_0 {
+                let (packed, scales) =
+                    cpu::repack_q8_0_smmla_8x8(weight_data(gguf, &self), self.m, self.k);
+                kind = Some(Repacked::Q40Smmla { packed, scales });
             }
             if qualifies && self.dtype == DType::Q4KM {
                 #[cfg(target_arch = "aarch64")]
@@ -1779,15 +1791,24 @@ pub(crate) fn quantize_rows(
         if n >= min_cols {
             let mat_ptr = mat.as_ptr() as usize;
             let quants_ptr = quants.as_mut_ptr() as usize;
-            cpu::par_rows_n(&mut scales[..n * nb], nb, min_cols, move |(j, sc)| {
-                let tok_f32 = unsafe {
-                    core::slice::from_raw_parts((mat_ptr as *const f32).add(j * dim), dim)
-                };
-                let tok_qs = unsafe {
-                    core::slice::from_raw_parts_mut((quants_ptr as *mut i8).add(j * dim), dim)
-                };
-                cpu::quantize_f32_to_q8_0_into(tok_f32, sc, tok_qs);
-            });
+            // Rows are tokens (cheap, many): small steal chunks over the whole pool. The old
+            // `min_cols` rows-per-worker floor made a 512-token chunk a 2-worker dispatch.
+            cpu::par_rows_n_chunked_active(
+                &mut scales[..n * nb],
+                nb,
+                1,
+                4,
+                usize::MAX,
+                move |(j, sc)| {
+                    let tok_f32 = unsafe {
+                        core::slice::from_raw_parts((mat_ptr as *const f32).add(j * dim), dim)
+                    };
+                    let tok_qs = unsafe {
+                        core::slice::from_raw_parts_mut((quants_ptr as *mut i8).add(j * dim), dim)
+                    };
+                    cpu::quantize_f32_to_q8_0_into(tok_f32, sc, tok_qs);
+                },
+            );
             return;
         }
     }

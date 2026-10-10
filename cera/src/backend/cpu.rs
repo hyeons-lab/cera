@@ -2155,11 +2155,11 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_dispatch(
     #[cfg(target_arch = "aarch64")]
     {
         assert!(
-            k.is_multiple_of(32) && m.is_multiple_of(16),
-            "gemm_preq_repacked_q4_0_smmla_dispatch: need k%32==0 and m%16==0, got m={m} k={k}"
+            k.is_multiple_of(32) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q4_0_smmla_dispatch: need k%32==0 and m%8==0, got m={m} k={k}"
         );
         assert!(
-            packed.len() >= (m / 16) * nb * 512 && scales.len() >= (m / 16) * nb * 16,
+            packed.len() >= (m / 8) * nb * 256 && scales.len() >= (m / 8) * nb * 8,
             "gemm_preq_repacked_q4_0_smmla_dispatch: repacked weights too small for {m}x{k}"
         );
     }
@@ -5444,6 +5444,13 @@ pub fn relu_inplace(x: &mut [f32]) {
     }
 }
 
+/// Smallest element count at which the element-wise activations (SiLU/GeLU gating, soft-cap) fan
+/// out over the pool. They dispatch on the *prefill* pool, whose workers are parked during decode:
+/// a 4608-element SwiGLU (one token's FFN) used to wake three of them through futexes to run a
+/// single 512-element chunk, ~2 ms per layer of system time, ten times the three GEMVs it follows
+/// (the unfused-FFN decode path of Q8_0 models). Serial is a few microseconds at that size.
+const ELEMENTWISE_PAR_MIN: usize = 16384;
+
 /// Fused SiLU activation + element-wise multiply: gate = silu(gate) * up.
 /// Single pass instead of separate silu_inplace + mul_inplace.
 pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
@@ -5451,7 +5458,7 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     let len = gate.len().min(up.len());
     let gate = &mut gate[..len];
     let up = &up[..len];
-    if len >= 2048 {
+    if len >= ELEMENTWISE_PAR_MIN {
         let chunk_size = 512;
         let up_ptr = up.as_ptr() as usize;
         par_rows_n(gate, chunk_size, 4, move |(idx, g_chunk)| {
@@ -5493,7 +5500,7 @@ pub fn gelu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     let len = gate.len().min(up.len());
     let gate = &mut gate[..len];
     let up = &up[..len];
-    if len >= 2048 {
+    if len >= ELEMENTWISE_PAR_MIN {
         let chunk_size = 512;
         let up_ptr = up.as_ptr() as usize;
         par_rows_n(gate, chunk_size, 4, move |(idx, g_chunk)| {
@@ -5521,7 +5528,7 @@ pub fn softcap_inplace(x: &mut [f32], cap: f32) {
         return;
     }
     let inv_cap = 1.0 / cap;
-    if x.len() >= 2048 {
+    if x.len() >= ELEMENTWISE_PAR_MIN {
         let chunk_size = 512;
         par_rows_n(x, chunk_size, 4, move |(_idx, chunk)| {
             for v in chunk.iter_mut() {

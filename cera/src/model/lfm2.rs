@@ -4719,11 +4719,9 @@ impl LfmModel {
                                     );
                                 }
                             }
-                            for j in 0..n {
-                                let g = &mut gate_mat[j * is..(j + 1) * is];
-                                let u = &up_mat[j * is..(j + 1) * is];
-                                cpu::silu_mul_inplace(g, u);
-                            }
+                            // Elementwise over the whole `[n x is]` block: one pool dispatch, not
+                            // one 9-row dispatch per token (which ran on a single worker).
+                            cpu::silu_mul_inplace(&mut gate_mat[..n * is], &up_mat[..n * is]);
                         }
                         if profile_prefill {
                             t_ffn_gate_up += t_gu.elapsed();
