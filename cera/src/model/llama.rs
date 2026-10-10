@@ -2445,19 +2445,14 @@ impl LlamaModel {
                             cfg.rms_norm_eps,
                         );
                     } else {
-                        for j in 0..n {
-                            for i in 0..hs {
-                                norm_col[i] = hidden[i * n + j];
-                            }
-                            cpu::rmsnorm(
-                                &mut norm_col,
-                                &self.attn_norm_weights[layer],
-                                cfg.rms_norm_eps,
-                            );
-                            for i in 0..hs {
-                                normed[i * n + j] = norm_col[i];
-                            }
-                        }
+                        transformer::rmsnorm_columns(
+                            &hidden,
+                            &mut normed,
+                            &self.attn_norm_weights[layer],
+                            cfg.rms_norm_eps,
+                            hs,
+                            n,
+                        );
                     }
                     &normed
                 }
@@ -2993,19 +2988,14 @@ impl LlamaModel {
                             cfg.rms_norm_eps,
                         );
                     } else {
-                        for j in 0..n {
-                            for i in 0..hs {
-                                ffn_col[i] = hidden[i * n + j];
-                            }
-                            cpu::rmsnorm(
-                                &mut ffn_col,
-                                &self.ffn_norm_weights[layer],
-                                cfg.rms_norm_eps,
-                            );
-                            for i in 0..hs {
-                                ffn_input[i * n + j] = ffn_col[i];
-                            }
-                        }
+                        transformer::rmsnorm_columns(
+                            &hidden,
+                            &mut ffn_input,
+                            &self.ffn_norm_weights[layer],
+                            cfg.rms_norm_eps,
+                            hs,
+                            n,
+                        );
                     }
                     &ffn_input
                 }
