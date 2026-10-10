@@ -2587,11 +2587,9 @@ impl LlamaModel {
             };
 
             // Pass A: per token, bias → QK-norm → RoPE → stash post-RoPE Q back
-            // into q_mat (so the attention pass can read every query) → append
-            // K/V to the f32 cache. Destructure the cache once (not per token)
-            // and reserve the whole prompt's growth up front (matches lfm2) so
-            // the per-token extend_from_slice doesn't repeatedly reallocate.
-            // f16 KV: append converts to half; Pass B widens back to an f32
+            // into q_mat (so the attention pass can read every query) → write
+            // K/V into the cache. Destructure the cache once (not per token).
+            // f16 KV: the write converts to half; Pass B widens back to an f32
             // scratch (below) so the existing flash/naive kernels are unchanged.
             let use_f16 = state.kv_f16;
             let (key_cache, value_cache, key_cache_f16, value_cache_f16) =
@@ -2605,26 +2603,12 @@ impl LlamaModel {
                     } => (key_cache, value_cache, key_cache_f16, value_cache_f16),
                     _ => unreachable!("dense transformer layer is always Attention"),
                 };
-            if use_f16 {
-                key_cache_f16.reserve(n * kv_dim);
-                value_cache_f16.reserve(n * kv_dim);
-            } else {
-                key_cache.reserve(n * kv_dim);
-                value_cache.reserve(n * kv_dim);
-            }
-            for j in 0..n {
-                let pos = start_pos + j;
-                let q = &mut state.scratch.q[..q_dim];
-                let k = &mut state.scratch.k[..kv_dim];
-                let v = &mut state.scratch.v[..kv_dim];
-                for i in 0..q_dim {
-                    q[i] = q_mat[i * n + j];
-                }
-                for i in 0..kv_dim {
-                    k[i] = k_mat[i * n + j];
-                    v[i] = v_mat[i * n + j];
-                }
-
+            // Tokens are independent here (the cache rows are disjoint and Pass B has
+            // not started), so Pass A fans out over the prefill pool in tiles of 16
+            // tokens: a tile gathers its columns of q/k/v (one 64-byte run per row,
+            // not one cache line per element), runs the same per-token code, scatters
+            // the post-RoPE Q back, and writes its K/V rows straight into the cache.
+            let process = |pos: usize, q: &mut [f32], k: &mut [f32], v: &mut [f32]| {
                 // Qwen2 Q/K/V bias.
                 if let Some((q_bias, k_bias, v_bias)) = qkv_bias {
                     cpu::add_inplace(q, q_bias);
@@ -2714,29 +2698,87 @@ impl LlamaModel {
                         ((pos as f32 / floor_scale as f32).floor() + 1.0).ln() * scale + 1.0;
                     cpu::scale_inplace(q, q_scale);
                 }
-
-                // Stash post-RoPE Q back into q_mat for the attention pass.
-                for i in 0..q_dim {
-                    q_mat[i * n + j] = q[i];
-                }
-
-                // Append K, V to the cache (destructured once above the loop).
-                if use_f16 {
-                    key_cache_f16.extend(
-                        state.scratch.k[..kv_dim]
-                            .iter()
-                            .map(|&x| crate::quant::f32_to_f16(x)),
-                    );
-                    value_cache_f16.extend(
-                        state.scratch.v[..kv_dim]
-                            .iter()
-                            .map(|&x| crate::quant::f32_to_f16(x)),
-                    );
-                } else {
-                    key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
-                    value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
-                }
+            };
+            const TILE: usize = 16;
+            let kv_base = if use_f16 {
+                key_cache_f16.len()
+            } else {
+                key_cache.len()
+            };
+            // `resize` keeps the old `extend` contract (rows land at the end of the
+            // cache) while giving each worker a disjoint, already-initialized span.
+            if use_f16 {
+                key_cache_f16.resize(kv_base + n * kv_dim, 0);
+                value_cache_f16.resize(kv_base + n * kv_dim, 0);
+            } else {
+                key_cache.resize(kv_base + n * kv_dim, 0.0);
+                value_cache.resize(kv_base + n * kv_dim, 0.0);
             }
+            let q_mat_ptr = q_mat.as_mut_ptr() as usize;
+            let kc32 = key_cache.as_mut_ptr() as usize;
+            let vc32 = value_cache.as_mut_ptr() as usize;
+            let kc16 = key_cache_f16.as_mut_ptr() as usize;
+            let vc16 = value_cache_f16.as_mut_ptr() as usize;
+            let (k_src, v_src) = (&k_mat[..], &v_mat[..]);
+            cpu::par_range_prefill(n.div_ceil(TILE), 1, |tile0, n_tiles| {
+                let q_mat = q_mat_ptr as *mut f32;
+                let mut qb = vec![0.0f32; TILE * q_dim];
+                let mut kb = vec![0.0f32; TILE * kv_dim];
+                let mut vb = vec![0.0f32; TILE * kv_dim];
+                for tile in tile0..tile0 + n_tiles {
+                    let j0 = tile * TILE;
+                    let nc = TILE.min(n - j0);
+                    for i in 0..q_dim {
+                        for c in 0..nc {
+                            // SAFETY: `i * n + j0 + c < q_dim * n`; tiles own disjoint columns.
+                            qb[c * q_dim + i] = unsafe { *q_mat.add(i * n + j0 + c) };
+                        }
+                    }
+                    for i in 0..kv_dim {
+                        for c in 0..nc {
+                            kb[c * kv_dim + i] = k_src[i * n + j0 + c];
+                            vb[c * kv_dim + i] = v_src[i * n + j0 + c];
+                        }
+                    }
+                    for c in 0..nc {
+                        let j = j0 + c;
+                        let q = &mut qb[c * q_dim..(c + 1) * q_dim];
+                        let k = &mut kb[c * kv_dim..(c + 1) * kv_dim];
+                        let v = &mut vb[c * kv_dim..(c + 1) * kv_dim];
+                        process(start_pos + j, q, k, v);
+                        let row = kv_base + j * kv_dim;
+                        // SAFETY: row `kv_base + j * kv_dim` was sized by the `resize` above and
+                        // is written only by the tile that owns token `j`.
+                        unsafe {
+                            if use_f16 {
+                                let (dk, dv) =
+                                    ((kc16 as *mut u16).add(row), (vc16 as *mut u16).add(row));
+                                for i in 0..kv_dim {
+                                    *dk.add(i) = crate::quant::f32_to_f16(k[i]);
+                                    *dv.add(i) = crate::quant::f32_to_f16(v[i]);
+                                }
+                            } else {
+                                core::ptr::copy_nonoverlapping(
+                                    k.as_ptr(),
+                                    (kc32 as *mut f32).add(row),
+                                    kv_dim,
+                                );
+                                core::ptr::copy_nonoverlapping(
+                                    v.as_ptr(),
+                                    (vc32 as *mut f32).add(row),
+                                    kv_dim,
+                                );
+                            }
+                        }
+                    }
+                    for i in 0..q_dim {
+                        for c in 0..nc {
+                            // SAFETY: as above; this tile's columns are written by this tile only.
+                            unsafe { *q_mat.add(i * n + j0 + c) = qb[c * q_dim + i] };
+                        }
+                    }
+                }
+            });
 
             prof.lap(2);
             // Pass B: GQA attention over the now-complete KV cache → out_proj_input.
