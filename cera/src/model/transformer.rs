@@ -1691,11 +1691,15 @@ pub(crate) fn quantize_columns(
             // column's 32-float block exactly as before (same bytes out).
             let mat_ptr = mat.as_ptr() as usize;
             let quants_ptr = quants.as_mut_ptr() as usize;
-            let tile_min = min_cols.div_ceil(QUANT_COL_TILE).max(1);
-            cpu::par_rows_n(
+            // Every tile is its own steal unit. With the old per-column floor (`min_cols`
+            // columns per worker, scaled to tiles) a 512-token chunk was 32 tiles in 2 chunks, so
+            // two workers did every activation quantize of the prefill.
+            cpu::par_rows_n_chunked_active(
                 &mut scales[..n * nb],
                 QUANT_COL_TILE * nb,
-                tile_min,
+                1,
+                1,
+                usize::MAX,
                 move |(g, sc)| {
                     let mat = mat_ptr as *const f32;
                     let j0 = g * QUANT_COL_TILE;
