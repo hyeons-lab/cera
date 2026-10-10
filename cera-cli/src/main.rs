@@ -51,10 +51,19 @@ impl ModalitySink for StdoutSink<'_> {
     fn on_done(&mut self, _reason: FinishReason) {}
 }
 
-/// Swallows every event. Used by `bench` to avoid stdout inside the timed loop.
-struct NoopSink;
+/// Swallows every event except the arrival time of the first text token. Used by `bench` to avoid
+/// stdout inside the timed loop while still reporting the time to first token.
+#[derive(Default)]
+struct FirstTokenSink {
+    first_token_at: Option<std::time::Instant>,
+}
 
-impl ModalitySink for NoopSink {
+impl ModalitySink for FirstTokenSink {
+    fn on_text_tokens(&mut self, tokens: &[u32]) {
+        if self.first_token_at.is_none() && !tokens.is_empty() {
+            self.first_token_at = Some(std::time::Instant::now());
+        }
+    }
     fn on_done(&mut self, _reason: FinishReason) {}
 }
 
@@ -2122,6 +2131,10 @@ impl PhaseIo {
 struct RunStats {
     prefill_tps: f64,
     decode_tps: f64,
+    /// Milliseconds from handing the prompt to the session until the first generated token
+    /// arrives (prefill plus sampling it). With `--max-tokens 0` there is no token, so this is
+    /// the prefill time: the moment the first token's logits are ready.
+    ttft_ms: f64,
     decode_io: PhaseIo,
     prefill_io: PhaseIo,
 }
@@ -6467,7 +6480,7 @@ fn main() -> Result<()> {
                 eprintln!("Speculative decode: OFF");
             }
 
-            // Greedy (temp=0): deterministic, bench-friendly. NoopSink swallows tokens.
+            // Greedy (temp=0): deterministic, bench-friendly. The sink swallows tokens.
             let run_once = || -> Result<RunStats> {
                 let mut session = engine.new_session(cera::SessionConfig {
                     kv_compression: kv_compression.clone(),
@@ -6496,6 +6509,10 @@ fn main() -> Result<()> {
                     // `max_tokens`, not stop early at EOS: otherwise short
                     // completions silently shrink the measured sample.
                     ignore_eos: true,
+                    // Deliver every token as it is produced. The default batches the sink
+                    // callback (16 tokens or 50 ms), which would stamp the first token 50 ms
+                    // late and make TTFT a statement about the flush timer.
+                    flush_every_tokens: 1,
                     no_spec,
                     spec: if !no_spec && spec {
                         Some(cera::SpecDecode {
@@ -6507,7 +6524,7 @@ fn main() -> Result<()> {
                     },
                     ..Default::default()
                 };
-                let mut sink = NoopSink;
+                let mut sink = FirstTokenSink::default();
                 // Scope these counters to decode only, so the decode rates are
                 // per decoded token and not diluted by prefill (measured
                 // separately above: its submit count varies wildly depending
@@ -6526,9 +6543,15 @@ fn main() -> Result<()> {
                 } else {
                     0.0
                 };
+                let ttft_ms = sink
+                    .first_token_at
+                    .map_or(prefill_elapsed, |t| t.duration_since(prefill_start))
+                    .as_secs_f64()
+                    * 1e3;
                 Ok(RunStats {
                     prefill_tps,
                     decode_tps,
+                    ttft_ms,
                     decode_io: PhaseIo::between(
                         io_before,
                         io_after,
@@ -6559,6 +6582,7 @@ fn main() -> Result<()> {
 
             let mut decode_tps = Vec::with_capacity(runs);
             let mut prefill_tps = Vec::with_capacity(runs);
+            let mut ttft_ms = Vec::with_capacity(runs);
             let mut headrooms = Vec::with_capacity(runs);
             let mut decode_io = PhaseIo::default();
             let mut prefill_io = PhaseIo::default();
@@ -6600,10 +6624,12 @@ fn main() -> Result<()> {
                     String::new()
                 };
                 eprintln!(
-                    "run {}/{}: prefill={pf:.0} decode={dc:.1} tok/s{suffix}{pool_suffix}",
+                    "run {}/{}: prefill={pf:.0} decode={dc:.1} tok/s ttft={:.0} ms{suffix}{pool_suffix}",
                     i + 1,
-                    runs
+                    runs,
+                    r.ttft_ms
                 );
+                ttft_ms.push(r.ttft_ms);
                 decode_tps.push(dc);
                 prefill_tps.push(pf);
                 decode_io.accumulate(r.decode_io);
@@ -6630,6 +6656,11 @@ fn main() -> Result<()> {
             let (p10, p50, p90, mean, stddev) = summarize(prefill_tps);
             eprintln!(
                 "prefill tok/s: p50={p50:.0} p10={p10:.0} p90={p90:.0} mean={mean:.0} stddev={stddev:.0} (n={runs})"
+            );
+            let (p10, p50, p90, mean, stddev) = summarize(ttft_ms);
+            eprintln!(
+                "ttft ms: p50={p50:.0} p10={p10:.0} p90={p90:.0} mean={mean:.0} stddev={stddev:.0} (n={runs}; \
+                 prompt handed to the session until the first generated token, so lower is better)"
             );
 
             if gpu_io {
@@ -9090,5 +9121,20 @@ mod tests {
 
         // Shape *validation* lives in the lib (`validate_gemv_shape` /
         // `validate_gemm_shape`) with its tests; the CLI only parses.
+    }
+
+    /// `bench` stamps the first text token's arrival for TTFT: empty batches must not count, the
+    /// first non-empty one must, and later ones must not move it.
+    #[test]
+    fn first_token_sink_records_only_the_first_nonempty_batch() {
+        use super::{FirstTokenSink, ModalitySink};
+        let mut sink = FirstTokenSink::default();
+        sink.on_text_tokens(&[]);
+        assert!(sink.first_token_at.is_none());
+        sink.on_text_tokens(&[7]);
+        let first = sink.first_token_at.expect("recorded on the first token");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        sink.on_text_tokens(&[8, 9]);
+        assert_eq!(sink.first_token_at, Some(first));
     }
 }
