@@ -2050,6 +2050,88 @@ pub fn gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
     false
 }
 
+/// Whether a Q4_1 weight of `m x k` can take the smmla prefill path ([`repack_q4_1_smmla_8x8`]).
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+pub(crate) fn q4_1_smmla_repack_supported(m: usize, k: usize) -> bool {
+    cfg!(target_arch = "aarch64") && m.is_multiple_of(16) && k.is_multiple_of(32)
+}
+
+/// Repack a Q4_1 weight for the smmla prefill GEMM. A Q4_1 value is `d*q + m` with `q` in
+/// `0..16`, i.e. `d*(q - 8) + (m + 8*d)`: the first term is exactly a Q4_0 block with the same
+/// scale and nibbles, so the blocks are re-laid as Q4_0 and interleaved by
+/// [`repack_q4_0_smmla_8x8`]; the second is returned as `mprime[row * nb + block] = m + 8*d`
+/// for [`crate::backend::simd::neon::q4_1_min_correction`]. Returns `(packed, scales, mprime)`.
+#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg_attr(has_blas, allow(dead_code))]
+pub(crate) fn repack_q4_1_smmla_8x8(
+    src: &[u8],
+    m: usize,
+    k: usize,
+) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    const Q41: usize = std::mem::size_of::<crate::quant::BlockQ4_1>();
+    const Q40: usize = std::mem::size_of::<crate::quant::BlockQ4_0>();
+    let nb = k / 32;
+    assert!(
+        src.len() >= m * nb * Q41,
+        "repack_q4_1_smmla_8x8: weight too small"
+    );
+    let mut q40 = Vec::with_capacity(m * nb * Q40);
+    let mut mprime = Vec::with_capacity(m * nb);
+    for blk in src[..m * nb * Q41].as_chunks::<Q41>().0 {
+        let d = u16::from_le_bytes([blk[0], blk[1]]);
+        let mn = u16::from_le_bytes([blk[2], blk[3]]);
+        q40.extend_from_slice(&d.to_le_bytes());
+        q40.extend_from_slice(&blk[4..20]);
+        mprime.push(crate::quant::f16_to_f32(mn) + 8.0 * crate::quant::f16_to_f32(d));
+    }
+    let (packed, scales) = repack_q4_0_smmla_8x8(&q40, m, k);
+    (packed, scales, mprime)
+}
+
+/// Q4_1 prefill GEMM (column-major `out[m, n]`) over the [`repack_q4_1_smmla_8x8`] layout: the
+/// Q4_0 smmla GEMM for the `d*(q-8)` term, then the `m + 8*d` term added from the activations'
+/// block sums. Returns `false` (caller runs the standard Q4_1 kernel) below 4 tokens, which keeps
+/// single-token decode on the GEMV-identical path, and without the i8mm tier.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn gemm_preq_repacked_q4_1_smmla_dispatch(
+    packed: &[u8],
+    scales: &[f32],
+    mprime: &[f32],
+    b_scales: &[f32],
+    b_quants: &[i8],
+    out: &mut [f32],
+    m: usize,
+    n: usize,
+    k: usize,
+) -> bool {
+    let _ = (packed, scales, mprime, b_scales, b_quants, &out, m, n, k);
+    #[cfg(target_arch = "aarch64")]
+    {
+        if n < 4
+            || super::cpu_features::cpu_features().tier != super::cpu_features::CpuTier::NeonI8mm
+        {
+            return false;
+        }
+        assert!(
+            mprime.len() >= m * (k / 32),
+            "gemm_preq_repacked_q4_1_smmla_dispatch: mprime too small for {m}x{k}"
+        );
+        if !gemm_preq_repacked_q4_0_smmla_dispatch(packed, scales, b_scales, b_quants, out, m, n, k)
+        {
+            return false;
+        }
+        unsafe {
+            crate::backend::simd::neon::q4_1_min_correction(
+                mprime, b_scales, b_quants, out, m, n, k,
+            );
+        }
+        return true;
+    }
+    #[allow(unreachable_code)]
+    false
+}
+
 /// Run the smmla-repacked-Q4_0 prefill GEMM (column-major `out[m, n]`). Same
 /// contract as [`gemm_preq_repacked_q4_0_dispatch`], but consumes the
 /// [`repack_q4_0_smmla_8x8`] layout, `b_quants` packed by
