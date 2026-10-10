@@ -12040,6 +12040,7 @@ pub(crate) mod neon {
         /// the Q4_K smmla dispatch must agree with the Q5_K GEMV on every column, to f32 rounding
         /// (the accumulation orders differ, the integer dots do not). Also pins the per-column GEMM
         /// fallback to the GEMV bit for bit.
+        #[cfg(not(has_blas))]
         #[test]
         fn q5_k_smmla_matches_gemv() {
             if !require_i8mm_kernel_or_skip() {
