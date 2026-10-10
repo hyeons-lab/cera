@@ -564,9 +564,17 @@ tokens. Time to first token, before to after (ms, p50, 4 alternating repetitions
 | LFM2.5-350M Q4_K_M | 14 to 14 (+0%) | 50 to 48 (-4%) |
 | LFM2.5-2.6B Agent Q4_0 | 70 to 70 (+0%) | 265 to 242 (-8%) |
 
-The output is byte-identical (the tile width does not change what is computed). Dense Llama at 16 tokens is 35 ms against llama.cpp's
-25; what is left there is the GEMM phases themselves (28 of the 41 ms before this change was
-spent in the four projections), which has not been profiled for bandwidth against compute yet.
+The output is byte-identical (the tile width does not change what is computed). Dense Llama at 16 tokens is 36 ms against llama.cpp's 25. Where
+the 36 ms goes now (per-phase profile): 24 ms in the four projections, 6 ms in the small passes (norms, RoPE, attention, SiLU,
+quantize) and 5.5 ms outside the layers (the last token's LM head reads 205 MB of weights, plus the embedding and final norm).
+`dense_small_n_microbench` (an ignored test: the column-major smmla GEMM on the Llama shapes at 8 to 512 tokens, weights streamed
+from DRAM against one cache-resident copy) shows what limits the projections. From 64 tokens up they are compute-bound (hot and cold
+weights time the same, 1.4 to 1.9 TOPS). At 16 tokens the big FFN shapes pull 47 to 60 GB/s of the int8 repack from DRAM, near the
+62 to 73 GB/s ceiling, and cold costs 15% to 30% over hot, so under about 32 tokens they are partly weight-bandwidth-bound: the int8
+repack is twice the bytes of the 4-bit weights llama.cpp reads (about 17 ms of weight traffic at the ceiling against about 9 ms). Reading
+4-bit weights below 32 tokens would be worth roughly 8 ms of the 11 ms gap at 16 tokens; it needs a second weight layout and a kernel
+that unpacks nibbles in registers, for a difference of about 10 ms on prompts that short, so it is not done. From 64 tokens the dense
+prefill is at parity (111 ms against 113).
 
 ## Baseline results (before the perf work)
 
