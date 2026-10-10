@@ -2051,9 +2051,9 @@ pub fn gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
 }
 
 /// Whether a Q4_1 weight of `m x k` can take the smmla prefill path ([`repack_q4_1_smmla_8x8`]).
-#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+#[cfg(all(target_arch = "aarch64", not(has_blas)))]
 pub(crate) fn q4_1_smmla_repack_supported(m: usize, k: usize) -> bool {
-    cfg!(target_arch = "aarch64") && m.is_multiple_of(16) && k.is_multiple_of(32)
+    m.is_multiple_of(16) && k.is_multiple_of(32)
 }
 
 /// Repack a Q4_1 weight for the smmla prefill GEMM. A Q4_1 value is `d*q + m` with `q` in
@@ -2061,7 +2061,7 @@ pub(crate) fn q4_1_smmla_repack_supported(m: usize, k: usize) -> bool {
 /// scale and nibbles, so the blocks are re-laid as Q4_0 and interleaved by
 /// [`repack_q4_0_smmla_8x8`]; the second is returned as `mprime[row * nb + block] = m + 8*d`
 /// for [`crate::backend::simd::neon::q4_1_min_correction`]. Returns `(packed, scales, mprime)`.
-#[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+#[cfg(target_arch = "aarch64")]
 #[cfg_attr(has_blas, allow(dead_code))]
 pub(crate) fn repack_q4_1_smmla_8x8(
     src: &[u8],
