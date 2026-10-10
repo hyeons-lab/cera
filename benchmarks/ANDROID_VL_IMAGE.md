@@ -523,9 +523,31 @@ Q8_0 and the 2.6B Q4_0 the two drop alike (4% and 2% against 4% and 1%). That is
 32-token decode numbers never exercised.
 
 Why the short prompts are slow (per-phase prefill profile, 450M Q4_0, 16 tokens: 12.4 ms, of which the FFN gate/up is 5.7 and the
-down projection 2.8): at that size the GEMMs are bound by weight traffic, not arithmetic. The smmla path reads an int8 repack of
-the 4-bit weights (twice the bytes) at about 30 GB/s, half of the 62 to 73 GB/s the device sustains, so a 16-token prefill costs about
-three times its bandwidth floor. Decode, by contrast, already streams weights at 46 to 58 GB/s effective (file size times tok/s).
+down projection 2.8): every GEMM phase ran at about 25 to 30 GB/s of int8-repacked weights, half of the 62 to 73 GB/s the device
+sustains, which first read as weight traffic. It is not (below): the cause was the worker cap. Decode, by contrast, streams weights
+at 46 to 58 GB/s effective (file size times tok/s).
+
+**The worker cap was the first cost, and it is fixed.** `prefill_threads_for_tokens` held the prefill to 2 workers up to 32 tokens and
+4 up to 64, on the assumption that an 8-way barrier outweighs a small GEMM. A microbenchmark of the row-major smmla GEMM
+(`smmla_small_n_microbench`, an ignored test) showed those GEMMs are not memory-bound at all (weights streamed from DRAM and
+cache-resident ones time the same from 16 tokens up) and that the throughput at 8 to 64 tokens was set by the worker count, not by
+the kernel (0.8 to 1.0 TOPS on 2 to 4 workers, 1.6 to 1.8 on 8). A sweep of `CERA_SMALL_PROMPT_THREADS` on the real models found
+the whole pool no slower at any length from 5 tokens up. The default is now 4 workers up to 4 tokens and the whole pool above. Time
+to first token, before to after (ms, p50, 2 alternating repetitions,
+`android_vl_image_raw/cpu_small_prompt_20261010/`):
+
+| Model | 16 tokens | 64 tokens | 512 tokens |
+|---|---:|---:|---:|
+| Llama-3.2-1B Q4_0 (dense) | 58 to 42 (-29%) | 175 to 142 (-19%) | 1032 to 1002 (-3%) |
+| LFM2.5-VL-450M Q4_0 | 15 to 12 (-20%) | 46 to 32 (-32%) | 261 to 260 (-1%) |
+| LFM2.5-350M Q4_K_M | 22 to 14 (-38%) | 82 to 50 (-39%) | 430 to 410 (-5%) |
+| LFM2.5-350M Q8_0 | 16 to 10 (-32%) | 46 to 33 (-29%) | 268 to 254 (-5%) |
+| LFM2.5-2.6B Agent Q4_0 | 122 to 74 (-40%) | 332 to 264 (-21%) | 2114 to 2096 (-1%) |
+| LFM2.5-2.6B Q5_K_M | 193 to 110 (-43%) | 627 to 410 (-35%) | 3618 to 3598 (-1%) |
+
+The 512-token column is the control: the cap never applied there, and the 1% to 5% is run noise. The prefill at 16 and 64 tokens is
+still behind llama.cpp's (dense Llama at 16 tokens is 41 ms against 25), so the next cost is the per-tile work of the smmla kernel at
+small token counts and the fixed per-layer overheads, not the thread count.
 
 ## Baseline results (before the perf work)
 
