@@ -2155,11 +2155,11 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_dispatch(
     #[cfg(target_arch = "aarch64")]
     {
         assert!(
-            k.is_multiple_of(32) && m.is_multiple_of(16),
-            "gemm_preq_repacked_q4_0_smmla_dispatch: need k%32==0 and m%16==0, got m={m} k={k}"
+            k.is_multiple_of(32) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q4_0_smmla_dispatch: need k%32==0 and m%8==0, got m={m} k={k}"
         );
         assert!(
-            packed.len() >= (m / 16) * nb * 512 && scales.len() >= (m / 16) * nb * 16,
+            packed.len() >= (m / 8) * nb * 256 && scales.len() >= (m / 8) * nb * 8,
             "gemm_preq_repacked_q4_0_smmla_dispatch: repacked weights too small for {m}x{k}"
         );
     }

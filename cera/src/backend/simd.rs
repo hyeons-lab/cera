@@ -11854,6 +11854,77 @@ pub(crate) mod neon {
             }
         }
 
+        /// Q8_0 weights repacked into the Q4_0 smmla layout (`repack_q8_0_smmla_8x8`) and run through
+        /// the column-major dispatch must agree with the standard Q8_0 kernel, and both must sit at
+        /// the f32 rounding floor of an f64 reference. Prints the three errors (`--nocapture`).
+        #[test]
+        fn q8_0_smmla_matches_standard_kernel() {
+            if !require_i8mm_kernel_or_skip() {
+                return;
+            }
+            for (m, n, k) in [(16usize, 5usize, 128usize), (64, 9, 1024), (24, 40, 4608)] {
+                let mut st = 0x8888_0001u64 ^ (m as u64) ^ ((n as u64) << 16) ^ ((k as u64) << 32);
+                let nb = k / 32;
+                let blocks: Vec<BlockQ8_0> = (0..m * nb)
+                    .map(|_| {
+                        let mut quants = [0i8; 32];
+                        for q in quants.iter_mut() {
+                            *q = (lcg(&mut st) * 127.0) as i32 as i8;
+                        }
+                        BlockQ8_0 {
+                            delta: crate::quant::f32_to_f16(0.002 + lcg(&mut st).abs() * 0.01),
+                            quants,
+                        }
+                    })
+                    .collect();
+                let a = blocks_to_bytes(&blocks);
+                let bmat: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+                let mut b_scales = vec![0.0f32; n * nb];
+                let mut b_quants = vec![0i8; n * k];
+                crate::model::transformer::quantize_rows(&bmat, k, n, &mut b_scales, &mut b_quants);
+
+                let mut std_out = vec![0.0f32; m * n];
+                unsafe { gemm_q8_0_q8_0_neon(&a, &b_scales, &b_quants, &mut std_out, m, n, k) };
+                let (packed, scales) = crate::backend::cpu::repack_q8_0_smmla_8x8(&a, m, k);
+                let mut new_out = vec![f32::NAN; m * n];
+                assert!(crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_dispatch(
+                    &packed,
+                    &scales,
+                    &b_scales,
+                    &b_quants,
+                    &mut new_out,
+                    m,
+                    n,
+                    k
+                ));
+                let (mut e_std, mut e_new, mut mag) = (0.0f64, 0.0f64, 0.0f64);
+                for i in 0..m {
+                    for j in 0..n {
+                        let mut r = 0.0f64;
+                        for b in 0..nb {
+                            let blk = &blocks[i * nb + b];
+                            let dot: i64 = (0..32)
+                                .map(|t| blk.quants[t] as i64 * b_quants[j * k + b * 32 + t] as i64)
+                                .sum();
+                            r += crate::quant::f16_to_f32(blk.delta) as f64
+                                * b_scales[j * nb + b] as f64
+                                * dot as f64;
+                        }
+                        e_std = e_std.max((std_out[i * n + j] as f64 - r).abs());
+                        e_new = e_new.max((new_out[i * n + j] as f64 - r).abs());
+                        mag = mag.max(r.abs());
+                    }
+                }
+                println!(
+                    "q8_0 {m}x{n}x{k}: max|out| {mag:.3}, max abs error standard {e_std:.2e}, smmla {e_new:.2e}"
+                );
+                assert!(
+                    e_new <= 1e-5 * mag + 1e-6,
+                    "smmla error {e_new} vs scale {mag}"
+                );
+            }
+        }
+
         /// Accuracy of the Q4_1 smmla path against an f64 reference, next to the standard kernel's,
         /// on weights shaped like a real Q4_1 tensor (`m` near `-8 d`, so the offset term cancels
         /// most of the unsigned-nibble dot) at the Llama down-projection depth.
