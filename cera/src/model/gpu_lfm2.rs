@@ -839,6 +839,17 @@ fn attention_prefill_tiled(
         && out_stride.is_multiple_of(4)
 }
 
+/// Whether the tiled prefill attention runs its fp16, 64-query kernel (`attention_prefill_hd64_f16`)
+/// instead of the f32 one: on by default wherever SPIR-V passthrough is (`CERA_WGPU_ATTN_F32=1`
+/// keeps the f32 kernel, the A/B and accuracy switch). It is 1.7x faster on an Adreno 830 at an
+/// output error of 0.06 to 0.25% of the output's rms against an f64 reference.
+fn use_attention_f16() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        !std::env::var("CERA_WGPU_ATTN_F32").is_ok_and(|v| !matches!(v.as_str(), "" | "0"))
+    })
+}
+
 /// The most work one `attention_prefill` dispatch may do, in units of one query reading one key
 /// row for one head.
 ///
@@ -1601,6 +1612,9 @@ struct GpuPipelines {
     attention_flash_hd64: wgpu::ComputePipeline,
     /// The register-tiled causal prefill over the packed-f16 cache (head_dim 64 only).
     attention_prefill_hd64: wgpu::ComputePipeline,
+    /// The fp16, 64-query twin of `attention_prefill_hd64` (SPIR-V passthrough, so `None` without
+    /// it); see `use_attention_f16`.
+    attention_prefill_hd64_f16: Option<wgpu::ComputePipeline>,
     // ── Routed mixture-of-experts (`lfm2moe`) ─────────────────────────────
     // Built for every model, dense or routed: pipeline creation is a shader
     // compile, so making it conditional would trade a fixed load-time cost for a
@@ -2553,6 +2567,12 @@ impl GpuLfmModel {
                 "main",
                 "attention_prefill_hd64",
             ),
+            attention_prefill_hd64_f16: if use_spirv_passthrough(&ctx) {
+                tracing::debug!("attention_prefill_hd64_f16: SPIR-V passthrough (slang)");
+                Some(ctx.attention_prefill_hd64_f16_passthrough())
+            } else {
+                None
+            },
             moe_route: ctx.create_pipeline(shaders::MOE_ROUTE, "moe_route", "moe_route"),
             moe_gemv_q4_0: ctx.create_pipeline(
                 shaders::MOE_GEMV_Q4_0,
@@ -8195,7 +8215,14 @@ impl GpuLfmModel {
             q_stride,
             out_stride,
         );
-        let (pipeline, queries_per_wg, label) = if tiled {
+        let f16_pipeline = self
+            .pipelines
+            .attention_prefill_hd64_f16
+            .as_ref()
+            .filter(|_| tiled && use_attention_f16());
+        let (pipeline, queries_per_wg, label) = if let Some(pipeline) = f16_pipeline {
+            (pipeline, 64, "attention_prefill_hd64_f16")
+        } else if tiled {
             (
                 &self.pipelines.attention_prefill_hd64,
                 32,
@@ -11676,7 +11703,7 @@ mod tests {
         use super::{
             ATTENTION_PREFILL_MAX_WORK, attention_prefill_chunks, attention_prefill_chunks_within,
         };
-        for quantum in [8u32, 32] {
+        for quantum in [8u32, 32, 64] {
             for &(n, heads, start, bidir) in &[
                 (1u32, 16u32, 0u32, true),
                 (7, 16, 0, true),
