@@ -1,0 +1,12 @@
+{"len": 512, "round": 0, "variant": "items", "tok_s": 243.0, "ap_before": 26.9}
+{"len": 512, "round": 0, "variant": "heads", "tok_s": 225.0, "ap_before": 27.0}
+{"len": 512, "round": 0, "variant": "old", "tok_s": 243.0, "ap_before": 27.0}
+{"len": 512, "round": 0, "variant": "llama", "tok_s": 552.6394, "ap_before": 28.0}
+{"len": 512, "round": 1, "variant": "heads", "tok_s": 264.0, "ap_before": 28.0}
+{"len": 512, "round": 1, "variant": "old", "tok_s": 257.0, "ap_before": 27.9}
+{"len": 512, "round": 1, "variant": "llama", "tok_s": 549.958059, "ap_before": 27.7}
+{"len": 512, "round": 1, "variant": "items", "tok_s": 264.0, "ap_before": 27.7}
+{"len": 512, "round": 2, "variant": "old", "tok_s": 264.0, "ap_before": 27.8}
+{"len": 512, "round": 2, "variant": "llama", "tok_s": 550.756807, "ap_before": 28.0}
+{"len": 512, "round": 2, "variant": "items", "tok_s": 267.0, "ap_before": 27.7}
+{"len": 512, "round": 2, "variant": "heads", "tok_s": 265.0, "ap_before": 27.9}

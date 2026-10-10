@@ -4168,56 +4168,10 @@ impl LfmModel {
 
                             let is_causal = cfg.is_causal
                                 && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
-                            if cpu::flash_attention_range_supported(head_dim) {
-                                // Work items of one head x 32 queries, heaviest (latest queries,
-                                // longest causal span) first: 16 whole heads over 8 workers of
-                                // unequal speed leave the slow cores holding the barrier.
-                                const Q_ITEM: usize = 32;
-                                let n_qb = n.div_ceil(Q_ITEM);
-                                let flash_ptr = flash_buf.as_mut_ptr() as usize;
-                                // One slot per item: the pool hands each worker a disjoint row of
-                                // `tickets`; the real output goes through `flash_ptr`.
-                                let mut tickets = vec![0.0f32; n_heads * n_qb];
-                                cpu::par_rows_n_chunked_active(
-                                    &mut tickets,
-                                    1,
-                                    1,
-                                    1,
-                                    max_active,
-                                    |(item, _)| {
-                                        let h = item % n_heads;
-                                        let q_lo = (n_qb - 1 - item / n_heads) * Q_ITEM;
-                                        let q_hi = (q_lo + Q_ITEM).min(n);
-                                        // SAFETY: items are disjoint `[q_lo, q_hi)` ranges of
-                                        // head `h`'s `[n, head_dim]` block in `flash_buf`.
-                                        let out = unsafe {
-                                            core::slice::from_raw_parts_mut(
-                                                (flash_ptr as *mut f32)
-                                                    .add((h * n + q_lo) * head_dim),
-                                                (q_hi - q_lo) * head_dim,
-                                            )
-                                        };
-                                        cpu::flash_attention_gqa_cpu_opt_range(
-                                            q_ref,
-                                            k_cache,
-                                            v_cache,
-                                            out,
-                                            h,
-                                            1,
-                                            n,
-                                            n,
-                                            kv_dim,
-                                            (h / group_size) * head_dim,
-                                            head_dim,
-                                            scale,
-                                            start_pos,
-                                            is_causal,
-                                            q_lo,
-                                            q_hi,
-                                        );
-                                    },
-                                );
-                            } else {
+                            if !cpu::flash_attention_prefill_items(
+                                q_ref, k_cache, v_cache, flash_buf, n_heads, group_size, n, kv_dim,
+                                head_dim, scale, start_pos, is_causal, max_active,
+                            ) {
                                 cpu::par_rows_n_chunked_active(
                                     flash_buf,
                                     head_chunk,

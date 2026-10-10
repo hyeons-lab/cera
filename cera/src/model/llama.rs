@@ -2748,31 +2748,38 @@ impl LlamaModel {
                 // would hand all heads to 2 workers. One head per steal unit lets
                 // every worker take a head.
                 let max_active = cpu::prefill_threads_for_tokens(n);
-                cpu::par_rows_n_chunked_active(
-                    flash_buf,
-                    head_chunk,
-                    1,
-                    1,
-                    max_active,
-                    |(h, chunk)| {
-                        let kv_h = h / group_size;
-                        cpu::flash_attention_gqa_cpu(
-                            q_ref,
-                            k_cache,
-                            v_cache,
-                            chunk,
-                            h,
-                            1,
-                            n,
-                            n,
-                            kv_dim,
-                            kv_h * head_dim,
-                            head_dim,
-                            scale,
-                            start_pos,
-                        );
-                    },
-                );
+                // Work items of one head x 32 queries where the NEON range kernel applies (so the
+                // pool can balance fast and slow cores); otherwise one item per head, as before.
+                if !cpu::flash_attention_prefill_items(
+                    q_ref, k_cache, v_cache, flash_buf, n_heads, group_size, n, kv_dim, head_dim,
+                    scale, start_pos, true, max_active,
+                ) {
+                    cpu::par_rows_n_chunked_active(
+                        flash_buf,
+                        head_chunk,
+                        1,
+                        1,
+                        max_active,
+                        |(h, chunk)| {
+                            let kv_h = h / group_size;
+                            cpu::flash_attention_gqa_cpu(
+                                q_ref,
+                                k_cache,
+                                v_cache,
+                                chunk,
+                                h,
+                                1,
+                                n,
+                                n,
+                                kv_dim,
+                                kv_h * head_dim,
+                                head_dim,
+                                scale,
+                                start_pos,
+                            );
+                        },
+                    );
+                }
                 // Scatter flash_out [n_heads, n, head_dim] → out_proj_input [q_dim,
                 // n] (stride-n columns). d-then-j inner order keeps out writes
                 // sequential (stride 1) with small-stride reads from flash_buf.
