@@ -412,6 +412,79 @@ prefill at 512 tokens is 257 tok/s with the previous kernel, 264 with the tiled 
 is at 0.48x of llama.cpp, a gap that is not attention: its 257 tok/s is about 0.65 TOPS-equivalent against about 1.8 for the LFM2 model on
 the same cores, which points at the GEMMs (the tiled smmla path or a tensor type that falls back) and is the next thing to profile.
 
+### CPU prefill and decode: dense Llama, Q4_1, Q8_0 and the K-quants (2026-10-10)
+
+The text models are not only LFM2 Q4_0. This pass measured the CPU path on the other shipped quants and on the dense
+Llama-3.2-1B, found each one well behind llama.cpp for a different reason, and fixed them. Gated (AP sensor at 28 C or
+less before every invocation, alternating binaries, 3 rounds, medians; `android_vl_image_raw/cpu_stack_20261010/`),
+the tip of #505 (before) against the top of this stack (after):
+
+| Model | Prefill before, after (tok/s) | Decode before, after (tok/s) | llama.cpp prefill, decode |
+|---|---:|---:|---:|
+| Llama-3.2-1B Q4_0 (dense), 512 tokens | 247, 509 | 62, 59 (noise, see below) | 473 to 532, 74 |
+| LFM2.5-VL-450M Q4_0 | 1,916, 2,109 | 240, 247 | 2,014, 257 |
+| LFM2.5-350M Q4_K_M | 1,198, 1,290 | 178, 203 | 1,168, 231 |
+| LFM2.5-350M Q8_0 | 446, 2,046 | 29, 149 | 1,655, 150 |
+| LFM2.5-2.6B Agent Q4_0 | 241, 248 | 33, 34 | 213 to 224, 35 to 36 |
+| LFM2.5-2.6B Q5_K_M, 128 tokens | 12, 169 | 22, 26 | 98 to 102 (512 tokens), 27 |
+
+The llama.cpp column was measured back to back on the same device with `llama-bench -t 8`, outside the thermal gate, so
+read it as a reference and not as a gated pair. The dense decode difference is not real: five more alternating rounds
+of that model give 64.2 (before) and 64.6 (after).
+
+**Dense Llama prefill, 257 to about 480 tok/s.** A per-phase profile (`CERA_PROFILE_PREFILL=1`) put 40% of a 1.9 s chunk
+outside the GEMMs. The model keeps its activations column-major, and three passes read them one token at a time: the two
+RMSNorms (serial, a strided gather and scatter per token), the activation quantize (one cache line per element at a
+stride of `n` floats, so the 16 MB FFN down input cost 20x the 4x smaller one) and the RoPE and KV append. Each now
+works on 16-token or 16-column tiles through an L1 transpose buffer and fans out over the pool; the arithmetic is
+unchanged, so the logits are byte-identical. The GEMMs were the rest: `gemm_preq` ran the older columnar smmla kernel,
+and the K and V projections (64 super-rows) used at most four workers. The tiled, work-stealing column-major kernel
+takes them from 0.69 to 2.05 TOPS, and the dense path now matches the LFM2 row-major kernel on every shape, which made a
+port to row-major activations unnecessary.
+
+**The dispatch floor.** `RowPool::dispatch_rows` floors its steal chunk at 16 rows, so a call with few heavy rows
+(a GEMM over 64 super-rows, a quantize over 32 tiles) quietly uses four workers or two. A temporary trace in
+`dispatch_inner` (rows, chunk, effective workers, microseconds, aggregated by shape on real prefills) found three more:
+LFM2's `quantize_rows`, a per-token `silu_mul_inplace`, and the tile quantize itself. The trace is the method; it is
+not committed.
+
+**Decode runs on a different pool.** Q8_0's FFN is unfused, so each decoded token ran `silu_mul_inplace` on 4,608
+elements, which fanned out on the prefill pool whose workers are parked in decode: three futex wakes for one 512-element
+chunk, about 2 ms of system time per layer (the main thread was at 81% system time). The GEMV kernel was fine at 30 GB/s.
+Q8_0 decode went from 29 to 149 tok/s with a threshold change.
+
+**Reusing the kernels that exist.** Q8_0 projection weights were never repacked for i8mm, although the vision encoder
+already used `repack_q8_0_smmla_8x8` and it writes the Q4_0 smmla layout, so they now share the Q4_0 tiles (4x prefill). A
+Q4_1 value is `d*(q-8) + (m + 8d)`, a Q4_0 block plus a small correction from the activations' block sums; Llama-3.2-1B
+"Q4_0" has two Q4_1 `ffn_down` tensors that ran at 0.25 TOPS. Q5_K had no int8 GEMM at all on the non-BLAS build, so Q5_K_M
+models prefilled one token at a time; it is the Q4_K form with a 5-bit `q`, so a repack into the Q4_K smmla layout runs
+it on the existing kernels (24 to about 135 tok/s on the 2.6B).
+
+**Bit-exactness and float order.** Where the arithmetic order is unchanged the logits are byte-identical. Q4_1 and Q8_0
+change the order, so they are not, and a byte compare is the wrong gate: LFM2.5-350M Q8_0 differs by at most 0.56 with
+cosine 0.9997, but the existing i8mm and dotprod Q8_0 kernels already differ by 0.558 from each other, and an f64 reference
+puts every kernel at the f32 floor (about 5e-7 relative). Llama-3.2-1B Q4_0 moves its logits by 0.226 (cosine 0.99988) when
+5e-7 of noise is injected into two layers. Those models amplify float-level noise; the gate used instead is the kernel
+against an f64 reference plus a noise-injection control.
+
+**K-quant decode was instruction-bound.** One core pulled about 16 GB/s of Q4_K or Q6_K weights against 41 to 54 for
+Q8_0, so the kernels needed several cores to reach the memory ceiling (llama.cpp holds 215 tok/s on the 350M Q4_K_M with five
+threads; Cera needed eight for 185). The cost was about 14 scalar float instructions per sub-block. The per-sub-block terms
+now form in vector lanes with the same IEEE operations and no fused multiply-add, the integer dots sum with a pairwise
+tree, and only the final accumulation stays scalar and in order, so the GEMV remains bit-exact against the GEMM.
+Q4_K_M decode goes from about 190 to 212 tok/s.
+
+**Tried and dropped** (`perf/cpu-silu-vector`, local): a NEON `expf` for the fused gate/up epilogue is 2x faster in
+isolation and invisible end to end; fusing the interleave into the activation quantize had a ceiling of 1.3%
+(measure a pass in the model before building the plumbing); and folding SwiGLU into the down projection's quantize made
+it 2x slower (the standalone loop vectorizes `expf`, the tile gather does not).
+
+What is left: dense Llama decode is 0.87x of llama.cpp (the Q4_0 `dec4` path, not touched here), the Q4_K_M and
+Q5_K_M decodes are about 0.9x, and the fused QKV `concat3` K-quant kernels keep the old scalar arithmetic. Reproduce with
+`cpu_stack_20261010/ab_stack.py` (`SERIAL=<adb serial> ab_stack.py OUT ROUNDS`, binaries `cera-base` and `cera-top` in
+`/data/local/tmp/cmp-cera`), `CERA_PROFILE_PREFILL=1`, and the ignored `dense_gemm_gops_microbench` and
+`decode_gemv_microbench` tests.
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
