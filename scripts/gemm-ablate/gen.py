@@ -25,12 +25,49 @@ SRC = open(os.path.join(ROOT, "cera/src/backend/shaders/spirv/gemm_stream_q4_0_k
 OUT = sys.argv[1] if len(sys.argv) > 1 else "ablate"
 os.makedirs(OUT, exist_ok=True)
 
+# ---- staging of the 64 (k) x 32 (columns) B tile into shared memory ----
+def stage_lines(threads, xf32):
+    """The loop staging the tile into `sh_b[kk * 8 + g]` (4 columns g*4..g*4+3 of row kk, as half4).
+
+    Default: from the transposed f16 copy `src_b` ([k][n_pad], written by `transpose_cast_f16`).
+    `xf32`: straight from the f32 token-major activations `src_bf` ([n][k]) the previous pass wrote,
+    converting as it goes, so no transpose pass is needed: lane-consecutive threads read consecutive
+    k of one token (coalesced), and a row past the last token is clamped onto it (its columns are
+    never stored).
+    """
+    stage = 512 // threads
+    if not xf32:
+        return [
+            f"        for (uint s = 0u; s < {stage}u; s++) {{",
+            f"            uint e = lid * {stage}u + s;",
+            "            uint kk = e / 8u;",
+            "            uint g = e % 8u;",
+            "            uint b = (kb * 64u + kk) * P.n_pad + col_base + g * 4u;",
+            "            sh_b[kk * 8u + g] = half4(src_b[b], src_b[b + 1u], src_b[b + 2u], src_b[b + 3u]);",
+            "        }",
+        ]
+    return [
+        f"        for (uint s = 0u; s < {stage}u; s++) {{",
+        f"            uint e = s * {threads}u + lid;",
+        "            uint kk = e % 64u;",
+        "            uint g = e / 64u;",
+        "            uint t0 = col_base + g * 4u;",
+        "            uint kidx = kb * 64u + kk;",
+        "            uint last = P.n_valid - 1u;",
+        "            sh_b[kk * 8u + g] = half4(half(src_bf[min(t0, last) * P.k + kidx]),",
+        "                                      half(src_bf[min(t0 + 1u, last) * P.k + kidx]),",
+        "                                      half(src_bf[min(t0 + 2u, last) * P.k + kidx]),",
+        "                                      half(src_bf[min(t0 + 3u, last) * P.k + kidx]));",
+        "        }",
+    ]
+
+
 # ---- register-blocked rewrite: R weight rows per thread, 256/R threads per workgroup ----
 import sys
-def gen(R, name, dequant=True, header=''):
+def gen(R, name, dequant=True, header='', xf32=False):
     T = 256 // R
     L = [header] if header else []
-    L.append('''struct StreamParams {
+    decls = '''struct StreamParams {
     uint m;
     uint k;
     uint n_valid;
@@ -45,7 +82,8 @@ def gen(R, name, dequant=True, header=''):
 [[vk::binding(4, 0)]] StructuredBuffer<StreamParams> paramsBuf;
 
 groupshared half4 sh_b[64 * 8];
-''')
+'''
+    L.append(decls.replace("StructuredBuffer<half> src_b;", "StructuredBuffer<float> src_bf;") if xf32 else decls)
     L.append(f'[numthreads({T}, 1, 1)]')
     L.append('void main(uint3 gid : SV_GroupID, uint lid : SV_GroupThreadID) {')
     L.append('    let P = paramsBuf[0];')
@@ -57,13 +95,7 @@ groupshared half4 sh_b[64 * 8];
             L.append(f'    half4 g{r}_{i} = half4(0.0h);')
     L.append('    uint n_kb = P.k / 64u;')
     L.append('    for (uint kb = 0u; kb < n_kb; kb++) {')
-    L.append(f'        for (uint s = 0u; s < {2 * R}u; s++) {{')
-    L.append(f'            uint e = lid * {2 * R}u + s;')
-    L.append('            uint kk = e / 8u;')
-    L.append('            uint g = e % 8u;')
-    L.append('            uint b = (kb * 64u + kk) * P.n_pad + col_base + g * 4u;')
-    L.append('            sh_b[kk * 8u + g] = half4(src_b[b], src_b[b + 1u], src_b[b + 2u], src_b[b + 3u]);')
-    L.append('        }')
+    L.extend(stage_lines(T, xf32))
     L.append('        GroupMemoryBarrierWithGroupSync();')
     for r in range(R):
         L.append(f'        uint pd{r} = src_d[kb * P.m + rrow{r}];')
@@ -112,11 +144,10 @@ groupshared half4 sh_b[64 * 8];
 
 
 # ---- fused gate/up GEMM: one B tile, two weight rows per thread, SiLU(gate) * up epilogue ----
-def gen_gateup(name, header="", threads=256):
+def gen_gateup(name, header="", threads=128, xf32=False):
     """One thread owns row `gid.x * threads + lid` of both the gate and the up weights."""
-    stage = 512 // threads  # half4 of the 64 x 32 B tile each thread stages
     L = [header] if header else []
-    L.append("""struct StreamParams {
+    decls = """struct StreamParams {
     uint m;
     uint k;
     uint n_valid;
@@ -133,7 +164,8 @@ def gen_gateup(name, header="", threads=256):
 [[vk::binding(6, 0)]] StructuredBuffer<StreamParams> paramsBuf;
 
 groupshared half4 sh_b[64 * 8];
-""")
+"""
+    L.append(decls.replace("StructuredBuffer<half> src_b;", "StructuredBuffer<float> src_bf;") if xf32 else decls)
     L.append(f"[numthreads({threads}, 1, 1)]")
     L.append("void main(uint3 gid : SV_GroupID, uint lid : SV_GroupThreadID) {")
     L.append("    let P = paramsBuf[0];")
@@ -146,14 +178,8 @@ groupshared half4 sh_b[64 * 8];
         L.append(f"    half4 u{i} = half4(0.0h);")
     L.append("    uint n_kb = P.k / 64u;")
     L.append("    for (uint kb = 0u; kb < n_kb; kb++) {")
-    L.append(f"        for (uint s = 0u; s < {stage}u; s++) {{")
-    L.append(f"            uint e = lid * {stage}u + s;")
-    L.append("""            uint kk = e / 8u;
-            uint g = e % 8u;
-            uint b = (kb * 64u + kk) * P.n_pad + col_base + g * 4u;
-            sh_b[kk * 8u + g] = half4(src_b[b], src_b[b + 1u], src_b[b + 2u], src_b[b + 3u]);
-        }
-        GroupMemoryBarrierWithGroupSync();
+    L.extend(stage_lines(threads, xf32))
+    L.append("""        GroupMemoryBarrierWithGroupSync();
         uint pdg = gate_d[kb * P.m + rrow];
         uint pdu = up_d[kb * P.m + rrow];
         half dwg0 = half(f16tof32(pdg & 0xFFFFu));
@@ -271,37 +297,53 @@ for f in sorted(os.listdir(".")):
 
 
 # ---- production kernels: `gen.py --production` rewrites them next to the kernel they extend ----
-# GATEUP_THREADS is the fused kernel's workgroup size (rows per workgroup); the host dispatches
-# ceil(m / GATEUP_THREADS) groups in X (`GATEUP_ROWS_PER_GROUP` in gpu_lfm2.rs).
+# All three read the f32 token-major activations directly (`xf32`), so the host runs no
+# `transpose_cast_f16` pass for them. GATEUP_THREADS is the fused kernel's workgroup size (rows per
+# workgroup); the host dispatches ceil(m / GATEUP_THREADS) groups in X (`GATEUP_ROWS_PER_GROUP` in
+# gpu_lfm2.rs).
 GATEUP_THREADS = int(os.environ.get("GATEUP_THREADS", "128"))
 if "--production" in sys.argv:
     prod = os.path.join(ROOT, "cera/src/backend/shaders/spirv")
-    hdr_r2 = """// Streaming Q4_0 prefill GEMM, k-slice-64, two weight rows per thread. GENERATED by
-// scripts/gemm-ablate/gen.py --production; edit the generator, not this file.
+    common = """// The activations come straight from the previous pass: binding 2 is the f32 token-major
+// `x[n][k]` (x_stride == k), converted to f16 while the B tile is staged, so there is no transpose
+// pass and no f16 copy. Rows past the last token are clamped onto it (their columns are never
+// stored). Staging this way is also 8 to 20% faster than reading a transposed f16 copy on an
+// Adreno 830.
+"""
+    hdr_r1 = """// Streaming Q4_0 prefill GEMM, k-slice-64, one weight row per thread, B staged from f32 token-major
+// activations. GENERATED by scripts/gemm-ablate/gen.py --production; edit the generator, not this file.
 //
-// Twin of `gemm_stream_q4_0_k64.slang` with the same five bindings, parameter block, entry (`main`)
-// and grid (ceil(m/256), n_pad/32), and bit-exact results, but a workgroup is 128 threads and each
+// Same weights, parameter block, entry (`main`) and grid (ceil(m/256), n_pad/32) as
+// `gemm_stream_q4_0_k64.slang`, which it replaces on the direct-B path, and bit-exact results.
+""" + common
+    hdr_r2 = """// Streaming Q4_0 prefill GEMM, k-slice-64, two weight rows per thread, B staged from f32 token-major
+// activations. GENERATED by scripts/gemm-ablate/gen.py --production; edit the generator, not this file.
+//
+// Same bindings, parameter block, entry (`main`) and grid (ceil(m/256), n_pad/32) as
+// `gemm_stream_q4_0_k64_xf32.slang`, and bit-exact results, but a workgroup is 128 threads and each
 // thread owns two rows (row = group*256 + lid and +128) over the same 32 columns. The B tile is read
 // from shared memory once per k and feeds two rows, which halves the shared-memory reads per FMA:
 // those were 43% of the one-row kernel's time on an Adreno 830. Measured 5 to 20% faster at 64 or
 // more workgroups (m/256 * n_pad/32); below that the smaller workgroups under-fill the GPU and the
 // one-row kernel wins, so the host picks by workgroup count (`gemm_stream_two_row`).
-"""
-    hdr_gu = f"""// Fused gate/up streaming Q4_0 prefill GEMM with a SiLU epilogue, k-slice-64. GENERATED by
-// scripts/gemm-ablate/gen.py --production; edit the generator, not this file.
+""" + common
+    hdr_gu = f"""// Fused gate/up streaming Q4_0 prefill GEMM with a SiLU epilogue, k-slice-64, B staged from f32
+// token-major activations. GENERATED by scripts/gemm-ablate/gen.py --production; edit the generator,
+// not this file.
 //
 // One thread owns the same row of the gate and the up weights over 32 columns: both read each B
 // tile from shared memory once, and the epilogue stores silu(gate) * up (gate clamped to +-80, as
 // `silu_mul_inplace` does) instead of two projections and a separate pass. Workgroups of
 // {GATEUP_THREADS} threads cover {GATEUP_THREADS} rows: grid (ceil(m/{GATEUP_THREADS}), n_pad/32). The output has
 // the layout of the gate GEMM's (dst[col * y_stride + row]). Bindings: 0/1 gate q/d, 2/3 up q/d,
-// 4 B (f16, k-major), 5 dst, 6 params.
-"""
+// 4 f32 token-major activations, 5 dst, 6 params.
+""" + common
     os.chdir(prod)
-    gen(2, "gemm_stream_q4_0_k64_r2.slang", True, hdr_r2)
-    gen_gateup("gemm_stream_q4_0_k64_gateup.slang", hdr_gu, GATEUP_THREADS)
+    gen(1, "gemm_stream_q4_0_k64_xf32.slang", True, hdr_r1, xf32=True)
+    gen(2, "gemm_stream_q4_0_k64_r2.slang", True, hdr_r2, xf32=True)
+    gen_gateup("gemm_stream_q4_0_k64_gateup.slang", hdr_gu, GATEUP_THREADS, xf32=True)
     slangc = os.environ.get("SLANGC") or shutil.which("slangc") or os.path.expanduser("~/.local/slang/bin/slangc")
-    for f in ("gemm_stream_q4_0_k64_r2", "gemm_stream_q4_0_k64_gateup"):
+    for f in ("gemm_stream_q4_0_k64_xf32", "gemm_stream_q4_0_k64_r2", "gemm_stream_q4_0_k64_gateup"):
         r = subprocess.run([slangc, f + ".slang", "-target", "spirv", "-O3", "-entry", "main", "-stage", "compute", "-o", f + ".spv"],
                            capture_output=True, text=True)
         print(("ok   " if r.returncode == 0 else "FAIL ") + f, r.stderr[:300])
