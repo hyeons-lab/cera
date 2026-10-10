@@ -399,10 +399,18 @@ Under the profiler the four chunks' attention goes from 27/78/129/187 to 13/37/6
 (llama.cpp's 512-token figure varied 1,911 to 2,114 across rounds, and one Cera run was an outlier at 1,873 against 2,133 and 2,065;
 the harness's cooldown makes all of these lower than a back-to-back run.) The full-vocabulary logits are byte-identical with and without
 the new kernel on five prompts of 60 to 3,600 characters. `CERA_CPU_ATTN_TILED=0` restores the previous kernel. The dense
-transformers' CPU prefill (`llama.rs`) still calls the older blocked kernel and was not changed. What is left: the kernel is at about
+transformers' CPU prefill (`llama.rs`), the vision encoder and the d1 head call the same dispatcher, so they run the new kernel too
+(bit-identical; a test pins the row-major Q layout the last two use). What is left: the kernel is at about
 60% of the FMA ceiling (the softmax's `exp` and the key packing take the rest) and the eight threads reach about
 60% of the cores' summed rate (10 ms ideal against 16 ms for the last chunk's layer), so a further 20 to 30% of
 attention, 4 to 5% of the prefill, is available.
+
+On the dense Llama-3.2-1B Q4_0 (`llama.rs`, gated, 3 rounds, medians, `android_vl_image_raw/cpu_dense_attention_20261009/`), CPU
+prefill at 512 tokens is 257 tok/s with the previous kernel, 264 with the tiled one over whole heads and 264 over the
+(head, 32-query) items, against llama.cpp CPU's 551: attention is a small part of a 512-token dense prefill, so the kernel moves it
+2.7% and the work items not at all (the 1,024- and 2,048-token runs were lost when the phone was unplugged mid-run). The dense prefill
+is at 0.48x of llama.cpp, a gap that is not attention: its 257 tok/s is about 0.65 TOPS-equivalent against about 1.8 for the LFM2 model on
+the same cores, which points at the GEMMs (the tiled smmla path or a tensor type that falls back) and is the next thing to profile.
 
 ## Baseline results (before the perf work)
 

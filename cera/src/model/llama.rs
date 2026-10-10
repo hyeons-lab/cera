@@ -226,6 +226,76 @@ fn lm_head_gemm_disabled() -> bool {
 }
 
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+/// Per-phase wall time of the dense batched prefill, printed with `CERA_PROFILE_PREFILL=1` (one line per
+/// prefill call). The phases are the `PREFILL_PHASES` names, in the order the layer loop crosses them.
+struct PrefillProf {
+    on: bool,
+    last: crate::time::Instant,
+    acc: [crate::time::Duration; 11],
+    /// Wall time of the down GEMM + residual (`down_residual`) per layer, in ms.
+    down_layers: Vec<f64>,
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+const PREFILL_PHASES: [&str; 11] = [
+    "norm",
+    "qkv_gemm",
+    "rope_kv",
+    "attention",
+    "out_proj",
+    "ffn_norm",
+    "ffn_quant",
+    "gate_up",
+    "silu",
+    "down_quant",
+    "down_residual",
+];
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+impl PrefillProf {
+    fn new() -> Self {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        let on = *ENABLED.get_or_init(|| std::env::var_os("CERA_PROFILE_PREFILL").is_some());
+        Self {
+            on,
+            last: crate::time::Instant::now(),
+            acc: [crate::time::Duration::ZERO; 11],
+            down_layers: Vec::new(),
+        }
+    }
+
+    /// Charge the time since the previous lap to `phase`.
+    fn lap(&mut self, phase: usize) {
+        if self.on {
+            let now = crate::time::Instant::now();
+            let d = now - self.last;
+            self.acc[phase] += d;
+            if phase == 10 {
+                self.down_layers.push(d.as_secs_f64() * 1e3);
+            }
+            self.last = now;
+        }
+    }
+
+    fn report(&self, n: usize) {
+        if self.on {
+            let total: crate::time::Duration = self.acc.iter().sum();
+            let mut line = format!("[PROFILE PREFILL dense] n={n}");
+            for (name, d) in PREFILL_PHASES.iter().zip(&self.acc) {
+                line.push_str(&format!(" | {name}: {:.2}ms", d.as_secs_f64() * 1e3));
+            }
+            line.push_str(&format!(" | total: {:.2}ms", total.as_secs_f64() * 1e3));
+            eprintln!("{line}");
+            let per: Vec<String> = self.down_layers.iter().map(|d| format!("{d:.0}")).collect();
+            eprintln!(
+                "[PROFILE PREFILL dense] down_residual per layer (ms): {}",
+                per.join(" ")
+            );
+        }
+    }
+}
+
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 #[inline]
 fn apply_column_major_bias(mat: &mut [f32], bias: &[f32], dim: usize, n: usize) {
     if n == 1 {
@@ -2376,6 +2446,7 @@ impl LlamaModel {
         let mut kv_widen_k: Vec<f32> = Vec::new();
         let mut kv_widen_v: Vec<f32> = Vec::new();
 
+        let mut prof = PrefillProf::new();
         for layer in 0..cfg.n_layers {
             let refs = &self.layer_refs[layer];
 
@@ -2390,25 +2461,21 @@ impl LlamaModel {
                             cfg.rms_norm_eps,
                         );
                     } else {
-                        for j in 0..n {
-                            for i in 0..hs {
-                                norm_col[i] = hidden[i * n + j];
-                            }
-                            cpu::rmsnorm(
-                                &mut norm_col,
-                                &self.attn_norm_weights[layer],
-                                cfg.rms_norm_eps,
-                            );
-                            for i in 0..hs {
-                                normed[i * n + j] = norm_col[i];
-                            }
-                        }
+                        transformer::rmsnorm_columns(
+                            &hidden,
+                            &mut normed,
+                            &self.attn_norm_weights[layer],
+                            cfg.rms_norm_eps,
+                            hs,
+                            n,
+                        );
                     }
                     &normed
                 }
                 NormOrder::PostNorm => &hidden,
             };
 
+            prof.lap(0);
             // Batched Q/K/V projections (weight [m×hs] × normed[hs×n] → [m×n]).
             #[cfg(has_blas)]
             {
@@ -2485,6 +2552,7 @@ impl LlamaModel {
                 );
             }
 
+            prof.lap(1);
             // LoRA on Q/K/V: added to the projection outputs before bias/RoPE,
             // input is the normed hidden `[hs×n]` (matches the decode hook order).
             if let Some(lora) = &lora {
@@ -2535,11 +2603,9 @@ impl LlamaModel {
             };
 
             // Pass A: per token, bias → QK-norm → RoPE → stash post-RoPE Q back
-            // into q_mat (so the attention pass can read every query) → append
-            // K/V to the f32 cache. Destructure the cache once (not per token)
-            // and reserve the whole prompt's growth up front (matches lfm2) so
-            // the per-token extend_from_slice doesn't repeatedly reallocate.
-            // f16 KV: append converts to half; Pass B widens back to an f32
+            // into q_mat (so the attention pass can read every query) → write
+            // K/V into the cache. Destructure the cache once (not per token).
+            // f16 KV: the write converts to half; Pass B widens back to an f32
             // scratch (below) so the existing flash/naive kernels are unchanged.
             let use_f16 = state.kv_f16;
             let (key_cache, value_cache, key_cache_f16, value_cache_f16) =
@@ -2553,26 +2619,12 @@ impl LlamaModel {
                     } => (key_cache, value_cache, key_cache_f16, value_cache_f16),
                     _ => unreachable!("dense transformer layer is always Attention"),
                 };
-            if use_f16 {
-                key_cache_f16.reserve(n * kv_dim);
-                value_cache_f16.reserve(n * kv_dim);
-            } else {
-                key_cache.reserve(n * kv_dim);
-                value_cache.reserve(n * kv_dim);
-            }
-            for j in 0..n {
-                let pos = start_pos + j;
-                let q = &mut state.scratch.q[..q_dim];
-                let k = &mut state.scratch.k[..kv_dim];
-                let v = &mut state.scratch.v[..kv_dim];
-                for i in 0..q_dim {
-                    q[i] = q_mat[i * n + j];
-                }
-                for i in 0..kv_dim {
-                    k[i] = k_mat[i * n + j];
-                    v[i] = v_mat[i * n + j];
-                }
-
+            // Tokens are independent here (the cache rows are disjoint and Pass B has
+            // not started), so Pass A fans out over the prefill pool in tiles of 16
+            // tokens: a tile gathers its columns of q/k/v (one 64-byte run per row,
+            // not one cache line per element), runs the same per-token code, scatters
+            // the post-RoPE Q back, and writes its K/V rows straight into the cache.
+            let process = |pos: usize, q: &mut [f32], k: &mut [f32], v: &mut [f32]| {
                 // Qwen2 Q/K/V bias.
                 if let Some((q_bias, k_bias, v_bias)) = qkv_bias {
                     cpu::add_inplace(q, q_bias);
@@ -2662,30 +2714,89 @@ impl LlamaModel {
                         ((pos as f32 / floor_scale as f32).floor() + 1.0).ln() * scale + 1.0;
                     cpu::scale_inplace(q, q_scale);
                 }
-
-                // Stash post-RoPE Q back into q_mat for the attention pass.
-                for i in 0..q_dim {
-                    q_mat[i * n + j] = q[i];
-                }
-
-                // Append K, V to the cache (destructured once above the loop).
-                if use_f16 {
-                    key_cache_f16.extend(
-                        state.scratch.k[..kv_dim]
-                            .iter()
-                            .map(|&x| crate::quant::f32_to_f16(x)),
-                    );
-                    value_cache_f16.extend(
-                        state.scratch.v[..kv_dim]
-                            .iter()
-                            .map(|&x| crate::quant::f32_to_f16(x)),
-                    );
-                } else {
-                    key_cache.extend_from_slice(&state.scratch.k[..kv_dim]);
-                    value_cache.extend_from_slice(&state.scratch.v[..kv_dim]);
-                }
+            };
+            const TILE: usize = 16;
+            let kv_base = if use_f16 {
+                key_cache_f16.len()
+            } else {
+                key_cache.len()
+            };
+            // `resize` keeps the old `extend` contract (rows land at the end of the
+            // cache) while giving each worker a disjoint, already-initialized span.
+            if use_f16 {
+                key_cache_f16.resize(kv_base + n * kv_dim, 0);
+                value_cache_f16.resize(kv_base + n * kv_dim, 0);
+            } else {
+                key_cache.resize(kv_base + n * kv_dim, 0.0);
+                value_cache.resize(kv_base + n * kv_dim, 0.0);
             }
+            let q_mat_ptr = q_mat.as_mut_ptr() as usize;
+            let kc32 = key_cache.as_mut_ptr() as usize;
+            let vc32 = value_cache.as_mut_ptr() as usize;
+            let kc16 = key_cache_f16.as_mut_ptr() as usize;
+            let vc16 = value_cache_f16.as_mut_ptr() as usize;
+            let (k_src, v_src) = (&k_mat[..], &v_mat[..]);
+            cpu::par_range_prefill(n.div_ceil(TILE), 1, |tile0, n_tiles| {
+                let q_mat = q_mat_ptr as *mut f32;
+                let mut qb = vec![0.0f32; TILE * q_dim];
+                let mut kb = vec![0.0f32; TILE * kv_dim];
+                let mut vb = vec![0.0f32; TILE * kv_dim];
+                for tile in tile0..tile0 + n_tiles {
+                    let j0 = tile * TILE;
+                    let nc = TILE.min(n - j0);
+                    for i in 0..q_dim {
+                        for c in 0..nc {
+                            // SAFETY: `i * n + j0 + c < q_dim * n`; tiles own disjoint columns.
+                            qb[c * q_dim + i] = unsafe { *q_mat.add(i * n + j0 + c) };
+                        }
+                    }
+                    for i in 0..kv_dim {
+                        for c in 0..nc {
+                            kb[c * kv_dim + i] = k_src[i * n + j0 + c];
+                            vb[c * kv_dim + i] = v_src[i * n + j0 + c];
+                        }
+                    }
+                    for c in 0..nc {
+                        let j = j0 + c;
+                        let q = &mut qb[c * q_dim..(c + 1) * q_dim];
+                        let k = &mut kb[c * kv_dim..(c + 1) * kv_dim];
+                        let v = &mut vb[c * kv_dim..(c + 1) * kv_dim];
+                        process(start_pos + j, q, k, v);
+                        let row = kv_base + j * kv_dim;
+                        // SAFETY: row `kv_base + j * kv_dim` was sized by the `resize` above and
+                        // is written only by the tile that owns token `j`.
+                        unsafe {
+                            if use_f16 {
+                                let (dk, dv) =
+                                    ((kc16 as *mut u16).add(row), (vc16 as *mut u16).add(row));
+                                for i in 0..kv_dim {
+                                    *dk.add(i) = crate::quant::f32_to_f16(k[i]);
+                                    *dv.add(i) = crate::quant::f32_to_f16(v[i]);
+                                }
+                            } else {
+                                core::ptr::copy_nonoverlapping(
+                                    k.as_ptr(),
+                                    (kc32 as *mut f32).add(row),
+                                    kv_dim,
+                                );
+                                core::ptr::copy_nonoverlapping(
+                                    v.as_ptr(),
+                                    (vc32 as *mut f32).add(row),
+                                    kv_dim,
+                                );
+                            }
+                        }
+                    }
+                    for i in 0..q_dim {
+                        for c in 0..nc {
+                            // SAFETY: as above; this tile's columns are written by this tile only.
+                            unsafe { *q_mat.add(i * n + j0 + c) = qb[c * q_dim + i] };
+                        }
+                    }
+                }
+            });
 
+            prof.lap(2);
             // Pass B: GQA attention over the now-complete KV cache → out_proj_input.
             // In f16 mode, widen the half cache into the reused f32 scratch once
             // per layer so the flash/naive kernels below stay f32-only (prefill
@@ -2748,31 +2859,38 @@ impl LlamaModel {
                 // would hand all heads to 2 workers. One head per steal unit lets
                 // every worker take a head.
                 let max_active = cpu::prefill_threads_for_tokens(n);
-                cpu::par_rows_n_chunked_active(
-                    flash_buf,
-                    head_chunk,
-                    1,
-                    1,
-                    max_active,
-                    |(h, chunk)| {
-                        let kv_h = h / group_size;
-                        cpu::flash_attention_gqa_cpu(
-                            q_ref,
-                            k_cache,
-                            v_cache,
-                            chunk,
-                            h,
-                            1,
-                            n,
-                            n,
-                            kv_dim,
-                            kv_h * head_dim,
-                            head_dim,
-                            scale,
-                            start_pos,
-                        );
-                    },
-                );
+                // Work items of one head x 32 queries where the NEON range kernel applies (so the
+                // pool can balance fast and slow cores); otherwise one item per head, as before.
+                if !cpu::flash_attention_prefill_items(
+                    q_ref, k_cache, v_cache, flash_buf, n_heads, group_size, n, kv_dim, head_dim,
+                    scale, start_pos, true, max_active,
+                ) {
+                    cpu::par_rows_n_chunked_active(
+                        flash_buf,
+                        head_chunk,
+                        1,
+                        1,
+                        max_active,
+                        |(h, chunk)| {
+                            let kv_h = h / group_size;
+                            cpu::flash_attention_gqa_cpu(
+                                q_ref,
+                                k_cache,
+                                v_cache,
+                                chunk,
+                                h,
+                                1,
+                                n,
+                                n,
+                                kv_dim,
+                                kv_h * head_dim,
+                                head_dim,
+                                scale,
+                                start_pos,
+                            );
+                        },
+                    );
+                }
                 // Scatter flash_out [n_heads, n, head_dim] → out_proj_input [q_dim,
                 // n] (stride-n columns). d-then-j inner order keeps out writes
                 // sequential (stride 1) with small-stride reads from flash_buf.
@@ -2837,6 +2955,7 @@ impl LlamaModel {
                 }
             }
 
+            prof.lap(3);
             // Batched output projection GEMM -> block_out[hs * n] (k = q_dim).
             #[cfg(has_blas)]
             {
@@ -2915,6 +3034,7 @@ impl LlamaModel {
             }
             cpu::add_inplace(&mut hidden, &block_out);
 
+            prof.lap(4);
             // FFN pre-norm: rmsnorm each column (PreNorm only).
             let ffn_in: &[f32] = match self.norm_order {
                 NormOrder::PreNorm => {
@@ -2926,25 +3046,21 @@ impl LlamaModel {
                             cfg.rms_norm_eps,
                         );
                     } else {
-                        for j in 0..n {
-                            for i in 0..hs {
-                                ffn_col[i] = hidden[i * n + j];
-                            }
-                            cpu::rmsnorm(
-                                &mut ffn_col,
-                                &self.ffn_norm_weights[layer],
-                                cfg.rms_norm_eps,
-                            );
-                            for i in 0..hs {
-                                ffn_input[i * n + j] = ffn_col[i];
-                            }
-                        }
+                        transformer::rmsnorm_columns(
+                            &hidden,
+                            &mut ffn_input,
+                            &self.ffn_norm_weights[layer],
+                            cfg.rms_norm_eps,
+                            hs,
+                            n,
+                        );
                     }
                     &ffn_input
                 }
                 NormOrder::PostNorm => &hidden,
             };
 
+            prof.lap(5);
             // FFN gate/up GEMM → silu(gate)⊙up → down GEMM.
             #[cfg(has_blas)]
             {
@@ -2979,6 +3095,7 @@ impl LlamaModel {
                     &mut bq_scales,
                     &mut bq_quants,
                 );
+                prof.lap(6);
                 transformer::gemm_preq(
                     &self.gguf,
                     &refs.ffn_gate,
@@ -3031,6 +3148,7 @@ impl LlamaModel {
                 apply_column_major_bias(&mut up_mat, bias, is, n);
             }
 
+            prof.lap(7);
             match self.activation {
                 FfnActivation::Swiglu => {
                     cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
@@ -3039,6 +3157,7 @@ impl LlamaModel {
                     cpu::gelu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
                 }
             }
+            prof.lap(8);
 
             #[cfg(has_blas)]
             {
@@ -3063,6 +3182,8 @@ impl LlamaModel {
                     &mut bq_scales,
                     &mut bq_quants,
                 );
+                prof.lap(9);
+                let t_dn = crate::time::Instant::now();
                 transformer::gemm_preq(
                     &self.gguf,
                     &refs.ffn_down,
@@ -3073,6 +3194,12 @@ impl LlamaModel {
                     n,
                     is,
                 );
+                if prof.on {
+                    eprintln!(
+                        "DOWN layer {layer}: {:.2} ms",
+                        t_dn.elapsed().as_secs_f64() * 1e3
+                    );
+                }
             }
 
             // LoRA on the down projection - applied BEFORE the residual scale;
@@ -3116,6 +3243,7 @@ impl LlamaModel {
             }
             cpu::add_inplace(&mut hidden, &ffn_out);
 
+            prof.lap(10);
             if self
                 .loop_norm_interval
                 .is_some_and(|n_phys| (layer + 1) % n_phys == 0)
@@ -3141,6 +3269,7 @@ impl LlamaModel {
             }
         }
 
+        prof.report(n);
         // Advance seq_len (the block loops appended KV cells without bumping it).
         state.seq_len = start_pos + n;
 

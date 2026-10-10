@@ -1534,6 +1534,70 @@ pub(crate) fn gemm_out_to_rows(src: &[f32], rows: usize, n: usize, cols: usize, 
     }
 }
 
+/// Tokens per work item in [`rmsnorm_columns`]: one 64-byte cache line of f32.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+const RMSNORM_COL_TILE: usize = 16;
+
+/// RMS-normalize every token (column) of a column-major `[hs × n]` activation matrix
+/// into `dst`, with the same bytes as gathering each column, calling
+/// [`cpu::rmsnorm`] and scattering it back.
+///
+/// The per-token loop this replaces ran serially and touched one cache line per
+/// element (stride `n` floats); here each work item takes 16 adjacent tokens, so
+/// every row of the gather and scatter is one 64-byte run, and the items fan out
+/// over the prefill pool. The reduction itself is still `cpu::rmsnorm` on a
+/// contiguous column, so it matches the decode path (n = 1) bit for bit.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+pub(crate) fn rmsnorm_columns(
+    src: &[f32],
+    dst: &mut [f32],
+    weight: &[f32],
+    eps: f32,
+    hs: usize,
+    n: usize,
+) {
+    assert!(
+        src.len() >= hs * n && dst.len() >= hs * n && weight.len() >= hs,
+        "rmsnorm_columns: buffers too small for hs={hs}, n={n}"
+    );
+    if hs == 0 || n == 0 {
+        return;
+    }
+    let dst_ptr = dst.as_mut_ptr() as usize;
+    let n_tiles = n.div_ceil(RMSNORM_COL_TILE);
+    cpu::par_range_prefill(n_tiles, 1, move |tile0, n_items| {
+        let mut buf = vec![0.0f32; hs * RMSNORM_COL_TILE];
+        let dst = dst_ptr as *mut f32;
+        for tile in tile0..tile0 + n_items {
+            let j0 = tile * RMSNORM_COL_TILE;
+            let nc = RMSNORM_COL_TILE.min(n - j0);
+            for i in 0..hs {
+                let row = &src[i * n + j0..i * n + j0 + nc];
+                for (c, &v) in row.iter().enumerate() {
+                    buf[c * hs + i] = v;
+                }
+            }
+            for c in 0..nc {
+                cpu::rmsnorm(&mut buf[c * hs..(c + 1) * hs], weight, eps);
+            }
+            for i in 0..hs {
+                for c in 0..nc {
+                    // SAFETY: `i * n + j0 + c < hs * n <= dst.len()`, and tiles own
+                    // disjoint column ranges, so no two items write the same element.
+                    unsafe { *dst.add(i * n + j0 + c) = buf[c * hs + i] };
+                }
+            }
+        }
+    });
+}
+
+/// Columns per work item in [`quantize_columns`]: one 64-byte cache line of f32.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    feature = "parallel"
+))]
+const QUANT_COL_TILE: usize = 16;
+
 /// Quantize all `n` columns of a column-major `[dim × n]` matrix to Q8_0
 /// (no-`blas` fallback). `col` is a scratch column of length ≥ `dim`;
 /// `scales`/`quants` receive the packed `[n][dim/32]` / `[n][dim]` layout the
@@ -1585,22 +1649,56 @@ pub(crate) fn quantize_columns(
     {
         let min_cols = cpu::prequant_par_min_cols();
         if n >= min_cols {
+            // Work item = `QUANT_COL_TILE` adjacent columns. Gathering one column at a
+            // time touches a fresh cache line per element (stride `n` floats) and the
+            // other columns sharing that line are fetched again by other workers; at
+            // `dim` = 8192 (the FFN down input, 16 MB) that thrashed to 20x the cost of
+            // the 4x smaller `dim` = 2048 case. A tile reads each row's 16 columns as
+            // one 64-byte run into an L1-resident transpose buffer, then quantizes each
+            // column's 32-float block exactly as before (same bytes out).
             let mat_ptr = mat.as_ptr() as usize;
             let quants_ptr = quants.as_mut_ptr() as usize;
-            cpu::par_rows_n(&mut scales[..n * nb], nb, min_cols, move |(j, sc)| {
-                let mat = mat_ptr as *const f32;
-                let qcol = (quants_ptr as *mut i8).wrapping_add(j * dim);
-                let mut blk = [0.0f32; 32];
-                for b in 0..nb {
-                    for (t, bt) in blk.iter_mut().enumerate() {
-                        *bt = unsafe { *mat.add((b * 32 + t) * n + j) };
+            let tile_min = min_cols.div_ceil(QUANT_COL_TILE).max(1);
+            cpu::par_rows_n(
+                &mut scales[..n * nb],
+                QUANT_COL_TILE * nb,
+                tile_min,
+                move |(g, sc)| {
+                    let mat = mat_ptr as *const f32;
+                    let j0 = g * QUANT_COL_TILE;
+                    let ncols = sc.len() / nb;
+                    let mut tile = [[0.0f32; QUANT_COL_TILE]; 32];
+                    let mut blk = [0.0f32; 32];
+                    for b in 0..nb {
+                        for (t, row) in tile.iter_mut().enumerate() {
+                            // SAFETY: row `b * 32 + t < dim`, columns `j0..j0 + ncols <= n`,
+                            // and `mat.len() >= dim * n` was asserted above.
+                            let src = unsafe { mat.add((b * 32 + t) * n + j0) };
+                            for (c, v) in row.iter_mut().enumerate().take(ncols) {
+                                *v = unsafe { *src.add(c) };
+                            }
+                        }
+                        for c in 0..ncols {
+                            for (t, bt) in blk.iter_mut().enumerate() {
+                                *bt = tile[t][c];
+                            }
+                            // SAFETY: column `j0 + c` owns `quants[(j0 + c) * dim..][..dim]`,
+                            // disjoint across columns and across work items.
+                            unsafe {
+                                let qs = core::slice::from_raw_parts_mut(
+                                    (quants_ptr as *mut i8).add((j0 + c) * dim + b * 32),
+                                    32,
+                                );
+                                cpu::quantize_f32_to_q8_0_into(
+                                    &blk,
+                                    &mut sc[c * nb + b..c * nb + b + 1],
+                                    qs,
+                                );
+                            }
+                        }
                     }
-                    unsafe {
-                        let qs = core::slice::from_raw_parts_mut(qcol.add(b * 32), 32);
-                        cpu::quantize_f32_to_q8_0_into(&blk, &mut sc[b..b + 1], qs);
-                    }
-                }
-            });
+                },
+            );
             return;
         }
     }
@@ -2827,6 +2925,49 @@ mod tests {
         }
     }
 
+    /// `rmsnorm_columns` must equal the gather / `cpu::rmsnorm` / scatter loop it
+    /// replaced, byte for byte, including a ragged tail tile and `n` smaller than a tile.
+    #[test]
+    fn rmsnorm_columns_matches_per_column_reference() {
+        let mut st = 0x1234_5678_9ABC_DEF0u64;
+        let mut lcg = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((st >> 33) as f32 / (1u64 << 31) as f32) * 4.0 - 2.0
+        };
+        for (hs, n) in [
+            (96usize, 1usize),
+            (96, 5),
+            (96, 16),
+            (96, 37),
+            (130, 130),
+            (2048, 70),
+        ] {
+            let src: Vec<f32> = (0..hs * n).map(|_| lcg()).collect();
+            let weight: Vec<f32> = (0..hs).map(|_| lcg()).collect();
+            let mut dst = vec![f32::NAN; hs * n];
+            rmsnorm_columns(&src, &mut dst, &weight, 1e-5, hs, n);
+
+            let mut want = vec![0.0f32; hs * n];
+            let mut col = vec![0.0f32; hs];
+            for j in 0..n {
+                for i in 0..hs {
+                    col[i] = src[i * n + j];
+                }
+                cpu::rmsnorm(&mut col, &weight, 1e-5);
+                for i in 0..hs {
+                    want[i * n + j] = col[i];
+                }
+            }
+            let same = dst
+                .iter()
+                .zip(&want)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            assert!(same, "rmsnorm_columns differs at hs={hs} n={n}");
+        }
+    }
+
     /// Parallel `quantize_columns` must produce byte-identical output to the
     /// serial per-column reference. There is no cross-column reduction, so the
     /// only way the fan-out can differ is a wiring bug (a column written to the
@@ -2834,8 +2975,15 @@ mod tests {
     /// above `prequant_par_min_cols()`, so the parallel branch is the one exercised.
     #[test]
     fn quantize_columns_parallel_matches_serial() {
-        let dim = 256usize;
-        let n = 64usize; // ≥ prequant_par_min_cols() → the parallel branch runs.
+        // All at or above the 256-column parallel threshold: 256 and 512 fill whole
+        // tiles, 275 leaves a ragged 3-column tail tile.
+        for n in [256usize, 275, 512] {
+            quantize_columns_matches_serial_at(256, n);
+        }
+    }
+
+    fn quantize_columns_matches_serial_at(dim: usize, n: usize) {
+        // `n` ≥ prequant_par_min_cols() → the parallel branch runs.
         let nb = dim / 32;
 
         // Deterministic column-major [dim × n] activation matrix.

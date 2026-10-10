@@ -7194,6 +7194,81 @@ pub fn flash_attention_gqa_cpu_opt_range(
     unreachable!("guarded by flash_attention_range_supported");
 }
 
+/// Run the prefill's flash attention as independent (head, 32-query) work items on the prefill pool,
+/// heaviest (latest queries) first, writing `[n_heads, n, head_dim]` into `out` (head `h` at
+/// `h * n * head_dim`, as one whole-head item would). Q is the prefill's stride-`n` column layout.
+/// Returns `false`, having done nothing, when the range kernel is unavailable (non-NEON, other head
+/// sizes, `CERA_CPU_ATTN_TILED=0`): the caller then runs one item per head.
+///
+/// 16 to 32 whole heads over workers of unequal speed leave the slow cores holding the barrier;
+/// the finer items let the pool's stealing balance prime and mid cores.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    not(all(feature = "parallel", target_arch = "aarch64")),
+    allow(unused_variables)
+)]
+pub fn flash_attention_prefill_items(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    group_size: usize,
+    n: usize,
+    kv_dim: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+    is_causal: bool,
+    max_active: usize,
+) -> bool {
+    if !flash_attention_range_supported(head_dim) {
+        return false;
+    }
+    /// Queries per work item: one query block of the kernel, so splitting costs no extra K packing.
+    const Q_ITEM: usize = 32;
+    let n_qb = n.div_ceil(Q_ITEM);
+    assert!(
+        out.len() >= n_heads * n * head_dim,
+        "attention output too small"
+    );
+    let out_ptr = out.as_mut_ptr() as usize;
+    // One slot per item: the pool hands each worker a disjoint row of `tickets`; the real output
+    // goes through `out_ptr`.
+    let mut tickets = vec![0.0f32; n_heads * n_qb];
+    par_rows_n_chunked_active(&mut tickets, 1, 1, 1, max_active, |(item, _)| {
+        let h = item % n_heads;
+        let q_lo = (n_qb - 1 - item / n_heads) * Q_ITEM;
+        let q_hi = (q_lo + Q_ITEM).min(n);
+        // SAFETY: items are disjoint `[q_lo, q_hi)` ranges of head `h`'s `[n, head_dim]` block.
+        let chunk = unsafe {
+            core::slice::from_raw_parts_mut(
+                (out_ptr as *mut f32).add((h * n + q_lo) * head_dim),
+                (q_hi - q_lo) * head_dim,
+            )
+        };
+        flash_attention_gqa_cpu_opt_range(
+            q_mat,
+            k_cache,
+            v_cache,
+            chunk,
+            h,
+            1,
+            n,
+            n,
+            kv_dim,
+            (h / group_size) * head_dim,
+            head_dim,
+            scale,
+            start_pos,
+            is_causal,
+            q_lo,
+            q_hi,
+        );
+    });
+    true
+}
+
 #[allow(dead_code, clippy::too_many_arguments, clippy::needless_range_loop)]
 /// Portable reference for [`flash_attention_gqa`], and the fallback wherever
 /// the NEON path does not apply.
@@ -13525,6 +13600,82 @@ mod tests {
                         "hd={head_dim} n={n} start={start_pos} causal={causal}"
                     );
                 }
+            }
+        }
+    }
+
+    /// The vision encoder and the d1 head hand the kernel row-major Q (`q[token * q_stride + dim]`,
+    /// `q_stride >= head_dim`), bidirectional, with a prefix: the tiled kernel must match the previous
+    /// one bit for bit there too.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn flash_tiled_matches_reference_for_row_major_q() {
+        let mut seed: u64 = 4242;
+        let mut rnd = |len: usize, amp: f32| -> Vec<f32> {
+            (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((seed >> 33) as i32) as f32 / 2147483648.0 * amp
+                })
+                .collect()
+        };
+        let head_dim = 64usize;
+        let n_heads = 3usize;
+        let n_embd = n_heads * head_dim;
+        for (n_tokens, nq) in [(70usize, 70usize), (97, 33), (5, 5), (130, 64)] {
+            let q = rnd(n_tokens * n_embd, 3.0);
+            let k = rnd(n_tokens * n_embd, 3.0);
+            let v = rnd(n_tokens * n_embd, 1.0);
+            let t0 = n_tokens - nq;
+            for h in 0..n_heads {
+                let run = |tiled: bool| {
+                    let mut out = vec![0.0f32; nq * head_dim];
+                    unsafe {
+                        if tiled {
+                            flash_attention_gqa_neon_tiled(
+                                &q[t0 * n_embd..],
+                                &k,
+                                &v,
+                                &mut out,
+                                h,
+                                1,
+                                nq,
+                                n_embd,
+                                n_embd,
+                                h * head_dim,
+                                head_dim,
+                                0.125,
+                                n_tokens - nq,
+                                false,
+                                0,
+                                nq,
+                            );
+                        } else {
+                            flash_attention_gqa_neon_opt(
+                                &q[t0 * n_embd..],
+                                &k,
+                                &v,
+                                &mut out,
+                                h,
+                                1,
+                                nq,
+                                n_embd,
+                                n_embd,
+                                h * head_dim,
+                                head_dim,
+                                0.125,
+                                n_tokens - nq,
+                                false,
+                            );
+                        }
+                    }
+                    out
+                };
+                let (a, b) = (run(false), run(true));
+                assert!(
+                    a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "tokens={n_tokens} nq={nq} head={h}"
+                );
             }
         }
     }
