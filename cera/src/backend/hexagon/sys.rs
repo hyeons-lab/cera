@@ -488,7 +488,7 @@ impl FastRpcDriver {
         Ok(())
     }
 
-    /// Open a FastRPC handle to a skeleton library (e.g. `file:///libggml-htp-v75.so?domain=3`).
+    /// Open a FastRPC handle to a skeleton library (e.g. `file:///libcera-htp-v75.so?domain=3`).
     pub fn open_skel_handle(&self, uri: &str) -> Result<RemoteHandle64, CeraError> {
         let c_uri = CString::new(uri).map_err(|e| CeraError::Backend(e.to_string()))?;
         let mut handle: RemoteHandle64 = 0;
