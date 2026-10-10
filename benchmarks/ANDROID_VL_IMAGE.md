@@ -485,6 +485,48 @@ Q5_K_M decodes are about 0.9x, and the fused QKV `concat3` K-quant kernels keep 
 `/data/local/tmp/cmp-cera`), `CERA_PROFILE_PREFILL=1`, and the ignored `dense_gemm_gops_microbench` and
 `decode_gemv_microbench` tests.
 
+### CPU time to first token, short prompts and decode at depth (2026-10-10)
+
+`cera bench` now reports time to first token (TTFT: the prompt handed to the session until the first generated token; with
+`--max-tokens 0` it is the prefill time). Cera against llama.cpp (`llama-bench -t 8`) on the same six models, thermally gated
+(AP sensor at 28 C or less before every invocation, engines alternating, 3 rounds, medians,
+`android_vl_image_raw/cpu_ttft_20261010/`). llama-bench has no TTFT, so it is derived the same way, as prompt tokens over its
+prompt-processing rate. Decode is measured after the prompt, so the 512 rows are decode at 512 tokens of context:
+
+| Model | Prompt | Prefill tok/s (Cera, llama.cpp) | TTFT ms (Cera, llama.cpp) | Decode tok/s (Cera, llama.cpp) |
+|---|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_0 (dense) | 16 | 232, 653 | 69, 25 | 66.7, 75.9 |
+| Llama-3.2-1B Q4_0 (dense) | 64 | 355, 565 | 180, 113 | 65.6, 73.5 |
+| Llama-3.2-1B Q4_0 (dense) | 512 | 516, 565 | 993, 907 | 59.4, 75.2 |
+| LFM2.5-VL-450M Q4_0 | 16 | 1038, 1816 | 15, 9 | 266.7, 257.5 |
+| LFM2.5-VL-450M Q4_0 | 64 | 1357, 2139 | 47, 30 | 271.2, 247.9 |
+| LFM2.5-VL-450M Q4_0 | 512 | 1929, 1922 | 265, 266 | 242.4, 250.1 |
+| LFM2.5-350M Q4_K_M | 16 | 588, 1165 | 27, 14 | 222.2, 232.9 |
+| LFM2.5-350M Q4_K_M | 64 | 775, 1260 | 83, 51 | 219.9, 229.9 |
+| LFM2.5-350M Q4_K_M | 512 | 1164, 1229 | 440, 417 | 195.1, 231.3 |
+| LFM2.5-350M Q8_0 | 16 | 853, 1562 | 19, 10 | 157.6, 156.4 |
+| LFM2.5-350M Q8_0 | 64 | 1397, 2026 | 46, 32 | 159.6, 154.1 |
+| LFM2.5-350M Q8_0 | 512 | 1878, 1689 | 273, 303 | 151.7, 150.6 |
+| LFM2.5-2.6B Agent Q4_0 | 16 | 109, 282 | 148, 57 | 34.6, 36.9 |
+| LFM2.5-2.6B Agent Q4_0 | 64 | 177, 287 | 361, 223 | 34.9, 36.6 |
+| LFM2.5-2.6B Agent Q4_0 | 512 | 245, 245 | 2090, 2089 | 33.8, 36.5 |
+| LFM2.5-2.6B Q5_K_M | 16 | 72, 118 | 223, 135 | 25.4, 28.6 |
+| LFM2.5-2.6B Q5_K_M | 64 | 100, 118 | 638, 541 | 25.0, 29.1 |
+| LFM2.5-2.6B Q5_K_M | 512 | 143, 111 | 3575, 4628 | 24.0, 28.5 |
+
+Three things stand out. At 512 tokens the prefill is at parity or ahead on four of six models (Q8_0 1.11x, Q5_K_M 1.29x, the 2.6B Q4_0
+and the 450M at 1.00x) and behind on the other two (dense Llama 0.91x, Q4_K_M 0.95x). At 16 and 64 tokens it is not: Cera's
+prefill is 0.36x to 0.69x of llama.cpp's (0.85x at 64 on Q5_K_M), so TTFT is 1.2x to 2.8x worse, which is the case a chat turn is
+made of. And on four models decode loses more with context in Cera than in llama.cpp: from a 16-token to a 512-token prompt Cera drops 11% on
+the dense Llama (66.7 to 59.4 tok/s), 12% on Q4_K_M, 9% on the 450M and 6% on Q5_K_M, where llama.cpp drops 1%, 1%, 3% and 0%. On
+Q8_0 and the 2.6B Q4_0 the two drop alike (4% and 2% against 4% and 1%). That is the attention over the KV cache, which the earlier
+32-token decode numbers never exercised.
+
+Why the short prompts are slow (per-phase prefill profile, 450M Q4_0, 16 tokens: 12.4 ms, of which the FFN gate/up is 5.7 and the
+down projection 2.8): at that size the GEMMs are bound by weight traffic, not arithmetic. The smmla path reads an int8 repack of
+the 4-bit weights (twice the bytes) at about 30 GB/s, half of the 62 to 73 GB/s the device sustains, so a 16-token prefill costs about
+three times its bandwidth floor. Decode, by contrast, already streams weights at 46 to 58 GB/s effective (file size times tok/s).
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
