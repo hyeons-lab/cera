@@ -1779,15 +1779,24 @@ pub(crate) fn quantize_rows(
         if n >= min_cols {
             let mat_ptr = mat.as_ptr() as usize;
             let quants_ptr = quants.as_mut_ptr() as usize;
-            cpu::par_rows_n(&mut scales[..n * nb], nb, min_cols, move |(j, sc)| {
-                let tok_f32 = unsafe {
-                    core::slice::from_raw_parts((mat_ptr as *const f32).add(j * dim), dim)
-                };
-                let tok_qs = unsafe {
-                    core::slice::from_raw_parts_mut((quants_ptr as *mut i8).add(j * dim), dim)
-                };
-                cpu::quantize_f32_to_q8_0_into(tok_f32, sc, tok_qs);
-            });
+            // Rows are tokens (cheap, many): small steal chunks over the whole pool. The old
+            // `min_cols` rows-per-worker floor made a 512-token chunk a 2-worker dispatch.
+            cpu::par_rows_n_chunked_active(
+                &mut scales[..n * nb],
+                nb,
+                1,
+                4,
+                usize::MAX,
+                move |(j, sc)| {
+                    let tok_f32 = unsafe {
+                        core::slice::from_raw_parts((mat_ptr as *const f32).add(j * dim), dim)
+                    };
+                    let tok_qs = unsafe {
+                        core::slice::from_raw_parts_mut((quants_ptr as *mut i8).add(j * dim), dim)
+                    };
+                    cpu::quantize_f32_to_q8_0_into(tok_f32, sc, tok_qs);
+                },
+            );
             return;
         }
     }
