@@ -2713,7 +2713,9 @@ impl LlamaModel {
                     cpu::scale_inplace(q, q_scale);
                 }
             };
-            const TILE: usize = 16;
+            // Up to 16 tokens per tile, fewer for short prompts so they still fan out over the pool.
+            const MAX_TILE: usize = 16;
+            let tile_w = n.div_ceil(8).clamp(1, MAX_TILE);
             let kv_base = if use_f16 {
                 key_cache_f16.len()
             } else {
@@ -2738,13 +2740,13 @@ impl LlamaModel {
             let kc16 = key_cache_f16.as_mut_ptr() as usize;
             let vc16 = value_cache_f16.as_mut_ptr() as usize;
             let (k_src, v_src) = (&k_mat[..], &v_mat[..]);
-            cpu::par_range_prefill(n.div_ceil(TILE), 1, |tile0, n_tiles| {
+            cpu::par_range_prefill(n.div_ceil(tile_w), 1, |tile0, n_tiles| {
                 let q_mat = q_mat_ptr as *mut f32;
                 PASS_A_SCRATCH.with(|sc| {
                     let mut sc = sc.borrow_mut();
                     let (qb_vec, kb_vec, vb_vec) = &mut *sc;
-                    let q_len = TILE * q_dim;
-                    let kv_len = TILE * kv_dim;
+                    let q_len = tile_w * q_dim;
+                    let kv_len = tile_w * kv_dim;
                     if qb_vec.len() < q_len {
                         qb_vec.resize(q_len, 0.0);
                     }
@@ -2758,8 +2760,8 @@ impl LlamaModel {
                     let kb = &mut kb_vec[..kv_len];
                     let vb = &mut vb_vec[..kv_len];
                     for tile in tile0..tile0 + n_tiles {
-                        let j0 = tile * TILE;
-                        let nc = TILE.min(n - j0);
+                        let j0 = tile * tile_w;
+                        let nc = tile_w.min(n - j0);
                         for i in 0..q_dim {
                             for c in 0..nc {
                                 // SAFETY: `i * n + j0 + c < q_dim * n`; tiles own disjoint columns.

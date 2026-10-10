@@ -1223,23 +1223,18 @@ pub fn gemv_par_threshold() -> usize {
     usize::MAX
 }
 
-/// Default minimum columns per worker for the batched-prefill activation
-/// pre-quantization (`quantize_columns`) RowPool fan-out.
+/// Smallest column (token) count at which the batched-prefill activation pre-quantization
+/// (`quantize_columns`, `quantize_rows`) fans out over the RowPool; fewer run serially on the caller.
 ///
-/// One value with one meaning: a worker is never handed fewer than this many
-/// columns, and — since a single worker's minimum is the smallest split worth
-/// making — fewer than this many columns total run serially on the caller. The
-/// split matters because the batched GEMM already parallelizes over output rows,
-/// so a *serial* pre-quant is the Amdahl term that caps multi-core prefill
-/// (measured as a regression on an 8-core Android big.LITTLE once the parallel
-/// GEMM shrank per core). A column's work (a strided gather + `dim/32` Q8_0
-/// block-quantizes) is lighter than a GEMV output row, so this sits well below
-/// [`GEMV_PAR_THRESHOLD_DEFAULT`].
+/// The batched GEMM parallelizes over output rows, so a *serial* pre-quant is an Amdahl term in the
+/// prefill. It was 256 when a fork-join cost real time; on the RowPool a dispatch is an atomic store,
+/// and the serial path cost 150 us per column of the 8192-wide FFN down input (a 64-token prompt
+/// spent 10 of 134 ms on it, 16 tokens 2 of 41). Eight is where a tile of tokens per worker starts.
 ///
-/// Consumed by the no-`blas` prefill `quantize_columns` on both int8-GEMM
-/// targets: aarch64 NEON and x86_64 int8 (VNNI or AVX2).
+/// Consumed by the no-`blas` prefill `quantize_columns` and `quantize_rows` on both int8-GEMM
+/// targets: aarch64 NEON and x86_64 int8 (VNNI or AVX2). Overridable with `CERA_PREQUANT_MIN_COLS`.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
-pub const PREQUANT_PAR_MIN_COLS_DEFAULT: usize = 256;
+pub const PREQUANT_PAR_MIN_COLS_DEFAULT: usize = 8;
 
 /// Minimum columns per worker for the prefill pre-quant fan-out, resolved once.
 /// `CERA_PREQUANT_MIN_COLS` overrides [`PREQUANT_PAR_MIN_COLS_DEFAULT`] for

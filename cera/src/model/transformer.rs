@@ -1666,12 +1666,14 @@ pub(crate) fn rmsnorm_columns(
             const { std::cell::RefCell::new(Vec::new()) };
     }
     let dst_ptr = dst.as_mut_ptr() as usize;
-    let n_tiles = n.div_ceil(RMSNORM_COL_TILE);
+    // Narrower tiles for short prompts, so that a 16-token chunk is eight work items and not one.
+    let tile_w = n.div_ceil(8).clamp(1, RMSNORM_COL_TILE);
+    let n_tiles = n.div_ceil(tile_w);
     cpu::par_range_prefill(n_tiles, 1, move |tile0, n_items| {
         RMSNORM_COL_SCRATCH.with(|cell| {
             let mut cell = cell.borrow_mut();
             let needed = hs
-                .checked_mul(RMSNORM_COL_TILE)
+                .checked_mul(tile_w)
                 .expect("rmsnorm_columns: scratch buffer overflow");
             if cell.len() < needed {
                 cell.resize(needed, 0.0);
@@ -1679,8 +1681,8 @@ pub(crate) fn rmsnorm_columns(
             let buf = &mut cell[..needed];
             let dst = dst_ptr as *mut f32;
             for tile in tile0..tile0 + n_items {
-                let j0 = tile * RMSNORM_COL_TILE;
-                let nc = RMSNORM_COL_TILE.min(n - j0);
+                let j0 = tile * tile_w;
+                let nc = tile_w.min(n - j0);
                 for i in 0..hs {
                     let row = &src[i * n + j0..i * n + j0 + nc];
                     for (c, &v) in row.iter().enumerate() {
@@ -1781,15 +1783,19 @@ pub(crate) fn quantize_columns(
             // Every tile is its own steal unit. With the old per-column floor (`min_cols`
             // columns per worker, scaled to tiles) a 512-token chunk was 32 tiles in 2 chunks, so
             // two workers did every activation quantize of the prefill.
+            // A tile is at most `QUANT_COL_TILE` columns, narrower for short prompts so that even a
+            // 16-token chunk is eight tiles and not one tile on one worker (the result is the same
+            // bytes whatever the width).
+            let tile_w = n.div_ceil(8).clamp(1, QUANT_COL_TILE);
             cpu::par_rows_n_chunked_active(
                 &mut scales[..n * nb],
-                QUANT_COL_TILE * nb,
+                tile_w * nb,
                 1,
                 1,
                 usize::MAX,
                 move |(g, sc)| {
                     let mat = mat_ptr as *const f32;
-                    let j0 = g * QUANT_COL_TILE;
+                    let j0 = g * tile_w;
                     let ncols = sc.len() / nb;
                     let mut tile = [[0.0f32; QUANT_COL_TILE]; 32];
                     let mut blk = [0.0f32; 32];
@@ -1839,6 +1845,13 @@ pub(crate) fn quantize_columns(
     }
 }
 
+/// Fewest tokens at which [`quantize_rows`] fans out; below it the serial loop is cheaper than waking workers.
+#[cfg(all(
+    any(target_arch = "aarch64", target_arch = "x86_64"),
+    feature = "parallel"
+))]
+const QUANTIZE_ROWS_PAR_MIN: usize = 64;
+
 /// Quantize all `n` token rows of a row-major `[n × dim]` activation matrix to Q8_0.
 /// Used by LFM2 prefill activations where token vectors are stored contiguously.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
@@ -1862,7 +1875,11 @@ pub(crate) fn quantize_rows(
 
     #[cfg(feature = "parallel")]
     {
-        let min_cols = cpu::prequant_par_min_cols();
+        // A row is a token's activation vector (one Q8_0 quantize, about 1 us per 2048 values), a lot
+        // lighter than a `quantize_columns` column (a strided gather at 150 us per 8192-wide column), so
+        // the fan-out only pays from 64 tokens: at 16 tokens the whole call is ~20 us serial and waking
+        // workers made the 2.6B's prefill 13% slower. `CERA_PREQUANT_MIN_COLS` can raise it further.
+        let min_cols = cpu::prequant_par_min_cols().max(QUANTIZE_ROWS_PAR_MIN);
         if n >= min_cols {
             let mat_ptr = mat.as_ptr() as usize;
             let quants_ptr = quants.as_mut_ptr() as usize;
@@ -3076,10 +3093,13 @@ mod tests {
             (96, 0),
             (96, 1),
             (96, 5),
+            (96, 8),
             (96, 16),
             (96, 37),
+            (96, 64),
             (130, 130),
             (2048, 70),
+            (130, 300),
         ] {
             let src: Vec<f32> = (0..hs * n).map(|_| lcg()).collect();
             let weight: Vec<f32> = (0..hs).map(|_| lcg()).collect();
@@ -3113,9 +3133,10 @@ mod tests {
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn quantize_columns_parallel_matches_serial() {
-        // All at or above the 256-column parallel threshold: 256 and 512 fill whole
-        // tiles, 275 leaves a ragged 3-column tail tile.
-        for n in [256usize, 275, 512] {
+        // All at or above the 8-column parallel threshold: 8 to 100 exercise the narrowed
+        // short-prompt tiles (1 to 13 columns), 256 and 512 fill whole 16-column tiles, 33 and
+        // 275 leave ragged tail tiles.
+        for n in [8usize, 16, 33, 64, 100, 256, 275, 512] {
             quantize_columns_matches_serial_at(256, n);
         }
     }
