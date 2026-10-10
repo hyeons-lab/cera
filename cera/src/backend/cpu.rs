@@ -458,10 +458,15 @@ pub fn par_range(total_rows: usize, _min_rows: usize, f: impl Fn(usize, usize) +
     f(0, total_rows);
 }
 
-/// Target worker cap for prefill passes given token sequence length `n`.
-/// For small prompt lengths (n <= 32), barrier sync across 8 cores can exceed arithmetic time.
-/// 2 threads (Prime cores) is ideal for n <= 32; 4 threads for n <= 64; full pool for n > 64.
-/// Overridable with `CERA_SMALL_PROMPT_THREADS`.
+/// Target worker cap for prefill passes given token sequence length `n`: 4 workers up to 4 tokens, the whole
+/// pool above that. Overridable with `CERA_SMALL_PROMPT_THREADS`, which replaces the cap for every `n`.
+///
+/// An earlier cap (2 workers up to 32 tokens, 4 up to 64) assumed the barrier across 8 cores outweighs the
+/// arithmetic of a small GEMM. On the S25 Ultra that stopped being true once the GEMM kernels got fast:
+/// time to first token on the 450M, 350M and 2.6B LFM2 models, dense Llama-3.2-1B and the Q4_K_M and Q8_0
+/// builds fell 16% to 45% with the whole pool at 16, 32 and 64 tokens (e.g. 450M Q4_0: 15 to 12 ms at 16
+/// tokens, 30 to 19 at 32, 47 to 34 at 64), and the whole pool was never slower than a smaller one from 5
+/// tokens up. Below that the work is a few tens of microseconds and the pool size makes no difference.
 pub fn prefill_threads_for_tokens(n: usize) -> usize {
     static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
     let override_val = OVERRIDE.get_or_init(|| {
@@ -472,13 +477,7 @@ pub fn prefill_threads_for_tokens(n: usize) -> usize {
     if let Some(threads) = *override_val {
         return threads.max(1);
     }
-    if n <= 32 {
-        2
-    } else if n <= 64 {
-        4
-    } else {
-        usize::MAX
-    }
+    if n <= 4 { 4 } else { usize::MAX }
 }
 
 /// Row-parallel range dispatch for prefill passes with an active worker cap: executes
@@ -13602,6 +13601,21 @@ mod tests {
         let weight = vec![1.0, 1.0];
         rmsnorm(&mut x, &weight, 1e-5);
         assert_eq!(x, vec![1.0, 2.0, 3.0, 4.0]);
+    }
+
+    /// The default small-prompt worker cap: a few tokens stay on four workers, anything from five tokens
+    /// up uses the whole pool (the old 2/4-worker steps cost 16% to 45% of TTFT at 16 to 64 tokens).
+    #[test]
+    fn small_prompt_worker_cap_defaults_to_the_whole_pool_above_four_tokens() {
+        if std::env::var_os("CERA_SMALL_PROMPT_THREADS").is_some() {
+            return; // an explicit override replaces the policy for every n
+        }
+        for n in 1..=4 {
+            assert_eq!(prefill_threads_for_tokens(n), 4, "n={n}");
+        }
+        for n in [5usize, 8, 16, 32, 33, 64, 65, 512, 4096] {
+            assert_eq!(prefill_threads_for_tokens(n), usize::MAX, "n={n}");
+        }
     }
 
     #[test]
