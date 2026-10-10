@@ -355,6 +355,16 @@ impl WeightRef {
             let qualifies = (self.dtype == DType::Q4_0
                 && cpu::q4_0_repack_supported(self.m, self.k))
                 || (self.dtype == DType::Q8_0 && cpu::q8_0_smmla_repack_supported(self.m, self.k))
+                || (self.dtype == DType::Q5KM && {
+                    #[cfg(target_arch = "aarch64")]
+                    {
+                        cpu::q5_k_smmla_repack_supported(self.m, self.k)
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    {
+                        false
+                    }
+                })
                 || (self.dtype == DType::Q4KM && cpu::q4_k_repack_supported(self.m, self.k))
                 || (self.dtype == DType::Q6K && cpu::q6_k_repack_supported(self.m, self.k));
             if !do_repack {
@@ -426,6 +436,13 @@ impl WeightRef {
                     scales,
                     mprime,
                 });
+            }
+            // Q5_K rides the Q4_K smmla kernels (same int8 layout and scale/min structure).
+            #[cfg(target_arch = "aarch64")]
+            if qualifies && self.dtype == DType::Q5KM {
+                let (packed, dsc, dmn) =
+                    cpu::repack_q5_k_smmla_8x8(weight_data(gguf, &self), self.m, self.k);
+                kind = Some(Repacked::Q4KSmmla { packed, dsc, dmn });
             }
             #[cfg(target_arch = "aarch64")]
             if qualifies && self.dtype == DType::Q6K {
@@ -628,35 +645,57 @@ mod gate_tests {
         }
     }
 
-    /// Q5_K is batched **exactly** when `blas` is on, and this asserts the
+    /// Q5_K is batched exactly where something can compute it, and this asserts the
     /// biconditional rather than one direction of it.
     ///
-    /// The failure it guards is not a slow path, it is silent corruption. Q5_K
-    /// has no int8 GEMM, so admitting it without BLAS makes `gemm_preq` decline
-    /// and the matmul get skipped entirely; the callers reuse one output buffer
-    /// across layers, so what the next layer reads is not zeros but the
-    /// *previous layer's* activations. Gating on `k_quant_gemm_available()`
-    /// like its K-quant siblings would do exactly that on any dotprod aarch64
-    /// host built without `blas`, which is every mobile build.
+    /// The failure it guards is not a slow path, it is silent corruption: admitting a dtype the
+    /// dispatcher then declines makes `gemm_preq` skip the matmul, and the callers reuse one output
+    /// buffer across layers, so what the next layer reads is the *previous layer's* activations.
+    /// Q5_K has no standard-layout int8 GEMM, so its admission rests on two things that must hold
+    /// together: BLAS (dequantize + SGEMM), or aarch64 dotprod, where the i8mm repack feeds the
+    /// Q4_K smmla kernels and an un-repacked weight takes the per-column GEMV fallback. The
+    /// second test below checks the dispatcher really computes whatever this admits.
     #[test]
-    fn q5_k_is_batched_exactly_under_blas() {
+    fn q5_k_is_batched_exactly_where_a_path_computes_it() {
         // Swept over the same k list as `k_quant_batched_gemm_requires_whole_superblocks`
-        // rather than checked at one aligned and one unaligned value. Note the
-        // negative half is vacuous without `blas` (the arm is already false for
-        // every k there), so the alignment requirement is only really asserted
-        // in the blas leg, which is the only configuration that can reach the
-        // dequantizer at all.
+        // rather than checked at one aligned and one unaligned value. The negative half is
+        // vacuous where the arm is already false for every k, so the alignment requirement is only
+        // really asserted in a configuration that admits Q5_K at all.
+        let admitted = cfg!(has_blas)
+            || (cfg!(all(target_arch = "aarch64", not(has_blas))) && k_quant_gemm_available());
         for k in [256usize, 512, 2048] {
             assert_eq!(
                 batched_gemm_supports(DType::Q5KM, k),
-                cfg!(has_blas),
-                "Q5_K at k={k} must track the `blas` feature exactly"
+                admitted,
+                "Q5_K at k={k} must track whether a batched path exists"
             );
         }
         for k in [32usize, 96, 128, 255, 257, 384] {
             assert!(
                 !batched_gemm_supports(DType::Q5KM, k),
                 "Q5_K admitted at k={k}, which is not a multiple of its 256-wide superblock"
+            );
+        }
+    }
+
+    /// Whatever `batched_gemm_supports` admits for Q5_K, the standard-layout dispatcher computes
+    /// (returns `true`) for a weight that was not repacked; the admission and the kernel table
+    /// must not drift apart.
+    #[cfg(all(target_arch = "aarch64", not(has_blas)))]
+    #[test]
+    fn q5_k_admission_is_backed_by_the_dispatcher() {
+        let (m, n, k) = (8usize, 3usize, 256usize);
+        let data = vec![0u8; m * (k / 256) * 176];
+        let b_scales = vec![0.0f32; n * (k / 32)];
+        let b_quants = vec![0i8; n * k];
+        let mut out = vec![f32::NAN; m * n];
+        let ran =
+            cpu::gemm_preq_dispatch(DType::Q5KM, &data, &b_scales, &b_quants, &mut out, m, n, k);
+        assert_eq!(ran, batched_gemm_supports(DType::Q5KM, k));
+        if ran {
+            assert!(
+                out.iter().all(|v| *v == 0.0),
+                "dispatcher claimed to compute but left {out:?}"
             );
         }
     }
@@ -887,15 +926,16 @@ pub fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
         // requirement: Q4_1 blocks are 32 wide.
         DType::Q4_1 => k_quant_gemm_available(),
         DType::Q4KM | DType::Q6K => k_quant_gemm_available() && k.is_multiple_of(256),
-        // Q5_K is the one shipped K-quant with no int8 GEMM, so unlike its
-        // siblings it must gate on `blas` itself rather than on
-        // `k_quant_gemm_available()`. That predicate is *true* on a non-BLAS
-        // dotprod aarch64 host, which would admit Q5_K here and then have
-        // `gemm_preq` decline for want of a kernel, silently skipping the
-        // matmul and leaving the previous layer's activations in the reused
-        // output buffer. Narrower than it looks, and deliberately so: the
-        // dequant+SGEMM route is the only Q5_K batched path that exists.
-        DType::Q5KM => cfg!(has_blas) && k.is_multiple_of(256),
+        // Q5_K has no standard-layout int8 GEMM of its own: on aarch64 the i8mm repack feeds the
+        // Q4_K smmla kernels (`repack_q5_k_smmla_8x8`), and a weight without that repack takes the
+        // per-column GEMV fallback (`gemm_q5_k_q8_0_neon`), so it is admitted on the same predicate
+        // as its siblings. x86 has no Q5_K kernel: `gemm_preq_dispatch` declines there, so this
+        // stays BLAS-only off aarch64.
+        DType::Q5KM => {
+            (cfg!(has_blas) || cfg!(target_arch = "aarch64"))
+                && k_quant_gemm_available()
+                && k.is_multiple_of(256)
+        }
         _ => false,
     }
 }
