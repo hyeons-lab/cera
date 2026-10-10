@@ -2170,10 +2170,32 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_dispatch(
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
-        unsafe {
-            crate::backend::simd::neon::gemm_q4_0_smmla_8x4_q8_0(
-                packed, scales, b_scales, b_quants, out, m, n, k,
-            );
+        let tiled = with_smmla_tiles(
+            b_scales,
+            b_quants,
+            n,
+            k,
+            |tile_scales, tile_quants| unsafe {
+                crate::backend::simd::neon::gemm_q4_0_smmla_8x4_q8_0_tiled(
+                    packed,
+                    scales,
+                    b_scales,
+                    b_quants,
+                    tile_scales,
+                    tile_quants,
+                    out,
+                    m,
+                    n,
+                    k,
+                );
+            },
+        );
+        if tiled.is_none() {
+            unsafe {
+                crate::backend::simd::neon::gemm_q4_0_smmla_8x4_q8_0(
+                    packed, scales, b_scales, b_quants, out, m, n, k,
+                );
+            }
         }
         return true;
     }

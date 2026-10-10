@@ -7594,6 +7594,99 @@ pub(crate) mod neon {
         }
     }
 
+    /// [`gemm_q4_0_smmla_8x4_q8_0`] (column-major `out[m, n]`) with the activations also given
+    /// interleaved per 4-token tile, as [`gemm_q4_0_smmla_8x4_q8_0_rowmajor_tiled`] does for the
+    /// row-major output: the full tiles run the shuffle-free tile kernel and the `n % 4` tail
+    /// tokens the single-token kernel. Bit-identical to the columnar kernel. Super-rows go out in
+    /// small stolen chunks, not one static slice per worker, so the slower cores of a big.LITTLE
+    /// pool take less (the static split ran a 64-super-row GEMM at a third of the tiled rate).
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    pub unsafe fn gemm_q4_0_smmla_8x4_q8_0_tiled(
+        packed: &[u8],
+        scales: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        tile_scales: &[f32],
+        tile_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(m % 8, 0, "smmla Q4_0 GEMM: m must be a multiple of 8");
+        debug_assert_eq!(k % 32, 0, "smmla Q4_0 GEMM: k must be divisible by 32");
+        let nb = k / 32;
+        let tiles = n / 4;
+        debug_assert_eq!(out.len(), m * n);
+        debug_assert_eq!(packed.len(), (m / 8) * nb * 256);
+        debug_assert_eq!(scales.len(), (m / 8) * nb * 8);
+        debug_assert!(b_quants.len() >= n * k && b_scales.len() >= n * nb);
+        debug_assert!(tile_quants.len() >= tiles * nb * 128 && tile_scales.len() >= tiles * nb * 8);
+
+        let p_base = packed.as_ptr() as usize;
+        let s_base = scales.as_ptr() as usize;
+        let bq_base = b_quants.as_ptr() as usize;
+        let bs_base = b_scales.as_ptr() as usize;
+        let tq_base = tile_quants.as_ptr() as usize;
+        let ts_base = tile_scales.as_ptr() as usize;
+        let out_base = out.as_mut_ptr() as usize;
+
+        let compute_super_row = move |sr: usize| unsafe {
+            let p_ptr = p_base as *const i8;
+            let s_ptr = s_base as *const f32;
+            let bq_ptr = bq_base as *const i8;
+            let bs_ptr = bs_base as *const f32;
+            let tq_ptr = tq_base as *const i8;
+            let ts_ptr = ts_base as *const f32;
+            let out_ptr = out_base as *mut f32;
+            let base_row = 8 * sr;
+
+            for tile in 0..tiles {
+                let mut t = [[0.0f32; 4]; 8];
+                smmla_q4_0_tile_8x4_il(p_ptr, s_ptr, tq_ptr, ts_ptr, sr, tile, nb, &mut t);
+                for (r, row) in t.iter().enumerate() {
+                    // SAFETY: super-row `sr` owns output rows `8 * sr..8 * sr + 8`, written by this
+                    // call only; `(base_row + r) * n + tile * 4 + 4 <= m * n`.
+                    core::ptr::copy_nonoverlapping(
+                        row.as_ptr(),
+                        out_ptr.add((base_row + r) * n + tile * 4),
+                        4,
+                    );
+                }
+            }
+            // Tail tokens, columnar
+            for j in tiles * 4..n {
+                let mut t = [0.0f32; 8];
+                smmla_q4_0_tile_8x1(p_ptr, s_ptr, bq_ptr, bs_ptr, sr, j, nb, k, &mut t);
+                for (r, v) in t.iter().enumerate() {
+                    *out_ptr.add((base_row + r) * n + j) = *v;
+                }
+            }
+        };
+
+        let sr_count = m / 8;
+        if sr_count >= 2 {
+            let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+            let nth = crate::backend::cpu::prefill_par_threads()
+                .max(1)
+                .min(max_active);
+            let chunk = sr_count.div_ceil(nth * 4).max(1);
+            let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
+            let mut tickets = vec![0.0f32; sr_count];
+            crate::backend::cpu::par_rows_n_chunked_active(
+                &mut tickets,
+                1,
+                1,
+                chunk,
+                max_active,
+                compute,
+            );
+        } else {
+            (0..sr_count).for_each(compute_super_row);
+        }
+    }
+
     /// [`gemm_q4_0_smmla_8x4_q8_0_rowmajor`] with the activations also given interleaved per 4-token tile
     /// (`tile_quants` / `tile_scales`, see [`smmla_q4_0_tile_8x4_il`]): the full 4-token tiles run the
     /// shuffle-free tile kernel, and the `n % 4` tail tokens the single-token kernel on the columnar
@@ -11530,6 +11623,22 @@ pub(crate) mod neon {
                 );
                 let (packed, scales) = crate::backend::cpu::repack_q4_0_smmla_8x8(&a, m, k);
                 let (packed2, scales2) = crate::backend::cpu::repack_q4_0_smmla_8x8(&a2, m, k);
+
+                let mut want = vec![0.0f32; m * n];
+                let mut got = vec![f32::NAN; m * n];
+                unsafe {
+                    gemm_q4_0_smmla_8x4_q8_0(
+                        &packed, &scales, &b_scales, &b_quants, &mut want, m, n, k,
+                    );
+                    gemm_q4_0_smmla_8x4_q8_0_tiled(
+                        &packed, &scales, &b_scales, &b_quants, &tile_s, &tile_q, &mut got, m, n, k,
+                    );
+                }
+                assert_eq!(
+                    want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "column-major plain m={m} n={n} k={k}"
+                );
 
                 let mut want = vec![0.0f32; m * n];
                 let mut got = vec![f32::NAN; m * n];
