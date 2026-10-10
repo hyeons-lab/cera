@@ -1925,125 +1925,76 @@ pub(crate) mod neon {
             xqs: xqs.as_ptr() as usize,
         };
 
-        let compute_row = move |(r, out_elem): (usize, &mut f32)| unsafe {
-            let mask_0f = vdupq_n_u8(0x0F);
-            let mone = vdupq_n_u8(1);
-            let mtwo = vdupq_n_u8(2);
-            let z = vdupq_n_s32(0);
-            let row_start = r * row_bytes;
-
-            let mut sum_g = 0.0f32;
-            let mut sum_u = 0.0f32;
-
-            for bi in 0..blocks_per_row {
-                let gblk =
-                    &*((ptrs.g().add(row_start + bi * size_of::<BlockQ5K>())) as *const BlockQ5K);
-                let ublk =
-                    &*((ptrs.u().add(row_start + bi * size_of::<BlockQ5K>())) as *const BlockQ5K);
-
-                core::arch::asm!(
-                    "prfm pldl1keep, [{0}, #256]",
-                    "prfm pldl1keep, [{1}, #256]",
-                    in(reg) (gblk as *const BlockQ5K),
-                    in(reg) (ublk as *const BlockQ5K),
-                    options(nostack, preserves_flags)
-                );
-
-                let dg = crate::quant::f16_to_f32(gblk.d);
-                let dming = crate::quant::f16_to_f32(gblk.dmin);
-                let (sc_g, mn_g) = crate::quant::decode_q4km_scales(&gblk.scales);
-
-                let du = crate::quant::f16_to_f32(ublk.d);
-                let dminu = crate::quant::f16_to_f32(ublk.dmin);
-                let (sc_u, mn_u) = crate::quant::decode_q4km_scales(&ublk.scales);
-
-                let qs_g = gblk.qs.as_ptr();
-                let qs_u = ublk.qs.as_ptr();
-
-                let mut qh_g_0 = vld1q_u8(gblk.qh.as_ptr());
-                let mut qh_g_1 = vld1q_u8(gblk.qh.as_ptr().add(16));
-                let mut qh_u_0 = vld1q_u8(ublk.qh.as_ptr());
-                let mut qh_u_1 = vld1q_u8(ublk.qh.as_ptr().add(16));
-
-                let xq_off = bi * 256;
-
-                for j in 0..4 {
-                    let sblo = 2 * j;
-                    let sbhi = 2 * j + 1;
-                    let xlo0 = vld1q_s8(ptrs.xq().add(xq_off + sblo * 32));
-                    let xlo1 = vld1q_s8(ptrs.xq().add(xq_off + sblo * 32 + 16));
-                    let xhi0 = vld1q_s8(ptrs.xq().add(xq_off + sbhi * 32));
-                    let xhi1 = vld1q_s8(ptrs.xq().add(xq_off + sbhi * 32 + 16));
-
-                    let sx_lo = *ptrs.xqs().add(xq_off / 32 + sblo);
-                    let sx_hi = *ptrs.xqs().add(xq_off / 32 + sbhi);
-
-                    let xs_lo = *ptrs.xs().add((xq_off + sblo * 32) / 32);
-                    let xs_hi = *ptrs.xs().add((xq_off + sbhi * 32) / 32);
-
-                    // Gate
-                    let qb_g_0 = vld1q_u8(qs_g.add(j * 32));
-                    let qb_g_1 = vld1q_u8(qs_g.add(j * 32 + 16));
-                    let h_g_lo_0 = vshlq_n_u8::<4>(vandq_u8(mone, qh_g_0));
-                    let h_g_lo_1 = vshlq_n_u8::<4>(vandq_u8(mone, qh_g_1));
-                    let h_g_hi_0 = vshlq_n_u8::<3>(vandq_u8(mtwo, qh_g_0));
-                    let h_g_hi_1 = vshlq_n_u8::<3>(vandq_u8(mtwo, qh_g_1));
-                    qh_g_0 = vshrq_n_u8::<2>(qh_g_0);
-                    qh_g_1 = vshrq_n_u8::<2>(qh_g_1);
-
-                    let wlo_g_0 =
-                        vreinterpretq_s8_u8(vorrq_u8(vandq_u8(qb_g_0, mask_0f), h_g_lo_0));
-                    let wlo_g_1 =
-                        vreinterpretq_s8_u8(vorrq_u8(vandq_u8(qb_g_1, mask_0f), h_g_lo_1));
-                    let whi_g_0 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(qb_g_0), h_g_hi_0));
-                    let whi_g_1 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(qb_g_1), h_g_hi_1));
-
-                    let dp_g_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, wlo_g_0, xlo0), wlo_g_1, xlo1));
-                    let dp_g_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, whi_g_0, xhi0), whi_g_1, xhi1));
-
-                    sum_g += xs_lo
-                        * (dg * sc_g[sblo] as f32 * dp_g_lo as f32
-                            - dming * mn_g[sblo] as f32 * sx_lo as f32);
-                    sum_g += xs_hi
-                        * (dg * sc_g[sbhi] as f32 * dp_g_hi as f32
-                            - dming * mn_g[sbhi] as f32 * sx_hi as f32);
-
-                    // Up
-                    let qb_u_0 = vld1q_u8(qs_u.add(j * 32));
-                    let qb_u_1 = vld1q_u8(qs_u.add(j * 32 + 16));
-                    let h_u_lo_0 = vshlq_n_u8::<4>(vandq_u8(mone, qh_u_0));
-                    let h_u_lo_1 = vshlq_n_u8::<4>(vandq_u8(mone, qh_u_1));
-                    let h_u_hi_0 = vshlq_n_u8::<3>(vandq_u8(mtwo, qh_u_0));
-                    let h_u_hi_1 = vshlq_n_u8::<3>(vandq_u8(mtwo, qh_u_1));
-                    qh_u_0 = vshrq_n_u8::<2>(qh_u_0);
-                    qh_u_1 = vshrq_n_u8::<2>(qh_u_1);
-
-                    let wlo_u_0 =
-                        vreinterpretq_s8_u8(vorrq_u8(vandq_u8(qb_u_0, mask_0f), h_u_lo_0));
-                    let wlo_u_1 =
-                        vreinterpretq_s8_u8(vorrq_u8(vandq_u8(qb_u_1, mask_0f), h_u_lo_1));
-                    let whi_u_0 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(qb_u_0), h_u_hi_0));
-                    let whi_u_1 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(qb_u_1), h_u_hi_1));
-
-                    let dp_u_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, wlo_u_0, xlo0), wlo_u_1, xlo1));
-                    let dp_u_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, whi_u_0, xhi0), whi_u_1, xhi1));
-
-                    sum_u += xs_lo
-                        * (du * sc_u[sblo] as f32 * dp_u_lo as f32
-                            - dminu * mn_u[sblo] as f32 * sx_lo as f32);
-                    sum_u += xs_hi
-                        * (du * sc_u[sbhi] as f32 * dp_u_hi as f32
-                            - dminu * mn_u[sbhi] as f32 * sx_hi as f32);
+        // Row pairs (gate and up of two rows = four independent chains), stolen in small chunks;
+        // see the Q4_K fused kernel.
+        let compute_pair = move |(g, chunk): (usize, &mut [f32])| unsafe {
+            let silu_mul = |sg: f32, su: f32| -> f32 {
+                (sg / (1.0 + crate::backend::cpu::ggml_expf(-sg))) * su
+            };
+            let r0 = g * 2;
+            if chunk.len() == 2 {
+                let mut sum_g = [0.0f32; 2];
+                let mut sum_u = [0.0f32; 2];
+                for bi in 0..blocks_per_row {
+                    let xq = ptrs.xq().add(bi * 256);
+                    let xs = ptrs.xs().add(bi * 8);
+                    let xqsp = ptrs.xqs().add(bi * 8);
+                    for r in 0..2 {
+                        let off = (r0 + r) * row_bytes + bi * size_of::<BlockQ5K>();
+                        let gblk = ptrs.g().add(off) as *const BlockQ5K;
+                        let ublk = ptrs.u().add(off) as *const BlockQ5K;
+                        core::arch::asm!(
+                            "prfm pldl1keep, [{0}, #256]",
+                            "prfm pldl1keep, [{1}, #256]",
+                            in(reg) gblk,
+                            in(reg) ublk,
+                            options(nostack, preserves_flags)
+                        );
+                        sum_g[r] = q5k_block_accum(gblk, xq, xs, xqsp, sum_g[r]);
+                        sum_u[r] = q5k_block_accum(ublk, xq, xs, xqsp, sum_u[r]);
+                    }
+                }
+                chunk[0] = silu_mul(sum_g[0], sum_u[0]);
+                chunk[1] = silu_mul(sum_g[1], sum_u[1]);
+            } else {
+                for (i, o) in chunk.iter_mut().enumerate() {
+                    let row = (r0 + i) * row_bytes;
+                    let (mut sum_g, mut sum_u) = (0.0f32, 0.0f32);
+                    for bi in 0..blocks_per_row {
+                        let xq = ptrs.xq().add(bi * 256);
+                        let xs = ptrs.xs().add(bi * 8);
+                        let xqsp = ptrs.xqs().add(bi * 8);
+                        let off = row + bi * size_of::<BlockQ5K>();
+                        sum_g = q5k_block_accum(
+                            ptrs.g().add(off) as *const BlockQ5K,
+                            xq,
+                            xs,
+                            xqsp,
+                            sum_g,
+                        );
+                        sum_u = q5k_block_accum(
+                            ptrs.u().add(off) as *const BlockQ5K,
+                            xq,
+                            xs,
+                            xqsp,
+                            sum_u,
+                        );
+                    }
+                    *o = silu_mul(sum_g, sum_u);
                 }
             }
-
-            *out_elem = (sum_g / (1.0 + crate::backend::cpu::ggml_expf(-sum_g))) * sum_u;
         };
 
         if out.len() >= super::super::cpu::gemv_par_threshold() {
-            crate::backend::cpu::par_rows(out, crate::backend::cpu::gemv_min_rows(), compute_row);
+            crate::backend::cpu::par_rows_n_chunked_decode(
+                out,
+                2,
+                crate::backend::cpu::gemv_min_rows().div_ceil(2),
+                4,
+                compute_pair,
+            );
         } else {
-            out.iter_mut().enumerate().for_each(compute_row);
+            out.chunks_mut(2).enumerate().for_each(compute_pair);
         }
     }
 
@@ -3836,7 +3787,7 @@ pub(crate) mod neon {
         xq: *const i8,
         xs: *const f32,
         xqs: *const i32,
-        mut sumf: f32,
+        sumf: f32,
     ) -> f32 {
         unsafe {
             let mask_0f = vdupq_n_u8(0x0F);
@@ -3862,6 +3813,78 @@ pub(crate) mod neon {
                     vld1q_s8(xp.add(48)),
                 );
             }
+            k_super_block_terms(&acc, d, dmin, &sc, &mn, xs, xqs, sumf)
+        }
+    }
+
+    /// [`q4k_block_accum`] for a Q5_K super-block: the same per-sub-block form with a 5-bit `q`
+    /// (the fifth bit of element `e` of sub-block `s` is bit `s` of `qh[e]`), so only the weight
+    /// unpack differs and the arithmetic after the integer dots is shared.
+    #[target_feature(enable = "neon,dotprod")]
+    #[inline]
+    unsafe fn q5k_block_accum(
+        blk: *const BlockQ5K,
+        xq: *const i8,
+        xs: *const f32,
+        xqs: *const i32,
+        sumf: f32,
+    ) -> f32 {
+        unsafe {
+            let mask_0f = vdupq_n_u8(0x0F);
+            let mone = vdupq_n_u8(1);
+            let mtwo = vdupq_n_u8(2);
+            let z = vdupq_n_s32(0);
+            let d = crate::quant::f16_to_f32((*blk).d);
+            let dmin = crate::quant::f16_to_f32((*blk).dmin);
+            let (sc, mn) = crate::quant::decode_q4km_scales(&(*blk).scales);
+            let qs = (*blk).qs.as_ptr();
+            let mut qh0 = vld1q_u8((*blk).qh.as_ptr());
+            let mut qh1 = vld1q_u8((*blk).qh.as_ptr().add(16));
+            let mut acc = [z; 8];
+            for j in 0..4 {
+                let qb0 = vld1q_u8(qs.add(j * 32));
+                let qb1 = vld1q_u8(qs.add(j * 32 + 16));
+                let h0_lo = vshlq_n_u8::<4>(vandq_u8(mone, qh0));
+                let h1_lo = vshlq_n_u8::<4>(vandq_u8(mone, qh1));
+                let h0_hi = vshlq_n_u8::<3>(vandq_u8(mtwo, qh0));
+                let h1_hi = vshlq_n_u8::<3>(vandq_u8(mtwo, qh1));
+                qh0 = vshrq_n_u8::<2>(qh0);
+                qh1 = vshrq_n_u8::<2>(qh1);
+                let wlo0 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(qb0, mask_0f), h0_lo));
+                let wlo1 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(qb1, mask_0f), h1_lo));
+                let whi0 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(qb0), h0_hi));
+                let whi1 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(qb1), h1_hi));
+                let xp = xq.add(j * 64);
+                acc[2 * j] =
+                    vdotq_s32(vdotq_s32(z, wlo0, vld1q_s8(xp)), wlo1, vld1q_s8(xp.add(16)));
+                acc[2 * j + 1] = vdotq_s32(
+                    vdotq_s32(z, whi0, vld1q_s8(xp.add(32))),
+                    whi1,
+                    vld1q_s8(xp.add(48)),
+                );
+            }
+            k_super_block_terms(&acc, d, dmin, &sc, &mn, xs, xqs, sumf)
+        }
+    }
+
+    /// The float half of a Q4_K / Q5_K super-block: folds the eight sub-blocks' integer dots `acc`
+    /// (one int32x4 partial per sub-block) into `sumf` in sub-block order, with the arithmetic and
+    /// rounding of the scalar `sumf += xs * ((d * sc) * dp - (dmin * mn) * sx)`. See
+    /// [`q4k_block_accum`] for why this is bit-identical to that scalar form.
+    #[target_feature(enable = "neon,dotprod")]
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    unsafe fn k_super_block_terms(
+        acc: &[int32x4_t; 8],
+        d: f32,
+        dmin: f32,
+        sc: &[u8; 8],
+        mn: &[u8; 8],
+        xs: *const f32,
+        xqs: *const i32,
+        mut sumf: f32,
+    ) -> f32 {
+        unsafe {
             let dp_a = vpaddq_s32(vpaddq_s32(acc[0], acc[1]), vpaddq_s32(acc[2], acc[3]));
             let dp_b = vpaddq_s32(vpaddq_s32(acc[4], acc[5]), vpaddq_s32(acc[6], acc[7]));
             let sc8 = vmovl_u8(vld1_u8(sc.as_ptr()));
@@ -3927,6 +3950,39 @@ pub(crate) mod neon {
                         options(nostack, preserves_flags)
                     );
                     sumf[r] = q4k_block_accum(blk, xq, xs, xqsp, sumf[r]);
+                }
+            }
+            sumf
+        }
+    }
+
+    /// Four rows of the Q5_K GEMV at once; see [`q4k_rows4`].
+    #[target_feature(enable = "neon,dotprod")]
+    #[inline]
+    unsafe fn q5k_rows4(
+        a_base: usize,
+        row_bytes: usize,
+        r0: usize,
+        xq_base: usize,
+        xs_base: usize,
+        xqs: &[i32],
+        blocks_per_row: usize,
+    ) -> [f32; 4] {
+        unsafe {
+            let mut sumf = [0.0f32; 4];
+            for bi in 0..blocks_per_row {
+                let xq = (xq_base as *const i8).add(bi * 256);
+                let xs = (xs_base as *const f32).add(bi * 8);
+                let xqsp = xqs.as_ptr().add(bi * 8);
+                for r in 0..4 {
+                    let blk = (a_base + (r0 + r) * row_bytes + bi * size_of::<BlockQ5K>())
+                        as *const BlockQ5K;
+                    core::arch::asm!(
+                        "prfm pldl1keep, [{0}, #256]",
+                        in(reg) blk,
+                        options(nostack, preserves_flags)
+                    );
+                    sumf[r] = q5k_block_accum(blk, xq, xs, xqsp, sumf[r]);
                 }
             }
             sumf
@@ -4110,80 +4166,55 @@ pub(crate) mod neon {
             };
 
             let compute_row = move |(r, out_elem): (usize, &mut f32)| unsafe {
-                let mask_0f = vdupq_n_u8(0x0F);
-                let mone = vdupq_n_u8(1);
-                let mtwo = vdupq_n_u8(2);
-                let z = vdupq_n_s32(0);
                 let row_start = r * row_bytes;
                 let mut sumf = 0.0f32;
-
                 for bi in 0..blocks_per_row {
-                    let blk =
-                        &*((a_base + row_start + bi * size_of::<BlockQ5K>()) as *const BlockQ5K);
-
+                    let blk = (a_base + row_start + bi * size_of::<BlockQ5K>()) as *const BlockQ5K;
                     core::arch::asm!(
                         "prfm pldl1keep, [{0}, #256]",
-                        in(reg) (blk as *const BlockQ5K),
+                        in(reg) blk,
                         options(nostack, preserves_flags)
                     );
-
-                    let d = crate::quant::f16_to_f32(blk.d);
-                    let dmin = crate::quant::f16_to_f32(blk.dmin);
-                    let (sc, mn) = crate::quant::decode_q4km_scales(&blk.scales);
-
-                    let qs = blk.qs.as_ptr();
-                    let mut qh0 = vld1q_u8(blk.qh.as_ptr());
-                    let mut qh1 = vld1q_u8(blk.qh.as_ptr().add(16));
-                    let xq_off = bi * 256;
-
-                    for j in 0..4 {
-                        let sblo = 2 * j;
-                        let sbhi = 2 * j + 1;
-                        let xlo0 = vld1q_s8((xq_base as *const i8).add(xq_off + sblo * 32));
-                        let xlo1 = vld1q_s8((xq_base as *const i8).add(xq_off + sblo * 32 + 16));
-                        let xhi0 = vld1q_s8((xq_base as *const i8).add(xq_off + sbhi * 32));
-                        let xhi1 = vld1q_s8((xq_base as *const i8).add(xq_off + sbhi * 32 + 16));
-
-                        let qb0 = vld1q_u8(qs.add(j * 32));
-                        let qb1 = vld1q_u8(qs.add(j * 32 + 16));
-
-                        let h0_lo = vshlq_n_u8::<4>(vandq_u8(mone, qh0));
-                        let h1_lo = vshlq_n_u8::<4>(vandq_u8(mone, qh1));
-                        let h0_hi = vshlq_n_u8::<3>(vandq_u8(mtwo, qh0));
-                        let h1_hi = vshlq_n_u8::<3>(vandq_u8(mtwo, qh1));
-                        qh0 = vshrq_n_u8::<2>(qh0);
-                        qh1 = vshrq_n_u8::<2>(qh1);
-
-                        let wlo0 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(qb0, mask_0f), h0_lo));
-                        let wlo1 = vreinterpretq_s8_u8(vorrq_u8(vandq_u8(qb1, mask_0f), h1_lo));
-                        let whi0 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(qb0), h0_hi));
-                        let whi1 = vreinterpretq_s8_u8(vorrq_u8(vshrq_n_u8::<4>(qb1), h1_hi));
-
-                        let dp_lo = vaddvq_s32(vdotq_s32(vdotq_s32(z, wlo0, xlo0), wlo1, xlo1));
-                        let dp_hi = vaddvq_s32(vdotq_s32(vdotq_s32(z, whi0, xhi0), whi1, xhi1));
-
-                        let sx_lo = *xqs.get_unchecked(xq_off / 32 + sblo);
-                        let sx_hi = *xqs.get_unchecked(xq_off / 32 + sbhi);
-
-                        let xs_lo = *(xs_base as *const f32).add((xq_off + sblo * 32) / 32);
-                        let xs_hi = *(xs_base as *const f32).add((xq_off + sbhi * 32) / 32);
-
-                        sumf += xs_lo
-                            * (d * sc[sblo] as f32 * dp_lo as f32
-                                - dmin * mn[sblo] as f32 * sx_lo as f32);
-                        sumf += xs_hi
-                            * (d * sc[sbhi] as f32 * dp_hi as f32
-                                - dmin * mn[sbhi] as f32 * sx_hi as f32);
-                    }
+                    sumf = q5k_block_accum(
+                        blk,
+                        (xq_base as *const i8).add(bi * 256),
+                        (xs_base as *const f32).add(bi * 8),
+                        xqs.as_ptr().add(bi * 8),
+                        sumf,
+                    );
                 }
-
                 *out_elem = sumf;
             };
 
+            // Four-row groups, stolen in small chunks; see the Q4_K GEMV.
+            let rows4 = move |(g, chunk): (usize, &mut [f32])| unsafe {
+                if chunk.len() == 4 {
+                    let v = q5k_rows4(
+                        a_base,
+                        row_bytes,
+                        g * 4,
+                        xq_base,
+                        xs_base,
+                        xqs,
+                        blocks_per_row,
+                    );
+                    chunk.copy_from_slice(&v);
+                } else {
+                    for (i, o) in chunk.iter_mut().enumerate() {
+                        compute_row((g * 4 + i, o));
+                    }
+                }
+            };
             if y.len() >= super::super::cpu::gemv_par_threshold() {
-                crate::backend::cpu::par_rows(y, crate::backend::cpu::gemv_min_rows(), compute_row);
+                crate::backend::cpu::par_rows_n_chunked_decode(
+                    y,
+                    4,
+                    crate::backend::cpu::gemv_min_rows().div_ceil(4),
+                    4,
+                    rows4,
+                );
             } else {
-                y.iter_mut().enumerate().for_each(compute_row);
+                y.chunks_mut(4).enumerate().for_each(rows4);
             }
         }
     }
