@@ -230,17 +230,19 @@ fn lm_head_gemm_disabled() -> bool {
 struct PrefillProf {
     on: bool,
     last: std::time::Instant,
-    acc: [std::time::Duration; 8],
+    acc: [std::time::Duration; 10],
 }
 
-const PREFILL_PHASES: [&str; 8] = [
+const PREFILL_PHASES: [&str; 10] = [
     "norm",
     "qkv_gemm",
     "rope_kv",
     "attention",
     "out_proj",
     "ffn_norm",
+    "ffn_quant",
     "gate_up_silu",
+    "down_quant",
     "down_residual",
 ];
 
@@ -251,7 +253,7 @@ impl PrefillProf {
         Self {
             on,
             last: std::time::Instant::now(),
-            acc: [std::time::Duration::ZERO; 8],
+            acc: [std::time::Duration::ZERO; 10],
         }
     }
 
@@ -3045,6 +3047,7 @@ impl LlamaModel {
                     &mut bq_scales,
                     &mut bq_quants,
                 );
+                prof.lap(6);
                 transformer::gemm_preq(
                     &self.gguf,
                     &refs.ffn_gate,
@@ -3105,7 +3108,7 @@ impl LlamaModel {
                     cpu::gelu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
                 }
             }
-            prof.lap(6);
+            prof.lap(7);
 
             #[cfg(has_blas)]
             {
@@ -3130,6 +3133,7 @@ impl LlamaModel {
                     &mut bq_scales,
                     &mut bq_quants,
                 );
+                prof.lap(8);
                 transformer::gemm_preq(
                     &self.gguf,
                     &refs.ffn_down,
@@ -3183,7 +3187,7 @@ impl LlamaModel {
             }
             cpu::add_inplace(&mut hidden, &ffn_out);
 
-            prof.lap(7);
+            prof.lap(9);
             if self
                 .loop_norm_interval
                 .is_some_and(|n_phys| (layer + 1) % n_phys == 0)
