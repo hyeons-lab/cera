@@ -1534,6 +1534,61 @@ pub(crate) fn gemm_out_to_rows(src: &[f32], rows: usize, n: usize, cols: usize, 
     }
 }
 
+/// Tokens per work item in [`rmsnorm_columns`]: one 64-byte cache line of f32.
+const RMSNORM_COL_TILE: usize = 16;
+
+/// RMS-normalize every token (column) of a column-major `[hs × n]` activation matrix
+/// into `dst`, with the same bytes as gathering each column, calling
+/// [`cpu::rmsnorm`] and scattering it back.
+///
+/// The per-token loop this replaces ran serially and touched one cache line per
+/// element (stride `n` floats); here each work item takes 16 adjacent tokens, so
+/// every row of the gather and scatter is one 64-byte run, and the items fan out
+/// over the prefill pool. The reduction itself is still `cpu::rmsnorm` on a
+/// contiguous column, so it matches the decode path (n = 1) bit for bit.
+pub(crate) fn rmsnorm_columns(
+    src: &[f32],
+    dst: &mut [f32],
+    weight: &[f32],
+    eps: f32,
+    hs: usize,
+    n: usize,
+) {
+    assert!(
+        src.len() >= hs * n && dst.len() >= hs * n && weight.len() >= hs,
+        "rmsnorm_columns: buffers too small for hs={hs}, n={n}"
+    );
+    if hs == 0 || n == 0 {
+        return;
+    }
+    let dst_ptr = dst.as_mut_ptr() as usize;
+    let n_tiles = n.div_ceil(RMSNORM_COL_TILE);
+    cpu::par_range_prefill(n_tiles, 1, move |tile0, n_items| {
+        let mut buf = vec![0.0f32; hs * RMSNORM_COL_TILE];
+        let dst = dst_ptr as *mut f32;
+        for tile in tile0..tile0 + n_items {
+            let j0 = tile * RMSNORM_COL_TILE;
+            let nc = RMSNORM_COL_TILE.min(n - j0);
+            for i in 0..hs {
+                let row = &src[i * n + j0..i * n + j0 + nc];
+                for (c, &v) in row.iter().enumerate() {
+                    buf[c * hs + i] = v;
+                }
+            }
+            for c in 0..nc {
+                cpu::rmsnorm(&mut buf[c * hs..(c + 1) * hs], weight, eps);
+            }
+            for i in 0..hs {
+                for c in 0..nc {
+                    // SAFETY: `i * n + j0 + c < hs * n <= dst.len()`, and tiles own
+                    // disjoint column ranges, so no two items write the same element.
+                    unsafe { *dst.add(i * n + j0 + c) = buf[c * hs + i] };
+                }
+            }
+        }
+    });
+}
+
 /// Columns per work item in [`quantize_columns`]: one 64-byte cache line of f32.
 #[cfg(all(
     any(target_arch = "aarch64", target_arch = "x86_64"),
@@ -2865,6 +2920,49 @@ mod tests {
                     );
                 }
             }
+        }
+    }
+
+    /// `rmsnorm_columns` must equal the gather / `cpu::rmsnorm` / scatter loop it
+    /// replaced, byte for byte, including a ragged tail tile and `n` smaller than a tile.
+    #[test]
+    fn rmsnorm_columns_matches_per_column_reference() {
+        let mut st = 0x1234_5678_9ABC_DEF0u64;
+        let mut lcg = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((st >> 33) as f32 / (1u64 << 31) as f32) * 4.0 - 2.0
+        };
+        for (hs, n) in [
+            (96usize, 1usize),
+            (96, 5),
+            (96, 16),
+            (96, 37),
+            (130, 130),
+            (2048, 70),
+        ] {
+            let src: Vec<f32> = (0..hs * n).map(|_| lcg()).collect();
+            let weight: Vec<f32> = (0..hs).map(|_| lcg()).collect();
+            let mut dst = vec![f32::NAN; hs * n];
+            rmsnorm_columns(&src, &mut dst, &weight, 1e-5, hs, n);
+
+            let mut want = vec![0.0f32; hs * n];
+            let mut col = vec![0.0f32; hs];
+            for j in 0..n {
+                for i in 0..hs {
+                    col[i] = src[i * n + j];
+                }
+                cpu::rmsnorm(&mut col, &weight, 1e-5);
+                for i in 0..hs {
+                    want[i * n + j] = col[i];
+                }
+            }
+            let same = dst
+                .iter()
+                .zip(&want)
+                .all(|(a, b)| a.to_bits() == b.to_bits());
+            assert!(same, "rmsnorm_columns differs at hs={hs} n={n}");
         }
     }
 
