@@ -363,7 +363,46 @@ invocation, rotating order, 3 rounds, medians; `android_vl_image_raw/cpu_smmla_t
 (The harness runs each measurement after a cooldown, so these are lower than a back-to-back profile run, which showed
 1,849 against 2,141 tok/s on the same binaries.) The full-vocabulary logits are byte-identical with and without the
 tiled kernels on five prompts of 60 to 3,600 characters. The gain shrinks with the context because attention
-(`attn_scores`, 24 ms of a 512-token chunk at about 0.12 TFLOPS) grows and is untouched here.
+(`attn_scores`, 24 ms of a 512-token chunk at about 0.12 TFLOPS) grows; the next section takes it on.
+
+### CPU prefill: register-tiled attention
+
+At 2,048 tokens the four 512-token chunks spend 27, 78, 129 and 187 ms in attention (`attn_scores`: Q transpose, the
+causal flash kernel, output transpose), 420 ms of a 1.4 s prefill. An isolated single-core microbenchmark of the NEON
+kernel (`flash_attention_microbench`, an ignored test; head size 64, 512 queries over 512 and 2,048 keys) measures
+it at 38 to 52 GFLOPS on a prime core, a third of the 138 GFLOPS the four FMA ports can do. The old tile computed
+4 queries x 8 keys, so it kept only 8 accumulators in flight (the FMA latency needs 16 to keep four ports busy), and it
+re-transposed every key vector for each of the eight query groups of a 32-query block (16 shuffles per 32 FMAs). Its
+value pass loaded and stored every accumulator for every key.
+
+`flash_attention_gqa_neon_tiled` keeps the blocking and the numerics and changes the data movement. Each 16-key block of
+K is repacked once per tile into `[dim][16 keys]` and shared by all eight query groups; a 4-query x 16-key tile (16
+accumulators) then runs on plain vector loads. The value pass keeps a 4-query x 16-dim block of the output in registers
+across the tile's keys. A rescale by `exp(old max - new max)` is skipped when the running max did not move (`exp(0)` is
+exactly 1 and scaling by 1.0 is the identity), which after the first tiles is nearly always. Every score and every
+output element sees the same FMA chain as before, so the result is bit-for-bit the old kernel's (a test pins it over
+head sizes 20 to 128, ragged query and key counts, a prefix and both masks). On one prime core: 83 to 86 GFLOPS, 1.6x the
+old kernel's best run (it swings from 38 to 52 between builds); on a mid core 33 GFLOPS.
+
+The prefill also splits the attention into work items of one head x 32 queries, heaviest (latest queries) first,
+instead of one item per head: 16 heads over 8 workers of unequal speed leave the slow cores holding the barrier.
+Under the profiler the four chunks' attention goes from 27/78/129/187 to 13/37/64/97 ms (210 against 420 ms). Gated
+(AP sensor at 28 C or less before every invocation, rotating order, 3 rounds, medians;
+`android_vl_image_raw/cpu_attn_tiled_20261009/`), CPU prefill tok/s:
+
+| Prompt | previous kernel | tiled, one item per head | tiled, (head, 32-query) items | llama.cpp (CPU) | vs previous | vs llama.cpp |
+|---|---:|---:|---:|---:|---:|---:|
+| 512 tokens | 1,859 | 1,950 | 2,065 | 1,929 | 1.11 | 1.07 |
+| 1,024 | 1,711 | 1,752 | 1,827 | 1,756 | 1.07 | 1.04 |
+| 2,048 | 1,409 | 1,620 | 1,640 | 1,557 | 1.16 | 1.05 |
+
+(llama.cpp's 512-token figure varied 1,911 to 2,114 across rounds, and one Cera run was an outlier at 1,873 against 2,133 and 2,065;
+the harness's cooldown makes all of these lower than a back-to-back run.) The full-vocabulary logits are byte-identical with and without
+the new kernel on five prompts of 60 to 3,600 characters. `CERA_CPU_ATTN_TILED=0` restores the previous kernel. The dense
+transformers' CPU prefill (`llama.rs`) still calls the older blocked kernel and was not changed. What is left: the kernel is at about
+60% of the FMA ceiling (the softmax's `exp` and the key packing take the rest) and the eight threads reach about
+60% of the cores' summed rate (10 ms ideal against 16 ms for the last chunk's layer), so a further 20 to 30% of
+attention, 4 to 5% of the prefill, is available.
 
 ## Baseline results (before the perf work)
 
