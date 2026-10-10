@@ -10021,6 +10021,43 @@ pub(crate) mod neon {
         true
     }
 
+    /// Q5_K x Q8_0 batched GEMM for hosts that run it without the smmla repack (a skipped repack,
+    /// or the dotprod tier): each activation column goes through [`gemv_q5k_q8_0_neon`], so the
+    /// result is bit-identical to the per-token GEMV and the weights stream once per column. It
+    /// exists so `batched_gemm_supports` can admit Q5_K without risking a silently skipped matmul;
+    /// the fast path is the repacked smmla kernel. Declines (returns `false`) off dotprod.
+    pub unsafe fn gemm_q5_k_q8_0_neon(
+        a_quant: &[u8],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) -> bool {
+        if !k_quant_gemm_available() || !k.is_multiple_of(256) {
+            return false;
+        }
+        let nb = k / 32;
+        let mut col = vec![0.0f32; m];
+        for j in 0..n {
+            unsafe {
+                gemv_q5k_q8_0_neon(
+                    a_quant,
+                    &b_scales[j * nb..(j + 1) * nb],
+                    &b_quants[j * k..(j + 1) * k],
+                    &mut col,
+                    m,
+                    k,
+                );
+            }
+            for (i, &v) in col.iter().enumerate() {
+                out[i * n + j] = v;
+            }
+        }
+        true
+    }
+
     /// Q8_0 × Q8_0 GEMM dispatcher. Prefers i8mm (`vmmlaq_s32`) when the tier is
     /// resolved to it, else dotprod, else the emulated-integer base.
     // Only non-test consumer is `transformer::gemm_preq`, gated
@@ -11965,6 +12002,85 @@ pub(crate) mod neon {
                     one.len() as f64 / med / 1e9,
                     one.len() as f64 / 1e6
                 );
+            }
+        }
+
+        /// Q5_K weights repacked into the Q4_K smmla layout (`repack_q5_k_smmla_8x8`) and run through
+        /// the Q4_K smmla dispatch must agree with the Q5_K GEMV on every column, to f32 rounding
+        /// (the accumulation orders differ, the integer dots do not). Also pins the per-column GEMM
+        /// fallback to the GEMV bit for bit.
+        #[test]
+        fn q5_k_smmla_matches_gemv() {
+            if !require_i8mm_kernel_or_skip() {
+                return;
+            }
+            for (m, n, k) in [(16usize, 5usize, 256usize), (32, 9, 512), (24, 13, 1024)] {
+                let mut st = 0x5e5e_0001u64 ^ (m as u64) ^ ((n as u64) << 16) ^ ((k as u64) << 32);
+                let nb = k / 256;
+                let blocks: Vec<crate::quant::BlockQ5K> = (0..m * nb)
+                    .map(|_| {
+                        let mut b = crate::quant::BlockQ5K {
+                            d: crate::quant::f32_to_f16(0.001 + lcg(&mut st).abs() * 0.004),
+                            dmin: crate::quant::f32_to_f16(0.001 + lcg(&mut st).abs() * 0.004),
+                            scales: [0; 12],
+                            qh: [0; 32],
+                            qs: [0; 128],
+                        };
+                        for v in b
+                            .scales
+                            .iter_mut()
+                            .chain(b.qh.iter_mut())
+                            .chain(b.qs.iter_mut())
+                        {
+                            *v = (lcg(&mut st) * 127.0) as i32 as u8;
+                        }
+                        b
+                    })
+                    .collect();
+                let a = blocks_to_bytes(&blocks);
+                let bmat: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+                let mut b_scales = vec![0.0f32; n * (k / 32)];
+                let mut b_quants = vec![0i8; n * k];
+                crate::model::transformer::quantize_rows(&bmat, k, n, &mut b_scales, &mut b_quants);
+
+                // Reference: the GEMV per column; also the fallback GEMM, which must equal it exactly.
+                let mut want = vec![0.0f32; m * n];
+                for j in 0..n {
+                    let mut y = vec![0.0f32; m];
+                    unsafe {
+                        gemv_q5k_q8_0_neon(
+                            &a,
+                            &b_scales[j * (k / 32)..(j + 1) * (k / 32)],
+                            &b_quants[j * k..(j + 1) * k],
+                            &mut y,
+                            m,
+                            k,
+                        );
+                    }
+                    for i in 0..m {
+                        want[i * n + j] = y[i];
+                    }
+                }
+                let mut fb = vec![f32::NAN; m * n];
+                assert!(unsafe { gemm_q5_k_q8_0_neon(&a, &b_scales, &b_quants, &mut fb, m, n, k) });
+                assert_eq!(
+                    want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    fb.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "fallback GEMM m={m} n={n} k={k}"
+                );
+
+                let (packed, dsc, dmn) = crate::backend::cpu::repack_q5_k_smmla_8x8(&a, m, k);
+                let mut got = vec![f32::NAN; m * n];
+                assert!(crate::backend::cpu::gemm_preq_repacked_q4_k_smmla_dispatch(
+                    &packed, &dsc, &dmn, &b_scales, &b_quants, &mut got, m, n, k
+                ));
+                let scale = want.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 2e-5 * scale + 1e-6,
+                        "m={m} n={n} k={k} element {i}: smmla {g} vs gemv {w} (scale {scale})"
+                    );
+                }
             }
         }
 
