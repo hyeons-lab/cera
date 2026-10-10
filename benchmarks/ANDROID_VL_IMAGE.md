@@ -549,6 +549,25 @@ The 512-token column is the control: the cap never applied there, and the 1% to 
 still behind llama.cpp's (dense Llama at 16 tokens is 41 ms against 25), so the next cost is the per-tile work of the smmla kernel at
 small token counts and the fixed per-layer overheads, not the thread count.
 
+**The passes around the GEMMs were the second cost.** With the cap gone, the profile of dense Llama at 16 tokens (40 ms) put about 12
+ms outside the GEMMs: the RMSNorms, the RoPE and KV append and the activation quantizes use 16-token tiles (one tile, one worker, for a
+16-token chunk), and `quantize_columns` still ran serially below 256 columns (150 us per column at the 8192-wide FFN down input). Tiles now
+narrow to `ceil(n / 8)` tokens so a short prompt is eight work items, and `quantize_columns` fans out from 8 columns. `quantize_rows` (the
+LFM2 path) costs about 20 us for 16 tokens, so it stays serial below 64: lowering it too made the 2.6B Agent Q4_0 13% slower at 16
+tokens. Time to first token, before to after (ms, p50, 4 alternating repetitions,
+`android_vl_image_raw/cpu_small_prompt_20261010/ab_passes2.jsonl`; the 512-token rows are unchanged within noise):
+
+| Model | 16 tokens | 64 tokens |
+|---|---:|---:|
+| Llama-3.2-1B Q4_0 (dense) | 42 to 34 (-18%) | 138 to 114 (-18%) |
+| LFM2.5-VL-450M Q4_0 | 12 to 11 (-4%) | 34 to 32 (-7%) |
+| LFM2.5-350M Q4_K_M | 14 to 14 (+0%) | 50 to 48 (-4%) |
+| LFM2.5-2.6B Agent Q4_0 | 70 to 70 (+0%) | 265 to 242 (-8%) |
+
+The output is byte-identical (the tile width does not change what is computed). Dense Llama at 16 tokens is 35 ms against llama.cpp's
+25; what is left there is the GEMM phases themselves (28 of the 41 ms before this change was
+spent in the four projections), which has not been profiled for bandwidth against compute yet.
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |

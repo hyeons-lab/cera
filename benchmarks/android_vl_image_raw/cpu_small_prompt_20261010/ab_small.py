@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
-"""TTFT A/B for the small-prompt worker cap: `cera-ttft` (old 2/4-worker steps) against `cera-smallp` (whole pool from 5 tokens),
-alternating binaries, REPS repetitions, p50 TTFT from `cera bench`. SERIAL=<adb serial>; usage: ab_small.py OUT REPS."""
+"""TTFT A/B of two cera binaries on the small-prompt path, alternating them, REPS repetitions, p50 TTFT from `cera bench`.
+SERIAL=<adb serial>, OLD / NEW = binary names in /data/local/tmp/cmp-cera (default cera-ttft / cera-smallp, the 2/4-worker steps
+against the whole pool); usage: ab_small.py OUT REPS."""
 import json, os, re, subprocess, sys, time
 
 if "SERIAL" not in os.environ:
@@ -13,6 +14,8 @@ OUT = sys.argv[1]
 REPS = int(sys.argv[2])
 AP_MAX_C = 30.0
 CERA = "/data/local/tmp/cmp-cera"
+OLD = os.environ.get("OLD", "cera-ttft")
+NEW = os.environ.get("NEW", "cera-smallp")
 MODELS = [
     ("llama-3.2-1b-q4_0", "Llama-3.2-1B-Q4_0.gguf"),
     ("lfm2.5-vl-450m-q4_0", "LFM2.5-VL-450M-Q4_0.gguf"),
@@ -21,9 +24,7 @@ MODELS = [
     ("lfm2.5-2.6b-agent-q4_0", "agent-q4_0.gguf"),
     ("lfm2.5-2.6b-q5_k_m", "LFM2.5-2.6B-Q5_K_M.gguf"),
 ]
-NS = [16, 64, 512]
-
-
+NS = [int(x) for x in os.environ.get("NS", "16,64,512").split(",")]
 def sh(cmd, timeout=900):
     r = subprocess.run(
         ["adb", "-s", SERIAL, "shell", cmd],
@@ -74,12 +75,9 @@ def ttft(binary, gguf, n):
 
 for rep in range(REPS):
     for label, gguf in MODELS:
+        if os.environ.get("ONLY") and label not in os.environ["ONLY"].split(","): continue
         for n in NS:
-            order = (
-                ["cera-ttft", "cera-smallp"]
-                if (rep + n) % 2 == 0
-                else ["cera-smallp", "cera-ttft"]
-            )
+            order = [OLD, NEW] if (rep + n) % 2 == 0 else [NEW, OLD]
             for b in order:
                 t = cool()
                 row = dict(
