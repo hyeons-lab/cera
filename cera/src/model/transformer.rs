@@ -1535,6 +1535,7 @@ pub(crate) fn gemm_out_to_rows(src: &[f32], rows: usize, n: usize, cols: usize, 
 }
 
 /// Tokens per work item in [`rmsnorm_columns`]: one 64-byte cache line of f32.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 const RMSNORM_COL_TILE: usize = 16;
 
 /// RMS-normalize every token (column) of a column-major `[hs × n]` activation matrix
@@ -1546,6 +1547,7 @@ const RMSNORM_COL_TILE: usize = 16;
 /// every row of the gather and scatter is one 64-byte run, and the items fan out
 /// over the prefill pool. The reduction itself is still `cpu::rmsnorm` on a
 /// contiguous column, so it matches the decode path (n = 1) bit for bit.
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 pub(crate) fn rmsnorm_columns(
     src: &[f32],
     dst: &mut [f32],
