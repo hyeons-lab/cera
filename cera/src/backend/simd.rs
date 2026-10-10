@@ -11583,6 +11583,98 @@ pub(crate) mod neon {
             }
         }
 
+        /// Whole-pool throughput of the Q4_0 smmla prefill GEMM dispatches on the dense Llama-3.2-1B
+        /// shapes at n = 512 tokens: the column-major `gemm_preq` kernel `llama.rs` uses, the
+        /// interleaved-tile row-major kernel LFM2 uses, and the fused gate/up/SiLU. Weights rotate
+        /// through enough copies (64 MB+) that every call streams them from DRAM, as a layer does
+        /// in the model. Run on a device: `cera_tests dense_gemm_gops_microbench --ignored
+        /// --nocapture --test-threads=1`.
+        #[test]
+        #[ignore = "microbenchmark: run explicitly on a device"]
+        fn dense_gemm_gops_microbench() {
+            if !require_i8mm_kernel_or_skip() {
+                return;
+            }
+            let n = 512usize;
+            // (name, m, k)
+            let shapes = [
+                ("q/out 2048x2048", 2048usize, 2048usize),
+                ("kv 512x2048", 512, 2048),
+                ("gate|up 8192x2048", 8192, 2048),
+                ("down 2048x8192", 2048, 8192),
+            ];
+            let time = |reps: usize, f: &mut dyn FnMut(usize)| -> (f64, f64) {
+                f(0);
+                f(1);
+                let mut v: Vec<f64> = (0..reps)
+                    .map(|i| {
+                        let t0 = std::time::Instant::now();
+                        f(i + 2);
+                        t0.elapsed().as_secs_f64()
+                    })
+                    .collect();
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                (v[0], v[v.len() / 2])
+            };
+            for (name, m, k) in shapes {
+                let mut st = 0xd3a5_0001u64 ^ (m as u64) ^ ((k as u64) << 20);
+                let (a, _, _) = random_q4_0_prefill_case(&mut st, m, 1, k);
+                let bmat: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+                let nb = k / 32;
+                let mut b_scales = vec![0.0f32; n * nb];
+                let mut b_quants = vec![0i8; n * k];
+                crate::model::transformer::quantize_rows(&bmat, k, n, &mut b_scales, &mut b_quants);
+                let (packed, scales) = crate::backend::cpu::repack_q4_0_smmla_8x8(&a, m, k);
+                let copies = (64usize << 20).div_ceil(packed.len()).max(2);
+                let ws: Vec<(Vec<u8>, Vec<f32>)> = (0..copies)
+                    .map(|_| (packed.clone(), scales.clone()))
+                    .collect();
+                let gops = |t: f64| 2.0 * m as f64 * n as f64 * k as f64 / t / 1e9;
+                let mut out = vec![0.0f32; m * n];
+                let (best, med) = time(15, &mut |i| {
+                    let (p, s) = &ws[i % copies];
+                    assert!(crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_dispatch(
+                        p, s, &b_scales, &b_quants, &mut out, m, n, k
+                    ));
+                });
+                println!(
+                    "{name:>20} colmajor gemm_preq : best {:7.0} / median {:7.0} GOPS",
+                    gops(best),
+                    gops(med)
+                );
+                let (best, med) = time(15, &mut |i| {
+                    let (p, s) = &ws[i % copies];
+                    assert!(
+                        crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
+                            p, s, &b_scales, &b_quants, &mut out, n, m, k
+                        )
+                    );
+                });
+                println!(
+                    "{name:>20} rowmajor tiled     : best {:7.0} / median {:7.0} GOPS",
+                    gops(best),
+                    gops(med)
+                );
+                if name.starts_with("gate") {
+                    let (best, med) = time(15, &mut |i| {
+                        let (p, s) = &ws[i % copies];
+                        let (p2, s2) = &ws[(i + 1) % copies];
+                        assert!(
+                            crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_gate_up_silu_dispatch(
+                                p, s, p2, s2, &b_scales, &b_quants, &mut out, m, n, k
+                            )
+                        );
+                    });
+                    // two GEMMs' worth of work
+                    println!(
+                        "{name:>20} fused gate/up/silu : best {:7.0} / median {:7.0} GOPS",
+                        2.0 * gops(best),
+                        2.0 * gops(med)
+                    );
+                }
+            }
+        }
+
         /// Smmla fused Gate+Up+SiLU vs unfused smmla gate/up GEMMs plus a scalar
         /// SiLU. Isolates the fusion; the colmajor test above pins smmla ≈ vdot.
         #[test]
