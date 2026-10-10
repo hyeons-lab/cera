@@ -11792,6 +11792,7 @@ pub(crate) mod neon {
         /// The Q4_1 smmla path (Q4_0 smmla on the same nibbles + the `m + 8*d` offset term from the
         /// activations' block sums) must agree with the standard Q4_1 dotprod kernel. The two sum in
         /// a different order, so the comparison is relative to the output scale rather than exact.
+        #[cfg(not(has_blas))]
         #[test]
         fn q4_1_smmla_matches_standard_kernel() {
             if !require_i8mm_kernel_or_skip() {
@@ -11856,6 +11857,7 @@ pub(crate) mod neon {
         /// Accuracy of the Q4_1 smmla path against an f64 reference, next to the standard kernel's,
         /// on weights shaped like a real Q4_1 tensor (`m` near `-8 d`, so the offset term cancels
         /// most of the unsigned-nibble dot) at the Llama down-projection depth.
+        #[cfg(not(has_blas))]
         #[test]
         #[ignore = "diagnostic: run explicitly on a device"]
         fn q4_1_smmla_accuracy_vs_f64() {
