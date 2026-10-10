@@ -108,6 +108,14 @@ pub enum Repacked {
         dsc: Vec<f32>,
         dmn: Vec<f32>,
     },
+    /// Q4_1 for the smmla prefill GEMM: the Q4_0 interleave of the same nibbles and scales
+    /// (`d*(q-8)`) plus `mprime[row * nb + block] = m + 8*d`, the offset term the
+    /// activations' block sums multiply. Only built on aarch64 with the i8mm tier.
+    Q41Smmla {
+        packed: Vec<u8>,
+        scales: Vec<f32>,
+        mprime: Vec<f32>,
+    },
     Q6K {
         packed: Vec<u8>,
         scales: Vec<f32>,
@@ -142,6 +150,7 @@ impl std::fmt::Debug for RepackedWeight {
         let (tag, packed_len) = match &self.kind {
             Repacked::Q40 { packed, .. } => ("Q4_0", packed.len()),
             Repacked::Q40Smmla { packed, .. } => ("Q4_0+smmla", packed.len()),
+            Repacked::Q41Smmla { packed, .. } => ("Q4_1+smmla", packed.len()),
             Repacked::Q4K { packed, .. } => ("Q4_K", packed.len()),
             Repacked::Q4KSmmla { packed, .. } => ("Q4_K+smmla", packed.len()),
             Repacked::Q6K { packed, .. } => ("Q6_K", packed.len()),
@@ -391,6 +400,20 @@ impl WeightRef {
                         cpu::repack_q4_k_8x8(weight_data(gguf, &self), self.m, self.k);
                     kind = Some(Repacked::Q4K { packed, dsc, dmn });
                 }
+            }
+            #[cfg(target_arch = "aarch64")]
+            if self.dtype == DType::Q4_1
+                && cpu::q4_1_smmla_repack_supported(self.m, self.k)
+                && crate::backend::cpu_features::cpu_features().tier
+                    == crate::backend::cpu_features::CpuTier::NeonI8mm
+            {
+                let (packed, scales, mprime) =
+                    cpu::repack_q4_1_smmla_8x8(weight_data(gguf, &self), self.m, self.k);
+                kind = Some(Repacked::Q41Smmla {
+                    packed,
+                    scales,
+                    mprime,
+                });
             }
             #[cfg(target_arch = "aarch64")]
             if qualifies && self.dtype == DType::Q6K {
@@ -1224,6 +1247,9 @@ pub(crate) fn try_repacked_gemm_rowmajor(
                     packed, dsc, dmn, b_scales, b_quants, out, n, m, k,
                 )
             }
+            // No row-major Q4_1 kernel: decline so the caller takes the column-scratch path
+            // (which reaches `gemm_preq` and the smmla Q4_1 dispatch above).
+            Repacked::Q41Smmla { .. } => false,
             Repacked::Q6K { packed, scales } => cpu::gemm_preq_repacked_q6_k_rowmajor_dispatch(
                 packed, scales, b_scales, b_quants, out, n, m, k,
             ),
@@ -1432,6 +1458,13 @@ pub(crate) fn gemm_preq(
             ),
             Repacked::Q4KSmmla { packed, dsc, dmn } => cpu::gemm_preq_repacked_q4_k_smmla_dispatch(
                 packed, dsc, dmn, b_scales, b_quants, out, m, n, k,
+            ),
+            Repacked::Q41Smmla {
+                packed,
+                scales,
+                mprime,
+            } => cpu::gemm_preq_repacked_q4_1_smmla_dispatch(
+                packed, scales, mprime, b_scales, b_quants, out, m, n, k,
             ),
             Repacked::Q6K { packed, scales } => cpu::gemm_preq_repacked_q6_k_dispatch(
                 packed, scales, b_scales, b_quants, out, m, n, k,
@@ -1658,11 +1691,15 @@ pub(crate) fn quantize_columns(
             // column's 32-float block exactly as before (same bytes out).
             let mat_ptr = mat.as_ptr() as usize;
             let quants_ptr = quants.as_mut_ptr() as usize;
-            let tile_min = min_cols.div_ceil(QUANT_COL_TILE).max(1);
-            cpu::par_rows_n(
+            // Every tile is its own steal unit. With the old per-column floor (`min_cols`
+            // columns per worker, scaled to tiles) a 512-token chunk was 32 tiles in 2 chunks, so
+            // two workers did every activation quantize of the prefill.
+            cpu::par_rows_n_chunked_active(
                 &mut scales[..n * nb],
                 QUANT_COL_TILE * nb,
-                tile_min,
+                1,
+                1,
+                usize::MAX,
                 move |(g, sc)| {
                     let mat = mat_ptr as *const f32;
                     let j0 = g * QUANT_COL_TILE;

@@ -4597,6 +4597,103 @@ pub(crate) mod neon {
         }
     }
 
+    /// Adds the Q4_1 offset term to a Q4_0-style GEMM result:
+    /// `out[i * n + j] += sum_b mprime[i * nb + b] * xs[j * nb + b] * sum(q8 block (j, b))`,
+    /// with `mprime = m + 8*d` (see `repack_q4_1_smmla_8x8`). The activation block sums are
+    /// computed once per call (`k/32` per column), then each output row is a short f32 dot per
+    /// column, four columns at a time.
+    #[target_feature(enable = "neon,dotprod")]
+    pub unsafe fn q4_1_min_correction(
+        mprime: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        let nb = k / 32;
+        assert!(
+            mprime.len() >= m * nb
+                && b_scales.len() >= n * nb
+                && b_quants.len() >= n * k
+                && out.len() >= m * n,
+            "q4_1_min_correction: buffers too small for {m}x{n}x{k}"
+        );
+        // S[j * nb + b] = xs * (sum of the block's int8 quants).
+        let mut s = vec![0.0f32; n * nb];
+        let bq_ptr = b_quants.as_ptr() as usize;
+        let bs_ptr = b_scales.as_ptr() as usize;
+        crate::backend::cpu::par_rows_n(&mut s, nb, 16, move |(j, row)| unsafe {
+            let bq = (bq_ptr as *const i8).add(j * k);
+            let bs = (bs_ptr as *const f32).add(j * nb);
+            let ones = vdupq_n_s8(1);
+            let z = vdupq_n_s32(0);
+            for (b, r) in row.iter_mut().enumerate() {
+                let p = bq.add(b * 32);
+                let sum = vaddvq_s32(vdotq_s32(
+                    vdotq_s32(z, ones, vld1q_s8(p)),
+                    ones,
+                    vld1q_s8(p.add(16)),
+                ));
+                *r = *bs.add(b) * sum as f32;
+            }
+        });
+        let mp_ptr = mprime.as_ptr() as usize;
+        let s_ptr = s.as_ptr() as usize;
+        let rows = move |(i, row_out): (usize, &mut [f32])| unsafe {
+            let mp = (mp_ptr as *const f32).add(i * nb);
+            let s = s_ptr as *const f32;
+            let mut j = 0usize;
+            while j + 4 <= n {
+                let (s0, s1, s2, s3) = (
+                    s.add(j * nb),
+                    s.add((j + 1) * nb),
+                    s.add((j + 2) * nb),
+                    s.add((j + 3) * nb),
+                );
+                let mut a = [vdupq_n_f32(0.0); 4];
+                let mut b = 0usize;
+                while b + 4 <= nb {
+                    let mv = vld1q_f32(mp.add(b));
+                    a[0] = vfmaq_f32(a[0], mv, vld1q_f32(s0.add(b)));
+                    a[1] = vfmaq_f32(a[1], mv, vld1q_f32(s1.add(b)));
+                    a[2] = vfmaq_f32(a[2], mv, vld1q_f32(s2.add(b)));
+                    a[3] = vfmaq_f32(a[3], mv, vld1q_f32(s3.add(b)));
+                    b += 4;
+                }
+                let mut t = [
+                    vaddvq_f32(a[0]),
+                    vaddvq_f32(a[1]),
+                    vaddvq_f32(a[2]),
+                    vaddvq_f32(a[3]),
+                ];
+                while b < nb {
+                    let mv = *mp.add(b);
+                    t[0] += mv * *s0.add(b);
+                    t[1] += mv * *s1.add(b);
+                    t[2] += mv * *s2.add(b);
+                    t[3] += mv * *s3.add(b);
+                    b += 1;
+                }
+                for (c, v) in t.iter().enumerate() {
+                    row_out[j + c] += *v;
+                }
+                j += 4;
+            }
+            while j < n {
+                let sj = s.add(j * nb);
+                let mut t = 0.0f32;
+                for b in 0..nb {
+                    t += *mp.add(b) * *sj.add(b);
+                }
+                row_out[j] += t;
+                j += 1;
+            }
+        };
+        crate::backend::cpu::par_rows_n(&mut out[..m * n], n, 16, rows);
+    }
+
     /// NEON Q4_1 × Q8_0 integer matrix multiplication using dotprod.
     ///
     /// Evaluates C = A * B where A is row-major Q4_1 quantized weights,
@@ -7492,6 +7589,99 @@ pub(crate) mod neon {
                     compute,
                 );
             }
+        } else {
+            (0..sr_count).for_each(compute_super_row);
+        }
+    }
+
+    /// [`gemm_q4_0_smmla_8x4_q8_0`] (column-major `out[m, n]`) with the activations also given
+    /// interleaved per 4-token tile, as [`gemm_q4_0_smmla_8x4_q8_0_rowmajor_tiled`] does for the
+    /// row-major output: the full tiles run the shuffle-free tile kernel and the `n % 4` tail
+    /// tokens the single-token kernel. Bit-identical to the columnar kernel. Super-rows go out in
+    /// small stolen chunks, not one static slice per worker, so the slower cores of a big.LITTLE
+    /// pool take less (the static split ran a 64-super-row GEMM at a third of the tiled rate).
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    pub unsafe fn gemm_q4_0_smmla_8x4_q8_0_tiled(
+        packed: &[u8],
+        scales: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        tile_scales: &[f32],
+        tile_quants: &[i8],
+        out: &mut [f32],
+        m: usize,
+        n: usize,
+        k: usize,
+    ) {
+        debug_assert_eq!(m % 8, 0, "smmla Q4_0 GEMM: m must be a multiple of 8");
+        debug_assert_eq!(k % 32, 0, "smmla Q4_0 GEMM: k must be divisible by 32");
+        let nb = k / 32;
+        let tiles = n / 4;
+        debug_assert_eq!(out.len(), m * n);
+        debug_assert_eq!(packed.len(), (m / 8) * nb * 256);
+        debug_assert_eq!(scales.len(), (m / 8) * nb * 8);
+        debug_assert!(b_quants.len() >= n * k && b_scales.len() >= n * nb);
+        debug_assert!(tile_quants.len() >= tiles * nb * 128 && tile_scales.len() >= tiles * nb * 8);
+
+        let p_base = packed.as_ptr() as usize;
+        let s_base = scales.as_ptr() as usize;
+        let bq_base = b_quants.as_ptr() as usize;
+        let bs_base = b_scales.as_ptr() as usize;
+        let tq_base = tile_quants.as_ptr() as usize;
+        let ts_base = tile_scales.as_ptr() as usize;
+        let out_base = out.as_mut_ptr() as usize;
+
+        let compute_super_row = move |sr: usize| unsafe {
+            let p_ptr = p_base as *const i8;
+            let s_ptr = s_base as *const f32;
+            let bq_ptr = bq_base as *const i8;
+            let bs_ptr = bs_base as *const f32;
+            let tq_ptr = tq_base as *const i8;
+            let ts_ptr = ts_base as *const f32;
+            let out_ptr = out_base as *mut f32;
+            let base_row = 8 * sr;
+
+            for tile in 0..tiles {
+                let mut t = [[0.0f32; 4]; 8];
+                smmla_q4_0_tile_8x4_il(p_ptr, s_ptr, tq_ptr, ts_ptr, sr, tile, nb, &mut t);
+                for (r, row) in t.iter().enumerate() {
+                    // SAFETY: super-row `sr` owns output rows `8 * sr..8 * sr + 8`, written by this
+                    // call only; `(base_row + r) * n + tile * 4 + 4 <= m * n`.
+                    core::ptr::copy_nonoverlapping(
+                        row.as_ptr(),
+                        out_ptr.add((base_row + r) * n + tile * 4),
+                        4,
+                    );
+                }
+            }
+            // Tail tokens, columnar
+            for j in tiles * 4..n {
+                let mut t = [0.0f32; 8];
+                smmla_q4_0_tile_8x1(p_ptr, s_ptr, bq_ptr, bs_ptr, sr, j, nb, k, &mut t);
+                for (r, v) in t.iter().enumerate() {
+                    *out_ptr.add((base_row + r) * n + j) = *v;
+                }
+            }
+        };
+
+        let sr_count = m / 8;
+        if sr_count >= 2 {
+            let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+            let nth = crate::backend::cpu::prefill_par_threads()
+                .max(1)
+                .min(max_active);
+            let chunk = sr_count.div_ceil(nth * 4).max(1);
+            let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
+            let mut tickets = vec![0.0f32; sr_count];
+            crate::backend::cpu::par_rows_n_chunked_active(
+                &mut tickets,
+                1,
+                1,
+                chunk,
+                max_active,
+                compute,
+            );
         } else {
             (0..sr_count).for_each(compute_super_row);
         }
@@ -11437,6 +11627,22 @@ pub(crate) mod neon {
                 let mut want = vec![0.0f32; m * n];
                 let mut got = vec![f32::NAN; m * n];
                 unsafe {
+                    gemm_q4_0_smmla_8x4_q8_0(
+                        &packed, &scales, &b_scales, &b_quants, &mut want, m, n, k,
+                    );
+                    gemm_q4_0_smmla_8x4_q8_0_tiled(
+                        &packed, &scales, &b_scales, &b_quants, &tile_s, &tile_q, &mut got, m, n, k,
+                    );
+                }
+                assert_eq!(
+                    want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    got.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "column-major plain m={m} n={n} k={k}"
+                );
+
+                let mut want = vec![0.0f32; m * n];
+                let mut got = vec![f32::NAN; m * n];
+                unsafe {
                     gemm_q4_0_smmla_8x4_q8_0_rowmajor(
                         &packed, &scales, &b_scales, &b_quants, &mut want, n, m, k,
                     );
@@ -11581,6 +11787,152 @@ pub(crate) mod neon {
                     best / best_il
                 );
             }
+        }
+
+        /// The Q4_1 smmla path (Q4_0 smmla on the same nibbles + the `m + 8*d` offset term from the
+        /// activations' block sums) must agree with the standard Q4_1 dotprod kernel. The two sum in
+        /// a different order, so the comparison is relative to the output scale rather than exact.
+        #[cfg(not(has_blas))]
+        #[test]
+        fn q4_1_smmla_matches_standard_kernel() {
+            if !require_i8mm_kernel_or_skip() {
+                return;
+            }
+            for (m, n, k) in [
+                (32usize, 5usize, 128usize),
+                (16, 8, 256),
+                (48, 13, 96),
+                (64, 4, 1024),
+            ] {
+                let mut st = 0x41a5_0001u64 ^ (m as u64) ^ ((n as u64) << 16) ^ ((k as u64) << 32);
+                let nb = k / 32;
+                let blocks: Vec<BlockQ4_1> = (0..m * nb)
+                    .map(|_| {
+                        let mut qs = [0u8; 16];
+                        for b in qs.iter_mut() {
+                            *b = (lcg(&mut st) * 127.0) as i32 as u8;
+                        }
+                        BlockQ4_1 {
+                            d: crate::quant::f32_to_f16(0.02 + lcg(&mut st).abs() * 0.1),
+                            m: crate::quant::f32_to_f16(lcg(&mut st) * 0.5),
+                            qs,
+                        }
+                    })
+                    .collect();
+                let a = blocks_to_bytes(&blocks);
+                let bmat: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+                let mut b_scales = vec![0.0f32; n * nb];
+                let mut b_quants = vec![0i8; n * k];
+                crate::model::transformer::quantize_rows(&bmat, k, n, &mut b_scales, &mut b_quants);
+
+                let mut want = vec![0.0f32; m * n];
+                unsafe {
+                    gemm_q4_1_q8_0_neon_dotprod(&a, &b_scales, &b_quants, &mut want, m, n, k)
+                };
+                let (packed, scales, mprime) = crate::backend::cpu::repack_q4_1_smmla_8x8(&a, m, k);
+                let mut got = vec![f32::NAN; m * n];
+                assert!(
+                    crate::backend::cpu::gemm_preq_repacked_q4_1_smmla_dispatch(
+                        &packed, &scales, &mprime, &b_scales, &b_quants, &mut got, m, n, k
+                    ),
+                    "dispatch declined at m={m} n={n} k={k}"
+                );
+                let scale = want.iter().fold(0.0f32, |acc, v| acc.max(v.abs()));
+                for (i, (g, w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 1e-4 * scale + 1e-6,
+                        "m={m} n={n} k={k} element {i}: smmla {g} vs standard {w} (scale {scale})"
+                    );
+                }
+                // Below four tokens the dispatch must decline, leaving the GEMV-identical path.
+                let mut sink = vec![0.0f32; m * 3];
+                assert!(
+                    !crate::backend::cpu::gemm_preq_repacked_q4_1_smmla_dispatch(
+                        &packed, &scales, &mprime, &b_scales, &b_quants, &mut sink, m, 3, k
+                    )
+                );
+            }
+        }
+
+        /// Accuracy of the Q4_1 smmla path against an f64 reference, next to the standard kernel's,
+        /// on weights shaped like a real Q4_1 tensor (`m` near `-8 d`, so the offset term cancels
+        /// most of the unsigned-nibble dot) at the Llama down-projection depth.
+        #[cfg(not(has_blas))]
+        #[test]
+        #[ignore = "diagnostic: run explicitly on a device"]
+        fn q4_1_smmla_accuracy_vs_f64() {
+            if !require_i8mm_kernel_or_skip() {
+                return;
+            }
+            let (m, n, k) = (64usize, 32usize, 8192usize);
+            let mut st = 0xacc0_0001u64;
+            let nb = k / 32;
+            let blocks: Vec<BlockQ4_1> = (0..m * nb)
+                .map(|_| {
+                    let mut qs = [0u8; 16];
+                    for b in qs.iter_mut() {
+                        // nibbles clustered around 8, like trained weights
+                        let lo = (8.0 + lcg(&mut st) * 4.0) as i32 as u8 & 15;
+                        let hi = (8.0 + lcg(&mut st) * 4.0) as i32 as u8 & 15;
+                        *b = lo | (hi << 4);
+                    }
+                    let d = 0.004 + lcg(&mut st).abs() * 0.01;
+                    BlockQ4_1 {
+                        d: crate::quant::f32_to_f16(d),
+                        m: crate::quant::f32_to_f16(-8.0 * d + lcg(&mut st) * 0.002),
+                        qs,
+                    }
+                })
+                .collect();
+            let a = blocks_to_bytes(&blocks);
+            let bmat: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+            let mut b_scales = vec![0.0f32; n * nb];
+            let mut b_quants = vec![0i8; n * k];
+            crate::model::transformer::quantize_rows(&bmat, k, n, &mut b_scales, &mut b_quants);
+            let mut std_out = vec![0.0f32; m * n];
+            unsafe { gemm_q4_1_q8_0_neon_dotprod(&a, &b_scales, &b_quants, &mut std_out, m, n, k) };
+            let (packed, scales, mprime) = crate::backend::cpu::repack_q4_1_smmla_8x8(&a, m, k);
+            let mut new_out = vec![0.0f32; m * n];
+            assert!(crate::backend::cpu::gemm_preq_repacked_q4_1_smmla_dispatch(
+                &packed,
+                &scales,
+                &mprime,
+                &b_scales,
+                &b_quants,
+                &mut new_out,
+                m,
+                n,
+                k
+            ));
+            let (mut e_std, mut e_new, mut mag) = (0.0f64, 0.0f64, 0.0f64);
+            for i in 0..m {
+                for j in 0..n {
+                    let mut r = 0.0f64;
+                    for b in 0..nb {
+                        let blk = &blocks[i * nb + b];
+                        let (d, mn) = (
+                            crate::quant::f16_to_f32(blk.d) as f64,
+                            crate::quant::f16_to_f32(blk.m) as f64,
+                        );
+                        let mut dot = 0i64;
+                        let mut sx = 0i64;
+                        for t in 0..32 {
+                            let byte = blk.qs[t % 16];
+                            let q = if t < 16 { byte & 15 } else { byte >> 4 } as i64;
+                            let x = b_quants[j * k + b * 32 + t] as i64;
+                            dot += q * x;
+                            sx += x;
+                        }
+                        r += b_scales[j * nb + b] as f64 * (d * dot as f64 + mn * sx as f64);
+                    }
+                    e_std = e_std.max((std_out[i * n + j] as f64 - r).abs());
+                    e_new = e_new.max((new_out[i * n + j] as f64 - r).abs());
+                    mag = mag.max(r.abs());
+                }
+            }
+            println!(
+                "q4_1 k={k}: max |out| {mag:.4}; max abs error standard {e_std:.3e}, smmla {e_new:.3e}"
+            );
         }
 
         /// Whole-pool throughput of the Q4_0 smmla prefill GEMM dispatches on the dense Llama-3.2-1B
