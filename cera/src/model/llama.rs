@@ -230,10 +230,12 @@ fn lm_head_gemm_disabled() -> bool {
 struct PrefillProf {
     on: bool,
     last: std::time::Instant,
-    acc: [std::time::Duration; 10],
+    acc: [std::time::Duration; 11],
+    /// Wall time of the down GEMM + residual (`down_residual`) per layer, in ms.
+    down_layers: Vec<f64>,
 }
 
-const PREFILL_PHASES: [&str; 10] = [
+const PREFILL_PHASES: [&str; 11] = [
     "norm",
     "qkv_gemm",
     "rope_kv",
@@ -241,7 +243,8 @@ const PREFILL_PHASES: [&str; 10] = [
     "out_proj",
     "ffn_norm",
     "ffn_quant",
-    "gate_up_silu",
+    "gate_up",
+    "silu",
     "down_quant",
     "down_residual",
 ];
@@ -253,7 +256,8 @@ impl PrefillProf {
         Self {
             on,
             last: std::time::Instant::now(),
-            acc: [std::time::Duration::ZERO; 10],
+            acc: [std::time::Duration::ZERO; 11],
+            down_layers: Vec::new(),
         }
     }
 
@@ -261,7 +265,11 @@ impl PrefillProf {
     fn lap(&mut self, phase: usize) {
         if self.on {
             let now = std::time::Instant::now();
-            self.acc[phase] += now - self.last;
+            let d = now - self.last;
+            self.acc[phase] += d;
+            if phase == 10 {
+                self.down_layers.push(d.as_secs_f64() * 1e3);
+            }
             self.last = now;
         }
     }
@@ -275,6 +283,11 @@ impl PrefillProf {
             }
             line.push_str(&format!(" | total: {:.2}ms", total.as_secs_f64() * 1e3));
             eprintln!("{line}");
+            let per: Vec<String> = self.down_layers.iter().map(|d| format!("{d:.0}")).collect();
+            eprintln!(
+                "[PROFILE PREFILL dense] down_residual per layer (ms): {}",
+                per.join(" ")
+            );
         }
     }
 }
@@ -3132,6 +3145,7 @@ impl LlamaModel {
                 apply_column_major_bias(&mut up_mat, bias, is, n);
             }
 
+            prof.lap(7);
             match self.activation {
                 FfnActivation::Swiglu => {
                     cpu::silu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
@@ -3140,7 +3154,7 @@ impl LlamaModel {
                     cpu::gelu_mul_inplace(&mut gate_mat[..is * n], &up_mat[..is * n]);
                 }
             }
-            prof.lap(7);
+            prof.lap(8);
 
             #[cfg(has_blas)]
             {
@@ -3165,7 +3179,8 @@ impl LlamaModel {
                     &mut bq_scales,
                     &mut bq_quants,
                 );
-                prof.lap(8);
+                prof.lap(9);
+                let t_dn = std::time::Instant::now();
                 transformer::gemm_preq(
                     &self.gguf,
                     &refs.ffn_down,
@@ -3176,6 +3191,12 @@ impl LlamaModel {
                     n,
                     is,
                 );
+                if prof.on {
+                    eprintln!(
+                        "DOWN layer {layer}: {:.2} ms",
+                        t_dn.elapsed().as_secs_f64() * 1e3
+                    );
+                }
             }
 
             // LoRA on the down projection - applied BEFORE the residual scale;
@@ -3219,7 +3240,7 @@ impl LlamaModel {
             }
             cpu::add_inplace(&mut hidden, &ffn_out);
 
-            prof.lap(9);
+            prof.lap(10);
             if self
                 .loop_norm_interval
                 .is_some_and(|n_phys| (layer + 1) % n_phys == 0)
