@@ -225,16 +225,18 @@ fn lm_head_gemm_disabled() -> bool {
     *DISABLED.get_or_init(|| std::env::var("CERA_LM_HEAD_NO_GEMM").as_deref() == Ok("1"))
 }
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 /// Per-phase wall time of the dense batched prefill, printed with `CERA_PROFILE_PREFILL=1` (one line per
 /// prefill call). The phases are the `PREFILL_PHASES` names, in the order the layer loop crosses them.
 struct PrefillProf {
     on: bool,
-    last: std::time::Instant,
-    acc: [std::time::Duration; 11],
+    last: crate::time::Instant,
+    acc: [crate::time::Duration; 11],
     /// Wall time of the down GEMM + residual (`down_residual`) per layer, in ms.
     down_layers: Vec<f64>,
 }
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 const PREFILL_PHASES: [&str; 11] = [
     "norm",
     "qkv_gemm",
@@ -249,14 +251,15 @@ const PREFILL_PHASES: [&str; 11] = [
     "down_residual",
 ];
 
+#[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 impl PrefillProf {
     fn new() -> Self {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         let on = *ENABLED.get_or_init(|| std::env::var_os("CERA_PROFILE_PREFILL").is_some());
         Self {
             on,
-            last: std::time::Instant::now(),
-            acc: [std::time::Duration::ZERO; 11],
+            last: crate::time::Instant::now(),
+            acc: [crate::time::Duration::ZERO; 11],
             down_layers: Vec::new(),
         }
     }
@@ -264,7 +267,7 @@ impl PrefillProf {
     /// Charge the time since the previous lap to `phase`.
     fn lap(&mut self, phase: usize) {
         if self.on {
-            let now = std::time::Instant::now();
+            let now = crate::time::Instant::now();
             let d = now - self.last;
             self.acc[phase] += d;
             if phase == 10 {
@@ -276,7 +279,7 @@ impl PrefillProf {
 
     fn report(&self, n: usize) {
         if self.on {
-            let total: std::time::Duration = self.acc.iter().sum();
+            let total: crate::time::Duration = self.acc.iter().sum();
             let mut line = format!("[PROFILE PREFILL dense] n={n}");
             for (name, d) in PREFILL_PHASES.iter().zip(&self.acc) {
                 line.push_str(&format!(" | {name}: {:.2}ms", d.as_secs_f64() * 1e3));
@@ -3180,7 +3183,7 @@ impl LlamaModel {
                     &mut bq_quants,
                 );
                 prof.lap(9);
-                let t_dn = std::time::Instant::now();
+                let t_dn = crate::time::Instant::now();
                 transformer::gemm_preq(
                     &self.gguf,
                     &refs.ffn_down,

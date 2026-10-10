@@ -11591,6 +11591,7 @@ pub(crate) mod neon {
         /// --nocapture --test-threads=1`.
         #[test]
         #[ignore = "microbenchmark: run explicitly on a device"]
+        #[cfg(not(has_blas))]
         fn dense_gemm_gops_microbench() {
             if !require_i8mm_kernel_or_skip() {
                 return;
