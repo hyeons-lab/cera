@@ -3422,6 +3422,34 @@ pub(crate) mod neon {
         }
     }
 
+    /// Smallest Q6_K tensor (bytes) that gets the long prefetch in [`q6k_prefetch_for`].
+    const Q6K_LONG_PREFETCH_MIN_BYTES: usize = 32 << 20;
+    /// Default lead of the long prefetch, bytes ahead in each row stream.
+    const Q6K_LONG_PREFETCH_BYTES: usize = 16384;
+
+    /// `(bytes ahead, cache lines per block)` for [`q6k_rows4`]'s software prefetch of a Q6_K tensor of
+    /// `total_bytes`. A block is 210 bytes, about four lines, in each of four row streams the hardware
+    /// prefetcher does not follow; a one-line prefetch 512 bytes ahead (about 85 ns of work at 140 cycles a
+    /// block) left a 215 MB LM head at 46 GB/s against a 69 GB/s streaming ceiling. From 32 MB up, which is
+    /// the LM heads, every line of the block goes 16 KB ahead and the head reaches 67 to 69 GB/s. Smaller
+    /// tensors keep the old setting: 2 to 14 MB measured within noise either way, and the extra
+    /// instructions cost 5% on a cache-resident one. `CERA_Q6K_PREFETCH` overrides the long distance
+    /// (0 turns the long prefetch off).
+    fn q6k_prefetch_for(total_bytes: usize) -> (usize, usize) {
+        static LONG: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let long = *LONG.get_or_init(|| {
+            std::env::var("CERA_Q6K_PREFETCH")
+                .ok()
+                .and_then(|v| v.trim().parse::<usize>().ok())
+                .unwrap_or(Q6K_LONG_PREFETCH_BYTES)
+        });
+        if long > 0 && total_bytes >= Q6K_LONG_PREFETCH_MIN_BYTES {
+            (long, 4)
+        } else {
+            (512, 1)
+        }
+    }
+
     /// Four consecutive Q6_K rows against the Q8_0 activations, one row per lane of the result.
     ///
     /// Each lane runs exactly the serial chain of [`q6k_row1`], term by term, so the four results are
@@ -3434,6 +3462,7 @@ pub(crate) mod neon {
     ///
     /// `rows` points at the first of four rows `row_bytes` apart.
     #[inline]
+    #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,dotprod")]
     unsafe fn q6k_rows4(
         rows: *const u8,
@@ -3442,6 +3471,8 @@ pub(crate) mod neon {
         xq: *const i8,
         xs: *const f32,
         xsum16: *const i32,
+        pf: usize,
+        pf_lines: usize,
     ) -> float32x4_t {
         unsafe {
             let m0f = vdupq_n_u8(0x0F);
@@ -3455,17 +3486,19 @@ pub(crate) mod neon {
                     rows.add(2 * row_bytes + bi * size_of::<BlockQ6K>()) as *const BlockQ6K,
                     rows.add(3 * row_bytes + bi * size_of::<BlockQ6K>()) as *const BlockQ6K,
                 ];
-                core::arch::asm!(
-                    "prfm pldl1keep, [{0}, #512]",
-                    "prfm pldl1keep, [{1}, #512]",
-                    "prfm pldl1keep, [{2}, #512]",
-                    "prfm pldl1keep, [{3}, #512]",
-                    in(reg) blks[0],
-                    in(reg) blks[1],
-                    in(reg) blks[2],
-                    in(reg) blks[3],
-                    options(nostack, preserves_flags)
-                );
+                for line in 0..pf_lines {
+                    core::arch::asm!(
+                        "prfm pldl1keep, [{0}]",
+                        "prfm pldl1keep, [{1}]",
+                        "prfm pldl1keep, [{2}]",
+                        "prfm pldl1keep, [{3}]",
+                        in(reg) (blks[0] as *const u8).wrapping_add(pf + 64 * line),
+                        in(reg) (blks[1] as *const u8).wrapping_add(pf + 64 * line),
+                        in(reg) (blks[2] as *const u8).wrapping_add(pf + 64 * line),
+                        in(reg) (blks[3] as *const u8).wrapping_add(pf + 64 * line),
+                        options(nostack, preserves_flags)
+                    );
+                }
                 let dv = [
                     crate::quant::f16_to_f32((*blks[0]).d),
                     crate::quant::f16_to_f32((*blks[1]).d),
@@ -3618,6 +3651,7 @@ pub(crate) mod neon {
             q8_sum16(x_quants.as_ptr(), chunks16, sum16);
             let sum16_ptr = sum16.as_ptr() as usize;
 
+            let (pf, pf_lines) = q6k_prefetch_for(m * row_bytes);
             // Four-row groups are the steal unit (a partial trailing group takes `q6k_row1`).
             let rows4 = move |(g, chunk): (usize, &mut [f32])| unsafe {
                 let r0 = g * 4;
@@ -3629,6 +3663,8 @@ pub(crate) mod neon {
                         ptrs.xq(),
                         ptrs.xs(),
                         sum16_ptr as *const i32,
+                        pf,
+                        pf_lines,
                     );
                     vst1q_f32(chunk.as_mut_ptr(), sumf);
                 } else {
@@ -3712,6 +3748,7 @@ pub(crate) mod neon {
         unsafe { q8_sum16(x_quants.as_ptr(), chunks16, sum16) };
         let sum16_ptr = sum16.as_ptr() as usize;
 
+        let (pf, pf_lines) = q6k_prefetch_for(m * row_bytes);
         let compute_chunk = |start_row: usize, slice_len: usize| unsafe {
             let chunk_idx = (start_row / chunk).min(n_chunks.saturating_sub(1));
             let mut local_max_val = f32::NEG_INFINITY;
@@ -3725,6 +3762,8 @@ pub(crate) mod neon {
                     ptrs.xq(),
                     ptrs.xs(),
                     sum16_ptr as *const i32,
+                    pf,
+                    pf_lines,
                 );
                 let mut lanes = [0.0f32; 4];
                 vst1q_f32(lanes.as_mut_ptr(), sumf);
@@ -12230,6 +12269,161 @@ pub(crate) mod neon {
                     want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                     fb_padded.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
                     "fallback GEMM padded m={m} n={n} k={k}"
+                );
+            }
+        }
+
+        /// The Q6_K prefetch selector gives the long four-line prefetch to LM-head-sized tensors and the
+        /// legacy one-line prefetch to everything smaller, so a small tensor never pays for the extra
+        /// instructions and a head never runs with the short lead.
+        #[test]
+        #[cfg(target_arch = "aarch64")]
+        fn q6k_prefetch_is_long_only_for_lm_head_sized_tensors() {
+            assert_eq!(q6k_prefetch_for(4 << 20), (512, 1));
+            assert_eq!(q6k_prefetch_for(Q6K_LONG_PREFETCH_MIN_BYTES - 1), (512, 1));
+            let (bytes, lines) = q6k_prefetch_for(55 << 20);
+            // CERA_Q6K_PREFETCH=0 turns the long prefetch off for A/B runs.
+            if std::env::var_os("CERA_Q6K_PREFETCH").is_none() {
+                assert_eq!((bytes, lines), (Q6K_LONG_PREFETCH_BYTES, 4));
+                assert_eq!(q6k_prefetch_for(215 << 20), (Q6K_LONG_PREFETCH_BYTES, 4));
+            }
+        }
+
+        /// Decode GEMV timing on the dense Llama-3.2-1B shapes through the entries `llama.rs` decode uses
+        /// (the Q4_0 decode repack and its fused gate/up/SwiGLU, and the Q6_K LM head), next to a pure
+        /// streaming read of the same bytes through the same pool, which is the bandwidth ceiling for a
+        /// kernel of that size. Weights rotate through enough copies to stream from DRAM.
+        /// `cera_tests llama_decode_gemv_microbench --ignored --nocapture --test-threads=1` on a device.
+        #[test]
+        #[ignore = "microbenchmark: run explicitly on a device"]
+        #[cfg(target_arch = "aarch64")]
+        fn llama_decode_gemv_microbench() {
+            use crate::tensor::DType;
+            if !crate::backend::cpu::q4_0_dec4_supported(16, 32) {
+                return;
+            }
+            let time = |copies: usize, f: &mut dyn FnMut(usize)| -> f64 {
+                let mut v = Vec::new();
+                for i in 0..60 {
+                    let t0 = std::time::Instant::now();
+                    f(i % copies);
+                    if i >= 10 {
+                        v.push(t0.elapsed().as_secs_f64());
+                    }
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let stream = |bytes: &[u8]| -> f64 {
+                let base = bytes.as_ptr() as usize;
+                let n = bytes.len() / 4096;
+                let sink = std::sync::atomic::AtomicU64::new(0);
+                crate::backend::cpu::par_range(n, 16, |start, count| {
+                    let mut acc = unsafe { vdupq_n_u8(0) };
+                    for i in start..start + count {
+                        let p = (base + i * 4096) as *const u8;
+                        for j in 0..64usize {
+                            acc = unsafe { veorq_u8(acc, vld1q_u8(p.add(j * 64))) };
+                            acc = unsafe { veorq_u8(acc, vld1q_u8(p.add(j * 64 + 16))) };
+                            acc = unsafe { veorq_u8(acc, vld1q_u8(p.add(j * 64 + 32))) };
+                            acc = unsafe { veorq_u8(acc, vld1q_u8(p.add(j * 64 + 48))) };
+                        }
+                    }
+                    sink.fetch_xor(
+                        unsafe { vgetq_lane_u64::<0>(vreinterpretq_u64_u8(acc)) },
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                });
+                std::hint::black_box(sink.load(std::sync::atomic::Ordering::Relaxed));
+                0.0
+            };
+            let mut st = 0x11ac_0001u64;
+            // (name, m, k, kind): kind 0 = dec4 plain, 1 = dec4 fused gate/up (two weights), 2 = Q6_K head
+            for (name, m, k, kind) in [
+                ("dec4 down 2048x8192", 2048usize, 8192usize, 0u8),
+                ("dec4 out 2048x2048", 2048, 2048, 0),
+                ("dec4 gate+up swiglu 8192x2048", 8192, 2048, 1),
+                ("q6k lm head 128256x2048", 128256, 2048, 2),
+                ("q6k 65536x2048", 65536, 2048, 2),
+                ("q6k 128256x1024", 128256, 1024, 2),
+                ("q6k 65536x1024", 65536, 1024, 2),
+                ("q6k 32064x4096", 32064, 4096, 2),
+                ("q6k 1024x2048 (2.1 MB)", 1024, 2048, 2),
+                ("q6k 2048x2048 (4.3 MB)", 2048, 2048, 2),
+                ("q6k 4096x2048 (8.6 MB)", 4096, 2048, 2),
+                ("q6k 2048x8192 (13.8 MB)", 2048, 8192, 2),
+                ("q6k 8192x2048 (13.8 MB)", 8192, 2048, 2),
+                ("q6k 4096x2048 (cache-hot)", 4096, 2048, 3),
+            ] {
+                let hot = kind == 3;
+                let kind = if hot { 2 } else { kind };
+                let row_bytes = match kind {
+                    2 => (k / 256) * std::mem::size_of::<BlockQ6K>(),
+                    _ => (k / 32) * std::mem::size_of::<BlockQ4_0>(),
+                };
+                let one_len = m * row_bytes;
+                let weights = if kind == 1 { 2 } else { 1 };
+                let copies = if hot {
+                    1
+                } else {
+                    (96usize << 20).div_ceil(one_len * weights).max(2)
+                };
+                let ws: Vec<Vec<u8>> = (0..copies * weights)
+                    .map(|_| {
+                        (0..one_len)
+                            .map(|_| (lcg(&mut st) * 127.0) as i32 as u8)
+                            .collect()
+                    })
+                    .collect();
+                let packed: Vec<Vec<u8>> = if kind == 2 {
+                    Vec::new()
+                } else {
+                    ws.iter()
+                        .map(|w| crate::backend::cpu::repack_q4_0_dec4(w, m, k))
+                        .collect()
+                };
+                let x: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+                let (xs, xq) = quantize_col(&x);
+                let mut y = vec![0.0f32; m];
+                let t = time(copies, &mut |i| match kind {
+                    0 => crate::backend::cpu::gemv_q4_0_dec4_with_q8(
+                        &packed[i], &xs, &xq, &mut y, m, k,
+                    ),
+                    1 => crate::backend::cpu::gemv_q4_0_dec4_gate_up_swiglu_with_q8(
+                        &packed[2 * i],
+                        &packed[2 * i + 1],
+                        &xs,
+                        &xq,
+                        &mut y,
+                        m,
+                        k,
+                    ),
+                    _ => crate::backend::cpu::gemv_with_preq(
+                        DType::Q6K,
+                        &ws[i],
+                        &xs,
+                        &xq,
+                        &x,
+                        &mut y,
+                        m,
+                        k,
+                    ),
+                });
+                let bytes = (one_len * weights) as f64;
+                let src: &[u8] = if kind == 2 { &ws[0] } else { &packed[0] };
+                let ts = time(copies, &mut |_| {
+                    stream(src);
+                    if kind == 1 {
+                        stream(&packed[1]);
+                    }
+                });
+                println!(
+                    "{name:>30}: {:7.3} ms {:5.1} GB/s   stream ceiling {:7.3} ms {:5.1} GB/s   ({:.1} MB)",
+                    t * 1e3,
+                    bytes / t / 1e9,
+                    ts * 1e3,
+                    bytes / ts / 1e9,
+                    bytes / 1e6
                 );
             }
         }
