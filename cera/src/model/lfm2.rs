@@ -210,6 +210,10 @@ pub struct LayerWeightRefs {
 pub struct LfmModel {
     gguf: GgufFile,
     config: ModelConfig,
+    /// Whether a bidirectional pass must take
+    /// [`Self::hidden_states_float_bidirectional`]. Decided once at load (tensor
+    /// dtypes never change), so the per-call gate stays a field read.
+    needs_bidirectional_float_path: bool,
     // Pre-dequantized small F32 weights
     output_norm_weight: Vec<f32>,
     attn_norm_weights: Vec<Vec<f32>>,
@@ -839,9 +843,14 @@ impl LfmModel {
             (None, None)
         };
 
+        // Tensor dtypes never change after load, so the bidirectional routing is
+        // decided once here instead of scanning the tensor index on every call.
+        let needs_bidirectional_float_path = Self::bidirectional_float_path_needed(&gguf, &config);
+
         Ok(Self {
             gguf,
             config,
+            needs_bidirectional_float_path,
             output_norm_weight,
             attn_norm_weights,
             ffn_norm_weights,
@@ -1546,11 +1555,16 @@ impl LfmModel {
     /// [`Self::hidden_states_float_bidirectional`]: some projection is a dtype the batched
     /// GEMM cannot run (F16, F32), and the per-token path that would take it instead is
     /// causal, so it would answer a different question.
+    fn bidirectional_needs_float_path(&self) -> bool {
+        self.needs_bidirectional_float_path
+    }
+
+    /// The load-time computation behind [`Self::bidirectional_needs_float_path`].
     ///
     /// A target with no batched GEMM at all (wasm32, 32-bit ARM and x86) has only that
     /// per-token path, so there every bidirectional model takes the float path.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
-    fn bidirectional_needs_float_path(&self) -> bool {
+    fn bidirectional_float_path_needed(gguf: &GgufFile, config: &ModelConfig) -> bool {
         const PROJECTIONS: [&str; 9] = [
             "shortconv.in_proj",
             "shortconv.out_proj",
@@ -1562,10 +1576,9 @@ impl LfmModel {
             "ffn_up",
             "ffn_down",
         ];
-        (0..self.config.n_layers).any(|layer| {
+        (0..config.n_layers).any(|layer| {
             PROJECTIONS.iter().any(|name| {
-                self.gguf
-                    .tensors
+                gguf.tensors
                     .get(&format!("blk.{layer}.{name}.weight"))
                     .is_some_and(|t| {
                         !transformer::batched_gemm_supports(
@@ -1579,25 +1592,33 @@ impl LfmModel {
 
     /// See the batched-target version: with no batched GEMM on this target, always.
     #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", has_blas)))]
-    fn bidirectional_needs_float_path(&self) -> bool {
+    fn bidirectional_float_path_needed(_gguf: &GgufFile, _config: &ModelConfig) -> bool {
         true
     }
 
     /// The bidirectional trunk in plain f32, for weights the batched GEMM cannot run.
     ///
-    /// Each projection is read and widened to f32 as it is used, so only one layer's weights
-    /// are resident at a time and a model is as large as its file, not four times it. It is
-    /// the textbook form of the block, which makes it the reference the quantized path is
-    /// measured against: pre-norm, a centred 3-tap gated convolution or full (non-causal)
-    /// grouped-query attention, and a SwiGLU feed-forward.
+    /// Takes the embedded hidden states, one row per token, and reuses that buffer as its
+    /// working state: the caller has already dequantized the embeddings, so taking the
+    /// tokens instead would allocate and embed a second `n * hidden` buffer. Each
+    /// projection is read and widened to f32 as it is used, so only one layer's weights
+    /// are resident at a time and a model is as large as its file, not four times it. It
+    /// is the textbook form of the block, which makes it the reference the quantized path
+    /// is measured against: pre-norm, a centred 3-tap gated convolution or full
+    /// (non-causal) grouped-query attention, and a SwiGLU feed-forward.
     ///
     /// Returns the post-final-norm hidden state of every token, `[tokens, hidden]`.
-    fn hidden_states_float_bidirectional(&self, tokens: &[u32]) -> Vec<f32> {
+    fn hidden_states_float_bidirectional(&self, mut h: Vec<f32>) -> Vec<f32> {
         use crate::model::pii::matmul_nt_f32;
         use crate::par::*;
         let cfg = &self.config;
         let hs = cfg.hidden_size;
-        let n = tokens.len();
+        debug_assert!(
+            !h.is_empty() && h.len().is_multiple_of(hs),
+            "the float trunk takes embedded rows, got {} f32 for hidden_size {hs}",
+            h.len()
+        );
+        let n = h.len() / hs;
         let weight = |layer: usize, name: &str| -> Vec<f32> {
             self.gguf
                 .get_tensor(&format!("blk.{layer}.{name}.weight"))
@@ -1610,12 +1631,11 @@ impl LfmModel {
             out
         };
 
-        let mut h = vec![0f32; n * hs];
-        for (i, &token) in tokens.iter().enumerate() {
-            self.dequantize_row_into(&self.embd_ref, token as usize, &mut h[i * hs..(i + 1) * hs]);
-        }
+        // One norm scratch for all layers: cloning `h` per norm would allocate
+        // `2 * n_layers` full-size buffers per pass.
+        let mut normed = vec![0f32; n * hs];
         for layer in 0..cfg.n_layers {
-            let mut normed = h.clone();
+            normed.copy_from_slice(&h);
             for row in normed.chunks_exact_mut(hs) {
                 cpu::rmsnorm(row, &self.attn_norm_weights[layer], cfg.rms_norm_eps);
             }
@@ -1694,7 +1714,7 @@ impl LfmModel {
             }
 
             // SwiGLU feed-forward
-            let mut normed = h.clone();
+            normed.copy_from_slice(&h);
             for row in normed.chunks_exact_mut(hs) {
                 cpu::rmsnorm(row, &self.ffn_norm_weights[layer], cfg.rms_norm_eps);
             }
@@ -5222,9 +5242,10 @@ impl Model for LfmModel {
                 );
             }
             // F16 and F32 projections cannot take the batched path, and the per-token path
-            // that would take them is causal: run the trunk in plain f32 instead
+            // that would take them is causal: run the trunk in plain f32 instead, handing
+            // it the embedded rows rather than embedding them a second time
             if state.lora.is_none() && self.bidirectional_needs_float_path() {
-                return self.hidden_states_float_bidirectional(tokens);
+                return self.hidden_states_float_bidirectional(hidden);
             }
             self.prefill_layers_loop(&mut hidden, n, 0, state);
             for j in 0..n {
@@ -6546,6 +6567,20 @@ mod bidirectional_float_tests {
         assert!(model.bidirectional_needs_float_path());
     }
 
+    /// The gate's other arm: a batchable model must stay off the float path. Without
+    /// this, a gate stuck at true would route the Q8_0 fixture below onto the float
+    /// path too, and the agreement test would compare the float path against itself.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
+    #[test]
+    fn q8_weights_stay_off_the_float_path() {
+        if !transformer::batched_gemm_supports(crate::tensor::DType::Q8_0, HS) {
+            eprintln!("SKIPPED: this host has no batched Q8_0 GEMM, so Q8_0 takes the float path");
+            return;
+        }
+        let model = LfmModel::from_gguf(bidirectional_gguf(true), 256).unwrap();
+        assert!(!model.bidirectional_needs_float_path());
+    }
+
     #[test]
     fn a_later_token_changes_an_earlier_hidden_state() {
         let a = hidden(bidirectional_gguf(false), &[3, 7, 9, 12, 5]);
@@ -6570,7 +6605,13 @@ mod bidirectional_float_tests {
         }
         let tokens = [3u32, 7, 9, 12, 5, 21, 8];
         let float = hidden(bidirectional_gguf(false), &tokens);
-        let quant = hidden(bidirectional_gguf(true), &tokens);
+        let quant_model = LfmModel::from_gguf(bidirectional_gguf(true), 256).unwrap();
+        assert!(
+            !quant_model.bidirectional_needs_float_path(),
+            "the Q8_0 fixture must take the batched path, or this compares the float path against itself"
+        );
+        let mut state = InferenceState::for_prefill(quant_model.config(), tokens.len()).unwrap();
+        let quant = quant_model.hidden_states(&tokens, &mut state);
         assert_eq!(float.len(), tokens.len() * HS);
         let (float_rows, _) = float.as_chunks::<HS>();
         let (quant_rows, _) = quant.as_chunks::<HS>();
