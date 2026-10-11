@@ -6977,6 +6977,81 @@ pub fn attn_values_f16(
     }
 }
 
+/// How many cache positions ahead the f16 decode attention kernels prefetch (`CERA_ATTN_PREFETCH` overrides; 0 turns
+/// it off). A head reads 128 bytes out of every KV-dim-wide row of the position-major cache (1 KB for 8 heads of 64), a
+/// stride the hardware prefetcher does not follow, so without this each position is a demand miss to DRAM: a
+/// prime core streams a head at 18 ns per position instead of 3.3 from cache, a mid core at 80 instead of 8.
+#[cfg(target_arch = "aarch64")]
+fn attn_prefetch_distance() -> usize {
+    static DIST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DIST.get_or_init(|| {
+        std::env::var("CERA_ATTN_PREFETCH")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(ATTN_PREFETCH_DEFAULT)
+    })
+}
+
+/// Fewest cached positions at which the decode attention prefetches. Below it a head's whole K and V (128 bytes a
+/// position each) sit in L1/L2 already, there is no DRAM latency to hide, and the extra instructions cost a few
+/// percent (dense Llama-3.2-1B at 128 tokens: 66.3 to 63.8 tok/s).
+#[cfg(target_arch = "aarch64")]
+const ATTN_PREFETCH_MIN_SEQ: usize = 256;
+
+/// Default for [`attn_prefetch_distance`], in cache positions (16 rows of a 1 KB-wide cache is 16 KB ahead).
+#[cfg(target_arch = "aarch64")]
+const ATTN_PREFETCH_DEFAULT: usize = 16;
+
+/// Positions ahead for the second, L2-targeted prefetch (`CERA_ATTN_PREFETCH_L2`; 0 = off).
+#[cfg(target_arch = "aarch64")]
+fn attn_prefetch_l2_distance() -> usize {
+    static DIST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *DIST.get_or_init(|| {
+        std::env::var("CERA_ATTN_PREFETCH_L2")
+            .ok()
+            .and_then(|v| v.trim().parse::<usize>().ok())
+            .unwrap_or(ATTN_PREFETCH_L2_DEFAULT)
+    })
+}
+
+/// Default for [`attn_prefetch_l2_distance`], in cache positions.
+#[cfg(target_arch = "aarch64")]
+const ATTN_PREFETCH_L2_DEFAULT: usize = 64;
+
+/// [`prefetch_lines`] into L2 only: it does not occupy the core's few L1 miss slots, so it can run further ahead.
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn prefetch_lines_l2(p: *const u8, bytes: usize) {
+    unsafe {
+        let mut off = 0usize;
+        while off < bytes {
+            core::arch::asm!(
+                "prfm pldl2keep, [{0}]",
+                in(reg) p.wrapping_add(off),
+                options(nostack, preserves_flags)
+            );
+            off += 64;
+        }
+    }
+}
+
+/// Prefetch the cache lines holding `bytes` bytes at `p` (non-faulting; `p` may point past the buffer).
+#[cfg(target_arch = "aarch64")]
+#[inline(always)]
+unsafe fn prefetch_lines(p: *const u8, bytes: usize) {
+    unsafe {
+        let mut off = 0usize;
+        while off < bytes {
+            core::arch::asm!(
+                "prfm pldl1keep, [{0}]",
+                in(reg) p.wrapping_add(off),
+                options(nostack, preserves_flags)
+            );
+            off += 64;
+        }
+    }
+}
+
 /// NEON f16→f32-widening score kernel. Uses the hardware FCVTL widen
 /// (`vcvt_f32_f16`) — the conversion is what makes f16 KV a decode-at-depth
 /// win (a software widen is dominated by GQA re-reading each KV element
@@ -7021,7 +7096,24 @@ unsafe fn attn_scores_f16_neon(
             q_vecs[i] = vld1q_f32(q_ptr.add(i * 4));
         }
 
+        let (pf, pf2) = if seq_len >= ATTN_PREFETCH_MIN_SEQ {
+            (attn_prefetch_distance(), attn_prefetch_l2_distance())
+        } else {
+            (0, 0)
+        };
         for t in 0..seq_len {
+            if pf != 0 {
+                prefetch_lines(
+                    k_ptr.wrapping_add((t + pf) * kv_dim + kv_h_offset) as *const u8,
+                    head_dim * 2,
+                );
+            }
+            if pf2 != 0 {
+                prefetch_lines_l2(
+                    k_ptr.wrapping_add((t + pf2) * kv_dim + kv_h_offset) as *const u8,
+                    head_dim * 2,
+                );
+            }
             let k_off = t * kv_dim + kv_h_offset;
             let mut sum0 = vdupq_n_f32(0.0);
             let mut sum1 = vdupq_n_f32(0.0);
@@ -7078,7 +7170,24 @@ unsafe fn attn_values_f16_neon(
         debug_assert!(n_vec <= MAX_ACC_VECS, "head_dim > 128 not supported");
         let mut acc = [vdupq_n_f32(0.0); MAX_ACC_VECS];
 
+        let (pf, pf2) = if seq_len >= ATTN_PREFETCH_MIN_SEQ {
+            (attn_prefetch_distance(), attn_prefetch_l2_distance())
+        } else {
+            (0, 0)
+        };
         for t in 0..seq_len {
+            if pf != 0 {
+                prefetch_lines(
+                    v_ptr.wrapping_add((t + pf) * kv_dim + kv_h_offset) as *const u8,
+                    head_dim * 2,
+                );
+            }
+            if pf2 != 0 {
+                prefetch_lines_l2(
+                    v_ptr.wrapping_add((t + pf2) * kv_dim + kv_h_offset) as *const u8,
+                    head_dim * 2,
+                );
+            }
             let s = vdupq_n_f32(scores[t]);
             let v_base = t * kv_dim + kv_h_offset;
             for i in 0..n_vec {
@@ -14447,6 +14556,79 @@ mod tests {
             true,
             1,
         ));
+    }
+
+    /// Single-thread cost of one decode attention head over an f16 KV cache (scores, softmax, values) at several
+    /// depths, with the head's K and V cache-resident and with them streamed from DRAM (a rotation of 32 layers'
+    /// worth of cache), on the Llama-3.2-1B shape (kv_dim 512 = 8 heads x 64, one head read at a time).
+    /// `cera_tests decode_attn_head_microbench --ignored --nocapture` on a device, pinned with `taskset 80`.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[ignore = "microbenchmark: run explicitly on a device"]
+    fn decode_attn_head_microbench() {
+        let (head_dim, kv_dim) = (64usize, 512usize);
+        let mut st = 0xa77e_0001u64;
+        let mut lcg = || {
+            st = st
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            ((st >> 33) as f32 / (1u64 << 31) as f32) - 0.5
+        };
+        let q: Vec<f32> = (0..head_dim).map(|_| lcg()).collect();
+        for depth in [512usize, 1024, 2048] {
+            let layers = 32usize;
+            let k: Vec<Vec<u16>> = (0..layers)
+                .map(|_| {
+                    (0..depth * kv_dim)
+                        .map(|_| crate::quant::f32_to_f16(lcg()))
+                        .collect()
+                })
+                .collect();
+            let v: Vec<Vec<u16>> = (0..layers)
+                .map(|_| {
+                    (0..depth * kv_dim)
+                        .map(|_| crate::quant::f32_to_f16(lcg()))
+                        .collect()
+                })
+                .collect();
+            let mut scores = vec![0.0f32; depth];
+            let mut out = vec![0.0f32; head_dim];
+            for cold in [false, true] {
+                let mut t_scores = Vec::new();
+                let mut t_soft = Vec::new();
+                let mut t_values = Vec::new();
+                for it in 0..80 {
+                    let l = if cold { it % layers } else { 0 };
+                    let t0 = std::time::Instant::now();
+                    attn_scores_f16(&q, &k[l], &mut scores, kv_dim, 128, head_dim, 0.125, depth);
+                    let t1 = std::time::Instant::now();
+                    softmax_inplace(&mut scores);
+                    let t2 = std::time::Instant::now();
+                    attn_values_f16(&scores, &v[l], &mut out, kv_dim, 128, head_dim, depth);
+                    let t3 = std::time::Instant::now();
+                    if it >= 16 {
+                        t_scores.push((t1 - t0).as_secs_f64());
+                        t_soft.push((t2 - t1).as_secs_f64());
+                        t_values.push((t3 - t2).as_secs_f64());
+                    }
+                }
+                let med = |v: &mut Vec<f64>| {
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    v[v.len() / 2]
+                };
+                let (a, b, c) = (med(&mut t_scores), med(&mut t_soft), med(&mut t_values));
+                println!(
+                    "depth {depth:5} {}: scores {:6.1} us ({:5.1} ns/pos)  softmax {:6.1} us ({:5.1} ns/pos)  values {:6.1} us ({:5.1} ns/pos)",
+                    if cold { "cold" } else { "hot " },
+                    a * 1e6,
+                    a * 1e9 / depth as f64,
+                    b * 1e6,
+                    b * 1e9 / depth as f64,
+                    c * 1e6,
+                    c * 1e9 / depth as f64
+                );
+            }
+        }
     }
 
     /// One core, prefill-shaped (hd 64, one head, stride-n Q): GFLOPS of both NEON kernels.
