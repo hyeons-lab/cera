@@ -12306,6 +12306,265 @@ pub(crate) mod neon {
             }
         }
 
+        /// smmla throughput against the number of independent accumulator chains: a chain count that
+        /// still scales means the instruction is latency-bound at that count, which is what limits a
+        /// kernel with few live accumulators. `taskset 04` for a mid core, `taskset 80` for a prime core.
+        #[test]
+        #[ignore = "microbenchmark: run explicitly on a device"]
+        #[cfg(not(has_blas))]
+        fn smmla_chain_sweep_microbench() {
+            if !require_i8mm_kernel_or_skip() {
+                return;
+            }
+            #[target_feature(enable = "neon,i8mm")]
+            unsafe fn chains<const N: usize>(iters: usize) -> i32 {
+                unsafe {
+                    let l = [vdupq_n_s8(1), vdupq_n_s8(2), vdupq_n_s8(3), vdupq_n_s8(4)];
+                    let r = [vdupq_n_s8(5), vdupq_n_s8(6), vdupq_n_s8(7), vdupq_n_s8(8)];
+                    let mut acc = [vdupq_n_s32(0); N];
+                    for _ in 0..iters {
+                        for (i, a) in acc.iter_mut().enumerate() {
+                            *a = vmmlaq_s32(*a, l[i % 4], r[(i / 4) % 4]);
+                        }
+                    }
+                    let mut sink = vdupq_n_s32(0);
+                    for a in acc.iter() {
+                        sink = vaddq_s32(sink, *a);
+                    }
+                    vaddvq_s32(sink)
+                }
+            }
+            macro_rules! sweep {
+                ($($n:literal),*) => {$(
+                    let iters = 4_000_000 / $n;
+                    let mut v: Vec<f64> = (0..9).map(|_| {
+                        let t0 = std::time::Instant::now();
+                        std::hint::black_box(unsafe { chains::<$n>(iters) });
+                        t0.elapsed().as_secs_f64()
+                    }).collect();
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    println!("chains {:2}: {:5.3} ns/smmla", $n, v[4] / (iters * $n) as f64 * 1e9);
+                )*};
+            }
+            sweep!(1, 2, 4, 6, 8, 12, 16);
+        }
+
+        /// Single-core, cache-resident ablation of the 8x4 smmla tile kernel at `k = 2048` and `8192` (one
+        /// super-row of weights against 64 tiles of activations): the shipping `smmla_q4_0_tile_8x4_il`, the
+        /// same loads and `smmla` with the float epilogue removed, loads and `smmla` alone (with and without
+        /// the per-block accumulator zeroing), and pure `smmla` throughput on registers. Pin it to a core
+        /// type: `taskset 80` is a prime core, `taskset 04` a mid core on a Snapdragon 8 Elite.
+        /// `cera_tests smmla_tile_ablation_microbench --ignored --nocapture --test-threads=1`.
+        #[test]
+        #[ignore = "microbenchmark: run explicitly on a device"]
+        #[cfg(not(has_blas))]
+        fn smmla_tile_ablation_microbench() {
+            if !require_i8mm_kernel_or_skip() {
+                return;
+            }
+            #[target_feature(enable = "neon,i8mm")]
+            unsafe fn no_epilogue(
+                p_ptr: *const i8,
+                bq_ptr: *const i8,
+                tile: usize,
+                nb: usize,
+            ) -> i32 {
+                unsafe {
+                    let mut sink = [[vdupq_n_s32(0); 2]; 4];
+                    for b in 0..nb {
+                        let mut acc = [[vdupq_n_s32(0); 2]; 4];
+                        let w_base = p_ptr.add(b * 256);
+                        let b_base = bq_ptr.add((tile * nb + b) * 128);
+                        for c in 0..4usize {
+                            let rhs0 = vld1q_s8(b_base.add(c * 32));
+                            let rhs1 = vld1q_s8(b_base.add(c * 32 + 16));
+                            for p in 0..4usize {
+                                let lhs = vld1q_s8(w_base.add(c * 64 + p * 16));
+                                acc[p][0] = vmmlaq_s32(acc[p][0], lhs, rhs0);
+                                acc[p][1] = vmmlaq_s32(acc[p][1], lhs, rhs1);
+                            }
+                        }
+                        // Eight independent sinks: one add per accumulator, no serial chain.
+                        for p in 0..4usize {
+                            sink[p][0] = vaddq_s32(sink[p][0], acc[p][0]);
+                            sink[p][1] = vaddq_s32(sink[p][1], acc[p][1]);
+                        }
+                    }
+                    let mut total = vdupq_n_s32(0);
+                    for a in sink.iter().flatten() {
+                        total = vaddq_s32(total, *a);
+                    }
+                    vaddvq_s32(total)
+                }
+            }
+            #[target_feature(enable = "neon,i8mm")]
+            unsafe fn pure_smmla(iters: usize) -> i32 {
+                unsafe {
+                    let l = [vdupq_n_s8(1), vdupq_n_s8(2), vdupq_n_s8(3), vdupq_n_s8(4)];
+                    let r = [vdupq_n_s8(5), vdupq_n_s8(6), vdupq_n_s8(7), vdupq_n_s8(8)];
+                    // 16 independent chains: enough to cover the instruction's latency.
+                    let mut acc = [[vdupq_n_s32(0); 4]; 4];
+                    for _ in 0..iters {
+                        for p in 0..4usize {
+                            for q in 0..4usize {
+                                acc[p][q] = vmmlaq_s32(acc[p][q], l[p], r[q]);
+                            }
+                        }
+                    }
+                    let mut sink = vdupq_n_s32(0);
+                    for a in acc.iter().flatten() {
+                        sink = vaddq_s32(sink, *a);
+                    }
+                    vaddvq_s32(sink)
+                }
+            }
+            /// Loads plus `smmla` only, over two alternating sets of eight accumulators (16 chains) so the
+            /// instruction latency is covered. `ZERO` re-zeroes the set about to be used, as the shipping
+            /// kernel does after each block's epilogue.
+            #[target_feature(enable = "neon,i8mm")]
+            unsafe fn loads_smmla<const ZERO: bool>(
+                p_ptr: *const i8,
+                bq_ptr: *const i8,
+                tile: usize,
+                nb: usize,
+            ) -> i32 {
+                unsafe {
+                    let mut acc = [[[vdupq_n_s32(0); 2]; 4]; 2];
+                    for b in 0..nb {
+                        let set = b & 1;
+                        if ZERO {
+                            acc[set] = [[vdupq_n_s32(0); 2]; 4];
+                        }
+                        let w_base = p_ptr.add(b * 256);
+                        let b_base = bq_ptr.add((tile * nb + b) * 128);
+                        for c in 0..4usize {
+                            let rhs0 = vld1q_s8(b_base.add(c * 32));
+                            let rhs1 = vld1q_s8(b_base.add(c * 32 + 16));
+                            for p in 0..4usize {
+                                let lhs = vld1q_s8(w_base.add(c * 64 + p * 16));
+                                acc[set][p][0] = vmmlaq_s32(acc[set][p][0], lhs, rhs0);
+                                acc[set][p][1] = vmmlaq_s32(acc[set][p][1], lhs, rhs1);
+                            }
+                        }
+                    }
+                    let mut sink = vdupq_n_s32(0);
+                    for a in acc.iter().flatten().flatten() {
+                        sink = vaddq_s32(sink, *a);
+                    }
+                    vaddvq_s32(sink)
+                }
+            }
+            for k in [2048usize, 8192] {
+                println!("k = {k}");
+                let (m, n) = (8usize, 256usize);
+                let (nb, tiles) = (k / 32, n / 4);
+                let mut st = 0x71e5_0001u64;
+                let (a, _, _) = random_q4_0_prefill_case(&mut st, m, 1, k);
+                let (packed, scales) = crate::backend::cpu::repack_q4_0_smmla_8x8(&a, m, k);
+                let tq: Vec<i8> = (0..tiles * nb * 128)
+                    .map(|_| (lcg(&mut st) * 100.0) as i8)
+                    .collect();
+                // The real layout per block: `[db0, db1, db0, db1, db2, db3, db2, db3]`.
+                let ts: Vec<f32> = (0..tiles * nb)
+                    .flat_map(|_| {
+                        let d: [f32; 4] =
+                            core::array::from_fn(|_| 0.01 + lcg(&mut st).abs() * 0.05);
+                        [d[0], d[1], d[0], d[1], d[2], d[3], d[2], d[3]]
+                    })
+                    .collect();
+                let med = |f: &mut dyn FnMut() -> f64| -> f64 {
+                    let mut v: Vec<f64> = (0..25).map(|_| f()).collect();
+                    v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                    v[v.len() / 2]
+                };
+                let smmla_per_tile = (nb * 32) as f64;
+                let report = |name: &str, secs: f64, smmla: f64| {
+                    println!(
+                        "{name:>26}: {:6.2} ns/smmla, {:5.2} TOPS",
+                        secs / smmla * 1e9,
+                        smmla * 64.0 / secs / 1e12
+                    );
+                };
+                let shipping = med(&mut || {
+                    let t0 = std::time::Instant::now();
+                    for tile in 0..tiles {
+                        let mut t = [[0.0f32; 4]; 8];
+                        unsafe {
+                            smmla_q4_0_tile_8x4_il(
+                                packed.as_ptr() as *const i8,
+                                scales.as_ptr(),
+                                tq.as_ptr(),
+                                ts.as_ptr(),
+                                0,
+                                tile,
+                                nb,
+                                &mut t,
+                            )
+                        };
+                        std::hint::black_box(&t);
+                    }
+                    t0.elapsed().as_secs_f64()
+                });
+                report(
+                    "shipping tile kernel",
+                    shipping,
+                    smmla_per_tile * tiles as f64,
+                );
+                let loads_only = med(&mut || {
+                    let t0 = std::time::Instant::now();
+                    let mut sink = 0i32;
+                    for tile in 0..tiles {
+                        sink = sink.wrapping_add(unsafe {
+                            loads_smmla::<false>(
+                                packed.as_ptr() as *const i8,
+                                tq.as_ptr(),
+                                tile,
+                                nb,
+                            )
+                        });
+                    }
+                    std::hint::black_box(sink);
+                    t0.elapsed().as_secs_f64()
+                });
+                report("loads + smmla", loads_only, smmla_per_tile * tiles as f64);
+                let loads_zero = med(&mut || {
+                    let t0 = std::time::Instant::now();
+                    let mut sink = 0i32;
+                    for tile in 0..tiles {
+                        sink = sink.wrapping_add(unsafe {
+                            loads_smmla::<true>(packed.as_ptr() as *const i8, tq.as_ptr(), tile, nb)
+                        });
+                    }
+                    std::hint::black_box(sink);
+                    t0.elapsed().as_secs_f64()
+                });
+                report(
+                    "loads + smmla + zeroing",
+                    loads_zero,
+                    smmla_per_tile * tiles as f64,
+                );
+                let bare = med(&mut || {
+                    let t0 = std::time::Instant::now();
+                    let mut sink = 0i32;
+                    for tile in 0..tiles {
+                        sink = sink.wrapping_add(unsafe {
+                            no_epilogue(packed.as_ptr() as *const i8, tq.as_ptr(), tile, nb)
+                        });
+                    }
+                    std::hint::black_box(sink);
+                    t0.elapsed().as_secs_f64()
+                });
+                report("no float epilogue", bare, smmla_per_tile * tiles as f64);
+                let iters = 2_000_000usize;
+                let pure = med(&mut || {
+                    let t0 = std::time::Instant::now();
+                    std::hint::black_box(unsafe { pure_smmla(iters) });
+                    t0.elapsed().as_secs_f64()
+                });
+                report("pure smmla (registers)", pure, iters as f64 * 16.0);
+            }
+        }
+
         /// Small-prompt behavior of the row-major smmla Q4_0 GEMM (the LFM2 prefill dispatch): time per
         /// call at 4 to 512 tokens with the weights streamed from DRAM (a rotation of copies, >= 64 MB)
         /// and with one cache-resident copy, so weight traffic can be told from compute and dispatch cost.
@@ -12540,6 +12799,11 @@ pub(crate) mod neon {
                 return;
             }
             let n = 512usize;
+            // CERA_BENCH_REPS lengthens each measurement, to see a sustained rate against a short burst.
+            let bench_reps = std::env::var("CERA_BENCH_REPS")
+                .ok()
+                .and_then(|v| v.parse::<usize>().ok())
+                .unwrap_or(15);
             // (name, m, k)
             let shapes = [
                 ("q/out 2048x2048", 2048usize, 2048usize),
@@ -12552,6 +12816,14 @@ pub(crate) mod neon {
                 f(1);
                 let mut v: Vec<f64> = (0..reps)
                     .map(|i| {
+                        // CERA_BENCH_GAP_US idles the pool before each timed call, to see what a GEMM that
+                        // follows a serial phase costs against back-to-back calls.
+                        if let Some(us) = std::env::var("CERA_BENCH_GAP_US")
+                            .ok()
+                            .and_then(|v| v.parse::<u64>().ok())
+                        {
+                            std::thread::sleep(std::time::Duration::from_micros(us));
+                        }
                         let t0 = std::time::Instant::now();
                         f(i + 2);
                         t0.elapsed().as_secs_f64()
@@ -12575,7 +12847,7 @@ pub(crate) mod neon {
                     .collect();
                 let gops = |t: f64| 2.0 * m as f64 * n as f64 * k as f64 / t / 1e9;
                 let mut out = vec![0.0f32; m * n];
-                let (best, med) = time(15, &mut |i| {
+                let (best, med) = time(bench_reps, &mut |i| {
                     let (p, s) = &ws[i % copies];
                     assert!(crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_dispatch(
                         p, s, &b_scales, &b_quants, &mut out, m, n, k
@@ -12586,7 +12858,7 @@ pub(crate) mod neon {
                     gops(best),
                     gops(med)
                 );
-                let (best, med) = time(15, &mut |i| {
+                let (best, med) = time(bench_reps, &mut |i| {
                     let (p, s) = &ws[i % copies];
                     assert!(
                         crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
@@ -12600,7 +12872,7 @@ pub(crate) mod neon {
                     gops(med)
                 );
                 if name.starts_with("gate") {
-                    let (best, med) = time(15, &mut |i| {
+                    let (best, med) = time(bench_reps, &mut |i| {
                         let (p, s) = &ws[i % copies];
                         let (p2, s2) = &ws[(i + 1) % copies];
                         assert!(

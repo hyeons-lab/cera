@@ -634,6 +634,48 @@ Tests: `rmsnorm_columns_matches_per_column_reference` gained streaming shapes (9
 `quantize_columns_parallel_matches_serial` gained zero, tiny (below the f16 flush), huge and lone-spike columns; both compare bits, and flipping the
 phase-combination order or the rounding mode in the new kernels fails them.
 
+### CPU smmla tile kernel: where its time goes, and what does not help (2026-10-10)
+
+The Q4_0 smmla tile kernel (8 weight rows by 4 tokens, `smmla_q4_0_tile_8x4_il`) is 62.6% of dense prefill cycles. A single-core, cache-resident
+ablation (`smmla_tile_ablation_microbench`, an ignored test; `taskset 80` for a prime core, `taskset 04` for a mid core) at k = 2048, ns per `smmla`
+and the TOPS it is worth (a Snapdragon 8 Elite has 2 prime cores at 4.47 GHz and 6 mid cores at 3.53 GHz):
+
+| Variant | Prime core | Mid core |
+|---|---:|---:|
+| pure `smmla` on registers (16 chains) | 0.06 ns, 1.04 TOPS | 0.16 ns, 0.39 TOPS |
+| loads and `smmla` | 0.12 to 0.14 ns, 0.45 to 0.55 | 0.26 to 0.31 ns, 0.20 to 0.25 |
+| loads, `smmla` and the per-block accumulator zeroing | 0.09 to 0.11 ns, 0.60 to 0.70 | 0.21 to 0.30 ns, 0.21 to 0.30 |
+| everything but the float epilogue | 0.09 to 0.12 ns, 0.55 to 0.69 | 0.25 to 0.28 ns, 0.23 to 0.26 |
+| the shipping kernel | 0.13 to 0.16 ns, 0.39 to 0.49 | 0.39 ns, 0.16 |
+
+`smmla_chain_sweep_microbench` gives the instruction itself: latency 3.5 cycles on the prime cores and 3.9 on the mid cores, 3.7 issued per cycle on a prime
+core (saturating at about 12 independent chains) and 1.8 on a mid core (about 7 chains). The kernel keeps 8 chains per block, which covers a mid core and
+not a prime one. The cost that separates the kernel from the instruction's own rate is the operand loads: 24 vector loads per 32 `smmla`, about one load per
+cycle on a mid core (24 to 27 cycles per block) and about 1.5 on a prime core, whether the activation tile comes from L2 or is held in L1 (a single hot tile
+costs the same). The float epilogue adds another 0.11 to 0.15 ns per `smmla` on a mid core. Six of the eight pool threads are on mid cores, so their
+profile is the pool's.
+
+Tried against that, all bit-identical to the shipping kernel and none faster:
+
+- activations as the first `smmla` operand so the weight scales load as `ld1r.2d` instead of two loads and four `zip`s: 0.39 against 0.39 ns (mid), 0.14 against 0.14 (prime);
+- the multi-register `ld1` forms (four registers for a chunk's weights, two for its activations): no change;
+- an 8x8 tile (two token tiles share every weight load: 0.375 loads per `smmla` where 8x4 has 0.75): 0.34 to 0.43 against 0.30 to 0.39 ns on a mid core, 0.15 to 0.18 against 0.13 to 0.16 on a
+  prime core, 5% to 15% slower, because 16 integer plus 16 float accumulators spill; and
+- the K-loop at k = 8192 (a 64 KB weight super-row): no slower than k = 2048 on one core.
+
+For reference, the same binary and llama.cpp (`llama-bench -t 8 -ngl 0 --device none`), alternated 5 times at 512 tokens on dense Llama-3.2-1B Q4_0: 540 against 552 tok/s,
+a ratio of 0.978 (`android_vl_image_raw/cpu_dense_prefill_20261010/ab_llamacpp_512.log`).
+
+Within the arithmetic the decode and prefill identity requires (the float epilogue is `facc + cvt(acc) * (dw * db)` per block), the 8x4 kernel is at a local optimum on this hardware.
+
+The same pool-level numbers show why the GEMM phases run below the isolated rate. The whole-pool GEMM bench (`dense_gemm_gops_microbench`) reaches 1.6 to 2.1 TOPS
+in a short burst, while the profile phases of a real prefill work out to 1.2 to 1.5 TOPS. Repeating the gate/up GEMM 400 times instead of 15 with the phone going from
+22 to 55 degrees takes the median from 1963 to 1476 GOPS (-25%), so the in-model rate is the sustained, power-limited one. An idle gap before the call costs nothing up to about
+1 ms and 27% at 2 ms (the pool parks its workers after 100,000 spins); lengthening or shortening that spin, `CERA_SPIN`, makes real prefill slower (567 to 528 and 414 for 10x and 200x, 506
+to 494 for 0.1x and 0.001x), so the default is where it should be. The fused gate/up/SiLU kernel the LFM2 models use measures 18% slower per operation than the plain GEMM in the isolated bench,
+but bypassing it end to end changes prefill by +3%, -2% and -7% on three LFM2 configurations (within the run-to-run noise except for the Q4_K_M model, where fusion wins), so it stays.
+`CERA_BENCH_GAP_US` and `CERA_BENCH_REPS` in the pool bench reproduce the gap and sustained measurements.
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
