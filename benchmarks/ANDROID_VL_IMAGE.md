@@ -740,6 +740,50 @@ the block far ahead in the Q4_K and Q5_K four-row kernels, the fix that took the
 giving the 17 MB Q6_K down projections the long prefetch changed decode by +0.0%. Single small-shape calls in the isolated bench vary 30 to 50% between runs, so only the end-to-end A/B is used to decide.
 What is left on this model is the per-dispatch cost of the small conv and attention projections (about 10 ms of a 40 ms token at roughly 55 to 60% of the ceiling).
 
+## CPU performance: where it stands and what is left (2026-10-11)
+
+Standing on the Samsung S25 Ultra (Snapdragon 8 Elite: 2 prime cores at 4.47 GHz and 6 mid cores at 3.53 GHz), CPU path, cera against llama.cpp (`llama-bench -t 8 -ngl 0 --device none`), alternated
+and thermally gated:
+
+| Workload | cera / llama.cpp |
+|---|---:|
+| Llama-3.2-1B Q4_0, prefill at 512 tokens | 0.978 |
+| Llama-3.2-1B Q4_0, decode | about 1.0 (75.0 against 74.6 tok/s) |
+| LFM2.5-350M Q4_K_M, decode | 0.983 |
+| LFM2.5-2.6B Q5_K_M, decode | 0.877 (25.2 against 28.8 tok/s) |
+
+The 2.6B Q5_K_M decode is the one real gap left. The remaining work, most promising first:
+
+1. **Per-dispatch cost of the small projections** on the 2.6B model, about 10 ms of a 40 ms token. The conv in and out projections (6144x2048, 2048x2048) and the attention q, k, v and o run at 18 to 44 GB/s from DRAM
+   against a 71 GB/s streaming ceiling, but at 86 to 90 GB/s-equivalent when cache-resident, so they are not compute-bound. Options: fuse the conv in and out projections, or q, k, v and o, into fewer dispatches; make the
+   K-quant concat3 kernels, which still use the old arithmetic, bit-identical to the current ones and then use them. Decide with an end-to-end alternated A/B only.
+2. **Static row and head splits.** The pool is 2 prime and 6 mid cores, so any `par_range` that gives each worker one contiguous slice leaves the prime cores waiting. The fused-argmax head was one (fixed, +3.6% on Llama).
+   Candidates to audit: the decode attention GQA group per worker, rope, the norms, `quantize_*` and the conv.
+3. **Idle workers in decode** (about 11 to 12% of cycles). Spin tuning is refuted (see below), so the leads are chunk sizing and the dispatch count (about 61 per token), and the serial work between dispatches.
+4. **Decode attention at depth.** A head-major KV layout would make each head's stream contiguous; it touches the prefix-cache snapshots, the KV shift and TurboQuant. The f32-KV attention kernels are not prefetched (f16 is the default).
+5. **A prefetch audit at DRAM-sized shapes** for the remaining one-line `prfm [.., #256]` sites (the Q8_0 and other row kernels). The Q6_K fix, every line of the block 16 KB ahead for tensors of 32 MB and up,
+   took the Llama head from 46 to 68 GB/s; the Q4_0 decode repack kernels already sit at 68 GB/s.
+6. **Dense K-quant models.** Only LFM2 K-quant models are on the phone, so dense Q4_K_M and Q5_K_M decode against llama.cpp is unmeasured. The Q8_0 and Q5_K smmla paths also keep an extra weight copy
+   (about 300 MB estimated for the 350M model, not measured).
+7. **Prefill leftovers:** pool idle time (about 11% of cycles), flash attention (about 7%), and the 16-token dense TTFT (36 against 25 ms; a 4-bit small-n path was judged not worth it).
+
+### Tried and refuted
+
+- **The smmla Q4_0 tile kernel** is load-bound (about one vector load per cycle on a mid core) and at a local optimum under the bit-exact arithmetic: swapped operands with `ld1r` scales, multi-register `ld1` and an
+  8x8 tile (5% to 15% slower, the accumulators spill) gained nothing.
+- **Pool wait policy:** lengthening or shortening `CERA_SPIN` from 0.001x to 200x makes real prefill slower; the default is right. Fixed-size and guided chunk scheduling both lose to the shipped fixed-count sizing.
+- **The fused gate/up/SiLU kernel** looks 18% slower per operation in isolation, but bypassing it end to end changes prefill by +3%, -2% and -7% on three LFM2 configurations (noise, and a loss for Q4_K_M).
+- **Long prefetch** on the Q4_K and Q5_K four-row kernels (+4.5% at an 8 KB lead and +0.8% at 16 KB end to end, overlapping runs) and on 2 to 17 MB Q6_K tensors (+0.0%).
+- **The in-model GEMM rate (1.2 to 1.5 TOPS) against the isolated bench (1.6 to 2.1)** is the sustained, power-limited rate, not a code defect: 400 repetitions instead of 15 take the median from 1963 to 1476 GOPS
+  as the phone goes from 22 to 55 degrees.
+
+### Method
+
+- Profile first, and put a streaming-read ceiling next to every kernel microbench. Ceilings for under about 30 MB of distinct bytes include system-cache hits and are not DRAM figures.
+- Isolated small-shape calls vary 30% to 50% between runs; only the alternated end-to-end A/B decides. Gate on the AP sensor below 36 degrees, alternate the order, and use 5 to 7 repetitions.
+- A kernel that is fast cache-resident and slow from DRAM is bound by latency and prefetch, not compute: check the software-prefetch lead (at least a DRAM latency) and how many cache lines of each block it covers.
+- Every arithmetic change must keep decode bit-identical to the prefill GEMM at one column; prefetch and scheduling changes are free of that constraint, reorderings of the float math are not.
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
