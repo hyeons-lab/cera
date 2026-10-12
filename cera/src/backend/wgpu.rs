@@ -2095,7 +2095,7 @@ impl GpuContext {
 
     /// ViT attention scores GEMM (`vit_attn_scores_f16.slang`): bindings 0 = Kt f16, 1 = Qt f16,
     /// 2 = S^T f32, 3 = params. Passthrough only.
-    pub fn vit_attn_scores_f16_passthrough(&self) -> wgpu::ComputePipeline {
+    pub(crate) fn vit_attn_scores_f16_passthrough(&self) -> wgpu::ComputePipeline {
         self.passthrough_pipeline(
             "vit_attn_scores_f16",
             wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/vit_attn_scores_f16.spv")),
@@ -2105,7 +2105,7 @@ impl GpuContext {
 
     /// ViT attention column softmax (`vit_attn_softmax_t.slang`): bindings 0 = S^T f32, 1 = P^T f16,
     /// 2 = row sums f32, 3 = params. Passthrough only.
-    pub fn vit_attn_softmax_t_passthrough(&self) -> wgpu::ComputePipeline {
+    pub(crate) fn vit_attn_softmax_t_passthrough(&self) -> wgpu::ComputePipeline {
         self.passthrough_pipeline(
             "vit_attn_softmax_t",
             wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/vit_attn_softmax_t.spv")),
@@ -2115,7 +2115,7 @@ impl GpuContext {
 
     /// ViT attention P·V GEMM (`vit_attn_pv_f16.slang`): bindings 0 = V f16, 1 = P^T f16, 2 = row
     /// sums f32, 3 = out f32, 4 = params. Passthrough only.
-    pub fn vit_attn_pv_f16_passthrough(&self) -> wgpu::ComputePipeline {
+    pub(crate) fn vit_attn_pv_f16_passthrough(&self) -> wgpu::ComputePipeline {
         self.passthrough_pipeline(
             "vit_attn_pv_f16",
             wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/vit_attn_pv_f16.spv")),

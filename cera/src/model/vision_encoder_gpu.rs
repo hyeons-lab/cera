@@ -686,6 +686,10 @@ pub async fn encode_image_gpu_wgpu_async(
          caller should fall back to CPU",
     );
 
+    // Only now touch the GPU context (flush the pending encoder, reset the profiler): a rejected
+    // input must leave it as it was.
+    ops.begin_encode();
+
     // 1. Patch embed: im2col on CPU, batched matmul + bias on GPU.
     let patches = im2col_patches(pixels, cfg, grid_w, grid_h);
     let patches_buf = ops.upload(&patches);
@@ -785,6 +789,7 @@ pub async fn encode_image_gpu_wgpu_async(
 
     ops.flush();
     let result = ops.ctx.download_f32_async(&out, n_out * proj_dim).await?;
+    ops.end_encode();
     Ok(result)
 }
 
@@ -2248,13 +2253,15 @@ impl VisionGpuEncode for WgpuVisionEncoder {
         grid_w: usize,
         grid_h: usize,
     ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Vec<f32>>> + Send + 'a>> {
-        Box::pin(encode_image_gpu_wgpu_async(
-            &self.ops,
-            &self.weights,
-            pixels,
-            grid_w,
-            grid_h,
-        ))
+        Box::pin(async move {
+            let _ = self.ops.ctx.take_readback_fault();
+            let res =
+                encode_image_gpu_wgpu_async(&self.ops, &self.weights, pixels, grid_w, grid_h).await;
+            if let Some(e) = self.ops.ctx.take_readback_fault() {
+                return Err(e.into());
+            }
+            res
+        })
     }
 }
 
@@ -2726,12 +2733,9 @@ fn try_wgpu_stack(spec: &VitStackSpec, need_flash: bool) -> Option<std::sync::Ar
         // this stack is for, so decline and let the caller stay on the host.
         return None;
     }
-    // A caller that needs the flash kernel needs its f32 precision too.
-    let ops = if need_flash {
-        ops.with_f32_attention()
-    } else {
-        ops
-    };
+    // A VitStack evaluates layers in f32 (the decision head scores are compared to host
+    // layers to 2e-3); the fp16 streaming pipeline is for WgpuVisionEncoder image encoding.
+    let ops = ops.with_f32_attention();
     match GpuStack::build(ops, spec) {
         Ok(stack) => {
             tracing::info!("vit stack: using wgpu GPU backend");
@@ -2909,6 +2913,14 @@ mod tests {
     use crate::model::vision_encoder::{PatchEmbedWeights, ProjectorWeights, VitBlockWeights};
     use crate::model::weights::MmapWeight;
     use crate::tensor::DType;
+
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    fn require_metal(err: impl std::fmt::Display) {
+        assert!(
+            std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1"),
+            "CERA_REQUIRE_METAL=1 but no Metal device is available: {err}"
+        );
+    }
 
     /// Deterministic pseudo-random f32s in roughly [-0.5, 0.5].
     fn rnd(n: usize, seed: usize) -> Vec<f32> {
@@ -3254,7 +3266,10 @@ mod tests {
     fn test_metal_encode_image_parity() {
         let ctx = match crate::backend::metal::MetalContext::new() {
             Ok(ctx) => ctx,
-            Err(_) => return, // no Metal device (CI)
+            Err(e) => {
+                require_metal(e);
+                return;
+            }
         };
         run_parity(&MetalVitOps::new(ctx).unwrap(), &synth_encoder(), 2e-3, 0.0);
     }
@@ -3346,7 +3361,10 @@ mod tests {
         let enc = synth_encoder();
         let encoder = match build_gpu_vision_encoder(&enc, BP::Metal) {
             Some(e) => e,
-            None => return, // no Metal device (CI)
+            None => {
+                require_metal("no Metal vision encoder built");
+                return;
+            }
         };
         let cfg = &enc.config;
         let pixels = rnd(3 * 8 * cfg.patch_size * 8 * cfg.patch_size, 999);
@@ -3367,7 +3385,10 @@ mod tests {
     fn test_metal_encode_image_parity_q8_0() {
         let ctx = match crate::backend::metal::MetalContext::new() {
             Ok(ctx) => ctx,
-            Err(_) => return, // no Metal device (CI)
+            Err(e) => {
+                require_metal(e);
+                return;
+            }
         };
         run_parity(
             &MetalVitOps::new(ctx).unwrap(),

@@ -270,7 +270,7 @@ impl ProjectorWeights {
         let mut out = vec![0f32; n_tokens * out_dim];
 
         // The same int8 GEMM the ViT blocks use; the f32 path stays as the fallback.
-        let mut q8 = Q8Act::for_dims(&[in_dim, mid_dim], n_tokens);
+        let mut q8 = Q8Act::for_dims(&[in_dim, mid_dim, out_dim], n_tokens);
         q8.quantize(pooled, in_dim, n_tokens);
         if !q8.matmul(&self.mm1_w, &mut mid) {
             self.mm1_w.batched_matmul(pooled, &mut mid, n_tokens);
@@ -1121,7 +1121,11 @@ impl Q8Act {
         {
             return true;
         }
-        let out_t = &mut self.out_t[..rows * n];
+        let needed = rows * n;
+        if self.out_t.len() < needed {
+            return false;
+        }
+        let out_t = &mut self.out_t[..needed];
         let ran = crate::backend::cpu::gemm_preq_dispatch(
             crate::tensor::DType::Q8_0,
             w.data(),

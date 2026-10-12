@@ -7503,7 +7503,7 @@ unsafe fn flash_attention_gqa_avx512_opt(
 /// the attention tiles stream keys along the key axis instead of re-transposing them for every group of
 /// queries.
 #[cfg(target_arch = "aarch64")]
-pub fn vit_transpose_keys(
+pub(crate) fn vit_transpose_keys(
     k: &[f32],
     kt: &mut [f32],
     n_tokens: usize,
@@ -7556,7 +7556,7 @@ pub fn vit_transpose_keys(
 /// of 8 at least `n_tokens`.
 #[cfg(target_arch = "aarch64")]
 #[allow(clippy::too_many_arguments, clippy::needless_range_loop)]
-pub fn vit_attention_chunk_neon(
+pub(crate) fn vit_attention_chunk_neon(
     q: &[f32],
     kt: &[f32],
     v: &[f32],

@@ -1655,7 +1655,7 @@ impl Default for SessionConfig {
         let core = cera::SessionConfig::default();
         Self {
             max_seq_len: core.max_seq_len,
-            // `None` == "use the core default" (f16 where the model honors it) — matches the
+            // `None` == "use the core default" (f16 where the model honors it), matching the
             // foreign-binding `#[uniffi(default = None)]` and the `From` mapping,
             // so the Rust `Default` and the no-arg `SessionConfig()` agree.
             kv_compression: None,

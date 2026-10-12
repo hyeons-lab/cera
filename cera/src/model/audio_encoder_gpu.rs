@@ -2320,11 +2320,16 @@ pub trait AudioGpuEncode: Send + Sync {
 struct MetalAudioEncoder {
     ops: MetalAudioOps,
     weights: GpuAudioWeights<MetalAudioOps>,
+    /// One encode at a time, as in `MetalVisionEncoder`: the engine shares this encoder across sessions
+    /// and the command-error slot drained around each encode belongs to the whole context, so a second
+    /// encode's entry drain could swallow the first one's commit fault.
+    encode_lock: std::sync::Mutex<()>,
 }
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 impl AudioGpuEncode for MetalAudioEncoder {
     fn encode_pcm(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize)> {
+        let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Drain the command-error slot around the encode (mirrors
         // Session's discard-at-entry/drain-after-work discipline): a
         // commit fault mid-encode otherwise returns Ok(stale embeddings)
@@ -2339,6 +2344,7 @@ impl AudioGpuEncode for MetalAudioEncoder {
     }
 
     fn encode_mel(&self, mel: &[f32], n_frames: usize) -> Result<(Vec<f32>, usize)> {
+        let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.ops.ctx.take_cmd_error();
         let out = encode_audio_mel_gpu(&self.ops, &self.weights, mel, n_frames)?;
         if let Some(e) = self.ops.ctx.take_cmd_error() {
@@ -2352,11 +2358,16 @@ impl AudioGpuEncode for MetalAudioEncoder {
 struct WgpuAudioEncoder {
     ops: WgpuAudioOps,
     weights: GpuAudioWeights<WgpuAudioOps>,
+    /// Serializes `encode_pcm` and `encode_mel`. The engine shares one encoder across every session,
+    /// and an encode records its passes into the encoder-wide pending encoder and draws from the
+    /// encoder-wide buffer pool: concurrent encodes would flush each other's passes and corrupt buffers.
+    encode_lock: std::sync::Mutex<()>,
 }
 
 #[cfg(feature = "gpu")]
 impl AudioGpuEncode for WgpuAudioEncoder {
     fn encode_pcm(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize)> {
+        let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Drain the readback slot around the encode (see `MetalAudioEncoder`): a fault
         // mid-encode otherwise returns zero embeddings as if they were the result.
         let _ = self.ops.vit.ctx.take_readback_fault();
@@ -2368,6 +2379,7 @@ impl AudioGpuEncode for WgpuAudioEncoder {
     }
 
     fn encode_mel(&self, mel: &[f32], n_frames: usize) -> Result<(Vec<f32>, usize)> {
+        let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.ops.vit.ctx.take_readback_fault();
         let out = encode_audio_mel_gpu(&self.ops, &self.weights, mel, n_frames)?;
         if let Some(e) = self.ops.vit.ctx.take_readback_fault() {
@@ -2420,6 +2432,7 @@ fn try_wgpu_audio_encoder(
     Some(std::sync::Arc::new(WgpuAudioEncoder {
         ops,
         weights: gpu_w,
+        encode_lock: std::sync::Mutex::new(()),
     }))
 }
 
@@ -2502,6 +2515,7 @@ fn try_metal_audio_encoder(
     Some(std::sync::Arc::new(MetalAudioEncoder {
         ops,
         weights: gpu_w,
+        encode_lock: std::sync::Mutex::new(()),
     }))
 }
 

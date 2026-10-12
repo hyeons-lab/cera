@@ -436,8 +436,19 @@ const LFM2_MAX_PIXELS_TOLERANCE: f64 = 2.0;
 /// single-image pixel budget times the 2.0 tolerance. Alignment rounds half to even (C's
 /// `nearbyint`), as llama.cpp's `should_tile` does.
 pub fn lfm2_should_tile(w: usize, h: usize, cfg: &VisionEncoderConfig) -> bool {
-    let align = (cfg.patch_size * cfg.scale_factor) as f64;
-    let round_by = |x: usize| ((x as f64 / align).round_ties_even() as usize) * align as usize;
+    let align_usize = cfg
+        .patch_size
+        .max(1)
+        .saturating_mul(cfg.scale_factor.max(1));
+    let align = align_usize as f64;
+    let round_by = |x: usize| {
+        let rounded = (x as f64 / align).round_ties_even();
+        if rounded <= 0.0 {
+            0
+        } else {
+            (rounded as usize).saturating_mul(align_usize)
+        }
+    };
     let h_bar = cfg.patch_size.max(round_by(h));
     let w_bar = cfg.patch_size.max(round_by(w));
     (h_bar as f64) * (w_bar as f64) > cfg.image_max_pixels as f64 * LFM2_MAX_PIXELS_TOLERANCE
@@ -448,7 +459,9 @@ pub fn lfm2_should_tile(w: usize, h: usize, cfg: &VisionEncoderConfig) -> bool {
 /// more than half of it. A port of llama.cpp's `find_closest_aspect_ratio` (single-precision, as
 /// there).
 pub fn lfm2_tile_grid(w: usize, h: usize) -> (usize, usize) {
-    let aspect = w as f32 / h as f32;
+    let w_safe = w.max(1);
+    let h_safe = h.max(1);
+    let aspect = w_safe as f32 / h_safe as f32;
     let mut ratios: Vec<(usize, usize)> = Vec::new();
     for n in LFM2_MIN_TILES..=LFM2_MAX_TILES {
         for cols in 1..=n {
@@ -463,8 +476,8 @@ pub fn lfm2_tile_grid(w: usize, h: usize) -> (usize, usize) {
         }
     }
     ratios.sort_by_key(|&(c, r)| c * r);
-    let area = (w * h) as f32;
-    let mut best = (1usize, 1usize);
+    let area = (w as f64 * h as f64) as f32;
+    let mut best = ratios.first().copied().unwrap_or((2, 1));
     let mut best_diff = f32::MAX;
     for &(c, r) in &ratios {
         let diff = (aspect - c as f32 / r as f32).abs();
@@ -1524,6 +1537,9 @@ mod tests {
         assert!(lfm2_should_tile(1024, 771, &cfg));
         // 16 is the round-half-even case: 16/32 = 0.5 rounds to 0, floored at one patch (16).
         assert!(!lfm2_should_tile(16, 16, &cfg));
+        assert!(!lfm2_should_tile(0, 0, &cfg));
+        assert!(!lfm2_should_tile(0, 500, &cfg));
+        assert!(!lfm2_should_tile(500, 0, &cfg));
     }
 
     #[test]
@@ -1538,8 +1554,16 @@ mod tests {
         // half of it, so a 1000x1000 photo is 4 tiles and a 1200x1200 one is 9.
         assert_eq!(lfm2_tile_grid(1000, 1000), (2, 2));
         assert_eq!(lfm2_tile_grid(1200, 1200), (3, 3));
-        // Never fewer than 2 tiles or more than 10.
-        for (w, h) in [(1500, 400), (400, 1500), (3000, 3000), (900, 1400)] {
+        // Never fewer than 2 tiles or more than 10, including edge cases with 0 dimension.
+        for (w, h) in [
+            (1500, 400),
+            (400, 1500),
+            (3000, 3000),
+            (900, 1400),
+            (0, 0),
+            (0, 500),
+            (500, 0),
+        ] {
             let (c, r) = lfm2_tile_grid(w, h);
             assert!((2..=10).contains(&(c * r)), "{w}x{h} -> {c}x{r}");
         }
