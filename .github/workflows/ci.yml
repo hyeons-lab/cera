@@ -112,6 +112,14 @@ jobs:
             echo "--- HexagonNpu.kt ---"; echo "$kt"
             exit 1
           fi
+          for skel in cera/src/backend/hexagon/skels/libcera-htp-v*.so; do
+            base=$(basename "$skel")
+            soname=$(objdump -p "$skel" 2>/dev/null | awk '/SONAME/{print $NF}' || true)
+            if [ -n "$soname" ] && [ "$soname" != "$base" ]; then
+              echo "::error::$skel SONAME mismatch: expected $base, got $soname"
+              exit 1
+            fi
+          done
 
   # Rustdoc lint. Runs on macOS so `--all-features` can enable the macOS-only
   # `metal` backend (a Linux runner can't compile it), giving the doc build

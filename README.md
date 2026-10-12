@@ -105,11 +105,11 @@ or you can pin one:
 
 ### Qualcomm Hexagon NPU backend
 
-Cera provides a native backend for Qualcomm Hexagon NPUs and Compute DSPs on Snapdragon 8 Gen 2 (`v73`), Snapdragon 8 Gen 3 (`v75`), Snapdragon 8 Elite (`v79`/`v81`). See the [Hexagon NPU Guide](docs/HEXAGON_NPU.md) for full architecture and Android packaging details.
+Cera provides a native backend for Qualcomm Hexagon NPUs and Compute DSPs on Snapdragon 8 Gen 2 (`v73`), Snapdragon 8 Gen 3 (`v75`), Snapdragon 8 Elite (`v79`), and next-generation Snapdragon architectures (`v81`/`v85`). See the [Hexagon NPU Guide](docs/HEXAGON_NPU.md) for full architecture and Android packaging details.
 
 - **FastRPC Unsigned Process Domain**: Runs within Qualcomm's CDSP unsigned user domain (`/dev/fastrpc-cdsp`), enabling third-party Play Store applications to execute on HTP/HVX hardware without root privileges or vendor signing keys.
 - **Zero-Copy Shared Memory**: Allocates model weights, activations, and KV cache buffers in shared `rpcmem` (DMA-BUF / ION) mapped into both CPU and DSP address spaces, eliminating bus copying.
-- **Embedded Skeleton Libraries**: Embeds prebuilt, 16 KB page-aligned DSP worker libraries (`libcera-htp-v{73,75,79,81}.so`) into the host binary and extracts them automatically at startup. Skeletons incorporate extended operators (`Conv1D`, `ConvTranspose1D`, `Snake`, `UnaryStep`, `Sum`).
+- **Embedded Skeleton Libraries**: Embeds prebuilt, 16 KB page-aligned DSP worker libraries (`libcera-htp-v{73,75,79,81,85}.so`) into the host binary and extracts them automatically at startup. Skeletons incorporate extended operators (`Conv1D`, `ConvTranspose1D`, `Snake`, `UnaryStep`, `Sum`).
 - **Accelerated Kernels**:
   - **LLM Text Generation**: 32x32 tiled Q4_0 and Q8_0 matrix repacking for HTP matrix units, forward decode batched to eliminate most synchronization boundaries (the default is one uncapped batch per token with a static batch template, and `CERA_HEXAGON_BATCH_TENSORS=<n>` caps each batch at `n` tensors for bisection), ping-pong scratch memory isolation, FastRPC latency QoS (`FASTRPC_CONTROL_LATENCY = 100 µs`), FastRPC driver wakelock (`FASTRPC_CONTROL_WAKELOCK`), and Q8_0 quantized KV cache (~47% memory reduction over F16).
   - **On-DSP Argmax**: Offloads greedy token argmax reduction directly to Hexagon HTP (`HtpOpCode::Argmax`, opcode 62), reading only 4 bytes of token ID from rpcmem rather than copying or invalidating 128 to 256 KB of float32 logits, eliminating host CPU allocations and memory traffic during greedy decode.

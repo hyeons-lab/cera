@@ -926,59 +926,83 @@ impl HexagonQueueSession {
         // The DSP's copy kernels dispatch on host-precomputed params and answer NO_SUPPORT for
         // empty ones, so a `Cpy` whose caller passed none gets them from the registered
         // tensors, as llama.cpp's host does (`ggml_hexagon_precompute_cpy_params`).
-        if opcode == HtpOpCode::Cpy as u32 && op.kernel_params == [0i32; 32] {
-            let (Some(s), Some(d)) = (
-                src.first().and_then(|&i| self.tens.get(i as usize)),
-                dst.first().and_then(|&i| self.tens.get(i as usize)),
-            ) else {
+        if opcode == HtpOpCode::Cpy as u32 {
+            if src.len() != 1 || dst.len() != 1 || src[0] == 0xffff || dst[0] == 0xffff {
                 self.drop_pending_batch();
                 return Err(CeraError::Backend(
                     "enqueue_op Cpy: needs one registered src tensor and one registered dst tensor"
                         .into(),
                 ));
-            };
-            let (s, d) = (*s, *d);
-            match build_copy_kernel_params(
-                &(&s).into(),
-                &(&d).into(),
-                self.dsp_threads(),
-                self.dsp_vtcm_bytes(),
-            ) {
-                Some(k) => op.kernel_params = k,
-                None => {
+            }
+            if op.kernel_params == [0i32; 32] {
+                let (Some(s), Some(d)) = (
+                    self.tens.get(src[0] as usize),
+                    self.tens.get(dst[0] as usize),
+                ) else {
                     self.drop_pending_batch();
-                    return Err(CeraError::Backend(format!(
-                        "enqueue_op Cpy: the HTP copy kernels do not handle {s:?} -> {d:?}"
-                    )));
+                    return Err(CeraError::Backend(
+                        "enqueue_op Cpy: needs one registered src tensor and one registered dst tensor"
+                            .into(),
+                    ));
+                };
+                let (s, d) = (*s, *d);
+                match build_copy_kernel_params(
+                    &(&s).into(),
+                    &(&d).into(),
+                    self.dsp_threads(),
+                    self.dsp_vtcm_bytes(),
+                ) {
+                    Some(k) => op.kernel_params = k,
+                    None => {
+                        self.drop_pending_batch();
+                        return Err(CeraError::Backend(format!(
+                            "enqueue_op Cpy: the HTP copy kernels do not handle {s:?} -> {d:?}"
+                        )));
+                    }
                 }
             }
         }
-        if opcode == HtpOpCode::Concat as u32 && op.kernel_params == [0i32; 32] {
-            let get = |i: Option<&u16>| i.and_then(|&i| self.tens.get(i as usize)).copied();
-            let (Some(ta), Some(tb), Some(td)) =
-                (get(src.first()), get(src.get(1)), get(dst.first()))
-            else {
+        if opcode == HtpOpCode::Concat as u32 {
+            if src.len() != 2
+                || dst.len() != 1
+                || src[0] == 0xffff
+                || src[1] == 0xffff
+                || dst[0] == 0xffff
+            {
                 self.drop_pending_batch();
                 return Err(CeraError::Backend(
                     "enqueue_op Concat: needs two registered src tensors and one registered dst tensor"
                         .into(),
                 ));
-            };
-            match build_concat_kernel_params(
-                &(&ta).into(),
-                &(&tb).into(),
-                &(&td).into(),
-                params[0],
-                self.dsp_threads(),
-                self.dsp_vtcm_bytes(),
-            ) {
-                Some(k) => op.kernel_params = k,
-                None => {
+            }
+            if op.kernel_params == [0i32; 32] {
+                let (Some(ta), Some(tb), Some(td)) = (
+                    self.tens.get(src[0] as usize).copied(),
+                    self.tens.get(src[1] as usize).copied(),
+                    self.tens.get(dst[0] as usize).copied(),
+                ) else {
                     self.drop_pending_batch();
-                    return Err(CeraError::Backend(format!(
-                        "enqueue_op Concat: the HTP concat kernels do not handle dim {} for {ta:?} + {tb:?} -> {td:?}",
-                        params[0]
-                    )));
+                    return Err(CeraError::Backend(
+                        "enqueue_op Concat: needs two registered src tensors and one registered dst tensor"
+                            .into(),
+                    ));
+                };
+                match build_concat_kernel_params(
+                    &(&ta).into(),
+                    &(&tb).into(),
+                    &(&td).into(),
+                    params[0],
+                    self.dsp_threads(),
+                    self.dsp_vtcm_bytes(),
+                ) {
+                    Some(k) => op.kernel_params = k,
+                    None => {
+                        self.drop_pending_batch();
+                        return Err(CeraError::Backend(format!(
+                            "enqueue_op Concat: the HTP concat kernels do not handle dim {} for {ta:?} + {tb:?} -> {td:?}",
+                            params[0]
+                        )));
+                    }
                 }
             }
         }
@@ -1665,26 +1689,47 @@ mod tests {
         assert!(err.contains("do not handle"), "{err}");
         assert_pending_empty(&q, "unsupported copy");
 
-        // Unregistered operands, the "no operand" sentinel included, are errors too.
-        for bad in [0xffffu16, 3] {
-            for case in 0..4 {
-                // One registered operand (id 0: the previous refusal dropped the batch), so only
-                // `bad` can be the reason for the refusal.
-                let a = q
-                    .add_tensor(&buf, 0, 256, 0, f32_t, [64, 1, 1, 1], [4, 256, 256, 256])
-                    .unwrap();
-                assert_eq!(a, 0, "the dropped batch starts over");
-                let (op, src, dst) = match case {
-                    0 => (HtpOpCode::Cpy, vec![bad], vec![a]),
-                    1 => (HtpOpCode::Cpy, vec![a], vec![bad]),
-                    2 => (HtpOpCode::Concat, vec![a, bad], vec![a]),
-                    _ => (HtpOpCode::Concat, vec![a, a], vec![bad]),
-                };
-                let e = q.enqueue_op(op as u32, &src, &dst, [0; 16], [0; 32]);
-                assert!(e.is_err(), "{op:?} {src:?} -> {dst:?} must be refused");
-                assert_pending_empty(&q, "unregistered operand");
+        // Unregistered operands, the "no operand" sentinel included, are errors too,
+        // whether kernel params are zeroed (auto-computed) or precomputed.
+        for precomputed in [[0i32; 32], [1i32; 32]] {
+            for bad in [0xffffu16, 3] {
+                for case in 0..4 {
+                    // One registered operand (id 0: the previous refusal dropped the batch), so only
+                    // `bad` can be the reason for the refusal.
+                    let a = q
+                        .add_tensor(&buf, 0, 256, 0, f32_t, [64, 1, 1, 1], [4, 256, 256, 256])
+                        .unwrap();
+                    assert_eq!(a, 0, "the dropped batch starts over");
+                    let (op, src, dst) = match case {
+                        0 => (HtpOpCode::Cpy, vec![bad], vec![a]),
+                        1 => (HtpOpCode::Cpy, vec![a], vec![bad]),
+                        2 => (HtpOpCode::Concat, vec![a, bad], vec![a]),
+                        _ => (HtpOpCode::Concat, vec![a, a], vec![bad]),
+                    };
+                    let e = q.enqueue_op(op as u32, &src, &dst, [0; 16], precomputed);
+                    assert!(e.is_err(), "{op:?} {src:?} -> {dst:?} must be refused");
+                    assert_pending_empty(&q, "unregistered operand");
+                }
             }
         }
+
+        // Invalid operand counts for Cpy and Concat are rejected even with precomputed params.
+        let a = q
+            .add_tensor(&buf, 0, 256, 0, f32_t, [64, 1, 1, 1], [4, 256, 256, 256])
+            .unwrap();
+        assert!(
+            q.enqueue_op(HtpOpCode::Cpy as u32, &[], &[a], [0; 16], [1; 32])
+                .is_err()
+        );
+        assert_pending_empty(&q, "cpy empty src");
+        let a = q
+            .add_tensor(&buf, 0, 256, 0, f32_t, [64, 1, 1, 1], [4, 256, 256, 256])
+            .unwrap();
+        assert!(
+            q.enqueue_op(HtpOpCode::Concat as u32, &[a], &[a], [0; 16], [1; 32])
+                .is_err()
+        );
+        assert_pending_empty(&q, "concat single src");
     }
 
     /// A batch the DSP has not answered may still be running against the

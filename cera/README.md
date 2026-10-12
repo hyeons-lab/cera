@@ -226,10 +226,10 @@ The `hexagon` feature flag activates Cera's native Qualcomm Hexagon NPU backend,
 ### Execution Architecture
 - **FastRPC Unsigned Process Domain**: Executes inside Qualcomm's CDSP unsigned user domain (`/dev/fastrpc-cdsp`), allowing standard non-root Android applications to access HTP matrix coprocessors and HVX vector units.
 - **Zero-Copy Shared Memory**: Allocates all weights, activations, and KV cache slabs in `rpcmem` DMA-BUF buffers shared directly between CPU and CDSP address spaces, bypassing bus copy bottlenecks.
-- **Dynamic Device Probing**: Automatically detects device architecture (`v73`, `v75`, `v79`, `v81`) via `HexagonDevice::probe()` and loads the matching embedded skeleton library.
+- **Dynamic Device Probing**: Automatically detects device architecture (`v73`, `v75`, `v79`, `v81`, `v85`) via `HexagonDevice::probe()` and loads the matching embedded skeleton library.
 
 ### Embedded Skeleton Libraries & Extended Operators
-The backend embeds prebuilt 16 KB page-aligned Hexagon ELF dynamic libraries (`libcera-htp-v{73,75,79,81}.so`) and extracts them to application storage at runtime. Key additions in 0.7.0 include:
+The backend embeds prebuilt 16 KB page-aligned Hexagon ELF dynamic libraries (`libcera-htp-v{73,75,79,81,85}.so`) and extracts them to application storage at runtime. Key additions in 0.7.0 include:
 - **Extended Operator Set**:
   - `Conv1D`: 1D convolution with configurable dilation, stride, and padding for waveform audio encoding and speech processing.
   - `ConvTranspose1D`: Transposed 1D convolution for speech decoders and vocoder audio reconstruction.

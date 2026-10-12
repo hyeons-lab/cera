@@ -139,8 +139,8 @@ pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
         // Compare contents, not just size: a corrupt same-length skel must
         // still be repaired, or the DSP loads wrong code with no signal.
         // (Length stat first: no point reading a file already known stale.)
-        let rewrite = match std::fs::metadata(&path) {
-            Ok(m) if m.len() != bytes.len() as u64 => true,
+        let rewrite = match std::fs::symlink_metadata(&path) {
+            Ok(m) if !m.is_file() || m.len() != bytes.len() as u64 => true,
             Ok(_) => match std::fs::read(&path) {
                 Ok(existing) => existing.as_slice() != bytes,
                 Err(_) => true,
@@ -209,10 +209,29 @@ const LEGACY_SKELS: &[LegacySkel] = &[
     ("libggml-htp-v85.so", 881928, 0x260b85a6333e67f0),
 ];
 
+#[cfg(test)]
 fn fnv1a64(bytes: &[u8]) -> u64 {
     bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| {
         (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
     })
+}
+
+fn hash_file_fnv1a64(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 8192];
+    let mut hash = 0xcbf29ce484222325u64;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        for &byte in &buf[..n] {
+            hash ^= byte as u64;
+            hash = hash.wrapping_mul(0x100000001b3u64);
+        }
+    }
+    Ok(hash)
 }
 
 /// Delete the previous cera skels left in `dir` under llama.cpp's file names. The loader
@@ -221,15 +240,28 @@ fn fnv1a64(bytes: &[u8]) -> u64 {
 /// one. Only a regular file whose length and contents match a known cera build goes: an
 /// app-provided directory may legitimately hold llama.cpp's own skels under those names.
 fn remove_legacy_skels(dir: &std::path::Path, known: &[LegacySkel]) {
+    let mut last_hash: Option<(&'static str, u64)> = None;
     for &(name, len, hash) in known {
         let path = dir.join(name);
-        let is_ours = std::fs::symlink_metadata(&path)
-            .ok()
-            .filter(|m| m.is_file() && m.len() == len)
-            .and_then(|_| std::fs::read(&path).ok())
-            .is_some_and(|b| fnv1a64(&b) == hash);
-        if is_ours {
+        let meta = std::fs::symlink_metadata(&path).ok();
+        let matches_len = meta.is_some_and(|m| m.is_file() && m.len() == len);
+        if !matches_len {
+            continue;
+        }
+        let file_hash = match last_hash {
+            Some((prev_name, h)) if prev_name == name => Some(h),
+            _ => {
+                if let Ok(h) = hash_file_fnv1a64(&path) {
+                    last_hash = Some((name, h));
+                    Some(h)
+                } else {
+                    None
+                }
+            }
+        };
+        if file_hash == Some(hash) {
             let _ = std::fs::remove_file(&path);
+            last_hash = None;
         }
     }
 }

@@ -1181,11 +1181,11 @@ pub(crate) fn mm_hvx_fused_nx_max_rows(
 /// activation width (K), `ne11`/`ne12` the activation rows/batches (1 for
 /// single-token decode), `dst_row_size` the output row stride in bytes.
 ///
-/// `kparams[2]` (`m_chunk`) is non-zero when the activation rows do not fit
+/// The `m_chunk` field is non-zero when the activation rows do not fit
 /// the VTCM at once; the kernel then walks them in chunks of that size, and
-/// `kparams[11..16]` describe one chunk's layout. The fused `MulMatNx` kernel
+/// the `vtcm_*_size` fields describe one chunk's layout. The fused `MulMatNx` kernel
 /// cannot chunk, so a caller building it must keep the rows within
-/// `mm_hvx_fused_nx_max_rows` (which implies `kparams[2] == 0`).
+/// `mm_hvx_fused_nx_max_rows` (which implies `m_chunk == 0`).
 ///
 /// The words are the packed [`MmKernelParams`] layout, not the one the earlier skels read: decode
 /// them with [`MmKernelParams::from_words`] instead of indexing.
@@ -1227,7 +1227,7 @@ pub fn build_mul_mat_kernel_params(
         best,
         vtcm_budget,
     );
-    // `kparams[11..16]` come from `mm_hvx_vtcm_layout`, the older model; the
+    // `kparams[7..=11]` come from `mm_hvx_vtcm_layout`, the older model; the
     // chunk decision above uses `mm_hvx_dsp_vtcm`, a port of the DSP's solver.
     // They differ by the destination term, so for a few unchunked shapes the
     // reported `vtcm_size` is above the budget: the DSP rebuilds its own
@@ -2006,7 +2006,7 @@ fn build_hmx_fa_kernel_params_impl(
     let pipelined = n_kv_blocks >= FA_MIN_KV_BLOCKS && nt >= 2;
     let kt = if pipelined { nt } else { 1 };
     let mut kparams = [0i32; 32];
-    kparams[0] = (2u32 | (FA_HEAD_SPLIT << 8) | ((kt as u32) << 24)) as i32;
+    kparams[0] = (2u32 | (FA_HEAD_SPLIT << 8) | ((wire_byte(kt) as u32) << 24)) as i32;
     kparams[1] = (br as u32 | ((bc as u32) << 16)) as i32;
     kparams[2] = ((n_kv_blocks as u32 & 0xffff) | ((g as u32 & 0xffff) << 16)) as i32;
     let (scale_word, softcap_word) = hmx_fa_scale_words(scale, softcap);
@@ -2097,8 +2097,10 @@ impl CopyTensor {
         }
     }
 
-    fn nelements(&self) -> u64 {
-        self.ne.iter().map(|&n| u64::from(n)).product()
+    fn nelements(&self) -> Option<u64> {
+        self.ne
+            .iter()
+            .try_fold(1u64, |acc, &n| acc.checked_mul(u64::from(n)))
     }
 
     /// `ggml_is_contiguous` for a type with a block size of 1.
@@ -2145,12 +2147,15 @@ pub fn build_copy_kernel_params(
 ) -> Option<[i32; 32]> {
     let src_ts = src.type_size()?;
     let dst_ts = dst.type_size()?;
-    let nelem = src.nelements();
-    if nelem != dst.nelements() {
+    let nelem = src.nelements()?;
+    if Some(nelem) != dst.nelements() {
         return None;
     }
     let pack = |kernel: u32, threads: u32| -> u32 {
-        kernel | ((src_ts as u32) << 8) | ((dst_ts as u32) << 16) | ((threads & 0xff) << 24)
+        kernel
+            | ((src_ts as u32) << 8)
+            | ((dst_ts as u32) << 16)
+            | ((wire_byte(threads as usize) as u32) << 24)
     };
     let mut k = [0i32; 32];
     k[1] = nelem as u32 as i32; // total_elems
@@ -2305,7 +2310,9 @@ pub fn build_concat_kernel_params(
             return None;
         }
     }
-    let pack = |kernel: u32, threads: u32| kernel | ((d as u32) << 8) | ((threads & 0xff) << 16);
+    let pack = |kernel: u32, threads: u32| {
+        kernel | ((d as u32) << 8) | ((wire_byte(threads as usize) as u32) << 16)
+    };
     let mut k = [0i32; 32];
 
     let nb0 = |t: &CopyTensor| u64::from(t.nb[0]);
@@ -2691,15 +2698,24 @@ mod tests {
     }
 
     /// In-contract counts pass through untouched; 255 is the largest one-byte param.
-    /// (Out-of-contract counts saturate at 255 in release builds; in debug builds the
-    /// `debug_assert` in `wire_byte` fires first, so saturation is verified by inspection
-    /// plus the release-mode check quoted in the fix, not by this test.)
     #[test]
     fn wire_byte_passes_through_in_contract_counts() {
         assert_eq!(wire_byte(0), 0);
         assert_eq!(wire_byte(1), 1);
         assert_eq!(wire_byte(8), 8);
         assert_eq!(wire_byte(255), 255);
+    }
+
+    /// Out-of-contract counts panic in debug builds and saturate at 255 in release builds.
+    #[test]
+    fn wire_byte_out_of_contract_panics_in_debug_or_saturates_in_release() {
+        if cfg!(debug_assertions) {
+            let panicked = std::panic::catch_unwind(|| wire_byte(256)).is_err();
+            assert!(panicked, "out-of-contract count must trip debug assertion");
+        } else {
+            assert_eq!(wire_byte(256), 255);
+            assert_eq!(wire_byte(1000), 255);
+        }
     }
 
     fn golden_get_rows(line: &str) -> (GetRowsShape, u32, usize, Vec<i32>) {
@@ -2736,18 +2752,26 @@ mod tests {
     #[test]
     fn get_rows_kernel_params_match_the_llama_cpp_host_code() {
         let golden = include_str!("testdata/get_rows_golden.txt");
-        let mut cases = 0usize;
+        let (mut cases, mut zero_rows, mut zero_vtcm) = (0usize, 0usize, 0usize);
         for line in golden
             .lines()
             .filter(|l| !l.starts_with('#') && !l.is_empty())
         {
             let (shape, threads, vtcm, mut words) = golden_get_rows(line);
+            if shape.ne10 == 0 {
+                zero_rows += 1;
+            }
+            if vtcm == 0 {
+                zero_vtcm += 1;
+            }
             words.resize(32, 0);
             let got = build_get_rows_kernel_params(&shape, threads, vtcm);
             assert_eq!(got.to_vec(), words, "{line}");
             cases += 1;
         }
         assert!(cases > 5000, "golden file looks truncated: {cases} cases");
+        assert!(zero_rows > 500, "zero-row cases missing: {zero_rows}");
+        assert!(zero_vtcm > 500, "zero-VTCM cases missing: {zero_vtcm}");
     }
 
     /// The scalar-broadcast params the llama.cpp host precompute produces

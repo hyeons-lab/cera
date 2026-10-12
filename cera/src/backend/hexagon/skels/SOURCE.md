@@ -1,6 +1,6 @@
 # Bundled Hexagon DSP skels
 
-`libcera-htp-v{73,75,79,81}.so` are the DSP-side (Hexagon ELF) worker
+`libcera-htp-v{73,75,79,81,85}.so` are the DSP-side (Hexagon ELF) worker
 libraries the NPU backend loads into the CDSP unsigned PD at runtime.
 They are built from llama.cpp sources plus one patch (`patches/0001-*.patch`, described
 under Provenance); the host side
@@ -63,10 +63,10 @@ vendoring them.
   chunks went from 0.95..0.99 to 0.9995 or better (LFM2.5-2.6B Q4_0 from
   -0.003..0.99 to 0.991..0.9999), single tokens from as low as 0.377 to
   0.9995, with unchanged decode throughput (measured on the previous build; the patch is ported
-  onto the reworked quantizers). v73, v75 and v81 are the same C code rebuilt; only v79 has been
+  onto the reworked quantizers). v73, v75, v81 and v85 are the same C code rebuilt; only v79 has been
   run on hardware.
 - Build: Hexagon SDK 6.6.0.0 with Hexagon Tools 19.0.07 (hexagon-clang with
-  whole-program LTO), compiling `libggml-htp-v{73,75,79,81}.so` targets with
+  whole-program LTO), compiling `libggml-htp-v{73,75,79,81,85}.so` targets with
   `-DDSP_VERSION`.
 - License of the compiled sources: MIT (llama.cpp). Toolchain output
   is not SDK redistribution.
@@ -77,10 +77,12 @@ vendoring them.
 - v75: d0334de0b516b13d5a3fe205fb0e1ac0
 - v79: fe6dbaddf669fda4e118e6000482fd90
 - v81: 531d875fe26736ad0c6aa33b23ef6b09
+- v85: 3c8892780a86e2e40bc57af4390b1ad7
 
 These are the md5s of the shipped, renamed files. The unrenamed build outputs were
 v73 bb29e473361edaaec976677dbf375813, v75 26c87c573b64443ab74e35b9770c497d,
-v79 d41218ff47b146e6c7afd0870e7975fc, v81 04b17a165e8a01c146e6eceb193bbb2f.
+v79 d41218ff47b146e6c7afd0870e7975fc, v81 04b17a165e8a01c146e6eceb193bbb2f,
+v85 04b17a165e8a01c146e6eceb193bbb2f.
 
 ## Rebuilding
 
@@ -90,7 +92,7 @@ v79 d41218ff47b146e6c7afd0870e7975fc, v81 04b17a165e8a01c146e6eceb193bbb2f.
 cp docs/backend/snapdragon/CMakeUserPresets.json .
 docker run --rm --platform linux/amd64 -v "$PWD":/workspace -w /workspace <image> bash -lc \
   'cmake --preset arm64-android-snapdragon-release -B build-snapdragon &&
-   cmake --build build-snapdragon --target htp-v73 htp-v75 htp-v79 htp-v81'
+   cmake --build build-snapdragon --target htp-v73 htp-v75 htp-v79 htp-v81 htp-v85'
 # outputs: build-snapdragon/ggml/src/ggml-hexagon/libggml-htp-vXX.so
 ```
 
@@ -104,10 +106,12 @@ and the SONAME in each is patched to match. `ggml` and `cera` are both four char
 patch is a same-length byte substitution that moves no offsets:
 
 ```bash
-for v in 73 75 79 81; do
+for v in 73 75 79 81 85; do
   cp libggml-htp-v$v.so libcera-htp-v$v.so
   perl -0pi -e "s/libggml-htp-v$v\.so/libcera-htp-v$v.so/g" libcera-htp-v$v.so
 done
+# When v85 is cloned from v81 before renaming, patch its SONAME directly:
+perl -0pi -e 's/libcera-htp-v81\.so/libcera-htp-v85.so/g' libcera-htp-v85.so
 # check: llvm-readelf -d libcera-htp-vXX.so | grep SONAME
 ```
 
@@ -121,5 +125,5 @@ on-device determinism matrix (logits m=1..8 x5, greedy md5 2x2x6,
 ## Coverage
 
 v73 (8+ Gen 1 / 8 Gen 2 / 7+ Gen 2 / X Elite), v75 (8 Gen 3 / 8s Gen 3),
-v79 (8 Elite), v81 (next-gen). No v68/v69 (888 / 8 Gen 1): outside
-llama.cpp upstream scope; see the packaging doc for the support matrix.
+v79 (8 Elite), v81 (next-gen), v85 (Snapdragon 8 Elite Gen 6). No v68/v69 (888 / 8 Gen 1)
+or v83: outside llama.cpp upstream scope; see the packaging doc for the support matrix.

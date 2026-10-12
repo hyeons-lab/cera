@@ -9,7 +9,7 @@ benchmarks/ANDROID_VL_IMAGE.md.
 
 Prerequisites (on the device, paths overridable below)
   $CERA_DIR/cera                      cargo ndk -t arm64-v8a build --release -p cera-cli --features gpu,hexagon
-  $CERA_DIR/skels/libggml-htp-v*.so   cera/src/backend/hexagon/skels/ (Cera's own DSP skels, never llama.cpp's)
+  $CERA_DIR/skels/libcera-htp-v*.so   cera/src/backend/hexagon/skels/ (Cera's own DSP skels, never llama.cpp's)
   $LLAMA_DIR/bin/llama-mtmd-cli, $LLAMA_DIR/lib   a llama.cpp Snapdragon build (OpenCL + Hexagon), e.g. the
                                       llama-cpp-android-arm64-snapdragon CI artifact of ggml-org/llama.cpp
   the GGUF, the mmproj GGUF, a Leap-style manifest JSON naming both, and the image

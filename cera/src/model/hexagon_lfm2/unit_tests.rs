@@ -819,8 +819,11 @@ fn dispatch_get_rows_with_zero_rows_enqueues_nothing() {
         4,
     )
     .unwrap();
-    let (_, _, _, ops) = session.export_batch();
-    assert!(ops.is_empty(), "a zero-row gather must enqueue nothing");
+    let (bufs, _, tens, ops) = session.export_batch();
+    assert!(
+        bufs.is_empty() && tens.is_empty() && ops.is_empty(),
+        "a zero-row gather must register no buffers, tensors, or ops"
+    );
 
     HexagonLfmModel::dispatch_get_rows(
         &mut session,
@@ -835,7 +838,9 @@ fn dispatch_get_rows_with_zero_rows_enqueues_nothing() {
         4,
     )
     .unwrap();
-    let (_, _, _, ops) = session.export_batch();
+    let (bufs, _, tens, ops) = session.export_batch();
+    assert_eq!(bufs.len(), 1);
+    assert_eq!(tens.len(), 3);
     let opcodes: Vec<u32> = ops.iter().map(|o| o.opcode).collect();
     assert_eq!(opcodes, [HtpOpCode::GetRows].map(|o| o as u32));
 }
