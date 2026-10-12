@@ -387,7 +387,11 @@ impl PendingReadback {
 /// Workgroup storage `attention_flash_hd64.wgsl` needs: qs 8192 + kt 8192 + vs 8704 +
 /// ps 4096 + pm 512 + corr 128 + lsum 512 bytes (see the `var<workgroup>` block there).
 /// An adapter under this cannot build the pipeline, so the flash gate requires it.
-const FLASH_ATTENTION_WORKGROUP_BYTES: u32 = 30_336;
+pub(crate) const FLASH_ATTENTION_WORKGROUP_BYTES: u32 = 30_336;
+
+/// Workgroup storage `attention_prefill_hd64_f16.slang` needs: qs 8192 + kt 4096 + vs 4352 +
+/// ps 8192 + ph 4096 + pm 1024 + corr 256 + lsum 1024 bytes (total 31,232 bytes).
+pub(crate) const FLASH_ATTENTION_F16_WORKGROUP_BYTES: u32 = 31_232;
 
 /// Pure predicate behind [`GpuContext::supports_flash_attention`], split out so a host test
 /// can pin it without a GPU: the kernel's workgroup storage, then OS plus vendor. `is_android`
@@ -1917,6 +1921,32 @@ impl GpuContext {
             })
     }
 
+    /// Pipeline over an explicit bind-group layout of storage buffers (`true` = read-only), checked
+    /// through an error scope on non-wasm targets.
+    unsafe fn try_stream_gemm_pipeline_checked(
+        &self,
+        label: &str,
+        desc: wgpu::ShaderModuleDescriptorPassthrough<'_>,
+        bindings: &[bool],
+    ) -> anyhow::Result<wgpu::ComputePipeline> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            // SAFETY: Caller guarantees desc satisfies safety invariant.
+            Ok(unsafe { self.stream_gemm_pipeline(label, desc, bindings) })
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            // SAFETY: Caller guarantees desc satisfies safety invariant.
+            let pipeline = unsafe { self.stream_gemm_pipeline(label, desc, bindings) };
+            let err = pollster::block_on(scope.pop());
+            match err {
+                Some(e) => Err(anyhow::anyhow!("{label}: pipeline validation failed: {e}")),
+                None => Ok(pipeline),
+            }
+        }
+    }
+
     /// The fp16, 64-query-per-workgroup causal prefill attention for head_dim 64
     /// (`attention_prefill_hd64_f16.slang`): the contract of `attention_prefill_hd64.wgsl` (q, K, V,
     /// out, 14 parameter words) on a grid of `(ceil(n_sub / 64), n_heads)` 256-thread workgroups.
@@ -1925,6 +1955,22 @@ impl GpuContext {
         // bindings (q, k, v read-only, out read-write, params read-only).
         unsafe {
             self.stream_gemm_pipeline(
+                "attention_prefill_hd64_f16_passthrough",
+                wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/attention_prefill_hd64_f16.spv"
+                )),
+                &[true, true, true, false, true],
+            )
+        }
+    }
+
+    /// Checked build of [`Self::attention_prefill_hd64_f16_passthrough`].
+    pub fn try_attention_prefill_hd64_f16_passthrough_checked(
+        &self,
+    ) -> anyhow::Result<wgpu::ComputePipeline> {
+        unsafe {
+            self.try_stream_gemm_pipeline_checked(
                 "attention_prefill_hd64_f16_passthrough",
                 wgpu::include_spirv_raw!(concat!(
                     env!("OUT_DIR"),
@@ -7798,6 +7844,12 @@ mod tests {
         let mut kernels = vec![(PrefillKernel::Tiled, 5e-3, 1e-3)];
         if ctx.supports_spirv_passthrough() {
             kernels.push((PrefillKernel::TiledF16, 8e-3, 1e-2));
+        } else if std::env::var("CERA_REQUIRE_PASSTHROUGH").as_deref() == Ok("1") {
+            panic!(
+                "CERA_REQUIRE_PASSTHROUGH=1 requested, but adapter does not support SPIR-V passthrough \
+                 for PrefillKernel::TiledF16 (backend={})",
+                ctx.backend
+            );
         }
         kernels
     }

@@ -519,6 +519,14 @@ def gen_t44(dt, s_block=8, pv_block=4):
 
 VARIANTS = [(8, 4), (8, 8), (16, 8), (16, 16), (32, 16)]
 
+def find_slangc():
+    c = os.environ.get("SLANGC") or shutil.which("slangc") or os.path.expanduser("~/.local/slang/bin/slangc")
+    if c and (os.path.isfile(c) or shutil.which(c)):
+        return c
+    sys.stderr.write("error: slangc compiler not found in PATH, SLANGC, or ~/.local/slang/bin/slangc\n")
+    sys.exit(1)
+
+
 def production():
     """`--production`: write the 64-query fp16 kernel next to the shaders the model loads."""
     root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -539,10 +547,12 @@ def production():
 """
     name = "attention_prefill_hd64_f16"
     open(os.path.join(spirv, name + ".slang"), "w").write(header + gen_q(64))
-    slangc = os.environ.get("SLANGC") or shutil.which("slangc") or os.path.expanduser("~/.local/slang/bin/slangc")
+    slangc = find_slangc()
     r = subprocess.run([slangc, os.path.join(spirv, name + ".slang"), "-target", "spirv", "-O3", "-entry", "main",
                         "-stage", "compute", "-o", os.path.join(spirv, name + ".spv")], capture_output=True, text=True)
     print(("ok   " if r.returncode == 0 else "FAIL ") + name, r.stderr[:400])
+    if r.returncode != 0:
+        sys.exit(r.returncode)
 
 
 if __name__ == "__main__":
@@ -551,7 +561,7 @@ if __name__ == "__main__":
         sys.exit(0)
     out = next((a for a in sys.argv[1:] if not a.startswith("--")), "attn_f16")
     os.makedirs(out, exist_ok=True)
-    slangc = os.environ.get("SLANGC") or shutil.which("slangc") or os.path.expanduser("~/.local/slang/bin/slangc")
+    slangc = find_slangc()
     jobs = [(f"attn_f16_s{s}_p{p}", s, p, ()) for s, p in VARIANTS]
     if "--ablate" in sys.argv:
         jobs += [(f"abl_no_{ph}", 8, 4, (ph,)) for ph in ("stage", "s", "pv", "soft")]
@@ -565,8 +575,13 @@ if __name__ == "__main__":
     texts["attn_t44_half"] = gen_t44("half")
     texts["attn_t44_float"] = gen_t44("float")
     jobs += [("attn_t44_half", 0, 0, ()), ("attn_t44_float", 0, 0, ())]
+    failed = False
     for name, s_, p_, skip in jobs:
         open(os.path.join(out, name + ".slang"), "w").write(texts[name])
         r = subprocess.run([slangc, os.path.join(out, name + ".slang"), "-target", "spirv", "-O3", "-entry", "main",
                             "-stage", "compute", "-o", os.path.join(out, name + ".spv")], capture_output=True, text=True)
         print(("ok   " if r.returncode == 0 else "FAIL ") + name, r.stderr[:400])
+        if r.returncode != 0:
+            failed = True
+    if failed:
+        sys.exit(1)

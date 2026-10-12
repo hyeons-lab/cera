@@ -99,12 +99,14 @@ fn reference(c: &Case) -> Vec<f32> {
                 break;
             }
             handles.push(s.spawn(move || {
+                let mut scores = Vec::new();
                 for (row, dst) in batch {
                     let pos = c.start as usize + row;
                     for h in 0..N_HEADS as usize {
                         let kvh = h / group;
                         let q = &c.q[row * Q_STRIDE as usize + h * HD as usize..][..HD as usize];
-                        let mut scores = Vec::with_capacity(pos + 1);
+                        scores.clear();
+                        scores.reserve(pos + 1);
                         for t in 0..=pos {
                             let k = &c.k[t * KV_DIM as usize + kvh * HD as usize..][..HD as usize];
                             let dot: f64 = q
@@ -210,8 +212,12 @@ fn load_variant(ctx: &GpuContext, path: &str) -> Variant {
     let name = std::path::Path::new(path)
         .file_stem()
         .map_or_else(|| path.to_string(), |s| s.to_string_lossy().into_owned());
-    // a kernel with "q64" in its file name takes 64 queries per workgroup; the rest take 32
-    let queries_per_group = if name.contains("q64") { 64 } else { 32 };
+    // a kernel with "q64" or "hd64_f16" in its file name takes 64 queries per workgroup; the rest take 32
+    let queries_per_group = if name.contains("q64") || name.contains("hd64_f16") {
+        64
+    } else {
+        32
+    };
     Variant {
         name,
         pipeline,

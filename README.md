@@ -614,6 +614,7 @@ optimal on any one. The knobs below override them.
 | `CERA_WGPU_GEMM_DIRECT_B=off` | wgpu prefill: disables direct-B staging and restores transposed f16 activation pass (`0` / `false` / `off`). |
 | `CERA_WGPU_GEMM_R1=1` | wgpu prefill: forces the 1-row streaming Q4_0 GEMM kernel everywhere (skips 2-row kernel). |
 | `CERA_WGPU_FUSE_GATE_UP=off` | wgpu prefill: disables fused gate/up streaming Q4_0 GEMM with SiLU epilogue (`0` / `false` / `off`). |
+| `CERA_WGPU_ATTN_F32=1` | wgpu prefill: forces the f32 attention kernel everywhere (skips 64-query fp16 attention kernel). |
 | `CERA_VIT_STREAM=off` / `CERA_VIT_WARMUP=off` | wgpu vision tower: `CERA_VIT_STREAM=off` restores the generic kernels instead of the fp16 streaming GEMMs and attention; `CERA_VIT_WARMUP=off` skips the blank-image warm-up encode at load (about 190 ms once). |
 | `RUST_LOG=<filter>` | Log level. Defaults to `warn`, which surfaces things like prefill falling back to the slow per-token path. |
 

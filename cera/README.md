@@ -627,6 +627,7 @@ size from):
 | `CERA_WGPU_GEMM_DIRECT_B` | on | `0` / `false` / `off` disables direct-B staging and restores transposed f16 activation pass. |
 | `CERA_WGPU_GEMM_R1` | off | `1` / `true` forces the 1-row streaming Q4_0 GEMM kernel everywhere (skips 2-row kernel). |
 | `CERA_WGPU_FUSE_GATE_UP` | on | `0` / `false` / `off` disables fused gate/up streaming Q4_0 GEMM with SiLU epilogue. |
+| `CERA_WGPU_ATTN_F32` | off | `1` / `true` forces the f32 attention kernel everywhere (skips 64-query fp16 attention kernel). |
 | `CERA_VIT_STREAM`, `CERA_VIT_WARMUP` | on | wgpu vision tower: `CERA_VIT_STREAM=off` restores the generic kernels instead of the fp16 streaming GEMMs and attention; `CERA_VIT_WARMUP=off` skips the blank-image warm-up encode at load (about 190 ms once). |
 | `CERA_MIN_ROWS` | 128 | Minimum output rows a decode-GEMV worker takes before another joins. |
 | `CERA_PAR_THRESHOLD` | 256 | Minimum output dimension before a GEMV parallelizes; smaller GEMVs stay serial. |

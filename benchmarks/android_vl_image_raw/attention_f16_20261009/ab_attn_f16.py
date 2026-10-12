@@ -19,10 +19,10 @@ def cool():
         t=ap()
         if (t is not None and t<=AP_MAX_C) or time.time()-t0>900: return t
         time.sleep(5)
-VARS = {"f16": ("cera-af16", ""), "f32": ("cera-af16", "CERA_WGPU_ATTN_F32=1 ")}
+VARS = {"f16": (BIN, ""), "f32": (BIN, "CERA_WGPU_ATTN_F32=1 ")}
 def cera(var, n):
-    BIN, env = VARS[var]
-    out = sh(f"{GUARD}cd {CERA} && {env}timeout 300 ./{BIN} bench -m {MODEL} --device gpu --runs 5 --warmup 2 --no-cache --prompt-tokens {n} --max-tokens 0 2>&1")
+    bin_name, env = VARS[var]
+    out = sh(f"{GUARD}cd {CERA} && {env}timeout 300 ./{bin_name} bench -m {MODEL} --device gpu --runs 5 --warmup 2 --no-cache --prompt-tokens {n} --max-tokens 0 2>&1")
     m = re.search(r"prefill tok/s: p50=([\d.]+)", out)
     return float(m.group(1)) if m else None
 def llama(n):
