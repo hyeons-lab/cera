@@ -2111,7 +2111,7 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_dispatch(
 ///
 /// where `nb = dim / 32`. Runs on the prefill pool, in tile chunks.
 #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
-#[cfg_attr(not(target_arch = "aarch64"), allow(dead_code))]
+#[cfg_attr(any(not(target_arch = "aarch64"), has_blas), allow(dead_code))]
 pub(crate) fn interleave_q8_tiles(
     quants: &[i8],
     scales: &[f32],
@@ -2122,7 +2122,10 @@ pub(crate) fn interleave_q8_tiles(
 ) {
     let nb = dim / 32;
     let tiles = n / 4;
-    assert!(dim.is_multiple_of(32), "interleave_q8_tiles: dim % 32 != 0");
+    assert!(
+        dim > 0 && dim.is_multiple_of(32),
+        "interleave_q8_tiles: dim {dim} must be positive and divisible by 32"
+    );
     assert!(
         quants.len() >= n * dim && scales.len() >= n * nb,
         "interleave_q8_tiles: activations too small for {n}x{dim}"
@@ -2131,6 +2134,9 @@ pub(crate) fn interleave_q8_tiles(
         out_q.len() >= tiles * nb * 128 && out_s.len() >= tiles * nb * 8,
         "interleave_q8_tiles: output too small for {tiles} tiles of {nb} blocks"
     );
+    if tiles == 0 {
+        return;
+    }
     let (q_base, s_base) = (quants.as_ptr() as usize, scales.as_ptr() as usize);
     let (oq_base, os_base) = (out_q.as_mut_ptr() as usize, out_s.as_mut_ptr() as usize);
     let do_tiles = move |start: usize, count: usize| unsafe {
@@ -2162,25 +2168,32 @@ pub(crate) fn interleave_q8_tiles(
     par_range_prefill_active(tiles, 8, max_active, do_tiles);
 }
 
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(has_blas)))]
 thread_local! {
     /// The calling thread's scratch for [`with_smmla_tiles`], grown on demand and reused.
-    static SMMLA_TILE_SCRATCH: std::cell::RefCell<(Vec<i8>, Vec<f32>)> =
-        const { std::cell::RefCell::new((Vec::new(), Vec::new())) };
+    static SMMLA_TILE_SCRATCH: std::cell::Cell<Option<(Vec<i8>, Vec<f32>)>> =
+        const { std::cell::Cell::new(None) };
 }
 
 /// Whether the smmla Q4_0 GEMMs run on tile-interleaved activations (on by default;
 /// `CERA_CPU_SMMLA_TILED=0` keeps the columnar kernels, the A/B switch).
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(has_blas)))]
 fn smmla_tiled_enabled() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("CERA_CPU_SMMLA_TILED").as_deref() != Ok("0"))
+    #[cfg(test)]
+    {
+        !super::cpu_features::env_disabled("CERA_CPU_SMMLA_TILED")
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| !super::cpu_features::env_disabled("CERA_CPU_SMMLA_TILED"))
+    }
 }
 
 /// Interleave the activations per 4-token tile into the thread's scratch (see
 /// [`interleave_q8_tiles`]) and call `f(tile_scales, tile_quants)`. `None` when there is no full
 /// tile (`n < 4`) or the tiled path is off: the caller then runs the columnar kernel.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", not(has_blas)))]
 fn with_smmla_tiles<R>(
     b_scales: &[f32],
     b_quants: &[i8],
@@ -2192,17 +2205,27 @@ fn with_smmla_tiles<R>(
         return None;
     }
     let (nb, tiles) = (k / 32, n / 4);
+    let q_len = tiles * nb * 128;
+    let s_len = tiles * nb * 8;
     SMMLA_TILE_SCRATCH.with(|cell| {
-        let mut scratch = cell.borrow_mut();
-        let (tq, ts) = &mut *scratch;
-        if tq.len() < tiles * nb * 128 {
-            tq.resize(tiles * nb * 128, 0);
+        let mut scratch = cell.take().unwrap_or_default();
+        if scratch.0.len() < q_len {
+            scratch.0.resize(q_len, 0);
         }
-        if ts.len() < tiles * nb * 8 {
-            ts.resize(tiles * nb * 8, 0.0);
+        if scratch.1.len() < s_len {
+            scratch.1.resize(s_len, 0.0);
         }
-        interleave_q8_tiles(b_quants, b_scales, n, k, tq, ts);
-        Some(f(ts, tq))
+        interleave_q8_tiles(
+            b_quants,
+            b_scales,
+            n,
+            k,
+            &mut scratch.0[..q_len],
+            &mut scratch.1[..s_len],
+        );
+        let res = f(&scratch.1[..s_len], &scratch.0[..q_len]);
+        cell.set(Some(scratch));
+        Some(res)
     })
 }
 
@@ -2241,6 +2264,9 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
         b_quants.len() >= n * k && b_scales.len() >= n * nb && out.len() == m * n,
         "gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
     );
+    if n == 0 {
+        return true;
+    }
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
@@ -2322,6 +2348,9 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_gate_up_silu_dispatch(
         b_quants.len() >= n * k && b_scales.len() >= n * nb && out.len() == m * n,
         "gemm_preq_repacked_q4_0_smmla_gate_up_silu_dispatch: activation/output buffers wrong for {m}x{n}x{k}"
     );
+    if n == 0 {
+        return true;
+    }
 
     #[cfg(target_arch = "aarch64")]
     if super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm {
@@ -9785,6 +9814,97 @@ pub fn axpy_inplace(a: &mut [f32], b: &[f32], alpha: f32) {
 
 #[cfg(test)]
 mod tests {
+    /// `interleave_q8_tiles` places every activation quant and scale where the tile kernel reads
+    /// it, for ragged `n` (the tail tokens are not copied) and several block counts. Pure data
+    /// movement, so it runs on any host.
+    #[test]
+    #[cfg(any(target_arch = "x86_64", target_arch = "aarch64"))]
+    fn interleave_q8_tiles_layout() {
+        fn lcg(st: &mut u64) -> f32 {
+            *st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+            ((*st >> 33) as f32) / ((1u64 << 31) as f32) - 0.5
+        }
+        for (n, k) in [
+            (0usize, 32usize),
+            (1, 32),
+            (3, 64),
+            (4, 32),
+            (5, 64),
+            (13, 96),
+            (64, 256),
+        ] {
+            let nb = k / 32;
+            let tiles = n / 4;
+            let mut st = 0x001e_a5e5_u64 ^ (n as u64) ^ ((k as u64) << 16);
+            let quants: Vec<i8> = (0..n * k).map(|_| (lcg(&mut st) * 127.0) as i8).collect();
+            let scales: Vec<f32> = (0..n * nb).map(|_| lcg(&mut st)).collect();
+            let mut out_q = vec![i8::MIN; tiles * nb * 128];
+            let mut out_s = vec![f32::NAN; tiles * nb * 8];
+            super::interleave_q8_tiles(&quants, &scales, n, k, &mut out_q, &mut out_s);
+            for tile in 0..tiles {
+                for b in 0..nb {
+                    for c in 0..4 {
+                        for tok in 0..4 {
+                            for e in 0..8 {
+                                assert_eq!(
+                                    out_q[((tile * nb + b) * 4 + c) * 32 + tok * 8 + e],
+                                    quants[(tile * 4 + tok) * k + b * 32 + c * 8 + e],
+                                    "quant tile {tile} block {b} chunk {c} tok {tok} elem {e} (n={n} k={k})"
+                                );
+                            }
+                        }
+                    }
+                    let d = |tok: usize| scales[(tile * 4 + tok) * nb + b];
+                    assert_eq!(
+                        out_s[(tile * nb + b) * 8..][..8],
+                        [d(0), d(1), d(0), d(1), d(2), d(3), d(2), d(3)],
+                        "scales tile {tile} block {b} (n={n} k={k})"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", not(has_blas)))]
+    fn with_smmla_tiles_alternating_batch_bounds() {
+        let k = 64usize;
+        let nb = k / 32;
+        for n in [64usize, 4, 32, 8, 4] {
+            let tiles = n / 4;
+            let quants = vec![1i8; n * k];
+            let scales = vec![1.0f32; n * nb];
+            let expected_q = tiles * nb * 128;
+            let expected_s = tiles * nb * 8;
+            let ran = super::with_smmla_tiles(&scales, &quants, n, k, |ts, tq| {
+                assert_eq!(
+                    tq.len(),
+                    expected_q,
+                    "tile_quants length mismatch for n={n}"
+                );
+                assert_eq!(
+                    ts.len(),
+                    expected_s,
+                    "tile_scales length mismatch for n={n}"
+                );
+            });
+            assert!(ran.is_some(), "with_smmla_tiles returned None for n={n}");
+        }
+    }
+
+    #[test]
+    #[cfg(all(target_arch = "aarch64", not(has_blas)))]
+    fn with_smmla_tiles_subtile_and_disabled() {
+        let k = 64usize;
+        let nb = k / 32;
+        let quants = vec![1i8; 3 * k];
+        let scales = vec![1.0f32; 3 * nb];
+        let ran = super::with_smmla_tiles(&scales, &quants, 3, k, |_, _| {});
+        assert!(ran.is_none());
+        let ran_zero = super::with_smmla_tiles(&scales, &quants, 0, k, |_, _| {});
+        assert!(ran_zero.is_none());
+    }
+
     /// A backend that divides each pair's angle by `yarn_freq_factors` and
     /// scales `cos`/`sin` by `mscale` must land on the CPU YaRN rotation.
     #[test]

@@ -7199,6 +7199,7 @@ pub(crate) mod neon {
     /// The block loop issues 32 `smmla` for 8 `movi` and 24 epilogue ops (down from about 54 ops of
     /// shuffles and epilogue), which is what the core's four vector ports bound: the same arithmetic
     /// in the same order, bit-identical results, 1.2x faster on a Snapdragon 8 Elite prime core.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[inline]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,i8mm")]
@@ -7398,6 +7399,57 @@ pub(crate) mod neon {
         }
     }
 
+    /// Dispatches `sr_count` super-rows across worker threads.
+    ///
+    /// For multi-token batches (`n >= 2`), scheduling uses a disjoint dummy buffer
+    /// sized to avoid borrowing the output slice during concurrent raw pointer writes.
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[inline(always)]
+    fn dispatch_smmla_super_rows<F>(sr_count: usize, n: usize, compute_super_row: F)
+    where
+        F: Fn(usize) + Send + Sync + Copy,
+    {
+        if sr_count >= 2 {
+            if n == 1 {
+                crate::backend::cpu::par_range(sr_count, 1, |start_sr, count| {
+                    for sr in start_sr..start_sr + count {
+                        compute_super_row(sr);
+                    }
+                });
+            } else {
+                let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
+                let nth = crate::backend::cpu::prefill_par_threads()
+                    .max(1)
+                    .min(max_active);
+                let chunk = sr_count.div_ceil(nth * 4).max(1);
+                let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
+                let mut dummy = [0.0f32; 4096];
+                if sr_count <= dummy.len() {
+                    crate::backend::cpu::par_rows_n_chunked_active(
+                        &mut dummy[..sr_count],
+                        1,
+                        1,
+                        chunk,
+                        max_active,
+                        compute,
+                    );
+                } else {
+                    let mut dummy_vec = vec![0.0f32; sr_count];
+                    crate::backend::cpu::par_rows_n_chunked_active(
+                        &mut dummy_vec,
+                        1,
+                        1,
+                        chunk,
+                        max_active,
+                        compute,
+                    );
+                }
+            }
+        } else {
+            (0..sr_count).for_each(compute_super_row);
+        }
+    }
+
     /// Smmla (i8mm) twin of [`gemm_q4_0_8x8_q8_0_rowmajor`]: repacked 8-row Q4_0
     /// × Q8_0 batched GEMM writing directly in row-major `out[n, m]` layout,
     /// with B quants packed by
@@ -7415,6 +7467,9 @@ pub(crate) mod neon {
         m: usize,
         k: usize,
     ) {
+        if n == 0 {
+            return;
+        }
         debug_assert_eq!(m % 8, 0, "smmla Q4_0 GEMM: m must be a multiple of 8");
         debug_assert_eq!(k % 32, 0, "smmla Q4_0 GEMM: k must be divisible by 32");
         let nb = k / 32;
@@ -7468,39 +7523,14 @@ pub(crate) mod neon {
             }
         };
 
-        let sr_count = m / 8;
-        if sr_count >= 2 {
-            if n == 1 {
-                crate::backend::cpu::par_range(sr_count, 1, |start_sr, count| {
-                    for sr in start_sr..start_sr + count {
-                        compute_super_row(sr);
-                    }
-                });
-            } else {
-                let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
-                let nth = crate::backend::cpu::prefill_par_threads()
-                    .max(1)
-                    .min(max_active);
-                let chunk = sr_count.div_ceil(nth * 4).max(1);
-                let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
-                crate::backend::cpu::par_rows_n_chunked_active(
-                    &mut out[..sr_count],
-                    1,
-                    1,
-                    chunk,
-                    max_active,
-                    compute,
-                );
-            }
-        } else {
-            (0..sr_count).for_each(compute_super_row);
-        }
+        dispatch_smmla_super_rows(m / 8, n, compute_super_row);
     }
 
     /// [`gemm_q4_0_smmla_8x4_q8_0_rowmajor`] with the activations also given interleaved per 4-token tile
-    /// (`tile_quants` / `tile_scales`, see [`smmla_q4_0_tile_8x4_il`]): the full 4-token tiles run the
+    /// (`tile_quants` / `tile_scales`, see `smmla_q4_0_tile_8x4_il`): the full 4-token tiles run the
     /// shuffle-free tile kernel, and the `n % 4` tail tokens the single-token kernel on the columnar
     /// `b_quants` / `b_scales`. Bit-identical to the columnar kernel.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,i8mm")]
     pub unsafe fn gemm_q4_0_smmla_8x4_q8_0_rowmajor_tiled(
@@ -7515,6 +7545,9 @@ pub(crate) mod neon {
         m: usize,
         k: usize,
     ) {
+        if n == 0 {
+            return;
+        }
         debug_assert_eq!(m % 8, 0, "smmla Q4_0 GEMM: m must be a multiple of 8");
         debug_assert_eq!(k % 32, 0, "smmla Q4_0 GEMM: k must be divisible by 32");
         let nb = k / 32;
@@ -7562,29 +7595,12 @@ pub(crate) mod neon {
             }
         };
 
-        let sr_count = m / 8;
-        if sr_count >= 2 {
-            let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
-            let nth = crate::backend::cpu::prefill_par_threads()
-                .max(1)
-                .min(max_active);
-            let chunk = sr_count.div_ceil(nth * 4).max(1);
-            let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
-            crate::backend::cpu::par_rows_n_chunked_active(
-                &mut out[..sr_count],
-                1,
-                1,
-                chunk,
-                max_active,
-                compute,
-            );
-        } else {
-            (0..sr_count).for_each(compute_super_row);
-        }
+        dispatch_smmla_super_rows(m / 8, n, compute_super_row);
     }
 
     /// [`gemm_q4_0_smmla_gate_up_silu_rowmajor`] over activations also given interleaved per 4-token
     /// tile, as [`gemm_q4_0_smmla_8x4_q8_0_rowmajor_tiled`] does for the plain GEMM.
+    #[cfg_attr(not(test), allow(dead_code))]
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,i8mm")]
     pub unsafe fn gemm_q4_0_smmla_gate_up_silu_rowmajor_tiled(
@@ -7601,6 +7617,9 @@ pub(crate) mod neon {
         m: usize,
         k: usize,
     ) {
+        if n == 0 {
+            return;
+        }
         debug_assert_eq!(
             m % 8,
             0,
@@ -7668,25 +7687,7 @@ pub(crate) mod neon {
             }
         };
 
-        let sr_count = m / 8;
-        if sr_count >= 2 {
-            let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
-            let nth = crate::backend::cpu::prefill_par_threads()
-                .max(1)
-                .min(max_active);
-            let chunk = sr_count.div_ceil(nth * 4).max(1);
-            let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
-            crate::backend::cpu::par_rows_n_chunked_active(
-                &mut out[..sr_count],
-                1,
-                1,
-                chunk,
-                max_active,
-                compute,
-            );
-        } else {
-            (0..sr_count).for_each(compute_super_row);
-        }
+        dispatch_smmla_super_rows(m / 8, n, compute_super_row);
     }
 
     /// Smmla (i8mm) twin of [`gemm_q4_0_gate_up_silu_rowmajor`]: fused Gate +
@@ -7712,6 +7713,9 @@ pub(crate) mod neon {
         m: usize,
         k: usize,
     ) {
+        if n == 0 {
+            return;
+        }
         debug_assert_eq!(
             m % 8,
             0,
@@ -7790,33 +7794,7 @@ pub(crate) mod neon {
             }
         };
 
-        let sr_count = m / 8;
-        if sr_count >= 2 {
-            if n == 1 {
-                crate::backend::cpu::par_range(sr_count, 1, |start_sr, count| {
-                    for sr in start_sr..start_sr + count {
-                        compute_super_row(sr);
-                    }
-                });
-            } else {
-                let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
-                let nth = crate::backend::cpu::prefill_par_threads()
-                    .max(1)
-                    .min(max_active);
-                let chunk = sr_count.div_ceil(nth * 4).max(1);
-                let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
-                crate::backend::cpu::par_rows_n_chunked_active(
-                    &mut out[..sr_count],
-                    1,
-                    1,
-                    chunk,
-                    max_active,
-                    compute,
-                );
-            }
-        } else {
-            (0..sr_count).for_each(compute_super_row);
-        }
+        dispatch_smmla_super_rows(m / 8, n, compute_super_row);
     }
 
     /// Is the K-quant (Q4_K/Q6_K) int8 GEMM usable on this CPU?
@@ -11355,46 +11333,6 @@ pub(crate) mod neon {
             }
         }
 
-        /// `interleave_q8_tiles` places every activation quant and scale where the tile kernel reads
-        /// it, for ragged `n` (the tail tokens are not copied) and several block counts. Pure data
-        /// movement, so it runs on any host.
-        #[test]
-        fn interleave_q8_tiles_layout() {
-            for (n, k) in [(4usize, 32usize), (5, 64), (13, 96), (64, 256)] {
-                let nb = k / 32;
-                let tiles = n / 4;
-                let mut st = 0x001e_a5e5_u64 ^ (n as u64) ^ ((k as u64) << 16);
-                let quants: Vec<i8> = (0..n * k).map(|_| (lcg(&mut st) * 127.0) as i8).collect();
-                let scales: Vec<f32> = (0..n * nb).map(|_| lcg(&mut st)).collect();
-                let mut out_q = vec![i8::MIN; tiles * nb * 128];
-                let mut out_s = vec![f32::NAN; tiles * nb * 8];
-                crate::backend::cpu::interleave_q8_tiles(
-                    &quants, &scales, n, k, &mut out_q, &mut out_s,
-                );
-                for tile in 0..tiles {
-                    for b in 0..nb {
-                        for c in 0..4 {
-                            for tok in 0..4 {
-                                for e in 0..8 {
-                                    assert_eq!(
-                                        out_q[((tile * nb + b) * 4 + c) * 32 + tok * 8 + e],
-                                        quants[(tile * 4 + tok) * k + b * 32 + c * 8 + e],
-                                        "quant tile {tile} block {b} chunk {c} tok {tok} elem {e} (n={n} k={k})"
-                                    );
-                                }
-                            }
-                        }
-                        let d = |tok: usize| scales[(tile * 4 + tok) * nb + b];
-                        assert_eq!(
-                            out_s[(tile * nb + b) * 8..][..8],
-                            [d(0), d(1), d(0), d(1), d(2), d(3), d(2), d(3)],
-                            "scales tile {tile} block {b} (n={n} k={k})"
-                        );
-                    }
-                }
-            }
-        }
-
         /// The tiled smmla Q4_0 GEMMs (activations interleaved per 4-token tile) equal the columnar
         /// kernels bit for bit, plain and fused with Gate+Up+SiLU, on token counts around the 4-token
         /// tile (the tail runs the single-token kernel) and on several row and block counts.
@@ -11404,9 +11342,15 @@ pub(crate) mod neon {
                 return;
             }
             for (m, n, k) in [
-                (16usize, 4usize, 128usize),
+                (16usize, 0usize, 128usize),
+                (16, 1, 128),
+                (16, 2, 128),
+                (16, 3, 128),
+                (16, 4, 128),
                 (16, 5, 128),
+                (16, 6, 128),
                 (16, 7, 96),
+                (16, 10, 256),
                 (16, 13, 256),
                 (64, 9, 512),
                 (256, 64, 1024),
@@ -11472,7 +11416,7 @@ pub(crate) mod neon {
 
         /// Single-thread throughput of the Q4_0 smmla tile, for tuning it (ignored in normal runs;
         /// run on a device pinned to one core):
-        /// `taskset 80 cera_tests smmla_q4_0_tile_microbench --ignored --nocapture`.
+        /// `cargo test -p cera --lib -- smmla_q4_0_tile_microbench -- --ignored --nocapture`.
         /// One 8-row super-row against 512 tokens of Q8_0 activations, at the model's k values.
         /// An `smmla` is 64 ops, so the printed TOPS compare with the measured per-core peak (about
         /// 1.14 on a Snapdragon 8 Elite prime core).
@@ -11555,7 +11499,18 @@ pub(crate) mod neon {
                             &mut got,
                         );
                     }
-                    assert_eq!(want, got, "interleaved tile differs at tile {tl} k={k}");
+                    let want_bits: Vec<u32> = want
+                        .iter()
+                        .flat_map(|r| r.iter().map(|x| x.to_bits()))
+                        .collect();
+                    let got_bits: Vec<u32> = got
+                        .iter()
+                        .flat_map(|r| r.iter().map(|x| x.to_bits()))
+                        .collect();
+                    assert_eq!(
+                        want_bits, got_bits,
+                        "interleaved tile differs at tile {tl} k={k}"
+                    );
                 }
                 let (qi, si) = (tile_q.as_ptr(), tile_s.as_ptr());
                 let mut run_il = |reps: usize| {

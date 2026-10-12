@@ -606,6 +606,7 @@ optimal on any one. The knobs below override them.
 | `CERA_CPU_TIER=<tier>` | Caps the SIMD tier (e.g. `avx2`, `avx512`). May only downgrade, useful for A/B-ing a kernel path. |
 | `CERA_LM_HEAD_NO_GEMM=1` | Puts the LM-head projection in `forward_prefill_logits_all` back on the per-row loop the batched GEMM replaced, so both halves of a speculative-decoding A/B run from the same binary. Measurement lever only: both paths compute the same projection, to within f32 accumulation order. |
 | `CERA_Q4_DEC4=off` | Disables the 4-row interleaved Q4_0 decode repack (`0` / `false` / `off`), which costs one extra copy of each repacked weight (about +155 MB resident on the 450M, measured on a Galaxy S25 Ultra and not seen on an Apple-silicon Mac) and decodes bit-identically to the repacked prefill GEMMs. A memory/A-B lever. |
+| `CERA_CPU_SMMLA_TILED=off` | Disables 4-token tile activation interleaving for aarch64 Q4_0 smmla GEMMs (`0` / `false` / `off`), restoring the columnar kernels. An A/B performance lever. |
 | `CERA_VIT_INT8=off` | Runs the CPU vision tower's linears on the f32 path instead of the int8 GEMM (roughly 2 to 3x slower, measured on an Apple-silicon Mac; `0` / `false` / `off`). |
 | `CERA_VIT_PROFILE=1` | Prints per-phase wall time of each vision-tower encode (CPU and GPU). Off by default and free when off. |
 | `CERA_GPU_PREBUILD=off` | wgpu decode: stops finishing the next token's command buffer while the current one executes (`0` / `false` / `off`). A/B lever; decode is about 20% slower with it off on Adreno 830. |

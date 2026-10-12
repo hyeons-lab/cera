@@ -1,7 +1,6 @@
 #!/usr/bin/env python3
-"""Thermally gated CPU prefill A/B: tiled vs columnar smmla activations (one binary) against llama-bench CPU. (was: GPU) the direct-B build, the previous PR's build (transposed B, two-row, fused
-gate/up) and the build before that (both switches off), against llama-bench, at several prompt lengths."""
-import csv, io, json, os, re, statistics as st, subprocess, sys, time
+"""Thermally gated CPU prefill A/B: tiled vs columnar smmla activations (one binary) against llama-bench CPU at several prompt lengths."""
+import csv, io, json, os, re, subprocess, sys, time
 SERIAL = os.environ["SERIAL"]; OUT = sys.argv[1]; ROUNDS = int(sys.argv[2]); BIN = sys.argv[3]
 LENS = [int(x) for x in sys.argv[4].split(",")]
 AP_MAX_C = 28.0
@@ -19,10 +18,10 @@ def cool():
         t=ap()
         if (t is not None and t<=AP_MAX_C) or time.time()-t0>900: return t
         time.sleep(5)
-VARS = {"tiled": ("cera-cpu2", ""), "columnar": ("cera-cpu2", "CERA_CPU_SMMLA_TILED=0 ")}
+VARS = {"tiled": (BIN, ""), "columnar": (BIN, "CERA_CPU_SMMLA_TILED=0 ")}
 def cera(var, n):
-    BIN, env = VARS[var]
-    out = sh(f"{GUARD}cd {CERA} && {env}timeout 300 ./{BIN} bench -m {MODEL} --device cpu --runs 5 --warmup 2 --no-cache --prompt-tokens {n} --max-tokens 0 2>&1")
+    bin_name, env = VARS[var]
+    out = sh(f"{GUARD}cd {CERA} && {env}timeout 300 ./{bin_name} bench -m {MODEL} --device cpu --runs 5 --warmup 2 --no-cache --prompt-tokens {n} --max-tokens 0 2>&1")
     m = re.search(r"prefill tok/s: p50=([\d.]+)", out)
     return float(m.group(1)) if m else None
 def llama(n):
