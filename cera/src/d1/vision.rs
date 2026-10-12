@@ -558,27 +558,27 @@ impl VisionTower {
 
     /// Run the transformer blocks on the GPU `backend` names, when there is one; the patch
     /// embedding, the positions and the projector stay on the host (they are a small part of
-    /// the work). Does nothing for the CPU or when no device opens. A crop the GPU cannot take
-    /// (more patches than its attention holds) still runs on the host.
+    /// the work). Does nothing for the CPU, for a tower without blocks, or when no device
+    /// opens. A crop the GPU cannot take (more patches than its attention holds) still runs on
+    /// the host. `gguf` must be the file the tower was loaded from (weights are matched by
+    /// shape only).
     pub fn accelerate(&mut self, gguf: &Arc<GgufFile>, backend: BackendPreference) {
-        if backend == BackendPreference::Cpu {
+        if backend == BackendPreference::Cpu || self.blocks.is_empty() {
             return;
         }
         let from_file = |i: usize, name: &str, rows: usize, cols: usize| -> Result<MmapWeight> {
-            let tensor = format!("d1.v.blk.{i}.{name}.weight");
-            let w = MmapWeight::from_gguf(gguf, &tensor)
-                .with_context(|| format!("the vision tower needs the tensor `{tensor}`"))?;
-            ensure!(
-                w.rows == rows && w.cols == cols,
-                "`{tensor}` is {} x {}, expected {rows} x {cols}",
-                w.rows,
-                w.cols
-            );
-            Ok(w)
+            crate::d1::block_weight(gguf, "d1.v.blk", "vision tower", i, name, rows, cols)
         };
         match self.stack_spec(from_file) {
-            Ok(spec) => self.gpu = build_vit_stack(&spec, backend),
-            Err(e) => tracing::warn!("the vision tower stays on the CPU: {e:#}"),
+            // A backend that cannot build must not clear a working stack: only `Some` sticks.
+            Ok(spec) => {
+                if let Some(stack) = build_vit_stack(&spec, backend) {
+                    self.gpu = Some(stack);
+                }
+            }
+            Err(e) => crate::d1::warn_cpu_fallback(format_args!(
+                "the vision tower stays on the CPU: {e:#}"
+            )),
         }
     }
 
@@ -708,7 +708,9 @@ impl VisionTower {
         if let Some(gpu) = &self.gpu {
             match gpu.run(&x, n) {
                 Ok(tokens) => return (tokens, rows, cols),
-                Err(e) => tracing::warn!("a crop of {n} patches runs on the CPU: {e:#}"),
+                Err(e) => crate::d1::warn_cpu_fallback(format_args!(
+                    "a crop of {n} patches runs on the CPU: {e:#}"
+                )),
             }
         }
         let project = |input: &[f32], w: &[f32], b: &[f32], out_rows: usize, k: usize| {
@@ -901,13 +903,7 @@ pub(crate) fn tower_builder_default() -> crate::gguf::GgufBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    fn noise(n: usize, seed: usize, scale: f32) -> Vec<f32> {
-        (0..n)
-            .map(|i| ((((i + seed) * 1_103_515_245 + 12_345) % 2000) as f32 / 1000.0 - 1.0) * scale)
-            .collect()
-    }
-
+    use crate::d1::noise;
     /// A small tower with deterministic weights: two blocks of 128 wide, two heads of 64.
     fn tiny_tower() -> VisionTower {
         let (d, ffn) = (128usize, 256usize);
@@ -950,18 +946,23 @@ mod tests {
         }
     }
 
+    /// `accelerate` on a tower without blocks is a no-op: nothing to move, no device touched.
+    #[test]
+    fn accelerate_without_blocks_is_a_noop() {
+        let gguf = Arc::new(crate::gguf::GgufBuilder::new().build());
+        let mut tower = tiny_tower();
+        tower.blocks.clear();
+        tower.accelerate(&gguf, BackendPreference::Gpu);
+        assert!(!tower.is_accelerated());
+    }
+
     /// The blocks on a GPU compute what the host blocks do, whole-grid and across a width that is
     /// not a multiple of the attention tile.
     #[test]
     fn the_gpu_blocks_match_the_host_blocks() {
         let mut tower = tiny_tower();
         let owned = |w: &[f32], rows: usize, cols: usize| {
-            MmapWeight::from_owned_bytes(
-                w.iter().flat_map(|v| v.to_le_bytes()).collect(),
-                crate::tensor::DType::F32,
-                rows,
-                cols,
-            )
+            MmapWeight::from_owned_f32(w.to_vec(), rows, cols)
         };
         let (d, ffn) = (tower.width, tower.ffn);
         let spec = tower
@@ -982,6 +983,18 @@ mod tests {
             })
             .unwrap();
         let Some(gpu) = build_vit_stack(&spec, BackendPreference::Auto) else {
+            // Dual-backend test: either require flag forces it (the Metal leg sets only the
+            // Metal flag, the wgpu leg only the GPU one).
+            assert!(
+                std::env::var("CERA_REQUIRE_GPU")
+                    .unwrap_or_default()
+                    .is_empty(),
+                "CERA_REQUIRE_GPU is set but no GPU backend is compiled in or available"
+            );
+            assert!(
+                std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1"),
+                "CERA_REQUIRE_METAL=1 is set but no GPU backend is compiled in or available"
+            );
             eprintln!("SKIPPED: no GPU backend is compiled in or available");
             return;
         };

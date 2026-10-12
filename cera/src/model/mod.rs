@@ -1169,7 +1169,7 @@ fn reject_bidirectional_lfm2(
     let causal = gguf
         .get_bool(&format!("{arch}.is_causal"))
         .or_else(|| gguf.get_bool(&format!("{arch}.attention.causal")))
-        .unwrap_or_else(|| gguf.get_tensor("classifier.weight").is_err());
+        .unwrap_or_else(|| gguf.tensor_data("classifier.weight").is_err());
     ensure!(
         causal,
         "the {backend} backend runs {arch} with causal attention only, and this model is bidirectional (CPU only)"
@@ -1441,6 +1441,26 @@ mod tests {
         assert_eq!((consumed, logits, ran), (0, None, 1));
     }
 
+    /// A header-only GGUF with `general.architecture` and an optional `{arch}.is_causal`
+    /// flag: enough to drive each loader's bidirectional rejection without hardware.
+    #[cfg(any(
+        feature = "gpu",
+        feature = "hexagon",
+        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+    ))]
+    fn bidir_test_gguf(arch: &str, causal: Option<bool>) -> crate::gguf::GgufFile {
+        use crate::convert::writer::GgufWriter;
+
+        let mut writer = GgufWriter::new();
+        writer.add_string("general.architecture", arch);
+        if let Some(causal) = causal {
+            writer.add_bool(format!("{arch}.is_causal"), causal);
+        }
+        let mut bytes = Vec::new();
+        writer.write_header_and_tensor_info(&mut bytes).unwrap();
+        crate::gguf::GgufFile::from_bytes(bytes.into()).unwrap()
+    }
+
     #[cfg(any(
         feature = "gpu",
         feature = "hexagon",
@@ -1449,18 +1469,9 @@ mod tests {
     #[test]
     fn gpu_loaders_refuse_bidirectional_lfm2_but_not_other_models() {
         use super::reject_bidirectional_lfm2;
-        use crate::convert::writer::GgufWriter;
+        use crate::convert::writer::{GGML_TYPE_F32, GgufWriter};
 
-        let gguf = |arch: &str, causal: Option<bool>| {
-            let mut writer = GgufWriter::new();
-            writer.add_string("general.architecture", arch);
-            if let Some(causal) = causal {
-                writer.add_bool(format!("{arch}.is_causal"), causal);
-            }
-            let mut bytes = Vec::new();
-            writer.write_header_and_tensor_info(&mut bytes).unwrap();
-            crate::gguf::GgufFile::from_bytes(bytes.into()).unwrap()
-        };
+        let gguf = |arch: &str, causal: Option<bool>| bidir_test_gguf(arch, causal);
         assert!(
             reject_bidirectional_lfm2(&gguf("lfm2", Some(true)), "lfm2", "Metal", false).is_ok()
         );
@@ -1471,12 +1482,72 @@ mod tests {
         let err = reject_bidirectional_lfm2(&gguf("lfm2", Some(false)), "lfm2", "Metal", false)
             .expect_err("a bidirectional lfm2 must not load on the GPU");
         assert!(err.to_string().contains("bidirectional"), "{err}");
+        // A backend with a dense bidirectional path still refuses the routed arch.
         let err = reject_bidirectional_lfm2(&gguf("lfm2moe", Some(false)), "lfm2moe", "wgpu", true)
             .expect_err("so must a bidirectional routed model");
         assert!(err.to_string().contains("wgpu"), "{err}");
-        // A backend with a dense bidirectional path still refuses the routed arch.
         assert!(
             reject_bidirectional_lfm2(&gguf("lfm2", Some(false)), "lfm2", "Metal", true).is_ok()
         );
+        // the `attention.causal` spelling refuses too
+        let mut writer = GgufWriter::new();
+        writer.add_string("general.architecture", "lfm2");
+        writer.add_bool("lfm2.attention.causal", false);
+        let mut bytes = Vec::new();
+        writer.write_header_and_tensor_info(&mut bytes).unwrap();
+        let file = crate::gguf::GgufFile::from_bytes(bytes.into()).unwrap();
+        let err = reject_bidirectional_lfm2(&file, "lfm2", "Metal", false)
+            .expect_err("the attention.causal spelling must refuse too");
+        assert!(err.to_string().contains("bidirectional"), "{err}");
+        // no flags but a classifier tensor: the classifier default refuses
+        let mut writer = GgufWriter::new();
+        writer.add_string("general.architecture", "lfm2");
+        writer.add_tensor("classifier.weight", vec![2], GGML_TYPE_F32, 8);
+        let mut bytes = Vec::new();
+        writer.write_header_and_tensor_info(&mut bytes).unwrap();
+        writer.write_tensor_data(&mut bytes, &[0u8; 8]).unwrap();
+        let file = crate::gguf::GgufFile::from_bytes(bytes.into()).unwrap();
+        let err = reject_bidirectional_lfm2(&file, "lfm2", "Metal", false)
+            .expect_err("a classifier model with no flags must refuse too");
+        assert!(err.to_string().contains("bidirectional"), "{err}");
+    }
+
+    // each loader's `reads_dense` literal pinned at the call site: flipping one ships silent
+    // causal reads of bidirectional models on that backend, and the helper test only covers
+    // hand-passed flags
+    #[cfg(feature = "hexagon")]
+    #[test]
+    fn hexagon_loader_rejects_bidirectional_lfm2() {
+        for arch in ["lfm2", "lfm2moe"] {
+            // `Box<dyn Model>` has no `Debug`, so `expect_err` is unavailable; match instead
+            let err = match super::load_model_hexagon(bidir_test_gguf(arch, Some(false)), None, 256)
+            {
+                Ok(_) => panic!("{arch}: hexagon has no bidirectional path"),
+                Err(e) => e,
+            };
+            assert!(err.to_string().contains("causal attention only"), "{err}");
+        }
+    }
+
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn gpu_loader_passes_dense_bidirectional_lfm2_to_construction() {
+        // the header-only file cannot finish loading (no tensors), but it must get past the
+        // bidirectional rejection: the error, if any, lacks the rejection text
+        let err = match super::load_model_gpu(bidir_test_gguf("lfm2", Some(false)), None, 256) {
+            Ok(_) => panic!("a header-only file cannot load"),
+            Err(e) => e,
+        };
+        assert!(!err.to_string().contains("causal attention only"), "{err}");
+    }
+
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn metal_loader_passes_dense_bidirectional_lfm2_to_construction() {
+        let err = match super::load_model_metal(bidir_test_gguf("lfm2", Some(false)), None, 256) {
+            Ok(_) => panic!("a header-only file cannot load"),
+            Err(e) => e,
+        };
+        assert!(!err.to_string().contains("causal attention only"), "{err}");
     }
 }

@@ -55,7 +55,6 @@ struct Layer {
 }
 
 /// The head's weights, read once as f32.
-#[derive(Debug)]
 pub struct Head {
     n_embd: usize,
     n_heads: usize,
@@ -73,6 +72,46 @@ pub struct Head {
     gpu: Option<Arc<dyn VitStack>>,
 }
 
+impl std::fmt::Debug for Head {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Head")
+            .field("n_embd", &self.n_embd)
+            .field("n_heads", &self.n_heads)
+            .field("ffn", &self.ffn)
+            .field("eps", &self.eps)
+            .field("layers", &self.layers)
+            .field("is_accelerated", &self.is_accelerated())
+            .finish()
+    }
+}
+
+/// Rows `from..to` of a row-major tensor, as a weight of their own. The slice is by whole
+/// blocks, so a quantized tensor stays quantized.
+fn rows_of(w: &MmapWeight, from: usize, to: usize) -> Result<MmapWeight> {
+    ensure!(
+        w.cols.is_multiple_of(w.dtype.block_size()),
+        "a {:?} row is not a whole number of blocks",
+        w.dtype
+    );
+    ensure!(
+        from <= to && to <= w.rows,
+        "rows {from}..{to} are outside {} rows",
+        w.rows
+    );
+    let row_bytes = w.cols / w.dtype.block_size() * w.dtype.block_bytes();
+    let end = (to as u64) * (row_bytes as u64);
+    ensure!(
+        end <= w.data().len() as u64,
+        "rows {from}..{to} need {end} bytes, the tensor holds {}",
+        w.data().len()
+    );
+    Ok(MmapWeight::from_owned_bytes(
+        w.data()[from * row_bytes..to * row_bytes].to_vec(),
+        w.dtype,
+        to - from,
+        w.cols,
+    ))
+}
 impl Head {
     /// Whether a GGUF carries a d1 head.
     pub fn is_present(gguf: &GgufFile) -> bool {
@@ -169,26 +208,25 @@ impl Head {
     /// Run the transformer layers on the GPU `backend` names, when it is Metal (see
     /// [`build_vit_stack_native`]: on wgpu the host is faster). The scorer (a LayerNorm, one linear
     /// and a GELU on a handful of rows) stays on the host. A pass the device cannot take (more
-    /// rows than its buffers hold) runs on the host as before.
+    /// rows than its buffers hold) runs on the host as before. `gguf` must be the file the head
+    /// was loaded from (weights are matched by shape only).
     pub fn accelerate(&mut self, gguf: &Arc<GgufFile>, backend: BackendPreference) {
         if backend == BackendPreference::Cpu || self.layers.is_empty() {
             return;
         }
         let from_file = |i: usize, name: &str, rows: usize, cols: usize| -> Result<MmapWeight> {
-            let tensor = format!("d1.blk.{i}.{name}.weight");
-            let w = MmapWeight::from_gguf(gguf, &tensor)
-                .with_context(|| format!("the head needs the tensor `{tensor}`"))?;
-            ensure!(
-                w.rows == rows && w.cols == cols,
-                "`{tensor}` is {} x {}, expected {rows} x {cols}",
-                w.rows,
-                w.cols
-            );
-            Ok(w)
+            crate::d1::block_weight(gguf, "d1.blk", "head", i, name, rows, cols)
         };
         match self.stack_spec(from_file) {
-            Ok(spec) => self.gpu = build_vit_stack_native(&spec, backend),
-            Err(e) => tracing::warn!("the d1 head stays on the CPU: {e:#}"),
+            // A backend that cannot build must not clear a working stack: only `Some` sticks.
+            Ok(spec) => {
+                if let Some(stack) = build_vit_stack_native(&spec, backend) {
+                    self.gpu = Some(stack);
+                }
+            }
+            Err(e) => {
+                crate::d1::warn_cpu_fallback(format_args!("the d1 head stays on the CPU: {e:#}"))
+            }
         }
     }
 
@@ -197,29 +235,15 @@ impl Head {
         self.gpu.is_some()
     }
 
-    /// The layers as a GPU stack takes them. The packed `in_proj` becomes three linears (the
-    /// query, key and value rows of one tensor, copied out whole so a quantized tensor stays
-    /// quantized); `weight(layer, name)` supplies a layer's linear weight.
+    /// The layers as a GPU stack takes them. The packed `attn_qkv` (the source checkpoint's
+    /// `self_attn.in_proj`) becomes three linears (the query, key and value rows of one tensor,
+    /// copied out whole so a quantized tensor stays quantized); `weight(layer, name)` supplies
+    /// a layer's linear weight.
     fn stack_spec(
         &self,
         weight: impl Fn(usize, &str, usize, usize) -> Result<MmapWeight>,
     ) -> Result<VitStackSpec> {
         let (d, ff) = (self.n_embd, self.ffn);
-        // rows `from..to` of a row-major tensor, as a weight of their own
-        let rows_of = |w: &MmapWeight, from: usize, to: usize| -> Result<MmapWeight> {
-            ensure!(
-                w.cols.is_multiple_of(w.dtype.block_size()),
-                "a {:?} row is not a whole number of blocks",
-                w.dtype
-            );
-            let row_bytes = w.cols / w.dtype.block_size() * w.dtype.block_bytes();
-            Ok(MmapWeight::from_owned_bytes(
-                w.data()[from * row_bytes..to * row_bytes].to_vec(),
-                w.dtype,
-                to - from,
-                w.cols,
-            ))
-        };
         let mut blocks = Vec::with_capacity(self.layers.len());
         for (i, l) in self.layers.iter().enumerate() {
             let qkv = weight(i, "attn_qkv", 3 * d, d)?;
@@ -290,7 +314,9 @@ impl Head {
         if let Some(gpu) = &self.gpu {
             match gpu.run(&x, n) {
                 Ok(y) => on_gpu = Some(y),
-                Err(e) => tracing::warn!("the d1 head runs on the CPU for {n} rows: {e:#}"),
+                Err(e) => crate::d1::warn_cpu_fallback(format_args!(
+                    "the d1 head runs on the CPU for {n} rows: {e:#}"
+                )),
             }
         }
         let rows: Vec<&[f32]> = if let Some(y) = &on_gpu {
@@ -372,7 +398,7 @@ impl Head {
         *x = y;
     }
 
-    /// [`Self::attend`] for every row as a query, which is what the first layer needs.
+    /// [`Self::attend`] for every row as a query, which is what every layer but the last needs.
     ///
     /// The row-at-a-time form re-reads all of K and V for every query, so on a long prompt it
     /// is bound by memory traffic, not arithmetic. This hands blocks of queries to the blocked
@@ -385,6 +411,10 @@ impl Head {
         let heads = self.n_heads;
         let blocks = n.div_ceil(BLOCK);
         let scale = (HEAD_DIM as f32).powf(-0.5);
+        // Block-padded scratch by design: the `parallel`-off shim only offers fixed
+        // `par_chunks_mut`, so exact-sized blocks would need indexed parallel writes the
+        // facade deliberately lacks. The waste is one partial block of zeroing plus one
+        // Q-sized gather pass, small next to the kernel work.
         let mut q_cols = vec![0f32; blocks * d * BLOCK];
         q_cols
             .par_chunks_mut(d * BLOCK)
@@ -532,6 +562,8 @@ pub(crate) fn head_builder_default() -> crate::gguf::GgufBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::d1::noise;
+    use crate::model::vision_encoder_gpu::build_vit_stack;
 
     fn head(layers: usize) -> Head {
         let d = HEAD_DIM; // one head
@@ -594,10 +626,42 @@ mod tests {
         }
     }
 
-    fn noise(n: usize, seed: usize, scale: f32) -> Vec<f32> {
-        (0..n)
-            .map(|i| ((((i + seed) * 1_103_515_245 + 12_345) % 2000) as f32 / 1000.0 - 1.0) * scale)
-            .collect()
+    /// `rows_of` slices a quantized tensor by whole blocks: a Q8_0 tensor split into thirds
+    /// keeps each third's bytes and shape, and a row that is not a whole number of blocks is
+    /// refused.
+    #[test]
+    fn rows_of_keeps_quantized_blocks_whole() {
+        use crate::tensor::DType;
+        let (rows, cols) = (6usize, 64usize);
+        let row_bytes = cols / DType::Q8_0.block_size() * DType::Q8_0.block_bytes();
+        let mut data = vec![0u8; rows * row_bytes];
+        for (r, row) in data.chunks_exact_mut(row_bytes).enumerate() {
+            row.fill(r as u8);
+        }
+        let w = MmapWeight::from_owned_bytes(data.clone(), DType::Q8_0, rows, cols);
+        for (third, from) in [0usize, 2, 4].iter().enumerate() {
+            let part = rows_of(&w, *from, from + 2).unwrap();
+            assert_eq!((part.rows, part.cols, part.dtype), (2, cols, DType::Q8_0));
+            assert_eq!(
+                part.data(),
+                &data[from * row_bytes..(from + 2) * row_bytes],
+                "third {third}"
+            );
+        }
+        let bad = MmapWeight::from_owned_bytes(vec![0u8; 48 * 4], DType::Q8_0, 1, 48);
+        assert!(rows_of(&bad, 0, 1).is_err());
+        // bounds: past-the-end and inverted ranges refuse rather than panicking the slice
+        assert!(rows_of(&w, 0, rows + 1).is_err());
+        assert!(rows_of(&w, 4, 2).is_err());
+        // a short payload with consistent dims refuses on bytes, not on rows (`MmapWeight`
+        // has no `Debug`, so `expect_err` is unavailable; match instead)
+        let short =
+            MmapWeight::from_owned_bytes(vec![0u8; rows * row_bytes - 1], DType::Q8_0, rows, cols);
+        let err = match rows_of(&short, 0, rows) {
+            Ok(_) => panic!("short payload must refuse"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("need"), "{err}");
     }
 
     /// A head with two real layers: 128 wide, two heads of 64, deterministic weights.
@@ -634,40 +698,85 @@ mod tests {
         }
     }
 
-    /// The layers on a GPU score what the host layers do, over a row count that is not a
-    /// multiple of the attention tile and with markers anywhere (the host skips all but the
-    /// markers in the last layer, the GPU computes every row).
+    /// `accelerate` only lets `Some` stick: a backend that cannot build (here `Gpu`, which
+    /// the native router declines without touching a device) must not clear a working stack,
+    /// and `Cpu` is a no-op.
     #[test]
-    fn the_gpu_layers_match_the_host_layers() {
-        let mut head = busy_head();
-        let d = head.n_embd;
+    fn accelerate_keeps_last_good_stack() {
+        struct KeepStack;
+        impl VitStack for KeepStack {
+            fn run(&self, _x: &[f32], _n: usize) -> Result<Vec<f32>> {
+                unreachable!("the fake stack is never run")
+            }
+        }
+
+        let head = busy_head();
+        let (d, ffn) = (head.n_embd, head.ffn);
+        // the layer tensors `accelerate` reads (`d1.blk.{i}.{name}.weight`; dims are
+        // `[cols, rows]` in GGUF order)
+        let mut gguf = crate::gguf::GgufBuilder::new();
+        for i in 0..head.layers.len() {
+            for (name, rows, cols) in [
+                ("attn_qkv", 3 * d, d),
+                ("attn_output", d, d),
+                ("ffn_up", ffn, d),
+                ("ffn_down", d, ffn),
+            ] {
+                gguf = gguf.tensor_f32(
+                    format!("d1.blk.{i}.{name}.weight"),
+                    &[cols, rows],
+                    &vec![0.0f32; rows * cols],
+                );
+            }
+        }
+        let gguf = Arc::new(gguf.build());
+
+        let mut kept = busy_head();
+        kept.gpu = Some(Arc::new(KeepStack));
+        kept.accelerate(&gguf, BackendPreference::Gpu);
+        assert!(
+            kept.is_accelerated(),
+            "a backend that cannot build must not clear a working stack"
+        );
+        let mut fresh = busy_head();
+        fresh.accelerate(&gguf, BackendPreference::Cpu);
+        assert!(!fresh.is_accelerated());
+    }
+
+    /// `accelerate` on a head without layers is a no-op: nothing to move, no device touched.
+    #[test]
+    fn accelerate_without_layers_is_a_noop() {
+        let gguf = Arc::new(crate::gguf::GgufBuilder::new().build());
+        let mut h = head(0);
+        assert!(h.layers.is_empty());
+        h.accelerate(&gguf, BackendPreference::Gpu);
+        assert!(!h.is_accelerated());
+    }
+
+    /// A `Relu` stack spec over `head`'s layers, for the GPU-vs-host parity legs.
+    fn relu_spec(head: &Head) -> VitStackSpec {
         let owned = |w: &[f32], rows: usize, cols: usize| {
-            MmapWeight::from_owned_bytes(
-                w.iter().flat_map(|v| v.to_le_bytes()).collect(),
-                crate::tensor::DType::F32,
-                rows,
-                cols,
-            )
+            MmapWeight::from_owned_f32(w.to_vec(), rows, cols)
         };
-        let spec = head
-            .stack_spec(|i, name, rows, cols| {
-                let l = &head.layers[i];
-                let w = match name {
-                    "attn_qkv" => &l.qkv_w,
-                    "attn_output" => &l.out_w,
-                    "ffn_up" => &l.up_w,
-                    "ffn_down" => &l.down_w,
-                    other => panic!("{other}"),
-                };
-                assert_eq!(w.len(), rows * cols);
-                Ok(owned(w, rows, cols))
-            })
-            .unwrap();
-        let Some(gpu) = build_vit_stack_native(&spec, BackendPreference::Auto) else {
-            eprintln!("SKIPPED: no Metal device is available");
-            return;
-        };
-        for n in [3usize, 40, 300, 777] {
+        head.stack_spec(|i, name, rows, cols| {
+            let l = &head.layers[i];
+            let w = match name {
+                "attn_qkv" => &l.qkv_w,
+                "attn_output" => &l.out_w,
+                "ffn_up" => &l.up_w,
+                "ffn_down" => &l.down_w,
+                other => panic!("{other}"),
+            };
+            assert_eq!(w.len(), rows * cols);
+            Ok(owned(w, rows, cols))
+        })
+        .unwrap()
+    }
+
+    /// Assert a GPU stack scores what the host layers do, for each row count and type.
+    fn assert_gpu_layers_match_host(head: &mut Head, gpu: &Arc<dyn VitStack>, ns: &[usize]) {
+        let d = head.n_embd;
+        for &n in ns {
             let hidden = noise(n * d, 5, 1.0);
             let markers = [0, n / 3, n - 1];
             for kind in 0..TYPES {
@@ -683,6 +792,46 @@ mod tests {
                 }
             }
         }
+    }
+
+    /// The layers on a GPU score what the host layers do, over a row count that is not a
+    /// multiple of the attention tile and with markers anywhere (the host skips all but the
+    /// markers in the last layer, the GPU computes every row).
+    #[test]
+    fn the_gpu_layers_match_the_host_layers() {
+        let mut head = busy_head();
+        let spec = relu_spec(&head);
+        let Some(gpu) = build_vit_stack_native(&spec, BackendPreference::Auto) else {
+            // Metal-only stack: CERA_REQUIRE_GPU is set on non-Metal GPU hosts too (the
+            // lavapipe leg), where skipping is correct; only the Metal flag forces this test.
+            assert!(
+                std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1"),
+                "CERA_REQUIRE_METAL=1 is set but no Metal device is available"
+            );
+            eprintln!("SKIPPED: no Metal device is available");
+            return;
+        };
+        assert_gpu_layers_match_host(&mut head, &gpu, &[3, 40, 300, 777]);
+    }
+
+    /// The wgpu ReLU path scores what the host layers do: `WgpuVitOps::relu` has no production
+    /// caller (the head builds Metal-only), so without this leg a wrong bind order or param
+    /// word would surface only if head routing ever enables wgpu.
+    #[test]
+    fn the_wgpu_relu_layers_match_the_host_layers() {
+        let mut head = busy_head();
+        let spec = relu_spec(&head);
+        let Some(gpu) = build_vit_stack(&spec, BackendPreference::Gpu) else {
+            assert!(
+                std::env::var("CERA_REQUIRE_GPU")
+                    .unwrap_or_default()
+                    .is_empty(),
+                "CERA_REQUIRE_GPU is set but no wgpu adapter is available"
+            );
+            eprintln!("SKIPPED: no wgpu adapter is available");
+            return;
+        };
+        assert_gpu_layers_match_host(&mut head, &gpu, &[3, 40, 300]);
     }
 
     #[test]

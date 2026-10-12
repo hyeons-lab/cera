@@ -13,6 +13,7 @@
 // Both kernels cover rows * hs elements one thread each, over a 2-D grid of workgroups of 256
 // (a single dimension tops out at 65535 workgroups, 16.7M elements).
 
+// Must equal BIDIR_GRID_X in `gpu_lfm2.rs` (host grid geometry).
 const GRID_X: u32 = 32768u;
 
 // ── bidir_split ──────────────────────────────────────────────────────────────

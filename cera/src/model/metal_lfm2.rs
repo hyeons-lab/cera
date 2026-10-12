@@ -3931,7 +3931,13 @@ impl Model for MetalLfmModel {
     }
 
     fn supports_hidden_states(&self) -> bool {
-        true
+        // `hidden_states` routes a bidirectional model through the bidirectional trunk, which
+        // has no routed-FFN path: only causal and dense models qualify.
+        self.config.is_causal
+            || self
+                .layers
+                .iter()
+                .all(|l| matches!(l.ffn, MetalFfn::Dense(_)))
     }
 
     /// Per-token post-final-norm hidden states, row-major `[n * hidden_size]`
@@ -3963,13 +3969,7 @@ impl Model for MetalLfmModel {
         // below is causal by construction.
         if !self.config.is_causal {
             let mut embeddings = vec![0.0f32; tokens.len() * hs];
-            for (row, &token) in embeddings.chunks_exact_mut(hs).zip(tokens) {
-                assert!(
-                    (token as usize) < vocab,
-                    "token_id {token} out of range (vocab_size={vocab})"
-                );
-                self.dequant_embedding_row(token as usize, row);
-            }
+            self.embed_tokens(tokens, &mut embeddings);
             return self.bidirectional_trunk(&embeddings, 0);
         }
 
@@ -4025,9 +4025,14 @@ impl Model for MetalLfmModel {
         out
     }
 
-    /// Only a bidirectional model reads a media prefix this way.
+    /// Only a bidirectional model reads a media prefix this way, and only a dense one:
+    /// the bidirectional trunk has no routed-FFN path.
     fn supports_media_prefix(&self) -> bool {
         !self.config.is_causal
+            && self
+                .layers
+                .iter()
+                .all(|l| matches!(l.ffn, MetalFfn::Dense(_)))
     }
 
     fn hidden_states_with_prefix(
@@ -4046,21 +4051,13 @@ impl Model for MetalLfmModel {
             prefix.len().is_multiple_of(hs),
             "the media prefix is not a whole number of rows"
         );
-        assert!(
-            !tokens.is_empty(),
-            "hidden_states_with_prefix requires at least one token"
-        );
+        if prefix.is_empty() && tokens.is_empty() {
+            return Vec::new();
+        }
         let prefix_rows = prefix.len() / hs;
         let mut embeddings = vec![0.0f32; prefix.len() + tokens.len() * hs];
         embeddings[..prefix.len()].copy_from_slice(prefix);
-        for (row, &token) in embeddings[prefix.len()..].chunks_exact_mut(hs).zip(tokens) {
-            assert!(
-                (token as usize) < self.config.vocab_size,
-                "token_id {token} out of range (vocab_size={})",
-                self.config.vocab_size
-            );
-            self.dequant_embedding_row(token as usize, row);
-        }
+        self.embed_tokens(tokens, &mut embeddings[prefix.len()..]);
         let mut out = self.bidirectional_trunk(&embeddings, prefix_rows);
         out.drain(..prefix.len());
         out
@@ -5820,6 +5817,20 @@ impl MetalLfmModel {
 }
 
 impl MetalLfmModel {
+    /// Dequant `tokens` into `out` (`[tokens.len(), hidden]`).
+    fn embed_tokens(&self, tokens: &[u32], out: &mut [f32]) {
+        let hs = self.config.hidden_size;
+        let vocab = self.config.vocab_size;
+        assert_eq!(out.len(), tokens.len() * hs);
+        for (row, &token) in out.chunks_exact_mut(hs).zip(tokens) {
+            assert!(
+                (token as usize) < vocab,
+                "token_id {token} out of range (vocab_size={vocab})"
+            );
+            self.dequant_embedding_row(token as usize, row);
+        }
+    }
+
     /// The bidirectional trunk over embeddings `embeddings` (`[n, hidden]`) whose first
     /// `prefix` rows are media embeddings; returns the post-final-norm hidden state of every
     /// row, `[n, hidden]`.
@@ -5855,6 +5866,14 @@ impl MetalLfmModel {
             .unwrap_or(0);
         let is = cfg.intermediate_size;
         let f32_bytes = |floats: usize| (floats * 4) as u64;
+        // The widest scratch of a pass (a projection, or one activation) still fits a Metal
+        // buffer, mirroring the wgpu trunk's gate. The feed-forward intermediate is not listed:
+        // it is chunked through the pre-sized prefill buffers below, never materialized whole.
+        let widest_bytes = f32_bytes(n * (3 * hs).max(q_dim).max(kv_dim_max));
+        assert!(
+            widest_bytes <= self.ctx.device.max_buffer_length(),
+            "the {n}-row bidirectional trunk needs a {widest_bytes}-byte scratch, over the Metal buffer limit"
+        );
         let h_buf = self.ctx.create_buffer(f32_bytes(n * hs));
         let normed = self.ctx.create_buffer(f32_bytes(n * hs.max(q_dim)));
         let scratch = self.ctx.create_buffer(f32_bytes(n * hs));
@@ -8064,8 +8083,9 @@ mod prefill_qpt_tests {
     }
 }
 
-/// The bidirectional trunk against the CPU one on a tiny non-causal model: one short-conv block
-/// and one attention block, so both the centred convolution and the unmasked attention run.
+/// The bidirectional trunk against the CPU one on a tiny non-causal model: one short-conv
+/// block and two attention blocks, so both the centred convolution and the unmasked
+/// attention run.
 #[cfg(test)]
 mod bidirectional_tests {
     use super::MetalLfmModel;
@@ -8080,11 +8100,39 @@ mod bidirectional_tests {
         dot / (norm(a) * norm(b))
     }
 
+    /// An empty prefix with empty tokens yields no rows instead of tripping the trunk's
+    /// non-empty precondition: the contract promises `tokens.len()` rows unconditionally.
+    #[test]
+    fn empty_prefix_and_tokens_yield_no_rows() {
+        let Some((cpu, metal)) = models(false) else {
+            return;
+        };
+        let mut cpu_state = InferenceState::for_prefill(cpu.config(), 0).unwrap();
+        let mut state = InferenceState::for_prefill(metal.config(), 0).unwrap();
+        assert!(
+            cpu.hidden_states_with_prefix(&[], &[], &mut cpu_state)
+                .is_empty()
+        );
+        assert!(
+            metal
+                .hidden_states_with_prefix(&[], &[], &mut state)
+                .is_empty()
+        );
+    }
+
     fn models(q8: bool) -> Option<(LfmModel, MetalLfmModel)> {
-        let cpu = LfmModel::from_gguf(bidirectional_gguf(q8), 256).unwrap();
-        let metal = match MetalLfmModel::from_gguf(bidirectional_gguf(q8), None, 256) {
+        // context 4096 (the fixture max): the whole-sequence leg below runs 2600 rows, past one
+        // 2048-row FFN chunk, so the chunk loop takes a second iteration with x_off > 0
+        let cpu = LfmModel::from_gguf(bidirectional_gguf(q8), 4096).unwrap();
+        let metal = match MetalLfmModel::from_gguf(bidirectional_gguf(q8), None, 4096) {
             Ok(m) => m,
             Err(e) => {
+                // Metal-only tests: only the Metal flag forces them (CERA_REQUIRE_GPU is set
+                // on non-Metal GPU legs too, where skipping is correct).
+                assert!(
+                    std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1"),
+                    "CERA_REQUIRE_METAL=1 is set but no Metal device is available ({e})"
+                );
                 eprintln!("SKIPPED: no Metal device ({e})");
                 return None;
             }
@@ -8126,6 +8174,16 @@ mod bidirectional_tests {
                 .map(|(a, b)| (a - b).abs())
                 .fold(0.0f32, f32::max);
             assert!(drift > 1e-4, "row 0 ignored the last token ({drift})");
+            // 2600 rows span two FFN chunks (ffn_rows = 2048): a second chunk-loop iteration
+            // with a nonzero row offset, mirroring the wgpu twin's multi-chunk leg
+            let long: Vec<u32> = (0..2600)
+                .map(|i| [3u32, 7, 9, 12, 5, 21, 8, 30, 1][i % 9])
+                .collect();
+            let mut state = InferenceState::for_prefill(cpu.config(), long.len()).unwrap();
+            let want = cpu.hidden_states(&long, &mut state);
+            let mut state = InferenceState::for_prefill(metal.config(), long.len()).unwrap();
+            let got = metal.hidden_states(&long, &mut state);
+            rows_agree(&format!("q8={q8} n=2600"), &want, &got);
         }
     }
 

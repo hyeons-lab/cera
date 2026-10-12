@@ -1934,6 +1934,10 @@ impl AudioGpuEncode for HexagonAudioEncoder {
     fn encode_pcm(&self, pcm: &[f32]) -> anyhow::Result<(Vec<f32>, usize)> {
         Ok(self.encode(pcm)?)
     }
+
+    fn encode_mel(&self, mel: &[f32], n_frames: usize) -> anyhow::Result<(Vec<f32>, usize)> {
+        Ok(HexagonAudioEncoder::encode_mel(self, mel, n_frames)?)
+    }
 }
 
 /// Longest sequence the NPU encoder is sized for (frames after the stem's 8x

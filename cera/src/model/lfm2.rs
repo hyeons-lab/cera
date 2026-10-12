@@ -5235,6 +5235,9 @@ impl Model for LfmModel {
             prefix.len().is_multiple_of(hs),
             "the media prefix is not a whole number of rows"
         );
+        if prefix.is_empty() && tokens.is_empty() {
+            return Vec::new();
+        }
         let prefix_rows = prefix.len() / hs;
         let mut h = Vec::with_capacity(prefix.len() + tokens.len() * hs);
         h.extend_from_slice(prefix);
@@ -6676,6 +6679,20 @@ pub(crate) mod bidirectional_float_tests {
         let mut h = embeddings(prefix_rows, prefix_seed);
         h.extend(embeddings(text_rows, text_seed));
         model.float_trunk(h, prefix_rows)
+    }
+
+    /// An empty prefix with empty tokens yields no rows instead of tripping the trunk's
+    /// non-empty precondition: the contract promises `tokens.len()` rows unconditionally.
+    #[test]
+    fn empty_prefix_and_tokens_yield_no_rows() {
+        use crate::kv_cache::InferenceState;
+        let model = LfmModel::from_gguf(bidirectional_gguf(false), 256).unwrap();
+        let mut state = InferenceState::for_prefill(model.config(), 0).unwrap();
+        assert!(
+            model
+                .hidden_states_with_prefix(&[], &[], &mut state)
+                .is_empty()
+        );
     }
 
     /// A media prefix is a function of the media alone: its rows attend only to each other and
