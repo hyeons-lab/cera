@@ -4198,10 +4198,20 @@ impl LfmModel {
                                 let n_qb = n.div_ceil(Q_ITEM);
                                 let flash_ptr = flash_buf.as_mut_ptr() as usize;
                                 // One slot per item: the pool hands each worker a disjoint row of
-                                // `tickets`; the real output goes through `flash_ptr`.
-                                let mut tickets = vec![0.0f32; n_heads * n_qb];
+                                // `tickets`; the real output goes through `flash_ptr`. Use a stack
+                                // buffer to avoid heap allocation across layer loops for prompts up
+                                // to 1024 tokens.
+                                let total_items = n_heads * n_qb;
+                                let mut stack_tickets = [0.0f32; 512];
+                                let mut heap_tickets;
+                                let tickets: &mut [f32] = if total_items <= stack_tickets.len() {
+                                    &mut stack_tickets[..total_items]
+                                } else {
+                                    heap_tickets = vec![0.0f32; total_items];
+                                    &mut heap_tickets
+                                };
                                 cpu::par_rows_n_chunked_active(
-                                    &mut tickets,
+                                    tickets,
                                     1,
                                     1,
                                     1,

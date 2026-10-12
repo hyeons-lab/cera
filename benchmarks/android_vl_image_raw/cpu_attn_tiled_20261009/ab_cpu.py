@@ -2,7 +2,7 @@
 """Thermally gated CPU prefill A/B for the register-tiled prefill attention: the previous kernel (CERA_CPU_ATTN_TILED=0), the tiled kernel
 over whole heads (cera-attn, built before the query-block work items) and the tiled kernel over (head, 32-query) work items (cera-attn2),
 against llama-bench CPU, at several prompt lengths."""
-import csv, io, json, os, re, statistics as st, subprocess, sys, time
+import csv, io, json, os, re, subprocess, sys, time
 SERIAL = os.environ["SERIAL"]; OUT = sys.argv[1]; ROUNDS = int(sys.argv[2]); BIN = sys.argv[3]
 LENS = [int(x) for x in sys.argv[4].split(",")]
 AP_MAX_C = 28.0

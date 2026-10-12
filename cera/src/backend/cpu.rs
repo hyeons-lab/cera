@@ -2175,12 +2175,19 @@ thread_local! {
         const { std::cell::Cell::new(None) };
 }
 
+/// Parse the `CERA_CPU_ATTN_TILED` environment variable string.
+#[cfg(target_arch = "aarch64")]
+fn parse_attn_tiled_env(val: Option<&str>) -> bool {
+    val.map(str::trim) != Some("0")
+}
+
 /// Whether the NEON prefill attention uses the register-tiled kernel (on by default;
 /// `CERA_CPU_ATTN_TILED=0` keeps the previous one, the A/B switch).
 #[cfg(target_arch = "aarch64")]
 fn attn_tiled_enabled() -> bool {
     static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("CERA_CPU_ATTN_TILED").as_deref() != Ok("0"))
+    *ENABLED
+        .get_or_init(|| parse_attn_tiled_env(std::env::var("CERA_CPU_ATTN_TILED").as_deref().ok()))
 }
 
 /// Whether the smmla Q4_0 GEMMs run on tile-interleaved activations (on by default;
@@ -7161,7 +7168,7 @@ pub fn flash_attention_gqa_cpu_opt(
 pub fn flash_attention_range_supported(head_dim: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
     {
-        head_dim.is_multiple_of(4) && head_dim <= 128 && attn_tiled_enabled()
+        head_dim > 0 && head_dim.is_multiple_of(4) && head_dim <= 128 && attn_tiled_enabled()
     }
     #[cfg(not(target_arch = "aarch64"))]
     {
@@ -7197,7 +7204,18 @@ pub fn flash_attention_gqa_cpu_opt_range(
     q_lo: usize,
     q_hi: usize,
 ) {
-    debug_assert!(flash_attention_range_supported(head_dim));
+    assert!(
+        flash_attention_range_supported(head_dim),
+        "flash_attention_range_supported({head_dim}) must be true"
+    );
+    assert!(
+        q_lo <= q_hi && q_hi <= n_queries,
+        "bad query range {q_lo}..{q_hi} for n_queries={n_queries}"
+    );
+    assert!(
+        out.len() >= group_size * (q_hi - q_lo) * head_dim,
+        "out buffer too small for contiguous [group_size, q_hi - q_lo, head_dim] output"
+    );
     #[cfg(target_arch = "aarch64")]
     unsafe {
         flash_attention_gqa_neon_tiled(
@@ -13733,6 +13751,53 @@ mod tests {
                 "causal={causal}"
             );
         }
+    }
+
+    #[test]
+    fn flash_range_supported_dimensions() {
+        // Zero head dim must never be reported as supported.
+        assert!(!flash_attention_range_supported(0));
+        // Odd and non-multiple-of-4 dimensions are unsupported.
+        assert!(!flash_attention_range_supported(1));
+        assert!(!flash_attention_range_supported(3));
+        assert!(!flash_attention_range_supported(62));
+        assert!(!flash_attention_range_supported(63));
+        // Greater than 128 is unsupported.
+        assert!(!flash_attention_range_supported(132));
+        assert!(!flash_attention_range_supported(256));
+
+        #[cfg(target_arch = "aarch64")]
+        {
+            assert!(flash_attention_range_supported(4));
+            assert!(flash_attention_range_supported(20));
+            assert!(flash_attention_range_supported(40));
+            assert!(flash_attention_range_supported(64));
+            assert!(flash_attention_range_supported(128));
+
+            // Verify env parsing with whitespace and disabled switch.
+            assert!(!parse_attn_tiled_env(Some("0")));
+            assert!(!parse_attn_tiled_env(Some(" 0 ")));
+            assert!(!parse_attn_tiled_env(Some("0\n")));
+            assert!(parse_attn_tiled_env(Some("1")));
+            assert!(parse_attn_tiled_env(Some("")));
+            assert!(parse_attn_tiled_env(None));
+        }
+
+        #[cfg(not(target_arch = "aarch64"))]
+        {
+            assert!(!flash_attention_range_supported(64));
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[should_panic(expected = "bad query range")]
+    fn flash_range_panics_on_inverted_range() {
+        let mut out = [0.0f32; 64];
+        let dummy = [0.0f32; 64];
+        flash_attention_gqa_cpu_opt_range(
+            &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 1, 0,
+        );
     }
 
     /// One core, prefill-shaped (hd 64, one head, stride-n Q): GFLOPS of both NEON kernels.
