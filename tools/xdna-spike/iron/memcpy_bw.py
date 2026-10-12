@@ -1,10 +1,13 @@
 # Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# Adapted for cera tools/xdna-spike from mlir-aie
-# programming_examples/getting_started/00_memcpy/memcpy.py.
-# Compile-only wrapper around getting_started/00_memcpy: transform_parallel
-# over every shim DMA in/out pair (num_channels=2), library passthrough kernel.
+# Modified for cera tools/xdna-spike from mlir-aie v1.4.3
+# programming_examples/getting_started/00_memcpy/memcpy.py. The design body
+# (transform_parallel over every shim DMA in/out pair, num_channels=2, library
+# passthrough kernel) is upstream's; the changes are that the transfer size is
+# a compile-time CLI argument and that main() compiles through run_design_cli,
+# so --xclbin-path/--insts-path write artifacts instead of running through the
+# JIT, and the element type is fixed to int32.
 import argparse
 
 import aie.iron as iron

@@ -42,6 +42,8 @@ def q4gemv(w: In, x: In, out: Out, *, M: CompileTime[int], K: CompileTime[int]):
     rows_per_worker = M // workers_n
     tiles_per_worker = rows_per_worker // ROWS
     outs_per_worker = tiles_per_worker // OUT_TILES
+    if K % 64:
+        raise ValueError("K must be a multiple of 64 (q4gemv.cc copies x 64 bytes at a time)")
     if outs_per_worker < 2:
         raise ValueError("need at least 2 output elements per worker (M >= 8192 on npu2)")
 

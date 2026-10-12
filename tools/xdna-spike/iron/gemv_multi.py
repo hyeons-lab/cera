@@ -2,12 +2,16 @@
 # Copyright (C) 2025-2026 Advanced Micro Devices, Inc.
 # SPDX-License-Identifier: Apache-2.0 WITH LLVM-exception
 #
-# Modified for cera tools/xdna-spike: n_cores and n_cols are parameters, and the
-# runtime sequence issues every A fill before waiting on any output drain.
-"""Matrix-vector multiply — IRON API design with ``@iron.jit`` compilation.
+# Modified for cera tools/xdna-spike from mlir-aie v1.4.3
+# programming_examples/basic/matrix_multiplication/matrix_vector/matrix_vector.py:
+# n_cores and n_cols are parameters (upstream fixes one core), and the runtime
+# sequence issues every A fill before waiting on any output drain.
+"""Matrix-vector multiply, an IRON API design with ``@iron.jit`` compilation.
 
-A single AIE compute core computes ``c = A @ b`` (M-row matrix x K-vector).
-Default config: ``M=K=288``, kernel tile ``m=k=32``, vectorized mv kernel.
+``n_cores`` AIE compute cores each compute ``M / n_cores`` rows of
+``c = A @ b`` (M-row int16 matrix x K-vector, int32 out). ``n_cols`` sets
+the device partition width; IRON's placer chooses which columns the cores
+land in. Kernel tile ``m=k=32``, vectorized mv kernel.
 """
 
 import argparse
@@ -176,6 +180,7 @@ def _run_and_verify(opts):
         k=opts.k,
         vectorized=not opts.scalar,
         use_chess=bool(opts.use_chess),
+        n_cores=opts.n_cores,
         warmup=opts.warmup,
         iters=opts.iters,
     )

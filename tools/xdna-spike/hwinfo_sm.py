@@ -6,10 +6,14 @@ window open. The free edition turns the option off after 12 hours.
     python hwinfo_sm.py list [--type power]
     python hwinfo_sm.py idle <seconds> --match "<label substring>" [--match ...]
     python hwinfo_sm.py run --match "<label substring>" [--match ...] -- <command ...>
+    add --steady "<label substring>>=<value>" to also summarize only the samples
+    where that reading is at least <value> (for example the NPU's usage), which
+    excludes host-side setup before the device is busy
 
 `idle` and `run` sample the matched readings every --interval seconds (HWiNFO's
-own polling period bounds how often values change) and report mean, min and
-max watts, plus energy as the trapezoid integral over the run. `run` also
+own polling period bounds how often values change) and report the mean, min
+and max of each in its own unit, plus energy (the trapezoid integral) for
+readings in watts. `run` also
 prints the command's own output and wall time. --csv writes every sample.
 
 While `idle` or `run` is active the process asks Windows to stay awake with the
@@ -97,18 +101,24 @@ class SharedMemory:
         k32.CloseHandle(self.h)
 
 
+def sensor_name(sensors, idx):
+    """Display name of a sensor: the user-set name if any, else the original."""
+    return sensors[idx][3] or sensors[idx][2]
+
+
 def select(sm, patterns):
     sensors = sm.sensors()
+    readings = sm.readings()
     chosen = []
     for pat in patterns:
-        hits = [(i, r) for i, r in enumerate(sm.readings()) if pat.lower() in r[3].lower()]
+        hits = [(i, r) for i, r in enumerate(readings) if pat.lower() in r[3].lower()]
         if not hits:
             sys.exit(f"no reading label contains {pat!r}; run `list` to see them")
         if len(hits) > 1:
-            names = "; ".join(f"[{sensors[r[1]][3] or sensors[r[1]][2]}] {r[3]}" for _, r in hits)
+            names = "; ".join(f"[{sensor_name(sensors, r[1])}] {r[3]}" for _, r in hits)
             sys.exit(f"{pat!r} matches {len(hits)} readings, be more specific: {names}")
         i, r = hits[0]
-        chosen.append((i, f"[{sensors[r[1]][3] or sensors[r[1]][2]}] {r[3]}", r[4]))
+        chosen.append((i, f"[{sensor_name(sensors, r[1])}] {r[3]}", r[4]))
     return chosen
 
 
@@ -122,15 +132,29 @@ def sample(sm, chosen, interval, stop, rows):
     rows.append((time.perf_counter() - t0, [rd[i][5] for i, _, _ in chosen]))
 
 
-def summarize(chosen, rows, csv_path):
-    print(f"samples: {len(rows)} over {rows[-1][0] - rows[0][0]:.2f} s")
+def print_stats(chosen, rows, prefix="", with_energy=True):
     for k, (_, name, unit) in enumerate(chosen):
         vals = [r[1][k] for r in rows]
-        energy = sum((rows[j + 1][0] - rows[j][0]) * (vals[j] + vals[j + 1]) / 2 for j in range(len(rows) - 1))
-        line = f"{name}: mean {sum(vals) / len(vals):.2f}  min {min(vals):.2f}  max {max(vals):.2f} {unit}"
-        if unit.upper() == "W":
+        line = f"{prefix}{name}: mean {sum(vals) / len(vals):.2f}  min {min(vals):.2f}  max {max(vals):.2f} {unit}"
+        if with_energy and unit.upper() == "W":
+            energy = sum((rows[j + 1][0] - rows[j][0]) * (vals[j] + vals[j + 1]) / 2 for j in range(len(rows) - 1))
             line += f"  energy {energy:.2f} J"
         print(line)
+
+
+def summarize(chosen, rows, csv_path, steady=None):
+    print(f"samples: {len(rows)} over {rows[-1][0] - rows[0][0]:.2f} s")
+    print_stats(chosen, rows)
+    if steady:
+        k, threshold = steady
+        sub = [r for r in rows if r[1][k] >= threshold]
+        if sub:
+            print(f"steady ({chosen[k][1]} >= {threshold:g}): {len(sub)} samples, {sub[0][0]:.1f} to {sub[-1][0]:.1f} s")
+            # No energy here: the subset can have gaps, and integrating across
+            # them would count the non-steady time as steady.
+            print_stats(chosen, sub, prefix="steady ", with_energy=False)
+        else:
+            print(f"steady: no sample has {chosen[k][1]} >= {threshold:g}")
     if csv_path:
         with open(csv_path, "w") as f:
             f.write("t_s," + ",".join(f'"{n}"' for _, n, _ in chosen) + "\n")
@@ -151,7 +175,18 @@ def main():
     p.add_argument("--match", action="append", default=[])
     p.add_argument("--interval", type=float, default=0.1)
     p.add_argument("--csv")
+    p.add_argument("--steady", help='idle/run: "<label substring>>=<value>", also summarize only those samples')
     a = p.parse_args(argv)
+    if a.mode == "run" and not cmd:
+        sys.exit("run needs a command after --")
+    steady_label = steady_value = None
+    if a.steady:
+        if ">=" not in a.steady:
+            sys.exit('--steady must look like "<label substring>>=<value>"')
+        steady_label, v = a.steady.rsplit(">=", 1)
+        steady_value = float(v)
+        if steady_label not in a.match:
+            a.match.append(steady_label)
 
     sm = SharedMemory()
     if a.mode == "list":
@@ -161,29 +196,33 @@ def main():
             t = READING_TYPES.get(rtype, str(rtype))
             if a.type and t != a.type:
                 continue
-            s = sensors[sidx]
-            print(f"{t:8} [{s[3] or s[2]}] {label} = {val:.3f} {unit}")
+            print(f"{t:8} [{sensor_name(sensors, sidx)}] {label} = {val:.3f} {unit}")
         return
     if not a.match:
         sys.exit("--match is required for idle and run")
     chosen = select(sm, a.match)
+    steady = (a.match.index(steady_label), steady_value) if a.steady else None
     keep_awake(True)
     rows, stop = [], threading.Event()
-    th = threading.Thread(target=sample, args=(sm, chosen, a.interval, stop, rows))
+    th = threading.Thread(target=sample, args=(sm, chosen, a.interval, stop, rows), daemon=True)
     th.start()
     rc = 0
-    if a.mode == "idle":
-        time.sleep(a.seconds)
-    else:
-        if not cmd:
-            sys.exit("run needs a command after --")
-        t0 = time.perf_counter()
-        rc = subprocess.call(cmd)
-        print(f"command wall time: {time.perf_counter() - t0:.3f} s, exit {rc}")
-    stop.set()
-    th.join()
-    keep_awake(False)
-    summarize(chosen, rows, a.csv)
+    try:
+        if a.mode == "idle":
+            time.sleep(a.seconds)
+        else:
+            t0 = time.perf_counter()
+            try:
+                rc = subprocess.call(cmd)
+            except OSError as e:
+                print(f"cannot run {cmd[0]}: {e}", file=sys.stderr)
+                rc = 127
+            print(f"command wall time: {time.perf_counter() - t0:.3f} s, exit {rc}")
+    finally:
+        stop.set()
+        th.join()
+        keep_awake(False)
+    summarize(chosen, rows, a.csv, steady)
     sm.close()
     sys.exit(rc)
 

@@ -30,7 +30,6 @@
 alignas(64) static int8_t x_q[KMAX];
 static float x_d[KMAX / QBLK];
 
-
 // The first element of each worker's stream carries x: K int8 values, then
 // K/32 f32 scales. Copy it into core-local memory so the stream buffers stay
 // free for weight tiles.
