@@ -758,7 +758,6 @@ mod tests {
         let owned = |w: &[f32], rows: usize, cols: usize| {
             MmapWeight::from_owned_f32(w.to_vec(), rows, cols)
         };
-<<<<<<< HEAD
         head.stack_spec(|i, name, rows, cols| {
             let l = &head.layers[i];
             let w = match name {
@@ -805,6 +804,10 @@ mod tests {
         // Metal's matrix-unit attention and wgpu's register-tiled flash kernel
         for backend in [BackendPreference::Metal, BackendPreference::Gpu] {
             let Some(gpu) = build_vit_stack_fast(&spec, backend) else {
+                // `None` conflates no GPU with a flash-gate refusal; under the require flag
+                // (the lavapipe leg, whose adapter runs flash) either is a failure, not a
+                // skip. Inline env read: this ungated test compiles without the `gpu`
+                // feature, where the `backend::wgpu` helper does not exist.
                 if backend == BackendPreference::Gpu {
                     assert!(
                         std::env::var("CERA_REQUIRE_FLASH")

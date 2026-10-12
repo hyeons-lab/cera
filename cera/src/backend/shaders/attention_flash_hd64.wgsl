@@ -29,8 +29,10 @@
 //   1 k       array<vec4<f32>>   [tokens, n_kv_head * 64]
 //   2 v       array<vec4<f32>>   [tokens, n_kv_head * 64]
 //   3 out     array<vec4<f32>>   [tokens, n_head * 64], read_write
-//   4 params  array<u32, 8>      tokens, n_head, head_dim (64), scale_bits, n_kv_head,
-//                                bidir, prefix_rows, first_query_tile
+//   4 params  array<u32, 8>      tokens, n_head, head_dim (must be 64, checked
+//                                host-side; the kernel hardwires HD and never reads
+//                                this slot), scale_bits, n_kv_head, bidir,
+//                                prefix_rows, first_query_tile
 //
 // A query reads the first `window(row)` keys: all `tokens` of them, or with `bidir` set and a
 // non-zero `prefix_rows`, a query inside the prefix reads only the prefix (a media prefix is a
@@ -38,10 +40,11 @@
 // packed f16 cache and has its own kernel (`attention_prefill.wgsl`).
 //
 // Dispatch: (ceil(tokens / 32), n_head, 1) workgroups of 128 threads, or any run of query tiles
-// of that grid starting at `first_query_tile`. Workgroup memory is about
-// 30 KB, so it is the one workgroup resident per core on Apple GPUs; the staging is cheap enough
-// that this has not mattered. On an Adreno 830 it runs at about 0.22 TFLOPS and is correct to 1e-6;
-// a call of seconds there loses the device, so the host issues long calls in short pieces.
+// of that grid starting at `first_query_tile`. Workgroup memory is 30336 B, so it is the one
+// workgroup resident per core on Apple GPUs; the staging is cheap enough that this has not
+// mattered. On an Adreno 830 it runs at about 0.22 TFLOPS and measured correct to 1e-6 (the
+// committed test pins 1e-4 to 2100 rows); a call of seconds there loses the device, so the host
+// issues long calls in short pieces.
 
 const QT: u32 = 32u;
 const KT: u32 = 32u;
@@ -53,9 +56,11 @@ const LOG2E: f32 = 1.4426950408889634;
 @group(0) @binding(1) var<storage, read> k: array<vec4<f32>>;
 @group(0) @binding(2) var<storage, read> v: array<vec4<f32>>;
 @group(0) @binding(3) var<storage, read_write> out: array<vec4<f32>>;
-// tokens, n_head, head_dim, scale_bits, n_kv_head, bidir, prefix_rows, _
+// tokens, n_head, head_dim, scale_bits, n_kv_head, bidir, prefix_rows, first_query_tile
 @group(0) @binding(4) var<storage, read> params: array<u32, 8>;
 
+// Workgroup memory is 30336 B in all (8192 + 8192 + 8704 + 4096 + 512 + 128 + 512),
+// which the host gate (`FLASH_ATTENTION_WORKGROUP_BYTES`) requires of the adapter.
 // Q^T: [d][32 queries], as 8 vec4 (4 queries each) per d.
 var<workgroup> qs: array<vec4<f32>, 512>;
 // K^T: [d][32 keys], as 16 vec2 (2 keys each) per d.
@@ -306,7 +311,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
 
 
         // online softmax, 4 threads per query, 8 keys each
-        var sv: array<f32, 8>;
         var pmax = NEG;
         let x0 = ps[(sp * 8u + 0u) * 32u + sq];
         pmax = max(pmax, x0);

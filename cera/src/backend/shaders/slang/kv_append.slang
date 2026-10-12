@@ -11,7 +11,7 @@
 // f16 storage without SHADER_F16 (withheld on Adreno) and no half values at
 // all in naga's core profile, so a `half` intermediate would not survive to
 // the WGSL output. Round to nearest (ties away from zero), half subnormals
-// are kept, overflow clamps to max-half (never Inf — an Inf K would NaN the softmax).
+// are kept, overflow clamps to max-half (never Inf, because an Inf K would NaN the softmax).
 //
 //   binding/buffer 0: src     f32, read (n)
 //   binding/buffer 1: dst     u32, read-write (cache slab, packed halves)

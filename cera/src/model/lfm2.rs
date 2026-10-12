@@ -6494,6 +6494,12 @@ pub(crate) mod bidirectional_float_tests {
         bidirectional_gguf_with(q8_projections, N_HEADS, HEAD_DIM)
     }
 
+    /// 4 heads of 32 and 2 of 64: the second takes the head_dim 64 attention kernels.
+    /// Shared by the Metal and wgpu bidirectional tests so a fixture shape change touches one
+    /// line.
+    #[cfg(all(any(feature = "gpu", feature = "metal"), not(target_arch = "wasm32")))]
+    pub(crate) const BIDIRECTIONAL_SHAPES: [(usize, usize); 2] = [(4, 32), (2, 64)];
+
     pub(crate) fn bidirectional_gguf_with(
         q8_projections: bool,
         n_heads: usize,

@@ -8092,10 +8092,9 @@ mod bidirectional_tests {
     use crate::kv_cache::InferenceState;
     use crate::model::Model;
     use crate::model::lfm2::LfmModel;
-    use crate::model::lfm2::bidirectional_float_tests::{HS, bidirectional_gguf_with, embeddings};
-
-    /// 4 heads of 32 and 2 of 64: the second takes the head_dim 64 attention kernels.
-    const SHAPES: [(usize, usize); 2] = [(4, 32), (2, 64)];
+    use crate::model::lfm2::bidirectional_float_tests::{
+        BIDIRECTIONAL_SHAPES, HS, bidirectional_gguf_with, embeddings,
+    };
 
     fn cosine(a: &[f32], b: &[f32]) -> f32 {
         let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
@@ -8127,21 +8126,23 @@ mod bidirectional_tests {
         // context 4096 (the fixture max): the whole-sequence leg below runs 2600 rows, past one
         // 2048-row FFN chunk, so the chunk loop takes a second iteration with x_off > 0
         let cpu = LfmModel::from_gguf(bidirectional_gguf_with(q8, heads, head_dim), 4096).unwrap();
-        let metal =
-            match MetalLfmModel::from_gguf(bidirectional_gguf_with(q8, heads, head_dim), None, 4096)
-            {
-                Ok(m) => m,
-                Err(e) => {
-                    // Metal-only tests: only the Metal flag forces them (CERA_REQUIRE_GPU is set
-                    // on non-Metal GPU legs too, where skipping is correct).
-                    assert!(
-                        std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1"),
-                        "CERA_REQUIRE_METAL=1 is set but no Metal device is available ({e})"
-                    );
-                    eprintln!("SKIPPED: no Metal device ({e})");
-                    return None;
-                }
-            };
+        let metal = match MetalLfmModel::from_gguf(
+            bidirectional_gguf_with(q8, heads, head_dim),
+            None,
+            4096,
+        ) {
+            Ok(m) => m,
+            Err(e) => {
+                // Metal-only tests: only the Metal flag forces them (CERA_REQUIRE_GPU is set
+                // on non-Metal GPU legs too, where skipping is correct).
+                assert!(
+                    std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1"),
+                    "CERA_REQUIRE_METAL=1 is set but no Metal device is available ({e})"
+                );
+                eprintln!("SKIPPED: no Metal device ({e})");
+                return None;
+            }
+        };
         assert!(
             !metal.config().is_causal,
             "the fixture must be bidirectional"
@@ -8159,10 +8160,11 @@ mod bidirectional_tests {
 
     #[test]
     fn metal_reads_the_whole_sequence_like_the_cpu() {
-        for (q8, (heads, head_dim)) in [true, false]
-            .into_iter()
-            .flat_map(|q8| SHAPES.into_iter().map(move |shape| (q8, shape)))
-        {
+        for (q8, (heads, head_dim)) in [true, false].into_iter().flat_map(|q8| {
+            BIDIRECTIONAL_SHAPES
+                .into_iter()
+                .map(move |shape| (q8, shape))
+        }) {
             let Some((cpu, metal)) = models(q8, heads, head_dim) else {
                 return;
             };
@@ -8197,7 +8199,7 @@ mod bidirectional_tests {
 
     #[test]
     fn metal_reads_a_media_prefix_like_the_cpu() {
-        for (heads, head_dim) in SHAPES {
+        for (heads, head_dim) in BIDIRECTIONAL_SHAPES {
             let Some((cpu, metal)) = models(true, heads, head_dim) else {
                 return;
             };

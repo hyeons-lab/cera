@@ -339,13 +339,14 @@ Two things the phone does that a desktop does not, and the code now respects bot
 hang detector kills a dispatch, or a submission, that runs for seconds: one 13.5k-row attention
 call (about 3.3 s) lost the device, and so did a 13.5k-row pass built as a single command buffer
 (tens of seconds of work). A flash-attention call is therefore issued as several dispatches of at
-most 2048 queries and 2^25 query-key pairs, and a trunk pass over more than 1024 rows submits
+most 2048 queries and 2^25 queries times keys times heads, and a trunk pass over more than 1024 rows submits
 after each chunk phase and each attention dispatch. The older scalar attention kernel had the same
-problem and is split the same way (at most 2^25 query-key rows per head per dispatch, about 0.12 s
+problem and is split the same way (at most 2^25 queries times keys times heads per dispatch, about 0.12 s
 here): as one dispatch it lost the device on a 6784-token prompt (about 2.7 s), though 4000 rows
 (0.9 s) was fine. Split, it runs the 6.8k-token example in 40 s (flash 28 s) and a 13.5k-token one
 in 120 s (flash 65 s), answering 0.30685 against 0.30660. The flash kernel is on for Adreno and for
-every desktop adapter (`GpuContext::supports_flash_attention`); other Android GPUs use the scalar
+every desktop adapter with 30336 bytes of workgroup storage (`GpuContext::supports_flash_attention`),
+and off on wasm32 where the build cannot be checked; other Android GPUs use the scalar
 kernel, which is now safe on long prompts but up to twice as slow.
 
 ## Not done yet
