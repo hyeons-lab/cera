@@ -611,6 +611,7 @@ optimal on any one. The knobs below override them.
 | `CERA_GPU_PREBUILD=off` | wgpu decode: stops finishing the next token's command buffer while the current one executes (`0` / `false` / `off`). A/B lever; decode is about 20% slower with it off on Adreno 830. |
 | `CERA_GPU_ATTN_SPLIT=off` | wgpu decode: uses the single-kernel attention instead of the split-K attention (head_dim 64 only; `0` / `false` / `off`). |
 | `CERA_WGPU_STREAM_MIN_N=<n>` | wgpu prefill: smallest batch size routed to the streaming Q4_0 GEMM (default 1, i.e. every batch). |
+| `CERA_WGPU_GEMM_DIRECT_B=off` | wgpu prefill: disables direct-B staging and restores transposed f16 activation pass (`0` / `false` / `off`). |
 | `CERA_WGPU_GEMM_R1=1` | wgpu prefill: forces the 1-row streaming Q4_0 GEMM kernel everywhere (skips 2-row kernel). |
 | `CERA_WGPU_FUSE_GATE_UP=off` | wgpu prefill: disables fused gate/up streaming Q4_0 GEMM with SiLU epilogue (`0` / `false` / `off`). |
 | `CERA_VIT_STREAM=off` / `CERA_VIT_WARMUP=off` | wgpu vision tower: `CERA_VIT_STREAM=off` restores the generic kernels instead of the fp16 streaming GEMMs and attention; `CERA_VIT_WARMUP=off` skips the blank-image warm-up encode at load (about 190 ms once). |

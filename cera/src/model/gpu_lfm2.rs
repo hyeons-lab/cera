@@ -375,8 +375,8 @@ fn gemm_stream_two_row(m: u32, n_pad: u32) -> bool {
 }
 
 /// Whether the FFN's gate and up projections run as one fused GEMM with a SiLU epilogue (on by
-/// default; `CERA_WGPU_FUSE_GATE_UP=0` turns it off). It saves a transpose pass and the separate
-/// `silu_mul` pass, and reads each activation tile once for two weight rows.
+/// default; `CERA_WGPU_FUSE_GATE_UP=0` turns it off). It eliminates the separate `silu_mul` pass
+/// and reads each activation tile once for two weight rows directly from f32 activations.
 fn use_fused_gate_up() -> bool {
     #[cfg(test)]
     let enabled = !std::env::var("CERA_WGPU_FUSE_GATE_UP")
@@ -1569,7 +1569,7 @@ enum PrefillCmd<'a> {
 
 /// `(n, flags, cursor, slots)`: see `stream_gemm_bg_cache`; a slot is `(transpose bind group, GEMM
 /// bind group)`, the transpose absent on the direct-B path. `flags` is bit 0 `all_logits`, bit 1
-/// "gate/up GEMMs are fused" (a different call sequence, so a different slot layout).
+/// "gate/up GEMMs are fused", bit 2 "direct-B path", bit 3 "k64 twin enabled".
 type StreamGemmBgCache = (
     u32,
     u8,
@@ -2100,19 +2100,19 @@ pub struct GpuLfmModel {
     /// dispatch needs its OWN params buffer (a single shared one would be
     /// last-write-wins across the submit); pooling reuses them across prefills so
     /// only adapter-active prefill pays, and only once (grows to the high-water
-    /// mark, then zero allocation). Locked under `infer_lock` — no contention.
+    /// mark, then zero allocation). Locked under `infer_lock`: no contention.
     lora_params_pool: Mutex<(Vec<wgpu::Buffer>, usize)>,
     prefill_params_pool: Mutex<(Vec<wgpu::Buffer>, usize)>,
     /// Cached bind groups for the streaming prefill GEMMs, in call order:
-    /// `(n, all_logits, cursor, slots)` where each slot is the
-    /// `(transpose_bg, gemm_bg)` pair for one `encode_gemm_stream_q4_0`
-    /// call. A prefill creates ~184 of these fresh (~16 µs each to create,
+    /// `(n, flags, cursor, slots)` where each slot is the
+    /// `(Option<transpose_bg>, gemm_bg)` pair for one streaming GEMM call
+    /// (the transpose bind group is None on the direct-B path). A prefill creates ~184 of these fresh (~16 µs each to create,
     /// plus ~115 µs each of first-use validation inside
-    /// `CommandEncoder::finish` — the 33 ms prefill `finish()` is almost
-    /// entirely this). The bound buffers are stable across prefills —
-    /// weights/scratch never move, and the pooled params buffers are handed
-    /// out in deterministic call order after the per-prefill cursor reset —
-    /// so only the *contents* need refreshing (which `next_prefill_params`
+    /// `CommandEncoder::finish`: the 33 ms prefill `finish()` is almost
+    /// entirely this). The bound buffers are stable across prefills
+    /// (weights/scratch never move, and the pooled params buffers are handed
+    /// out in deterministic call order after the per-prefill cursor reset,
+    /// so only the *contents* need refreshing, which `next_prefill_params`
     /// still does on every call). Keyed by `n` because a small n can route to
     /// reg-tile (`CERA_WGPU_STREAM_MIN_N`) and shifts the pool layout, and by `all_logits` because it
     /// swaps the lm-head output buffer; `start_pos` never appears in these
@@ -7610,7 +7610,10 @@ impl GpuLfmModel {
 
     /// Bind-group cache key flags for the call now being encoded (see `StreamGemmBgCache`).
     fn stream_cache_flags(&self, all_logits: bool) -> u8 {
-        u8::from(all_logits) | (u8::from(self.fuse_gate_up_active.load(Ordering::Relaxed)) << 1)
+        u8::from(all_logits)
+            | (u8::from(self.fuse_gate_up_active.load(Ordering::Relaxed)) << 1)
+            | (u8::from(use_direct_b()) << 2)
+            | (u8::from(use_gemm_k64()) << 3)
     }
 
     /// Whether `gate` and `up` can run as the fused streaming GEMM for `n` tokens of width `k`:
@@ -11709,7 +11712,12 @@ async fn gemm_q4_0_microbench_async(
         passthrough,
         "gemm-bench needs SPIR-V passthrough (Vulkan + subgroups)"
     );
-    let base_pipe = ctx.gemm_stream_q4_0_passthrough();
+    let b_f32_direct = std::env::var("CERA_GEMM_BENCH_B_F32").as_deref() == Ok("1");
+    let base_pipe = if b_f32_direct {
+        ctx.gemm_stream_q4_0_k64_xf32_passthrough()
+    } else {
+        ctx.gemm_stream_q4_0_passthrough()
+    };
 
     // Experimental variants: same bind-group layout as the baseline (contract
     // above), module swapped for the file's SPIR-V.
@@ -11746,7 +11754,7 @@ async fn gemm_q4_0_microbench_async(
         // `CERA_GEMM_BENCH_B_F32=1` hands the kernels the activations as they leave the previous
         // pass, f32 token-major `[n_pad][k]` (rows past `n` zero), for `--spv` variants that stage
         // the B tile themselves instead of reading the transposed f16 copy.
-        let b_buf = if std::env::var("CERA_GEMM_BENCH_B_F32").as_deref() == Ok("1") {
+        let b_buf = if b_f32_direct {
             let mut b_tm = vec![0.0f32; n_pad * k_us];
             b_tm[..n_us * k_us].copy_from_slice(&b);
             ctx.upload_storage(bytemuck::cast_slice(&b_tm), "bench.b_f32")
@@ -13763,5 +13771,19 @@ mod tests {
             n,
             k as u32
         ));
+
+        // direct-b path must be enabled
+        unsafe { std::env::set_var("CERA_WGPU_GEMM_DIRECT_B", "0") };
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &gate_shape,
+            true,
+            crate::tensor::DType::Q4_0,
+            &up_shape,
+            true,
+            n,
+            k as u32
+        ));
+        unsafe { std::env::remove_var("CERA_WGPU_GEMM_DIRECT_B") };
     }
 }

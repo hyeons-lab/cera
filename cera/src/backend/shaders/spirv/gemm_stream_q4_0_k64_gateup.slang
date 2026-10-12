@@ -8,7 +8,7 @@
 // 128 threads cover 128 rows: grid (ceil(m/128), n_pad/32). The output has
 // the layout of the gate GEMM's (dst[col * y_stride + row]). Bindings: 0/1 gate q/d, 2/3 up q/d,
 // 4 f32 token-major activations, 5 dst, 6 params.
-// The activations come straight from the previous pass: binding 2 is the f32 token-major
+// The activations come straight from the previous pass: binding 4 is the f32 token-major
 // `x[n][k]` (x_stride == k), converted to f16 while the B tile is staged, so there is no transpose
 // pass and no f16 copy. Rows past the last token are clamped onto it (their columns are never
 // stored). Staging this way is also 8 to 20% faster than reading a transposed f16 copy on an

@@ -2,8 +2,8 @@
 """Thermally gated GPU prefill A/B: the direct-B build, the previous PR's build (transposed B, two-row, fused
 gate/up) and the build before that (both switches off), against llama-bench, at several prompt lengths."""
 import csv, io, json, os, re, statistics as st, subprocess, sys, time
-SERIAL = os.environ["SERIAL"]; OUT = sys.argv[1]; ROUNDS = int(sys.argv[2]); BIN = sys.argv[3]
-LENS = [int(x) for x in sys.argv[4].split(",")]
+SERIAL = os.environ["SERIAL"]; OUT = sys.argv[1]; ROUNDS = int(sys.argv[2])
+LENS = [int(x) for x in sys.argv[3].split(",")]
 AP_MAX_C = 28.0
 MODEL = "/data/local/tmp/LFM2.5-VL-450M-Q4_0.gguf"; CERA = "/data/local/tmp/cmp-cera"; LL = "/data/local/tmp/cmp-llamacpp"
 GUARD = "echo 0 > /proc/$$/oom_score_adj 2>/dev/null; "
@@ -21,8 +21,8 @@ def cool():
         time.sleep(5)
 VARS = {"direct": ("cera-direct", ""), "pr497": ("cera-r2", ""), "previous": ("cera-r2", "CERA_WGPU_FUSE_GATE_UP=0 CERA_WGPU_GEMM_R1=1 ")}
 def cera(var, n):
-    BIN, env = VARS[var]
-    out = sh(f"{GUARD}cd {CERA} && {env}timeout 300 ./{BIN} bench -m {MODEL} --device gpu --runs 5 --warmup 2 --no-cache --prompt-tokens {n} --max-tokens 0 2>&1")
+    bin_name, env = VARS[var]
+    out = sh(f"{GUARD}cd {CERA} && {env}timeout 300 ./{bin_name} bench -m {MODEL} --device gpu --runs 5 --warmup 2 --no-cache --prompt-tokens {n} --max-tokens 0 2>&1")
     m = re.search(r"prefill tok/s: p50=([\d.]+)", out)
     return float(m.group(1)) if m else None
 def llama(n):

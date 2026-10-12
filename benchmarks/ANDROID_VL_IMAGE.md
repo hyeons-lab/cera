@@ -254,7 +254,7 @@ faster than staging from the f16 copy: with `cera gemm-bench` on the model's sha
 activations directly; `gemm_stream_q4_0_k64_xf32` is the one-row kernel for small dispatches. A row past the last
 token is clamped onto it, so the last tile never reads outside the buffer. Models and shapes that cannot use the
 k64 family (k not a multiple of 64, Q8_0, Q4_K) keep the transpose, and `CERA_WGPU_GEMM_DIRECT_B=0` restores the
-transposed path everywhere (with the one-row kernel and unfused gate/up, which exist only for the direct path).
+transposed path everywhere (running the one-row kernel without fused gate/up, since two-row and fused gate/up exist only for the direct path).
 
 Per 512-token chunk under the profiler the GPU time falls from 153 to 140 ms: the transposes (7.7 ms) are gone and
 the GEMMs are 5 ms faster (two-row 58.2 to 55.8, fused gate/up 57.2 to 54.3). Gated like the runs above (AP sensor
