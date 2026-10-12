@@ -73,6 +73,7 @@ kotlin {
 // keep the assembled jar deterministic (no timestamps in the manifest).
 tasks.shadowJar {
     archiveClassifier.set("all")
+    duplicatesStrategy = DuplicatesStrategy.INCLUDE
     isPreserveFileTimestamps = false
     isReproducibleFileOrder = true
 }
