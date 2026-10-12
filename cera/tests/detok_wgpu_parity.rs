@@ -98,6 +98,36 @@ fn complex_cosine_metric_sanity() {
         "half-energy sign flip should collapse, got {c:.6}"
     );
 
+    // Verify magnitude weighting: a large phase error on a negligible-energy
+    // bin should not degrade the score, whereas that same error on a high-energy bin collapses it.
+    let mut weighted_log_abs = vec![-10.0f32; 64];
+    weighted_log_abs[0] = 5.0f32;
+    let mut bad_low_energy_phase = phase.clone();
+    bad_low_energy_phase[1] += std::f32::consts::PI;
+    let c_masked = complex_cosine(
+        &weighted_log_abs,
+        &phase,
+        &weighted_log_abs,
+        &bad_low_energy_phase,
+    );
+    assert!(
+        c_masked > 0.999,
+        "phase inversion on a -10 log-abs bin must not degrade score, got {c_masked:.6}"
+    );
+
+    let mut bad_high_energy_phase = phase.clone();
+    bad_high_energy_phase[0] += std::f32::consts::PI;
+    let c_collapsed = complex_cosine(
+        &weighted_log_abs,
+        &phase,
+        &weighted_log_abs,
+        &bad_high_energy_phase,
+    );
+    assert!(
+        c_collapsed < 0.0,
+        "phase inversion on the dominant bin must collapse score, got {c_collapsed:.6}"
+    );
+
     let silent = vec![f32::NEG_INFINITY; 64];
     assert_eq!(complex_cosine(&silent, &phase, &silent, &phase), 0.0);
 }

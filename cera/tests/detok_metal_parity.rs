@@ -3,15 +3,16 @@
 //! GPU↔CPU parity tests for the Metal detokenizer.
 //!
 //! These tests verify that the Metal GPU detokenizer produces spectrums
-//! matching the CPU path. They serve as precision regression tests —
+//! matching the CPU path. They serve as precision regression tests:
 //! if a performance optimization (Q4_0 GEMV, f16 KV cache, fused shaders)
 //! degrades audio quality, these tests fail.
 //!
-//! Both paths use F32 dequantized weights, but the GPU attention reads an
-//! f16 KV cache (the only dtype the Metal flash-attention kernel accepts —
-//! same as the production LLM decode path), so the per-frame gate is a
+//! Both paths use F32 dequantized weights; the per-frame gate is a
 //! magnitude-weighted complex cosine at 0.95 rather than a raw cosine near
-//! 1.0. The log-magnitude `max_diff` gate is the primary correctness check.
+//! 1.0. The Metal and wgpu decoders agree to 0.999998 on every frame despite
+//! different KV cache dtypes (f16 on Metal, f32 on wgpu), with both sitting
+//! 0.98 from the CPU reference on high-gain frames where the CPU is the outlier.
+//! The log-magnitude `max_diff` gate is the primary correctness check.
 //! If the GPU path's precision changes again, re-evaluate.
 
 // ── Helpers ─────────────────────────────────────────────────────────────────
@@ -43,7 +44,7 @@ fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
 /// Each frame is `[log_abs (641 bins), phase (641 bins)]`, and the ISTFT
 /// consumes bins as `exp(log_abs + i * phase)`. A raw cosine over the
 /// concatenated vector mixes log-magnitude units with unwrapped-radian
-/// units, so benign f16 phase noise on high-gain frames can tank it (one
+/// units, so benign phase differences on high-gain frames can tank it (one
 /// measured frame dipped to 0.961 while every other frame sat above
 /// 0.9998). Weighting the phase agreement by bin magnitude measures what
 /// the ISTFT actually hears. Returns 0.0 when either frame is silent.
@@ -109,6 +110,36 @@ fn complex_cosine_metric_sanity() {
     assert!(
         c.abs() < 1e-6,
         "half-energy sign flip should collapse, got {c:.6}"
+    );
+
+    // Verify magnitude weighting: a large phase error on a negligible-energy
+    // bin should not degrade the score, whereas that same error on a high-energy bin collapses it.
+    let mut weighted_log_abs = vec![-10.0f32; 64];
+    weighted_log_abs[0] = 5.0f32;
+    let mut bad_low_energy_phase = phase.clone();
+    bad_low_energy_phase[1] += std::f32::consts::PI;
+    let c_masked = complex_cosine(
+        &weighted_log_abs,
+        &phase,
+        &weighted_log_abs,
+        &bad_low_energy_phase,
+    );
+    assert!(
+        c_masked > 0.999,
+        "phase inversion on a -10 log-abs bin must not degrade score, got {c_masked:.6}"
+    );
+
+    let mut bad_high_energy_phase = phase.clone();
+    bad_high_energy_phase[0] += std::f32::consts::PI;
+    let c_collapsed = complex_cosine(
+        &weighted_log_abs,
+        &phase,
+        &weighted_log_abs,
+        &bad_high_energy_phase,
+    );
+    assert!(
+        c_collapsed < 0.0,
+        "phase inversion on the dominant bin must collapse score, got {c_collapsed:.6}"
     );
 
     let silent = vec![f32::NEG_INFINITY; 64];
@@ -186,7 +217,7 @@ fn spectrum_parity() {
             let ph_gpu = &gpu_frame[n_fft_bins..];
             // Magnitude-weighted complex cosine: the quantity the ISTFT
             // consumes. Measured worst frame: 0.980, every other frame above
-            // 0.9915, so the gate sits at 0.95. This is not the Metal f16 KV
+            // 0.9995, so the gate sits at 0.95. This is not the Metal f16 KV
             // cache: the wgpu decoder reads f32 K/V and agrees with this one
             // to 0.999998 on every frame, and both sit the same 0.98 from the
             // CPU reference, which is the outlier on that high-gain frame. A
