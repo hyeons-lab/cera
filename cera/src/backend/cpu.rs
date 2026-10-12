@@ -2176,9 +2176,14 @@ thread_local! {
 }
 
 /// Parse the `CERA_CPU_ATTN_TILED` environment variable string.
-#[cfg(target_arch = "aarch64")]
+#[cfg(any(target_arch = "aarch64", test))]
 fn parse_attn_tiled_env(val: Option<&str>) -> bool {
-    val.map(str::trim) != Some("0")
+    !val.is_some_and(|v| {
+        let v = v.trim();
+        ["0", "false", "off"]
+            .iter()
+            .any(|d| v.eq_ignore_ascii_case(d))
+    })
 }
 
 /// Whether the NEON prefill attention uses the register-tiled kernel (on by default;
@@ -7041,7 +7046,7 @@ pub fn flash_attention_gqa_cpu_opt(
     // Fall back to scalar for unsupported dimensions.
     #[cfg(target_arch = "aarch64")]
     {
-        if head_dim.is_multiple_of(4) && head_dim <= 128 {
+        if head_dim > 0 && head_dim.is_multiple_of(4) && head_dim <= 128 {
             unsafe {
                 if attn_tiled_enabled() {
                     flash_attention_gqa_neon_tiled(
@@ -7215,6 +7220,28 @@ pub fn flash_attention_gqa_cpu_opt_range(
     assert!(
         out.len() >= group_size * (q_hi - q_lo) * head_dim,
         "out buffer too small for contiguous [group_size, q_hi - q_lo, head_dim] output"
+    );
+    assert!(
+        (n_queries == 0)
+            || (q_stride == n_queries
+                && q_mat.len()
+                    >= ((n_heads_start + group_size) * head_dim - 1) * q_stride + n_queries)
+            || (q_stride >= head_dim
+                && q_mat.len()
+                    >= (n_queries - 1) * q_stride + (n_heads_start + group_size) * head_dim),
+        "q_mat too small for the given head range and q_stride"
+    );
+    assert!(
+        (start_pos + n_queries == 0)
+            || (kv_h_offset + head_dim <= kv_dim
+                && k_cache.len() >= (start_pos + n_queries - 1) * kv_dim + kv_h_offset + head_dim),
+        "k_cache too small"
+    );
+    assert!(
+        (start_pos + n_queries == 0)
+            || (kv_h_offset + head_dim <= kv_dim
+                && v_cache.len() >= (start_pos + n_queries - 1) * kv_dim + kv_h_offset + head_dim),
+        "v_cache too small"
     );
     #[cfg(target_arch = "aarch64")]
     unsafe {
@@ -13766,6 +13793,19 @@ mod tests {
         assert!(!flash_attention_range_supported(132));
         assert!(!flash_attention_range_supported(256));
 
+        // Verify env parsing with whitespace and disabled switch across 0, false, off.
+        assert!(!parse_attn_tiled_env(Some("0")));
+        assert!(!parse_attn_tiled_env(Some(" 0 ")));
+        assert!(!parse_attn_tiled_env(Some("0\n")));
+        assert!(!parse_attn_tiled_env(Some("false")));
+        assert!(!parse_attn_tiled_env(Some("FALSE")));
+        assert!(!parse_attn_tiled_env(Some("  off  ")));
+        assert!(!parse_attn_tiled_env(Some("OFF")));
+        assert!(parse_attn_tiled_env(Some("1")));
+        assert!(parse_attn_tiled_env(Some("true")));
+        assert!(parse_attn_tiled_env(Some("")));
+        assert!(parse_attn_tiled_env(None));
+
         #[cfg(target_arch = "aarch64")]
         {
             assert!(flash_attention_range_supported(4));
@@ -13773,14 +13813,6 @@ mod tests {
             assert!(flash_attention_range_supported(40));
             assert!(flash_attention_range_supported(64));
             assert!(flash_attention_range_supported(128));
-
-            // Verify env parsing with whitespace and disabled switch.
-            assert!(!parse_attn_tiled_env(Some("0")));
-            assert!(!parse_attn_tiled_env(Some(" 0 ")));
-            assert!(!parse_attn_tiled_env(Some("0\n")));
-            assert!(parse_attn_tiled_env(Some("1")));
-            assert!(parse_attn_tiled_env(Some("")));
-            assert!(parse_attn_tiled_env(None));
         }
 
         #[cfg(not(target_arch = "aarch64"))]
@@ -13797,6 +13829,64 @@ mod tests {
         let dummy = [0.0f32; 64];
         flash_attention_gqa_cpu_opt_range(
             &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 1, 0,
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[should_panic(expected = "bad query range")]
+    fn flash_range_panics_on_q_hi_out_of_bounds() {
+        let mut out = [0.0f32; 64];
+        let dummy = [0.0f32; 64];
+        flash_attention_gqa_cpu_opt_range(
+            &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 2,
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[should_panic(expected = "out buffer too small")]
+    fn flash_range_panics_on_undersized_output() {
+        let mut out = [0.0f32; 32];
+        let dummy = [0.0f32; 64];
+        flash_attention_gqa_cpu_opt_range(
+            &dummy, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[should_panic(expected = "q_mat too small")]
+    fn flash_range_panics_on_undersized_q_mat() {
+        let mut out = [0.0f32; 64];
+        let short_q = [0.0f32; 32];
+        let dummy = [0.0f32; 64];
+        flash_attention_gqa_cpu_opt_range(
+            &short_q, &dummy, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[should_panic(expected = "k_cache too small")]
+    fn flash_range_panics_on_undersized_k_cache() {
+        let mut out = [0.0f32; 64];
+        let short_k = [0.0f32; 32];
+        let dummy = [0.0f32; 64];
+        flash_attention_gqa_cpu_opt_range(
+            &dummy, &short_k, &dummy, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
+        );
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    #[should_panic(expected = "v_cache too small")]
+    fn flash_range_panics_on_undersized_v_cache() {
+        let mut out = [0.0f32; 64];
+        let short_v = [0.0f32; 32];
+        let dummy = [0.0f32; 64];
+        flash_attention_gqa_cpu_opt_range(
+            &dummy, &dummy, &short_v, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
         );
     }
 

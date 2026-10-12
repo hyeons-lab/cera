@@ -22,8 +22,8 @@ def cool():
         time.sleep(5)
 VARS = {"items": ("cera-attn2", ""), "heads": ("cera-attn", ""), "old": ("cera-attn2", "CERA_CPU_ATTN_TILED=0 ")}
 def cera(var, n):
-    BIN, env = VARS[var]
-    out = sh(f"{GUARD}cd {CERA} && {env}timeout 300 ./{BIN} bench -m {MODEL} --device cpu --runs 5 --warmup 2 --no-cache --prompt-tokens {n} --max-tokens 0 2>&1")
+    bin_name, env = VARS[var]
+    out = sh(f"{GUARD}cd {CERA} && {env}timeout 300 ./{bin_name} bench -m {MODEL} --device cpu --runs 5 --warmup 2 --no-cache --prompt-tokens {n} --max-tokens 0 2>&1")
     m = re.search(r"prefill tok/s: p50=([\d.]+)", out)
     return float(m.group(1)) if m else None
 def llama(n):
