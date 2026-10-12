@@ -1234,6 +1234,23 @@ impl BpeTokenizer {
         t
     }
 
+    /// Creates a minimal test tokenizer carrying the d1 decision delimiters.
+    pub fn d1_for_test() -> Self {
+        let mut t = Self::empty_for_test();
+        t.bos_id = Some(1);
+        for (name, id) in [
+            ("<|mask|>", 2),
+            ("<|reserved_7|>", 3),
+            ("<|reserved_8|>", 4),
+            ("<|reserved_9|>", 5),
+            ("<|reserved_10|>", 6),
+            ("<|reserved_11|>", 7),
+        ] {
+            t.special_tokens.insert(name.to_string(), id);
+        }
+        t
+    }
+
     /// Creates a minimal test tokenizer with a custom chat template.
     pub fn with_custom_template_for_test(template: &str, eos: Option<u32>) -> Self {
         let mut t = Self::empty_for_test();

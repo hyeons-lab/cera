@@ -579,6 +579,11 @@ impl Model for BertModel {
         true
     }
 
+    /// Classic full-matrix attention: every token reads every token.
+    fn supports_bidirectional_hidden_states(&self) -> bool {
+        !self.config.is_causal
+    }
+
     /// No LoRA hooks: `hidden_states` ignores `state` and `forward` is an
     /// empty-logits stub, so an adapter would install and adapt nothing.
     /// Restated (not inherited) so whoever adds the hooks reads this here.
@@ -927,6 +932,28 @@ mod tests {
                 .contains("bert.embedding_length must be > 0"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn a_bert_model_reports_bidirectional_hidden_states() {
+        // the d1 gate refuses causal-only extractors; BERT's full-matrix
+        // attention reads the whole context, so it must opt in
+        let gguf = crate::gguf::GgufBuilder::new()
+            .kv_str("general.architecture", "bert")
+            .kv_u32("bert.block_count", 1)
+            .kv_u32("bert.embedding_length", 8)
+            .kv_u32("bert.feed_forward_length", 16)
+            .kv_u32("bert.attention.head_count", 2)
+            .tensor_f32("token_embd.weight", &[8, 32], &vec![0.0; 8 * 32])
+            .tensor_f32("blk.0.attn_q.weight", &[8, 8], &vec![0.0; 64])
+            .tensor_f32("blk.0.attn_k.weight", &[8, 8], &vec![0.0; 64])
+            .tensor_f32("blk.0.attn_v.weight", &[8, 8], &vec![0.0; 64])
+            .tensor_f32("blk.0.attn_output.weight", &[8, 8], &vec![0.0; 64])
+            .tensor_f32("blk.0.ffn_up.weight", &[8, 16], &vec![0.0; 8 * 16])
+            .tensor_f32("blk.0.ffn_down.weight", &[16, 8], &vec![0.0; 16 * 8])
+            .build();
+        let model = BertModel::from_gguf_with_id(gguf, 32, "test".into()).unwrap();
+        assert!(model.supports_bidirectional_hidden_states());
     }
 
     #[test]

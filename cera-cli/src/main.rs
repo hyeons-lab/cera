@@ -890,8 +890,8 @@ enum Command {
     ///
     /// Reads `config.json`, `tokenizer.json` and the `.safetensors` files of `--input` and
     /// writes one GGUF at `--output`, quantized to `--quant`. The d1 decision models
-    /// (`model_type = "d1_omni"`) convert to a non-causal LFM2 trunk plus their decision head;
-    /// their vision and audio towers are not converted yet.
+    /// (`model_type = "d1_omni"`) convert to a non-causal LFM2 trunk plus their decision head
+    /// and their vision and audio towers.
     Convert {
         /// SafeTensors model directory.
         #[arg(short, long)]
@@ -929,8 +929,8 @@ enum Command {
         #[arg(short, long, default_value = "-")]
         request: String,
 
-        /// Device to use: cpu, gpu, metal, or auto.
-        #[arg(long, default_value = "auto")]
+        /// Device to use: cpu, gpu, metal, or auto (defaults to cpu; d1 models run on CPU in this version).
+        #[arg(long, default_value = "cpu")]
         device: String,
 
         /// Longest prompt in tokens. The model supports up to its trained 16384.
@@ -942,7 +942,7 @@ enum Command {
         #[arg(long = "image")]
         images: Vec<PathBuf>,
 
-        /// A speech clip (WAV) to read ahead of the text. A request carries images or speech,
+        /// A speech clip (WAV) to read ahead of the text. A request carries images or audio,
         /// not both.
         #[arg(long = "audio")]
         audio: Option<PathBuf>,
@@ -3503,6 +3503,78 @@ fn check_vad_npu_dropout(npu: bool, accelerated: bool) -> Result<()> {
     Ok(())
 }
 
+/// The `--quant`/`--strategy` pair the Convert and parity arms share, parsed together so a
+/// new spelling or message cannot land in one arm and not the other.
+fn parse_quant_pair(
+    quant: &str,
+    strategy: &str,
+) -> anyhow::Result<(cera::convert::TargetQuant, cera::convert::QuantStrategy)> {
+    let quant = cera::convert::TargetQuant::parse_str(quant)
+        .ok_or_else(|| anyhow::anyhow!("unknown quant type `{quant}`"))?;
+    let strategy = cera::convert::QuantStrategy::parse_str(strategy)
+        .ok_or_else(|| anyhow::anyhow!("unknown quant strategy `{strategy}`"))?;
+    Ok((quant, strategy))
+}
+
+/// Whether the `--image`/`--audio` flags combine with a parsed request: flags
+/// accumulate onto same-kind body media, but images with audio refuse. The arm
+/// and the test both call this so the combination lives in one place.
+fn decide_media_ok(cli_images: bool, cli_audio: bool, request: &cera::d1::D1Request) -> bool {
+    cera::d1::D1Request::media_combo_ok(
+        cli_images || !request.images.is_empty(),
+        cli_audio || request.audio.is_some(),
+    )
+}
+
+/// Read the Decide arm's media files onto the request, after refusing a
+/// conflicting combination: the check runs before any read so a conflict
+/// reports the combo error, never an IO error from the reads below.
+fn load_decide_media(
+    images: &[PathBuf],
+    audio: &Option<PathBuf>,
+    mut request: cera::d1::D1Request,
+) -> anyhow::Result<cera::d1::D1Request> {
+    anyhow::ensure!(
+        decide_media_ok(!images.is_empty(), audio.is_some(), &request),
+        "{}",
+        cera::d1::D1Request::MEDIA_COMBO_ERR
+    );
+    for path in images {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading the image `{}`", path.display()))?;
+        request = request.with_image(bytes);
+    }
+    if let Some(path) = audio {
+        let bytes = std::fs::read(path)
+            .with_context(|| format!("reading the clip `{}`", path.display()))?;
+        request = request.with_audio(bytes);
+    }
+    Ok(request)
+}
+
+/// Refuse a Decide run on an explicitly accelerated backend before any weight
+/// load: the pipeline gates would refuse it after GBs of loads. `cpu`, `auto`,
+/// and unknown spellings (which the engine reports) fall through. GPU and
+/// Metal support arrives with bidirectional extractors, which relax this.
+fn decide_device_ok(device: &str, wants_media: bool) -> anyhow::Result<()> {
+    // match on the engine's own parser, not a re-spelled table: a new
+    // accelerated spelling then refuses here without a second edit
+    let reason = match BackendPreference::parse_str(device) {
+        Ok(BackendPreference::Gpu | BackendPreference::Metal) => {
+            cera::d1::BIDIRECTIONAL_STATES_REASON
+        }
+        Ok(BackendPreference::Hexagon | BackendPreference::Npu) => cera::d1::HIDDEN_STATES_REASON,
+        Ok(BackendPreference::Cpu | BackendPreference::Auto) | Err(_) => return Ok(()),
+    };
+    if wants_media {
+        anyhow::bail!(
+            "media questions need `--device cpu` (this backend {})",
+            cera::d1::MEDIA_PREFIX_REASON
+        );
+    }
+    anyhow::bail!("d1 questions need `--device cpu` (this backend {reason})")
+}
+
 fn main() -> Result<()> {
     #[cfg(target_os = "android")]
     relax_oom_score();
@@ -4388,10 +4460,7 @@ fn main() -> Result<()> {
             strategy,
             tensor_overrides,
         } => {
-            let quant = cera::convert::TargetQuant::parse_str(&quant)
-                .ok_or_else(|| anyhow::anyhow!("unknown quant type `{quant}`"))?;
-            let strategy = cera::convert::QuantStrategy::parse_str(&strategy)
-                .ok_or_else(|| anyhow::anyhow!("unknown quant strategy `{strategy}`"))?;
+            let (quant, strategy) = parse_quant_pair(&quant, &strategy)?;
             let overrides = tensor_overrides
                 .iter()
                 .map(|s| {
@@ -4425,17 +4494,19 @@ fn main() -> Result<()> {
                 std::fs::read_to_string(&request)
                     .with_context(|| format!("reading the request `{request}`"))?
             };
-            let mut request = cera::d1::D1Request::parse(&text)?;
-            for path in &images {
-                let bytes = std::fs::read(path)
-                    .with_context(|| format!("reading the image `{}`", path.display()))?;
-                request = request.with_image(bytes);
-            }
-            if let Some(path) = &audio {
-                let bytes = std::fs::read(path)
-                    .with_context(|| format!("reading the clip `{}`", path.display()))?;
-                request = request.with_audio(bytes);
-            }
+            let request = cera::d1::D1Request::parse(&text)?;
+            // the pipeline refuses the combination after the model load, so the
+            // arm checks here, before reading any media files or loading the model
+            let request = load_decide_media(&images, &audio, request)?;
+            // d1 decision models currently run their bidirectional trunk on CPU only;
+            // auto selects CPU so the default CLI run works on Metal and GPU hosts.
+            let run_device = if device == "auto" { "cpu" } else { &device };
+            // same fail-early for the backend: an accelerated device would only
+            // be refused after the tower and trunk weights load below
+            decide_device_ok(
+                run_device,
+                !request.images.is_empty() || request.audio.is_some(),
+            )?;
             let gguf = std::sync::Arc::new(cera::gguf::GgufFile::open(Path::new(&model))?);
             let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
             let d1 = cera::d1::D1Model::from_gguf(&gguf, &tokenizer)?;
@@ -4447,7 +4518,7 @@ fn main() -> Result<()> {
                 None,
                 None,
                 None,
-                &device,
+                run_device,
                 context_size.min(d1.max_length()),
             )?;
             let mut session = engine.new_session(cera::SessionConfig::default())?;
@@ -5363,10 +5434,7 @@ fn main() -> Result<()> {
                 );
             }
 
-            let target_quant = cera::convert::TargetQuant::parse_str(&quant)
-                .ok_or_else(|| anyhow::anyhow!("unknown quant type `{quant}`"))?;
-            let quant_strategy = cera::convert::QuantStrategy::parse_str(&strategy)
-                .ok_or_else(|| anyhow::anyhow!("unknown quant strategy `{strategy}`"))?;
+            let (target_quant, quant_strategy) = parse_quant_pair(&quant, &strategy)?;
 
             let mut _temp_dir = None;
             let cera_path = if let Some(ref st_path) = safetensors {
@@ -9038,5 +9106,183 @@ mod tests {
 
         // Shape *validation* lives in the lib (`validate_gemv_shape` /
         // `validate_gemm_shape`) with its tests; the CLI only parses.
+    }
+
+    #[test]
+    fn quant_pair_parses_both_flags_or_names_the_bad_one() {
+        use super::parse_quant_pair;
+        use cera::convert::{QuantStrategy, TargetQuant};
+
+        assert!(matches!(
+            parse_quant_pair("q8_0", "auto").unwrap(),
+            (TargetQuant::Q8_0, QuantStrategy::Auto)
+        ));
+        assert!(matches!(
+            parse_quant_pair("Q4_K_M", "fast-mse").unwrap(),
+            (TargetQuant::Q4_K_M, QuantStrategy::FastMse)
+        ));
+        let err = parse_quant_pair("q9_9", "auto").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown quant type"),
+            "unexpected message: {err}"
+        );
+        let err = parse_quant_pair("q8_0", "slow").unwrap_err();
+        assert!(
+            err.to_string().contains("unknown quant strategy"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn media_combo_refuses_images_with_audio_only() {
+        let req = |body: &str| cera::d1::D1Request::parse(body).unwrap();
+        let q = r#""q": {"type": "noul", "instructions": "?"}"#;
+        let plain = req(&format!(r#"{{"questions": {{{q}}}}}"#));
+        let with_images = req(&format!(r#"{{"questions": {{{q}}}, "images": ["aGk="]}}"#));
+        let with_audio = req(&format!(r#"{{"questions": {{{q}}}, "audio": "aGk="}}"#));
+        // the Decide arm's combination, through the helper the arm calls
+        use super::decide_media_ok;
+        // the shared refusal text every call site renders
+        assert_eq!(
+            cera::d1::D1Request::MEDIA_COMBO_ERR,
+            "a request carries images or audio, not both"
+        );
+        // each source alone is fine, from flags or from the request body
+        for (cli_images, cli_audio, request) in [
+            (false, false, &plain),
+            (true, false, &plain),
+            (false, true, &plain),
+            (false, false, &with_images),
+            (false, false, &with_audio),
+            // flags accumulate onto same-kind body media rather than conflicting
+            (true, false, &with_images),
+            (false, true, &with_audio),
+        ] {
+            assert!(
+                decide_media_ok(cli_images, cli_audio, request),
+                "flags ({cli_images}, {cli_audio}) over images={} audio={}",
+                !request.images.is_empty(),
+                request.audio.is_some()
+            );
+        }
+        // images and audio together refuse, however they combine
+        for (cli_images, cli_audio, request) in [
+            (true, true, &plain),
+            (true, false, &with_audio),
+            (false, true, &with_images),
+            (true, true, &with_images),
+            (true, true, &with_audio),
+        ] {
+            assert!(
+                !decide_media_ok(cli_images, cli_audio, request),
+                "flags ({cli_images}, {cli_audio}) over images={} audio={}",
+                !request.images.is_empty(),
+                request.audio.is_some()
+            );
+        }
+    }
+
+    fn decide_body() -> cera::d1::D1Request {
+        cera::d1::D1Request::parse(
+            r#"{"state": "x", "questions": {"q": {"type": "noul", "instructions": "i"}}}"#,
+        )
+        .unwrap()
+    }
+
+    fn decide_body_with_images() -> cera::d1::D1Request {
+        cera::d1::D1Request::parse(
+            r#"{"state": "x", "questions": {"q": {"type": "noul", "instructions": "i"}},
+                "images": ["data:image/png;base64,AA=="]}"#,
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn decide_media_loads_check_before_any_read() {
+        // a body image plus an audio flag: both paths below are missing, so the
+        // combo error proves the check ran before either read was attempted
+        // (a read-first mutant reports an IO error instead)
+        let body = decide_body_with_images();
+        let err = super::load_decide_media(
+            &[std::path::PathBuf::from("no-such-image.png")],
+            &Some(std::path::PathBuf::from("no-such-clip.wav")),
+            body,
+        )
+        .expect_err("expected the combo check to refuse");
+        assert!(
+            err.to_string().contains("not both"),
+            "unexpected message: {err}"
+        );
+        // ... while empty flags pass a plain request through untouched
+        let out = super::load_decide_media(&[], &None, decide_body()).unwrap();
+        assert!(out.images.is_empty() && out.audio.is_none());
+    }
+
+    #[test]
+    fn decide_media_loads_files_onto_the_request() {
+        let dir = tempfile::tempdir().unwrap();
+        let img = dir.path().join("i.png");
+        let clip = dir.path().join("c.wav");
+        std::fs::write(&img, [1u8, 2, 3]).unwrap();
+        std::fs::write(&clip, [4u8, 5]).unwrap();
+        let plain = || decide_body();
+        // without this leg a gutted loop answers text-only for media flags
+        let out = super::load_decide_media(&[img], &None, plain()).unwrap();
+        assert_eq!(out.images, vec![vec![1u8, 2, 3]]);
+        assert!(out.audio.is_none());
+        let out = super::load_decide_media(&[], &Some(clip), plain()).unwrap();
+        assert!(out.images.is_empty());
+        assert_eq!(out.audio, Some(vec![4u8, 5]));
+        // ... and a missing file reports which read failed, not the combo check
+        let err = super::load_decide_media(&[dir.path().join("no-such-image.png")], &None, plain())
+            .expect_err("expected the missing file to refuse");
+        assert!(
+            err.to_string().contains("reading the image"),
+            "unexpected message: {err}"
+        );
+        let err =
+            super::load_decide_media(&[], &Some(dir.path().join("no-such-clip.wav")), plain())
+                .expect_err("expected the missing file to refuse");
+        assert!(
+            err.to_string().contains("reading the clip"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn decide_device_ok_refuses_accelerated_backends_before_any_load() {
+        // every spelling the engine accepts, plus a case variant: each refuses
+        // before the weight loads with the reason the pipeline would give late
+        for (device, reason) in [
+            ("gpu", "causal hidden states only"),
+            ("wgpu", "causal hidden states only"),
+            ("metal", "causal hidden states only"),
+            ("hexagon", "cannot read hidden states"),
+            ("htp", "cannot read hidden states"),
+            ("npu", "cannot read hidden states"),
+            ("GPU", "causal hidden states only"),
+        ] {
+            let err = super::decide_device_ok(device, false)
+                .expect_err("expected the device check to refuse");
+            assert!(
+                err.to_string().contains("need `--device cpu`"),
+                "unexpected message: {err}"
+            );
+            assert!(
+                err.to_string().contains(reason),
+                "unexpected message: {err}"
+            );
+            let err = super::decide_device_ok(device, true)
+                .expect_err("expected the device check to refuse");
+            assert!(
+                err.to_string().contains("cannot read a media prefix"),
+                "unexpected message: {err}"
+            );
+        }
+        // cpu, auto, empty, and unknown spellings fall through to the engine
+        for device in ["cpu", "auto", "", "bogus"] {
+            super::decide_device_ok(device, false).unwrap();
+            super::decide_device_ok(device, true).unwrap();
+        }
     }
 }

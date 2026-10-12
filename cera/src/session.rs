@@ -807,7 +807,8 @@ pub struct Session {
     /// duration of a `generate` (to avoid borrow conflicts with `model`/`sampler`) and
     /// restored before returning. See [`crate::grammar`].
     grammar_mask: Option<crate::grammar::GrammarMask>,
-    /// Reusable throwaway state for [`Self::hidden_states_for_tokens`]. Sized to
+    /// Reusable throwaway state for [`Self::hidden_states_for_tokens`] and
+    /// [`Self::hidden_states_with_prefix`]. Sized to
     /// the prompt via [`InferenceState::for_prefill`] and `clear_for_reuse`d
     /// between calls, so the per-chunk classifier path does ~0 allocation after
     /// warmup and never allocates a full-context KV cache. Separate from the
@@ -1221,6 +1222,13 @@ impl Session {
         self.lora.is_some()
     }
 
+    /// Install an adapter without validation, for tests: the d1 legs pin the
+    /// media fail-fast probe, which only needs an adapter present.
+    #[cfg(test)]
+    pub(crate) fn install_lora_for_test(&mut self, adapter: Arc<crate::lora::LoraAdapterWeights>) {
+        self.lora = Some(adapter);
+    }
+
     /// Replace the session-default sampler seed and restart the RNG from it
     /// immediately (`None` re-seeds from entropy). KV, position, and the
     /// repetition history are untouched (only the random stream restarts),
@@ -1536,6 +1544,41 @@ impl Session {
         self.hidden_states_for_tokens_inner(tokens, lora)
     }
 
+    /// The shared hidden-states scratch slot, (re)built when too small and cleared
+    /// for reuse otherwise. Both the text and the media-prefix extractors call here:
+    /// their calls are sequential, so one slot serves both. Stores the RAW row count
+    /// (not clamped to max_seq_len): otherwise an over-length call would rebuild on
+    /// every call. Keeps the largest count either caller needed, so a smaller
+    /// follow-up reuses instead of rebuilding. The KV Vec grows once past the capped
+    /// reservation and `clear_for_reuse` keeps that capacity, so this never allocates
+    /// a full-context KV cache up front.
+    fn hs_scratch_for(
+        &mut self,
+        config: &crate::model::ModelConfig,
+        rows: usize,
+    ) -> Result<&mut InferenceState, CeraError> {
+        let rebuild = self.hs_scratch.is_none() || self.hs_scratch_cap < rows;
+        if rebuild {
+            self.hs_scratch = Some(InferenceState::for_prefill(config, rows)?);
+            self.hs_scratch_cap = rows;
+        }
+        // The slot is always `Some` after the rebuild block (rebuild covers the
+        // `is_none()` case), so the `None` arm is a defensive error, not a
+        // reachable path.
+        let state = match self.hs_scratch.as_mut() {
+            Some(s) => s,
+            None => {
+                return Err(CeraError::Backend(
+                    "hs_scratch is None after rebuild block".into(),
+                ));
+            }
+        };
+        if !rebuild {
+            state.clear_for_reuse();
+        }
+        Ok(state)
+    }
+
     /// Like [`Self::hidden_states_for_tokens`] but with an explicit per-call
     /// adapter choice: `Some` extracts through that adapter (a single
     /// adapter or a [`crate::lora::LoraAdapterWeights::compose`]d stack),
@@ -1597,32 +1640,7 @@ impl Session {
                 by: (tokens.len() - max_seq_len) as u32,
             });
         }
-        let n = tokens.len();
-        // Reuse the scratch state when it's big enough; else (re)build it sized to
-        // this prompt. Store the RAW `n` (not clamped to max_seq_len): otherwise a
-        // prompt longer than max_seq_len would compare `cap < n` true on EVERY
-        // call and rebuild each time. The KV Vec grows once past the capped
-        // reservation and `clear_for_reuse` keeps that capacity. Never allocates a
-        // full-context KV cache up front.
-        let rebuild = self.hs_scratch.is_none() || self.hs_scratch_cap < n;
-        if rebuild {
-            self.hs_scratch = Some(InferenceState::for_prefill(model.config(), n)?);
-            self.hs_scratch_cap = n;
-        }
-        // The slot is always `Some` after the rebuild block (rebuild covers the
-        // `is_none()` case), so the `None` arm is a defensive error, not a
-        // reachable path.
-        let state = match self.hs_scratch.as_mut() {
-            Some(s) => s,
-            None => {
-                return Err(CeraError::Backend(
-                    "hs_scratch is None after rebuild block".into(),
-                ));
-            }
-        };
-        if !rebuild {
-            state.clear_for_reuse();
-        }
+        let state = self.hs_scratch_for(model.config(), tokens.len())?;
         // Run the extraction under the chosen adapter (the coordination point:
         // the CPU per-token path applies it via the decode hooks). `None`
         // extracts from the base model even when the session has adapters
@@ -1655,7 +1673,11 @@ impl Session {
     /// # Errors
     ///
     /// [`CeraError::UnsupportedModality`] when the backend cannot read a media prefix;
+    /// [`CeraError::LoraUnsupportedByBackend`] when an adapter is attached (the media
+    /// trunk has no apply hooks and would silently ignore it);
+    /// [`CeraError::Backend`] when the model reports a zero hidden size;
     /// [`CeraError::InvalidToken`] for an id outside the vocabulary;
+    /// [`CeraError::EmptyInput`] when `tokens` is empty;
     /// [`CeraError::ContextOverflow`] when prefix and text together exceed the context.
     pub fn hidden_states_with_prefix(
         &mut self,
@@ -1672,7 +1694,19 @@ impl Session {
         if !model.supports_media_prefix() {
             return Err(CeraError::UnsupportedModality);
         }
+        if self.lora.is_some() {
+            return Err(CeraError::LoraUnsupportedByBackend(
+                "media-prefix hidden states have no LoRA apply hooks, so the adapter would be \
+                 silently ignored; detach it or use the text path"
+                    .to_string(),
+            ));
+        }
         let hidden = model.config().hidden_size;
+        if hidden == 0 {
+            return Err(CeraError::Backend(
+                "hidden_states_with_prefix: model hidden_size is 0".into(),
+            ));
+        }
         if !prefix.len().is_multiple_of(hidden) {
             return Err(CeraError::Backend(format!(
                 "the media prefix has {} values, not a whole number of {hidden}-wide rows",
@@ -1686,16 +1720,29 @@ impl Session {
                 vocab_size: vocab_size as u32,
             });
         }
-        let total = prefix.len() / hidden + tokens.len();
+        let prefix_rows = prefix.len() / hidden;
         let max_seq_len = model.config().max_seq_len;
-        if total > max_seq_len {
-            return Err(CeraError::ContextOverflow {
-                max_seq_len: max_seq_len as u32,
-                by: (total - max_seq_len) as u32,
-            });
-        }
-        let mut state = InferenceState::for_prefill(model.config(), total)?;
-        let out = model.hidden_states_with_prefix(prefix, tokens, &mut state);
+        let total = match prefix_rows.checked_add(tokens.len()) {
+            Some(t) if t <= max_seq_len => t,
+            Some(t) => {
+                return Err(CeraError::ContextOverflow {
+                    max_seq_len: max_seq_len as u32,
+                    by: (t - max_seq_len) as u32,
+                });
+            }
+            None => {
+                return Err(CeraError::ContextOverflow {
+                    max_seq_len: max_seq_len as u32,
+                    by: u32::MAX,
+                });
+            }
+        };
+        let state = self.hs_scratch_for(model.config(), total)?;
+        // Defense in depth: the media trunk has no LoRA hooks (adapters are refused
+        // above), so the call pins the slot empty. The text path restores the slot
+        // today, but the media trunk must never inherit an adapter if that changes.
+        state.lora = None;
+        let out = model.hidden_states_with_prefix(prefix, tokens, state);
         self.check_decode_error()?;
         Ok(out)
     }
@@ -4579,6 +4626,18 @@ mod tests {
             self.record_armed_failure();
             vec![0.0; tokens.len() * self.config.hidden_size.max(1)]
         }
+        fn supports_media_prefix(&self) -> bool {
+            true
+        }
+        fn hidden_states_with_prefix(
+            &self,
+            _prefix: &[f32],
+            tokens: &[u32],
+            _state: &mut crate::kv_cache::InferenceState,
+        ) -> Vec<f32> {
+            self.record_armed_failure();
+            vec![0.0; tokens.len() * self.config.hidden_size.max(1)]
+        }
     }
 
     fn mock_config() -> crate::model::ModelConfig {
@@ -4603,6 +4662,68 @@ mod tests {
             is_causal: true,
             class_labels: Vec::new(),
         }
+    }
+
+    fn media_session(hidden_size: usize) -> Session {
+        let mut config = mock_config();
+        config.hidden_size = hidden_size;
+        let model = Arc::new(MockTestModel::new(config));
+        let tokenizer = Arc::new(BpeTokenizer::empty_for_test());
+        Session::new(
+            model,
+            tokenizer,
+            ModalityCapabilities::text_only(),
+            SessionConfig::default(),
+        )
+        .unwrap()
+    }
+
+    #[test]
+    fn media_prefix_hidden_states_reuse_the_text_scratch() {
+        let mut session = media_session(8);
+        // the text path claims the shared slot first ...
+        let out = session.hidden_states_for_tokens(&[1, 2]).unwrap();
+        assert_eq!(out.len(), 2 * 8);
+        assert_eq!(session.hs_scratch_cap, 2);
+        // ... the media path grows it ...
+        let out = session
+            .hidden_states_with_prefix(&[0.0; 2 * 8], &[1, 2])
+            .unwrap();
+        assert_eq!(out.len(), 2 * 8);
+        assert_eq!(session.hs_scratch_cap, 4);
+        // ... and a smaller text follow-up reuses it instead of rebuilding
+        let out = session.hidden_states_for_tokens(&[3]).unwrap();
+        assert_eq!(out.len(), 8);
+        assert_eq!(session.hs_scratch_cap, 4);
+    }
+
+    #[test]
+    fn media_prefix_hidden_states_refuse_an_adapter_and_a_zero_width() {
+        let mut session = media_session(8);
+        session.lora = Some(crate::lora::LoraAdapterWeights::new_classifier_for_testing(
+            vec![0.0; 2],
+            None,
+            vec!["class".into()],
+        ));
+        let err = session
+            .hidden_states_with_prefix(&[0.0; 8], &[1])
+            .unwrap_err();
+        match err {
+            CeraError::LoraUnsupportedByBackend(detail) => assert!(
+                detail.contains("no LoRA apply hooks") && detail.contains("detach it"),
+                "refusal must name the missing hooks and the recovery, got: {detail}"
+            ),
+            other => panic!("expected LoraUnsupportedByBackend, got {other:?}"),
+        }
+        let mut session = media_session(0);
+        let err = session
+            .hidden_states_with_prefix(&[0.0; 8], &[1])
+            .unwrap_err();
+        // the next guard returns Backend too, so only the message pins this one
+        assert!(
+            err.to_string().contains("hidden_size is 0"),
+            "unexpected error: {err:?}"
+        );
     }
 
     #[test]

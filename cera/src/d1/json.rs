@@ -7,6 +7,7 @@
 //! separators, `1e-05` for small floats, `Infinity` for an overflowing one, control characters
 //! escaped and everything else left as it is.
 
+use std::collections::HashMap;
 use std::fmt::Write as _;
 
 use anyhow::{Result, bail, ensure};
@@ -128,6 +129,12 @@ fn write_string(out: &mut String, s: &str) {
 
 /// Python's `repr(float)`: the shortest digits that read back the same value, fixed notation
 /// for a decimal exponent from -4 up to 15 and scientific (`1e-05`, `1.5e+16`) outside it.
+///
+/// The digits come from Rust's `{:e}`, a shortest round-trip spelling laid out with
+/// Python's notation choice. Where two shortest spellings both read back the same value
+/// (a small fraction of doubles, e.g. `9828611460527.062` vs `9828611460527.063`), the
+/// two sides may pick different winners: the spelling always round-trips, but is not
+/// always Python's exact digits.
 pub fn float_repr(f: f64) -> String {
     if f.is_nan() {
         return "NaN".into();
@@ -265,6 +272,9 @@ impl Parser<'_> {
         self.nested(|p| {
             p.expect(b'{')?;
             let mut entries: Vec<(String, Json)> = Vec::new();
+            // key to entry index, so the duplicate check below stays linear overall
+            // instead of quadratic in the key count
+            let mut index: HashMap<String, usize> = HashMap::new();
             p.skip_space();
             if p.peek() == Some(b'}') {
                 p.pos += 1;
@@ -279,9 +289,12 @@ impl Parser<'_> {
                 p.skip_space();
                 let value = p.value()?;
                 // Python's dict: a repeated key keeps its first position and its last value
-                match entries.iter_mut().find(|(k, _)| *k == key) {
-                    Some(slot) => slot.1 = value,
-                    None => entries.push((key, value)),
+                match index.get(&key) {
+                    Some(&at) => entries[at].1 = value,
+                    None => {
+                        index.insert(key.clone(), entries.len());
+                        entries.push((key, value));
+                    }
                 }
                 p.skip_space();
                 match p.peek() {
@@ -465,6 +478,45 @@ mod tests {
     }
 
     #[test]
+    fn float_repr_round_trips_where_it_disagrees_with_python() {
+        // shortest is not unique: CPython spells these bits `...062`, we spell `...063`;
+        // both read back the same value, and the round-trip is the guaranteed property
+        let f = f64::from_bits(0x42a1e0cdca1b5e20);
+        let spelled = float_repr(f);
+        assert_eq!(spelled, "9828611460527.063");
+        assert_eq!(spelled.parse::<f64>().unwrap().to_bits(), f.to_bits());
+        assert_eq!(
+            "9828611460527.062".parse::<f64>().unwrap().to_bits(),
+            f.to_bits()
+        );
+    }
+
+    #[test]
+    fn float_repr_keeps_every_digit_a_shortest_spelling_needs() {
+        // the classic 0.1 + 0.2: 17 significant digits, all required to read back
+        let sum = 0.1f64 + 0.2;
+        assert_eq!(float_repr(sum), "0.30000000000000004");
+        assert_eq!(
+            "0.30000000000000004".parse::<f64>().unwrap().to_bits(),
+            sum.to_bits()
+        );
+    }
+
+    #[test]
+    fn non_standard_float_literals_parse_for_python_compat() {
+        assert!(matches!(Json::parse("NaN"), Ok(Json::Float(f)) if f.is_nan()));
+        assert_eq!(Json::parse("Infinity").unwrap(), Json::Float(f64::INFINITY));
+        assert_eq!(
+            Json::parse("-Infinity").unwrap(),
+            Json::Float(f64::NEG_INFINITY)
+        );
+        // and they dump back to the same spellings
+        assert_eq!(Json::Float(f64::NAN).dumps(), "NaN");
+        assert_eq!(Json::Float(f64::INFINITY).dumps(), "Infinity");
+        assert_eq!(Json::Float(f64::NEG_INFINITY).dumps(), "-Infinity");
+    }
+
+    #[test]
     fn numbers_keep_their_kind() {
         assert_eq!(Json::parse("-0").unwrap().dumps(), "0");
         assert_eq!(
@@ -501,7 +553,10 @@ mod tests {
 
     #[test]
     fn surrogate_pairs_decode() {
-        assert_eq!(Json::parse(r#""😀""#).unwrap(), Json::Str("😀".into()));
+        assert_eq!(
+            Json::parse(r#""\uD83D\uDE00""#).unwrap(),
+            Json::Str("😀".into())
+        );
     }
 
     #[test]

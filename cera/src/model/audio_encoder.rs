@@ -93,10 +93,15 @@ pub const NORM_VAR_EPS: f64 = 1e-5;
 ///   output Nyquist (8 kHz here) fold back as aliasing artifacts.
 ///   Speech energy is mostly under 8 kHz so this is tolerable for
 ///   ASR but not studio-quality.
+///
+/// Lowest sample rate [`resample_linear`] accepts; anything else yields no samples.
+pub(crate) const RESAMPLE_RATE_MIN: u32 = 1000;
+/// Highest sample rate [`resample_linear`] accepts; anything else yields no samples.
+pub(crate) const RESAMPLE_RATE_MAX: u32 = 192_000;
 pub fn resample_linear(samples: &[f32], sr_in: u32, sr_out: u32) -> Vec<f32> {
     if samples.is_empty()
-        || !(1000..=192_000).contains(&sr_in)
-        || !(1000..=192_000).contains(&sr_out)
+        || !(RESAMPLE_RATE_MIN..=RESAMPLE_RATE_MAX).contains(&sr_in)
+        || !(RESAMPLE_RATE_MIN..=RESAMPLE_RATE_MAX).contains(&sr_out)
     {
         return Vec::new();
     }
@@ -302,7 +307,8 @@ impl AudioEncoderWeights {
     /// Load every encoder tensor from a multimodal_projector GGUF.
     /// Errors if any required tensor or metadata key is missing —
     /// no silent defaults. Per-tensor `with_context` makes the first
-    /// missing name visible at the top of the error chain.
+    /// missing name visible at the top of the error chain. Also errors
+    /// on zero or mismatched widths and a non-positive-finite epsilon.
     ///
     /// **Required metadata keys**: `clip.audio.block_count`,
     /// `clip.audio.embedding_length`, `clip.audio.attention.head_count`,
@@ -326,12 +332,27 @@ impl AudioEncoderWeights {
         let n_head = gguf
             .get_u32(KEY_N_HEAD)
             .with_context(|| format!("missing `{KEY_N_HEAD}`"))? as usize;
+        // before any weight load, so a hand-built file refuses here instead of
+        // panicking in the attention forward (which poisons the FFI session)
+        anyhow::ensure!(n_head >= 1, "the audio encoder has no heads");
+        anyhow::ensure!(n_embd >= 1, "the audio encoder has no width");
+        anyhow::ensure!(
+            n_embd.is_multiple_of(n_head),
+            "{n_head} heads do not divide {n_embd}"
+        );
         let eps = gguf
             .get_f32(KEY_LN_EPS)
             .with_context(|| format!("missing `{KEY_LN_EPS}`"))?;
+        // a present-but-bad value would silently degenerate every conformer norm
+        // (+inf zeroes each norm to its bias, finitely, so no guard downstream fires)
+        anyhow::ensure!(
+            eps.is_finite() && eps > 0.0,
+            "the audio encoder epsilon ({eps}) is not positive and finite"
+        );
         let n_mel_bins =
             gguf.get_u32(KEY_N_MEL_BINS)
                 .with_context(|| format!("missing `{KEY_N_MEL_BINS}`"))? as usize;
+        anyhow::ensure!(n_mel_bins >= 1, "the audio encoder has no mel bins");
         // `n_ff` is derived from the loaded ffn_up tensor below, not
         // from `KEY_N_FF`. The metadata key is unreliable on the
         // real LFM2.5-Audio-1.5B mmproj GGUF (says 512 but the
@@ -357,7 +378,9 @@ impl AudioEncoderWeights {
         };
 
         // ── Conformer blocks ──
-        let mut layers = Vec::with_capacity(n_layer);
+        // no pre-size: `n_layer` is a file-declared count, and reserving it up front
+        // turns a corrupt GGUF into an aborted process instead of a load error
+        let mut layers = Vec::new();
         for il in 0..n_layer {
             layers.push(load_conformer_block(gguf, il)?);
         }
@@ -1780,6 +1803,60 @@ mod tests {
                     "expected missing-key error, got: {msg}"
                 );
             }
+        }
+    }
+
+    /// Heads that do not divide the width (or no heads or width at all) refuse at
+    /// load, before any weight reads: past this point the attention forward would
+    /// panic instead of returning an error. A header-only GGUF suffices since the
+    /// guard fires on metadata alone.
+    #[test]
+    fn from_gguf_refuses_heads_that_do_not_divide_the_width() {
+        use crate::gguf::GgufBuilder;
+        // the builder, not a built file: legs chain last-wins overrides
+        let file = |n_embd: u32, n_head: u32| {
+            GgufBuilder::new()
+                .kv_u32(KEY_N_LAYER, 1)
+                .kv_u32(KEY_N_EMBD, n_embd)
+                .kv_u32(KEY_N_HEAD, n_head)
+                .kv_f32(KEY_LN_EPS, 1e-5)
+                .kv_u32(KEY_N_MEL_BINS, 80)
+        };
+        // a match, not unwrap_err: the weights hold mmap handles without Debug
+        let check = |n_embd: u32, n_head: u32, want: &str| {
+            let built = Arc::new(file(n_embd, n_head).build());
+            let msg = match AudioEncoderWeights::from_gguf(&built) {
+                Ok(_) => panic!("expected `{want}`"),
+                Err(e) => e.to_string(),
+            };
+            assert!(msg.contains(want), "unexpected message: {msg}");
+        };
+        check(4, 3, "3 heads do not divide 4");
+        check(4, 0, "has no heads");
+        // zero is a multiple of every head count, so the divisibility check
+        // alone would let a 0-wide encoder through to a chunking panic
+        check(0, 1, "has no width");
+        // the divisible pair passes the guard: it fails later, on the stem
+        // tensors this header-only fixture omits
+        check(4, 2, "loading a.conv1d.0.weight");
+        // a 0-bin file refuses on the metadata, before any weight loads
+        let nobins = Arc::new(file(4, 2).kv_u32(KEY_N_MEL_BINS, 0).build());
+        let msg = match AudioEncoderWeights::from_gguf(&nobins) {
+            Ok(_) => panic!("expected the mel-bins guard to refuse"),
+            Err(e) => e.to_string(),
+        };
+        assert!(msg.contains("has no mel bins"), "unexpected message: {msg}");
+        // a present-but-bad epsilon would silently degenerate every norm
+        for bad in [f32::NAN, -1.0, f32::INFINITY] {
+            let broken = Arc::new(file(4, 2).kv_f32(KEY_LN_EPS, bad).build());
+            let msg = match AudioEncoderWeights::from_gguf(&broken) {
+                Ok(_) => panic!("expected the epsilon guard to refuse"),
+                Err(e) => e.to_string(),
+            };
+            assert!(
+                msg.contains("is not positive and finite"),
+                "unexpected message: {msg}"
+            );
         }
     }
 

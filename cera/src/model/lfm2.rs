@@ -352,6 +352,21 @@ fn validate_conv_kernel_size(v: Option<usize>) -> anyhow::Result<Option<usize>> 
     Ok(v)
 }
 
+/// Whether a GGUF's attention is causal: `is_causal` is cera's key,
+/// `attention.causal` the one llama.cpp's converter writes for the bidirectional
+/// encoders (Embedding, ColBERT), and a token classification model without either
+/// key defaults to bidirectional attention.
+pub(crate) fn gguf_is_causal(gguf: &GgufFile, prefix: &str) -> bool {
+    if let Some(causal) = gguf
+        .get_bool(&format!("{prefix}.is_causal"))
+        .or_else(|| gguf.get_bool(&format!("{prefix}.attention.causal")))
+    {
+        causal
+    } else {
+        gguf.get_tensor("classifier.weight").is_err()
+    }
+}
+
 impl LfmModel {
     fn check_rewind_mode(
         &self,
@@ -527,19 +542,7 @@ impl LfmModel {
             None
         };
 
-        // `is_causal` is cera's key; `attention.causal` is the one llama.cpp's converter writes
-        // for the bidirectional encoders (Embedding, ColBERT)
-        let is_causal = if let Some(causal) = gguf
-            .get_bool(&format!("{prefix}.is_causal"))
-            .or_else(|| gguf.get_bool(&format!("{prefix}.attention.causal")))
-        {
-            causal
-        } else if gguf.get_tensor("classifier.weight").is_ok() {
-            // Token classification models default to bidirectional attention
-            false
-        } else {
-            true
-        };
+        let is_causal = gguf_is_causal(gguf, prefix);
 
         let class_labels: Vec<String> = gguf
             .get_string_array("token_classifier.labels")
@@ -5211,6 +5214,12 @@ impl Model for LfmModel {
         !self.config.is_causal
     }
 
+    /// The CPU extractor branches on the config: full-context prefill for a
+    /// bidirectional model, a causal loop otherwise.
+    fn supports_bidirectional_hidden_states(&self) -> bool {
+        !self.config.is_causal
+    }
+
     fn hidden_states_with_prefix(
         &self,
         prefix: &[f32],
@@ -6633,6 +6642,14 @@ mod bidirectional_float_tests {
     }
 
     #[test]
+    fn a_bidirectional_cpu_model_reports_bidirectional_hidden_states() {
+        // the d1 gate refuses causal-only extractors; without this opt-in a
+        // flipped default would refuse every CPU question with no test failing
+        let model = LfmModel::from_gguf(bidirectional_gguf(false), 256).unwrap();
+        assert!(model.supports_bidirectional_hidden_states());
+    }
+
+    #[test]
     fn a_later_token_changes_an_earlier_hidden_state() {
         let a = hidden(bidirectional_gguf(false), &[3, 7, 9, 12, 5]);
         let b = hidden(bidirectional_gguf(false), &[3, 7, 9, 12, 20]);
@@ -6645,8 +6662,6 @@ mod bidirectional_float_tests {
         assert!(moved > 1e-4, "token 0 ignored the last token ({moved})");
     }
 
-    /// The float path computes the function the batched quantized path does: the same
-    /// weights, once as F32 and once as Q8_0, agree to the quantization error.
     /// Deterministic embeddings, `rows` of `HS`, for a seed.
     fn embeddings(rows: usize, seed: f32) -> Vec<f32> {
         (0..rows * HS)
@@ -6724,6 +6739,8 @@ mod bidirectional_float_tests {
         assert_ne!(plain, split);
     }
 
+    /// The float path computes the function the batched quantized path does: the same
+    /// weights, once as F32 and once as Q8_0, agree to the quantization error.
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
     #[test]
     fn the_float_path_agrees_with_the_batched_quantized_path() {

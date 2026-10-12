@@ -189,8 +189,11 @@ impl GgufFile {
 pub(crate) enum KvValue {
     U32(u32),
     F32(f32),
+    Bool(bool),
     Str(String),
     I32Array(Vec<i32>),
+    StringArray(Vec<String>),
+    F32Array(Vec<f32>),
     /// Pre-encoded value: GGUF value type id plus its exact bytes.
     Raw(u32, Vec<u8>),
 }
@@ -225,6 +228,18 @@ impl GgufBuilder {
 
     pub(crate) fn kv_f32(self, key: impl Into<String>, v: f32) -> Self {
         self.kv(key, KvValue::F32(v))
+    }
+
+    pub(crate) fn kv_bool(self, key: impl Into<String>, v: bool) -> Self {
+        self.kv(key, KvValue::Bool(v))
+    }
+
+    pub(crate) fn kv_string_array(self, key: impl Into<String>, v: Vec<String>) -> Self {
+        self.kv(key, KvValue::StringArray(v))
+    }
+
+    pub(crate) fn kv_f32_array(self, key: impl Into<String>, v: Vec<f32>) -> Self {
+        self.kv(key, KvValue::F32Array(v))
     }
 
     pub(crate) fn kv_str(self, key: impl Into<String>, v: impl Into<String>) -> Self {
@@ -285,6 +300,10 @@ impl GgufBuilder {
                     out.extend_from_slice(&6u32.to_le_bytes());
                     out.extend_from_slice(&x.to_le_bytes());
                 }
+                KvValue::Bool(b) => {
+                    out.extend_from_slice(&7u32.to_le_bytes());
+                    out.push(u8::from(*b));
+                }
                 KvValue::Str(x) => {
                     out.extend_from_slice(&8u32.to_le_bytes());
                     put_str(&mut out, x);
@@ -292,6 +311,22 @@ impl GgufBuilder {
                 KvValue::I32Array(a) => {
                     out.extend_from_slice(&9u32.to_le_bytes());
                     out.extend_from_slice(&5u32.to_le_bytes());
+                    out.extend_from_slice(&(a.len() as u64).to_le_bytes());
+                    for x in a {
+                        out.extend_from_slice(&x.to_le_bytes());
+                    }
+                }
+                KvValue::StringArray(a) => {
+                    out.extend_from_slice(&9u32.to_le_bytes());
+                    out.extend_from_slice(&8u32.to_le_bytes());
+                    out.extend_from_slice(&(a.len() as u64).to_le_bytes());
+                    for s in a {
+                        put_str(&mut out, s);
+                    }
+                }
+                KvValue::F32Array(a) => {
+                    out.extend_from_slice(&9u32.to_le_bytes());
+                    out.extend_from_slice(&6u32.to_le_bytes());
                     out.extend_from_slice(&(a.len() as u64).to_le_bytes());
                     for x in a {
                         out.extend_from_slice(&x.to_le_bytes());

@@ -48,8 +48,11 @@
 
 use serde_json::Value;
 
-use crate::convert::safetensors::translate_hf_to_gguf_tensor_name_with_arch;
+use crate::convert::safetensors::{gguf_tensor_dims, translate_hf_to_gguf_tensor_name_with_arch};
 use crate::convert::writer::GgufWriter;
+use crate::d1::head::HEAD_DIM;
+use crate::d1::prompt::MIN_OPTION_BUDGET;
+use crate::d1::vision::{PATCH, POSITION_SIDE};
 use crate::session::CeraError;
 
 /// `model_type` of a d1-omni `config.json`.
@@ -123,11 +126,12 @@ pub fn fold_batch_norm(
         .collect()
 }
 
-/// The GGUF dimensions of a tensor: the reversed shape, with the singleton axis of the audio
-/// 1-D convolution kernels dropped (a depthwise `[c, 1, k]` becomes `[k, c]`, a pointwise
-/// `[o, i, 1]` becomes `[i, o]`).
+/// The GGUF dimensions of a tensor: the canonical reversed shape (including the LFM2
+/// short-convolution singleton squeeze), with the singleton axis of the audio 1-D
+/// convolution kernels dropped on top (a depthwise `[c, 1, k]` becomes `[k, c]`, a
+/// pointwise `[o, i, 1]` becomes `[i, o]`).
 pub fn tensor_dims(gguf_name: &str, shape: &[usize]) -> Vec<u64> {
-    let mut dims: Vec<u64> = shape.iter().rev().map(|&d| d as u64).collect();
+    let mut dims = gguf_tensor_dims(gguf_name, shape);
     if shape.len() == 3 {
         if gguf_name.ends_with(".conv_dw.weight") && shape[1] == 1 {
             dims.remove(1);
@@ -234,7 +238,8 @@ fn vision_tensor_name(hf_name: &str) -> Option<String> {
     if let Some(rest) = hf_name.strip_prefix("vision.projector.") {
         let (layer, kind) = rest.split_once('.')?;
         let n = layer.strip_prefix("linear_")?;
-        return matches!(n, "1" | "2").then(|| format!("d1.v.mm.{n}.{kind}"));
+        return (matches!(n, "1" | "2") && matches!(kind, "weight" | "bias"))
+            .then(|| format!("d1.v.mm.{n}.{kind}"));
     }
     let rest = hf_name.strip_prefix("vision.tower.vision_model.")?;
     match rest {
@@ -286,7 +291,7 @@ pub fn tensor_name(hf_name: &str) -> Option<String> {
             "3" => "d1.cls.output",
             _ => return None,
         };
-        return Some(format!("{part}.{kind}"));
+        return matches!(kind, "weight" | "bias").then(|| format!("{part}.{kind}"));
     }
     let (index, suffix) = rest.strip_prefix("head.layers.")?.split_once('.')?;
     index.parse::<usize>().ok()?;
@@ -309,11 +314,47 @@ pub fn tensor_name(hf_name: &str) -> Option<String> {
 }
 
 fn count(config: &Value, key: &str) -> Result<u32, CeraError> {
-    config
-        .get(key)
-        .and_then(Value::as_u64)
+    let Some(value) = config.get(key) else {
+        return Err(CeraError::Backend(format!(
+            "d1-omni config.json: `{key}` is missing"
+        )));
+    };
+    value
+        .as_u64()
         .and_then(|n| u32::try_from(n).ok())
-        .ok_or_else(|| CeraError::Backend(format!("d1-omni config.json: `{key}` is missing")))
+        .ok_or_else(|| {
+            CeraError::Backend(format!(
+                "d1-omni config.json: `{key}` must be an integer 0..=u32::MAX"
+            ))
+        })
+}
+
+/// A count from a config section, with the same missing-vs-wrong-type split as [`count`].
+fn section_count(section: &Value, section_name: &str, key: &str) -> Result<u32, CeraError> {
+    let value = section.get(key).ok_or_else(|| {
+        CeraError::Backend(format!("d1-omni config.json: no `{section_name}.{key}`"))
+    })?;
+    value
+        .as_u64()
+        .and_then(|n| u32::try_from(n).ok())
+        .ok_or_else(|| {
+            CeraError::Backend(format!(
+                "d1-omni config.json: `{section_name}.{key}` must be an integer 0..=u32::MAX"
+            ))
+        })
+}
+
+/// Refuse a zero count the loaders cannot use, naming the config key as `count`
+/// would (`section.key` for section fields, bare for top-level ones). Per-site,
+/// not blanket: some block counts and unblocked widths may legitimately be 0
+/// (a block-less vision tower), while the audio encoder needs both.
+fn nonzero(value: u32, key: &str) -> Result<u32, CeraError> {
+    if value == 0 {
+        return Err(CeraError::Backend(format!(
+            "d1-omni config.json: {key} is 0"
+        )));
+    }
+    Ok(value)
 }
 
 /// Write the `d1.*` metadata of a d1-omni `config.json`.
@@ -322,94 +363,158 @@ fn count(config: &Value, key: &str) -> Result<u32, CeraError> {
 ///
 /// Refuses a config without the counts the head and the prompt budget are read from.
 pub fn apply_metadata(config: &Value, writer: &mut GgufWriter) -> Result<(), CeraError> {
-    let hidden = config
-        .get("text_config")
-        .and_then(|t| t.get("hidden_size"))
-        .and_then(Value::as_u64)
-        .and_then(|n| u32::try_from(n).ok())
-        .ok_or_else(|| {
-            CeraError::Backend("d1-omni config.json: no `text_config.hidden_size`".into())
-        })?;
+    let text = config.get("text_config").ok_or_else(|| {
+        CeraError::Backend("d1-omni config.json: no `text_config.hidden_size`".into())
+    })?;
+    let hidden = section_count(text, "text_config", "hidden_size")?;
     let layers = count(config, "head_layers")?;
     writer.add_u32("d1.head.block_count", layers);
-    // the head is `nn.TransformerEncoderLayer(d, d // 64, 4 * d)`
-    writer.add_u32("d1.head.attention.head_count", hidden / 64);
-    writer.add_u32("d1.head.feed_forward_length", 4 * hidden);
+    // the head is `nn.TransformerEncoderLayer(d, d // HEAD_DIM, 4 * d)`
+    let hidden = nonzero(hidden, "text_config.hidden_size")?;
+    if hidden % (HEAD_DIM as u32) != 0 {
+        return Err(CeraError::Backend(format!(
+            "d1-omni config.json: text_config.hidden_size ({hidden}) is not a multiple of {HEAD_DIM}"
+        )));
+    }
+    writer.add_u32("d1.head.attention.head_count", hidden / (HEAD_DIM as u32));
+    let ffn = hidden.checked_mul(4).ok_or_else(|| {
+        CeraError::Backend(format!(
+            "d1-omni config.json: text_config.hidden_size ({hidden}) overflows u32 * 4"
+        ))
+    })?;
+    writer.add_u32("d1.head.feed_forward_length", ffn);
     writer.add_f32("d1.head.layer_norm_epsilon", 1e-5);
-    writer.add_u32("d1.context_length", count(config, "max_length")?);
-    writer.add_u32("d1.image_text_length", count(config, "image_text_length")?);
-    writer.add_u32("d1.audio_text_length", count(config, "audio_text_length")?);
+    let max_length = count(config, "max_length")?;
+    if max_length < MIN_OPTION_BUDGET as u32 {
+        return Err(CeraError::Backend(format!(
+            "d1-omni config.json: max_length ({max_length}) is below the {MIN_OPTION_BUDGET} the prompt needs"
+        )));
+    }
+    writer.add_u32("d1.context_length", max_length);
+    let image_text_length = nonzero(count(config, "image_text_length")?, "image_text_length")?;
+    writer.add_u32("d1.image_text_length", image_text_length);
+    let audio_text_length = nonzero(count(config, "audio_text_length")?, "audio_text_length")?;
+    writer.add_u32("d1.audio_text_length", audio_text_length);
     if let Some(vision) = config.get("vision_config") {
-        let field = |key: &str| {
-            vision
-                .get(key)
-                .and_then(Value::as_u64)
-                .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| {
-                    CeraError::Backend(format!("d1-omni config.json: no `vision_config.{key}`"))
-                })
-        };
+        let field = |key: &str| section_count(vision, "vision_config", key);
         writer.add_u32("d1.vision.block_count", field("num_hidden_layers")?);
-        writer.add_u32("d1.vision.embedding_length", field("hidden_size")?);
-        writer.add_u32("d1.vision.feed_forward_length", field("intermediate_size")?);
-        writer.add_u32(
-            "d1.vision.attention.head_count",
+        let vision_width = nonzero(field("hidden_size")?, "vision_config.hidden_size")?;
+        writer.add_u32("d1.vision.embedding_length", vision_width);
+        // strict even for a block-less section: a 0 here is a config typo, while
+        // the loader accepts a 0 width only where no block reads it
+        let vision_ffn = nonzero(
+            field("intermediate_size")?,
+            "vision_config.intermediate_size",
+        )?;
+        writer.add_u32("d1.vision.feed_forward_length", vision_ffn);
+        let vision_heads = nonzero(
             field("num_attention_heads")?,
-        );
-        writer.add_u32("d1.vision.patch_size", field("patch_size")?);
+            "vision_config.num_attention_heads",
+        )?;
+        writer.add_u32("d1.vision.attention.head_count", vision_heads);
+        let patch = field("patch_size")?;
+        if patch as usize != PATCH {
+            return Err(CeraError::Backend(format!(
+                "d1-omni config.json: vision_config.patch_size ({patch}) is not the {PATCH} px the tower reads"
+            )));
+        }
+        writer.add_u32("d1.vision.patch_size", patch);
         // the position table is square: `num_patches` is its area
         let patches = field("num_patches")?;
         let side = (f64::from(patches).sqrt().round()) as u32;
-        if side * side != patches {
+        if u64::from(side) * u64::from(side) != u64::from(patches) {
             return Err(CeraError::Backend(format!(
-                "d1-omni vision_config.num_patches ({patches}) is not a square"
+                "d1-omni config.json: vision_config.num_patches ({patches}) is not a square"
+            )));
+        }
+        if side as usize != POSITION_SIDE {
+            return Err(CeraError::Backend(format!(
+                "d1-omni config.json: vision_config.num_patches ({patches}) is not the {POSITION_SIDE} x {POSITION_SIDE} table the tower reads"
             )));
         }
         writer.add_u32("d1.vision.position_side", side);
-        writer.add_f32(
-            "d1.vision.layer_norm_epsilon",
-            vision
-                .get("layer_norm_eps")
-                .and_then(Value::as_f64)
-                .unwrap_or(1e-6) as f32,
-        );
-        writer.add_u32(
-            "d1.vision.projector_hidden_length",
+        // missing means the default, but a present epsilon must be a positive
+        // finite f32: a bad one is refused here with a clear message instead of
+        // a confusing refusal at the final guard (and a +inf epsilon would
+        // pass every guard silently)
+        let eps = match vision.get("layer_norm_eps") {
+            None => 1e-6,
+            Some(value) => {
+                let f = value.as_f64().ok_or_else(|| {
+                    CeraError::Backend(
+                        "d1-omni config.json: `vision_config.layer_norm_eps` must be a number"
+                            .into(),
+                    )
+                })?;
+                let e = f as f32;
+                if !(e.is_finite() && e > 0.0) {
+                    return Err(CeraError::Backend(format!(
+                        "d1-omni config.json: `vision_config.layer_norm_eps` must be positive and finite, got {f}"
+                    )));
+                }
+                e
+            }
+        };
+        writer.add_f32("d1.vision.layer_norm_epsilon", eps);
+        let projector_hidden = nonzero(
             count(config, "projector_hidden_size")?,
-        );
+            "projector_hidden_size",
+        )?;
+        writer.add_u32("d1.vision.projector_hidden_length", projector_hidden);
     }
     if let Some(audio) = config.get("audio_config") {
-        let field = |key: &str| {
-            audio
-                .get(key)
-                .and_then(Value::as_u64)
-                .and_then(|n| u32::try_from(n).ok())
-                .ok_or_else(|| {
-                    CeraError::Backend(format!("d1-omni config.json: no `audio_config.{key}`"))
-                })
-        };
-        let width = field("d_model")?;
+        let field = |key: &str| section_count(audio, "audio_config", key);
+        let width = nonzero(field("d_model")?, "audio_config.d_model")?;
         writer.add_bool("clip.has_audio_encoder", true);
-        writer.add_u32("clip.audio.block_count", field("n_layers")?);
-        writer.add_u32("clip.audio.embedding_length", width);
         writer.add_u32(
-            "clip.audio.feed_forward_length",
-            width * field("ff_expansion_factor")?,
+            "clip.audio.block_count",
+            nonzero(field("n_layers")?, "audio_config.n_layers")?,
         );
-        writer.add_u32("clip.audio.attention.head_count", field("n_heads")?);
+        writer.add_u32("clip.audio.embedding_length", width);
+        let factor = field("ff_expansion_factor")?;
+        let audio_ffn = width.checked_mul(factor).ok_or_else(|| {
+            CeraError::Backend(format!(
+                "d1-omni config.json: audio_config overflows u32: d_model ({width}) * ff_expansion_factor ({factor})"
+            ))
+        })?;
+        writer.add_u32("clip.audio.feed_forward_length", audio_ffn);
+        let audio_heads = nonzero(field("n_heads")?, "audio_config.n_heads")?;
+        // past the zero gate, so the remainder is safe
+        if width % audio_heads != 0 {
+            return Err(CeraError::Backend(format!(
+                "d1-omni config.json: audio_config.d_model ({width}) is not a multiple of n_heads ({audio_heads})"
+            )));
+        }
+        writer.add_u32("clip.audio.attention.head_count", audio_heads);
         writer.add_f32("clip.audio.attention.layer_norm_epsilon", 1e-5);
-        writer.add_u32("clip.audio.num_mel_bins", field("feat_in")?);
-        writer.add_u32("d1.audio.residual_width", field("residual_width")?);
+        let feat_in = nonzero(field("feat_in")?, "audio_config.feat_in")?;
+        writer.add_u32("clip.audio.num_mel_bins", feat_in);
+        let residual = nonzero(field("residual_width")?, "audio_config.residual_width")?;
+        writer.add_u32("d1.audio.residual_width", residual);
     }
-    if let Some(temperatures) = config.get("temperatures").and_then(Value::as_object) {
+    if let Some(temperatures) = config.get("temperatures") {
+        let temperatures = temperatures.as_object().ok_or_else(|| {
+            CeraError::Backend("d1-omni config.json: `temperatures` must be an object".into())
+        })?;
         let mut keys = Vec::new();
         let mut values = Vec::new();
         for (key, value) in temperatures {
             let value = value.as_f64().ok_or_else(|| {
-                CeraError::Backend(format!("d1-omni temperature `{key}` is not a number"))
+                CeraError::Backend(format!(
+                    "d1-omni config.json: temperature `{key}` is not a number"
+                ))
             })?;
+            // the loader refuses what is not positive and finite, so refuse it
+            // here: the check runs on the f32 the file stores, since 1e300 is a
+            // finite f64 but an infinite f32
+            let stored = value as f32;
+            if !(stored.is_finite() && stored > 0.0) {
+                return Err(CeraError::Backend(format!(
+                    "d1-omni config.json: temperature `{key}` must be positive and finite, got {value}"
+                )));
+            }
             keys.push(key.clone());
-            values.push(value as f32);
+            values.push(stored);
         }
         writer.add_string_array("d1.temperature.keys", keys);
         writer.add_f32_array("d1.temperature.values", values);
@@ -420,6 +525,7 @@ pub fn apply_metadata(config: &Value, writer: &mut GgufWriter) -> Result<(), Cer
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::convert::writer::MetadataValue;
 
     #[test]
     fn trunk_tensors_take_the_lfm2_names() {
@@ -497,6 +603,8 @@ mod tests {
         }
         for bad in [
             "vision.projector.linear_3.weight",
+            "vision.projector.linear_1.running_mean",
+            "vision.projector.linear_1.weight.extra",
             "vision.tower.vision_model.encoder.layers.0.mlp.fc3.weight",
             "vision.tower.vision_model.encoder.layers.x.layer_norm1.weight",
             "vision.tower.vision_model.encoder.layers.0.layer_norm1.running_mean",
@@ -506,10 +614,12 @@ mod tests {
     }
 
     #[test]
-    fn towers_and_unknown_tensors_are_left_out() {
+    fn unknown_tensors_are_left_out() {
         for hf in [
             "head.head.layers.0.self_attn.mystery",
             "head.scorer.2.weight",
+            "head.scorer.1.num_batches_tracked",
+            "head.scorer.1.weight.extra",
             "head.head.layers.x.norm1.weight",
         ] {
             assert_eq!(tensor_name(hf), None, "{hf}");
@@ -637,6 +747,11 @@ mod tests {
             tensor_dims("a.blk.0.ffn_up.weight", &[2048, 512]),
             vec![512, 2048]
         );
+        // the trunk inherits the canonical short-convolution squeeze
+        assert_eq!(
+            tensor_dims("blk.0.shortconv.conv.weight", &[512, 1, 9]),
+            vec![9, 512]
+        );
     }
 
     #[test]
@@ -684,6 +799,60 @@ mod tests {
         assert!(writer.get_metadata("d1.vision.position_side").is_some());
         assert!(writer.get_metadata("clip.audio.block_count").is_some());
         assert!(writer.get_metadata("d1.audio.residual_width").is_some());
+        // the derived counts, not just their presence: 1024 wide means 16 heads
+        assert_eq!(
+            writer.get_metadata("d1.head.attention.head_count"),
+            Some(&MetadataValue::Uint32(16))
+        );
+        assert_eq!(
+            writer.get_metadata("d1.head.feed_forward_length"),
+            Some(&MetadataValue::Uint32(4096))
+        );
+        assert_eq!(
+            writer.get_metadata("d1.vision.position_side"),
+            Some(&MetadataValue::Uint32(16))
+        );
+        assert_eq!(
+            writer.get_metadata("clip.audio.feed_forward_length"),
+            Some(&MetadataValue::Uint32(2048))
+        );
+        assert_eq!(
+            writer.get_metadata("d1.temperature.keys"),
+            Some(&MetadataValue::StringArray(vec![
+                "choice".into(),
+                "noul:2".into()
+            ]))
+        );
+        assert_eq!(
+            writer.get_metadata("d1.temperature.values"),
+            Some(&MetadataValue::Float32Array(vec![1.0, 1.5]))
+        );
+        // the vision block count is read, never defaulted: 12 layers in, 12 out
+        assert_eq!(
+            writer.get_metadata("d1.vision.block_count"),
+            Some(&MetadataValue::Uint32(12))
+        );
+        // ... and a missing epsilon defaults instead of refusing
+        let mut noeps = config.clone();
+        noeps["vision_config"]
+            .as_object_mut()
+            .unwrap()
+            .remove("layer_norm_eps");
+        let mut writer = GgufWriter::new();
+        apply_metadata(&noeps, &mut writer).unwrap();
+        assert_eq!(
+            writer.get_metadata("d1.vision.layer_norm_epsilon"),
+            Some(&MetadataValue::Float32(1e-6))
+        );
+        // ... while a present one is carried, not defaulted over
+        let mut custom = config.clone();
+        custom["vision_config"]["layer_norm_eps"] = serde_json::json!(1e-5);
+        let mut writer = GgufWriter::new();
+        apply_metadata(&custom, &mut writer).unwrap();
+        assert_eq!(
+            writer.get_metadata("d1.vision.layer_norm_epsilon"),
+            Some(&MetadataValue::Float32(1e-5))
+        );
         assert!(
             apply_metadata(
                 &serde_json::json!({"head_layers": 2}),
@@ -691,5 +860,253 @@ mod tests {
             )
             .is_err()
         );
+    }
+
+    #[test]
+    fn metadata_refuses_counts_the_loaders_cannot_use() {
+        // head_layers, max_length and the text rooms are valid in every leg
+        let base = serde_json::json!({
+            "head_layers": 2,
+            "max_length": 16384,
+            "image_text_length": 896,
+            "audio_text_length": 15360,
+            "text_config": {"hidden_size": 2048},
+        });
+        let with = |key: &str, value: serde_json::Value| {
+            let mut config = base.clone();
+            config[key] = value;
+            config
+        };
+        let without = |key: &str| {
+            let mut config = base.clone();
+            config.as_object_mut().unwrap().remove(key);
+            config
+        };
+        // every leg pins the guard that fires it, so a refactor cannot hand a leg to
+        // a different guard while its target rots
+        // one base section per tower, one-field patches per leg: a new required key
+        // is added once instead of once per leg
+        let vision_base = || {
+            serde_json::json!({"num_hidden_layers": 1, "hidden_size": 64,
+                "intermediate_size": 64, "num_attention_heads": 1,
+                "patch_size": 16, "num_patches": 256})
+        };
+        let vision_with = |key: &str, value: serde_json::Value| {
+            let mut section = vision_base();
+            section[key] = value;
+            with("vision_config", section)
+        };
+        let vision_without = |key: &str| {
+            let mut section = vision_base();
+            section.as_object_mut().unwrap().remove(key);
+            with("vision_config", section)
+        };
+        let audio_base = || {
+            serde_json::json!({"d_model": 64, "ff_expansion_factor": 4,
+                "n_heads": 1, "n_layers": 1, "feat_in": 1, "residual_width": 1})
+        };
+        let audio_with = |key: &str, value: serde_json::Value| {
+            let mut section = audio_base();
+            section[key] = value;
+            with("audio_config", section)
+        };
+        let audio_without = |key: &str| {
+            let mut section = audio_base();
+            section.as_object_mut().unwrap().remove(key);
+            with("audio_config", section)
+        };
+        for (config, want) in [
+            // a wrong-typed count names the type error, not a missing key
+            (
+                with("head_layers", serde_json::json!("2")),
+                "must be an integer",
+            ),
+            // ... and a missing count names the missing key
+            (without("head_layers"), "is missing"),
+            // a zero hidden width passes the % 64 gate but loads nothing
+            (
+                with("text_config", serde_json::json!({"hidden_size": 0})),
+                "is 0",
+            ),
+            // a missing hidden width names the missing key
+            (
+                with("text_config", serde_json::json!({})),
+                "no `text_config.hidden_size`",
+            ),
+            // the prompt needs 96 positions of context
+            (with("max_length", serde_json::json!(64)), "below the 96"),
+            // ... one below the floor refuses too: the gate is `<`, not `<=`
+            (with("max_length", serde_json::json!(95)), "below the 96"),
+            // a zero text room would load, then blame the prompt for every refusal
+            (
+                with("image_text_length", serde_json::json!(0)),
+                "image_text_length is 0",
+            ),
+            (
+                with("audio_text_length", serde_json::json!(0)),
+                "audio_text_length is 0",
+            ),
+            // hidden width that is not a multiple of 64 loses heads to truncation
+            (
+                with("text_config", serde_json::json!({"hidden_size": 1000})),
+                "not a multiple of 64",
+            ),
+            // 4 * hidden must fit u32 (a multiple of 64, so the % 64 gate passes first)
+            (
+                with(
+                    "text_config",
+                    serde_json::json!({"hidden_size": u32::MAX - 63}),
+                ),
+                "overflows u32",
+            ),
+            // a wrong-typed hidden width names the type error too
+            (
+                with("text_config", serde_json::json!({"hidden_size": "2048"})),
+                "must be an integer",
+            ),
+            // the position table must be square ...
+            (
+                vision_with("num_patches", serde_json::json!(257)),
+                "not a square",
+            ),
+            // ... and 16 x 16, the only table the tower reads
+            (
+                vision_with("num_patches", serde_json::json!(100)),
+                "16 x 16",
+            ),
+            // u32::MAX patches: the square itself must not overflow the check
+            (
+                vision_with("num_patches", serde_json::json!(u32::MAX)),
+                "not a square",
+            ),
+            // the tower reads 16 px patches
+            (vision_with("patch_size", serde_json::json!(32)), "16 px"),
+            // a wrong-typed vision field names the type error, not a missing key
+            (
+                vision_with("patch_size", serde_json::json!("16")),
+                "must be an integer",
+            ),
+            // a missing vision field names the missing key
+            (
+                vision_without("patch_size"),
+                "no `vision_config.patch_size`",
+            ),
+            // the tower needs at least one head
+            (
+                vision_with("num_attention_heads", serde_json::json!(0)),
+                "num_attention_heads is 0",
+            ),
+            // a zero feed-forward width loads 0-element block tensors
+            (
+                vision_with("intermediate_size", serde_json::json!(0)),
+                "intermediate_size is 0",
+            ),
+            // a zero vision width converts every tensor, then refuses at load
+            (
+                vision_with("hidden_size", serde_json::json!(0)),
+                "vision_config.hidden_size is 0",
+            ),
+            // a present-but-bad epsilon would NaN every vision prefix
+            (
+                vision_with("layer_norm_eps", serde_json::json!(-1.0)),
+                "layer_norm_eps` must be positive and finite",
+            ),
+            // 1e300 is a finite f64 but an infinite f32: the check runs on the stored value
+            (
+                vision_with("layer_norm_eps", serde_json::json!(1e300)),
+                "layer_norm_eps` must be positive and finite",
+            ),
+            // ... and a wrong-typed one must name the type error, not silently default
+            (
+                vision_with("layer_norm_eps", serde_json::json!("1e-6")),
+                "layer_norm_eps` must be a number",
+            ),
+            // a zero projector width loads 0-element projector tensors (the guard
+            // lives in the vision section, so the leg needs it present)
+            (
+                {
+                    let mut config = with("vision_config", vision_base());
+                    config["projector_hidden_size"] = serde_json::json!(0);
+                    config
+                },
+                "projector_hidden_size is 0",
+            ),
+            // audio width times expansion must fit u32
+            (
+                audio_with("d_model", serde_json::json!(u32::MAX)),
+                "overflows u32",
+            ),
+            // a zero audio width converts every tensor, then refuses at load
+            (
+                audio_with("d_model", serde_json::json!(0)),
+                "audio_config.d_model is 0",
+            ),
+            // the audio encoder needs its blocks: zero loads nothing usable
+            (
+                audio_with("n_layers", serde_json::json!(0)),
+                "audio_config.n_layers is 0",
+            ),
+            // a non-numeric temperature names the key, not a missing count
+            (
+                with("temperatures", serde_json::json!({"noul": "hot"})),
+                "temperature `noul` is not a number",
+            ),
+            // a zero temperature converts cleanly, then refuses at load
+            (
+                with("temperatures", serde_json::json!({"noul": 0})),
+                "temperature `noul` must be positive and finite",
+            ),
+            // ... as does a negative one
+            (
+                with("temperatures", serde_json::json!({"noul": -1.0})),
+                "temperature `noul` must be positive and finite",
+            ),
+            // 1e300 is a finite f64 but an infinite f32: the check runs on the stored value
+            (
+                with("temperatures", serde_json::json!({"noul": 1e300})),
+                "temperature `noul` must be positive and finite",
+            ),
+            // a missing vision block count names the key, never a default
+            (
+                vision_without("num_hidden_layers"),
+                "no `vision_config.num_hidden_layers`",
+            ),
+            // ... and a missing audio expansion factor names its key too
+            (
+                audio_without("ff_expansion_factor"),
+                "no `audio_config.ff_expansion_factor`",
+            ),
+            // a wrong-typed audio field names the type error, not a missing key
+            (
+                audio_with("n_heads", serde_json::json!("1")),
+                "must be an integer",
+            ),
+            // a missing audio field names the missing key
+            (audio_without("n_heads"), "no `audio_config.n_heads`"),
+            // the encoder needs at least one head
+            (audio_with("n_heads", serde_json::json!(0)), "n_heads is 0"),
+            // heads that do not divide the width would panic in attention
+            // (the base d_model of 64 is indivisible by 3)
+            (
+                audio_with("n_heads", serde_json::json!(3)),
+                "not a multiple of n_heads",
+            ),
+            // no mel bins means no frames for any clip, scored as an empty prefix
+            (audio_with("feat_in", serde_json::json!(0)), "feat_in is 0"),
+            // a zero residual width would load, then answer through a degenerate adapter
+            (
+                audio_with("residual_width", serde_json::json!(0)),
+                "residual_width is 0",
+            ),
+        ] {
+            let err = apply_metadata(&config, &mut GgufWriter::new()).unwrap_err();
+            assert!(err.to_string().contains(want), "unexpected message: {err}");
+        }
+        // ... and exactly the floor converts
+        apply_metadata(
+            &with("max_length", serde_json::json!(96)),
+            &mut GgufWriter::new(),
+        )
+        .unwrap();
     }
 }

@@ -11,20 +11,21 @@
 //! options. The delimiters are the tokenizer's reserved block, and a `<|name|>` in caller text is
 //! rewritten so a state can never forge one.
 
-use anyhow::{Result, bail, ensure};
+use anyhow::{Context, Result, bail, ensure};
 
 use super::json::Json;
 use crate::tokenizer::BpeTokenizer;
 
-/// What a question asks for, in the order of the head's question-type table.
+/// What a question asks for. The row each variant scores lives in
+/// [`QuestionType::index`], the only place the mapping is spelled.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum QuestionType {
     /// One of the named options.
-    Choice = 0,
+    Choice,
     /// An ordered level, two to ten of them.
-    Score = 1,
+    Score,
     /// Yes or no.
-    Noul = 2,
+    Noul,
 }
 
 impl QuestionType {
@@ -43,6 +44,16 @@ impl QuestionType {
             Self::Choice => "choice",
             Self::Score => "score",
             Self::Noul => "noul",
+        }
+    }
+
+    /// The row in the head's question-type table, the contract
+    /// [`crate::d1::head::Head::scores`] reads.
+    pub const fn index(self) -> usize {
+        match self {
+            Self::Choice => 0,
+            Self::Score => 1,
+            Self::Noul => 2,
         }
     }
 }
@@ -86,10 +97,7 @@ impl Question {
         let Some(kind) = QuestionType::from_name(kind_name) else {
             bail!("question type must be one of choice, noul, score, got {kind_name:?}");
         };
-        let instructions = match instructions {
-            Json::Str(s) => s.clone(),
-            other => other.dumps(),
-        };
+        let instructions = render_value(instructions);
         let criteria = q.get("criteria").filter(|c| !matches!(c, Json::Null));
         let criteria = match (kind, criteria) {
             (QuestionType::Choice, Some(Json::Object(entries))) if entries.len() >= 2 => {
@@ -145,14 +153,6 @@ impl Question {
     }
 }
 
-/// A description as the prompt writes it: a string as it is, anything else as JSON.
-fn criterion(value: &Json) -> String {
-    match value {
-        Json::Str(s) => s.clone(),
-        other => other.dumps(),
-    }
-}
-
 fn is_blank(value: &Json) -> bool {
     matches!(value, Json::Null) || matches!(value, Json::Str(s) if s.is_empty())
 }
@@ -172,7 +172,7 @@ pub fn render_options(q: &Question, media: Media) -> Vec<String> {
                 let text = if is_blank(description) {
                     key.clone()
                 } else {
-                    criterion(description)
+                    render_value(description)
                 };
                 format!("option_{i:03}: {text}")
             })
@@ -184,7 +184,7 @@ pub fn render_options(q: &Question, media: Media) -> Vec<String> {
                 if is_blank(description) {
                     key.clone()
                 } else {
-                    format!("{key}: {}", criterion(description))
+                    format!("{key}: {}", render_value(description))
                 }
             })
             .collect(),
@@ -192,7 +192,7 @@ pub fn render_options(q: &Question, media: Media) -> Vec<String> {
             .criteria
             .iter()
             .enumerate()
-            .map(|(i, (_, level))| format!("level {i}: {}", criterion(level)))
+            .map(|(i, (_, level))| format!("level {i}: {}", render_value(level)))
             .collect(),
         QuestionType::Noul
             if media == Media::Audio || (media == Media::Image && q.criteria.is_empty()) =>
@@ -207,7 +207,7 @@ pub fn render_options(q: &Question, media: Media) -> Vec<String> {
                     .map(|(_, v)| v)
             };
             let describe = |value: Option<&Json>, fallback: &str| match value {
-                Some(v) if !is_blank(v) => criterion(v),
+                Some(v) if !is_blank(v) => render_value(v),
                 _ => fallback.to_string(),
             };
             vec![
@@ -249,9 +249,9 @@ pub fn escape(text: &str) -> String {
     out
 }
 
-/// A state as the prompt writes it: a string as it is, anything else as `json.dumps`.
-pub fn serialize_state(state: &Json) -> String {
-    match state {
+/// A value as the prompt writes it: a string as it is, anything else as `json.dumps`.
+pub fn render_value(value: &Json) -> String {
+    match value {
         Json::Str(s) => s.clone(),
         other => other.dumps(),
     }
@@ -297,14 +297,30 @@ impl PromptTokens {
 /// Tokens a question gets per option, before the shared allowance.
 const PER_OPTION: usize = 24;
 
+/// Smallest option-block allowance, in tokens, and therefore the smallest context a d1
+/// model can answer from (gated in [`super::D1Model::from_gguf`] and
+/// [`crate::convert::d1::apply_metadata`]).
+pub(crate) const MIN_OPTION_BUDGET: usize = 96;
+
+/// The state's token stream, uncapped: the state delimiter plus every state token. Encode
+/// once per request with [`encode_with_state_ids`]; each question then takes the room its
+/// options leave, instead of re-running BPE over the whole state per question.
+pub(crate) fn encode_state(tok: &BpeTokenizer, ids: &PromptTokens, state: &Json) -> Vec<u32> {
+    let mut out = vec![ids.state];
+    out.extend(tok.encode(&escape(&render_value(state))));
+    out
+}
+
 /// The token ids of one question over one state, and the position of each option's marker.
 ///
-/// The option block gets `max(96, min(24 k + 32, max_len / 2))` tokens, shared out evenly; the
+/// The option block gets `max(MIN_OPTION_BUDGET, min(24 k + 32, max_len / 2))` tokens,
+/// shared out evenly; the
 /// state is cut on the right to the room that is left.
 ///
 /// # Errors
 ///
-/// Fails when the options do not fit in `max_len`.
+/// Fails when the question has fewer than two options, or the options do not fit in
+/// `max_len`.
 pub fn encode(
     tok: &BpeTokenizer,
     ids: &PromptTokens,
@@ -313,10 +329,30 @@ pub fn encode(
     max_len: usize,
     media: Media,
 ) -> Result<(Vec<u32>, Vec<usize>)> {
+    encode_with_state_ids(tok, ids, &encode_state(tok, ids, state), q, max_len, media)
+}
+
+/// Like [`encode`], over an already-encoded state stream (see [`encode_state`]).
+///
+/// `state_ids[0]` must be the state delimiter; anything else fails.
+///
+/// # Errors
+///
+/// Fails on an empty state stream, a state stream not starting with the state delimiter,
+/// fewer than two options, or options that do not fit in `max_len`.
+pub(crate) fn encode_with_state_ids(
+    tok: &BpeTokenizer,
+    ids: &PromptTokens,
+    state_ids: &[u32],
+    q: &Question,
+    max_len: usize,
+    media: Media,
+) -> Result<(Vec<u32>, Vec<usize>)> {
     let enc = |s: &str| tok.encode(&escape(s));
     let options = render_options(q, media);
     let k = options.len();
-    let budget = 96.max((k * PER_OPTION + 32).min(max_len / 2));
+    ensure!(k >= 2, "a question needs at least two options (has {k})");
+    let budget = MIN_OPTION_BUDGET.max((k * PER_OPTION + 32).min(max_len / 2));
     let per = 2.max(budget.saturating_sub(3 * k) / k);
 
     let mut question = vec![ids.question];
@@ -333,51 +369,104 @@ pub fn encode(
     question.push(ids.decide);
 
     let room = max_len.saturating_sub(question.len() + 2);
-    let mut state_ids = vec![ids.state];
-    state_ids.extend(enc(&serialize_state(state)).into_iter().take(room));
-
-    let mut out = Vec::with_capacity(1 + state_ids.len() + question.len());
-    out.push(ids.bos);
-    out.extend_from_slice(&state_ids);
-    out.extend_from_slice(&question);
-    out.truncate(max_len);
-    let markers: Vec<usize> = markers.iter().map(|m| m + 1 + state_ids.len()).collect();
+    let (head, tail) = state_ids
+        .split_first()
+        .context("the encoded state is empty")?;
     ensure!(
-        markers.last().is_some_and(|m| *m < max_len),
-        "the options do not fit in the context"
+        *head == ids.state,
+        "the encoded state must start with the state delimiter"
     );
+    let mut kept = Vec::with_capacity(1 + room.min(tail.len()));
+    kept.push(*head);
+    kept.extend(tail.iter().take(room).copied());
+
+    let mut out = Vec::with_capacity(1 + kept.len() + question.len());
+    out.push(ids.bos);
+    out.extend_from_slice(&kept);
+    out.extend_from_slice(&question);
+    // the state already took its cut above, so the question must fit whole: truncating
+    // here would cut decide and the tail options while every marker still resolves
+    ensure!(
+        out.len() <= max_len,
+        "the options do not fit in the context (need {}, have {max_len})",
+        out.len()
+    );
+    // markers index into `out`, so they resolve exactly when the length check
+    // above passes; a second guard here could never fire (and the small-overrun
+    // test below is what pins the refusal, not this mapping).
+    let markers: Vec<usize> = markers.iter().map(|m| m + 1 + kept.len()).collect();
     Ok((out, markers))
 }
 
 /// The probabilities a question's scores mean: softmax over the options after the calibration
 /// `temperature`, in option order (`[yes, no]` for a `noul`: the model reads it as
 /// `[false, true]`).
-pub fn probabilities(q: &Question, scores: &[f32], temperature: f32) -> Vec<f32> {
-    let z: Vec<f32> = scores
-        .iter()
-        .take(q.options())
-        .map(|s| s / temperature)
-        .collect();
-    let max = z.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-    let mut p: Vec<f32> = z.iter().map(|v| (v - max).exp()).collect();
-    let sum: f32 = p.iter().sum();
-    for v in &mut p {
-        *v /= sum;
-    }
+///
+/// # Errors
+///
+/// Fails when the question has fewer than two options, `scores` does not hold exactly one
+/// score per option, the temperature is not positive and finite (dividing by zero
+/// yields NaN probabilities, not an error, without this), or the scores divide to
+/// probabilities that are not finite (a denormal temperature overflows ordinary
+/// scores to infinity, and `inf - inf` in the softmax is NaN).
+pub fn probabilities(q: &Question, scores: &[f32], temperature: f32) -> Result<Vec<f32>> {
+    ensure!(
+        q.options() >= 2,
+        "a question needs at least two options (has {})",
+        q.options()
+    );
+    ensure!(
+        scores.len() == q.options(),
+        "probabilities needs one score per option ({} != {})",
+        scores.len(),
+        q.options()
+    );
+    ensure!(
+        temperature.is_finite() && temperature > 0.0,
+        "temperature must be positive and finite, got {temperature}"
+    );
+    // names the culprit when the weights themselves are bad; the output check
+    // below is what closes the overflow trigger
+    ensure!(
+        scores.iter().all(|s| s.is_finite()),
+        "scores must be finite"
+    );
+    let mut p: Vec<f32> = scores.iter().map(|s| s / temperature).collect();
+    super::softmax_exact(&mut p);
+    ensure!(
+        p.iter().all(|v| v.is_finite()),
+        "probabilities are not finite"
+    );
     if q.kind == QuestionType::Noul {
         p.reverse();
     }
-    p
+    Ok(p)
 }
 
 /// A question's answer as the response object: a `noul`'s P(yes); a `choice`'s pick, its
 /// confidence and its probabilities; a `score`'s expected level, its confidence, its
 /// probabilities and the legend of the levels.
-pub fn answer(q: &Question, p: &[f32]) -> Json {
+///
+/// # Errors
+///
+/// Fails when the question has fewer than two options, or `p` does not hold exactly one
+/// probability per option (the `zip` below would silently drop the surplus side).
+pub fn answer(q: &Question, p: &[f32]) -> Result<Json> {
+    ensure!(
+        q.options() >= 2,
+        "a question needs at least two options (has {})",
+        q.options()
+    );
+    ensure!(
+        p.len() == q.options(),
+        "answer needs one probability per option ({} != {})",
+        p.len(),
+        q.options()
+    );
     let kind = |name: &str| ("type".to_string(), Json::Str(name.to_string()));
     let f = |v: f32| Json::Float(f64::from(v));
     if q.kind == QuestionType::Noul {
-        return Json::Object(vec![kind("noul"), ("noul".into(), f(p[0]))]);
+        return Ok(Json::Object(vec![kind("noul"), ("noul".into(), f(p[0]))]));
     }
     // the first maximum
     let best = p
@@ -388,12 +477,12 @@ pub fn answer(q: &Question, p: &[f32]) -> Json {
         |names: Vec<String>| Json::Object(names.into_iter().zip(p.iter().map(|v| f(*v))).collect());
     if q.kind == QuestionType::Choice {
         let names: Vec<String> = q.criteria.iter().map(|(k, _)| k.clone()).collect();
-        return Json::Object(vec![
+        return Ok(Json::Object(vec![
             kind("choice"),
             ("choice".into(), Json::Str(names[best].clone())),
             ("confidence".into(), f(p[best])),
             ("probabilities".into(), probabilities(names)),
-        ]);
+        ]));
     }
     let levels: Vec<String> = (0..p.len()).map(|i| i.to_string()).collect();
     let expected: f32 = p.iter().enumerate().map(|(i, v)| i as f32 * v).sum();
@@ -401,16 +490,16 @@ pub fn answer(q: &Question, p: &[f32]) -> Json {
         q.criteria
             .iter()
             .enumerate()
-            .map(|(i, (_, level))| (i.to_string(), Json::Str(criterion(level))))
+            .map(|(i, (_, level))| (i.to_string(), Json::Str(render_value(level))))
             .collect(),
     );
-    Json::Object(vec![
+    Ok(Json::Object(vec![
         kind("score"),
         ("score".into(), f(expected)),
         ("confidence".into(), f(p[best])),
         ("probabilities".into(), probabilities(levels)),
         ("legend".into(), legend),
-    ])
+    ]))
 }
 
 #[cfg(test)]
@@ -557,9 +646,9 @@ mod tests {
     fn a_noul_reads_the_model_as_false_then_true() {
         let noul = q(r#"{"type":"noul","instructions":"?"}"#);
         // scores [false, true] = [0, ln 3]: P(true) = 0.75
-        let p = probabilities(&noul, &[0.0, 3f32.ln()], 1.0);
+        let p = probabilities(&noul, &[0.0, 3f32.ln()], 1.0).unwrap();
         assert!((p[0] - 0.75).abs() < 1e-6 && (p[1] - 0.25).abs() < 1e-6);
-        let answer = answer(&noul, &p);
+        let answer = answer(&noul, &p).unwrap();
         assert!(
             (answer
                 .get("noul")
@@ -577,7 +666,7 @@ mod tests {
     #[test]
     fn a_score_answers_with_its_expected_level() {
         let score = q(r#"{"type":"score","instructions":"?","criteria":["a","b","c"]}"#);
-        let a = answer(&score, &[0.25, 0.5, 0.25]);
+        let a = answer(&score, &[0.25, 0.5, 0.25]).unwrap();
         match a.get("score") {
             Some(Json::Float(f)) => assert!((f - 1.0).abs() < 1e-6),
             other => panic!("{other:?}"),
@@ -585,6 +674,314 @@ mod tests {
         assert_eq!(
             a.get("legend").unwrap().dumps(),
             r#"{"0": "a", "1": "b", "2": "c"}"#
+        );
+    }
+
+    /// Delimiter ids far outside the toy vocab, so a marker hit cannot be a coincidence.
+    fn ids() -> PromptTokens {
+        PromptTokens {
+            bos: 100,
+            marker: 101,
+            state: 102,
+            question: 103,
+            option: 104,
+            option_end: 105,
+            decide: 106,
+        }
+    }
+
+    /// A merge-less tokenizer over the only bytes the fixtures below use.
+    fn tiny_tok() -> BpeTokenizer {
+        BpeTokenizer::from_vocab(vec![
+            b"a".to_vec(),
+            b"b".to_vec(),
+            b" ".to_vec(),
+            b"?".to_vec(),
+        ])
+    }
+
+    fn two_choice() -> Question {
+        q(r#"{"type":"choice","instructions":"?","criteria":{"a":"","b":""}}"#)
+    }
+
+    #[test]
+    fn markers_land_on_the_mask_ids_in_option_order() {
+        let (out, markers) = encode(
+            &tiny_tok(),
+            &ids(),
+            &Json::Str("a".into()),
+            &two_choice(),
+            256,
+            Media::None,
+        )
+        .unwrap();
+        assert_eq!(markers.len(), 2);
+        assert!(markers[0] < markers[1]);
+        for m in &markers {
+            assert_eq!(out[*m], 101);
+        }
+        assert!(out.len() < 256);
+    }
+
+    #[test]
+    fn a_long_state_is_cut_on_the_right_and_the_question_survives() {
+        let tok = tiny_tok();
+        let ids = ids();
+        let q = two_choice();
+        // head and tail differ, so keeping the wrong end fails
+        let state = Json::Str(format!("{} {}", "a ".repeat(300), "b ".repeat(300)));
+        let (full, _) = encode(&tok, &ids, &state, &q, 1_000_000, Media::None).unwrap();
+        let (out, markers) = encode(&tok, &ids, &state, &q, 64, Media::None).unwrap();
+        assert_eq!(out.len(), 64);
+        assert!(out.len() < full.len());
+        // the tail cut nothing: decide is still there and every marker resolves
+        assert!(out.contains(&ids.decide));
+        for m in &markers {
+            assert_eq!(out[*m], ids.marker);
+            assert!(*m < 64);
+        }
+        // ... and the cut kept the head: the kept state is the full stream's prefix
+        let q_at = out.iter().position(|&t| t == ids.question).unwrap();
+        assert_eq!(&out[1..q_at], &full[1..q_at]);
+    }
+
+    #[test]
+    fn a_state_stream_starting_elsewhere_is_refused() {
+        let ids = ids();
+        let bad = [ids.bos, ids.marker];
+        let err = encode_with_state_ids(&tiny_tok(), &ids, &bad, &two_choice(), 256, Media::None)
+            .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("must start with the state delimiter"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn an_empty_state_stream_is_refused_not_indexed() {
+        let err = encode_with_state_ids(&tiny_tok(), &ids(), &[], &two_choice(), 256, Media::None)
+            .unwrap_err();
+        assert!(
+            err.to_string().contains("the encoded state is empty"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn a_tiny_context_refuses_instead_of_truncating_the_options() {
+        let err = encode(
+            &tiny_tok(),
+            &ids(),
+            &Json::Str("a".into()),
+            &two_choice(),
+            8,
+            Media::None,
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("do not fit"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn a_question_barely_over_budget_refuses_instead_of_dropping_decide() {
+        let tok = tiny_tok();
+        let ids = ids();
+        // 86 instruction tokens plus two 5-token options is a 98-token question
+        // against max_len 96: the 4-token overrun is shorter than the last option
+        // block, so every marker still resolves while decide is cut
+        let mut q = two_choice();
+        q.instructions = "a ".repeat(43);
+        let err = encode(&tok, &ids, &Json::Str("a".into()), &q, 96, Media::None).unwrap_err();
+        assert!(
+            err.to_string().contains("do not fit"),
+            "unexpected message: {err}"
+        );
+        // the refusal reports both sides, so the caller sees the overshoot
+        // (the 98-token question plus the bos and state framing)
+        assert!(
+            err.to_string().contains("need 100") && err.to_string().contains("have 96"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn a_manually_built_question_still_needs_two_options() {
+        let tok = tiny_tok();
+        let ids = ids();
+        let state = Json::Str("a".into());
+        for (criteria, want) in [
+            (vec![], "(has 0)"),
+            (vec![("a".to_string(), Json::Str("b".into()))], "(has 1)"),
+        ] {
+            let q = Question {
+                kind: QuestionType::Choice,
+                instructions: String::new(),
+                criteria,
+            };
+            let err = encode(&tok, &ids, &state, &q, 256, Media::None).unwrap_err();
+            assert!(
+                err.to_string().contains("at least two options"),
+                "unexpected message: {err}"
+            );
+            assert!(err.to_string().contains(want), "unexpected message: {err}");
+        }
+    }
+
+    #[test]
+    fn question_type_rows_follow_the_head_table() {
+        assert_eq!(
+            (
+                QuestionType::Choice.index(),
+                QuestionType::Score.index(),
+                QuestionType::Noul.index()
+            ),
+            (0, 1, 2)
+        );
+    }
+
+    fn close_enough(got: &[f32], want: &[f32]) {
+        assert_eq!(got.len(), want.len());
+        for (g, w) in got.iter().zip(want) {
+            assert!((g - w).abs() < 1e-6, "got {got:?}, want {want:?}");
+        }
+    }
+
+    #[test]
+    fn temperature_scales_every_question_type_before_the_softmax() {
+        let noul = q(r#"{"type":"noul","instructions":"?"}"#);
+        let choice = two_choice();
+        let score = q(r#"{"type":"score","instructions":"?","criteria":["a","b"]}"#);
+        // scores [0, ln 2]: T=1 -> [1/3, 2/3]; T=2 halves the logits first. The noul
+        // reports [yes, no], so its expectations are the reversal of the other two.
+        for (q, t1, t2) in [
+            (&noul, [2.0 / 3.0, 1.0 / 3.0], [0.58578644, 0.41421356]),
+            (&choice, [1.0 / 3.0, 2.0 / 3.0], [0.41421356, 0.58578644]),
+            (&score, [1.0 / 3.0, 2.0 / 3.0], [0.41421356, 0.58578644]),
+        ] {
+            close_enough(&probabilities(q, &[0.0, 2f32.ln()], 1.0).unwrap(), &t1);
+            close_enough(&probabilities(q, &[0.0, 2f32.ln()], 2.0).unwrap(), &t2);
+        }
+        // the [false, true] model order is reported [yes, no]: [ln 3, 0] reads [0.25, 0.75]
+        close_enough(
+            &probabilities(&noul, &[3f32.ln(), 0.0], 1.0).unwrap(),
+            &[0.25, 0.75],
+        );
+    }
+
+    #[test]
+    fn a_non_positive_temperature_is_refused_not_nan() {
+        let noul = q(r#"{"type":"noul","instructions":"?"}"#);
+        for t in [0.0, -1.0, f32::NAN, f32::INFINITY] {
+            let err = probabilities(&noul, &[0.0, 1.0], t).unwrap_err();
+            assert!(
+                err.to_string().contains("temperature"),
+                "unexpected message: {err}"
+            );
+        }
+    }
+
+    #[test]
+    fn encode_and_encode_with_state_ids_agree() {
+        let tok = tiny_tok();
+        let ids = ids();
+        let q = two_choice();
+        for (state, max) in [
+            (Json::Str("a".into()), 256),
+            (Json::Str("a ".repeat(300)), 64),
+        ] {
+            let a = encode(&tok, &ids, &state, &q, max, Media::None).unwrap();
+            let b = encode_with_state_ids(
+                &tok,
+                &ids,
+                &encode_state(&tok, &ids, &state),
+                &q,
+                max,
+                Media::None,
+            )
+            .unwrap();
+            assert_eq!(a, b);
+        }
+    }
+
+    fn one_option() -> Question {
+        Question {
+            kind: QuestionType::Choice,
+            instructions: String::new(),
+            criteria: vec![("a".to_string(), Json::Str("b".into()))],
+        }
+    }
+
+    #[test]
+    fn probabilities_needs_one_score_per_option() {
+        let choice = two_choice();
+        for scores in [vec![0.0], vec![0.0, 1.0, 2.0]] {
+            let err = probabilities(&choice, &scores, 1.0).unwrap_err();
+            assert!(
+                err.to_string().contains("one score per option"),
+                "unexpected message: {err}"
+            );
+        }
+        // the count matches but the question is short an option: only k >= 2 fires
+        let err = probabilities(&one_option(), &[0.5], 1.0).unwrap_err();
+        assert!(
+            err.to_string().contains("at least two options"),
+            "unexpected message: {err}"
+        );
+        assert!(
+            err.to_string().contains("(has 1)"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn probabilities_refuse_scores_that_divide_out_of_finite_range() {
+        let choice = two_choice();
+        // non-finite scores name themselves, before any division
+        let err = probabilities(&choice, &[0.5, f32::NAN], 1.0).unwrap_err();
+        assert!(
+            err.to_string().contains("scores must be finite"),
+            "unexpected message: {err}"
+        );
+        // ... while a denormal temperature passes the positive check, then
+        // overflows ordinary scores to infinity (inf - inf is NaN)
+        let err = probabilities(&choice, &[0.5, -0.5], 1e-45).unwrap_err();
+        assert!(
+            err.to_string().contains("probabilities are not finite"),
+            "unexpected message: {err}"
+        );
+    }
+
+    #[test]
+    fn an_answer_needs_one_probability_per_option() {
+        let choice = two_choice();
+        let err = answer(&choice, &[]).unwrap_err();
+        assert!(
+            err.to_string().contains("one probability per option"),
+            "unexpected message: {err}"
+        );
+        let err = answer(&choice, &[0.5]).unwrap_err();
+        assert!(
+            err.to_string().contains("one probability per option"),
+            "unexpected message: {err}"
+        );
+        // ... and a surplus, which the zip below would silently drop
+        let err = answer(&choice, &[0.25, 0.25, 0.5]).unwrap_err();
+        assert!(
+            err.to_string().contains("one probability per option"),
+            "unexpected message: {err}"
+        );
+        // the count matches but the question is short an option: only k >= 2 fires
+        let err = answer(&one_option(), &[0.5]).unwrap_err();
+        assert!(
+            err.to_string().contains("at least two options"),
+            "unexpected message: {err}"
+        );
+        assert!(
+            err.to_string().contains("(has 1)"),
+            "unexpected message: {err}"
         );
     }
 }

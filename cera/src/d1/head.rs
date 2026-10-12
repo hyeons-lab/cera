@@ -19,7 +19,7 @@
 //! feed-forward for the marker rows alone; every earlier layer needs all rows because the next
 //! layer attends over them.
 
-use anyhow::{Context, Result, ensure};
+use anyhow::{Result, ensure};
 
 use crate::backend::cpu;
 use crate::gguf::GgufFile;
@@ -29,8 +29,9 @@ use crate::par::*;
 /// Number of question types (`choice`, `score`, `noul`).
 const TYPES: usize = 3;
 /// Per-head width of the attention (`d / heads` is 64 for every d1 head).
-const HEAD_DIM: usize = 64;
+pub(crate) const HEAD_DIM: usize = 64;
 
+#[derive(Debug)]
 struct Layer {
     attn_norm_w: Vec<f32>,
     attn_norm_b: Vec<f32>,
@@ -47,6 +48,7 @@ struct Layer {
 }
 
 /// The head's weights, read once as f32.
+#[derive(Debug)]
 pub struct Head {
     n_embd: usize,
     n_heads: usize,
@@ -62,19 +64,6 @@ pub struct Head {
     out_b: f32,
 }
 
-fn tensor(gguf: &GgufFile, name: &str, elements: usize) -> Result<Vec<f32>> {
-    let t = gguf
-        .get_tensor(name)
-        .with_context(|| format!("the head needs the tensor `{name}`"))?
-        .to_f32_vec();
-    ensure!(
-        t.len() == elements,
-        "`{name}` has {} values, expected {elements}",
-        t.len()
-    );
-    Ok(t)
-}
-
 impl Head {
     /// Whether a GGUF carries a d1 head.
     pub fn is_present(gguf: &GgufFile) -> bool {
@@ -85,66 +74,97 @@ impl Head {
     ///
     /// # Errors
     ///
-    /// Fails when a setting or a tensor is missing or has the wrong size.
+    /// Fails when a setting or a tensor is missing or has the wrong size, or the
+    /// present epsilon is not positive and finite.
     pub fn from_gguf(gguf: &GgufFile, n_embd: usize) -> Result<Self> {
-        let setting = |key: &str| {
-            gguf.get_u32(key)
-                .map(|v| v as usize)
-                .with_context(|| format!("missing {key}"))
-        };
+        let setting = |key: &str| super::setting_u32(gguf, key);
         let blocks = setting("d1.head.block_count")?;
         let n_heads = setting("d1.head.attention.head_count")?;
         let ffn = setting("d1.head.feed_forward_length")?;
+        ensure!(n_embd >= 1, "the head is 0 wide");
+        // checked: `n_heads` is file-declared, and the multiply wraps on 32-bit
+        // (67108865 heads * 64 reads back as 64 wide), passing a hostile count
+        // that panics in `attend` instead of refusing here
         ensure!(
-            n_heads * HEAD_DIM == n_embd,
+            n_heads.checked_mul(HEAD_DIM) == Some(n_embd),
             "the head has {n_heads} heads of {HEAD_DIM}, not {n_embd} wide"
         );
+        // the feed-forward width only feeds block tensors, so a block-less head
+        // needs no width (mirrors the vision tower's guard)
+        ensure!(
+            blocks == 0 || ffn >= 1,
+            "the head has no feed-forward width"
+        );
         let eps = gguf.get_f32("d1.head.layer_norm_epsilon").unwrap_or(1e-5);
+        // old files without the key still default; a present-but-bad value would
+        // silently degenerate every score (+inf zeroes each norm to its bias), so refuse it here
+        ensure!(
+            eps.is_finite() && eps > 0.0,
+            "the head epsilon ({eps}) is not positive and finite"
+        );
         let d = n_embd;
-        let mut layers = Vec::with_capacity(blocks);
+        // no pre-size: `blocks` is a file-declared count, and reserving it up front
+        // turns a corrupt GGUF into an aborted process instead of a load error
+        let mut layers = Vec::new();
         for i in 0..blocks {
-            let t = |suffix: &str, elements: usize| {
-                tensor(gguf, &format!("d1.blk.{i}.{suffix}"), elements)
+            // element counts multiply file-declared widths, so they route
+            // through the checked product: the plain multiply wraps on 32-bit
+            let t = |suffix: &str, factors: &[usize]| {
+                let name = format!("d1.blk.{i}.{suffix}");
+                let elements = super::checked_len(&name, factors)?;
+                super::load_f32(gguf, "head", &name, elements)
             };
             layers.push(Layer {
-                attn_norm_w: t("attn_norm.weight", d)?,
-                attn_norm_b: t("attn_norm.bias", d)?,
-                qkv_w: t("attn_qkv.weight", 3 * d * d)?,
-                qkv_b: t("attn_qkv.bias", 3 * d)?,
-                out_w: t("attn_output.weight", d * d)?,
-                out_b: t("attn_output.bias", d)?,
-                ffn_norm_w: t("ffn_norm.weight", d)?,
-                ffn_norm_b: t("ffn_norm.bias", d)?,
-                up_w: t("ffn_up.weight", ffn * d)?,
-                up_b: t("ffn_up.bias", ffn)?,
-                down_w: t("ffn_down.weight", d * ffn)?,
-                down_b: t("ffn_down.bias", d)?,
+                attn_norm_w: t("attn_norm.weight", &[d])?,
+                attn_norm_b: t("attn_norm.bias", &[d])?,
+                qkv_w: t("attn_qkv.weight", &[3, d, d])?,
+                qkv_b: t("attn_qkv.bias", &[3, d])?,
+                out_w: t("attn_output.weight", &[d, d])?,
+                out_b: t("attn_output.bias", &[d])?,
+                ffn_norm_w: t("ffn_norm.weight", &[d])?,
+                ffn_norm_b: t("ffn_norm.bias", &[d])?,
+                up_w: t("ffn_up.weight", &[ffn, d])?,
+                up_b: t("ffn_up.bias", &[ffn])?,
+                down_w: t("ffn_down.weight", &[d, ffn])?,
+                down_b: t("ffn_down.bias", &[d])?,
             });
         }
-        let out_b = tensor(gguf, "d1.cls.output.bias", 1)?[0];
+        let out_b = super::load_f32(gguf, "head", "d1.cls.output.bias", 1)?[0];
         Ok(Self {
             n_embd,
             n_heads,
             ffn,
             eps,
-            types: tensor(gguf, "d1.question_type.weight", TYPES * d)?,
+            types: super::load_f32(
+                gguf,
+                "head",
+                "d1.question_type.weight",
+                super::checked_len("d1.question_type.weight", &[TYPES, d])?,
+            )?,
             layers,
-            cls_norm_w: tensor(gguf, "d1.cls.norm.weight", d)?,
-            cls_norm_b: tensor(gguf, "d1.cls.norm.bias", d)?,
-            cls_w: tensor(gguf, "d1.cls.weight", d * d)?,
-            cls_b: tensor(gguf, "d1.cls.bias", d)?,
-            out_w: tensor(gguf, "d1.cls.output.weight", d)?,
+            cls_norm_w: super::load_f32(gguf, "head", "d1.cls.norm.weight", d)?,
+            cls_norm_b: super::load_f32(gguf, "head", "d1.cls.norm.bias", d)?,
+            cls_w: super::load_f32(
+                gguf,
+                "head",
+                "d1.cls.weight",
+                super::checked_len("d1.cls.weight", &[d, d])?,
+            )?,
+            cls_b: super::load_f32(gguf, "head", "d1.cls.bias", d)?,
+            out_w: super::load_f32(gguf, "head", "d1.cls.output.weight", d)?,
             out_b,
         })
     }
 
     /// The score at each of `markers`, for a question of type `question_type`
-    /// (0 choice, 1 score, 2 noul), over the trunk's hidden states `hidden`
+    /// (pass [`QuestionType::index`](crate::d1::prompt::QuestionType::index);
+    /// 0 choice, 1 score, 2 noul today), over the trunk's hidden states `hidden`
     /// (`[n, n_embd]` row-major).
     ///
     /// # Errors
     ///
-    /// Fails on a marker outside the sequence or a hidden buffer of the wrong size.
+    /// Fails on a question type outside the head's table, a marker outside the
+    /// sequence, or a hidden buffer of the wrong size.
     pub fn scores(
         &self,
         hidden: &[f32],
@@ -185,9 +205,7 @@ impl Head {
             cpu::layer_norm_inplace(&mut g, &self.cls_norm_w, &self.cls_norm_b, self.eps);
             let mut h = vec![0f32; d];
             matmul_nt_f32(1, d, d, &g, &self.cls_w, Some(&self.cls_b), &mut h);
-            for v in &mut h {
-                *v = gelu(*v);
-            }
+            super::gelu_exact_inplace(&mut h);
             let dot: f32 = h.iter().zip(&self.out_w).map(|(a, b)| a * b).sum();
             scores.push(dot + self.out_b);
         }
@@ -258,15 +276,10 @@ impl Head {
                     let k = &qkv[j * 3 * d + d + h * HEAD_DIM..][..HEAD_DIM];
                     *s = cpu::dot_f32(q, k) * scale;
                 }
-                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0f32;
-                for s in &mut scores {
-                    *s = (*s - max).exp();
-                    sum += *s;
-                }
+                super::softmax_exact(&mut scores);
                 let dst = &mut out_row[h * HEAD_DIM..(h + 1) * HEAD_DIM];
                 for (j, s) in scores.iter().enumerate() {
-                    let w = s / sum;
+                    let w = *s;
                     let v = &qkv[j * 3 * d + 2 * d + h * HEAD_DIM..][..HEAD_DIM];
                     for (o, v) in dst.iter_mut().zip(v) {
                         *o += w * v;
@@ -278,79 +291,70 @@ impl Head {
     }
 }
 
-/// The exact (erf) GELU, `torch.nn.GELU()`'s default.
-fn gelu(x: f32) -> f32 {
-    0.5 * x * (1.0 + libm_erf(x * std::f32::consts::FRAC_1_SQRT_2))
+/// A zero-block head GGUF for tests, shared by the loader tests here and the pipeline
+/// tests in `super` (one core builder, so a new required tensor is added once).
+#[cfg(test)]
+pub(crate) fn head_builder(heads: u32, types_len: usize) -> crate::gguf::GgufBuilder {
+    head_builder_core(
+        heads,
+        &vec![0.0; types_len],
+        &vec![0.0; 64],
+        &vec![0.0; 64 * 64],
+        &vec![0.0; 64],
+    )
 }
 
-/// `erf` to f32 precision (Abramowitz & Stegun 7.1.26 is too coarse for parity; this is the
-/// W. J. Cody rational approximation as used by the C library, evaluated in f64).
-fn libm_erf(x: f32) -> f32 {
-    erf64(f64::from(x)) as f32
+/// The tensor list both head fixtures share; only the payloads differ per fixture.
+#[cfg(test)]
+fn head_builder_core(
+    heads: u32,
+    types: &[f32],
+    norm_w: &[f32],
+    cls_w: &[f32],
+    out_w: &[f32],
+) -> crate::gguf::GgufBuilder {
+    crate::gguf::GgufBuilder::new()
+        .kv_u32("d1.head.block_count", 0)
+        .kv_u32("d1.head.attention.head_count", heads)
+        .kv_u32("d1.head.feed_forward_length", 256)
+        .tensor_f32("d1.question_type.weight", &[types.len()], types)
+        .tensor_f32("d1.cls.norm.weight", &[norm_w.len()], norm_w)
+        .tensor_f32("d1.cls.norm.bias", &[64], &vec![0.0; 64])
+        .tensor_f32("d1.cls.weight", &[cls_w.len()], cls_w)
+        .tensor_f32("d1.cls.bias", &[64], &vec![0.0; 64])
+        .tensor_f32("d1.cls.output.weight", &[out_w.len()], out_w)
+        .tensor_f32("d1.cls.output.bias", &[1], &[0.0])
 }
 
-fn erf64(x: f64) -> f64 {
-    // erf(x) = 2/sqrt(pi) * sum_{n>=0} (-1)^n x^(2n+1) / (n! (2n+1)) converges for all x but
-    // loses precision for large |x|; use the continued fraction of erfc there.
-    let ax = x.abs();
-    let value = if ax == 0.0 {
-        0.0
-    } else if ax < 2.5 {
-        let mut term = ax;
-        let mut sum = ax;
-        let x2 = ax * ax;
-        let mut n = 0.0f64;
-        loop {
-            n += 1.0;
-            term *= -x2 / n;
-            let add = term / (2.0 * n + 1.0);
-            sum += add;
-            if add.abs() <= 1e-17 * sum.abs() {
-                break;
-            }
-        }
-        sum * 2.0 / std::f64::consts::PI.sqrt()
-    } else if ax > 6.0 {
-        1.0
-    } else {
-        // erfc(x) = exp(-x^2) / (x sqrt(pi)) * 1 / (1 + 1/(2x^2) / (1 + 2/(2x^2) / (1 + ...)))
-        let x2 = ax * ax;
-        let mut frac = 0.0f64;
-        for k in (1..=60).rev() {
-            frac = (k as f64 / 2.0) / (ax + frac);
-        }
-        let erfc = (-x2).exp() / ((ax + frac) * std::f64::consts::PI.sqrt());
-        1.0 - erfc
-    };
-    if x < 0.0 { -value } else { value }
+/// A zero-block head GGUF whose scores track the question-type row: distinct type
+/// rows (row `r` holds `r` at channel 0), a unit cls norm, and one-hot cls and
+/// output weights. The pipeline wiring leg answers two types through it and
+/// asserts the vectors differ, so a hardcoded row fails.
+#[cfg(test)]
+pub(crate) fn head_builder_typed() -> crate::gguf::GgufBuilder {
+    let mut types = vec![0.0f32; TYPES * 64];
+    for r in 0..TYPES {
+        types[r * 64] = r as f32;
+    }
+    let mut one_hot = vec![0.0f32; 64 * 64];
+    one_hot[0] = 1.0;
+    let mut out_hot = vec![0.0f32; 64];
+    out_hot[0] = 1.0;
+    head_builder_core(1, &types, &vec![1.0; 64], &one_hot, &out_hot)
+}
+
+/// A zero-block head GGUF with the standard test geometry: 1 head, 64-wide.
+/// Scalar-guard legs override via chained `.kv_u32(...)` (builder keys are
+/// last-wins); only legs that vary tensor bytes keep the positional
+/// [`head_builder`].
+#[cfg(test)]
+pub(crate) fn head_builder_default() -> crate::gguf::GgufBuilder {
+    head_builder(1, 3 * 64)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn erf_matches_known_values() {
-        for (x, want) in [
-            (0.0, 0.0),
-            (0.5, 0.520_499_877_813_046_5),
-            (1.0, 0.842_700_792_949_714_9),
-            (-1.0, -0.842_700_792_949_714_9),
-            (2.0, 0.995_322_265_018_952_7),
-            (3.0, 0.999_977_909_503_001_4),
-            (5.0, 0.999_999_999_998_462_5),
-        ] {
-            assert!((erf64(x) - want).abs() < 1e-13, "erf({x}) = {}", erf64(x));
-        }
-    }
-
-    #[test]
-    fn gelu_is_the_exact_form() {
-        assert!(gelu(0.0).abs() < 1e-9);
-        assert!((gelu(1.0) - 0.841_344_8).abs() < 1e-6);
-        assert!((gelu(-1.0) + 0.158_655_3).abs() < 1e-6);
-        assert!((gelu(10.0) - 10.0).abs() < 1e-6);
-    }
 
     fn head(layers: usize) -> Head {
         let d = HEAD_DIM; // one head
@@ -400,7 +404,39 @@ mod tests {
     fn a_head_without_layers_scores_the_marker_rows() {
         let h = head(0);
         let hidden = vec![0.0f32; 4 * HEAD_DIM];
-        assert_eq!(h.scores(&hidden, 4, 2, &[1, 3]).unwrap().len(), 2);
+        // zero weights score every marker row at the scorer bias
+        assert_eq!(h.scores(&hidden, 4, 2, &[1, 3]).unwrap(), vec![0.25, 0.25]);
+    }
+
+    #[test]
+    fn scores_follow_the_marker_rows_not_the_first_rows() {
+        let mut h = head(0);
+        h.cls_w[0] = 1.0; // one-hot: the score tracks row[0] through the norm
+        let mut hidden = vec![0.0f32; 2 * HEAD_DIM];
+        for (c, v) in hidden[HEAD_DIM..].iter_mut().enumerate() {
+            *v = c as f32; // row 1 ramps, row 0 is constant
+        }
+        assert_eq!(h.scores(&hidden, 2, 0, &[0]).unwrap(), vec![0.25]);
+        assert_ne!(
+            h.scores(&hidden, 2, 0, &[1]).unwrap(),
+            h.scores(&hidden, 2, 0, &[0]).unwrap()
+        );
+    }
+
+    #[test]
+    fn scores_read_the_row_of_the_question_type() {
+        let mut h = head(0);
+        h.cls_w[0] = 1.0; // one-hot: the score tracks row[0] through the norm
+        for r in 0..TYPES {
+            h.types[r * HEAD_DIM] = r as f32; // distinct rows, so the wrong row scores wrong
+        }
+        let hidden = vec![0.0f32; 2 * HEAD_DIM];
+        let choice = h.scores(&hidden, 2, 0, &[0]).unwrap();
+        let score = h.scores(&hidden, 2, 1, &[0]).unwrap();
+        let noul = h.scores(&hidden, 2, 2, &[0]).unwrap();
+        assert_ne!(choice, score);
+        assert_ne!(score, noul);
+        assert_ne!(choice, noul);
     }
 
     #[test]
@@ -414,5 +450,97 @@ mod tests {
             h.scores(&hidden[..HEAD_DIM], 2, 0, &[0]).is_err(),
             "short hidden"
         );
+    }
+
+    #[test]
+    fn loader_guards_refuse_a_broken_head() {
+        Head::from_gguf(&head_builder_default().build(), 64).unwrap();
+        let err = Head::from_gguf(
+            &head_builder_default()
+                .kv_u32("d1.head.attention.head_count", 2)
+                .build(),
+            64,
+        )
+        .expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("not 64 wide"),
+            "unexpected message: {err}"
+        );
+        // the short types table is tensor bytes, not a scalar, so this leg
+        // keeps the positional builder
+        let err = Head::from_gguf(&head_builder(1, 3 * 64 - 1).build(), 64)
+            .expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("has 191 values, expected 192"),
+            "unexpected message: {err}"
+        );
+        let err = Head::from_gguf(&crate::gguf::GgufBuilder::new().build(), 64)
+            .expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("missing d1.head.block_count"),
+            "unexpected message: {err}"
+        );
+        // zero heads pass the width product at width zero, so only this guard
+        // says 0 wide (without it the failure is a tensor length mismatch)
+        let err = Head::from_gguf(
+            &head_builder_default()
+                .kv_u32("d1.head.attention.head_count", 0)
+                .build(),
+            0,
+        )
+        .expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("0 wide"),
+            "unexpected message: {err}"
+        );
+        // 67108865 heads * 64 wraps to 64 wide on 32-bit: the checked product
+        // refuses on every width (on 64-bit the plain multiply refuses too, so
+        // this leg pins the message, and the wrap only on narrow targets)
+        let err = Head::from_gguf(
+            &head_builder_default()
+                .kv_u32("d1.head.attention.head_count", 67108865)
+                .build(),
+            64,
+        )
+        .expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("not 64 wide"),
+            "unexpected message: {err}"
+        );
+        // a zero feed-forward width with blocks refuses up front, not deep in
+        // the tensor reads; a block-less head needs no width, so it loads
+        let err = Head::from_gguf(
+            &head_builder_default()
+                .kv_u32("d1.head.block_count", 1)
+                .kv_u32("d1.head.feed_forward_length", 0)
+                .build(),
+            64,
+        )
+        .expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("no feed-forward width"),
+            "unexpected message: {err}"
+        );
+        Head::from_gguf(
+            &head_builder_default()
+                .kv_u32("d1.head.feed_forward_length", 0)
+                .build(),
+            64,
+        )
+        .unwrap();
+        // a present-but-bad epsilon would silently degenerate every score
+        for bad in [f32::NAN, -1.0, f32::INFINITY] {
+            let err = Head::from_gguf(
+                &head_builder_default()
+                    .kv_f32("d1.head.layer_norm_epsilon", bad)
+                    .build(),
+                64,
+            )
+            .expect_err("expected the guard to refuse");
+            assert!(
+                err.to_string().contains("is not positive and finite"),
+                "unexpected message: {err}"
+            );
+        }
     }
 }

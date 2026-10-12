@@ -862,6 +862,32 @@ pub fn quantize_safetensors_to_gguf_with_overrides(
     )
 }
 
+/// Whether the four batch-norm spans cover the same channels, so folding them cannot
+/// index past the short one.
+fn fold_stats_match(stats: &[Vec<f32>]) -> bool {
+    stats
+        .first()
+        .is_some_and(|first| stats.len() == 4 && stats.iter().all(|s| s.len() == first.len()))
+}
+
+/// Fold batch-norm statistics, refusing spans that disagree on channels with the span
+/// lengths instead of indexing past the short one inside the fold.
+fn fold_stats_checked(
+    kind: d1::Fold,
+    stats: &[Vec<f32>],
+    gguf_name: &str,
+) -> Result<Vec<f32>, CeraError> {
+    if !fold_stats_match(stats) {
+        let lens: Vec<usize> = stats.iter().map(Vec::len).collect();
+        return Err(CeraError::Backend(format!(
+            "batch-norm statistics disagree for `{gguf_name}`: {lens:?}"
+        )));
+    }
+    Ok(d1::fold_batch_norm(
+        kind, &stats[0], &stats[1], &stats[2], &stats[3],
+    ))
+}
+
 /// Quantize a local SafeTensors directory or file to GGUF with explicit strategy and per-tensor overrides.
 ///
 /// # Errors
@@ -1184,7 +1210,9 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
                 decode_safetensor_to_f32_into(&bytes, &src.dtype, &mut values)?;
                 stats.push(values);
             }
-            f32_data = d1::fold_batch_norm(*kind, &stats[0], &stats[1], &stats[2], &stats[3]);
+            // a corrupt shard fails here with the span lengths, not inside the fold with
+            // an index panic
+            f32_data = fold_stats_checked(*kind, &stats, &pt.gguf_name)?;
         } else {
             let file = current_file
                 .as_mut()
@@ -1606,5 +1634,47 @@ mod tests {
         // 4. Missing or invalid
         let empty_val: serde_json::Value = serde_json::json!({});
         assert_eq!(extract_chat_template(&empty_val), None);
+    }
+
+    #[test]
+    fn fold_stats_match_needs_four_equal_spans() {
+        let even = vec![vec![0.0f32; 8]; 4];
+        assert!(fold_stats_match(&even));
+        let mut short = even.clone();
+        short[2].truncate(7);
+        assert!(!fold_stats_match(&short));
+        assert!(!fold_stats_match(&even[..3]));
+        assert!(!fold_stats_match(&[]));
+        assert!(!fold_stats_match(&vec![vec![0.0f32; 8]; 5]));
+    }
+
+    #[test]
+    fn the_fold_refuses_spans_that_disagree() {
+        // distinct per-position spans: any permutation inside the wrapper changes the
+        // output, and Shift exercises the bias/mean roles Scale ignores
+        let spans = vec![
+            vec![2.0f32; 4], // weight
+            vec![0.5f32; 4], // bias
+            vec![1.5f32; 4], // mean
+            vec![3.0f32; 4], // var
+        ];
+        for kind in [d1::Fold::Scale, d1::Fold::Shift] {
+            let folded = fold_stats_checked(kind, &spans, "t").unwrap();
+            assert_eq!(
+                folded,
+                d1::fold_batch_norm(kind, &spans[0], &spans[1], &spans[2], &spans[3])
+            );
+        }
+        let mut short = spans.clone();
+        short[2].truncate(3);
+        let err = fold_stats_checked(d1::Fold::Scale, &short, "blk.0.ffn").unwrap_err();
+        assert!(
+            err.to_string().contains("batch-norm statistics disagree"),
+            "unexpected message: {err}"
+        );
+        assert!(
+            err.to_string().contains("blk.0.ffn"),
+            "unexpected message: {err}"
+        );
     }
 }

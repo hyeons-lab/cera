@@ -859,6 +859,14 @@ pub trait Model: Send + Sync {
         false
     }
 
+    /// Static capability probe: does this backend's [`Self::hidden_states`]
+    /// honor a bidirectional (`is_causal == false`) config? Default `false`;
+    /// causal-only autoregressive extractors must not opt in, so callers that
+    /// need future context refuse instead of silently mis-scoring.
+    fn supports_bidirectional_hidden_states(&self) -> bool {
+        false
+    }
+
     /// [`Self::hidden_states`] over a media prefix followed by `tokens`.
     ///
     /// `prefix` is `[prefix_rows * hidden_size]` embeddings of an image or an audio clip, laid

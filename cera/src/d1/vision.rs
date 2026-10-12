@@ -21,9 +21,9 @@ use crate::par::*;
 /// Side of a tile, in pixels.
 const TILE: usize = 512;
 /// Pixels per patch side.
-const PATCH: usize = 16;
+pub(crate) const PATCH: usize = 16;
 /// Resolution of the position table: 16 x 16 patches.
-const POSITION_SIDE: usize = 16;
+pub(crate) const POSITION_SIDE: usize = 16;
 /// Side factor of the pixel unshuffle.
 const UNSHUFFLE: usize = 2;
 /// LFM2-VL's pixel budget for one crop, in the units its smart resize works in.
@@ -57,16 +57,66 @@ impl Rgb {
     }
 }
 
-/// Decode a PNG or JPEG into RGB.
+/// The decode dimension bound both image readers enforce (same bound as the VL
+/// preprocessor).
+#[cfg(feature = "vl-preprocess")]
+fn decode_limits() -> image::Limits {
+    use crate::model::vision_preprocessor::MAX_DECODE_DIM;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(MAX_DECODE_DIM);
+    limits.max_image_height = Some(MAX_DECODE_DIM);
+    limits
+}
+
+/// An image reader over the bytes with its format detected.
+#[cfg(feature = "vl-preprocess")]
+fn image_reader(bytes: &[u8]) -> Result<image::ImageReader<std::io::Cursor<&[u8]>>> {
+    image::ImageReader::new(std::io::Cursor::new(bytes))
+        .with_guessed_format()
+        .context("detecting the image format")
+}
+
+/// The declared dimensions of a PNG or JPEG, read from the header without
+/// allocating the pixels, so the budget refuses an over-budget image before the
+/// decode transient lands.
 ///
 /// # Errors
 ///
-/// Fails on bytes that are not a supported image, or when the `vl-preprocess` feature is off.
+/// Fails on bytes that are not a supported image, an image past the dimension bound,
+/// or when the `vl-preprocess` feature is off.
+#[cfg(feature = "vl-preprocess")]
+pub(crate) fn image_dims(bytes: &[u8]) -> Result<(usize, usize)> {
+    use image::ImageDecoder as _;
+    let decoder = image_reader(bytes)?.into_decoder()?;
+    let (width, height) = decoder.dimensions();
+    decode_limits().check_dimensions(width, height)?;
+    Ok((width as usize, height as usize))
+}
+
+/// The declared dimensions of a PNG or JPEG.
+///
+/// # Errors
+///
+/// Always: this build has no image decoder (the `vl-preprocess` feature is off).
+#[cfg(not(feature = "vl-preprocess"))]
+pub(crate) fn image_dims(_bytes: &[u8]) -> Result<(usize, usize)> {
+    bail!("this build cannot decode images (the `vl-preprocess` feature is off)")
+}
+
+/// Decode a PNG or JPEG into RGB.
+///
+/// Declared dimensions are bounded before the pixel buffer is allocated, so a hostile
+/// file cannot ask for a gigapixel allocation (same bound as the VL preprocessor).
+///
+/// # Errors
+///
+/// Fails on bytes that are not a supported image, an image past the dimension bound,
+/// or when the `vl-preprocess` feature is off.
 #[cfg(feature = "vl-preprocess")]
 pub fn decode_image(bytes: &[u8]) -> Result<Rgb> {
-    let img = image::load_from_memory(bytes)
-        .context("decoding the image")?
-        .to_rgb8();
+    let mut reader = image_reader(bytes)?;
+    reader.limits(decode_limits());
+    let img = reader.decode().context("decoding the image")?.to_rgb8();
     Ok(Rgb {
         width: img.width() as usize,
         height: img.height() as usize,
@@ -237,7 +287,12 @@ fn fixed_point_weights(in_size: usize, out_size: usize) -> (u32, Vec<(usize, Vec
 }
 
 fn round_shift(acc: i64, precision: u32) -> u8 {
-    ((acc + (1i64 << (precision - 1).min(62))) >> precision).clamp(0, 255) as u8
+    let round = if precision > 0 {
+        1i64 << (precision - 1).min(62)
+    } else {
+        0
+    };
+    ((acc + round) >> precision).clamp(0, 255) as u8
 }
 
 /// Resize with PyTorch's antialiased bilinear on `uint8`: width first, each pass rounded to
@@ -336,19 +391,7 @@ fn patchify(crop: &Rgb) -> (Vec<f32>, usize, usize) {
     (out, rows, cols)
 }
 
-/// `torch.nn.functional.gelu(x, approximate="tanh")`.
-fn gelu_tanh(x: f32) -> f32 {
-    const C: f32 = 0.797_884_6; // sqrt(2 / pi)
-    0.5 * x * (1.0 + (C * (x + 0.044_715 * x * x * x)).tanh())
-}
-
-/// Exact (erf) GELU, `torch.nn.functional.gelu`'s default.
-fn gelu_exact(x: f32) -> f32 {
-    let mut v = [x];
-    cpu::gelu_erf_inplace(&mut v);
-    v[0]
-}
-
+#[derive(Debug)]
 struct Block {
     ln1_w: Vec<f32>,
     ln1_b: Vec<f32>,
@@ -369,6 +412,7 @@ struct Block {
 }
 
 /// The SigLIP2 tower and the projector into the trunk's width.
+#[derive(Debug)]
 pub struct VisionTower {
     width: usize,
     heads: usize,
@@ -399,13 +443,11 @@ impl VisionTower {
     ///
     /// # Errors
     ///
-    /// Fails when a setting or a tensor is missing or has the wrong size.
+    /// Fails when a setting or a tensor is missing or has the wrong size, a
+    /// width is zero or mismatched, or the present epsilon is not positive
+    /// and finite.
     pub fn from_gguf(gguf: &GgufFile, out_width: usize) -> Result<Self> {
-        let setting = |key: &str| {
-            gguf.get_u32(key)
-                .map(|v| v as usize)
-                .with_context(|| format!("missing {key}"))
-        };
+        let setting = |key: &str| super::setting_u32(gguf, key);
         let width = setting("d1.vision.embedding_length")?;
         let blocks = setting("d1.vision.block_count")?;
         let heads = setting("d1.vision.attention.head_count")?;
@@ -416,43 +458,57 @@ impl VisionTower {
                 && setting("d1.vision.position_side")? == POSITION_SIDE,
             "the vision tower is not 16 px patches on a 16 x 16 position table"
         );
+        ensure!(heads >= 1, "the vision tower has no heads");
+        ensure!(width >= 1, "the vision tower has no width");
         ensure!(width % heads == 0, "{heads} heads do not divide {width}");
+        // the feed-forward width only feeds block tensors, so a block-less tower
+        // needs no width; the projector width always feeds tensors below
+        ensure!(
+            blocks == 0 || ffn >= 1,
+            "the vision tower has no feed-forward width"
+        );
+        ensure!(
+            projector_hidden >= 1,
+            "the vision tower has no projector width"
+        );
         let eps = gguf.get_f32("d1.vision.layer_norm_epsilon").unwrap_or(1e-6);
-        let t = |name: &str, elements: usize| -> Result<Vec<f32>> {
-            let v = gguf
-                .get_tensor(name)
-                .with_context(|| format!("the vision tower needs the tensor `{name}`"))?
-                .to_f32_vec();
-            ensure!(
-                v.len() == elements,
-                "`{name}` has {} values, expected {elements}",
-                v.len()
-            );
-            Ok(v)
+        // old files without the key still default; a present-but-bad value would
+        // NaN every vision prefix, so refuse it here
+        ensure!(
+            eps.is_finite() && eps > 0.0,
+            "the vision tower epsilon ({eps}) is not positive and finite"
+        );
+        // element counts multiply file-declared widths, so they route
+        // through the checked product: the plain multiply wraps on 32-bit
+        let t = |name: &str, factors: &[usize]| {
+            let elements = super::checked_len(name, factors)?;
+            super::load_f32(gguf, "vision tower", name, elements)
         };
-        let mut layers = Vec::with_capacity(blocks);
+        // no pre-size: `blocks` is a file-declared count, and reserving it up front
+        // turns a corrupt GGUF into an aborted process instead of a load error
+        let mut layers = Vec::new();
         for i in 0..blocks {
-            let b = |s: &str, n: usize| t(&format!("d1.v.blk.{i}.{s}"), n);
+            let b = |s: &str, n: &[usize]| t(&format!("d1.v.blk.{i}.{s}"), n);
             layers.push(Block {
-                ln1_w: b("ln1.weight", width)?,
-                ln1_b: b("ln1.bias", width)?,
-                q_w: b("attn_q.weight", width * width)?,
-                q_b: b("attn_q.bias", width)?,
-                k_w: b("attn_k.weight", width * width)?,
-                k_b: b("attn_k.bias", width)?,
-                v_w: b("attn_v.weight", width * width)?,
-                v_b: b("attn_v.bias", width)?,
-                o_w: b("attn_out.weight", width * width)?,
-                o_b: b("attn_out.bias", width)?,
-                ln2_w: b("ln2.weight", width)?,
-                ln2_b: b("ln2.bias", width)?,
-                up_w: b("ffn_up.weight", ffn * width)?,
-                up_b: b("ffn_up.bias", ffn)?,
-                down_w: b("ffn_down.weight", width * ffn)?,
-                down_b: b("ffn_down.bias", width)?,
+                ln1_w: b("ln1.weight", &[width])?,
+                ln1_b: b("ln1.bias", &[width])?,
+                q_w: b("attn_q.weight", &[width, width])?,
+                q_b: b("attn_q.bias", &[width])?,
+                k_w: b("attn_k.weight", &[width, width])?,
+                k_b: b("attn_k.bias", &[width])?,
+                v_w: b("attn_v.weight", &[width, width])?,
+                v_b: b("attn_v.bias", &[width])?,
+                o_w: b("attn_out.weight", &[width, width])?,
+                o_b: b("attn_out.bias", &[width])?,
+                ln2_w: b("ln2.weight", &[width])?,
+                ln2_b: b("ln2.bias", &[width])?,
+                up_w: b("ffn_up.weight", &[ffn, width])?,
+                up_b: b("ffn_up.bias", &[ffn])?,
+                down_w: b("ffn_down.weight", &[width, ffn])?,
+                down_b: b("ffn_down.bias", &[width])?,
             });
         }
-        let merged = width * UNSHUFFLE * UNSHUFFLE;
+        let merged = super::checked_len("d1.v merged width", &[width, UNSHUFFLE, UNSHUFFLE])?;
         Ok(Self {
             width,
             heads,
@@ -460,19 +516,19 @@ impl VisionTower {
             eps,
             out_width,
             projector_hidden,
-            patch_w: t("d1.v.patch_embd.weight", width * PATCH * PATCH * 3)?,
-            patch_b: t("d1.v.patch_embd.bias", width)?,
+            patch_w: t("d1.v.patch_embd.weight", &[width, PATCH, PATCH, 3])?,
+            patch_b: t("d1.v.patch_embd.bias", &[width])?,
             position: t(
                 "d1.v.position_embd.weight",
-                POSITION_SIDE * POSITION_SIDE * width,
+                &[POSITION_SIDE, POSITION_SIDE, width],
             )?,
             blocks: layers,
-            post_w: t("d1.v.post_ln.weight", width)?,
-            post_b: t("d1.v.post_ln.bias", width)?,
-            mm1_w: t("d1.v.mm.1.weight", projector_hidden * merged)?,
-            mm1_b: t("d1.v.mm.1.bias", projector_hidden)?,
-            mm2_w: t("d1.v.mm.2.weight", out_width * projector_hidden)?,
-            mm2_b: t("d1.v.mm.2.bias", out_width)?,
+            post_w: t("d1.v.post_ln.weight", &[width])?,
+            post_b: t("d1.v.post_ln.bias", &[width])?,
+            mm1_w: t("d1.v.mm.1.weight", &[projector_hidden, merged])?,
+            mm1_b: t("d1.v.mm.1.bias", &[projector_hidden])?,
+            mm2_w: t("d1.v.mm.2.weight", &[out_width, projector_hidden])?,
+            mm2_b: t("d1.v.mm.2.bias", &[out_width])?,
         })
     }
 
@@ -524,15 +580,10 @@ impl VisionTower {
                 for (j, s) in scores.iter_mut().enumerate() {
                     *s = cpu::dot_f32(qh, &k[j * d + h * hd..][..hd]) * scale;
                 }
-                let max = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
-                let mut sum = 0f32;
-                for s in &mut scores {
-                    *s = (*s - max).exp();
-                    sum += *s;
-                }
+                super::softmax_exact(&mut scores);
                 let dst = &mut row[h * hd..(h + 1) * hd];
                 for (j, s) in scores.iter().enumerate() {
-                    let w = s / sum;
+                    let w = *s;
                     for (o, x) in dst.iter_mut().zip(&v[j * d + h * hd..][..hd]) {
                         *o += w * x;
                     }
@@ -583,9 +634,7 @@ impl VisionTower {
                 cpu::layer_norm_inplace(row, &blk.ln2_w, &blk.ln2_b, self.eps);
             }
             let mut mid = project(&normed, &blk.up_w, &blk.up_b, self.ffn, d);
-            for v in &mut mid {
-                *v = gelu_tanh(*v);
-            }
+            cpu::gelu_inplace(&mut mid);
             let down = project(&mid, &blk.down_w, &blk.down_b, d, self.ffn);
             for (a, b) in x.iter_mut().zip(&down) {
                 *a += b;
@@ -628,9 +677,7 @@ impl VisionTower {
             Some(&self.mm1_b),
             &mut mid,
         );
-        for v in &mut mid {
-            *v = gelu_exact(*v);
-        }
+        super::gelu_exact_inplace(&mut mid);
         let mut out = vec![0f32; n * self.out_width];
         matmul_nt_f32(
             n,
@@ -686,6 +733,69 @@ impl VisionTower {
         }
         Ok(rows)
     }
+}
+
+/// A flat PNG of `w` by `h` pixels for tests, shared by the image tests here and the
+/// pipeline tests in `super` (one encoder, so the pixel layout is asserted once).
+#[cfg(test)]
+#[cfg(feature = "vl-preprocess")]
+pub(crate) fn png_bytes_for_test(w: u32, h: u32) -> Vec<u8> {
+    let img = image::RgbImage::from_pixel(w, h, image::Rgb([10u8, 10, 10]));
+    let mut out = std::io::Cursor::new(Vec::new());
+    image::DynamicImage::ImageRgb8(img)
+        .write_to(&mut out, image::ImageFormat::Png)
+        .unwrap();
+    out.into_inner()
+}
+
+/// A zero-block vision tower GGUF for tests, shared by the loader tests here and the
+/// pipeline tests in `super` (one builder, so a new required tensor is added once).
+#[cfg(test)]
+pub(crate) fn tower_builder(
+    heads: u32,
+    bias_len: usize,
+    patch: u32,
+    side: u32,
+    width: usize,
+) -> crate::gguf::GgufBuilder {
+    crate::gguf::GgufBuilder::new()
+        .kv_u32("d1.vision.block_count", 0)
+        .kv_u32("d1.vision.embedding_length", width as u32)
+        .kv_u32("d1.vision.feed_forward_length", width as u32)
+        .kv_u32("d1.vision.attention.head_count", heads)
+        .kv_u32("d1.vision.patch_size", patch)
+        .kv_u32("d1.vision.position_side", side)
+        .kv_u32("d1.vision.projector_hidden_length", 64)
+        .tensor_f32(
+            "d1.v.patch_embd.weight",
+            &[width * 16 * 16 * 3],
+            &vec![0.0; width * 16 * 16 * 3],
+        )
+        .tensor_f32("d1.v.patch_embd.bias", &[bias_len], &vec![0.0; bias_len])
+        .tensor_f32(
+            "d1.v.position_embd.weight",
+            &[16 * 16 * width],
+            &vec![0.0; 16 * 16 * width],
+        )
+        .tensor_f32("d1.v.post_ln.weight", &[width], &vec![0.0; width])
+        .tensor_f32("d1.v.post_ln.bias", &[width], &vec![0.0; width])
+        .tensor_f32(
+            "d1.v.mm.1.weight",
+            &[64 * width * 4],
+            &vec![0.0; 64 * width * 4],
+        )
+        .tensor_f32("d1.v.mm.1.bias", &[64], &vec![0.0; 64])
+        .tensor_f32("d1.v.mm.2.weight", &[64 * width], &vec![0.0; 64 * width])
+        .tensor_f32("d1.v.mm.2.bias", &[width], &vec![0.0; width])
+}
+
+/// A zero-block vision tower GGUF with the standard test geometry: 1 head,
+/// 64-wide, 16 px patches on a 16 x 16 table. Scalar-guard legs override via
+/// chained `.kv_u32(...)` (builder keys are last-wins); only legs that vary
+/// tensor bytes keep the positional [`tower_builder`].
+#[cfg(test)]
+pub(crate) fn tower_builder_default() -> crate::gguf::GgufBuilder {
+    tower_builder(1, 64, 16, 16, 64)
 }
 
 #[cfg(test)]
@@ -832,8 +942,214 @@ mod tests {
 
     #[test]
     fn gelu_variants_differ_where_they_should() {
-        assert!(gelu_tanh(0.0).abs() < 1e-9);
-        assert!((gelu_tanh(1.0) - 0.841_192).abs() < 1e-5);
-        assert!((gelu_exact(1.0) - 0.841_344_8).abs() < 1e-5);
+        let mut tanh = [0.0f32, 1.0];
+        cpu::gelu_inplace(&mut tanh);
+        assert!(tanh[0].abs() < 1e-9);
+        assert!((tanh[1] - 0.841_192).abs() < 1e-5);
+        let mut exact = [1.0f32];
+        crate::d1::gelu_exact_inplace(&mut exact);
+        assert!((exact[0] - 0.841_344_8).abs() < 1e-5);
+    }
+
+    #[cfg(feature = "vl-preprocess")]
+    fn crc32(data: &[u8]) -> u32 {
+        let mut crc = 0xFFFF_FFFFu32;
+        for &b in data {
+            crc ^= u32::from(b);
+            for _ in 0..8 {
+                let lsb = crc & 1;
+                crc >>= 1;
+                if lsb == 1 {
+                    crc ^= 0xEDB8_8320;
+                }
+            }
+        }
+        !crc
+    }
+
+    /// A PNG declaring `declared_w` px wide with a valid CRC, so only the dimension
+    /// bound fires.
+    #[cfg(feature = "vl-preprocess")]
+    fn png_with_declared_width(w: u32, h: u32, declared_w: u32) -> Vec<u8> {
+        let mut png = super::png_bytes_for_test(w, h);
+        png[16..20].copy_from_slice(&declared_w.to_be_bytes());
+        let crc = crc32(&png[12..29]);
+        png[29..33].copy_from_slice(&crc.to_be_bytes());
+        png
+    }
+
+    #[test]
+    #[cfg(feature = "vl-preprocess")]
+    fn a_huge_declared_width_is_refused_before_its_pixels_allocate() {
+        let png = super::png_bytes_for_test(64, 64);
+        assert!(decode_image(&png).is_ok());
+        let png = png_with_declared_width(64, 64, 20_000);
+        let err = decode_image(&png).unwrap_err();
+        // the dimension bound fires, not a CRC or truncation error: pin the typed
+        // variant, not the third-party wording
+        let typed = err.downcast_ref::<image::ImageError>();
+        assert!(
+            matches!(typed, Some(image::ImageError::Limits(_))),
+            "expected the dimension bound, got: {err:?}"
+        );
+    }
+
+    #[test]
+    #[cfg(feature = "vl-preprocess")]
+    fn image_dims_read_the_header_without_the_pixels() {
+        let png = super::png_bytes_for_test(64, 48);
+        assert_eq!(image_dims(&png).unwrap(), (64, 48));
+        // the dimension bound fires on the header dims, with the typed refusal
+        let huge = png_with_declared_width(64, 48, 20_000);
+        let err = image_dims(&huge).unwrap_err();
+        let typed = err.downcast_ref::<image::ImageError>();
+        assert!(
+            matches!(typed, Some(image::ImageError::Limits(_))),
+            "expected the dimension bound, got: {err:?}"
+        );
+        // non-image bytes refuse as an undeterminable format, not the dimension
+        // bound: pin the typed variant, not the third-party wording
+        let err = image_dims(b"not an image").unwrap_err();
+        let typed = err.downcast_ref::<image::ImageError>();
+        assert!(
+            matches!(typed, Some(image::ImageError::Unsupported(_))),
+            "expected an undeterminable-format refusal, got: {err:?}"
+        );
+        // the JPEG side of the documented pair: same header read, other container
+        let rgb = image::RgbImage::from_pixel(64, 48, image::Rgb([10u8, 10, 10]));
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::DynamicImage::ImageRgb8(rgb)
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+            .unwrap();
+        assert_eq!(image_dims(&jpeg.into_inner()).unwrap(), (64, 48));
+    }
+
+    #[test]
+    fn encode_returns_the_rows_prefix_rows_predicts() {
+        let tower = VisionTower::from_gguf(&tower_builder_default().build(), 64).unwrap();
+        for (w, h) in [(640, 480), (2048, 1536)] {
+            let rgb = Rgb::filled(w, h, [10, 200, 77]);
+            let prefix = tower.encode(std::slice::from_ref(&rgb)).unwrap();
+            assert_eq!(
+                prefix.len() / 64,
+                VisionTower::prefix_rows(&[(w, h)]).unwrap()
+            );
+        }
+    }
+
+    #[test]
+    fn loader_guards_refuse_a_broken_tower() {
+        VisionTower::from_gguf(&tower_builder_default().build(), 64).unwrap();
+        let err = VisionTower::from_gguf(
+            &tower_builder_default()
+                .kv_u32("d1.vision.patch_size", 32)
+                .build(),
+            64,
+        )
+        .expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("not 16 px patches"),
+            "unexpected message: {err}"
+        );
+        let err = VisionTower::from_gguf(
+            &tower_builder_default()
+                .kv_u32("d1.vision.attention.head_count", 0)
+                .build(),
+            64,
+        )
+        .expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("no heads"),
+            "unexpected message: {err}"
+        );
+        // the width conjunct feeds from the embedding_length key; the chained key
+        // overrides the shared width (builder keys are last-wins), and the shared
+        // tensors are unread since the guard fires before any load
+        let nowide = tower_builder_default()
+            .kv_u32("d1.vision.embedding_length", 0)
+            .build();
+        let err = VisionTower::from_gguf(&nowide, 64).expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("no width"),
+            "unexpected message: {err}"
+        );
+        // a present-but-bad epsilon would NaN every vision prefix
+        for bad in [f32::NAN, -1.0, f32::INFINITY] {
+            let badeps = tower_builder_default()
+                .kv_f32("d1.vision.layer_norm_epsilon", bad)
+                .build();
+            let err =
+                VisionTower::from_gguf(&badeps, 64).expect_err("expected the guard to refuse");
+            assert!(
+                err.to_string().contains("is not positive and finite"),
+                "unexpected message: {err}"
+            );
+        }
+        // the side conjunct: 16 px patches on an 8 x 8 table still refuse
+        let err = VisionTower::from_gguf(
+            &tower_builder_default()
+                .kv_u32("d1.vision.position_side", 8)
+                .build(),
+            64,
+        )
+        .expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("16 x 16 position table"),
+            "unexpected message: {err}"
+        );
+        let err = VisionTower::from_gguf(
+            &tower_builder_default()
+                .kv_u32("d1.vision.attention.head_count", 3)
+                .build(),
+            64,
+        )
+        .expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("do not divide"),
+            "unexpected message: {err}"
+        );
+        // the short bias is tensor bytes, not a scalar, so this leg keeps the
+        // positional builder
+        let err = VisionTower::from_gguf(&tower_builder(1, 63, 16, 16, 64).build(), 64)
+            .expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("has 63 values, expected 64"),
+            "unexpected message: {err}"
+        );
+        let err = VisionTower::from_gguf(&crate::gguf::GgufBuilder::new().build(), 64)
+            .expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string()
+                .contains("missing d1.vision.embedding_length"),
+            "unexpected message: {err}"
+        );
+        // a zero feed-forward width with blocks would load 0-element tensors (the
+        // shared builder carries no blocks, so the leg adds one)
+        let noffn = tower_builder_default()
+            .kv_u32("d1.vision.block_count", 1)
+            .kv_u32("d1.vision.feed_forward_length", 0)
+            .build();
+        let err = VisionTower::from_gguf(&noffn, 64).expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("no feed-forward width"),
+            "unexpected message: {err}"
+        );
+        // ... while a block-less tower needs no width, so it loads without one
+        VisionTower::from_gguf(
+            &tower_builder_default()
+                .kv_u32("d1.vision.feed_forward_length", 0)
+                .build(),
+            64,
+        )
+        .unwrap();
+        // a zero projector width would load 0-element projector tensors
+        let noph = tower_builder_default()
+            .kv_u32("d1.vision.projector_hidden_length", 0)
+            .build();
+        let err = VisionTower::from_gguf(&noph, 64).expect_err("expected the guard to refuse");
+        assert!(
+            err.to_string().contains("no projector width"),
+            "unexpected message: {err}"
+        );
     }
 }
