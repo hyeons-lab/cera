@@ -289,11 +289,18 @@ fn stream_layout_eligible(dtype: DType, k: usize) -> bool {
 /// prompt prefilled at 62 tok/s against 170. The padded columns are free because the kernel is bound
 /// by streaming the weights, not by arithmetic.
 fn stream_gemm_min_n() -> u32 {
-    static MIN_N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
-    *MIN_N.get_or_init(|| {
-        crate::backend::cpu_features::env_usize("CERA_WGPU_STREAM_MIN_N")
-            .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX))
-    })
+    #[cfg(test)]
+    let min_n = crate::backend::cpu_features::env_usize("CERA_WGPU_STREAM_MIN_N")
+        .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX));
+    #[cfg(not(test))]
+    let min_n = {
+        static MIN_N: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+        *MIN_N.get_or_init(|| {
+            crate::backend::cpu_features::env_usize("CERA_WGPU_STREAM_MIN_N")
+                .map_or(1, |n| u32::try_from(n).unwrap_or(u32::MAX))
+        })
+    };
+    min_n
 }
 
 /// Whether the k-slice-64 streaming GEMM twin is enabled: on by default
@@ -302,8 +309,18 @@ fn stream_gemm_min_n() -> u32 {
 /// Read once per process so kernel selection per prefill call is static
 /// (the stream-GEMM bind-group cache pairs slots with pipelines).
 fn use_gemm_k64() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("CERA_WGPU_GEMM_K64").as_deref() != Ok("0"))
+    #[cfg(test)]
+    let enabled = !std::env::var("CERA_WGPU_GEMM_K64")
+        .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off"));
+    #[cfg(not(test))]
+    let enabled = {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            !std::env::var("CERA_WGPU_GEMM_K64")
+                .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off"))
+        })
+    };
+    enabled
 }
 
 /// Rows per workgroup of the fused gate/up kernel (its thread count; `GATEUP_THREADS` in
@@ -318,21 +335,71 @@ const GEMM_TWO_ROW_MIN_GROUPS: u32 = 64;
 /// Whether the two-row streaming GEMM (`gemm_stream_q4_0_k64_r2`) takes an `m x n_pad` dispatch.
 /// `CERA_WGPU_GEMM_R1=1` forces the one-row kernel everywhere (the A/B switch). Both kernels give
 /// bit-identical results.
+fn gemm_two_row_workgroups(m: u32, n_pad: u32) -> bool {
+    u64::from(m.div_ceil(256)) * u64::from(n_pad.div_ceil(32)) >= u64::from(GEMM_TWO_ROW_MIN_GROUPS)
+}
+
 fn gemm_stream_two_row(m: u32, n_pad: u32) -> bool {
-    static FORCE_ONE_ROW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let force_one_row = *FORCE_ONE_ROW.get_or_init(|| {
-        std::env::var("CERA_WGPU_GEMM_R1").is_ok_and(|v| !matches!(v.as_str(), "" | "0"))
-    });
-    !force_one_row
-        && u64::from(m.div_ceil(256)) * u64::from(n_pad / 32) >= u64::from(GEMM_TWO_ROW_MIN_GROUPS)
+    #[cfg(test)]
+    let force_one_row = std::env::var("CERA_WGPU_GEMM_R1")
+        .is_ok_and(|v| !matches!(v.as_str(), "" | "0" | "false" | "off"));
+    #[cfg(not(test))]
+    let force_one_row = {
+        static FORCE_ONE_ROW: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FORCE_ONE_ROW.get_or_init(|| {
+            std::env::var("CERA_WGPU_GEMM_R1")
+                .is_ok_and(|v| !matches!(v.as_str(), "" | "0" | "false" | "off"))
+        })
+    };
+    !force_one_row && gemm_two_row_workgroups(m, n_pad)
 }
 
 /// Whether the FFN's gate and up projections run as one fused GEMM with a SiLU epilogue (on by
 /// default; `CERA_WGPU_FUSE_GATE_UP=0` turns it off). It saves a transpose pass and the separate
 /// `silu_mul` pass, and reads each activation tile once for two weight rows.
 fn use_fused_gate_up() -> bool {
-    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    *ENABLED.get_or_init(|| std::env::var("CERA_WGPU_FUSE_GATE_UP").as_deref() != Ok("0"))
+    #[cfg(test)]
+    let enabled = !std::env::var("CERA_WGPU_FUSE_GATE_UP")
+        .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off"));
+    #[cfg(not(test))]
+    let enabled = {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            !std::env::var("CERA_WGPU_FUSE_GATE_UP")
+                .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off"))
+        })
+    };
+    enabled
+}
+
+/// Pure predicate for `can_fuse_gate_up`, split out so unit tests can assert all gating conditions
+/// without constructing a GPU context or pipeline objects.
+#[allow(clippy::too_many_arguments)]
+fn can_fuse_gate_up_shape(
+    gate_dtype: DType,
+    gate_shape: &[usize],
+    gate_has_stream: bool,
+    up_dtype: DType,
+    up_shape: &[usize],
+    up_has_stream: bool,
+    n: u32,
+    k: u32,
+) -> bool {
+    let ku = k as usize;
+    use_fused_gate_up()
+        && use_gemm_k64()
+        && k > 0
+        && k.is_multiple_of(64)
+        && n >= stream_gemm_min_n()
+        && gate_dtype == DType::Q4_0
+        && up_dtype == DType::Q4_0
+        && gate_shape.len() >= 2
+        && up_shape.len() >= 2
+        && gate_shape[0] == up_shape[0]
+        && gate_shape[1] == ku
+        && up_shape[1] == ku
+        && gate_has_stream
+        && up_has_stream
 }
 
 /// Repack Q4_0 GGUF bytes into the streaming-GEMM layout: feature-major
@@ -1479,7 +1546,7 @@ enum PrefillCmd<'a> {
     },
 }
 
-/// `(n, flags, cursor, slots)` — see `stream_gemm_bg_cache`. `flags` is bit 0 `all_logits`, bit 1
+/// `(n, flags, cursor, slots)`: see `stream_gemm_bg_cache`. `flags` is bit 0 `all_logits`, bit 1
 /// "gate/up GEMMs are fused" (a different call sequence, so a different slot layout).
 type StreamGemmBgCache = (
     u32,
@@ -7496,19 +7563,18 @@ impl GpuLfmModel {
     /// fusion not switched off. The same conditions as the unfused streaming path, so a model that
     /// takes that one takes this one.
     fn can_fuse_gate_up(&self, gate: &GpuWeight, up: &GpuWeight, n: u32, k: u32) -> bool {
-        use_fused_gate_up()
-            && use_gemm_k64()
-            && k.is_multiple_of(64)
-            && n >= stream_gemm_min_n()
-            && gate.tensor.dtype == DType::Q4_0
-            && up.tensor.dtype == DType::Q4_0
-            && gate.tensor.shape[0] == up.tensor.shape[0]
-            && gate.stream_q.is_some()
-            && gate.stream_d.is_some()
-            && up.stream_q.is_some()
-            && up.stream_d.is_some()
-            && self.pipelines.gemm_stream_q4_0_k64_gateup.is_some()
+        self.pipelines.gemm_stream_q4_0_k64_gateup.is_some()
             && self.pipelines.transpose_cast_f16.is_some()
+            && can_fuse_gate_up_shape(
+                gate.tensor.dtype,
+                &gate.tensor.shape,
+                gate.stream_q.is_some() && gate.stream_d.is_some(),
+                up.tensor.dtype,
+                &up.tensor.shape,
+                up.stream_q.is_some() && up.stream_d.is_some(),
+                n,
+                k,
+            )
     }
 
     /// Fused gate/up streaming GEMM: `y[n, m] = silu(x @ gate^T) * (x @ up^T)` in one dispatch,
@@ -8412,10 +8478,16 @@ impl GpuLfmModel {
             .lock()
             .unwrap_or_else(|e| e.into_inner())
             .clone();
-        // The FFN fuses gate, up and SiLU unless an adapter needs the raw projections; the choice
-        // is part of the stream-GEMM bind-group cache key (the call sequence differs).
+        // The FFN fuses gate, up and SiLU only when no LoRA adapter is attached and the model
+        // actually satisfies all prerequisites for the fused streaming kernel; the choice is
+        // part of the stream-GEMM bind-group cache key (the call sequence differs).
+        let will_fuse_gate_up = lora.is_none()
+            && self.layers.first().is_some_and(|lw| match &lw.ffn {
+                GpuFfn::Dense(d) => self.can_fuse_gate_up(&d.gate, &d.up, n as u32, hs as u32),
+                GpuFfn::Moe(_) => false,
+            });
         self.fuse_gate_up_active
-            .store(lora.is_none() && use_fused_gate_up(), Ordering::Relaxed);
+            .store(will_fuse_gate_up, Ordering::Relaxed);
 
         // Stage the TurboQuant shader params for every layer in one write, before
         // the encoders below are submitted. `n` rows appended at `start_pos`; Q
@@ -13281,13 +13353,6 @@ mod tests {
         );
     }
 
-    /// A passthrough-capable context, or `None` (the tests below are skipped on adapters without
-    /// SPIR-V passthrough, e.g. Metal; the lavapipe and Android runs exercise them).
-    fn passthrough_ctx() -> Option<GpuContext> {
-        let ctx = GpuContext::new().ok()?;
-        ctx.supports_spirv_passthrough().then_some(ctx)
-    }
-
     /// Synthetic Q4_0 weights of `m` rows by `k`, as the repacked resident (q, d) streams.
     fn stream_weight(
         ctx: &GpuContext,
@@ -13377,7 +13442,10 @@ mod tests {
     /// clamp are all in play when `m` is not a multiple of 256.
     #[test]
     fn two_row_stream_gemm_matches_one_row_bit_for_bit() {
-        let Some(ctx) = passthrough_ctx() else { return };
+        let Some(ctx) = passthrough_ctx_or_skip("two_row_stream_gemm_matches_one_row_bit_for_bit")
+        else {
+            return;
+        };
         let one = ctx.gemm_stream_q4_0_k64_passthrough();
         let two = ctx.gemm_stream_q4_0_k64_r2_passthrough();
         for &(m, n, k) in STREAM_TEST_SHAPES {
@@ -13408,7 +13476,10 @@ mod tests {
     /// of the f16 accumulators; the only difference is the GPU's `exp` against the CPU's here).
     #[test]
     fn fused_gate_up_matches_separate_gemms_and_silu() {
-        let Some(ctx) = passthrough_ctx() else { return };
+        let Some(ctx) = passthrough_ctx_or_skip("fused_gate_up_matches_separate_gemms_and_silu")
+        else {
+            return;
+        };
         let one = ctx.gemm_stream_q4_0_k64_passthrough();
         let fused = ctx.gemm_stream_q4_0_k64_gateup_passthrough();
         for &(m, n, k) in STREAM_TEST_SHAPES {
@@ -13454,5 +13525,185 @@ mod tests {
         assert!(!two_row(2048, 224), "8 x 7 = 56");
         assert!(!two_row(2048, 64), "8 x 2");
         assert!(!two_row(4608, 32), "18 x 1: a short final chunk");
+    }
+
+    /// All prerequisite gates for the fused gate/up streaming kernel are verified.
+    #[test]
+    fn can_fuse_gate_up_shape_gates_all_prerequisites() {
+        let m = 2048;
+        let k = 256;
+        let n = 32;
+        let gate_shape = [m, k];
+        let up_shape = [m, k];
+
+        assert!(
+            super::can_fuse_gate_up_shape(
+                crate::tensor::DType::Q4_0,
+                &gate_shape,
+                true,
+                crate::tensor::DType::Q4_0,
+                &up_shape,
+                true,
+                n,
+                k as u32,
+            ),
+            "baseline valid parameters must be accepted"
+        );
+
+        // k must be > 0 and multiple of 64
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &gate_shape,
+            true,
+            crate::tensor::DType::Q4_0,
+            &up_shape,
+            true,
+            n,
+            0
+        ));
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &gate_shape,
+            true,
+            crate::tensor::DType::Q4_0,
+            &up_shape,
+            true,
+            n,
+            63
+        ));
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &gate_shape,
+            true,
+            crate::tensor::DType::Q4_0,
+            &up_shape,
+            true,
+            n,
+            65
+        ));
+
+        // n must be >= stream_gemm_min_n() (default 1)
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &gate_shape,
+            true,
+            crate::tensor::DType::Q4_0,
+            &up_shape,
+            true,
+            0,
+            k as u32
+        ));
+
+        // gate and up must be Q4_0
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q8_0,
+            &gate_shape,
+            true,
+            crate::tensor::DType::Q4_0,
+            &up_shape,
+            true,
+            n,
+            k as u32
+        ));
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &gate_shape,
+            true,
+            crate::tensor::DType::F16,
+            &up_shape,
+            true,
+            n,
+            k as u32
+        ));
+
+        // shape dimensions must have rank >= 2
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &[m * k],
+            true,
+            crate::tensor::DType::Q4_0,
+            &up_shape,
+            true,
+            n,
+            k as u32
+        ));
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &gate_shape,
+            true,
+            crate::tensor::DType::Q4_0,
+            &[m * k],
+            true,
+            n,
+            k as u32
+        ));
+
+        // row count m must match between gate and up
+        let diff_m_shape = [m + 1, k];
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &diff_m_shape,
+            true,
+            crate::tensor::DType::Q4_0,
+            &up_shape,
+            true,
+            n,
+            k as u32
+        ));
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &gate_shape,
+            true,
+            crate::tensor::DType::Q4_0,
+            &diff_m_shape,
+            true,
+            n,
+            k as u32
+        ));
+
+        // col count k must match k parameter
+        let diff_k_shape = [m, k + 64];
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &diff_k_shape,
+            true,
+            crate::tensor::DType::Q4_0,
+            &up_shape,
+            true,
+            n,
+            k as u32
+        ));
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &gate_shape,
+            true,
+            crate::tensor::DType::Q4_0,
+            &diff_k_shape,
+            true,
+            n,
+            k as u32
+        ));
+
+        // resident stream buffers must be present
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &gate_shape,
+            false,
+            crate::tensor::DType::Q4_0,
+            &up_shape,
+            true,
+            n,
+            k as u32
+        ));
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &gate_shape,
+            true,
+            crate::tensor::DType::Q4_0,
+            &up_shape,
+            false,
+            n,
+            k as u32
+        ));
     }
 }

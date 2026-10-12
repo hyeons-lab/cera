@@ -1846,61 +1846,15 @@ impl GpuContext {
     /// `gemm_stream_q4_0_k64.slang`). Only call when
     /// `supports_spirv_passthrough()` is true.
     pub fn gemm_stream_q4_0_k64_passthrough(&self) -> wgpu::ComputePipeline {
-        assert!(
-            self.supports_spirv_passthrough(),
-            "SPIR-V passthrough pipeline requested on a backend that does not \
-             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
-            self.backend
-        );
-        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("gemm_stream_q4_0_k64_passthrough_bgl"),
-                entries: &[
-                    storage(0, true),
-                    storage(1, true),
-                    storage(2, true),
-                    storage(3, false),
-                    storage(4, true),
-                ],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("gemm_stream_q4_0_k64_passthrough_layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
-        // SAFETY: slangc-compiled from gemm_stream_q4_0_k64.slang, spirv-val clean.
-        let module = unsafe {
-            self.device
-                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
-                    env!("OUT_DIR"),
-                    "/gemm_stream_q4_0_k64.spv"
-                )))
-        };
-        self.device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("gemm_stream_q4_0_k64_passthrough"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-                cache: None,
-            })
+        // SAFETY: slangc-compiled from gemm_stream_q4_0_k64.slang, spirv-val clean, same
+        // five-binding storage buffer interface as gemm_stream_q4_0_k64_r2.
+        unsafe {
+            self.stream_gemm_pipeline(
+                "gemm_stream_q4_0_k64_passthrough",
+                wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemm_stream_q4_0_k64.spv")),
+                &[true, true, true, false, true],
+            )
+        }
     }
 
     /// Pipeline over an explicit bind-group layout of storage buffers (`true` = read-only), for the
@@ -2008,61 +1962,14 @@ impl GpuContext {
     /// `gemm_stream_q8_0_k64.slang`). Only call when
     /// `supports_spirv_passthrough()` is true.
     pub fn gemm_stream_q8_0_k64_passthrough(&self) -> wgpu::ComputePipeline {
-        assert!(
-            self.supports_spirv_passthrough(),
-            "SPIR-V passthrough pipeline requested on a backend that does not \
-             accept it (backend={}); gate on GpuContext::supports_spirv_passthrough()",
-            self.backend
-        );
-        let storage = |binding: u32, read_only: bool| wgpu::BindGroupLayoutEntry {
-            binding,
-            visibility: wgpu::ShaderStages::COMPUTE,
-            ty: wgpu::BindingType::Buffer {
-                ty: wgpu::BufferBindingType::Storage { read_only },
-                has_dynamic_offset: false,
-                min_binding_size: None,
-            },
-            count: None,
-        };
-        let bgl = self
-            .device
-            .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
-                label: Some("gemm_stream_q8_0_k64_passthrough_bgl"),
-                entries: &[
-                    storage(0, true),
-                    storage(1, true),
-                    storage(2, true),
-                    storage(3, false),
-                    storage(4, true),
-                ],
-            });
-        let layout = self
-            .device
-            .create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
-                label: Some("gemm_stream_q8_0_k64_passthrough_layout"),
-                bind_group_layouts: &[Some(&bgl)],
-                immediate_size: 0,
-            });
         // SAFETY: slangc-compiled from gemm_stream_q8_0_k64.slang, spirv-val clean.
-        let module = unsafe {
-            self.device
-                .create_shader_module_passthrough(wgpu::include_spirv_raw!(concat!(
-                    env!("OUT_DIR"),
-                    "/gemm_stream_q8_0_k64.spv"
-                )))
-        };
-        self.device
-            .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
-                label: Some("gemm_stream_q8_0_k64_passthrough"),
-                layout: Some(&layout),
-                module: &module,
-                entry_point: Some("main"),
-                compilation_options: wgpu::PipelineCompilationOptions {
-                    zero_initialize_workgroup_memory: false,
-                    ..Default::default()
-                },
-                cache: None,
-            })
+        unsafe {
+            self.stream_gemm_pipeline(
+                "gemm_stream_q8_0_k64_passthrough",
+                wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemm_stream_q8_0_k64.spv")),
+                &[true, true, true, false, true],
+            )
+        }
     }
 
     /// Transpose + f32->f16 cast feeding the streaming GEMM. Three bindings

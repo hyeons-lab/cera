@@ -624,6 +624,8 @@ size from):
 | `CERA_GPU_PREBUILD` | on | `0` / `false` / `off` stops wgpu decode finishing the next token's command buffer while the current one executes (decode is about 20% slower with it off on Adreno 830). |
 | `CERA_GPU_ATTN_SPLIT` | on | `0` / `false` / `off` uses the single-kernel attention instead of the split-K attention (head_dim 64 only). |
 | `CERA_WGPU_STREAM_MIN_N` | 1 | wgpu prefill: smallest batch size routed to the streaming Q4_0 GEMM. |
+| `CERA_WGPU_GEMM_R1` | off | `1` / `true` forces the 1-row streaming Q4_0 GEMM kernel everywhere (skips 2-row kernel). |
+| `CERA_WGPU_FUSE_GATE_UP` | on | `0` / `false` / `off` disables fused gate/up streaming Q4_0 GEMM with SiLU epilogue. |
 | `CERA_VIT_STREAM`, `CERA_VIT_WARMUP` | on | wgpu vision tower: `CERA_VIT_STREAM=off` restores the generic kernels instead of the fp16 streaming GEMMs and attention; `CERA_VIT_WARMUP=off` skips the blank-image warm-up encode at load (about 190 ms once). |
 | `CERA_MIN_ROWS` | 128 | Minimum output rows a decode-GEMV worker takes before another joins. |
 | `CERA_PAR_THRESHOLD` | 256 | Minimum output dimension before a GEMV parallelizes; smaller GEMVs stay serial. |
