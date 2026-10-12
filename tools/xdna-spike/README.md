@@ -5,6 +5,7 @@ A measurement tool for the AMD XDNA NPU feasibility study (`docs/XDNA_NPU_PHASE0
 - `spike.cpp`: the Windows host program (MSVC, C++17).
 - `build.ps1`: builds `spike.exe`, including an import library generated from the driver's own `xrt_coreutil.dll`.
 - `hwinfo_sm.py`: reads HWiNFO sensors through its shared-memory interface (Windows Python); `list`, `idle <s>` and `run -- <command>` with per-run energy.
+- `npu_power.sh`: NPU package power during back-to-back kernels, bracketed by idle floors.
 - `baselines.sh`: the section 2 CPU and GPU baseline runs, each wrapped in `hwinfo_sm.py`.
 - `iron/`: IRON designs and a build script, compiled on Linux (WSL2 works) into `.xclbin` plus instruction binaries that `spike.exe` loads.
 
@@ -20,6 +21,9 @@ spike gemv         <xclbin> <insts.bin> <M> <K> [iters]    IRON int16 GEMV, chec
 spike memcpy       <xclbin> <insts.bin> <n_int32> [iters]  IRON memcpy, checked, reports DDR GB/s
 spike readbw       <xclbin> <insts.bin> <n_int32> <workers> [tile] [iters]
                                                            read-dominant design (iron/readbw.py), checked, reports read GB/s
+spike q4gemv       <xclbin> <insts.bin> <M> <K> [iters]  Q4_0-style GEMV (iron/q4gemv), checked against a CPU reference
+                                                           env: SPIKE_Q4_STREAM=L keeps L runs in flight; SPIKE_Q4_TRACE=1 prints per-run times;
+                                                           SPIKE_Q4_UNIT, SPIKE_Q4_HI, SPIKE_Q4_BT are layout diagnostics
 spike gemvchain    <xclbin> <insts.bin> <M> <K> <iters> <L> [<L>...]
                                                            L dependent GEMVs (run i+1 reads run i's output), runlist and stream
 ```
@@ -64,10 +68,10 @@ Tested with mlir-aie `v1.4.3` (`95b3d1ccc0bfe5183bae1fa9014cfdc1fb4d96c8`) and l
    for d in *.deb; do dpkg-deb -x "$d" $IRON_HOME/xrt-local; done
    ```
 
-4. `iron/build.sh gemv 8192 2048 8 8`, `iron/build.sh memcpy 16777216` or `iron/build.sh readbw 67108864 4096`. For `readbw` on npu2 pass `16` as the worker count to `spike` (8 columns x 2 channels). `IRON_HOME` defaults to `~/xdna-iron`, and `OUT_DIR` defaults to `./out`. For the GEMV, `M / (32 x n_cores)` must be at most 64 (a DMA buffer-descriptor repeat limit), and `n_cols` must be at least `n_cores`.
+4. `iron/build.sh gemv 8192 2048 8 8`, `iron/build.sh memcpy 16777216`, `iron/build.sh readbw 67108864 4096` or `iron/build.sh q4gemv 65536`. For `readbw` on npu2 pass `16` as the worker count to `spike` (8 columns x 2 channels). `IRON_HOME` defaults to `~/xdna-iron`, and `OUT_DIR` defaults to `./out`. For the GEMV, `M / (32 x n_cores)` must be at most 64 (a DMA buffer-descriptor repeat limit), and `n_cols` must be at least `n_cores`.
 
 The memcpy bypass variant in the results is mlir-aie's own `programming_examples/basic/memcpy/memcpy.py --dev npu2 -l 16777216 -co 8 -ch 2 -b True` with `--xclbin-path` and `--insts-path`.
 
 ## Licenses
 
-`spike.cpp`, `build.ps1` and `iron/build.sh` are cera's (Apache-2.0 OR MIT). `iron/gemv_multi.py` and `iron/memcpy_bw.py` are modified copies of mlir-aie examples and keep their `Apache-2.0 WITH LLVM-exception` headers, with the modifications noted at the top of each file. The XRT headers are not vendored here.
+`spike.cpp`, `build.ps1` and `iron/build.sh` are cera's (Apache-2.0 OR MIT). `iron/q4gemv/` is cera's. `iron/gemv_multi.py` and `iron/memcpy_bw.py` are modified copies of mlir-aie examples and keep their `Apache-2.0 WITH LLVM-exception` headers, with the modifications noted at the top of each file. The XRT headers are not vendored here.

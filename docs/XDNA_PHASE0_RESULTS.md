@@ -358,6 +358,53 @@ What this says:
 
 - How much per-command cost a real fused kernel hides behind its DMA (needs device-side timestamps or the kernel's isolated device time).
 
+## 3e. Q4 GEMV kernel spike
+
+Run 2026-10-12 at the user's request, after the recommendation below to stop. Purpose: find out whether a **real** 4-bit GEMV kernel can approach the trivial read-only kernel's bandwidth and energy. Turbo mode, machine otherwise idle, everything verified against a CPU reference. Code: `tools/xdna-spike/iron/q4gemv/` (design and kernel) and `spike q4gemv` (host packing, reference, timing).
+
+**Format:** Q4_0-equivalent at 4.5 bits per weight. Weights are signed int4 (Q4_0's `q - 8`) with one bf16 scale per 32-weight block per row. Q4_0 stores f16 scales, and XDNA2 has no float16 vector type, so the host converts them to bf16. Activations are int8 with one f32 scale per 32-element block (Q8_0-style). Quantization follows llama.cpp's Q4_0 and Q8_0 rounding.
+
+**Kernel:** `aie::mmul<4, 16, 16, int8, int4>` per 16-column half-block, with only row 0 of A populated (the bandwidth margin makes the wasted MACs free). Each block's int32 result is scaled by the bf16 row scales times the activation scale and accumulated in `accfloat`.
+
+**Design:** 16 workers, one per (column, shim channel) pair. Each worker gets one linear stream on its own channel: an 18,432-byte slot carrying x and its scales, then its weight tiles (16 rows x 2,048 columns = 18,432 bytes each), pre-packed by the host in consumption order. x rides the weight channel because the weights need all 16 shim channels. Within a tile, all int4 blocks come first and all scales last, which keeps every 128-byte int4 load 64-byte aligned. The first version interleaved them at a 288-byte stride, and AIE vector loads silently read from the aligned-down address, so results were wrong until this was fixed.
+
+**Correctness:** with unit scales the NPU matches the integer reference exactly; with real scales the worst error is 1.66e-7 of the row's magnitude (f32 rounding), on 8,192 x 2,048 and 65,536 x 2,048.
+
+**Bandwidth** (65,536 x 2,048, 72 MB of weights per run, including scales):
+
+| Submission | n | p50 (us) | p99 (us) | GB/s at p50 |
+|---|---|---|---|---|
+| one run at a time (start, wait) | 100, two processes | 2637.6, 2700.4 | 5859.2, 5833.2 | 28.6, 28.0 (best 53.0) |
+| 4 runs in flight | 60 | 1713.8 | 2491.2 | 44.1 |
+| 16 runs in flight | 60 | 1456.5 | 1653.1 | 51.8 |
+| 16 runs in flight, clean idle floors (below) | 2,600 | **1378.8** | 1382.5 | **54.76** |
+
+One run at a time alternates between fast phases (about 1,450 us, 52 GB/s, 15 to 20 runs long) and slow phases (about 2,600 to 3,000 us with a repeating 5.8, 4.1 and 3.6 ms spike pattern). Keeping runs in flight removes the slow phases, so a backend must keep the NPU fed rather than wait on each matrix. The cause of the slow phases (power-management state changes while the NPU idles between runs, or periodic memory contention) was not isolated. On 8,192 x 2,048 (9 MB), one run at a time gives 34.1 GB/s at p50.
+
+Some early runs of this spike were interrupted by Modern Standby (10:26 to 10:46 and 10:55 to 11:03). On this machine the display timeout itself enters Modern Standby even with sleep disabled, so every number in this table comes from runs after 11:03 or under `hwinfo_sm.py`, which holds a keep-awake request. The user set sleep on AC to never at about 11:05.
+
+**Energy:** the 16-in-flight run for 58 s, bracketed by 60 s idle floors with HWiNFO's NPU usage at 0% (an earlier attempt was discarded because its floors showed the NPU 33 to 50% busy from another process; M365Copilot was then closed at the user's request). Steady state is taken as the samples with NPU usage at 99% or more (492 samples, 4.5 to 58.0 s), which excludes host-side setup:
+
+| | Value |
+|---|---|
+| Steady package power | 27.55 W |
+| Idle floor (before, after) | 14.85 W, 15.47 W |
+| Net of floor | 12.38 W |
+| **J per GB of weights, gross** | **0.503** |
+| J per GB, net | 0.226 |
+
+For comparison, the trivial read-only kernel was 0.409 J/GB gross at 22.6 W, and cera's GPU Q4_0 decode 0.889 J/GB gross at 64.2 W. The real kernel streams at the same rate as the trivial one but draws about 5 W more.
+
+**Projection for Llama-3.2-1B Q4_0** (773 MB per token, weights and dispatch only, so a ceiling, not demonstrated), against the GPU's 93.4 tok/s at 1.46 tok/J gross (1.95 net):
+
+| Per-token dispatch | Decode | Share of GPU | tok/J gross | tok/J net |
+|---|---|---|---|---|
+| 5.2 ms (measured floor for 112 dependent links) | 51.8 tok/s | 55% | 1.88 (1.29x) | 4.18 (2.14x) |
+| 1 ms (fusion, not demonstrated) | 66.2 tok/s | 71% | 2.40 (1.65x) | 5.34 (2.73x) |
+| none (perfect fusion) | 70.8 tok/s | 76% | 2.57 (1.77x) | 5.72 (2.93x) |
+
+**Against the spike's stop criterion** (at least about 40 GB/s at no more than about 0.42 J/GB gross): **bandwidth passes easily (54.8 GB/s); gross energy fails (0.503 J/GB).** Even with perfect fusion, whole-package tokens per joule reaches about 1.77x the GPU, short of the proposed 2x. Net of the idle floor, it clears 2x at every dispatch level.
+
 ## 3d. Decision
 
 **Provisionally (a): raw XRT works on Windows.** Our own unsigned IRON xclbins load and run correctly through the XRT that ships with the NPU driver, driven from our own MSVC binary, with no Ryzen AI Software. The license audit (3a) allows shipping IRON and Peano-built kernels.
@@ -368,8 +415,10 @@ What this says:
 - **Best case, not demonstrated: passes speed, fails the 2x efficiency bar on gross energy.** If a real 4-bit kernel ran at the read-only kernel's 55.4 GB/s, decode would reach about 52 tok/s (56% of the GPU) at about 1.6x the GPU's gross tokens per joule (2.8x net of the idle floor). That assumes weight streaming and dispatch are the only costs, the `int8 x int4` path works as read from the headers, and the 5.2 ms of per-token dispatch is not reduced by fusion.
 - The NPU's real advantage is low absolute power: about 7 to 10 W above idle against about 48 W for the GPU. That frees the GPU and keeps the machine cool, but on energy per token the GPU's much higher speed wins most of it back.
 
-**Recommendation: stop before backend work.** Even the undemonstrated best case falls short of the 2x efficiency bar on whole-package energy, a real kernel is far from that best case, and a backend is weeks to months of Windows-only work (C++ shim, hand-written kernels for every op, fusion to beat the dispatch floor, a Linux kernel toolchain, AMD driver churn). The vendor-neutral `--device npu` selection (Phase A) stands on its own.
+**Recommendation: stop before backend work** (written before the 3e spike; the spike confirms it on the agreed criterion, see the end of this section). Even the undemonstrated best case falls short of the 2x efficiency bar on whole-package energy, a real kernel is far from that best case, and a backend is weeks to months of Windows-only work (C++ shim, hand-written kernels for every op, fusion to beat the dispatch floor, a Linux kernel toolchain, AMD driver churn). The vendor-neutral `--device npu` selection (Phase A) stands on its own.
 
 **What would change it:** a time-boxed optimized Q4 GEMV spike (MemTile staging, `int8 x int4` mmul, per-block scale epilogue) showing that a real kernel reaches **at least about 40 GB/s at no more than about 0.42 J/GB gross** (about 17 W package), together with evidence that fusion can bring per-token dispatch down to about 1 ms. Worked back from the bar: 0.773 GB / 40 GB/s = 19.3 ms plus 1 ms of dispatch is about 49 tok/s (53% of the GPU), and at about 17 W that is about 2.9 tok/J, 2.0x the GPU's gross 1.46. For scale, the trivial read-only kernel is at 0.41 J/GB and 55.4 GB/s, so a real kernel would have to match a trivial kernel's energy per byte at about 72% of its throughput. Worth running only if NPU efficiency matters enough to the product to justify the backend afterwards. This is the user's call.
 
 The other 0b exit criteria remain open: the weight format (`int8 x int4` with a per-block scale epilogue, versus `bfp16ebs8`), activation quantization (int8 if 4-bit weights are kept), and the parity-tolerance policy.
+
+**After the 3e spike (2026-10-12):** a real Q4 kernel reaches the read ceiling (54.8 GB/s), so speed is no longer the obstacle, but its whole-package energy (0.503 J/GB) misses the 0.42 J/GB stop criterion, and the best projected gross efficiency is about 1.77x the GPU even with perfect fusion. On the bar as proposed, the recommendation stands: stop. Two things could still justify continuing, and both are product decisions, not measurements: (1) counting energy net of the idle floor (2.1 to 2.9x the GPU), which is right only if the machine would be awake anyway, for example while other work runs; (2) valuing the NPU's low absolute power (about 12 W above idle against about 48 W for the GPU) for running a model alongside GPU or CPU work, rather than as a faster or more efficient replacement for them. Not yet accounted for in any projection: attention, normalization, RoPE, activation quantization on the NPU, and demonstrated dispatch fusion, all of which would lower the projected rates.

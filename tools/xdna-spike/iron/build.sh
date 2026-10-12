@@ -3,6 +3,7 @@
 #   build.sh gemv   <M> <K> <n_cores> <n_cols>
 #   build.sh memcpy <length_int32>
 #   build.sh readbw <length_int32> [tile_int32]
+#   build.sh q4gemv <M> [K]   (M a multiple of 8192 on npu2; K = 2048 tested)
 # Needs an IRON venv (see ../README.md); IRON_HOME points at it.
 set -eo pipefail
 IRON_HOME="${IRON_HOME:-$HOME/xdna-iron}"
@@ -26,5 +27,8 @@ case "$1" in
     t="${3:-1024}"
     python3 "$HERE/readbw.py" --dev npu2 -l "$2" -t "$t" \
       --xclbin-path="$OUT_DIR/readbw_${2}_t$t.xclbin" --insts-path="$OUT_DIR/insts_readbw_${2}_t$t.bin" ;;
-  *) echo "usage: build.sh gemv <M> <K> <n_cores> <n_cols> | memcpy <length> | readbw <length> [tile]" >&2; exit 2 ;;
+  q4gemv)
+    python3 "$HERE/q4gemv/q4gemv.py" --dev npu2 -M "$2" -K "${3:-2048}" \
+      --xclbin-path="$OUT_DIR/q4gemv_${2}x${3:-2048}.xclbin" --insts-path="$OUT_DIR/insts_q4gemv_${2}x${3:-2048}.bin" ;;
+  *) echo "usage: build.sh gemv <M> <K> <n_cores> <n_cols> | memcpy <length> | readbw <length> [tile] | q4gemv <M> [K]" >&2; exit 2 ;;
 esac

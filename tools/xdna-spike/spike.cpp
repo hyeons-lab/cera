@@ -13,6 +13,7 @@
 //   spike gemv    <xclbin> <insts.bin> <M> <K> [iters]   (IRON int16 GEMV, verified)
 //   spike memcpy  <xclbin> <insts.bin> <n_int32> [iters] (IRON memcpy, verified)
 //   spike gemvchain <xclbin> <insts.bin> <M> <K> <iters> <L> [<L>...] (dependent GEMV chains)
+//   spike q4gemv  <xclbin> <insts.bin> <M> <K> [iters] (Q4_0-style GEMV, iron/q4gemv, verified)
 //   spike readbw  <xclbin> <insts.bin> <n_int32> <workers> [tile] [iters] (read-dominant, verified)
 
 #include "xrt/xrt_bo.h"
@@ -23,6 +24,7 @@
 #include "xrt/experimental/xrt_xclbin.h"
 
 #include <algorithm>
+#include <cmath>
 #include <chrono>
 #include <cstdio>
 #include <cstdlib>
@@ -502,7 +504,204 @@ static int cmd_gemvchain(const char* xclbin_path, const char* insts_path, int M,
   return 0;
 }
 
+// Q4_0-style GEMV (iron/q4gemv): weights int4 (q - 8) with a bf16 scale per
+// 32-weight block, x int8 with an f32 scale per 32-element block. The host
+// quantizes random data the way llama.cpp's Q4_0 / Q8_0 do, packs one stream
+// per worker in consumption order, and checks the NPU against a CPU reference
+// that uses the same quantized values (so a mismatch is the kernel's, not
+// quantization error).
+static uint16_t f32_to_bf16(float f) {
+  uint32_t u;
+  std::memcpy(&u, &f, 4);
+  u += 0x7FFF + ((u >> 16) & 1);  // round to nearest even
+  return uint16_t(u >> 16);
+}
+static float bf16_to_f32(uint16_t h) {
+  uint32_t u = uint32_t(h) << 16;
+  float f;
+  std::memcpy(&f, &u, 4);
+  return f;
+}
+
+static int cmd_q4gemv(const char* xclbin_path, const char* insts_path, int M, int K, int iters) {
+  const int QB = 32, ROWS = 16, WORKERS = 16;
+  const size_t tb = size_t(K / QB) * (2 * 128 + ROWS * 2);
+  if (M % (WORKERS * ROWS) || K % QB) throw std::runtime_error("bad M or K");
+  FILE* f = std::fopen(insts_path, "rb");
+  if (!f) throw std::runtime_error("cannot open insts file");
+  std::vector<uint32_t> instr;
+  uint32_t word;
+  while (std::fread(&word, 4, 1, f) == 1) instr.push_back(word);
+  std::fclose(f);
+
+  // Random weights and activations, quantized like Q4_0 / Q8_0.
+  uint32_t s = 2024;
+  auto frand = [&]() { s = s * 1664525u + 1013904223u; return float((s >> 8) & 0xFFFF) / 32768.0f - 1.0f; };
+  int nb = K / QB;
+  std::vector<int8_t> wq(size_t(M) * K);    // q - 8, in [-8, 7]
+  std::vector<uint16_t> wd(size_t(M) * nb);  // bf16 scales
+  std::vector<float> wrow(K);
+  for (int r = 0; r < M; ++r) {
+    for (int k = 0; k < K; ++k) wrow[k] = frand();
+    for (int b = 0; b < nb; ++b) {
+      float amax = 0, mx = 0;
+      for (int j = 0; j < QB; ++j) {
+        float v = wrow[b * QB + j];
+        if (std::fabs(v) > amax) { amax = std::fabs(v); mx = v; }
+      }
+      float d = mx / -8.0f, id = d ? 1.0f / d : 0.0f;
+      wd[size_t(r) * nb + b] = f32_to_bf16(d);
+      for (int j = 0; j < QB; ++j) {
+        int q = int(wrow[b * QB + j] * id + 8.5f);
+        q = q < 0 ? 0 : (q > 15 ? 15 : q);
+        wq[size_t(r) * K + b * QB + j] = int8_t(q - 8);
+      }
+    }
+  }
+  std::vector<int8_t> xq(K);
+  std::vector<float> xd(nb);
+  for (int b = 0; b < nb; ++b) {
+    float xs[32], amax = 0;
+    for (int j = 0; j < QB; ++j) { xs[j] = frand(); amax = std::max(amax, std::fabs(xs[j])); }
+    float d = amax / 127.0f, id = d ? 1.0f / d : 0.0f;
+    xd[b] = d;
+    for (int j = 0; j < QB; ++j) xq[b * QB + j] = int8_t(std::lround(xs[j] * id));
+  }
+
+  auto dev = xrt::device(0);
+  xrt::xclbin x{std::string(xclbin_path)};
+  std::string kname;
+  for (auto& k : x.get_kernels())
+    if (k.get_name().rfind("MLIR_AIE", 0) == 0) kname = k.get_name();
+  if (kname.empty()) throw std::runtime_error("no MLIR_AIE kernel in xclbin");
+  dev.register_xclbin(x);
+  xrt::hw_context ctx(dev, x.get_uuid());
+  xrt::kernel kernel(ctx, kname);
+
+  const size_t w_bytes = size_t(M / ROWS) * tb;
+  auto bo_instr = xrt::bo(dev, instr.size() * 4, XCL_BO_FLAGS_CACHEABLE, kernel.group_id(1));
+  auto bo_w = xrt::bo(dev, w_bytes, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(3));
+  auto bo_x = xrt::bo(dev, tb, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(4));
+  auto bo_y = xrt::bo(dev, size_t(M) * 4, XRT_BO_FLAGS_HOST_ONLY, kernel.group_id(5));
+  std::memcpy(bo_instr.map<void*>(), instr.data(), instr.size() * 4);
+
+  // Pack: worker w owns rows [w*rpw, (w+1)*rpw); its tiles are contiguous.
+  // A tile holds, for every block b, two 16x16 int4 B matrices (B[k][n] =
+  // W[r0+n][b*32 + h*16 + k], element e = k*16+n, low nibble first), then the
+  // 16 bf16 row scales of every block.
+  // Layout diagnostics (env): SPIKE_Q4_UNIT=1 sets every scale to 1 so the
+  // output is the raw integer dot product; SPIKE_Q4_HI=1 puts even elements in
+  // the high nibble; SPIKE_Q4_BT=1 packs B as [n][k] instead of [k][n].
+  const bool unit = std::getenv("SPIKE_Q4_UNIT") != nullptr;
+  const bool hi_first = std::getenv("SPIKE_Q4_HI") != nullptr;
+  const bool bt = std::getenv("SPIKE_Q4_BT") != nullptr;
+  if (unit) {
+    for (auto& d : wd) d = f32_to_bf16(1.0f);
+    for (auto& d : xd) d = 1.0f;
+  }
+  auto* w = bo_w.map<uint8_t*>();
+  std::memset(w, 0, w_bytes);
+  for (int tile = 0; tile < M / ROWS; ++tile) {
+    int r0 = tile * ROWS;
+    uint8_t* tp = w + size_t(tile) * tb;
+    for (int b = 0; b < nb; ++b) {
+      uint8_t* bp = tp + size_t(b) * 256;  // weights for all blocks first, then all scales
+      for (int h = 0; h < 2; ++h)
+        for (int k = 0; k < 16; ++k)
+          for (int n = 0; n < 16; ++n) {
+            int e = bt ? n * 16 + k : k * 16 + n;
+            uint8_t nib = uint8_t(wq[size_t(r0 + n) * K + b * QB + h * 16 + k]) & 0xF;
+            bool high = ((e & 1) != 0) != hi_first;
+            bp[h * 128 + e / 2] |= high ? uint8_t(nib << 4) : nib;
+          }
+      auto* sp = reinterpret_cast<uint16_t*>(tp + size_t(nb) * 256 + size_t(b) * ROWS * 2);
+      for (int n = 0; n < 16; ++n) sp[n] = wd[size_t(r0 + n) * nb + b];
+    }
+  }
+  auto* xs = bo_x.map<uint8_t*>();
+  std::memset(xs, 0, tb);
+  std::memcpy(xs, xq.data(), K);
+  std::memcpy(xs + K, xd.data(), nb * 4);
+  auto* y = bo_y.map<float*>();
+  std::memset(y, 0, size_t(M) * 4);
+  bo_instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  bo_w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  bo_x.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+  bo_y.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+  auto run = xrt::run(kernel);
+  run.set_arg(0, uint64_t(3));
+  run.set_arg(1, bo_instr);
+  run.set_arg(2, uint32_t(instr.size()));
+  run.set_arg(3, bo_w);
+  run.set_arg(4, bo_x);
+  run.set_arg(5, bo_y);
+  run.start();
+  auto state = run.wait();
+  bo_y.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+  // Reference from the same quantized values; error relative to the row's
+  // magnitude scale (sum of |terms|), since f32 accumulation order differs.
+  int bad = 0;
+  double worst = 0;
+  for (int r = 0; r < M; ++r) {
+    double ref = 0, mag = 0;
+    for (int b = 0; b < nb; ++b) {
+      int32_t dot = 0;
+      for (int j = 0; j < QB; ++j) dot += int32_t(wq[size_t(r) * K + b * QB + j]) * xq[b * QB + j];
+      double term = double(dot) * bf16_to_f32(wd[size_t(r) * nb + b]) * xd[b];
+      ref += term;
+      mag += std::fabs(term);
+    }
+    double err = std::fabs(double(y[r]) - ref) / (mag > 0 ? mag : 1);
+    worst = std::max(worst, err);
+    if (err > 1e-4 && bad++ < 5) std::printf("  row %d: npu=%.6f ref=%.6f rel=%.2e\n", r, y[r], ref, err);
+  }
+  std::printf("kernel %s, state=%d, verify: %d of %d rows off by >1e-4 of row magnitude (worst %.2e) -> %s\n",
+              kname.c_str(), int(state), bad, M, worst, bad ? "FAIL" : "PASS");
+
+  // SPIKE_Q4_STREAM=L keeps L runs in flight (all started, then all waited),
+  // so the NPU never idles between runs; times are reported per run.
+  int depth = std::getenv("SPIKE_Q4_STREAM") ? std::atoi(std::getenv("SPIKE_Q4_STREAM")) : 1;
+  std::vector<xrt::run> runs;
+  for (int i = 0; i < std::max(depth, 1); ++i) {
+    xrt::run r(kernel);
+    r.set_arg(0, uint64_t(3));
+    r.set_arg(1, bo_instr);
+    r.set_arg(2, uint32_t(instr.size()));
+    r.set_arg(3, bo_w);
+    r.set_arg(4, bo_x);
+    r.set_arg(5, bo_y);
+    runs.push_back(r);
+  }
+  std::vector<double> t;
+  for (int i = 0; i < iters + 3; ++i) {
+    auto t0 = clk::now();
+    for (auto& r : runs) r.start();
+    for (auto& r : runs) r.wait2();
+    if (i >= 3) t.push_back(us_since(t0) / runs.size());
+  }
+  report(depth > 1 ? "q4gemv streamed (per run)" : "q4gemv start+wait", t, 1.0);
+  if (std::getenv("SPIKE_Q4_TRACE")) {  // per-run times in order, to see where the tail comes from
+    for (size_t i = 0; i < t.size(); ++i) std::printf("%s%.0f", i % 20 ? " " : "\n  ", t[i]);
+    std::printf("\n");
+  }
+  std::sort(t.begin(), t.end());
+  double p50 = t[t.size() / 2], p90 = t[size_t(0.9 * (t.size() - 1) + 0.5)];
+  std::printf("weights %.2f MB (4.5 bits/weight incl. bf16 scales): %.2f GB/s at p50, %.2f at p90, best %.2f\n",
+              w_bytes / 1048576.0, w_bytes / (p50 * 1e3), w_bytes / (p90 * 1e3), w_bytes / (t.front() * 1e3));
+  return bad ? 1 : 0;
+}
+
 int main(int argc, char** argv) {
+  if (argc >= 6 && std::string(argv[1]) == "q4gemv") {
+    try {
+      return cmd_q4gemv(argv[2], argv[3], std::atoi(argv[4]), std::atoi(argv[5]), argc > 6 ? std::atoi(argv[6]) : 200);
+    } catch (const std::exception& e) {
+      std::fprintf(stderr, "error: %s\n", e.what());
+      return 1;
+    }
+  }
   if (argc >= 8 && std::string(argv[1]) == "gemvchain") {
     try {
       std::vector<int> lens;
