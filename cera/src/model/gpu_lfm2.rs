@@ -789,10 +789,16 @@ fn attention_prefill_tiled(
     q_stride: u32,
     out_stride: u32,
 ) -> bool {
-    static FORCE_SCALAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-    let force_scalar = *FORCE_SCALAR.get_or_init(|| {
-        std::env::var("CERA_WGPU_ATTN_SCALAR").is_ok_and(|v| !matches!(v.as_str(), "" | "0"))
-    });
+    #[cfg(test)]
+    let force_scalar =
+        std::env::var("CERA_WGPU_ATTN_SCALAR").is_ok_and(|v| !matches!(v.as_str(), "" | "0"));
+    #[cfg(not(test))]
+    let force_scalar = {
+        static FORCE_SCALAR: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *FORCE_SCALAR.get_or_init(|| {
+            std::env::var("CERA_WGPU_ATTN_SCALAR").is_ok_and(|v| !matches!(v.as_str(), "" | "0"))
+        })
+    };
     adapter_ok
         && !force_scalar
         && head_dim == 64
@@ -835,7 +841,6 @@ fn attention_prefill_chunks(
         quantum,
     )
 }
-}
 
 fn attention_prefill_chunks_within(
     n: u32,
@@ -877,7 +882,7 @@ fn packed_f16_binding(buffer: &wgpu::Buffer, len_floats: u64) -> wgpu::BindingRe
     wgpu::BindingResource::Buffer(wgpu::BufferBinding {
         buffer,
         offset: 0,
-        size: wgpu::BufferSize::new(bytes.max(4)),
+        size: wgpu::BufferSize::new(bytes.max(8)),
     })
 }
 
@@ -2529,10 +2534,12 @@ impl GpuLfmModel {
                     Ok(pipe) => Some(pipe),
                     Err(e) => {
                         tracing::warn!(
-                            "attention_prefill_hd64 pipeline validation failed ({e});                              causal prefill falls back to generic kernel"
+                            "attention_prefill_hd64 pipeline validation failed ({e}); \
+                             causal prefill falls back to generic kernel"
                         );
                         eprintln!(
-                            "[cera::wgpu] attention_prefill_hd64 pipeline validation failed ({e});                              causal prefill falls back to generic kernel"
+                            "[cera::wgpu] attention_prefill_hd64 pipeline validation failed ({e}); \
+                             causal prefill falls back to generic kernel"
                         );
                         None
                     }
@@ -8027,22 +8034,30 @@ impl GpuLfmModel {
         // kernel) share each workgroup and each K/V tile stream; params[11] is the authoritative
         // chunk size edge workgroups mask against, params[7] the whole call's key rows for a
         // bidirectional pass.
-        let tiled = attention_prefill_tiled(
+        let (pipeline, queries_per_wg, label, tiled) = if attention_prefill_tiled(
             self.ctx.supports_flash_attention(),
             head_dim,
             q_stride,
             out_stride,
-        );
-        let (pipeline, queries_per_wg, label) =
-            if tiled && self.pipelines.attention_prefill_hd64.is_some() {
-                (
-                    self.pipelines.attention_prefill_hd64.as_ref().unwrap(),
-                    32,
-                    "attention_prefill_hd64",
-                )
+        ) {
+            if let Some(pipe) = self.pipelines.attention_prefill_hd64.as_ref() {
+                (pipe, 32, "attention_prefill_hd64", true)
             } else {
-                (&self.pipelines.attention_prefill, 8, "attention_prefill")
-            };
+                (
+                    &self.pipelines.attention_prefill,
+                    8,
+                    "attention_prefill",
+                    false,
+                )
+            }
+        } else {
+            (
+                &self.pipelines.attention_prefill,
+                8,
+                "attention_prefill",
+                false,
+            )
+        };
         let total_rows = start_pos.saturating_add(n);
         for (q_base, n_sub) in attention_prefill_chunks(
             n,
@@ -8051,6 +8066,11 @@ impl GpuLfmModel {
             bidir_prefix.is_some(),
             queries_per_wg,
         ) {
+            #[cfg(test)]
+            if !tiled {
+                self.generic_prefill_dispatches
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            }
             let params: [u32; 14] = [
                 n_heads,
                 n_kv_heads,
@@ -11618,7 +11638,6 @@ mod tests {
             "unaligned output rows"
         );
     }
-    }
 
     /// `--spv` bytes are validated before reaching the driver: word
     /// alignment, the size cap, and the 5-word header shape each fail with
@@ -12178,7 +12197,7 @@ mod tests {
                 // bidirectional (production passes `Some(prefix)`).
                 if (heads, head_dim) == (4, 32) {
                     let chunks =
-                        attention_prefill_chunks(n as u32, heads as u32, 0, true).len() as u32;
+                        attention_prefill_chunks(n as u32, heads as u32, 0, true, 8).len() as u32;
                     assert_eq!(
                         generic_after - generic_before,
                         attn_layers * chunks,

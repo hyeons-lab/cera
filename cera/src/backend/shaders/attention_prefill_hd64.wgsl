@@ -322,7 +322,6 @@ fn main(@builtin(local_invocation_id) lid: vec3<u32>, @builtin(workgroup_id) wid
 
 
         // online softmax, 4 threads per query, 8 keys each
-        var sv: array<f32, 8>;
         var pmax = NEG;
         let x0 = ps[(sp * 8u + 0u) * 32u + sq];
         pmax = max(pmax, x0);

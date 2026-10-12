@@ -26,7 +26,6 @@ OUT = sys.argv[1] if len(sys.argv) > 1 else "ablate"
 os.makedirs(OUT, exist_ok=True)
 
 # ---- register-blocked rewrite: R weight rows per thread, 256/R threads per workgroup ----
-import sys
 def gen(R, name, dequant=True):
     T = 256 // R
     L = []
@@ -171,6 +170,9 @@ gen(4, "r4.slang")
 gen(2, "r2_nodq.slang", False)
 
 slangc = os.environ.get("SLANGC") or shutil.which("slangc") or os.path.expanduser("~/.local/slang/bin/slangc")
+if not (os.path.isfile(slangc) and os.access(slangc, os.X_OK)):
+    print(f"note: slangc not found at {slangc}; generated .slang files without compiling .spv")
+    sys.exit(0)
 for f in sorted(os.listdir(".")):
     if f.endswith(".slang"):
         r = subprocess.run([slangc, f, "-target", "spirv", "-O3", "-entry", "main", "-stage", "compute", "-o", f[:-6] + ".spv"],

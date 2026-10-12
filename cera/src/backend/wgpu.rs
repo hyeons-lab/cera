@@ -2848,6 +2848,8 @@ pub mod shaders {
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
     /// Register-tiled flash attention for head_dim 64 (f32 Q/K/V, GQA, bidirectional windows).
     pub const ATTENTION_FLASH_HD64: &str = include_str!("shaders/attention_flash_hd64.wgsl");
+    /// Register-tiled causal and bidirectional-prefix flash attention prefill for head_dim 64
+    /// (reading the packed-f16 KV cache with hand-unrolled 4x4 register tiles).
     pub const ATTENTION_PREFILL_HD64: &str = include_str!("shaders/attention_prefill_hd64.wgsl");
     /// The centred gated convolution of a bidirectional LFM2 trunk.
     pub const BIDIRECTIONAL: &str = include_str!("shaders/bidirectional.wgsl");
@@ -8380,10 +8382,16 @@ mod tests {
     /// not multiples of 32 (so `q_base` lands mid-tile), and an LFM2-shaped 16/8-head call.
     #[test]
     fn test_gpu_attention_prefill_hd64_parity() {
-        let ctx = match GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(_) => return,
-        };
+        let Some(ctx) = gpu_or_skip() else { return };
+        let flash_capable = ctx.supports_flash_attention();
+        require_flash_or_skip(
+            &ctx,
+            flash_capable,
+            "test_gpu_attention_prefill_hd64_parity",
+        );
+        if !flash_capable {
+            return;
+        }
         for &(heads, kv_heads, n, start) in &[
             (4u32, 2u32, 70u32, 0u32), // group 2, ragged last tile
             (4, 2, 70, 5),             // start_pos that is not a tile multiple
@@ -8410,10 +8418,16 @@ mod tests {
     /// mid-tile: the running max and sum are rescaled across the whole sweep.
     #[test]
     fn test_gpu_attention_prefill_hd64_long_kv() {
-        let ctx = match GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(_) => return,
-        };
+        let Some(ctx) = gpu_or_skip() else { return };
+        let flash_capable = ctx.supports_flash_attention();
+        require_flash_or_skip(
+            &ctx,
+            flash_capable,
+            "test_gpu_attention_prefill_hd64_long_kv",
+        );
+        if !flash_capable {
+            return;
+        }
         // start_pos 900 + 200 queries: the last query reads 1100 keys, 34 tiles and a bit.
         let f = build_attn_prefill_fixture(4, 2, 64, 200, 900);
         assert!(f.max_seq > 34 * 32);
@@ -8428,10 +8442,16 @@ mod tests {
     /// kernel.
     #[test]
     fn test_gpu_attention_prefill_hd64_bidirectional_split_matches_cpu() {
-        let ctx = match GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(_) => return,
-        };
+        let Some(ctx) = gpu_or_skip() else { return };
+        let flash_capable = ctx.supports_flash_attention();
+        require_flash_or_skip(
+            &ctx,
+            flash_capable,
+            "test_gpu_attention_prefill_hd64_bidirectional_split_matches_cpu",
+        );
+        if !flash_capable {
+            return;
+        }
         let f = build_attn_prefill_fixture(4, 2, 64, 70, 0);
         for prefix in [0u32, 24, 40] {
             let want = bidirectional_attention_reference(&f, prefix);
@@ -8458,10 +8478,16 @@ mod tests {
     /// output buffer starts at a sentinel so the test sees the write.
     #[test]
     fn test_gpu_attention_prefill_hd64_empty_window_writes_zero() {
-        let ctx = match GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(_) => return,
-        };
+        let Some(ctx) = gpu_or_skip() else { return };
+        let flash_capable = ctx.supports_flash_attention();
+        require_flash_or_skip(
+            &ctx,
+            flash_capable,
+            "test_gpu_attention_prefill_hd64_empty_window_writes_zero",
+        );
+        if !flash_capable {
+            return;
+        }
         let (n_heads, n_kv_heads, head_dim, n) = (2u32, 1u32, 64u32, 3u32);
         let kv_dim = n_kv_heads * head_dim;
         let q_stride = n_heads * head_dim;
