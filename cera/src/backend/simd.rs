@@ -4603,6 +4603,7 @@ pub(crate) mod neon {
     /// computed once per call (`k/32` per column), then each output row is a short f32 dot per
     /// column, four columns at a time.
     #[target_feature(enable = "neon,dotprod")]
+    #[cfg_attr(has_blas, allow(dead_code))]
     pub unsafe fn q4_1_min_correction(
         mprime: &[f32],
         b_scales: &[f32],
@@ -4612,6 +4613,13 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) {
+        if m == 0 || n == 0 || k == 0 {
+            return;
+        }
+        assert!(
+            k > 0 && k.is_multiple_of(32),
+            "q4_1_min_correction: k must be a positive multiple of 32"
+        );
         let nb = k / 32;
         assert!(
             mprime.len() >= m * nb
@@ -4708,6 +4716,9 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) {
+        if m == 0 || n == 0 {
+            return;
+        }
         debug_assert_eq!(k % 32, 0, "Q4_1 GEMM: k must be divisible by 32");
         let nb = k / 32;
         let row_bytes = nb * size_of::<BlockQ4_1>();
@@ -7631,6 +7642,7 @@ pub(crate) mod neon {
     /// pool take less (the static split ran a 64-super-row GEMM at a third of the tiled rate).
     #[allow(clippy::too_many_arguments)]
     #[target_feature(enable = "neon,i8mm")]
+    #[cfg_attr(has_blas, allow(dead_code))]
     pub unsafe fn gemm_q4_0_smmla_8x4_q8_0_tiled(
         packed: &[u8],
         scales: &[f32],
@@ -7643,6 +7655,9 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) {
+        if n == 0 {
+            return;
+        }
         debug_assert_eq!(m % 8, 0, "smmla Q4_0 GEMM: m must be a multiple of 8");
         debug_assert_eq!(k % 32, 0, "smmla Q4_0 GEMM: k must be divisible by 32");
         let nb = k / 32;
@@ -7702,15 +7717,27 @@ pub(crate) mod neon {
                 .min(max_active);
             let chunk = sr_count.div_ceil(nth * 4).max(1);
             let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
-            let mut tickets = vec![0.0f32; sr_count];
-            crate::backend::cpu::par_rows_n_chunked_active(
-                &mut tickets,
-                1,
-                1,
-                chunk,
-                max_active,
-                compute,
-            );
+            if sr_count <= 4096 {
+                let mut tickets = [0.0f32; 4096];
+                crate::backend::cpu::par_rows_n_chunked_active(
+                    &mut tickets[..sr_count],
+                    1,
+                    1,
+                    chunk,
+                    max_active,
+                    compute,
+                );
+            } else {
+                let mut tickets = vec![0.0f32; sr_count];
+                crate::backend::cpu::par_rows_n_chunked_active(
+                    &mut tickets,
+                    1,
+                    1,
+                    chunk,
+                    max_active,
+                    compute,
+                );
+            }
         } else {
             (0..sr_count).for_each(compute_super_row);
         }
@@ -11754,7 +11781,10 @@ pub(crate) mod neon {
                 return;
             }
             for (m, n, k) in [
-                (32usize, 5usize, 128usize),
+                (16usize, 0usize, 128usize),
+                (16, 6, 128),
+                (32, 5, 128),
+                (32, 7, 128),
                 (16, 8, 256),
                 (48, 13, 96),
                 (64, 4, 1024),
@@ -11887,6 +11917,10 @@ pub(crate) mod neon {
             }
             println!(
                 "q4_1 k={k}: max |out| {mag:.4}; max abs error standard {e_std:.3e}, smmla {e_new:.3e}"
+            );
+            assert!(
+                e_new <= 1e-3 * mag + 1e-5,
+                "smmla error {e_new} exceeds tolerance against f64 (mag {mag})"
             );
         }
 

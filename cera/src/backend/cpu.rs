@@ -2065,7 +2065,7 @@ pub fn gemm_preq_repacked_q4_0_gate_up_silu_dispatch(
 /// Whether a Q4_1 weight of `m x k` can take the smmla prefill path ([`repack_q4_1_smmla_8x8`]).
 #[cfg(all(target_arch = "aarch64", not(has_blas)))]
 pub(crate) fn q4_1_smmla_repack_supported(m: usize, k: usize) -> bool {
-    m.is_multiple_of(16) && k.is_multiple_of(32)
+    m > 0 && k > 0 && m.is_multiple_of(16) && k.is_multiple_of(32)
 }
 
 /// Repack a Q4_1 weight for the smmla prefill GEMM. A Q4_1 value is `d*q + m` with `q` in
@@ -2080,19 +2080,29 @@ pub(crate) fn repack_q4_1_smmla_8x8(
     m: usize,
     k: usize,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    assert!(
+        m > 0 && m.is_multiple_of(16) && k > 0 && k.is_multiple_of(32),
+        "repack_q4_1_smmla_8x8: invalid shape {m}x{k}, need m > 0 (multiple of 16) and k > 0 (multiple of 32)"
+    );
     const Q41: usize = std::mem::size_of::<crate::quant::BlockQ4_1>();
     const Q40: usize = std::mem::size_of::<crate::quant::BlockQ4_0>();
     let nb = k / 32;
+    let total_blocks = m
+        .checked_mul(nb)
+        .expect("repack_q4_1_smmla_8x8: total blocks overflow");
+    let total_src_bytes = total_blocks
+        .checked_mul(Q41)
+        .expect("repack_q4_1_smmla_8x8: total bytes overflow");
     assert!(
-        src.len() >= m * nb * Q41,
+        src.len() >= total_src_bytes,
         "repack_q4_1_smmla_8x8: weight too small"
     );
-    let mut q40 = Vec::with_capacity(m * nb * Q40);
-    let mut mprime = Vec::with_capacity(m * nb);
-    for blk in src[..m * nb * Q41].as_chunks::<Q41>().0 {
+    let mut q40 = Vec::with_capacity(total_blocks * Q40);
+    let mut mprime = Vec::with_capacity(total_blocks);
+    for blk in src[..total_src_bytes].as_chunks::<Q41>().0 {
         let d = u16::from_le_bytes([blk[0], blk[1]]);
         let mn = u16::from_le_bytes([blk[2], blk[3]]);
-        q40.extend_from_slice(&d.to_le_bytes());
+        q40.extend_from_slice(&blk[0..2]);
         q40.extend_from_slice(&blk[4..20]);
         mprime.push(crate::quant::f16_to_f32(mn) + 8.0 * crate::quant::f16_to_f32(d));
     }
@@ -2120,6 +2130,9 @@ pub(crate) fn gemm_preq_repacked_q4_1_smmla_dispatch(
     let _ = (packed, scales, mprime, b_scales, b_quants, &out, m, n, k);
     #[cfg(target_arch = "aarch64")]
     {
+        if n == 0 || m == 0 {
+            return true;
+        }
         if n < 4
             || super::cpu_features::cpu_features().tier != super::cpu_features::CpuTier::NeonI8mm
         {
@@ -2163,6 +2176,9 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_dispatch(
     k: usize,
 ) -> bool {
     let _ = (packed, scales);
+    if n == 0 || m == 0 {
+        return true;
+    }
     let nb = k / 32;
     #[cfg(target_arch = "aarch64")]
     {
@@ -2384,6 +2400,9 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
     k: usize,
 ) -> bool {
     let _ = (packed, scales);
+    if n == 0 || m == 0 {
+        return true;
+    }
     let nb = k / 32;
     #[cfg(target_arch = "aarch64")]
     {
@@ -2459,6 +2478,9 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_gate_up_silu_dispatch(
     k: usize,
 ) -> bool {
     let _ = (gate_packed, gate_scales, up_packed, up_scales);
+    if n == 0 || m == 0 {
+        return true;
+    }
     let nb = k / 32;
     #[cfg(target_arch = "aarch64")]
     {

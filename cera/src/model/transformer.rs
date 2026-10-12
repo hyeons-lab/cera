@@ -351,10 +351,19 @@ impl WeightRef {
             // fallback can warn instead of running slow-silent. Q4_0 and
             // Q4_K are disjoint dtypes, so one predicate covers both arms
             // (a weight that qualified for one can never take the other).
+            #[cfg(target_arch = "aarch64")]
+            let q41_qualifies = self.dtype == DType::Q4_1
+                && cpu::q4_1_smmla_repack_supported(self.m, self.k)
+                && crate::backend::cpu_features::cpu_features().tier
+                    == crate::backend::cpu_features::CpuTier::NeonI8mm;
+            #[cfg(not(target_arch = "aarch64"))]
+            let q41_qualifies = false;
+
             let qualifies = (self.dtype == DType::Q4_0
                 && cpu::q4_0_repack_supported(self.m, self.k))
                 || (self.dtype == DType::Q4KM && cpu::q4_k_repack_supported(self.m, self.k))
-                || (self.dtype == DType::Q6K && cpu::q6_k_repack_supported(self.m, self.k));
+                || (self.dtype == DType::Q6K && cpu::q6_k_repack_supported(self.m, self.k))
+                || q41_qualifies;
             if !do_repack {
                 self.repacked = None;
                 self.repack_loader_skipped = qualifies;
@@ -402,11 +411,7 @@ impl WeightRef {
                 }
             }
             #[cfg(target_arch = "aarch64")]
-            if self.dtype == DType::Q4_1
-                && cpu::q4_1_smmla_repack_supported(self.m, self.k)
-                && crate::backend::cpu_features::cpu_features().tier
-                    == crate::backend::cpu_features::CpuTier::NeonI8mm
-            {
+            if q41_qualifies {
                 let (packed, scales, mprime) =
                     cpu::repack_q4_1_smmla_8x8(weight_data(gguf, &self), self.m, self.k);
                 kind = Some(Repacked::Q41Smmla {
