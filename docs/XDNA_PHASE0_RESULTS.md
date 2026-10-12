@@ -21,10 +21,25 @@ Recorded 2026-10-03.
 | XRT | 2.19.0, hash `77c7088d804602a53c3eb489b9cb37b709bcd751` (2025-10-02), shipped inside the NPU driver package |
 | Ryzen AI Software | Not installed |
 | GPU driver | 32.0.31032.1003 (Radeon 8060S) |
-| Power plan | High performance (`27fa6203-...`, "performance"); xrt-smi reports NPU power mode "Performance" |
+| Power plan | The ASUS operating modes appear as Windows power plans. Sections 1, 3b and 3c (through commit `11a15ad`) and the first baseline matrix ran in **"performance"** (`27fa6203-3987-4dcc-918d-748559d549ec`). From 2026-10-12 everything ran in **"Turbo"** (`6fecc5ae-f350-48a5-b669-b472cb895ccf`), chosen by the user. xrt-smi reports NPU power mode "Performance" in both |
+| Power limits | Not readable directly; inferred from HWiNFO's percent-of-limit readings (power divided by percent used). Turbo: PPT FAST about 85 W, PPT SLOW about 67 W, STAPM about 86 W. "Silent" capped the package at about 15 W (PPT and STAPM at about 97% used, thermal limit 56%, on AC) |
+| Sleep | The Turbo plan sends the display to sleep and the machine into Modern Standby after 300 s without input, and a running benchmark does not prevent it. One measurement was lost to it (Modern Standby from 08:37:43 to 09:17:05 on 2026-10-12). Since then `hwinfo_sm.py` holds `SetThreadExecutionState(ES_CONTINUOUS \| ES_SYSTEM_REQUIRED \| ES_DISPLAY_REQUIRED)` while it measures, and the event log showed no further Modern Standby entries |
 | Power source | AC (battery status 2, 80% charge at the time) |
-| Power measurement tool | HWiNFO (chosen). **Not yet installed**, so no power numbers exist yet. The sensor used (package, NPU or system) will be recorded with the first series |
-| Idle package power | Open (needs the power tool) |
+| Power measurement tool | HWiNFO 8.54-6090 (free edition), read through its shared-memory interface by `tools/xdna-spike/hwinfo_sm.py` at 10 Hz. HWiNFO itself updated the values about every 1.97 s (its default polling period; a 250 ms setting did not survive an HWiNFO restart), so every measurement runs 50 s or longer |
+| Sensor used | **CPU Package Power** (`CPU [#0]: AMD RYZEN AI MAX+ 395: Enhanced`). See the inventory below for why |
+| Idle package power | Depends heavily on what else the machine is doing, so every energy comparison below uses a floor measured next to it. Performance mode, browser closed, user present: **18.06 W** (16.81 to 24.67; Total System Power 16.57, SoC 5.45, Core+SoC 6.94). Same with a browser open: 22.82 W. Turbo, user present: 21.70 W (19.55 to 26.32). Turbo, machine left alone: **12.65 and 13.47 W** around the NPU runs, **16.52 and 16.20 W** around the GPU rerun |
+| Host load during baselines | Brave closed; about 19 `msedgewebview2.exe` processes (embedded web views in other apps) stayed running |
+
+### Power sensors HWiNFO exposes on this machine
+
+Read on 2026-10-03 through shared memory (15 sensors, 331 readings):
+
+- **Power readings:** CPU Package Power; per-core power (Core 0 to 15); CPU Core Power (SVI3 TFN); CPU SoC Power (SVI3 TFN); Core+SoC Power (SVI3 TFN); APU STAPM; Total System Power.
+- **NPU** (`NPU [#1]: AMD NPU 8x8`): NPU Clock (1810 MHz at the time), NPU Core Voltage, NPU D3D Usage, NPU Computing 0 Usage, NPU D3D Memory Dynamic. **No NPU power reading.**
+- **iGPU** (`iGPU [#0]: AMD Radeon 8060S`): clocks (core, memory, SoC, VCN), core voltage, utilization, temperature. **No GPU power reading.**
+- **Battery:** charge rate reads 0 W on AC, so it cannot stand in for wall power.
+
+There is no per-device rail for the NPU or the iGPU, so neither can be measured in isolation. CPU Package Power is used because it covers the whole APU. That it includes the iGPU is inferred, not documented: GPU decode runs, whose CPU threads mostly wait on the GPU, raise it from the 18 W idle floor to 44 to 50 W, about as much as CPU runs do. "Total System Power" reads **below** package power (16.6 against 18.1 W at idle), so it is a firmware estimate, not wall power, and is recorded only as a cross-check. APU STAPM is a smoothed limit-tracking value and is not used for per-run energy.
 
 ## 1. cera on Windows
 
@@ -34,6 +49,8 @@ Recorded 2026-10-03.
 | `cargo build --release -p cera-cli` | Pass. The binary is `cera.exe` |
 | `cargo test --release -p cera --lib` | 1162 passed, **2 failed**, 16 ignored (see below) |
 | `cera inspect --model Llama-3.2-1B-Instruct-Q4_0.gguf` | Pass: 147 tensors, 35 metadata keys, `llama`, 16 blocks. GGUF mmap and Windows path handling work |
+| GPU build | `cargo build --release -p cera-cli --features gpu` passes. The CLI's default feature set is empty, so a plain build has no GPU backend; all `--device gpu` numbers here use the `gpu` build |
+| wgpu backend chosen | **Vulkan**: `CERA_GPU_HOST_PROFILE=1` prints `adapter=AMD Radeon(TM) 8060S Graphics backend=Vulkan SUBGROUP=true SUBGROUP_BARRIER=true TIMESTAMP=true SHADER_F16=true` |
 | CPU tier selected | Open |
 | `RUSTFLAGS="-C target-cpu=native"` effect | Open |
 
@@ -53,7 +70,69 @@ The two test failures are Windows portability problems in the tests, not in the 
 
 ## 2. Phase 0 baselines
 
-Open. These runs wait for HWiNFO logging, so that every row has its power number. The `WGPU_BACKEND` override for the Vulkan-versus-DX12 comparison has not landed yet.
+Recorded 2026-10-03 (Performance) and 2026-10-12 (Turbo). `cera bench`, one fresh process per measurement, package power sampled over that process by `tools/xdna-spike/hwinfo_sm.py` (driver: `tools/xdna-spike/baselines.sh`). GPU rows use the Vulkan backend; the `WGPU_BACKEND` override for a DX12 comparison has not landed. Models are the Instruct Q4_0 and Q8_0 files from section 1.
+
+### Matrix: 128 decode tokens after a 512- or 2048-token prompt, 20 runs per process, two interleaved rounds
+
+Decode tok/s p50 (round 1 / round 2):
+
+| | Performance, GPU | Performance, CPU | Turbo, GPU | Turbo, CPU |
+|---|---|---|---|---|
+| Q4_0, 512-token prompt | 68.3 / 64.2 | 57.6 / 54.7 | 78.3 / 78.5 | 57.0 / 56.2 |
+| Q8_0, 512-token prompt | 27.3 / 27.2 | 41.8 / 42.8 | 47.6 / 47.4 | 43.0 / 43.3 |
+| Q4_0, 2048-token prompt | 40.3 / 39.1 | 46.4 / 47.8 | 46.9 / 47.2 | 48.0 / 49.1 |
+| Q8_0, 2048-token prompt | 21.7 / 21.1 | 36.9 / 37.0 | 34.1 / 34.2 | 38.8 / 37.7 |
+
+Prefill tok/s p50 (round 1 / round 2):
+
+| | Performance, GPU | Performance, CPU | Turbo, GPU | Turbo, CPU |
+|---|---|---|---|---|
+| Q4_0, 512-token prompt | 1615 / 1414 | 256 / 255 | 2446 / 2415 | 257 / 258 |
+| Q8_0, 512-token prompt | 1083 / 991 | 217 / 218 | 1971 / 1895 | 223 / 222 |
+| Q4_0, 2048-token prompt | 1002 / 1015 | 235 / 234 | 1806 / 1793 | 240 / 239 |
+| Q8_0, 2048-token prompt | 794 / 796 | 201 / 200 | 1498 / 1495 | 206 / 205 |
+
+Mean package power over each process: 41 to 50 W in Performance, 52 to 70 W in Turbo. The full p10, p90 and power per row are in the logs next to the harness output. Round 1 and round 2 agree within about 6% on every row.
+
+What this says:
+
+- **The GPU depends on the power envelope; the CPU barely does.** Turbo raises GPU decode by 15 to 75% and GPU prefill by 50 to 90%, while CPU numbers move 0 to 5%. GPU Q8_0 decode in particular goes from 27 to 47 tok/s, so its weakness in Performance mode was mostly the envelope, not only the kernel.
+- **GPU decode is also sensitive to what else the machine is doing.** The same Turbo GPU Q4_0 decode-dominant run measured 73.7 tok/s with the user active and **93.4 tok/s** with the machine left alone (below). Rows are comparable with each other within one session, not across sessions.
+- **cera's GPU path is far from the iGPU's memory limit.** 93.4 tok/s at about 773 MB per token is about 72 GB/s of weight traffic, against a theoretical 256 GB/s for the board's memory (a specification, not a measurement).
+
+### Decode-dominant runs, for energy per token
+
+16-token prompt, 512 decode tokens, 10 runs per process; decode is 73 to 83% of each process's wall time.
+
+| Turbo, user present (floor 21.70 W) | Decode tok/s p50 | Package W | tok/J gross | tok/J net of floor | Net J per GB of weights |
+|---|---|---|---|---|---|
+| GPU Q4_0 | 73.7 | 66.5 | 1.11 | 1.65 | 0.79 |
+| GPU Q8_0 | 51.2 | 68.0 | 0.75 | 1.11 | 0.69 |
+| CPU Q4_0 | 60.3 | 65.6 | 0.92 | 1.37 | 0.94 |
+| CPU Q8_0 | 44.5 | 57.2 | 0.78 | 1.25 | 0.60 |
+
+The Performance-mode decode-dominant set from 2026-10-03 is not reported: its CPU Q8_0 run hit the Silent mode's 15 W cap (25.1 tok/s at 15.0 W), which also cast doubt on when the switch happened.
+
+### NPU power, and the like-for-like comparison
+
+Turbo, machine left alone, each load bracketed by idle floors (`tools/xdna-spike/npu_power.sh`). HWiNFO has no NPU or GPU power rail, so each device's cost is read as package power, gross and above the adjacent floor. HWiNFO's NPU usage reading confirms the NPU was busy (mean 92 to 93%, clock up to 1810 MHz) and idle in the floors (0%).
+
+| Load (about 60 s, back to back) | Throughput | Package W | Adjacent floor W | Net W | J per GB gross | J per GB net |
+|---|---|---|---|---|---|---|
+| GPU, cera Q4_0 decode, 93.4 tok/s | 72.2 GB/s of weights | 64.18 | 16.36 | 47.82 | 0.889 | 0.662 |
+| NPU, read-only kernel (`readbw`, 256 MB per run, n = 12000) | 55.4 GB/s p50 | 22.64 | 13.06 | 9.58 | 0.409 | 0.173 |
+| NPU, real GEMV (8192 x 2048, 8 cores, n = 30000) | 17.0 GB/s p50 | 20.22 | 13.06 | 7.16 | 1.192 | 0.422 |
+
+The read-only kernel reached 55.4 GB/s in Turbo, above its 45 to 49 GB/s in Performance, so the NPU's data path also depends on the envelope.
+
+Projected onto Llama-3.2-1B Q4_0 (773 MB per token), adding the measured floor of about 112 dependent dispatches x 46 us = 5.2 ms per token. Weights and dispatch only, with no other compute, so these are **ceilings, not demonstrated**:
+
+| NPU rate used | Decode | Share of GPU (93.4) | tok/J gross (GPU 1.46) | tok/J net (GPU 1.95) |
+|---|---|---|---|---|
+| Read-only kernel, 55.4 GB/s | about 52 tok/s | 56% | 2.31 (1.6x the GPU) | 5.46 (2.8x) |
+| Real GEMV today, 17.0 GB/s | about 20 tok/s | 21% | 0.97 (0.66x) | 2.75 (1.4x) |
+
+Gross is the honest number for battery life: the floor is paid for every second the work takes, and a slower device pays it for longer.
 
 ## 3a. License audit
 
@@ -283,6 +362,14 @@ What this says:
 
 **Provisionally (a): raw XRT works on Windows.** Our own unsigned IRON xclbins load and run correctly through the XRT that ships with the NPU driver, driven from our own MSVC binary, with no Ryzen AI Software. The license audit (3a) allows shipping IRON and Peano-built kernels.
 
-The go/no-go bar is not decided. It needs the section 2 baselines (iGPU decode tok/s and power), and the evidence so far points the hard way on raw speed. A trivial read kernel pulls about 45 to 49 GB/s from DDR, which puts a ceiling (not demonstrated) on 1B-model decode of about 58 to 63 tok/s at 4-bit weights before any compute or dispatch cost, and about 28 to 32 tok/s with `bfp16ebs8` weights. The only real GEMV so far reaches 16.8 to 18.3 GB/s, and the 4-bit `int8 x int4` path is read from headers, not run, so whether a real kernel gets near the ceiling is the main open question on the NPU side. Small dependent dispatches add a floor of about 5 ms per token unless matmuls are fused. Clearing "50% of iGPU decode" therefore depends on how fast the iGPU actually is, and the case for the NPU will likely rest on tokens per joule. Both need HWiNFO. A fair comparison weighs bytes honestly: NPU `bfp16ebs8` (about 9 bits per weight) against the iGPU on Q8_0 (about 8.5 bits), and NPU `int8 x int4` against the iGPU's best Q4_0 configuration, with tokens per joule for each.
+**Against the proposed bar** ("at least 50% of iGPU decode at 2x its tokens per joule or better"), measured in Turbo with the machine left alone (section 2):
+
+- **Real kernel today: fails both.** The only real NPU GEMV projects to about 20 tok/s (21% of the GPU's 93.4) at 0.66x the GPU's gross tokens per joule.
+- **Best case, not demonstrated: passes speed, fails the 2x efficiency bar on gross energy.** If a real 4-bit kernel ran at the read-only kernel's 55.4 GB/s, decode would reach about 52 tok/s (56% of the GPU) at about 1.6x the GPU's gross tokens per joule (2.8x net of the idle floor). That assumes weight streaming and dispatch are the only costs, the `int8 x int4` path works as read from the headers, and the 5.2 ms of per-token dispatch is not reduced by fusion.
+- The NPU's real advantage is low absolute power: about 7 to 10 W above idle against about 48 W for the GPU. That frees the GPU and keeps the machine cool, but on energy per token the GPU's much higher speed wins most of it back.
+
+**Recommendation: stop before backend work.** Even the undemonstrated best case falls short of the 2x efficiency bar on whole-package energy, a real kernel is far from that best case, and a backend is weeks to months of Windows-only work (C++ shim, hand-written kernels for every op, fusion to beat the dispatch floor, a Linux kernel toolchain, AMD driver churn). The vendor-neutral `--device npu` selection (Phase A) stands on its own.
+
+**What would change it:** a time-boxed optimized Q4 GEMV spike (MemTile staging, `int8 x int4` mmul, per-block scale epilogue) showing that a real kernel reaches **at least about 40 GB/s at no more than about 0.42 J/GB gross** (about 17 W package), together with evidence that fusion can bring per-token dispatch down to about 1 ms. Worked back from the bar: 0.773 GB / 40 GB/s = 19.3 ms plus 1 ms of dispatch is about 49 tok/s (53% of the GPU), and at about 17 W that is about 2.9 tok/J, 2.0x the GPU's gross 1.46. For scale, the trivial read-only kernel is at 0.41 J/GB and 55.4 GB/s, so a real kernel would have to match a trivial kernel's energy per byte at about 72% of its throughput. Worth running only if NPU efficiency matters enough to the product to justify the backend afterwards. This is the user's call.
 
 The other 0b exit criteria remain open: the weight format (`int8 x int4` with a per-block scale epilogue, versus `bfp16ebs8`), activation quantization (int8 if 4-bit weights are kept), and the parity-tolerance policy.

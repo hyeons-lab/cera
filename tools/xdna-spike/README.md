@@ -4,6 +4,8 @@ A measurement tool for the AMD XDNA NPU feasibility study (`docs/XDNA_NPU_PHASE0
 
 - `spike.cpp`: the Windows host program (MSVC, C++17).
 - `build.ps1`: builds `spike.exe`, including an import library generated from the driver's own `xrt_coreutil.dll`.
+- `hwinfo_sm.py`: reads HWiNFO sensors through its shared-memory interface (Windows Python); `list`, `idle <s>` and `run -- <command>` with per-run energy.
+- `baselines.sh`: the section 2 CPU and GPU baseline runs, each wrapped in `hwinfo_sm.py`.
 - `iron/`: IRON designs and a build script, compiled on Linux (WSL2 works) into `.xclbin` plus instruction binaries that `spike.exe` loads.
 
 ## Commands
