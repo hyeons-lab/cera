@@ -3426,6 +3426,43 @@ pub(crate) mod neon {
     const Q6K_LONG_PREFETCH_MIN_BYTES: usize = 32 << 20;
     /// Default lead of the long prefetch, bytes ahead in each row stream.
     const Q6K_LONG_PREFETCH_BYTES: usize = 16384;
+    /// Maximum Q6_K software prefetch distance (1 MiB) to prevent runaway offsets or overflow.
+    const MAX_Q6K_PREFETCH_BYTES: usize = 1 << 20;
+
+    /// Parses the `CERA_Q6K_PREFETCH` override knob from `lookup`, returning `0` when disabled
+    /// (`0`, `false`, or `off`) and clamping positive byte leads to [`MAX_Q6K_PREFETCH_BYTES`].
+    fn parse_q6k_prefetch_knob_from(lookup: impl Fn(&str) -> Option<String>) -> usize {
+        let Some(val) = lookup("CERA_Q6K_PREFETCH") else {
+            return Q6K_LONG_PREFETCH_BYTES;
+        };
+        let v = val.trim();
+        if ["0", "false", "off"]
+            .iter()
+            .any(|d| v.eq_ignore_ascii_case(d))
+        {
+            0
+        } else {
+            match v.parse::<usize>() {
+                Ok(d) => d.min(MAX_Q6K_PREFETCH_BYTES),
+                Err(_) => {
+                    eprintln!(
+                        "warning: invalid CERA_Q6K_PREFETCH={val:?}; using default {Q6K_LONG_PREFETCH_BYTES}"
+                    );
+                    Q6K_LONG_PREFETCH_BYTES
+                }
+            }
+        }
+    }
+
+    /// Selects `(bytes ahead, cache lines per block)` for a Q6_K tensor of `total_bytes` given
+    /// the resolved long-prefetch distance `long`.
+    fn q6k_prefetch_for_with(total_bytes: usize, long: usize) -> (usize, usize) {
+        if long > 0 && total_bytes >= Q6K_LONG_PREFETCH_MIN_BYTES {
+            (long, 4)
+        } else {
+            (512, 1)
+        }
+    }
 
     /// `(bytes ahead, cache lines per block)` for [`q6k_rows4`]'s software prefetch of a Q6_K tensor of
     /// `total_bytes`. A block is 210 bytes, about four lines, in each of four row streams the hardware
@@ -3434,20 +3471,15 @@ pub(crate) mod neon {
     /// the LM heads, every line of the block goes 16 KB ahead and the head reaches 67 to 69 GB/s. Smaller
     /// tensors keep the old setting: 2 to 14 MB measured within noise either way, and the extra
     /// instructions cost 5% on a cache-resident one. `CERA_Q6K_PREFETCH` overrides the long distance
-    /// (0 turns the long prefetch off).
+    /// (`0`, `off`, or `false` turns the long prefetch off).
     fn q6k_prefetch_for(total_bytes: usize) -> (usize, usize) {
         static LONG: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-        let long = *LONG.get_or_init(|| {
-            std::env::var("CERA_Q6K_PREFETCH")
-                .ok()
-                .and_then(|v| v.trim().parse::<usize>().ok())
-                .unwrap_or(Q6K_LONG_PREFETCH_BYTES)
-        });
-        if long > 0 && total_bytes >= Q6K_LONG_PREFETCH_MIN_BYTES {
-            (long, 4)
+        let long = if cfg!(test) && std::env::var_os("CERA_TEST_ALLOW_ENV_KNOBS").is_none() {
+            Q6K_LONG_PREFETCH_BYTES
         } else {
-            (512, 1)
-        }
+            *LONG.get_or_init(|| parse_q6k_prefetch_knob_from(|k| std::env::var(k).ok()))
+        };
+        q6k_prefetch_for_with(total_bytes, long)
     }
 
     /// Four consecutive Q6_K rows against the Q8_0 activations, one row per lane of the result.
@@ -3487,15 +3519,16 @@ pub(crate) mod neon {
                     rows.add(3 * row_bytes + bi * size_of::<BlockQ6K>()) as *const BlockQ6K,
                 ];
                 for line in 0..pf_lines {
+                    let off = pf.saturating_add(64 * line);
                     core::arch::asm!(
                         "prfm pldl1keep, [{0}]",
                         "prfm pldl1keep, [{1}]",
                         "prfm pldl1keep, [{2}]",
                         "prfm pldl1keep, [{3}]",
-                        in(reg) (blks[0] as *const u8).wrapping_add(pf + 64 * line),
-                        in(reg) (blks[1] as *const u8).wrapping_add(pf + 64 * line),
-                        in(reg) (blks[2] as *const u8).wrapping_add(pf + 64 * line),
-                        in(reg) (blks[3] as *const u8).wrapping_add(pf + 64 * line),
+                        in(reg) (blks[0] as *const u8).wrapping_add(off),
+                        in(reg) (blks[1] as *const u8).wrapping_add(off),
+                        in(reg) (blks[2] as *const u8).wrapping_add(off),
+                        in(reg) (blks[3] as *const u8).wrapping_add(off),
                         options(nostack, preserves_flags)
                     );
                 }
@@ -3651,11 +3684,22 @@ pub(crate) mod neon {
             q8_sum16(x_quants.as_ptr(), chunks16, sum16);
             let sum16_ptr = sum16.as_ptr() as usize;
 
-            let (pf, pf_lines) = q6k_prefetch_for(m * row_bytes);
+            let total_bytes = m * row_bytes;
+            let (pf, pf_lines) = q6k_prefetch_for(total_bytes);
+            let pf_end_row = if pf_lines > 0 && row_bytes > 0 {
+                total_bytes.saturating_sub(pf.saturating_add(64 * pf_lines)) / row_bytes
+            } else {
+                0
+            };
             // Four-row groups are the steal unit (a partial trailing group takes `q6k_row1`).
             let rows4 = move |(g, chunk): (usize, &mut [f32])| unsafe {
                 let r0 = g * 4;
                 if chunk.len() == 4 {
+                    let (g_pf, g_pf_lines) = if r0 + 4 <= pf_end_row {
+                        (pf, pf_lines)
+                    } else {
+                        (0, 0)
+                    };
                     let sumf = q6k_rows4(
                         ptrs.a().add(r0 * row_bytes),
                         row_bytes,
@@ -3663,8 +3707,8 @@ pub(crate) mod neon {
                         ptrs.xq(),
                         ptrs.xs(),
                         sum16_ptr as *const i32,
-                        pf,
-                        pf_lines,
+                        g_pf,
+                        g_pf_lines,
                     );
                     vst1q_f32(chunk.as_mut_ptr(), sumf);
                 } else {
@@ -3748,22 +3792,34 @@ pub(crate) mod neon {
         unsafe { q8_sum16(x_quants.as_ptr(), chunks16, sum16) };
         let sum16_ptr = sum16.as_ptr() as usize;
 
-        let (pf, pf_lines) = q6k_prefetch_for(m * row_bytes);
+        let total_bytes = m * row_bytes;
+        let (pf, pf_lines) = q6k_prefetch_for(total_bytes);
+        let pf_end_row = if pf_lines > 0 && row_bytes > 0 {
+            total_bytes.saturating_sub(pf.saturating_add(64 * pf_lines)) / row_bytes
+        } else {
+            0
+        };
         let compute_chunk = |start_row: usize, slice_len: usize| unsafe {
             let chunk_idx = (start_row / chunk).min(n_chunks.saturating_sub(1));
             let mut local_max_val = f32::NEG_INFINITY;
             let mut local_max_idx = start_row;
             let mut r = 0usize;
             while r + 3 < slice_len {
+                let r0 = start_row + r;
+                let (g_pf, g_pf_lines) = if r0 + 4 <= pf_end_row {
+                    (pf, pf_lines)
+                } else {
+                    (0, 0)
+                };
                 let sumf = q6k_rows4(
-                    ptrs.a().add((start_row + r) * row_bytes),
+                    ptrs.a().add(r0 * row_bytes),
                     row_bytes,
                     blocks_per_row,
                     ptrs.xq(),
                     ptrs.xs(),
                     sum16_ptr as *const i32,
-                    pf,
-                    pf_lines,
+                    g_pf,
+                    g_pf_lines,
                 );
                 let mut lanes = [0.0f32; 4];
                 vst1q_f32(lanes.as_mut_ptr(), sumf);
@@ -12277,15 +12333,79 @@ pub(crate) mod neon {
         /// legacy one-line prefetch to everything smaller, so a small tensor never pays for the extra
         /// instructions and a head never runs with the short lead.
         #[test]
-        #[cfg(target_arch = "aarch64")]
         fn q6k_prefetch_is_long_only_for_lm_head_sized_tensors() {
             assert_eq!(q6k_prefetch_for(4 << 20), (512, 1));
             assert_eq!(q6k_prefetch_for(Q6K_LONG_PREFETCH_MIN_BYTES - 1), (512, 1));
-            let (bytes, lines) = q6k_prefetch_for(55 << 20);
-            // CERA_Q6K_PREFETCH=0 turns the long prefetch off for A/B runs.
-            if std::env::var_os("CERA_Q6K_PREFETCH").is_none() {
-                assert_eq!((bytes, lines), (Q6K_LONG_PREFETCH_BYTES, 4));
-                assert_eq!(q6k_prefetch_for(215 << 20), (Q6K_LONG_PREFETCH_BYTES, 4));
+            assert_eq!(
+                q6k_prefetch_for(Q6K_LONG_PREFETCH_MIN_BYTES),
+                (Q6K_LONG_PREFETCH_BYTES, 4)
+            );
+            assert_eq!(q6k_prefetch_for(55 << 20), (Q6K_LONG_PREFETCH_BYTES, 4));
+            assert_eq!(q6k_prefetch_for(215 << 20), (Q6K_LONG_PREFETCH_BYTES, 4));
+
+            // Disable spellings, custom leads, clamping, and invalid fallback via the lookup seam.
+            assert_eq!(
+                parse_q6k_prefetch_knob_from(|_| None),
+                Q6K_LONG_PREFETCH_BYTES
+            );
+            for off in ["0", "off", "false", "OFF", " FALSE "] {
+                let long = parse_q6k_prefetch_knob_from(|_| Some(off.into()));
+                assert_eq!(long, 0, "off spelling {off:?}");
+                assert_eq!(
+                    q6k_prefetch_for_with(Q6K_LONG_PREFETCH_MIN_BYTES, long),
+                    (512, 1)
+                );
+            }
+            let custom = parse_q6k_prefetch_knob_from(|_| Some("8192".into()));
+            assert_eq!(custom, 8192);
+            assert_eq!(
+                q6k_prefetch_for_with(Q6K_LONG_PREFETCH_MIN_BYTES, custom),
+                (8192, 4)
+            );
+            assert_eq!(
+                q6k_prefetch_for_with(Q6K_LONG_PREFETCH_MIN_BYTES - 1, custom),
+                (512, 1)
+            );
+            let huge = parse_q6k_prefetch_knob_from(|_| Some("999999999".into()));
+            assert_eq!(huge, MAX_Q6K_PREFETCH_BYTES);
+            assert_eq!(
+                parse_q6k_prefetch_knob_from(|_| Some("invalid".into())),
+                Q6K_LONG_PREFETCH_BYTES
+            );
+
+            // Also verify `q6k_rows4` directly with the 4-line prefetch active against `q6k_row1`.
+            if std::arch::is_aarch64_feature_detected!("dotprod") {
+                let (m, k) = (4usize, 256usize);
+                let row_bytes = size_of::<BlockQ6K>();
+                let mut a = vec![0u8; m * row_bytes + Q6K_LONG_PREFETCH_BYTES + 256];
+                let mut st = 0x6640_0001u64;
+                for b in a[..m * row_bytes].iter_mut() {
+                    *b = (lcg(&mut st) * 127.0) as i32 as u8;
+                }
+                let x: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+                let (xs, xq) = quantize_col(&x);
+                let mut sum16 = [0i32; 16];
+                unsafe { q8_sum16(xq.as_ptr(), 16, &mut sum16) };
+                let mut got = [0.0f32; 4];
+                unsafe {
+                    let sumf = q6k_rows4(
+                        a.as_ptr(),
+                        row_bytes,
+                        1,
+                        xq.as_ptr(),
+                        xs.as_ptr(),
+                        sum16.as_ptr(),
+                        Q6K_LONG_PREFETCH_BYTES,
+                        4,
+                    );
+                    vst1q_f32(got.as_mut_ptr(), sumf);
+                }
+                for (r, &g) in got.iter().enumerate() {
+                    let want = unsafe {
+                        q6k_row1(a.as_ptr().add(r * row_bytes), 1, xq.as_ptr(), xs.as_ptr())
+                    };
+                    assert_eq!(g.to_bits(), want.to_bits(), "row {r}");
+                }
             }
         }
 
@@ -12296,7 +12416,6 @@ pub(crate) mod neon {
         /// `cera_tests llama_decode_gemv_microbench --ignored --nocapture --test-threads=1` on a device.
         #[test]
         #[ignore = "microbenchmark: run explicitly on a device"]
-        #[cfg(target_arch = "aarch64")]
         fn llama_decode_gemv_microbench() {
             use crate::tensor::DType;
             if !crate::backend::cpu::q4_0_dec4_supported(16, 32) {
@@ -12314,7 +12433,7 @@ pub(crate) mod neon {
                 v.sort_by(|a, b| a.partial_cmp(b).unwrap());
                 v[v.len() / 2]
             };
-            let stream = |bytes: &[u8]| -> f64 {
+            let stream = |bytes: &[u8]| {
                 let base = bytes.as_ptr() as usize;
                 let n = bytes.len() / 4096;
                 let sink = std::sync::atomic::AtomicU64::new(0);
@@ -12335,7 +12454,6 @@ pub(crate) mod neon {
                     );
                 });
                 std::hint::black_box(sink.load(std::sync::atomic::Ordering::Relaxed));
-                0.0
             };
             let mut st = 0x11ac_0001u64;
             // (name, m, k, kind): kind 0 = dec4 plain, 1 = dec4 fused gate/up (two weights), 2 = Q6_K head
@@ -12410,11 +12528,16 @@ pub(crate) mod neon {
                     ),
                 });
                 let bytes = (one_len * weights) as f64;
-                let src: &[u8] = if kind == 2 { &ws[0] } else { &packed[0] };
-                let ts = time(copies, &mut |_| {
-                    stream(src);
-                    if kind == 1 {
-                        stream(&packed[1]);
+                let ts = time(copies, &mut |i| match kind {
+                    0 => {
+                        stream(&packed[i]);
+                    }
+                    1 => {
+                        stream(&packed[2 * i]);
+                        stream(&packed[2 * i + 1]);
+                    }
+                    _ => {
+                        stream(&ws[i]);
                     }
                 });
                 println!(
