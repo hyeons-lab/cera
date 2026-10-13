@@ -6977,6 +6977,50 @@ pub fn attn_values_f16(
     }
 }
 
+/// Maximum prefetch distance clamped to avoid overflow or runaway prefetching.
+#[cfg(any(target_arch = "aarch64", test))]
+const MAX_ATTN_PREFETCH_DISTANCE: usize = 1024;
+
+/// Parse prefetch distance knob with a custom lookup seam.
+#[cfg(any(target_arch = "aarch64", test))]
+fn parse_attn_prefetch_knob_from(
+    name: &str,
+    default_val: usize,
+    lookup: impl Fn(&str) -> Option<String>,
+) -> usize {
+    if let Some(val) = lookup(name) {
+        let v = val.trim();
+        if ["0", "false", "off"]
+            .iter()
+            .any(|d| v.eq_ignore_ascii_case(d))
+        {
+            0
+        } else {
+            match v.parse::<usize>() {
+                Ok(d) => d.min(MAX_ATTN_PREFETCH_DISTANCE),
+                Err(_) => {
+                    eprintln!("warning: invalid {name}={val:?}; using default {default_val}");
+                    default_val
+                }
+            }
+        }
+    } else {
+        default_val
+    }
+}
+
+/// Parse prefetch distance knob from environment. Returns 0 if disabled via 0, "off", or "false".
+///
+/// Bypasses the process environment under `cfg(test)` unless `CERA_TEST_ALLOW_ENV_KNOBS` is set,
+/// keeping tests hermetic against developer shell variables.
+#[cfg(target_arch = "aarch64")]
+fn parse_attn_prefetch_knob(name: &str, default_val: usize) -> usize {
+    if cfg!(test) && std::env::var("CERA_TEST_ALLOW_ENV_KNOBS").is_err() {
+        return default_val;
+    }
+    parse_attn_prefetch_knob_from(name, default_val, |k| std::env::var(k).ok())
+}
+
 /// How many cache positions ahead the f16 decode attention kernels prefetch (`CERA_ATTN_PREFETCH` overrides; 0 turns
 /// it off). A head reads 128 bytes out of every KV-dim-wide row of the position-major cache (1 KB for 8 heads of 64), a
 /// stride the hardware prefetcher does not follow, so without this each position is a demand miss to DRAM: a
@@ -6984,12 +7028,7 @@ pub fn attn_values_f16(
 #[cfg(target_arch = "aarch64")]
 fn attn_prefetch_distance() -> usize {
     static DIST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *DIST.get_or_init(|| {
-        std::env::var("CERA_ATTN_PREFETCH")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(ATTN_PREFETCH_DEFAULT)
-    })
+    *DIST.get_or_init(|| parse_attn_prefetch_knob("CERA_ATTN_PREFETCH", ATTN_PREFETCH_DEFAULT))
 }
 
 /// Fewest cached positions at which the decode attention prefetches. Below it a head's whole K and V (128 bytes a
@@ -6998,7 +7037,7 @@ fn attn_prefetch_distance() -> usize {
 #[cfg(target_arch = "aarch64")]
 const ATTN_PREFETCH_MIN_SEQ: usize = 256;
 
-/// Default for [`attn_prefetch_distance`], in cache positions (16 rows of a 1 KB-wide cache is 16 KB ahead).
+/// Default for `attn_prefetch_distance`, in cache positions (16 rows of a 1 KB-wide cache is 16 KB ahead).
 #[cfg(target_arch = "aarch64")]
 const ATTN_PREFETCH_DEFAULT: usize = 16;
 
@@ -7006,32 +7045,34 @@ const ATTN_PREFETCH_DEFAULT: usize = 16;
 #[cfg(target_arch = "aarch64")]
 fn attn_prefetch_l2_distance() -> usize {
     static DIST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *DIST.get_or_init(|| {
-        std::env::var("CERA_ATTN_PREFETCH_L2")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-            .unwrap_or(ATTN_PREFETCH_L2_DEFAULT)
-    })
+    *DIST
+        .get_or_init(|| parse_attn_prefetch_knob("CERA_ATTN_PREFETCH_L2", ATTN_PREFETCH_L2_DEFAULT))
 }
 
-/// Default for [`attn_prefetch_l2_distance`], in cache positions.
+/// Default for `attn_prefetch_l2_distance`, in cache positions.
 #[cfg(target_arch = "aarch64")]
 const ATTN_PREFETCH_L2_DEFAULT: usize = 64;
 
-/// [`prefetch_lines`] into L2 only: it does not occupy the core's few L1 miss slots, so it can run further ahead.
+/// `prefetch_lines` into L2 only: it does not occupy the core's few L1 miss slots, so it can run further ahead.
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn prefetch_lines_l2(p: *const u8, bytes: usize) {
-    unsafe {
-        let mut off = 0usize;
-        while off < bytes {
+    if bytes == 0 {
+        return;
+    }
+    let start = p as usize;
+    let end = start.saturating_add(bytes);
+    let mut line = start & !63;
+    while line < end {
+        // Safety: prfm is an architectural non-faulting memory hint on ARMv8-A.
+        unsafe {
             core::arch::asm!(
                 "prfm pldl2keep, [{0}]",
-                in(reg) p.wrapping_add(off),
+                in(reg) line,
                 options(nostack, preserves_flags)
             );
-            off += 64;
         }
+        line = line.wrapping_add(64);
     }
 }
 
@@ -7039,16 +7080,22 @@ unsafe fn prefetch_lines_l2(p: *const u8, bytes: usize) {
 #[cfg(target_arch = "aarch64")]
 #[inline(always)]
 unsafe fn prefetch_lines(p: *const u8, bytes: usize) {
-    unsafe {
-        let mut off = 0usize;
-        while off < bytes {
+    if bytes == 0 {
+        return;
+    }
+    let start = p as usize;
+    let end = start.saturating_add(bytes);
+    let mut line = start & !63;
+    while line < end {
+        // Safety: prfm is an architectural non-faulting memory hint on ARMv8-A.
+        unsafe {
             core::arch::asm!(
                 "prfm pldl1keep, [{0}]",
-                in(reg) p.wrapping_add(off),
+                in(reg) line,
                 options(nostack, preserves_flags)
             );
-            off += 64;
         }
+        line = line.wrapping_add(64);
     }
 }
 
@@ -7101,18 +7148,30 @@ unsafe fn attn_scores_f16_neon(
         } else {
             (0, 0)
         };
+        let pf_limit = if pf != 0 {
+            seq_len.saturating_sub(pf)
+        } else {
+            0
+        };
+        let pf2_limit = if pf2 != 0 {
+            seq_len.saturating_sub(pf2)
+        } else {
+            0
+        };
         for t in 0..seq_len {
-            if pf != 0 {
-                prefetch_lines(
-                    k_ptr.wrapping_add((t + pf) * kv_dim + kv_h_offset) as *const u8,
-                    head_dim * 2,
-                );
+            if t < pf_limit {
+                let k_pf_idx = t
+                    .saturating_add(pf)
+                    .saturating_mul(kv_dim)
+                    .saturating_add(kv_h_offset);
+                prefetch_lines(k_ptr.wrapping_add(k_pf_idx) as *const u8, head_dim * 2);
             }
-            if pf2 != 0 {
-                prefetch_lines_l2(
-                    k_ptr.wrapping_add((t + pf2) * kv_dim + kv_h_offset) as *const u8,
-                    head_dim * 2,
-                );
+            if t < pf2_limit {
+                let k_pf_idx = t
+                    .saturating_add(pf2)
+                    .saturating_mul(kv_dim)
+                    .saturating_add(kv_h_offset);
+                prefetch_lines_l2(k_ptr.wrapping_add(k_pf_idx) as *const u8, head_dim * 2);
             }
             let k_off = t * kv_dim + kv_h_offset;
             let mut sum0 = vdupq_n_f32(0.0);
@@ -7175,18 +7234,30 @@ unsafe fn attn_values_f16_neon(
         } else {
             (0, 0)
         };
+        let pf_limit = if pf != 0 {
+            seq_len.saturating_sub(pf)
+        } else {
+            0
+        };
+        let pf2_limit = if pf2 != 0 {
+            seq_len.saturating_sub(pf2)
+        } else {
+            0
+        };
         for t in 0..seq_len {
-            if pf != 0 {
-                prefetch_lines(
-                    v_ptr.wrapping_add((t + pf) * kv_dim + kv_h_offset) as *const u8,
-                    head_dim * 2,
-                );
+            if t < pf_limit {
+                let v_pf_idx = t
+                    .saturating_add(pf)
+                    .saturating_mul(kv_dim)
+                    .saturating_add(kv_h_offset);
+                prefetch_lines(v_ptr.wrapping_add(v_pf_idx) as *const u8, head_dim * 2);
             }
-            if pf2 != 0 {
-                prefetch_lines_l2(
-                    v_ptr.wrapping_add((t + pf2) * kv_dim + kv_h_offset) as *const u8,
-                    head_dim * 2,
-                );
+            if t < pf2_limit {
+                let v_pf_idx = t
+                    .saturating_add(pf2)
+                    .saturating_mul(kv_dim)
+                    .saturating_add(kv_h_offset);
+                prefetch_lines_l2(v_ptr.wrapping_add(v_pf_idx) as *const u8, head_dim * 2);
             }
             let s = vdupq_n_f32(scores[t]);
             let v_base = t * kv_dim + kv_h_offset;
@@ -13911,10 +13982,13 @@ mod tests {
     /// f16 rounding, so any drift is a kernel bug, not precision. Runs
     /// `head_dim` through the 8-wide, 4-wide, and scalar-tail code paths.
     fn check_attn_f16_kernels(head_dim: usize) {
+        check_attn_f16_kernels_seq(head_dim, 13);
+    }
+
+    fn check_attn_f16_kernels_seq(head_dim: usize, seq_len: usize) {
         let n_kv_heads = 2;
         let kv_dim = n_kv_heads * head_dim;
         let kv_h_off = head_dim; // second KV head
-        let seq_len = 13;
         let scale = 1.0 / (head_dim as f32).sqrt();
 
         let q: Vec<f32> = (0..head_dim).map(|i| (i as f32 - 8.0) * 0.05).collect();
@@ -13964,7 +14038,7 @@ mod tests {
             let diff = (expected[t] - actual[t]).abs();
             assert!(
                 diff < 1e-4,
-                "attn_scores_f16 mismatch (head_dim={head_dim}) at t={t}: \
+                "attn_scores_f16 mismatch (head_dim={head_dim}, seq_len={seq_len}) at t={t}: \
                  expected={}, actual={}, diff={diff}",
                 expected[t],
                 actual[t]
@@ -13987,7 +14061,7 @@ mod tests {
             let diff = (vexp[d] - vact[d]).abs();
             assert!(
                 diff < 1e-4,
-                "attn_values_f16 mismatch (head_dim={head_dim}) at d={d}: \
+                "attn_values_f16 mismatch (head_dim={head_dim}, seq_len={seq_len}) at d={d}: \
                  expected={}, actual={}, diff={diff}",
                 vexp[d],
                 vact[d]
@@ -14001,6 +14075,56 @@ mod tests {
         check_attn_f16_kernels(12); // 8-wide + 4-wide
         check_attn_f16_kernels(10); // 8-wide + scalar-2 tail
         check_attn_f16_kernels(6); // 4-wide + scalar-2 tail
+    }
+
+    #[test]
+    fn test_attn_f16_prefetch_threshold_parity() {
+        // Sweep across ATTN_PREFETCH_MIN_SEQ (256) to assert parity with prefetch inactive and active
+        for seq_len in [255, 256, 300] {
+            check_attn_f16_kernels_seq(64, seq_len);
+        }
+    }
+
+    #[test]
+    fn test_attn_prefetch_knob_parsing_and_bounds() {
+        // Disabled spellings return 0
+        assert_eq!(
+            parse_attn_prefetch_knob_from("KNOB", 16, |_| Some("0".into())),
+            0
+        );
+        assert_eq!(
+            parse_attn_prefetch_knob_from("KNOB", 16, |_| Some("off".into())),
+            0
+        );
+        assert_eq!(
+            parse_attn_prefetch_knob_from("KNOB", 16, |_| Some("False".into())),
+            0
+        );
+
+        // Valid values parse and return numeric value
+        assert_eq!(
+            parse_attn_prefetch_knob_from("KNOB", 16, |_| Some("32".into())),
+            32
+        );
+
+        // Large values clamped to MAX_ATTN_PREFETCH_DISTANCE
+        assert_eq!(
+            parse_attn_prefetch_knob_from("KNOB", 16, |_| Some("999999999".into())),
+            MAX_ATTN_PREFETCH_DISTANCE
+        );
+
+        // Unset returns default
+        assert_eq!(parse_attn_prefetch_knob_from("KNOB", 16, |_| None), 16);
+
+        // Malformed strings log warning and fall back to default
+        assert_eq!(
+            parse_attn_prefetch_knob_from("KNOB", 16, |_| Some("invalid".into())),
+            16
+        );
+        assert_eq!(
+            parse_attn_prefetch_knob_from("KNOB", 16, |_| Some("-5".into())),
+            16
+        );
     }
 
     /// f32 twin of [`check_attn_f16_kernels`]: dispatcher output vs the scalar
@@ -14628,6 +14752,29 @@ mod tests {
                     c * 1e9 / depth as f64
                 );
             }
+        }
+    }
+
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn test_prefetch_lines_execution() {
+        let buf = [0u8; 256];
+        unsafe {
+            // Zero bytes boundary check: should not loop or fault
+            prefetch_lines(buf.as_ptr(), 0);
+            prefetch_lines_l2(buf.as_ptr(), 0);
+
+            // Aligned cache lines
+            prefetch_lines(buf.as_ptr(), 64);
+            prefetch_lines_l2(buf.as_ptr(), 128);
+
+            // Unaligned pointer and partial cache-line lengths
+            prefetch_lines(buf.as_ptr().wrapping_add(3), 70);
+            prefetch_lines_l2(buf.as_ptr().wrapping_add(7), 130);
+
+            // Non-faulting wrapping addresses
+            prefetch_lines(buf.as_ptr().wrapping_add(1024), 64);
+            prefetch_lines_l2(buf.as_ptr().wrapping_add(2048), 64);
         }
     }
 
