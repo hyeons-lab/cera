@@ -721,7 +721,6 @@ pub fn par_rows_n_active(
     max_active: usize,
     f: impl Fn((usize, &mut [f32])) + Sync + Send,
 ) {
-    debug_assert_ne!(n, 0, "par_rows_n_active: n must be > 0");
     if n == 0 || y.is_empty() {
         return;
     }
@@ -15410,5 +15409,12 @@ mod q8_activation_quantizer_tests {
             let rel = (num / den).sqrt();
             assert!(rel < 0.02, "amax {amax:e}: relative error {rel:.4}");
         }
+    }
+
+    #[test]
+    fn par_rows_n_active_handles_zero_n_and_empty_slice_without_panic() {
+        let mut y = [0.0f32; 16];
+        super::par_rows_n_active(&mut y[..0], 0, 1, 4, |_| panic!("must not be called"));
+        super::par_rows_n_active(&mut y, 0, 1, 4, |_| panic!("must not be called"));
     }
 }

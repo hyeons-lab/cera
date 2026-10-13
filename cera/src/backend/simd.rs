@@ -6457,6 +6457,9 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) {
+        if n == 0 || m == 0 {
+            return;
+        }
         debug_assert_eq!(m % 8, 0, "repacked Q4_0 GEMM: m must be a multiple of 8");
         debug_assert_eq!(k % 32, 0, "repacked Q4_0 GEMM: k must be divisible by 32");
         let nb = k / 32;
@@ -7449,6 +7452,9 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) {
+        if n == 0 || m == 0 {
+            return;
+        }
         debug_assert_eq!(m % 8, 0, "smmla Q4_0 GEMM: m must be a multiple of 8");
         debug_assert_eq!(k % 32, 0, "smmla Q4_0 GEMM: k must be divisible by 32");
         let nb = k / 32;
@@ -7655,7 +7661,7 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) {
-        if n == 0 {
+        if n == 0 || m == 0 {
             return;
         }
         debug_assert_eq!(m % 8, 0, "smmla Q4_0 GEMM: m must be a multiple of 8");
@@ -8559,6 +8565,9 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) {
+        if n == 0 || m == 0 {
+            return;
+        }
         debug_assert_eq!(m % 8, 0, "smmla Q4_K GEMM: m must be a multiple of 8");
         debug_assert_eq!(k % 256, 0, "smmla Q4_K GEMM: k must be divisible by 256");
         let nb32 = k / 32;
@@ -9054,6 +9063,9 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) {
+        if n == 0 || m == 0 {
+            return;
+        }
         debug_assert_eq!(m % 8, 0, "repacked Q4_K GEMM: m must be a multiple of 8");
         debug_assert_eq!(k % 256, 0, "repacked Q4_K GEMM: k must be divisible by 256");
         let nb32 = k / 32;
@@ -9537,6 +9549,9 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) {
+        if n == 0 || m == 0 {
+            return;
+        }
         debug_assert_eq!(m % 8, 0, "smmla Q6_K GEMM: m must be a multiple of 8");
         debug_assert_eq!(k % 256, 0, "smmla Q6_K GEMM: k must be divisible by 256");
         let nb16 = k / 16;
@@ -9847,6 +9862,9 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) {
+        if n == 0 || m == 0 {
+            return;
+        }
         debug_assert_eq!(m % 8, 0, "repacked Q6_K GEMM: m must be a multiple of 8");
         debug_assert_eq!(k % 256, 0, "repacked Q6_K GEMM: k must be divisible by 256");
         let nb16 = k / 16;
