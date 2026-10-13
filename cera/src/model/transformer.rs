@@ -1901,7 +1901,15 @@ pub(crate) fn quantize_columns(
             // A tile is at most `QUANT_COL_TILE` columns, narrower for short prompts so that even a
             // 16-token chunk is eight tiles and not one tile on one worker (the result is the same
             // bytes whatever the width).
-            let tile_w = n.div_ceil(8).clamp(1, QUANT_COL_TILE);
+            #[cfg(target_arch = "aarch64")]
+            let stream = n >= RMSNORM_STREAM_MIN_N;
+            #[cfg(not(target_arch = "aarch64"))]
+            let stream = false;
+            let tile_w = if stream {
+                QUANT_COL_TILE
+            } else {
+                n.div_ceil(8).clamp(1, QUANT_COL_TILE)
+            };
             cpu::par_rows_n_chunked_active(
                 &mut scales[..n * nb],
                 tile_w * nb,
@@ -1913,7 +1921,7 @@ pub(crate) fn quantize_columns(
                     let j0 = g * tile_w;
                     let ncols = sc.len() / nb;
                     #[cfg(target_arch = "aarch64")]
-                    if ncols == QUANT_COL_TILE {
+                    if stream && ncols == QUANT_COL_TILE {
                         // SAFETY: `j0 + 16 <= n`, `mat` holds `dim * n` floats (asserted above), `sc` is this
                         // tile's `16 * nb` scales, and the 16 columns' `quants` spans are this item's alone.
                         unsafe {
@@ -1921,6 +1929,8 @@ pub(crate) fn quantize_columns(
                         }
                         return;
                     }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let _ = stream;
                     let mut tile = [[0.0f32; QUANT_COL_TILE]; 32];
                     let mut blk = [0.0f32; 32];
                     for b in 0..nb {
@@ -1979,7 +1989,7 @@ pub(crate) fn quantize_columns(
 /// # Safety
 /// `mat` must be valid for `dim * n` floats with `dim = nb * 32`, `j0 + 16 <= n`, `sc` must hold `16 * nb` scales,
 /// and the caller must own `quants[(j0 + c) * dim..][..dim]` for the 16 columns.
-#[cfg(target_arch = "aarch64")]
+#[cfg(all(target_arch = "aarch64", feature = "parallel"))]
 #[target_feature(enable = "neon")]
 unsafe fn quantize_tile16_stream(
     mat: *const f32,
@@ -1993,7 +2003,9 @@ unsafe fn quantize_tile16_stream(
     unsafe {
         let dim = nb * 32;
         let mut rows = [vdupq_n_u8(0); 32];
-        let mut tmp = [0u8; 8 * 64];
+        #[repr(C, align(64))]
+        struct AlignedTmp([u8; 8 * 64]);
+        let mut tmp = AlignedTmp([0u8; 8 * 64]);
         for b in 0..nb {
             let base = mat.add(b * 32 * n + j0);
             let mut m = [vdupq_n_f32(0.0); 4];
@@ -2034,7 +2046,7 @@ unsafe fn quantize_tile16_stream(
             // tmp[g * 64 + 4 * c + k] = quant of row 4g + k, column c.
             for g in 0..8usize {
                 vst4q_u8(
-                    tmp.as_mut_ptr().add(g * 64),
+                    tmp.0.as_mut_ptr().add(g * 64),
                     uint8x16x4_t(
                         rows[4 * g],
                         rows[4 * g + 1],
@@ -2047,7 +2059,7 @@ unsafe fn quantize_tile16_stream(
                 let dst = quants.add((j0 + c) * dim + b * 32) as *mut u8;
                 for g in 0..8usize {
                     core::ptr::copy_nonoverlapping(
-                        tmp.as_ptr().add(g * 64 + 4 * c),
+                        tmp.0.as_ptr().add(g * 64 + 4 * c),
                         dst.add(4 * g),
                         4,
                     );
@@ -3352,9 +3364,14 @@ mod tests {
     #[test]
     fn quantize_columns_parallel_matches_serial() {
         // Sweeps serial threshold boundaries (< 8 columns), narrowed short-prompt tiles
-        // (8 to 100 columns), full 16-column tiles (256, 512), and ragged tails (33, 275).
-        for n in [0usize, 1, 7, 8, 9, 16, 33, 64, 100, 256, 275, 512] {
-            quantize_columns_matches_serial_at(256, n);
+        // (8 to 100 columns), 128 for streaming threshold, ragged tail tiles (130, 200, 33, 275),
+        // and full 16-column tiles (256, 512) across multiple block dimensions.
+        for dim in [32usize, 64, 256, 1024] {
+            for n in [
+                0usize, 1, 7, 8, 9, 16, 33, 64, 100, 128, 130, 200, 256, 275, 512,
+            ] {
+                quantize_columns_matches_serial_at(dim, n);
+            }
         }
     }
 
