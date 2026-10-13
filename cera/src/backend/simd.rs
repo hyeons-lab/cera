@@ -12311,7 +12311,6 @@ pub(crate) mod neon {
         /// kernel with few live accumulators. `taskset 04` for a mid core, `taskset 80` for a prime core.
         #[test]
         #[ignore = "microbenchmark: run explicitly on a device"]
-        #[cfg(not(has_blas))]
         fn smmla_chain_sweep_microbench() {
             if !require_i8mm_kernel_or_skip() {
                 return;
@@ -12357,7 +12356,6 @@ pub(crate) mod neon {
         /// `cera_tests smmla_tile_ablation_microbench --ignored --nocapture --test-threads=1`.
         #[test]
         #[ignore = "microbenchmark: run explicitly on a device"]
-        #[cfg(not(has_blas))]
         fn smmla_tile_ablation_microbench() {
             if !require_i8mm_kernel_or_skip() {
                 return;
@@ -12378,16 +12376,16 @@ pub(crate) mod neon {
                         for c in 0..4usize {
                             let rhs0 = vld1q_s8(b_base.add(c * 32));
                             let rhs1 = vld1q_s8(b_base.add(c * 32 + 16));
-                            for p in 0..4usize {
+                            for (p, acc_p) in acc.iter_mut().enumerate() {
                                 let lhs = vld1q_s8(w_base.add(c * 64 + p * 16));
-                                acc[p][0] = vmmlaq_s32(acc[p][0], lhs, rhs0);
-                                acc[p][1] = vmmlaq_s32(acc[p][1], lhs, rhs1);
+                                acc_p[0] = vmmlaq_s32(acc_p[0], lhs, rhs0);
+                                acc_p[1] = vmmlaq_s32(acc_p[1], lhs, rhs1);
                             }
                         }
                         // Eight independent sinks: one add per accumulator, no serial chain.
-                        for p in 0..4usize {
-                            sink[p][0] = vaddq_s32(sink[p][0], acc[p][0]);
-                            sink[p][1] = vaddq_s32(sink[p][1], acc[p][1]);
+                        for (s, a) in sink.iter_mut().zip(acc.iter()) {
+                            s[0] = vaddq_s32(s[0], a[0]);
+                            s[1] = vaddq_s32(s[1], a[1]);
                         }
                     }
                     let mut total = vdupq_n_s32(0);
@@ -12405,9 +12403,9 @@ pub(crate) mod neon {
                     // 16 independent chains: enough to cover the instruction's latency.
                     let mut acc = [[vdupq_n_s32(0); 4]; 4];
                     for _ in 0..iters {
-                        for p in 0..4usize {
-                            for q in 0..4usize {
-                                acc[p][q] = vmmlaq_s32(acc[p][q], l[p], r[q]);
+                        for (ap, &lp) in acc.iter_mut().zip(l.iter()) {
+                            for (apq, &rq) in ap.iter_mut().zip(r.iter()) {
+                                *apq = vmmlaq_s32(*apq, lp, rq);
                             }
                         }
                     }
@@ -12440,10 +12438,10 @@ pub(crate) mod neon {
                         for c in 0..4usize {
                             let rhs0 = vld1q_s8(b_base.add(c * 32));
                             let rhs1 = vld1q_s8(b_base.add(c * 32 + 16));
-                            for p in 0..4usize {
+                            for (p, acc_p) in acc[set].iter_mut().enumerate() {
                                 let lhs = vld1q_s8(w_base.add(c * 64 + p * 16));
-                                acc[set][p][0] = vmmlaq_s32(acc[set][p][0], lhs, rhs0);
-                                acc[set][p][1] = vmmlaq_s32(acc[set][p][1], lhs, rhs1);
+                                acc_p[0] = vmmlaq_s32(acc_p[0], lhs, rhs0);
+                                acc_p[1] = vmmlaq_s32(acc_p[1], lhs, rhs1);
                             }
                         }
                     }
@@ -12803,7 +12801,14 @@ pub(crate) mod neon {
             let bench_reps = std::env::var("CERA_BENCH_REPS")
                 .ok()
                 .and_then(|v| v.parse::<usize>().ok())
-                .unwrap_or(15);
+                .unwrap_or(15)
+                .max(1);
+            // CERA_BENCH_GAP_US idles the pool before each timed call, to see what a GEMM that
+            // follows a serial phase costs against back-to-back calls.
+            let bench_gap_us = std::env::var("CERA_BENCH_GAP_US")
+                .ok()
+                .and_then(|v| v.parse::<u64>().ok())
+                .filter(|&us| us > 0);
             // (name, m, k)
             let shapes = [
                 ("q/out 2048x2048", 2048usize, 2048usize),
@@ -12816,12 +12821,7 @@ pub(crate) mod neon {
                 f(1);
                 let mut v: Vec<f64> = (0..reps)
                     .map(|i| {
-                        // CERA_BENCH_GAP_US idles the pool before each timed call, to see what a GEMM that
-                        // follows a serial phase costs against back-to-back calls.
-                        if let Some(us) = std::env::var("CERA_BENCH_GAP_US")
-                            .ok()
-                            .and_then(|v| v.parse::<u64>().ok())
-                        {
+                        if let Some(us) = bench_gap_us {
                             std::thread::sleep(std::time::Duration::from_micros(us));
                         }
                         let t0 = std::time::Instant::now();
