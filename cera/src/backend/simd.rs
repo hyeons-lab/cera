@@ -11923,6 +11923,10 @@ pub(crate) mod neon {
                     "q8_0 {m}x{n}x{k}: max|out| {mag:.3}, max abs error standard {e_std:.2e}, smmla {e_new:.2e}"
                 );
                 assert!(
+                    e_std <= 1e-5 * mag + 1e-6,
+                    "standard kernel error {e_std} vs scale {mag}"
+                );
+                assert!(
                     e_new <= 1e-5 * mag + 1e-6,
                     "smmla error {e_new} vs scale {mag}"
                 );
@@ -11950,11 +11954,10 @@ pub(crate) mod neon {
                     DType::Q8_0 => nb * std::mem::size_of::<BlockQ8_0>(),
                     _ => nb * std::mem::size_of::<BlockQ4_0>(),
                 };
-                let one: Vec<u8> = (0..m * row_bytes)
+                let mut one: Vec<u8> = (0..m * row_bytes)
                     .map(|_| (lcg(&mut st) * 127.0) as i32 as u8)
                     .collect();
                 // make scales sane: f16 of a small value at each block's first two bytes
-                let mut one = one;
                 let blk = row_bytes / nb;
                 for b in 0..m * nb {
                     let h = crate::quant::f32_to_f16(0.01).to_le_bytes();

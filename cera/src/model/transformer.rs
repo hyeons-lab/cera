@@ -89,7 +89,7 @@ pub enum Repacked {
     /// (`(m/8)*nb*256` packed bytes, `(m/8)*nb*8` f32 scales) but the
     /// [`crate::backend::cpu::repack_q4_0_smmla_8x8`] row-pair × 8-wide
     /// k-chunk interleave instead of the vdot 4-wide one. Built instead of
-    /// `Q40` when the process tier is `NeonI8mm` — never alongside it, so the
+    /// `Q40` when the process tier is `NeonI8mm`, never alongside it, so the
     /// extra-copy cost is unchanged.
     Q40Smmla {
         packed: Vec<u8>,
@@ -3859,5 +3859,43 @@ mod repack_flag_tests {
             col_out.iter().any(|&v| v != 7.0),
             "column dispatch wrote nothing"
         );
+    }
+
+    #[test]
+    fn quantize_rows_parallel_matches_serial() {
+        let dim = 256usize;
+        let nb = dim / 32;
+        for n in [1usize, 16, 255, 256, 275, 512] {
+            let mut st = 0x1234_5678u64 ^ (n as u64);
+            let mut lcg = || {
+                st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((st >> 33) as f32) / ((1u32 << 31) as f32) - 0.5
+            };
+            let mat: Vec<f32> = (0..n * dim).map(|_| lcg() * 10.0).collect();
+
+            let mut ref_scales = vec![0.0f32; n * nb];
+            let mut ref_quants = vec![0i8; n * dim];
+            for j in 0..n {
+                let tok_f32 = &mat[j * dim..(j + 1) * dim];
+                cpu::quantize_f32_to_q8_0_into(
+                    tok_f32,
+                    &mut ref_scales[j * nb..(j + 1) * nb],
+                    &mut ref_quants[j * dim..(j + 1) * dim],
+                );
+            }
+
+            let mut test_scales = vec![0.0f32; n * nb];
+            let mut test_quants = vec![0i8; n * dim];
+            quantize_rows(&mat, dim, n, &mut test_scales, &mut test_quants);
+
+            assert_eq!(
+                test_scales, ref_scales,
+                "quantize_rows scales mismatch for n={n}, dim={dim}"
+            );
+            assert_eq!(
+                test_quants, ref_quants,
+                "quantize_rows quants mismatch for n={n}, dim={dim}"
+            );
+        }
     }
 }

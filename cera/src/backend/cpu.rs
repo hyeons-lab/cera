@@ -1693,7 +1693,9 @@ pub(crate) fn q8_0_smmla_repack_supported(m: usize, k: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
     {
         super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm
+            && m != 0
             && m.is_multiple_of(8)
+            && k != 0
             && k.is_multiple_of(32)
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -12355,8 +12357,8 @@ mod tests {
             );
         }
 
-        // Test serial and parallel branches (threshold >= 2048)
-        for n in [1025, 2048, 2049, 3072] {
+        // Test serial and parallel branches (threshold >= ELEMENTWISE_PAR_MIN = 16384)
+        for n in [1025, 2048, 16383, 16384, 16897, 20480] {
             let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
             let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
             let mut ref_large = gate_large.clone();
@@ -12391,8 +12393,8 @@ mod tests {
             );
         }
 
-        // Test serial and parallel branches (threshold >= 2048)
-        for n in [1025, 2048, 2049, 3072] {
+        // Test serial and parallel branches (threshold >= ELEMENTWISE_PAR_MIN = 16384)
+        for n in [1025, 2048, 16383, 16384, 16897, 20480] {
             let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
             let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
             let mut ref_large = gate_large.clone();
@@ -12451,8 +12453,8 @@ mod tests {
         assert!(extremes[2].is_finite());
         assert!(extremes[3].is_finite());
 
-        // Test serial and parallel branches (threshold >= 2048)
-        for n in [1025, 1537, 2048, 2049, 3072] {
+        // Test serial and parallel branches (threshold >= ELEMENTWISE_PAR_MIN = 16384)
+        for n in [1025, 1537, 2048, 16383, 16384, 16897, 20480] {
             let mut x_large: Vec<f32> = (0..n).map(|i| (i as f32 - 1024.0) * 0.1).collect();
             let expected_large: Vec<f32> =
                 x_large.iter().map(|&v| cap * (v / cap).tanh()).collect();
