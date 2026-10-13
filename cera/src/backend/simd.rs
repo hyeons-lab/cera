@@ -1684,6 +1684,9 @@ pub(crate) mod neon {
         _m: usize,
         k: usize,
     ) {
+        if out.is_empty() || k == 0 {
+            return;
+        }
         debug_assert!(
             k.is_multiple_of(256),
             "Q4_K GEMV: k must be divisible by 256"
@@ -1746,59 +1749,41 @@ pub(crate) mod neon {
         // form this replaced. Pairs are stolen from the pool in small chunks rather than split evenly
         // across workers, so the prime cores take more of them than the mid cores.
         let compute_pair = move |(g, chunk): (usize, &mut [f32])| unsafe {
-            let silu_mul = |sg: f32, su: f32| -> f32 {
-                (sg / (1.0 + crate::backend::cpu::ggml_expf(-sg))) * su
-            };
             let r0 = g * 2;
             if chunk.len() == 2 {
-                let mut sum_g = [0.0f32; 2];
-                let mut sum_u = [0.0f32; 2];
-                for bi in 0..blocks_per_row {
-                    let xq = ptrs.xq().add(bi * 256);
-                    let xs = ptrs.xs().add(bi * 8);
-                    let xqsp = ptrs.xqs().add(bi * 8);
-                    for r in 0..2 {
-                        let off = (r0 + r) * row_bytes + bi * size_of::<BlockQ4KM>();
-                        let gblk = ptrs.g().add(off) as *const BlockQ4KM;
-                        let ublk = ptrs.u().add(off) as *const BlockQ4KM;
-                        core::arch::asm!(
-                            "prfm pldl1keep, [{0}, #256]",
-                            "prfm pldl1keep, [{1}, #256]",
-                            in(reg) gblk,
-                            in(reg) ublk,
-                            options(nostack, preserves_flags)
-                        );
-                        sum_g[r] = q4k_block_accum(gblk, xq, xs, xqsp, sum_g[r]);
-                        sum_u[r] = q4k_block_accum(ublk, xq, xs, xqsp, sum_u[r]);
-                    }
-                }
-                chunk[0] = silu_mul(sum_g[0], sum_u[0]);
-                chunk[1] = silu_mul(sum_g[1], sum_u[1]);
+                let off = r0 * row_bytes;
+                let res = q4k_swiglu_pair2(
+                    ptrs.g().add(off),
+                    ptrs.u().add(off),
+                    row_bytes,
+                    blocks_per_row,
+                    ptrs.xq(),
+                    ptrs.xs(),
+                    ptrs.xqs(),
+                );
+                chunk[0] = res[0];
+                chunk[1] = res[1];
             } else {
+                let silu_mul = |sg: f32, su: f32| -> f32 {
+                    (sg / (1.0 + crate::backend::cpu::ggml_expf(-sg))) * su
+                };
                 for (i, o) in chunk.iter_mut().enumerate() {
-                    let row = (r0 + i) * row_bytes;
-                    let (mut sum_g, mut sum_u) = (0.0f32, 0.0f32);
-                    for bi in 0..blocks_per_row {
-                        let xq = ptrs.xq().add(bi * 256);
-                        let xs = ptrs.xs().add(bi * 8);
-                        let xqsp = ptrs.xqs().add(bi * 8);
-                        let off = row + bi * size_of::<BlockQ4KM>();
-                        sum_g = q4k_block_accum(
-                            ptrs.g().add(off) as *const BlockQ4KM,
-                            xq,
-                            xs,
-                            xqsp,
-                            sum_g,
-                        );
-                        sum_u = q4k_block_accum(
-                            ptrs.u().add(off) as *const BlockQ4KM,
-                            xq,
-                            xs,
-                            xqsp,
-                            sum_u,
-                        );
-                    }
-                    *o = silu_mul(sum_g, sum_u);
+                    let off = (r0 + i) * row_bytes;
+                    let sg = q4k_row1(
+                        ptrs.g().add(off),
+                        blocks_per_row,
+                        ptrs.xq(),
+                        ptrs.xs(),
+                        ptrs.xqs(),
+                    );
+                    let su = q4k_row1(
+                        ptrs.u().add(off),
+                        blocks_per_row,
+                        ptrs.xq(),
+                        ptrs.xs(),
+                        ptrs.xqs(),
+                    );
+                    *o = silu_mul(sg, su);
                 }
             }
         };
@@ -3641,6 +3626,7 @@ pub(crate) mod neon {
         m: usize,
         k: usize,
     ) {
+        debug_assert_eq!(k % 256, 0, "Q6_K GEMV: k must be divisible by 256");
         if y.len() < m {
             debug_assert!(
                 false,
@@ -3648,10 +3634,22 @@ pub(crate) mod neon {
             );
             return;
         }
+        if m == 0 || k == 0 {
+            return;
+        }
         let y = &mut y[..m];
+        debug_assert!(
+            x_scales.len() >= k / 32 && x_quants.len() >= k,
+            "Q6_K GEMV: activation scratch too small"
+        );
         unsafe {
             let blocks_per_row = k / 256;
             let row_bytes = blocks_per_row * size_of::<BlockQ6K>();
+            debug_assert_eq!(
+                a_quant.len(),
+                m * row_bytes,
+                "Q6_K GEMV: a_quant size mismatch"
+            );
             let ptrs = GemvPtrs {
                 a: a_quant.as_ptr() as usize,
                 xq: x_quants.as_ptr() as usize,
@@ -3752,8 +3750,15 @@ pub(crate) mod neon {
         };
 
         let chunks16 = k / 16;
-        let mut sum16 = vec![0i32; chunks16];
-        unsafe { q8_sum16(x_quants.as_ptr(), chunks16, &mut sum16) };
+        let mut stack_sum16 = [0i32; 1024];
+        let mut heap_sum16;
+        let sum16: &mut [i32] = if chunks16 <= 1024 {
+            &mut stack_sum16[..chunks16]
+        } else {
+            heap_sum16 = vec![0i32; chunks16];
+            &mut heap_sum16
+        };
+        unsafe { q8_sum16(x_quants.as_ptr(), chunks16, sum16) };
         let sum16_ptr = sum16.as_ptr() as usize;
 
         let compute_chunk = |start_row: usize, slice_len: usize| unsafe {
@@ -3898,35 +3903,102 @@ pub(crate) mod neon {
         }
     }
 
+    /// Single row accumulation of a Q4_K weight row against Q8_0 activations.
+    /// Bit-identical to [`q4k_rows4`].
+    #[target_feature(enable = "neon,dotprod")]
+    #[inline]
+    unsafe fn q4k_row1(
+        row: *const u8,
+        blocks_per_row: usize,
+        xq: *const i8,
+        xs: *const f32,
+        xqs: *const i32,
+    ) -> f32 {
+        unsafe {
+            let mut sumf = 0.0f32;
+            for bi in 0..blocks_per_row {
+                let blk = row.add(bi * size_of::<BlockQ4KM>()) as *const BlockQ4KM;
+                core::arch::asm!(
+                    "prfm pldl1keep, [{0}, #256]",
+                    in(reg) blk,
+                    options(nostack, preserves_flags)
+                );
+                sumf =
+                    q4k_block_accum(blk, xq.add(bi * 256), xs.add(bi * 8), xqs.add(bi * 8), sumf);
+            }
+            sumf
+        }
+    }
+
+    /// Evaluates two consecutive rows of gate and up Q4_K projections with SwiGLU activation.
+    #[target_feature(enable = "neon,dotprod")]
+    #[inline]
+    unsafe fn q4k_swiglu_pair2(
+        g_row: *const u8,
+        u_row: *const u8,
+        row_bytes: usize,
+        blocks_per_row: usize,
+        xq: *const i8,
+        xs: *const f32,
+        xqs: *const i32,
+    ) -> [f32; 2] {
+        unsafe {
+            let mut sum_g = [0.0f32; 2];
+            let mut sum_u = [0.0f32; 2];
+            for bi in 0..blocks_per_row {
+                let xq_b = xq.add(bi * 256);
+                let xs_b = xs.add(bi * 8);
+                let xqsp = xqs.add(bi * 8);
+                for r in 0..2 {
+                    let off = r * row_bytes + bi * size_of::<BlockQ4KM>();
+                    let gblk = g_row.add(off) as *const BlockQ4KM;
+                    let ublk = u_row.add(off) as *const BlockQ4KM;
+                    core::arch::asm!(
+                        "prfm pldl1keep, [{0}, #256]",
+                        "prfm pldl1keep, [{1}, #256]",
+                        in(reg) gblk,
+                        in(reg) ublk,
+                        options(nostack, preserves_flags)
+                    );
+                    sum_g[r] = q4k_block_accum(gblk, xq_b, xs_b, xqsp, sum_g[r]);
+                    sum_u[r] = q4k_block_accum(ublk, xq_b, xs_b, xqsp, sum_u[r]);
+                }
+            }
+            let silu_mul = |sg: f32, su: f32| -> f32 {
+                (sg / (1.0 + crate::backend::cpu::ggml_expf(-sg))) * su
+            };
+            [silu_mul(sum_g[0], sum_u[0]), silu_mul(sum_g[1], sum_u[1])]
+        }
+    }
+
     /// Four rows of the Q4_K GEMV at once: [`q4k_block_accum`] on four independent `sumf` chains,
     /// interleaved per super-block so the sequential accumulation of one row overlaps the dots of
     /// the next. Bit-identical to four single-row calls.
     #[target_feature(enable = "neon,dotprod")]
     #[inline]
     unsafe fn q4k_rows4(
-        a_base: usize,
+        rows: *const u8,
         row_bytes: usize,
-        r0: usize,
-        xq_base: usize,
-        xs_base: usize,
-        xqs: &[i32],
         blocks_per_row: usize,
+        xq: *const i8,
+        xs: *const f32,
+        xqs: *const i32,
     ) -> [f32; 4] {
         unsafe {
             let mut sumf = [0.0f32; 4];
             for bi in 0..blocks_per_row {
-                let xq = (xq_base as *const i8).add(bi * 256);
-                let xs = (xs_base as *const f32).add(bi * 8);
-                let xqsp = xqs.as_ptr().add(bi * 8);
+                let xq_b = xq.add(bi * 256);
+                let xs_b = xs.add(bi * 8);
+                let xqsp = xqs.add(bi * 8);
                 for r in 0..4 {
-                    let blk = (a_base + (r0 + r) * row_bytes + bi * size_of::<BlockQ4KM>())
-                        as *const BlockQ4KM;
+                    let blk =
+                        rows.add(r * row_bytes + bi * size_of::<BlockQ4KM>()) as *const BlockQ4KM;
                     core::arch::asm!(
                         "prfm pldl1keep, [{0}, #256]",
                         in(reg) blk,
                         options(nostack, preserves_flags)
                     );
-                    sumf[r] = q4k_block_accum(blk, xq, xs, xqsp, sumf[r]);
+                    sumf[r] = q4k_block_accum(blk, xq_b, xs_b, xqsp, sumf[r]);
                 }
             }
             sumf
@@ -3962,6 +4034,9 @@ pub(crate) mod neon {
             );
             return;
         }
+        if m == 0 || k == 0 {
+            return;
+        }
         let y = &mut y[..m];
         debug_assert!(
             x_scales.len() >= k / 32 && x_quants.len() >= k,
@@ -3977,9 +4052,11 @@ pub(crate) mod neon {
                 m * row_bytes,
                 "Q4_K GEMV: a_quant size mismatch"
             );
-            let a_base = a_quant.as_ptr() as usize;
-            let xq_base = x_quants.as_ptr() as usize;
-            let xs_base = x_scales.as_ptr() as usize;
+            let ptrs = GemvPtrs {
+                a: a_quant.as_ptr() as usize,
+                xq: x_quants.as_ptr() as usize,
+                xs: x_scales.as_ptr() as usize,
+            };
 
             // Precompute the per-32-block activation quant sums `Σ x_quants[b*32..]`
             // once via the shared `q8_0_col_sums` helper (a single activation column,
@@ -4002,46 +4079,36 @@ pub(crate) mod neon {
                 &heap_xqs
             };
 
+            let xqs_ptr = xqs.as_ptr() as usize;
+
             let compute_row = move |(r, out_elem): (usize, &mut f32)| unsafe {
-                let row_start = r * row_bytes;
-                let mut sumf = 0.0f32;
-                for bi in 0..blocks_per_row {
-                    let blk =
-                        (a_base + row_start + bi * size_of::<BlockQ4KM>()) as *const BlockQ4KM;
-                    core::arch::asm!(
-                        "prfm pldl1keep, [{0}, #256]",
-                        in(reg) blk,
-                        options(nostack, preserves_flags)
-                    );
-                    sumf = q4k_block_accum(
-                        blk,
-                        (xq_base as *const i8).add(bi * 256),
-                        (xs_base as *const f32).add(bi * 8),
-                        xqs.as_ptr().add(bi * 8),
-                        sumf,
-                    );
-                }
-                *out_elem = sumf;
+                *out_elem = q4k_row1(
+                    ptrs.a().add(r * row_bytes),
+                    blocks_per_row,
+                    ptrs.xq(),
+                    ptrs.xs(),
+                    xqs_ptr as *const i32,
+                );
             };
 
             // Rows go out four at a time (see `q4k_rows4`); a trailing partial group, or a
             // short `y`, takes the single-row loop. Groups are the steal unit, so the
             // 16-row minimum chunk of the per-row dispatch becomes 4 groups.
             let rows4 = move |(g, chunk): (usize, &mut [f32])| unsafe {
+                let r0 = g * 4;
                 if chunk.len() == 4 {
                     let v = q4k_rows4(
-                        a_base,
+                        ptrs.a().add(r0 * row_bytes),
                         row_bytes,
-                        g * 4,
-                        xq_base,
-                        xs_base,
-                        xqs,
                         blocks_per_row,
+                        ptrs.xq(),
+                        ptrs.xs(),
+                        xqs_ptr as *const i32,
                     );
                     chunk.copy_from_slice(&v);
                 } else {
                     for (i, o) in chunk.iter_mut().enumerate() {
-                        compute_row((g * 4 + i, o));
+                        compute_row((r0 + i, o));
                     }
                 }
             };
@@ -10724,6 +10791,7 @@ pub(crate) mod neon {
                 (30, 4608),
                 (4, 512),
                 (7, 1024),
+                (257, 512),
             ] {
                 let nb = k / 256;
                 let mut st = 0x6666_1234u64 ^ (m as u64) << 20 ^ k as u64;
@@ -10758,6 +10826,13 @@ pub(crate) mod neon {
                     "m={m} k={k}: fused argmax vs argmax of the GEMV"
                 );
             }
+
+            let mut empty_y = vec![0.0f32; 0];
+            unsafe {
+                gemv_q6k_q8_0_neon_dotprod(&[], &[], &[], &mut empty_y, 0, 512);
+                let best = gemv_q6k_q8_0_argmax_neon(&[], &[], &[], 0, 512);
+                assert_eq!(best, 0);
+            }
         }
 
         #[test]
@@ -10790,38 +10865,54 @@ pub(crate) mod neon {
             if !require_simd_or_skip("dotprod", cpu_features().dotprod) {
                 return;
             }
-            // 2 super-blocks/row (k=512) * 7 rows: exercises multi-block accumulation,
-            // 2-row unrolling (3 pairs), and single remainder row.
-            let (m, k, nb) = (7usize, 512usize, 2usize);
-            let mut st = 0xbeef_cafeu64;
-            let g_blocks: Vec<BlockQ4KM> = (0..m * nb).map(|_| random_q4km(&mut st)).collect();
-            let u_blocks: Vec<BlockQ4KM> = (0..m * nb).map(|_| random_q4km(&mut st)).collect();
-            let g_bytes = blocks_to_bytes(&g_blocks);
-            let u_bytes = blocks_to_bytes(&u_blocks);
-            let x: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
-            let (xs, xq) = quantize_col(&x);
+            // Exercises both serial fallback (m < 256) and parallel chunked decode (m >= 256)
+            // with odd row counts so that full pairs and trailing remainder rows are both tested.
+            for &(m, k) in &[(7usize, 512usize), (257, 512), (300, 256)] {
+                let nb = k / 256;
+                let mut st = 0xbeef_cafeu64 ^ (m as u64);
+                let g_blocks: Vec<BlockQ4KM> = (0..m * nb).map(|_| random_q4km(&mut st)).collect();
+                let u_blocks: Vec<BlockQ4KM> = (0..m * nb).map(|_| random_q4km(&mut st)).collect();
+                let g_bytes = blocks_to_bytes(&g_blocks);
+                let u_bytes = blocks_to_bytes(&u_blocks);
+                let x: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+                let (xs, xq) = quantize_col(&x);
 
-            let mut out_fused = vec![0.0f32; m];
-            unsafe {
-                gemv_q4k_gate_up_swiglu_neon(&g_bytes, &u_bytes, &xs, &xq, &mut out_fused, m, k);
+                let mut out_fused = vec![0.0f32; m];
+                unsafe {
+                    gemv_q4k_gate_up_swiglu_neon(
+                        &g_bytes,
+                        &u_bytes,
+                        &xs,
+                        &xq,
+                        &mut out_fused,
+                        m,
+                        k,
+                    );
+                }
+
+                let mut y_gate = vec![0.0f32; m];
+                let mut y_up = vec![0.0f32; m];
+                unsafe {
+                    gemv_q4k_q8_0_neon_dotprod(&g_bytes, &xs, &xq, &mut y_gate, m, k);
+                    gemv_q4k_q8_0_neon_dotprod(&u_bytes, &xs, &xq, &mut y_up, m, k);
+                }
+                crate::backend::cpu::silu_mul_inplace(&mut y_gate, &y_up);
+
+                for i in 0..m {
+                    let diff = (out_fused[i] - y_gate[i]).abs();
+                    assert!(
+                        diff < 1e-4,
+                        "m={m} row {i}: fused {} vs separate {}, diff={diff}",
+                        out_fused[i],
+                        y_gate[i]
+                    );
+                }
             }
 
-            let mut y_gate = vec![0.0f32; m];
-            let mut y_up = vec![0.0f32; m];
+            // Verify empty input handling.
+            let mut empty_out = vec![0.0f32; 0];
             unsafe {
-                gemv_q4k_q8_0_neon_dotprod(&g_bytes, &xs, &xq, &mut y_gate, m, k);
-                gemv_q4k_q8_0_neon_dotprod(&u_bytes, &xs, &xq, &mut y_up, m, k);
-            }
-            crate::backend::cpu::silu_mul_inplace(&mut y_gate, &y_up);
-
-            for i in 0..m {
-                let diff = (out_fused[i] - y_gate[i]).abs();
-                assert!(
-                    diff < 1e-4,
-                    "row {i}: fused {} vs separate {}, diff={diff}",
-                    out_fused[i],
-                    y_gate[i]
-                );
+                gemv_q4k_gate_up_swiglu_neon(&[], &[], &[], &[], &mut empty_out, 0, 512);
             }
         }
 
