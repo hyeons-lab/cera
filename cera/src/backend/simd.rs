@@ -3769,14 +3769,8 @@ pub(crate) mod neon {
             m
         };
         let n_chunks = m.div_ceil(chunk);
-        let mut worker_results_stack = [(f32::NEG_INFINITY, 0usize); 128];
-        let mut worker_results_heap;
-        let worker_results: &mut [(f32, usize)] = if n_chunks <= 128 {
-            &mut worker_results_stack[..n_chunks]
-        } else {
-            worker_results_heap = vec![(f32::NEG_INFINITY, 0usize); n_chunks];
-            &mut worker_results_heap[..]
-        };
+        let mut worker_results = [(f32::NEG_INFINITY, 0usize); 128];
+        let worker_results = &mut worker_results[..n_chunks];
         let worker_results_ptr = worker_results.as_mut_ptr() as usize;
 
         let blocks_per_row = k / 256;
@@ -3806,8 +3800,7 @@ pub(crate) mod neon {
         } else {
             0
         };
-        let compute_chunk = |start_row: usize, slice_len: usize| unsafe {
-            let chunk_idx = (start_row / chunk).min(n_chunks.saturating_sub(1));
+        let compute_chunk = |chunk_idx: usize, start_row: usize, slice_len: usize| unsafe {
             let mut local_max_val = f32::NEG_INFINITY;
             let mut local_max_idx = start_row;
             let mut r = 0usize;
@@ -3866,13 +3859,13 @@ pub(crate) mod neon {
                 1,
                 |(item, _)| {
                     let start_row = item * chunk;
-                    compute_chunk(start_row, chunk.min(m - start_row));
+                    compute_chunk(item, start_row, chunk.min(m - start_row));
                 },
             );
         }
 
         #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
-        compute_chunk(0, m);
+        compute_chunk(0, 0, m);
 
         let mut best_val = f32::NEG_INFINITY;
         let mut best_idx = 0usize;

@@ -11537,6 +11537,12 @@ mod tests {
         #[cfg(target_arch = "aarch64")]
         #[test]
         fn q6k_argmax_stolen_items_match_the_logits_argmax() {
+            if !crate::backend::simd::require_simd_or_skip(
+                "dotprod",
+                crate::backend::cpu_features::cpu_features().dotprod,
+            ) {
+                return;
+            }
             let k = 256usize;
             let mut st = 0xa86_3a5eu64;
             let x: Vec<f32> = (0..k)
