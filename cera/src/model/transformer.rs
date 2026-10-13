@@ -3093,7 +3093,9 @@ mod tests {
             (96, 0),
             (96, 1),
             (96, 5),
+            (96, 7),
             (96, 8),
+            (96, 9),
             (96, 16),
             (96, 37),
             (96, 64),
@@ -3128,22 +3130,21 @@ mod tests {
     /// Parallel `quantize_columns` must produce byte-identical output to the
     /// serial per-column reference. There is no cross-column reduction, so the
     /// only way the fan-out can differ is a wiring bug (a column written to the
-    /// wrong `scales`/`quants` slice); this asserts it away at a column count
-    /// above `prequant_par_min_cols()`, so the parallel branch is the one exercised.
+    /// wrong `scales`/`quants` slice); this asserts parity across both serial
+    /// fallback (below 8 columns) and parallel fan-out (8 columns and above).
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn quantize_columns_parallel_matches_serial() {
-        // All at or above the 8-column parallel threshold: 8 to 100 exercise the narrowed
-        // short-prompt tiles (1 to 13 columns), 256 and 512 fill whole 16-column tiles, 33 and
-        // 275 leave ragged tail tiles.
-        for n in [8usize, 16, 33, 64, 100, 256, 275, 512] {
+        // Sweeps serial threshold boundaries (< 8 columns), narrowed short-prompt tiles
+        // (8 to 100 columns), full 16-column tiles (256, 512), and ragged tails (33, 275).
+        for n in [0usize, 1, 7, 8, 9, 16, 33, 64, 100, 256, 275, 512] {
             quantize_columns_matches_serial_at(256, n);
         }
     }
 
     #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     fn quantize_columns_matches_serial_at(dim: usize, n: usize) {
-        // `n` ≥ prequant_par_min_cols() → the parallel branch runs.
+        // `n` >= prequant_par_min_cols() -> the parallel branch runs.
         let nb = dim / 32;
 
         // Deterministic column-major [dim × n] activation matrix.
@@ -3184,6 +3185,45 @@ mod tests {
             scales, ref_scales,
             "parallel quantize_columns scales differ"
         );
+    }
+
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
+    #[test]
+    fn quantize_rows_parallel_matches_serial() {
+        let dim = 256usize;
+        let nb = dim / 32;
+        for n in [0usize, 1, 16, 63, 64, 65, 128, 255, 256, 275, 512] {
+            let mut st = 0x1234_5678u64 ^ (n as u64);
+            let mut lcg = || {
+                st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
+                ((st >> 33) as f32) / ((1u32 << 31) as f32) - 0.5
+            };
+            let mat: Vec<f32> = (0..n * dim).map(|_| lcg() * 10.0).collect();
+
+            let mut ref_scales = vec![0.0f32; n * nb];
+            let mut ref_quants = vec![0i8; n * dim];
+            for j in 0..n {
+                let tok_f32 = &mat[j * dim..(j + 1) * dim];
+                cpu::quantize_f32_to_q8_0_into(
+                    tok_f32,
+                    &mut ref_scales[j * nb..(j + 1) * nb],
+                    &mut ref_quants[j * dim..(j + 1) * dim],
+                );
+            }
+
+            let mut test_scales = vec![0.0f32; n * nb];
+            let mut test_quants = vec![0i8; n * dim];
+            quantize_rows(&mat, dim, n, &mut test_scales, &mut test_quants);
+
+            assert_eq!(
+                test_scales, ref_scales,
+                "quantize_rows scales mismatch for n={n}, dim={dim}"
+            );
+            assert_eq!(
+                test_quants, ref_quants,
+                "quantize_rows quants mismatch for n={n}, dim={dim}"
+            );
+        }
     }
 }
 
@@ -3920,43 +3960,5 @@ mod repack_flag_tests {
             col_out.iter().any(|&v| v != 7.0),
             "column dispatch wrote nothing"
         );
-    }
-
-    #[test]
-    fn quantize_rows_parallel_matches_serial() {
-        let dim = 256usize;
-        let nb = dim / 32;
-        for n in [1usize, 16, 255, 256, 275, 512] {
-            let mut st = 0x1234_5678u64 ^ (n as u64);
-            let mut lcg = || {
-                st = st.wrapping_mul(6364136223846793005).wrapping_add(1);
-                ((st >> 33) as f32) / ((1u32 << 31) as f32) - 0.5
-            };
-            let mat: Vec<f32> = (0..n * dim).map(|_| lcg() * 10.0).collect();
-
-            let mut ref_scales = vec![0.0f32; n * nb];
-            let mut ref_quants = vec![0i8; n * dim];
-            for j in 0..n {
-                let tok_f32 = &mat[j * dim..(j + 1) * dim];
-                cpu::quantize_f32_to_q8_0_into(
-                    tok_f32,
-                    &mut ref_scales[j * nb..(j + 1) * nb],
-                    &mut ref_quants[j * dim..(j + 1) * dim],
-                );
-            }
-
-            let mut test_scales = vec![0.0f32; n * nb];
-            let mut test_quants = vec![0i8; n * dim];
-            quantize_rows(&mat, dim, n, &mut test_scales, &mut test_quants);
-
-            assert_eq!(
-                test_scales, ref_scales,
-                "quantize_rows scales mismatch for n={n}, dim={dim}"
-            );
-            assert_eq!(
-                test_quants, ref_quants,
-                "quantize_rows quants mismatch for n={n}, dim={dim}"
-            );
-        }
     }
 }

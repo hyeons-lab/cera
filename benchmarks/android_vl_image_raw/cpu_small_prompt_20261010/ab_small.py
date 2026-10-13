@@ -16,6 +16,9 @@ AP_MAX_C = 30.0
 CERA = "/data/local/tmp/cmp-cera"
 OLD = os.environ.get("OLD", "cera-ttft")
 NEW = os.environ.get("NEW", "cera-smallp")
+for name, b in [("OLD", OLD), ("NEW", NEW)]:
+    if not re.match(r"^[a-zA-Z0-9_.-]+$", b):
+        sys.exit(f"error: invalid binary name in {name}: {b!r}")
 MODELS = [
     ("llama-3.2-1b-q4_0", "Llama-3.2-1B-Q4_0.gguf"),
     ("lfm2.5-vl-450m-q4_0", "LFM2.5-VL-450M-Q4_0.gguf"),
@@ -24,7 +27,7 @@ MODELS = [
     ("lfm2.5-2.6b-agent-q4_0", "agent-q4_0.gguf"),
     ("lfm2.5-2.6b-q5_k_m", "LFM2.5-2.6B-Q5_K_M.gguf"),
 ]
-NS = [int(x) for x in os.environ.get("NS", "16,64,512").split(",")]
+NS = [int(x.strip()) for x in os.environ.get("NS", "16,64,512").split(",") if x.strip()]
 def sh(cmd, timeout=900):
     r = subprocess.run(
         ["adb", "-s", SERIAL, "shell", cmd],
@@ -73,9 +76,16 @@ def ttft(binary, gguf, n):
     return float(m.group(1))
 
 
+only_models = (
+    {x.strip() for x in os.environ["ONLY"].split(",") if x.strip()}
+    if os.environ.get("ONLY")
+    else None
+)
+
 for rep in range(REPS):
     for label, gguf in MODELS:
-        if os.environ.get("ONLY") and label not in os.environ["ONLY"].split(","): continue
+        if only_models and label not in only_models:
+            continue
         for n in NS:
             order = [OLD, NEW] if (rep + n) % 2 == 0 else [NEW, OLD]
             for b in order:

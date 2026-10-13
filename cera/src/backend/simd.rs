@@ -12374,8 +12374,9 @@ pub(crate) mod neon {
         /// Small-prompt behavior of the column-major smmla Q4_0 GEMM the dense (`llama.rs`) prefill uses
         /// (`gemm_preq`): time per call at 8 to 512 tokens on the Llama-3.2-1B shapes, with the weights
         /// streamed from DRAM (a rotation of copies, >= 96 MB) and with one cache-resident copy, so weight
-        /// traffic can be told from compute and dispatch cost. Prints achieved TOPS and GB/s of the int8
-        /// repack. `cera_tests dense_small_n_microbench --ignored --nocapture --test-threads=1` on a device.
+        /// traffic can be told from compute and dispatch cost. Activations are pre-quantized into the
+        /// packed layout expected by the kernel. Prints achieved TOPS and GB/s of the int8 repack.
+        /// `cera_tests dense_small_n_microbench --ignored --nocapture --test-threads=1` on a device.
         #[test]
         #[ignore = "microbenchmark: run explicitly on a device"]
         #[cfg(not(has_blas))]
@@ -12393,7 +12394,7 @@ pub(crate) mod neon {
                 let (a, _, _) = random_q4_0_prefill_case(&mut st, m, 1, k);
                 let (packed, scales) = crate::backend::cpu::repack_q4_0_smmla_8x8(&a, m, k);
                 let nb = k / 32;
-                let cold_copies = (96usize << 20).div_ceil(packed.len()).max(2);
+                let cold_copies = (96usize << 20).div_ceil(packed.len().max(1)).max(2);
                 let ws: Vec<(Vec<u8>, Vec<f32>)> = (0..cold_copies)
                     .map(|_| (packed.clone(), scales.clone()))
                     .collect();

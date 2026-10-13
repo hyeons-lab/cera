@@ -555,7 +555,7 @@ ms outside the GEMMs: the RMSNorms, the RoPE and KV append and the activation qu
 narrow to `ceil(n / 8)` tokens so a short prompt is eight work items, and `quantize_columns` fans out from 8 columns. `quantize_rows` (the
 LFM2 path) costs about 20 us for 16 tokens, so it stays serial below 64: lowering it too made the 2.6B Agent Q4_0 13% slower at 16
 tokens. Time to first token, before to after (ms, p50, 4 alternating repetitions,
-`android_vl_image_raw/cpu_small_prompt_20261010/ab_passes2.jsonl`; the 512-token rows are unchanged within noise):
+`android_vl_image_raw/cpu_small_prompt_20261010/ab_passes2.jsonl`; the 512-token rows in `ab_passes.jsonl` are unchanged within noise):
 
 | Model | 16 tokens | 64 tokens |
 |---|---:|---:|
