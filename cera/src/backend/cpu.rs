@@ -458,6 +458,26 @@ pub fn par_range(total_rows: usize, _min_rows: usize, f: impl Fn(usize, usize) +
     f(0, total_rows);
 }
 
+/// Default worker cap policy for prefill passes given token sequence length `n`:
+/// 4 workers up to 4 tokens, and the whole pool (`usize::MAX`) above that.
+#[inline]
+pub fn default_prefill_threads_for_tokens(n: usize) -> usize {
+    if n <= 4 { 4 } else { usize::MAX }
+}
+
+/// Evaluates the worker cap for `n` tokens given an optional explicit thread count override.
+#[inline]
+pub(crate) fn prefill_threads_for_tokens_policy(
+    n: usize,
+    override_threads: Option<usize>,
+) -> usize {
+    if let Some(threads) = override_threads {
+        threads.max(1)
+    } else {
+        default_prefill_threads_for_tokens(n)
+    }
+}
+
 /// Target worker cap for prefill passes given token sequence length `n`: 4 workers up to 4 tokens, the whole
 /// pool above that. Overridable with `CERA_SMALL_PROMPT_THREADS`, which replaces the cap for every `n`.
 ///
@@ -469,15 +489,9 @@ pub fn par_range(total_rows: usize, _min_rows: usize, f: impl Fn(usize, usize) +
 /// tokens up. Below that the work is a few tens of microseconds and the pool size makes no difference.
 pub fn prefill_threads_for_tokens(n: usize) -> usize {
     static OVERRIDE: std::sync::OnceLock<Option<usize>> = std::sync::OnceLock::new();
-    let override_val = OVERRIDE.get_or_init(|| {
-        std::env::var("CERA_SMALL_PROMPT_THREADS")
-            .ok()
-            .and_then(|v| v.trim().parse::<usize>().ok())
-    });
-    if let Some(threads) = *override_val {
-        return threads.max(1);
-    }
-    if n <= 4 { 4 } else { usize::MAX }
+    let override_val =
+        OVERRIDE.get_or_init(|| super::cpu_features::env_usize("CERA_SMALL_PROMPT_THREADS"));
+    prefill_threads_for_tokens_policy(n, *override_val)
 }
 
 /// Row-parallel range dispatch for prefill passes with an active worker cap: executes
@@ -13607,15 +13621,23 @@ mod tests {
     /// up uses the whole pool (the old 2/4-worker steps cost 16% to 45% of TTFT at 16 to 64 tokens).
     #[test]
     fn small_prompt_worker_cap_defaults_to_the_whole_pool_above_four_tokens() {
-        if std::env::var_os("CERA_SMALL_PROMPT_THREADS").is_some() {
-            return; // an explicit override replaces the policy for every n
-        }
-        for n in 1..=4 {
-            assert_eq!(prefill_threads_for_tokens(n), 4, "n={n}");
+        for n in 0..=4 {
+            assert_eq!(prefill_threads_for_tokens_policy(n, None), 4, "n={n}");
         }
         for n in [5usize, 8, 16, 32, 33, 64, 65, 512, 4096] {
-            assert_eq!(prefill_threads_for_tokens(n), usize::MAX, "n={n}");
+            assert_eq!(
+                prefill_threads_for_tokens_policy(n, None),
+                usize::MAX,
+                "n={n}"
+            );
         }
+    }
+
+    #[test]
+    fn small_prompt_worker_cap_override_pins_thread_count() {
+        assert_eq!(prefill_threads_for_tokens_policy(2, Some(8)), 8);
+        assert_eq!(prefill_threads_for_tokens_policy(64, Some(8)), 8);
+        assert_eq!(prefill_threads_for_tokens_policy(16, Some(0)), 1);
     }
 
     #[test]

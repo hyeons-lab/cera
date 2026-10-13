@@ -12325,7 +12325,7 @@ pub(crate) mod neon {
                 let (a, _, _) = random_q4_0_prefill_case(&mut st, m, 1, k);
                 let (packed, scales) = crate::backend::cpu::repack_q4_0_smmla_8x8(&a, m, k);
                 let nb = k / 32;
-                let cold_copies = (96usize << 20).div_ceil(packed.len()).max(2);
+                let cold_copies = (96usize << 20).div_ceil(packed.len().max(1)).max(2);
                 let ws: Vec<(Vec<u8>, Vec<f32>)> = (0..cold_copies)
                     .map(|_| (packed.clone(), scales.clone()))
                     .collect();
