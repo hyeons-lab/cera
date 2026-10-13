@@ -481,7 +481,7 @@ it 2x slower (the standalone loop vectorizes `expf`, the tile gather does not).
 
 What is left: dense Llama decode is 0.87x of llama.cpp (the Q4_0 `dec4` path, not touched here), the Q4_K_M and
 Q5_K_M decodes are about 0.9x, and the fused QKV `concat3` K-quant kernels keep the old scalar arithmetic. Reproduce with
-`cpu_stack_20261010/ab_stack.py` (`SERIAL=<adb serial> ab_stack.py OUT ROUNDS`, binaries `cera-base` and `cera-top` in
+`android_vl_image_raw/cpu_stack_20261010/ab_stack.py` (`SERIAL=<adb serial> ab_stack.py OUT ROUNDS`, binaries `cera-base` and `cera-top` in
 `/data/local/tmp/cmp-cera`), `CERA_PROFILE_PREFILL=1`, and the ignored `dense_gemm_gops_microbench` and
 `decode_gemv_microbench` tests.
 
