@@ -51,7 +51,7 @@ impl ModalitySink for StdoutSink<'_> {
     fn on_done(&mut self, _reason: FinishReason) {}
 }
 
-/// Swallows every event except the arrival time of the first text token. Used by `bench` to avoid
+/// Swallows every event except the arrival time of the first text token or audio frame. Used by `bench` to avoid
 /// stdout inside the timed loop while still reporting the time to first token.
 #[derive(Default)]
 struct FirstTokenSink {
@@ -61,6 +61,11 @@ struct FirstTokenSink {
 impl ModalitySink for FirstTokenSink {
     fn on_text_tokens(&mut self, tokens: &[u32]) {
         if self.first_token_at.is_none() && !tokens.is_empty() {
+            self.first_token_at = Some(std::time::Instant::now());
+        }
+    }
+    fn on_audio_frames(&mut self, pcm: &[f32], _sample_rate: u32) {
+        if self.first_token_at.is_none() && !pcm.is_empty() {
             self.first_token_at = Some(std::time::Instant::now());
         }
     }
@@ -6423,6 +6428,9 @@ fn main() -> Result<()> {
             draft_model,
         } => {
             anyhow::ensure!(runs >= 1, "--runs must be >= 1");
+            if let Some(n) = prompt_tokens {
+                anyhow::ensure!(n >= 1, "--prompt-tokens must be >= 1");
+            }
             if spec || draft_model.is_some() {
                 anyhow::ensure!(spec_ngram >= 1, "--spec-ngram must be >= 1");
                 anyhow::ensure!(spec_k >= 1, "--spec-k must be >= 1");
@@ -6611,11 +6619,13 @@ fn main() -> Result<()> {
                 } else {
                     0.0
                 };
-                let ttft_ms = sink
-                    .first_token_at
-                    .map_or(prefill_elapsed, |t| t.duration_since(prefill_start))
-                    .as_secs_f64()
-                    * 1e3;
+                let ttft_ms = if max_tokens == 0 {
+                    prefill_elapsed.as_secs_f64() * 1e3
+                } else if let Some(t) = sink.first_token_at {
+                    t.saturating_duration_since(prefill_start).as_secs_f64() * 1e3
+                } else {
+                    0.0
+                };
                 Ok(RunStats {
                     prefill_tps,
                     decode_tps,
@@ -6670,7 +6680,7 @@ fn main() -> Result<()> {
             let mut prev_pool = cera::backend::threadpool::stats::snapshot();
             for i in 0..runs {
                 let r = run_once()?;
-                let (pf, dc) = (r.prefill_tps, r.decode_tps);
+                let (pf, dc, ttft) = (r.prefill_tps, r.decode_tps, r.ttft_ms);
                 let suffix = match sample_headroom() {
                     Some(h) => {
                         headrooms.push(h);
@@ -6692,10 +6702,9 @@ fn main() -> Result<()> {
                     String::new()
                 };
                 eprintln!(
-                    "run {}/{}: prefill={pf:.0} decode={dc:.1} tok/s ttft={:.0} ms{suffix}{pool_suffix}",
+                    "run {}/{}: prefill={pf:.0} decode={dc:.1} tok/s ttft={ttft:.0} ms{suffix}{pool_suffix}",
                     i + 1,
-                    runs,
-                    r.ttft_ms
+                    runs
                 );
                 ttft_ms.push(r.ttft_ms);
                 decode_tps.push(dc);
@@ -9369,8 +9378,8 @@ mod tests {
         }
     }
 
-    /// `bench` stamps the first text token's arrival for TTFT: empty batches must not count, the
-    /// first non-empty one must, and later ones must not move it.
+    /// `bench` stamps the first text token or audio frame arrival for TTFT: empty batches must not
+    /// count, the first non-empty one must, and later ones must not move it.
     #[test]
     fn first_token_sink_records_only_the_first_nonempty_batch() {
         use super::{FirstTokenSink, ModalitySink};
@@ -9382,5 +9391,27 @@ mod tests {
         std::thread::sleep(std::time::Duration::from_millis(2));
         sink.on_text_tokens(&[8, 9]);
         assert_eq!(sink.first_token_at, Some(first));
+
+        let mut audio_sink = FirstTokenSink::default();
+        audio_sink.on_audio_frames(&[], 16000);
+        assert!(audio_sink.first_token_at.is_none());
+        audio_sink.on_audio_frames(&[0.1, -0.2], 16000);
+        let first_audio = audio_sink
+            .first_token_at
+            .expect("recorded on first audio frame");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        audio_sink.on_audio_frames(&[0.3], 16000);
+        assert_eq!(audio_sink.first_token_at, Some(first_audio));
+    }
+
+    #[test]
+    fn summarize_calculates_percentiles_and_moments() {
+        use super::summarize;
+        let (p10, p50, p90, mean, stddev) = summarize(vec![10.0, 20.0, 30.0, 40.0, 50.0]);
+        assert_eq!(p10, 10.0);
+        assert_eq!(p50, 30.0);
+        assert_eq!(p90, 50.0);
+        assert_eq!(mean, 30.0);
+        assert!((stddev - 14.1421356).abs() < 1e-4);
     }
 }
