@@ -1556,38 +1556,59 @@ pub(crate) fn rmsnorm_columns(
     hs: usize,
     n: usize,
 ) {
+    let total_elems = hs
+        .checked_mul(n)
+        .expect("rmsnorm_columns: dimension overflow");
     assert!(
-        src.len() >= hs * n && dst.len() >= hs * n && weight.len() >= hs,
+        src.len() >= total_elems && dst.len() >= total_elems && weight.len() >= hs,
         "rmsnorm_columns: buffers too small for hs={hs}, n={n}"
     );
     if hs == 0 || n == 0 {
         return;
     }
+    if n == 1 {
+        dst[..hs].copy_from_slice(&src[..hs]);
+        cpu::rmsnorm(&mut dst[..hs], weight, eps);
+        return;
+    }
+    thread_local! {
+        static RMSNORM_COL_SCRATCH: std::cell::RefCell<Vec<f32>> =
+            const { std::cell::RefCell::new(Vec::new()) };
+    }
     let dst_ptr = dst.as_mut_ptr() as usize;
     let n_tiles = n.div_ceil(RMSNORM_COL_TILE);
     cpu::par_range_prefill(n_tiles, 1, move |tile0, n_items| {
-        let mut buf = vec![0.0f32; hs * RMSNORM_COL_TILE];
-        let dst = dst_ptr as *mut f32;
-        for tile in tile0..tile0 + n_items {
-            let j0 = tile * RMSNORM_COL_TILE;
-            let nc = RMSNORM_COL_TILE.min(n - j0);
-            for i in 0..hs {
-                let row = &src[i * n + j0..i * n + j0 + nc];
-                for (c, &v) in row.iter().enumerate() {
-                    buf[c * hs + i] = v;
+        RMSNORM_COL_SCRATCH.with(|cell| {
+            let mut cell = cell.borrow_mut();
+            let needed = hs
+                .checked_mul(RMSNORM_COL_TILE)
+                .expect("rmsnorm_columns: scratch buffer overflow");
+            if cell.len() < needed {
+                cell.resize(needed, 0.0);
+            }
+            let buf = &mut cell[..needed];
+            let dst = dst_ptr as *mut f32;
+            for tile in tile0..tile0 + n_items {
+                let j0 = tile * RMSNORM_COL_TILE;
+                let nc = RMSNORM_COL_TILE.min(n - j0);
+                for i in 0..hs {
+                    let row = &src[i * n + j0..i * n + j0 + nc];
+                    for (c, &v) in row.iter().enumerate() {
+                        buf[c * hs + i] = v;
+                    }
                 }
-            }
-            for c in 0..nc {
-                cpu::rmsnorm(&mut buf[c * hs..(c + 1) * hs], weight, eps);
-            }
-            for i in 0..hs {
                 for c in 0..nc {
-                    // SAFETY: `i * n + j0 + c < hs * n <= dst.len()`, and tiles own
-                    // disjoint column ranges, so no two items write the same element.
-                    unsafe { *dst.add(i * n + j0 + c) = buf[c * hs + i] };
+                    cpu::rmsnorm(&mut buf[c * hs..(c + 1) * hs], weight, eps);
+                }
+                for i in 0..hs {
+                    for c in 0..nc {
+                        // SAFETY: `i * n + j0 + c < hs * n <= dst.len()`, and tiles own
+                        // disjoint column ranges, so no two items write the same element.
+                        unsafe { *dst.add(i * n + j0 + c) = buf[c * hs + i] };
+                    }
                 }
             }
-        }
+        });
     });
 }
 
@@ -1612,6 +1633,9 @@ pub(crate) fn quantize_columns(
     scales: &mut [f32],
     quants: &mut [i8],
 ) {
+    if dim == 0 || n == 0 {
+        return;
+    }
     // Q8_0 packs 32-element blocks; `dim` must divide evenly (else the tail is
     // silently dropped by `dim / 32`). Assert alignment + scratch capacity at the
     // top so misuse is caught before the unsafe NEON quantizer runs.
@@ -1619,11 +1643,17 @@ pub(crate) fn quantize_columns(
         dim.is_multiple_of(32),
         "quantize_columns: dim ({dim}) must be a multiple of 32"
     );
+    let total_elems = dim
+        .checked_mul(n)
+        .expect("quantize_columns: dimension overflow");
+    let total_scales = (dim / 32)
+        .checked_mul(n)
+        .expect("quantize_columns: scales overflow");
     assert!(
-        mat.len() >= dim * n
+        mat.len() >= total_elems
             && col.len() >= dim
-            && scales.len() >= n * (dim / 32)
-            && quants.len() >= n * dim,
+            && scales.len() >= total_scales
+            && quants.len() >= total_elems,
         "quantize_columns: scratch too small for dim={dim}, n={n}",
     );
     let nb = dim / 32;
@@ -2853,7 +2883,7 @@ pub(crate) fn forward_ffn_block(
     }
 }
 
-#[cfg(all(test, target_arch = "aarch64", not(has_blas), feature = "parallel"))]
+#[cfg(all(test, feature = "parallel"))]
 mod tests {
     fn gguf_with_one_quantized_tensor(dims: Vec<u64>, nbytes: usize) -> GgufFile {
         use crate::convert::writer::{GGML_TYPE_Q4_K, GgufWriter};
@@ -2927,6 +2957,7 @@ mod tests {
 
     /// `rmsnorm_columns` must equal the gather / `cpu::rmsnorm` / scatter loop it
     /// replaced, byte for byte, including a ragged tail tile and `n` smaller than a tile.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
     #[test]
     fn rmsnorm_columns_matches_per_column_reference() {
         let mut st = 0x1234_5678_9ABC_DEF0u64;
@@ -2937,7 +2968,10 @@ mod tests {
             ((st >> 33) as f32 / (1u64 << 31) as f32) * 4.0 - 2.0
         };
         for (hs, n) in [
-            (96usize, 1usize),
+            (0usize, 0usize),
+            (0, 5),
+            (96, 0),
+            (96, 1),
             (96, 5),
             (96, 16),
             (96, 37),
@@ -2973,6 +3007,7 @@ mod tests {
     /// only way the fan-out can differ is a wiring bug (a column written to the
     /// wrong `scales`/`quants` slice); this asserts it away at a column count
     /// above `prequant_par_min_cols()`, so the parallel branch is the one exercised.
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     #[test]
     fn quantize_columns_parallel_matches_serial() {
         // All at or above the 256-column parallel threshold: 256 and 512 fill whole
@@ -2982,6 +3017,7 @@ mod tests {
         }
     }
 
+    #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
     fn quantize_columns_matches_serial_at(dim: usize, n: usize) {
         // `n` ≥ prequant_par_min_cols() → the parallel branch runs.
         let nb = dim / 32;

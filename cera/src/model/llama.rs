@@ -210,6 +210,11 @@ thread_local! {
     static PROJECT_LOGITS_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
+thread_local! {
+    static PASS_A_SCRATCH: std::cell::RefCell<(Vec<f32>, Vec<f32>, Vec<f32>)> =
+        const { std::cell::RefCell::new((Vec::new(), Vec::new(), Vec::new())) };
+}
+
 /// Force the batched LM-head projection to decline, for A/B measurement.
 ///
 /// `CERA_LM_HEAD_NO_GEMM=1` puts the projection back on the per-row loop the
@@ -255,7 +260,9 @@ const PREFILL_PHASES: [&str; 11] = [
 impl PrefillProf {
     fn new() -> Self {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        let on = *ENABLED.get_or_init(|| std::env::var_os("CERA_PROFILE_PREFILL").is_some());
+        let on = *ENABLED.get_or_init(|| {
+            std::env::var("CERA_PROFILE_PREFILL").is_ok_and(|v| v != "0" && !v.is_empty())
+        });
         Self {
             on,
             last: crate::time::Instant::now(),
@@ -2453,23 +2460,14 @@ impl LlamaModel {
             // Attention pre-norm: rmsnorm each column (PreNorm only).
             let normed_input: &[f32] = match self.norm_order {
                 NormOrder::PreNorm => {
-                    if n == 1 {
-                        normed[..hs].copy_from_slice(&hidden[..hs]);
-                        cpu::rmsnorm(
-                            &mut normed[..hs],
-                            &self.attn_norm_weights[layer],
-                            cfg.rms_norm_eps,
-                        );
-                    } else {
-                        transformer::rmsnorm_columns(
-                            &hidden,
-                            &mut normed,
-                            &self.attn_norm_weights[layer],
-                            cfg.rms_norm_eps,
-                            hs,
-                            n,
-                        );
-                    }
+                    transformer::rmsnorm_columns(
+                        &hidden,
+                        &mut normed,
+                        &self.attn_norm_weights[layer],
+                        cfg.rms_norm_eps,
+                        hs,
+                        n,
+                    );
                     &normed
                 }
                 NormOrder::PostNorm => &hidden,
@@ -2723,12 +2721,16 @@ impl LlamaModel {
             };
             // `resize` keeps the old `extend` contract (rows land at the end of the
             // cache) while giving each worker a disjoint, already-initialized span.
+            let new_kv_len = n
+                .checked_mul(kv_dim)
+                .and_then(|tot| kv_base.checked_add(tot))
+                .expect("dense prefill: kv cache length overflow");
             if use_f16 {
-                key_cache_f16.resize(kv_base + n * kv_dim, 0);
-                value_cache_f16.resize(kv_base + n * kv_dim, 0);
+                key_cache_f16.resize(new_kv_len, 0);
+                value_cache_f16.resize(new_kv_len, 0);
             } else {
-                key_cache.resize(kv_base + n * kv_dim, 0.0);
-                value_cache.resize(kv_base + n * kv_dim, 0.0);
+                key_cache.resize(new_kv_len, 0.0);
+                value_cache.resize(new_kv_len, 0.0);
             }
             let q_mat_ptr = q_mat.as_mut_ptr() as usize;
             let kc32 = key_cache.as_mut_ptr() as usize;
@@ -2738,62 +2740,77 @@ impl LlamaModel {
             let (k_src, v_src) = (&k_mat[..], &v_mat[..]);
             cpu::par_range_prefill(n.div_ceil(TILE), 1, |tile0, n_tiles| {
                 let q_mat = q_mat_ptr as *mut f32;
-                let mut qb = vec![0.0f32; TILE * q_dim];
-                let mut kb = vec![0.0f32; TILE * kv_dim];
-                let mut vb = vec![0.0f32; TILE * kv_dim];
-                for tile in tile0..tile0 + n_tiles {
-                    let j0 = tile * TILE;
-                    let nc = TILE.min(n - j0);
-                    for i in 0..q_dim {
-                        for c in 0..nc {
-                            // SAFETY: `i * n + j0 + c < q_dim * n`; tiles own disjoint columns.
-                            qb[c * q_dim + i] = unsafe { *q_mat.add(i * n + j0 + c) };
-                        }
+                PASS_A_SCRATCH.with(|sc| {
+                    let mut sc = sc.borrow_mut();
+                    let (qb_vec, kb_vec, vb_vec) = &mut *sc;
+                    let q_len = TILE * q_dim;
+                    let kv_len = TILE * kv_dim;
+                    if qb_vec.len() < q_len {
+                        qb_vec.resize(q_len, 0.0);
                     }
-                    for i in 0..kv_dim {
-                        for c in 0..nc {
-                            kb[c * kv_dim + i] = k_src[i * n + j0 + c];
-                            vb[c * kv_dim + i] = v_src[i * n + j0 + c];
-                        }
+                    if kb_vec.len() < kv_len {
+                        kb_vec.resize(kv_len, 0.0);
                     }
-                    for c in 0..nc {
-                        let j = j0 + c;
-                        let q = &mut qb[c * q_dim..(c + 1) * q_dim];
-                        let k = &mut kb[c * kv_dim..(c + 1) * kv_dim];
-                        let v = &mut vb[c * kv_dim..(c + 1) * kv_dim];
-                        process(start_pos + j, q, k, v);
-                        let row = kv_base + j * kv_dim;
-                        // SAFETY: row `kv_base + j * kv_dim` was sized by the `resize` above and
-                        // is written only by the tile that owns token `j`.
-                        unsafe {
-                            if use_f16 {
-                                let (dk, dv) =
-                                    ((kc16 as *mut u16).add(row), (vc16 as *mut u16).add(row));
-                                for i in 0..kv_dim {
-                                    *dk.add(i) = crate::quant::f32_to_f16(k[i]);
-                                    *dv.add(i) = crate::quant::f32_to_f16(v[i]);
+                    if vb_vec.len() < kv_len {
+                        vb_vec.resize(kv_len, 0.0);
+                    }
+                    let qb = &mut qb_vec[..q_len];
+                    let kb = &mut kb_vec[..kv_len];
+                    let vb = &mut vb_vec[..kv_len];
+                    for tile in tile0..tile0 + n_tiles {
+                        let j0 = tile * TILE;
+                        let nc = TILE.min(n - j0);
+                        for i in 0..q_dim {
+                            for c in 0..nc {
+                                // SAFETY: `i * n + j0 + c < q_dim * n`; tiles own disjoint columns.
+                                qb[c * q_dim + i] = unsafe { *q_mat.add(i * n + j0 + c) };
+                            }
+                        }
+                        for i in 0..kv_dim {
+                            for c in 0..nc {
+                                kb[c * kv_dim + i] = k_src[i * n + j0 + c];
+                                vb[c * kv_dim + i] = v_src[i * n + j0 + c];
+                            }
+                        }
+                        for c in 0..nc {
+                            let j = j0 + c;
+                            let q = &mut qb[c * q_dim..(c + 1) * q_dim];
+                            let k = &mut kb[c * kv_dim..(c + 1) * kv_dim];
+                            let v = &mut vb[c * kv_dim..(c + 1) * kv_dim];
+                            process(start_pos + j, q, k, v);
+                            let row = kv_base + j * kv_dim;
+                            // SAFETY: row `kv_base + j * kv_dim` was sized by the `resize` above and
+                            // is written only by the tile that owns token `j`.
+                            unsafe {
+                                if use_f16 {
+                                    let (dk, dv) =
+                                        ((kc16 as *mut u16).add(row), (vc16 as *mut u16).add(row));
+                                    for i in 0..kv_dim {
+                                        *dk.add(i) = crate::quant::f32_to_f16(k[i]);
+                                        *dv.add(i) = crate::quant::f32_to_f16(v[i]);
+                                    }
+                                } else {
+                                    core::ptr::copy_nonoverlapping(
+                                        k.as_ptr(),
+                                        (kc32 as *mut f32).add(row),
+                                        kv_dim,
+                                    );
+                                    core::ptr::copy_nonoverlapping(
+                                        v.as_ptr(),
+                                        (vc32 as *mut f32).add(row),
+                                        kv_dim,
+                                    );
                                 }
-                            } else {
-                                core::ptr::copy_nonoverlapping(
-                                    k.as_ptr(),
-                                    (kc32 as *mut f32).add(row),
-                                    kv_dim,
-                                );
-                                core::ptr::copy_nonoverlapping(
-                                    v.as_ptr(),
-                                    (vc32 as *mut f32).add(row),
-                                    kv_dim,
-                                );
+                            }
+                        }
+                        for i in 0..q_dim {
+                            for c in 0..nc {
+                                // SAFETY: as above; this tile's columns are written by this tile only.
+                                unsafe { *q_mat.add(i * n + j0 + c) = qb[c * q_dim + i] };
                             }
                         }
                     }
-                    for i in 0..q_dim {
-                        for c in 0..nc {
-                            // SAFETY: as above; this tile's columns are written by this tile only.
-                            unsafe { *q_mat.add(i * n + j0 + c) = qb[c * q_dim + i] };
-                        }
-                    }
-                }
+                });
             });
 
             prof.lap(2);
@@ -2861,9 +2878,11 @@ impl LlamaModel {
                 let max_active = cpu::prefill_threads_for_tokens(n);
                 // Work items of one head x 32 queries where the NEON range kernel applies (so the
                 // pool can balance fast and slow cores); otherwise one item per head, as before.
+                let is_causal = self.config.is_causal
+                    && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
                 if !cpu::flash_attention_prefill_items(
                     q_ref, k_cache, v_cache, flash_buf, n_heads, group_size, n, kv_dim, head_dim,
-                    scale, start_pos, true, max_active,
+                    scale, start_pos, is_causal, max_active,
                 ) {
                     cpu::par_rows_n_chunked_active(
                         flash_buf,
@@ -2873,7 +2892,7 @@ impl LlamaModel {
                         max_active,
                         |(h, chunk)| {
                             let kv_h = h / group_size;
-                            cpu::flash_attention_gqa_cpu(
+                            cpu::flash_attention_gqa_cpu_opt(
                                 q_ref,
                                 k_cache,
                                 v_cache,
@@ -2887,6 +2906,7 @@ impl LlamaModel {
                                 head_dim,
                                 scale,
                                 start_pos,
+                                is_causal,
                             );
                         },
                     );
@@ -3038,23 +3058,14 @@ impl LlamaModel {
             // FFN pre-norm: rmsnorm each column (PreNorm only).
             let ffn_in: &[f32] = match self.norm_order {
                 NormOrder::PreNorm => {
-                    if n == 1 {
-                        ffn_input[..hs].copy_from_slice(&hidden[..hs]);
-                        cpu::rmsnorm(
-                            &mut ffn_input[..hs],
-                            &self.ffn_norm_weights[layer],
-                            cfg.rms_norm_eps,
-                        );
-                    } else {
-                        transformer::rmsnorm_columns(
-                            &hidden,
-                            &mut ffn_input,
-                            &self.ffn_norm_weights[layer],
-                            cfg.rms_norm_eps,
-                            hs,
-                            n,
-                        );
-                    }
+                    transformer::rmsnorm_columns(
+                        &hidden,
+                        &mut ffn_input,
+                        &self.ffn_norm_weights[layer],
+                        cfg.rms_norm_eps,
+                        hs,
+                        n,
+                    );
                     &ffn_input
                 }
                 NormOrder::PostNorm => &hidden,
@@ -3064,6 +3075,7 @@ impl LlamaModel {
             // FFN gate/up GEMM → silu(gate)⊙up → down GEMM.
             #[cfg(has_blas)]
             {
+                prof.lap(6);
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
                     &refs.ffn_gate,
@@ -3161,6 +3173,7 @@ impl LlamaModel {
 
             #[cfg(has_blas)]
             {
+                prof.lap(9);
                 transformer::try_blas_prefill_gemm(
                     &self.gguf,
                     &refs.ffn_down,
@@ -3183,7 +3196,6 @@ impl LlamaModel {
                     &mut bq_quants,
                 );
                 prof.lap(9);
-                let t_dn = crate::time::Instant::now();
                 transformer::gemm_preq(
                     &self.gguf,
                     &refs.ffn_down,
@@ -3194,12 +3206,6 @@ impl LlamaModel {
                     n,
                     is,
                 );
-                if prof.on {
-                    eprintln!(
-                        "DOWN layer {layer}: {:.2} ms",
-                        t_dn.elapsed().as_secs_f64() * 1e3
-                    );
-                }
             }
 
             // LoRA on the down projection - applied BEFORE the residual scale;

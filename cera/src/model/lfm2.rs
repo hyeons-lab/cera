@@ -2570,7 +2570,9 @@ impl LfmModel {
 
     fn profile_prefill_enabled() -> bool {
         static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        *ENABLED.get_or_init(|| std::env::var_os("CERA_PROFILE_PREFILL").is_some())
+        *ENABLED.get_or_init(|| {
+            std::env::var("CERA_PROFILE_PREFILL").is_ok_and(|v| v != "0" && !v.is_empty())
+        })
     }
 
     fn profile_decode_enabled() -> bool {
