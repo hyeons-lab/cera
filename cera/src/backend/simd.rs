@@ -10156,18 +10156,38 @@ pub(crate) mod neon {
         n: usize,
         k: usize,
     ) -> bool {
-        if !k_quant_gemm_available() || !k.is_multiple_of(256) {
+        if !k_quant_gemm_available() || k == 0 || !k.is_multiple_of(256) {
             return false;
         }
+        if m == 0 || n == 0 {
+            return true;
+        }
+        let blocks_per_row = k / 256;
+        let row_bytes = blocks_per_row * size_of::<BlockQ5K>();
         let nb = k / 32;
-        let mut col = vec![0.0f32; m];
+        if a_quant.len() < m * row_bytes
+            || b_scales.len() < n * nb
+            || b_quants.len() < n * k
+            || out.len() < m * n
+        {
+            return false;
+        }
+        let a_quant = &a_quant[..m * row_bytes];
+        let mut stack_col = [0.0f32; 4096];
+        let mut heap_col;
+        let col: &mut [f32] = if m <= 4096 {
+            &mut stack_col[..m]
+        } else {
+            heap_col = vec![0.0f32; m];
+            &mut heap_col
+        };
         for j in 0..n {
             unsafe {
                 gemv_q5k_q8_0_neon(
                     a_quant,
                     &b_scales[j * nb..(j + 1) * nb],
                     &b_quants[j * k..(j + 1) * k],
-                    &mut col,
+                    col,
                     m,
                     k,
                 );
@@ -12134,10 +12154,89 @@ pub(crate) mod neon {
             }
         }
 
+        /// Q5_K fallback GEMM must match the per-column GEMV bit for bit across dimensions,
+        /// including when the input weight slice contains trailing padding.
+        #[cfg(not(has_blas))]
+        #[test]
+        fn q5_k_fallback_gemm_matches_gemv() {
+            if !k_quant_gemm_available() {
+                return;
+            }
+            for (m, n, k) in [(16usize, 5usize, 256usize), (32, 9, 512), (24, 13, 1024)] {
+                let mut st = 0x5e5e_0001u64 ^ (m as u64) ^ ((n as u64) << 16) ^ ((k as u64) << 32);
+                let nb = k / 256;
+                let blocks: Vec<crate::quant::BlockQ5K> = (0..m * nb)
+                    .map(|_| {
+                        let mut b = crate::quant::BlockQ5K {
+                            d: crate::quant::f32_to_f16(0.001 + lcg(&mut st).abs() * 0.004),
+                            dmin: crate::quant::f32_to_f16(0.001 + lcg(&mut st).abs() * 0.004),
+                            scales: [0; 12],
+                            qh: [0; 32],
+                            qs: [0; 128],
+                        };
+                        for v in b
+                            .scales
+                            .iter_mut()
+                            .chain(b.qh.iter_mut())
+                            .chain(b.qs.iter_mut())
+                        {
+                            *v = (lcg(&mut st) * 127.0) as i32 as u8;
+                        }
+                        b
+                    })
+                    .collect();
+                let a = blocks_to_bytes(&blocks);
+                let bmat: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+                let mut b_scales = vec![0.0f32; n * (k / 32)];
+                let mut b_quants = vec![0i8; n * k];
+                crate::model::transformer::quantize_rows(&bmat, k, n, &mut b_scales, &mut b_quants);
+
+                // Reference: the GEMV per column.
+                let mut want = vec![0.0f32; m * n];
+                for j in 0..n {
+                    let mut y = vec![0.0f32; m];
+                    unsafe {
+                        gemv_q5k_q8_0_neon(
+                            &a,
+                            &b_scales[j * (k / 32)..(j + 1) * (k / 32)],
+                            &b_quants[j * k..(j + 1) * k],
+                            &mut y,
+                            m,
+                            k,
+                        );
+                    }
+                    for i in 0..m {
+                        want[i * n + j] = y[i];
+                    }
+                }
+
+                // Verify exact match against fallback GEMM.
+                let mut fb = vec![f32::NAN; m * n];
+                assert!(unsafe { gemm_q5_k_q8_0_neon(&a, &b_scales, &b_quants, &mut fb, m, n, k) });
+                assert_eq!(
+                    want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    fb.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "fallback GEMM m={m} n={n} k={k}"
+                );
+
+                // Padded weight slice must also succeed and match bit for bit.
+                let mut a_padded = a.clone();
+                a_padded.extend_from_slice(&[0u8; 128]);
+                let mut fb_padded = vec![f32::NAN; m * n];
+                assert!(unsafe {
+                    gemm_q5_k_q8_0_neon(&a_padded, &b_scales, &b_quants, &mut fb_padded, m, n, k)
+                });
+                assert_eq!(
+                    want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    fb_padded.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
+                    "fallback GEMM padded m={m} n={n} k={k}"
+                );
+            }
+        }
+
         /// Q5_K weights repacked into the Q4_K smmla layout (`repack_q5_k_smmla_8x8`) and run through
         /// the Q4_K smmla dispatch must agree with the Q5_K GEMV on every column, to f32 rounding
-        /// (the accumulation orders differ, the integer dots do not). Also pins the per-column GEMM
-        /// fallback to the GEMV bit for bit.
+        /// (the accumulation orders differ, the integer dots do not).
         #[cfg(not(has_blas))]
         #[test]
         fn q5_k_smmla_matches_gemv() {
@@ -12173,7 +12272,7 @@ pub(crate) mod neon {
                 let mut b_quants = vec![0i8; n * k];
                 crate::model::transformer::quantize_rows(&bmat, k, n, &mut b_scales, &mut b_quants);
 
-                // Reference: the GEMV per column; also the fallback GEMM, which must equal it exactly.
+                // Reference: the GEMV per column.
                 let mut want = vec![0.0f32; m * n];
                 for j in 0..n {
                     let mut y = vec![0.0f32; m];
@@ -12191,13 +12290,6 @@ pub(crate) mod neon {
                         want[i * n + j] = y[i];
                     }
                 }
-                let mut fb = vec![f32::NAN; m * n];
-                assert!(unsafe { gemm_q5_k_q8_0_neon(&a, &b_scales, &b_quants, &mut fb, m, n, k) });
-                assert_eq!(
-                    want.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                    fb.iter().map(|x| x.to_bits()).collect::<Vec<_>>(),
-                    "fallback GEMM m={m} n={n} k={k}"
-                );
 
                 let (packed, dsc, dmn) = crate::backend::cpu::repack_q5_k_smmla_8x8(&a, m, k);
                 let mut got = vec![f32::NAN; m * n];

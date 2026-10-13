@@ -2690,11 +2690,17 @@ pub(crate) fn repack_q4_k_smmla_8x8(
 
 /// Whether a Q5_K weight of `m x k` can take the smmla prefill path ([`repack_q5_k_smmla_8x8`]):
 /// the i8mm tier, whole 8-row super-rows and 256-aligned `k`.
-#[cfg(all(target_arch = "aarch64", not(has_blas)))]
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
 pub(crate) fn q5_k_smmla_repack_supported(m: usize, k: usize) -> bool {
-    super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm
+    let _ = (m, k);
+    #[cfg(target_arch = "aarch64")]
+    return m > 0
+        && k > 0
+        && super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm
         && m.is_multiple_of(8)
-        && k.is_multiple_of(256)
+        && k.is_multiple_of(256);
+    #[cfg(target_arch = "x86_64")]
+    return false;
 }
 
 /// Repack `m x k` Q5_K weights into the Q4_K smmla layout. A Q5_K value is `d*sc*q - dmin*mn` with
@@ -2746,21 +2752,41 @@ fn repack_k_smmla_8x8(
     sc_off: usize,
     quant: impl Fn(&[u8], usize, usize) -> u8,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
-    assert!(m.is_multiple_of(8), "{what}: m must be a multiple of 8");
-    assert!(k.is_multiple_of(256), "{what}: k must be a multiple of 256");
+    assert!(
+        m > 0 && m.is_multiple_of(8),
+        "{what}: m must be positive multiple of 8, got {m}"
+    );
+    assert!(
+        k > 0 && k.is_multiple_of(256),
+        "{what}: k must be positive multiple of 256, got {k}"
+    );
     let sb = k / 256;
     let nb32 = k / 32;
+    let total_blocks = m
+        .checked_mul(sb)
+        .expect("repack_k_smmla_8x8: total blocks overflow");
+    let expected_bytes = total_blocks
+        .checked_mul(bsz)
+        .expect("repack_k_smmla_8x8: expected bytes overflow");
     assert_eq!(
         src.len(),
-        m * sb * bsz,
+        expected_bytes,
         "{what}: src is {} bytes, need {} for {m}x{k}",
         src.len(),
-        m * sb * bsz,
+        expected_bytes,
     );
     let sr_count = m / 8;
-    let mut packed = vec![0u8; sr_count * nb32 * 256];
-    let mut dsc = vec![0.0f32; sr_count * nb32 * 8];
-    let mut dmn = vec![0.0f32; sr_count * nb32 * 8];
+    let packed_len = sr_count
+        .checked_mul(nb32)
+        .and_then(|x| x.checked_mul(256))
+        .expect("repack_k_smmla_8x8: packed len overflow");
+    let scales_len = sr_count
+        .checked_mul(nb32)
+        .and_then(|x| x.checked_mul(8))
+        .expect("repack_k_smmla_8x8: scales len overflow");
+    let mut packed = vec![0u8; packed_len];
+    let mut dsc = vec![0.0f32; scales_len];
+    let mut dmn = vec![0.0f32; scales_len];
 
     for sr in 0..sr_count {
         for bi in 0..sb {

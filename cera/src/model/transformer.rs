@@ -363,16 +363,7 @@ impl WeightRef {
             let qualifies = (self.dtype == DType::Q4_0
                 && cpu::q4_0_repack_supported(self.m, self.k))
                 || (self.dtype == DType::Q8_0 && cpu::q8_0_smmla_repack_supported(self.m, self.k))
-                || (self.dtype == DType::Q5KM && {
-                    #[cfg(target_arch = "aarch64")]
-                    {
-                        cpu::q5_k_smmla_repack_supported(self.m, self.k)
-                    }
-                    #[cfg(not(target_arch = "aarch64"))]
-                    {
-                        false
-                    }
-                })
+                || (self.dtype == DType::Q5KM && cpu::q5_k_smmla_repack_supported(self.m, self.k))
                 || (self.dtype == DType::Q4KM && cpu::q4_k_repack_supported(self.m, self.k))
                 || (self.dtype == DType::Q6K && cpu::q6_k_repack_supported(self.m, self.k))
                 || q41_qualifies;
@@ -613,14 +604,14 @@ mod gate_tests {
     /// is a clean fall back to per-token GEMV.
     #[test]
     fn k_quant_batched_gemm_requires_whole_superblocks() {
-        for k in [32usize, 128, 255, 257, 384] {
+        for k in [0usize, 32, 128, 255, 257, 384] {
             assert!(
                 !batched_gemm_supports(DType::Q4KM, k),
-                "Q4KM admitted k={k}, which is not a multiple of 256"
+                "Q4KM admitted k={k}, which is not a positive multiple of 256"
             );
             assert!(
                 !batched_gemm_supports(DType::Q6K, k),
-                "Q6K admitted k={k}, which is not a multiple of 256"
+                "Q6K admitted k={k}, which is not a positive multiple of 256"
             );
         }
         // The positive direction, so the test cannot pass by the gate being
@@ -675,10 +666,10 @@ mod gate_tests {
                 "Q5_K at k={k} must track whether a batched path exists"
             );
         }
-        for k in [32usize, 96, 128, 255, 257, 384] {
+        for k in [0usize, 32, 96, 128, 255, 257, 384] {
             assert!(
                 !batched_gemm_supports(DType::Q5KM, k),
-                "Q5_K admitted at k={k}, which is not a multiple of its 256-wide superblock"
+                "Q5_K admitted at k={k}, which is not a positive multiple of its 256-wide superblock"
             );
         }
     }
@@ -690,17 +681,25 @@ mod gate_tests {
     #[test]
     fn q5_k_admission_is_backed_by_the_dispatcher() {
         let (m, n, k) = (8usize, 3usize, 256usize);
-        let data = vec![0u8; m * (k / 256) * 176];
-        let b_scales = vec![0.0f32; n * (k / 32)];
-        let b_quants = vec![0i8; n * k];
+        let mut data = vec![0u8; m * (k / 256) * 176];
+        for blk in 0..m * (k / 256) {
+            let off = blk * 176;
+            let d_bits = crate::quant::f32_to_f16(0.05).to_le_bytes();
+            data[off..off + 2].copy_from_slice(&d_bits);
+            data[off + 4..off + 12].fill(0x15);
+            data[off + 16..off + 48].fill(0xAA);
+            data[off + 48..off + 176].fill(0x33);
+        }
+        let b_scales = vec![0.1f32; n * (k / 32)];
+        let b_quants = vec![1i8; n * k];
         let mut out = vec![f32::NAN; m * n];
         let ran =
             cpu::gemm_preq_dispatch(DType::Q5KM, &data, &b_scales, &b_quants, &mut out, m, n, k);
         assert_eq!(ran, batched_gemm_supports(DType::Q5KM, k));
         if ran {
             assert!(
-                out.iter().all(|v| *v == 0.0),
-                "dispatcher claimed to compute but left {out:?}"
+                out.iter().all(|v| v.is_finite() && *v != 0.0),
+                "dispatcher claimed to compute but left non-finite or zero values {out:?}"
             );
         }
     }
@@ -930,14 +929,15 @@ pub fn batched_gemm_supports(dtype: DType, k: usize) -> bool {
         // dequant+SGEMM BLAS path. Unlike the K-quants there is no 256-alignment
         // requirement: Q4_1 blocks are 32 wide.
         DType::Q4_1 => k_quant_gemm_available(),
-        DType::Q4KM | DType::Q6K => k_quant_gemm_available() && k.is_multiple_of(256),
+        DType::Q4KM | DType::Q6K => k > 0 && k_quant_gemm_available() && k.is_multiple_of(256),
         // Q5_K has no standard-layout int8 GEMM of its own: on aarch64 the i8mm repack feeds the
         // Q4_K smmla kernels (`repack_q5_k_smmla_8x8`), and a weight without that repack takes the
         // per-column GEMV fallback (`gemm_q5_k_q8_0_neon`), so it is admitted on the same predicate
         // as its siblings. x86 has no Q5_K kernel: `gemm_preq_dispatch` declines there, so this
         // stays BLAS-only off aarch64.
         DType::Q5KM => {
-            (cfg!(has_blas) || cfg!(target_arch = "aarch64"))
+            k > 0
+                && (cfg!(has_blas) || cfg!(target_arch = "aarch64"))
                 && k_quant_gemm_available()
                 && k.is_multiple_of(256)
         }
