@@ -533,6 +533,9 @@ pub fn par_range_prefill_active(
     _max_active: usize,
     f: impl Fn(usize, usize) + Sync + Send,
 ) {
+    if total_rows == 0 {
+        return;
+    }
     f(0, total_rows);
 }
 
@@ -544,6 +547,9 @@ pub fn par_range_prefill_active(
     _max_active: usize,
     f: impl Fn(usize, usize) + Sync + Send,
 ) {
+    if total_rows == 0 {
+        return;
+    }
     f(0, total_rows);
 }
 
@@ -565,6 +571,9 @@ pub fn par_range_prefill(
     _min_rows: usize,
     f: impl Fn(usize, usize) + Sync + Send,
 ) {
+    if total_rows == 0 {
+        return;
+    }
     f(0, total_rows);
 }
 
@@ -575,6 +584,9 @@ pub fn par_range_prefill(
     _min_rows: usize,
     f: impl Fn(usize, usize) + Sync + Send,
 ) {
+    if total_rows == 0 {
+        return;
+    }
     f(0, total_rows);
 }
 
@@ -7268,6 +7280,119 @@ pub fn flash_attention_gqa_cpu_opt_range(
     unreachable!("guarded by flash_attention_range_supported");
 }
 
+/// Run the prefill's flash attention as independent (head, 32-query) work items on the prefill pool,
+/// heaviest (latest queries) first, writing `[n_heads, n, head_dim]` into `out` (head `h` at
+/// `h * n * head_dim`, as one whole-head item would). Q is the prefill's stride-`n` column layout.
+/// Returns `false`, having done nothing, when the range kernel is unavailable (non-NEON, other head
+/// sizes, `CERA_CPU_ATTN_TILED=0`): the caller then runs one item per head.
+///
+/// 16 to 32 whole heads over workers of unequal speed leave the slow cores holding the barrier;
+/// the finer items let the pool's stealing balance prime and mid cores.
+#[allow(clippy::too_many_arguments)]
+#[cfg_attr(
+    not(all(feature = "parallel", target_arch = "aarch64")),
+    allow(unused_variables)
+)]
+pub fn flash_attention_prefill_items(
+    q_mat: &[f32],
+    k_cache: &[f32],
+    v_cache: &[f32],
+    out: &mut [f32],
+    n_heads: usize,
+    group_size: usize,
+    n: usize,
+    kv_dim: usize,
+    head_dim: usize,
+    scale: f32,
+    start_pos: usize,
+    is_causal: bool,
+    max_active: usize,
+) -> bool {
+    if !flash_attention_range_supported(head_dim) {
+        return false;
+    }
+    if n == 0 {
+        return true;
+    }
+    assert!(
+        group_size > 0,
+        "flash_attention_prefill_items: group_size must be > 0"
+    );
+    assert!(
+        n_heads > 0,
+        "flash_attention_prefill_items: n_heads must be > 0"
+    );
+    let n_kv_heads = (n_heads - 1) / group_size + 1;
+    let min_kv_dim = n_kv_heads
+        .checked_mul(head_dim)
+        .expect("flash_attention_prefill_items: kv_dim overflow");
+    assert!(
+        kv_dim >= min_kv_dim,
+        "flash_attention_prefill_items: kv_dim ({kv_dim}) too small for {n_kv_heads} KV heads of dim {head_dim}"
+    );
+    let min_q_len = n_heads
+        .checked_mul(n)
+        .and_then(|hn| hn.checked_mul(head_dim))
+        .expect("flash_attention_prefill_items: q/out overflow");
+    assert!(out.len() >= min_q_len, "attention output too small");
+    assert!(q_mat.len() >= min_q_len, "attention q_mat too small");
+    let min_kv_len = start_pos
+        .checked_add(n)
+        .and_then(|tot| tot.checked_mul(kv_dim))
+        .expect("flash_attention_prefill_items: kv length overflow");
+    assert!(
+        k_cache.len() >= min_kv_len && v_cache.len() >= min_kv_len,
+        "attention k_cache or v_cache too small"
+    );
+    // Queries per work item: one query block of the kernel, so splitting costs no extra K packing.
+    const Q_ITEM: usize = 32;
+    let n_qb = n.div_ceil(Q_ITEM);
+    let out_ptr = out.as_mut_ptr() as usize;
+    // One slot per item: the pool hands each worker a disjoint row of `tickets`; the real output
+    // goes through `out_ptr`.
+    let total_tickets = n_heads * n_qb;
+    let mut stack_tickets = [0.0f32; 2048];
+    let run = |tickets: &mut [f32]| {
+        par_rows_n_chunked_active(tickets, 1, 1, 1, max_active, |(item, _)| {
+            let h = item % n_heads;
+            let q_lo = (n_qb - 1 - item / n_heads) * Q_ITEM;
+            let q_hi = (q_lo + Q_ITEM).min(n);
+            // SAFETY: items are disjoint `[q_lo, q_hi)` ranges of head `h`'s `[n, head_dim]` block.
+            let chunk = unsafe {
+                core::slice::from_raw_parts_mut(
+                    (out_ptr as *mut f32).add((h * n + q_lo) * head_dim),
+                    (q_hi - q_lo) * head_dim,
+                )
+            };
+            flash_attention_gqa_cpu_opt_range(
+                q_mat,
+                k_cache,
+                v_cache,
+                chunk,
+                h,
+                1,
+                n,
+                n,
+                kv_dim,
+                (h / group_size) * head_dim,
+                head_dim,
+                scale,
+                start_pos,
+                is_causal,
+                q_lo,
+                q_hi,
+            );
+        });
+    };
+    if total_tickets <= stack_tickets.len() {
+        run(&mut stack_tickets[..total_tickets]);
+    } else {
+        let mut tickets = vec![0.0f32; total_tickets];
+        run(&mut tickets);
+    }
+    true
+}
+
 #[allow(dead_code, clippy::too_many_arguments, clippy::needless_range_loop)]
 /// Portable reference for [`flash_attention_gqa`], and the fallback wherever
 /// the NEON path does not apply.
@@ -13699,6 +13824,82 @@ mod tests {
         }
     }
 
+    /// The vision encoder and the d1 head hand the kernel row-major Q (`q[token * q_stride + dim]`,
+    /// `q_stride >= head_dim`), bidirectional, with a prefix: the tiled kernel must match the previous
+    /// one bit for bit there too.
+    #[cfg(target_arch = "aarch64")]
+    #[test]
+    fn flash_tiled_matches_reference_for_row_major_q() {
+        let mut seed: u64 = 4242;
+        let mut rnd = |len: usize, amp: f32| -> Vec<f32> {
+            (0..len)
+                .map(|_| {
+                    seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1);
+                    ((seed >> 33) as i32) as f32 / 2147483648.0 * amp
+                })
+                .collect()
+        };
+        let head_dim = 64usize;
+        let n_heads = 3usize;
+        let n_embd = n_heads * head_dim;
+        for (n_tokens, nq) in [(70usize, 70usize), (97, 33), (5, 5), (130, 64)] {
+            let q = rnd(n_tokens * n_embd, 3.0);
+            let k = rnd(n_tokens * n_embd, 3.0);
+            let v = rnd(n_tokens * n_embd, 1.0);
+            let t0 = n_tokens - nq;
+            for h in 0..n_heads {
+                let run = |tiled: bool| {
+                    let mut out = vec![0.0f32; nq * head_dim];
+                    unsafe {
+                        if tiled {
+                            flash_attention_gqa_neon_tiled(
+                                &q[t0 * n_embd..],
+                                &k,
+                                &v,
+                                &mut out,
+                                h,
+                                1,
+                                nq,
+                                n_embd,
+                                n_embd,
+                                h * head_dim,
+                                head_dim,
+                                0.125,
+                                n_tokens - nq,
+                                false,
+                                0,
+                                nq,
+                            );
+                        } else {
+                            flash_attention_gqa_neon_opt(
+                                &q[t0 * n_embd..],
+                                &k,
+                                &v,
+                                &mut out,
+                                h,
+                                1,
+                                nq,
+                                n_embd,
+                                n_embd,
+                                h * head_dim,
+                                head_dim,
+                                0.125,
+                                n_tokens - nq,
+                                false,
+                            );
+                        }
+                    }
+                    out
+                };
+                let (a, b) = (run(false), run(true));
+                assert!(
+                    a.iter().zip(&b).all(|(x, y)| x.to_bits() == y.to_bits()),
+                    "tokens={n_tokens} nq={nq} head={h}"
+                );
+            }
+        }
+    }
+
     /// Running the queries in independent ranges (the pool's work items) reproduces the whole-range
     /// result bit for bit, for ranges that do not align with the 32-query block or the 4-query group.
     #[cfg(target_arch = "aarch64")]
@@ -13888,6 +14089,110 @@ mod tests {
         flash_attention_gqa_cpu_opt_range(
             &dummy, &dummy, &short_v, &mut out, 0, 1, 1, 1, 64, 0, 64, 1.0, 0, true, 0, 1,
         );
+    }
+
+    /// `flash_attention_prefill_items` must match `flash_attention_gqa_cpu_opt_range` bit for bit,
+    /// covering multi-head scheduling, head_dim 64 and 128, non-uniform vectors, and ragged tail query blocks.
+    #[cfg(all(target_arch = "aarch64", feature = "parallel"))]
+    #[test]
+    fn flash_attention_prefill_items_matches_opt_range() {
+        let mut seed: u64 = 0x9E37_79B9_7F4A_7C15;
+        let mut rnd = |len: usize| -> Vec<f32> {
+            (0..len)
+                .map(|_| {
+                    seed = seed
+                        .wrapping_mul(6364136223846793005)
+                        .wrapping_add(1442695040888963407);
+                    ((seed >> 33) as f32 / 2147483648.0 - 1.0) * 2.0
+                })
+                .collect()
+        };
+
+        for (head_dim, n_heads, n_kv_heads) in [
+            (64usize, 4usize, 2usize),
+            (128usize, 4usize, 2usize),
+            (64usize, 4usize, 4usize),
+        ] {
+            let kv_dim = n_kv_heads * head_dim;
+            let hs = n_heads * head_dim;
+            let scale = 1.0 / (head_dim as f32).sqrt();
+            let group_size = n_heads / n_kv_heads;
+
+            for (n, start_pos, is_causal) in [
+                (0usize, 0usize, true),
+                (1, 0, true),
+                (31, 0, true),
+                (64, 16, true),
+                (75, 0, true),
+                (75, 10, false),
+            ] {
+                let q = rnd(hs * n);
+                let k = rnd((start_pos + n) * kv_dim);
+                let v = rnd((start_pos + n) * kv_dim);
+                let mut got = vec![0.0f32; hs * n];
+                let ok = flash_attention_prefill_items(
+                    &q, &k, &v, &mut got, n_heads, group_size, n, kv_dim, head_dim, scale,
+                    start_pos, is_causal, 8,
+                );
+                assert!(
+                    ok,
+                    "flash_attention_prefill_items returned false for hd={head_dim}, n={n}"
+                );
+
+                if n == 0 {
+                    continue;
+                }
+
+                let mut want = vec![0.0f32; hs * n];
+                for h in 0..n_heads {
+                    let kv_h = h / group_size;
+                    let chunk = &mut want[h * n * head_dim..(h + 1) * n * head_dim];
+                    flash_attention_gqa_cpu_opt_range(
+                        &q,
+                        &k,
+                        &v,
+                        chunk,
+                        h,
+                        1,
+                        n,
+                        n,
+                        kv_dim,
+                        kv_h * head_dim,
+                        head_dim,
+                        scale,
+                        start_pos,
+                        is_causal,
+                        0,
+                        n,
+                    );
+                }
+                assert!(
+                    got.iter()
+                        .zip(&want)
+                        .all(|(a, b)| a.to_bits() == b.to_bits()),
+                    "mismatch for hd={head_dim}, n={n}, start_pos={start_pos}, is_causal={is_causal}"
+                );
+            }
+        }
+
+        // Verify rejection on unsupported head dimensions
+        let dummy_in = [0.0f32; 64];
+        let mut dummy_out = [0.0f32; 64];
+        assert!(!flash_attention_prefill_items(
+            &dummy_in,
+            &dummy_in,
+            &dummy_in,
+            &mut dummy_out,
+            1,
+            1,
+            1,
+            50,
+            50,
+            0.125,
+            0,
+            true,
+            1,
+        ));
     }
 
     /// One core, prefill-shaped (hd 64, one head, stride-n Q): GFLOPS of both NEON kernels.
