@@ -650,21 +650,24 @@ impl HexagonVisionEncoder {
             dst_nb,
         )?;
 
-        let mut kparams = crate::backend::hexagon::build_mul_mat_kernel_params(
-            w_dtype,
-            ne0,
-            n_tokens as u32,
-            1,
-            ne1 * 4,
-            session.dsp_threads(),
-            dispatch::VTCM_BUDGET,
+        let mut mm = crate::backend::hexagon::MmKernelParams::from_words(
+            &crate::backend::hexagon::build_mul_mat_kernel_params(
+                w_dtype,
+                ne0,
+                n_tokens as u32,
+                1,
+                ne1 * 4,
+                session.dsp_threads(),
+                dispatch::VTCM_BUDGET,
+            ),
         );
         // `fits_fused` above keeps the rows inside what the fused layout holds,
         // which implies the plain layout needs no chunk; the fused kernel could
         // not honour one.
-        debug_assert_eq!(kparams[2], 0, "fused QKV must not need a row chunk");
-        kparams[0] = 5; // HTP_MM_KERNEL_HVX_QUANT_ROW
-        kparams[17] = 3; // n_weights
+        debug_assert_eq!(mm.m_chunk, 0, "fused QKV must not need a row chunk");
+        mm.kernel_type = 5; // HTP_MM_KERNEL_HVX_QUANT_ROW
+        mm.n_weights = 3;
+        let kparams = mm.to_words();
 
         let params = [0i32; 16];
         session

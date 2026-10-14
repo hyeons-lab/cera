@@ -117,14 +117,19 @@ pub enum HtpOpCode {
     MdevGroup = 60,
     Roll = 61,
     Argmax = 62,
-    Conv1D = 63,
-    UnarySnake = 64,
-    UnarySin = 65,
-    UnaryCos = 66,
-    ConvTranspose1D = 67,
-    UnaryHardSigmoid = 68,
-    UnaryHardSwish = 69,
-    UnaryElu = 70,
+    UnaryGeluErf = 63,
+    GluGegluErf = 64,
+    Pool2D = 65,
+    Pool1D = 66,
+    UnaryGeluQuick = 67,
+    Conv1D = 68,
+    UnarySnake = 69,
+    UnarySin = 70,
+    UnaryCos = 71,
+    ConvTranspose1D = 72,
+    UnaryHardSigmoid = 73,
+    UnaryHardSwish = 74,
+    UnaryElu = 75,
 
     Invalid = 0xFFFF_FFFF,
 }
@@ -196,6 +201,11 @@ impl HtpOpCode {
             Self::MdevGroup => "MdevGroup",
             Self::Roll => "Roll",
             Self::Argmax => "Argmax",
+            Self::UnaryGeluErf => "UnaryGeluErf",
+            Self::GluGegluErf => "GluGegluErf",
+            Self::Pool2D => "Pool2D",
+            Self::Pool1D => "Pool1D",
+            Self::UnaryGeluQuick => "UnaryGeluQuick",
             Self::Conv1D => "Conv1D",
             Self::UnarySnake => "UnarySnake",
             Self::UnarySin => "UnarySin",
@@ -274,14 +284,19 @@ impl HtpOpCode {
             60 => Some(Self::MdevGroup),
             61 => Some(Self::Roll),
             62 => Some(Self::Argmax),
-            63 => Some(Self::Conv1D),
-            64 => Some(Self::UnarySnake),
-            65 => Some(Self::UnarySin),
-            66 => Some(Self::UnaryCos),
-            67 => Some(Self::ConvTranspose1D),
-            68 => Some(Self::UnaryHardSigmoid),
-            69 => Some(Self::UnaryHardSwish),
-            70 => Some(Self::UnaryElu),
+            63 => Some(Self::UnaryGeluErf),
+            64 => Some(Self::GluGegluErf),
+            65 => Some(Self::Pool2D),
+            66 => Some(Self::Pool1D),
+            67 => Some(Self::UnaryGeluQuick),
+            68 => Some(Self::Conv1D),
+            69 => Some(Self::UnarySnake),
+            70 => Some(Self::UnarySin),
+            71 => Some(Self::UnaryCos),
+            72 => Some(Self::ConvTranspose1D),
+            73 => Some(Self::UnaryHardSigmoid),
+            74 => Some(Self::UnaryHardSwish),
+            75 => Some(Self::UnaryElu),
             0xFFFF_FFFF => Some(Self::Invalid),
             _ => None,
         }
@@ -480,9 +495,35 @@ mod tests {
     fn test_htp_opcode_from_u32() {
         assert_eq!(HtpOpCode::from_u32(0), Some(HtpOpCode::Mul));
         assert_eq!(HtpOpCode::from_u32(1), Some(HtpOpCode::Add));
-        assert_eq!(HtpOpCode::from_u32(70), Some(HtpOpCode::UnaryElu));
+        assert_eq!(HtpOpCode::from_u32(75), Some(HtpOpCode::UnaryElu));
         assert_eq!(HtpOpCode::from_u32(0xFFFF_FFFF), Some(HtpOpCode::Invalid));
-        assert_eq!(HtpOpCode::from_u32(71), None);
+        assert_eq!(HtpOpCode::from_u32(76), None);
+    }
+
+    /// The discriminants are the wire values of `enum htp_op_code` in the bundled skels, so a
+    /// shift is a silent miscompute rather than an error. Pin the ones around the insertion point
+    /// (llama.cpp added five upstream ops at 63 to 67) and every op our extensions add.
+    #[test]
+    fn htp_opcode_values_match_the_bundled_skels() {
+        for (op, want) in [
+            (HtpOpCode::Argmax, 62u32),
+            (HtpOpCode::UnaryGeluErf, 63),
+            (HtpOpCode::GluGegluErf, 64),
+            (HtpOpCode::Pool2D, 65),
+            (HtpOpCode::Pool1D, 66),
+            (HtpOpCode::UnaryGeluQuick, 67),
+            (HtpOpCode::Conv1D, 68),
+            (HtpOpCode::UnarySnake, 69),
+            (HtpOpCode::UnarySin, 70),
+            (HtpOpCode::UnaryCos, 71),
+            (HtpOpCode::ConvTranspose1D, 72),
+            (HtpOpCode::UnaryHardSigmoid, 73),
+            (HtpOpCode::UnaryHardSwish, 74),
+            (HtpOpCode::UnaryElu, 75),
+        ] {
+            assert_eq!(op as u32, want, "{}", op.name());
+            assert_eq!(HtpOpCode::from_u32(want), Some(op), "{}", op.name());
+        }
     }
 
     #[test]

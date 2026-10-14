@@ -6,6 +6,7 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
+use super::params::{build_concat_kernel_params, build_copy_kernel_params};
 use super::rpcmem::RpcmemBuffer;
 use super::sys::FastRpcDriver;
 use super::types::{
@@ -879,6 +880,17 @@ impl HexagonQueueSession {
         params: [i32; 16],
         kernel_params: [i32; 32],
     ) -> Result<(), CeraError> {
+        let kernel_params = validate_and_derive_op_params(
+            opcode,
+            src,
+            dst,
+            &params,
+            kernel_params,
+            &self.tens,
+            self.dsp_threads(),
+            self.dsp_vtcm_bytes(),
+        )
+        .inspect_err(|_| self.drop_pending_batch())?;
         let mut op = HtpOpDesc {
             opcode,
             flags: 0,
@@ -888,40 +900,8 @@ impl HexagonQueueSession {
             dst: [0xffff; 4],
             pad: [0; 2],
         };
-        if src.len() > 10 {
-            self.drop_pending_batch();
-            return Err(CeraError::Backend(format!(
-                "enqueue_op opcode {opcode}: too many src operands ({} > 10)",
-                src.len()
-            )));
-        }
-        if dst.len() > 4 {
-            self.drop_pending_batch();
-            return Err(CeraError::Backend(format!(
-                "enqueue_op opcode {opcode}: too many dst operands ({} > 4)",
-                dst.len()
-            )));
-        }
-        for (i, &s) in src.iter().enumerate() {
-            if s != 0xffff && (s as usize) >= self.tens.len() {
-                self.drop_pending_batch();
-                return Err(CeraError::Backend(format!(
-                    "enqueue_op opcode {opcode}: src[{i}] index {s} out of bounds (registered {})",
-                    self.tens.len()
-                )));
-            }
-            op.src[i] = s;
-        }
-        for (i, &d) in dst.iter().enumerate() {
-            if d != 0xffff && (d as usize) >= self.tens.len() {
-                self.drop_pending_batch();
-                return Err(CeraError::Backend(format!(
-                    "enqueue_op opcode {opcode}: dst[{i}] index {d} out of bounds (registered {})",
-                    self.tens.len()
-                )));
-            }
-            op.dst[i] = d;
-        }
+        op.src[..src.len()].copy_from_slice(src);
+        op.dst[..dst.len()].copy_from_slice(dst);
         self.ops.push(op);
         if self.max_ops_per_flush.is_some_and(|m| self.ops.len() >= m) {
             self.flush().map_err(|e| {
@@ -1342,6 +1322,109 @@ impl Drop for HexagonQueueSession {
     }
 }
 
+/// Validate `enqueue_op` operand counts, tensor indices, and `Cpy`/`Concat` arity, and derive
+/// `Cpy`/`Concat` `kernel_params` when the caller passed `[0; 32]`. Shared with test sinks so
+/// fake and real queues enforce identical preconditions and derive identical parameter words.
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn validate_and_derive_op_params<T>(
+    opcode: u32,
+    src: &[u16],
+    dst: &[u16],
+    params: &[i32; 16],
+    mut kernel_params: [i32; 32],
+    tensors: &[T],
+    dsp_threads: u32,
+    vtcm_bytes: usize,
+) -> Result<[i32; 32], CeraError>
+where
+    T: std::fmt::Debug,
+    for<'a> &'a T: Into<super::params::CopyTensor>,
+{
+    if src.len() > 10 {
+        return Err(CeraError::Backend(format!(
+            "enqueue_op opcode {opcode}: too many src operands ({} > 10)",
+            src.len()
+        )));
+    }
+    if dst.len() > 4 {
+        return Err(CeraError::Backend(format!(
+            "enqueue_op opcode {opcode}: too many dst operands ({} > 4)",
+            dst.len()
+        )));
+    }
+    for (i, &s) in src.iter().enumerate() {
+        if s != 0xffff && (s as usize) >= tensors.len() {
+            return Err(CeraError::Backend(format!(
+                "enqueue_op opcode {opcode}: src[{i}] index {s} out of bounds (registered {})",
+                tensors.len()
+            )));
+        }
+    }
+    for (i, &d) in dst.iter().enumerate() {
+        if d != 0xffff && (d as usize) >= tensors.len() {
+            return Err(CeraError::Backend(format!(
+                "enqueue_op opcode {opcode}: dst[{i}] index {d} out of bounds (registered {})",
+                tensors.len()
+            )));
+        }
+    }
+    // The DSP's copy kernels dispatch on host-precomputed params and answer NO_SUPPORT for
+    // empty ones, so a `Cpy` whose caller passed none gets them from the registered
+    // tensors, as llama.cpp's host does (`ggml_hexagon_precompute_cpy_params`).
+    if opcode == HtpOpCode::Cpy as u32 {
+        if src.len() != 1 || dst.len() != 1 || src[0] == 0xffff || dst[0] == 0xffff {
+            return Err(CeraError::Backend(
+                "enqueue_op Cpy: needs one registered src tensor and one registered dst tensor"
+                    .into(),
+            ));
+        }
+        if kernel_params == [0i32; 32] {
+            let (s, d) = (&tensors[src[0] as usize], &tensors[dst[0] as usize]);
+            kernel_params = build_copy_kernel_params(&s.into(), &d.into(), dsp_threads, vtcm_bytes)
+                .ok_or_else(|| {
+                    CeraError::Backend(format!(
+                        "enqueue_op Cpy: the HTP copy kernels do not handle {s:?} -> {d:?}"
+                    ))
+                })?;
+        }
+    }
+    if opcode == HtpOpCode::Concat as u32 {
+        if src.len() != 2
+            || dst.len() != 1
+            || src[0] == 0xffff
+            || src[1] == 0xffff
+            || dst[0] == 0xffff
+        {
+            return Err(CeraError::Backend(
+                "enqueue_op Concat: needs two registered src tensors and one registered dst tensor"
+                    .into(),
+            ));
+        }
+        if kernel_params == [0i32; 32] {
+            let (ta, tb, td) = (
+                &tensors[src[0] as usize],
+                &tensors[src[1] as usize],
+                &tensors[dst[0] as usize],
+            );
+            kernel_params = build_concat_kernel_params(
+                &ta.into(),
+                &tb.into(),
+                &td.into(),
+                params[0],
+                dsp_threads,
+                vtcm_bytes,
+            )
+            .ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "enqueue_op Concat: the HTP concat kernels do not handle dim {} for {ta:?} + {tb:?} -> {td:?}",
+                    params[0]
+                ))
+            })?;
+        }
+    }
+    Ok(kernel_params)
+}
+
 /// Short opcode names for profile tables. Discriminants are firmware-ABI
 /// pinned (see `HtpOpCode`); unknown ids print numerically via the `op` column.
 fn htp_opcode_name(opcode: u32) -> &'static str {
@@ -1351,6 +1434,7 @@ fn htp_opcode_name(opcode: u32) -> &'static str {
 #[cfg(test)]
 mod tests {
     use super::super::sys::fake;
+    use super::super::types::HtpDataType;
     use super::*;
 
     /// A batch shaped like `export_staged_batch` output: `n_tensors`
@@ -1526,6 +1610,125 @@ mod tests {
         // The helper ends its group, which is where the cap flushes.
         let err = enqueue_with_tensor(&mut q, &buf).unwrap_err().to_string();
         assert!(err.contains("cap=1") && err.contains("tensors=1"), "{err}");
+    }
+
+    /// A `Cpy` or `Concat` enqueued with empty kernel params gets them from the registered
+    /// tensors; an operand that is not registered (including the `0xffff` "no operand" id) or a
+    /// shape the kernels cannot take is an error that drops the batch, never a panic.
+    #[test]
+    fn copy_and_concat_params_are_filled_from_the_registered_tensors() {
+        use super::super::params::{
+            CopyTensor, build_concat_kernel_params, build_copy_kernel_params,
+        };
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let f32_t = HtpDataType::F32 as u32;
+        let mut q = test_session();
+        let (threads, vtcm) = (q.dsp_threads(), q.dsp_vtcm_bytes());
+
+        let a = q
+            .add_tensor(&buf, 0, 256, 0, f32_t, [64, 1, 1, 1], [4, 256, 256, 256])
+            .unwrap();
+        let b = q
+            .add_tensor(&buf, 256, 256, 0, f32_t, [64, 1, 1, 1], [4, 256, 256, 256])
+            .unwrap();
+        q.enqueue_op(HtpOpCode::Cpy as u32, &[a], &[b], [0; 16], [0; 32])
+            .unwrap();
+        let view = |t: &HtpTensor| CopyTensor::from(t);
+        let want = build_copy_kernel_params(
+            &view(&q.tens[a as usize]),
+            &view(&q.tens[b as usize]),
+            threads,
+            vtcm,
+        )
+        .expect("a contiguous f32 copy is supported");
+        assert_eq!(q.ops[0].kernel_params, want);
+        assert_ne!(want, [0; 32]);
+
+        // Concat along dim 1: the dim reaches the blob (dim 0 gives a different one, or none).
+        let c1 = q
+            .add_tensor(&buf, 512, 256, 0, f32_t, [4, 2, 1, 1], [4, 16, 32, 32])
+            .unwrap();
+        let c2 = q
+            .add_tensor(&buf, 768, 256, 0, f32_t, [4, 2, 1, 1], [4, 16, 32, 32])
+            .unwrap();
+        let cd = q
+            .add_tensor(&buf, 1024, 256, 0, f32_t, [4, 4, 1, 1], [4, 16, 64, 64])
+            .unwrap();
+        let cat = |dim: i32, q: &HexagonQueueSession| {
+            build_concat_kernel_params(
+                &view(&q.tens[c1 as usize]),
+                &view(&q.tens[c2 as usize]),
+                &view(&q.tens[cd as usize]),
+                dim,
+                threads,
+                vtcm,
+            )
+        };
+        let mut params = [0i32; 16];
+        params[0] = 1;
+        q.enqueue_op(HtpOpCode::Concat as u32, &[c1, c2], &[cd], params, [0; 32])
+            .unwrap();
+        let want = cat(1, &q).expect("a dim-1 concat of f32 rows is supported");
+        assert_eq!(q.ops[1].kernel_params, want);
+        assert_ne!(cat(0, &q), Some(want), "the dim is part of the blob");
+
+        // Unsupported pair (the copy kernels do not resize): an error naming the tensors, with
+        // the whole batch dropped.
+        let small = q
+            .add_tensor(&buf, 1280, 4, 0, f32_t, [1, 1, 1, 1], [4, 4, 4, 4])
+            .unwrap();
+        let big = q
+            .add_tensor(&buf, 1288, 8, 0, f32_t, [2, 1, 1, 1], [4, 8, 8, 8])
+            .unwrap();
+        let err = q
+            .enqueue_op(HtpOpCode::Cpy as u32, &[small], &[big], [0; 16], [0; 32])
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("do not handle"), "{err}");
+        assert_pending_empty(&q, "unsupported copy");
+
+        // Unregistered operands, the "no operand" sentinel included, are errors too,
+        // whether kernel params are zeroed (auto-computed) or precomputed.
+        for precomputed in [[0i32; 32], [1i32; 32]] {
+            for bad in [0xffffu16, 3] {
+                for case in 0..4 {
+                    // One registered operand (id 0: the previous refusal dropped the batch), so only
+                    // `bad` can be the reason for the refusal.
+                    let a = q
+                        .add_tensor(&buf, 0, 256, 0, f32_t, [64, 1, 1, 1], [4, 256, 256, 256])
+                        .unwrap();
+                    assert_eq!(a, 0, "the dropped batch starts over");
+                    let (op, src, dst) = match case {
+                        0 => (HtpOpCode::Cpy, vec![bad], vec![a]),
+                        1 => (HtpOpCode::Cpy, vec![a], vec![bad]),
+                        2 => (HtpOpCode::Concat, vec![a, bad], vec![a]),
+                        _ => (HtpOpCode::Concat, vec![a, a], vec![bad]),
+                    };
+                    let e = q.enqueue_op(op as u32, &src, &dst, [0; 16], precomputed);
+                    assert!(e.is_err(), "{op:?} {src:?} -> {dst:?} must be refused");
+                    assert_pending_empty(&q, "unregistered operand");
+                }
+            }
+        }
+
+        // Invalid operand counts for Cpy and Concat are rejected even with precomputed params.
+        let a = q
+            .add_tensor(&buf, 0, 256, 0, f32_t, [64, 1, 1, 1], [4, 256, 256, 256])
+            .unwrap();
+        assert!(
+            q.enqueue_op(HtpOpCode::Cpy as u32, &[], &[a], [0; 16], [1; 32])
+                .is_err()
+        );
+        assert_pending_empty(&q, "cpy empty src");
+        let a = q
+            .add_tensor(&buf, 0, 256, 0, f32_t, [64, 1, 1, 1], [4, 256, 256, 256])
+            .unwrap();
+        assert!(
+            q.enqueue_op(HtpOpCode::Concat as u32, &[a], &[a], [0; 16], [1; 32])
+                .is_err()
+        );
+        assert_pending_empty(&q, "concat single src");
     }
 
     /// A batch the DSP has not answered may still be running against the

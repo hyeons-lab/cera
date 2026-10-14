@@ -115,7 +115,8 @@ pub(crate) fn dump_if_requested(label: &str, batches: &[String]) {
 
 /// Assert `got == expected`; on mismatch print the per-opcode histogram and
 /// how to dump the full op text. The digest stays the tight pin, this only
-/// makes a failure readable.
+/// makes a failure readable. With `CERA_UPDATE_GOLDEN` set it dumps instead of asserting, so
+/// one run regenerates every golden; that mode refuses to run under `CI`.
 pub(crate) fn assert_golden<T: PartialEq + std::fmt::Debug>(
     label: &str,
     got: T,
@@ -123,6 +124,16 @@ pub(crate) fn assert_golden<T: PartialEq + std::fmt::Debug>(
     batches: &[String],
 ) {
     dump_if_requested(label, batches);
+    // While dumping, keep going: one run then writes every golden's text, instead of stopping at
+    // the first changed pin and leaving the rest stale.
+    if golden_flag(std::env::var("CERA_UPDATE_GOLDEN").ok().as_deref()) {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "CERA_UPDATE_GOLDEN skips the golden asserts and must not be set in CI"
+        );
+        eprintln!("golden-value {label}: got {got:?} expected {expected:?}");
+        return;
+    }
     assert!(
         got == expected,
         "golden `{label}` changed\n  got      {got:?}\n  expected {expected:?}\n  {} flushes, ops per kind: {:?}\n  rerun with CERA_UPDATE_GOLDEN=1 to dump the op text to target/golden/{label}.txt and diff it",

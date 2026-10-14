@@ -1,6 +1,6 @@
 //! Embedded Hexagon DSP skels + device probe.
 //!
-//! The `skels/` directory vendors the five `libggml-htp-vXX.so` DSP
+//! The `skels/` directory vendors the five `libcera-htp-vXX.so` DSP
 //! libraries (see `skels/SOURCE.md` for provenance). They are embedded
 //! in the binary so apps ship one artifact: at runtime the engine writes
 //! the matching skel next to itself (or into an app-provided directory)
@@ -16,11 +16,11 @@ use crate::session::CeraError;
 /// Embedded skel bytes per architecture (see `skels/SOURCE.md`).
 pub fn embedded_skel(arch: HexagonArch) -> &'static [u8] {
     match arch {
-        HexagonArch::V73 => include_bytes!("skels/libggml-htp-v73.so"),
-        HexagonArch::V75 => include_bytes!("skels/libggml-htp-v75.so"),
-        HexagonArch::V79 => include_bytes!("skels/libggml-htp-v79.so"),
-        HexagonArch::V81 => include_bytes!("skels/libggml-htp-v81.so"),
-        HexagonArch::V85 => include_bytes!("skels/libggml-htp-v85.so"),
+        HexagonArch::V73 => include_bytes!("skels/libcera-htp-v73.so"),
+        HexagonArch::V75 => include_bytes!("skels/libcera-htp-v75.so"),
+        HexagonArch::V79 => include_bytes!("skels/libcera-htp-v79.so"),
+        HexagonArch::V81 => include_bytes!("skels/libcera-htp-v81.so"),
+        HexagonArch::V85 => include_bytes!("skels/libcera-htp-v85.so"),
     }
 }
 
@@ -139,8 +139,8 @@ pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
         // Compare contents, not just size: a corrupt same-length skel must
         // still be repaired, or the DSP loads wrong code with no signal.
         // (Length stat first: no point reading a file already known stale.)
-        let rewrite = match std::fs::metadata(&path) {
-            Ok(m) if m.len() != bytes.len() as u64 => true,
+        let rewrite = match std::fs::symlink_metadata(&path) {
+            Ok(m) if !m.is_file() || m.len() != bytes.len() as u64 => true,
             Ok(_) => match std::fs::read(&path) {
                 Ok(existing) => existing.as_slice() != bytes,
                 Err(_) => true,
@@ -173,6 +173,7 @@ pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
             count += 1;
         }
     }
+    remove_legacy_skels(dir, LEGACY_SKELS);
     // `;`-joined: the separator the FastRPC loader parses (verified with
     // the AAR flow on a retail S25U) and the one `HexagonNpu.setup` writes.
     // A `:`-joined value would reach the loader as one path containing a
@@ -187,6 +188,85 @@ pub fn install_skels(dir: &std::path::Path) -> Result<usize, CeraError> {
     // race (no in-process primitive can enforce that half).
     unsafe { std::env::set_var("ADSP_LIBRARY_PATH", merged) };
     Ok(count)
+}
+
+/// A skel that earlier cera builds installed under the name llama.cpp's own skels use:
+/// `(file name, length, FNV-1a 64 of the contents)`.
+type LegacySkel = (&'static str, u64, u64);
+
+/// The `libggml-htp-vXX.so` files cera shipped before the skels were renamed (the build before
+/// the Q8 quantizer fix, and the one after it).
+const LEGACY_SKELS: &[LegacySkel] = &[
+    ("libggml-htp-v73.so", 890856, 0x9ff26275dfa72858),
+    ("libggml-htp-v73.so", 890856, 0xd20698d252543138),
+    ("libggml-htp-v75.so", 836680, 0x5086a2b100fe8ead),
+    ("libggml-htp-v75.so", 836680, 0xab2f061fbf9e2e04),
+    ("libggml-htp-v79.so", 853160, 0xd993ac714327ddab),
+    ("libggml-htp-v79.so", 853160, 0x41da0f7f31f74734),
+    ("libggml-htp-v81.so", 881960, 0x09fb2a033ba74d5e),
+    ("libggml-htp-v81.so", 881928, 0x260b85a6333e67f0),
+    ("libggml-htp-v85.so", 881960, 0x09fb2a033ba74d5e),
+    ("libggml-htp-v85.so", 881928, 0x260b85a6333e67f0),
+];
+
+const FNV1A64_INIT: u64 = 0xcbf29ce484222325;
+
+fn fnv1a64_update(hash: u64, bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(hash, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3))
+}
+
+#[cfg(test)]
+fn fnv1a64(bytes: &[u8]) -> u64 {
+    fnv1a64_update(FNV1A64_INIT, bytes)
+}
+
+fn hash_file_fnv1a64(path: &std::path::Path) -> std::io::Result<u64> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 8192];
+    let mut hash = FNV1A64_INIT;
+    loop {
+        let n = file.read(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        hash = fnv1a64_update(hash, &buf[..n]);
+    }
+    Ok(hash)
+}
+
+/// Delete the previous cera skels left in `dir` under llama.cpp's file names. The loader
+/// searches `dir` before the other entries on `ADSP_LIBRARY_PATH`, so a stale copy there would
+/// answer a coexisting llama.cpp runtime's request for its own skel with cera's old, ABI-skewed
+/// one. Only a regular file whose length and contents match a known cera build goes: an
+/// app-provided directory may legitimately hold llama.cpp's own skels under those names.
+fn remove_legacy_skels(dir: &std::path::Path, known: &[LegacySkel]) {
+    let mut last_hash: Option<(&'static str, u64)> = None;
+    for &(name, len, hash) in known {
+        let path = dir.join(name);
+        let meta = std::fs::symlink_metadata(&path).ok();
+        let matches_len = meta.is_some_and(|m| m.is_file() && m.len() == len);
+        if !matches_len {
+            continue;
+        }
+        let file_hash = match last_hash {
+            Some((prev_name, h)) if prev_name == name => Some(h),
+            _ => {
+                if let Ok(h) = hash_file_fnv1a64(&path) {
+                    last_hash = Some((name, h));
+                    Some(h)
+                } else {
+                    None
+                }
+            }
+        };
+        if file_hash == Some(hash) {
+            let _ = std::fs::remove_file(&path);
+            last_hash = None;
+        }
+    }
 }
 
 /// Merge a staged path list with the current `ADSP_LIBRARY_PATH` value:
@@ -260,6 +340,143 @@ mod tests {
             0,
             "nothing may be written into a refused dir"
         );
+    }
+
+    #[test]
+    fn legacy_skels_are_removed_only_when_they_are_ours() {
+        let root = tempfile::tempdir().unwrap();
+        let dir = root.path();
+        let ours = b"a previous cera skel".as_slice();
+        let known: &[LegacySkel] = &[
+            ("libggml-htp-v73.so", ours.len() as u64, fnv1a64(ours)),
+            ("libggml-htp-v75.so", ours.len() as u64, fnv1a64(ours)),
+            ("libggml-htp-v79.so", ours.len() as u64, fnv1a64(ours) ^ 1),
+            ("libggml-htp-v79.so", ours.len() as u64, fnv1a64(ours)),
+        ];
+        std::fs::write(dir.join("libggml-htp-v79.so"), ours).unwrap();
+        // Same name, same length, other contents: llama.cpp's own copy, kept.
+        let theirs = b"A previous cera skel".as_slice();
+        assert_eq!(theirs.len(), ours.len());
+        std::fs::write(dir.join("libggml-htp-v75.so"), theirs).unwrap();
+        // A link to a matching file is never followed or removed (the link is examined before
+        // anything else is deleted, and its target outlives the call).
+        std::fs::write(dir.join("elsewhere.so"), ours).unwrap();
+        std::os::unix::fs::symlink(dir.join("elsewhere.so"), dir.join("libggml-htp-v73.so"))
+            .unwrap();
+        remove_legacy_skels(dir, known);
+        assert!(!dir.join("libggml-htp-v79.so").exists(), "ours is removed");
+        assert!(dir.join("elsewhere.so").exists());
+        assert_eq!(
+            std::fs::read(dir.join("libggml-htp-v75.so")).unwrap(),
+            theirs
+        );
+        assert!(dir.join("libggml-htp-v73.so").symlink_metadata().is_ok());
+    }
+
+    /// The previous builds, as `(name, length, FNV-1a 64)` of the blobs at the commits that
+    /// shipped them (before and after the Q8 quantizer fix). An edit here is deliberate: a wrong
+    /// value silently leaves a stale skel installed.
+    #[test]
+    fn the_legacy_table_pins_the_shipped_builds() {
+        let want: &[LegacySkel] = &[
+            ("libggml-htp-v73.so", 890856, 0x9ff26275dfa72858),
+            ("libggml-htp-v73.so", 890856, 0xd20698d252543138),
+            ("libggml-htp-v75.so", 836680, 0x5086a2b100fe8ead),
+            ("libggml-htp-v75.so", 836680, 0xab2f061fbf9e2e04),
+            ("libggml-htp-v79.so", 853160, 0xd993ac714327ddab),
+            ("libggml-htp-v79.so", 853160, 0x41da0f7f31f74734),
+            ("libggml-htp-v81.so", 881960, 0x09fb2a033ba74d5e),
+            ("libggml-htp-v81.so", 881928, 0x260b85a6333e67f0),
+            ("libggml-htp-v85.so", 881960, 0x09fb2a033ba74d5e),
+            ("libggml-htp-v85.so", 881928, 0x260b85a6333e67f0),
+        ];
+        assert_eq!(LEGACY_SKELS, want);
+    }
+
+    #[test]
+    fn the_legacy_table_names_every_renamed_skel() {
+        for arch in PROBE_ARCHS {
+            let old = arch.skel_filename().replace("libcera-htp", "libggml-htp");
+            assert!(
+                LEGACY_SKELS.iter().any(|&(n, ..)| n == old),
+                "{old} has no legacy entry"
+            );
+        }
+    }
+
+    /// Parse `DT_SONAME` from a 32-bit little-endian ELF image (`PT_DYNAMIC` ->
+    /// `DT_STRTAB` + `DT_SONAME`, mapped through `PT_LOAD`).
+    fn elf32_soname(elf: &[u8]) -> Option<&str> {
+        if elf.get(..6)? != b"\x7fELF\x01\x01" {
+            return None;
+        }
+        let u16_at = |o: usize| Some(u16::from_le_bytes(elf.get(o..o + 2)?.try_into().ok()?));
+        let u32_at = |o: usize| Some(u32::from_le_bytes(elf.get(o..o + 4)?.try_into().ok()?));
+        let phoff = u32_at(28)? as usize;
+        let phentsize = u16_at(42)? as usize;
+        let phnum = u16_at(44)? as usize;
+        const PT_LOAD: u32 = 1;
+        const PT_DYNAMIC: u32 = 2;
+        const DT_NULL: u32 = 0;
+        const DT_STRTAB: u32 = 5;
+        const DT_SONAME: u32 = 14;
+        let mut loads = Vec::new();
+        let mut dyn_seg = None;
+        for i in 0..phnum {
+            let p = phoff.checked_add(i.checked_mul(phentsize)?)?;
+            let p_type = u32_at(p)?;
+            let p_offset = u32_at(p + 4)? as usize;
+            let p_vaddr = u32_at(p + 8)? as usize;
+            let p_filesz = u32_at(p + 16)? as usize;
+            if p_type == PT_LOAD {
+                loads.push((p_vaddr, p_offset, p_filesz));
+            } else if p_type == PT_DYNAMIC {
+                dyn_seg = Some((p_offset, p_filesz));
+            }
+        }
+        let (dyn_off, dyn_sz) = dyn_seg?;
+        let mut strtab_vaddr = None;
+        let mut soname_off = None;
+        for off in (dyn_off..dyn_off.checked_add(dyn_sz)?).step_by(8) {
+            let tag = u32_at(off)?;
+            let val = u32_at(off + 4)? as usize;
+            if tag == DT_NULL {
+                break;
+            } else if tag == DT_STRTAB {
+                strtab_vaddr = Some(val);
+            } else if tag == DT_SONAME {
+                soname_off = Some(val);
+            }
+        }
+        let str_vaddr = strtab_vaddr?.checked_add(soname_off?)?;
+        for (p_vaddr, p_offset, p_filesz) in loads {
+            if str_vaddr >= p_vaddr && str_vaddr < p_vaddr.checked_add(p_filesz)? {
+                let start = p_offset.checked_add(str_vaddr - p_vaddr)?;
+                let tail = elf.get(start..)?;
+                let end = tail.iter().position(|&b| b == 0)?;
+                return std::str::from_utf8(&tail[..end]).ok();
+            }
+        }
+        None
+    }
+
+    /// The CDSP loader deduplicates loaded libraries by `DT_SONAME`, not only by filename:
+    /// an embedded skel whose `DT_SONAME` still said `libggml-htp-vXX.so` would alias llama.cpp's
+    /// skel in a process that loads both. Also check that a corrupted SONAME fails the check.
+    #[test]
+    fn the_embedded_skels_carry_their_own_soname() {
+        for arch in PROBE_ARCHS {
+            let want = arch.skel_filename();
+            let bytes = embedded_skel(arch);
+            assert_eq!(elf32_soname(bytes), Some(want), "{arch:?}");
+            let mut mutated = bytes.to_vec();
+            let pos = mutated
+                .windows(want.len())
+                .position(|w| w == want.as_bytes())
+                .expect("SONAME string present in skel image");
+            mutated[pos] ^= 1;
+            assert_ne!(elf32_soname(&mutated), Some(want), "{arch:?} mutation");
+        }
     }
 
     #[test]
@@ -401,6 +618,15 @@ mod tests {
         std::fs::write(&p, &bytes).unwrap();
         assert_eq!(install_skels(&dir).unwrap(), 1);
         assert_eq!(std::fs::read(&p).unwrap(), embedded_skel(PROBE_ARCHS[0]));
+        #[cfg(unix)]
+        {
+            let target = dir.join("copy.so");
+            std::fs::write(&target, embedded_skel(PROBE_ARCHS[0])).unwrap();
+            std::fs::remove_file(&p).unwrap();
+            std::os::unix::fs::symlink(&target, &p).unwrap();
+            assert_eq!(install_skels(&dir).unwrap(), 1);
+            assert!(std::fs::symlink_metadata(&p).unwrap().is_file());
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
         // Env restore is the `_restore` guard's `Drop` (panic-safe).

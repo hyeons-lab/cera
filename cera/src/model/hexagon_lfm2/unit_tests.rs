@@ -792,6 +792,59 @@ fn test_moe_renorm_op_chain_matches_cpu_select_experts() {
     assert!((w.iter().sum::<f32>() - 1.0).abs() < 1e-6);
 }
 
+/// A zero-row gather enqueues nothing: with no rows the params would carry
+/// `n_threads = 0`, which must never cross the FastRPC boundary. A non-empty
+/// gather still enqueues exactly one `GetRows` op.
+#[test]
+fn dispatch_get_rows_with_zero_rows_enqueues_nothing() {
+    use crate::backend::hexagon::sys::fake;
+    fake::reset();
+    let driver = fake::driver();
+    let scratch = RpcmemBuffer::alloc(Arc::clone(&driver), 4096, true).unwrap();
+    let mut session = HexagonQueueSession::new(driver).unwrap();
+    // Hermetic: an exported `CERA_HEXAGON_STEP` must not flush the batch
+    // this test exports.
+    session.set_step_mode(false);
+
+    HexagonLfmModel::dispatch_get_rows(
+        &mut session,
+        &scratch,
+        0,
+        &scratch,
+        0,
+        &scratch,
+        0,
+        0,
+        0,
+        4,
+    )
+    .unwrap();
+    let (bufs, _, tens, ops) = session.export_batch();
+    assert!(
+        bufs.is_empty() && tens.is_empty() && ops.is_empty(),
+        "a zero-row gather must register no buffers, tensors, or ops"
+    );
+
+    HexagonLfmModel::dispatch_get_rows(
+        &mut session,
+        &scratch,
+        0,
+        &scratch,
+        1024,
+        &scratch,
+        2048,
+        8,
+        4,
+        4,
+    )
+    .unwrap();
+    let (bufs, _, tens, ops) = session.export_batch();
+    assert_eq!(bufs.len(), 1);
+    assert_eq!(tens.len(), 3);
+    let opcodes: Vec<u32> = ops.iter().map(|o| o.opcode).collect();
+    assert_eq!(opcodes, [HtpOpCode::GetRows].map(|o| o as u32));
+}
+
 /// Golden op sequence and operand offsets of the renormalization chain,
 /// recorded through a real queue session on the fake FastRPC driver.
 #[test]
