@@ -676,6 +676,42 @@ to 494 for 0.1x and 0.001x), so the default is where it should be. The fused gat
 but bypassing it end to end changes prefill by +3%, -2% and -7% on three LFM2 configurations (within the run-to-run noise except for the Q4_K_M model, where fusion wins), so it stays.
 `CERA_BENCH_GAP_US` and `CERA_BENCH_REPS` in the pool bench reproduce the gap and sustained measurements.
 
+### CPU decode: the Q6_K LM head was prefetching one line of four, 85 ns ahead (2026-10-11)
+
+Dense Llama-3.2-1B Q4_0 decodes at 64.6 tok/s against llama.cpp's 72.9 (`llama-bench -t 8 -p 0 -n 128`). It is a mixed-quant GGUF, and a cycle profile of decode puts
+28.5% of the cycles in `q6k_rows4`, the 215 MB Q6_K LM head, which is 29.5% of the model's bytes; the Q4_0 gate/up kernel moves 41% of the bytes in 26.8% of the cycles.
+
+`llama_decode_gemv_microbench` (an ignored test, new) times the decode GEMV entries on Llama's shapes next to a pure streaming read of the same bytes through the same pool.
+The Q4_0 decode repack kernels already run at 68 GB/s (`dec4 down 2048x8192` 68, `dec4 gate+up swiglu 8192x2048` 68.5); the Q6_K head ran at 45 to 47 GB/s against a streaming ceiling of 69 GB/s,
+4.7 ms against 3.1 ms of a 15 ms token. The kernel is not compute-bound: on a cache-resident matrix it runs at about 100 GB/s-equivalent across the pool. It is waiting on memory.
+
+Each thread streams four rows at once, a Q6_K block is 210 bytes (about four cache lines), and `q6k_rows4` prefetched one line per row 512 bytes ahead: about 85 ns of work at the 140 cycles a block
+costs, shorter than a mobile DRAM latency, and the other three lines of the block were left to a hardware prefetcher that does not follow four row streams. Sweeping lead and lines
+(GB/s on the 128256x2048 head, 65536x1024 and 32064x4096; ceiling 69 to 75):
+
+| Lead ahead | Lines per block | 128256x2048 | 65536x1024 | 32064x4096 |
+|---|---:|---:|---:|---:|
+| 512 B (before) | 1 | 46.8 | 63.2 | 51.5 |
+| 8 KB | 1 | 52.1 | 62.7 | 55.3 |
+| 2 KB | 4 | 51.2 | 63.9 | 48.4 |
+| 4 KB | 4 | 51.6 | 67.4 | 54.8 |
+| 8 KB | 4 | 67.3 | 72.7 | 66.3 |
+| 16 KB | 4 | 68.0 | 71.4 | 69.4 |
+
+Both a long lead and every line of the block are needed. Tensors of 32 MB and up (the LM heads) now prefetch all four lines 16 KB ahead (`q6k_prefetch_for`; `CERA_Q6K_PREFETCH` overrides the
+distance, 0 restores the old setting). Smaller Q6_K tensors keep the old prefetch: 2 to 14 MB measured within noise in both directions and the extra instructions cost 5% on a cache-resident one. Only the
+prefetch changed, so output is byte-identical (a 64-token greedy generation matches with and without it).
+
+Decode tok/s, long prefetch off and on in one binary, alternating (`android_vl_image_raw/cpu_decode_lm_head_20261011/`):
+
+| Model | Off | On | Change |
+|---|---:|---:|---:|
+| Llama-3.2-1B Q4_0 (215 MB Q6_K head), 7 reps | 64.6 | 72.9 | +12.8% |
+| LFM2.5-350M Q4_K_M (55 MB head), 5 reps | 213.3 | 217.3 | +1.9% |
+| LFM2.5-VL-450M Q4_0, 5 reps | 264.5 | 268.9 | +1.7% |
+
+Against llama.cpp (`llama-bench -t 8 -p 0 -n 128 -ngl 0 --device none`), alternated 5 times on dense Llama-3.2-1B Q4_0: 73.0 against 74.6 tok/s, a ratio of 0.977 (it was 0.91).
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
