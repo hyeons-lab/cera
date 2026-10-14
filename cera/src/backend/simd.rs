@@ -3760,16 +3760,17 @@ pub(crate) mod neon {
         #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
         let nth = 1usize;
 
-        let chunk = m.div_ceil(nth).max(1);
-        let n_chunks = m.div_ceil(chunk);
-        let mut worker_results_stack = [(f32::NEG_INFINITY, 0usize); 128];
-        let mut worker_results_heap;
-        let worker_results: &mut [(f32, usize)] = if n_chunks <= 128 {
-            &mut worker_results_stack[..n_chunks]
+        // Work items of a multiple of four rows, at most 128 of them, handed out by stealing: one
+        // contiguous slice per worker left the two prime cores of a prime/mid pool waiting on the six
+        // mid cores (the 205 MB head ran at 50 to 53 GB/s in the model against 67 to 69 when stolen).
+        let chunk = if nth > 1 {
+            (m.div_ceil(128).div_ceil(4) * 4).max(64)
         } else {
-            worker_results_heap = vec![(f32::NEG_INFINITY, 0usize); n_chunks];
-            &mut worker_results_heap[..]
+            m
         };
+        let n_chunks = m.div_ceil(chunk);
+        let mut worker_results = [(f32::NEG_INFINITY, 0usize); 128];
+        let worker_results = &mut worker_results[..n_chunks];
         let worker_results_ptr = worker_results.as_mut_ptr() as usize;
 
         let blocks_per_row = k / 256;
@@ -3799,8 +3800,7 @@ pub(crate) mod neon {
         } else {
             0
         };
-        let compute_chunk = |start_row: usize, slice_len: usize| unsafe {
-            let chunk_idx = (start_row / chunk).min(n_chunks.saturating_sub(1));
+        let compute_chunk = |chunk_idx: usize, start_row: usize, slice_len: usize| unsafe {
             let mut local_max_val = f32::NEG_INFINITY;
             let mut local_max_idx = start_row;
             let mut r = 0usize;
@@ -3849,12 +3849,23 @@ pub(crate) mod neon {
         };
 
         #[cfg(all(feature = "parallel", not(target_arch = "wasm32")))]
-        crate::backend::cpu::par_range(m, chunk, |start_row, num_rows| {
-            compute_chunk(start_row, num_rows);
-        });
+        {
+            // One float of "output" per work item, so the row-stealing dispatch can hand them out.
+            let mut tickets = [0.0f32; 128];
+            crate::backend::cpu::par_rows_n_chunked_decode(
+                &mut tickets[..n_chunks],
+                1,
+                1,
+                1,
+                |(item, _)| {
+                    let start_row = item * chunk;
+                    compute_chunk(item, start_row, chunk.min(m - start_row));
+                },
+            );
+        }
 
         #[cfg(not(all(feature = "parallel", not(target_arch = "wasm32"))))]
-        compute_chunk(0, m);
+        compute_chunk(0, 0, m);
 
         let mut best_val = f32::NEG_INFINITY;
         let mut best_idx = 0usize;
@@ -12406,6 +12417,134 @@ pub(crate) mod neon {
                     };
                     assert_eq!(g.to_bits(), want.to_bits(), "row {r}");
                 }
+            }
+        }
+
+        /// Decode GEMV timing on the LFM2.5-2.6B Q5_K_M shapes (the fused Q5_K gate/up, the plain Q5_K
+        /// projections and the Q6_K down), each with a streaming-read ceiling over the same bytes. Weights
+        /// rotate through >= 96 MB (>= 3 copies of the largest) so they stream from DRAM; a ceiling below
+        /// about 30 MB of distinct bytes is partly system-cache and not a DRAM figure.
+        /// `cera_tests lfm2_q5k_decode_gemv_microbench --ignored --nocapture --test-threads=1`.
+        #[test]
+        #[ignore = "microbenchmark: run explicitly on a device"]
+        #[cfg(target_arch = "aarch64")]
+        fn lfm2_q5k_decode_gemv_microbench() {
+            use crate::tensor::DType;
+            if !crate::backend::cpu_features::cpu_features().dotprod {
+                return;
+            }
+            let time = |copies: usize, f: &mut dyn FnMut(usize)| -> f64 {
+                let mut v = Vec::new();
+                for i in 0..60 {
+                    let t0 = std::time::Instant::now();
+                    f(i % copies);
+                    if i >= 10 {
+                        v.push(t0.elapsed().as_secs_f64());
+                    }
+                }
+                v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                v[v.len() / 2]
+            };
+            let stream = |bytes: &[u8]| {
+                let base = bytes.as_ptr() as usize;
+                let n = bytes.len() / 4096;
+                let sink = std::sync::atomic::AtomicU64::new(0);
+                crate::backend::cpu::par_range(n, 16, |start, count| {
+                    let mut acc = unsafe { vdupq_n_u8(0) };
+                    for i in start..start + count {
+                        let p = (base + i * 4096) as *const u8;
+                        for j in 0..64usize {
+                            for q in 0..4usize {
+                                acc = unsafe { veorq_u8(acc, vld1q_u8(p.add(j * 64 + q * 16))) };
+                            }
+                        }
+                    }
+                    sink.fetch_xor(
+                        unsafe { vgetq_lane_u64::<0>(vreinterpretq_u64_u8(acc)) },
+                        std::sync::atomic::Ordering::Relaxed,
+                    );
+                });
+                std::hint::black_box(sink.load(std::sync::atomic::Ordering::Relaxed));
+            };
+            let mut st = 0x25c0_0001u64;
+            // kind 0 = Q5_K plain, 1 = Q5_K fused gate/up (two weights), 2 = Q6_K plain
+            for (name, m, k, kind) in [
+                ("q5k gate+up swiglu 10752x2048", 10752usize, 2048usize, 1u8),
+                ("q5k conv in 6144x2048", 6144, 2048, 0),
+                ("q5k out 2048x2048", 2048, 2048, 0),
+                ("q6k down 2048x10752", 2048, 10752, 2),
+                ("q5k conv in 6144x2048 (hot)", 6144, 2048, 0),
+                ("q5k out 2048x2048 (hot)", 2048, 2048, 0),
+                ("q5k gate+up 10752x2048 (hot)", 10752, 2048, 1),
+            ] {
+                let hot = name.contains("(hot)");
+                let row_bytes = (k / 256)
+                    * match kind {
+                        2 => std::mem::size_of::<BlockQ6K>(),
+                        _ => std::mem::size_of::<crate::quant::BlockQ5K>(),
+                    };
+                let one_len = m * row_bytes;
+                let weights = if kind == 1 { 2 } else { 1 };
+                let copies = if hot {
+                    1
+                } else {
+                    (160usize << 20).div_ceil(one_len * weights).max(3)
+                };
+                let ws: Vec<Vec<u8>> = (0..copies * weights)
+                    .map(|_| {
+                        (0..one_len)
+                            .map(|_| (lcg(&mut st) * 127.0) as i32 as u8)
+                            .collect()
+                    })
+                    .collect();
+                let x: Vec<f32> = (0..k).map(|_| lcg(&mut st)).collect();
+                let (xs, xq) = quantize_col(&x);
+                let mut y = vec![0.0f32; m];
+                let t = time(copies, &mut |i| match kind {
+                    1 => crate::backend::cpu::gemv_q5k_gate_up_swiglu_with_q8(
+                        &ws[2 * i],
+                        &ws[2 * i + 1],
+                        &xs,
+                        &xq,
+                        &mut y,
+                        m,
+                        k,
+                    ),
+                    0 => crate::backend::cpu::gemv_with_preq(
+                        DType::Q5KM,
+                        &ws[i],
+                        &xs,
+                        &xq,
+                        &x,
+                        &mut y,
+                        m,
+                        k,
+                    ),
+                    _ => crate::backend::cpu::gemv_with_preq(
+                        DType::Q6K,
+                        &ws[i],
+                        &xs,
+                        &xq,
+                        &x,
+                        &mut y,
+                        m,
+                        k,
+                    ),
+                });
+                let bytes = (one_len * weights) as f64;
+                let ts = time(copies, &mut |i| {
+                    for w in 0..weights {
+                        stream(&ws[weights * i + w]);
+                    }
+                });
+                println!(
+                    "{name:>32}: {:7.3} ms {:5.1} GB/s   stream {:7.3} ms {:5.1} GB/s   ({:.1} MB)",
+                    t * 1e3,
+                    bytes / t / 1e9,
+                    ts * 1e3,
+                    bytes / ts / 1e9,
+                    bytes / 1e6
+                );
             }
         }
 

@@ -11530,6 +11530,44 @@ mod tests {
             assert_eq!(got_sub, want_sub);
         }
 
+        /// The Q6_K argmax splits its rows into stolen work items (a multiple of four rows each, at
+        /// most 128): it must agree with the argmax of the full logits GEMV for item counts from one to the
+        /// cap and for ragged last items, and a table of identical rows (every logit equal) must keep
+        /// the lowest index whichever worker finishes first.
+        #[cfg(target_arch = "aarch64")]
+        #[test]
+        fn q6k_argmax_stolen_items_match_the_logits_argmax() {
+            if !crate::backend::simd::require_simd_or_skip(
+                "dotprod",
+                crate::backend::cpu_features::cpu_features().dotprod,
+            ) {
+                return;
+            }
+            let k = 256usize;
+            let mut st = 0xa86_3a5eu64;
+            let x: Vec<f32> = (0..k)
+                .map(|_| (lcg(&mut st) % 2000) as f32 / 1000.0 - 1.0)
+                .collect();
+            let mut scales = vec![0.0f32; k / 32];
+            let mut quants = vec![0i8; k];
+            quantize_f32_to_q8_0_into(&x, &mut scales, &mut quants);
+            for m in [4usize, 61, 64, 65, 4099, 8192, 20003, 32768 + 7] {
+                let data = weights(DType::Q6K, m, k, &mut st);
+                let mut logits = vec![0.0f32; m];
+                gemv_with_preq(DType::Q6K, &data, &scales, &quants, &x, &mut logits, m, k);
+                let want = crate::sampler::argmax(&logits) as usize;
+                let got = gemv_with_preq_argmax(DType::Q6K, &data, &scales, &quants, &x, m, k);
+                assert_eq!(got, want, "m={m}: stolen-item argmax {got} vs {want}");
+            }
+            let row = weights(DType::Q6K, 1, k, &mut st);
+            let same: Vec<u8> = (0..9001).flat_map(|_| row.iter().copied()).collect();
+            assert_eq!(
+                gemv_with_preq_argmax(DType::Q6K, &same, &scales, &quants, &x, 9001, k),
+                0,
+                "equal logits must keep the lowest index"
+            );
+        }
+
         #[test]
         fn gemv_with_preq_handles_y_len_greater_than_m() {
             let (m, k) = (16usize, 256usize);

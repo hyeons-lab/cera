@@ -712,6 +712,34 @@ Decode tok/s, long prefetch off and on in one binary, alternating (`android_vl_i
 
 Against llama.cpp (`llama-bench -t 8 -p 0 -n 128 -ngl 0 --device none`), alternated 5 times on dense Llama-3.2-1B Q4_0: 73.0 against 74.6 tok/s, a ratio of 0.977 (it was 0.91).
 
+### CPU decode: the greedy LM head split its rows statically, and where the 2.6B K-quant gap is (2026-10-11)
+
+The greedy decode path computes the Q6_K LM head with a fused argmax (`gemv_q6k_q8_0_argmax_neon`) so the logits never reach memory. It handed each worker one contiguous slice of
+`m / threads` rows. On a prime/mid pool (2 prime cores at 4.47 GHz, 6 mid cores at 3.53 GHz) the prime cores finish first and wait: the 205 MB head of LFM2.5-2.6B ran at 50 to 53 GB/s in the
+real decode while the same kernel with row stealing measured 67 to 69 GB/s in isolation. It now cuts the rows into at most 128 work items of a multiple of four rows each and hands them out with the
+stealing dispatch; the per-item results are reduced in item order with a strict comparison, so ties keep the lowest row index. Output is unchanged (a 64-token greedy generation matches; a new test compares
+against the argmax of the full logits GEMV for item counts from one to the cap with ragged last items, and an all-equal table must return row 0, which flipping the reduction to `>=` breaks).
+
+Dense Llama-3.2-1B Q4_0 decode, before and after, alternating, 7 repetitions: 72.4 to 75.0 tok/s (+3.6%, runs 71.5 to 73.1 against 73.7 to 76.0). On LFM2.5-2.6B Q5_K_M, whose head is a smaller share of a
+longer token, it is 24.5 against 24.5 (+0.0%, within noise). With the Q6_K prefetch of the previous section, dense Llama decode is now about at llama.cpp's rate (75.0 against the 74.6 of the alternated run in
+that section; not alternated with this binary).
+
+The remaining K-quant gap is on the 2.6B Q5_K_M model: 25.2 against llama.cpp's 28.8 tok/s alternated (0.877x; the 350M Q4_K_M is at 0.983x). Its per-token budget from `CERA_PROFILE_DECODE`, ms:
+
+| Phase | ms | Bytes per token | GB/s |
+|---|---:|---:|---:|
+| FFN (30 layers; fused Q5_K gate/up, Q6_K down) | 25.2 | 1.38 GB | 55 |
+| conv blocks (22 layers; Q5_K in and out projections) | 6.3 | 0.24 GB | 38 |
+| attention blocks (8 layers; q, k, v, o) | 1.8 to 3.1 | 0.06 GB | 18 to 30 |
+| LM head argmax | 3.9 to 4.1 | 0.205 GB | 50 to 53 |
+| norms | 0.1 | | |
+
+Against a streaming ceiling of about 71 GB/s (`lfm2_q5k_decode_gemv_microbench`, new, ignored): the fused Q5_K gate/up reaches 60 to 63 GB/s and the Q6_K down 59 to 68, so the FFN is near its ceiling; the small
+Q5_K projections (conv in 6144x2048 at 27 to 44 GB/s, out 2048x2048 at 28 to 39) are far below it, yet cache-resident they run at 86 to 90 GB/s-equivalent, so they are not compute-bound. Prefetching every line of
+the block far ahead in the Q4_K and Q5_K four-row kernels, the fix that took the Q6_K head from 46 to 68 GB/s, gave +4.5% (8 KB lead) and +0.8% (16 KB) on this model end to end with overlapping runs, so it was not kept;
+giving the 17 MB Q6_K down projections the long prefetch changed decode by +0.0%. Single small-shape calls in the isolated bench vary 30 to 50% between runs, so only the end-to-end A/B is used to decide.
+What is left on this model is the per-dispatch cost of the small conv and attention projections (about 10 ms of a 40 ms token at roughly 55 to 60% of the ceiling).
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
