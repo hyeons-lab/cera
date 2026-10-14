@@ -81,10 +81,9 @@
 //! front-end depends on nothing in the GGUF but the band count.
 
 mod common;
+use common::test_pcm;
 
-use cera::model::audio_encoder::{
-    AudioEncoderWeights, SAMPLE_RATE, audio_encoder_forward, conv_stem_forward,
-};
+use cera::model::audio_encoder::{AudioEncoderWeights, audio_encoder_forward, conv_stem_forward};
 use cera::model::audio_encoder_gpu::{
     GpuAudioWeights, MetalAudioOps, encode_audio_mel_gpu, encoder_input_gpu,
 };
@@ -339,26 +338,6 @@ fn load_encoder() -> Option<AudioEncoderWeights> {
     }
     let gguf = cera::gguf::GgufFile::open_arc(&path).expect("open audio mmproj");
     Some(AudioEncoderWeights::from_gguf(&gguf).expect("parse audio encoder"))
-}
-
-/// A deterministic, broadband test signal: three tones plus a chirp, so the mel
-/// spectrogram has structure across the whole filterbank rather than energy in
-/// one bin. `secs` of mono PCM at the encoder's sample rate.
-///
-/// Broadband matters: a single tone leaves most mel bins near the log floor,
-/// where post-norm values are tiny and a cosine gate passes almost anything.
-fn test_pcm(secs: f32) -> Vec<f32> {
-    let n = (SAMPLE_RATE as f32 * secs) as usize;
-    (0..n)
-        .map(|i| {
-            let t = i as f32 / SAMPLE_RATE as f32;
-            let chirp = (std::f32::consts::TAU * (200.0 + 900.0 * t) * t).sin();
-            0.30 * (std::f32::consts::TAU * 440.0 * t).sin()
-                + 0.20 * (std::f32::consts::TAU * 1320.0 * t).sin()
-                + 0.15 * (std::f32::consts::TAU * 3000.0 * t).sin()
-                + 0.25 * chirp
-        })
-        .collect()
 }
 
 /// Load the encoder, a Metal context, and the uploaded GPU weights, or `None` to

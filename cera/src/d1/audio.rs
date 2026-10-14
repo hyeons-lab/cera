@@ -17,11 +17,13 @@ use std::sync::Arc;
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::backend::cpu;
+use crate::engine::BackendPreference;
 use crate::gguf::GgufFile;
 use crate::model::audio_encoder::{
     AudioEncoderWeights, RESAMPLE_RATE_MAX, RESAMPLE_RATE_MIN, audio_encoder_forward,
     resample_linear,
 };
+use crate::model::audio_encoder_gpu::{AudioGpuEncode, build_gpu_audio_encoder};
 use crate::model::audio_preprocessor::log_mel_spectrogram;
 use crate::model::pii::matmul_nt_f32;
 
@@ -217,7 +219,9 @@ pub fn prepare_clip(samples: &[f32], rate: u32) -> Result<Vec<f32>> {
 
 /// The speech encoder and its residual block.
 pub struct AudioTower {
-    encoder: AudioEncoderWeights,
+    encoder: Arc<AudioEncoderWeights>,
+    /// The encoder on a GPU, when [`Self::accelerate`] found one.
+    gpu: Option<Arc<dyn AudioGpuEncode>>,
     width: usize,
     hidden: usize,
     norm_w: Vec<f32>,
@@ -298,7 +302,7 @@ impl AudioTower {
         };
         let plane = out_ch; // F_out is 1 for 8 mel bins after three halvings
         Self {
-            encoder: AudioEncoderWeights {
+            encoder: Arc::new(AudioEncoderWeights {
                 config: AudioEncoderConfig {
                     n_layer: 0,
                     n_embd: plane,
@@ -332,7 +336,8 @@ impl AudioTower {
                     down_w: MmapWeight::from_owned_f32(vec![0.0; trunk_width * 8], trunk_width, 8),
                     down_b: vec![0.0; trunk_width],
                 },
-            },
+            }),
+            gpu: None,
             width: trunk_width,
             hidden: 8,
             norm_w: vec![0.0; trunk_width],
@@ -375,7 +380,8 @@ impl AudioTower {
             super::load_f32(gguf, "speech tower", name, elements)
         };
         Ok(Self {
-            encoder,
+            encoder: Arc::new(encoder),
+            gpu: None,
             width,
             hidden,
             norm_w: t("d1.a.res.norm.weight", &[width])?,
@@ -385,6 +391,23 @@ impl AudioTower {
             up_w: t("d1.a.res.up.weight", &[width, hidden])?,
             up_b: t("d1.a.res.up.bias", &[width])?,
         })
+    }
+
+    /// Run the encoder on the accelerator `backend` names, when there is one; the log-mel
+    /// front end stays on the host so that exactly the reference's frames are read. Does
+    /// nothing for the CPU or when no device opens.
+    pub fn accelerate(&mut self, backend: BackendPreference) {
+        // A backend that cannot build must not clear a working encoder: only `Some` sticks.
+        if backend != BackendPreference::Cpu
+            && let Some(gpu) = build_gpu_audio_encoder(&self.encoder, backend)
+        {
+            self.gpu = Some(gpu);
+        }
+    }
+
+    /// Whether the encoder runs on an accelerator (a GPU or the NPU).
+    pub fn is_accelerated(&self) -> bool {
+        self.gpu.is_some()
     }
 
     /// `x + up(GELU(down(LayerNorm(x))))` over `rows` embeddings.
@@ -441,8 +464,18 @@ impl AudioTower {
             );
             return Ok(Vec::new());
         }
+        let mel = &mel[..frames * bins];
+        let on_gpu = self.gpu.as_ref().and_then(|gpu| {
+            gpu.encode_mel(mel, frames)
+                .map_err(|e| {
+                    crate::d1::warn_cpu_fallback(format_args!(
+                        "the speech encoder runs on the CPU: {e:#}"
+                    ))
+                })
+                .ok()
+        });
         let (mut embeddings, rows) =
-            audio_encoder_forward(&mel[..frames * bins], frames, &self.encoder);
+            on_gpu.unwrap_or_else(|| audio_encoder_forward(mel, frames, &self.encoder));
         ensure!(
             rows == prefix_rows(pcm.len()),
             "the speech encoder returned {rows} rows for {} samples, expected {}",
@@ -655,7 +688,7 @@ mod tests {
         use crate::model::weights::MmapWeight;
         let noweight = || MmapWeight::from_owned_f32(Vec::new(), 0, 0);
         AudioTower {
-            encoder: AudioEncoderWeights {
+            encoder: Arc::new(AudioEncoderWeights {
                 config: AudioEncoderConfig {
                     n_layer: 0,
                     n_embd: 0,
@@ -679,7 +712,8 @@ mod tests {
                     down_w: noweight(),
                     down_b: Vec::new(),
                 },
-            },
+            }),
+            gpu: None,
             width: 0,
             hidden: 0,
             norm_w: Vec::new(),
@@ -808,5 +842,57 @@ mod tests {
                 );
             }
         }
+    }
+
+    /// AudioTower acceleration honors BackendPreference::Cpu and keeps acceleration off.
+    #[test]
+    fn audio_tower_accelerate_handles_cpu_and_refusals() {
+        use crate::engine::BackendPreference;
+        use crate::model::audio_encoder::{
+            AudioEncoderConfig, AudioEncoderWeights, AudioMlpAdapterWeights, ConvStemWeights,
+        };
+        use crate::model::weights::MmapWeight;
+
+        let config = AudioEncoderConfig {
+            n_layer: 0,
+            n_embd: 64,
+            n_ff: 128,
+            n_head: 2,
+            eps: 1e-5,
+            n_mel_bins: 128,
+            llm_hidden_size: 64,
+        };
+        let weights = AudioEncoderWeights {
+            config,
+            conv_stem: ConvStemWeights {
+                layers: Vec::new(),
+                pre_encode_out_w: MmapWeight::from_owned_f32(vec![0.0; 64 * 64], 64, 64),
+                pre_encode_out_b: vec![0.0; 64],
+            },
+            layers: Vec::new(),
+            mlp_adapter: AudioMlpAdapterWeights {
+                norm_w: vec![0.0; 64],
+                norm_b: vec![0.0; 64],
+                up_w: MmapWeight::from_owned_f32(vec![0.0; 64 * 64], 64, 64),
+                up_b: vec![0.0; 64],
+                down_w: MmapWeight::from_owned_f32(vec![0.0; 64 * 64], 64, 64),
+                down_b: vec![0.0; 64],
+            },
+        };
+        let mut tower = AudioTower {
+            encoder: Arc::new(weights),
+            gpu: None,
+            width: 64,
+            hidden: 64,
+            norm_w: vec![1.0; 64],
+            norm_b: vec![0.0; 64],
+            down_w: vec![0.0; 64 * 64],
+            down_b: vec![0.0; 64],
+            up_w: vec![0.0; 64 * 64],
+            up_b: vec![0.0; 64],
+        };
+        assert!(!tower.is_accelerated());
+        tower.accelerate(BackendPreference::Cpu);
+        assert!(!tower.is_accelerated());
     }
 }

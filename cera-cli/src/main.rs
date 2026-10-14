@@ -4509,7 +4509,12 @@ fn main() -> Result<()> {
             )?;
             let gguf = std::sync::Arc::new(cera::gguf::GgufFile::open(Path::new(&model))?);
             let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
-            let d1 = cera::d1::D1Model::from_gguf(&gguf, &tokenizer)?;
+            let backend = cera::engine::BackendPreference::parse_str(&device)
+                .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let mut d1 = cera::d1::D1Model::from_gguf(&gguf, &tokenizer)?;
+            d1.accelerate(&gguf, backend);
+            let (head, vision, audio) = d1.accelerated();
+            eprintln!("d1 towers accelerated: head={head} vision={vision} audio={audio}");
             let engine = resolve_engine(
                 Some(&model),
                 None,

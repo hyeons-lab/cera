@@ -173,6 +173,10 @@ required-features = ["hexagon", "mmap"]
 # test targets, which blocks `--all-targets` wasm clippy. Combos with mmap
 # on but gpu off still build them (empty bodies), exactly as before.
 [[test]]
+name = "audio_encoder_wgpu_parity"
+required-features = ["mmap"]
+
+[[test]]
 name = "detok_wgpu_parity"
 required-features = ["mmap"]
 

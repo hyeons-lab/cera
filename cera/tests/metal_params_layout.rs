@@ -192,6 +192,12 @@ fn cases() -> Vec<(usize, &'static str, &'static str, &'static str)> {
             "PrefillAttnParams",
         ),
         (
+            size_of::<BidirConvParams>(),
+            shaders::BIDIRECTIONAL,
+            "BidirConvParams",
+            "BidirConvParams",
+        ),
+        (
             size_of::<ElementwiseParams>(),
             shaders::ELEMENTWISE,
             "Params",

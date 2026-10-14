@@ -5235,6 +5235,9 @@ impl Model for LfmModel {
             prefix.len().is_multiple_of(hs),
             "the media prefix is not a whole number of rows"
         );
+        if prefix.is_empty() && tokens.is_empty() {
+            return Vec::new();
+        }
         let prefix_rows = prefix.len() / hs;
         let mut h = Vec::with_capacity(prefix.len() + tokens.len() * hs);
         h.extend_from_slice(prefix);
@@ -6470,21 +6473,23 @@ pub(crate) mod release_tests {
 /// and the per-token path that used to take them is causal. These tests pin the float path
 /// that runs instead.
 #[cfg(test)]
-mod bidirectional_float_tests {
+pub(crate) mod bidirectional_float_tests {
     use super::*;
     use crate::convert::TargetQuant;
     use crate::convert::writer::GGML_TYPE_Q8_0;
     use crate::model::Model;
 
-    const HS: usize = 64;
-    const INTER: usize = 128;
+    // 128 wide: the batched Q8_0 GEMV on Metal reads in steps of 128 values
+    pub(crate) const HS: usize = 128;
+    const INTER: usize = 256;
     const VOCAB: usize = 32;
-    const N_HEADS: usize = 2;
+    const N_HEADS: usize = 4;
     const HEAD_DIM: usize = 32;
 
-    /// A two-layer non-causal LFM2 (one short-conv block, one attention block) with
-    /// deterministic weights; the projections are F32, or Q8_0 of the same values.
-    fn bidirectional_gguf(q8_projections: bool) -> GgufFile {
+    /// A three-layer non-causal LFM2 (a short-conv block, then two attention blocks, so that one
+    /// layer's attention feeds the next layer's) with deterministic weights; the projections are
+    /// F32, or Q8_0 of the same values.
+    pub(crate) fn bidirectional_gguf(q8_projections: bool) -> GgufFile {
         use crate::gguf::GgufBuilder;
         let mut seed = 0x2545_f491u64;
         let mut values = move |n: usize, scale: f32, base: f32| -> Vec<f32> {
@@ -6499,15 +6504,15 @@ mod bidirectional_float_tests {
         };
         let mut b = GgufBuilder::new()
             .kv_str("general.architecture", "lfm2")
-            .kv_u32("lfm2.block_count", 2)
+            .kv_u32("lfm2.block_count", 3)
             .kv_u32("lfm2.embedding_length", HS as u32)
             .kv_u32("lfm2.feed_forward_length", INTER as u32)
             .kv_u32("lfm2.attention.head_count", N_HEADS as u32)
-            .kv_i32_array("lfm2.attention.head_count_kv", vec![0, 1])
+            .kv_i32_array("lfm2.attention.head_count_kv", vec![0, 1, 1])
             .kv_u32("lfm2.shortconv.l_cache", 3)
             .kv_f32("lfm2.attention.layer_norm_rms_epsilon", 1e-5)
             .kv_f32("lfm2.rope.freq_base", 10_000.0)
-            .kv_u32("lfm2.context_length", 256)
+            .kv_u32("lfm2.context_length", 4096)
             .kv_u32("lfm2.vocab_size", VOCAB as u32)
             .kv_raw("lfm2.attention.causal", 7, vec![0]);
         let embd = values(VOCAB * HS, 1.0, 0.0);
@@ -6523,11 +6528,11 @@ mod bidirectional_float_tests {
                 b.tensor_f32(name, &dims, &w)
             }
         };
-        for layer in 0..2 {
+        for layer in 0..3 {
             let n = |s: &str| format!("blk.{layer}.{s}");
             b = b.tensor_f32(n("attn_norm.weight"), &[HS], &values(HS, 0.1, 1.0));
             b = b.tensor_f32(n("ffn_norm.weight"), &[HS], &values(HS, 0.1, 1.0));
-            if layer == 1 {
+            if layer >= 1 {
                 b = projection(
                     b,
                     n("attn_q.weight"),
@@ -6663,7 +6668,7 @@ mod bidirectional_float_tests {
     }
 
     /// Deterministic embeddings, `rows` of `HS`, for a seed.
-    fn embeddings(rows: usize, seed: f32) -> Vec<f32> {
+    pub(crate) fn embeddings(rows: usize, seed: f32) -> Vec<f32> {
         (0..rows * HS)
             .map(|i| ((i as f32 * 0.37 + seed).sin()) * 0.8)
             .collect()
@@ -6674,6 +6679,20 @@ mod bidirectional_float_tests {
         let mut h = embeddings(prefix_rows, prefix_seed);
         h.extend(embeddings(text_rows, text_seed));
         model.float_trunk(h, prefix_rows)
+    }
+
+    /// An empty prefix with empty tokens yields no rows instead of tripping the trunk's
+    /// non-empty precondition: the contract promises `tokens.len()` rows unconditionally.
+    #[test]
+    fn empty_prefix_and_tokens_yield_no_rows() {
+        use crate::kv_cache::InferenceState;
+        let model = LfmModel::from_gguf(bidirectional_gguf(false), 256).unwrap();
+        let mut state = InferenceState::for_prefill(model.config(), 0).unwrap();
+        assert!(
+            model
+                .hidden_states_with_prefix(&[], &[], &mut state)
+                .is_empty()
+        );
     }
 
     /// A media prefix is a function of the media alone: its rows attend only to each other and

@@ -56,6 +56,11 @@ struct PrefillAttnParams {
     uint scale_bits;
     uint q_stride;
     uint out_stride;
+    // 0: causal (the default). 1: bidirectional, every query reads the whole
+    // sequence except that a query in the first `prefix_rows` rows reads only
+    // those rows (a media prefix is a function of the media alone).
+    uint bidir;
+    uint prefix_rows;
 };
 
 // Templated helper. HD_CONST>0 folds `hd` to a literal (Iter 5). QPT is the
@@ -88,7 +93,13 @@ inline void attention_prefill_impl(
     const uint kv_h_off = kv_head * hd;
 
     const uint n_q = min(QPT, n_queries - q_base);
-    const uint max_seq = start_pos + q_base + n_q;
+    // Keys visible to the query at global row `row`; the loop bound is the widest of a block.
+    const uint total_rows = start_pos + n_queries;
+    const bool bidir = params.bidir != 0u;
+    const uint prefix_rows = params.prefix_rows;
+    const uint last_row = start_pos + q_base + n_q - 1u;
+    const uint max_seq = bidir ? (last_row < prefix_rows ? prefix_rows : total_rows)
+                               : start_pos + q_base + n_q;
 
     const uint n_threads = (C_CHUNK == 32) ? 128u : 256u;
     const uint n_sg = n_threads / 32u;
@@ -170,7 +181,8 @@ inline void attention_prefill_impl(
         for (uint idx = tid; idx < n_q * c_len; idx += n_threads) {
             uint q = idx / c_len;
             uint t = idx % c_len;
-            uint seq_len_q = start_pos + q_base + q + 1;
+            const uint row = start_pos + q_base + q;
+            uint seq_len_q = bidir ? (row < prefix_rows ? prefix_rows : total_rows) : row + 1u;
             float s = scores[q * C_CHUNK + t];
             if (c0 + t >= seq_len_q) {
                 s = -INFINITY;

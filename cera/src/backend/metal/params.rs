@@ -379,8 +379,12 @@ pub struct PrefillAttnParams {
     pub scale_bits: u32,
     pub q_stride: u32,
     pub out_stride: u32,
+    /// 1 reads the whole sequence (bidirectional) instead of the causal prefix.
+    pub bidir: u32,
+    /// With `bidir`, rows below this attend only to each other.
+    pub prefix_rows: u32,
 }
-const _: () = assert!(size_of::<PrefillAttnParams>() == 36);
+const _: () = assert!(size_of::<PrefillAttnParams>() == 44);
 impl MetalParams for PrefillAttnParams {}
 
 // ── Element-wise / norms / conv ─────────────────────────────────────────────────
@@ -538,6 +542,19 @@ pub struct Conv1dBatchParams {
 }
 const _: () = assert!(size_of::<Conv1dBatchParams>() == 24);
 impl MetalParams for Conv1dBatchParams {}
+
+/// Mirror of `BidirConvParams` in `shaders/bidirectional.metal`.
+#[repr(C)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct BidirConvParams {
+    pub n: u32,
+    pub hs: u32,
+    pub prefix: u32,
+    pub proj_stride: u32,
+    pub out_stride: u32,
+}
+const _: () = assert!(size_of::<BidirConvParams>() == 20);
+impl MetalParams for BidirConvParams {}
 
 /// Mirror of `CopyParams` in `shaders/kv_shift.metal` (`memcpy_f16_offsets`).
 #[repr(C)]

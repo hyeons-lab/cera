@@ -208,12 +208,80 @@ path. On this Mac (CPU only, one run each, so indicative): a 640x480 image with 
 about 2 s end to end (F32 and F16), the tiled 2048x1536 image about 8 s (F32), and the pair of
 those two images about 10 s (F16).
 
+## Backends
+
+`cera decide --device` takes `cpu`, `metal`, `gpu` (wgpu) or `auto`. The same GGUF runs on all of
+them and the CPU is the reference.
+
+| | Trunk (text, and the rows after a prefix) | Vision tower blocks | Speech encoder | Head layers |
+|---|---|---|---|---|
+| CPU | yes | yes | yes | yes |
+| Metal | yes | yes | yes | yes |
+| wgpu | yes | yes | yes | CPU (the GPU is slower there) |
+| Hexagon NPU | refused | not run | falls back to the CPU | CPU |
+
+The trunk is bidirectional, which the GPU LFM2 graphs were not: they are causal and ignored the
+model's attention mask, so a d1 model used to load on Metal or wgpu and answer a different question
+(the refund probability in the text example fell from 0.998 to 0.12). Each GPU trunk now has a
+non-causal attention mode (the prefill attention kernel gains a flag and the media-prefix rule), a
+centred 3-tap gated convolution, and a pass that runs all rows at once: the projections and the
+feed-forward in chunks of the prefill buffers, attention and the convolution as one dispatch over
+every row. A loader refuses a bidirectional checkpoint where it has no such pass (the routed
+`lfm2moe` arch, and the Hexagon NPU), so `--device auto` falls back instead of answering wrongly.
+
+Against the reference, with identical token counts (Q8_0 over the whole corpus, F16 over ten
+requests that cover text, tiled images and speech):
+
+| Backend | Q8_0 largest difference | Q8_0 flipped answers | F16 largest difference | F16 flipped |
+|---|---|---|---|---|
+| CPU | 6.2e-2 | 1 | 1.0e-3 | 0 |
+| Metal | 5.7e-2 | 1 | 1.1e-3 | 0 |
+| wgpu | 7.0e-2 | 1 | 1.4e-2 | 0 |
+
+The flipped answer is the same near-tie on an 8-level score on every backend. CPU and Metal agree
+with each other to about 1e-5 on short requests. wgpu reads its activations in f32 where the CPU
+and Metal quantize them to Q8_0 for a Q8_0 model, so on a long prompt its Q8_0 answers drift from
+theirs by the usual Q8_0 noise (a 13.5k-token prompt: 0.177 against 0.244 for the same weights; the
+reference says 0.246) while F16 weights agree on all three (0.2471 on wgpu, 0.2469 on Metal). Use
+F16 where that matters.
+
+Speed (Apple M-series, one run each, so indicative; Q8_0 weights):
+
+| Request | CPU | Metal | wgpu |
+|---|---|---|---|
+| a 27,000-token state (two questions) | 76 s | 12 s | 60 s |
+| the tiled 2048x1536 image (two questions) | 9.0 s | 3.1 s | 7.4 s |
+| a 30 s clip (two questions) | 2.6 s | 1.3 s | 1.6 s |
+
+Where the time went. A request is the media tower, then one trunk pass per question, then the head.
+The head's first layer attends from every row; done one query at a time it re-read all of K and V per
+query and was bound by memory traffic (5 s per question at 13.5k rows), so on the CPU it uses the
+blocked flash-attention kernel the CPU trunk uses, and on Metal the head's layers run on the GPU
+(the 27,000-token request falls from 21 s to 12 s, answers within 1e-3 of the host's). The vision tower was
+6.6 s of a 7 s image request on the host and is about 1.9 s on Metal; a 30 s clip's request falls from 2.6 s on
+the host to 1.3 s on Metal and 1.6 s on wgpu with the encoder on the GPU. On Metal a 13.5k-row trunk pass takes about 4 s.
+
+wgpu is the slow backend for anything long. Its trunk is 3 s for 3k rows (Metal 0.4 s), and the
+scalar tiled attention kernel is the reason the head stays on the host there: moved to the wgpu GPU
+it measured slower (36 s against about 30 s per question at 13.5k rows). Elementwise wgpu ops
+(bias, ReLU, GELU, add) over more than 16.7M elements, which a 4k-row head feed-forward already is,
+are split into several dispatches because a dispatch is at most 65535 workgroups; before that the
+head's answers were quietly wrong past about 3k rows.
+
+Weights that are neither quantized with a batched GEMM (Q4_0, Q4_1, Q8_0 and the K-quants) nor
+dequantized at upload run on Metal as one GEMV dispatch per row, so F16 on Metal is correct but
+slow (a 27,000-token request: 230 s against 21 s for Q8_0). wgpu dequantizes them to f32 and keeps
+the batched GEMM. Use Q8_0 or Q4_0 for Metal.
+
+A single pass needs buffers of `rows x width` floats: on wgpu the largest binding must fit the
+adapter's storage-binding limit (about 128 MB on common adapters, so roughly 32k rows).
+
 ## Not done yet
 
-* Metal, wgpu and NPU: the trunk is the ordinary LFM2 model, but the decision head, the vision
-  tower and the speech residual are host-side and only the CPU float path is validated.
+* The Hexagon NPU refuses a bidirectional checkpoint (so `--device npu` reports why), and no
+  bidirectional pass is written for it.
+* The head runs on the host on wgpu, until a faster attention kernel exists there.
 * The media prefix (an image's or a clip's) is recomputed through the trunk for every question; it
   depends only on the media, so it could be computed once.
-* Speech speed has not been measured.
 * `cera run --hf` and the other streaming conversions refuse a d1 checkpoint: download the
   repository and use `cera convert` on the directory.

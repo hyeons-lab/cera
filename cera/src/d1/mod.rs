@@ -38,7 +38,9 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result, ensure};
 
+use crate::engine::BackendPreference;
 use crate::gguf::GgufFile;
+use crate::model::weights::MmapWeight;
 use crate::session::Session;
 use crate::tokenizer::BpeTokenizer;
 
@@ -83,6 +85,38 @@ pub(crate) fn load_f32(
         values.len()
     );
     Ok(values)
+}
+
+/// One stack linear from the model file: `{prefix}.{i}.{name}.weight` must be `[rows, cols]`.
+/// Shared by the head and vision tower `accelerate` loaders so the shape check and the
+/// missing-tensor message cannot drift between them.
+pub(crate) fn block_weight(
+    gguf: &Arc<GgufFile>,
+    prefix: &str,
+    owner: &str,
+    i: usize,
+    name: &str,
+    rows: usize,
+    cols: usize,
+) -> Result<MmapWeight> {
+    let tensor = format!("{prefix}.{i}.{name}.weight");
+    let w = MmapWeight::from_gguf(gguf, &tensor)
+        .with_context(|| format!("the {owner} needs the tensor `{tensor}`"))?;
+    ensure!(
+        w.rows == rows && w.cols == cols,
+        "`{tensor}` is {} x {}, expected {rows} x {cols}",
+        w.rows,
+        w.cols
+    );
+    Ok(w)
+}
+
+/// A tower that stays on, or drops back to, the CPU must say so where the shipping
+/// platforms can see it: they install no `tracing` subscriber, so the warning is paired
+/// with a stderr line.
+pub(crate) fn warn_cpu_fallback(msg: impl std::fmt::Display) {
+    tracing::warn!("{msg}");
+    eprintln!("{msg}");
 }
 
 /// The exact (erf) GELU, `torch.nn.GELU()`'s default.
@@ -155,6 +189,15 @@ pub(crate) fn softmax_exact(scores: &mut [f32]) {
     for s in scores.iter_mut() {
         *s /= sum;
     }
+}
+
+/// Deterministic test values in `[-scale, scale]`: the one home for the tower
+/// fixtures, so the distribution cannot drift between suites.
+#[cfg(test)]
+pub(crate) fn noise(n: usize, seed: usize, scale: f32) -> Vec<f32> {
+    (0..n)
+        .map(|i| ((((i + seed) * 1_103_515_245 + 12_345) % 2000) as f32 / 1000.0 - 1.0) * scale)
+        .collect()
 }
 
 /// A request: a state and the named questions to answer about it, in order.
@@ -415,6 +458,34 @@ impl D1Model {
             audio,
             audio_text_length,
         })
+    }
+
+    /// Which towers run on an accelerator: (head, vision, audio). A tower the model lacks reports false.
+    pub fn accelerated(&self) -> (bool, bool, bool) {
+        (
+            self.head.is_accelerated(),
+            self.vision.as_ref().is_some_and(|v| v.is_accelerated()),
+            self.audio.as_ref().is_some_and(|a| a.is_accelerated()),
+        )
+    }
+
+    /// Run the decision head and the vision and speech towers on `backend`, where each one can.
+    /// Routing differs per tower: the head is Metal only (`Metal`, or `Auto` where Metal opens),
+    /// vision is Metal then wgpu, audio is Metal then NPU then wgpu. This is for the encoders in
+    /// front of the trunk, which are most of the time of a request that carries media, and the
+    /// head behind it, which is most of the time of a long text prompt; the trunk follows the
+    /// session's own backend. A tower that cannot use `backend`, or that the model lacks, stays
+    /// on the CPU; check [`Self::accelerated`] to see what moved. `gguf` must be the file the
+    /// model was loaded from: stack weights are matched by shape only, so a different
+    /// same-geometry file would silently mix its weights with this model's biases.
+    pub fn accelerate(&mut self, gguf: &Arc<GgufFile>, backend: BackendPreference) {
+        self.head.accelerate(gguf, backend);
+        if let Some(vision) = &mut self.vision {
+            vision.accelerate(gguf, backend);
+        }
+        if let Some(audio) = &mut self.audio {
+            audio.accelerate(backend);
+        }
     }
 
     /// The longest prompt, in tokens.

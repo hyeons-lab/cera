@@ -573,3 +573,33 @@ pub fn write_lora_gguf(tensors: &[(String, Vec<usize>, Vec<f32>)], alpha: f32) -
     }
     out
 }
+
+/// Deterministic test values in `[-scale, scale]`: the one home for integration-suite
+/// fixtures, so the distribution cannot drift between suites (lib unit tests share the
+/// `crate::d1::noise` copy instead; an integration crate cannot name a lib `cfg(test)` item).
+pub fn noise(n: usize, seed: usize, scale: f32) -> Vec<f32> {
+    (0..n)
+        .map(|i| ((((i + seed) * 1_103_515_245 + 12_345) % 2000) as f32 / 1000.0 - 1.0) * scale)
+        .collect()
+}
+
+/// A deterministic, broadband test signal: three tones plus a chirp, so the mel
+/// spectrogram has structure across the whole filterbank rather than energy in
+/// one bin. `secs` of mono PCM at the encoder's sample rate.
+///
+/// Broadband matters: a single tone leaves most mel bins near the log floor,
+/// where post-norm values are tiny and a cosine gate passes almost anything.
+pub fn test_pcm(secs: f32) -> Vec<f32> {
+    use cera::model::audio_encoder::SAMPLE_RATE;
+    let n = (SAMPLE_RATE as f32 * secs) as usize;
+    (0..n)
+        .map(|i| {
+            let t = i as f32 / SAMPLE_RATE as f32;
+            let chirp = (std::f32::consts::TAU * (200.0 + 900.0 * t) * t).sin();
+            0.30 * (std::f32::consts::TAU * 440.0 * t).sin()
+                + 0.20 * (std::f32::consts::TAU * 1320.0 * t).sin()
+                + 0.15 * (std::f32::consts::TAU * 3000.0 * t).sin()
+                + 0.25 * chirp
+        })
+        .collect()
+}

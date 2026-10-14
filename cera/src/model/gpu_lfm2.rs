@@ -712,7 +712,7 @@ fn gcd_u64(mut a: u64, mut b: u64) -> u64 {
     a
 }
 
-fn lcm_u64(a: u64, b: u64) -> u64 {
+pub(crate) fn lcm_u64(a: u64, b: u64) -> u64 {
     (a / gcd_u64(a, b)) * b
 }
 
@@ -1380,6 +1380,10 @@ struct GpuPipelines {
     add_rmsnorm_batch: wgpu::ComputePipeline,
     qk_norm_rope_batch: wgpu::ComputePipeline,
     conv1d_fused_batch: wgpu::ComputePipeline,
+    /// Split an in-projection into B*x and C for the bidirectional trunk.
+    bidir_split: wgpu::ComputePipeline,
+    /// Centred gated convolution for the bidirectional trunk.
+    bidir_conv_centered: wgpu::ComputePipeline,
     /// Broadcast bias add for batched prefill (`x[t*dim+j] += bias[j]`). Qwen2
     /// QKV bias; absent on every other arch.
     bias_add: wgpu::ComputePipeline,
@@ -1878,6 +1882,23 @@ enum DecodeTail {
     LogitsUnsubmitted(TailArgmax),
 }
 
+/// Refuse a dense SwiGLU slab this backend cannot dispatch: `silu_mul_inplace` spends one
+/// workgroup per 256 elements of the worst-case `rows × is` slab in a single grid dimension,
+/// so past `MAX_WG` groups the constructor must fail (a named error, and Auto falls through)
+/// rather than aborting on an over-limit dispatch mid-prefill. Covers the causal and
+/// bidirectional paths, which chunk alike. Pure so a host test pins it without a device.
+fn check_dense_silu_fits(rows: usize, is: usize) -> Result<()> {
+    let groups = (rows as u64) * (is as u64);
+    let groups = groups.div_ceil(256);
+    anyhow::ensure!(
+        groups <= crate::backend::wgpu::MAX_WG as u64,
+        "the dense SwiGLU over {rows} rows of width {is} needs {groups} workgroups, over this \
+         backend's {} per-dimension cap",
+        crate::backend::wgpu::MAX_WG,
+    );
+    Ok(())
+}
+
 impl GpuLfmModel {
     /// Construct without a model identifier. Equivalent to
     /// `from_gguf_with_id(gguf, context_size, "")`. Warm prefix caching works;
@@ -2206,6 +2227,12 @@ impl GpuLfmModel {
                 shaders::CONV1D_FUSED_BATCH,
                 "conv1d_fused_batch",
                 "conv1d_fused_batch",
+            ),
+            bidir_split: ctx.create_pipeline(shaders::BIDIRECTIONAL, "bidir_split", "bidir_split"),
+            bidir_conv_centered: ctx.create_pipeline(
+                shaders::BIDIRECTIONAL,
+                "bidir_conv_centered",
+                "bidir_conv_centered",
             ),
             bias_add: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "bias_add"),
 
@@ -2822,6 +2849,9 @@ impl GpuLfmModel {
         let prefill_proj_buf = f((3 * hs).max(q_dim) * max_pref, "prefill_proj");
         let prefill_gate_buf = f(is.max(max_kv_dim).max(hs) * max_pref, "prefill_gate");
         let prefill_up_buf = f(is.max(max_kv_dim).max(hs) * max_pref, "prefill_up");
+        // the dense SwiGLU grid is sized from the same worst case: refuse here, where the
+        // refusal is still a loader error, rather than mid-prefill on either trunk path
+        check_dense_silu_fits(max_pref, is)?;
         // Streaming-GEMM B16 scratch: [max_k × max_pref_padded] halfs. max_k
         // covers every Q4_0 matmul K (hs for most projections, `is` for FFN
         // down, q_dim for attention out). Only when the streaming path is on.
@@ -7457,6 +7487,10 @@ impl GpuLfmModel {
     /// Encode `attention_prefill` (batched FlashAttention). Reads Q from
     /// `q_batch`, K/V from the model's KV caches, writes per-(token, head) output
     /// to `out_batch`. Online-softmax over a tiled pass — no scores scratch slab.
+    ///
+    /// `bidir_prefix` is `None` for the causal prefill. `Some(p)` reads the whole sequence
+    /// instead (`start_pos` must be 0 and `n` the full length), except that the first `p` rows
+    /// attend only to each other.
     #[allow(clippy::too_many_arguments)]
     fn encode_attention_prefill<'a>(
         &'a self,
@@ -7475,6 +7509,7 @@ impl GpuLfmModel {
         q_stride: u32,
         out_stride: u32,
         scale: f32,
+        bidir_prefix: Option<u32>,
     ) {
         // No queries → nothing to dispatch (a 0-workgroup dispatch is a validation
         // error on some backends).
@@ -7522,7 +7557,7 @@ impl GpuLfmModel {
         // scores slab gone there is no binding-size reason to. 8 queries share
         // each workgroup (and each K/V tile stream); params[11] is the
         // authoritative batch size edge workgroups mask against.
-        let params: [u32; 12] = [
+        let params: [u32; 14] = [
             n_heads,
             n_kv_heads,
             head_dim,
@@ -7535,6 +7570,8 @@ impl GpuLfmModel {
             out_stride,
             0, // q_base
             n, // n_sub (authoritative; single dispatch so == batch size)
+            u32::from(bidir_prefix.is_some()),
+            bidir_prefix.unwrap_or(0),
         ];
         let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
         let bg = self
@@ -7590,9 +7627,23 @@ impl GpuLfmModel {
     /// naturally. Do NOT re-add a `start_pos == 0` gate on the caller side — it
     /// silently dropped every chunk after the first onto the per-token loop.
     ///
-    /// Mirrors `MetalLfmModel::prefill_layers_and_logits`
-    /// (metal_lfm2.rs:2906); the Metal version is the canonical
-    /// reference for the dispatch order + buffer assignment.
+    /// Reset the pooled prefill resources for one encoder plus one submit: profiler spans,
+    /// and the params-pool and stream-GEMM bind-group cache cursors back to zero, so slots
+    /// are handed out in call order from zero. Shared by the causal and bidirectional paths.
+    fn reset_prefill_pools(&self) {
+        self.ctx.reset_profiler();
+        self.prefill_params_pool
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .1 = 0;
+        self.stream_gemm_bg_cache
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .2 = 0;
+    }
+
+    /// Mirrors `MetalLfmModel::prefill_layers_and_logits`; the Metal version is the
+    /// canonical reference for the dispatch order + buffer assignment.
     fn encode_prefill_batched_locked(
         &self,
         tokens: &[u32],
@@ -7629,7 +7680,7 @@ impl GpuLfmModel {
         // own profile output and starts clean. Conv buffer zeroing is
         // the dispatcher's responsibility (happens once per fresh
         // prefill, regardless of which path runs and how many chunks).
-        self.ctx.reset_profiler();
+        self.reset_prefill_pools();
         self.gpu_state.seq_len.store(start_pos, Ordering::Relaxed);
 
         // Active LoRA adapter (staged by `resolve_lora`); `None` on the base path.
@@ -7686,18 +7737,6 @@ impl GpuLfmModel {
                 .unwrap_or_else(|e| e.into_inner())
                 .1 = 0;
         }
-        self.prefill_params_pool
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .1 = 0;
-        // Reset the stream-GEMM bind-group cache cursor alongside the params
-        // pool: both are handed out in call order, so slot `i` always pairs
-        // with the same pooled params buffers.
-        self.stream_gemm_bg_cache
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .2 = 0;
-
         let mut enc = self.new_encoder();
         // Recorded prefill commands, emitted per layer (see `PrefillCmd`).
         let mut cmds: Vec<PrefillCmd> = Vec::new();
@@ -8050,6 +8089,7 @@ impl GpuLfmModel {
                         q_dim,
                         q_dim,
                         attn_scale,
+                        None,
                     );
                 }
 
@@ -8170,40 +8210,8 @@ impl GpuLfmModel {
                 &self.prefill_up_buf,
                 n_u,
             );
-            // silu_mul over the full N × is buffer.
-            {
-                let total = n_u * is_u;
-                let params: [u32; 2] = [total, 0];
-                let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
-                let bg = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &self.pipelines.silu_mul_inplace.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: self.prefill_gate_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: self.prefill_up_buf.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: p_buf.as_entire_binding(),
-                            },
-                        ],
-                    });
-                Self::push_prefill_dispatch(
-                    &mut cmds,
-                    &self.pipelines.silu_mul_inplace,
-                    bg,
-                    (total.div_ceil(256), 1, 1),
-                    "silu_mul_batch",
-                );
-            }
+            // silu_mul over the full N × is buffer (shared with the bidirectional trunk).
+            self.encode_silu_mul_prefill(&mut cmds, n_u * is_u);
             // FFN down → prefill_up_buf (next layer's residual scratch).
             // The next layer's add_rmsnorm_batch reads from this buffer
             // as `residual`; using `prefill_up_buf` (rather than
@@ -8937,6 +8945,446 @@ impl GpuLfmModel {
 #[cfg(not(target_arch = "wasm32"))]
 mod recovery;
 
+/// A copy of `rows` rows of `width` floats between row offsets of two buffers.
+fn copy_rows<'a>(
+    src: &'a wgpu::Buffer,
+    src_row: usize,
+    dst: &'a wgpu::Buffer,
+    dst_row: usize,
+    rows: usize,
+    width: usize,
+) -> PrefillCmd<'a> {
+    PrefillCmd::Copy {
+        src,
+        src_off_floats: (src_row * width) as u64,
+        dst,
+        dst_off_floats: (dst_row * width) as u64,
+        len_floats: (rows * width) as u64,
+    }
+}
+
+/// The x-extent of the 2-D thread grid `push_bidir_dispatch` emits. Must equal GRID_X in
+/// `bidirectional.wgsl`; the `bidir_grid_matches_the_shader` test pins the agreement.
+const BIDIR_GRID_X: u32 = 32768;
+
+impl GpuLfmModel {
+    /// The input embeddings of `tokens`, `[tokens, hidden]`, with the model's embedding
+    /// multiplier folded in (1.0 for LFM2).
+    fn embed_rows(&self, tokens: &[u32]) -> Vec<f32> {
+        let mut out = Vec::with_capacity(tokens.len() * self.config.hidden_size);
+        self.embed_rows_into(tokens, &mut out);
+        out
+    }
+
+    /// Dequant `tokens` after the rows `out` already holds.
+    fn embed_rows_into(&self, tokens: &[u32], out: &mut Vec<f32>) {
+        let hs = self.config.hidden_size;
+        let vocab = self.config.vocab_size;
+        let scale = self.scalars.embedding;
+        let base = out.len();
+        out.resize(base + tokens.len() * hs, 0.0);
+        for (row, &token) in out[base..].chunks_exact_mut(hs).zip(tokens) {
+            assert!(
+                (token as usize) < vocab,
+                "token_id {token} out of range (vocab_size={vocab})"
+            );
+            self.gpu_state.embedding.dequantize_row(token as usize, row);
+            if scale != 1.0 {
+                for v in row.iter_mut() {
+                    *v *= scale;
+                }
+            }
+        }
+    }
+
+    /// Dispatch a `bidirectional.wgsl` kernel over `elements` threads (a 2-D grid, since a
+    /// single dimension tops out at 65535 workgroups).
+    fn push_bidir_dispatch<'a>(
+        &'a self,
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        pipeline: &'a wgpu::ComputePipeline,
+        buffers: [&wgpu::Buffer; 3],
+        params: [u32; 4],
+        elements: u32,
+        label: &'static str,
+    ) {
+        let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
+        let entries = [
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: buffers[0].as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: buffers[1].as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: buffers[2].as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 3,
+                resource: p_buf.as_entire_binding(),
+            },
+        ];
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: Some(label),
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &entries,
+            });
+        let groups = elements.div_ceil(256);
+        // A grid-y above 1 needs over 8.4M elements, past what the trunk dispatches
+        // (it caps at `max_seq_len` rows), so the second dimension is defensive: only a
+        // synthetic kernel test could reach it.
+        Self::push_prefill_dispatch(
+            cmds,
+            pipeline,
+            bg,
+            (groups.min(BIDIR_GRID_X), groups.div_ceil(BIDIR_GRID_X), 1),
+            label,
+        );
+    }
+
+    /// `silu(gate) * up` over the first `total` elements of the prefill gate/up buffers.
+    fn encode_silu_mul_prefill<'a>(&'a self, cmds: &mut Vec<PrefillCmd<'a>>, total: u32) {
+        let params: [u32; 2] = [total, 0];
+        let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self.pipelines.silu_mul_inplace.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: self.prefill_gate_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: self.prefill_up_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: p_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        Self::push_prefill_dispatch(
+            cmds,
+            &self.pipelines.silu_mul_inplace,
+            bg,
+            (total.div_ceil(256), 1, 1),
+            "silu_mul_batch",
+        );
+    }
+
+    /// The bidirectional trunk over embeddings `embeddings` (`[n, hidden]`) whose first
+    /// `prefix` rows are media embeddings; returns the post-final-norm hidden state of every
+    /// row, `[n, hidden]`. The wgpu twin of `MetalLfmModel::bidirectional_trunk`.
+    ///
+    /// Everything row-wise (the norms, the projections, the feed-forward) runs in chunks of
+    /// the prefill buffers' size, copying rows between them and buffers that hold the whole
+    /// sequence; what looks across rows (attention, the convolution) is one dispatch over all
+    /// of them. K and V go to the scratch caches `hidden_states` already owns.
+    fn bidirectional_trunk(&self, embeddings: &[f32], prefix: usize) -> Vec<f32> {
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let n = embeddings.len() / hs;
+        assert!(n > 0 && embeddings.len() == n * hs);
+        assert!(
+            n <= self.gpu_state.max_seq_len,
+            "bidirectional pass over {n} rows exceeds max_seq_len ({})",
+            self.gpu_state.max_seq_len
+        );
+        assert!(
+            self.loop_norm_interval.is_none(),
+            "the bidirectional wgpu trunk has no looped-layer support"
+        );
+        let head_dim = cfg.head_dim;
+        let q_dim = cfg.n_heads * head_dim;
+        let is = cfg.intermediate_size;
+        let big_bytes = (n * hs.max(q_dim) * 4) as u64;
+        assert!(
+            big_bytes <= self.ctx.max_storage_buffer_binding_size,
+            "a bidirectional pass over {n} rows needs a {big_bytes} byte binding; this adapter allows {}",
+            self.ctx.max_storage_buffer_binding_size
+        );
+        let chunk_cap = self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS);
+        let h_big = self.ctx.create_storage_rw((n * hs * 4) as u64, "bidir.h");
+        let buf_a = self.ctx.create_storage_rw(big_bytes, "bidir.a");
+        let buf_b = self.ctx.create_storage_rw(big_bytes, "bidir.b");
+        self.ctx
+            .queue
+            .write_buffer(&h_big, 0, bytemuck::cast_slice(embeddings));
+        let kv_scratch = &self.hs_scratch().kv;
+
+        // Same pooled-resource protocol as `encode_prefill_batched_locked`: one encoder, one
+        // submit, params and stream-GEMM bind groups handed out in call order from zero.
+        self.reset_prefill_pools();
+        let mut enc = self.new_encoder();
+        let mut cmds: Vec<PrefillCmd> = Vec::new();
+        let (hs_u, is_u) = (hs as u32, is as u32);
+        let chunks: Vec<(usize, usize)> = (0..n)
+            .step_by(chunk_cap)
+            .map(|r0| (r0, chunk_cap.min(n - r0)))
+            .collect();
+
+        for (layer, (lw, layer_kv)) in self.layers.iter().zip(kv_scratch).enumerate() {
+            let conv = cfg.block_types[layer] == BlockType::GatedConv;
+            // width of an operator's per-row result: the convolution's C, or attention's heads
+            let width = if conv { hs } else { q_dim };
+            let label = format!("bidir_l{layer}");
+
+            // Per chunk: norm, then the projections that feed the cross-row operator.
+            for &(r0, m) in &chunks {
+                let m_u = m as u32;
+                cmds.push(copy_rows(&h_big, r0, &self.prefill_batch_buf, 0, m, hs));
+                self.encode_rmsnorm_batch(
+                    &mut cmds,
+                    &self.prefill_batch_buf,
+                    &self.prefill_normed_buf,
+                    &lw.attn_norm,
+                    m_u,
+                    hs_u,
+                );
+                if conv {
+                    self.encode_mul_mat_reg_tile(
+                        &mut cmds,
+                        lw.conv_in_proj.as_ref().unwrap(),
+                        &self.prefill_normed_buf,
+                        &self.prefill_proj_buf,
+                        m_u,
+                        hs_u,
+                        hs_u,
+                        3 * hs_u,
+                        false,
+                    );
+                    let elements = m_u as u64 * hs_u as u64;
+                    assert!(
+                        elements <= u32::MAX as u64,
+                        "bidir split over {elements} elements exceeds the u32 grid the shader assumes"
+                    );
+                    self.push_bidir_dispatch(
+                        &mut cmds,
+                        &self.pipelines.bidir_split,
+                        [&self.prefill_proj_buf, &buf_a, &buf_b],
+                        [m_u, hs_u, r0 as u32, 0],
+                        elements as u32,
+                        "bidir_split",
+                    );
+                } else {
+                    let n_heads = cfg.n_heads as u32;
+                    let n_kv_heads = cfg.kv_heads_per_layer[layer] as u32;
+                    let kv_dim = n_kv_heads * head_dim as u32;
+                    let (k16, v16) = layer_kv.as_ref().expect("attention layer has scratch K/V");
+                    for (w, out, dim) in [
+                        (
+                            lw.attn_q.as_ref().unwrap(),
+                            &self.prefill_proj_buf,
+                            q_dim as u32,
+                        ),
+                        (lw.attn_k.as_ref().unwrap(), &self.prefill_gate_buf, kv_dim),
+                        (lw.attn_v.as_ref().unwrap(), &self.prefill_up_buf, kv_dim),
+                    ] {
+                        self.encode_mul_mat_reg_tile(
+                            &mut cmds,
+                            w,
+                            &self.prefill_normed_buf,
+                            out,
+                            m_u,
+                            hs_u,
+                            hs_u,
+                            dim,
+                            false,
+                        );
+                    }
+                    self.encode_qk_norm_rope_batch(
+                        &mut cmds,
+                        &self.prefill_proj_buf,
+                        &self.prefill_gate_buf,
+                        lw.attn_q_norm.as_ref(),
+                        lw.attn_k_norm.as_ref(),
+                        r0 as u32,
+                        m_u,
+                        n_heads,
+                        n_kv_heads,
+                        head_dim as u32,
+                        q_dim as u32,
+                        kv_dim,
+                    );
+                    let off_words = (r0 * kv_dim as usize / 2) as u32;
+                    let floats = m_u * kv_dim;
+                    self.encode_kv_append_prefill(
+                        &mut cmds,
+                        &self.prefill_gate_buf,
+                        k16,
+                        off_words,
+                        floats,
+                    );
+                    self.encode_kv_append_prefill(
+                        &mut cmds,
+                        &self.prefill_up_buf,
+                        v16,
+                        off_words,
+                        floats,
+                    );
+                    cmds.push(copy_rows(&self.prefill_proj_buf, 0, &buf_a, r0, m, q_dim));
+                }
+                self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("{label}a"), m_u);
+            }
+
+            // Across rows.
+            if conv {
+                let elements = n as u64 * hs as u64;
+                assert!(
+                    elements <= u32::MAX as u64,
+                    "bidir convolution over {elements} elements exceeds the u32 grid the shader assumes"
+                );
+                self.push_bidir_dispatch(
+                    &mut cmds,
+                    &self.pipelines.bidir_conv_centered,
+                    [&buf_a, lw.conv_weight.as_ref().unwrap(), &buf_b],
+                    [n as u32, hs_u, prefix as u32, 0],
+                    elements as u32,
+                    "bidir_conv_centered",
+                );
+            } else {
+                let n_kv_heads = cfg.kv_heads_per_layer[layer] as u32;
+                let (k16, v16) = layer_kv.as_ref().unwrap();
+                let scale = self
+                    .scalars
+                    .attn
+                    .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
+                self.encode_attention_prefill(
+                    &mut cmds,
+                    &buf_a,
+                    k16,
+                    v16,
+                    &buf_b,
+                    n as u32,
+                    cfg.n_heads as u32,
+                    n_kv_heads,
+                    head_dim as u32,
+                    n_kv_heads * head_dim as u32,
+                    n as u32,
+                    0,
+                    q_dim as u32,
+                    q_dim as u32,
+                    scale,
+                    Some(prefix as u32),
+                );
+            }
+            self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("{label}x"), n as u32);
+
+            // Per chunk: output projection, residual, feed-forward.
+            for &(r0, m) in &chunks {
+                let m_u = m as u32;
+                cmds.push(copy_rows(&buf_b, r0, &self.prefill_normed_buf, 0, m, width));
+                self.encode_mul_mat_reg_tile(
+                    &mut cmds,
+                    if conv {
+                        lw.conv_out_proj.as_ref().unwrap()
+                    } else {
+                        lw.attn_output.as_ref().unwrap()
+                    },
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    m_u,
+                    width as u32,
+                    width as u32,
+                    hs_u,
+                    false,
+                );
+                cmds.push(copy_rows(&h_big, r0, &self.prefill_batch_buf, 0, m, hs));
+                self.encode_add_rmsnorm_batch(
+                    &mut cmds,
+                    &self.prefill_batch_buf,
+                    &self.prefill_normed_buf,
+                    &lw.ffn_norm,
+                    &self.prefill_gate_buf,
+                    m_u,
+                    hs_u,
+                );
+                let GpuFfn::Dense(dense) = &lw.ffn else {
+                    panic!("the bidirectional wgpu trunk has no routed-FFN support");
+                };
+                self.encode_mul_mat_reg_tile(
+                    &mut cmds,
+                    &dense.gate,
+                    &self.prefill_normed_buf,
+                    &self.prefill_gate_buf,
+                    m_u,
+                    hs_u,
+                    hs_u,
+                    is_u,
+                    false,
+                );
+                self.encode_mul_mat_reg_tile(
+                    &mut cmds,
+                    &dense.up,
+                    &self.prefill_normed_buf,
+                    &self.prefill_up_buf,
+                    m_u,
+                    hs_u,
+                    hs_u,
+                    is_u,
+                    false,
+                );
+                self.encode_silu_mul_prefill(&mut cmds, m_u * is_u);
+                self.encode_mul_mat_reg_tile(
+                    &mut cmds,
+                    &dense.down,
+                    &self.prefill_gate_buf,
+                    &self.prefill_up_buf,
+                    m_u,
+                    is_u,
+                    is_u,
+                    hs_u,
+                    false,
+                );
+                self.encode_scaled_add_inplace_batch(
+                    &mut cmds,
+                    &self.prefill_batch_buf,
+                    &self.prefill_up_buf,
+                    m_u * hs_u,
+                    self.scalars.residual,
+                    "bidir_residual",
+                );
+                cmds.push(copy_rows(&self.prefill_batch_buf, 0, &h_big, r0, m, hs));
+                self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("{label}b"), m_u);
+            }
+        }
+
+        // Output norm, gathered into `buf_a` ([n, hs]).
+        for &(r0, m) in &chunks {
+            cmds.push(copy_rows(&h_big, r0, &self.prefill_batch_buf, 0, m, hs));
+            self.encode_rmsnorm_batch(
+                &mut cmds,
+                &self.prefill_batch_buf,
+                &self.prefill_normed_buf,
+                &self.output_norm,
+                m as u32,
+                hs_u,
+            );
+            self.emit_prefill_cmds(&mut enc, &mut cmds, "bidir_out", m as u32);
+            Self::encode_copy(
+                &mut enc,
+                &self.prefill_normed_buf,
+                0,
+                &buf_a,
+                (r0 * hs) as u64,
+                (m * hs) as u64,
+            );
+        }
+        self.submit_and_wait(enc);
+        self.ctx.download_f32(&buf_a, n * hs)
+    }
+}
+
 impl Model for GpuLfmModel {
     #[cfg(not(target_arch = "wasm32"))]
     fn try_reset_kv(
@@ -8986,7 +9434,13 @@ impl Model for GpuLfmModel {
     }
 
     fn supports_hidden_states(&self) -> bool {
-        true
+        // `hidden_states` routes a bidirectional model through the bidirectional trunk, which
+        // has no routed-FFN path: only causal and dense models qualify.
+        self.config.is_causal
+            || self
+                .layers
+                .iter()
+                .all(|l| matches!(l.ffn, GpuFfn::Dense(_)))
     }
 
     /// Per-token post-final-norm hidden states, row-major `[n * hidden_size]`
@@ -9022,6 +9476,13 @@ impl Model for GpuLfmModel {
             tokens.len(),
             self.gpu_state.max_seq_len
         );
+
+        // A bidirectional model reads the whole sequence in one pass: the per-token loop
+        // below is causal by construction.
+        if !self.config.is_causal {
+            let embeddings = self.embed_rows(tokens);
+            return self.bidirectional_trunk(&embeddings, 0);
+        }
 
         // Build scratch (once) and zero its conv rolling buffers so each
         // extraction starts from a clean convolution state.
@@ -9074,6 +9535,43 @@ impl Model for GpuLfmModel {
             self.forward_inner_compute(&[token], pos, &mut dummy);
             out.extend_from_slice(&self.ctx.download_f32(&self.hidden_buf, hs));
         }
+        out
+    }
+
+    /// Only a bidirectional model reads a media prefix this way, and only a dense one:
+    /// the bidirectional trunk has no routed-FFN path.
+    fn supports_media_prefix(&self) -> bool {
+        !self.config.is_causal
+            && self
+                .layers
+                .iter()
+                .all(|l| matches!(l.ffn, GpuFfn::Dense(_)))
+    }
+
+    fn hidden_states_with_prefix(
+        &self,
+        prefix: &[f32],
+        tokens: &[u32],
+        _state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let hs = self.config.hidden_size;
+        assert!(
+            !self.config.is_causal,
+            "hidden_states_with_prefix needs a bidirectional model"
+        );
+        assert!(
+            prefix.len().is_multiple_of(hs),
+            "the media prefix is not a whole number of rows"
+        );
+        if prefix.is_empty() && tokens.is_empty() {
+            return Vec::new();
+        }
+        let mut embeddings = Vec::with_capacity(prefix.len() + tokens.len() * hs);
+        embeddings.extend_from_slice(prefix);
+        self.embed_rows_into(tokens, &mut embeddings);
+        let mut out = self.bidirectional_trunk(&embeddings, prefix.len() / hs);
+        out.drain(..prefix.len());
         out
     }
 
@@ -10621,9 +11119,136 @@ mod tests {
         }
     }
 
+    /// The bidirectional trunk against the CPU one on a tiny non-causal model (one short-conv
+    /// block, two attention blocks), over lengths that span one chunk, several chunks, and a
+    /// media prefix that is shorter, equal to and longer than an attention query group.
+    #[test]
+    fn wgpu_reads_the_whole_sequence_like_the_cpu() {
+        use crate::kv_cache::InferenceState;
+        use crate::model::Model;
+        use crate::model::lfm2::LfmModel;
+        use crate::model::lfm2::bidirectional_float_tests::{HS, bidirectional_gguf, embeddings};
+        let Some(ctx) = gpu_ctx_or_skip() else {
+            return;
+        };
+        let cpu = LfmModel::from_gguf(bidirectional_gguf(true), 4096).unwrap();
+        let gpu = super::GpuLfmModel::from_gguf_with_ctx(
+            bidirectional_gguf(true),
+            4096,
+            "bidir".into(),
+            ctx,
+        )
+        .unwrap();
+        assert!(!gpu.config().is_causal, "the fixture must be bidirectional");
+        let cosine = |a: &[f32], b: &[f32]| {
+            let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
+            let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            dot / (norm(a) * norm(b))
+        };
+        let rows_agree = |what: &str, want: &[f32], got: &[f32]| {
+            assert_eq!(want.len(), got.len(), "{what}: length");
+            for (t, (c, g)) in want.chunks(HS).zip(got.chunks(HS)).enumerate() {
+                let cos = cosine(c, g);
+                assert!(cos > 0.999, "{what}: row {t} cosine {cos}");
+            }
+        };
+        for n in [9usize, 300, 700, 2600] {
+            let tokens: Vec<u32> = (0..n).map(|i| ((i * 7 + 3) % 32) as u32).collect();
+            let mut state = InferenceState::for_prefill(cpu.config(), n).unwrap();
+            let want = cpu.hidden_states(&tokens, &mut state);
+            let mut state = InferenceState::for_prefill(gpu.config(), n).unwrap();
+            let got = gpu.hidden_states(&tokens, &mut state);
+            rows_agree(&format!("n={n}"), &want, &got);
+        }
+        let tokens = [3u32, 7, 9, 12, 5];
+        for prefix_rows in [1usize, 4, 11, 600] {
+            let prefix = embeddings(prefix_rows, 0.3);
+            let mut state =
+                InferenceState::for_prefill(cpu.config(), prefix_rows + tokens.len()).unwrap();
+            let want = cpu.hidden_states_with_prefix(&prefix, &tokens, &mut state);
+            let mut state =
+                InferenceState::for_prefill(gpu.config(), prefix_rows + tokens.len()).unwrap();
+            let got = gpu.hidden_states_with_prefix(&prefix, &tokens, &mut state);
+            rows_agree(&format!("prefix={prefix_rows}"), &want, &got);
+        }
+    }
+
+    /// The dense SwiGLU load gate admits a full 2048-row chunk at width 8191 (65528
+    /// groups) and refuses it at 8192 (65536 groups, one past the per-dimension cap).
+    #[test]
+    fn dense_silu_gate_matches_the_dispatch_grid() {
+        assert!(super::check_dense_silu_fits(2048, 8191).is_ok());
+        assert!(super::check_dense_silu_fits(32, 4096).is_ok());
+        let err = super::check_dense_silu_fits(2048, 8192).expect_err("one group past the cap");
+        assert!(err.to_string().contains("per-dimension cap"), "{err}");
+    }
+
+    /// The host GRID_X in `push_bidir_dispatch` and the shader GRID_X in
+    /// `bidirectional.wgsl` must agree, or threads map to the wrong elements.
+    #[test]
+    fn bidir_grid_matches_the_shader() {
+        let src = include_str!("../backend/shaders/bidirectional.wgsl");
+        let line = src
+            .lines()
+            .find(|l| l.contains("const GRID_X"))
+            .expect("bidirectional.wgsl keeps its GRID_X");
+        let shader: u32 = line
+            .split('=')
+            .nth(1)
+            .expect("GRID_X line keeps its assignment")
+            .trim()
+            .trim_end_matches(['u', ';'])
+            .parse()
+            .expect("GRID_X stays a u32 literal");
+        // 16.7M elements (the u32-ceiling math in `push_bidir_dispatch` divides `elements`
+        // by 256 threads, then by GRID_X rows) must still fit the two grid dimensions.
+        assert_eq!(
+            shader,
+            super::BIDIR_GRID_X,
+            "host and shader GRID_X drifted"
+        );
+        assert!(
+            (u32::MAX as u64)
+                .div_ceil(256)
+                .div_ceil(super::BIDIR_GRID_X as u64)
+                <= crate::backend::wgpu::MAX_WG as u64
+        );
+    }
+
+    /// An empty prefix with empty tokens yields no rows instead of tripping the trunk's
+    /// non-empty precondition: the contract promises `tokens.len()` rows unconditionally.
+    #[test]
+    fn empty_prefix_and_tokens_yield_no_rows() {
+        use crate::kv_cache::InferenceState;
+        use crate::model::Model;
+        use crate::model::lfm2::LfmModel;
+        use crate::model::lfm2::bidirectional_float_tests::bidirectional_gguf;
+        let Some(ctx) = gpu_ctx_or_skip() else {
+            return;
+        };
+        let cpu = LfmModel::from_gguf(bidirectional_gguf(true), 4096).unwrap();
+        let gpu = super::GpuLfmModel::from_gguf_with_ctx(
+            bidirectional_gguf(true),
+            4096,
+            "bidir".into(),
+            ctx,
+        )
+        .unwrap();
+        let mut cpu_state = InferenceState::for_prefill(cpu.config(), 0).unwrap();
+        let mut gpu_state = InferenceState::for_prefill(gpu.config(), 0).unwrap();
+        assert!(
+            cpu.hidden_states_with_prefix(&[], &[], &mut cpu_state)
+                .is_empty()
+        );
+        assert!(
+            gpu.hidden_states_with_prefix(&[], &[], &mut gpu_state)
+                .is_empty()
+        );
+    }
+
     /// Acquire a GPU context or skip. Under `CERA_REQUIRE_GPU` (the lavapipe CI
     /// job) a missing adapter is a hard failure, mirroring the oracle tests, so
-    /// the contract below cannot pass by silently skipping.
+    /// the tests below cannot pass by silently skipping.
     fn gpu_ctx_or_skip() -> Option<GpuContext> {
         match GpuContext::new() {
             Ok(ctx) => Some(ctx),

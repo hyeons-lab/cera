@@ -11,11 +11,18 @@
 //! pass first, each pass rounded back to `uint8`, with 16-bit fixed-point weights. Any other
 //! resampler moves pixels by one level here and there, which moves the answers.
 
+use std::sync::Arc;
+
 use anyhow::{Context, Result, bail, ensure};
 
 use crate::backend::cpu;
+use crate::engine::BackendPreference;
 use crate::gguf::GgufFile;
 use crate::model::pii::matmul_nt_f32;
+use crate::model::vision_encoder_gpu::{
+    VitStack, VitStackActivation, VitStackBlock, VitStackSpec, build_vit_stack,
+};
+use crate::model::weights::MmapWeight;
 use crate::par::*;
 
 /// Side of a tile, in pixels.
@@ -412,7 +419,6 @@ struct Block {
 }
 
 /// The SigLIP2 tower and the projector into the trunk's width.
-#[derive(Debug)]
 pub struct VisionTower {
     width: usize,
     heads: usize,
@@ -431,6 +437,23 @@ pub struct VisionTower {
     mm1_b: Vec<f32>,
     mm2_w: Vec<f32>,
     mm2_b: Vec<f32>,
+    /// The blocks on a GPU, when [`Self::accelerate`] found one.
+    gpu: Option<Arc<dyn VitStack>>,
+}
+
+impl std::fmt::Debug for VisionTower {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("VisionTower")
+            .field("width", &self.width)
+            .field("heads", &self.heads)
+            .field("ffn", &self.ffn)
+            .field("eps", &self.eps)
+            .field("out_width", &self.out_width)
+            .field("projector_hidden", &self.projector_hidden)
+            .field("blocks", &self.blocks)
+            .field("is_accelerated", &self.is_accelerated())
+            .finish()
+    }
 }
 
 impl VisionTower {
@@ -529,6 +552,77 @@ impl VisionTower {
             mm1_b: t("d1.v.mm.1.bias", &[projector_hidden])?,
             mm2_w: t("d1.v.mm.2.weight", &[out_width, projector_hidden])?,
             mm2_b: t("d1.v.mm.2.bias", &[out_width])?,
+            gpu: None,
+        })
+    }
+
+    /// Run the transformer blocks on the GPU `backend` names, when there is one; the patch
+    /// embedding, the positions and the projector stay on the host (they are a small part of
+    /// the work). Does nothing for the CPU, for a tower without blocks, or when no device
+    /// opens. A crop the GPU cannot take (more patches than its attention holds) still runs on
+    /// the host. `gguf` must be the file the tower was loaded from (weights are matched by
+    /// shape only).
+    pub fn accelerate(&mut self, gguf: &Arc<GgufFile>, backend: BackendPreference) {
+        if backend == BackendPreference::Cpu || self.blocks.is_empty() {
+            return;
+        }
+        let from_file = |i: usize, name: &str, rows: usize, cols: usize| -> Result<MmapWeight> {
+            crate::d1::block_weight(gguf, "d1.v.blk", "vision tower", i, name, rows, cols)
+        };
+        match self.stack_spec(from_file) {
+            // A backend that cannot build must not clear a working stack: only `Some` sticks.
+            Ok(spec) => {
+                if let Some(stack) = build_vit_stack(&spec, backend) {
+                    self.gpu = Some(stack);
+                }
+            }
+            Err(e) => crate::d1::warn_cpu_fallback(format_args!(
+                "the vision tower stays on the CPU: {e:#}"
+            )),
+        }
+    }
+
+    /// Whether the blocks run on a GPU.
+    pub fn is_accelerated(&self) -> bool {
+        self.gpu.is_some()
+    }
+
+    /// The blocks as a GPU stack takes them. `linear(block, name, rows, cols)` supplies a linear
+    /// weight, which the model file does at load.
+    fn stack_spec(
+        &self,
+        linear: impl Fn(usize, &str, usize, usize) -> Result<MmapWeight>,
+    ) -> Result<VitStackSpec> {
+        let (d, ff) = (self.width, self.ffn);
+        let mut blocks = Vec::with_capacity(self.blocks.len());
+        for (i, b) in self.blocks.iter().enumerate() {
+            blocks.push(VitStackBlock {
+                ln1_w: b.ln1_w.clone(),
+                ln1_b: b.ln1_b.clone(),
+                q: linear(i, "attn_q", d, d)?,
+                q_b: b.q_b.clone(),
+                k: linear(i, "attn_k", d, d)?,
+                k_b: b.k_b.clone(),
+                v: linear(i, "attn_v", d, d)?,
+                v_b: b.v_b.clone(),
+                o: linear(i, "attn_out", d, d)?,
+                o_b: b.o_b.clone(),
+                ln2_w: b.ln2_w.clone(),
+                ln2_b: b.ln2_b.clone(),
+                up: linear(i, "ffn_up", ff, d)?,
+                up_b: b.up_b.clone(),
+                down: linear(i, "ffn_down", d, ff)?,
+                down_b: b.down_b.clone(),
+            });
+        }
+        Ok(VitStackSpec {
+            width: d,
+            heads: self.heads,
+            ffn: ff,
+            eps: self.eps,
+            activation: VitStackActivation::GeluTanh,
+            blocks,
+            post: Some((self.post_w.clone(), self.post_b.clone())),
         })
     }
 
@@ -610,6 +704,14 @@ impl VisionTower {
         );
         for (a, b) in x.iter_mut().zip(self.positions(rows, cols)) {
             *a += b;
+        }
+        if let Some(gpu) = &self.gpu {
+            match gpu.run(&x, n) {
+                Ok(tokens) => return (tokens, rows, cols),
+                Err(e) => crate::d1::warn_cpu_fallback(format_args!(
+                    "a crop of {n} patches runs on the CPU: {e:#}"
+                )),
+            }
         }
         let project = |input: &[f32], w: &[f32], b: &[f32], out_rows: usize, k: usize| {
             let mut out = vec![0f32; n * out_rows];
@@ -801,6 +903,122 @@ pub(crate) fn tower_builder_default() -> crate::gguf::GgufBuilder {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::d1::noise;
+    /// A small tower with deterministic weights: two blocks of 128 wide, two heads of 64.
+    fn tiny_tower() -> VisionTower {
+        let (d, ffn) = (128usize, 256usize);
+        let block = |s: usize| Block {
+            ln1_w: noise(d, s, 0.1).iter().map(|v| v + 1.0).collect(),
+            ln1_b: noise(d, s + 1, 0.1),
+            q_w: noise(d * d, s + 2, 0.1),
+            q_b: noise(d, s + 3, 0.1),
+            k_w: noise(d * d, s + 4, 0.1),
+            k_b: noise(d, s + 5, 0.1),
+            v_w: noise(d * d, s + 6, 0.1),
+            v_b: noise(d, s + 7, 0.1),
+            o_w: noise(d * d, s + 8, 0.1),
+            o_b: noise(d, s + 9, 0.1),
+            ln2_w: noise(d, s + 10, 0.1).iter().map(|v| v + 1.0).collect(),
+            ln2_b: noise(d, s + 11, 0.1),
+            up_w: noise(ffn * d, s + 12, 0.1),
+            up_b: noise(ffn, s + 13, 0.1),
+            down_w: noise(d * ffn, s + 14, 0.1),
+            down_b: noise(d, s + 15, 0.1),
+        };
+        VisionTower {
+            width: d,
+            heads: 2,
+            ffn,
+            eps: 1e-6,
+            out_width: 64,
+            projector_hidden: 64,
+            patch_w: noise(d * PATCH * PATCH * 3, 1, 0.05),
+            patch_b: noise(d, 2, 0.05),
+            position: noise(POSITION_SIDE * POSITION_SIDE * d, 3, 0.2),
+            blocks: vec![block(100), block(200)],
+            post_w: noise(d, 4, 0.1).iter().map(|v| v + 1.0).collect(),
+            post_b: noise(d, 5, 0.1),
+            mm1_w: Vec::new(),
+            mm1_b: Vec::new(),
+            mm2_w: Vec::new(),
+            mm2_b: Vec::new(),
+            gpu: None,
+        }
+    }
+
+    /// `accelerate` on a tower without blocks is a no-op: nothing to move, no device touched.
+    #[test]
+    fn accelerate_without_blocks_is_a_noop() {
+        let gguf = Arc::new(crate::gguf::GgufBuilder::new().build());
+        let mut tower = tiny_tower();
+        tower.blocks.clear();
+        tower.accelerate(&gguf, BackendPreference::Gpu);
+        assert!(!tower.is_accelerated());
+    }
+
+    /// The blocks on a GPU compute what the host blocks do, whole-grid and across a width that is
+    /// not a multiple of the attention tile.
+    #[test]
+    fn the_gpu_blocks_match_the_host_blocks() {
+        let mut tower = tiny_tower();
+        let owned = |w: &[f32], rows: usize, cols: usize| {
+            MmapWeight::from_owned_f32(w.to_vec(), rows, cols)
+        };
+        let (d, ffn) = (tower.width, tower.ffn);
+        let spec = tower
+            .stack_spec(|i, name, rows, cols| {
+                let b = &tower.blocks[i];
+                let w = match name {
+                    "attn_q" => &b.q_w,
+                    "attn_k" => &b.k_w,
+                    "attn_v" => &b.v_w,
+                    "attn_out" => &b.o_w,
+                    "ffn_up" => &b.up_w,
+                    "ffn_down" => &b.down_w,
+                    other => panic!("{other}"),
+                };
+                assert_eq!(w.len(), rows * cols);
+                assert!(rows == d || rows == ffn);
+                Ok(owned(w, rows, cols))
+            })
+            .unwrap();
+        let Some(gpu) = build_vit_stack(&spec, BackendPreference::Auto) else {
+            // Dual-backend test: either require flag forces it (the Metal leg sets only the
+            // Metal flag, the wgpu leg only the GPU one).
+            assert!(
+                std::env::var("CERA_REQUIRE_GPU")
+                    .unwrap_or_default()
+                    .is_empty(),
+                "CERA_REQUIRE_GPU is set but no GPU backend is compiled in or available"
+            );
+            assert!(
+                std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1"),
+                "CERA_REQUIRE_METAL=1 is set but no GPU backend is compiled in or available"
+            );
+            eprintln!("SKIPPED: no GPU backend is compiled in or available");
+            return;
+        };
+        for (w, h) in [(64usize, 64usize), (48, 80), (16, 16)] {
+            let mut data = Vec::with_capacity(w * h * 3);
+            for i in 0..w * h * 3 {
+                data.push(((i * 37 + 11) % 251) as u8);
+            }
+            let crop = Rgb {
+                width: w,
+                height: h,
+                data,
+            };
+            tower.gpu = None;
+            let (want, rows, cols) = tower.tower(&crop);
+            tower.gpu = Some(gpu.clone());
+            let (got, got_rows, got_cols) = tower.tower(&crop);
+            assert_eq!((rows, cols), (got_rows, got_cols));
+            let dot: f32 = want.iter().zip(&got).map(|(a, b)| a * b).sum();
+            let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let cosine = dot / (norm(&want) * norm(&got));
+            assert!(cosine > 0.9995, "{w}x{h}: cosine {cosine}");
+        }
+    }
 
     #[test]
     fn layouts_follow_the_smart_resize() {
@@ -909,6 +1127,7 @@ mod tests {
             mm1_b: vec![0.0; 12],
             mm2_w: (0..12 * 12).map(|i| f32::from(i / 12 == i % 12)).collect(),
             mm2_b: vec![0.0; 12],
+            gpu: None,
         };
         let out = tower.project(&tokens, rows, cols);
         assert_eq!(out.len(), 4 * 12);

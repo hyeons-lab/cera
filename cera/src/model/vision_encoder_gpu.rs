@@ -143,6 +143,40 @@ pub trait VitGpuOps {
         head_dim: usize,
     ) -> Self::Buf;
 
+    /// In-place ReLU over `len` elements.
+    ///
+    /// Default: panics; backends that run a ReLU stack must override.
+    fn relu(&self, x: &Self::Buf, len: usize) {
+        let _ = (x, len);
+        unimplemented!("relu not supported by this backend")
+    }
+
+    /// Whether this backend implements [`Self::relu`]. `GpuStack::build` consults this for
+    /// `Relu` specs so a non-overriding backend refuses instead of panicking mid-run.
+    fn supports_relu(&self) -> bool {
+        false
+    }
+
+    /// The most tokens [`Self::attention`] takes at this `head_dim`. The flash kernels have no
+    /// limit; the scalar fallbacks keep one query's scores in workgroup memory.
+    fn attention_token_limit(&self, _head_dim: usize) -> usize {
+        MAX_VIT_TOKENS
+    }
+
+    /// The most rows [`Self::layernorm`] takes in one dispatch. Backends whose norm kernel
+    /// spends one workgroup per row override this with the grid limit; the default admits.
+    fn max_rows(&self) -> usize {
+        usize::MAX
+    }
+
+    /// The largest single buffer a pass may ask for, in bytes.
+    ///
+    /// Default 0 refuses every GPU pass, so an impl without a real limit falls back to the
+    /// CPU instead of over-allocating; backends must override.
+    fn max_buffer_bytes(&self) -> u64 {
+        0
+    }
+
     /// In-place residual add: `dst[i] += src[i]` over `len` elements.
     fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize);
 
@@ -851,18 +885,52 @@ pub enum WgpuVitWeight {
     },
 }
 
+/// How [`WgpuVitOps::dispatch_elements`] binds one buffer of an elementwise kernel.
+#[cfg(feature = "gpu")]
+enum ElementBind<'a> {
+    /// Bound whole, every chunk.
+    Whole(&'a wgpu::Buffer),
+    /// Bound at the chunk's element offset: a buffer the kernel walks with the thread index.
+    Ranged(&'a wgpu::Buffer),
+    /// The chunk's parameters.
+    Params,
+}
+
+/// `(offset, len)` chunks covering `len` elements for [`WgpuVitOps::dispatch_elements`]:
+/// the largest chunk that is a whole number of row-preserving steps and fits the dispatch
+/// limit (`MAX_GROUPS` workgroups of 256 threads), with every boundary on the 64-element
+/// storage-offset alignment. Pure so a host test can pin it without a device.
+#[cfg(feature = "gpu")]
+fn chunk_bounds(len: usize, unit: usize) -> Vec<(usize, usize)> {
+    const MAX_GROUPS: usize = crate::backend::wgpu::MAX_WG as usize;
+    const OFFSET_ALIGN_ELEMS: usize = 64;
+    let unit = unit.max(1);
+    let step = crate::model::gpu_lfm2::lcm_u64(unit as u64, OFFSET_ALIGN_ELEMS as u64) as usize;
+    // the largest chunk that is a whole number of steps and fits the dispatch limit
+    let chunk = ((MAX_GROUPS * 256) / step).max(1) * step;
+    let mut bounds = Vec::new();
+    let mut offset = 0usize;
+    while offset < len {
+        let n = chunk.min(len - offset);
+        bounds.push((offset, n));
+        offset += n;
+    }
+    bounds
+}
+
 /// wgpu implementation of [`VitGpuOps`]. Owns the [`GpuContext`](crate::backend::wgpu::GpuContext) and the compute
 /// pipelines (compiled once) so it can be cached for the session's lifetime.
 /// Bind groups are created per dispatch (cheap relative to the kernel work).
 #[cfg(feature = "gpu")]
 pub struct WgpuVitOps {
-    ctx: crate::backend::wgpu::GpuContext,
+    pub(crate) ctx: crate::backend::wgpu::GpuContext,
     p_linear: wgpu::ComputePipeline,
     p_mul_mat_q8_0: wgpu::ComputePipeline,
     p_mul_mat_q4_0: wgpu::ComputePipeline,
     p_bias: wgpu::ComputePipeline,
     p_layernorm: wgpu::ComputePipeline,
     p_gelu: wgpu::ComputePipeline,
+    p_relu: wgpu::ComputePipeline,
     p_attn: wgpu::ComputePipeline,
     p_attn_tiled: wgpu::ComputePipeline,
     p_add: wgpu::ComputePipeline,
@@ -870,6 +938,20 @@ pub struct WgpuVitOps {
 
 #[cfg(feature = "gpu")]
 impl WgpuVitOps {
+    /// The head-dim ceiling of the query-tiled attention kernel.
+    const VIT_ATTN_TILED_MAX_HEAD_DIM: usize = 64;
+
+    /// Whether the query-tiled attention kernel takes this head dim (and so streams K/V
+    /// without a token cap). Single source for the dispatch branch and the token limit.
+    ///
+    /// On Android / Vulkan (Adreno, Mali), vit_attention_tiled.wgsl allocates
+    /// 128 dynamic registers per thread across 256 threads that spill to DRAM,
+    /// hanging the Qualcomm driver watchdog. vit_attention.wgsl uses workgroup
+    /// shared memory (spill-free) and executes safely on mobile GPUs.
+    fn streams_kv(head_dim: usize) -> bool {
+        cfg!(not(target_os = "android")) && head_dim <= Self::VIT_ATTN_TILED_MAX_HEAD_DIM
+    }
+
     pub fn new(ctx: crate::backend::wgpu::GpuContext) -> Result<Self> {
         use crate::backend::wgpu::shaders;
         // `create_pipeline*` return the pipeline directly and panic on shader
@@ -913,6 +995,7 @@ impl WgpuVitOps {
                     "vit_layernorm",
                 ),
                 p_gelu: ctx.create_pipeline(shaders::GELU, "gelu_inplace", "vit_gelu"),
+                p_relu: ctx.create_pipeline(shaders::ACTIVATIONS, "relu_inplace", "vit_relu"),
                 p_attn: ctx.create_pipeline(
                     shaders::VIT_ATTENTION,
                     "vit_attention",
@@ -935,28 +1018,21 @@ impl WgpuVitOps {
         })
     }
 
-    /// Encode one bind group from `bufs` (in binding order) and dispatch.
-    fn dispatch(
+    /// Encode one bind group from prebuilt `entries` and dispatch `workgroups`: the shared
+    /// tail of [`Self::dispatch`], [`Self::dispatch_ranges`], and [`Self::dispatch_elements`].
+    fn dispatch_entries(
         &self,
         pipeline: &wgpu::ComputePipeline,
-        bufs: &[&wgpu::Buffer],
+        entries: &[wgpu::BindGroupEntry<'_>],
         workgroups: (u32, u32, u32),
     ) {
-        let entries: Vec<wgpu::BindGroupEntry> = bufs
-            .iter()
-            .enumerate()
-            .map(|(i, b)| wgpu::BindGroupEntry {
-                binding: i as u32,
-                resource: b.as_entire_binding(),
-            })
-            .collect();
         let bind_group = self
             .ctx
             .device
             .create_bind_group(&wgpu::BindGroupDescriptor {
                 label: None,
                 layout: &pipeline.get_bind_group_layout(0),
-                entries: &entries,
+                entries,
             });
         let mut enc = self
             .ctx
@@ -972,6 +1048,94 @@ impl WgpuVitOps {
             pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
         }
         self.ctx.submit_encoder(enc);
+    }
+
+    /// Like [`Self::dispatch`], binding each buffer over `(offset_bytes, size_bytes)` of it
+    /// (`size_bytes == 0` binds from the offset to the end). Offsets must be multiples of the
+    /// storage-offset alignment (256 bytes).
+    pub(crate) fn dispatch_ranges(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        bufs: &[(&wgpu::Buffer, u64, u64)],
+        workgroups: (u32, u32, u32),
+    ) {
+        let entries: Vec<wgpu::BindGroupEntry> = bufs
+            .iter()
+            .enumerate()
+            .map(|(i, &(buffer, offset, size))| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                    buffer,
+                    offset,
+                    size: wgpu::BufferSize::new(if size == 0 {
+                        buffer.size().saturating_sub(offset)
+                    } else {
+                        size
+                    }),
+                }),
+            })
+            .collect();
+        self.dispatch_entries(pipeline, &entries, workgroups);
+    }
+
+    /// Encode one bind group from `bufs` (in binding order) and dispatch.
+    pub(crate) fn dispatch(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        bufs: &[&wgpu::Buffer],
+        workgroups: (u32, u32, u32),
+    ) {
+        let entries: Vec<wgpu::BindGroupEntry> = bufs
+            .iter()
+            .enumerate()
+            .map(|(i, b)| wgpu::BindGroupEntry {
+                binding: i as u32,
+                resource: b.as_entire_binding(),
+            })
+            .collect();
+        self.dispatch_entries(pipeline, &entries, workgroups);
+    }
+
+    /// An elementwise kernel over `len` elements, one thread each, split into dispatches of at
+    /// most 65535 workgroups (the per-dimension limit) when it is longer than 16.7M elements:
+    /// the feed-forward intermediate of a few thousand tokens already is. `binds` are in binding
+    /// order; a `Ranged` buffer is bound at the chunk's element offset (a multiple of 64
+    /// elements, the storage-offset alignment), a `Whole` one as is, and `Params` takes
+    /// `params(chunk_elements)`. `unit` keeps chunk boundaries on whole rows for kernels that
+    /// index by `i % dim`.
+    fn dispatch_elements(
+        &self,
+        pipeline: &wgpu::ComputePipeline,
+        binds: &[ElementBind<'_>],
+        len: usize,
+        unit: usize,
+        params: impl Fn(u32) -> Vec<u32>,
+    ) {
+        for (offset, n) in chunk_bounds(len, unit) {
+            let p_buf = self.ctx.upload_storage(
+                bytemuck::cast_slice(&params(n as u32)),
+                "vit_elementwise_params",
+            );
+            let entries: Vec<wgpu::BindGroupEntry> = binds
+                .iter()
+                .enumerate()
+                .map(|(i, b)| wgpu::BindGroupEntry {
+                    binding: i as u32,
+                    resource: match b {
+                        ElementBind::Whole(buf) => buf.as_entire_binding(),
+                        ElementBind::Ranged(buf) => {
+                            wgpu::BindingResource::Buffer(wgpu::BufferBinding {
+                                buffer: buf,
+                                offset: (offset * 4) as u64,
+                                size: wgpu::BufferSize::new(((n * 4) as u64).max(4)),
+                            })
+                        }
+                        ElementBind::Params => p_buf.as_entire_binding(),
+                    },
+                })
+                .collect();
+            self.dispatch_entries(pipeline, &entries, ((n as u32).div_ceil(256), 1, 1));
+        }
     }
 
     /// Quantized `y[tokens, out_dim] = x[tokens, in_dim] · wᵀ` via the
@@ -1095,15 +1259,16 @@ impl VitGpuOps for WgpuVitOps {
     }
 
     fn bias_add(&self, x: &Self::Buf, bias: &Self::Buf, rows: usize, dim: usize) {
-        let total = (rows * dim) as u32;
-        let params: [u32; 2] = [total, dim as u32];
-        let p_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&params), "vit_bias_params");
-        self.dispatch(
+        self.dispatch_elements(
             &self.p_bias,
-            &[x, bias, &p_buf],
-            (total.div_ceil(256), 1, 1),
+            &[
+                ElementBind::Ranged(x),
+                ElementBind::Whole(bias),
+                ElementBind::Params,
+            ],
+            rows * dim,
+            dim,
+            |n| vec![n, dim as u32],
         );
     }
 
@@ -1134,15 +1299,46 @@ impl VitGpuOps for WgpuVitOps {
     }
 
     fn gelu(&self, x: &Self::Buf, len: usize) {
-        let params: [u32; 2] = [len as u32, 0];
-        let p_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&params), "vit_gelu_params");
-        self.dispatch(
+        self.dispatch_elements(
             &self.p_gelu,
-            &[x, &p_buf],
-            ((len as u32).div_ceil(256), 1, 1),
+            &[ElementBind::Ranged(x), ElementBind::Params],
+            len,
+            1,
+            |n| vec![n, 0],
         );
+    }
+
+    fn relu(&self, x: &Self::Buf, len: usize) {
+        self.dispatch_elements(
+            &self.p_relu,
+            &[ElementBind::Ranged(x), ElementBind::Params],
+            len,
+            1,
+            |n| vec![n, 0],
+        );
+    }
+
+    fn supports_relu(&self) -> bool {
+        true
+    }
+
+    fn attention_token_limit(&self, head_dim: usize) -> usize {
+        // the query-tiled kernel (every desktop adapter) streams K/V; the scalar one does not
+        if Self::streams_kv(head_dim) {
+            usize::MAX
+        } else {
+            MAX_VIT_TOKENS
+        }
+    }
+
+    fn max_rows(&self) -> usize {
+        // the norm kernel spends one workgroup per row with no chunking (Metal's grid is u64,
+        // so only wgpu overrides)
+        crate::backend::wgpu::MAX_WG as usize
+    }
+
+    fn max_buffer_bytes(&self) -> u64 {
+        self.ctx.max_storage_buffer_binding_size
     }
 
     fn attention(
@@ -1173,13 +1369,8 @@ impl VitGpuOps for WgpuVitOps {
         // Query-tiled flash attention (one workgroup per Q_TILE=256 queries,
         // reusing K/V tiles in shared memory) when head_dim fits its shared/
         // register sizing; else the scalar per-query kernel.
-        // On Android / Vulkan (Adreno, Mali), vit_attention_tiled.wgsl allocates
-        // 128 dynamic registers per thread across 256 threads that spill to DRAM,
-        // hanging the Qualcomm driver watchdog. vit_attention.wgsl uses workgroup
-        // shared memory (spill-free) and executes safely on mobile GPUs.
         const VIT_ATTN_TILED_Q: u32 = 256;
-        const VIT_ATTN_TILED_MAX_HEAD_DIM: usize = 64;
-        let use_tiled = cfg!(not(target_os = "android")) && head_dim <= VIT_ATTN_TILED_MAX_HEAD_DIM;
+        let use_tiled = Self::streams_kv(head_dim);
         if use_tiled {
             self.dispatch(
                 &self.p_attn_tiled,
@@ -1197,14 +1388,16 @@ impl VitGpuOps for WgpuVitOps {
     }
 
     fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize) {
-        let params: [u32; 2] = [len as u32, 0];
-        let p_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&params), "vit_add_params");
-        self.dispatch(
+        self.dispatch_elements(
             &self.p_add,
-            &[dst, src, &p_buf],
-            ((len as u32).div_ceil(256), 1, 1),
+            &[
+                ElementBind::Ranged(dst),
+                ElementBind::Ranged(src),
+                ElementBind::Params,
+            ],
+            len,
+            1,
+            |n| vec![n, 0],
         );
     }
 
@@ -1246,6 +1439,7 @@ pub struct MetalVitOps {
     p_bias: metal::ComputePipelineState,
     p_layernorm: metal::ComputePipelineState,
     p_gelu: metal::ComputePipelineState,
+    p_relu: metal::ComputePipelineState,
     p_attn: metal::ComputePipelineState,
     p_attn_mma: metal::ComputePipelineState,
     p_attn_mma_hd64: metal::ComputePipelineState,
@@ -1254,6 +1448,17 @@ pub struct MetalVitOps {
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 impl MetalVitOps {
+    /// Whether the flash-attention MMA kernel takes this head dim (a multiple of 8, at most
+    /// 128). Single source for the dispatch branch and the token limit.
+    ///
+    /// The kernel's threadgroup memory is 176·head_dim + 2144 bytes, so head_dim=256
+    /// would need ~46 KB and blow the 32 KB threadgroup limit on Apple M1.
+    /// 128 keeps it at ~24 KB and covers every current LFM2 ViT (hd ∈ {64,
+    /// 128}); larger head dims fall back to the scalar kernel.
+    fn streams_kv(head_dim: usize) -> bool {
+        head_dim.is_multiple_of(8) && head_dim <= 128
+    }
+
     pub fn new(ctx: crate::backend::metal::MetalContext) -> Result<Self> {
         use crate::backend::metal::shaders;
         Ok(Self {
@@ -1261,6 +1466,7 @@ impl MetalVitOps {
             p_bias: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add")?,
             p_layernorm: ctx.create_pipeline(shaders::LAYERNORM_BATCH, "layernorm_batch")?,
             p_gelu: ctx.create_pipeline(shaders::GELU, "gelu_inplace")?,
+            p_relu: ctx.create_pipeline(shaders::ACTIVATIONS, "relu_inplace")?,
             p_attn: ctx.create_pipeline(shaders::VIT_ATTENTION, "vit_attention")?,
             p_attn_mma: ctx.create_pipeline(shaders::VIT_ATTENTION_MMA, "vit_attention_mma")?,
             p_attn_mma_hd64: ctx
@@ -1398,6 +1604,33 @@ impl VitGpuOps for MetalVitOps {
         );
     }
 
+    fn relu(&self, x: &Self::Buf, len: usize) {
+        self.ctx.run_kernel(
+            &self.p_relu,
+            &[x],
+            &ElementwiseParams::new(len as u32),
+            metal::MTLSize::new((len as u64).div_ceil(256), 1, 1),
+            metal::MTLSize::new(256, 1, 1),
+        );
+    }
+
+    fn supports_relu(&self) -> bool {
+        true
+    }
+
+    fn attention_token_limit(&self, head_dim: usize) -> usize {
+        // the flash MMA kernel streams K/V; the scalar fallback does not
+        if Self::streams_kv(head_dim) {
+            usize::MAX
+        } else {
+            MAX_VIT_TOKENS
+        }
+    }
+
+    fn max_buffer_bytes(&self) -> u64 {
+        self.ctx.device.max_buffer_length()
+    }
+
     fn attention(
         &self,
         q: &Self::Buf,
@@ -1409,12 +1642,7 @@ impl VitGpuOps for MetalVitOps {
     ) -> Self::Buf {
         let dim = n_head * head_dim;
         let out = self.ctx.create_buffer((tokens * dim * 4) as u64);
-        // Flash-attention MMA kernel needs head_dim a multiple of 8 and ≤ 128:
-        // its threadgroup memory is 176·head_dim + 2144 bytes, so head_dim=256
-        // would need ~46 KB and blow the 32 KB threadgroup limit on Apple M1.
-        // 128 keeps it at ~24 KB and covers every current LFM2 ViT (hd ∈ {64,
-        // 128}); larger head dims fall back to the scalar kernel.
-        if head_dim.is_multiple_of(8) && head_dim <= 128 {
+        if Self::streams_kv(head_dim) {
             self.run_attn_mma(q, k, v, &out, tokens, n_head, head_dim);
         } else {
             let scale = 1.0f32 / (head_dim as f32).sqrt();
@@ -1527,6 +1755,436 @@ impl VisionGpuEncode for MetalVisionEncoder {
         }
         Ok(out)
     }
+}
+
+// ── A ViT block stack with caller-supplied weights ───────────────────────────
+
+/// One pre-norm ViT block as the caller holds it: the norm and bias vectors on the host, the
+/// linear weights as tensors of the model file (kept packed on the GPU when they are Q8_0 or
+/// Q4_0).
+pub struct VitStackBlock {
+    pub ln1_w: Vec<f32>,
+    pub ln1_b: Vec<f32>,
+    pub q: MmapWeight,
+    pub q_b: Vec<f32>,
+    pub k: MmapWeight,
+    pub k_b: Vec<f32>,
+    pub v: MmapWeight,
+    pub v_b: Vec<f32>,
+    pub o: MmapWeight,
+    pub o_b: Vec<f32>,
+    pub ln2_w: Vec<f32>,
+    pub ln2_b: Vec<f32>,
+    pub up: MmapWeight,
+    pub up_b: Vec<f32>,
+    pub down: MmapWeight,
+    pub down_b: Vec<f32>,
+}
+
+/// A stack of pre-norm transformer blocks and an optional final LayerNorm: for the ViT, everything
+/// between the position-embedded patch tokens and the tokens the projector reads. LayerNorm and
+/// unmasked attention are those of [`encode_image_gpu`]; only where the weights come from and the
+/// feed-forward activation differ, so a model whose patch embedding, positions or projector
+/// differ from LFM2-VL's can still use it, and so can a decision head with ReLU blocks.
+pub struct VitStackSpec {
+    pub width: usize,
+    pub heads: usize,
+    pub ffn: usize,
+    pub eps: f32,
+    /// What sits between a block's two feed-forward projections.
+    pub activation: VitStackActivation,
+    pub blocks: Vec<VitStackBlock>,
+    /// The final LayerNorm's weight and bias, when the stack ends in one.
+    pub post: Option<(Vec<f32>, Vec<f32>)>,
+}
+
+/// The feed-forward activation of a [`VitStackSpec`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VitStackActivation {
+    /// The tanh approximation SigLIP and the other ViTs use.
+    GeluTanh,
+    /// The plain rectifier of `torch.nn.TransformerEncoderLayer`'s default.
+    Relu,
+}
+
+/// A [`VitStackSpec`] uploaded to a GPU, ready to run.
+pub trait VitStack: Send + Sync {
+    /// Run the blocks (and the final LayerNorm, if any) over `tokens` rows of `x` (`[tokens, width]`).
+    ///
+    /// # Errors
+    ///
+    /// Fails when `tokens` is over what the attention kernel holds or a pass needs a buffer the
+    /// device cannot make, or the device faults; the caller falls back to the CPU.
+    fn run(&self, x: &[f32], tokens: usize) -> Result<Vec<f32>>;
+}
+
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+struct StackBlock<O: VitGpuOps> {
+    ln1_w: O::Buf,
+    ln1_b: O::Buf,
+    q: O::Weight,
+    q_b: O::Buf,
+    k: O::Weight,
+    k_b: O::Buf,
+    v: O::Weight,
+    v_b: O::Buf,
+    o: O::Weight,
+    o_b: O::Buf,
+    ln2_w: O::Buf,
+    ln2_b: O::Buf,
+    up: O::Weight,
+    up_b: O::Buf,
+    down: O::Weight,
+    down_b: O::Buf,
+}
+
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+struct GpuStack<O: VitGpuOps> {
+    ops: O,
+    width: usize,
+    heads: usize,
+    ffn: usize,
+    eps: f32,
+    activation: VitStackActivation,
+    blocks: Vec<StackBlock<O>>,
+    post: Option<(O::Buf, O::Buf)>,
+}
+
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+/// The caller-supplied public spec is enforced before uploading: a zero head count would
+/// divide by zero in `run`, and a ragged geometry or short vector would misread on the
+/// device. Pure so a host test can pin it without a device.
+fn check_spec(spec: &VitStackSpec) -> Result<()> {
+    anyhow::ensure!(
+        spec.width > 0 && spec.ffn > 0,
+        "width {} and ffn {} must be positive",
+        spec.width,
+        spec.ffn
+    );
+    anyhow::ensure!(
+        spec.heads > 0 && spec.width.is_multiple_of(spec.heads),
+        "width {} is not a whole number of {} heads",
+        spec.width,
+        spec.heads
+    );
+    if let Some((w, b)) = &spec.post {
+        anyhow::ensure!(
+            w.len() == spec.width && b.len() == spec.width,
+            "the final norm is not {} wide",
+            spec.width
+        );
+    }
+    for (i, b) in spec.blocks.iter().enumerate() {
+        for (name, w, rows, cols) in [
+            ("q", &b.q, spec.width, spec.width),
+            ("k", &b.k, spec.width, spec.width),
+            ("v", &b.v, spec.width, spec.width),
+            ("o", &b.o, spec.width, spec.width),
+            ("up", &b.up, spec.ffn, spec.width),
+            ("down", &b.down, spec.width, spec.ffn),
+        ] {
+            anyhow::ensure!(
+                w.rows == rows && w.cols == cols,
+                "block {i} {name} is {} x {}, expected {rows} x {cols}",
+                w.rows,
+                w.cols
+            );
+            anyhow::ensure!(
+                w.cols.is_multiple_of(w.dtype.block_size()),
+                "block {i} {name}: {} columns are not whole {:?} blocks",
+                w.cols,
+                w.dtype
+            );
+            // the uploads trust the payload blindly (packed weights go whole, the dense path
+            // short-copies), so a short buffer must refuse here rather than misread on-device
+            let row_bytes = w.cols / w.dtype.block_size() * w.dtype.block_bytes();
+            let want = (w.rows as u64) * (row_bytes as u64);
+            anyhow::ensure!(
+                w.data().len() as u64 == want,
+                "block {i} {name} holds {} bytes, expected {want} for {} x {} {:?}",
+                w.data().len(),
+                w.rows,
+                w.cols,
+                w.dtype
+            );
+        }
+        for (name, v, want) in [
+            ("ln1_w", &b.ln1_w, spec.width),
+            ("ln1_b", &b.ln1_b, spec.width),
+            ("q_b", &b.q_b, spec.width),
+            ("k_b", &b.k_b, spec.width),
+            ("v_b", &b.v_b, spec.width),
+            ("o_b", &b.o_b, spec.width),
+            ("ln2_w", &b.ln2_w, spec.width),
+            ("ln2_b", &b.ln2_b, spec.width),
+            ("up_b", &b.up_b, spec.ffn),
+            ("down_b", &b.down_b, spec.width),
+        ] {
+            anyhow::ensure!(
+                v.len() == want,
+                "block {i} {name} has {} values, expected {want}",
+                v.len()
+            );
+        }
+    }
+    Ok(())
+}
+
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+impl<O: VitGpuOps> GpuStack<O> {
+    fn build(ops: O, spec: &VitStackSpec) -> Result<Self> {
+        check_spec(spec)?;
+        if spec.activation == VitStackActivation::Relu {
+            anyhow::ensure!(
+                ops.supports_relu(),
+                "this backend has no ReLU kernel; caller should fall back to CPU"
+            );
+        }
+        let blocks = spec
+            .blocks
+            .iter()
+            .map(|b| StackBlock {
+                ln1_w: ops.upload(&b.ln1_w),
+                ln1_b: ops.upload(&b.ln1_b),
+                q: ops.upload_weight(&b.q),
+                q_b: ops.upload(&b.q_b),
+                k: ops.upload_weight(&b.k),
+                k_b: ops.upload(&b.k_b),
+                v: ops.upload_weight(&b.v),
+                v_b: ops.upload(&b.v_b),
+                o: ops.upload_weight(&b.o),
+                o_b: ops.upload(&b.o_b),
+                ln2_w: ops.upload(&b.ln2_w),
+                ln2_b: ops.upload(&b.ln2_b),
+                up: ops.upload_weight(&b.up),
+                up_b: ops.upload(&b.up_b),
+                down: ops.upload_weight(&b.down),
+                down_b: ops.upload(&b.down_b),
+            })
+            .collect();
+        Ok(Self {
+            width: spec.width,
+            heads: spec.heads,
+            ffn: spec.ffn,
+            eps: spec.eps,
+            activation: spec.activation,
+            blocks,
+            post: spec
+                .post
+                .as_ref()
+                .map(|(w, b)| (ops.upload(w), ops.upload(b))),
+            ops,
+        })
+    }
+
+    fn run(&self, x: &[f32], n: usize) -> Result<Vec<f32>> {
+        let ops = &self.ops;
+        let (d, ff) = (self.width, self.ffn);
+        anyhow::ensure!(
+            n > 0 && x.len() == n * d,
+            "{} values are not {n} tokens of {d}",
+            x.len()
+        );
+        let limit = ops.attention_token_limit(d / self.heads);
+        anyhow::ensure!(
+            n <= limit,
+            "{n} tokens exceeds the GPU attention limit ({limit}); caller should fall back to CPU"
+        );
+        let max_rows = ops.max_rows();
+        anyhow::ensure!(
+            n <= max_rows,
+            "{n} tokens exceeds this backend's per-dispatch row limit ({max_rows}); caller should fall back to CPU"
+        );
+        // the widest tensor of a pass is the feed-forward's intermediate or one [n, d]
+        // activation, padded the way upload/linear/attention pad (multiples of 32)
+        let widest = (n.next_multiple_of(32) * ff.max(d).next_multiple_of(32) * 4) as u64;
+        anyhow::ensure!(
+            widest <= ops.max_buffer_bytes(),
+            "a {n}-token pass needs a {widest} byte buffer, more than the device allows ({}); \
+             caller should fall back to CPU",
+            ops.max_buffer_bytes()
+        );
+        let tokens = ops.upload(x);
+        for b in &self.blocks {
+            let normed = ops.layernorm(&tokens, &b.ln1_w, &b.ln1_b, self.eps, n, d);
+            let q = ops.linear(&normed, &b.q, n, d, d);
+            ops.bias_add(&q, &b.q_b, n, d);
+            let k = ops.linear(&normed, &b.k, n, d, d);
+            ops.bias_add(&k, &b.k_b, n, d);
+            let v = ops.linear(&normed, &b.v, n, d, d);
+            ops.bias_add(&v, &b.v_b, n, d);
+            let attn = ops.attention(&q, &k, &v, n, self.heads, d / self.heads);
+            let proj = ops.linear(&attn, &b.o, n, d, d);
+            ops.bias_add(&proj, &b.o_b, n, d);
+            ops.add(&tokens, &proj, n * d);
+            let normed = ops.layernorm(&tokens, &b.ln2_w, &b.ln2_b, self.eps, n, d);
+            let mid = ops.linear(&normed, &b.up, n, ff, d);
+            ops.bias_add(&mid, &b.up_b, n, ff);
+            match self.activation {
+                VitStackActivation::GeluTanh => ops.gelu(&mid, n * ff),
+                VitStackActivation::Relu => ops.relu(&mid, n * ff),
+            }
+            let down = ops.linear(&mid, &b.down, n, d, ff);
+            ops.bias_add(&down, &b.down_b, n, d);
+            ops.add(&tokens, &down, n * d);
+        }
+        let out = match &self.post {
+            Some((w, b)) => ops.layernorm(&tokens, w, b, self.eps, n, d),
+            None => tokens,
+        };
+        Ok(ops.download(&out, n * d))
+    }
+}
+
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+impl VitStack for GpuStack<MetalVitOps> {
+    fn run(&self, x: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        // Same fault discipline as `MetalVisionEncoder`: a faulted commit must not return
+        // stale tokens as if they were the result.
+        let _ = self.ops.ctx.take_cmd_error();
+        let out = GpuStack::run(self, x, tokens)?;
+        if let Some(e) = self.ops.ctx.take_cmd_error() {
+            return Err(e.into());
+        }
+        Ok(out)
+    }
+}
+
+#[cfg(feature = "gpu")]
+impl VitStack for GpuStack<WgpuVitOps> {
+    fn run(&self, x: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        let _ = self.ops.ctx.take_readback_fault();
+        let out = GpuStack::run(self, x, tokens)?;
+        if let Some(e) = self.ops.ctx.take_readback_fault() {
+            return Err(e.into());
+        }
+        Ok(out)
+    }
+}
+
+/// Upload `spec` to the GPU that `backend` names: `Metal`, `Gpu`, or `Auto` (Metal, then
+/// wgpu). Returns `None` for `Cpu`, `Hexagon`, and `Npu`, when the named feature is not
+/// compiled, or when no device could be opened.
+pub fn build_vit_stack(
+    spec: &VitStackSpec,
+    backend: crate::engine::BackendPreference,
+) -> Option<std::sync::Arc<dyn VitStack>> {
+    use crate::engine::BackendPreference as BP;
+    match backend {
+        BP::Metal => try_metal_stack(spec),
+        BP::Gpu => try_wgpu_stack(spec),
+        BP::Auto => try_metal_stack(spec).or_else(|| try_wgpu_stack(spec)),
+        BP::Cpu | BP::Hexagon | BP::Npu => None,
+    }
+}
+
+/// [`build_vit_stack`] for a stack that only pays on a GPU with matrix units: `Metal`, or `Auto`
+/// where Metal opens. The wgpu attention kernel is a scalar tiled one, and a long sequence through
+/// it takes longer than the host's blocked kernel does, so the decision head does not use it.
+pub fn build_vit_stack_native(
+    spec: &VitStackSpec,
+    backend: crate::engine::BackendPreference,
+) -> Option<std::sync::Arc<dyn VitStack>> {
+    use crate::engine::BackendPreference as BP;
+    match backend {
+        BP::Metal | BP::Auto => try_metal_stack(spec),
+        BP::Gpu | BP::Cpu | BP::Hexagon | BP::Npu => None,
+    }
+}
+
+/// A stack backend that opens but then fails (pipelines, spec) must be visible, since the
+/// only other symptom is "the tower is slow". `tracing` alone is not enough: no subscriber
+/// exists on the shipping mobile/FFI platforms, so the warning is paired with a stderr line.
+/// (An absent device is ordinary Auto fallthrough and stays at debug at the call site.)
+#[cfg(any(
+    feature = "gpu",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+fn warn_stack_unavailable(what: &str, e: impl std::fmt::Display) {
+    tracing::warn!("vit stack: {what} unavailable: {e:#}");
+    eprintln!("vit stack: {what} unavailable: {e:#}");
+}
+
+#[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+fn try_metal_stack(spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
+    // an absent device is ordinary Auto fallthrough (the trunk logs it at debug); only a
+    // backend that opens but then fails (pipelines, spec) is a warn-worthy refusal
+    let ctx = match crate::backend::metal::MetalContext::new() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            tracing::debug!("vit stack: Metal backend unavailable ({e:#}); falling back");
+            return None;
+        }
+    };
+    let ops = match MetalVitOps::new(ctx) {
+        Ok(ops) => ops,
+        Err(e) => {
+            warn_stack_unavailable("Metal pipelines", e);
+            return None;
+        }
+    };
+    match GpuStack::build(ops, spec) {
+        Ok(stack) => {
+            tracing::info!("vit stack: using native Metal backend");
+            Some(std::sync::Arc::new(stack))
+        }
+        Err(e) => {
+            warn_stack_unavailable("Metal stack spec", e);
+            None
+        }
+    }
+}
+
+#[cfg(not(all(feature = "metal", any(target_os = "macos", target_os = "ios"))))]
+fn try_metal_stack(_spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
+    None
+}
+
+#[cfg(feature = "gpu")]
+fn try_wgpu_stack(spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
+    // an absent device is ordinary Auto fallthrough (the trunk logs it at debug); only a
+    // backend that opens but then fails (pipelines, spec) is a warn-worthy refusal
+    let ctx = match crate::backend::wgpu::GpuContext::new() {
+        Ok(ctx) => ctx,
+        Err(e) => {
+            tracing::debug!("vit stack: wgpu backend unavailable ({e:#}); falling back");
+            return None;
+        }
+    };
+    let ops = match WgpuVitOps::new(ctx) {
+        Ok(ops) => ops,
+        Err(e) => {
+            warn_stack_unavailable("wgpu pipelines", e);
+            return None;
+        }
+    };
+    match GpuStack::build(ops, spec) {
+        Ok(stack) => {
+            tracing::info!("vit stack: using wgpu GPU backend");
+            Some(std::sync::Arc::new(stack))
+        }
+        Err(e) => {
+            warn_stack_unavailable("wgpu stack spec", e);
+            None
+        }
+    }
+}
+
+#[cfg(not(feature = "gpu"))]
+fn try_wgpu_stack(_spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
+    None
 }
 
 /// Build a cached GPU vision encoder for `weights`, honoring `backend`.
@@ -1963,5 +2621,336 @@ mod tests {
         #[cfg(not(target_os = "android"))]
         assert!(result.is_none());
         let _ = result;
+    }
+
+    /// A spec-spoiling function for the per-entry negative legs below.
+    type Spoil = fn(&mut VitStackBlock);
+
+    /// Device-free ops for pinning the `GpuStack` guards: buffers are host shadows, every
+    /// producing op returns zeros of the promised shape, and the limits are knobs.
+    struct TinyOps {
+        token_limit: usize,
+        max_bytes: u64,
+        max_rows: usize,
+    }
+
+    impl VitGpuOps for TinyOps {
+        type Buf = Vec<f32>;
+        type Weight = ();
+
+        fn upload(&self, data: &[f32]) -> Self::Buf {
+            data.to_vec()
+        }
+
+        fn download(&self, buf: &Self::Buf, len: usize) -> Vec<f32> {
+            buf.iter()
+                .copied()
+                .chain(std::iter::repeat(0.0))
+                .take(len)
+                .collect()
+        }
+
+        fn upload_weight(&self, _w: &MmapWeight) -> Self::Weight {}
+
+        fn upload_weight_f32(
+            &self,
+            _data: &[f32],
+            _out_dim: usize,
+            _in_dim: usize,
+        ) -> Self::Weight {
+        }
+
+        fn linear(
+            &self,
+            _x: &Self::Buf,
+            _w: &Self::Weight,
+            tokens: usize,
+            out_dim: usize,
+            _in_dim: usize,
+        ) -> Self::Buf {
+            vec![0.0; tokens * out_dim]
+        }
+
+        fn bias_add(&self, _x: &Self::Buf, _bias: &Self::Buf, _rows: usize, _dim: usize) {}
+
+        fn layernorm(
+            &self,
+            _src: &Self::Buf,
+            _weight: &Self::Buf,
+            _bias: &Self::Buf,
+            _eps: f32,
+            rows: usize,
+            dim: usize,
+        ) -> Self::Buf {
+            vec![0.0; rows * dim]
+        }
+
+        fn gelu(&self, _x: &Self::Buf, _len: usize) {}
+
+        fn attention(
+            &self,
+            _q: &Self::Buf,
+            _k: &Self::Buf,
+            _v: &Self::Buf,
+            tokens: usize,
+            n_head: usize,
+            head_dim: usize,
+        ) -> Self::Buf {
+            vec![0.0; tokens * n_head * head_dim]
+        }
+
+        fn attention_token_limit(&self, _head_dim: usize) -> usize {
+            self.token_limit
+        }
+
+        fn max_buffer_bytes(&self) -> u64 {
+            self.max_bytes
+        }
+
+        fn max_rows(&self) -> usize {
+            self.max_rows
+        }
+
+        fn add(&self, _dst: &Self::Buf, _src: &Self::Buf, _len: usize) {}
+    }
+
+    /// A valid one-block stack spec: `d` wide, 2 heads, `ff` intermediate.
+    fn tiny_spec(d: usize, ff: usize) -> VitStackSpec {
+        let vec = |n: usize| vec![0.0f32; n];
+        let mat =
+            |rows: usize, cols: usize| MmapWeight::from_owned_f32(vec(rows * cols), rows, cols);
+        VitStackSpec {
+            width: d,
+            heads: 2,
+            ffn: ff,
+            eps: 1e-5,
+            activation: VitStackActivation::GeluTanh,
+            blocks: vec![VitStackBlock {
+                ln1_w: vec(d),
+                ln1_b: vec(d),
+                q: mat(d, d),
+                q_b: vec(d),
+                k: mat(d, d),
+                k_b: vec(d),
+                v: mat(d, d),
+                v_b: vec(d),
+                o: mat(d, d),
+                o_b: vec(d),
+                ln2_w: vec(d),
+                ln2_b: vec(d),
+                up: mat(ff, d),
+                up_b: vec(ff),
+                down: mat(d, ff),
+                down_b: vec(d),
+            }],
+            post: Some((vec(d), vec(d))),
+        }
+    }
+
+    /// The `GpuStack` guards refuse violating inputs: a ragged spec fails `build` (each of the
+    /// 16 guarded entries pinned by a leg naming it, plus a short-payload leg), and an
+    /// over-limit or misshapen pass fails `run` (attention, byte, and row gates each pinned),
+    /// while a valid pass succeeds through the fake.
+    #[test]
+    fn stack_guards_refuse_violating_inputs() {
+        let ops = || TinyOps {
+            token_limit: 4,
+            max_bytes: u64::MAX,
+            max_rows: usize::MAX,
+        };
+        let (d, ff) = (8usize, 16usize);
+        let stack = GpuStack::build(ops(), &tiny_spec(d, ff)).unwrap();
+        assert_eq!(stack.run(&vec![0.0; 2 * d], 2).unwrap().len(), 2 * d);
+        // `GpuStack` has no `Debug`, so `expect_err` is unavailable; match instead
+        let expect_refusal = |name: &str, spec: &VitStackSpec| match GpuStack::build(ops(), spec) {
+            Ok(_) => panic!("{name}: build must refuse"),
+            Err(e) => e,
+        };
+
+        let mut bad_heads = tiny_spec(d, ff);
+        bad_heads.heads = 0;
+        assert!(GpuStack::build(ops(), &bad_heads).is_err());
+        // every guarded entry gets its own negative leg naming it: dropping one tuple from
+        // the spec loops must fail this test, not sail through on a later guard
+        let bad_vectors: &[(&str, Spoil)] = &[
+            ("ln1_w", |b| {
+                b.ln1_w.pop();
+            }),
+            ("ln1_b", |b| {
+                b.ln1_b.pop();
+            }),
+            ("q_b", |b| {
+                b.q_b.pop();
+            }),
+            ("k_b", |b| {
+                b.k_b.pop();
+            }),
+            ("v_b", |b| {
+                b.v_b.pop();
+            }),
+            ("o_b", |b| {
+                b.o_b.pop();
+            }),
+            ("ln2_w", |b| {
+                b.ln2_w.pop();
+            }),
+            ("ln2_b", |b| {
+                b.ln2_b.pop();
+            }),
+            ("up_b", |b| {
+                b.up_b.pop();
+            }),
+            ("down_b", |b| {
+                b.down_b.pop();
+            }),
+        ];
+        for (name, spoil) in bad_vectors {
+            let mut bad = tiny_spec(d, ff);
+            spoil(&mut bad.blocks[0]);
+            let err = expect_refusal(name, &bad);
+            assert!(err.to_string().contains(&format!(" {name} has ")), "{err}");
+        }
+        let bad_matrices: &[(&str, Spoil)] = &[
+            ("q", |b| {
+                b.q.rows -= 1;
+            }),
+            ("k", |b| {
+                b.k.rows -= 1;
+            }),
+            ("v", |b| {
+                b.v.rows -= 1;
+            }),
+            ("o", |b| {
+                b.o.rows -= 1;
+            }),
+            ("up", |b| {
+                b.up.rows -= 1;
+            }),
+            ("down", |b| {
+                b.down.rows -= 1;
+            }),
+        ];
+        for (name, spoil) in bad_matrices {
+            let mut bad = tiny_spec(d, ff);
+            spoil(&mut bad.blocks[0]);
+            let err = expect_refusal(name, &bad);
+            assert!(err.to_string().contains(&format!(" {name} is ")), "{err}");
+        }
+        let mut bad_post = tiny_spec(d, ff);
+        bad_post.post.as_mut().unwrap().0.pop();
+        assert!(GpuStack::build(ops(), &bad_post).is_err());
+        let mut bad_width = tiny_spec(d, ff);
+        bad_width.width = 0;
+        let err = expect_refusal("width 0", &bad_width);
+        assert!(err.to_string().contains("must be positive"), "{err}");
+        let mut bad_ffn = tiny_spec(d, ff);
+        bad_ffn.ffn = 0;
+        let err = expect_refusal("ffn 0", &bad_ffn);
+        assert!(err.to_string().contains("must be positive"), "{err}");
+        let mut bad_ratio = tiny_spec(d, ff);
+        bad_ratio.heads = 3;
+        assert!(GpuStack::build(ops(), &bad_ratio).is_err());
+        let mut bad_post_b = tiny_spec(d, ff);
+        bad_post_b.post.as_mut().unwrap().1.pop();
+        assert!(GpuStack::build(ops(), &bad_post_b).is_err());
+        // right shape (48 x 48) but 48 columns are not whole Q8_0 blocks
+        let mut bad_blocks = tiny_spec(48, 64);
+        bad_blocks.blocks[0].q =
+            MmapWeight::from_owned_bytes(vec![0u8; 48 * 34], DType::Q8_0, 48, 48);
+        assert!(GpuStack::build(ops(), &bad_blocks).is_err());
+        // right dims and dtype but a short payload: the byte check refuses what the shape
+        // checks admit
+        let mut bad_short = tiny_spec(d, ff);
+        bad_short.blocks[0].q =
+            MmapWeight::from_owned_bytes(vec![0u8; d * d * 4 - 4], DType::F32, d, d);
+        let err = expect_refusal("short payload", &bad_short);
+        assert!(err.to_string().contains("bytes, expected"), "{err}");
+        // a `Relu` spec through a backend without the kernel refuses rather than panicking
+        // mid-run (`TinyOps` keeps the trait default)
+        let mut bad_relu = tiny_spec(d, ff);
+        bad_relu.activation = VitStackActivation::Relu;
+        let err = expect_refusal("relu without kernel", &bad_relu);
+        assert!(err.to_string().contains("no ReLU kernel"), "{err}");
+
+        let err = stack
+            .run(&vec![0.0; 5 * d], 5)
+            .expect_err("5 tokens exceeds the limit of 4");
+        assert!(err.to_string().contains("attention limit"), "{err}");
+        assert!(stack.run(&vec![0.0; 2 * d + 1], 2).is_err());
+        let tight = GpuStack::build(
+            TinyOps {
+                token_limit: 4,
+                max_bytes: 100,
+                max_rows: usize::MAX,
+            },
+            &tiny_spec(d, ff),
+        )
+        .unwrap();
+        let err = tight
+            .run(&vec![0.0; 2 * d], 2)
+            .expect_err("the padded pass needs more than 100 bytes");
+        assert!(err.to_string().contains("byte buffer"), "{err}");
+        // a row limit tighter than the token and byte gates refuses a pass both admit
+        let narrow = GpuStack::build(
+            TinyOps {
+                token_limit: 4,
+                max_bytes: u64::MAX,
+                max_rows: 1,
+            },
+            &tiny_spec(d, ff),
+        )
+        .unwrap();
+        let err = narrow
+            .run(&vec![0.0; 2 * d], 2)
+            .expect_err("2 tokens exceeds the row limit of 1");
+        assert!(err.to_string().contains("row limit"), "{err}");
+    }
+
+    /// The kernel-selection helper agrees with itself at the boundary each backend retunes:
+    /// the tiled ceiling admits, one past it refuses. (Android always takes the scalar path,
+    /// so this leg is host-only.)
+    #[cfg(all(feature = "gpu", not(target_os = "android")))]
+    #[test]
+    fn wgpu_streams_kv_matches_the_tiled_ceiling() {
+        assert!(super::WgpuVitOps::streams_kv(64));
+        assert!(!super::WgpuVitOps::streams_kv(65));
+    }
+
+    /// The MMA window admits a multiple of 8 through 128 and refuses past it or off-alignment.
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    #[test]
+    fn metal_streams_kv_matches_the_mma_window() {
+        assert!(super::MetalVitOps::streams_kv(64));
+        assert!(super::MetalVitOps::streams_kv(128));
+        assert!(!super::MetalVitOps::streams_kv(136));
+        assert!(!super::MetalVitOps::streams_kv(100));
+    }
+
+    /// `chunk_bounds` covers short inputs in one chunk and splits long ones on the
+    /// storage-offset alignment and whole rows, with every chunk fitting one dispatch.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn chunk_bounds_respects_alignment_and_limit() {
+        assert_eq!(chunk_bounds(100, 1), vec![(0, 100)]);
+        assert!(chunk_bounds(0, 128).is_empty());
+        assert!(chunk_bounds(0, 0).is_empty());
+        let big = chunk_bounds(20_000_000, 128);
+        assert!(big.len() > 1);
+        let mut covered = 0usize;
+        for (i, (off, n)) in big.iter().enumerate() {
+            assert_eq!(*off, covered);
+            assert_eq!(off % 64, 0, "chunk {i} offset");
+            assert_eq!(off % 128, 0, "chunk {i} row alignment");
+            // every chunk but the last is a whole number of steps; the last is the remainder
+            if i + 1 < big.len() {
+                assert_eq!(n % 128, 0, "chunk {i} length");
+            }
+            assert!(
+                n.div_ceil(256) <= crate::backend::wgpu::MAX_WG as usize,
+                "chunk {i} fits one dispatch"
+            );
+            covered += n;
+        }
+        assert_eq!(covered, 20_000_000);
     }
 }

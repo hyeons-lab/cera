@@ -363,7 +363,7 @@ jobs:
       - name: Show Vulkan adapter
         run: vulkaninfo --summary || true
       - name: Run wgpu kernel + host-logic tests
-        run: cargo test -p cera --features gpu --lib --test wgpu_kv_shift_oracle --test wgpu_mul_mat_parity
+        run: cargo test -p cera --features gpu --lib --test wgpu_kv_shift_oracle --test wgpu_mul_mat_parity --test audio_encoder_wgpu_parity
       # Model-backed GPU tests need a fixture, and until now no job had both a
       # GPU and a GGUF: this one has the adapter but fetched nothing, while
       # `parity` fetches fixtures and builds without `--features gpu`. So the
@@ -460,15 +460,19 @@ jobs:
       - name: Metal-gated unit tests
         run: |
           set -euo pipefail
-          FILTERS="metal::tests:: prefill_qpt_tests::"
+          # `d1::head::tests::the_gpu_layers` is a substring filter for the one GPU test in
+          # that module; the module's CPU tests already run in the default legs.
+          # `d1::vision::tests::the_gpu_blocks` likewise covers the dual-backend vision stack
+          # on Metal (the wgpu leg only exercises its wgpu half).
+          FILTERS="metal::tests:: prefill_qpt_tests:: bidirectional_tests:: d1::head::tests::the_gpu_layers d1::vision::tests::the_gpu_blocks"
           # shellcheck disable=SC2086
           # `|| true`: grep -c exits 1 on zero matches, which under `set -e`
           # would abort here — precisely in the case this check exists to
           # report, and before the annotation below could explain why.
           COUNT=$(cargo test -p cera --features metal --lib -- --list $FILTERS \
                   | grep -c ': test$' || true)
-          if [ "$COUNT" -ne 3 ]; then
-            echo "::error::expected 3 metal-gated lib tests, found $COUNT — did a module get renamed? Update the filters in this job." >&2
+          if [ "$COUNT" -ne 8 ]; then
+            echo "::error::expected 8 metal-gated lib tests, found $COUNT: did a module get renamed? Update the filters in this job." >&2
             exit 1
           fi
           # `--nocapture` so `test_metal_context_init`'s device name reaches the
