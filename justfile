@@ -874,7 +874,8 @@ WASM_MT_RUSTFLAGS := "-C target-feature=+atomics,+bulk-memory,+mutable-globals,+
 # once after `await init()` resolves; subsequent `Session.generate`
 # calls run rayon work on the worker pool.
 wasm-web-mt:
-    RUSTFLAGS="{{WASM_MT_RUSTFLAGS}}" \
+    env -u RUSTFLAGS \
+    CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="{{WASM_MT_RUSTFLAGS}}" \
     wasm-pack build cera-wasm \
         --target web --release \
         --scope hyeons-lab --out-dir pkg-web-mt \
@@ -888,7 +889,8 @@ wasm-web-mt:
 # Node consumers `await initThreadPool(os.cpus().length)` once before
 # driving inference; the pool is backed by `worker_threads`.
 wasm-node-mt:
-    RUSTFLAGS="{{WASM_MT_RUSTFLAGS}}" \
+    env -u RUSTFLAGS \
+    CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="{{WASM_MT_RUSTFLAGS}}" \
     wasm-pack build cera-wasm \
         --target nodejs --release \
         --scope hyeons-lab --out-dir pkg-nodejs-mt \

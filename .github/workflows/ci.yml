@@ -779,7 +779,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack@0.14.0
+          tool: wasm-pack@0.14.0,wasm-bindgen-cli@0.2.117
       - uses: extractions/setup-just@v4
       - name: Run the simd128 kernel oracle tests under Node
         # Do not set RUSTFLAGS in this step. The job-level value above is
@@ -833,7 +833,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack@0.14.0
+          tool: wasm-pack@0.14.0,wasm-bindgen-cli@0.2.117
       - name: Browser and driver versions
         # Printed rather than asserted: the pair is whatever the image ships,
         # and the log is what makes a future mismatch diagnosable in one look.
@@ -920,7 +920,7 @@ jobs:
       # `tool:` form takes no leading `v`.
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack@0.14.0
+          tool: wasm-pack@0.14.0,wasm-bindgen-cli@0.2.117
       - uses: ./.github/actions/install-binaryen
       - name: Build cera-wasm npm package
         # `--scope hyeons-lab` matches the package name advertised in
@@ -1052,10 +1052,11 @@ jobs:
     needs: check
     runs-on: ubuntu-latest
     timeout-minutes: 15
-    # The build step below assigns its own `RUSTFLAGS` inline, which shadows
-    # this for that command. It is here so that a step added to this job later
-    # inherits the feature instead of the workflow-level `RUSTFLAGS: ""`, and
-    # so silently compiling scalar is not the default for new work.
+    # The build step below unsets `RUSTFLAGS` and sets
+    # `CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS` so wasm32 linker flags
+    # (`--shared-memory`, `--import-memory`, etc.) never leak into host build
+    # scripts or fallback host `cargo install` calls. Job-level `RUSTFLAGS` stays
+    # here so any other step added to this job later still inherits `+simd128`.
     env:
       RUSTFLAGS: "-C target-feature=+simd128"
     strategy:
@@ -1082,7 +1083,7 @@ jobs:
       # `tool:` form takes no leading `v`.
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack@0.14.0
+          tool: wasm-pack@0.14.0,wasm-bindgen-cli@0.2.117
       - uses: ./.github/actions/install-binaryen
       - name: Build cera-wasm npm package (threaded)
         # Flag breakdown lives in the justfile next to
@@ -1093,7 +1094,8 @@ jobs:
         # The feature list below is byte-identical to the justfile's so the
         # next drift is visible by eye.
         run: |
-          RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128 \
+          env -u RUSTFLAGS \
+          CARGO_TARGET_WASM32_UNKNOWN_UNKNOWN_RUSTFLAGS="-C target-feature=+atomics,+bulk-memory,+mutable-globals,+simd128 \
             -C link-arg=--shared-memory \
             -C link-arg=--import-memory \
             -C link-arg=--max-memory=4294967296 \
