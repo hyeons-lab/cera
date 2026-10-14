@@ -414,14 +414,20 @@ keeps the recipe shape uniform and forestalls an externally-set
 CeraFFI.xcframework/
 ├── Info.plist
 ├── ios-arm64/
-│   ├── libcera_ffi.a       # iOS device staticlib (aarch64-apple-ios)
-│   └── Headers/{cera_ffiFFI.h, module.modulemap}
+│   └── CeraFFI.framework/          # iOS device dynamic framework (aarch64-apple-ios)
+│       ├── CeraFFI
+│       ├── Headers/CeraFFI.h
+│       ├── Modules/module.modulemap
+│       └── Info.plist
 ├── ios-arm64-simulator/
-│   ├── libcera_ffi.a       # iOS Simulator staticlib (aarch64-apple-ios-sim)
-│   └── Headers/{cera_ffiFFI.h, module.modulemap}
+│   └── CeraFFI.framework/          # iOS Simulator dynamic framework (aarch64-apple-ios-sim)
+│       ├── CeraFFI
+│       ├── Headers/CeraFFI.h
+│       ├── Modules/module.modulemap
+│       └── Info.plist
 └── macos-arm64/
-    ├── libcera_ffi.a       # native macOS staticlib (aarch64-apple-darwin)
-    └── Headers/{cera_ffiFFI.h, module.modulemap}
+    └── CeraFFI.framework/          # native macOS versioned dynamic framework (aarch64-apple-darwin)
+        └── Versions/A/{CeraFFI, Headers/CeraFFI.h, Modules/module.modulemap, Resources/Info.plist}
 ```
 
 ### Swift Package Manager consumption
@@ -432,7 +438,7 @@ any iOS / macOS app the usual way:
 ```swift
 // Package.swift
 dependencies: [
-    .package(url: "https://github.com/hyeons-lab/cera", from: "0.4.0"),
+    .package(url: "https://github.com/hyeons-lab/cera", from: "0.7.0"),
 ],
 targets: [
     .target(
@@ -452,11 +458,11 @@ falling back to the CPU (Accelerate / NEON) when Metal is unavailable.
 The iOS Metal path is validated on the iOS **Simulator** (byte-identical
 to CPU output); real-device validation on a physical iPhone/iPad is
 recommended before relying on it in production.
-Because the slices are Metal-enabled *static* libraries, the `Cera`
-SwiftPM target links `Metal.framework` + `Foundation` explicitly
-(`linkerSettings` in `Package.swift`); a `.binaryTarget` static lib
-does not auto-link the system frameworks its symbols reference, so
-without those a consumer would hit undefined-symbol link errors. The
+Because the slices are Metal-enabled *dynamic* frameworks (`CeraFFI.framework`),
+they record their own load commands for `Metal.framework` and `Foundation`
+and `dyld` resolves them automatically without explicit `linkerSettings` in
+`Package.swift` (and symbols remain discoverable at runtime via
+`DynamicLibrary.process()` for the Flutter/Dart plugin). The
 framework carries three arm64-only slices (`ios-arm64`,
 `ios-arm64-simulator`, `macos-arm64`), so the package targets
 `.iOS(.v15)` / `.macOS(.v12)` (no x86_64).
@@ -469,9 +475,9 @@ How it resolves:
   release, so consumers never compile Rust.
 - A thin `Cera` Swift target holds the UniFFI-generated wrapper
   (`cera-ffi/apple/Sources/Cera/cera_ffi.swift`, a committed copy of
-  the vendored `cera-ffi/bindings/swift/cera_ffi.swift`) and depends on
-  `CeraFFI` so `import cera_ffiFFI` resolves against the XCFramework's
-  clang module.
+  the vendored `cera-ffi/bindings/swift/cera_ffi.swift`, plus
+  `ChatSession+Streaming.swift`) and depends on `CeraFFI` so
+  `import CeraFFI` resolves against the XCFramework's clang module.
 
 The `url` + `checksum` are checked in with the literal placeholders
 `RELEASE_VERSION` / `RELEASE_CHECKSUM`; the `release` job in

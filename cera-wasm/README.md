@@ -147,7 +147,7 @@ module (the entry self-loads the wasm via `fs.readFileSync`).
 ```js
 import { ceraVersion, Manifest } from '@hyeons-lab/cera-wasm';
 
-console.log(ceraVersion());  // e.g. "0.4.0"
+console.log(ceraVersion());  // e.g. "0.7.0"
 
 const res = await fetch('/path/to/manifest.json');
 const bytes = new Uint8Array(await res.arrayBuffer());
@@ -580,14 +580,40 @@ default builds above are CPU-only; the standard `Session` remains the
 supported path.
 
 The WebGPU loader admits `lfm2`, `lfm2moe`, `llama`, `qwen2`, `qwen3`, `granite`,
-`minicpm`, `minicpm5`, `nanbeige`, `phi3` and `phi`, subject to supported tensor
-layouts and device limits. Generation supports greedy decoding and stochastic
-sampling. Pass temperature, top-p, top-k and seed before the token callback;
-use `undefined` for a sampling default. A seed is a JavaScript `bigint`.
+`minicpm`, `minicpm5`, `nanbeige`, `phi3`/`phi`, and `mistral3`/`ministral3`,
+subject to supported tensor layouts and device limits. Generation supports greedy
+decoding and stochastic sampling. Pass temperature, top-p, top-k and seed before
+the token callback; use `undefined` for a sampling default. A seed is a
+JavaScript `bigint`.
 
 ```js
-import { WebGpuSession, TurboQuantConfig } from '@hyeons-lab/cera-wasm';
+import {
+    WebGpuSession,
+    TurboQuantConfig,
+    BundleRepo,
+    listLeapBundles,
+} from '@hyeons-lab/cera-wasm';
 
+// Option A: Stream a published bundle from the browser's Origin Private File
+// System (OPFS) cache via `BundleRepo`. Inside a Dedicated Worker, `fromBundleId`
+// probes only the GGUF header and streams tensor slices directly from OPFS into
+// WebGPU buffers without staging the full GGUF in 32-bit wasm linear memory.
+// (`CeraEngine.fromBundleId` provides the CPU counterpart.)
+const bundles = await listLeapBundles(); // [{ name, quants: [...] }, ...]
+const repo = new BundleRepo();           // OPFS directory defaults to "cera-models"
+const bundledSession = await WebGpuSession.fromBundleId(
+    repo,
+    'LFM2.5-1.2B-Instruct-GGUF',
+    'Q4_0',
+    4096,
+    null,
+    (url, loaded, total) => console.log(url, loaded, total),
+);
+
+// Option B: Construct directly from in-memory GGUF bytes (or use
+// `WebGpuSession.createWithParts(ggufBytes, mmprojBytes, contextSize, kv)` to
+// attach a vision projector for `session.appendImage(imageBytes)`).
+//
 // Async constructor: initializes WebGPU (requestAdapter / requestDevice
 // resolve on the event loop), parses the GGUF, and uploads the model to
 // the GPU. `contextSize` defaults to 4096. Throws if WebGPU is

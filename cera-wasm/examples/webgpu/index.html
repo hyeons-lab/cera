@@ -3,7 +3,7 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>cera-wasm · WebGPU LFM2 demo</title>
+    <title>cera-wasm · WebGPU demo</title>
     <style>
       :root {
         color-scheme: dark;
@@ -84,19 +84,23 @@
     </style>
   </head>
   <body>
-    <h1>cera-wasm · WebGPU LFM2 text generation</h1>
+    <h1>cera-wasm · WebGPU text generation</h1>
     <p class="hint">
-      Loads an LFM2 GGUF entirely in your browser and runs prefill + greedy
-      decode on the GPU via WebGPU (no server inference). Requires a
-      WebGPU-capable browser (Chrome/Edge 113+, or Safari Technology Preview).
-      A real model is hundreds of MB — this page is the manual end-to-end
-      harness; the automated test (<code>webgpu_smoke.rs</code>) covers the
-      async GPU host layer.
+      Loads a supported GGUF (<code>lfm2</code>, <code>lfm2moe</code>,
+      <code>llama</code>, <code>qwen2</code>, <code>qwen3</code>,
+      <code>granite</code>, <code>minicpm</code>, <code>minicpm5</code>,
+      <code>nanbeige</code>, <code>phi3</code>/<code>phi</code>,
+      <code>mistral3</code>/<code>ministral3</code>) entirely in your browser
+      and runs prefill + greedy decode on the GPU via WebGPU (no server
+      inference). Requires a WebGPU-capable browser (Chrome/Edge 113+, or
+      Safari). A real model is hundreds of MB: this page is the manual
+      end-to-end harness; the automated test (<code>webgpu_smoke.rs</code>)
+      covers the async GPU host layer.
     </p>
 
     <div class="controls">
       <div class="row">
-        <label for="model">LFM2 GGUF:</label>
+        <label for="model">Model GGUF:</label>
         <input type="file" id="model" accept=".gguf" />
       </div>
       <div class="row">
@@ -153,7 +157,7 @@
       if (!("gpu" in navigator)) {
         setStatus("❌ WebGPU not available in this browser.");
       } else {
-        setStatus(`Ready (cera ${ceraVersion()}). Pick an LFM2 GGUF to begin.`);
+        setStatus(`Ready (cera ${ceraVersion()}). Pick a GGUF model to begin.`);
       }
 
       // (Re)build the GPU session from the currently selected file + KV mode.

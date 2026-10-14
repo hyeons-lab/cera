@@ -1,9 +1,10 @@
 # cera_ffi_flutter_example
 
-A chat app built on `cera_ffi_flutter`: pick a GGUF, talk to it, watch tokens
-stream in. One code path serves Android, iOS, macOS, Linux, Windows and the
-browser, because it is written against `Cera`, the portable async API, rather
-than against the generated `dart:ffi` bindings.
+A chat app built on `cera_ffi_flutter`: download a model bundle from Hugging Face
+(or pick a local `.gguf`), talk to it, and watch tokens stream in. One code path
+serves Android, iOS, macOS, Linux, Windows and the browser, because it is written
+against `Cera`, the portable async API, rather than against the generated
+`dart:ffi` bindings.
 
 The controller manages rendered prompt deltas through `Cera`. It recognizes
 ChatML, Llama and Gemma continuation delimiters; an unknown template asks the
@@ -45,7 +46,8 @@ Two things decide whether you are actually on the GPU:
 
 - **The model architecture must be supported on WebGPU.** `WebGpuSession` supports
   `lfm2`/`lfm2.5`/`lfm2moe` as well as dense transformers (`llama`, `qwen2`, `qwen3`,
-  `granite`, with classic Mistral served under `llama`).
+  `granite`, `minicpm`, `minicpm5`, `nanbeige`, `phi3`/`phi`, and
+  `mistral3`/`ministral3`, with classic Mistral served under `llama`).
 - **The browser must expose `navigator.gpu`.** WebGPU is allowed on `localhost`
   without HTTPS, so local development needs no certificate.
 
@@ -60,7 +62,9 @@ secrets. See
 `.github/workflows/deploy-web-demo.yml`, whose header documents the one-time
 Cloudflare setup and how to attach a custom domain.
 
-Nothing about the deployment hosts a model. The app reads the GGUF the visitor
-picks off their own disk, which is what keeps it inside Cloudflare's 25 MiB
-per-file limit and off any bandwidth bill. If you ever want a model preloaded,
-it belongs in R2 with CORS enabled, not in the Pages deployment.
+Nothing about the deployment hosts a model. The app either fetches a chosen
+bundle directly from Hugging Face into the browser's Origin Private File System
+(OPFS) cache or reads a `.gguf` the visitor picks off their own disk, which is
+what keeps the static site inside Cloudflare's 25 MiB per-file limit and off any
+bandwidth bill. If you ever want a custom model hosted outside Hugging Face, it
+belongs in R2 with CORS enabled, not in the Pages deployment.

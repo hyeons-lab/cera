@@ -76,15 +76,21 @@ cera embed -m model.gguf -p "a chunk" --json        # JSON array output instead 
 | `chat` | Interactive multi-turn REPL with `/help`, `/clear`, `/exit` slash commands. Optional `--lora` adapter and speculative decoding (`--spec` / `--no-spec` / `--draft`). Run with no model source at all on a terminal (and without `--no-tui`) to pick one from the published catalog. |
 | `embed` | Extract last-layer hidden-state embeddings for a prompt: mean-pooled by default, `--per-token` for the full matrix, `--json` for array output. |
 | `logits` | Dump the next-token logits over the full vocabulary for a prompt (single prefill): `--top-k` for the K highest `(token_id, logit)` pairs, `--json` for array output. Handy for cross-backend parity checks. |
+| `convert` | Convert a local SafeTensors model directory to a quantized GGUF file (including `d1_omni` decision models). |
+| `decide` | Answer structured questions over text, image, or audio state using a bidirectional `d1` decision model. |
 | `inspect` | Inspect a GGUF file's metadata and resolved CPU backend tier. |
 | `cpu` | Print the host's CPU backend tier + detected SIMD features (no model needed). |
+| `thermal` | Print current and forecast device thermal headroom on Android API 30+ (`unavailable` elsewhere). |
 | `tokenize` | Tokenize text and print token IDs (e.g. to compare against HuggingFace). |
 | `bench` | Measure decode throughput (tok/s) with p10/p50/p90/mean/stddev over N runs. `--spec` (plus `--spec-ngram` / `--spec-k`) measures greedy speculative decoding; `--no-spec` disables speculative decoding; `--gpu-io` reports wgpu submits, compute passes, and readbacks per token. |
+| `gemv-bench` | Microbenchmark wgpu quantized GEMV kernels (`--features gpu`) across `m,k` shapes and verify CPU parity. |
+| `gemm-bench` | Microbenchmark wgpu quantized GEMM kernels (`--features gpu`) across `m,n,k` shapes and verify CPU parity. |
 | `list-bundles` | List bundles on `LiquidAI/LeapBundles` (add `--quants` for per-bundle quants). |
 | `list-hf` | Discover and list GGUF model files in a Hugging Face repository. |
 | `download-bundles` | Download bundle manifests + model files without loading them. |
 | `vad` | Run Voice Activity Detection (VAD) on audio files using pure-Rust Silero VAD v5 with timestamp segmentation and `--json` export. |
-| `transcribe` | Transcribe speech audio to text using OpenAI Whisper ASR with multi-language and timestamp support. |
+| `diarize` | Run speaker diarization on audio files using Streaming Sortformer or Nemotron-3-Diarization (plus `--compare`). |
+| `transcribe` | Transcribe speech audio to text using OpenAI Whisper or LFM2-Audio ASR with multi-language and timestamp support. |
 | `compare-quants` | Audit metadata, tensor inventory, quantization fidelity (cosine similarity, SNR, RMSE), and inference logit parity between Cera-converted models and reference community GGUFs. |
 
 ```sh
@@ -106,7 +112,7 @@ cera compare-quants --cera-gguf ./cera.gguf --reference ./upstream.gguf --json
 
 Run `cera <command> --help` for the full flag list. Common `run` flags:
 `--max-tokens` (default 256), `--temperature` (default 0.7), `--device`
-(`cpu` / `gpu` / `metal` / `hexagon` / `auto`, default `auto`), `--grammar` / `--json`, and
+(`cpu` / `gpu` / `metal` / `npu` / `hexagon` / `auto`, default `auto`), `--grammar` / `--json`, and
 `--lora` to attach a LoRA adapter. For tool calling, `--tools <JSON|@file>`
 passes an array of OpenAI-style function schemas (rendered into the chat
 template; the reply's tool calls are parsed to a JSON array on stdout), and
