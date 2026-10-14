@@ -179,7 +179,7 @@ while IFS=$'\t' read -r tier name want url; do
   # disk — never mistaken for the real file (that was the point of the suffix),
   # but repeated failures accumulated multi-hundred-MB fragments. Seen for real:
   # a 2.5 GB fetch died at 126 MB with an SSL record error.
-  if ! curl -fL --retry 3 --retry-delay 2 --connect-timeout 20 -o "$tmp" "$url"; then
+  if ! curl -fL --retry 5 --retry-delay 5 --connect-timeout 20 -o "$tmp" "$url"; then
     rm -f "$tmp"
     echo "error: $name download failed" >&2
     exit 1

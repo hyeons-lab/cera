@@ -1872,9 +1872,31 @@ mod tests {
     #[test]
     fn thread_self_pinned_matches_claim_and_live_mask() {
         let _affinity = AFFINITY_TEST_LOCK.lock().expect("affinity lock held");
-        use crate::backend::threadpool::{debug_set_caller_pin_for_test, thread_self_pinned};
-        // SAFETY: both always succeed.
+        // SAFETY: `gettid` is always valid.
         let me = unsafe { libc::gettid() };
+        // SAFETY: `cpu_set_t` is a plain bitmask; all-zero is a valid set.
+        let mut initial_mask: libc::cpu_set_t = unsafe { std::mem::zeroed() };
+        let ok = unsafe {
+            libc::sched_getaffinity(
+                me,
+                std::mem::size_of::<libc::cpu_set_t>(),
+                &mut initial_mask,
+            )
+        };
+        assert_eq!(ok, 0);
+        let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
+        let mut initial_count = 0;
+        for cpu in 0..capacity {
+            if unsafe { libc::CPU_ISSET(cpu, &initial_mask) } {
+                initial_count += 1;
+            }
+        }
+        if initial_count <= 1 {
+            eprintln!("skip: 1-CPU mask cannot discriminate");
+            return;
+        }
+        use crate::backend::threadpool::{debug_set_caller_pin_for_test, thread_self_pinned};
+        // SAFETY: `getpid` is always valid.
         let leader = unsafe { libc::getpid() };
         // Unclaimed anywhere: nobody is self-pinned.
         assert!(!thread_self_pinned(me));
