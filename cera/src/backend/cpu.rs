@@ -2666,56 +2666,139 @@ pub(crate) fn repack_q4_k_smmla_8x8(
     m: usize,
     k: usize,
 ) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    const QS_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, qs);
+    repack_k_smmla_8x8(
+        "repack_q4_k_smmla_8x8",
+        src,
+        m,
+        k,
+        size_of::<crate::quant::BlockQ4KM>(),
+        std::mem::offset_of!(crate::quant::BlockQ4KM, d),
+        std::mem::offset_of!(crate::quant::BlockQ4KM, dmin),
+        std::mem::offset_of!(crate::quant::BlockQ4KM, scales),
+        // Sub-block `s`, element `e`: the low nibble of the pair's byte for even `s`, the high one for odd.
+        |blk: &[u8], s: usize, e: usize| {
+            let byte = blk[QS_OFF + (s / 2) * 32 + e];
+            if s.is_multiple_of(2) {
+                byte & 0x0F
+            } else {
+                byte >> 4
+            }
+        },
+    )
+}
+
+/// Whether a Q5_K weight of `m x k` can take the smmla prefill path ([`repack_q5_k_smmla_8x8`]):
+/// the i8mm tier, whole 8-row super-rows and 256-aligned `k`.
+#[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
+pub(crate) fn q5_k_smmla_repack_supported(m: usize, k: usize) -> bool {
+    let _ = (m, k);
+    #[cfg(target_arch = "aarch64")]
+    return m > 0
+        && k > 0
+        && super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm
+        && m.is_multiple_of(8)
+        && k.is_multiple_of(256);
+    #[cfg(target_arch = "x86_64")]
+    return false;
+}
+
+/// Repack `m x k` Q5_K weights into the Q4_K smmla layout. A Q5_K value is `d*sc*q - dmin*mn` with
+/// `q` in `0..32` (the fifth bit of element `e` of sub-block `s` is bit `s` of `qh[e]`), exactly the
+/// Q4_K form with a wider `q`; the repack writes it as int8 like Q4_K's nibbles, so the Q4_K smmla
+/// kernels (GEMM, row-major, fused gate/up) run Q5_K weights unchanged.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(has_blas, allow(dead_code))]
+pub(crate) fn repack_q5_k_smmla_8x8(
+    src: &[u8],
+    m: usize,
+    k: usize,
+) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
+    const QH_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ5K, qh);
+    const QS_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ5K, qs);
+    repack_k_smmla_8x8(
+        "repack_q5_k_smmla_8x8",
+        src,
+        m,
+        k,
+        size_of::<crate::quant::BlockQ5K>(),
+        std::mem::offset_of!(crate::quant::BlockQ5K, d),
+        std::mem::offset_of!(crate::quant::BlockQ5K, dmin),
+        std::mem::offset_of!(crate::quant::BlockQ5K, scales),
+        |blk: &[u8], s: usize, e: usize| {
+            let byte = blk[QS_OFF + (s / 2) * 32 + e];
+            let nib = if s.is_multiple_of(2) {
+                byte & 0x0F
+            } else {
+                byte >> 4
+            };
+            nib | (((blk[QH_OFF + e] >> s) & 1) << 4)
+        },
+    )
+}
+
+/// Shared body of the K-quant smmla repacks: `quant(block_bytes, sub_block, element)` returns the
+/// unsigned quant value; the 6-bit scale/min decode and the `d*sc`, `dmin*mn` products are common.
+#[cfg(target_arch = "aarch64")]
+#[allow(clippy::too_many_arguments)]
+fn repack_k_smmla_8x8(
+    what: &str,
+    src: &[u8],
+    m: usize,
+    k: usize,
+    bsz: usize,
+    d_off: usize,
+    dmin_off: usize,
+    sc_off: usize,
+    quant: impl Fn(&[u8], usize, usize) -> u8,
+) -> (Vec<u8>, Vec<f32>, Vec<f32>) {
     assert!(
-        m.is_multiple_of(8),
-        "repack_q4_k_smmla_8x8: m must be a multiple of 8"
+        m > 0 && m.is_multiple_of(8),
+        "{what}: m must be positive multiple of 8, got {m}"
     );
     assert!(
-        k.is_multiple_of(256),
-        "repack_q4_k_smmla_8x8: k must be a multiple of 256"
+        k > 0 && k.is_multiple_of(256),
+        "{what}: k must be positive multiple of 256, got {k}"
     );
     let sb = k / 256;
     let nb32 = k / 32;
-    let bsz = size_of::<crate::quant::BlockQ4KM>();
+    let total_blocks = m
+        .checked_mul(sb)
+        .expect("repack_k_smmla_8x8: total blocks overflow");
+    let expected_bytes = total_blocks
+        .checked_mul(bsz)
+        .expect("repack_k_smmla_8x8: expected bytes overflow");
     assert_eq!(
         src.len(),
-        m * sb * bsz,
-        "repack_q4_k_smmla_8x8: src is {} bytes, need {} for {m}x{k}",
+        expected_bytes,
+        "{what}: src is {} bytes, need {} for {m}x{k}",
         src.len(),
-        m * sb * bsz,
+        expected_bytes,
     );
     let sr_count = m / 8;
-    let mut packed = vec![0u8; sr_count * nb32 * 256];
-    let mut dsc = vec![0.0f32; sr_count * nb32 * 8];
-    let mut dmn = vec![0.0f32; sr_count * nb32 * 8];
-    const D_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, d);
-    const DMIN_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, dmin);
-    const SC_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, scales);
-    const QS_OFF: usize = std::mem::offset_of!(crate::quant::BlockQ4KM, qs);
-
-    let nibble = |row: usize, block: usize, e: usize| -> u8 {
-        let bi = block / 8;
-        let s = block % 8;
-        let qs = (row * sb + bi) * bsz + QS_OFF;
-        let byte = src[qs + (s / 2) * 32 + e];
-        if s.is_multiple_of(2) {
-            byte & 0x0F
-        } else {
-            byte >> 4
-        }
-    };
+    let packed_len = sr_count
+        .checked_mul(nb32)
+        .and_then(|x| x.checked_mul(256))
+        .expect("repack_k_smmla_8x8: packed len overflow");
+    let scales_len = sr_count
+        .checked_mul(nb32)
+        .and_then(|x| x.checked_mul(8))
+        .expect("repack_k_smmla_8x8: scales len overflow");
+    let mut packed = vec![0u8; packed_len];
+    let mut dsc = vec![0.0f32; scales_len];
+    let mut dmn = vec![0.0f32; scales_len];
 
     for sr in 0..sr_count {
         for bi in 0..sb {
             for r in 0..8 {
                 let off = ((8 * sr + r) * sb + bi) * bsz;
-                let d = f16_to_f32(u16::from_le_bytes([src[off + D_OFF], src[off + D_OFF + 1]]));
+                let d = f16_to_f32(u16::from_le_bytes([src[off + d_off], src[off + d_off + 1]]));
                 let dmin = f16_to_f32(u16::from_le_bytes([
-                    src[off + DMIN_OFF],
-                    src[off + DMIN_OFF + 1],
+                    src[off + dmin_off],
+                    src[off + dmin_off + 1],
                 ]));
                 let scales_bytes: &[u8; 12] =
-                    src[off + SC_OFF..off + SC_OFF + 12].try_into().unwrap();
+                    src[off + sc_off..off + sc_off + 12].try_into().unwrap();
                 let (sc, mn) = crate::quant::decode_q4km_scales(scales_bytes);
                 for s in 0..8 {
                     let block = bi * 8 + s;
@@ -2729,9 +2812,11 @@ pub(crate) fn repack_q4_k_smmla_8x8(
                 for c in 0..4usize {
                     for p in 0..4usize {
                         for rr in 0..2usize {
+                            let row = 8 * sr + 2 * p + rr;
+                            let blk = &src[(row * sb + bi) * bsz..(row * sb + bi + 1) * bsz];
                             for e in 0..8usize {
-                                let val = nibble(8 * sr + 2 * p + rr, block, 8 * c + e);
-                                packed[base + c * 64 + p * 16 + rr * 8 + e] = val;
+                                packed[base + c * 64 + p * 16 + rr * 8 + e] =
+                                    quant(blk, s, 8 * c + e);
                             }
                         }
                     }
@@ -3629,6 +3714,9 @@ pub fn gemm_preq_dispatch(
             // at runtime even though the dtype is known.
             DType::Q4KM => neon::gemm_q4_k_q8_0_neon(data, b_scales, b_quants, out, m, n, k),
             DType::Q6K => neon::gemm_q6_k_q8_0_neon(data, b_scales, b_quants, out, m, n, k),
+            // No standard-layout Q5_K GEMM: this is the per-column GEMV fallback for a weight that
+            // was not smmla-repacked (see `neon::gemm_q5_k_q8_0_neon`).
+            DType::Q5KM => neon::gemm_q5_k_q8_0_neon(data, b_scales, b_quants, out, m, n, k),
             _ => false,
         }
     }
