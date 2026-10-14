@@ -686,13 +686,6 @@ impl MetalLfmModel {
                 "Model specifies projection or FFN biases, which are not accelerated on Metal; biases will be omitted in forward passes"
             );
         }
-        if let Some(why) = cpu.gpu_unsupported_reason() {
-            anyhow::bail!("{why}");
-        }
-        let context_size = super::gpu_weight_source::cap_context_for_attn_temp(
-            context_size,
-            cpu.gpu_context_cap(),
-        );
         Self::from_weight_source(&cpu, path, context_size)
     }
 
@@ -706,6 +699,13 @@ impl MetalLfmModel {
         path: Option<&std::path::Path>,
         context_size: usize,
     ) -> Result<Self> {
+        if let Some(why) = src.gpu_unsupported_reason() {
+            anyhow::bail!("{why}");
+        }
+        let context_size = super::gpu_weight_source::cap_context_for_attn_temp(
+            context_size,
+            src.gpu_context_cap(),
+        );
         let ctx = MetalContext::new()?;
         let data_offset = src.gguf().data_offset();
         let mut config = src.config().clone();
@@ -964,7 +964,7 @@ impl MetalLfmModel {
                         "Metal backend cannot dequantize output.weight with unsupported dtype {:?}",
                         wref.dtype,
                     );
-                    let f32_data = src.dequantize_weight(wref);
+                    let f32_data = src.dequantize_weight(wref)?;
                     let buf = ctx.upload_f32(&f32_data);
                     (None, Some(buf), DType::F32)
                 }
@@ -987,7 +987,7 @@ impl MetalLfmModel {
                         src.config().vocab_size,
                         hs,
                     );
-                    let f32_data = src.dequantize_weight(&emb_wref);
+                    let f32_data = src.dequantize_weight(&emb_wref)?;
                     let buf = ctx.upload_f32(&f32_data);
                     (None, Some(buf), DType::F32)
                 }
@@ -1041,7 +1041,7 @@ impl MetalLfmModel {
                 if wref.start.is_multiple_of(4) {
                     (wref.start, None, wref.dtype)
                 } else {
-                    let bytes = src.weight_bytes(wref);
+                    let bytes = src.weight_bytes(wref)?;
                     let buf = ctx.upload_bytes(&bytes);
                     (0, Some(buf), wref.dtype)
                 }
@@ -1053,7 +1053,7 @@ impl MetalLfmModel {
                 );
                 // Dequantize non-native weight formats (F16, BF16) to F32 on CPU
                 // during upload into a dedicated buffer so they execute via gemv_f32.
-                let f32_data = src.dequantize_weight(wref);
+                let f32_data = src.dequantize_weight(wref)?;
                 let buf = ctx.upload_f32(&f32_data);
                 (0, Some(buf), DType::F32)
             };

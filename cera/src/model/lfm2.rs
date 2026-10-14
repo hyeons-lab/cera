@@ -725,7 +725,9 @@ impl LfmModel {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
-        Self::from_gguf_impl(gguf, context_size, model_id, true)
+        Self::from_gguf_impl(gguf, context_size, model_id, true, |g, name| {
+            Ok(g.get_tensor(name)?.try_to_f32_vec()?)
+        })
     }
 
     /// Load without the CPU int8 repacks. For the GPU/Metal loaders, which
@@ -738,13 +740,28 @@ impl LfmModel {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
-        Self::from_gguf_impl(gguf, context_size, model_id, false)
+        Self::from_gguf_impl(gguf, context_size, model_id, false, |g, name| {
+            Ok(g.get_tensor(name)?.try_to_f32_vec()?)
+        })
     }
 
     /// Load without the CPU int8 repacks (see
     /// [`from_gguf_with_id_no_repack`](Self::from_gguf_with_id_no_repack)).
     pub fn from_gguf_no_repack(gguf: GgufFile, context_size: usize) -> Result<Self> {
-        Self::from_gguf_impl(gguf, context_size, String::new(), false)
+        Self::from_gguf_with_id_no_repack(gguf, context_size, String::new())
+    }
+
+    /// Same as [`Self::from_gguf_with_id_no_repack`], but uses a custom `load_f32`
+    /// callback for small 1D norm, conv, MoE bias, and classifier tensors so
+    /// header-only GGUF sources (such as OPFS streaming in WebAssembly) share the
+    /// exact same validation and metadata resolution path.
+    pub fn from_gguf_no_repack_with_loader(
+        gguf: GgufFile,
+        context_size: usize,
+        model_id: String,
+        load_f32: impl FnMut(&GgufFile, &str) -> Result<Vec<f32>>,
+    ) -> Result<Self> {
+        Self::from_gguf_impl(gguf, context_size, model_id, false, load_f32)
     }
 
     fn from_gguf_impl(
@@ -752,13 +769,28 @@ impl LfmModel {
         context_size: usize,
         model_id: String,
         repack: bool,
+        mut load_f32: impl FnMut(&GgufFile, &str) -> Result<Vec<f32>>,
     ) -> Result<Self> {
         let config = Self::parse_config(&gguf, context_size)?;
         let n_layers = config.n_layers;
+        let hs = config.hidden_size;
+        let head_dim = config.head_dim;
         let block_types = config.block_types.clone();
 
         // Pre-extract small F32 weights
-        let output_norm_weight = gguf.get_tensor("token_embd_norm.weight")?.to_f32_vec();
+        let output_norm_name = if gguf.tensors.contains_key("token_embd_norm.weight")
+            || !gguf.tensors.contains_key("output_norm.weight")
+        {
+            "token_embd_norm.weight"
+        } else {
+            "output_norm.weight"
+        };
+        let output_norm_weight = load_f32(&gguf, output_norm_name)?;
+        ensure!(
+            output_norm_weight.len() == hs,
+            "{output_norm_name} length {} != hidden_size ({hs})",
+            output_norm_weight.len()
+        );
 
         let mut attn_norm_weights = Vec::with_capacity(n_layers);
         let mut ffn_norm_weights = Vec::with_capacity(n_layers);
@@ -768,34 +800,48 @@ impl LfmModel {
         let mut conv_weights_transposed = Vec::with_capacity(n_layers);
 
         for (i, bt) in block_types.iter().enumerate() {
-            attn_norm_weights.push(
-                gguf.get_tensor(&format!("blk.{i}.attn_norm.weight"))?
-                    .to_f32_vec(),
+            let attn_norm_name = format!("blk.{i}.attn_norm.weight");
+            let attn_norm = load_f32(&gguf, &attn_norm_name)?;
+            ensure!(
+                attn_norm.len() == hs,
+                "{attn_norm_name} length {} != hidden_size ({hs})",
+                attn_norm.len()
             );
-            ffn_norm_weights.push(
-                gguf.get_tensor(&format!("blk.{i}.ffn_norm.weight"))?
-                    .to_f32_vec(),
+            attn_norm_weights.push(attn_norm);
+
+            let ffn_norm_name = format!("blk.{i}.ffn_norm.weight");
+            let ffn_norm = load_f32(&gguf, &ffn_norm_name)?;
+            ensure!(
+                ffn_norm.len() == hs,
+                "{ffn_norm_name} length {} != hidden_size ({hs})",
+                ffn_norm.len()
             );
+            ffn_norm_weights.push(ffn_norm);
 
             if *bt == BlockType::Attention {
-                attn_q_norm_weights.push(Some(
-                    gguf.get_tensor(&format!("blk.{i}.attn_q_norm.weight"))?
-                        .to_f32_vec(),
-                ));
-                attn_k_norm_weights.push(Some(
-                    gguf.get_tensor(&format!("blk.{i}.attn_k_norm.weight"))?
-                        .to_f32_vec(),
-                ));
+                let q_norm_name = format!("blk.{i}.attn_q_norm.weight");
+                let q_norm = load_f32(&gguf, &q_norm_name)?;
+                ensure!(
+                    q_norm.len() == head_dim,
+                    "{q_norm_name} length {} != head_dim ({head_dim})",
+                    q_norm.len()
+                );
+                let k_norm_name = format!("blk.{i}.attn_k_norm.weight");
+                let k_norm = load_f32(&gguf, &k_norm_name)?;
+                ensure!(
+                    k_norm.len() == head_dim,
+                    "{k_norm_name} length {} != head_dim ({head_dim})",
+                    k_norm.len()
+                );
+                attn_q_norm_weights.push(Some(q_norm));
+                attn_k_norm_weights.push(Some(k_norm));
                 conv_weights.push(None);
                 conv_weights_transposed.push(None);
             } else {
                 attn_q_norm_weights.push(None);
                 attn_k_norm_weights.push(None);
-                let w = gguf
-                    .get_tensor(&format!("blk.{i}.shortconv.conv.weight"))?
-                    .to_f32_vec();
+                let w = load_f32(&gguf, &format!("blk.{i}.shortconv.conv.weight"))?;
                 let kernel_size = config.conv_kernel_size.unwrap_or(3);
-                let hs = config.hidden_size;
                 ensure!(
                     w.len() == hs * kernel_size,
                     "blk.{i}.shortconv.conv.weight size {} != hidden_size * conv_kernel_size ({} * {})",
@@ -823,8 +869,20 @@ impl LfmModel {
             }
         }
 
-        let layer_refs = Self::resolve_all_layer_refs_with_repack(&gguf, &config, repack)?;
+        let layer_refs =
+            Self::resolve_all_layer_refs_with_loader(&gguf, &config, repack, &mut load_f32)?;
         let embd_ref = Self::resolve_weight(&gguf, "token_embd.weight")?;
+        ensure!(
+            embd_ref.k == hs,
+            "token_embd.weight has k={} but hidden_size is {hs}",
+            embd_ref.k
+        );
+        ensure!(
+            embd_ref.m >= config.vocab_size,
+            "token_embd.weight has {} rows, fewer than vocab_size {}",
+            embd_ref.m,
+            config.vocab_size
+        );
 
         let prefix_cache = Mutex::new(KvPrefixCache::for_model(
             crate::kv_cache::KvCacheConfig::default(),
@@ -833,13 +891,14 @@ impl LfmModel {
             &format!("cpu:{model_id}"),
         ));
 
-        let (classifier_weight, classifier_bias) = if gguf.get_tensor("classifier.weight").is_ok() {
-            let w = gguf.get_tensor("classifier.weight")?.to_f32_vec();
-            let b = gguf
-                .get_tensor("classifier.bias")
-                .ok()
-                .map(|t| t.to_f32_vec());
-            let hs = config.hidden_size;
+        let (classifier_weight, classifier_bias) = if gguf.tensors.contains_key("classifier.weight")
+        {
+            let w = load_f32(&gguf, "classifier.weight")?;
+            let b = if gguf.tensors.contains_key("classifier.bias") {
+                Some(load_f32(&gguf, "classifier.bias")?)
+            } else {
+                None
+            };
             if hs == 0 || !w.len().is_multiple_of(hs) {
                 bail!(
                     "classifier.weight length {} is not a multiple of hidden_size {}",
@@ -5975,11 +6034,13 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LfmModel {
         None
     }
 
-    fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]> {
-        std::borrow::Cow::Borrowed(transformer::weight_data(&self.gguf, wref))
+    fn weight_bytes(&self, wref: &WeightRef) -> Result<std::borrow::Cow<'_, [u8]>> {
+        Ok(std::borrow::Cow::Borrowed(transformer::weight_data(
+            &self.gguf, wref,
+        )))
     }
-    fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32> {
-        transformer::dequantize_weight(&self.gguf, wref)
+    fn dequantize_weight(&self, wref: &WeightRef) -> Result<Vec<f32>> {
+        Ok(transformer::dequantize_weight(&self.gguf, wref))
     }
 
     fn output_ref(&self) -> Option<&WeightRef> {
@@ -6019,6 +6080,17 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LfmModel {
         self.layer_refs[layer].attn_output.as_ref()
     }
 
+    fn gpu_unsupported_reason(&self) -> Option<String> {
+        if !self.config.is_causal
+            && (self.config.moe.is_some() || self.config.architecture == "lfm2moe")
+        {
+            return Some(format!(
+                "the GPU backends run {} with causal attention only, and this model is bidirectional (CPU only)",
+                self.config.architecture
+            ));
+        }
+        None
+    }
     fn rope_type(&self) -> crate::backend::cpu::RopeType {
         crate::backend::cpu::RopeType::Neox
     }

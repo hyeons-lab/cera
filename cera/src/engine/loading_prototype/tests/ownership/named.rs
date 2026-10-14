@@ -347,8 +347,14 @@ fn dspark_gpu_identity_includes_base_weights_and_draft_weights() {
     let same = source(draft, base);
     assert_eq!(original.gguf().mmap_data(), changed_base.gguf().mmap_data());
     assert_ne!(
-        original.embedding_tensor_data().unwrap(),
-        changed_base.embedding_tensor_data().unwrap()
+        original
+            .embedding_mmap_weight(&original.dspark.gguf)
+            .unwrap()
+            .data(),
+        changed_base
+            .embedding_mmap_weight(&changed_base.dspark.gguf)
+            .unwrap()
+            .data()
     );
     let original_id = for_gpu_source(&original, "same-draft-path");
     assert_eq!(original_id, for_gpu_source(&same, "same-draft-path"));

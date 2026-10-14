@@ -843,16 +843,26 @@ fn repack_q6_k_flat(data: &[u8], m: usize, k: usize) -> Vec<u8> {
 /// (that copy cost vocab×hidden×4 B — 1 GB on a 128k-vocab model). Rows go
 /// up in 256-row writes; the table stays unscaled (callers that need the
 /// embedding multiplier apply it at gather time, input only).
-fn upload_mmap_table_as_f16(ctx: &GpuContext, table: &MmapWeight, label: &str) -> wgpu::Buffer {
+fn upload_mmap_table_as_f16_rows(
+    ctx: &GpuContext,
+    table: &MmapWeight,
+    rows: usize,
+    label: &str,
+) -> wgpu::Buffer {
     const ROWS_PER_WRITE: usize = 256;
-    let vocab = table.rows as u64;
+    assert!(
+        rows <= table.rows,
+        "{label} requested {rows} rows from table with {} rows",
+        table.rows
+    );
+    let vocab = rows as u64;
     let hs = table.cols as u64;
     let buf = ctx.create_storage_rw(vocab * hs * 2, label);
     let mut row = vec![0.0f32; table.cols];
     let mut chunk: Vec<f16> = Vec::with_capacity(ROWS_PER_WRITE * table.cols);
-    for start in (0..table.rows).step_by(ROWS_PER_WRITE) {
+    for start in (0..rows).step_by(ROWS_PER_WRITE) {
         chunk.clear();
-        for r in start..(start + ROWS_PER_WRITE).min(table.rows) {
+        for r in start..(start + ROWS_PER_WRITE).min(rows) {
             table.dequantize_row(r, &mut row);
             chunk.extend(row.iter().map(|&x| f16::from_f32(x)));
         }
@@ -1461,12 +1471,10 @@ fn upload_moe(
             refs.len(),
             ctx.max_storage_buffer_binding_size,
         );
-        let bytes = refs
-            .iter()
-            .fold(Vec::with_capacity(total as usize), |mut acc: Vec<u8>, r| {
-                acc.extend_from_slice(&src.weight_bytes(r));
-                acc
-            });
+        let mut bytes = Vec::with_capacity(total as usize);
+        for r in refs {
+            bytes.extend_from_slice(&src.weight_bytes(r)?);
+        }
         Ok(GpuMoeWeight {
             buffer: ctx.upload_storage(&bytes, &format!("l{layer}.{what}")),
             m: u32::try_from(layout.rows)
@@ -1544,7 +1552,7 @@ fn upload_moe(
 
     Ok(GpuMoeFfn {
         router: ctx.upload_f32(
-            &src.dequantize_weight(&moe.router),
+            &src.dequantize_weight(&moe.router)?,
             &format!("l{layer}.ffn_gate_inp"),
         ),
         bias: ctx.upload_f32(&moe.exp_probs_b, &format!("l{layer}.exp_probs_b")),
@@ -2279,7 +2287,8 @@ impl GpuLfmModel {
         let arch = gguf.architecture().unwrap_or("").to_lowercase();
         match arch.as_str() {
             "llama" | "qwen2" | "qwen3" | "granite" | "minicpm" | "minicpm5" | "nanbeige"
-            | "phi3" | "phi" => {
+            | "phi3" | "phi" | "mistral3" | "ministral" | "ministral3" | "internlm2"
+            | "internlm" | "baichuan" | "deepseek" | "openelm" => {
                 // No CPU repacks: the GPU loader only resolves metadata from
                 // this model (see `with_repack_if`).
                 let cpu_model = super::llama::LlamaModel::from_gguf_with_id_no_repack(
@@ -2309,6 +2318,9 @@ impl GpuLfmModel {
                 )?;
                 Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
             }
+            "stablelm" | "starcoder2" | "cohere" | "command-r" => anyhow::bail!(
+                "architecture {arch} requires LayerNorm/parallel-residual support, which the GPU backends do not implement (CPU only)"
+            ),
             other => anyhow::bail!("unsupported architecture for GPU: {other}"),
         }
     }
@@ -2346,13 +2358,6 @@ impl GpuLfmModel {
                 "Model specifies projection or FFN biases, which are not accelerated on WebGPU; biases will be omitted in GPU forward passes"
             );
         }
-        if let Some(why) = cpu_model.gpu_unsupported_reason() {
-            anyhow::bail!("{why}");
-        }
-        let context_size = super::gpu_weight_source::cap_context_for_attn_temp(
-            context_size,
-            cpu_model.gpu_context_cap(),
-        );
         Self::from_weight_source(&cpu_model, context_size, model_id)
     }
 
@@ -2365,6 +2370,9 @@ impl GpuLfmModel {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
+        if let Some(why) = src.gpu_unsupported_reason() {
+            anyhow::bail!("{why}");
+        }
         // Native: build the GPU context synchronously. wasm callers must use
         // `from_*_with_ctx` with a context built via `GpuContext::new_async`
         // (WebGPU init only resolves on the JS event loop).
@@ -2398,6 +2406,13 @@ impl GpuLfmModel {
         model_id: String,
         ctx: GpuContext,
     ) -> Result<Self> {
+        if let Some(why) = src.gpu_unsupported_reason() {
+            anyhow::bail!("{why}");
+        }
+        let context_size = super::gpu_weight_source::cap_context_for_attn_temp(
+            context_size,
+            src.gpu_context_cap(),
+        );
         // The CPU loader already caps max_seq_len to context_size internally,
         // so the second .min() below is redundant but kept for clarity.
         let mut config = src.config().clone();
@@ -2761,54 +2776,25 @@ impl GpuLfmModel {
         // LlamaModel (`scale_inplace` after `dequantize_row`).
         let gguf_arc = Arc::new(src.gguf().clone());
         let emb_table = src.embedding_mmap_weight(&gguf_arc)?;
+        anyhow::ensure!(
+            emb_table.cols == config.hidden_size && emb_table.rows >= config.vocab_size,
+            "token_embd.weight shape [{} rows, {} cols] is incompatible with [vocab_size={}, hidden_size={}]",
+            emb_table.rows,
+            emb_table.cols,
+            config.vocab_size,
+            config.hidden_size,
+        );
+        if let Some(wref) = src.output_ref() {
+            anyhow::ensure!(
+                wref.k == config.hidden_size && wref.m >= config.vocab_size,
+                "output.weight shape [{} rows, {} cols] is incompatible with [vocab_size={}, hidden_size={}]",
+                wref.m,
+                wref.k,
+                config.vocab_size,
+                config.hidden_size,
+            );
+        }
 
-        // The logit-projection weight, as GGUF stores it: `output.weight` when
-        // untied, else the tied embedding table.
-        let (lm_head_dtype, lm_head_bytes) = match src.output_ref() {
-            Some(wref) => (wref.dtype, src.weight_bytes(wref)),
-            None => (
-                emb_table.dtype,
-                std::borrow::Cow::Borrowed(emb_table.data()),
-            ),
-        };
-        // Resident stream layout for the logit projection (Q4_0, Q4_K_M): the
-        // vocab projection is ~19% of prefill FLOPs, so it gets the repack
-        // like every other eligible weight. Repacked on the host here; the
-        // GPU upload happens inside the Quantized arm below so the F16
-        // fallback never pays for buffers it drops.
-        let lm_head_repack =
-            if stream_layout && stream_layout_eligible(lm_head_dtype, config.hidden_size) {
-                if lm_head_dtype == DType::Q4KM {
-                    Some(repack_q4_k_stream(
-                        &lm_head_bytes,
-                        config.vocab_size,
-                        config.hidden_size,
-                    ))
-                } else {
-                    Some(repack_q4_0_stream(
-                        &lm_head_bytes,
-                        config.vocab_size,
-                        config.hidden_size,
-                    ))
-                }
-            } else {
-                None
-            };
-        // Compare the size the buffers will actually be *bound* at, not the
-        // raw GGUF length: `upload_storage` rounds up to
-        // COPY_BUFFER_ALIGNMENT, and Q6_K (210 B/block), Q4_0 (18 B) and Q8_0
-        // (34 B) are all 2 mod 4, so an odd block count does round up. Same
-        // reasoning as `encode_gemv_f16`'s tiled/non-tiled check — on an
-        // adapter whose `max_binding` is not itself a multiple of 4,
-        // comparing the raw length could pick this path and then fail
-        // binding validation. Resident binds q and d separately, so the
-        // bound is the larger half, not the raw total.
-        let lm_head_bound_bytes = if let Some((q, d)) = lm_head_repack.as_ref() {
-            // u32 counts times 4: already a multiple of 4, no round-up.
-            q.len().max(d.len()) as u64 * 4
-        } else {
-            (lm_head_bytes.len() as u64).div_ceil(4) * 4
-        };
         // `[m, k, 0, 0]`; identical for both variants, so it is built once.
         let lm_head_params = ctx.upload_storage(
             bytemuck::cast_slice(&[
@@ -2819,86 +2805,182 @@ impl GpuLfmModel {
             ]),
             "lm_head.params",
         );
-        // Take the quantized path only if the whole weight also fits one storage
-        // binding — the GEMV kernels bind it entire, whereas the f16 path can
-        // fall back to `encode_gemv_f16_tiled`. Quantized is the smaller of the
-        // two, so this rejects only weights the f16 path would have had to tile
-        // anyway.
-        let lm_head = if Self::has_quantized_gemv(lm_head_dtype)
-            && lm_head_bound_bytes <= ctx.max_storage_buffer_binding_size
-        {
-            // Resident weights keep only the (q, d) repack: `tensor.buffer`
-            // is the q half (see `GpuWeight`), and there is no raw upload.
-            let (main_buffer, stream_q, stream_d, resident_stream) = match lm_head_repack {
-                Some((q, d)) => {
-                    let qb = ctx.upload_storage(bytemuck::cast_slice(&q), "lm_head.stream_q");
-                    let db = ctx.upload_storage(bytemuck::cast_slice(&d), "lm_head.stream_d");
-                    (qb.clone(), Some(qb), Some(db), true)
-                }
-                None => (
-                    ctx.upload_storage(&lm_head_bytes, "lm_head"),
-                    None,
-                    None,
-                    false,
-                ),
+
+        // The logit-projection weight, as GGUF stores it: `output.weight` when
+        // untied, else the tied embedding table. Only read raw bytes when a
+        // quantized GEMV kernel exists for `lm_head_dtype`, and drop the borrow
+        // before the `LmHead::F16` fallback so OPFS streaming never holds two
+        // copies of `output.weight` in WASM linear memory simultaneously.
+        let lm_head_dtype = src.output_ref().map_or(emb_table.dtype, |wref| wref.dtype);
+        let quantized_lm_head = if Self::has_quantized_gemv(lm_head_dtype) {
+            let lm_head_raw = match src.output_ref() {
+                Some(wref) => src.weight_bytes(wref)?,
+                None => std::borrow::Cow::Borrowed(emb_table.data()),
             };
-            // Flat-planes Q6_K twin for decode GEMV (passthrough only): the
-            // same bytes as the interleaved upload, de-interleaved, so the
-            // flat kernel reads aligned words with no funnel shifts. The
-            // interleaved buffer stays as `main` for the prefill GEMM's
-            // reg-tile loader, which expects GGUF block order.
-            let flat = if lm_head_dtype == DType::Q6K && use_flat_q6k(&ctx) {
-                let flat_bytes =
-                    repack_q6_k_flat(&lm_head_bytes, config.vocab_size, config.hidden_size);
-                Some(Box::new(GpuWeight {
-                    tensor: GpuTensor {
-                        buffer: ctx.upload_storage(&flat_bytes, "lm_head.flat_q6k"),
-                        dtype: lm_head_dtype,
-                        shape: vec![config.vocab_size, config.hidden_size],
+            let lm_head_block_size = lm_head_dtype.block_size().max(1);
+            anyhow::ensure!(
+                config.hidden_size.is_multiple_of(lm_head_block_size),
+                "LM head inner dim {} is not divisible by {:?} block size {}",
+                config.hidden_size,
+                lm_head_dtype,
+                lm_head_block_size,
+            );
+            let lm_head_row_bytes =
+                (config.hidden_size / lm_head_block_size) * lm_head_dtype.block_bytes();
+            let lm_head_vocab_bytes = config.vocab_size * lm_head_row_bytes;
+            anyhow::ensure!(
+                lm_head_raw.len() >= lm_head_vocab_bytes,
+                "LM head buffer has {} bytes, fewer than vocab_size * row_bytes ({lm_head_vocab_bytes})",
+                lm_head_raw.len(),
+            );
+            // Slice to `config.vocab_size` rows so padded GGUF tables (`m > vocab_size`)
+            // match `config.vocab_size` in `repack_q6_k_flat`, stream repacks, and
+            // storage-binding size checks.
+            let lm_head_bytes = &lm_head_raw[..lm_head_vocab_bytes];
+            // Resident stream layout for the logit projection (Q4_0, Q4_K_M): the
+            // vocab projection is ~19% of prefill FLOPs, so it gets the repack
+            // like every other eligible weight. Repacked on the host here; the
+            // GPU upload happens inside the Quantized arm below so the F16
+            // fallback never pays for buffers it drops.
+            let lm_head_repack =
+                if stream_layout && stream_layout_eligible(lm_head_dtype, config.hidden_size) {
+                    if lm_head_dtype == DType::Q4KM {
+                        Some(repack_q4_k_stream(
+                            lm_head_bytes,
+                            config.vocab_size,
+                            config.hidden_size,
+                        ))
+                    } else {
+                        Some(repack_q4_0_stream(
+                            lm_head_bytes,
+                            config.vocab_size,
+                            config.hidden_size,
+                        ))
+                    }
+                } else {
+                    None
+                };
+            // Compare the size the buffers will actually be *bound* at, not the
+            // raw GGUF length: `upload_storage` rounds up to
+            // COPY_BUFFER_ALIGNMENT, and Q6_K (210 B/block), Q4_0 (18 B) and Q8_0
+            // (34 B) are all 2 mod 4, so an odd block count does round up. Same
+            // reasoning as `encode_gemv_f16`'s tiled/non-tiled check - on an
+            // adapter whose `max_binding` is not itself a multiple of 4,
+            // comparing the raw length could pick this path and then fail
+            // binding validation. Resident binds q and d separately, so the
+            // bound is the larger half, not the raw total.
+            let lm_head_bound_bytes = if let Some((q, d)) = lm_head_repack.as_ref() {
+                // u32 counts times 4: already a multiple of 4, no round-up.
+                q.len().max(d.len()) as u64 * 4
+            } else {
+                (lm_head_bytes.len() as u64).div_ceil(4) * 4
+            };
+            // Take the quantized path only if the whole weight also fits one storage
+            // binding - the GEMV kernels bind it entire, whereas the f16 path can
+            // fall back to `encode_gemv_f16_tiled`. Quantized is the smaller of the
+            // two, so this rejects only weights the f16 path would have had to tile
+            // anyway.
+            if lm_head_bound_bytes <= ctx.max_storage_buffer_binding_size {
+                // Resident weights keep only the (q, d) repack: `tensor.buffer`
+                // is the q half (see `GpuWeight`), and there is no raw upload.
+                let (main_buffer, stream_q, stream_d, resident_stream) = match lm_head_repack {
+                    Some((q, d)) => {
+                        let qb = ctx.upload_storage(bytemuck::cast_slice(&q), "lm_head.stream_q");
+                        let db = ctx.upload_storage(bytemuck::cast_slice(&d), "lm_head.stream_d");
+                        (qb.clone(), Some(qb), Some(db), true)
+                    }
+                    None => (
+                        ctx.upload_storage(lm_head_bytes, "lm_head"),
+                        None,
+                        None,
+                        false,
+                    ),
+                };
+                // Flat-planes Q6_K twin for decode GEMV (passthrough only): the
+                // same bytes as the interleaved upload, de-interleaved, so the
+                // flat kernel reads aligned words with no funnel shifts. The
+                // interleaved buffer stays as `main` for the prefill GEMM's
+                // reg-tile loader, which expects GGUF block order.
+                let flat = if lm_head_dtype == DType::Q6K && use_flat_q6k(&ctx) {
+                    let flat_bytes =
+                        repack_q6_k_flat(lm_head_bytes, config.vocab_size, config.hidden_size);
+                    Some(Box::new(GpuWeight {
+                        tensor: GpuTensor {
+                            buffer: ctx.upload_storage(&flat_bytes, "lm_head.flat_q6k"),
+                            dtype: lm_head_dtype,
+                            shape: vec![config.vocab_size, config.hidden_size],
+                        },
+                        stream_q: None,
+                        stream_d: None,
+                        resident_stream: false,
+                        flat_q6k: true,
+                        params_buf: lm_head_params.clone(),
+                        cached_bg: None,
+                    }))
+                } else {
+                    None
+                };
+                Some(LmHead::Quantized {
+                    main: GpuWeight {
+                        tensor: GpuTensor {
+                            buffer: main_buffer,
+                            dtype: lm_head_dtype,
+                            shape: vec![config.vocab_size, config.hidden_size],
+                        },
+                        stream_q,
+                        stream_d,
+                        resident_stream,
+                        flat_q6k: false,
+                        params_buf: lm_head_params.clone(),
+                        cached_bg: None,
                     },
-                    stream_q: None,
-                    stream_d: None,
-                    resident_stream: false,
-                    flat_q6k: true,
-                    params_buf: lm_head_params.clone(),
-                    cached_bg: None,
-                }))
+                    flat,
+                })
             } else {
                 None
-            };
-            LmHead::Quantized {
-                main: GpuWeight {
-                    tensor: GpuTensor {
-                        buffer: main_buffer,
-                        dtype: lm_head_dtype,
-                        shape: vec![config.vocab_size, config.hidden_size],
-                    },
-                    stream_q,
-                    stream_d,
-                    resident_stream,
-                    flat_q6k: false,
-                    params_buf: lm_head_params,
-                    cached_bg: None,
-                },
-                flat,
             }
         } else {
-            // No quantized GEMV for this dtype (or it needs tiling): dequantize
-            // and keep an f16 copy, which is still half the VRAM of f32.
-            let f16_weight = match src.output_ref() {
-                // Untied head: same row-wise conversion as the tied arm, so
-                // no host f32 copy of the vocab-sized table ever exists.
-                // `output.weight` is the key `output_ref` resolves (llama
-                // family; LFM2 always ties and takes the arm below).
-                Some(_) => {
-                    let out_table = src.output_mmap_weight(&gguf_arc)?;
-                    upload_mmap_table_as_f16(&ctx, &out_table, "output.weight")
+            None
+        };
+        let lm_head = match quantized_lm_head {
+            Some(quantized) => quantized,
+            None => {
+                // No quantized GEMV for this dtype (or it needs tiling): dequantize
+                // and keep an f16 copy, which is still half the VRAM of f32.
+                let f16_weight = match src.output_ref() {
+                    // Untied head: same row-wise conversion as the tied arm, so
+                    // no host f32 copy of the vocab-sized table ever exists.
+                    // `output.weight` is the key `output_ref` resolves (llama
+                    // family; LFM2 always ties and takes the arm below).
+                    Some(_) => {
+                        let out_table = src.output_mmap_weight(&gguf_arc)?;
+                        anyhow::ensure!(
+                            out_table.cols == config.hidden_size
+                                && out_table.rows >= config.vocab_size,
+                            "output.weight shape [{} rows, {} cols] is incompatible with [vocab_size={}, hidden_size={}]",
+                            out_table.rows,
+                            out_table.cols,
+                            config.vocab_size,
+                            config.hidden_size,
+                        );
+                        upload_mmap_table_as_f16_rows(
+                            &ctx,
+                            &out_table,
+                            config.vocab_size,
+                            "output.weight",
+                        )
+                    }
+                    None => upload_mmap_table_as_f16_rows(
+                        &ctx,
+                        &emb_table,
+                        config.vocab_size,
+                        "token_embd.weight",
+                    ),
+                };
+                LmHead::F16 {
+                    weight: f16_weight,
+                    params: lm_head_params,
                 }
-                None => upload_mmap_table_as_f16(&ctx, &emb_table, "token_embd.weight"),
-            };
-            LmHead::F16 {
-                weight: f16_weight,
-                params: lm_head_params,
             }
         };
 
@@ -2907,10 +2989,10 @@ impl GpuLfmModel {
         let mut uploaded_weights: std::collections::HashMap<(u64, usize), GpuWeight> =
             std::collections::HashMap::new();
 
-        let mut upload_weight = |wref: &WeightRef, name: &str| -> GpuWeight {
+        let mut upload_weight = |wref: &WeightRef, name: &str| -> Result<GpuWeight> {
             let key = (wref.start, wref.size);
             if let Some(existing) = uploaded_weights.get(&key) {
-                return existing.clone();
+                return Ok(existing.clone());
             }
             let (buf, dtype, stream, resident_stream) = if matches!(
                 wref.dtype,
@@ -2930,7 +3012,7 @@ impl GpuLfmModel {
                 // Q5KM (`nb*176` B) is already 4-aligned; Q6K (`nb*210`), Q4_0
                 // (18 B/block), and Q8_0 (34 B/block) are not, and rely on that
                 // round-up guarantee.
-                let data = src.weight_bytes(wref);
+                let data = src.weight_bytes(wref)?;
                 // Resident stream layout: eligible Q4_0 and Q4_K_M upload the (q, d)
                 // repack INSTEAD of raw (same bytes, transposed) and both
                 // phases read it directly: no second copy, no per-GEMM
@@ -2960,7 +3042,7 @@ impl GpuLfmModel {
                 //
                 // TODO: Upload as F16 to halve this weight bandwidth (needs an
                 // F16-aware reg-tile loader); a perf optimization, not correctness.
-                let f32_data = src.dequantize_weight(wref);
+                let f32_data = src.dequantize_weight(wref)?;
                 (ctx.upload_f32(&f32_data, name), DType::F32, None, false)
             };
             let params_buf = ctx.upload_storage(
@@ -2987,7 +3069,7 @@ impl GpuLfmModel {
                 cached_bg: None,
             };
             uploaded_weights.insert(key, weight.clone());
-            weight
+            Ok(weight)
         };
 
         // Optional per-head QK-norm (Qwen3) and QKV bias (Qwen2) upload helpers.
@@ -3116,9 +3198,9 @@ impl GpuLfmModel {
 
             let ffn = match src.moe_refs(i) {
                 None => GpuFfn::Dense(Box::new(GpuDenseFfn {
-                    gate: upload_weight(src.ffn_gate_ref(i)?, &format!("l{i}.ffn_gate")),
-                    up: upload_weight(src.ffn_up_ref(i)?, &format!("l{i}.ffn_up")),
-                    down: upload_weight(src.ffn_down_ref(i)?, &format!("l{i}.ffn_down")),
+                    gate: upload_weight(src.ffn_gate_ref(i)?, &format!("l{i}.ffn_gate"))?,
+                    up: upload_weight(src.ffn_up_ref(i)?, &format!("l{i}.ffn_up"))?,
+                    down: upload_weight(src.ffn_down_ref(i)?, &format!("l{i}.ffn_down"))?,
                 })),
                 Some(m) => GpuFfn::Moe(Box::new(upload_moe(
                     &ctx,
@@ -3140,8 +3222,8 @@ impl GpuLfmModel {
                     .conv_out_proj_ref(i)
                     .ok_or_else(|| anyhow!("conv layer missing out_proj"))?;
                 (
-                    Some(upload_weight(ip, &format!("l{i}.conv_ip"))),
-                    Some(upload_weight(op, &format!("l{i}.conv_op"))),
+                    Some(upload_weight(ip, &format!("l{i}.conv_ip"))?),
+                    Some(upload_weight(op, &format!("l{i}.conv_op"))?),
                     Some(
                         ctx.upload_f32(
                             src.conv_weight(i)
@@ -3163,22 +3245,22 @@ impl GpuLfmModel {
                         src.attn_q_ref(i)
                             .ok_or_else(|| anyhow!("attn layer missing q"))?,
                         &format!("l{i}.attn_q"),
-                    )),
+                    )?),
                     Some(upload_weight(
                         src.attn_k_ref(i)
                             .ok_or_else(|| anyhow!("attn layer missing k"))?,
                         &format!("l{i}.attn_k"),
-                    )),
+                    )?),
                     Some(upload_weight(
                         src.attn_v_ref(i)
                             .ok_or_else(|| anyhow!("attn layer missing v"))?,
                         &format!("l{i}.attn_v"),
-                    )),
+                    )?),
                     Some(upload_weight(
                         src.attn_output_ref(i)
                             .ok_or_else(|| anyhow!("attn layer missing output"))?,
                         &format!("l{i}.attn_o"),
-                    )),
+                    )?),
                     upload_opt_f32(src.attn_q_norm_weight(i), &format!("l{i}.qn")),
                     upload_opt_f32(src.attn_k_norm_weight(i), &format!("l{i}.kn")),
                 )
@@ -12644,7 +12726,7 @@ mod tests {
     /// whose element count exceeds `u32::MAX`.
     #[test]
     fn dense_silu_gate_matches_the_dispatch_grid() {
-        use crate::backend::wgpu::{MAX_WG, kv_shift_workgroups};
+        use crate::backend::wgpu::{MAX_WG, gemv_row_workgroups, kv_shift_workgroups, shaders};
         for is in [4096usize, 8191, 8192, 10752] {
             assert!(
                 super::check_dense_silu_fits(2048, is).is_ok(),
@@ -12655,17 +12737,136 @@ mod tests {
             assert!(u64::from(wx) * u64::from(wy) * 256 >= 2048 * is as u64);
         }
         let elem_wgsl = include_str!("../backend/shaders/elementwise.wgsl");
-        assert!(
-            elem_wgsl.contains("gid.x + gid.y * (65535u * 256u)"),
-            "elementwise.wgsl must fold gid.y into the linear index for 2D dispatches"
-        );
-        let qk_wgsl = include_str!("../backend/shaders/qk_norm_rope_batch.wgsl");
-        assert!(
-            qk_wgsl.contains("get_wid(wid)"),
-            "qk_norm_rope_batch.wgsl must fold wid.y into the workgroup index for 2D dispatches"
+        assert_eq!(
+            elem_wgsl.matches("gid.x + gid.y * (65535u * 256u)").count(),
+            4,
+            "all 4 entry points in elementwise.wgsl must fold gid.y into the linear index for 2D dispatches"
         );
         let err = super::check_dense_silu_fits(65536, 65536).expect_err("overflows u32::MAX");
         assert!(err.to_string().contains("u32 element cap"), "{err}");
+
+        if let Some(ctx) = gpu_or_skip() {
+            // 32768 tokens * (1 Q head + 1 KV head) = 65536 workgroups (`MAX_WG + 1`),
+            // so `gemv_row_workgroups(65536)` spills into `wid.y == 1` (`(65535, 2, 1)`).
+            // Without `get_wid(wid)` in `qk_norm_rope_batch.wgsl`, workgroup `(0, 1, 0)`
+            // re-normalizes `tg = 0` (`q_batch[0..2]`) a second time and leaves
+            // `tg = 65535` (`k_batch[65534..65536]`) untouched.
+            let n_tokens: u32 = 32768;
+            let n_heads: u32 = 1;
+            let n_kv_heads: u32 = 1;
+            let head_dim: u32 = 2;
+            let eps = 1e-5f32;
+            let freq_base = 10000.0f32;
+            let q_batch: Vec<f32> = (0..n_tokens * head_dim)
+                .map(|i| if i % 2 == 0 { 1.5 } else { -2.0 })
+                .collect();
+            let k_batch: Vec<f32> = (0..n_tokens * head_dim)
+                .map(|i| if i % 2 == 0 { 3.0 } else { 4.0 })
+                .collect();
+            let q_norm_w = [1.25f32, 0.75];
+            let k_norm_w = [0.5f32, 1.5];
+
+            let mut ref_q0 = [1.5f32, -2.0];
+            let mut ref_k0 = [3.0f32, 4.0];
+            crate::backend::cpu::rmsnorm(&mut ref_q0, &q_norm_w, eps);
+            crate::backend::cpu::rmsnorm(&mut ref_k0, &k_norm_w, eps);
+            crate::backend::cpu::rope(&mut ref_q0, &mut ref_k0, 0, 1, 1, 2, freq_base);
+
+            let mut ref_q_last = [1.5f32, -2.0];
+            let mut ref_k_last = [3.0f32, 4.0];
+            crate::backend::cpu::rmsnorm(&mut ref_q_last, &q_norm_w, eps);
+            crate::backend::cpu::rmsnorm(&mut ref_k_last, &k_norm_w, eps);
+            // Dividing `pos = 32767` by `freq_factors[0] = 32767.0` yields `angle = 1.0`
+            // (`pos = 1` unscaled), avoiding GPU fast-math `sin`/`cos` range-reduction drift.
+            crate::backend::cpu::rope(&mut ref_q_last, &mut ref_k_last, 1, 1, 1, 2, freq_base);
+
+            let pipeline = ctx.create_pipeline(
+                shaders::QK_NORM_ROPE_BATCH,
+                "qk_norm_rope_batch",
+                "qk_norm_rope_batch",
+            );
+            let q_buf = ctx.create_storage_rw((q_batch.len() as u64) * 4, "q_2d");
+            ctx.queue
+                .write_buffer(&q_buf, 0, bytemuck::cast_slice(&q_batch));
+            let k_buf = ctx.create_storage_rw((k_batch.len() as u64) * 4, "k_2d");
+            ctx.queue
+                .write_buffer(&k_buf, 0, bytemuck::cast_slice(&k_batch));
+            let qw_buf = ctx.upload_f32(&q_norm_w, "q_norm_w_2d");
+            let kw_buf = ctx.upload_f32(&k_norm_w, "k_norm_w_2d");
+            let params = [
+                0u32,
+                n_tokens,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                eps.to_bits(),
+                freq_base.to_bits(),
+                0u32,
+                head_dim,
+                head_dim,
+                1u32,
+                1u32,
+            ];
+            let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params_2d");
+            let ff_buf = ctx.upload_f32(&[(n_tokens - 1) as f32], "ff_2d");
+            let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &pipeline.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: q_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: k_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: qw_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: kw_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 4,
+                        resource: p_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 5,
+                        resource: ff_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            let (wx, wy, wz) = gemv_row_workgroups(n_tokens * (n_heads + n_kv_heads));
+            assert_eq!((wx, wy, wz), (MAX_WG, 2, 1));
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipeline);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups(wx, wy, wz);
+            }
+            ctx.submit_encoder(enc);
+            let got_q = ctx.download_f32(&q_buf, q_batch.len());
+            let got_k = ctx.download_f32(&k_buf, k_batch.len());
+            let last = ((n_tokens - 1) * head_dim) as usize;
+            for d in 0..2 {
+                assert!(
+                    (got_q[d] - ref_q0[d]).abs() < 1e-5,
+                    "tg=0 q[{d}] got {} vs ref {}",
+                    got_q[d],
+                    ref_q0[d]
+                );
+                assert!(
+                    (got_k[last + d] - ref_k_last[d]).abs() < 1e-5,
+                    "tg=65535 (wid.y=1) k[last+{d}] got {} vs ref {}",
+                    got_k[last + d],
+                    ref_k_last[d]
+                );
+            }
+        }
     }
 
     /// `use_attention_f16` enables fp16 causal prefill by default and disables it
@@ -13032,17 +13233,20 @@ mod tests {
     /// adapter (hard-fails under `CERA_REQUIRE_GPU`, like the oracles).
     #[test]
     fn f16_table_upload_round_trip() {
-        use super::{MmapWeight, upload_mmap_table_as_f16};
+        use super::{MmapWeight, upload_mmap_table_as_f16_rows};
         let Some(ctx) = gpu_or_skip() else {
             return;
         };
         const ROWS: usize = 257;
+        const PADDED_ROWS: usize = 260;
         const COLS: usize = 64;
         // 2 Q8_0 blocks/row; coprime strides so a wrong row/block base or a
-        // dropped trailing chunk cannot cancel out in the reference.
-        let mut raw = Vec::with_capacity(ROWS * 2 * 34);
+        // dropped trailing chunk cannot cancel out in the reference. Include 3
+        // extra padded rows past `ROWS` to verify `upload_mmap_table_as_f16_rows`
+        // truncates the upload buffer to `ROWS`.
+        let mut raw = Vec::with_capacity(PADDED_ROWS * 2 * 34);
         let mut expected = Vec::with_capacity(ROWS * COLS);
-        for r in 0..ROWS {
+        for r in 0..PADDED_ROWS {
             for b in 0..2 {
                 let scale = 0.01 + ((r * 3 + b * 11) % 97) as f32 * 0.001;
                 let delta = half::f16::from_f32(scale);
@@ -13050,13 +13254,17 @@ mod tests {
                 for c in 0..32 {
                     let q = ((r * 7 + b * 13 + c * 5) % 251) as i8;
                     raw.push(q as u8);
-                    let v = q as f32 * crate::quant::f16_to_f32(delta.to_bits());
-                    expected.push(half::f16::from_f32(v).to_bits());
+                    if r < ROWS {
+                        let v = q as f32 * crate::quant::f16_to_f32(delta.to_bits());
+                        expected.push(half::f16::from_f32(v).to_bits());
+                    }
                 }
             }
         }
-        let table = MmapWeight::from_owned_bytes(raw, crate::tensor::DType::Q8_0, ROWS, COLS);
-        let buf = upload_mmap_table_as_f16(&ctx, &table, "test_f16_table");
+        let table =
+            MmapWeight::from_owned_bytes(raw, crate::tensor::DType::Q8_0, PADDED_ROWS, COLS);
+        let buf = upload_mmap_table_as_f16_rows(&ctx, &table, ROWS, "test_f16_table");
+        assert_eq!(buf.size(), (ROWS * COLS * 2) as u64);
         let got_f32 = ctx.download_f16_as_f32(&buf, ROWS * COLS);
         assert_eq!(got_f32.len(), expected.len());
         for (i, (&got, &exp)) in got_f32.iter().zip(expected.iter()).enumerate() {
@@ -13911,6 +14119,10 @@ mod tests {
         struct HeaderOnlySource {
             inner: LfmModel,
             header_only_gguf: GgufFile,
+            full_gguf: GgufFile,
+            unsupported_reason: Option<String>,
+            context_cap: Option<usize>,
+            fail_weight_read: bool,
         }
 
         impl GpuWeightSource for HeaderOnlySource {
@@ -13950,12 +14162,21 @@ mod tests {
             fn rope_freqs(&self) -> Option<&[f32]> {
                 GpuWeightSource::rope_freqs(&self.inner)
             }
+            fn gpu_unsupported_reason(&self) -> Option<String> {
+                self.unsupported_reason
+                    .clone()
+                    .or_else(|| GpuWeightSource::gpu_unsupported_reason(&self.inner))
+            }
+            fn gpu_context_cap(&self) -> Option<usize> {
+                self.context_cap
+                    .or_else(|| GpuWeightSource::gpu_context_cap(&self.inner))
+            }
             fn embedding_mmap_weight(
                 &self,
                 _gguf_arc: &std::sync::Arc<GgufFile>,
             ) -> anyhow::Result<MmapWeight> {
-                let info = self.inner.gguf().tensors.get("token_embd.weight").unwrap();
-                let bytes = self.inner.gguf().tensor_data("token_embd.weight")?.to_vec();
+                let info = self.full_gguf.tensors.get("token_embd.weight").unwrap();
+                let bytes = self.full_gguf.tensor_data("token_embd.weight")?.to_vec();
                 Ok(MmapWeight::from_owned_bytes(
                     bytes,
                     info.dtype,
@@ -13967,8 +14188,8 @@ mod tests {
                 &self,
                 _gguf_arc: &std::sync::Arc<GgufFile>,
             ) -> anyhow::Result<MmapWeight> {
-                let info = self.inner.gguf().tensors.get("output.weight").unwrap();
-                let bytes = self.inner.gguf().tensor_data("output.weight")?.to_vec();
+                let info = self.full_gguf.tensors.get("output.weight").unwrap();
+                let bytes = self.full_gguf.tensor_data("output.weight")?.to_vec();
                 Ok(MmapWeight::from_owned_bytes(
                     bytes,
                     info.dtype,
@@ -13976,11 +14197,22 @@ mod tests {
                     info.shape[0],
                 ))
             }
-            fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]> {
-                GpuWeightSource::weight_bytes(&self.inner, wref)
+            fn weight_bytes(&self, wref: &WeightRef) -> anyhow::Result<std::borrow::Cow<'_, [u8]>> {
+                if self.fail_weight_read {
+                    anyhow::bail!("simulated OPFS short read");
+                }
+                Ok(std::borrow::Cow::Borrowed(
+                    crate::model::transformer::weight_data(&self.full_gguf, wref),
+                ))
             }
-            fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32> {
-                GpuWeightSource::dequantize_weight(&self.inner, wref)
+            fn dequantize_weight(&self, wref: &WeightRef) -> anyhow::Result<Vec<f32>> {
+                if self.fail_weight_read {
+                    anyhow::bail!("simulated OPFS short read");
+                }
+                Ok(crate::model::transformer::dequantize_weight(
+                    &self.full_gguf,
+                    wref,
+                ))
             }
             fn output_ref(&self) -> Option<&WeightRef> {
                 GpuWeightSource::output_ref(&self.inner)
@@ -14029,6 +14261,12 @@ mod tests {
         let Some(ctx2) = gpu_or_skip() else {
             return;
         };
+        let Some(ctx_refusal) = gpu_or_skip() else {
+            return;
+        };
+        let Some(ctx_read_err) = gpu_or_skip() else {
+            return;
+        };
 
         let full_gguf = bidirectional_gguf(true);
         let full_len = full_gguf.mmap_data().len() as u64;
@@ -14049,12 +14287,53 @@ mod tests {
             "expected header-only MmapWeight::from_gguf to fail, got: {direct_err}"
         );
 
-        let inner = LfmModel::from_gguf_no_repack(full_gguf.clone(), 256).unwrap();
-        let src = HeaderOnlySource {
+        let inner = LfmModel::from_gguf_no_repack_with_loader(
+            header_only_gguf.clone(),
+            256,
+            "header-only-test".into(),
+            |_, name| Ok(full_gguf.get_tensor(name)?.try_to_f32_vec()?),
+        )
+        .expect("LfmModel::from_gguf_no_repack_with_loader must succeed on header-only GGUF");
+
+        let mut src = HeaderOnlySource {
             inner,
             header_only_gguf,
+            full_gguf: full_gguf.clone(),
+            unsupported_reason: Some("rotary refusal sentinel".into()),
+            context_cap: Some(64),
+            fail_weight_read: false,
         };
+        let refusal_err = match super::GpuLfmModel::from_weight_source_with_ctx(
+            &src,
+            256,
+            "refusal-test".into(),
+            ctx_refusal,
+        ) {
+            Ok(_) => panic!("expected gpu_unsupported_reason to fail load"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            refusal_err.contains("rotary refusal sentinel"),
+            "unexpected refusal error: {refusal_err}"
+        );
 
+        src.unsupported_reason = None;
+        src.fail_weight_read = true;
+        let read_err = match super::GpuLfmModel::from_weight_source_with_ctx(
+            &src,
+            256,
+            "read-err-test".into(),
+            ctx_read_err,
+        ) {
+            Ok(_) => panic!("expected weight_bytes/dequantize_weight error to fail load"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            read_err.contains("simulated OPFS short read"),
+            "unexpected read error: {read_err}"
+        );
+
+        src.fail_weight_read = false;
         let gpu_from_header = super::GpuLfmModel::from_weight_source_with_ctx(
             &src,
             256,
@@ -14062,8 +14341,13 @@ mod tests {
             ctx1,
         )
         .expect("GpuLfmModel::from_weight_source_with_ctx must succeed on header-only GGUF source");
+        assert_eq!(
+            gpu_from_header.config().max_seq_len,
+            64,
+            "from_weight_source_with_ctx must honor src.gpu_context_cap()"
+        );
         let gpu_from_full =
-            super::GpuLfmModel::from_gguf_with_ctx(full_gguf, 256, "full-gguf-test".into(), ctx2)
+            super::GpuLfmModel::from_gguf_with_ctx(full_gguf, 64, "full-gguf-test".into(), ctx2)
                 .unwrap();
 
         let mut state_header = InferenceState::from_config(gpu_from_header.config()).unwrap();

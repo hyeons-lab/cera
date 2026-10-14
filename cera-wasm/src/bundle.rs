@@ -424,14 +424,17 @@ impl BundleRepo {
         read_file(&handle).await
     }
 
-    /// Ensure `url` is cached in OPFS and open a synchronous access handle to it.
+    /// Ensure `url` is cached in OPFS and open a synchronous access handle to it
+    /// when `createSyncAccessHandle` is available in the current thread context
+    /// (Dedicated Web Worker). Returns `Ok(None)` on the main thread where sync
+    /// access handles are unsupported.
     #[allow(dead_code)]
     pub(crate) async fn open_sync_handle(
         &self,
         url: &str,
         expected_sha256: Option<&str>,
         on_progress: Option<&Function>,
-    ) -> Result<FileSystemSyncAccessHandle, JsError> {
+    ) -> Result<Option<FileSystemSyncAccessHandle>, JsError> {
         self.ensure_cached(url, expected_sha256, on_progress)
             .await?;
         let Some(handle) = self.file_handle(url, false).await? else {
@@ -441,14 +444,17 @@ impl BundleRepo {
             )));
         };
         if !has_sync_access(&handle) {
-            return Err(JsError::new(
-                "FileSystemSyncAccessHandle is not supported in this thread context (must run inside Web Worker)",
-            ));
+            return Ok(None);
         }
-        let sync = JsFuture::from(handle.create_sync_access_handle())
-            .await
-            .map_err(|e| js_err("opening OPFS sync handle", e))?;
-        Ok(sync.unchecked_into())
+        match JsFuture::from(handle.create_sync_access_handle()).await {
+            Ok(sync) => Ok(Some(sync.unchecked_into())),
+            Err(e) => {
+                crate::console_info(&format!(
+                    "[cera-wasm] OPFS createSyncAccessHandle unavailable ({e:?}), falling back to in-memory read"
+                ));
+                Ok(None)
+            }
+        }
     }
 
     /// Whether the cached entry for `url` can be reused.

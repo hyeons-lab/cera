@@ -1037,23 +1037,27 @@ impl LlamaModel {
             // LayerNorm bias tensors (StableLM/StarCoder2). RMSNorm archs have
             // none; a stray one on an RMS arch would be silently dropped, so it
             // fails closed instead.
-            let attn_norm_bias_name = format!("blk.{i}.attn_norm.bias");
-            let attn_norm_b = if gguf.tensors.contains_key(&attn_norm_bias_name) {
-                ensure!(
-                    norm_kind == NormKind::Layer,
-                    "`{attn_norm_bias_name}` is a LayerNorm bias, but {prefix:?} is loaded as an RMSNorm architecture"
-                );
-                let b = load_f32(&gguf, &attn_norm_bias_name)?;
-                ensure!(
-                    b.len() == hidden_size,
-                    "layer {i} {attn_norm_bias_name} length {} != hidden_size ({hidden_size})",
-                    b.len()
-                );
-                Some(b)
-            } else {
-                None
-            };
-            attn_norm_biases.push(attn_norm_b);
+            macro_rules! load_norm_bias {
+                ($name:expr) => {{
+                    let name: &str = $name;
+                    if gguf.tensors.contains_key(name) {
+                        ensure!(
+                            norm_kind == NormKind::Layer,
+                            "`{name}` is a LayerNorm bias, but {prefix:?} is loaded as an RMSNorm architecture"
+                        );
+                        let b = load_f32(&gguf, name)?;
+                        ensure!(
+                            b.len() == hidden_size,
+                            "layer {i} {name} length {} != hidden_size ({hidden_size})",
+                            b.len()
+                        );
+                        Some(b)
+                    } else {
+                        None
+                    }
+                }};
+            }
+            attn_norm_biases.push(load_norm_bias!(&format!("blk.{i}.attn_norm.bias")));
 
             let ffn_norm_name = format!("blk.{i}.ffn_norm.weight");
             let ffn_norm = if gguf.tensors.contains_key(&ffn_norm_name) {
@@ -1073,23 +1077,7 @@ impl LlamaModel {
                 );
             }
             ffn_norm_weights.push(ffn_norm);
-            let ffn_norm_bias_name = format!("blk.{i}.ffn_norm.bias");
-            let ffn_norm_b = if gguf.tensors.contains_key(&ffn_norm_bias_name) {
-                ensure!(
-                    norm_kind == NormKind::Layer,
-                    "`{ffn_norm_bias_name}` is a LayerNorm bias, but {prefix:?} is loaded as an RMSNorm architecture"
-                );
-                let b = load_f32(&gguf, &ffn_norm_bias_name)?;
-                ensure!(
-                    b.len() == hidden_size,
-                    "layer {i} {ffn_norm_bias_name} length {} != hidden_size ({hidden_size})",
-                    b.len()
-                );
-                Some(b)
-            } else {
-                None
-            };
-            ffn_norm_biases.push(ffn_norm_b);
+            ffn_norm_biases.push(load_norm_bias!(&format!("blk.{i}.ffn_norm.bias")));
 
             // Post-norms (Gemma 2, Olmo 2/3): check canonical GGUF names first.
             let attn_post = [
@@ -1490,24 +1478,23 @@ impl LlamaModel {
         // reachable on a well-formed GGUF; rejecting the file beats undefined
         // behaviour that only shows up as plausible garbage.
         {
-            let head = output_ref.as_ref().unwrap_or(&embd_ref);
-            let head_name = if output_ref.is_some() {
-                "output.weight"
-            } else {
-                "token_embd.weight"
-            };
-            ensure!(
-                head.k == config.hidden_size,
-                "LM head `{head_name}` has k={} but hidden_size is {}",
-                head.k,
-                config.hidden_size
-            );
-            ensure!(
-                head.m >= config.vocab_size,
-                "LM head `{head_name}` has {} rows, fewer than vocab_size {}",
-                head.m,
-                config.vocab_size
-            );
+            for (head_name, head) in [("token_embd.weight", &embd_ref)]
+                .into_iter()
+                .chain(output_ref.as_ref().map(|r| ("output.weight", r)))
+            {
+                ensure!(
+                    head.k == config.hidden_size,
+                    "LM head `{head_name}` has k={} but hidden_size is {}",
+                    head.k,
+                    config.hidden_size
+                );
+                ensure!(
+                    head.m >= config.vocab_size,
+                    "LM head `{head_name}` has {} rows, fewer than vocab_size {}",
+                    head.m,
+                    config.vocab_size
+                );
+            }
             ensure!(
                 config.hidden_size.is_multiple_of(32),
                 "hidden_size {} is not a multiple of 32, which the Q8_0 \
@@ -1537,7 +1524,7 @@ impl LlamaModel {
         // that divide each rotation angle, applied by llama.cpp on every rope call.
         // Present on Llama-3.x, absent on Qwen/Mistral/Granite ⇒ None (plain RoPE).
         let rope_freqs = if gguf.tensors.contains_key("rope_freqs.weight") {
-            load_f32(&gguf, "rope_freqs.weight").ok()
+            Some(load_f32(&gguf, "rope_freqs.weight")?)
         } else {
             None
         };
@@ -1681,11 +1668,7 @@ impl LlamaModel {
     /// Why the GPU backends cannot run this model's rotary scheme, if they
     /// cannot: YaRN that does not reduce to a frequency table (see
     /// `yarn_freq_factors`).
-    #[cfg(any(
-        feature = "gpu",
-        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
-    ))]
-    pub(crate) fn gpu_unsupported_reason(&self) -> Option<String> {
+    pub fn gpu_unsupported_reason(&self) -> Option<String> {
         (self.yarn.is_some() && self.yarn_freq_factors.is_none()).then(|| {
             "YaRN rope scaling combined with rope_freqs, sliding-window layers or partial rotary \
              is not reproducible by the GPU rotary kernel"
@@ -1697,11 +1680,7 @@ impl LlamaModel {
     /// temperature scaling multiplies Q by a per-position factor that is 1
     /// below `floor_scale`; the GPU forward has no hook for the factor, so it
     /// is exact only below that position.
-    #[cfg(any(
-        feature = "gpu",
-        all(feature = "metal", any(target_os = "macos", target_os = "ios"))
-    ))]
-    pub(crate) fn gpu_context_cap(&self) -> Option<usize> {
+    pub fn gpu_context_cap(&self) -> Option<usize> {
         self.attn_temp_scale.map(|(_, floor_scale)| floor_scale)
     }
 
@@ -3776,12 +3755,20 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LlamaModel {
     fn final_logit_softcapping(&self) -> Option<f32> {
         self.final_logit_softcapping
     }
-
-    fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]> {
-        std::borrow::Cow::Borrowed(transformer::weight_data(&self.gguf, wref))
+    fn gpu_unsupported_reason(&self) -> Option<String> {
+        LlamaModel::gpu_unsupported_reason(self)
     }
-    fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32> {
-        transformer::dequantize_weight(&self.gguf, wref)
+    fn gpu_context_cap(&self) -> Option<usize> {
+        LlamaModel::gpu_context_cap(self)
+    }
+
+    fn weight_bytes(&self, wref: &WeightRef) -> Result<std::borrow::Cow<'_, [u8]>> {
+        Ok(std::borrow::Cow::Borrowed(transformer::weight_data(
+            &self.gguf, wref,
+        )))
+    }
+    fn dequantize_weight(&self, wref: &WeightRef) -> Result<Vec<f32>> {
+        Ok(transformer::dequantize_weight(&self.gguf, wref))
     }
 
     fn output_ref(&self) -> Option<&WeightRef> {
@@ -4664,5 +4651,37 @@ mod tests {
                 assert!((g - r).abs() < 2e-3 * r.abs().max(1.0), "{g} vs {r}");
             }
         }
+    }
+
+    /// A loader failure on a present `rope_freqs.weight` must propagate as an
+    /// error rather than silently degrading to `None` (unscaled RoPE).
+    #[test]
+    fn rope_freqs_load_error_fails_closed() {
+        let mut m = build_tiny(Kind::Cohere);
+        m.arch = Some("llama");
+        for l in 0..NLAYER {
+            m.tensors
+                .push((format!("blk.{l}.ffn_norm.weight"), vec![HS], vec![1.0; HS]));
+        }
+        m.tensors
+            .push(("rope_freqs.weight".into(), vec![HD / 2], vec![1.0; HD / 2]));
+        let gguf = GgufFile::from_bytes(Arc::from(gguf_bytes(&m).into_boxed_slice())).unwrap();
+        let err = LlamaModel::from_gguf_no_repack_with_loader(
+            gguf,
+            64,
+            "test-rope-freqs-err".to_string(),
+            |g, name| {
+                if name == "rope_freqs.weight" {
+                    anyhow::bail!("simulated OPFS read failure on rope_freqs.weight");
+                }
+                Ok(g.get_tensor(name)?.try_to_f32_vec()?)
+            },
+        )
+        .err()
+        .expect("load_f32 error on rope_freqs.weight must fail closed");
+        assert!(
+            err.to_string().contains("simulated OPFS read failure"),
+            "{err}"
+        );
     }
 }

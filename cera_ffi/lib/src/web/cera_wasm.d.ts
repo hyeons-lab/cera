@@ -1736,11 +1736,12 @@ export class WebGpuSession {
      * downloads only; a fully cached bundle loads without calling it.
      * `totalBytes` is `null` when the server doesn't say.
      *
-     * **Memory:** the weights go from the store straight into wasm linear
-     * memory and stay for the session's lifetime. They are never handed to
-     * JS on the way, which is what keeps this clear of the ~2 GiB ceiling
-     * on a single JS `ArrayBuffer` that loading through `create` runs into,
-     * and costs one copy of the model rather than two.
+     * **Memory:** in a Dedicated Worker (where OPFS `createSyncAccessHandle`
+     * is available), the GGUF header is probed first and weights stream
+     * on demand from OPFS into WebGPU buffers without staging the full
+     * model in wasm linear memory. On the main thread, weights are read
+     * into wasm linear memory without creating a full JS `ArrayBuffer`
+     * copy.
      *
      * Throws for every reason `create` does, plus bundle download/manifest errors.
      * A caller wanting a fallback should catch and retry through
@@ -2279,11 +2280,11 @@ export interface InitOutput {
     readonly turnresult_tokensGenerated: (a: number) => number;
     readonly session_intoChat: (a: number, b: number) => void;
     readonly sessionconfig_set_seed: (a: number, b: number, c: bigint) => void;
-    readonly __wasm_bindgen_func_elem_7987: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6814: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6814_2: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6814_3: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_8002: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_8065: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6892: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6892_2: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6892_3: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_8080: (a: number, b: number, c: number, d: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

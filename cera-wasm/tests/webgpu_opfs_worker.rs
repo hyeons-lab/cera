@@ -334,4 +334,42 @@ async fn opfs_sync_handle_releases_lock_on_drop_and_streams_lfm2_and_llama_to_we
         Some(800_000)
     );
     sync.close();
+
+    // 4. Verify `OpfsGpuWeightSource` fails closed when the OPFS file is truncated mid-load
+    // rather than silently uploading empty/zeroed weights.
+    let full_bytes = build_minimal_gguf_bytes("lfm2");
+    let full_gguf = GgufFile::from_bytes(Arc::from(full_bytes.clone().into_boxed_slice())).unwrap();
+    let header_len = full_gguf.data_offset();
+    let header_bytes: Arc<[u8]> = Arc::from(&full_bytes[..header_len]);
+    let header_only_gguf =
+        Arc::new(GgufFile::from_header_bytes(header_bytes, full_bytes.len() as u64).unwrap());
+    let raw_sync = write_and_open_opfs_sync("test-truncated-opfs.gguf", &full_bytes).await;
+    let raw_sync_for_trunc = raw_sync.clone();
+    let sync = OpfsSyncHandle::new(raw_sync);
+    let opfs_source = OpfsGpuWeightSource::new(
+        sync,
+        Arc::clone(&header_only_gguf),
+        128,
+        "opfs-truncated".to_string(),
+    )
+    .expect("OpfsGpuWeightSource::new succeeds before truncation");
+    // Truncate the OPFS file down to the header so 2D weight reads come back short.
+    raw_sync_for_trunc
+        .truncate_with_u32(header_len as u32)
+        .expect("truncate to header");
+    let ctx_trunc = cera::backend::wgpu::GpuContext::new_async().await.unwrap();
+    let err = match GpuLfmModel::from_weight_source_with_ctx(
+        &opfs_source,
+        128,
+        "opfs-truncated".to_string(),
+        ctx_trunc,
+    ) {
+        Ok(_) => panic!("truncated OPFS file must fail GpuLfmModel::from_weight_source_with_ctx"),
+        Err(e) => format!("{e:#}"),
+    };
+    assert!(
+        err.contains("short read from OPFS"),
+        "expected short read from OPFS error, got: {err}"
+    );
+    opfs_source.close();
 }

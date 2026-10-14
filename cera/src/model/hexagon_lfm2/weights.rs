@@ -896,7 +896,10 @@ impl TensorSource for DenseSource<'_> {
         buf: &mut RpcmemBuffer,
     ) -> Result<(), CeraError> {
         let w = self.wref(name)?;
-        let raw = self.src.weight_bytes(&w);
+        let raw = self
+            .src
+            .weight_bytes(&w)
+            .map_err(|e| CeraError::Backend(format!("reading {name}: {e:#}")))?;
         repack_weight(
             w.dtype,
             &raw,
@@ -922,7 +925,10 @@ impl TensorSource for DenseSource<'_> {
                     sw.n_expert
                 ))
             })?;
-            let raw = self.src.weight_bytes(w);
+            let raw = self
+                .src
+                .weight_bytes(w)
+                .map_err(|err| CeraError::Backend(format!("reading {name}.{e}: {err:#}")))?;
             let offset = sw.offset + e * sw.expert_stride;
             repack_weight(
                 w.dtype,

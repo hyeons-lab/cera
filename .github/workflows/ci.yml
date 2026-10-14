@@ -779,7 +779,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack@0.14.0,wasm-bindgen-cli@0.2.117
+          tool: wasm-pack@0.15.0,wasm-bindgen-cli@0.2.117
       - uses: extractions/setup-just@v4
       - name: Run the simd128 kernel oracle tests under Node
         # Do not set RUSTFLAGS in this step. The job-level value above is
@@ -833,7 +833,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack@0.14.0,wasm-bindgen-cli@0.2.117
+          tool: wasm-pack@0.15.0,wasm-bindgen-cli@0.2.117
       - name: Browser and driver versions
         # Printed rather than asserted: the pair is whatever the image ships,
         # and the log is what makes a future mismatch diagnosable in one look.
@@ -867,7 +867,7 @@ jobs:
         # adapter even though Vulkan is present.
         env:
           WASM_BINDGEN_TEST_WEBDRIVER_JSON: ${{ github.workspace }}/cera-wasm/webdriver-linux.json
-        run: cd cera-wasm && wasm-pack test --headless --chrome --features wgpu --test webgpu_smoke
+        run: cd cera-wasm && wasm-pack test --headless --chrome --features wgpu --test webgpu_smoke --test webgpu_opfs_worker
 
   cera-wasm-pack:
     # Multi-target wasm-pack build. Each matrix entry produces one
@@ -920,7 +920,7 @@ jobs:
       # `tool:` form takes no leading `v`.
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack@0.14.0,wasm-bindgen-cli@0.2.117
+          tool: wasm-pack@0.15.0,wasm-bindgen-cli@0.2.117
       - uses: ./.github/actions/install-binaryen
       - name: Build cera-wasm npm package
         # `--scope hyeons-lab` matches the package name advertised in
@@ -1083,7 +1083,7 @@ jobs:
       # `tool:` form takes no leading `v`.
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack@0.14.0,wasm-bindgen-cli@0.2.117
+          tool: wasm-pack@0.15.0,wasm-bindgen-cli@0.2.117
       - uses: ./.github/actions/install-binaryen
       - name: Build cera-wasm npm package (threaded)
         # Flag breakdown lives in the justfile next to
