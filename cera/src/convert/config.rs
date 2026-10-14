@@ -204,9 +204,13 @@ impl HfModelConfig {
     /// An encoder checkpoint (`Lfm2BidirectionalModel`, `Lfm2BidirP2ForTokenClassification`):
     /// full attention and a centred short convolution instead of the causal ones.
     fn is_bidirectional(&self) -> bool {
-        self.architectures
-            .first()
-            .is_some_and(|a| a.to_ascii_lowercase().contains("bidir"))
+        // the d1 decision models run their trunk bidirectionally too
+        self.model_type
+            .eq_ignore_ascii_case(crate::convert::d1::MODEL_TYPE)
+            || self
+                .architectures
+                .first()
+                .is_some_and(|a| a.to_ascii_lowercase().contains("bidir"))
     }
 
     fn is_lfm_family(&self) -> bool {
@@ -358,7 +362,7 @@ impl HfModelConfig {
             "mamba2" | "falcon_mamba" => "mamba2",
             "mamba" => "mamba",
             "phi3" | "phi" | "phi-3" | "phi4" | "phi-4" => "phi3",
-            "lfm" | "lfm2" | "lfm2.5" | "liquid" => "lfm2",
+            "lfm" | "lfm2" | "lfm2.5" | "liquid" | "d1_omni" => "lfm2",
             "lfm2_moe" | "lfm2moe" => "lfm2moe",
             "whisper" => "whisper",
             _ => {

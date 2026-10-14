@@ -125,8 +125,8 @@ pub fn calc_size_preserved_ratio(
 /// allocated. 16384 px per side comfortably covers real photographs
 /// while bounding the worst case; the `image` crate's default 512 MiB
 /// `max_alloc` is the secondary backstop. See the decode site in
-/// [`preprocess_image_with_opts`].
-const MAX_DECODE_DIM: u32 = 16_384;
+/// [`preprocess_image_with_opts`]. The d1 image path shares this bound.
+pub(crate) const MAX_DECODE_DIM: u32 = 16_384;
 
 /// Decode + dynamic-resolution resize + normalize an image into a
 /// [`PreprocessedImage`] the encoder consumes. `bytes` may be PNG

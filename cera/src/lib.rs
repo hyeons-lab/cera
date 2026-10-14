@@ -35,6 +35,7 @@ pub mod backend;
 pub mod bundle;
 pub mod classifier;
 pub mod convert;
+pub mod d1;
 pub mod engine;
 /// Auto-generated FlatBuffers code for KV cache serialization.
 /// Regenerate with: `flatc --rust -o src/generated schema/kv_cache.fbs`
