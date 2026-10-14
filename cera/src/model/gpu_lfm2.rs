@@ -923,6 +923,22 @@ fn attention_prefill_tiled(
         && out_stride.is_multiple_of(4)
 }
 
+/// Whether the tiled prefill attention runs its fp16, 64-query kernel (`attention_prefill_hd64_f16`)
+/// instead of the f32 one: on by default wherever SPIR-V passthrough is (`CERA_WGPU_ATTN_F32=1`
+/// keeps the f32 kernel, the A/B and accuracy switch). It is 1.7x faster on an Adreno 830 at an
+/// output error of 0.06 to 0.25% of the output's rms against an f64 reference.
+fn use_attention_f16() -> bool {
+    #[cfg(test)]
+    {
+        !crate::backend::cpu_features::env_enabled("CERA_WGPU_ATTN_F32")
+    }
+    #[cfg(not(test))]
+    {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| !crate::backend::cpu_features::env_enabled("CERA_WGPU_ATTN_F32"))
+    }
+}
+
 /// The most work one `attention_prefill` dispatch may do, in units of one query reading one key
 /// row for one head.
 ///
@@ -1695,6 +1711,9 @@ struct GpuPipelines {
     attention_flash_hd64: Option<wgpu::ComputePipeline>,
     /// The register-tiled causal prefill over the packed-f16 cache (head_dim 64 only).
     attention_prefill_hd64: Option<wgpu::ComputePipeline>,
+    /// The fp16, 64-query twin of `attention_prefill_hd64` (SPIR-V passthrough, so `None` without
+    /// it); see `use_attention_f16`.
+    attention_prefill_hd64_f16: Option<wgpu::ComputePipeline>,
     // ── Routed mixture-of-experts (`lfm2moe`) ─────────────────────────────
     // Built for every model, dense or routed: pipeline creation is a shader
     // compile, so making it conditional would trade a fixed load-time cost for a
@@ -1921,6 +1940,10 @@ pub struct GpuLfmModel {
     /// correct too and would otherwise hide a dropped split with a green suite).
     #[cfg(test)]
     generic_prefill_dispatches: std::sync::atomic::AtomicU32,
+    /// F16-prefill (`attention_prefill_hd64_f16`) dispatches issued (test observability:
+    /// proves the fp16 prefill kernel ran when enabled).
+    #[cfg(test)]
+    f16_prefill_dispatches: std::sync::atomic::AtomicU32,
     /// Llama-3 RoPE frequency factors (`rope_freqs.weight`), or a 1-element
     /// dummy when the model uses plain RoPE. Always bound (binding 3) on the
     /// decode rope dispatch; `has_freq_factors` in `rope_params` gates its use.
@@ -2695,6 +2718,31 @@ impl GpuLfmModel {
             } else {
                 None
             },
+            attention_prefill_hd64_f16: if ctx.uses_flash_attention(head_dim)
+                && ctx.max_compute_workgroup_storage_size
+                    >= crate::backend::wgpu::FLASH_ATTENTION_F16_WORKGROUP_BYTES
+                && use_spirv_passthrough(&ctx)
+            {
+                match ctx.try_attention_prefill_hd64_f16_passthrough_checked() {
+                    Ok(pipe) => {
+                        tracing::debug!("attention_prefill_hd64_f16: SPIR-V passthrough (slang)");
+                        Some(pipe)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "attention_prefill_hd64_f16 pipeline validation failed ({e}); \
+                             causal prefill falls back to f32 or generic kernel"
+                        );
+                        eprintln!(
+                            "[cera::wgpu] attention_prefill_hd64_f16 pipeline validation failed ({e}); \
+                             causal prefill falls back to f32 or generic kernel"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            },
             moe_route: ctx.create_pipeline(shaders::MOE_ROUTE, "moe_route", "moe_route"),
             moe_gemv_q4_0: ctx.create_pipeline(
                 shaders::MOE_GEMV_Q4_0,
@@ -3420,6 +3468,8 @@ impl GpuLfmModel {
             flash_dispatches: std::sync::atomic::AtomicU32::new(0),
             #[cfg(test)]
             generic_prefill_dispatches: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            f16_prefill_dispatches: std::sync::atomic::AtomicU32::new(0),
             rope_freqs_buf,
             has_freq_factors,
             hidden_buf,
@@ -8339,22 +8389,21 @@ impl GpuLfmModel {
         // kernel) share each workgroup and each K/V tile stream; params[11] is the authoritative
         // chunk size edge workgroups mask against, params[7] the whole call's key rows for a
         // bidirectional pass.
-        let (pipeline, queries_per_wg, label, tiled) = if attention_prefill_tiled(
+        let tiled = attention_prefill_tiled(
             self.ctx.supports_flash_attention(),
             head_dim,
             q_stride,
             out_stride,
-        ) {
-            if let Some(pipe) = self.pipelines.attention_prefill_hd64.as_ref() {
-                (pipe, 32, "attention_prefill_hd64", true)
-            } else {
-                (
-                    &self.pipelines.attention_prefill,
-                    8,
-                    "attention_prefill",
-                    false,
-                )
-            }
+        );
+        let f16_pipeline = self
+            .pipelines
+            .attention_prefill_hd64_f16
+            .as_ref()
+            .filter(|_| tiled && use_attention_f16());
+        let (pipeline, queries_per_wg, label, tiled) = if let Some(pipeline) = f16_pipeline {
+            (pipeline, 64, "attention_prefill_hd64_f16", true)
+        } else if let (true, Some(pipe)) = (tiled, self.pipelines.attention_prefill_hd64.as_ref()) {
+            (pipe, 32, "attention_prefill_hd64", true)
         } else {
             (
                 &self.pipelines.attention_prefill,
@@ -8374,6 +8423,9 @@ impl GpuLfmModel {
             #[cfg(test)]
             if !tiled {
                 self.generic_prefill_dispatches
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            } else if label == "attention_prefill_hd64_f16" {
+                self.f16_prefill_dispatches
                     .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
             }
             let params: [u32; 14] = [
@@ -11885,7 +11937,7 @@ mod tests {
         use super::{
             ATTENTION_PREFILL_MAX_WORK, attention_prefill_chunks, attention_prefill_chunks_within,
         };
-        for quantum in [8u32, 32] {
+        for quantum in [8u32, 32, 64] {
             for &(n, heads, start, bidir) in &[
                 (1u32, 16u32, 0u32, true),
                 (7, 16, 0, true),
@@ -12597,6 +12649,41 @@ mod tests {
         assert!(super::check_dense_silu_fits(32, 4096).is_ok());
         let err = super::check_dense_silu_fits(2048, 8192).expect_err("one group past the cap");
         assert!(err.to_string().contains("per-dimension cap"), "{err}");
+    }
+
+    /// `use_attention_f16` enables fp16 causal prefill by default and disables it
+    /// when `CERA_WGPU_ATTN_F32` is truthy (1, true).
+    #[test]
+    fn use_attention_f16_env_toggle() {
+        let key = "CERA_WGPU_ATTN_F32";
+        // SAFETY: Test serializes environment access for this variable.
+        unsafe {
+            std::env::remove_var(key);
+            assert!(
+                super::use_attention_f16(),
+                "unset must default to fp16 attention enabled"
+            );
+            std::env::set_var(key, "0");
+            assert!(
+                super::use_attention_f16(),
+                "0 must keep fp16 attention enabled"
+            );
+            std::env::set_var(key, "false");
+            assert!(
+                super::use_attention_f16(),
+                "false must keep fp16 attention enabled"
+            );
+            std::env::set_var(key, "off");
+            assert!(
+                super::use_attention_f16(),
+                "off must keep fp16 attention enabled"
+            );
+            std::env::set_var(key, "1");
+            assert!(!super::use_attention_f16(), "1 must force f32 attention");
+            std::env::set_var(key, "true");
+            assert!(!super::use_attention_f16(), "true must force f32 attention");
+            std::env::remove_var(key);
+        }
     }
 
     /// The host GRID_X in `push_bidir_dispatch` and the shader GRID_X in

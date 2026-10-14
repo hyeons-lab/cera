@@ -387,7 +387,11 @@ impl PendingReadback {
 /// Workgroup storage `attention_flash_hd64.wgsl` needs: qs 8192 + kt 8192 + vs 8704 +
 /// ps 4096 + pm 512 + corr 128 + lsum 512 bytes (see the `var<workgroup>` block there).
 /// An adapter under this cannot build the pipeline, so the flash gate requires it.
-const FLASH_ATTENTION_WORKGROUP_BYTES: u32 = 30_336;
+pub(crate) const FLASH_ATTENTION_WORKGROUP_BYTES: u32 = 30_336;
+
+/// Workgroup storage `attention_prefill_hd64_f16.slang` needs: qs 8192 + kt 4096 + vs 4352 +
+/// ps 8192 + ph 4096 + pm 1024 + corr 256 + lsum 1024 bytes (total 31,232 bytes).
+pub(crate) const FLASH_ATTENTION_F16_WORKGROUP_BYTES: u32 = 31_232;
 
 /// Pure predicate behind [`GpuContext::supports_flash_attention`], split out so a host test
 /// can pin it without a GPU: the kernel's workgroup storage, then OS plus vendor. `is_android`
@@ -1915,6 +1919,66 @@ impl GpuContext {
                 },
                 cache: None,
             })
+    }
+
+    /// Pipeline over an explicit bind-group layout of storage buffers (`true` = read-only), checked
+    /// through an error scope on non-wasm targets.
+    unsafe fn try_stream_gemm_pipeline_checked(
+        &self,
+        label: &str,
+        desc: wgpu::ShaderModuleDescriptorPassthrough<'_>,
+        bindings: &[bool],
+    ) -> anyhow::Result<wgpu::ComputePipeline> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            // SAFETY: Caller guarantees desc satisfies safety invariant.
+            Ok(unsafe { self.stream_gemm_pipeline(label, desc, bindings) })
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            // SAFETY: Caller guarantees desc satisfies safety invariant.
+            let pipeline = unsafe { self.stream_gemm_pipeline(label, desc, bindings) };
+            let err = pollster::block_on(scope.pop());
+            match err {
+                Some(e) => Err(anyhow::anyhow!("{label}: pipeline validation failed: {e}")),
+                None => Ok(pipeline),
+            }
+        }
+    }
+
+    /// The fp16, 64-query-per-workgroup causal prefill attention for head_dim 64
+    /// (`attention_prefill_hd64_f16.slang`): the contract of `attention_prefill_hd64.wgsl` (q, K, V,
+    /// out, 14 parameter words) on a grid of `(ceil(n_sub / 64), n_heads)` 256-thread workgroups.
+    pub fn attention_prefill_hd64_f16_passthrough(&self) -> wgpu::ComputePipeline {
+        // SAFETY: slangc-compiled from attention_prefill_hd64_f16.slang, spirv-val clean, five
+        // bindings (q, k, v read-only, out read-write, params read-only).
+        unsafe {
+            self.stream_gemm_pipeline(
+                "attention_prefill_hd64_f16_passthrough",
+                wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/attention_prefill_hd64_f16.spv"
+                )),
+                &[true, true, true, false, true],
+            )
+        }
+    }
+
+    /// Checked build of [`Self::attention_prefill_hd64_f16_passthrough`].
+    pub fn try_attention_prefill_hd64_f16_passthrough_checked(
+        &self,
+    ) -> anyhow::Result<wgpu::ComputePipeline> {
+        unsafe {
+            self.try_stream_gemm_pipeline_checked(
+                "attention_prefill_hd64_f16_passthrough",
+                wgpu::include_spirv_raw!(concat!(
+                    env!("OUT_DIR"),
+                    "/attention_prefill_hd64_f16.spv"
+                )),
+                &[true, true, true, false, true],
+            )
+        }
     }
 
     /// Direct-B twin of [`Self::gemm_stream_q4_0_k64_passthrough`] (`gemm_stream_q4_0_k64_xf32.slang`):
@@ -7746,18 +7810,13 @@ mod tests {
     enum PrefillKernel {
         Scalar,
         Tiled,
+        /// The fp16, 64-query SPIR-V kernel (passthrough adapters only).
+        TiledF16,
     }
 
-    /// [`run_gpu_attention_prefill_mode`] on a chosen kernel.
-    fn run_gpu_attention_prefill_kernel(
-        ctx: &GpuContext,
-        f: &AttnPrefillFixture,
-        tile: u32,
-        bidir_prefix: Option<u32>,
-        kernel: PrefillKernel,
-    ) -> Vec<f32> {
-        assert!(tile > 0, "tile must be > 0 (0 would never advance q_base)");
-        let (pipeline, queries_per_wg) = match kernel {
+    /// A kernel's pipeline and its queries per workgroup.
+    fn prefill_pipeline(ctx: &GpuContext, kernel: PrefillKernel) -> (wgpu::ComputePipeline, u32) {
+        match kernel {
             PrefillKernel::Scalar => (
                 ctx.create_pipeline(
                     shaders::ATTENTION_PREFILL,
@@ -7774,7 +7833,37 @@ mod tests {
                 ),
                 32,
             ),
-        };
+            PrefillKernel::TiledF16 => (ctx.attention_prefill_hd64_f16_passthrough(), 64),
+        }
+    }
+
+    /// The head_dim-64 kernels this adapter can run, each with the `(abs, rel)` tolerance against the
+    /// CPU reference: the f32 kernel's flash-form tolerance, and a looser one for fp16 math (half
+    /// products and partial sums; about 0.1% of the output's rms on unit-variance data).
+    fn tiled_kernels(ctx: &GpuContext) -> Vec<(PrefillKernel, f32, f32)> {
+        let mut kernels = vec![(PrefillKernel::Tiled, 5e-3, 1e-3)];
+        if ctx.supports_spirv_passthrough() {
+            kernels.push((PrefillKernel::TiledF16, 8e-3, 1e-2));
+        } else if std::env::var("CERA_REQUIRE_PASSTHROUGH").as_deref() == Ok("1") {
+            panic!(
+                "CERA_REQUIRE_PASSTHROUGH=1 requested, but adapter does not support SPIR-V passthrough \
+                 for PrefillKernel::TiledF16 (backend={})",
+                ctx.backend
+            );
+        }
+        kernels
+    }
+
+    /// [`run_gpu_attention_prefill_mode`] on a chosen kernel.
+    fn run_gpu_attention_prefill_kernel(
+        ctx: &GpuContext,
+        f: &AttnPrefillFixture,
+        tile: u32,
+        bidir_prefix: Option<u32>,
+        kernel: PrefillKernel,
+    ) -> Vec<f32> {
+        assert!(tile > 0, "tile must be > 0 (0 would never advance q_base)");
+        let (pipeline, queries_per_wg) = prefill_pipeline(ctx, kernel);
         // Pack K/V pairs LE (even elem in the low bits), exactly as
         // `kv_append` lays them out; the fixture already holds f16-rounded
         // values.
@@ -7838,7 +7927,7 @@ mod tests {
                     PrefillKernel::Scalar => {
                         pass.dispatch_workgroups(f.n_heads, n_sub.div_ceil(queries_per_wg), 1)
                     }
-                    PrefillKernel::Tiled => {
+                    PrefillKernel::Tiled | PrefillKernel::TiledF16 => {
                         pass.dispatch_workgroups(n_sub.div_ceil(queries_per_wg), f.n_heads, 1)
                     }
                 }
@@ -7861,9 +7950,20 @@ mod tests {
     /// accumulation order differs from the CPU's batched order, so exact equality
     /// does not hold (same tolerance as `test_gpu_flash_attention_matches_cpu`).
     fn assert_attn_prefill_matches(f: &AttnPrefillFixture, got: &[f32], label: &str) {
+        assert_attn_prefill_matches_tol(f, got, label, 5e-3, 1e-3);
+    }
+
+    /// [`assert_attn_prefill_matches`] with an explicit `abs + rel * |ref|` tolerance.
+    fn assert_attn_prefill_matches_tol(
+        f: &AttnPrefillFixture,
+        got: &[f32],
+        label: &str,
+        abs: f32,
+        rel: f32,
+    ) {
         for (i, &g) in got.iter().enumerate() {
             let r = f.ref_out[i];
-            let tol = 5e-3f32 + 1e-3f32 * r.abs();
+            let tol = abs + rel * r.abs();
             let diff = (r - g).abs();
             assert!(
                 diff <= tol,
@@ -8416,20 +8516,26 @@ mod tests {
             (4u32, 2u32, 70u32, 0u32), // group 2, ragged last tile
             (4, 2, 70, 5),             // start_pos that is not a tile multiple
             (4, 4, 33, 0),             // MHA, one query past a tile
-            (8, 2, 64, 0),             // group 4, two exact tiles
+            (8, 2, 64, 0),             // group 4, two exact tiles (one exact 64-query tile)
+            (4, 2, 130, 3),            // two exact 64-query tiles and two queries more
             (2, 1, 1, 0),              // a single query reads a single key
             (16, 8, 512, 0),           // the LFM2-350M attention shape
         ] {
             let f = build_attn_prefill_fixture(heads, kv_heads, 64, n, start);
-            for tile in [n, 32, 33, 17, 8] {
-                let tile = tile.min(n);
-                let got =
-                    run_gpu_attention_prefill_kernel(&ctx, &f, tile, None, PrefillKernel::Tiled);
-                assert_attn_prefill_matches(
-                    &f,
-                    &got,
-                    &format!("hd64 heads={heads}/{kv_heads} n={n} start={start} tile={tile}"),
-                );
+            for (kernel, abs, rel) in tiled_kernels(&ctx) {
+                for tile in [n, 64, 32, 33, 17, 8] {
+                    let tile = tile.min(n);
+                    let got = run_gpu_attention_prefill_kernel(&ctx, &f, tile, None, kernel);
+                    assert_attn_prefill_matches_tol(
+                        &f,
+                        &got,
+                        &format!(
+                            "{kernel:?} heads={heads}/{kv_heads} n={n} start={start} tile={tile}"
+                        ),
+                        abs,
+                        rel,
+                    );
+                }
             }
         }
     }
@@ -8451,9 +8557,17 @@ mod tests {
         // start_pos 900 + 200 queries: the last query reads 1100 keys, 34 tiles and a bit.
         let f = build_attn_prefill_fixture(4, 2, 64, 200, 900);
         assert!(f.max_seq > 34 * 32);
-        for tile in [200u32, 64] {
-            let got = run_gpu_attention_prefill_kernel(&ctx, &f, tile, None, PrefillKernel::Tiled);
-            assert_attn_prefill_matches(&f, &got, &format!("hd64 long-kv tile={tile}"));
+        for (kernel, abs, rel) in tiled_kernels(&ctx) {
+            for tile in [200u32, 64] {
+                let got = run_gpu_attention_prefill_kernel(&ctx, &f, tile, None, kernel);
+                assert_attn_prefill_matches_tol(
+                    &f,
+                    &got,
+                    &format!("{kernel:?} long-kv tile={tile}"),
+                    abs,
+                    rel,
+                );
+            }
         }
     }
 
@@ -8475,20 +8589,17 @@ mod tests {
         let f = build_attn_prefill_fixture(4, 2, 64, 70, 0);
         for prefix in [0u32, 24, 40] {
             let want = bidirectional_attention_reference(&f, prefix);
-            for tile in [70u32, 32, 24, 8] {
-                let got = run_gpu_attention_prefill_kernel(
-                    &ctx,
-                    &f,
-                    tile,
-                    Some(prefix),
-                    PrefillKernel::Tiled,
-                );
-                for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
-                    assert!(
-                        (g - w).abs() <= 5e-3 + 1e-3 * w.abs(),
-                        "hd64 bidirectional prefix={prefix} tile={tile}: idx {i} (token {}) gpu={g} cpu={w}",
-                        i / f.out_stride as usize
-                    );
+            for (kernel, abs, rel) in tiled_kernels(&ctx) {
+                for tile in [70u32, 64, 32, 24, 8] {
+                    let got =
+                        run_gpu_attention_prefill_kernel(&ctx, &f, tile, Some(prefix), kernel);
+                    for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                        assert!(
+                            (g - w).abs() <= abs + rel * w.abs(),
+                            "{kernel:?} bidirectional prefix={prefix} tile={tile}: idx {i} (token {}) gpu={g} cpu={w}",
+                            i / f.out_stride as usize
+                        );
+                    }
                 }
             }
         }
@@ -8508,15 +8619,17 @@ mod tests {
         if !flash_capable {
             return;
         }
+        for (kernel, _, _) in tiled_kernels(&ctx) {
+            assert_empty_window_writes_zero(&ctx, kernel);
+        }
+    }
+
+    fn assert_empty_window_writes_zero(ctx: &GpuContext, kernel: PrefillKernel) {
         let (n_heads, n_kv_heads, head_dim, n) = (2u32, 1u32, 64u32, 3u32);
         let kv_dim = n_kv_heads * head_dim;
         let q_stride = n_heads * head_dim;
         let out_len = (n * q_stride) as usize;
-        let pipeline = ctx.create_pipeline(
-            shaders::ATTENTION_PREFILL_HD64,
-            "main",
-            "attention_prefill_hd64",
-        );
+        let (pipeline, queries_per_wg) = prefill_pipeline(ctx, kernel);
         let q_buf = ctx.upload_f32(&vec![0.5f32; (n * q_stride) as usize], "q");
         // never read when the window is empty; bind one valid row each (64 halves = 32 words)
         let k_buf = ctx.upload_storage(bytemuck::cast_slice(&[0x3C00_3C00u32; 32]), "k");
@@ -8570,11 +8683,14 @@ mod tests {
             let mut pass = enc.begin_compute_pass(&Default::default());
             pass.set_pipeline(&pipeline);
             pass.set_bind_group(0, &bg, &[]);
-            pass.dispatch_workgroups(n.div_ceil(32), n_heads, 1);
+            pass.dispatch_workgroups(n.div_ceil(queries_per_wg), n_heads, 1);
         }
         ctx.submit_encoder(enc);
         for (i, &g) in ctx.download_f32(&out_buf, out_len).iter().enumerate() {
-            assert_eq!(g, 0.0, "an empty window must write zeros; idx {i} = {g}");
+            assert_eq!(
+                g, 0.0,
+                "{kernel:?}: an empty window must write zeros; idx {i} = {g}"
+            );
         }
     }
 }
