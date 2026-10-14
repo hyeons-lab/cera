@@ -549,6 +549,33 @@ The 512-token column is the control: the cap never applied there, and the 1% to 
 still behind llama.cpp's (dense Llama at 16 tokens is 41 ms against 25), so the next cost is the per-tile work of the smmla kernel at
 small token counts and the fixed per-layer overheads, not the thread count.
 
+**The passes around the GEMMs were the second cost.** With the cap gone, the profile of dense Llama at 16 tokens (40 ms) put about 12
+ms outside the GEMMs: the RMSNorms, the RoPE and KV append and the activation quantizes use 16-token tiles (one tile, one worker, for a
+16-token chunk), and `quantize_columns` still ran serially below 256 columns (150 us per column at the 8192-wide FFN down input). Tiles now
+narrow to `ceil(n / 8)` tokens so a short prompt is eight work items, and `quantize_columns` fans out from 8 columns. `quantize_rows` (the
+LFM2 path) costs about 20 us for 16 tokens, so it stays serial below 64: lowering it too made the 2.6B Agent Q4_0 13% slower at 16
+tokens. Time to first token, before to after (ms, p50, 4 alternating repetitions,
+`android_vl_image_raw/cpu_small_prompt_20261010/ab_passes2.jsonl`; the 512-token rows in `ab_passes.jsonl` are unchanged within noise):
+
+| Model | 16 tokens | 64 tokens |
+|---|---:|---:|
+| Llama-3.2-1B Q4_0 (dense) | 42 to 34 (-18%) | 138 to 114 (-18%) |
+| LFM2.5-VL-450M Q4_0 | 12 to 11 (-4%) | 34 to 32 (-7%) |
+| LFM2.5-350M Q4_K_M | 14 to 14 (+0%) | 50 to 48 (-4%) |
+| LFM2.5-2.6B Agent Q4_0 | 70 to 70 (+0%) | 265 to 242 (-8%) |
+
+The output is byte-identical (the tile width does not change what is computed). Dense Llama at 16 tokens is 36 ms against llama.cpp's 25. Where
+the 36 ms goes now (per-phase profile): 24 ms in the four projections, 6 ms in the small passes (norms, RoPE, attention, SiLU,
+quantize) and 5.5 ms outside the layers (the last token's LM head reads 205 MB of weights, plus the embedding and final norm).
+`dense_small_n_microbench` (an ignored test: the column-major smmla GEMM on the Llama shapes at 8 to 512 tokens, weights streamed
+from DRAM against one cache-resident copy) shows what limits the projections. From 64 tokens up they are compute-bound (hot and cold
+weights time the same, 1.4 to 1.9 TOPS). At 16 tokens the big FFN shapes pull 47 to 60 GB/s of the int8 repack from DRAM, near the
+62 to 73 GB/s ceiling, and cold costs 15% to 30% over hot, so under about 32 tokens they are partly weight-bandwidth-bound: the int8
+repack is twice the bytes of the 4-bit weights llama.cpp reads (about 17 ms of weight traffic at the ceiling against about 9 ms). Reading
+4-bit weights below 32 tokens would be worth roughly 8 ms of the 11 ms gap at 16 tokens; it needs a second weight layout and a kernel
+that unpacks nibbles in registers, for a difference of about 10 ms on prompts that short, so it is not done. From 64 tokens the dense
+prefill is at parity (111 ms against 113).
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
