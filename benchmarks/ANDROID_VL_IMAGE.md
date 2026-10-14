@@ -117,6 +117,101 @@ large image comes from the vision tower (3.1 against 5.1 s) and from that slow m
 faster prefill kernels; CPU decode is level with llama.cpp within the run-to-run spread (a 5 to 10% edge in
 some cells is inside the ranges). Raw data: `android_vl_image_raw/rerun_20261009/`.
 
+### GPU prefill: a register-tiled causal attention kernel
+
+The text-only profile of a 512-token GPU prefill (`CERA_GPU_PROFILE=1`, wgpu timestamps) put 64% of the 205 ms
+in the Q4_0 GEMMs and 22.6% (46 ms, six layers) in `attention_prefill`, which ran at about 0.07 TFLOPS. The
+scalar kernel dates from before the head_dim-64 tiled kernel (`attention_flash_hd64.wgsl`, 0.2 TFLOPS on this
+Adreno), which only handled f32 K/V and bidirectional windows, so the causal prefill over the packed-f16 cache
+never used it. `attention_prefill_hd64.wgsl` is that tiled kernel with the cache's packed-f16 loads and the
+prefill's windows (causal with `start_pos`, bidirectional with a media prefix, split into `q_base`/`n_sub`
+dispatches); it is chosen for head_dim 64 on desktop adapters and Adreno, and `CERA_WGPU_ATTN_SCALAR=1` selects
+the old kernel for an A/B. The attention phase falls from 45.9 to 14.8 ms and the whole 512-token prefill from
+206 to 174 ms under the profiler.
+
+Gated like the text-only runs above (AP sensor at 28 C or less before every invocation, rotating order, 3 rounds,
+medians; `android_vl_image_raw/causal_attention_20261009/`), prefill tok/s on the GPU:
+
+| Prompt | scalar attention | tiled attention | llama.cpp (OpenCL) | tiled / scalar | tiled / llama.cpp |
+|---|---:|---:|---:|---:|---:|
+| 512 tokens | 2,414 | 2,844 | 3,275 | 1.18 | 0.87 |
+| 1,024 | 1,978 | 2,636 | 3,135 | 1.33 | 0.84 |
+| 2,048 | 1,427 | 2,251 | 2,891 | 1.58 | 0.78 |
+
+The gain grows with the context because attention is quadratic; the rest of the gap is the Q4_0 GEMMs
+(about 2.2 TFLOPS) and, at 2,048 tokens, attention again. Accuracy on the device: over seven prompts of 60 to
+3,600 characters the full next-token logits of the tiled kernel agree with the CPU's as closely as the scalar
+kernel's do (cosine 0.9999 or better on six; the seventh, a noisy prompt, is 0.9989 against the scalar kernel's
+0.9957), with the same argmax on every prompt.
+
+#### What the Adreno 830 can do (`wgpu_peak_bench`)
+
+The GPU kernels' TFLOPS mean little without the ceiling, so `cera/examples/wgpu_peak_bench.rs` measures it
+through the same SPIR-V passthrough path as the production GEMMs: dependent-free FMA chains, a packed int8
+dot product, and a coalesced streaming read. Each kernel runs about 25 ms per dispatch, 8 dispatches per
+submit, median of 5 rounds; three runs agree within 1%.
+
+| Ceiling | Measured | Production kernel | Share of ceiling |
+|---|---:|---|---:|
+| fp32 FMA | 3.60 TFLOPS | tiled causal attention, 0.23 TFLOPS | 6% |
+| fp16 FMA | 7.10 TFLOPS | `gemm_stream_q4_0_k64`, 2.2 TFLOPS in the model (2.73 in `gemm-bench`) | 31% (38%) |
+| int8 packed dot (`SPV_KHR_integer_dot_product`) | 6.83 TOPS | none | no gain over fp16 |
+| read bandwidth | 62.5 GB/s | decode: 220 MB of weights per token at 173 tok/s is 38 GB/s | 61% |
+
+fp16 runs at twice the fp32 rate, and the int8 dot product is no faster than fp16 FMA, so an int8
+formulation of the prefill GEMM would buy nothing on this GPU. The GEMM does more than FMAs (it unpacks
+and scales each 4-bit weight, about 5 instructions against 8 half4 FMAs per weight), so its practical
+ceiling is below the 7.1; roughly 60% of it, 4 TFLOPS, is a fair target and would take the 512-token
+chunk's GEMMs from 133 ms to about 70. Attention is the furthest from its ceiling in relative terms (6% of
+fp32, 3% of fp16) but is the smaller block at 512 tokens. fp16 requires a SPIR-V passthrough kernel: wgpu
+does not advertise `SHADER_F16` on this driver, so a WGSL kernel cannot use it.
+
+#### What holds the GEMM at 31%
+
+`scripts/gemm-ablate/gen.py` builds variants of `gemm_stream_q4_0_k64.slang` that each remove one component,
+and `cera gemm-bench --spv` times them against the production kernel on the phone (same bindings and grid; the
+ablations compute wrong values on purpose). One thread owns one weight row and 32 output columns: per weight
+it dequantizes a nibble, reads the 8 half4 of the B tile from shared memory (the same address for the whole
+workgroup) and does 8 half4 FMAs. `gemm-bench` reports `a0_base`, the same source as the built-in kernel, at
+1.94 ms for 4608x512x1024 (2.5 TFLOPS); the first kernel in a run reads 20% slower from clock ramp, so
+compare within the list.
+
+| Variant (4608x512x1024) | ms | TFLOPS | Cost of what was removed |
+|---|---:|---:|---|
+| `a0_base` (production source) | 1.94 | 2.5 | |
+| `a1_nodequant` | 1.69 | 2.9 | dequant, 0.25 |
+| `a5_noglobal` (no weight loads) | 1.74 | 2.8 | weight loads, 0.20 |
+| `a4_nostage` (no B staging or barrier) | 1.65 | 2.9 | staging, 0.29 |
+| `a2_nolds` (B from registers) | 1.14 | 4.2 | shared-memory reads, 0.80 |
+| `a7_ldsfma` (shared reads + FMA only) | 1.60 | 3.0 | |
+| `a3_nolds_nodequant` | 0.78 | 6.2 | |
+| `a6_fmaonly` (nothing else) | 0.77 | 6.3 | |
+
+- **The FMA pipe is not the limit.** The structure with only FMAs runs at 6.3 TFLOPS, 88% of the 7.1
+  ceiling. The 31% is everything around the FMAs.
+- **The costs add up** rather than overlap (shared reads +0.83 and dequant +0.37 on top of 0.77 gives 1.97, the
+  measured 1.94), which is what an issue-bound kernel does and a bandwidth-bound one does not. Shared-memory
+  reads are the largest piece (about 43% of the time), then FMAs (40%) and dequant (19%); staging and weight
+  loads overlap with those.
+- **Register blocking helps less than the ablation suggests.** Two weight rows per thread (`r2`, 128 threads per
+  workgroup, bit-exact) shares each shared read between two rows and takes the GEMMs 5% faster at 4608x512x1024,
+  18% at 1024x512x4608 (ffn_down), 8% at 3072x512x1024, 20% at 1024x512x1024, 8% at 10752x128x2048 and 8% at
+  4608x2048x1024; it is neutral at 9216x512x1024 and 32% slower at 2048x64x2048, where the smaller workgroups
+  under-fill the GPU. Four rows per thread (`r4`) is 60% slower (64 accumulator registers). Weighted by the
+  model's shapes `r2` saves about 9% of the GEMM time, 7% of a prefill.
+- **Reading B straight from a storage buffer** (no staging, no barrier, no shared memory) is 2.8x slower than
+  shared memory (0.87 against 2.5 TFLOPS), so only a texture path could beat it. The adapter reports subgroups of
+  64, 32 KiB of workgroup memory and no cooperative matrices.
+- **Tried and not worth it:** a magic-number nibble conversion (`e1`, +/-1%), and 64-bit staging loads (`e2`,
+  24% slower). A 128-bit shared-memory read variant lost the GPU context and was dropped.
+- **No hardware matrix unit to use:** `wgpu_coopmat_probe` lists zero cooperative-matrix configurations on this
+  adapter, and the int8 dot product is no faster than fp16 FMA (above).
+
+What it would take to do much better than `r2` is a different tile: dequantize the weights once into a half
+tile in shared memory and run a register outer product (4x4 or 4x8 per thread) so each shared read feeds
+many FMAs, which is what the older `mul_mat_reg_tile` kernels do and why they lost to this one here. The
+streaming kernel's structure caps it near 40% of the fp16 ceiling; `r2` is the cheap step toward that.
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
