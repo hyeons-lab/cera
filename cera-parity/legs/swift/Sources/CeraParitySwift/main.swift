@@ -97,7 +97,7 @@ func runOnce(_ args: RunArgsOwned) throws -> [UInt32] {
     // silent divergences — keep the configs aligned.
     let sessionCfg = SessionConfig(
         maxSeqLen: nil,
-        kvCompression: nil, // nil == no compression (KvCompression is now optional)
+        kvCompression: nil, // nil == the core default (f16 where the model honors it), as in the other legs
         nKeep: 0,
         seed: args.seed,
         ubatchSize: 512

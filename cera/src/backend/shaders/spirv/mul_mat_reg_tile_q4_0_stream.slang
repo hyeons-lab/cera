@@ -1,5 +1,5 @@
 // Register-tiled Q4_0 GEMM over the resident stream layout: the fallthrough
-// for prefill GEMMs the streaming kernel declines (n < 32, strided B).
+// for prefill GEMMs the streaming kernel declines (strided B, or n below CERA_WGPU_STREAM_MIN_N).
 // Same tiling as `mul_mat_reg_tile_q4_0` (16x16 workgroup, TILE_M=TILE_N=4,
 // TILE_K=16, k-major staging, 4x vec4 register accumulators) — only the
 // `init_shmem_src0` loader differs: it dequantizes from the resident (q, d)

@@ -858,27 +858,18 @@ fn knobs(pairs: &[(&str, &str)]) -> HexagonKnobs {
     })
 }
 
-/// The decode tensor cap defaults on, `0` turns it off, and a number sets it.
+/// The tensor cap defaults off, `0` is off too, and a number sets it. An unparsable value runs
+/// uncapped rather than guessing a cap.
 #[test]
 fn test_batch_tensor_cap_knob() {
     let cap = |v: Option<&str>| match v {
         Some(v) => knobs(&[("CERA_HEXAGON_BATCH_TENSORS", v)]).batch_tensors,
         None => knobs(&[]).batch_tensors,
     };
-    assert_eq!(cap(None), Some(MAX_TENSORS_PER_FLUSH));
+    assert_eq!(cap(None), None);
     assert_eq!(cap(Some("0")), None);
     assert_eq!(cap(Some(" 24 ")), Some(24));
-    assert_eq!(
-        cap(Some("many")),
-        Some(MAX_TENSORS_PER_FLUSH),
-        "unparsable keeps the default"
-    );
-    const {
-        assert!(
-            MAX_TENSORS_PER_FLUSH <= 40,
-            "40 is the largest cap seen to decode reproducibly on every model"
-        );
-    }
+    assert_eq!(cap(Some("many")), None, "unparsable runs uncapped");
 }
 
 /// One boolean rule per knob kind: opt-in on for `1`/`true` only, default-on
@@ -940,4 +931,56 @@ fn test_knob_numeric_values() {
         HexagonArch::from_u32(79)
     );
     assert_eq!(knobs(&[("CERA_HEXAGON_ARCH", "x")]).arch_override, None);
+}
+
+/// Every conv layer gets its own staging slot, each wide enough for the two rows the state writeback
+/// reads and none overlapping another or running past the scratch buffer. Pinned apart from the
+/// opaque op digests, which only change when the address does (and not at all when two layers are
+/// handed the same address on a model whose goldens hold a single conv layer).
+#[test]
+fn conv_stage_slots_are_disjoint_and_inside_the_scratch() {
+    let hidden = 1024;
+    let so = ScratchOffsets::new(hidden, hidden, 256, 4096, 32000, 2048, None, None);
+    assert!(
+        so.conv_stage_slot >= 2 * hidden * 4,
+        "a slot holds two f32 rows"
+    );
+    let mut addrs: Vec<usize> = (0..CONV_STAGE_SLOTS).map(|i| so.conv_stage_at(i)).collect();
+    addrs.sort_unstable();
+    for pair in addrs.windows(2) {
+        assert!(
+            pair[1] - pair[0] >= so.conv_stage_slot,
+            "slots {:#x} and {:#x} overlap",
+            pair[0],
+            pair[1]
+        );
+    }
+    assert!(
+        addrs[0] >= so.conv_bx,
+        "stage slots start after the shared conv_bx scratch"
+    );
+    assert!(
+        *addrs.last().unwrap() + so.conv_stage_slot <= so.total_size,
+        "the last slot runs past the scratch buffer"
+    );
+}
+
+/// The slot is `layer % CONV_STAGE_SLOTS`, so a model with two conv layers that far apart would
+/// silently share one; construction refuses it instead of relying on the sizing assumption.
+#[test]
+fn conv_layers_that_share_a_stage_slot_are_refused() {
+    let conv = |n: usize| {
+        let mut cfg = tiny_config();
+        cfg.n_layers = n;
+        cfg.block_types = vec![BlockType::GatedConv; n];
+        cfg
+    };
+    assert!(check_conv_stage_slots(&conv(CONV_STAGE_SLOTS)).is_ok());
+    let err = check_conv_stage_slots(&conv(CONV_STAGE_SLOTS + 1)).unwrap_err();
+    assert!(err.to_string().contains("conv stage slot"), "{err}");
+    // Attention layers take no slot, so a long attention-only stack is fine.
+    let mut attn = tiny_config();
+    attn.n_layers = CONV_STAGE_SLOTS + 8;
+    attn.block_types = vec![BlockType::Attention; CONV_STAGE_SLOTS + 8];
+    assert!(check_conv_stage_slots(&attn).is_ok());
 }

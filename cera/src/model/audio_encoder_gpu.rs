@@ -47,7 +47,7 @@ use super::audio_encoder::{
     relative_pos_emb,
 };
 #[cfg(feature = "gpu")]
-use super::vision_encoder_gpu::{VitGpuOps, WgpuVitOps, WgpuVitWeight};
+use super::vision_encoder_gpu::{VitBuf, VitGpuOps, WgpuVitOps, WgpuVitWeight};
 use crate::model::weights::MmapWeight;
 
 /// Longest post-stem sequence the `audio_xl_attention` kernel supports: its
@@ -1897,10 +1897,9 @@ impl WgpuAudioOps {
     }
 
     /// An uninitialized buffer of `len` f32, padded to a whole 32 like [`VitGpuOps::upload`].
-    fn alloc(&self, len: usize) -> wgpu::Buffer {
+    fn alloc(&self, len: usize) -> VitBuf {
         self.vit
-            .ctx
-            .create_storage_rw((len.next_multiple_of(32).max(32) * 4) as u64, "audio")
+            .rw_buf((len.next_multiple_of(32).max(32) * 4) as u64, "audio")
     }
 
     /// The parameter words as a buffer, padded to whole `uint4`s as the kernels declare them.
@@ -1915,6 +1914,7 @@ impl WgpuAudioOps {
     /// One thread per element, 256 to a workgroup: the shape every elementwise kernel here shares.
     fn flat(
         &self,
+        label: &str,
         pipe: &wgpu::ComputePipeline,
         bufs: &[&wgpu::Buffer],
         words: &[u32],
@@ -1929,7 +1929,7 @@ impl WgpuAudioOps {
         let mut all: Vec<&wgpu::Buffer> = bufs.to_vec();
         all.push(&params);
         self.vit
-            .dispatch(pipe, &all, ((len as u32).div_ceil(256), 1, 1));
+            .dispatch(label, pipe, &all, ((len as u32).div_ceil(256), 1, 1));
     }
 
     fn conv2d_words(spec: &Conv2dSpec) -> [u32; 16] {
@@ -1956,7 +1956,7 @@ impl WgpuAudioOps {
 
 #[cfg(feature = "gpu")]
 impl AudioEncoderGpuOps for WgpuAudioOps {
-    type Buf = wgpu::Buffer;
+    type Buf = VitBuf;
     type Weight = WgpuVitWeight;
 
     fn upload(&self, data: &[f32]) -> Self::Buf {
@@ -2003,11 +2003,17 @@ impl AudioEncoderGpuOps for WgpuAudioOps {
     }
 
     fn silu(&self, x: &Self::Buf, len: usize) {
-        self.flat(&self.p_silu, &[x], &[len as u32, 0], len);
+        self.flat("audio_silu", &self.p_silu, &[x], &[len as u32, 0], len);
     }
 
     fn gelu_erf(&self, x: &Self::Buf, len: usize) {
-        self.flat(&self.p_gelu_erf, &[x], &[len as u32, 0], len);
+        self.flat(
+            "audio_gelu_erf",
+            &self.p_gelu_erf,
+            &[x],
+            &[len as u32, 0],
+            len,
+        );
     }
 
     fn add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize) {
@@ -2016,6 +2022,7 @@ impl AudioEncoderGpuOps for WgpuAudioOps {
 
     fn scaled_add(&self, dst: &Self::Buf, src: &Self::Buf, len: usize, scale: f32) {
         self.flat(
+            "audio_scaled_add",
             &self.p_scaled_add,
             &[dst, src],
             &[len as u32, scale.to_bits()],
@@ -2059,6 +2066,7 @@ impl AudioEncoderGpuOps for WgpuAudioOps {
         // belt-and-braces for a caller that skipped the planner.
         if total <= Self::MAX_FLAT {
             self.flat(
+                "audio_conv2d",
                 &self.p_conv2d,
                 &[input, weight, bias, &out],
                 &Self::conv2d_words(spec),
@@ -2095,6 +2103,7 @@ impl AudioEncoderGpuOps for WgpuAudioOps {
                 0
             };
             self.vit.dispatch_ranges(
+                "audio_conv2d",
                 &self.p_conv2d,
                 &[
                     (input, input_offset, 0),
@@ -2117,6 +2126,7 @@ impl AudioEncoderGpuOps for WgpuAudioOps {
         let total = a * b * k;
         let dst = self.alloc(total);
         self.flat(
+            "audio_transpose",
             &self.p_transpose,
             &[src, &dst],
             &[a as u32, b as u32, k as u32, 0],
@@ -2129,6 +2139,7 @@ impl AudioEncoderGpuOps for WgpuAudioOps {
         let total = rows * n;
         let dst = self.alloc(total);
         self.flat(
+            "audio_glu",
             &self.p_glu,
             &[src, &dst],
             &[rows as u32, n as u32, 0, 0],
@@ -2146,6 +2157,7 @@ impl AudioEncoderGpuOps for WgpuAudioOps {
         t: usize,
     ) {
         self.flat(
+            "audio_chan_affine",
             &self.p_chan_affine,
             &[x, w, b],
             &[channels as u32, t as u32, 0, 0],
@@ -2173,6 +2185,7 @@ impl AudioEncoderGpuOps for WgpuAudioOps {
             (1.0f32 / (head_dim as f32).sqrt()).to_bits(),
         ]);
         self.vit.dispatch(
+            "audio_xl_attention",
             &self.p_attn,
             &[q, k, v, p, bias_u, bias_v, &out, &params],
             (tokens as u32, n_head as u32, 1),
@@ -2192,6 +2205,7 @@ impl AudioEncoderGpuOps for WgpuAudioOps {
         let total = n_frames * N_FFT;
         let frames = self.alloc(total);
         self.flat(
+            "audio_stft",
             &self.p_stft,
             &[pcm, hann, &frames],
             &[
@@ -2217,6 +2231,7 @@ impl AudioEncoderGpuOps for WgpuAudioOps {
         let total = n_frames * N_FFT_BINS;
         let power = self.alloc(total);
         self.flat(
+            "audio_power",
             &self.p_power,
             &[frames, twiddle, &power],
             &[n_frames as u32, N_FFT as u32, N_FFT_BINS as u32, 0],
@@ -2238,6 +2253,7 @@ impl AudioEncoderGpuOps for WgpuAudioOps {
         let total = n_mel * n_frames;
         let mel = self.alloc(total);
         self.flat(
+            "audio_mel_project",
             &self.p_mel_project,
             &[power, filters, &mel],
             &[
@@ -2267,6 +2283,7 @@ impl AudioEncoderGpuOps for WgpuAudioOps {
         ]);
         // One workgroup per mel bin: the reduction is over the time axis.
         self.vit.dispatch(
+            "audio_mel_norm",
             &self.p_mel_norm,
             &[mel, &dst, &params],
             (n_mel as u32, 1, 1),
@@ -2303,11 +2320,16 @@ pub trait AudioGpuEncode: Send + Sync {
 struct MetalAudioEncoder {
     ops: MetalAudioOps,
     weights: GpuAudioWeights<MetalAudioOps>,
+    /// One encode at a time, as in `MetalVisionEncoder`: the engine shares this encoder across sessions
+    /// and the command-error slot drained around each encode belongs to the whole context, so a second
+    /// encode's entry drain could swallow the first one's commit fault.
+    encode_lock: std::sync::Mutex<()>,
 }
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 impl AudioGpuEncode for MetalAudioEncoder {
     fn encode_pcm(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize)> {
+        let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Drain the command-error slot around the encode (mirrors
         // Session's discard-at-entry/drain-after-work discipline): a
         // commit fault mid-encode otherwise returns Ok(stale embeddings)
@@ -2322,6 +2344,7 @@ impl AudioGpuEncode for MetalAudioEncoder {
     }
 
     fn encode_mel(&self, mel: &[f32], n_frames: usize) -> Result<(Vec<f32>, usize)> {
+        let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.ops.ctx.take_cmd_error();
         let out = encode_audio_mel_gpu(&self.ops, &self.weights, mel, n_frames)?;
         if let Some(e) = self.ops.ctx.take_cmd_error() {
@@ -2335,11 +2358,16 @@ impl AudioGpuEncode for MetalAudioEncoder {
 struct WgpuAudioEncoder {
     ops: WgpuAudioOps,
     weights: GpuAudioWeights<WgpuAudioOps>,
+    /// Serializes `encode_pcm` and `encode_mel`. The engine shares one encoder across every session,
+    /// and an encode records its passes into the encoder-wide pending encoder and draws from the
+    /// encoder-wide buffer pool: concurrent encodes would flush each other's passes and corrupt buffers.
+    encode_lock: std::sync::Mutex<()>,
 }
 
 #[cfg(feature = "gpu")]
 impl AudioGpuEncode for WgpuAudioEncoder {
     fn encode_pcm(&self, pcm: &[f32]) -> Result<(Vec<f32>, usize)> {
+        let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Drain the readback slot around the encode (see `MetalAudioEncoder`): a fault
         // mid-encode otherwise returns zero embeddings as if they were the result.
         let _ = self.ops.vit.ctx.take_readback_fault();
@@ -2351,6 +2379,7 @@ impl AudioGpuEncode for WgpuAudioEncoder {
     }
 
     fn encode_mel(&self, mel: &[f32], n_frames: usize) -> Result<(Vec<f32>, usize)> {
+        let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _ = self.ops.vit.ctx.take_readback_fault();
         let out = encode_audio_mel_gpu(&self.ops, &self.weights, mel, n_frames)?;
         if let Some(e) = self.ops.vit.ctx.take_readback_fault() {
@@ -2403,6 +2432,7 @@ fn try_wgpu_audio_encoder(
     Some(std::sync::Arc::new(WgpuAudioEncoder {
         ops,
         weights: gpu_w,
+        encode_lock: std::sync::Mutex::new(()),
     }))
 }
 
@@ -2485,6 +2515,7 @@ fn try_metal_audio_encoder(
     Some(std::sync::Arc::new(MetalAudioEncoder {
         ops,
         weights: gpu_w,
+        encode_lock: std::sync::Mutex::new(()),
     }))
 }
 

@@ -1,0 +1,283 @@
+0.00.029.570 I cmn  common_init_: fitting params to device memory ...
+0.00.029.576 I cmn  common_init_: (for bugs during this step try to reproduce them with -fit off, or provide --verbose logs if the bug only occurs with -fit on)
+0.00.029.586 I common_params_fit_impl: getting device memory data for initial parameters:
+..............................................................................................................................................................................
+0.00.211.030 I common_memory_breakdown_print: | memory breakdown [MiB]                  | total   free    self   model   context   compute    unaccounted |
+0.00.211.070 I common_memory_breakdown_print: |   - GPUOpenCL (QUALCOMM Adreno(TM) 830) |  5556 = 4532 + (1863 =   206 +    1500 +     156) +        -839 |
+0.00.211.070 I common_memory_breakdown_print: |   - Host                                |                  181 =    52 +       0 +     129                |
+0.00.217.697 I common_params_fit_impl: projected to use 1863 MiB of device memory vs. 4532 MiB of free device memory
+0.00.217.704 I common_params_fit_impl: will leave 2669 >= 1024 MiB of free device memory, no changes needed
+0.00.217.705 I common_fit_params: successfully fit params to free device memory
+0.00.217.706 I common_fit_params: fitting params to free memory took 0.19 seconds
+0.00.226.652 I llama_model_loader: loaded meta data with 39 key-value pairs and 148 tensors from /data/local/tmp/LFM2.5-VL-450M-Q4_0.gguf (version GGUF V3 (latest))
+0.00.226.664 I llama_model_loader: Dumping metadata keys/values. Note: KV overrides do not apply in this output.
+0.00.226.666 I llama_model_loader: - kv   0:                       general.architecture str              = lfm2
+0.00.226.666 I llama_model_loader: - kv   1:                               general.type str              = model
+0.00.226.667 I llama_model_loader: - kv   2:                               general.name str              = LFM2.5-VL-450M-new-chat-template-3
+0.00.226.667 I llama_model_loader: - kv   3:                            general.version str              = 3
+0.00.226.668 I llama_model_loader: - kv   4:                           general.finetune str              = new-chat-template
+0.00.226.668 I llama_model_loader: - kv   5:                           general.basename str              = LFM2.5-VL
+0.00.226.669 I llama_model_loader: - kv   6:                         general.size_label str              = 450M
+0.00.226.669 I llama_model_loader: - kv   7:                            general.license str              = other
+0.00.226.670 I llama_model_loader: - kv   8:                       general.license.name str              = lfm1.0
+0.00.226.670 I llama_model_loader: - kv   9:                       general.license.link str              = LICENSE
+0.00.226.671 I llama_model_loader: - kv  10:                   general.base_model.count u32              = 1
+0.00.226.671 I llama_model_loader: - kv  11:                  general.base_model.0.name str              = LFM2.5 350M
+0.00.226.672 I llama_model_loader: - kv  12:          general.base_model.0.organization str              = LiquidAI
+0.00.226.673 I llama_model_loader: - kv  13:              general.base_model.0.repo_url str              = https://huggingface.co/LiquidAI/LFM2....
+0.00.226.678 I llama_model_loader: - kv  14:                               general.tags arr[str,7]       = ["liquid", "lfm2", "lfm2-vl", "edge",...
+0.00.226.680 I llama_model_loader: - kv  15:                          general.languages arr[str,8]       = ["en", "ja", "ko", "fr", "es", "de", ...
+0.00.226.681 I llama_model_loader: - kv  16:                           lfm2.block_count u32              = 16
+0.00.226.681 I llama_model_loader: - kv  17:                        lfm2.context_length u32              = 128000
+0.00.226.682 I llama_model_loader: - kv  18:                      lfm2.embedding_length u32              = 1024
+0.00.226.682 I llama_model_loader: - kv  19:                   lfm2.feed_forward_length u32              = 4608
+0.00.226.683 I llama_model_loader: - kv  20:                  lfm2.attention.head_count u32              = 16
+0.00.226.684 I llama_model_loader: - kv  21:               lfm2.attention.head_count_kv arr[i32,16]      = [0, 0, 8, 0, 0, 8, 0, 0, 8, 0, 8, 0, ...
+0.00.226.686 I llama_model_loader: - kv  22:                        lfm2.rope.freq_base f32              = 1000000.000000
+0.00.226.687 I llama_model_loader: - kv  23:      lfm2.attention.layer_norm_rms_epsilon f32              = 0.000010
+0.00.226.688 I llama_model_loader: - kv  24:                            lfm2.vocab_size u32              = 65536
+0.00.226.688 I llama_model_loader: - kv  25:                     lfm2.shortconv.l_cache u32              = 3
+0.00.226.688 I llama_model_loader: - kv  26:                       tokenizer.ggml.model str              = gpt2
+0.00.226.689 I llama_model_loader: - kv  27:                         tokenizer.ggml.pre str              = lfm2
+0.00.231.274 I llama_model_loader: - kv  28:                      tokenizer.ggml.tokens arr[str,65536]   = ["<|pad|>", "<|startoftext|>", "<|end...
+0.00.232.779 I llama_model_loader: - kv  29:                  tokenizer.ggml.token_type arr[i32,65536]   = [3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, 3, ...
+0.00.237.743 I llama_model_loader: - kv  30:                      tokenizer.ggml.merges arr[str,63683]   = ["Ċ Ċ", "Ċ ĊĊ", "ĊĊ Ċ", "Ċ �...
+0.00.237.752 I llama_model_loader: - kv  31:                tokenizer.ggml.bos_token_id u32              = 1
+0.00.237.752 I llama_model_loader: - kv  32:                tokenizer.ggml.eos_token_id u32              = 7
+0.00.237.753 I llama_model_loader: - kv  33:            tokenizer.ggml.padding_token_id u32              = 0
+0.00.237.754 I llama_model_loader: - kv  34:               tokenizer.ggml.add_bos_token bool             = true
+0.00.237.754 I llama_model_loader: - kv  35:               tokenizer.ggml.add_sep_token bool             = false
+0.00.237.756 I llama_model_loader: - kv  36:                    tokenizer.chat_template str              = {{- bos_token -}}\n{%- set keep_past_t...
+0.00.237.756 I llama_model_loader: - kv  37:               general.quantization_version u32              = 2
+0.00.237.757 I llama_model_loader: - kv  38:                          general.file_type u32              = 2
+0.00.237.757 I llama_model_loader: - type  f32:   55 tensors
+0.00.237.758 I llama_model_loader: - type q4_0:   92 tensors
+0.00.237.758 I llama_model_loader: - type q6_K:    1 tensors
+0.00.237.759 I print_info: file format = GGUF V3 (latest)
+0.00.237.760 I print_info: file type   = Q4_0
+0.00.237.761 I print_info: file size   = 206.87 MiB (4.90 BPW) 
+0.00.237.765 I llama_prepare_model_devices: using device GPUOpenCL (QUALCOMM Adreno(TM) 830) (unknown id) - 4532 MiB free
+0.00.253.571 I load: 0 unused tokens
+0.00.255.919 I load: printing all EOG tokens:
+0.00.255.926 I load:   - 2 ('<|endoftext|>')
+0.00.255.927 I load:   - 7 ('<|im_end|>')
+0.00.255.964 I load: special tokens cache size = 507
+0.00.266.072 I load: token to piece cache size = 0.3759 MB
+0.00.266.086 I print_info: arch                  = lfm2
+0.00.266.087 I print_info: vocab_only            = 0
+0.00.266.087 I print_info: no_alloc              = 0
+0.00.266.088 I print_info: n_ctx_train           = 128000
+0.00.266.088 I print_info: n_embd_inp            = 1024
+0.00.266.088 I print_info: n_embd                = 1024
+0.00.266.089 I print_info: n_embd_out            = 1024
+0.00.266.089 I print_info: n_layer               = 16
+0.00.266.090 I print_info: n_layer_all           = 16
+0.00.266.097 I print_info: n_head                = 16
+0.00.266.099 I print_info: n_head_kv             = [0, 0, 8, 0, 0, 8, 0, 0, 8, 0, 8, 0, 8, 0, 8, 0]
+0.00.266.100 I print_info: n_rot                 = 64
+0.00.266.100 I print_info: n_swa                 = 0
+0.00.266.101 I print_info: is_swa_any            = 0
+0.00.266.101 I print_info: non_causal_type       = 0
+0.00.266.102 I print_info: n_embd_head_k         = 64
+0.00.266.102 I print_info: n_embd_head_v         = 64
+0.00.266.104 I print_info: n_gqa                 = [0, 0, 2, 0, 0, 2, 0, 0, 2, 0, 2, 0, 2, 0, 2, 0]
+0.00.266.108 I print_info: n_embd_k_gqa          = [0, 0, 512, 0, 0, 512, 0, 0, 512, 0, 512, 0, 512, 0, 512, 0]
+0.00.266.110 I print_info: n_embd_v_gqa          = [0, 0, 512, 0, 0, 512, 0, 0, 512, 0, 512, 0, 512, 0, 512, 0]
+0.00.266.111 I print_info: f_norm_eps            = 0.0e+00
+0.00.266.112 I print_info: f_norm_rms_eps        = 1.0e-05
+0.00.266.112 I print_info: f_clamp_kqv           = 0.0e+00
+0.00.266.112 I print_info: f_max_alibi_bias      = 0.0e+00
+0.00.266.113 I print_info: f_logit_scale         = 0.0e+00
+0.00.266.113 I print_info: f_attn_scale          = 0.0e+00
+0.00.266.113 I print_info: f_attn_value_scale    = 0.0000
+0.00.266.114 I print_info: n_ff                  = 4608
+0.00.266.114 I print_info: n_expert              = 0
+0.00.266.115 I print_info: n_expert_used         = 0
+0.00.266.115 I print_info: n_expert_groups       = 0
+0.00.266.115 I print_info: n_group_used          = 0
+0.00.266.115 I print_info: causal attn           = 1
+0.00.266.116 I print_info: pooling type          = -1
+0.00.266.116 I print_info: rope type             = 2
+0.00.266.116 I print_info: rope scaling          = linear
+0.00.266.117 I print_info: freq_base_train       = 1000000.0
+0.00.266.117 I print_info: freq_scale_train      = 1
+0.00.266.118 I print_info: n_ctx_orig_yarn       = 128000
+0.00.266.118 I print_info: rope_yarn_log_mul     = 0.0000
+0.00.266.118 I print_info: rope_finetuned        = unknown
+0.00.266.119 I print_info: model type            = 350M
+0.00.266.119 I print_info: model params          = 354.48 M
+0.00.266.119 I print_info: general.name          = LFM2.5-VL-450M-new-chat-template-3
+0.00.266.120 I print_info: vocab type            = BPE
+0.00.266.120 I print_info: n_vocab               = 65536
+0.00.266.121 I print_info: n_merges              = 63683
+0.00.266.121 I print_info: BOS token             = 1 '<|startoftext|>'
+0.00.266.121 I print_info: EOS token             = 7 '<|im_end|>'
+0.00.266.122 I print_info: EOT token             = 2 '<|endoftext|>'
+0.00.266.122 I print_info: PAD token             = 0 '<|pad|>'
+0.00.266.122 I print_info: LF token              = 708 'Ċ'
+0.00.266.123 I print_info: EOG token             = 2 '<|endoftext|>'
+0.00.266.123 I print_info: EOG token             = 7 '<|im_end|>'
+0.00.266.123 I print_info: max token length      = 30
+0.00.266.124 I load_tensors: loading model tensors, this can take a while... (load_mode = none)
+0.00.309.124 I load_tensors: offloading output layer to GPU
+0.00.309.131 I load_tensors: offloading 15 repeating layers to GPU
+0.00.309.132 I load_tensors: offloaded 17/17 layers to GPU
+0.00.309.136 I load_tensors:          CPU model buffer size =    52.50 MiB
+0.00.309.137 I load_tensors:       OpenCL model buffer size =   206.92 MiB
+.............................................................
+0.01.040.642 I cmn  common_init_: added <|endoftext|> logit bias = -inf
+0.01.040.647 I cmn  common_init_: added <|im_end|> logit bias = -inf
+0.01.041.088 I llama_context: constructing llama_context
+0.01.041.094 I llama_context: n_seq_max             = 1
+0.01.041.094 I llama_context: n_ctx                 = 128000
+0.01.041.095 I llama_context: n_ctx_seq             = 128000
+0.01.041.096 I llama_context: n_batch               = 2048
+0.01.041.096 I llama_context: n_ubatch              = 512
+0.01.041.097 I llama_context: causal_attn           = 1
+0.01.041.098 I llama_context: flash_attn            = auto
+0.01.041.098 I llama_context: kv_unified            = false
+0.01.041.101 I llama_context: freq_base             = 1000000.0
+0.01.041.102 I llama_context: freq_scale            = 1
+0.01.041.102 I llama_context: n_rs_seq              = 0
+0.01.041.102 I llama_context: n_outputs_max         = 2048
+0.01.041.103 I llama_context: n_outputs_max_per_seq = 1
+0.01.041.105 I ggml_opencl: OpenCL device: QUALCOMM Adreno(TM) 830
+0.01.041.106 I ggml_opencl: OpenCL driver: OpenCL 3.0 QUALCOMM build: 0800.64.8 Compiler E031.47.18.56
+0.01.041.107 I ggml_opencl: vector subgroup broadcast support: true
+0.01.041.107 I ggml_opencl: subgroup shuffle support: true
+0.01.041.107 I ggml_opencl: device FP16 support: true
+0.01.041.108 I ggml_opencl: khr dot product support: true
+0.01.041.109 I ggml_opencl: mem base addr align: 128
+0.01.041.109 I ggml_opencl: global mem size: 5556 MB
+0.01.041.110 I ggml_opencl: max mem alloc size: 1024 MB
+0.01.041.111 I ggml_opencl: device max image buffer size (pixels): 134217728
+0.01.041.111 I ggml_opencl: device max image2d size: 16384 x 16384
+0.01.041.112 I ggml_opencl: device max workgroup size: 1024
+0.01.041.112 I ggml_opencl: SVM coarse grain buffer support: true
+0.01.041.112 I ggml_opencl: SVM fine grain buffer support: true
+0.01.041.113 I ggml_opencl: SVM fine grain system support: false
+0.01.041.114 I ggml_opencl: SVM atomics support: true
+0.01.041.114 I ggml_opencl: cl_qcom_subgroup_shuffle support: true
+0.01.041.115 I ggml_opencl: flattening quantized weights representation as struct of arrays (GGML_OPENCL_SOA_Q)
+0.01.041.115 I ggml_opencl: using kernels optimized for Adreno (GGML_OPENCL_USE_ADRENO_KERNELS)
+0.01.041.116 I ggml_opencl: Adreno xmem F16xF32 GEMM enabled (temporary weight prepack)
+0.01.041.187 I llama_context:        CPU  output buffer size =     0.25 MiB
+0.01.356.268 I llama_kv_cache:     OpenCL KV buffer size =  1500.00 MiB
+0.01.391.985 I llama_kv_cache: size = 1500.00 MiB (128000 cells,   6 layers,  1/1 seqs), K (f16):  750.00 MiB, V (f16):  750.00 MiB
+0.01.391.994 I llama_kv_cache: attn_rot_k = 0, n_embd_head_k_all = 64
+0.01.391.995 I llama_kv_cache: attn_rot_v = 0, n_embd_head_k_all = 64
+0.01.392.459 I llama_memory_recurrent:     OpenCL RS buffer size =     0.08 MiB
+0.01.392.467 I llama_memory_recurrent: size =    0.08 MiB (     1 cells,  16 layers,  1 seqs  0 rs_seq), R (f32):    0.08 MiB, S (f32):    0.00 MiB, P (f32):    0.00 MiB
+0.01.392.472 I sched_reserve: reserving ...
+0.01.392.872 I resolve_fused_ops: Flash Attention enabled
+0.01.392.885 I resolve_fused_ops: resolving fused DeepSeek V4 HC support:
+0.01.393.031 I resolve_fused_ops: fused DeepSeek V4 HC pre enabled
+0.01.393.170 I resolve_fused_ops: fused DeepSeek V4 HC comb enabled
+0.01.393.310 I resolve_fused_ops: fused DeepSeek V4 HC post enabled
+0.01.445.189 I sched_reserve:     OpenCL compute buffer size =   156.02 MiB
+0.01.445.196 I sched_reserve:        CPU compute buffer size =   129.01 MiB
+0.01.445.197 I sched_reserve: graph: nodes = 548, splits = 2, input objects = 4, input tensors = 7
+0.01.445.199 I sched_reserve: reserve took 52.73 ms, sched copies = 1
+0.01.445.252 I cmn          init: llama threadpool init, n_threads = 8
+0.01.445.612 I cmn  common_init_: warming up the model with an empty run - please wait ... (--no-warmup to disable)
+0.01.446.577 I ggml_opencl: lazy-compiling flash_attn prepass for DK=64 DV=64
+0.01.446.587 I ggml_opencl: compiling fa prepass f16
+0.01.469.719 I ggml_opencl: compiling fa f32_f16
+0.01.866.439 I ggml_opencl: flash_attn_f32_f16_q1_vec_mq_split_c8 DK=64 DV=64 per-kernel max 192 < required 256; skipping registration (will fall back)
+0.01.866.459 I ggml_opencl: compiling fa f32_f16 MQ_GQA=8
+0.02.103.261 I ggml_opencl: flash_attn_f32_f16_q1_vec_mq (g8) DK=64 DV=64 per-kernel max 128 < required 192; skipping registration (will fall back)
+0.02.103.273 I ggml_opencl: flash_attn_f32_f16_q1_vec_mq_split (g8) DK=64 DV=64 per-kernel max 128 < required 192; skipping registration (will fall back)
+0.02.103.277 I ggml_opencl: flash_attn_f32_f16_q1_vec_mq_split_c8 (g8) DK=64 DV=64 per-kernel max 128 < required 192; skipping registration (will fall back)
+0.02.103.279 I ggml_opencl: compiling fa f32_f16 c8 NSG2
+0.02.259.430 I ggml_opencl: compiling fa f32_f16 c8 g8 NSG2
+0.02.494.774 I ggml_opencl: compiling fa f32_f16 split
+0.02.880.802 I clip_model_loader: model name:   LFM2.5-VL-450M-new-chat-template-3
+0.02.880.809 I clip_model_loader: description:  
+0.02.880.810 I clip_model_loader: GGUF version: 3
+0.02.880.811 I clip_model_loader: alignment:    32
+0.02.880.811 I clip_model_loader: n_tensors:    201
+0.02.880.811 I clip_model_loader: n_kv:         32
+0.02.880.812 I 
+0.02.880.814 I clip_model_loader: has vision encoder
+0.02.880.953 I ggml_opencl: OpenCL device: QUALCOMM Adreno(TM) 830
+0.02.880.953 I ggml_opencl: OpenCL driver: OpenCL 3.0 QUALCOMM build: 0800.64.8 Compiler E031.47.18.56
+0.02.880.954 I ggml_opencl: vector subgroup broadcast support: true
+0.02.880.954 I ggml_opencl: subgroup shuffle support: true
+0.02.880.954 I ggml_opencl: device FP16 support: true
+0.02.880.955 I ggml_opencl: khr dot product support: true
+0.02.880.955 I ggml_opencl: mem base addr align: 128
+0.02.880.956 I ggml_opencl: global mem size: 5556 MB
+0.02.880.956 I ggml_opencl: max mem alloc size: 1024 MB
+0.02.880.957 I ggml_opencl: device max image buffer size (pixels): 134217728
+0.02.880.957 I ggml_opencl: device max image2d size: 16384 x 16384
+0.02.880.958 I ggml_opencl: device max workgroup size: 1024
+0.02.880.958 I ggml_opencl: SVM coarse grain buffer support: true
+0.02.880.958 I ggml_opencl: SVM fine grain buffer support: true
+0.02.880.959 I ggml_opencl: SVM fine grain system support: false
+0.02.880.959 I ggml_opencl: SVM atomics support: true
+0.02.880.960 I ggml_opencl: cl_qcom_subgroup_shuffle support: true
+0.02.880.960 I ggml_opencl: flattening quantized weights representation as struct of arrays (GGML_OPENCL_SOA_Q)
+0.02.880.960 I ggml_opencl: using kernels optimized for Adreno (GGML_OPENCL_USE_ADRENO_KERNELS)
+0.02.880.961 I ggml_opencl: Adreno xmem F16xF32 GEMM enabled (temporary weight prepack)
+0.02.880.962 I clip_ctx: CLIP using OpenCL backend
+0.02.881.099 I load_hparams: projector:          lfm2
+0.02.881.100 I load_hparams: n_embd:             768
+0.02.881.100 I load_hparams: n_head:             12
+0.02.881.100 I load_hparams: n_ff:               3072
+0.02.881.100 I load_hparams: n_layer:            12
+0.02.881.101 I load_hparams: ffn_op:             gelu
+0.02.881.101 I load_hparams: projection_dim:     1024
+0.02.881.102 I 
+--- vision hparams ---
+0.02.881.102 I load_hparams: image_size:         256
+0.02.881.103 I load_hparams: patch_size:         16
+0.02.881.103 I load_hparams: has_llava_proj:     0
+0.02.881.103 I load_hparams: minicpmv_version:   0
+0.02.881.103 I load_hparams: n_merge:            2
+0.02.881.104 I load_hparams: n_wa_pattern: 0
+0.02.881.104 I load_hparams: image_min_pixels:   65536
+0.02.881.104 I load_hparams: image_max_pixels:   262144
+0.02.881.104 I 
+0.02.881.107 I load_hparams: model size:         98.04 MiB
+0.02.881.107 I load_hparams: metadata size:      0.07 MiB
+0.03.104.397 I get_dummy_batch: warmup with image size = 512 x 512
+0.03.105.628 I get_dummy_batch: warmup with image size = 512 x 512
+0.03.110.506 I reserve_compute_meta:     OpenCL compute buffer size =    21.00 MiB
+0.03.110.513 I reserve_compute_meta:        CPU compute buffer size =     3.75 MiB
+0.03.110.513 I reserve_compute_meta: graph splits = 3, nodes = 405
+0.03.110.522 I warmup: flash attention is enabled
+0.03.110.522 W warmup: *****************************************************************
+0.03.110.523 W warmup: WARNING: the CLIP graph uses unsupported operators by the backend
+0.03.110.523 W warmup:          the performance will be suboptimal                      
+0.03.110.524 W warmup:          list of unsupported ops (backend=OpenCL):
+0.03.110.525 W warmup:          UPSCALE: type = f32, ne = [32 32 768 1]
+0.03.110.525 W warmup: flash attention is enabled
+0.03.110.525 W warmup: please report this on github as an issue
+0.03.110.526 W warmup: ref: https://github.com/ggml-org/llama.cpp/pull/16837#issuecomment-3461676118
+0.03.110.526 W warmup: *****************************************************************
+0.03.112.831 I mtmd_cli_context: chat template example:
+<|im_start|>system
+You are a helpful assistant<|im_end|>
+<|im_start|>user
+Hello<|im_end|>
+<|im_start|>assistant
+Hi there<|im_end|>
+<|im_start|>user
+How are you?<|im_end|>
+<|im_start|>assistant
+
+0.03.112.836 I main: loading model: /data/local/tmp/LFM2.5-VL-450M-Q4_0.gguf
+0.03.112.862 W WARN: This is an experimental CLI for testing multimodal capability.
+0.03.112.862 W       For normal use cases, please use the standard llama-cli
+0.03.118.460 I encoding mtmd batch, n_chunks = 1 (done = 1, total = 3)
+0.03.292.945 I mtmd batch encoding done in 174 ms
+0.03.292.963 I decoding image batch 1/1, n_tokens_batch = 192
+0.03.296.603 I image decoded (batch 1/1) in 4 ms
+
+A pug dog with a wrinkled face and dark eyes is lying on a textured carpet, its tongue playfully sticking out. The dog's ears are floppy, and it appears to be in a relaxed state. In the background, a pair of black flip-flops is visible, suggesting a casual, home
+
+0.03.790.682 I llama_perf_context_print:        load time =    2642.77 ms
+0.03.790.687 I llama_perf_context_print: prompt eval time =     288.89 ms /   210 tokens (    1.38 ms per token,   726.91 tokens per second)
+0.03.790.688 I llama_perf_context_print:        eval time =     373.46 ms /    63 runs   (    5.93 ms per token,   168.69 tokens per second)
+0.03.790.689 I llama_perf_context_print:       total time =     910.14 ms /   273 tokens
+0.03.790.689 I llama_perf_context_print:    graphs reused =         62

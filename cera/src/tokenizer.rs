@@ -268,6 +268,16 @@ impl BpeTokenizer {
         self
     }
 
+    /// Register literal special tokens (text, id) so `encode` returns the id for each, as a vocabulary's
+    /// `<|...|>` control tokens do.
+    #[cfg(all(test, feature = "vl-preprocess"))]
+    pub(crate) fn with_special_texts_for_testing(mut self, specials: &[(&str, u32)]) -> Self {
+        for &(text, id) in specials {
+            self.special_tokens.insert(text.to_string(), id);
+        }
+        self
+    }
+
     /// Encode text, optionally adding the model's special BOS/EOS markers —
     /// the analog of llama.cpp's `llama_tokenize(..., add_special)`.
     ///

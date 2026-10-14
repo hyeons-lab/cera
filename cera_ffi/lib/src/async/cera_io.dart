@@ -214,18 +214,23 @@ class _ProgressSink implements DownloadProgressSink {
   }
 }
 
-KvCompression? _kvCompressionOf(CeraKvCompression compression) =>
-    switch (compression) {
-      CeraKvCompression.none => null,
-      CeraKvCompression.f16 => const KvCompressionF16(),
-      CeraKvCompression.turboQuant => const KvCompressionTurboQuant(
-        seed: 0,
-        keys: true,
-        values: true,
-      ),
-    };
+KvCompression _kvCompressionOf(
+  CeraKvCompression compression,
+) => switch (compression) {
+  // Explicit, not `null`: an omitted mode now means the core default (f16 where the model honors
+  // it), so `none` has to ask for the backend's own full-precision cache by name.
+  CeraKvCompression.none => const KvCompressionNone(),
+  CeraKvCompression.f16 => const KvCompressionF16(),
+  CeraKvCompression.turboQuant => const KvCompressionTurboQuant(
+    seed: 0,
+    keys: true,
+    values: true,
+  ),
+};
 
-SessionConfig _sessionConfigOf(CeraOptions options) => SessionConfig(
+/// The native session config for [options]. Public only so tests can pin the mapping; this library is
+/// not exported from the package API.
+SessionConfig sessionConfigOf(CeraOptions options) => SessionConfig(
   ubatchSize: options.ubatchSize,
   gpuDepthformer: options.gpuDepthformer,
   kvCompression: _kvCompressionOf(options.effectiveKvCompression),
@@ -233,7 +238,7 @@ SessionConfig _sessionConfigOf(CeraOptions options) => SessionConfig(
 
 class _NativeCera implements Cera {
   _NativeCera(this._engine, this._options)
-    : _sessionHandle = _engine.newSession(_sessionConfigOf(_options)),
+    : _sessionHandle = _engine.newSession(sessionConfigOf(_options)),
       // Read once. Both are fixed by the GGUF, and `metadata()` builds a whole
       // record across the FFI boundary, which is not something to do on every
       // prompt for two fields.
@@ -265,7 +270,7 @@ class _NativeCera implements Cera {
   // operation opens a fresh one. (Per-request `generate` seeds travel on
   // `GenerateOpts`, never by replacing this handle.)
   Session get _session =>
-      _sessionHandle ??= _engine.newSession(_sessionConfigOf(_options));
+      _sessionHandle ??= _engine.newSession(sessionConfigOf(_options));
   bool _closed = false;
   List<int>? _pendingAudioSuffixTokens;
 

@@ -2204,6 +2204,11 @@ impl Session {
     /// - `0`: force *no* cap for this call, overriding a session default.
     /// - `n`: cap at `n` pixels.
     ///
+    /// With no cap, a large image is tiled the way the LFM2-VL reference does: up to 10 tiles of
+    /// 256 tokens plus a thumbnail (about 1,800 tokens for a 4:3 photo, up to about 2,800 for a
+    /// panorama), with one vision-tower pass per tile. Set `maxLongSize` to keep one tile. The
+    /// `WebGpuSession` does not tile (see its `appendImage`).
+    ///
     /// Requires a VL bundle (`capabilities.imageIn === true`), which means
     /// loading via `CeraEngine.fromGgufParts` with the vision mmproj.
     /// Otherwise this throws `"modality not supported by this model"`.
@@ -3803,6 +3808,9 @@ mod webgpu {
         /// `maxLongSize` follows the CPU session: `null` uses the session
         /// default, `0` forces no cap for this call, `n` caps at `n` pixels.
         ///
+        /// Unlike the CPU session, a large image is never tiled here: it is always one image (about
+        /// 64 to 256 tokens), so the same photo costs fewer tokens on this session type.
+        ///
         /// Ordering is the caller's to manage, as with `generateTokens`:
         /// append the image where the chat template puts its `<image>` marker,
         /// which usually means framing the prompt in two halves around it.
@@ -3826,6 +3834,8 @@ mod webgpu {
                 Some(n) => Some(n),
             };
 
+            // One image only: see the doc comment above; this goes through
+            // `preprocess_image_with_opts`, not the layout one the native session uses.
             let t_start = Instant::now();
             let pre = cera::model::vision_preprocessor::preprocess_image_with_opts(
                 bytes,
