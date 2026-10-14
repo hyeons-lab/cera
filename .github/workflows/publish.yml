@@ -358,7 +358,7 @@ jobs:
       # ci.yml. Same pinned wasm-pack version.
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack@0.14.0
+          tool: wasm-pack@0.15.0
 
       - uses: ./.github/actions/install-binaryen
 
@@ -719,7 +719,7 @@ jobs:
       # ci.yml. Same pinned wasm-pack version.
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack@0.14.0
+          tool: wasm-pack@0.15.0
 
       - uses: ./.github/actions/install-binaryen
 

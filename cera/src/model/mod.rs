@@ -1178,10 +1178,7 @@ fn reject_bidirectional_lfm2(
     if !matches!(arch, "lfm2" | "lfm2moe") || (arch == "lfm2" && reads_dense_lfm2) {
         return Ok(());
     }
-    let causal = gguf
-        .get_bool(&format!("{arch}.is_causal"))
-        .or_else(|| gguf.get_bool(&format!("{arch}.attention.causal")))
-        .unwrap_or_else(|| gguf.tensor_data("classifier.weight").is_err());
+    let causal = lfm2::gguf_is_causal(gguf, arch);
     ensure!(
         causal,
         "the {backend} backend runs {arch} with causal attention only, and this model is bidirectional (CPU only)"
@@ -1518,9 +1515,17 @@ mod tests {
         let mut bytes = Vec::new();
         writer.write_header_and_tensor_info(&mut bytes).unwrap();
         writer.write_tensor_data(&mut bytes, &[0u8; 8]).unwrap();
-        let file = crate::gguf::GgufFile::from_bytes(bytes.into()).unwrap();
+        let file = crate::gguf::GgufFile::from_bytes(bytes.clone().into()).unwrap();
         let err = reject_bidirectional_lfm2(&file, "lfm2", "Metal", false)
             .expect_err("a classifier model with no flags must refuse too");
+        assert!(err.to_string().contains("bidirectional"), "{err}");
+        let header_only = crate::gguf::GgufFile::from_header_bytes(
+            std::sync::Arc::from(&bytes[..file.data_offset()]),
+            bytes.len() as u64,
+        )
+        .unwrap();
+        let err = reject_bidirectional_lfm2(&header_only, "lfm2", "Metal", false)
+            .expect_err("a header-only classifier model with no flags must refuse too");
         assert!(err.to_string().contains("bidirectional"), "{err}");
     }
 

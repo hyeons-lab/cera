@@ -3176,6 +3176,11 @@ mod webgpu {
                 ctx,
             )
             .map_err(map_err)?;
+            if !model.config().is_causal {
+                return Err(JsError::new(
+                    "WebGpuSession runs causal generation only, and this model is bidirectional (CPU only)",
+                ));
+            }
             // Builds the GPU-resident compressed cache. Must run before the first
             // forward pass — `Session::new` calls it at the same point.
             let compression = crate::to_kv_compression(kv_compression.as_ref());
@@ -3272,11 +3277,12 @@ mod webgpu {
         /// downloads only; a fully cached bundle loads without calling it.
         /// `totalBytes` is `null` when the server doesn't say.
         ///
-        /// **Memory:** the weights go from the store straight into wasm linear
-        /// memory and stay for the session's lifetime. They are never handed to
-        /// JS on the way, which is what keeps this clear of the ~2 GiB ceiling
-        /// on a single JS `ArrayBuffer` that loading through `create` runs into,
-        /// and costs one copy of the model rather than two.
+        /// **Memory:** in a Dedicated Worker (where OPFS `createSyncAccessHandle`
+        /// is available), the GGUF header is probed first and weights stream
+        /// on demand from OPFS into WebGPU buffers without staging the full
+        /// model in wasm linear memory. On the main thread, weights are read
+        /// into wasm linear memory without creating a full JS `ArrayBuffer`
+        /// copy.
         ///
         /// Throws for every reason `create` does, plus bundle download/manifest errors.
         /// A caller wanting a fallback should catch and retry through
@@ -3293,49 +3299,51 @@ mod webgpu {
         ) -> Result<WebGpuSession, JsError> {
             let want_dspark = quant.to_ascii_lowercase().contains("dspark");
             let clean_quant = quant.split(['+', ' ']).next().unwrap_or(&quant).trim();
-            let manifest = if let Some(known) =
+            let (manifest, base_url_owned) = if let Some(known) =
                 cera::bundle::known_bundle_manifest(&bundle_id, clean_quant)
             {
-                known
+                (
+                    known,
+                    "https://huggingface.co/LiquidAI/LeapBundles".to_string(),
+                )
             } else {
                 let manifest_url = cera::bundle::leap_bundles_manifest_url(&bundle_id, clean_quant)
                     .map_err(|e| JsError::new(&e.to_string()))?;
                 let manifest_bytes = repo
                     .read_or_download(&manifest_url, None, on_progress.as_ref())
                     .await?;
-                cera::manifest::Manifest::from_bytes(&manifest_bytes)
-                    .map_err(|e| JsError::new(&format!("parsing `{manifest_url}`: {e:#}")))?
+                let parsed = cera::manifest::Manifest::from_bytes(&manifest_bytes)
+                    .map_err(|e| JsError::new(&format!("parsing `{manifest_url}`: {e:#}")))?;
+                (parsed, manifest_url)
             };
 
-            let base_url = "https://huggingface.co/LiquidAI/LeapBundles";
+            let base_url = base_url_owned.as_str();
             let model_url = crate::bundle::join_url(base_url, &manifest.files.model)
                 .map_err(|e| JsError::new(&e))?;
 
-            // Try direct OPFS -> WebGPU streaming when sync access handle is supported (Web Worker)
-            let session_result = async {
-                let sync = repo
-                    .open_sync_handle(&model_url, None, on_progress.as_ref())
-                    .await?;
+            // Direct OPFS -> WebGPU streaming when sync access handle is supported (Web Worker).
+            // Once a sync handle is opened, any GGUF, WebGPU, or sidecar error is returned
+            // directly rather than falling back to `load_bundle`, which would stage the full
+            // multi-gigabyte GGUF into 32-bit WASM linear memory and OOM-abort the Worker.
+            if let Some(raw_sync) = repo
+                .open_sync_handle(&model_url, None, on_progress.as_ref())
+                .await?
+            {
+                let sync = crate::opfs_source::OpfsSyncHandle::new(raw_sync);
                 console_info(&format!(
                     "[cera-wasm] streaming model weights directly from OPFS to WebGPU for \"{bundle_id}\"..."
                 ));
-                let gguf = match crate::bundle::read_gguf_header_from_sync_handle(&sync) {
-                    Ok(g) => g,
-                    Err(e) => {
-                        sync.close();
-                        return Err(e);
-                    }
-                };
+                let gguf = crate::bundle::read_gguf_header_from_sync_handle(sync.as_raw())?;
                 let gguf_arc = Arc::new(gguf);
-                let tokenizer = Arc::new(
-                    cera::tokenizer::BpeTokenizer::from_gguf(&gguf_arc).map_err(map_err)?,
-                );
+                let tokenizer =
+                    Arc::new(cera::tokenizer::BpeTokenizer::from_gguf(&gguf_arc).map_err(map_err)?);
                 let eos = tokenizer.eos_token();
                 let ctx_size = context_size.unwrap_or(4096) as usize;
                 let opfs_source = crate::opfs_source::OpfsGpuWeightSource::new(
                     sync,
                     Arc::clone(&gguf_arc),
                     ctx_size,
+                    bundle_id.clone(),
                 )?;
                 let ctx = cera::backend::wgpu::GpuContext::new_async()
                     .await
@@ -3347,7 +3355,7 @@ mod webgpu {
                     ctx,
                 )
                 .map_err(map_err)?;
-                opfs_source.close();
+                drop(opfs_source);
 
                 let compression = crate::to_kv_compression(kv_compression.as_ref());
                 model
@@ -3444,73 +3452,54 @@ mod webgpu {
                     session.attach_audio_sidecars(voc_bytes, tok_bytes)?;
                 }
 
-                let mut draft_bytes = None;
-                let draft_rel = manifest
+                let has_draft_spec = manifest
                     .files
                     .draft_model
                     .as_deref()
-                    .filter(|s| !s.trim().is_empty())
-                    .map(|s| s.to_string())
-                    .or_else(|| {
-                        if want_dspark {
-                            cera::bundle::hf::known_companion_dspark_url(&bundle_id, clean_quant)
-                        } else {
-                            None
-                        }
-                    });
-                if let Some(rel) = draft_rel {
-                    let draft_url =
-                        crate::bundle::join_url(base_url, &rel).map_err(|e| JsError::new(&e))?;
-                    draft_bytes = Some(Arc::from(
-                        repo.read_or_download(&draft_url, None, on_progress.as_ref())
-                            .await?,
-                    ));
+                    .is_some_and(|s| !s.trim().is_empty())
+                    || want_dspark;
+                // `gguf_arc` on the OPFS streaming path is header-only, whereas
+                // `DSparkDraftModel::from_gguf` requires the base model's
+                // `token_embd.weight` / `output.weight` payload in `mmap_data()`.
+                // Skip downloading the companion DSpark GGUF into WASM RAM when
+                // it would be rejected anyway, and attach the prompt-lookup
+                // drafter directly.
+                if has_draft_spec {
+                    console_warn(
+                        "[cera-wasm] DSpark companion drafter requires in-memory base embeddings; \
+                         using prompt-lookup speculative decoding on the OPFS streaming path",
+                    );
+                    session.attach_drafter(None, &gguf_arc);
                 }
 
-                if draft_bytes.is_some() || want_dspark {
-                    session.attach_drafter(draft_bytes, &gguf_arc);
-                }
-
-                Ok::<WebGpuSession, JsError>(session)
+                return Ok(session);
             }
-            .await;
 
-            match session_result {
-                Ok(session) => Ok(session),
-                Err(opfs_err) => {
-                    console_info(&format!(
-                        "[cera-wasm] OPFS streaming not available or failed ({opfs_err:?}), falling back to in-memory load"
-                    ));
-                    let parts =
-                        crate::bundle::load_bundle(repo, &bundle_id, &quant, on_progress.as_ref())
-                            .await?;
-                    let mut session = Self::from_model_bytes(
-                        Arc::clone(&parts.model),
-                        context_size,
-                        kv_compression,
-                    )
+            console_info(
+                "[cera-wasm] OPFS sync access handle not available in this context, falling back to in-memory load",
+            );
+            let parts =
+                crate::bundle::load_bundle(repo, &bundle_id, &quant, on_progress.as_ref()).await?;
+            let mut session =
+                Self::from_model_bytes(Arc::clone(&parts.model), context_size, kv_compression)
                     .await?;
-                    session.model_label = format!("{bundle_id} ({quant})");
-                    session.generation_defaults = parts.generation_defaults;
-                    if let Some(profile) = parts.audio_profile {
-                        session.audio_profile = profile;
-                    }
-                    if let Some(mmproj) = parts.multimodal_projector {
-                        session.attach_projector(mmproj)?;
-                    }
-                    if parts.audio_decoder.is_some() || parts.audio_tokenizer.is_some() {
-                        session
-                            .attach_audio_sidecars(parts.audio_decoder, parts.audio_tokenizer)?;
-                    }
-                    if parts.draft_model.is_some() || want_dspark {
-                        let base_gguf = Arc::new(
-                            cera::gguf::GgufFile::from_bytes(parts.model).map_err(map_err)?,
-                        );
-                        session.attach_drafter(parts.draft_model, &base_gguf);
-                    }
-                    Ok(session)
-                }
+            session.model_label = format!("{bundle_id} ({quant})");
+            session.generation_defaults = parts.generation_defaults;
+            if let Some(profile) = parts.audio_profile {
+                session.audio_profile = profile;
             }
+            if let Some(mmproj) = parts.multimodal_projector {
+                session.attach_projector(mmproj)?;
+            }
+            if parts.audio_decoder.is_some() || parts.audio_tokenizer.is_some() {
+                session.attach_audio_sidecars(parts.audio_decoder, parts.audio_tokenizer)?;
+            }
+            if parts.draft_model.is_some() || want_dspark {
+                let base_gguf =
+                    Arc::new(cera::gguf::GgufFile::from_bytes(parts.model).map_err(map_err)?);
+                session.attach_drafter(parts.draft_model, &base_gguf);
+            }
+            Ok(session)
         }
 
         /// Parse audio decoder (depthformer) & detokenizer sidecars and attach them,

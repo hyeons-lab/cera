@@ -50,7 +50,7 @@ fn qk_norm_rope_batch(
 ) {
     let tid = lid.x;
     let start_pos = params[0];
-    // params[1] (n_tokens) is implicit in the dispatch grid.
+    let n_tokens = params[1];
     let n_heads = params[2];
     let n_kv_heads = params[3];
     let head_dim = params[4];
@@ -63,8 +63,12 @@ fn qk_norm_rope_batch(
     let has_qk_norm = params[11];
 
     let heads_per_token = n_heads + n_kv_heads;
-    let token = wid.x / heads_per_token;
-    let head = wid.x % heads_per_token;
+    let tg = get_wid(wid);
+    if tg >= n_tokens * heads_per_token {
+        return;
+    }
+    let token = tg / heads_per_token;
+    let head = tg % heads_per_token;
     let pos = start_pos + token;
     let half_dim = head_dim / 2u;
 

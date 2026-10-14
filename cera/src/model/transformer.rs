@@ -305,13 +305,9 @@ impl WeightRef {
             .start
             .checked_add(start_offset)
             .context("overflow computing absolute start byte for sliced rows")?;
-        let end_abs = start
+        start
             .checked_add(size as u64)
             .context("overflow computing absolute end byte for sliced rows")?;
-        usize::try_from(start)
-            .context("sliced weight start offset exceeds platform pointer width")?;
-        usize::try_from(end_abs)
-            .context("sliced weight end offset exceeds platform pointer width")?;
 
         Ok(Self::new(start, size, self.dtype, num_rows, self.k))
     }
@@ -524,8 +520,8 @@ pub(crate) fn resolve_expert_weight(
     name: &str,
     expert: usize,
 ) -> Result<WeightRef> {
-    let (start, size, m, k, dtype) = gguf.tensor_meta_expert(name, expert)?;
-    Ok(WeightRef::new(start as u64, size, dtype, m, k))
+    let (start, size, m, k, dtype) = gguf.tensor_meta_expert_u64(name, expert)?;
+    Ok(WeightRef::new(start, size, dtype, m, k))
 }
 
 /// Get the raw bytes for a pre-resolved weight.
@@ -3972,6 +3968,17 @@ mod decode_attn_tests {
         // Unaligned k on quantized type
         let w_unaligned = WeightRef::new(3000, 100, DType::Q4_0, 4, 30);
         assert!(w_unaligned.slice_rows(0, 2).is_err());
+
+        // >4 GiB u64 start offset (exercised by 32-bit wasm32 OPFS streaming)
+        let above_4gib: u64 = (u32::MAX as u64) + 1_000_000;
+        let w_high = WeightRef::new(above_4gib, 4 * 128, DType::F16, 4, 64);
+        let s_high = w_high.slice_rows(1, 2).unwrap();
+        assert_eq!(s_high.start, above_4gib + 128);
+        assert_eq!(s_high.size, 256);
+
+        // u64 overflow on start + start_offset rejected
+        let w_u64_ovf = WeightRef::new(u64::MAX - 64, 4 * 128, DType::F16, 4, 64);
+        assert!(w_u64_ovf.slice_rows(1, 2).is_err());
     }
 }
 

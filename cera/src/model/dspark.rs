@@ -376,7 +376,11 @@ impl DSparkDraftModel {
     /// Load a DSpark draft model from paired draft and base GGUF files, resolving base model weights automatically.
     pub fn from_ggufs(draft_gguf: Arc<GgufFile>, base_gguf: Arc<GgufFile>) -> Result<Self> {
         let base_embd_ref = transformer::resolve_weight(&base_gguf, "token_embd.weight")?;
-        let base_output_ref = transformer::resolve_weight(&base_gguf, "output.weight").ok();
+        let base_output_ref = base_gguf
+            .tensors
+            .contains_key("output.weight")
+            .then(|| transformer::resolve_weight(&base_gguf, "output.weight"))
+            .transpose()?;
         Self::from_gguf(draft_gguf, base_gguf, base_embd_ref, base_output_ref)
     }
 
@@ -387,6 +391,27 @@ impl DSparkDraftModel {
         base_embd_ref: WeightRef,
         base_output_ref: Option<WeightRef>,
     ) -> Result<Self> {
+        let base_len = base_gguf.mmap_data().len() as u64;
+        let embd_end = base_embd_ref
+            .start
+            .checked_add(base_embd_ref.size as u64)
+            .context("base token_embd.weight offset overflow")?;
+        ensure!(
+            embd_end <= base_len,
+            "base token_embd.weight [{}, {embd_end}) extends beyond base GGUF buffer ({base_len} bytes)",
+            base_embd_ref.start
+        );
+        if let Some(out_ref) = &base_output_ref {
+            let out_end = out_ref
+                .start
+                .checked_add(out_ref.size as u64)
+                .context("base output.weight offset overflow")?;
+            ensure!(
+                out_end <= base_len,
+                "base output.weight [{}, {out_end}) extends beyond base GGUF buffer ({base_len} bytes)",
+                out_ref.start
+            );
+        }
         let config = DSparkConfig::from_gguf(&draft_gguf, base_embd_ref.m, base_embd_ref.k)?;
         let mut layers = Vec::with_capacity(config.num_layers);
 
@@ -1048,30 +1073,33 @@ impl crate::model::gpu_weight_source::GpuWeightSource for DSparkGpuWeightSource 
     fn rope_freqs(&self) -> Option<&[f32]> {
         None
     }
-    fn embedding_tensor(&self) -> Result<crate::tensor::Tensor> {
-        self.dspark.base_gguf.get_tensor("token_embd.weight")
+    fn embedding_mmap_weight(
+        &self,
+        _gguf_arc: &Arc<GgufFile>,
+    ) -> Result<crate::model::weights::MmapWeight> {
+        crate::model::weights::MmapWeight::from_gguf(&self.dspark.base_gguf, "token_embd.weight")
     }
-    fn embedding_tensor_data(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
-        self.dspark
-            .base_gguf
-            .tensor_data("token_embd.weight")
-            .map(std::borrow::Cow::Borrowed)
+    fn output_mmap_weight(
+        &self,
+        _gguf_arc: &Arc<GgufFile>,
+    ) -> Result<crate::model::weights::MmapWeight> {
+        crate::model::weights::MmapWeight::from_gguf(&self.dspark.base_gguf, "output.weight")
     }
-    fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]> {
+    fn weight_bytes(&self, wref: &WeightRef) -> Result<std::borrow::Cow<'_, [u8]>> {
         let bytes = if self.is_base_weight(wref) {
             transformer::weight_data(&self.dspark.base_gguf, wref)
         } else {
             transformer::weight_data(&self.dspark.gguf, wref)
         };
-        std::borrow::Cow::Borrowed(bytes)
+        Ok(std::borrow::Cow::Borrowed(bytes))
     }
-    fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32> {
+    fn dequantize_weight(&self, wref: &WeightRef) -> Result<Vec<f32>> {
         let gguf = if self.is_base_weight(wref) {
             &self.dspark.base_gguf
         } else {
             &self.dspark.gguf
         };
-        transformer::dequantize_weight(gguf, wref)
+        Ok(transformer::dequantize_weight(gguf, wref))
     }
     fn output_ref(&self) -> Option<&WeightRef> {
         self.dspark.base_output_ref.as_ref()
@@ -1624,5 +1652,20 @@ mod tests {
         // drafter must correctly truncate the unaccepted speculative draft token and sync up to len 5
         assert_eq!(drafter.synced_pos, 5);
         assert_eq!(drafter.state.as_ref().unwrap().seq_len, 5);
+    }
+
+    #[test]
+    fn dspark_from_gguf_rejects_header_only_base_gguf() {
+        let draft_gguf = empty_gguf();
+        let header_only_base = empty_gguf();
+        let base_embd_ref = transformer::WeightRef::new(4096, 4 * 32 * 4, DType::F32, 4, 32);
+        let err = DSparkDraftModel::from_gguf(draft_gguf, header_only_base, base_embd_ref, None)
+            .err()
+            .expect("header-only base_gguf must be rejected cleanly")
+            .to_string();
+        assert!(
+            err.contains("extends beyond base GGUF buffer"),
+            "unexpected error: {err}"
+        );
     }
 }

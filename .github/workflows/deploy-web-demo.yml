@@ -224,7 +224,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - uses: taiki-e/install-action@v2
         with:
-          tool: wasm-pack@0.14.0
+          tool: wasm-pack@0.15.0
       - uses: ./.github/actions/install-binaryen
       - uses: extractions/setup-just@v4
       - uses: subosito/flutter-action@v2

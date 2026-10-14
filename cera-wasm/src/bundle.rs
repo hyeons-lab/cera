@@ -424,14 +424,17 @@ impl BundleRepo {
         read_file(&handle).await
     }
 
-    /// Ensure `url` is cached in OPFS and open a synchronous access handle to it.
+    /// Ensure `url` is cached in OPFS and open a synchronous access handle to it
+    /// when `createSyncAccessHandle` is available in the current thread context
+    /// (Dedicated Web Worker). Returns `Ok(None)` on the main thread where sync
+    /// access handles are unsupported.
     #[allow(dead_code)]
     pub(crate) async fn open_sync_handle(
         &self,
         url: &str,
         expected_sha256: Option<&str>,
         on_progress: Option<&Function>,
-    ) -> Result<FileSystemSyncAccessHandle, JsError> {
+    ) -> Result<Option<FileSystemSyncAccessHandle>, JsError> {
         self.ensure_cached(url, expected_sha256, on_progress)
             .await?;
         let Some(handle) = self.file_handle(url, false).await? else {
@@ -441,14 +444,17 @@ impl BundleRepo {
             )));
         };
         if !has_sync_access(&handle) {
-            return Err(JsError::new(
-                "FileSystemSyncAccessHandle is not supported in this thread context (must run inside Web Worker)",
-            ));
+            return Ok(None);
         }
-        let sync = JsFuture::from(handle.create_sync_access_handle())
-            .await
-            .map_err(|e| js_err("opening OPFS sync handle", e))?;
-        Ok(sync.unchecked_into())
+        match JsFuture::from(handle.create_sync_access_handle()).await {
+            Ok(sync) => Ok(Some(sync.unchecked_into())),
+            Err(e) => {
+                crate::console_info(&format!(
+                    "[cera-wasm] OPFS createSyncAccessHandle unavailable ({e:?}), falling back to in-memory read"
+                ));
+                Ok(None)
+            }
+        }
     }
 
     /// Whether the cached entry for `url` can be reused.
@@ -1322,16 +1328,39 @@ pub fn read_gguf_header_from_sync_handle(
     sync: &FileSystemSyncAccessHandle,
 ) -> Result<cera::gguf::GgufFile, JsError> {
     let file_size = sync.get_size().map_err(|e| js_err("sizing GGUF file", e))? as u64;
-    let header_read_size = ((4 * 1024 * 1024) as u64).min(file_size) as usize;
-    let mut header_buf = vec![0u8; header_read_size];
-    let opts = FileSystemReadWriteOptions::new();
-    opts.set_at(0.0);
-    let read = sync
-        .read_with_u8_array_and_options(&mut header_buf, &opts)
-        .map_err(|e| js_err("reading GGUF header from OPFS", e))?;
-    header_buf.truncate(read as usize);
-    cera::gguf::GgufFile::from_header_bytes(Arc::from(header_buf.into_boxed_slice()), file_size)
-        .map_err(|e| JsError::new(&format!("parsing GGUF header from OPFS: {e:#}")))
+    // Most GGUF headers (metadata + tensor directory) fit in 4 MiB, but models with large
+    // tokenizers / merges tables (e.g. LFM2.5-2.6B at ~7.84 MiB, Qwen3.5 at ~10.44 MiB)
+    // exceed 4 MiB. Probe in escalating sizes up to 64 MiB so small headers do not allocate
+    // more than 4 MiB while large-vocabulary headers still parse without buffering the full file.
+    const PROBE_CAP_SIZES: [u64; 3] = [4 * 1024 * 1024, 16 * 1024 * 1024, 64 * 1024 * 1024];
+    let mut last_err = None;
+    for cap in PROBE_CAP_SIZES {
+        let header_read_size = cap.min(file_size) as usize;
+        let mut header_buf = vec![0u8; header_read_size];
+        let opts = FileSystemReadWriteOptions::new();
+        opts.set_at(0.0);
+        let read = sync
+            .read_with_u8_array_and_options(&mut header_buf, &opts)
+            .map_err(|e| js_err("reading GGUF header from OPFS", e))? as usize;
+        header_buf.truncate(read);
+        let reached_eof = (read as u64) >= file_size;
+        match cera::gguf::GgufFile::from_header_bytes(
+            Arc::from(header_buf.into_boxed_slice()),
+            file_size,
+        ) {
+            Ok(gguf) => return Ok(gguf),
+            Err(e) => {
+                last_err = Some(e);
+                if reached_eof {
+                    break;
+                }
+            }
+        }
+    }
+    Err(JsError::new(&format!(
+        "parsing GGUF header from OPFS: {:#}",
+        last_err.expect("PROBE_CAP_SIZES is non-empty")
+    )))
 }
 
 fn set(obj: &js_sys::Object, key: &str, value: &JsValue) -> Result<(), JsError> {

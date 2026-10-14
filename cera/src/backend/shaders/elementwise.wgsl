@@ -5,7 +5,8 @@
 //   @binding(1) b: array<f32>  (read-only)
 //   @binding(2) params: vec2<u32>  (n, unused)
 //
-// Dispatch: (ceil(n / 256), 1, 1) workgroups
+// Dispatch: (ceil(n / 256), 1, 1) workgroups, or 2-D via
+// `kv_shift_workgroups(n)` when ceil(n / 256) > 65535.
 
 @group(0) @binding(0) var<storage, read_write> a: array<f32>;
 @group(0) @binding(1) var<storage, read> b: array<f32>;
@@ -13,7 +14,7 @@
 
 @compute @workgroup_size(256, 1, 1)
 fn add_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    let i = gid.x + gid.y * (65535u * 256u);
     let n = params.x;
     if i >= n { return; }
     a[i] = a[i] + b[i];
@@ -24,7 +25,7 @@ fn add_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
 // other arch passes s = 1.0, making this identical to `add_inplace`.
 @compute @workgroup_size(256, 1, 1)
 fn scaled_add_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    let i = gid.x + gid.y * (65535u * 256u);
     let n = params.x;
     if i >= n { return; }
     a[i] = a[i] + bitcast<f32>(params.y) * b[i];
@@ -32,7 +33,7 @@ fn scaled_add_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(256, 1, 1)
 fn mul_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    let i = gid.x + gid.y * (65535u * 256u);
     let n = params.x;
     if i >= n { return; }
     a[i] = a[i] * b[i];
@@ -40,7 +41,7 @@ fn mul_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
 
 @compute @workgroup_size(256, 1, 1)
 fn silu_mul_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
-    let i = gid.x;
+    let i = gid.x + gid.y * (65535u * 256u);
     let n = params.x;
     if i >= n { return; }
     let g = a[i];

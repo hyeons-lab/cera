@@ -107,27 +107,51 @@ pub trait GpuWeightSource {
         None
     }
 
-    /// Token embedding tensor metadata (`token_embd.weight`).
-    fn embedding_tensor(&self) -> Result<crate::tensor::Tensor> {
-        self.gguf().get_tensor("token_embd.weight")
+    /// Why the GPU backends cannot run this model's rotary or attention scheme,
+    /// if they cannot.
+    #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
+    fn gpu_unsupported_reason(&self) -> Option<String> {
+        None
     }
 
-    /// Token embedding tensor raw byte slice.
-    fn embedding_tensor_data(&self) -> Result<std::borrow::Cow<'_, [u8]>> {
-        self.gguf()
-            .tensor_data("token_embd.weight")
-            .map(std::borrow::Cow::Borrowed)
+    /// Longest context the GPU backends can serve (for example, the
+    /// attention temperature scaling floor).
+    #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
+    fn gpu_context_cap(&self) -> Option<usize> {
+        None
+    }
+
+    /// Lazy-dequantized `MmapWeight` handle for `token_embd.weight`.
+    ///
+    /// Sources backed by a full in-memory/mmap GGUF borrow directly from `gguf_arc`;
+    /// streaming sources (such as OPFS in WebAssembly) or paired draft-model sources
+    /// override this to read from the backing store or base GGUF.
+    #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
+    fn embedding_mmap_weight(
+        &self,
+        gguf_arc: &std::sync::Arc<GgufFile>,
+    ) -> Result<crate::model::weights::MmapWeight> {
+        crate::model::weights::MmapWeight::from_gguf(gguf_arc, "token_embd.weight")
+    }
+
+    /// Lazy-dequantized `MmapWeight` handle for `output.weight` when untied.
+    #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
+    fn output_mmap_weight(
+        &self,
+        gguf_arc: &std::sync::Arc<GgufFile>,
+    ) -> Result<crate::model::weights::MmapWeight> {
+        crate::model::weights::MmapWeight::from_gguf(gguf_arc, "output.weight")
     }
 
     // ── Raw quantized-weight access (GGUF mmap handles) ─────────────────────
     // The metal loader maps weights by absolute `wref.start` offset into its own
     // mmap buffer, so it needs neither the byte slice nor a full dequantize.
     #[cfg_attr(not(any(feature = "gpu", feature = "hexagon")), allow(dead_code))]
-    fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]>;
+    fn weight_bytes(&self, wref: &WeightRef) -> Result<std::borrow::Cow<'_, [u8]>>;
     // The metal loader references weights via mmap byte offsets, or dequantizes
     // non-native quant dtypes to F32 buffers during upload.
     #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
-    fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32>;
+    fn dequantize_weight(&self, wref: &WeightRef) -> Result<Vec<f32>>;
 
     // ── Per-layer / global weight refs ─────────────────────────────────────
     /// Separate output projection (`output.weight`) when present; `None` ⇒ the

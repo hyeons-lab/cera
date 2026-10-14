@@ -731,9 +731,16 @@ impl GgufFile {
 
     /// Parse GGUF metadata and tensor index from a header byte buffer, given the total file size on disk.
     /// Used for streaming weight loaders (e.g. browser OPFS or chunked network loaders) where the full
-    /// model payload is not buffered in RAM.
+    /// model payload is not buffered in RAM. Releases `header_bytes` after parsing so the returned
+    /// `GgufFile` holds only the parsed metadata and tensor descriptors (`mmap_data().is_empty()`).
     pub fn from_header_bytes(header_bytes: Arc<[u8]>, file_size: u64) -> Result<Self> {
-        Self::from_backing_with_file_size(Backing::Owned(header_bytes), file_size)
+        let mut gguf = Self::from_backing_with_file_size(Backing::Owned(header_bytes), file_size)?;
+        let empty: Arc<[u8]> = Arc::from([]);
+        let ptr =
+            NonNull::new(empty.as_ptr() as *mut u8).expect("slice pointer is always non-null");
+        gguf.data = SafeDataPtr { ptr, len: 0 };
+        gguf._backing = Backing::Owned(empty);
+        Ok(gguf)
     }
 
     /// Core parse: take a backing, walk the header + tensor infos, and
@@ -1165,7 +1172,32 @@ impl GgufFile {
         name: &str,
         expert: usize,
     ) -> Result<(usize, usize, usize, usize, DType)> {
-        let (info, range) = self.tensor_range(name)?;
+        let _ = self.tensor_range(name)?;
+        let (start, slice_bytes, ne1, ne0, dtype) = self.tensor_meta_expert_u64(name, expert)?;
+        let start = usize::try_from(start)
+            .with_context(|| format!("tensor {name} expert {expert} offset overflow"))?;
+        Ok((start, slice_bytes, ne1, ne0, dtype))
+    }
+
+    /// Resolve a single expert's `[ne1, ne0]` slice within a rank-3 `[ne0, ne1, n_expert]`
+    /// stacked expert tensor (`ffn_{gate,up,down}_exps.weight`) using 64-bit byte offsets
+    /// directly from header metadata, without requiring tensor payload bytes to be resident
+    /// in `self.data`.
+    pub fn tensor_meta_expert_u64(
+        &self,
+        name: &str,
+        expert: usize,
+    ) -> Result<(u64, usize, usize, usize, DType)> {
+        let info = self
+            .tensors
+            .get(name)
+            .with_context(|| format!("tensor not found: {name}"))?;
+        ensure!(
+            info.size_bytes > 0,
+            "tensor {name} has unsupported GGML type {} ({})",
+            info.ggml_type_id,
+            ggml_type_name(info.ggml_type_id)
+        );
         let [ne0, ne1, n_expert] = match info.shape[..] {
             [ne0, ne1, n_expert] => [ne0, ne1, n_expert],
             _ => bail!(
@@ -1180,17 +1212,20 @@ impl GgufFile {
 
         Self::ensure_whole_blocks(name, info.dtype, ne0)?;
         let slice_bytes = tensor_data_size(&[ne0, ne1], info.dtype)?;
-        let start = expert
-            .checked_mul(slice_bytes)
-            .and_then(|off| range.start.checked_add(off))
+        let slice_bytes_u64 = slice_bytes as u64;
+        let tensor_end = info
+            .offset
+            .checked_add(info.size_bytes as u64)
+            .with_context(|| format!("tensor {name} end offset overflow"))?;
+        let start = (expert as u64)
+            .checked_mul(slice_bytes_u64)
+            .and_then(|off| info.offset.checked_add(off))
             .with_context(|| format!("tensor {name} expert {expert} offset overflow"))?;
         let end = start
-            .checked_add(slice_bytes)
+            .checked_add(slice_bytes_u64)
             .with_context(|| format!("tensor {name} expert {expert} end offset overflow"))?;
-        // The stacked tensor's own bound, not the buffer's: a short final slice
-        // would otherwise read into whatever tensor follows it.
         ensure!(
-            end <= range.end,
+            end <= tensor_end,
             "tensor {name} expert {expert} slice extends past the tensor"
         );
 
@@ -1201,7 +1236,7 @@ impl GgufFile {
     /// one row at a time in whole blocks, so such a matrix cannot be read (its rows would
     /// start mid-block); an older converter wrote them when it checked only the element count.
     /// Refusing here gives a message naming the tensor instead of a panic at first use.
-    pub(crate) fn ensure_whole_blocks(name: &str, dtype: DType, row_len: usize) -> Result<()> {
+    pub fn ensure_whole_blocks(name: &str, dtype: DType, row_len: usize) -> Result<()> {
         ensure!(
             row_len.is_multiple_of(dtype.block_size()),
             "{name}: rows of {row_len} are not a whole number of {dtype:?} blocks ({}); the file \
@@ -1746,6 +1781,60 @@ mod tests {
         assert_eq!(bytes.len(), trimmed.len() + 28);
         assert_eq!(bytes[..trimmed.len()], trimmed[..]);
     }
+
+    #[test]
+    fn from_header_bytes_accepts_valid_header_and_rejects_out_of_bounds_or_overflowing_tensors() {
+        let full_bytes = GgufBuilder::new()
+            .tensor_f32("w", &[4], &[1.0, 2.0, 3.0, 4.0])
+            .build_bytes();
+        let full = GgufFile::from_bytes(Arc::from(full_bytes.clone().into_boxed_slice())).unwrap();
+
+        // Even when passed the full buffer as a probe, `from_header_bytes` releases the probe
+        // buffer after parsing so `mmap_data()` is empty and `tensor_data` fails closed.
+        let parsed = GgufFile::from_header_bytes(
+            Arc::from(full_bytes.clone().into_boxed_slice()),
+            full_bytes.len() as u64,
+        )
+        .expect("valid header-only GGUF must parse");
+        assert_eq!(parsed.tensors["w"].size_bytes, 16);
+        assert!(parsed.mmap_data().is_empty());
+        assert!(parsed.tensor_data("w").is_err());
+
+        // A file_size smaller than `data_offset + size_bytes` must fail closed.
+        let header_only: Arc<[u8]> = Arc::from(&full_bytes[..full.data_offset()]);
+        let short_err = match GgufFile::from_header_bytes(
+            Arc::clone(&header_only),
+            (full.data_offset() + 8) as u64,
+        ) {
+            Ok(_) => panic!("expected tensor extending beyond file_size to fail"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            short_err.contains("extends beyond file"),
+            "unexpected error: {short_err}"
+        );
+
+        // A relative tensor offset that overflows u64 when added to data_offset must fail closed.
+        let mut raw_ovf = Vec::new();
+        raw_ovf.extend_from_slice(b"GGUF");
+        raw_ovf.extend_from_slice(&3u32.to_le_bytes());
+        raw_ovf.extend_from_slice(&1u64.to_le_bytes()); // 1 tensor
+        raw_ovf.extend_from_slice(&0u64.to_le_bytes()); // 0 kv
+        raw_ovf.extend_from_slice(&1u64.to_le_bytes()); // name len = 1
+        raw_ovf.extend_from_slice(b"w");
+        raw_ovf.extend_from_slice(&1u32.to_le_bytes()); // rank 1
+        raw_ovf.extend_from_slice(&4u64.to_le_bytes()); // dim[0] = 4
+        raw_ovf.extend_from_slice(&0u32.to_le_bytes()); // F32
+        raw_ovf.extend_from_slice(&u64::MAX.to_le_bytes()); // relative offset = u64::MAX
+        let overflow_err = match GgufFile::from_header_bytes(Arc::from(raw_ovf), u64::MAX) {
+            Ok(_) => panic!("expected u64::MAX relative offset to fail"),
+            Err(e) => format!("{e:#}"),
+        };
+        assert!(
+            overflow_err.contains("offset overflow"),
+            "unexpected error: {overflow_err}"
+        );
+    }
 }
 
 #[cfg(test)]
@@ -1829,5 +1918,72 @@ mod expert_slice_tests {
         let gguf = gguf_with_expert_tensor(64, 32, 8, 0);
         let err = gguf.tensor_meta("exps").unwrap_err().to_string();
         assert!(err.contains("unexpected rank"), "{err}");
+    }
+
+    /// `tensor_meta_expert_u64` resolves expert slices from header-only GGUFs
+    /// (`data.len == 0`, as in OPFS streaming) and at offsets beyond 4 GiB
+    /// (`u32::MAX`, which would overflow 32-bit `usize` on `wasm32`).
+    #[test]
+    fn tensor_meta_expert_u64_resolves_header_only_and_above_4gib() {
+        let (ne0, ne1, n_expert) = (64usize, 32usize, 8usize);
+        let slice_bytes = ne0 * ne1 * 4;
+        let total_bytes = slice_bytes * n_expert;
+        let base_offset: u64 = 5_000_000_000; // > 4 GiB
+
+        let empty: Arc<[u8]> = Arc::from(Vec::<u8>::new().into_boxed_slice());
+        let ptr = NonNull::new(empty.as_ptr() as *mut u8).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "exps".to_string(),
+            TensorInfo {
+                name: "exps".to_string(),
+                shape: vec![ne0, ne1, n_expert],
+                dtype: DType::F32,
+                offset: base_offset,
+                size_bytes: total_bytes,
+                ggml_type_id: GGML_TYPE_F32,
+            },
+        );
+        tensors.insert(
+            "exps_unmapped".to_string(),
+            TensorInfo {
+                name: "exps_unmapped".to_string(),
+                shape: vec![ne0, ne1, n_expert],
+                dtype: DType::F32,
+                offset: base_offset,
+                size_bytes: 0,
+                ggml_type_id: 3, // Q5_0 (unmapped sentinel)
+            },
+        );
+        let gguf = GgufFile {
+            metadata: HashMap::new(),
+            tensors,
+            data: SafeDataPtr { ptr, len: 0 },
+            _backing: Backing::Owned(empty),
+            data_offset: 4096,
+        };
+
+        for e in 0..n_expert {
+            let (start, size, rows, cols, dtype) = gguf.tensor_meta_expert_u64("exps", e).unwrap();
+            assert_eq!(start, base_offset + (e as u64) * (slice_bytes as u64));
+            assert_eq!(size, slice_bytes);
+            assert_eq!((rows, cols), (ne1, ne0));
+            assert_eq!(dtype, DType::F32);
+        }
+
+        let err = gguf
+            .tensor_meta_expert_u64("exps", n_expert)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("out of range"), "{err}");
+
+        let unmapped_err = gguf
+            .tensor_meta_expert_u64("exps_unmapped", 0)
+            .unwrap_err()
+            .to_string();
+        assert!(
+            unmapped_err.contains("unsupported GGML type"),
+            "{unmapped_err}"
+        );
     }
 }
