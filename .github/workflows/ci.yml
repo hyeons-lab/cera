@@ -493,6 +493,43 @@ jobs:
             --test metal_kv_shift_oracle \
             --test metal_params_layout \
             --test slang_multitarget_parity
+      # RoPE table/direct bit-identity under optimization. The sincos fusion this
+      # guards against only happens in optimized builds, so every debug leg passes
+      # with or without the single-definition fix; this Apple release step is the
+      # pin that observes it. Name filter with presence and execution
+      # guards (substring match constrained by COUNT==1, not `--exact`):
+      # a rename or deletion must fail here rather than silently
+      # un-covering the contract (a family filter would keep passing on its other
+      # matches, and also sweeps in unrelated substring matches like the grammar
+      # tests), and an `#[ignore]` must fail too (`--list` counts ignored tests,
+      # and the run then exits 0 while executing nothing).
+      - name: RoPE agreement (release lib)
+        run: |
+          set -euo pipefail
+          PIN=test_rope_table_matches_direct
+          # Separate the list invocation from grep -c so compilation failures
+          # abort immediately under `set -e` rather than being swallowed into COUNT=0.
+          # `|| true`: grep -c exits 1 on zero matches, which under `set -e`
+          # would abort before the annotation below could explain why.
+          LIST=$(cargo test -p cera --release --lib -- --list "$PIN")
+          COUNT=$(grep -c ': test$' <<< "$LIST" || true)
+          if [ "$COUNT" -ne 1 ]; then
+            echo "::error::expected 1 RoPE agreement test, found $COUNT: did it get renamed or deleted? Update the filter in this step." >&2
+            exit 1
+          fi
+          # Capture output while preserving the test exit status. If the test fails,
+          # print the full output so the panic location and value diffs are visible.
+          OUT=
+          if ! OUT=$(cargo test -p cera --release --lib -- "$PIN" 2>&1); then
+            echo "$OUT"
+            echo "::error::RoPE agreement test failed bit-identity verification under release optimization." >&2
+            exit 1
+          fi
+          echo "$OUT"
+          if ! grep -q 'test result: ok. 1 passed; 0 failed; 0 ignored' <<< "$OUT"; then
+            echo "::error::RoPE agreement test did not execute exactly once (ignored or filtered?). Failing the pin." >&2
+            exit 1
+          fi
       # The cross-backend microbench needs `gpu` AND `metal` together: no
       # other leg unifies that combo, so without this step its file
       # compiles cfg'd-out (empty) everywhere and the code rots while
