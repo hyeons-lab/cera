@@ -22,13 +22,11 @@ import sys
 
 ROOT = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 SRC = open(os.path.join(ROOT, "cera/src/backend/shaders/spirv/gemm_stream_q4_0_k64.slang")).read()
-OUT = sys.argv[1] if len(sys.argv) > 1 else "ablate"
-os.makedirs(OUT, exist_ok=True)
 
 # ---- register-blocked rewrite: R weight rows per thread, 256/R threads per workgroup ----
-def gen(R, name, dequant=True):
+def gen(R, name, dequant=True, header=''):
     T = 256 // R
-    L = []
+    L = [header] if header else []
     L.append('''struct StreamParams {
     uint m;
     uint k;
@@ -110,6 +108,98 @@ groupshared half4 sh_b[64 * 8];
     open(name, 'w').write('\n'.join(L) + '\n')
 
 
+# ---- fused gate/up GEMM: one B tile, two weight rows per thread, SiLU(gate) * up epilogue ----
+def gen_gateup(name, header="", threads=256):
+    """One thread owns row `gid.x * threads + lid` of both the gate and the up weights."""
+    stage = 512 // threads  # half4 of the 64 x 32 B tile each thread stages
+    L = [header] if header else []
+    L.append("""struct StreamParams {
+    uint m;
+    uint k;
+    uint n_valid;
+    uint n_pad;
+    uint y_stride;
+};
+
+[[vk::binding(0, 0)]] StructuredBuffer<uint> gate_q;
+[[vk::binding(1, 0)]] StructuredBuffer<uint> gate_d;
+[[vk::binding(2, 0)]] StructuredBuffer<uint> up_q;
+[[vk::binding(3, 0)]] StructuredBuffer<uint> up_d;
+[[vk::binding(4, 0)]] StructuredBuffer<half> src_b;
+[[vk::binding(5, 0)]] RWStructuredBuffer<float> dst;
+[[vk::binding(6, 0)]] StructuredBuffer<StreamParams> paramsBuf;
+
+groupshared half4 sh_b[64 * 8];
+""")
+    L.append(f"[numthreads({threads}, 1, 1)]")
+    L.append("void main(uint3 gid : SV_GroupID, uint lid : SV_GroupThreadID) {")
+    L.append("    let P = paramsBuf[0];")
+    L.append(f"    uint row = gid.x * {threads}u + lid;")
+    L.append("    uint col_base = gid.y * 32u;")
+    L.append("    uint rrow = row < P.m ? row : 0u;")
+    L.append("    bool row_valid = row < P.m;")
+    for i in range(8):
+        L.append(f"    half4 g{i} = half4(0.0h);")
+        L.append(f"    half4 u{i} = half4(0.0h);")
+    L.append("    uint n_kb = P.k / 64u;")
+    L.append("    for (uint kb = 0u; kb < n_kb; kb++) {")
+    L.append(f"        for (uint s = 0u; s < {stage}u; s++) {{")
+    L.append(f"            uint e = lid * {stage}u + s;")
+    L.append("""            uint kk = e / 8u;
+            uint g = e % 8u;
+            uint b = (kb * 64u + kk) * P.n_pad + col_base + g * 4u;
+            sh_b[kk * 8u + g] = half4(src_b[b], src_b[b + 1u], src_b[b + 2u], src_b[b + 3u]);
+        }
+        GroupMemoryBarrierWithGroupSync();
+        uint pdg = gate_d[kb * P.m + rrow];
+        uint pdu = up_d[kb * P.m + rrow];
+        half dwg0 = half(f16tof32(pdg & 0xFFFFu));
+        half dwg1 = half(f16tof32(pdg >> 16u));
+        half dwu0 = half(f16tof32(pdu & 0xFFFFu));
+        half dwu1 = half(f16tof32(pdu >> 16u));
+        for (uint p = 0u; p < 8u; p++) {
+            uint pqg = gate_q[(kb * 8u + p) * P.m + rrow];
+            uint pqu = up_q[(kb * 8u + p) * P.m + rrow];
+            uint glo = pqg & 0xFFFFu;
+            uint ghi = pqg >> 16u;
+            uint ulo = pqu & 0xFFFFu;
+            uint uhi = pqu >> 16u;
+            half dwg = (p < 4u ? dwg0 : dwg1);
+            half dwu = (p < 4u ? dwu0 : dwu1);
+            uint kl0 = p * 8u;""")
+    for t in range(8):
+        part = "lo" if t < 4 else "hi"
+        sh = (t % 4) * 4
+        L.append("            {")
+        L.append(f"                uint b = kl0 * 8u + {t * 8}u;")
+        for i in range(8):
+            L.append(f"                half4 b{i} = sh_b[b + {i}u];")
+        for who, w in (("g", "dwg"), ("u", "dwu")):
+            nib = f"({who}{part} >> {sh}u) & 0xFu" if sh else f"{who}{part} & 0xFu"
+            L.append(f"                half w{who} = (half({nib}) - half(8.0h)) * {w};")
+            for i in range(8):
+                L.append(f"                {who}{i} += b{i} * w{who};")
+        L.append("            }")
+    L.append("        }")
+    L.append("        GroupMemoryBarrierWithGroupSync();")
+    L.append("    }")
+    L.append("    if (!row_valid) {")
+    L.append("        return;")
+    L.append("    }")
+    for i in range(8):
+        L.append(f"    uint c{i} = col_base + {4 * i}u;")
+        L.append(f"    if (c{i} < P.n_valid) {{")
+        L.append(f"        float4 cg = clamp(float4(g{i}), float4(-80.0), float4(80.0));")
+        L.append(f"        float4 o = (cg / (float4(1.0) + exp(-cg))) * float4(u{i});")
+        L.append(f"        dst[c{i} * P.y_stride + row] = o.x;")
+        L.append(f"        if (c{i} + 1u < P.n_valid) {{ dst[(c{i} + 1u) * P.y_stride + row] = o.y; }}")
+        L.append(f"        if (c{i} + 2u < P.n_valid) {{ dst[(c{i} + 2u) * P.y_stride + row] = o.z; }}")
+        L.append(f"        if (c{i} + 3u < P.n_valid) {{ dst[(c{i} + 3u) * P.y_stride + row] = o.w; }}")
+        L.append("    }")
+    L.append("}")
+    open(name, "w").write("\n".join(L) + "\n")
+
+
 # ---- ablations of the production source: each removes one component ----
 def nodq(s):
     return s.replace("half w = (half(nib) - half(8.0h)) * dw;", "half w = dw;")
@@ -161,20 +251,67 @@ VARIANTS = {
     "e1_magic": magic,
     "e2_stage64": stage64,
 }
-for name, f in VARIANTS.items():
-    open(os.path.join(OUT, name + ".slang"), "w").write(f(SRC))
-os.chdir(OUT)
-gen(1, "r1.slang")
-gen(2, "r2.slang")
-gen(4, "r4.slang")
-gen(2, "r2_nodq.slang", False)
+if __name__ == "__main__":
+    GATEUP_THREADS = int(os.environ.get("GATEUP_THREADS", "128"))
+    slangc = os.environ.get("SLANGC") or shutil.which("slangc") or os.path.expanduser("~/.local/slang/bin/slangc")
+    has_slangc = bool(slangc and os.path.isfile(slangc) and os.access(slangc, os.X_OK))
+    if "-h" in sys.argv or "--help" in sys.argv:
+        print(__doc__.strip())
+        sys.exit(0)
 
-slangc = os.environ.get("SLANGC") or shutil.which("slangc") or os.path.expanduser("~/.local/slang/bin/slangc")
-if not (os.path.isfile(slangc) and os.access(slangc, os.X_OK)):
-    print(f"note: slangc not found at {slangc}; generated .slang files without compiling .spv")
-    sys.exit(0)
-for f in sorted(os.listdir(".")):
-    if f.endswith(".slang"):
-        r = subprocess.run([slangc, f, "-target", "spirv", "-O3", "-entry", "main", "-stage", "compute", "-o", f[:-6] + ".spv"],
-                           capture_output=True, text=True)
-        print(("ok   " if r.returncode == 0 else "FAIL ") + f)
+    if "--production" in sys.argv:
+        prod = os.path.join(ROOT, "cera/src/backend/shaders/spirv")
+        hdr_r2 = """// Streaming Q4_0 prefill GEMM, k-slice-64, two weight rows per thread. GENERATED by
+// scripts/gemm-ablate/gen.py --production; edit the generator, not this file.
+//
+// Twin of `gemm_stream_q4_0_k64.slang` with the same five bindings, parameter block, entry (`main`)
+// and grid (ceil(m/256), n_pad/32), and bit-exact results, but a workgroup is 128 threads and each
+// thread owns two rows (row = group*256 + lid and +128) over the same 32 columns. The B tile is read
+// from shared memory once per k and feeds two rows, which halves the shared-memory reads per FMA:
+// those were 43% of the one-row kernel's time on an Adreno 830. Measured 5 to 20% faster at 64 or
+// more workgroups (m/256 * n_pad/32); below that the smaller workgroups under-fill the GPU and the
+// one-row kernel wins, so the host picks by workgroup count (`gemm_stream_two_row`).
+"""
+        hdr_gu = f"""// Fused gate/up streaming Q4_0 prefill GEMM with a SiLU epilogue, k-slice-64. GENERATED by
+// scripts/gemm-ablate/gen.py --production; edit the generator, not this file.
+//
+// One thread owns the same row of the gate and the up weights over 32 columns: both read each B
+// tile from shared memory once, and the epilogue stores silu(gate) * up (gate clamped to +-80, as
+// `silu_mul_inplace` does) instead of two projections and a separate pass. Workgroups of
+// {GATEUP_THREADS} threads cover {GATEUP_THREADS} rows: grid (ceil(m/{GATEUP_THREADS}), n_pad/32). The output has
+// the layout of the gate GEMM's (dst[col * y_stride + row]). Bindings: 0/1 gate q/d, 2/3 up q/d,
+// 4 B (f16, k-major), 5 dst, 6 params.
+"""
+        os.chdir(prod)
+        gen(2, "gemm_stream_q4_0_k64_r2.slang", True, hdr_r2)
+        gen_gateup("gemm_stream_q4_0_k64_gateup.slang", hdr_gu, GATEUP_THREADS)
+        if has_slangc:
+            for f in ("gemm_stream_q4_0_k64_r2", "gemm_stream_q4_0_k64_gateup"):
+                r = subprocess.run([slangc, f + ".slang", "-target", "spirv", "-O3", "-entry", "main", "-stage", "compute", "-o", f + ".spv"],
+                                   capture_output=True, text=True)
+                print(("ok   " if r.returncode == 0 else "FAIL ") + f, r.stderr[:300])
+        else:
+            print(f"note: slangc not found at {slangc}; generated production .slang without compiling .spv")
+        sys.exit(0)
+
+    pos_args = [a for a in sys.argv[1:] if not a.startswith("-")]
+    OUT = pos_args[0] if pos_args else "ablate"
+    os.makedirs(OUT, exist_ok=True)
+
+    for name, f in VARIANTS.items():
+        with open(os.path.join(OUT, name + ".slang"), "w") as out_f:
+            out_f.write(f(SRC))
+    os.chdir(OUT)
+    gen(1, "r1.slang")
+    gen(2, "r2.slang")
+    gen(4, "r4.slang")
+    gen(2, "r2_nodq.slang", False)
+
+    if not has_slangc:
+        print(f"note: slangc not found at {slangc}; generated .slang files without compiling .spv")
+        sys.exit(0)
+    for f in sorted(os.listdir(".")):
+        if f.endswith(".slang"):
+            r = subprocess.run([slangc, f, "-target", "spirv", "-O3", "-entry", "main", "-stage", "compute", "-o", f[:-6] + ".spv"],
+                               capture_output=True, text=True)
+            print(("ok   " if r.returncode == 0 else "FAIL ") + f)
