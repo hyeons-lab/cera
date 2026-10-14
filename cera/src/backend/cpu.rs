@@ -1693,7 +1693,9 @@ pub(crate) fn q8_0_smmla_repack_supported(m: usize, k: usize) -> bool {
     #[cfg(target_arch = "aarch64")]
     {
         super::cpu_features::cpu_features().tier == super::cpu_features::CpuTier::NeonI8mm
+            && m != 0
             && m.is_multiple_of(8)
+            && k != 0
             && k.is_multiple_of(32)
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -2182,11 +2184,11 @@ pub(crate) fn gemm_preq_repacked_q4_0_smmla_dispatch(
     #[cfg(target_arch = "aarch64")]
     {
         assert!(
-            k.is_multiple_of(32) && m.is_multiple_of(16),
-            "gemm_preq_repacked_q4_0_smmla_dispatch: need k%32==0 and m%16==0, got m={m} k={k}"
+            k.is_multiple_of(32) && m.is_multiple_of(8),
+            "gemm_preq_repacked_q4_0_smmla_dispatch: need k%32==0 and m%8==0, got m={m} k={k}"
         );
         assert!(
-            packed.len() >= (m / 16) * nb * 512 && scales.len() >= (m / 16) * nb * 16,
+            packed.len() >= (m / 8) * nb * 256 && scales.len() >= (m / 8) * nb * 8,
             "gemm_preq_repacked_q4_0_smmla_dispatch: repacked weights too small for {m}x{k}"
         );
     }
@@ -5518,6 +5520,13 @@ pub fn relu_inplace(x: &mut [f32]) {
     }
 }
 
+/// Smallest element count at which the element-wise activations (SiLU/GeLU gating, soft-cap) fan
+/// out over the pool. They dispatch on the *prefill* pool, whose workers are parked during decode:
+/// a 4608-element SwiGLU (one token's FFN) used to wake three of them through futexes to run a
+/// single 512-element chunk, ~2 ms per layer of system time, ten times the three GEMVs it follows
+/// (the unfused-FFN decode path of Q8_0 models). Serial is a few microseconds at that size.
+const ELEMENTWISE_PAR_MIN: usize = 16384;
+
 /// Fused SiLU activation + element-wise multiply: gate = silu(gate) * up.
 /// Single pass instead of separate silu_inplace + mul_inplace.
 pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
@@ -5525,7 +5534,7 @@ pub fn silu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     let len = gate.len().min(up.len());
     let gate = &mut gate[..len];
     let up = &up[..len];
-    if len >= 2048 {
+    if len >= ELEMENTWISE_PAR_MIN {
         let chunk_size = 512;
         let up_ptr = up.as_ptr() as usize;
         par_rows_n(gate, chunk_size, 4, move |(idx, g_chunk)| {
@@ -5567,7 +5576,7 @@ pub fn gelu_mul_inplace(gate: &mut [f32], up: &[f32]) {
     let len = gate.len().min(up.len());
     let gate = &mut gate[..len];
     let up = &up[..len];
-    if len >= 2048 {
+    if len >= ELEMENTWISE_PAR_MIN {
         let chunk_size = 512;
         let up_ptr = up.as_ptr() as usize;
         par_rows_n(gate, chunk_size, 4, move |(idx, g_chunk)| {
@@ -5595,7 +5604,7 @@ pub fn softcap_inplace(x: &mut [f32], cap: f32) {
         return;
     }
     let inv_cap = 1.0 / cap;
-    if x.len() >= 2048 {
+    if x.len() >= ELEMENTWISE_PAR_MIN {
         let chunk_size = 512;
         par_rows_n(x, chunk_size, 4, move |(_idx, chunk)| {
             for v in chunk.iter_mut() {
@@ -12348,8 +12357,8 @@ mod tests {
             );
         }
 
-        // Test serial and parallel branches (threshold >= 2048)
-        for n in [1025, 2048, 2049, 3072] {
+        // Test serial and parallel branches (threshold >= ELEMENTWISE_PAR_MIN = 16384)
+        for n in [1025, 2048, 16383, 16384, 16897, 20480] {
             let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
             let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
             let mut ref_large = gate_large.clone();
@@ -12384,8 +12393,8 @@ mod tests {
             );
         }
 
-        // Test serial and parallel branches (threshold >= 2048)
-        for n in [1025, 2048, 2049, 3072] {
+        // Test serial and parallel branches (threshold >= ELEMENTWISE_PAR_MIN = 16384)
+        for n in [1025, 2048, 16383, 16384, 16897, 20480] {
             let mut gate_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.01).sin()).collect();
             let up_large: Vec<f32> = (0..n).map(|i| (i as f32 * 0.02).cos()).collect();
             let mut ref_large = gate_large.clone();
@@ -12444,8 +12453,8 @@ mod tests {
         assert!(extremes[2].is_finite());
         assert!(extremes[3].is_finite());
 
-        // Test serial and parallel branches (threshold >= 2048)
-        for n in [1025, 1537, 2048, 2049, 3072] {
+        // Test serial and parallel branches (threshold >= ELEMENTWISE_PAR_MIN = 16384)
+        for n in [1025, 1537, 2048, 16383, 16384, 16897, 20480] {
             let mut x_large: Vec<f32> = (0..n).map(|i| (i as f32 - 1024.0) * 0.1).collect();
             let expected_large: Vec<f32> =
                 x_large.iter().map(|&v| cap * (v / cap).tanh()).collect();
