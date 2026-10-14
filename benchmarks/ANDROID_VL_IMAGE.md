@@ -576,6 +576,38 @@ repack is twice the bytes of the 4-bit weights llama.cpp reads (about 17 ms of w
 that unpacks nibbles in registers, for a difference of about 10 ms on prompts that short, so it is not done. From 64 tokens the dense
 prefill is at parity (111 ms against 113).
 
+### CPU decode attention at depth: a DRAM-latency problem, fixed with prefetch (2026-10-10)
+
+Decode slowed with context far more than the arithmetic explains. From a 16-token to a 2,048-token prompt the dense Llama-3.2-1B went from
+14.97 to 22.62 ms per token, about 3.8 us per cached position per token, seven times what reading that KV from DRAM costs at the device's
+ceiling; the LFM2 450M and 350M Q4_K_M (six attention layers each) lost 2.0 and 2.1 ms per token over the same span. A decode profile at 2,048 tokens of context
+(`simpleperf`, `--delay` past the prefill) put 29% of the cycles in the attention kernels (`attn_scores_f16_neon` 14%, `attn_values_f16_neon` 13%, the head loop 2%) and another
+21% in idle worker spin.
+
+A single-thread microbenchmark of one head (`decode_attn_head_microbench`, an ignored test: scores, softmax and values over an f16 cache, 2,048
+positions) says why. With the head's K and V cache-resident a prime core spends 3.3 ns per position on the scores and 3.0 on the values; with the
+cache streamed from DRAM it spends 17.8 and 19.6 ns, and a mid core 80 and 82 ns (about 1.6 GB/s). The cache is position-major, so a head reads
+128 bytes out of every 1 KB row (8 heads of 64), a stride the hardware prefetcher does not follow, and every position is a demand miss. Softmax
+is 1.1 ns per position either way.
+
+The two kernels now prefetch the rows 16 positions ahead into L1 and 64 positions ahead into L2 (`CERA_ATTN_PREFETCH` and
+`CERA_ATTN_PREFETCH_L2` override the distances, 0 disables), from 256 cached positions up: below that a head's whole K and V are in cache, and
+the prefetch instructions cost dense Llama 2% to 4% at 128 tokens. Cold per head, 2,048 positions: mid core 163 and 169 us to 20 us each (8x),
+prime core 39 and 41 us to about 30 us. The arithmetic is untouched, so the output is byte-identical (greedy outputs of 96 tokens on three
+models and f32 KV match the previous binary). Decode tok/s with the prefetch off and on in one binary, alternating, 5 repetitions each, p50 of 3
+runs (`android_vl_image_raw/cpu_decode_depth_20261010/`), context in tokens; raw runs at 1,024 and 2,048 do not overlap:
+
+| Model | 128 tokens | 256 tokens | 384 tokens | 512 tokens | 1024 tokens | 2048 tokens |
+|---|---:|---:|---:|---:|---:|---:|
+| Llama-3.2-1B Q4_0 (dense) | 66.0 to 64.9 (-2%) | 63.9 to 64.5 (+1%) | 61.0 to 61.4 (+1%) | 58.8 to 61.5 (+5%) | 54.1 to 58.0 (+7%) | 43.8 to 49.3 (+13%) |
+| LFM2.5-VL-450M Q4_0 | 263.7 to 263.7 (+0%) | n/a | n/a | 243.7 to 241.2 (-1%) | 213.3 to 229.7 (+8%) | 170.8 to 202.5 (+19%) |
+| LFM2.5-350M Q4_K_M | n/a | n/a | n/a | n/a | 178.4 to 187.5 (+5%) | 147.7 to 172.7 (+17%) |
+| LFM2.5-350M Q8_0 | n/a | n/a | n/a | n/a | 137.5 to 145.5 (+6%) | 118.8 to 136.0 (+14%) |
+
+At 2,048 tokens of context decode is 13% to 19% faster, 5% to 8% at 1,024, and it is neutral below 256 (the 128-token cells are the gate working:
+the same code runs in both modes, so the 1% to 2% differences there are run noise). The remaining cost at depth is the strided access itself;
+a head-major cache layout would make each head's stream contiguous, but it touches the prefix-cache snapshots, the KV shift and TurboQuant, and is not done.
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
