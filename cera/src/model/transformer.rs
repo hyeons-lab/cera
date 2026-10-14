@@ -1624,6 +1624,89 @@ pub(crate) fn gemm_out_to_rows(src: &[f32], rows: usize, n: usize, cols: usize, 
     }
 }
 
+/// Fewest tokens at which [`rmsnorm_columns`] normalizes 16-column tiles by streaming down the column-major
+/// matrix (below it the narrower gather tiles spread a short prompt over more workers).
+#[cfg(target_arch = "aarch64")]
+const RMSNORM_STREAM_MIN_N: usize = 128;
+
+/// RMS-normalize the 16 columns `j0..j0 + 16` of a column-major `[hs x n]` matrix without transposing: the
+/// squares of 8 columns at a time accumulate down the rows (the lanes are adjacent tokens, so every load is
+/// contiguous), then one scale pass writes the 16 columns. The arithmetic is `cpu::rmsnorm`'s exactly, per
+/// column: four f64 partial sums (rows `i` with the same `i % 4`, each accumulated in row order with a fused
+/// multiply-add), combined as `(P0 + P2) + (P1 + P3)`, then the remaining `hs % 4` rows added as `v * v`,
+/// `inv = (1 / sqrt(mean + eps)) as f32`, and `(x * inv) * w`; so the result is bit-identical to the
+/// per-column kernel (and to decode).
+///
+/// # Safety
+/// `src` and `dst` must be valid for `hs * n` floats, `weight` for `hs`, and `j0 + 16 <= n`; the caller owns
+/// the destination columns.
+#[cfg(target_arch = "aarch64")]
+#[target_feature(enable = "neon")]
+unsafe fn rmsnorm_stream_tile16(
+    src: *const f32,
+    dst: *mut f32,
+    weight: *const f32,
+    eps: f32,
+    hs: usize,
+    n: usize,
+    j0: usize,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let n_chunks = hs / 4;
+        let mut inv = [0.0f32; 16];
+        for half in 0..2usize {
+            let jc = j0 + half * 8;
+            // acc[phase][column pair]
+            let mut acc = [[vdupq_n_f64(0.0); 4]; 4];
+            for chunk in 0..n_chunks {
+                for (ph, acc_ph) in acc.iter_mut().enumerate() {
+                    let p = src.add((chunk * 4 + ph) * n + jc);
+                    let a = vld1q_f32(p);
+                    let b = vld1q_f32(p.add(4));
+                    let v = [
+                        vcvt_f64_f32(vget_low_f32(a)),
+                        vcvt_high_f64_f32(a),
+                        vcvt_f64_f32(vget_low_f32(b)),
+                        vcvt_high_f64_f32(b),
+                    ];
+                    for (a_q, v_q) in acc_ph.iter_mut().zip(v) {
+                        *a_q = vfmaq_f64(*a_q, v_q, v_q);
+                    }
+                }
+            }
+            for q in 0..4usize {
+                let s02 = vaddq_f64(acc[0][q], acc[2][q]);
+                let s13 = vaddq_f64(acc[1][q], acc[3][q]);
+                let tot = vaddq_f64(s02, s13);
+                let mut t = [vgetq_lane_f64::<0>(tot), vgetq_lane_f64::<1>(tot)];
+                for (c, tc) in t.iter_mut().enumerate() {
+                    for i in (n_chunks * 4)..hs {
+                        let v = *src.add(i * n + jc + 2 * q + c) as f64;
+                        *tc += v * v;
+                    }
+                    let mean = *tc / hs as f64;
+                    let rms = (mean + eps as f64).sqrt();
+                    inv[half * 8 + 2 * q + c] = (1.0 / rms) as f32;
+                }
+            }
+        }
+        let inv_v = [
+            vld1q_f32(inv.as_ptr()),
+            vld1q_f32(inv.as_ptr().add(4)),
+            vld1q_f32(inv.as_ptr().add(8)),
+            vld1q_f32(inv.as_ptr().add(12)),
+        ];
+        for i in 0..hs {
+            let w = vdupq_n_f32(*weight.add(i));
+            for (q, iv) in inv_v.iter().enumerate() {
+                let x = vld1q_f32(src.add(i * n + j0 + 4 * q));
+                vst1q_f32(dst.add(i * n + j0 + 4 * q), vmulq_f32(vmulq_f32(x, *iv), w));
+            }
+        }
+    }
+}
+
 /// Tokens per work item in [`rmsnorm_columns`]: one 64-byte cache line of f32.
 #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
 const RMSNORM_COL_TILE: usize = 16;
@@ -1666,23 +1749,55 @@ pub(crate) fn rmsnorm_columns(
             const { std::cell::RefCell::new(Vec::new()) };
     }
     let dst_ptr = dst.as_mut_ptr() as usize;
-    // Narrower tiles for short prompts, so that a 16-token chunk is eight work items and not one.
-    let tile_w = n.div_ceil(8).clamp(1, RMSNORM_COL_TILE);
+    let src_ptr = src.as_ptr() as usize;
+    let weight_ptr = weight.as_ptr() as usize;
+    // Streaming tiles are 16 wide; narrower tiles for short prompts, so that a 16-token chunk is eight
+    // work items and not one.
+    #[cfg(target_arch = "aarch64")]
+    let stream = n >= RMSNORM_STREAM_MIN_N;
+    #[cfg(not(target_arch = "aarch64"))]
+    let stream = false;
+    let tile_w = if stream {
+        RMSNORM_COL_TILE
+    } else {
+        n.div_ceil(8).clamp(1, RMSNORM_COL_TILE)
+    };
     let n_tiles = n.div_ceil(tile_w);
     cpu::par_range_prefill(n_tiles, 1, move |tile0, n_items| {
         RMSNORM_COL_SCRATCH.with(|cell| {
-            let mut cell = cell.borrow_mut();
-            let needed = hs
-                .checked_mul(tile_w)
-                .expect("rmsnorm_columns: scratch buffer overflow");
-            if cell.len() < needed {
-                cell.resize(needed, 0.0);
-            }
-            let buf = &mut cell[..needed];
             let dst = dst_ptr as *mut f32;
             for tile in tile0..tile0 + n_items {
                 let j0 = tile * tile_w;
                 let nc = tile_w.min(n - j0);
+                #[cfg(target_arch = "aarch64")]
+                if stream && nc == RMSNORM_COL_TILE {
+                    // SAFETY: the buffers were length-checked above, `j0 + 16 <= n`, and this tile owns
+                    // columns `j0..j0 + 16` of the destination.
+                    unsafe {
+                        rmsnorm_stream_tile16(
+                            src_ptr as *const f32,
+                            dst,
+                            weight_ptr as *const f32,
+                            eps,
+                            hs,
+                            n,
+                            j0,
+                        );
+                    }
+                    continue;
+                }
+                #[cfg(not(target_arch = "aarch64"))]
+                let _ = (src_ptr, weight_ptr);
+
+                let mut cell = cell.borrow_mut();
+                let needed = hs
+                    .checked_mul(tile_w)
+                    .expect("rmsnorm_columns: scratch buffer overflow");
+                if cell.len() < needed {
+                    cell.resize(needed, 0.0);
+                }
+                let buf = &mut cell[..needed];
+
                 for i in 0..hs {
                     let row = &src[i * n + j0..i * n + j0 + nc];
                     for (c, &v) in row.iter().enumerate() {
@@ -1786,7 +1901,15 @@ pub(crate) fn quantize_columns(
             // A tile is at most `QUANT_COL_TILE` columns, narrower for short prompts so that even a
             // 16-token chunk is eight tiles and not one tile on one worker (the result is the same
             // bytes whatever the width).
-            let tile_w = n.div_ceil(8).clamp(1, QUANT_COL_TILE);
+            #[cfg(target_arch = "aarch64")]
+            let stream = n >= RMSNORM_STREAM_MIN_N;
+            #[cfg(not(target_arch = "aarch64"))]
+            let stream = false;
+            let tile_w = if stream {
+                QUANT_COL_TILE
+            } else {
+                n.div_ceil(8).clamp(1, QUANT_COL_TILE)
+            };
             cpu::par_rows_n_chunked_active(
                 &mut scales[..n * nb],
                 tile_w * nb,
@@ -1797,6 +1920,17 @@ pub(crate) fn quantize_columns(
                     let mat = mat_ptr as *const f32;
                     let j0 = g * tile_w;
                     let ncols = sc.len() / nb;
+                    #[cfg(target_arch = "aarch64")]
+                    if stream && ncols == QUANT_COL_TILE {
+                        // SAFETY: `j0 + 16 <= n`, `mat` holds `dim * n` floats (asserted above), `sc` is this
+                        // tile's `16 * nb` scales, and the 16 columns' `quants` spans are this item's alone.
+                        unsafe {
+                            quantize_tile16_stream(mat, n, nb, j0, sc, quants_ptr as *mut i8);
+                        }
+                        return;
+                    }
+                    #[cfg(not(target_arch = "aarch64"))]
+                    let _ = stream;
                     let mut tile = [[0.0f32; QUANT_COL_TILE]; 32];
                     let mut blk = [0.0f32; 32];
                     for b in 0..nb {
@@ -1842,6 +1976,96 @@ pub(crate) fn quantize_columns(
             &mut scales[j * nb..(j + 1) * nb],
             &mut quants[j * dim..(j + 1) * dim],
         );
+    }
+}
+
+/// Quantize the 16 columns `j0..j0 + 16` of a column-major `[dim x n]` matrix to Q8_0 with the lanes across the
+/// columns: each row of the 16-column tile is four contiguous vectors, so the per-column absolute maximum is
+/// 32 `vmaxq` steps, the rounding runs on whole vectors, and only the `d` and `1/d` of [`crate::quant::q8_0_block_scale`]
+/// stay scalar (one per column per block). Every operation is the one `quantize_f32_to_q8_0_neon` applies to a
+/// column's block (`amax`, `x * id`, round-to-nearest-even, saturating narrows), so the bytes are identical; the
+/// result is transposed to the column-contiguous layout with `st4` and 4-byte copies.
+///
+/// # Safety
+/// `mat` must be valid for `dim * n` floats with `dim = nb * 32`, `j0 + 16 <= n`, `sc` must hold `16 * nb` scales,
+/// and the caller must own `quants[(j0 + c) * dim..][..dim]` for the 16 columns.
+#[cfg(all(target_arch = "aarch64", feature = "parallel"))]
+#[target_feature(enable = "neon")]
+unsafe fn quantize_tile16_stream(
+    mat: *const f32,
+    n: usize,
+    nb: usize,
+    j0: usize,
+    sc: &mut [f32],
+    quants: *mut i8,
+) {
+    use core::arch::aarch64::*;
+    unsafe {
+        let dim = nb * 32;
+        let mut rows = [vdupq_n_u8(0); 32];
+        #[repr(C, align(64))]
+        struct AlignedTmp([u8; 8 * 64]);
+        let mut tmp = AlignedTmp([0u8; 8 * 64]);
+        for b in 0..nb {
+            let base = mat.add(b * 32 * n + j0);
+            let mut m = [vdupq_n_f32(0.0); 4];
+            for t in 0..32usize {
+                let p = base.add(t * n);
+                for (q, mq) in m.iter_mut().enumerate() {
+                    *mq = vmaxq_f32(*mq, vabsq_f32(vld1q_f32(p.add(4 * q))));
+                }
+            }
+            let mut amax = [0.0f32; 16];
+            for (q, mq) in m.iter().enumerate() {
+                vst1q_f32(amax.as_mut_ptr().add(4 * q), *mq);
+            }
+            let mut id = [0.0f32; 16];
+            for c in 0..16usize {
+                let d = crate::quant::q8_0_block_scale(amax[c]);
+                id[c] = crate::quant::q8_0_block_recip(d);
+                sc[c * nb + b] = d;
+            }
+            let idv = [
+                vld1q_f32(id.as_ptr()),
+                vld1q_f32(id.as_ptr().add(4)),
+                vld1q_f32(id.as_ptr().add(8)),
+                vld1q_f32(id.as_ptr().add(12)),
+            ];
+            for (t, row) in rows.iter_mut().enumerate() {
+                let p = base.add(t * n);
+                let vi = [
+                    vcvtnq_s32_f32(vmulq_f32(vld1q_f32(p), idv[0])),
+                    vcvtnq_s32_f32(vmulq_f32(vld1q_f32(p.add(4)), idv[1])),
+                    vcvtnq_s32_f32(vmulq_f32(vld1q_f32(p.add(8)), idv[2])),
+                    vcvtnq_s32_f32(vmulq_f32(vld1q_f32(p.add(12)), idv[3])),
+                ];
+                let lo = vqmovn_high_s32(vqmovn_s32(vi[0]), vi[1]);
+                let hi = vqmovn_high_s32(vqmovn_s32(vi[2]), vi[3]);
+                *row = vreinterpretq_u8_s8(vqmovn_high_s16(vqmovn_s16(lo), hi));
+            }
+            // tmp[g * 64 + 4 * c + k] = quant of row 4g + k, column c.
+            for g in 0..8usize {
+                vst4q_u8(
+                    tmp.0.as_mut_ptr().add(g * 64),
+                    uint8x16x4_t(
+                        rows[4 * g],
+                        rows[4 * g + 1],
+                        rows[4 * g + 2],
+                        rows[4 * g + 3],
+                    ),
+                );
+            }
+            for c in 0..16usize {
+                let dst = quants.add((j0 + c) * dim + b * 32) as *mut u8;
+                for g in 0..8usize {
+                    core::ptr::copy_nonoverlapping(
+                        tmp.0.as_ptr().add(g * 64 + 4 * c),
+                        dst.add(4 * g),
+                        4,
+                    );
+                }
+            }
+        }
     }
 }
 
@@ -3102,6 +3326,10 @@ mod tests {
             (130, 130),
             (2048, 70),
             (130, 300),
+            (96, 128),
+            (99, 200),
+            (2048, 160),
+            (64, 512),
         ] {
             let src: Vec<f32> = (0..hs * n).map(|_| lcg()).collect();
             let weight: Vec<f32> = (0..hs).map(|_| lcg()).collect();
@@ -3136,9 +3364,14 @@ mod tests {
     #[test]
     fn quantize_columns_parallel_matches_serial() {
         // Sweeps serial threshold boundaries (< 8 columns), narrowed short-prompt tiles
-        // (8 to 100 columns), full 16-column tiles (256, 512), and ragged tails (33, 275).
-        for n in [0usize, 1, 7, 8, 9, 16, 33, 64, 100, 256, 275, 512] {
-            quantize_columns_matches_serial_at(256, n);
+        // (8 to 100 columns), 128 for streaming threshold, ragged tail tiles (130, 200, 33, 275),
+        // and full 16-column tiles (256, 512) across multiple block dimensions.
+        for dim in [32usize, 64, 256, 1024] {
+            for n in [
+                0usize, 1, 7, 8, 9, 16, 33, 64, 100, 128, 130, 200, 256, 275, 512,
+            ] {
+                quantize_columns_matches_serial_at(dim, n);
+            }
         }
     }
 
@@ -3155,7 +3388,27 @@ mod tests {
                 .wrapping_add(1442695040888963407);
             ((st >> 33) as f32 / (1u64 << 31) as f32) - 1.0
         };
-        let mat: Vec<f32> = (0..dim * n).map(|_| lcg()).collect();
+        let mut mat: Vec<f32> = (0..dim * n).map(|_| lcg()).collect();
+        // Awkward columns where they exist: all zero, tiny (below the f16 flush), huge, and one with a
+        // lone spike per block.
+        for i in 0..dim {
+            if n > 3 {
+                mat[i * n + 3] = 0.0;
+            }
+            if n > 5 {
+                mat[i * n + 5] *= 1e-8;
+            }
+            if n > 7 {
+                mat[i * n + 7] *= 1e6;
+            }
+            if n > 9 {
+                mat[i * n + 9] = if i % 32 == 17 {
+                    3.0e4
+                } else {
+                    mat[i * n + 9] * 1e-3
+                };
+            }
+        }
 
         let mut col = vec![0.0f32; dim];
         let mut scales = vec![0.0f32; n * nb];

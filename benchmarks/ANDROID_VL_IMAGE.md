@@ -608,6 +608,32 @@ At 2,048 tokens of context decode is 13% to 19% faster, 5% to 8% at 1,024, and i
 the same code runs in both modes, so the 1% to 2% differences there are run noise). The remaining cost at depth is the strided access itself;
 a head-major cache layout would make each head's stream contiguous, but it touches the prefix-cache snapshots, the KV shift and TurboQuant, and is not done.
 
+### CPU dense prefill at 512 tokens: the two activation passes that ran scalar-per-column (2026-10-10)
+
+A profile of dense Llama-3.2-1B Q4_0 prefill at 512 tokens (`simpleperf`, steady state) puts 62.6% of the cycles in the smmla tile kernel and the rest in
+the passes around it: the pool's idle workers 11.1%, tiled flash attention 7.0%, `quantize_columns` 5.8%, `rmsnorm_columns` 5.2%. The two column passes
+gathered each 16-token tile into a transposed buffer and ran the one-column kernel on it; the lanes of a vector were the *hidden dimension*, so the work
+was a transpose, a reduction and a scatter around a few vector instructions. Both now keep the lanes across the 16 tokens of a tile, which are adjacent in
+the column-major matrix, so every load is contiguous and nothing is transposed (from 128 tokens up; narrower short-prompt tiles keep the gather path).
+
+- `rmsnorm_stream_tile16`: the squares of a column accumulate down the rows in four f64 phase partials combined as `(P0 + P2) + (P1 + P3)`, then the
+  remainder rows, `1 / sqrt(mean + eps)`, and `(x * inv) * w`: the same operations `cpu::rmsnorm` applies per column, in the same order, so the bytes are identical.
+- `quantize_tile16_stream`: the per-column absolute maximum is 32 `vmaxq` steps over the tile rows, the scale and its reciprocal come from the shared scalar
+  helpers, the rounding and saturating narrows run on whole vectors, and an `st4` transpose writes the column-contiguous layout. Identical to
+  `quantize_f32_to_q8_0_neon` per column.
+
+Phase times at 512 tokens (`CERA_PROFILE_PREFILL`): the two RMSNorms 27 to 9 ms each, `down_quant` 34 to 18 to 20 ms, `ffn_quant` 5 to 3 ms. The logits of a prompt over 128 tokens are byte-identical to the previous binary. Prefill tok/s, baseline against this change, alternated, p50 of 3 runs, 7 and 5 repetitions
+(`android_vl_image_raw/cpu_dense_prefill_20261010/`):
+
+| Prompt tokens | Before | After | Change |
+|---|---:|---:|---:|
+| 256 | 557 | 584 | +4.8% |
+| 512 | 528 | 555 | +5.1% |
+
+Tests: `rmsnorm_columns_matches_per_column_reference` gained streaming shapes (96, 99, 2048 by 128 to 512 tokens, ragged tails) and
+`quantize_columns_parallel_matches_serial` gained zero, tiny (below the f16 flush), huge and lone-spike columns; both compare bits, and flipping the
+phase-combination order or the rounding mode in the new kernels fails them.
+
 ## Baseline results (before the perf work)
 
 | | TTFT | vision tower | decode | time to 64th token |
