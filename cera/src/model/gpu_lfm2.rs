@@ -323,6 +323,26 @@ fn use_gemm_k64() -> bool {
     enabled
 }
 
+/// Whether the Q4_0 k64 streaming GEMMs read the f32 token-major activations themselves (on by
+/// default) instead of a transposed f16 copy written by a `transpose_cast_f16` pass. Staging the
+/// tile straight from f32 is 8 to 20% faster per GEMM on an Adreno 830 and drops the 76 transposes
+/// of a prefill. `CERA_WGPU_GEMM_DIRECT_B=0` restores the transposed path (with the one-row kernel
+/// and no fused gate/up: both exist only for the direct path).
+fn use_direct_b() -> bool {
+    #[cfg(test)]
+    let enabled = !std::env::var("CERA_WGPU_GEMM_DIRECT_B")
+        .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off"));
+    #[cfg(not(test))]
+    let enabled = {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| {
+            !std::env::var("CERA_WGPU_GEMM_DIRECT_B")
+                .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off"))
+        })
+    };
+    enabled
+}
+
 /// Rows per workgroup of the fused gate/up kernel (its thread count; `GATEUP_THREADS` in
 /// `scripts/gemm-ablate/gen.py`).
 const GATEUP_ROWS_PER_GROUP: u32 = 128;
@@ -355,8 +375,8 @@ fn gemm_stream_two_row(m: u32, n_pad: u32) -> bool {
 }
 
 /// Whether the FFN's gate and up projections run as one fused GEMM with a SiLU epilogue (on by
-/// default; `CERA_WGPU_FUSE_GATE_UP=0` turns it off). It saves a transpose pass and the separate
-/// `silu_mul` pass, and reads each activation tile once for two weight rows.
+/// default; `CERA_WGPU_FUSE_GATE_UP=0` turns it off). It eliminates the separate `silu_mul` pass
+/// and reads each activation tile once for two weight rows directly from f32 activations.
 fn use_fused_gate_up() -> bool {
     #[cfg(test)]
     let enabled = !std::env::var("CERA_WGPU_FUSE_GATE_UP")
@@ -387,6 +407,7 @@ fn can_fuse_gate_up_shape(
 ) -> bool {
     let ku = k as usize;
     use_fused_gate_up()
+        && use_direct_b()
         && use_gemm_k64()
         && k > 0
         && k.is_multiple_of(64)
@@ -1546,13 +1567,14 @@ enum PrefillCmd<'a> {
     },
 }
 
-/// `(n, flags, cursor, slots)`: see `stream_gemm_bg_cache`. `flags` is bit 0 `all_logits`, bit 1
-/// "gate/up GEMMs are fused" (a different call sequence, so a different slot layout).
+/// `(n, flags, cursor, slots)`: see `stream_gemm_bg_cache`; a slot is `(transpose bind group, GEMM
+/// bind group)`, the transpose absent on the direct-B path. `flags` is bit 0 `all_logits`, bit 1
+/// "gate/up GEMMs are fused", bit 2 "direct-B path", bit 3 "k64 twin enabled".
 type StreamGemmBgCache = (
     u32,
     u8,
     usize,
-    Vec<Option<(wgpu::BindGroup, wgpu::BindGroup)>>,
+    Vec<Option<(Option<wgpu::BindGroup>, wgpu::BindGroup)>>,
 );
 
 /// Compute pipelines for all shader entry points.
@@ -1652,8 +1674,11 @@ struct GpuPipelines {
     /// k-slice covers 64 k. Dispatched when k % 64 == 0 (see `use_gemm_k64`).
     /// Same `None`-unless-streaming convention as `gemm_stream_q4_0`.
     gemm_stream_q4_0_k64: Option<wgpu::ComputePipeline>,
-    /// Two-row twin of `gemm_stream_q4_0_k64` (same interface, 128-thread workgroups): chosen when
-    /// the dispatch has enough workgroups (`gemm_stream_two_row`).
+    /// Direct-B twin of `gemm_stream_q4_0_k64`: reads the f32 token-major activations itself, so no
+    /// transpose pass precedes it (see `use_direct_b`).
+    gemm_stream_q4_0_k64_xf32: Option<wgpu::ComputePipeline>,
+    /// Two-row twin of `gemm_stream_q4_0_k64_xf32` (same interface, 128-thread workgroups): chosen
+    /// when the dispatch has enough workgroups (`gemm_stream_two_row`).
     gemm_stream_q4_0_k64_r2: Option<wgpu::ComputePipeline>,
     /// Fused gate/up GEMM with a SiLU epilogue (`use_fused_gate_up`).
     gemm_stream_q4_0_k64_gateup: Option<wgpu::ComputePipeline>,
@@ -2075,19 +2100,19 @@ pub struct GpuLfmModel {
     /// dispatch needs its OWN params buffer (a single shared one would be
     /// last-write-wins across the submit); pooling reuses them across prefills so
     /// only adapter-active prefill pays, and only once (grows to the high-water
-    /// mark, then zero allocation). Locked under `infer_lock` — no contention.
+    /// mark, then zero allocation). Locked under `infer_lock`: no contention.
     lora_params_pool: Mutex<(Vec<wgpu::Buffer>, usize)>,
     prefill_params_pool: Mutex<(Vec<wgpu::Buffer>, usize)>,
     /// Cached bind groups for the streaming prefill GEMMs, in call order:
-    /// `(n, all_logits, cursor, slots)` where each slot is the
-    /// `(transpose_bg, gemm_bg)` pair for one `encode_gemm_stream_q4_0`
-    /// call. A prefill creates ~184 of these fresh (~16 µs each to create,
+    /// `(n, flags, cursor, slots)` where each slot is the
+    /// `(Option<transpose_bg>, gemm_bg)` pair for one streaming GEMM call
+    /// (the transpose bind group is None on the direct-B path). A prefill creates ~184 of these fresh (~16 µs each to create,
     /// plus ~115 µs each of first-use validation inside
-    /// `CommandEncoder::finish` — the 33 ms prefill `finish()` is almost
-    /// entirely this). The bound buffers are stable across prefills —
-    /// weights/scratch never move, and the pooled params buffers are handed
-    /// out in deterministic call order after the per-prefill cursor reset —
-    /// so only the *contents* need refreshing (which `next_prefill_params`
+    /// `CommandEncoder::finish`: the 33 ms prefill `finish()` is almost
+    /// entirely this). The bound buffers are stable across prefills
+    /// (weights/scratch never move, and the pooled params buffers are handed
+    /// out in deterministic call order after the per-prefill cursor reset,
+    /// so only the *contents* need refreshing, which `next_prefill_params`
     /// still does on every call). Keyed by `n` because a small n can route to
     /// reg-tile (`CERA_WGPU_STREAM_MIN_N`) and shifts the pool layout, and by `all_logits` because it
     /// swaps the lm-head output buffer; `start_pos` never appears in these
@@ -2562,6 +2587,12 @@ impl GpuLfmModel {
             gemm_stream_q4_0_k64: if stream_layout {
                 tracing::debug!("gemm_stream_q4_0_k64: SPIR-V passthrough (slang)");
                 Some(ctx.gemm_stream_q4_0_k64_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_0_k64_xf32: if stream_layout {
+                tracing::debug!("gemm_stream_q4_0_k64_xf32: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_0_k64_xf32_passthrough())
             } else {
                 None
             },
@@ -7370,10 +7401,12 @@ impl GpuLfmModel {
 
     /// Streaming fp16 Q4_0 GEMM (`gemm_stream_q4_0`). Same contract as
     /// `encode_mul_mat_reg_tile` for the Q4_0 case: `y[n, m] = x[n, k] @
-    /// w[m, k]^T` with token-major strides. Two passes into the same
-    /// encoder (no extra submit): `transpose_cast_f16` first rewrites `x`
-    /// into the B16 scratch as f16 k-major, then the GEMM reads the
-    /// resident repack (`stream_q`/`stream_d`) plus B16. Grid
+    /// w[m, k]^T` with token-major strides. When `k % 64 == 0` the kernel
+    /// (the k64 family, see `use_direct_b`) reads the resident repack
+    /// (`stream_q`/`stream_d`) and stages its B tile straight from the f32
+    /// `x`: one dispatch. Otherwise two passes into the same encoder (no
+    /// extra submit): `transpose_cast_f16` first rewrites `x` into the B16
+    /// scratch as f16 k-major, then the GEMM reads the repack plus B16. Grid
     /// `(ceil(m/256), ceil(n/32))` — each fiber covers 1 row x 32 columns
     /// in 256-thread workgroups; columns past `n` idle inside the fiber, so
     /// callers may route small n to the reg-tile kernel instead (see `stream_gemm_min_n`). Requires packed
@@ -7396,14 +7429,24 @@ impl GpuLfmModel {
         // static per call (k is fixed per weight, the hatch process-static),
         // so the bind-group cache below stays paired.
         let k64 = k.is_multiple_of(64) && use_gemm_k64();
+        // Direct-B kernels (the k64 family) stage the f32 activations themselves: no transpose.
+        let direct = k64 && use_direct_b();
         let n_pad = n.next_multiple_of(32);
-        let (gemm, gemm_label) = if k64 && gemm_stream_two_row(m, n_pad) {
+        let (gemm, gemm_label) = if direct && gemm_stream_two_row(m, n_pad) {
             (
                 self.pipelines
                     .gemm_stream_q4_0_k64_r2
                     .as_ref()
                     .expect("two-row streaming GEMM dispatched without a pipeline"),
                 "gemm_stream_q4_0_k64_r2",
+            )
+        } else if direct {
+            (
+                self.pipelines
+                    .gemm_stream_q4_0_k64_xf32
+                    .as_ref()
+                    .expect("direct-B streaming GEMM dispatched without a pipeline"),
+                "gemm_stream_q4_0_k64_xf32",
             )
         } else if k64 {
             (
@@ -7422,15 +7465,17 @@ impl GpuLfmModel {
                 "gemm_stream_q4_0",
             )
         };
-        let transpose = self
-            .pipelines
-            .transpose_cast_f16
-            .as_ref()
-            .expect("streaming GEMM dispatched without a transpose pipeline");
-        let b16 = self
-            .stream_b16_buf
-            .as_ref()
-            .expect("streaming GEMM dispatched without B16 scratch");
+        let transposed = (!direct).then(|| {
+            (
+                self.pipelines
+                    .transpose_cast_f16
+                    .as_ref()
+                    .expect("streaming GEMM dispatched without a transpose pipeline"),
+                self.stream_b16_buf
+                    .as_ref()
+                    .expect("streaming GEMM dispatched without B16 scratch"),
+            )
+        });
         let (sq, sd) = match (&w.stream_q, &w.stream_d) {
             (Some(q), Some(d)) => (q, d),
             _ => panic!("streaming GEMM dispatched without resident (q, d) buffers"),
@@ -7448,8 +7493,10 @@ impl GpuLfmModel {
         // stable, but each prefill rewrites them). The bind groups below
         // bind the pooled buffer *objects*, which is what makes them
         // cacheable across prefills.
-        let t_params: [u32; 4] = [n, n_pad, k, 0];
-        let t_buf = self.next_prefill_params(bytemuck::cast_slice(&t_params));
+        let t_buf = transposed.map(|_| {
+            let t_params: [u32; 4] = [n, n_pad, k, 0];
+            self.next_prefill_params(bytemuck::cast_slice(&t_params))
+        });
         let params: [u32; 5] = [m, k, n, n_pad, y_stride];
         let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
 
@@ -7478,27 +7525,31 @@ impl GpuLfmModel {
                 slots.resize_with(idx + 1, || None);
             }
             if slots[idx].is_none() {
-                let fresh_t = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &transpose.get_bind_group_layout(0),
-                        entries: &[
-                            wgpu::BindGroupEntry {
-                                binding: 0,
-                                resource: x.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 1,
-                                resource: b16.as_entire_binding(),
-                            },
-                            wgpu::BindGroupEntry {
-                                binding: 2,
-                                resource: t_buf.as_entire_binding(),
-                            },
-                        ],
-                    });
+                let fresh_t = transposed.map(|(transpose, b16)| {
+                    self.ctx
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: None,
+                            layout: &transpose.get_bind_group_layout(0),
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: x.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: b16.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: t_buf
+                                        .as_ref()
+                                        .expect("transpose params")
+                                        .as_entire_binding(),
+                                },
+                            ],
+                        })
+                });
                 let fresh_bg = self
                     .ctx
                     .device
@@ -7516,7 +7567,9 @@ impl GpuLfmModel {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: b16.as_entire_binding(),
+                                // the activations: f32 token-major as they are (direct), or the
+                                // transposed f16 copy
+                                resource: transposed.map_or(x, |(_, b16)| b16).as_entire_binding(),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
@@ -7537,13 +7590,15 @@ impl GpuLfmModel {
         // shared pass (transpose-then-GEMM RAW on B16 needs no boundary:
         // same guarantee as the decode `ffn` span). Profile mode keeps one
         // pass per dispatch, labeled as below.
-        Self::push_prefill_dispatch(
-            cmds,
-            transpose,
-            t_bg,
-            (n_pad / 32, k.div_ceil(32), 1),
-            "transpose_cast_f16",
-        );
+        if let (Some((transpose, _)), Some(t_bg)) = (transposed, t_bg) {
+            Self::push_prefill_dispatch(
+                cmds,
+                transpose,
+                t_bg,
+                (n_pad / 32, k.div_ceil(32), 1),
+                "transpose_cast_f16",
+            );
+        }
         Self::push_prefill_dispatch(
             cmds,
             gemm,
@@ -7555,7 +7610,10 @@ impl GpuLfmModel {
 
     /// Bind-group cache key flags for the call now being encoded (see `StreamGemmBgCache`).
     fn stream_cache_flags(&self, all_logits: bool) -> u8 {
-        u8::from(all_logits) | (u8::from(self.fuse_gate_up_active.load(Ordering::Relaxed)) << 1)
+        u8::from(all_logits)
+            | (u8::from(self.fuse_gate_up_active.load(Ordering::Relaxed)) << 1)
+            | (u8::from(use_direct_b()) << 2)
+            | (u8::from(use_gemm_k64()) << 3)
     }
 
     /// Whether `gate` and `up` can run as the fused streaming GEMM for `n` tokens of width `k`:
@@ -7564,7 +7622,6 @@ impl GpuLfmModel {
     /// takes that one takes this one.
     fn can_fuse_gate_up(&self, gate: &GpuWeight, up: &GpuWeight, n: u32, k: u32) -> bool {
         self.pipelines.gemm_stream_q4_0_k64_gateup.is_some()
-            && self.pipelines.transpose_cast_f16.is_some()
             && can_fuse_gate_up_shape(
                 gate.tensor.dtype,
                 &gate.tensor.shape,
@@ -7578,7 +7635,7 @@ impl GpuLfmModel {
     }
 
     /// Fused gate/up streaming GEMM: `y[n, m] = silu(x @ gate^T) * (x @ up^T)` in one dispatch,
-    /// after one transpose of `x` (the unfused path transposes it twice). Same layout and
+    /// reading the f32 activations directly (direct-B path, so no transpose). Same layout and
     /// strides as the gate GEMM's output, so it replaces the gate GEMM, the up GEMM and the
     /// `silu_mul` pass. Callers check [`Self::can_fuse_gate_up`] and that no LoRA delta needs the
     /// raw projections. Grid `(ceil(m/GATEUP_ROWS_PER_GROUP), ceil(n/32))`.
@@ -7601,15 +7658,6 @@ impl GpuLfmModel {
             .gemm_stream_q4_0_k64_gateup
             .as_ref()
             .expect("fused gate/up GEMM dispatched without a pipeline");
-        let transpose = self
-            .pipelines
-            .transpose_cast_f16
-            .as_ref()
-            .expect("streaming GEMM dispatched without a transpose pipeline");
-        let b16 = self
-            .stream_b16_buf
-            .as_ref()
-            .expect("streaming GEMM dispatched without B16 scratch");
         let (gq, gd, uq, ud) = match (&gate.stream_q, &gate.stream_d, &up.stream_q, &up.stream_d) {
             (Some(gq), Some(gd), Some(uq), Some(ud)) => (gq, gd, uq, ud),
             _ => panic!("fused gate/up GEMM dispatched without resident (q, d) buffers"),
@@ -7624,12 +7672,10 @@ impl GpuLfmModel {
             debug_assert!(u64::from(nd) * 4 <= d.size());
         }
         let n_pad = n.next_multiple_of(32);
-        let t_params: [u32; 4] = [n, n_pad, k, 0];
-        let t_buf = self.next_prefill_params(bytemuck::cast_slice(&t_params));
         let params: [u32; 5] = [m, k, n, n_pad, y_stride];
         let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
 
-        let (t_bg, bg) = {
+        let (_, bg) = {
             let mut cache = self
                 .stream_gemm_bg_cache
                 .lock()
@@ -7654,14 +7700,6 @@ impl GpuLfmModel {
                         resource: buffer.as_entire_binding(),
                     }
                 }
-                let fresh_t = self
-                    .ctx
-                    .device
-                    .create_bind_group(&wgpu::BindGroupDescriptor {
-                        label: None,
-                        layout: &transpose.get_bind_group_layout(0),
-                        entries: &[entry(0, x), entry(1, b16), entry(2, &t_buf)],
-                    });
                 let fresh_bg = self
                     .ctx
                     .device
@@ -7673,23 +7711,16 @@ impl GpuLfmModel {
                             entry(1, gd),
                             entry(2, uq),
                             entry(3, ud),
-                            entry(4, b16),
+                            entry(4, x),
                             entry(5, y),
                             entry(6, &p_buf),
                         ],
                     });
-                slots[idx] = Some((fresh_t, fresh_bg));
+                slots[idx] = Some((None, fresh_bg));
             }
             slots[idx].as_ref().unwrap().clone()
         };
 
-        Self::push_prefill_dispatch(
-            cmds,
-            transpose,
-            t_bg,
-            (n_pad / 32, k.div_ceil(32), 1),
-            "transpose_cast_f16",
-        );
         Self::push_prefill_dispatch(
             cmds,
             gemm,
@@ -7814,7 +7845,7 @@ impl GpuLfmModel {
                             },
                         ],
                     });
-                slots[idx] = Some((fresh_t, fresh_bg));
+                slots[idx] = Some((Some(fresh_t), fresh_bg));
             }
             slots[idx].as_ref().unwrap().clone()
         };
@@ -7822,7 +7853,7 @@ impl GpuLfmModel {
         Self::push_prefill_dispatch(
             cmds,
             transpose,
-            t_bg,
+            t_bg.expect("the Q4_K streaming GEMM always transposes"),
             (n_pad / 32, k.div_ceil(32), 1),
             "transpose_cast_f16",
         );
@@ -11681,7 +11712,12 @@ async fn gemm_q4_0_microbench_async(
         passthrough,
         "gemm-bench needs SPIR-V passthrough (Vulkan + subgroups)"
     );
-    let base_pipe = ctx.gemm_stream_q4_0_passthrough();
+    let b_f32_direct = std::env::var("CERA_GEMM_BENCH_B_F32").as_deref() == Ok("1");
+    let base_pipe = if b_f32_direct {
+        ctx.gemm_stream_q4_0_k64_xf32_passthrough()
+    } else {
+        ctx.gemm_stream_q4_0_passthrough()
+    };
 
     // Experimental variants: same bind-group layout as the baseline (contract
     // above), module swapped for the file's SPIR-V.
@@ -11715,7 +11751,16 @@ async fn gemm_q4_0_microbench_async(
 
         let q_buf = ctx.upload_storage(bytemuck::cast_slice(&q), "bench.q");
         let d_buf = ctx.upload_storage(bytemuck::cast_slice(&d), "bench.d");
-        let b_buf = ctx.upload_storage(bytemuck::cast_slice(&b16), "bench.b16");
+        // `CERA_GEMM_BENCH_B_F32=1` hands the kernels the activations as they leave the previous
+        // pass, f32 token-major `[n_pad][k]` (rows past `n` zero), for `--spv` variants that stage
+        // the B tile themselves instead of reading the transposed f16 copy.
+        let b_buf = if b_f32_direct {
+            let mut b_tm = vec![0.0f32; n_pad * k_us];
+            b_tm[..n_us * k_us].copy_from_slice(&b);
+            ctx.upload_storage(bytemuck::cast_slice(&b_tm), "bench.b_f32")
+        } else {
+            ctx.upload_storage(bytemuck::cast_slice(&b16), "bench.b16")
+        };
         let y_buf = ctx.create_storage_rw((n_pad as u64) * (m as u64) * 4, "bench.y");
         let params_buf = ctx.upload_storage(
             bytemuck::cast_slice(&[m, k, n, n_pad as u32, m]),
@@ -13425,6 +13470,17 @@ mod tests {
         ctx.upload_storage(bytemuck::cast_slice(&b16), "test.b16")
     }
 
+    /// The same activations as [`b16_buffer`], as the f32 token-major `[n][k]` the direct-B kernels
+    /// read: exactly `n` rows, so the clamp onto the last token is what keeps the padded columns of
+    /// the last tile inside the buffer.
+    fn b_f32_buffer(ctx: &GpuContext, n: usize, k: usize, salt: u32) -> wgpu::Buffer {
+        let b = super::synth_q4_0_vec(n * k, salt);
+        // the transposed copy rounds to f16 on the host; the kernel rounds on the device, so feed the
+        // already-rounded values to make "equal bit for bit" a fair claim
+        let rounded: Vec<f32> = b.iter().map(|&v| half::f16::from_f32(v).to_f32()).collect();
+        ctx.upload_storage(bytemuck::cast_slice(&rounded), "test.b_f32")
+    }
+
     /// Shapes covering ragged rows (below, across and well past one 128- and 256-row group), ragged
     /// columns, several k-slices, and the model's own FFN shape.
     const STREAM_TEST_SHAPES: &[(u32, u32, u32)] = &[
@@ -13437,36 +13493,45 @@ mod tests {
         (4608, 512, 1024),
     ];
 
-    /// The two-row streaming GEMM equals the one-row kernel bit for bit (same accumulation order
-    /// per row), on every ragged shape: each thread's second row, the row guards and the `rrow`
-    /// clamp are all in play when `m` is not a multiple of 256.
+    /// The direct-B streaming GEMMs (one row and two rows per thread, reading the f32 token-major
+    /// activations) equal the transposed-B one-row kernel bit for bit (same accumulation order per
+    /// row), on every ragged shape: each thread's second row, the row guards, the `rrow` clamp and
+    /// the clamp of the last tile's padded columns are all in play when `m` is not a multiple of 256
+    /// and `n` is not a multiple of 32.
     #[test]
-    fn two_row_stream_gemm_matches_one_row_bit_for_bit() {
-        let Some(ctx) = passthrough_ctx_or_skip("two_row_stream_gemm_matches_one_row_bit_for_bit")
-        else {
+    fn direct_b_stream_gemms_match_the_transposed_kernel_bit_for_bit() {
+        let Some(ctx) = passthrough_ctx_or_skip(
+            "direct_b_stream_gemms_match_the_transposed_kernel_bit_for_bit",
+        ) else {
             return;
         };
-        let one = ctx.gemm_stream_q4_0_k64_passthrough();
-        let two = ctx.gemm_stream_q4_0_k64_r2_passthrough();
+        let reference = ctx.gemm_stream_q4_0_k64_passthrough();
+        let kernels = [
+            ("one-row", ctx.gemm_stream_q4_0_k64_xf32_passthrough()),
+            ("two-row", ctx.gemm_stream_q4_0_k64_r2_passthrough()),
+        ];
         for &(m, n, k) in STREAM_TEST_SHAPES {
             let (q, d) = stream_weight(&ctx, m as usize, k as usize, super::SYNTH_SALT_WEIGHTS);
             let b16 = b16_buffer(&ctx, n as usize, k as usize, super::SYNTH_SALT_INPUTS);
-            let want = run_stream_gemm(&ctx, &one, &[&q, &d], (m, n, k), 256, &b16);
-            let got = run_stream_gemm(&ctx, &two, &[&q, &d], (m, n, k), 256, &b16);
-            for c in 0..n as usize {
-                for r in 0..m as usize {
-                    let i = c * m as usize + r;
-                    assert_ne!(
-                        got[i], 12345.0,
-                        "m={m} n={n} k={k}: cell ({c},{r}) never written"
-                    );
-                    assert_eq!(
-                        got[i].to_bits(),
-                        want[i].to_bits(),
-                        "m={m} n={n} k={k}: cell ({c},{r}) two-row {} one-row {}",
-                        got[i],
-                        want[i]
-                    );
+            let bf = b_f32_buffer(&ctx, n as usize, k as usize, super::SYNTH_SALT_INPUTS);
+            let want = run_stream_gemm(&ctx, &reference, &[&q, &d], (m, n, k), 256, &b16);
+            for (name, pipe) in &kernels {
+                let got = run_stream_gemm(&ctx, pipe, &[&q, &d], (m, n, k), 256, &bf);
+                for c in 0..n as usize {
+                    for r in 0..m as usize {
+                        let i = c * m as usize + r;
+                        assert_ne!(
+                            got[i], 12345.0,
+                            "{name} m={m} n={n} k={k}: ({c},{r}) unwritten"
+                        );
+                        assert_eq!(
+                            got[i].to_bits(),
+                            want[i].to_bits(),
+                            "{name} m={m} n={n} k={k}: cell ({c},{r}) got {} want {}",
+                            got[i],
+                            want[i]
+                        );
+                    }
                 }
             }
         }
@@ -13486,6 +13551,7 @@ mod tests {
             let (gq, gd) = stream_weight(&ctx, m as usize, k as usize, 0x1111);
             let (uq, ud) = stream_weight(&ctx, m as usize, k as usize, 0x2222);
             let b16 = b16_buffer(&ctx, n as usize, k as usize, super::SYNTH_SALT_INPUTS);
+            let bf = b_f32_buffer(&ctx, n as usize, k as usize, super::SYNTH_SALT_INPUTS);
             let gate = run_stream_gemm(&ctx, &one, &[&gq, &gd], (m, n, k), 256, &b16);
             let up = run_stream_gemm(&ctx, &one, &[&uq, &ud], (m, n, k), 256, &b16);
             let got = run_stream_gemm(
@@ -13494,7 +13560,7 @@ mod tests {
                 &[&gq, &gd, &uq, &ud],
                 (m, n, k),
                 super::GATEUP_ROWS_PER_GROUP,
-                &b16,
+                &bf,
             );
             for c in 0..n as usize {
                 for r in 0..m as usize {
@@ -13705,5 +13771,19 @@ mod tests {
             n,
             k as u32
         ));
+
+        // direct-b path must be enabled
+        unsafe { std::env::set_var("CERA_WGPU_GEMM_DIRECT_B", "0") };
+        assert!(!super::can_fuse_gate_up_shape(
+            crate::tensor::DType::Q4_0,
+            &gate_shape,
+            true,
+            crate::tensor::DType::Q4_0,
+            &up_shape,
+            true,
+            n,
+            k as u32
+        ));
+        unsafe { std::env::remove_var("CERA_WGPU_GEMM_DIRECT_B") };
     }
 }
