@@ -216,6 +216,7 @@ pub struct GpuContext {
     pub max_storage_buffer_binding_size: u64,
     pub max_buffer_size: u64,
     pub min_storage_buffer_offset_alignment: u64,
+    pub max_compute_workgroup_storage_size: u32,
     pub preprocessor: Preprocessor,
     /// Timestamp profiling (None if TIMESTAMP_QUERY not supported).
     pub profiler: Option<Arc<GpuProfiler>>,
@@ -261,6 +262,7 @@ impl Clone for GpuContext {
             max_storage_buffer_binding_size: self.max_storage_buffer_binding_size,
             max_buffer_size: self.max_buffer_size,
             min_storage_buffer_offset_alignment: self.min_storage_buffer_offset_alignment,
+            max_compute_workgroup_storage_size: self.max_compute_workgroup_storage_size,
             preprocessor: self.preprocessor.clone(),
             profiler: self.profiler.clone(),
             staging: Arc::clone(&self.staging),
@@ -380,6 +382,37 @@ impl PendingReadback {
         self.staging.unmap();
         Ok(bytes)
     }
+}
+
+/// Workgroup storage `attention_flash_hd64.wgsl` needs: qs 8192 + kt 8192 + vs 8704 +
+/// ps 4096 + pm 512 + corr 128 + lsum 512 bytes (see the `var<workgroup>` block there).
+/// An adapter under this cannot build the pipeline, so the flash gate requires it.
+const FLASH_ATTENTION_WORKGROUP_BYTES: u32 = 30_336;
+
+/// Pure predicate behind [`GpuContext::supports_flash_attention`], split out so a host test
+/// can pin it without a GPU: the kernel's workgroup storage, then OS plus vendor. `is_android`
+/// is a parameter (not `cfg!`) so the vendor clause is pinnable on desktop builds too.
+fn flash_attention_supported(workgroup_storage: u32, adapter_name: &str, is_android: bool) -> bool {
+    workgroup_storage >= FLASH_ATTENTION_WORKGROUP_BYTES
+        && (!is_android || adapter_name.contains("Adreno"))
+}
+
+/// Pure predicate behind [`GpuContext::uses_flash_attention`]: the head_dim the kernel
+/// hardwires, plus the adapter half above. Split out so a host test can pin the conjunct
+/// without a GPU.
+fn flash_attention_supported_for(
+    head_dim: usize,
+    workgroup_storage: u32,
+    adapter_name: &str,
+    is_android: bool,
+    is_wasm32: bool,
+) -> bool {
+    // No blocking scope pop on wasm32, so the checked build cannot fail loudly there: fail
+    // closed to the always-built generic kernel instead of risking silent-zero output.
+    // (Re-enable with an async-checked path if wasm ever needs flash.)
+    !is_wasm32
+        && head_dim == 64
+        && flash_attention_supported(workgroup_storage, adapter_name, is_android)
 }
 
 impl GpuContext {
@@ -622,6 +655,7 @@ impl GpuContext {
             max_buffer_size: adapter_limits.max_buffer_size,
             min_storage_buffer_offset_alignment: adapter_limits.min_storage_buffer_offset_alignment
                 as u64,
+            max_compute_workgroup_storage_size: adapter_limits.max_compute_workgroup_storage_size,
             preprocessor,
             profiler,
             staging: Arc::new(std::sync::Mutex::new(None)),
@@ -716,6 +750,70 @@ impl GpuContext {
              max_buffer_size {}; a smaller context or paged KV is required",
             self.max_buffer_size
         );
+    }
+
+    /// How many 32-query tiles of one flash-attention call to issue per dispatch.
+    ///
+    /// A dispatch that runs for seconds is killed by a mobile GPU's hang detector (an Adreno 830
+    /// lost the device on one 13.5k-row call, about 3.3 s, though 8k rows at 1.2 s was fine), so
+    /// a long call is issued as several short ones. The work of a dispatch is its queries times
+    /// the keys it reads times the heads, which is capped at 2^25 (about 0.04 s there), and at
+    /// most 2048 queries. The 32-query floor can exceed the cap on very long wide calls; one
+    /// tile is the smallest dispatch.
+    pub(crate) fn flash_attention_tiles_per_dispatch(tokens: usize, n_heads: usize) -> u32 {
+        const MAX_WORK: usize = 1 << 25;
+        const MAX_QUERIES: usize = 2048;
+        let queries = (MAX_WORK / tokens.max(1) / n_heads.max(1)).clamp(32, MAX_QUERIES);
+        (queries / 32) as u32
+    }
+
+    /// Runs of 32-query tiles covering `tiles` tiles, one dispatch each, sized by
+    /// [`Self::flash_attention_tiles_per_dispatch`]: `(first_tile, tile_count)` pairs, in order.
+    /// Both flash callers iterate this so the hang-detector split stays one algorithm.
+    pub(crate) fn flash_dispatch_runs(
+        tiles: u32,
+        tokens: usize,
+        n_heads: usize,
+    ) -> Vec<(u32, u32)> {
+        let per = Self::flash_attention_tiles_per_dispatch(tokens, n_heads);
+        debug_assert!(per > 0, "tiles per dispatch is clamped to at least 1");
+        let mut runs = Vec::new();
+        let mut first = 0;
+        while first < tiles {
+            let count = per.min(tiles - first);
+            runs.push((first, count));
+            first += count;
+        }
+        runs
+    }
+
+    /// Whether the register-tiled flash attention kernel (`attention_flash_hd64.wgsl`) is known
+    /// to run correctly and fast on this adapter. Past the workgroup storage it needs (see
+    /// `FLASH_ATTENTION_WORKGROUP_BYTES`), it is on for every desktop adapter; on Android it
+    /// is on for Qualcomm Adreno only, where it was checked on an Adreno 830 (1e-4 to 2100 rows
+    /// pinned in `wgpu_flash_attention_matches_the_definition`, 1e-6 to 8192 rows measured once
+    /// there, about 0.2 TFLOPS), because its workgroup memory and register use are not known to
+    /// suit the other mobile drivers.
+    pub fn supports_flash_attention(&self) -> bool {
+        flash_attention_supported(
+            self.max_compute_workgroup_storage_size,
+            &self.adapter_name,
+            cfg!(target_os = "android"),
+        )
+    }
+
+    /// Whether attention with `head_dim` runs on the flash kernel: head_dim 64 on an adapter
+    /// that runs it (see [`Self::supports_flash_attention`]), never on wasm32. The one
+    /// predicate both flash callers gate on, so the trunk and the ViT encoder cannot
+    /// drift apart.
+    pub fn uses_flash_attention(&self, head_dim: usize) -> bool {
+        flash_attention_supported_for(
+            head_dim,
+            self.max_compute_workgroup_storage_size,
+            &self.adapter_name,
+            cfg!(target_os = "android"),
+            cfg!(target_arch = "wasm32"),
+        )
     }
 
     /// Create a zeroed GPU buffer with read-write storage usage.
@@ -1236,6 +1334,65 @@ impl GpuContext {
                 },
                 cache: None,
             })
+    }
+
+    /// Create a compute pipeline, returning `Err` when the driver rejects it instead of an
+    /// invalid pipeline: pinned wgpu 30 never panics on validation or compile failure, it
+    /// reports to the error sink and hands back a pipeline whose dispatches are silently
+    /// dropped, so without this check a failed build zeroes output with nothing programmatic
+    /// surfacing. Only the flash builds use it today; every other kernel is within
+    /// spec-minimum limits and builds on any conformant adapter. On wasm32 this always
+    /// returns `Ok`: popping the error scope needs a blocking executor, which wasm32 lacks
+    /// (constructors are sync; `new_async` only covers context creation), so the build is
+    /// unchecked there and callers rely on the capability gate (which keeps flash off).
+    pub fn try_create_pipeline_checked(
+        &self,
+        shader_source: &str,
+        entry_point: &str,
+        label: &str,
+    ) -> anyhow::Result<wgpu::ComputePipeline> {
+        #[cfg(target_arch = "wasm32")]
+        {
+            Ok(self.create_pipeline(shader_source, entry_point, label))
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        {
+            let scope = self.device.push_error_scope(wgpu::ErrorFilter::Validation);
+            let pipeline = self.create_pipeline(shader_source, entry_point, label);
+            let err = pollster::block_on(scope.pop());
+            match err {
+                Some(e) => Err(anyhow::anyhow!("{label}: pipeline validation failed: {e}")),
+                None => Ok(pipeline),
+            }
+        }
+    }
+
+    /// Build the flash pipeline, degrading to `None` with a loud log when validation fails.
+    /// Both flash callers share this tail so the degrade-instead-of-fail policy cannot drift;
+    /// `fallback_note` names what the caller falls back to. Gates stay at the call sites
+    /// (the trunk gates on head_dim too, ViT on the adapter only). Both channels carry the
+    /// driver error: shipping hosts install no tracing subscriber, so stderr is the record.
+    pub(crate) fn build_flash_pipeline_or_log(
+        &self,
+        fallback_note: &str,
+    ) -> Option<wgpu::ComputePipeline> {
+        match self.try_create_pipeline_checked(
+            shaders::ATTENTION_FLASH_HD64,
+            "main",
+            "attention_flash_hd64",
+        ) {
+            Ok(pipe) => Some(pipe),
+            Err(e) => {
+                tracing::warn!(
+                    "attention_flash_hd64 pipeline validation failed ({e}); {fallback_note}"
+                );
+                eprintln!(
+                    "[cera::wgpu] attention_flash_hd64 pipeline validation failed ({e}); \
+                     {fallback_note}"
+                );
+                None
+            }
+        }
     }
 
     /// True if the device can take a SPIR-V passthrough module. Only the Vulkan
@@ -2495,6 +2652,8 @@ pub mod shaders {
     /// stay `array<f32>` so its exact CPU/GPU parity test keeps passing.
     pub const FLASH_ATTENTION_F32: &str = include_str!("shaders/flash_attention_f32.wgsl");
     pub const ATTENTION_PREFILL: &str = include_str!("shaders/attention_prefill.wgsl");
+    /// Register-tiled flash attention for head_dim 64 (f32 Q/K/V, GQA, bidirectional windows).
+    pub const ATTENTION_FLASH_HD64: &str = include_str!("shaders/attention_flash_hd64.wgsl");
     /// The centred gated convolution of a bidirectional LFM2 trunk.
     pub const BIDIRECTIONAL: &str = include_str!("shaders/bidirectional.wgsl");
     /// TurboQuant KV compression: `tq_encode_keys`, `tq_encode_values`,
@@ -2663,30 +2822,58 @@ pub(crate) fn require_passthrough_or_skip(ctx: &GpuContext, ran: bool, label: &s
     );
 }
 
+/// Fail-closed skip for flash-only tests, mirroring `require_passthrough_or_skip`: under
+/// `CERA_REQUIRE_FLASH=1` (the lavapipe CI leg, whose 32 KiB workgroup storage runs the
+/// kernel) a capability skip is a failure, so the flash kernel never reports green untested;
+/// elsewhere it is a visible note. Called unconditionally with whether the path ran (the
+/// caller's gate value), like the passthrough twin, so a caller cannot fail the require leg
+/// spuriously by forgetting a manual gate.
+#[cfg(test)]
+pub(crate) fn require_flash_or_skip(ctx: &GpuContext, ran: bool, label: &str) {
+    if ran {
+        return;
+    }
+    assert!(
+        std::env::var("CERA_REQUIRE_FLASH")
+            .unwrap_or_default()
+            .is_empty(),
+        "CERA_REQUIRE_FLASH is set but this adapter ({}) cannot run the flash kernel",
+        ctx.adapter_name
+    );
+    eprintln!(
+        "[gpu-flash] SKIP {label} flash on adapter ({})",
+        ctx.adapter_name
+    );
+}
+
+/// A GPU context, or `None` (skip) when no adapter exists. Under
+/// `CERA_REQUIRE_GPU` a missing adapter fails instead of skipping, so a
+/// CI leg that must exercise the GPU cannot pass vacuously. The canonical
+/// copy for lib unit tests (every `#[cfg(test)]` module in this crate
+/// imports it), like `require_passthrough_or_skip` above.
+#[cfg(test)]
+pub(crate) fn gpu_or_skip() -> Option<GpuContext> {
+    match GpuContext::new() {
+        Ok(ctx) => Some(ctx),
+        Err(e) => {
+            assert!(
+                std::env::var("CERA_REQUIRE_GPU")
+                    .unwrap_or_default()
+                    .is_empty(),
+                "CERA_REQUIRE_GPU is set but no GPU is available: {e}"
+            );
+            eprintln!("skipping: no GPU ({e})");
+            None
+        }
+    }
+}
+
 // ── Tests ──────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::future::Future;
-
-    /// A GPU context, or `None` (skip) when no adapter exists. Under
-    /// `CERA_REQUIRE_GPU` a missing adapter fails instead of skipping, so a
-    /// CI leg that must exercise the GPU cannot pass vacuously.
-    fn gpu_or_skip() -> Option<GpuContext> {
-        match GpuContext::new() {
-            Ok(ctx) => Some(ctx),
-            Err(e) => {
-                assert!(
-                    std::env::var("CERA_REQUIRE_GPU")
-                        .unwrap_or_default()
-                        .is_empty(),
-                    "CERA_REQUIRE_GPU is set but no GPU is available: {e}"
-                );
-                None
-            }
-        }
-    }
 
     /// Pack f32 pairs LE (even elem in the low bits) for KV-cache uploads,
     /// exactly as `kv_append` lays them out. One copy for every oracle that
@@ -7163,13 +7350,25 @@ mod tests {
 
     /// Run `attention_prefill` over the whole query batch and return the
     /// downloaded output. Queries are dispatched in sub-batches of at most `tile`,
-    /// each with its own `q_base` offset — so `tile == n_queries` is the single
-    /// dispatch the production host uses, and a smaller `tile` exercises the
-    /// shader's `q_base` offset arithmetic (q_global / out_offset / causal pos).
+    /// each with its own `q_base` offset, so `tile == n_queries` is the single-dispatch
+    /// short-call case, and a smaller `tile` exercises the shader's `q_base` offset
+    /// arithmetic the way a chunked production call does (q_global / out_offset / causal pos).
     fn run_gpu_attention_prefill_tiled(
         ctx: &GpuContext,
         f: &AttnPrefillFixture,
         tile: u32,
+    ) -> Vec<f32> {
+        run_gpu_attention_prefill_mode(ctx, f, tile, None)
+    }
+
+    /// [`run_gpu_attention_prefill_tiled`] for a causal pass (`bidir_prefix` `None`) or a
+    /// bidirectional one (`Some(prefix_rows)`): every dispatch gets the whole call's row count in
+    /// params[7], which is what a bidirectional window is read from.
+    fn run_gpu_attention_prefill_mode(
+        ctx: &GpuContext,
+        f: &AttnPrefillFixture,
+        tile: u32,
+        bidir_prefix: Option<u32>,
     ) -> Vec<f32> {
         assert!(tile > 0, "tile must be > 0 (0 would never advance q_base)");
         let pipeline = ctx.create_pipeline(
@@ -7196,13 +7395,13 @@ mod tests {
                 f.max_seq,
                 f.scale.to_bits(),
                 f.start_pos,
-                n_sub,
+                f.start_pos + f.n_queries, // total_rows: read by a bidirectional pass only
                 f.q_stride,
                 f.out_stride,
                 q_base,
                 n_sub,
-                0, // causal
-                0, // prefix_rows
+                u32::from(bidir_prefix.is_some()),
+                bidir_prefix.unwrap_or(0),
             ];
             let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "params");
             let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -7245,7 +7444,8 @@ mod tests {
     }
 
     /// Run `attention_prefill` in a single dispatch over the whole query batch (the
-    /// production path) and return the downloaded output.
+    /// short-call production path; long calls split per the host chunk plan) and return the
+    /// downloaded output.
     fn run_gpu_attention_prefill(ctx: &GpuContext, f: &AttnPrefillFixture) -> Vec<f32> {
         run_gpu_attention_prefill_tiled(ctx, f, f.n_queries)
     }
@@ -7267,6 +7467,361 @@ mod tests {
                 (i % f.out_stride as usize) / f.head_dim as usize,
                 i % f.head_dim as usize,
             );
+        }
+    }
+
+    /// The flash gate needs the kernel's workgroup storage, not just a desktop OS: a 16 KB
+    /// adapter takes the generic kernel instead of failing the flash pipeline build. On Android
+    /// the gate additionally needs an Adreno adapter. Pure host check.
+    #[test]
+    fn flash_gate_checks_workgroup_storage() {
+        use super::{
+            FLASH_ATTENTION_WORKGROUP_BYTES, flash_attention_supported,
+            flash_attention_supported_for,
+        };
+        const MIN: u32 = FLASH_ATTENTION_WORKGROUP_BYTES;
+        // storage boundary on desktop (any adapter name passes the vendor clause)
+        assert!(!flash_attention_supported(16384, "desktop", false));
+        assert!(!flash_attention_supported(MIN - 1, "desktop", false));
+        assert!(flash_attention_supported(MIN, "desktop", false));
+        assert!(flash_attention_supported(32768, "desktop", false));
+        // vendor clause on Android: Adreno passes, anything else refuses
+        assert!(flash_attention_supported(32768, "Adreno 830", true));
+        assert!(!flash_attention_supported(32768, "Mali-G720", true));
+        assert!(!flash_attention_supported(16384, "Adreno 830", true));
+        // head_dim conjunct: only 64 takes flash, whatever the adapter offers
+        assert!(flash_attention_supported_for(
+            64, MIN, "desktop", false, false
+        ));
+        assert!(!flash_attention_supported_for(
+            32, 32768, "desktop", false, false
+        ));
+        assert!(!flash_attention_supported_for(
+            128,
+            32768,
+            "Adreno 830",
+            true,
+            false
+        ));
+        // wasm32 fails closed: the checked build cannot pop its scope there
+        assert!(!flash_attention_supported_for(
+            64, 32768, "desktop", false, true
+        ));
+    }
+
+    /// `FLASH_ATTENTION_WORKGROUP_BYTES` matches the `var<workgroup>` block of
+    /// `attention_flash_hd64.wgsl`: if the kernel grows without updating the const, narrow
+    /// adapters fail at load instead of falling back. Offsets honor each decl's alignment, so
+    /// a decl that inserts padding is caught too. Pure host check.
+    #[test]
+    fn flash_workgroup_bytes_match_the_shader() {
+        let mut offsets = Vec::new();
+        let mut offset = 0u32;
+        for line in super::shaders::ATTENTION_FLASH_HD64.lines() {
+            let rest = match line.trim().strip_prefix("var<workgroup>") {
+                Some(rest) => rest,
+                None => continue,
+            };
+            let (elem_bytes, elem_align) = if rest.contains("vec4<f32>") {
+                (16, 16)
+            } else if rest.contains("vec2<f32>") {
+                (8, 8)
+            } else if rest.contains("array<f32,") {
+                (4, 4)
+            } else {
+                panic!("unrecognized workgroup decl: {line}");
+            };
+            let count: u32 = rest
+                .rsplit(',')
+                .next()
+                .and_then(|s| s.trim().strip_suffix(">;"))
+                .and_then(|s| s.trim().parse().ok())
+                .unwrap_or_else(|| panic!("unparseable workgroup decl: {line}"));
+            offset = offset.next_multiple_of(elem_align);
+            offsets.push(offset);
+            offset += elem_bytes * count;
+        }
+        assert_eq!(
+            offsets,
+            vec![0, 8192, 16384, 25088, 29184, 29696, 29824],
+            "workgroup layout drifted; update FLASH_ATTENTION_WORKGROUP_BYTES to match"
+        );
+        assert_eq!(offset, super::FLASH_ATTENTION_WORKGROUP_BYTES);
+    }
+
+    /// `flash_dispatch_runs` covers every tile exactly once, in order, keeping each run
+    /// within the work cap: the split is what keeps dispatches short for phone hang
+    /// detectors, and GPU tests assert output correctness only. Pure host check.
+    #[test]
+    fn flash_dispatch_runs_cover_the_tiles_within_the_cap() {
+        for &(tiles, tokens, heads) in &[
+            (0u32, 2100usize, 4usize),
+            (1, 5, 4),
+            (66, 2100, 4),
+            (128, 4096, 2),
+            (300, 5000, 4),
+        ] {
+            let runs = GpuContext::flash_dispatch_runs(tiles, tokens, heads);
+            let mut next = 0;
+            for &(first, count) in &runs {
+                assert_eq!(first, next);
+                assert!(count > 0);
+                let queries = count as usize * 32;
+                assert!(
+                    count == 1 || queries * tokens * heads <= 1 << 25,
+                    "run over the cap"
+                );
+                next = first + count;
+            }
+            assert_eq!(next, tiles);
+        }
+        assert_eq!(GpuContext::flash_attention_tiles_per_dispatch(2100, 4), 64);
+        assert_eq!(
+            GpuContext::flash_attention_tiles_per_dispatch(1_000_000, 64),
+            1
+        );
+    }
+
+    /// `try_create_pipeline_checked` fails loudly where `create_pipeline` hands back an
+    /// invalid pipeline: pinned wgpu 30 reports validation failures to the error sink
+    /// instead of panicking, so an unchecked bad build would drop every dispatch and
+    /// read back zeros. Both probes are backend-independent (naga-level), so they fail
+    /// identically on Metal and lavapipe. Not wasm32: the checked build is unchecked
+    /// there by construction (see `checked_pipeline_creation_is_unchecked_on_wasm32`).
+    /// Needs a GPU.
+    #[test]
+    #[cfg(not(target_arch = "wasm32"))]
+    fn checked_pipeline_creation_rejects_invalid_builds() {
+        let Some(ctx) = gpu_or_skip() else { return };
+        let trivial = "@compute @workgroup_size(1) fn main() {}";
+        // a missing entry point fails validation: the checked build errors...
+        assert!(
+            ctx.try_create_pipeline_checked(trivial, "main_missing", "bad_entry_probe")
+                .is_err()
+        );
+        // ...as does a WGSL syntax error, which fails at module creation inside the scope...
+        assert!(
+            ctx.try_create_pipeline_checked(
+                "@compute @workgroup_size(1) fn main() { let x: u32 = ; }",
+                "main",
+                "bad_module_probe",
+            )
+            .is_err()
+        );
+        // ...while the unchecked build does not panic (it returns an invalid pipeline whose
+        // dispatches the driver drops), pinning the premise the checked helper exists for.
+        let unchecked = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            ctx.create_pipeline(trivial, "main_missing", "bad_entry_probe_unchecked")
+        }));
+        assert!(unchecked.is_ok(), "unchecked creation must not panic");
+        // ...and a trivial valid shader still builds through the checked path.
+        assert!(
+            ctx.try_create_pipeline_checked(trivial, "main", "trivial_probe")
+                .is_ok()
+        );
+    }
+
+    /// The wasm32 exception to `try_create_pipeline_checked`: popping the error scope
+    /// needs a blocking executor, which wasm32 lacks, so the build is unchecked there
+    /// and always returns `Ok` (callers rely on the capability gate, which keeps flash
+    /// off). Pins the documented behavior so the non-wasm test above can stay strict.
+    /// Needs a GPU.
+    #[test]
+    #[cfg(target_arch = "wasm32")]
+    fn checked_pipeline_creation_is_unchecked_on_wasm32() {
+        let Some(ctx) = gpu_or_skip() else { return };
+        let trivial = "@compute @workgroup_size(1) fn main() {}";
+        assert!(
+            ctx.try_create_pipeline_checked(trivial, "main_missing", "bad_entry_probe")
+                .is_ok()
+        );
+        assert!(
+            ctx.try_create_pipeline_checked(
+                "@compute @workgroup_size(1) fn main() { let x: u32 = ; }",
+                "main",
+                "bad_module_probe",
+            )
+            .is_ok()
+        );
+    }
+
+    /// `kv_append` packs f32 into f16 pairs with hand-written bit ops, and every wgpu KV cache
+    /// goes through it. It must agree with a correct f32 -> f16 conversion everywhere: a mantissa
+    /// that rounds up past its top has to carry into the exponent for odd and even exponents
+    /// alike (an OR instead of an add halved such values, about 1 in 4000 of the K/V a model
+    /// writes), half subnormals are kept, and an overflow clamps to max-half rather than Inf.
+    /// Exact ties are skipped: the shader rounds them away from zero, `half` to even.
+    #[test]
+    fn test_gpu_kv_append_matches_f16_conversion() {
+        let Some(ctx) = gpu_or_skip() else { return };
+        let mut values: Vec<f32> = Vec::new();
+        // Every binade from below the smallest half subnormal to past the overflow, with the
+        // mantissas that sit on a rounding or carry boundary and a spread of others.
+        let mut lcg = 0x2545_F491_4F6C_DD1Du64;
+        for exp in 100u32..=146 {
+            for mant in [
+                0u32, 1, 0x0FFF, 0x1001, 0x1FFF, 0x2000, 0x7F_E000, 0x7F_EFFF, 0x7F_F001,
+                0x7F_F800, 0x7F_FFFF,
+            ] {
+                values.push(f32::from_bits((exp << 23) | mant));
+            }
+            for _ in 0..64 {
+                lcg = lcg
+                    .wrapping_mul(6364136223846793005)
+                    .wrapping_add(1442695040888963407);
+                values.push(f32::from_bits(
+                    (exp << 23) | ((lcg >> 41) as u32 & 0x7F_FFFF),
+                ));
+            }
+        }
+        values.extend([
+            0.0,
+            65504.0,
+            65519.0,
+            65520.0,
+            1.0e9,
+            // Inf clamps to max-half, never Inf (mirrored to -Inf below)
+            f32::INFINITY,
+        ]);
+        let values: Vec<f32> = values.iter().flat_map(|&v| [v, -v]).collect();
+        let n = values.len();
+        assert!(n.is_multiple_of(2));
+
+        let expected = |x: f32| -> Option<u16> {
+            let r = half::f16::from_f32(x);
+            let rd = f64::from(r.to_f32());
+            let (xd, mag) = (f64::from(x), r.to_bits() & 0x7FFF);
+            // the neighbour on the other side of x, to detect an exact tie
+            let other_bits = if rd > xd {
+                if x < 0.0 {
+                    r.to_bits() + 1
+                } else {
+                    r.to_bits().wrapping_sub(1)
+                }
+            } else if x < 0.0 {
+                r.to_bits().wrapping_sub(1)
+            } else {
+                r.to_bits() + 1
+            };
+            if (mag != 0 || rd != xd) && rd != xd {
+                let od = f64::from(half::f16::from_bits(other_bits).to_f32());
+                if od.is_finite() && (xd - rd).abs() == (xd - od).abs() {
+                    return None;
+                }
+            }
+            Some(if r.is_infinite() {
+                (r.to_bits() & 0x8000) | 0x7BFF
+            } else {
+                r.to_bits()
+            })
+        };
+
+        let src = ctx.upload_f32(&values, "kv_append.src");
+        let dst = ctx.create_storage_rw((n / 2 * 4) as u64, "kv_append.dst");
+        let params: [u32; 4] = [0, n as u32, 0, 0];
+        let p_buf = ctx.upload_storage(bytemuck::cast_slice(&params), "kv_append.params");
+        let pipeline = ctx.create_pipeline(shaders::KV_APPEND, "kv_append", "kv_append");
+        let bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: None,
+            layout: &pipeline.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: src.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: dst.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ],
+        });
+        let mut enc = ctx.device.create_command_encoder(&Default::default());
+        {
+            let mut pass = enc.begin_compute_pass(&Default::default());
+            pass.set_pipeline(&pipeline);
+            pass.set_bind_group(0, &bg, &[]);
+            pass.dispatch_workgroups((n as u32 / 2).div_ceil(256), 1, 1);
+        }
+        ctx.submit_encoder(enc);
+        let words = ctx.download_u32(&dst, n / 2);
+
+        let mut checked = 0usize;
+        for (i, &x) in values.iter().enumerate() {
+            let Some(want) = expected(x) else { continue };
+            let got = ((words[i / 2] >> (16 * (i % 2))) & 0xFFFF) as u16;
+            assert_eq!(
+                got,
+                want,
+                "kv_append({x:e}, bits {:#010x}) = {got:#06x}, want {want:#06x}",
+                x.to_bits()
+            );
+            checked += 1;
+        }
+        assert!(
+            checked > n * 9 / 10,
+            "too many values skipped as ties: {checked} of {n}"
+        );
+    }
+
+    /// A bidirectional pass split into several dispatches matches a CPU reference, with and
+    /// without a media prefix. A split dispatch only knows its own share of the queries, so the
+    /// key window has to come from the whole call's row count (params[7]); deriving it from the
+    /// chunk's query count read too few keys and shifted the d1 decision models' answers.
+    #[test]
+    fn test_gpu_attention_prefill_bidirectional_split_matches_cpu() {
+        let Some(ctx) = gpu_or_skip() else { return };
+        let f = build_attn_prefill_fixture(4, 2, 32, 70, 0);
+        let (hd, kv_dim) = (f.head_dim as usize, f.kv_dim as usize);
+        let group = (f.n_heads / f.n_kv_heads) as usize;
+        for prefix in [0u32, 24] {
+            let mut want = vec![0.0f32; f.ref_out.len()];
+            for q in 0..f.n_queries as usize {
+                // a query in the media prefix reads only the prefix; the others read everything
+                let window = if prefix > 0 && (q as u32) < prefix {
+                    prefix as usize
+                } else {
+                    f.n_queries as usize
+                };
+                for h in 0..f.n_heads as usize {
+                    let kv_off = (h / group) * hd;
+                    let q_off = q * f.q_stride as usize + h * hd;
+                    let mut scores: Vec<f32> = (0..window)
+                        .map(|t| {
+                            (0..hd)
+                                .map(|d| f.q_batch[q_off + d] * f.k_cache[t * kv_dim + kv_off + d])
+                                .sum::<f32>()
+                                * f.scale
+                        })
+                        .collect();
+                    let max_s = scores.iter().copied().fold(f32::NEG_INFINITY, f32::max);
+                    let mut sum = 0.0f32;
+                    for s in &mut scores {
+                        *s = (*s - max_s).exp();
+                        sum += *s;
+                    }
+                    for d in 0..hd {
+                        want[q * f.out_stride as usize + h * hd + d] = scores
+                            .iter()
+                            .enumerate()
+                            .map(|(t, s)| s / sum * f.v_cache[t * kv_dim + kv_off + d])
+                            .sum();
+                    }
+                }
+            }
+            for tile in [70u32, 24, 16, 8] {
+                let got = run_gpu_attention_prefill_mode(&ctx, &f, tile, Some(prefix));
+                for (i, (&g, &w)) in got.iter().zip(&want).enumerate() {
+                    assert!(
+                        (g - w).abs() <= 5e-3 + 1e-3 * w.abs(),
+                        "bidirectional prefix={prefix} tile={tile}: idx {i} (token {}) gpu={g} cpu={w}",
+                        i / f.out_stride as usize
+                    );
+                }
+            }
         }
     }
 
@@ -7323,13 +7878,11 @@ mod tests {
         assert_attn_prefill_matches(&f, &got, "seq1 attention_prefill");
     }
 
-    /// `attention_prefill` `q_base` offset: the shader still supports dispatching a
+    /// `attention_prefill` `q_base` offset: the shader supports dispatching a
     /// query sub-batch at a `q_base` offset into `q_batch`/`out_batch` (the
-    /// production host always passes 0, but the param path is live and drives
-    /// `q_global`, `out_offset`, and the causal position). Dispatching the batch in
-    /// `q_base`-offset sub-batches must match the single dispatch — guarding that
-    /// offset arithmetic, which lost its only cover when the query-tiling test was
-    /// removed.
+    /// production host passes nonzero `q_base` for split calls, and the param path
+    /// drives `q_global`, `out_offset`, and the causal position). Dispatching the
+    /// batch in `q_base`-offset sub-batches must match the single dispatch.
     #[test]
     fn test_gpu_attention_prefill_qbase_offset() {
         let ctx = match GpuContext::new() {
@@ -7381,7 +7934,7 @@ mod tests {
             0, // max_seq == 0 → seq_len == 0
             1.0f32.to_bits(),
             0, // start_pos
-            n,
+            n, // total_rows (ignored: causal)
             q_stride,
             out_stride,
             0, // q_base

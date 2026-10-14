@@ -933,7 +933,16 @@ pub struct WgpuVitOps {
     p_relu: wgpu::ComputePipeline,
     p_attn: wgpu::ComputePipeline,
     p_attn_tiled: wgpu::ComputePipeline,
+    /// Register-tiled flash attention, `None` when its build failed: the kernel needs
+    /// `FLASH_ATTENTION_WORKGROUP_BYTES` of workgroup storage, past some adapters' limit,
+    /// and losing it must fall back to the tiled/scalar kernels rather than fail the
+    /// whole encoder.
+    p_attn_flash: Option<wgpu::ComputePipeline>,
     p_add: wgpu::ComputePipeline,
+    /// Flash-attention dispatches issued (test observability: proves the flash kernel ran,
+    /// since every fallback produces correct output too and would otherwise hide a dead path).
+    #[cfg(test)]
+    flash_dispatches: std::sync::atomic::AtomicU32,
 }
 
 #[cfg(feature = "gpu")]
@@ -954,12 +963,14 @@ impl WgpuVitOps {
 
     pub fn new(ctx: crate::backend::wgpu::GpuContext) -> Result<Self> {
         use crate::backend::wgpu::shaders;
-        // `create_pipeline*` return the pipeline directly and panic on shader
-        // preprocessing or adapter-side validation/compile failure (they have
-        // no `Result`). Catch that here and surface an `Err` so the caller's
-        // `?` degrades to the CPU encoder — mirroring `MetalVitOps::new`'s
-        // `.ok()?` — instead of aborting `CeraEngine` construction on a weak or
-        // non-conformant adapter.
+        // `create_pipeline*` return the pipeline directly and panic only on host-side
+        // shader preprocessing failure (pinned wgpu 30 reports adapter-side
+        // validation/compile failure to the error sink and hands back an invalid
+        // pipeline instead of panicking). Catch the host panic here and surface an `Err`
+        // so the caller's `?` degrades to the CPU encoder, mirroring
+        // `MetalVitOps::new`'s `.ok()?`, instead of aborting `CeraEngine`
+        // construction. The flash build below checks its error scope explicitly because
+        // it is the one kernel that can exceed an adapter's workgroup limit.
         std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
             let (wg_m, wg_n) = (format!("{VIT_MM_WG_M}u"), format!("{VIT_MM_WG_N}u"));
             let (tile_m, tile_n) = (format!("{VIT_MM_TILE_M}u"), format!("{VIT_MM_TILE_N}u"));
@@ -1006,11 +1017,26 @@ impl WgpuVitOps {
                     "vit_attention_tiled",
                     "vit_attention_tiled",
                 ),
+                // Built only where the flash gate passes (the kernel needs
+                // `FLASH_ATTENTION_WORKGROUP_BYTES`, past some adapters' limit,
+                // and the checked build cannot run on wasm32, so the gate keeps
+                // flash off there); a flash-only failure falls back, far slower,
+                // instead of failing the encoder (shared tail in
+                // `build_flash_pipeline_or_log`).
+                p_attn_flash: if ctx.uses_flash_attention(64) {
+                    ctx.build_flash_pipeline_or_log(
+                        "ViT attention falls back to the tiled/scalar kernels",
+                    )
+                } else {
+                    None
+                },
                 p_add: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "vit_add"),
                 p_mul_mat_q8_0,
                 p_mul_mat_q4_0,
                 p_linear,
                 ctx,
+                #[cfg(test)]
+                flash_dispatches: std::sync::atomic::AtomicU32::new(0),
             }
         }))
         .map_err(|_| {
@@ -1048,6 +1074,12 @@ impl WgpuVitOps {
             pass.dispatch_workgroups(workgroups.0, workgroups.1, workgroups.2);
         }
         self.ctx.submit_encoder(enc);
+    }
+
+    /// Whether `attention` with `head_dim` runs on the register-tiled flash kernel: head_dim 64
+    /// on an adapter that runs it, with the pipeline built.
+    fn flash_ready(&self, head_dim: usize) -> bool {
+        self.p_attn_flash.is_some() && self.ctx.uses_flash_attention(head_dim)
     }
 
     /// Like [`Self::dispatch`], binding each buffer over `(offset_bytes, size_bytes)` of it
@@ -1323,8 +1355,9 @@ impl VitGpuOps for WgpuVitOps {
     }
 
     fn attention_token_limit(&self, head_dim: usize) -> usize {
-        // the query-tiled kernel (every desktop adapter) streams K/V; the scalar one does not
-        if Self::streams_kv(head_dim) {
+        // the flash kernel where built, and the query-tiled kernel on desktop, stream K/V;
+        // the scalar one does not
+        if self.flash_ready(head_dim) || Self::streams_kv(head_dim) {
             usize::MAX
         } else {
             MAX_VIT_TOKENS
@@ -1351,38 +1384,83 @@ impl VitGpuOps for WgpuVitOps {
         head_dim: usize,
     ) -> Self::Buf {
         let dim = n_head * head_dim;
-        let pad_tokens = tokens.next_multiple_of(32);
-        let pad_dim = dim.next_multiple_of(32);
+        let pad_tokens = tokens.next_multiple_of(32).max(32);
+        let pad_dim = dim.next_multiple_of(32).max(32);
         let out = self
             .ctx
             .create_storage_rw((pad_tokens * pad_dim * 4) as u64, "vit_attn_out");
+        if tokens == 0 {
+            return out;
+        }
         let scale = 1.0f32 / (head_dim as f32).sqrt();
-        let params: [u32; 4] = [
-            tokens as u32,
-            n_head as u32,
-            head_dim as u32,
-            scale.to_bits(),
-        ];
-        let p_buf = self
-            .ctx
-            .upload_storage(bytemuck::cast_slice(&params), "vit_attn_params");
         // Query-tiled flash attention (one workgroup per Q_TILE=256 queries,
         // reusing K/V tiles in shared memory) when head_dim fits its shared/
         // register sizing; else the scalar per-query kernel.
         const VIT_ATTN_TILED_Q: u32 = 256;
         let use_tiled = Self::streams_kv(head_dim);
-        if use_tiled {
-            self.dispatch(
-                &self.p_attn_tiled,
-                &[q, k, v, &out, &p_buf],
-                ((tokens as u32).div_ceil(VIT_ATTN_TILED_Q), n_head as u32, 1),
+        if self.flash_ready(head_dim) {
+            // the gate holds head_dim at 64, which the kernel hardwires (its params[2] is
+            // informational and never read). Fail fast on a malformed call, like the trunk.
+            assert!(
+                head_dim == 64,
+                "vit attention_flash_hd64 hardcodes head_dim 64; got {head_dim}"
             );
+            let flash_pipe = self
+                .p_attn_flash
+                .as_ref()
+                .expect("flash pipeline is built when flash_ready() holds");
+            // tokens, n_head, head_dim, scale, n_kv_head (every head has its own), no window, and
+            // the first query tile of the dispatch; a long call is several short dispatches
+            for (first, count) in crate::backend::wgpu::GpuContext::flash_dispatch_runs(
+                (tokens as u32).div_ceil(32),
+                tokens,
+                n_head,
+            ) {
+                #[cfg(test)]
+                self.flash_dispatches
+                    .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let flash: [u32; 8] = [
+                    tokens as u32,
+                    n_head as u32,
+                    head_dim as u32,
+                    scale.to_bits(),
+                    n_head as u32,
+                    0,
+                    0,
+                    first,
+                ];
+                let flash_buf = self
+                    .ctx
+                    .upload_storage(bytemuck::cast_slice(&flash), "vit_attn_flash_params");
+                self.dispatch(
+                    flash_pipe,
+                    &[q, k, v, &out, &flash_buf],
+                    (count, n_head as u32, 1),
+                );
+            }
         } else {
-            self.dispatch(
-                &self.p_attn,
-                &[q, k, v, &out, &p_buf],
-                (tokens as u32, n_head as u32, 1),
-            );
+            let params: [u32; 4] = [
+                tokens as u32,
+                n_head as u32,
+                head_dim as u32,
+                scale.to_bits(),
+            ];
+            let p_buf = self
+                .ctx
+                .upload_storage(bytemuck::cast_slice(&params), "vit_attn_params");
+            if use_tiled {
+                self.dispatch(
+                    &self.p_attn_tiled,
+                    &[q, k, v, &out, &p_buf],
+                    ((tokens as u32).div_ceil(VIT_ATTN_TILED_Q), n_head as u32, 1),
+                );
+            } else {
+                self.dispatch(
+                    &self.p_attn,
+                    &[q, k, v, &out, &p_buf],
+                    (tokens as u32, n_head as u32, 1),
+                );
+            }
         }
         out
     }
@@ -2084,23 +2162,27 @@ pub fn build_vit_stack(
     use crate::engine::BackendPreference as BP;
     match backend {
         BP::Metal => try_metal_stack(spec),
-        BP::Gpu => try_wgpu_stack(spec),
-        BP::Auto => try_metal_stack(spec).or_else(|| try_wgpu_stack(spec)),
+        BP::Gpu => try_wgpu_stack(spec, false),
+        BP::Auto => try_metal_stack(spec).or_else(|| try_wgpu_stack(spec, false)),
         BP::Cpu | BP::Hexagon | BP::Npu => None,
     }
 }
 
-/// [`build_vit_stack`] for a stack that only pays on a GPU with matrix units: `Metal`, or `Auto`
-/// where Metal opens. The wgpu attention kernel is a scalar tiled one, and a long sequence through
-/// it takes longer than the host's blocked kernel does, so the decision head does not use it.
-pub fn build_vit_stack_native(
+/// [`build_vit_stack`] for a stack that sees long sequences, which only pays on a GPU whose
+/// attention is fast: Metal, or wgpu where the adapter runs the register-tiled flash kernel
+/// (head_dim 64, see `crate::backend::wgpu::GpuContext::uses_flash_attention`). The scalar
+/// wgpu attention kernels are slower than the host's blocked kernel on a long sequence, so
+/// elsewhere this returns `None` and the caller stays on the host.
+pub fn build_vit_stack_fast(
     spec: &VitStackSpec,
     backend: crate::engine::BackendPreference,
 ) -> Option<std::sync::Arc<dyn VitStack>> {
     use crate::engine::BackendPreference as BP;
     match backend {
-        BP::Metal | BP::Auto => try_metal_stack(spec),
-        BP::Gpu | BP::Cpu | BP::Hexagon | BP::Npu => None,
+        BP::Metal => try_metal_stack(spec),
+        BP::Gpu => try_wgpu_stack(spec, true),
+        BP::Auto => try_metal_stack(spec).or_else(|| try_wgpu_stack(spec, true)),
+        BP::Cpu | BP::Hexagon | BP::Npu => None,
     }
 }
 
@@ -2115,6 +2197,19 @@ pub fn build_vit_stack_native(
 fn warn_stack_unavailable(what: &str, e: impl std::fmt::Display) {
     tracing::warn!("vit stack: {what} unavailable: {e:#}");
     eprintln!("vit stack: {what} unavailable: {e:#}");
+}
+
+/// Renamed to [`build_vit_stack_fast`]: `Gpu` now returns a stack when the adapter runs the
+/// flash kernel instead of always returning `None`.
+#[deprecated(
+    since = "0.7.0",
+    note = "renamed to build_vit_stack_fast; Gpu now returns a stack when the adapter runs the flash kernel"
+)]
+pub fn build_vit_stack_native(
+    spec: &VitStackSpec,
+    backend: crate::engine::BackendPreference,
+) -> Option<std::sync::Arc<dyn VitStack>> {
+    build_vit_stack_fast(spec, backend)
 }
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -2152,8 +2247,9 @@ fn try_metal_stack(_spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>>
     None
 }
 
+/// A wgpu stack; with `need_flash`, only on an adapter that attends with the flash kernel.
 #[cfg(feature = "gpu")]
-fn try_wgpu_stack(spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
+fn try_wgpu_stack(spec: &VitStackSpec, need_flash: bool) -> Option<std::sync::Arc<dyn VitStack>> {
     // an absent device is ordinary Auto fallthrough (the trunk logs it at debug); only a
     // backend that opens but then fails (pipelines, spec) is a warn-worthy refusal
     let ctx = match crate::backend::wgpu::GpuContext::new() {
@@ -2163,6 +2259,10 @@ fn try_wgpu_stack(spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
             return None;
         }
     };
+    let head_dim = spec.width / spec.heads.max(1);
+    if need_flash && !ctx.uses_flash_attention(head_dim) {
+        return None;
+    }
     let ops = match WgpuVitOps::new(ctx) {
         Ok(ops) => ops,
         Err(e) => {
@@ -2170,6 +2270,11 @@ fn try_wgpu_stack(spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
             return None;
         }
     };
+    if need_flash && !ops.flash_ready(head_dim) {
+        // the gate passed but the flash pipeline failed to build: the slow path is not what
+        // this stack is for, so decline and let the caller stay on the host.
+        return None;
+    }
     match GpuStack::build(ops, spec) {
         Ok(stack) => {
             tracing::info!("vit stack: using wgpu GPU backend");
@@ -2183,7 +2288,7 @@ fn try_wgpu_stack(spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
 }
 
 #[cfg(not(feature = "gpu"))]
-fn try_wgpu_stack(_spec: &VitStackSpec) -> Option<std::sync::Arc<dyn VitStack>> {
+fn try_wgpu_stack(_spec: &VitStackSpec, _need_flash: bool) -> Option<std::sync::Arc<dyn VitStack>> {
     None
 }
 
@@ -2287,6 +2392,8 @@ fn try_metal_vision_encoder(
 mod tests {
     use super::*;
 
+    #[cfg(feature = "gpu")]
+    use crate::backend::wgpu::{gpu_or_skip, require_flash_or_skip};
     use crate::model::vision_encoder::{PatchEmbedWeights, ProjectorWeights, VitBlockWeights};
     use crate::model::weights::MmapWeight;
     use crate::tensor::DType;
@@ -2491,13 +2598,100 @@ mod tests {
         );
     }
 
+    /// The register-tiled flash kernel (head_dim 64) against a direct f64 softmax-attention, over
+    /// token counts that are and are not a multiple of its 32-query and 32-key tiles.
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn wgpu_flash_attention_matches_the_definition() {
+        let Some(ctx) = gpu_or_skip() else { return };
+        // The dispatch predicate, not the adapter-only one: the `runs > 0` assert below
+        // needs `flash_ready`, which carries the head_dim and wasm32 conjuncts.
+        let flash_capable = ctx.uses_flash_attention(64);
+        require_flash_or_skip(
+            &ctx,
+            flash_capable,
+            "wgpu_flash_attention_matches_the_definition",
+        );
+        if !flash_capable {
+            return;
+        }
+        let ops = WgpuVitOps::new(ctx).expect("build wgpu vit ops");
+        let (heads, hd) = (4usize, 64usize);
+        let dim = heads * hd;
+        // 2100 tokens is 66 query tiles: past the 64 one dispatch covers, so the call splits
+        for n in [1usize, 5, 31, 32, 33, 257, 1100, 2100] {
+            let before = ops
+                .flash_dispatches
+                .load(std::sync::atomic::Ordering::Relaxed);
+            let (q, k, v) = (rnd(n * dim, 1), rnd(n * dim, 2), rnd(n * dim, 3));
+            let want = {
+                let scale = (hd as f64).powf(-0.5);
+                let mut out = vec![0f32; n * dim];
+                let mut s = vec![0.0f64; n];
+                for r in 0..n {
+                    for h in 0..heads {
+                        let q_off = r * dim + h * hd;
+                        for (j, sj) in s.iter_mut().enumerate() {
+                            let k_off = j * dim + h * hd;
+                            let mut dot = 0.0f64;
+                            for d in 0..hd {
+                                dot += f64::from(q[q_off + d]) * f64::from(k[k_off + d]);
+                            }
+                            *sj = dot * scale;
+                        }
+                        let max = s.iter().cloned().fold(f64::MIN, f64::max);
+                        let mut sum = 0.0;
+                        for x in s.iter_mut() {
+                            *x = (*x - max).exp();
+                            sum += *x;
+                        }
+                        let inv_sum = 1.0 / sum;
+                        let mut acc = [0.0f64; 64];
+                        for (j, &sj) in s.iter().enumerate() {
+                            let v_off = j * dim + h * hd;
+                            for d in 0..hd {
+                                acc[d] += sj * f64::from(v[v_off + d]);
+                            }
+                        }
+                        for d in 0..hd {
+                            out[q_off + d] = (acc[d] * inv_sum) as f32;
+                        }
+                    }
+                }
+                out
+            };
+            let got = ops.attention(
+                &ops.upload(&q),
+                &ops.upload(&k),
+                &ops.upload(&v),
+                n,
+                heads,
+                hd,
+            );
+            let got = ops.download(&got, n * dim);
+            let worst = want
+                .iter()
+                .zip(&got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(worst < 1e-4, "n={n}: worst {worst}");
+            // output alone cannot tell flash from the tiled fallback, so pin the dispatch:
+            // every leg here must run the flash kernel, and the 2100-token leg splits in two.
+            let runs = ops
+                .flash_dispatches
+                .load(std::sync::atomic::Ordering::Relaxed)
+                - before;
+            assert!(runs > 0, "n={n}: the flash kernel ran zero dispatches");
+            if n == 2100 {
+                assert_eq!(runs, 2, "2100 tokens are 66 tiles over 64 per dispatch");
+            }
+        }
+    }
+
     #[cfg(feature = "gpu")]
     #[test]
     fn test_gpu_encode_image_parity() {
-        let ctx = match crate::backend::wgpu::GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(_) => return, // no GPU (CI)
-        };
+        let Some(ctx) = gpu_or_skip() else { return };
         run_parity(
             &WgpuVitOps::new(ctx).expect("build wgpu vit ops"),
             &synth_encoder(),
@@ -2526,12 +2720,10 @@ mod tests {
     #[cfg(feature = "gpu")]
     #[test]
     fn test_wgpu_encode_wrapper_happy_path() {
-        use crate::engine::BackendPreference as BP;
         let enc = synth_encoder();
-        let encoder = match build_gpu_vision_encoder(&enc, BP::Gpu) {
-            Some(e) => e,
-            None => return, // no GPU (CI)
-        };
+        let Some(ctx) = gpu_or_skip() else { return };
+        let encoder =
+            build_wgpu_vision_encoder_with_context(ctx, &enc).expect("build wgpu vision encoder");
         let cfg = &enc.config;
         let pixels = rnd(3 * 8 * cfg.patch_size * 8 * cfg.patch_size, 999);
         let cpu_out = enc.encode_image(&pixels, 8, 8).unwrap();
@@ -2585,10 +2777,7 @@ mod tests {
     #[cfg(feature = "gpu")]
     #[test]
     fn test_gpu_encode_image_parity_q8_0() {
-        let ctx = match crate::backend::wgpu::GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(_) => return, // no GPU (CI)
-        };
+        let Some(ctx) = gpu_or_skip() else { return };
         run_parity(
             &WgpuVitOps::new(ctx).expect("build wgpu vit ops"),
             &synth_encoder_quant(Some(DType::Q8_0)),
@@ -2602,16 +2791,22 @@ mod tests {
     #[cfg(feature = "gpu")]
     #[test]
     fn test_gpu_encode_image_parity_q4_0() {
-        let ctx = match crate::backend::wgpu::GpuContext::new() {
-            Ok(ctx) => ctx,
-            Err(_) => return, // no GPU (CI)
-        };
+        let Some(ctx) = gpu_or_skip() else { return };
         run_parity(
             &WgpuVitOps::new(ctx).expect("build wgpu vit ops"),
             &synth_encoder_quant(Some(DType::Q4_0)),
             2e-1,
             4e-2, // 4-bit GEMM noise scales with magnitude (see run_parity)
         );
+    }
+    #[cfg(feature = "gpu")]
+    #[test]
+    fn test_wgpu_vit_ops_attention_zero_tokens() {
+        let Some(ctx) = gpu_or_skip() else { return };
+        let ops = WgpuVitOps::new(ctx).expect("build wgpu vit ops");
+        let empty = ops.upload(&[]);
+        let out = ops.attention(&empty, &empty, &empty, 0, 4, 64);
+        assert_eq!(out.size(), (32 * 256 * 4) as u64);
     }
 
     #[test]

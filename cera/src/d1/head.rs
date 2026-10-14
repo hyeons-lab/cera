@@ -28,7 +28,7 @@ use crate::engine::BackendPreference;
 use crate::gguf::GgufFile;
 use crate::model::pii::matmul_nt_f32;
 use crate::model::vision_encoder_gpu::{
-    VitStack, VitStackActivation, VitStackBlock, VitStackSpec, build_vit_stack_native,
+    VitStack, VitStackActivation, VitStackBlock, VitStackSpec, build_vit_stack_fast,
 };
 use crate::model::weights::MmapWeight;
 use crate::par::*;
@@ -205,8 +205,8 @@ impl Head {
         })
     }
 
-    /// Run the transformer layers on the GPU `backend` names, when it is Metal (see
-    /// [`build_vit_stack_native`]: on wgpu the host is faster). The scorer (a LayerNorm, one linear
+    /// Run the transformer layers on the GPU `backend` names, when its attention is fast (see
+    /// [`build_vit_stack_fast`]: Metal, or wgpu's flash kernel). The scorer (a LayerNorm, one linear
     /// and a GELU on a handful of rows) stays on the host. A pass the device cannot take (more
     /// rows than its buffers hold) runs on the host as before. `gguf` must be the file the head
     /// was loaded from (weights are matched by shape only).
@@ -220,7 +220,7 @@ impl Head {
         match self.stack_spec(from_file) {
             // A backend that cannot build must not clear a working stack: only `Some` sticks.
             Ok(spec) => {
-                if let Some(stack) = build_vit_stack_native(&spec, backend) {
+                if let Some(stack) = build_vit_stack_fast(&spec, backend) {
                     self.gpu = Some(stack);
                 }
             }
@@ -801,17 +801,26 @@ mod tests {
     fn the_gpu_layers_match_the_host_layers() {
         let mut head = busy_head();
         let spec = relu_spec(&head);
-        let Some(gpu) = build_vit_stack_native(&spec, BackendPreference::Auto) else {
-            // Metal-only stack: CERA_REQUIRE_GPU is set on non-Metal GPU hosts too (the
-            // lavapipe leg), where skipping is correct; only the Metal flag forces this test.
-            assert!(
-                std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1"),
-                "CERA_REQUIRE_METAL=1 is set but no Metal device is available"
-            );
-            eprintln!("SKIPPED: no Metal device is available");
-            return;
-        };
-        assert_gpu_layers_match_host(&mut head, &gpu, &[3, 40, 300, 777]);
+        // Metal's matrix-unit attention and wgpu's register-tiled flash kernel
+        for backend in [BackendPreference::Metal, BackendPreference::Gpu] {
+            let Some(gpu) = build_vit_stack_fast(&spec, backend) else {
+                // `None` conflates no GPU with a flash-gate refusal; under the require flag
+                // (the lavapipe leg, whose adapter runs flash) either is a failure, not a
+                // skip. Inline env read: this ungated test compiles without the `gpu`
+                // feature, where the `backend::wgpu` helper does not exist.
+                if backend == BackendPreference::Gpu {
+                    assert!(
+                        std::env::var("CERA_REQUIRE_FLASH")
+                            .unwrap_or_default()
+                            .is_empty(),
+                        "CERA_REQUIRE_FLASH is set but the Gpu fast stack was refused"
+                    );
+                }
+                eprintln!("SKIPPED {backend:?}: no GPU with fast attention is available");
+                continue;
+            };
+            assert_gpu_layers_match_host(&mut head, &gpu, &[3, 40, 300, 777]);
+        }
     }
 
     /// The wgpu ReLU path scores what the host layers do: `WgpuVitOps::relu` has no production

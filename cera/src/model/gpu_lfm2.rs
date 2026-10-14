@@ -737,6 +737,60 @@ fn assert_kv_dim_packable(kv_dim: usize, head_dim: usize) {
     );
 }
 
+/// The most work one `attention_prefill` dispatch may do, in units of one query reading one key
+/// row for one head.
+///
+/// A mobile GPU kills a dispatch that runs for seconds: an Adreno 830 lost the device on a
+/// 6784-token bidirectional call, which is one dispatch of about 2.7 s at the kernel's measured
+/// 0.07 TFLOPS, though 4000 rows (0.9 s) was fine. 2^25 units of 256 flops each (head_dim 64) is
+/// about 0.12 s there, which leaves a large margin for slower drivers. A call needs at
+/// least queries*keys*heads/2^25 dispatches (halving overshoots the ideal: 32 at 6784 rows,
+/// about 530 at 27000, 16 heads bidirectional).
+const ATTENTION_PREFILL_MAX_WORK: u64 = 1 << 25;
+
+/// Split `n` queries (at positions `start_pos..start_pos + n`) into `(q_base, n_sub)` chunks, one
+/// dispatch each, so that no chunk does more than [`ATTENTION_PREFILL_MAX_WORK`].
+///
+/// A causal chunk reads up to the position of its last query; a bidirectional one reads all
+/// `start_pos + n` rows. Chunks are multiples of the kernel's 8-query workgroup, except a
+/// possibly ragged last chunk (sequences with `n < 8` produce a single chunk of length `n`);
+/// splitting stops at 8 queries, so a non-final chunk keeps the multiple however long the keys are.
+fn attention_prefill_chunks(n: u32, n_heads: u32, start_pos: u32, bidir: bool) -> Vec<(u32, u32)> {
+    attention_prefill_chunks_within(n, n_heads, start_pos, bidir, ATTENTION_PREFILL_MAX_WORK)
+}
+
+fn attention_prefill_chunks_within(
+    n: u32,
+    n_heads: u32,
+    start_pos: u32,
+    bidir: bool,
+    max_work: u64,
+) -> Vec<(u32, u32)> {
+    let mut chunks = Vec::new();
+    let mut q_base = 0u32;
+    while q_base < n {
+        let keys = |len: u32| {
+            u64::from(if bidir {
+                start_pos.saturating_add(n)
+            } else {
+                start_pos.saturating_add(q_base).saturating_add(len)
+            })
+        };
+        let mut len = n - q_base;
+        while len > 8
+            && u64::from(len)
+                .saturating_mul(keys(len))
+                .saturating_mul(u64::from(n_heads))
+                > max_work
+        {
+            len = (len / 2 / 8 * 8).max(8);
+        }
+        chunks.push((q_base, len));
+        q_base += len;
+    }
+    chunks
+}
+
 fn packed_f16_binding(buffer: &wgpu::Buffer, len_floats: u64) -> wgpu::BindingResource<'_> {
     let bytes = len_floats
         .checked_mul(2)
@@ -1417,6 +1471,11 @@ struct GpuPipelines {
     /// Same `None`-unless-streaming convention as `gemm_stream_q4_0`.
     transpose_cast_f16: Option<wgpu::ComputePipeline>,
     attention_prefill: wgpu::ComputePipeline,
+    /// Register-tiled f32 flash attention for head_dim 64 (the bidirectional trunk).
+    /// `None` unless the model attends with it: the kernel needs
+    /// `FLASH_ATTENTION_WORKGROUP_BYTES` of workgroup storage, past some adapters' limit,
+    /// so building it unconditionally would fail loads whose model would never dispatch it.
+    attention_flash_hd64: Option<wgpu::ComputePipeline>,
     // ── Routed mixture-of-experts (`lfm2moe`) ─────────────────────────────
     // Built for every model, dense or routed: pipeline creation is a shader
     // compile, so making it conditional would trade a fixed load-time cost for a
@@ -1634,6 +1693,15 @@ pub struct GpuLfmModel {
     /// Latches once the "ignoring a routed-FFN adapter" error has been logged,
     /// so a long generation does not repeat it per token. See `resolve_lora`.
     moe_lora_dropped_warned: AtomicBool,
+    /// Flash-attention dispatches issued (test observability: proves the flash kernel ran,
+    /// since every fallback produces correct output too and would otherwise hide a dead path).
+    #[cfg(test)]
+    flash_dispatches: std::sync::atomic::AtomicU32,
+    /// Generic-prefill (`attention_prefill`) dispatches issued (test observability: proves
+    /// production iterates the chunk planner, since one dispatch per call is mathematically
+    /// correct too and would otherwise hide a dropped split with a green suite).
+    #[cfg(test)]
+    generic_prefill_dispatches: std::sync::atomic::AtomicU32,
     /// Llama-3 RoPE frequency factors (`rope_freqs.weight`), or a 1-element
     /// dummy when the model uses plain RoPE. Always bound (binding 3) on the
     /// decode rope dispatch; `has_freq_factors` in `rope_params` gates its use.
@@ -2315,6 +2383,16 @@ impl GpuLfmModel {
                 "attention_prefill",
                 "attention_prefill",
             ),
+            // The generic kernel above always builds, so a flash-only failure falls
+            // back instead of failing the load (shared tail in
+            // `build_flash_pipeline_or_log`).
+            attention_flash_hd64: if ctx.uses_flash_attention(head_dim) {
+                ctx.build_flash_pipeline_or_log(
+                    "bidirectional prefill falls back to the generic kernel",
+                )
+            } else {
+                None
+            },
             moe_route: ctx.create_pipeline(shaders::MOE_ROUTE, "moe_route", "moe_route"),
             moe_gemv_q4_0: ctx.create_pipeline(
                 shaders::MOE_GEMV_Q4_0,
@@ -3028,6 +3106,10 @@ impl GpuLfmModel {
             batched_prefill,
             batched_fallback_warned: AtomicBool::new(false),
             moe_lora_dropped_warned: AtomicBool::new(false),
+            #[cfg(test)]
+            flash_dispatches: std::sync::atomic::AtomicU32::new(0),
+            #[cfg(test)]
+            generic_prefill_dispatches: std::sync::atomic::AtomicU32::new(0),
             rope_freqs_buf,
             has_freq_factors,
             hidden_buf,
@@ -7552,64 +7634,72 @@ impl GpuLfmModel {
             "attention_prefill live KV",
         );
 
-        // Single dispatch over the whole query batch; `q_base = 0`. The kernel
-        // still honors `q_base`, so a caller could sub-batch queries, but with the
-        // scores slab gone there is no binding-size reason to. 8 queries share
-        // each workgroup (and each K/V tile stream); params[11] is the
-        // authoritative batch size edge workgroups mask against.
-        let params: [u32; 14] = [
-            n_heads,
-            n_kv_heads,
-            head_dim,
-            kv_dim,
-            max_seq,
-            scale.to_bits(),
-            start_pos,
-            n,
-            q_stride,
-            out_stride,
-            0, // q_base
-            n, // n_sub (authoritative; single dispatch so == batch size)
-            u32::from(bidir_prefix.is_some()),
-            bidir_prefix.unwrap_or(0),
-        ];
-        let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
-        let bg = self
-            .ctx
-            .device
-            .create_bind_group(&wgpu::BindGroupDescriptor {
-                label: None,
-                layout: &self.pipelines.attention_prefill.get_bind_group_layout(0),
-                entries: &[
-                    wgpu::BindGroupEntry {
-                        binding: 0,
-                        resource: q_batch.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 1,
-                        resource: packed_f16_binding(k_cache, kv_live_floats),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 2,
-                        resource: packed_f16_binding(v_cache, kv_live_floats),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 3,
-                        resource: out_batch.as_entire_binding(),
-                    },
-                    wgpu::BindGroupEntry {
-                        binding: 4,
-                        resource: p_buf.as_entire_binding(),
-                    },
-                ],
-            });
-        Self::push_prefill_dispatch(
-            cmds,
-            &self.pipelines.attention_prefill,
-            bg,
-            (n_heads, n.div_ceil(8), 1),
-            "attention_prefill",
-        );
+        // One dispatch per chunk of queries (`q_base`/`n_sub`), each short enough for a mobile
+        // GPU's hang detector: the kernel's work is queries x keys x heads, so a long call is
+        // quadratic and a single dispatch over it can run for seconds. 8 queries share each
+        // workgroup (and each K/V tile stream); params[11] is the authoritative chunk size edge
+        // workgroups mask against, params[7] the whole call's key rows for a bidirectional pass.
+        let total_rows = start_pos.saturating_add(n);
+        for (q_base, n_sub) in
+            attention_prefill_chunks(n, n_heads, start_pos, bidir_prefix.is_some())
+        {
+            #[cfg(test)]
+            self.generic_prefill_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let params: [u32; 14] = [
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                kv_dim,
+                max_seq,
+                scale.to_bits(),
+                start_pos,
+                total_rows,
+                q_stride,
+                out_stride,
+                q_base,
+                n_sub,
+                u32::from(bidir_prefix.is_some()),
+                bidir_prefix.unwrap_or(0),
+            ];
+            let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
+            let bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: None,
+                    layout: &self.pipelines.attention_prefill.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: q_batch.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: packed_f16_binding(k_cache, kv_live_floats),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: packed_f16_binding(v_cache, kv_live_floats),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: out_batch.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: p_buf.as_entire_binding(),
+                        },
+                    ],
+                });
+            Self::push_prefill_dispatch(
+                cmds,
+                &self.pipelines.attention_prefill,
+                bg,
+                (n_heads, n_sub.div_ceil(8), 1),
+                "attention_prefill",
+            );
+        }
     }
 
     /// Batched prefill — single-pass over `n` tokens for all layers, then
@@ -8997,6 +9087,161 @@ impl GpuLfmModel {
         }
     }
 
+    /// The register-tiled flash attention (`attention_flash_hd64.wgsl`) over `n` rows whose f32
+    /// Q, K and V are `q`, `k` and `v`, with the media-prefix window of a bidirectional trunk.
+    #[allow(clippy::too_many_arguments)]
+    fn encode_attention_flash<'a>(
+        &'a self,
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        q: &wgpu::Buffer,
+        k: &wgpu::Buffer,
+        v: &wgpu::Buffer,
+        out: &wgpu::Buffer,
+        n: u32,
+        n_heads: u32,
+        n_kv_heads: u32,
+        prefix: u32,
+    ) {
+        // No queries → nothing to dispatch (`flash_dispatch_runs` over zero tiles
+        // yields zero runs, so the loop below would issue nothing anyway; return
+        // before the setup and asserts for the empty call).
+        if n == 0 {
+            return;
+        }
+
+        // attention_flash_hd64.wgsl hardcodes 16 vec4s per head and never reads
+        // params[2], so head_dim must be 64, the same contract the dispatch gate
+        // (`flash_ready`) checks. Fail fast on a malformed call.
+        assert!(
+            self.config.head_dim == 64,
+            "wgpu attention_flash_hd64 hardcodes head_dim 64; got {}",
+            self.config.head_dim
+        );
+        // GQA invariants the kernel assumes (kv_head = head / (n_heads / n_kv_heads)).
+        // Fail fast on a malformed config.
+        assert!(
+            n_kv_heads > 0 && n_heads.is_multiple_of(n_kv_heads),
+            "wgpu attention_flash_hd64 requires n_kv_heads > 0 and n_heads divisible \
+             by n_kv_heads; got n_heads={n_heads}, n_kv_heads={n_kv_heads}"
+        );
+        // A media-prefix query reads `prefix` key rows of K/V buffers that hold `n`.
+        assert!(
+            prefix <= n,
+            "wgpu attention_flash_hd64 requires prefix <= n; got prefix={prefix}, n={n}"
+        );
+
+        let flash = self
+            .pipelines
+            .attention_flash_hd64
+            .as_ref()
+            .expect("attention_flash_hd64 is built whenever flash_ready() holds");
+        let head_dim = self.config.head_dim as f32;
+        let scale = self.scalars.attn.unwrap_or_else(|| 1.0 / head_dim.sqrt());
+        // one call is several short dispatches over runs of query tiles (see
+        // `GpuContext::flash_dispatch_runs`)
+        for (first, count) in
+            GpuContext::flash_dispatch_runs(n.div_ceil(32), n as usize, n_heads as usize)
+        {
+            #[cfg(test)]
+            self.flash_dispatches
+                .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            let params: [u32; 8] = [
+                n,
+                n_heads,
+                self.config.head_dim as u32,
+                scale.to_bits(),
+                n_kv_heads,
+                1,
+                prefix,
+                first,
+            ];
+            let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
+            let entries = [
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: q.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: k.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: v.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: out.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: p_buf.as_entire_binding(),
+                },
+            ];
+            let bg = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("attention_flash_hd64"),
+                    layout: &flash.get_bind_group_layout(0),
+                    entries: &entries,
+                });
+            Self::push_prefill_dispatch(
+                cmds,
+                flash,
+                bg,
+                (count, n_heads, 1),
+                "attention_flash_hd64",
+            );
+        }
+    }
+
+    /// Submit what `enc` holds and start a new encoder, when `split` is set.
+    ///
+    /// A long bidirectional pass is tens of seconds of GPU work, and a mobile GPU kills a
+    /// submission that runs for seconds (an Adreno 830 lost the device on a 13.5k-row pass built
+    /// as one command buffer). Submitting in pieces keeps each piece short; the pieces still run
+    /// back to back, in order, on the one queue.
+    fn flush_submit(&self, enc: &mut wgpu::CommandEncoder, split: bool) {
+        if split {
+            let full = std::mem::replace(enc, self.new_encoder());
+            self.ctx.submit_encoder(full);
+        }
+    }
+
+    /// [`Self::emit_prefill_cmds`] for `cmds`, one submission per command when `split` is set:
+    /// for a run of long attention dispatches, each of which is already as long as a submission
+    /// should be.
+    fn emit_each<'a>(
+        &self,
+        enc: &mut wgpu::CommandEncoder,
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        label: &str,
+        n: u32,
+        split: bool,
+    ) {
+        if !split {
+            self.emit_prefill_cmds(enc, cmds, label, n);
+            return;
+        }
+        for cmd in std::mem::take(cmds) {
+            cmds.push(cmd);
+            self.emit_prefill_cmds(enc, cmds, label, n);
+            self.flush_submit(enc, true);
+        }
+    }
+
+    /// Whether the bidirectional trunk attends with the flash kernel: head_dim 64 on an adapter
+    /// that runs it (see `GpuContext::supports_flash_attention`).
+    fn flash_ready(&self) -> bool {
+        // The build may have failed validation after the gate passed (see the checked build
+        // above): without the `is_some` the trunk would dispatch an invalid pipeline whose
+        // dropped dispatches read back as zeros. Named like `WgpuVitOps::flash_ready`, which
+        // is the same combined check (built plus gate-passed).
+        self.pipelines.attention_flash_hd64.is_some()
+            && self.ctx.uses_flash_attention(self.config.head_dim)
+    }
+
     /// Dispatch a `bidirectional.wgsl` kernel over `elements` threads (a 2-D grid, since a
     /// single dimension tops out at 65535 workgroups).
     fn push_bidir_dispatch<'a>(
@@ -9121,6 +9366,22 @@ impl GpuLfmModel {
             .queue
             .write_buffer(&h_big, 0, bytemuck::cast_slice(embeddings));
         let kv_scratch = &self.hs_scratch().kv;
+        // The flash kernel reads K and V as f32 for the whole sequence, so they get buffers of
+        // their own instead of the packed-f16 scratch caches the generic kernel reads.
+        let flash = self.flash_ready();
+        let kv_dim_max = cfg
+            .kv_heads_per_layer
+            .iter()
+            .map(|&kv| kv * head_dim)
+            .max()
+            .unwrap_or(0);
+        let kv_big = flash.then(|| {
+            let bytes = (n * kv_dim_max.max(1) * 4) as u64;
+            (
+                self.ctx.create_storage_rw(bytes, "bidir.k"),
+                self.ctx.create_storage_rw(bytes, "bidir.v"),
+            )
+        });
 
         // Same pooled-resource protocol as `encode_prefill_batched_locked`: one encoder, one
         // submit, params and stream-GEMM bind groups handed out in call order from zero.
@@ -9128,6 +9389,8 @@ impl GpuLfmModel {
         let mut enc = self.new_encoder();
         let mut cmds: Vec<PrefillCmd> = Vec::new();
         let (hs_u, is_u) = (hs as u32, is as u32);
+        // past a thousand rows a pass is long enough to need submitting in pieces
+        let split = n > 1024;
         let chunks: Vec<(usize, usize)> = (0..n)
             .step_by(chunk_cap)
             .map(|r0| (r0, chunk_cap.min(n - r0)))
@@ -9216,25 +9479,45 @@ impl GpuLfmModel {
                         q_dim as u32,
                         kv_dim,
                     );
-                    let off_words = (r0 * kv_dim as usize / 2) as u32;
-                    let floats = m_u * kv_dim;
-                    self.encode_kv_append_prefill(
-                        &mut cmds,
-                        &self.prefill_gate_buf,
-                        k16,
-                        off_words,
-                        floats,
-                    );
-                    self.encode_kv_append_prefill(
-                        &mut cmds,
-                        &self.prefill_up_buf,
-                        v16,
-                        off_words,
-                        floats,
-                    );
+                    if let Some((k_big, v_big)) = &kv_big {
+                        cmds.push(copy_rows(
+                            &self.prefill_gate_buf,
+                            0,
+                            k_big,
+                            r0,
+                            m,
+                            kv_dim as usize,
+                        ));
+                        cmds.push(copy_rows(
+                            &self.prefill_up_buf,
+                            0,
+                            v_big,
+                            r0,
+                            m,
+                            kv_dim as usize,
+                        ));
+                    } else {
+                        let off_words = (r0 * kv_dim as usize / 2) as u32;
+                        let floats = m_u * kv_dim;
+                        self.encode_kv_append_prefill(
+                            &mut cmds,
+                            &self.prefill_gate_buf,
+                            k16,
+                            off_words,
+                            floats,
+                        );
+                        self.encode_kv_append_prefill(
+                            &mut cmds,
+                            &self.prefill_up_buf,
+                            v16,
+                            off_words,
+                            floats,
+                        );
+                    }
                     cmds.push(copy_rows(&self.prefill_proj_buf, 0, &buf_a, r0, m, q_dim));
                 }
                 self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("{label}a"), m_u);
+                self.flush_submit(&mut enc, split);
             }
 
             // Across rows.
@@ -9254,31 +9537,45 @@ impl GpuLfmModel {
                 );
             } else {
                 let n_kv_heads = cfg.kv_heads_per_layer[layer] as u32;
-                let (k16, v16) = layer_kv.as_ref().unwrap();
-                let scale = self
-                    .scalars
-                    .attn
-                    .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
-                self.encode_attention_prefill(
-                    &mut cmds,
-                    &buf_a,
-                    k16,
-                    v16,
-                    &buf_b,
-                    n as u32,
-                    cfg.n_heads as u32,
-                    n_kv_heads,
-                    head_dim as u32,
-                    n_kv_heads * head_dim as u32,
-                    n as u32,
-                    0,
-                    q_dim as u32,
-                    q_dim as u32,
-                    scale,
-                    Some(prefix as u32),
-                );
+                if let Some((k_big, v_big)) = &kv_big {
+                    self.encode_attention_flash(
+                        &mut cmds,
+                        &buf_a,
+                        k_big,
+                        v_big,
+                        &buf_b,
+                        n as u32,
+                        cfg.n_heads as u32,
+                        n_kv_heads,
+                        prefix as u32,
+                    );
+                } else {
+                    let (k16, v16) = layer_kv.as_ref().unwrap();
+                    let scale = self
+                        .scalars
+                        .attn
+                        .unwrap_or_else(|| 1.0 / (head_dim as f32).sqrt());
+                    self.encode_attention_prefill(
+                        &mut cmds,
+                        &buf_a,
+                        k16,
+                        v16,
+                        &buf_b,
+                        n as u32,
+                        cfg.n_heads as u32,
+                        n_kv_heads,
+                        head_dim as u32,
+                        n_kv_heads * head_dim as u32,
+                        n as u32,
+                        0,
+                        q_dim as u32,
+                        q_dim as u32,
+                        scale,
+                        Some(prefix as u32),
+                    );
+                }
             }
-            self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("{label}x"), n as u32);
+            self.emit_each(&mut enc, &mut cmds, &format!("{label}x"), n as u32, split);
 
             // Per chunk: output projection, residual, feed-forward.
             for &(r0, m) in &chunks {
@@ -9356,6 +9653,7 @@ impl GpuLfmModel {
                 );
                 cmds.push(copy_rows(&self.prefill_batch_buf, 0, &h_big, r0, m, hs));
                 self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("{label}b"), m_u);
+                self.flush_submit(&mut enc, split);
             }
         }
 
@@ -9379,6 +9677,7 @@ impl GpuLfmModel {
                 (r0 * hs) as u64,
                 (m * hs) as u64,
             );
+            self.flush_submit(&mut enc, split);
         }
         self.submit_and_wait(enc);
         self.ctx.download_f32(&buf_a, n * hs)
@@ -10714,7 +11013,76 @@ async fn gemm_q4_0_microbench_async(
 #[cfg(test)]
 #[cfg(not(target_arch = "wasm32"))]
 mod tests {
-    use crate::backend::wgpu::{DevicePollExt, GpuContext};
+    use crate::backend::wgpu::{DevicePollExt, GpuContext, gpu_or_skip, require_flash_or_skip};
+
+    /// The attention chunk plan covers every query exactly once, in order, keeps each chunk
+    /// within the work cap (down to the 8-query floor), and splits a long call on a phone's
+    /// budget while leaving a short one whole. Pure host check.
+    #[test]
+    fn attention_prefill_chunks_cover_the_queries_within_the_cap() {
+        use super::{
+            ATTENTION_PREFILL_MAX_WORK, attention_prefill_chunks, attention_prefill_chunks_within,
+        };
+        for &(n, heads, start, bidir) in &[
+            (1u32, 16u32, 0u32, true),
+            (7, 16, 0, true),
+            (257, 16, 0, true),
+            (1534, 16, 0, true),
+            (6784, 16, 0, true),
+            (30_000, 16, 0, true),
+            (6784, 16, 0, false),
+            (4096, 32, 9_000, false),
+            (4096, 32, 9_000, true),
+        ] {
+            let chunks = attention_prefill_chunks(n, heads, start, bidir);
+            let mut next = 0u32;
+            for (i, &(q_base, len)) in chunks.iter().enumerate() {
+                assert_eq!(q_base, next, "chunks are contiguous: {chunks:?}");
+                assert!(len > 0);
+                if i + 1 < chunks.len() {
+                    assert_eq!(len % 8, 0, "only the last chunk may be ragged");
+                }
+                let keys = if bidir {
+                    start.saturating_add(n)
+                } else {
+                    start.saturating_add(q_base).saturating_add(len)
+                };
+                assert!(
+                    len == 8.min(n - q_base)
+                        || u64::from(len) * u64::from(keys) * u64::from(heads)
+                            <= ATTENTION_PREFILL_MAX_WORK,
+                    "chunk ({q_base}, {len}) of n={n} over the cap"
+                );
+                next = q_base + len;
+            }
+            assert_eq!(next, n, "all queries covered for n={n}");
+        }
+        // a short call stays one dispatch; a long bidirectional one is split many times
+        assert_eq!(attention_prefill_chunks(300, 16, 0, true), vec![(0, 300)]);
+        // exact counts behind the `ATTENTION_PREFILL_MAX_WORK` doc figures
+        assert_eq!(attention_prefill_chunks(6784, 16, 0, true).len(), 32);
+        assert_eq!(attention_prefill_chunks(27_000, 16, 0, true).len(), 534);
+        // a tiny cap forces the 8-query floor
+        let tiny = attention_prefill_chunks_within(20, 16, 0, true, 1);
+        assert_eq!(tiny, vec![(0, 8), (8, 8), (16, 4)]);
+        // an exact causal split pins the causal key count (start + q_base + len, not start + n)
+        assert_eq!(
+            attention_prefill_chunks_within(64, 2, 0, false, 3000),
+            vec![(0, 32), (32, 16), (48, 16)]
+        );
+        // u32 edge: saturation keeps keys huge, so the planner floors at 8-query chunks;
+        // with plain `+` the sum wraps small and this collapses to one chunk.
+        assert_eq!(
+            attention_prefill_chunks_within(
+                20,
+                16,
+                u32::MAX - 10,
+                true,
+                ATTENTION_PREFILL_MAX_WORK
+            ),
+            vec![(0, 8), (8, 8), (16, 4)]
+        );
+    }
 
     /// `--spv` bytes are validated before reaching the driver: word
     /// alignment, the size cap, and the 5-word header shape each fail with
@@ -11119,27 +11487,20 @@ mod tests {
         }
     }
 
-    /// The bidirectional trunk against the CPU one on a tiny non-causal model (one short-conv
-    /// block, two attention blocks), over lengths that span one chunk, several chunks, and a
-    /// media prefix that is shorter, equal to and longer than an attention query group.
+    /// The bidirectional trunk against the CPU one on a tiny non-causal model (a short-conv block
+    /// and two attention blocks), over lengths that span one chunk, several chunks, and a media
+    /// prefix that is shorter, equal to and longer than an attention query group. Heads of 32
+    /// take the generic prefill kernel and heads of 64 the register-tiled flash kernel.
     #[test]
     fn wgpu_reads_the_whole_sequence_like_the_cpu() {
+        use super::attention_prefill_chunks;
         use crate::kv_cache::InferenceState;
+        use crate::model::BlockType;
         use crate::model::Model;
         use crate::model::lfm2::LfmModel;
-        use crate::model::lfm2::bidirectional_float_tests::{HS, bidirectional_gguf, embeddings};
-        let Some(ctx) = gpu_ctx_or_skip() else {
-            return;
+        use crate::model::lfm2::bidirectional_float_tests::{
+            BIDIRECTIONAL_SHAPES, HS, bidirectional_gguf_with, embeddings,
         };
-        let cpu = LfmModel::from_gguf(bidirectional_gguf(true), 4096).unwrap();
-        let gpu = super::GpuLfmModel::from_gguf_with_ctx(
-            bidirectional_gguf(true),
-            4096,
-            "bidir".into(),
-            ctx,
-        )
-        .unwrap();
-        assert!(!gpu.config().is_causal, "the fixture must be bidirectional");
         let cosine = |a: &[f32], b: &[f32]| {
             let dot: f32 = a.iter().zip(b).map(|(x, y)| x * y).sum();
             let norm = |v: &[f32]| v.iter().map(|x| x * x).sum::<f32>().sqrt();
@@ -11152,24 +11513,99 @@ mod tests {
                 assert!(cos > 0.999, "{what}: row {t} cosine {cos}");
             }
         };
-        for n in [9usize, 300, 700, 2600] {
-            let tokens: Vec<u32> = (0..n).map(|i| ((i * 7 + 3) % 32) as u32).collect();
-            let mut state = InferenceState::for_prefill(cpu.config(), n).unwrap();
-            let want = cpu.hidden_states(&tokens, &mut state);
-            let mut state = InferenceState::for_prefill(gpu.config(), n).unwrap();
-            let got = gpu.hidden_states(&tokens, &mut state);
-            rows_agree(&format!("n={n}"), &want, &got);
-        }
-        let tokens = [3u32, 7, 9, 12, 5];
-        for prefix_rows in [1usize, 4, 11, 600] {
-            let prefix = embeddings(prefix_rows, 0.3);
-            let mut state =
-                InferenceState::for_prefill(cpu.config(), prefix_rows + tokens.len()).unwrap();
-            let want = cpu.hidden_states_with_prefix(&prefix, &tokens, &mut state);
-            let mut state =
-                InferenceState::for_prefill(gpu.config(), prefix_rows + tokens.len()).unwrap();
-            let got = gpu.hidden_states_with_prefix(&prefix, &tokens, &mut state);
-            rows_agree(&format!("prefix={prefix_rows}"), &want, &got);
+        for (heads, head_dim) in BIDIRECTIONAL_SHAPES {
+            let Some(ctx) = gpu_or_skip() else {
+                return;
+            };
+            // The dispatch predicate, not the adapter-only one: the flash-dispatch
+            // assert below needs `flash_ready`, which carries the head_dim and
+            // wasm32 conjuncts.
+            let flash_capable = ctx.uses_flash_attention(head_dim);
+            if (heads, head_dim) == (2, 64) {
+                require_flash_or_skip(
+                    &ctx,
+                    flash_capable,
+                    "wgpu_reads_the_whole_sequence_like_the_cpu",
+                );
+            }
+            let cpu =
+                LfmModel::from_gguf(bidirectional_gguf_with(true, heads, head_dim), 4096).unwrap();
+            let gpu = super::GpuLfmModel::from_gguf_with_ctx(
+                bidirectional_gguf_with(true, heads, head_dim),
+                4096,
+                "bidir".into(),
+                ctx,
+            )
+            .unwrap();
+            assert!(!gpu.config().is_causal, "the fixture must be bidirectional");
+            // 4096 splits into two generic-kernel dispatches on the 4x32 leg (2600 stays
+            // whole), so the multi-chunk params[7] wiring executes; the 2x64 leg takes flash.
+            let attn_layers = gpu
+                .config()
+                .block_types
+                .iter()
+                .filter(|b| matches!(b, BlockType::Attention))
+                .count() as u32;
+            for n in [9usize, 300, 700, 2600, 4096] {
+                let tokens: Vec<u32> = (0..n).map(|i| ((i * 7 + 3) % 32) as u32).collect();
+                let mut state = InferenceState::for_prefill(cpu.config(), n).unwrap();
+                let want = cpu.hidden_states(&tokens, &mut state);
+                let mut state = InferenceState::for_prefill(gpu.config(), n).unwrap();
+                let generic_before = gpu
+                    .generic_prefill_dispatches
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                let got = gpu.hidden_states(&tokens, &mut state);
+                rows_agree(&format!("{heads}x{head_dim} n={n}"), &want, &got);
+                let generic_after = gpu
+                    .generic_prefill_dispatches
+                    .load(std::sync::atomic::Ordering::Relaxed);
+                // The 4x32 leg can never take flash (head_dim 32), so every attention
+                // layer runs the generic kernel once per planned chunk: one dispatch per
+                // call is output-correct but hang-unsafe, and only this counter sees a
+                // dropped split. The planner takes bidir = true because the fixture is
+                // bidirectional (production passes `Some(prefix)`).
+                if (heads, head_dim) == (4, 32) {
+                    let chunks =
+                        attention_prefill_chunks(n as u32, heads as u32, 0, true).len() as u32;
+                    assert_eq!(
+                        generic_after - generic_before,
+                        attn_layers * chunks,
+                        "{heads}x{head_dim} n={n}: one generic dispatch per planned chunk per layer"
+                    );
+                }
+                // A flash call runs no generic attention: both kernels compute the same
+                // values, so output parity cannot catch mixed routing either.
+                if (heads, head_dim) == (2, 64) && flash_capable {
+                    assert_eq!(
+                        generic_after - generic_before,
+                        0,
+                        "{heads}x{head_dim} n={n}: the flash leg must not run the generic kernel"
+                    );
+                }
+            }
+            let tokens = [3u32, 7, 9, 12, 5];
+            for prefix_rows in [1usize, 4, 11, 600] {
+                let prefix = embeddings(prefix_rows, 0.3);
+                let mut state =
+                    InferenceState::for_prefill(cpu.config(), prefix_rows + tokens.len()).unwrap();
+                let want = cpu.hidden_states_with_prefix(&prefix, &tokens, &mut state);
+                let mut state =
+                    InferenceState::for_prefill(gpu.config(), prefix_rows + tokens.len()).unwrap();
+                let got = gpu.hidden_states_with_prefix(&prefix, &tokens, &mut state);
+                rows_agree(
+                    &format!("{heads}x{head_dim} prefix={prefix_rows}"),
+                    &want,
+                    &got,
+                );
+            }
+            if (heads, head_dim) == (2, 64) && flash_capable {
+                assert!(
+                    gpu.flash_dispatches
+                        .load(std::sync::atomic::Ordering::Relaxed)
+                        > 0,
+                    "the 2x64 leg must dispatch the flash kernel on a flash-capable adapter"
+                );
+            }
         }
     }
 
@@ -11267,7 +11703,7 @@ mod tests {
     /// GPU context gated on SPIR-V passthrough, or `None` to skip.
     /// Fail-closed under `CERA_REQUIRE_*`, like every passthrough test.
     fn passthrough_ctx_or_skip(label: &str) -> Option<GpuContext> {
-        let ctx = gpu_ctx_or_skip()?;
+        let ctx = gpu_or_skip()?;
         let passthrough = ctx.supports_spirv_passthrough() && ctx.has_subgroup;
         crate::backend::wgpu::require_passthrough_or_skip(&ctx, passthrough, label);
         if !passthrough {
@@ -11395,7 +11831,7 @@ mod tests {
     /// this same helper, so this is the value-level guard they otherwise lacked.
     #[test]
     fn encode_copy_scales_float_offsets_to_bytes() {
-        let Some(ctx) = gpu_ctx_or_skip() else {
+        let Some(ctx) = gpu_or_skip() else {
             return;
         };
         let src: Vec<f32> = (0..16).map(|x| x as f32).collect();
@@ -11513,7 +11949,7 @@ mod tests {
     #[test]
     fn f16_table_upload_round_trip() {
         use super::{MmapWeight, upload_mmap_table_as_f16};
-        let Some(ctx) = gpu_ctx_or_skip() else {
+        let Some(ctx) = gpu_or_skip() else {
             return;
         };
         const ROWS: usize = 257;
@@ -11947,7 +12383,7 @@ mod tests {
     #[test]
     fn lost_device_does_not_cache_prefix_snapshot() {
         use crate::model::Model;
-        let Some(ctx) = gpu_ctx_or_skip() else {
+        let Some(ctx) = gpu_or_skip() else {
             return;
         };
         let probe = ctx.clone();

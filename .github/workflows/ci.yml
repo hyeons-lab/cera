@@ -261,6 +261,9 @@ jobs:
   # and the `backend::wgpu` host-side unit tests actually execute. `CERA_REQUIRE_GPU`
   # turns a missing adapter into a failure (mirrors `CERA_REQUIRE_SIMD`), so a
   # green check proves the kernels ran rather than silently skipping.
+  # `CERA_REQUIRE_FLASH` fails the flash-only tests when the adapter cannot run the
+  # flash kernel; lavapipe reports 32 KiB of workgroup storage, so the kernel runs
+  # there and a skip means a gate regression, not a weak adapter.
   gpu-tests:
     name: GPU tests (lavapipe)
     needs: check
@@ -268,6 +271,7 @@ jobs:
     timeout-minutes: 20
     env:
       CERA_REQUIRE_GPU: 1
+      CERA_REQUIRE_FLASH: 1
       # lavapipe is a Vulkan backend, which accepts SPIR-V passthrough, so the
       # Q4_0/Q8_0 passthrough parity assertions must actually run here (not skip
       # as they do on the Metal leg). Turns a skip into a failure.
