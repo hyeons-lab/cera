@@ -13,6 +13,7 @@
 // Declaring the plugins at the root collapses them to one classloader scope and
 // resolves the conflict.
 plugins {
+    alias(libs.plugins.android.application) apply false
     alias(libs.plugins.android.library) apply false
     alias(libs.plugins.kotlin.jvm) apply false
     alias(libs.plugins.maven.publish) apply false
