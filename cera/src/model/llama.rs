@@ -492,7 +492,7 @@ impl LlamaModel {
         })
     }
 
-    /// Same as [`Self::from_gguf_no_repack`], but uses a custom `load_f32` callback
+    /// Same as [`Self::from_gguf_with_id_no_repack`], but uses a custom `load_f32` callback
     /// for 1D norm, bias, and RoPE frequency vectors so header-only GGUF sources
     /// (such as OPFS streaming in WebAssembly) can read small tensors on demand.
     pub fn from_gguf_no_repack_with_loader(
