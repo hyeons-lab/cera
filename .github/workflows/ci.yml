@@ -867,6 +867,7 @@ jobs:
         # adapter even though Vulkan is present.
         env:
           WASM_BINDGEN_TEST_WEBDRIVER_JSON: ${{ github.workspace }}/cera-wasm/webdriver-linux.json
+          WASM_BINDGEN_TEST_TIMEOUT: "120"
         run: cd cera-wasm && wasm-pack test --headless --chrome --features wgpu --test webgpu_smoke --test webgpu_opfs_worker
 
   cera-wasm-pack:

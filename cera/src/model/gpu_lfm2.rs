@@ -2448,6 +2448,14 @@ impl GpuLfmModel {
             scalars.residual,
         );
 
+        // The largest batch the prefill path hands the kernels in one dispatch,
+        // and the token count every buffer sized per-token below multiplies by:
+        // the routed-FFN scratch, `lora_tmp_batched`, and the five `prefill_*_buf`.
+        // Validate the dense SwiGLU dispatch grid before uploading weights or
+        // compiling pipelines so oversized configs fail immediately.
+        let max_pref = max_seq_len.min(MAX_PREFILL_TOKENS);
+        check_dense_silu_fits(max_pref, is)?;
+
         tracing::info!(
             "GPU model: {} layers, hs={hs}, is={is}, vocab={}",
             config.n_layers,
@@ -2464,308 +2472,6 @@ impl GpuLfmModel {
                  decode and prefill read the resident (q, d) directly"
             );
         }
-
-        // Create pipelines
-        let pipelines = GpuPipelines {
-            gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32"),
-            gemv_f16: ctx.create_pipeline_with_defines(
-                shaders::GEMV_F32,
-                "gemv_f32",
-                "gemv_f16",
-                &[("F16_A", "1")],
-            ),
-            gemv_f32_accum: ctx.create_pipeline(
-                shaders::GEMV_F32,
-                "gemv_f32_accum",
-                "gemv_f32_accum",
-            ),
-            gemm_f32_nt: ctx.create_pipeline(shaders::GEMM_F32, "gemm_f32_nt", "gemm_f32_nt"),
-            gemm_f32_nt_accum: ctx.create_pipeline(
-                shaders::GEMM_F32,
-                "gemm_f32_nt_accum",
-                "gemm_f32_nt_accum",
-            ),
-            gemv_q4_0: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0", "gemv_q4_0"),
-            gemv_q4_0_fast: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
-                // Vulkan: subgroup-reduction twin via passthrough (naga
-                // cannot parse `enable subgroups`, so the WGSL twin below
-                // carries the tree instead). Same bindings, same NR=8.
-                ctx.gemv_q4_0_fast_passthrough()
-            } else {
-                ctx.create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast", "gemv_q4_0_fast")
-            },
-            gemv_q4_0_stream: if stream_layout {
-                tracing::debug!("gemv_q4_0_stream: SPIR-V passthrough (slang)");
-                Some(ctx.gemv_q4_0_stream_passthrough())
-            } else {
-                None
-            },
-            gemv_q4_k: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
-                ctx.gemv_q4_k_passthrough()
-            } else {
-                ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k", "gemv_q4_k")
-            },
-            gemv_q4_k_stream: if stream_layout {
-                tracing::debug!("gemv_q4_k_stream: SPIR-V passthrough (slang)");
-                Some(ctx.gemv_q4_k_stream_passthrough())
-            } else {
-                None
-            },
-            gemv_q5_k: ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k", "gemv_q5_k"),
-            gemv_q6_k: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
-                // Vulkan: 64-thread subgroup twin via passthrough. Same
-                // bindings, NR=1 (WGSL fallback is NR=2 — the rows gate in
-                // `gemv_pipeline_rows_label` mirrors this condition).
-                ctx.gemv_q6_k_passthrough()
-            } else {
-                ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "gemv_q6_k")
-            },
-            gemv_q6_k_flat: if use_flat_q6k(&ctx) {
-                tracing::debug!("gemv_q6_k_flat: SPIR-V passthrough (slang)");
-                Some(ctx.gemv_q6_k_flat_passthrough())
-            } else {
-                None
-            },
-            gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "gemv_q8_0"),
-            add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "add"),
-            scaled_add_inplace: ctx.create_pipeline(
-                shaders::ELEMENTWISE,
-                "scaled_add_inplace",
-                "scaled_add",
-            ),
-            scale_f32: ctx.create_pipeline(shaders::SCALE_F32, "scale_f32", "scale_f32"),
-            mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_inplace", "mul"),
-            silu_mul_inplace: ctx.create_pipeline(
-                shaders::ELEMENTWISE,
-                "silu_mul_inplace",
-                "silu_mul",
-            ),
-            ffn_swiglu_q4_0: ctx.create_pipeline(
-                shaders::FFN_SWIGLU_Q4_0,
-                "ffn_swiglu_q4_0",
-                "ffn_swiglu_q4_0",
-            ),
-            rmsnorm: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm", "rmsnorm"),
-            rmsnorm_out: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm_out", "rmsnorm_out"),
-            kv_append: ctx.create_pipeline(shaders::KV_APPEND, "kv_append", "kv_append"),
-            per_head_rmsnorm: ctx.create_pipeline(
-                shaders::PER_HEAD_RMSNORM,
-                "per_head_rmsnorm",
-                "per_head_rmsnorm",
-            ),
-            rope: ctx.create_pipeline(shaders::ROPE, "rope", "rope"),
-            kv_shift: ctx.create_pipeline(shaders::KV_SHIFT, "kv_shift", "kv_shift"),
-            flash_attention: ctx.create_pipeline(
-                shaders::FLASH_ATTENTION,
-                "flash_attention",
-                "flash_attention",
-            ),
-            flash_attention_split: ctx.create_pipeline(
-                shaders::FLASH_ATTENTION_SPLIT,
-                "flash_attention_split",
-                "flash_attention_split",
-            ),
-            flash_attention_merge: ctx.create_pipeline(
-                shaders::FLASH_ATTENTION_MERGE,
-                "flash_attention_merge",
-                "flash_attention_merge",
-            ),
-            conv1d_fused: ctx.create_pipeline(
-                shaders::CONV1D_FUSED,
-                "conv1d_fused",
-                "conv1d_fused",
-            ),
-            argmax_f32: ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32", "argmax_f32"),
-            rmsnorm_batch: ctx.create_pipeline(
-                shaders::RMSNORM_BATCH,
-                "rmsnorm_batch",
-                "rmsnorm_batch",
-            ),
-            add_rmsnorm_batch: ctx.create_pipeline(
-                shaders::RMSNORM_BATCH,
-                "add_rmsnorm_batch",
-                "add_rmsnorm_batch",
-            ),
-            qk_norm_rope_batch: ctx.create_pipeline(
-                shaders::QK_NORM_ROPE_BATCH,
-                "qk_norm_rope_batch",
-                "qk_norm_rope_batch",
-            ),
-            conv1d_fused_batch: ctx.create_pipeline(
-                shaders::CONV1D_FUSED_BATCH,
-                "conv1d_fused_batch",
-                "conv1d_fused_batch",
-            ),
-            bidir_split: ctx.create_pipeline(shaders::BIDIRECTIONAL, "bidir_split", "bidir_split"),
-            bidir_conv_centered: ctx.create_pipeline(
-                shaders::BIDIRECTIONAL,
-                "bidir_conv_centered",
-                "bidir_conv_centered",
-            ),
-            bias_add: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "bias_add"),
-
-            mul_mat_reg_tile_q4_0: if use_spirv_passthrough(&ctx) {
-                tracing::debug!("mul_mat_reg_tile_q4_0: SPIR-V passthrough (slang)");
-                ctx.mul_mat_reg_tile_q4_0_passthrough()
-            } else {
-                build_mul_mat_pipeline(&ctx, "mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0", "u32")
-            },
-            mul_mat_reg_tile_q4_0_stream: if stream_layout {
-                tracing::debug!("mul_mat_reg_tile_q4_0_stream: SPIR-V passthrough (slang)");
-                Some(ctx.mul_mat_reg_tile_q4_0_stream_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q4_0: if stream_layout {
-                tracing::debug!("gemm_stream_q4_0: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q4_0_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q4_0_k64: if stream_layout {
-                tracing::debug!("gemm_stream_q4_0_k64: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q4_0_k64_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q4_0_k64_xf32: if stream_layout {
-                tracing::debug!("gemm_stream_q4_0_k64_xf32: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q4_0_k64_xf32_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q4_0_k64_r2: if stream_layout {
-                tracing::debug!("gemm_stream_q4_0_k64_r2: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q4_0_k64_r2_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q4_0_k64_gateup: if stream_layout {
-                tracing::debug!("gemm_stream_q4_0_k64_gateup: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q4_0_k64_gateup_passthrough())
-            } else {
-                None
-            },
-            gemm_stream_q4_k: if stream_layout {
-                tracing::debug!("gemm_stream_q4_k: SPIR-V passthrough (slang)");
-                Some(ctx.gemm_stream_q4_k_passthrough())
-            } else {
-                None
-            },
-            transpose_cast_f16: if stream_layout {
-                tracing::debug!("transpose_cast_f16: SPIR-V passthrough (slang)");
-                Some(ctx.transpose_cast_f16_passthrough())
-            } else {
-                None
-            },
-            // Every quantized weight goes through the register-tiled kernel (weight
-            // reuse across the token tile), NOT the batched-GEMV-shaped gemm_* kernels:
-            // those re-dequantize the weight once per token, so they buy submit count
-            // and no compute, and measured *slower* than the per-token fallback they
-            // were meant to replace.
-            mul_mat_reg_tile_q8_0: if use_spirv_passthrough(&ctx) {
-                tracing::debug!("mul_mat_reg_tile_q8_0: SPIR-V passthrough (slang)");
-                ctx.mul_mat_reg_tile_q8_0_passthrough()
-            } else {
-                build_mul_mat_pipeline(&ctx, "mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0", "u32")
-            },
-            mul_mat_reg_tile_q4_k: if use_spirv_passthrough(&ctx) {
-                tracing::debug!("mul_mat_reg_tile_q4_k: SPIR-V passthrough (slang)");
-                ctx.mul_mat_reg_tile_q4_k_passthrough()
-            } else {
-                build_mul_mat_pipeline(&ctx, "mul_mat_q4_k", "INIT_SRC0_SHMEM_Q4_K", "u32")
-            },
-            mul_mat_reg_tile_q5_k: if use_spirv_passthrough(&ctx) {
-                tracing::debug!("mul_mat_reg_tile_q5_k: SPIR-V passthrough (slang)");
-                ctx.mul_mat_reg_tile_q5_k_passthrough()
-            } else {
-                build_mul_mat_pipeline(&ctx, "mul_mat_q5_k", "INIT_SRC0_SHMEM_Q5_K", "u32")
-            },
-            mul_mat_reg_tile_q6_k: if use_spirv_passthrough(&ctx) {
-                tracing::debug!("mul_mat_reg_tile_q6_k: SPIR-V passthrough (slang)");
-                ctx.mul_mat_reg_tile_q6_k_passthrough()
-            } else {
-                build_mul_mat_pipeline(&ctx, "mul_mat_q6_k", "INIT_SRC0_SHMEM_Q6_K", "u32")
-            },
-            // Dense-f32 fallback loader. Stays on naga: the Slang SPIR-V
-            // passthrough is Vulkan-only and covers just the quantized loaders
-            // (the dense f32 loader was never naga-regressed).
-            mul_mat_reg_tile_f32: build_mul_mat_pipeline(
-                &ctx,
-                "mul_mat_f32",
-                "INIT_SRC0_SHMEM_FLOAT",
-                "f32",
-            ),
-            attention_prefill: ctx.create_pipeline(
-                shaders::ATTENTION_PREFILL,
-                "attention_prefill",
-                "attention_prefill",
-            ),
-            // The generic kernel above always builds, so a flash-only failure falls
-            // back instead of failing the load (shared tail in
-            // `build_flash_pipeline_or_log`).
-            attention_flash_hd64: if ctx.uses_flash_attention(head_dim) {
-                ctx.build_flash_pipeline_or_log(
-                    "bidirectional prefill falls back to the generic kernel",
-                )
-            } else {
-                None
-            },
-            attention_prefill_hd64: if ctx.uses_flash_attention(head_dim) {
-                match ctx.try_create_pipeline_checked(
-                    shaders::ATTENTION_PREFILL_HD64,
-                    "main",
-                    "attention_prefill_hd64",
-                ) {
-                    Ok(pipe) => Some(pipe),
-                    Err(e) => {
-                        tracing::warn!(
-                            "attention_prefill_hd64 pipeline validation failed ({e}); \
-                             causal prefill falls back to generic kernel"
-                        );
-                        eprintln!(
-                            "[cera::wgpu] attention_prefill_hd64 pipeline validation failed ({e}); \
-                             causal prefill falls back to generic kernel"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            },
-            attention_prefill_hd64_f16: if ctx.uses_flash_attention(head_dim)
-                && ctx.max_compute_workgroup_storage_size
-                    >= crate::backend::wgpu::FLASH_ATTENTION_F16_WORKGROUP_BYTES
-                && use_spirv_passthrough(&ctx)
-            {
-                match ctx.try_attention_prefill_hd64_f16_passthrough_checked() {
-                    Ok(pipe) => {
-                        tracing::debug!("attention_prefill_hd64_f16: SPIR-V passthrough (slang)");
-                        Some(pipe)
-                    }
-                    Err(e) => {
-                        tracing::warn!(
-                            "attention_prefill_hd64_f16 pipeline validation failed ({e}); \
-                             causal prefill falls back to f32 or generic kernel"
-                        );
-                        eprintln!(
-                            "[cera::wgpu] attention_prefill_hd64_f16 pipeline validation failed ({e}); \
-                             causal prefill falls back to f32 or generic kernel"
-                        );
-                        None
-                    }
-                }
-            } else {
-                None
-            },
-            moe_route: ctx.create_pipeline(shaders::MOE_ROUTE, "moe_route", "moe_route"),
-            moe_gemv_q4_0: ctx.create_pipeline(
-                shaders::MOE_GEMV_Q4_0,
-                "moe_gemv_q4_0",
-                "moe_gemv_q4_0",
-            ),
-            moe_combine: ctx.create_pipeline(shaders::MOE_COMBINE, "moe_combine", "moe_combine"),
-        };
 
         // Upload weights: Q4_0/Q8_0/Q6K stay quantized, others dequantized to f32.
         // The input-embedding lookup reads rows from this mmap handle (kept
@@ -3077,13 +2783,6 @@ impl GpuLfmModel {
             data.map(|d| ctx.upload_f32(d, name))
         };
 
-        // The largest batch the prefill path hands the kernels in one dispatch,
-        // and the token count every buffer sized per-token below multiplies by:
-        // the routed-FFN scratch here, and further down `lora_tmp_batched` and
-        // the five `prefill_*_buf`. Any of them smaller than a chunk is an
-        // out-of-bounds device write, not a load error, so it is bound once.
-        let max_pref = max_seq_len.min(MAX_PREFILL_TOKENS);
-
         // Routed-FFN scratch: one allocation for the whole model, shared by every
         // routed layer, so decode reuses it as the n = 1 case rather than
         // allocating per call.
@@ -3357,9 +3056,6 @@ impl GpuLfmModel {
         let prefill_proj_buf = f((3 * hs).max(q_dim) * max_pref, "prefill_proj");
         let prefill_gate_buf = f(is.max(max_kv_dim).max(hs) * max_pref, "prefill_gate");
         let prefill_up_buf = f(is.max(max_kv_dim).max(hs) * max_pref, "prefill_up");
-        // the dense SwiGLU grid is sized from the same worst case: refuse here, where the
-        // refusal is still a loader error, rather than mid-prefill on either trunk path
-        check_dense_silu_fits(max_pref, is)?;
         // Streaming-GEMM B16 scratch: [max_k × max_pref_padded] halfs. max_k
         // covers every Q4_0 matmul K (hs for most projections, `is` for FFN
         // down, q_dim for attention out). Only when the streaming path is on.
@@ -3489,6 +3185,310 @@ impl GpuLfmModel {
             bytemuck::cast_slice(&[config.vocab_size as u32, 0u32]),
             "argmax_params",
         );
+
+        // Compile compute pipelines after all fallible weight reads and
+        // scratch-sizing validations have succeeded.
+        let pipelines = GpuPipelines {
+            gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32"),
+            gemv_f16: ctx.create_pipeline_with_defines(
+                shaders::GEMV_F32,
+                "gemv_f32",
+                "gemv_f16",
+                &[("F16_A", "1")],
+            ),
+            gemv_f32_accum: ctx.create_pipeline(
+                shaders::GEMV_F32,
+                "gemv_f32_accum",
+                "gemv_f32_accum",
+            ),
+            gemm_f32_nt: ctx.create_pipeline(shaders::GEMM_F32, "gemm_f32_nt", "gemm_f32_nt"),
+            gemm_f32_nt_accum: ctx.create_pipeline(
+                shaders::GEMM_F32,
+                "gemm_f32_nt_accum",
+                "gemm_f32_nt_accum",
+            ),
+            gemv_q4_0: ctx.create_pipeline(shaders::GEMV_Q4_0, "gemv_q4_0", "gemv_q4_0"),
+            gemv_q4_0_fast: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
+                // Vulkan: subgroup-reduction twin via passthrough (naga
+                // cannot parse `enable subgroups`, so the WGSL twin below
+                // carries the tree instead). Same bindings, same NR=8.
+                ctx.gemv_q4_0_fast_passthrough()
+            } else {
+                ctx.create_pipeline(shaders::GEMV_Q4_0_FAST, "gemv_q4_0_fast", "gemv_q4_0_fast")
+            },
+            gemv_q4_0_stream: if stream_layout {
+                tracing::debug!("gemv_q4_0_stream: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q4_0_stream_passthrough())
+            } else {
+                None
+            },
+            gemv_q4_k: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
+                ctx.gemv_q4_k_passthrough()
+            } else {
+                ctx.create_pipeline(shaders::GEMV_Q4_K, "gemv_q4_k", "gemv_q4_k")
+            },
+            gemv_q4_k_stream: if stream_layout {
+                tracing::debug!("gemv_q4_k_stream: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q4_k_stream_passthrough())
+            } else {
+                None
+            },
+            gemv_q5_k: ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k", "gemv_q5_k"),
+            gemv_q6_k: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
+                // Vulkan: 64-thread subgroup twin via passthrough. Same
+                // bindings, NR=1 (WGSL fallback is NR=2: the rows gate in
+                // `gemv_pipeline_rows_label` mirrors this condition).
+                ctx.gemv_q6_k_passthrough()
+            } else {
+                ctx.create_pipeline(shaders::GEMV_Q6_K, "gemv_q6_k", "gemv_q6_k")
+            },
+            gemv_q6_k_flat: if use_flat_q6k(&ctx) {
+                tracing::debug!("gemv_q6_k_flat: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q6_k_flat_passthrough())
+            } else {
+                None
+            },
+            gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "gemv_q8_0"),
+            add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "add"),
+            scaled_add_inplace: ctx.create_pipeline(
+                shaders::ELEMENTWISE,
+                "scaled_add_inplace",
+                "scaled_add",
+            ),
+            scale_f32: ctx.create_pipeline(shaders::SCALE_F32, "scale_f32", "scale_f32"),
+            mul_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "mul_inplace", "mul"),
+            silu_mul_inplace: ctx.create_pipeline(
+                shaders::ELEMENTWISE,
+                "silu_mul_inplace",
+                "silu_mul",
+            ),
+            ffn_swiglu_q4_0: ctx.create_pipeline(
+                shaders::FFN_SWIGLU_Q4_0,
+                "ffn_swiglu_q4_0",
+                "ffn_swiglu_q4_0",
+            ),
+            rmsnorm: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm", "rmsnorm"),
+            rmsnorm_out: ctx.create_pipeline(shaders::RMSNORM, "rmsnorm_out", "rmsnorm_out"),
+            kv_append: ctx.create_pipeline(shaders::KV_APPEND, "kv_append", "kv_append"),
+            per_head_rmsnorm: ctx.create_pipeline(
+                shaders::PER_HEAD_RMSNORM,
+                "per_head_rmsnorm",
+                "per_head_rmsnorm",
+            ),
+            rope: ctx.create_pipeline(shaders::ROPE, "rope", "rope"),
+            kv_shift: ctx.create_pipeline(shaders::KV_SHIFT, "kv_shift", "kv_shift"),
+            flash_attention: ctx.create_pipeline(
+                shaders::FLASH_ATTENTION,
+                "flash_attention",
+                "flash_attention",
+            ),
+            flash_attention_split: ctx.create_pipeline(
+                shaders::FLASH_ATTENTION_SPLIT,
+                "flash_attention_split",
+                "flash_attention_split",
+            ),
+            flash_attention_merge: ctx.create_pipeline(
+                shaders::FLASH_ATTENTION_MERGE,
+                "flash_attention_merge",
+                "flash_attention_merge",
+            ),
+            conv1d_fused: ctx.create_pipeline(
+                shaders::CONV1D_FUSED,
+                "conv1d_fused",
+                "conv1d_fused",
+            ),
+            argmax_f32: ctx.create_pipeline(shaders::ARGMAX_F32, "argmax_f32", "argmax_f32"),
+            rmsnorm_batch: ctx.create_pipeline(
+                shaders::RMSNORM_BATCH,
+                "rmsnorm_batch",
+                "rmsnorm_batch",
+            ),
+            add_rmsnorm_batch: ctx.create_pipeline(
+                shaders::RMSNORM_BATCH,
+                "add_rmsnorm_batch",
+                "add_rmsnorm_batch",
+            ),
+            qk_norm_rope_batch: ctx.create_pipeline(
+                shaders::QK_NORM_ROPE_BATCH,
+                "qk_norm_rope_batch",
+                "qk_norm_rope_batch",
+            ),
+            conv1d_fused_batch: ctx.create_pipeline(
+                shaders::CONV1D_FUSED_BATCH,
+                "conv1d_fused_batch",
+                "conv1d_fused_batch",
+            ),
+            bidir_split: ctx.create_pipeline(shaders::BIDIRECTIONAL, "bidir_split", "bidir_split"),
+            bidir_conv_centered: ctx.create_pipeline(
+                shaders::BIDIRECTIONAL,
+                "bidir_conv_centered",
+                "bidir_conv_centered",
+            ),
+            bias_add: ctx.create_pipeline(shaders::BIAS_ADD, "bias_add", "bias_add"),
+
+            mul_mat_reg_tile_q4_0: if use_spirv_passthrough(&ctx) {
+                tracing::debug!("mul_mat_reg_tile_q4_0: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q4_0_passthrough()
+            } else {
+                build_mul_mat_pipeline(&ctx, "mul_mat_q4_0", "INIT_SRC0_SHMEM_Q4_0", "u32")
+            },
+            mul_mat_reg_tile_q4_0_stream: if stream_layout {
+                tracing::debug!("mul_mat_reg_tile_q4_0_stream: SPIR-V passthrough (slang)");
+                Some(ctx.mul_mat_reg_tile_q4_0_stream_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_0: if stream_layout {
+                tracing::debug!("gemm_stream_q4_0: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_0_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_0_k64: if stream_layout {
+                tracing::debug!("gemm_stream_q4_0_k64: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_0_k64_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_0_k64_xf32: if stream_layout {
+                tracing::debug!("gemm_stream_q4_0_k64_xf32: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_0_k64_xf32_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_0_k64_r2: if stream_layout {
+                tracing::debug!("gemm_stream_q4_0_k64_r2: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_0_k64_r2_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_0_k64_gateup: if stream_layout {
+                tracing::debug!("gemm_stream_q4_0_k64_gateup: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_0_k64_gateup_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q4_k: if stream_layout {
+                tracing::debug!("gemm_stream_q4_k: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q4_k_passthrough())
+            } else {
+                None
+            },
+            transpose_cast_f16: if stream_layout {
+                tracing::debug!("transpose_cast_f16: SPIR-V passthrough (slang)");
+                Some(ctx.transpose_cast_f16_passthrough())
+            } else {
+                None
+            },
+            // Every quantized weight goes through the register-tiled kernel (weight
+            // reuse across the token tile), NOT the batched-GEMV-shaped gemm_* kernels:
+            // those re-dequantize the weight once per token, so they buy submit count
+            // and no compute, and measured *slower* than the per-token fallback they
+            // were meant to replace.
+            mul_mat_reg_tile_q8_0: if use_spirv_passthrough(&ctx) {
+                tracing::debug!("mul_mat_reg_tile_q8_0: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q8_0_passthrough()
+            } else {
+                build_mul_mat_pipeline(&ctx, "mul_mat_q8_0", "INIT_SRC0_SHMEM_Q8_0", "u32")
+            },
+            mul_mat_reg_tile_q4_k: if use_spirv_passthrough(&ctx) {
+                tracing::debug!("mul_mat_reg_tile_q4_k: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q4_k_passthrough()
+            } else {
+                build_mul_mat_pipeline(&ctx, "mul_mat_q4_k", "INIT_SRC0_SHMEM_Q4_K", "u32")
+            },
+            mul_mat_reg_tile_q5_k: if use_spirv_passthrough(&ctx) {
+                tracing::debug!("mul_mat_reg_tile_q5_k: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q5_k_passthrough()
+            } else {
+                build_mul_mat_pipeline(&ctx, "mul_mat_q5_k", "INIT_SRC0_SHMEM_Q5_K", "u32")
+            },
+            mul_mat_reg_tile_q6_k: if use_spirv_passthrough(&ctx) {
+                tracing::debug!("mul_mat_reg_tile_q6_k: SPIR-V passthrough (slang)");
+                ctx.mul_mat_reg_tile_q6_k_passthrough()
+            } else {
+                build_mul_mat_pipeline(&ctx, "mul_mat_q6_k", "INIT_SRC0_SHMEM_Q6_K", "u32")
+            },
+            // Dense-f32 fallback loader. Stays on naga: the Slang SPIR-V
+            // passthrough is Vulkan-only and covers just the quantized loaders
+            // (the dense f32 loader was never naga-regressed).
+            mul_mat_reg_tile_f32: build_mul_mat_pipeline(
+                &ctx,
+                "mul_mat_f32",
+                "INIT_SRC0_SHMEM_FLOAT",
+                "f32",
+            ),
+            attention_prefill: ctx.create_pipeline(
+                shaders::ATTENTION_PREFILL,
+                "attention_prefill",
+                "attention_prefill",
+            ),
+            // The generic kernel above always builds, so a flash-only failure falls
+            // back instead of failing the load (shared tail in
+            // `build_flash_pipeline_or_log`).
+            attention_flash_hd64: if ctx.uses_flash_attention(head_dim) {
+                ctx.build_flash_pipeline_or_log(
+                    "bidirectional prefill falls back to the generic kernel",
+                )
+            } else {
+                None
+            },
+            attention_prefill_hd64: if ctx.uses_flash_attention(head_dim) {
+                match ctx.try_create_pipeline_checked(
+                    shaders::ATTENTION_PREFILL_HD64,
+                    "main",
+                    "attention_prefill_hd64",
+                ) {
+                    Ok(pipe) => Some(pipe),
+                    Err(e) => {
+                        tracing::warn!(
+                            "attention_prefill_hd64 pipeline validation failed ({e}); \
+                             causal prefill falls back to generic kernel"
+                        );
+                        eprintln!(
+                            "[cera::wgpu] attention_prefill_hd64 pipeline validation failed ({e}); \
+                             causal prefill falls back to generic kernel"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            },
+            attention_prefill_hd64_f16: if ctx.uses_flash_attention(head_dim)
+                && ctx.max_compute_workgroup_storage_size
+                    >= crate::backend::wgpu::FLASH_ATTENTION_F16_WORKGROUP_BYTES
+                && use_spirv_passthrough(&ctx)
+            {
+                match ctx.try_attention_prefill_hd64_f16_passthrough_checked() {
+                    Ok(pipe) => {
+                        tracing::debug!("attention_prefill_hd64_f16: SPIR-V passthrough (slang)");
+                        Some(pipe)
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "attention_prefill_hd64_f16 pipeline validation failed ({e}); \
+                             causal prefill falls back to f32 or generic kernel"
+                        );
+                        eprintln!(
+                            "[cera::wgpu] attention_prefill_hd64_f16 pipeline validation failed ({e}); \
+                             causal prefill falls back to f32 or generic kernel"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            },
+            moe_route: ctx.create_pipeline(shaders::MOE_ROUTE, "moe_route", "moe_route"),
+            moe_gemv_q4_0: ctx.create_pipeline(
+                shaders::MOE_GEMV_Q4_0,
+                "moe_gemv_q4_0",
+                "moe_gemv_q4_0",
+            ),
+            moe_combine: ctx.create_pipeline(shaders::MOE_COMBINE, "moe_combine", "moe_combine"),
+        };
+
         let argmax_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
             label: Some("argmax_bg"),
             layout: &pipelines.argmax_f32.get_bind_group_layout(0),

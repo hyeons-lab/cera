@@ -21,8 +21,10 @@ use web_sys::{
 
 use cera::gguf::GgufFile;
 use cera::kv_cache::InferenceState;
-use cera::model::Model;
 use cera::model::gpu_lfm2::GpuLfmModel;
+use cera::model::lfm2::LfmModel;
+use cera::model::llama::LlamaModel;
+use cera::model::{GpuWeightSource, Model};
 use cera_wasm::opfs_source::{OpfsGpuWeightSource, OpfsSyncHandle};
 
 wasm_bindgen_test_configure!(run_in_dedicated_worker);
@@ -229,13 +231,93 @@ async fn write_and_open_opfs_sync(filename: &str, bytes: &[u8]) -> FileSystemSyn
     sync
 }
 
+fn assert_weight_source_parity(
+    opfs: &OpfsGpuWeightSource,
+    full: &dyn GpuWeightSource,
+    header_only_gguf: &Arc<GgufFile>,
+    full_gguf: &Arc<GgufFile>,
+) {
+    assert_eq!(opfs.config().hidden_size, full.config().hidden_size);
+    assert_eq!(opfs.config().vocab_size, full.config().vocab_size);
+    assert_eq!(opfs.output_norm_weight(), full.output_norm_weight());
+    assert_eq!(opfs.attn_norm_weight(0), full.attn_norm_weight(0));
+    assert_eq!(opfs.ffn_norm_weight(0), full.ffn_norm_weight(0));
+    assert_eq!(opfs.attn_q_norm_weight(0), full.attn_q_norm_weight(0));
+    assert_eq!(opfs.attn_k_norm_weight(0), full.attn_k_norm_weight(0));
+
+    let emb_opfs = opfs
+        .embedding_mmap_weight(header_only_gguf)
+        .expect("opfs embedding_mmap_weight");
+    let emb_full = full
+        .embedding_mmap_weight(full_gguf)
+        .expect("full embedding_mmap_weight");
+    assert_eq!(emb_opfs.rows, emb_full.rows);
+    assert_eq!(emb_opfs.cols, emb_full.cols);
+    assert_eq!(emb_opfs.data(), emb_full.data());
+
+    let pairs = [
+        (
+            opfs.attn_q_ref(0).unwrap(),
+            full.attn_q_ref(0).unwrap(),
+            "attn_q",
+        ),
+        (
+            opfs.attn_k_ref(0).unwrap(),
+            full.attn_k_ref(0).unwrap(),
+            "attn_k",
+        ),
+        (
+            opfs.attn_v_ref(0).unwrap(),
+            full.attn_v_ref(0).unwrap(),
+            "attn_v",
+        ),
+        (
+            opfs.attn_output_ref(0).unwrap(),
+            full.attn_output_ref(0).unwrap(),
+            "attn_output",
+        ),
+        (
+            opfs.ffn_gate_ref(0).unwrap(),
+            full.ffn_gate_ref(0).unwrap(),
+            "ffn_gate",
+        ),
+        (
+            opfs.ffn_up_ref(0).unwrap(),
+            full.ffn_up_ref(0).unwrap(),
+            "ffn_up",
+        ),
+        (
+            opfs.ffn_down_ref(0).unwrap(),
+            full.ffn_down_ref(0).unwrap(),
+            "ffn_down",
+        ),
+    ];
+    for (o_ref, f_ref, label) in pairs {
+        assert_eq!(
+            opfs.weight_bytes(o_ref).unwrap().as_ref(),
+            full.weight_bytes(f_ref).unwrap().as_ref(),
+            "weight_bytes mismatch on {label}"
+        );
+        assert_eq!(
+            opfs.dequantize_weight(o_ref).unwrap(),
+            full.dequantize_weight(f_ref).unwrap(),
+            "dequantize_weight mismatch on {label}"
+        );
+    }
+}
+
 #[wasm_bindgen_test]
 async fn opfs_sync_handle_releases_lock_on_drop_and_streams_lfm2_and_llama_to_webgpu() {
+    let ctx = cera::backend::wgpu::GpuContext::new_async()
+        .await
+        .expect("GpuContext::new_async");
+
     for arch in ["lfm2", "llama"] {
         let filename = format!("test-webgpu-opfs-{arch}.gguf");
         let full_bytes = build_minimal_gguf_bytes(arch);
         let full_gguf = GgufFile::from_bytes(Arc::from(full_bytes.clone().into_boxed_slice()))
             .expect("parse full gguf");
+        let full_gguf_arc = Arc::new(full_gguf.clone());
 
         // 1. Verify RAII OpfsSyncHandle releases the exclusive lock on drop (simulating early error)
         {
@@ -264,48 +346,52 @@ async fn opfs_sync_handle_releases_lock_on_drop_and_streams_lfm2_and_llama_to_we
         )
         .expect("OpfsGpuWeightSource::new must succeed on header-only GGUF");
 
-        let ctx1 = cera::backend::wgpu::GpuContext::new_async()
-            .await
-            .expect("GpuContext::new_async");
-        let gpu_from_opfs = GpuLfmModel::from_weight_source_with_ctx(
-            &opfs_source,
-            128,
-            format!("opfs-{arch}"),
-            ctx1,
-        )
-        .expect("GpuLfmModel::from_weight_source_with_ctx must succeed from OpfsGpuWeightSource");
-        opfs_source.close();
+        if arch == "lfm2" {
+            let cpu_full = LfmModel::from_gguf(full_gguf, 128).expect("LfmModel::from_gguf");
+            assert_weight_source_parity(&opfs_source, &cpu_full, &header_only_gguf, &full_gguf_arc);
 
-        let ctx2 = cera::backend::wgpu::GpuContext::new_async()
-            .await
-            .expect("GpuContext::new_async 2");
-        let gpu_from_full =
-            GpuLfmModel::from_gguf_with_ctx(full_gguf, 128, format!("full-{arch}"), ctx2)
-                .expect("GpuLfmModel::from_gguf_with_ctx");
+            // Compile `GpuPipelines` once for `"lfm2"` (avoiding 5x redundant LLVM JIT
+            // shader compiles on software Vulkan `lavapipe` in CI) and verify that the
+            // WebGPU forward pass matches the full in-memory reference model.
+            let gpu_from_opfs = GpuLfmModel::from_weight_source_with_ctx(
+                &opfs_source,
+                128,
+                format!("opfs-{arch}"),
+                ctx.clone(),
+            )
+            .expect(
+                "GpuLfmModel::from_weight_source_with_ctx must succeed from OpfsGpuWeightSource",
+            );
+            opfs_source.close();
 
-        let mut state_opfs = InferenceState::from_config(gpu_from_opfs.config()).unwrap();
-        let mut state_full = InferenceState::from_config(gpu_from_full.config()).unwrap();
+            let mut state_opfs = InferenceState::from_config(gpu_from_opfs.config()).unwrap();
+            let mut state_cpu = InferenceState::from_config(Model::config(&cpu_full)).unwrap();
 
-        gpu_from_opfs.forward_prefill_step(1, 0, &mut state_opfs);
-        gpu_from_full.forward_prefill_step(1, 0, &mut state_full);
+            gpu_from_opfs.forward_prefill_step(1, 0, &mut state_opfs);
+            cpu_full.forward_prefill(&[1], 0, &mut state_cpu);
 
-        let logits_opfs = gpu_from_opfs
-            .forward_logits_async(2, 1, &mut state_opfs)
-            .await
-            .expect("forward_logits_async opfs");
-        let logits_full = gpu_from_full
-            .forward_logits_async(2, 1, &mut state_full)
-            .await
-            .expect("forward_logits_async full");
+            let logits_opfs = gpu_from_opfs
+                .forward_logits_async(2, 1, &mut state_opfs)
+                .await
+                .expect("forward_logits_async opfs");
+            let logits_cpu = cpu_full.forward(&[2], 1, &mut state_cpu);
 
-        assert!(
-            logits_opfs.iter().all(|v| v.is_finite()) && logits_opfs.iter().any(|&v| v != 0.0),
-            "WebGPU forward pass must produce non-zero finite logits for {arch} (catches WGSL pipeline validation errors)"
-        );
-        assert_eq!(
-            logits_opfs, logits_full,
-            "OPFS-streamed WebGPU logits must match full in-memory GGUF logits for {arch}"
-        );
+            assert!(
+                logits_opfs.iter().all(|v| v.is_finite()) && logits_opfs.iter().any(|&v| v != 0.0),
+                "WebGPU forward pass must produce non-zero finite logits for {arch} (catches WGSL pipeline validation errors)"
+            );
+            assert_eq!(logits_opfs.len(), logits_cpu.len());
+            for (i, (g, c)) in logits_opfs.iter().zip(logits_cpu.iter()).enumerate() {
+                assert!(
+                    (g - c).abs() < 1e-2,
+                    "OPFS-streamed WebGPU logit[{i}] ({g}) diverged from full in-memory reference ({c})"
+                );
+            }
+        } else {
+            let cpu_full = LlamaModel::from_gguf(full_gguf, 128).expect("LlamaModel::from_gguf");
+            assert_weight_source_parity(&opfs_source, &cpu_full, &header_only_gguf, &full_gguf_arc);
+            opfs_source.close();
+        }
     }
 
     // 3. Verify `read_gguf_header_from_sync_handle` escalates past the initial 4 MiB probe
@@ -357,12 +443,11 @@ async fn opfs_sync_handle_releases_lock_on_drop_and_streams_lfm2_and_llama_to_we
     raw_sync_for_trunc
         .truncate_with_u32(header_len as u32)
         .expect("truncate to header");
-    let ctx_trunc = cera::backend::wgpu::GpuContext::new_async().await.unwrap();
     let err = match GpuLfmModel::from_weight_source_with_ctx(
         &opfs_source,
         128,
         "opfs-truncated".to_string(),
-        ctx_trunc,
+        ctx,
     ) {
         Ok(_) => panic!("truncated OPFS file must fail GpuLfmModel::from_weight_source_with_ctx"),
         Err(e) => format!("{e:#}"),
