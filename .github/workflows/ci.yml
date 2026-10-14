@@ -112,14 +112,64 @@ jobs:
             echo "--- HexagonNpu.kt ---"; echo "$kt"
             exit 1
           fi
-          for skel in cera/src/backend/hexagon/skels/libcera-htp-v*.so; do
-            base=$(basename "$skel")
-            soname=$(objdump -p "$skel" 2>/dev/null | awk '/SONAME/{print $NF}' || true)
-            if [ -n "$soname" ] && [ "$soname" != "$base" ]; then
-              echo "::error::$skel SONAME mismatch: expected $base, got $soname"
-              exit 1
-            fi
-          done
+          python3 - cera/src/backend/hexagon/skels/libcera-htp-v*.so <<'PY'
+          import os, struct, sys
+
+          PT_LOAD, PT_DYNAMIC = 1, 2
+          DT_NULL, DT_STRTAB, DT_SONAME = 0, 5, 14
+
+          def elf32_soname(data: bytes) -> str:
+              if data[:6] != b"\x7fELF\x01\x01":
+                  raise ValueError("not a 32-bit little-endian ELF")
+              e_phoff = struct.unpack_from("<I", data, 28)[0]
+              e_phentsize, e_phnum = struct.unpack_from("<HH", data, 42)
+              loads, dyn = [], None
+              for i in range(e_phnum):
+                  p_type, p_offset, p_vaddr, _, p_filesz = struct.unpack_from(
+                      "<5I", data, e_phoff + i * e_phentsize
+                  )
+                  if p_type == PT_LOAD:
+                      loads.append((p_vaddr, p_offset, p_filesz))
+                  elif p_type == PT_DYNAMIC:
+                      dyn = (p_offset, p_filesz)
+              if dyn is None:
+                  raise ValueError("missing PT_DYNAMIC segment")
+              dyn_off, dyn_sz = dyn
+              strtab_vaddr = soname_off = None
+              for off in range(dyn_off, dyn_off + dyn_sz, 8):
+                  d_tag, d_val = struct.unpack_from("<iI", data, off)
+                  if d_tag == DT_NULL:
+                      break
+                  if d_tag == DT_STRTAB:
+                      strtab_vaddr = d_val
+                  elif d_tag == DT_SONAME:
+                      soname_off = d_val
+              if strtab_vaddr is None or soname_off is None:
+                  raise ValueError("missing DT_STRTAB or DT_SONAME")
+              str_vaddr = strtab_vaddr + soname_off
+              for p_vaddr, p_offset, p_filesz in loads:
+                  if p_vaddr <= str_vaddr < p_vaddr + p_filesz:
+                      file_off = p_offset + (str_vaddr - p_vaddr)
+                      end = data.index(0, file_off)
+                      return data[file_off:end].decode("ascii")
+              raise ValueError(f"DT_SONAME vaddr {str_vaddr:#x} outside PT_LOAD")
+
+          paths = sys.argv[1:]
+          if not paths:
+              print("::error::no Hexagon skel files matched", file=sys.stderr)
+              sys.exit(1)
+          for path in paths:
+              base = os.path.basename(path)
+              with open(path, "rb") as f:
+                  soname = elf32_soname(f.read())
+              if soname != base:
+                  print(
+                      f"::error::{path} SONAME mismatch: expected {base}, got {soname}",
+                      file=sys.stderr,
+                  )
+                  sys.exit(1)
+          print(f"skel SONAMEs verified ({len(paths)} files)")
+          PY
 
   # Rustdoc lint. Runs on macOS so `--all-features` can enable the macOS-only
   # `metal` backend (a Linux runner can't compile it), giving the doc build

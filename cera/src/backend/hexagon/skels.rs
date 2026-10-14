@@ -209,27 +209,30 @@ const LEGACY_SKELS: &[LegacySkel] = &[
     ("libggml-htp-v85.so", 881928, 0x260b85a6333e67f0),
 ];
 
+const FNV1A64_INIT: u64 = 0xcbf29ce484222325;
+
+fn fnv1a64_update(hash: u64, bytes: &[u8]) -> u64 {
+    bytes
+        .iter()
+        .fold(hash, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100000001b3))
+}
+
 #[cfg(test)]
 fn fnv1a64(bytes: &[u8]) -> u64 {
-    bytes.iter().fold(0xcbf29ce484222325u64, |h, &b| {
-        (h ^ u64::from(b)).wrapping_mul(0x100000001b3)
-    })
+    fnv1a64_update(FNV1A64_INIT, bytes)
 }
 
 fn hash_file_fnv1a64(path: &std::path::Path) -> std::io::Result<u64> {
     use std::io::Read;
     let mut file = std::fs::File::open(path)?;
     let mut buf = [0u8; 8192];
-    let mut hash = 0xcbf29ce484222325u64;
+    let mut hash = FNV1A64_INIT;
     loop {
         let n = file.read(&mut buf)?;
         if n == 0 {
             break;
         }
-        for &byte in &buf[..n] {
-            hash ^= byte as u64;
-            hash = hash.wrapping_mul(0x100000001b3u64);
-        }
+        hash = fnv1a64_update(hash, &buf[..n]);
     }
     Ok(hash)
 }
@@ -347,6 +350,7 @@ mod tests {
         let known: &[LegacySkel] = &[
             ("libggml-htp-v73.so", ours.len() as u64, fnv1a64(ours)),
             ("libggml-htp-v75.so", ours.len() as u64, fnv1a64(ours)),
+            ("libggml-htp-v79.so", ours.len() as u64, fnv1a64(ours) ^ 1),
             ("libggml-htp-v79.so", ours.len() as u64, fnv1a64(ours)),
         ];
         std::fs::write(dir.join("libggml-htp-v79.so"), ours).unwrap();
@@ -397,6 +401,81 @@ mod tests {
                 LEGACY_SKELS.iter().any(|&(n, ..)| n == old),
                 "{old} has no legacy entry"
             );
+        }
+    }
+
+    /// Parse `DT_SONAME` from a 32-bit little-endian ELF image (`PT_DYNAMIC` ->
+    /// `DT_STRTAB` + `DT_SONAME`, mapped through `PT_LOAD`).
+    fn elf32_soname(elf: &[u8]) -> Option<&str> {
+        if elf.get(..6)? != b"\x7fELF\x01\x01" {
+            return None;
+        }
+        let u16_at = |o: usize| Some(u16::from_le_bytes(elf.get(o..o + 2)?.try_into().ok()?));
+        let u32_at = |o: usize| Some(u32::from_le_bytes(elf.get(o..o + 4)?.try_into().ok()?));
+        let phoff = u32_at(28)? as usize;
+        let phentsize = u16_at(42)? as usize;
+        let phnum = u16_at(44)? as usize;
+        const PT_LOAD: u32 = 1;
+        const PT_DYNAMIC: u32 = 2;
+        const DT_NULL: u32 = 0;
+        const DT_STRTAB: u32 = 5;
+        const DT_SONAME: u32 = 14;
+        let mut loads = Vec::new();
+        let mut dyn_seg = None;
+        for i in 0..phnum {
+            let p = phoff.checked_add(i.checked_mul(phentsize)?)?;
+            let p_type = u32_at(p)?;
+            let p_offset = u32_at(p + 4)? as usize;
+            let p_vaddr = u32_at(p + 8)? as usize;
+            let p_filesz = u32_at(p + 16)? as usize;
+            if p_type == PT_LOAD {
+                loads.push((p_vaddr, p_offset, p_filesz));
+            } else if p_type == PT_DYNAMIC {
+                dyn_seg = Some((p_offset, p_filesz));
+            }
+        }
+        let (dyn_off, dyn_sz) = dyn_seg?;
+        let mut strtab_vaddr = None;
+        let mut soname_off = None;
+        for off in (dyn_off..dyn_off.checked_add(dyn_sz)?).step_by(8) {
+            let tag = u32_at(off)?;
+            let val = u32_at(off + 4)? as usize;
+            if tag == DT_NULL {
+                break;
+            } else if tag == DT_STRTAB {
+                strtab_vaddr = Some(val);
+            } else if tag == DT_SONAME {
+                soname_off = Some(val);
+            }
+        }
+        let str_vaddr = strtab_vaddr?.checked_add(soname_off?)?;
+        for (p_vaddr, p_offset, p_filesz) in loads {
+            if str_vaddr >= p_vaddr && str_vaddr < p_vaddr.checked_add(p_filesz)? {
+                let start = p_offset.checked_add(str_vaddr - p_vaddr)?;
+                let tail = elf.get(start..)?;
+                let end = tail.iter().position(|&b| b == 0)?;
+                return std::str::from_utf8(&tail[..end]).ok();
+            }
+        }
+        None
+    }
+
+    /// The CDSP loader deduplicates loaded libraries by `DT_SONAME`, not only by filename:
+    /// an embedded skel whose `DT_SONAME` still said `libggml-htp-vXX.so` would alias llama.cpp's
+    /// skel in a process that loads both. Also check that a corrupted SONAME fails the check.
+    #[test]
+    fn the_embedded_skels_carry_their_own_soname() {
+        for arch in PROBE_ARCHS {
+            let want = arch.skel_filename();
+            let bytes = embedded_skel(arch);
+            assert_eq!(elf32_soname(bytes), Some(want), "{arch:?}");
+            let mut mutated = bytes.to_vec();
+            let pos = mutated
+                .windows(want.len())
+                .position(|w| w == want.as_bytes())
+                .expect("SONAME string present in skel image");
+            mutated[pos] ^= 1;
+            assert_ne!(elf32_soname(&mutated), Some(want), "{arch:?} mutation");
         }
     }
 
@@ -539,6 +618,15 @@ mod tests {
         std::fs::write(&p, &bytes).unwrap();
         assert_eq!(install_skels(&dir).unwrap(), 1);
         assert_eq!(std::fs::read(&p).unwrap(), embedded_skel(PROBE_ARCHS[0]));
+        #[cfg(unix)]
+        {
+            let target = dir.join("copy.so");
+            std::fs::write(&target, embedded_skel(PROBE_ARCHS[0])).unwrap();
+            std::fs::remove_file(&p).unwrap();
+            std::os::unix::fs::symlink(&target, &p).unwrap();
+            assert_eq!(install_skels(&dir).unwrap(), 1);
+            assert!(std::fs::symlink_metadata(&p).unwrap().is_file());
+        }
 
         let _ = std::fs::remove_dir_all(&dir);
         // Env restore is the `_restore` guard's `Drop` (panic-safe).

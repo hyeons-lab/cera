@@ -1117,7 +1117,8 @@ pub(crate) fn add_residual<S: OpSink>(
 }
 
 /// `Cpy` that narrows an F32 `[dim, n_tokens]` activation to F16. Never
-/// tiled: a plain copy has no VTCM working set.
+/// tiled on `n_tokens`: the `SAMESHAPE_CONVERT` VTCM staging footprint
+/// depends only on `dim` (`ne[0]`), not on the token count (`ne[1]`).
 pub(crate) fn cpy_f32_to_f16<S: OpSink>(
     session: &mut S,
     src: &S::Buf,
@@ -1164,6 +1165,16 @@ pub(crate) mod testing {
         pub dtype: u32,
         pub ne: [u32; 4],
         pub nb: [u32; 4],
+    }
+
+    impl From<&RecTensor> for super::super::CopyTensor {
+        fn from(t: &RecTensor) -> Self {
+            Self {
+                dtype: t.dtype,
+                ne: t.ne,
+                nb: t.nb,
+            }
+        }
     }
 
     #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1262,12 +1273,22 @@ pub(crate) mod testing {
             if self.fail_op_at == Some(self.ops.len()) {
                 return Err(CeraError::Backend("injected".into()));
             }
+            let kparams = super::super::queue::validate_and_derive_op_params(
+                opcode,
+                src,
+                dst,
+                &params,
+                kernel_params,
+                &self.tensors,
+                self.dsp_threads(),
+                VTCM_BUDGET,
+            )?;
             self.ops.push(RecOp {
                 opcode,
                 src: src.to_vec(),
                 dst: dst.to_vec(),
                 params,
-                kparams: kernel_params,
+                kparams,
             });
             Ok(())
         }
@@ -1518,6 +1539,16 @@ mod tests {
         assert_eq!(cpy_dst.ne, [7, 3, 1, 1]);
         assert_eq!(cpy_dst.size, 7 * 3 * 2);
         assert_eq!(cpy_dst.nb, [2, 14, 42, 42]);
+        assert_eq!(
+            s.ops[2].kparams,
+            super::super::build_copy_kernel_params(
+                &s.src(2, 0).into(),
+                &cpy_dst.into(),
+                8,
+                VTCM_BUDGET,
+            )
+            .unwrap()
+        );
     }
 
     #[test]
@@ -1653,6 +1684,34 @@ mod tests {
         assert_eq!(sm.src.len(), 2);
         assert_eq!(f32::from_bits(sm.params[0] as u32), 0.5);
         assert_eq!(f32::from_bits(sm.kparams[18] as u32), 0.5);
+        for code in [HtpOpCode::Cpy as u32, HtpOpCode::Concat as u32] {
+            let op = s.ops.iter().find(|o| o.opcode == code).unwrap();
+            assert_ne!(op.kparams, [0i32; 32], "opcode {code} kparams precomputed");
+        }
+        // Unsupported `Cpy` and `Concat` shapes and out-of-bounds tensor indices are
+        // refused at `RecordingSink::enqueue_op`, just as `HexagonQueueSession::enqueue_op`
+        // refuses them.
+        assert!(copy_view(&mut s, v(0), View::new(&"b", 1024, [7, 4, 1], [4, 28, 112])).is_err());
+        let bad_src = ConcatSrc { nb0: 8, ..src(0) };
+        assert!(concat_time_inner(&mut s, bad_src, src(512), &"b", 2048, 8).is_err());
+        for precomputed in [[0i32; 32], [1i32; 32]] {
+            for bad in [0xffffu16, 999] {
+                assert!(
+                    s.enqueue_op(HtpOpCode::Cpy as u32, &[bad], &[0], [0; 16], precomputed)
+                        .is_err()
+                );
+                assert!(
+                    s.enqueue_op(
+                        HtpOpCode::Concat as u32,
+                        &[0, bad],
+                        &[0],
+                        [0; 16],
+                        precomputed,
+                    )
+                    .is_err()
+                );
+            }
+        }
     }
 
     /// `CERA_HEXAGON_STEP` on the real queue: the helpers reuse tensor

@@ -2607,7 +2607,7 @@ mod tests {
         };
         // 262144 for the weights leaves 100000 B: 390 rows of 256 B, made even.
         let k = build_mul_mat_f32_kernel_params(shape, 8, 262144 + 100_000).unwrap();
-        assert_eq!(k[2], 390);
+        assert_eq!(MmKernelParams::from_words(&k).m_chunk, 390);
         assert!(MmKernelParams::from_words(&k).vtcm_size as usize <= 262144 + 100_000);
         assert!(build_mul_mat_f32_kernel_params(shape, 8, 262144).is_none());
     }
@@ -3212,7 +3212,8 @@ mod tests {
     #[test]
     fn rows_the_vtcm_cannot_hold_are_chunked_to_fit() {
         let k = build_mul_mat_kernel_params(HtpDataType::Q8_0, 3072, 160, 1, 768 * 4, 6, VTCM);
-        let chunk = k[2] as usize;
+        let mm = MmKernelParams::from_words(&k);
+        let chunk = mm.m_chunk as usize;
         assert!(
             (2..160).contains(&chunk) && chunk.is_multiple_of(2),
             "m_chunk {chunk}"
@@ -3221,7 +3222,7 @@ mod tests {
         // The DSP's solver: (VTCM - weight prefetch) / (quantized + raw row),
         // rounded down to an even count: (8 MiB - 1327104) / (110592 + 12288).
         assert_eq!(chunk, 56);
-        let reported = MmKernelParams::from_words(&k).vtcm_size as usize;
+        let reported = mm.vtcm_size as usize;
         assert!(reported <= VTCM, "the reported layout is the chunk's");
         assert!(reported > 0, "the DSP is told how much VTCM the chunk uses");
     }
@@ -3270,7 +3271,11 @@ mod tests {
     fn rows_that_fit_and_single_rows_take_no_chunk() {
         for (k_dim, rows) in [(768, 160), (3072, 40), (2048, 1), (2048, 4), (1024, 64)] {
             let k = build_mul_mat_kernel_params(HtpDataType::Q8_0, k_dim, rows, 1, 4096, 6, VTCM);
-            assert_eq!(k[2], 0, "K {k_dim} rows {rows}");
+            assert_eq!(
+                MmKernelParams::from_words(&k).m_chunk,
+                0,
+                "K {k_dim} rows {rows}"
+            );
         }
     }
 
