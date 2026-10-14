@@ -12306,6 +12306,71 @@ pub(crate) mod neon {
             }
         }
 
+        /// Small-prompt behavior of the row-major smmla Q4_0 GEMM (the LFM2 prefill dispatch): time per
+        /// call at 4 to 512 tokens with the weights streamed from DRAM (a rotation of copies, >= 64 MB)
+        /// and with one cache-resident copy, so weight traffic can be told from compute and dispatch cost.
+        /// `cera_tests smmla_small_n_microbench --ignored --nocapture --test-threads=1` on a device.
+        #[test]
+        #[ignore = "microbenchmark: run explicitly on a device"]
+        #[cfg(not(has_blas))]
+        fn smmla_small_n_microbench() {
+            if !require_i8mm_kernel_or_skip() {
+                return;
+            }
+            for (name, m, k) in [
+                ("ffn gate 4608x1024", 4608usize, 1024usize),
+                ("ffn down 1024x4608", 1024, 4608),
+            ] {
+                let mut st = 0x5a11_0001u64 ^ (m as u64);
+                let (a, _, _) = random_q4_0_prefill_case(&mut st, m, 1, k);
+                let (packed, scales) = crate::backend::cpu::repack_q4_0_smmla_8x8(&a, m, k);
+                let nb = k / 32;
+                let cold_copies = (96usize << 20).div_ceil(packed.len().max(1)).max(2);
+                let ws: Vec<(Vec<u8>, Vec<f32>)> = (0..cold_copies)
+                    .map(|_| (packed.clone(), scales.clone()))
+                    .collect();
+                for n in [4usize, 8, 16, 32, 64, 128, 512] {
+                    let bmat: Vec<f32> = (0..n * k).map(|_| lcg(&mut st)).collect();
+                    let mut b_scales = vec![0.0f32; n * nb];
+                    let mut b_quants = vec![0i8; n * k];
+                    crate::model::transformer::quantize_rows(
+                        &bmat,
+                        k,
+                        n,
+                        &mut b_scales,
+                        &mut b_quants,
+                    );
+                    let mut out = vec![0.0f32; m * n];
+                    let mut time = |cold: bool| -> f64 {
+                        let mut v = Vec::new();
+                        for i in 0..40 {
+                            let w = if cold { &ws[i % cold_copies] } else { &ws[0] };
+                            let t0 = std::time::Instant::now();
+                            assert!(crate::backend::cpu::gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
+                                &w.0, &w.1, &b_scales, &b_quants, &mut out, n, m, k
+                            ));
+                            if i >= 8 {
+                                v.push(t0.elapsed().as_secs_f64());
+                            }
+                        }
+                        v.sort_by(|a, b| a.partial_cmp(b).unwrap());
+                        v[v.len() / 2]
+                    };
+                    let (cold, hot) = (time(true), time(false));
+                    let bytes = (packed.len() + scales.len() * 4) as f64;
+                    println!(
+                        "{name} n={n:4}: cold {:7.1} us ({:5.1} GB/s, {:4.2} TOPS)  hot {:7.1} us ({:5.1} GB/s, {:4.2} TOPS)",
+                        cold * 1e6,
+                        bytes / cold / 1e9,
+                        2.0 * m as f64 * n as f64 * k as f64 / cold / 1e12,
+                        hot * 1e6,
+                        bytes / hot / 1e9,
+                        2.0 * m as f64 * n as f64 * k as f64 / hot / 1e12
+                    );
+                }
+            }
+        }
+
         /// Accuracy of the Q4_1 smmla path against an f64 reference, next to the standard kernel's,
         /// on weights shaped like a real Q4_1 tensor (`m` near `-8 d`, so the offset term cancels
         /// most of the unsigned-nibble dot) at the Llama down-projection depth.
