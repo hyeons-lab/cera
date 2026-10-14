@@ -17,7 +17,8 @@
 //   binding/buffer 2: params  (n, scale_bits): scale_bits is the raw f32 bits of
 //                             the scaled_add multiplier, unused by the others
 //
-// Dispatch: (ceil(n / 256), 1, 1) workgroups of 256.
+// Dispatch: (ceil(n / 256), 1, 1) workgroups of 256, or 2-D via
+// `kv_shift_workgroups(n)` when ceil(n / 256) > 65535.
 
 [[vk::binding(0)]] RWStructuredBuffer<float> a_buf   : register(u0);
 [[vk::binding(1)]] StructuredBuffer<float>   b_buf   : register(t1);
@@ -26,7 +27,7 @@
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void add_inplace(uint3 gid : SV_DispatchThreadID) {
-    uint i = gid.x;
+    uint i = gid.x + gid.y * (65535u * 256u);
     if (i >= par_buf[0].x) {
         return;
     }
@@ -39,7 +40,7 @@ void add_inplace(uint3 gid : SV_DispatchThreadID) {
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void scaled_add_inplace(uint3 gid : SV_DispatchThreadID) {
-    uint i = gid.x;
+    uint i = gid.x + gid.y * (65535u * 256u);
     if (i >= par_buf[0].x) {
         return;
     }
@@ -49,7 +50,7 @@ void scaled_add_inplace(uint3 gid : SV_DispatchThreadID) {
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void mul_inplace(uint3 gid : SV_DispatchThreadID) {
-    uint i = gid.x;
+    uint i = gid.x + gid.y * (65535u * 256u);
     if (i >= par_buf[0].x) {
         return;
     }
@@ -59,7 +60,7 @@ void mul_inplace(uint3 gid : SV_DispatchThreadID) {
 [shader("compute")]
 [numthreads(256, 1, 1)]
 void silu_mul_inplace(uint3 gid : SV_DispatchThreadID) {
-    uint i = gid.x;
+    uint i = gid.x + gid.y * (65535u * 256u);
     if (i >= par_buf[0].x) {
         return;
     }

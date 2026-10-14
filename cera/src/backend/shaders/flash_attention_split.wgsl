@@ -185,7 +185,7 @@ fn flash_attention_split(
             let j = part_id * 32u + jj;
             let tt = base + j;
             if tt < seq_len {
-                let pair = unpack2x16float(v_cache[(tt * kv_dim >> 1u) + v_word]);
+                let pair = unpack2x16float(v_cache[((tt * kv_dim) >> 1u) + v_word]);
                 let pj = tile_scores[j];
                 sx += pj * pair.x;
                 sy += pj * pair.y;

@@ -2205,19 +2205,19 @@ enum DecodeTail {
     LogitsUnsubmitted(TailArgmax),
 }
 
-/// Refuse a dense SwiGLU slab this backend cannot dispatch: `silu_mul_inplace` spends one
-/// workgroup per 256 elements of the worst-case `rows × is` slab in a single grid dimension,
-/// so past `MAX_WG` groups the constructor must fail (a named error, and Auto falls through)
-/// rather than aborting on an over-limit dispatch mid-prefill. Covers the causal and
-/// bidirectional paths, which chunk alike. Pure so a host test pins it without a device.
+/// Refuse a dense SwiGLU slab this backend cannot dispatch: `silu_mul_inplace` flattens a
+/// 2-D workgroup grid of 256-thread groups via `kv_shift_workgroups(total)` and indexes the
+/// `rows × is` slab by a `u32` element count (`params.x`), so past `u32::MAX` elements the
+/// constructor must fail (a named error, and Auto falls through) rather than wrapping the
+/// element count mid-prefill. Covers the causal and bidirectional paths, which chunk alike.
+/// Pure so a host test pins it without a device.
 fn check_dense_silu_fits(rows: usize, is: usize) -> Result<()> {
-    let groups = (rows as u64) * (is as u64);
-    let groups = groups.div_ceil(256);
+    let elements = (rows as u64) * (is as u64);
     anyhow::ensure!(
-        groups <= crate::backend::wgpu::MAX_WG as u64,
-        "the dense SwiGLU over {rows} rows of width {is} needs {groups} workgroups, over this \
-         backend's {} per-dimension cap",
-        crate::backend::wgpu::MAX_WG,
+        elements <= u32::MAX as u64,
+        "the dense SwiGLU over {rows} rows of width {is} needs {elements} elements, over this \
+         backend's {} u32 element cap",
+        u32::MAX,
     );
     Ok(())
 }
@@ -3071,21 +3071,15 @@ impl GpuLfmModel {
                     m.n_expert_used,
                     crate::backend::wgpu::MAX_WG,
                 );
-                // The routed SwiGLU is the third and last grid this scratch
-                // sizes, and the only one that is not one workgroup per row or
-                // per entry: `silu_mul_inplace` takes 256 elements each and
-                // indexes by a bare `gid.x`, so its extent is the whole
-                // `entries x expert_ff_len` slab divided by 256. Checked in the
-                // same place as the other two, so all three of the scratch's
-                // dispatch bounds are one screenful apart rather than one of
-                // them surfacing as a wgpu validation failure mid-prefill.
-                let silu_groups = cells(entries, m.expert_ff_len, "SwiGLU")?.div_ceil(256);
+                // The routed SwiGLU uses `kv_shift_workgroups` so `silu_mul_inplace`
+                // can span a 2D grid past 65,535 workgroups; only the u32 element
+                // count (`params.x` / `gid.x + gid.y * (65535 * 256)`) caps the slab.
+                let silu_elems = cells(entries, m.expert_ff_len, "SwiGLU")?;
                 anyhow::ensure!(
-                    silu_groups <= crate::backend::wgpu::MAX_WG as usize,
+                    u32::try_from(silu_elems).is_ok(),
                     "the routed SwiGLU over {max_entries} entries of width {} needs \
-                     {silu_groups} workgroups, over this backend's {} per-dimension cap",
+                     {silu_elems} elements, over the u32 index cap",
                     m.expert_ff_len,
-                    crate::backend::wgpu::MAX_WG,
                 );
                 Ok(Arc::new(MoeScratch {
                     n_expert: dim(m.n_expert, "expert count")?,
@@ -5051,7 +5045,7 @@ impl GpuLfmModel {
                     "moe_silu",
                     &[&scratch.gate, &scratch.up, &silu_params],
                 ),
-                workgroups: (silu_total.div_ceil(256), 1, 1),
+                workgroups: crate::backend::wgpu::kv_shift_workgroups(silu_total),
             },
             // The down projection reads the per-entry SwiGLU product, so its
             // activation row is the entry itself, not the token.
@@ -7386,7 +7380,7 @@ impl GpuLfmModel {
             cmds,
             &self.pipelines.scaled_add_inplace,
             bg,
-            (total.div_ceil(256), 1, 1),
+            crate::backend::wgpu::kv_shift_workgroups(total),
             label,
         );
     }
@@ -8207,7 +8201,7 @@ impl GpuLfmModel {
             cmds,
             &self.pipelines.qk_norm_rope_batch,
             bg,
-            (tg_count, 1, 1),
+            crate::backend::wgpu::gemv_row_workgroups(tg_count),
             "qk_norm_rope_batch",
         );
     }
@@ -10211,7 +10205,7 @@ impl GpuLfmModel {
             cmds,
             &self.pipelines.silu_mul_inplace,
             bg,
-            (total.div_ceil(256), 1, 1),
+            crate::backend::wgpu::kv_shift_workgroups(total),
             "silu_mul_batch",
         );
     }
@@ -12644,14 +12638,34 @@ mod tests {
         }
     }
 
-    /// The dense SwiGLU load gate admits a full 2048-row chunk at width 8191 (65528
-    /// groups) and refuses it at 8192 (65536 groups, one past the per-dimension cap).
+    /// The dense SwiGLU load gate admits a full 2048-row prefill chunk at the widths of
+    /// LFM2-1.2B / 1.5B-Audio / 1.6B-VL (`is = 8192`, 65,536 workgroups) and LFM2-2.6B
+    /// (`is = 10752`, 86,016 workgroups) via `kv_shift_workgroups`, and refuses shapes
+    /// whose element count exceeds `u32::MAX`.
     #[test]
     fn dense_silu_gate_matches_the_dispatch_grid() {
-        assert!(super::check_dense_silu_fits(2048, 8191).is_ok());
-        assert!(super::check_dense_silu_fits(32, 4096).is_ok());
-        let err = super::check_dense_silu_fits(2048, 8192).expect_err("one group past the cap");
-        assert!(err.to_string().contains("per-dimension cap"), "{err}");
+        use crate::backend::wgpu::{MAX_WG, kv_shift_workgroups};
+        for is in [4096usize, 8191, 8192, 10752] {
+            assert!(
+                super::check_dense_silu_fits(2048, is).is_ok(),
+                "2048 x {is} must be admitted"
+            );
+            let (wx, wy, wz) = kv_shift_workgroups(2048 * is as u32);
+            assert!(wx <= MAX_WG && wy <= MAX_WG && wz == 1);
+            assert!(u64::from(wx) * u64::from(wy) * 256 >= 2048 * is as u64);
+        }
+        let elem_wgsl = include_str!("../backend/shaders/elementwise.wgsl");
+        assert!(
+            elem_wgsl.contains("gid.x + gid.y * (65535u * 256u)"),
+            "elementwise.wgsl must fold gid.y into the linear index for 2D dispatches"
+        );
+        let qk_wgsl = include_str!("../backend/shaders/qk_norm_rope_batch.wgsl");
+        assert!(
+            qk_wgsl.contains("get_wid(wid)"),
+            "qk_norm_rope_batch.wgsl must fold wid.y into the workgroup index for 2D dispatches"
+        );
+        let err = super::check_dense_silu_fits(65536, 65536).expect_err("overflows u32::MAX");
+        assert!(err.to_string().contains("u32 element cap"), "{err}");
     }
 
     /// `use_attention_f16` enables fp16 causal prefill by default and disables it

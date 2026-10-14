@@ -61,8 +61,8 @@ fn build_minimal_gguf_bytes(arch: &str) -> Vec<u8> {
         }
     }
 
-    const HS: usize = 64;
-    const INTER: usize = 128;
+    const HS: usize = 128;
+    const INTER: usize = 256;
     const VOCAB: usize = 32;
 
     let mut tensors: Vec<(&str, Vec<usize>, Vec<f32>)> = Vec::new();
@@ -298,9 +298,40 @@ async fn opfs_sync_handle_releases_lock_on_drop_and_streams_lfm2_and_llama_to_we
             .await
             .expect("forward_logits_async full");
 
+        assert!(
+            logits_opfs.iter().all(|v| v.is_finite()) && logits_opfs.iter().any(|&v| v != 0.0),
+            "WebGPU forward pass must produce non-zero finite logits for {arch} (catches WGSL pipeline validation errors)"
+        );
         assert_eq!(
             logits_opfs, logits_full,
             "OPFS-streamed WebGPU logits must match full in-memory GGUF logits for {arch}"
         );
     }
+
+    // 3. Verify `read_gguf_header_from_sync_handle` escalates past the initial 4 MiB probe
+    // when a GGUF header exceeds 4 MiB (e.g. LFM2.5-2.6B at 7.84 MiB).
+    let mut big_header_gguf = Vec::new();
+    big_header_gguf.extend_from_slice(b"GGUF");
+    big_header_gguf.extend_from_slice(&3u32.to_le_bytes());
+    big_header_gguf.extend_from_slice(&0u64.to_le_bytes()); // 0 tensors
+    big_header_gguf.extend_from_slice(&6u64.to_le_bytes()); // 6 KV entries (~4.8 MB total)
+    let filler = "x".repeat(800_000);
+    for i in 0..6 {
+        let key = format!("test.padding.{i}");
+        big_header_gguf.extend_from_slice(&(key.len() as u64).to_le_bytes());
+        big_header_gguf.extend_from_slice(key.as_bytes());
+        big_header_gguf.extend_from_slice(&8u32.to_le_bytes()); // GGUF_TYPE_STRING
+        big_header_gguf.extend_from_slice(&(filler.len() as u64).to_le_bytes());
+        big_header_gguf.extend_from_slice(filler.as_bytes());
+    }
+    assert!(big_header_gguf.len() > 4 * 1024 * 1024);
+    let raw_sync = write_and_open_opfs_sync("test-big-header.gguf", &big_header_gguf).await;
+    let sync = OpfsSyncHandle::new(raw_sync);
+    let parsed = cera_wasm::bundle::read_gguf_header_from_sync_handle(sync.as_raw())
+        .expect("read_gguf_header_from_sync_handle must parse >4 MiB GGUF headers");
+    assert_eq!(
+        parsed.get_str("test.padding.0").map(str::len),
+        Some(800_000)
+    );
+    sync.close();
 }
