@@ -42,7 +42,7 @@ fn conv2d_direct(@builtin(global_invocation_id) gid_0 : vec3<u32>)
     var _S9 : f32 = bias_buf_0[oc_0];
     var ic_local_0 : u32 = u32(0);
     var acc_0 : f32 = _S9;
-    for(;;)
+    loop
     {
         if(ic_local_0 < _S5)
         {
@@ -55,7 +55,7 @@ fn conv2d_direct(@builtin(global_invocation_id) gid_0 : vec3<u32>)
         var _S11 : u32 = (_S6 * _S5 + ic_local_0) * _S1 * _S2;
         var ki_0 : u32 = u32(0);
         var acc_1 : f32 = acc_0;
-        for(;;)
+        loop
         {
             if(ki_0 < _S3)
             {
@@ -85,7 +85,7 @@ fn conv2d_direct(@builtin(global_invocation_id) gid_0 : vec3<u32>)
             var _S13 : u32 = _S11 + u32(ih_0) * _S2;
             var kj_0 : u32 = u32(0);
             acc_2 = acc_1;
-            for(;;)
+            loop
             {
                 if(kj_0 < _S4)
                 {

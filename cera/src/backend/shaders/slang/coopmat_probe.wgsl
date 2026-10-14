@@ -17,7 +17,7 @@ fn coopmat_probe(@builtin(local_invocation_id) tid_0 : vec3<u32>)
         var _S2 : u32 = t_0 % u32(8);
         var i_0 : u32 = u32(0);
         var acc_0 : f32 = 0.0f;
-        for(;;)
+        loop
         {
             if(i_0 < u32(8))
             {

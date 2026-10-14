@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 83 "cera/src/backend/shaders/slang/power_spec.slang"
+#line 51 "cera/src/backend/shaders/slang/power_spec.slang"
 struct KernelContext_0
 {
     packed_uint4 device* par_buf_0;

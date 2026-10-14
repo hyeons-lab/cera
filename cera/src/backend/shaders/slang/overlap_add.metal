@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 60 "cera/src/backend/shaders/slang/overlap_add.slang"
+#line 28 "cera/src/backend/shaders/slang/overlap_add.slang"
 struct KernelContext_0
 {
     packed_uint4 device* par_buf_0;

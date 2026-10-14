@@ -46,7 +46,7 @@ fn q4_block_loop_0( m_0 : u32,  k_0 : u32,  r0_0 : u32,  ix_0 : u32,  il_0 : u32
     var nb_0 : u32 = k_0 / u32(32);
     var _S2 : u32 = nb_0 * u32(18);
     var r_0 : u32 = u32(0);
-    for(;;)
+    loop
     {
         if(r_0 < u32(8))
         {
@@ -61,7 +61,7 @@ fn q4_block_loop_0( m_0 : u32,  k_0 : u32,  r0_0 : u32,  ix_0 : u32,  il_0 : u32
     var _S3 : u32 = ix_0 * u32(32) + il_0;
     var ib_0 : u32 = ix_0;
     var yb_off_0 : u32 = _S3;
-    for(;;)
+    loop
     {
         if(ib_0 < nb_0)
         {
@@ -100,7 +100,7 @@ fn q4_block_loop_0( m_0 : u32,  k_0 : u32,  r0_0 : u32,  ix_0 : u32,  il_0 : u32
         var _S15 : f32 = a15_0 * 0.000244140625f;
         var _S16 : f32 = a0_0 + a1_0 + (a2_0 + a3_0) + (a4_0 + a5_0) + (a6_0 + a7_0) + (a8_0 + a9_0 + (a10_0 + a11_0) + (a12_0 + a13_0) + (a14_0 + a15_0));
         r_0 = u32(0);
-        for(;;)
+        loop
         {
             if(r_0 < u32(8))
             {
@@ -143,7 +143,7 @@ fn gemv_q4_0_fast(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(work
     var sumf_1 : array<f32, i32(8)>;
     q4_block_loop_0(m_1, params_0[i32(0)].y, r0_1, tid_0 / u32(2), ((tid_0 & (u32(1)))) * u32(8), &(sumf_1));
     var r_1 : u32 = u32(0);
-    for(;;)
+    loop
     {
         if(r_1 < u32(8))
         {
@@ -157,7 +157,7 @@ fn gemv_q4_0_fast(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(work
     }
     workgroupBarrier();
     var stride_0 : u32 = u32(32);
-    for(;;)
+    loop
     {
         if(stride_0 > u32(0))
         {
@@ -169,7 +169,7 @@ fn gemv_q4_0_fast(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(work
         if(tid_0 < stride_0)
         {
             r_1 = u32(0);
-            for(;;)
+            loop
             {
                 if(r_1 < u32(8))
                 {
@@ -189,7 +189,7 @@ fn gemv_q4_0_fast(@builtin(local_invocation_id) lid_0 : vec3<u32>, @builtin(work
     if(tid_0 == u32(0))
     {
         r_1 = u32(0);
-        for(;;)
+        loop
         {
             if(r_1 < u32(8))
             {

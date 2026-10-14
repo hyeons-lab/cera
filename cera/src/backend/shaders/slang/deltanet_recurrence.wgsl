@@ -49,7 +49,7 @@ fn deltanet_recurrence(@builtin(workgroup_id) gid_0 : vec3<u32>, @builtin(local_
     var s_col_0 : array<f32, i32(128)>;
     var i_0 : u32 = u32(0);
     var sk_j_0 : f32 = 0.0f;
-    for(;;)
+    loop
     {
         if(i_0 < head_k_dim_0)
         {
@@ -85,7 +85,7 @@ fn deltanet_recurrence(@builtin(workgroup_id) gid_0 : vec3<u32>, @builtin(local_
     var _S8 : f32 = b_0 * (vj_0 - sk_j_0);
     i_0 = u32(0);
     var oj_0 : f32 = 0.0f;
-    for(;;)
+    loop
     {
         if(i_0 < head_k_dim_0)
         {

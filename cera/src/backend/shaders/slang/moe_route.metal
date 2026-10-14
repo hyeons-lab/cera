@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 74 "cera/src/backend/shaders/slang/moe_route.slang"
+#line 57 "cera/src/backend/shaders/slang/moe_route.slang"
 struct KernelContext_0
 {
     packed_uint4 device* params_0;

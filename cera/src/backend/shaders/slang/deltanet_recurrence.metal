@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 71 "cera/src/backend/shaders/slang/deltanet_recurrence.slang"
+#line 34 "cera/src/backend/shaders/slang/deltanet_recurrence.slang"
 struct KernelContext_0
 {
     uint device* par_buf_0;

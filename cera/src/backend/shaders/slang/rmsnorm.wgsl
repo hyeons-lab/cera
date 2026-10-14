@@ -19,7 +19,7 @@ fn block_sum_0( tid_0 : u32,  v_0 : f32) -> f32
     scratch_0[tid_0] = v_0;
     workgroupBarrier();
     var s_0 : u32 = u32(128);
-    for(;;)
+    loop
     {
         if(s_0 > u32(0))
         {
@@ -48,7 +48,7 @@ fn rmsnorm(@builtin(local_invocation_id) lid_0 : vec3<u32>)
     var eps_0 : f32 = (bitcast<f32>((p_wgsl_0[i32(0)].y)));
     var i_0 : u32 = tid_1;
     var partial_0 : f32 = 0.0f;
-    for(;;)
+    loop
     {
         if(i_0 < n_0)
         {
@@ -64,7 +64,7 @@ fn rmsnorm(@builtin(local_invocation_id) lid_0 : vec3<u32>)
     var _S2 : f32 = block_sum_0(tid_1, partial_0);
     var _S3 : f32 = 1.0f / sqrt(_S2 / f32(n_0) + eps_0);
     i_0 = tid_1;
-    for(;;)
+    loop
     {
         if(i_0 < n_0)
         {
@@ -88,7 +88,7 @@ fn rmsnorm_out(@builtin(local_invocation_id) lid_1 : vec3<u32>)
     var eps_1 : f32 = (bitcast<f32>((p_oop_0[i32(0)].y)));
     var i_1 : u32 = tid_2;
     var partial_2 : f32 = 0.0f;
-    for(;;)
+    loop
     {
         if(i_1 < n_1)
         {
@@ -105,7 +105,7 @@ fn rmsnorm_out(@builtin(local_invocation_id) lid_1 : vec3<u32>)
     var _S4 : f32 = block_sum_0(tid_2, partial_2);
     var _S5 : f32 = 1.0f / sqrt(_S4 / f32(n_1) + eps_1);
     i_1 = tid_2;
-    for(;;)
+    loop
     {
         if(i_1 < n_1)
         {

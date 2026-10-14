@@ -4439,6 +4439,16 @@ fn generated_deltanet_wgsl_binds_eight_slots() {
     );
 }
 
+/// How many unconditional loops a generated shader contains. slangc spells the same loop
+/// `for(;;)` on C-like targets, and for WGSL either `for(;;)` (2026.14.1) or a bare `loop` header
+/// with the brace on the next line (2026.19), so count header lines, not one spelling.
+fn count_loops(src: &str) -> usize {
+    src.lines()
+        .map(str::trim)
+        .filter(|l| matches!(*l, "for(;;)" | "for(;;) {" | "loop" | "loop {"))
+        .count()
+}
+
 /// `conv1d_fused_batch` gets its speed from having all five loops over its
 /// `w_local[4]` / `rb[3]` state written with a literal trip count and
 /// `[ForceUnroll]`. Losing that unroll measured 0.72x against the handwritten
@@ -4464,7 +4474,7 @@ fn generated_conv_batch_unrolls_its_register_loops() {
     {
         checked += 1;
         let msl = cera::backend::metal::shaders::CONV1D_FUSED_BATCH;
-        let loops = msl.matches("for(;;)").count();
+        let loops = count_loops(msl);
         assert_eq!(
             loops, 1,
             "generated MSL for conv1d_fused_batch has {loops} loops, expected only the \
@@ -4475,7 +4485,7 @@ fn generated_conv_batch_unrolls_its_register_loops() {
     {
         checked += 1;
         let wgsl = cera::backend::wgpu::shaders::CONV1D_FUSED_BATCH;
-        let loops = wgsl.matches("for(;;)").count() + wgsl.matches("loop {").count();
+        let loops = count_loops(wgsl);
         assert_eq!(
             loops, 1,
             "generated WGSL for conv1d_fused_batch has {loops} loops, expected only the \

@@ -3,7 +3,7 @@
 #include <metal_texture>
 using namespace metal;
 
-#line 67 "cera/src/backend/shaders/slang/stft_frame.slang"
+#line 33 "cera/src/backend/shaders/slang/stft_frame.slang"
 struct KernelContext_0
 {
     packed_uint4 device* par_buf_0;

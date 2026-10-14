@@ -41,7 +41,7 @@ fn overlap_add(@builtin(global_invocation_id) gid_0 : vec3<u32>)
     var i_0 : u32 = i_lo_0;
     var numer_0 : f32 = 0.0f;
     var denom_0 : f32 = 0.0f;
-    for(;;)
+    loop
     {
         if(i_0 <= i_hi_1)
         {
