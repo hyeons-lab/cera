@@ -363,7 +363,10 @@ pub(crate) fn gguf_is_causal(gguf: &GgufFile, prefix: &str) -> bool {
     {
         causal
     } else {
-        gguf.get_tensor("classifier.weight").is_err()
+        !gguf
+            .tensors
+            .get("classifier.weight")
+            .is_some_and(|t| t.size_bytes > 0)
     }
 }
 
@@ -589,6 +592,21 @@ impl LfmModel {
         config: &ModelConfig,
         repack: bool,
     ) -> Result<Vec<LayerWeightRefs>> {
+        Self::resolve_all_layer_refs_with_loader(gguf, config, repack, |g, name| {
+            Ok(g.get_tensor(name)?.try_to_f32_vec()?)
+        })
+    }
+
+    /// Resolve all layer weight references for an LFM2 model using a custom `load_f32`
+    /// callback for small 1D host tensors (such as `blk.{i}.exp_probs_b.bias` on `lfm2moe`),
+    /// allowing header-only GGUF sources (like OPFS streaming in WebAssembly) to read
+    /// small tensor payloads on demand.
+    pub fn resolve_all_layer_refs_with_loader(
+        gguf: &GgufFile,
+        config: &ModelConfig,
+        repack: bool,
+        mut load_f32: impl FnMut(&GgufFile, &str) -> Result<Vec<f32>>,
+    ) -> Result<Vec<LayerWeightRefs>> {
         let mut layer_refs = Vec::with_capacity(config.n_layers);
         for (i, bt) in config.block_types.iter().enumerate() {
             let is_moe = config
@@ -607,9 +625,7 @@ impl LfmModel {
                         .collect()
                 };
 
-                let exp_probs_b = gguf
-                    .get_tensor(&format!("blk.{i}.exp_probs_b.bias"))?
-                    .to_f32_vec();
+                let exp_probs_b = load_f32(gguf, &format!("blk.{i}.exp_probs_b.bias"))?;
                 ensure!(
                     exp_probs_b.len() == n_expert,
                     "layer {i}: exp_probs_b has {} entries, expected {n_expert}",

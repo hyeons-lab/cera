@@ -524,8 +524,8 @@ pub(crate) fn resolve_expert_weight(
     name: &str,
     expert: usize,
 ) -> Result<WeightRef> {
-    let (start, size, m, k, dtype) = gguf.tensor_meta_expert(name, expert)?;
-    Ok(WeightRef::new(start as u64, size, dtype, m, k))
+    let (start, size, m, k, dtype) = gguf.tensor_meta_expert_u64(name, expert)?;
+    Ok(WeightRef::new(start, size, dtype, m, k))
 }
 
 /// Get the raw bytes for a pre-resolved weight.

@@ -2760,13 +2760,16 @@ impl GpuLfmModel {
         // time instead (no-op for every other arch), exactly like the CPU
         // LlamaModel (`scale_inplace` after `dequantize_row`).
         let gguf_arc = Arc::new(src.gguf().clone());
-        let emb_table = MmapWeight::from_gguf(&gguf_arc, "token_embd.weight")?;
+        let emb_table = src.embedding_mmap_weight(&gguf_arc)?;
 
         // The logit-projection weight, as GGUF stores it: `output.weight` when
         // untied, else the tied embedding table.
         let (lm_head_dtype, lm_head_bytes) = match src.output_ref() {
             Some(wref) => (wref.dtype, src.weight_bytes(wref)),
-            None => (emb_table.dtype, src.embedding_tensor_data()?),
+            None => (
+                emb_table.dtype,
+                std::borrow::Cow::Borrowed(emb_table.data()),
+            ),
         };
         // Resident stream layout for the logit projection (Q4_0, Q4_K_M): the
         // vocab projection is ~19% of prefill FLOPs, so it gets the repack
@@ -2888,7 +2891,7 @@ impl GpuLfmModel {
                 // `output.weight` is the key `output_ref` resolves (llama
                 // family; LFM2 always ties and takes the arm below).
                 Some(_) => {
-                    let out_table = MmapWeight::from_gguf(&gguf_arc, "output.weight")?;
+                    let out_table = src.output_mmap_weight(&gguf_arc)?;
                     upload_mmap_table_as_f16(&ctx, &out_table, "output.weight")
                 }
                 None => upload_mmap_table_as_f16(&ctx, &emb_table, "token_embd.weight"),
@@ -13872,5 +13875,187 @@ mod tests {
             k as u32
         ));
         unsafe { std::env::remove_var("CERA_WGPU_GEMM_DIRECT_B") };
+    }
+
+    /// Regression test for WebGPU OPFS streaming (`OpfsGpuWeightSource`):
+    /// when a `GpuWeightSource` holds only a header-only `GgufFile` in `src.gguf()`
+    /// (so `MmapWeight::from_gguf(&Arc::new(src.gguf().clone()), "token_embd.weight")`
+    /// fails with `data extends beyond GGUF buffer`) and supplies `token_embd.weight`
+    /// via `embedding_mmap_weight`, `GpuLfmModel::from_weight_source_with_ctx` must
+    /// load and produce identical output to a full in-memory GGUF load.
+    #[test]
+    fn header_only_weight_source_loads_and_matches_full_gguf() {
+        use crate::gguf::GgufFile;
+        use crate::kv_cache::InferenceState;
+        use crate::model::Model;
+        use crate::model::gpu_weight_source::{GpuWeightSource, RopeType};
+        use crate::model::lfm2::LfmModel;
+        use crate::model::lfm2::bidirectional_float_tests::bidirectional_gguf;
+        use crate::model::transformer::WeightRef;
+        use crate::model::weights::MmapWeight;
+
+        struct HeaderOnlySource {
+            inner: LfmModel,
+            header_only_gguf: GgufFile,
+        }
+
+        impl GpuWeightSource for HeaderOnlySource {
+            fn config(&self) -> &crate::model::ModelConfig {
+                GpuWeightSource::config(&self.inner)
+            }
+            fn gguf(&self) -> &GgufFile {
+                &self.header_only_gguf
+            }
+            fn output_norm_weight(&self) -> &[f32] {
+                GpuWeightSource::output_norm_weight(&self.inner)
+            }
+            fn attn_norm_weight(&self, layer: usize) -> &[f32] {
+                GpuWeightSource::attn_norm_weight(&self.inner, layer)
+            }
+            fn ffn_norm_weight(&self, layer: usize) -> &[f32] {
+                GpuWeightSource::ffn_norm_weight(&self.inner, layer)
+            }
+            fn attn_q_norm_weight(&self, layer: usize) -> Option<&[f32]> {
+                GpuWeightSource::attn_q_norm_weight(&self.inner, layer)
+            }
+            fn attn_k_norm_weight(&self, layer: usize) -> Option<&[f32]> {
+                GpuWeightSource::attn_k_norm_weight(&self.inner, layer)
+            }
+            fn conv_weight(&self, layer: usize) -> Option<&[f32]> {
+                GpuWeightSource::conv_weight(&self.inner, layer)
+            }
+            fn attn_q_bias(&self, layer: usize) -> Option<&[f32]> {
+                GpuWeightSource::attn_q_bias(&self.inner, layer)
+            }
+            fn attn_k_bias(&self, layer: usize) -> Option<&[f32]> {
+                GpuWeightSource::attn_k_bias(&self.inner, layer)
+            }
+            fn attn_v_bias(&self, layer: usize) -> Option<&[f32]> {
+                GpuWeightSource::attn_v_bias(&self.inner, layer)
+            }
+            fn rope_freqs(&self) -> Option<&[f32]> {
+                GpuWeightSource::rope_freqs(&self.inner)
+            }
+            fn embedding_mmap_weight(
+                &self,
+                _gguf_arc: &std::sync::Arc<GgufFile>,
+            ) -> anyhow::Result<MmapWeight> {
+                let info = self.inner.gguf().tensors.get("token_embd.weight").unwrap();
+                let bytes = self.inner.gguf().tensor_data("token_embd.weight")?.to_vec();
+                Ok(MmapWeight::from_owned_bytes(
+                    bytes,
+                    info.dtype,
+                    info.shape[1],
+                    info.shape[0],
+                ))
+            }
+            fn output_mmap_weight(
+                &self,
+                _gguf_arc: &std::sync::Arc<GgufFile>,
+            ) -> anyhow::Result<MmapWeight> {
+                let info = self.inner.gguf().tensors.get("output.weight").unwrap();
+                let bytes = self.inner.gguf().tensor_data("output.weight")?.to_vec();
+                Ok(MmapWeight::from_owned_bytes(
+                    bytes,
+                    info.dtype,
+                    info.shape[1],
+                    info.shape[0],
+                ))
+            }
+            fn weight_bytes(&self, wref: &WeightRef) -> std::borrow::Cow<'_, [u8]> {
+                GpuWeightSource::weight_bytes(&self.inner, wref)
+            }
+            fn dequantize_weight(&self, wref: &WeightRef) -> Vec<f32> {
+                GpuWeightSource::dequantize_weight(&self.inner, wref)
+            }
+            fn output_ref(&self) -> Option<&WeightRef> {
+                GpuWeightSource::output_ref(&self.inner)
+            }
+            fn ffn_gate_ref(&self, layer: usize) -> anyhow::Result<&WeightRef> {
+                GpuWeightSource::ffn_gate_ref(&self.inner, layer)
+            }
+            fn ffn_up_ref(&self, layer: usize) -> anyhow::Result<&WeightRef> {
+                GpuWeightSource::ffn_up_ref(&self.inner, layer)
+            }
+            fn ffn_down_ref(&self, layer: usize) -> anyhow::Result<&WeightRef> {
+                GpuWeightSource::ffn_down_ref(&self.inner, layer)
+            }
+            fn moe_refs(&self, layer: usize) -> Option<&crate::model::lfm2::MoeFfnRefs> {
+                GpuWeightSource::moe_refs(&self.inner, layer)
+            }
+            fn conv_in_proj_ref(&self, layer: usize) -> Option<&WeightRef> {
+                GpuWeightSource::conv_in_proj_ref(&self.inner, layer)
+            }
+            fn conv_out_proj_ref(&self, layer: usize) -> Option<&WeightRef> {
+                GpuWeightSource::conv_out_proj_ref(&self.inner, layer)
+            }
+            fn attn_q_ref(&self, layer: usize) -> Option<&WeightRef> {
+                GpuWeightSource::attn_q_ref(&self.inner, layer)
+            }
+            fn attn_k_ref(&self, layer: usize) -> Option<&WeightRef> {
+                GpuWeightSource::attn_k_ref(&self.inner, layer)
+            }
+            fn attn_v_ref(&self, layer: usize) -> Option<&WeightRef> {
+                GpuWeightSource::attn_v_ref(&self.inner, layer)
+            }
+            fn attn_output_ref(&self, layer: usize) -> Option<&WeightRef> {
+                GpuWeightSource::attn_output_ref(&self.inner, layer)
+            }
+            fn rope_type(&self) -> RopeType {
+                GpuWeightSource::rope_type(&self.inner)
+            }
+            fn supports_batched_prefill(&self) -> bool {
+                GpuWeightSource::supports_batched_prefill(&self.inner)
+            }
+        }
+
+        let Some(ctx1) = gpu_or_skip() else {
+            return;
+        };
+        let Some(ctx2) = gpu_or_skip() else {
+            return;
+        };
+
+        let full_gguf = bidirectional_gguf(true);
+        let full_len = full_gguf.mmap_data().len() as u64;
+        let header_len = full_gguf.data_offset();
+        let header_bytes: std::sync::Arc<[u8]> =
+            std::sync::Arc::from(&full_gguf.mmap_data()[..header_len]);
+        let header_only_gguf = GgufFile::from_header_bytes(header_bytes, full_len).unwrap();
+
+        // Confirm that calling MmapWeight::from_gguf on the header-only GGUF fails
+        // with the exact error that previously broke WebGPU OPFS loading.
+        let header_arc = std::sync::Arc::new(header_only_gguf.clone());
+        let direct_err = format!(
+            "{:#}",
+            MmapWeight::from_gguf(&header_arc, "token_embd.weight").unwrap_err()
+        );
+        assert!(
+            direct_err.contains("extends beyond GGUF buffer"),
+            "expected header-only MmapWeight::from_gguf to fail, got: {direct_err}"
+        );
+
+        let inner = LfmModel::from_gguf_no_repack(full_gguf.clone(), 256).unwrap();
+        let src = HeaderOnlySource {
+            inner,
+            header_only_gguf,
+        };
+
+        let gpu_from_header = super::GpuLfmModel::from_weight_source_with_ctx(
+            &src,
+            256,
+            "header-only-test".into(),
+            ctx1,
+        )
+        .expect("GpuLfmModel::from_weight_source_with_ctx must succeed on header-only GGUF source");
+        let gpu_from_full =
+            super::GpuLfmModel::from_gguf_with_ctx(full_gguf, 256, "full-gguf-test".into(), ctx2)
+                .unwrap();
+
+        let mut state_header = InferenceState::from_config(gpu_from_header.config()).unwrap();
+        let mut state_full = InferenceState::from_config(gpu_from_full.config()).unwrap();
+        let logits_header = gpu_from_header.forward(&[1], 0, &mut state_header);
+        let logits_full = gpu_from_full.forward(&[1], 0, &mut state_full);
+        assert_eq!(logits_header, logits_full);
     }
 }

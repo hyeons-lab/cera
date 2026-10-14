@@ -2279,11 +2279,11 @@ export interface InitOutput {
     readonly turnresult_tokensGenerated: (a: number) => number;
     readonly session_intoChat: (a: number, b: number) => void;
     readonly sessionconfig_set_seed: (a: number, b: number, c: bigint) => void;
-    readonly __wasm_bindgen_func_elem_7827: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6654: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6654_2: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_6654_3: (a: number, b: number, c: number, d: number) => void;
-    readonly __wasm_bindgen_func_elem_7842: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_7987: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6814: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6814_2: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_6814_3: (a: number, b: number, c: number, d: number) => void;
+    readonly __wasm_bindgen_func_elem_8002: (a: number, b: number, c: number, d: number) => void;
     readonly __wbindgen_export: (a: number, b: number) => number;
     readonly __wbindgen_export2: (a: number, b: number, c: number, d: number) => number;
     readonly __wbindgen_export3: (a: number) => void;

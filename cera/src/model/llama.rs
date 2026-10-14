@@ -469,7 +469,9 @@ impl LlamaModel {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
-        Self::from_gguf_impl(gguf, context_size, model_id, true)
+        Self::from_gguf_impl(gguf, context_size, model_id, true, |g, name| {
+            Ok(g.get_tensor(name)?.try_to_f32_vec()?)
+        })
     }
 
     /// Load without the CPU int8 repacks. For the GPU/Metal loaders, which
@@ -485,7 +487,21 @@ impl LlamaModel {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
-        Self::from_gguf_impl(gguf, context_size, model_id, false)
+        Self::from_gguf_impl(gguf, context_size, model_id, false, |g, name| {
+            Ok(g.get_tensor(name)?.try_to_f32_vec()?)
+        })
+    }
+
+    /// Same as [`Self::from_gguf_no_repack`], but uses a custom `load_f32` callback
+    /// for 1D norm, bias, and RoPE frequency vectors so header-only GGUF sources
+    /// (such as OPFS streaming in WebAssembly) can read small tensors on demand.
+    pub fn from_gguf_no_repack_with_loader(
+        gguf: GgufFile,
+        context_size: usize,
+        model_id: String,
+        load_f32: impl FnMut(&GgufFile, &str) -> Result<Vec<f32>>,
+    ) -> Result<Self> {
+        Self::from_gguf_impl(gguf, context_size, model_id, false, load_f32)
     }
 
     fn from_gguf_impl(
@@ -493,6 +509,7 @@ impl LlamaModel {
         context_size: usize,
         model_id: String,
         repack: bool,
+        mut load_f32: impl FnMut(&GgufFile, &str) -> Result<Vec<f32>>,
     ) -> Result<Self> {
         ensure!(context_size > 0, "context_size must be > 0");
 
@@ -936,7 +953,7 @@ impl LlamaModel {
         };
 
         // Final norm tensor (NOT the LFM2 `token_embd_norm.weight`).
-        let output_norm_weight = gguf.get_tensor("output_norm.weight")?.try_to_f32_vec()?;
+        let output_norm_weight = load_f32(&gguf, "output_norm.weight")?;
         ensure!(
             output_norm_weight.len() == hidden_size,
             "output_norm length {} != hidden_size ({hidden_size})",
@@ -947,7 +964,7 @@ impl LlamaModel {
                 norm_kind == NormKind::Layer,
                 "`output_norm.bias` is a LayerNorm bias, but {prefix:?} is loaded as an RMSNorm architecture"
             );
-            let b = gguf.get_tensor("output_norm.bias")?.try_to_f32_vec()?;
+            let b = load_f32(&gguf, "output_norm.bias")?;
             ensure!(
                 b.len() == hidden_size,
                 "output_norm.bias length {} != hidden_size ({hidden_size})",
@@ -1003,7 +1020,7 @@ impl LlamaModel {
             // cpu::rmsnorm without runtime offset addition matches upstream GGUF semantics.
             let attn_norm_name = format!("blk.{i}.attn_norm.weight");
             let attn_norm = if gguf.tensors.contains_key(&attn_norm_name) {
-                gguf.get_tensor(&attn_norm_name)?.try_to_f32_vec()?
+                load_f32(&gguf, &attn_norm_name)?
             } else if norm_order == NormOrder::PostNorm {
                 Vec::new()
             } else {
@@ -1020,27 +1037,27 @@ impl LlamaModel {
             // LayerNorm bias tensors (StableLM/StarCoder2). RMSNorm archs have
             // none; a stray one on an RMS arch would be silently dropped, so it
             // fails closed instead.
-            let load_norm_bias = |name: String| -> Result<Option<Vec<f32>>> {
-                if !gguf.tensors.contains_key(&name) {
-                    return Ok(None);
-                }
+            let attn_norm_bias_name = format!("blk.{i}.attn_norm.bias");
+            let attn_norm_b = if gguf.tensors.contains_key(&attn_norm_bias_name) {
                 ensure!(
                     norm_kind == NormKind::Layer,
-                    "`{name}` is a LayerNorm bias, but {prefix:?} is loaded as an RMSNorm architecture"
+                    "`{attn_norm_bias_name}` is a LayerNorm bias, but {prefix:?} is loaded as an RMSNorm architecture"
                 );
-                let b = gguf.get_tensor(&name)?.try_to_f32_vec()?;
+                let b = load_f32(&gguf, &attn_norm_bias_name)?;
                 ensure!(
                     b.len() == hidden_size,
-                    "layer {i} {name} length {} != hidden_size ({hidden_size})",
+                    "layer {i} {attn_norm_bias_name} length {} != hidden_size ({hidden_size})",
                     b.len()
                 );
-                Ok(Some(b))
+                Some(b)
+            } else {
+                None
             };
-            attn_norm_biases.push(load_norm_bias(format!("blk.{i}.attn_norm.bias"))?);
+            attn_norm_biases.push(attn_norm_b);
 
             let ffn_norm_name = format!("blk.{i}.ffn_norm.weight");
             let ffn_norm = if gguf.tensors.contains_key(&ffn_norm_name) {
-                gguf.get_tensor(&ffn_norm_name)?.try_to_f32_vec()?
+                load_f32(&gguf, &ffn_norm_name)?
             } else if norm_order == NormOrder::PostNorm || norm_kind == NormKind::Layer {
                 // LayerNorm archs without `ffn_norm` run attention and FFN in
                 // parallel off the attention norm (Cohere, StableLM 2 12B).
@@ -1056,7 +1073,23 @@ impl LlamaModel {
                 );
             }
             ffn_norm_weights.push(ffn_norm);
-            ffn_norm_biases.push(load_norm_bias(format!("blk.{i}.ffn_norm.bias"))?);
+            let ffn_norm_bias_name = format!("blk.{i}.ffn_norm.bias");
+            let ffn_norm_b = if gguf.tensors.contains_key(&ffn_norm_bias_name) {
+                ensure!(
+                    norm_kind == NormKind::Layer,
+                    "`{ffn_norm_bias_name}` is a LayerNorm bias, but {prefix:?} is loaded as an RMSNorm architecture"
+                );
+                let b = load_f32(&gguf, &ffn_norm_bias_name)?;
+                ensure!(
+                    b.len() == hidden_size,
+                    "layer {i} {ffn_norm_bias_name} length {} != hidden_size ({hidden_size})",
+                    b.len()
+                );
+                Some(b)
+            } else {
+                None
+            };
+            ffn_norm_biases.push(ffn_norm_b);
 
             // Post-norms (Gemma 2, Olmo 2/3): check canonical GGUF names first.
             let attn_post = [
@@ -1065,10 +1098,7 @@ impl LlamaModel {
             ]
             .into_iter()
             .find(|name| gguf.tensors.contains_key(name))
-            .map(|name| -> anyhow::Result<Vec<f32>> {
-                let t = gguf.get_tensor(&name)?;
-                Ok(t.try_to_f32_vec()?)
-            })
+            .map(|name| load_f32(&gguf, &name))
             .transpose()?;
             if norm_order == NormOrder::PostNorm {
                 ensure!(
@@ -1091,10 +1121,7 @@ impl LlamaModel {
             ]
             .into_iter()
             .find(|name| gguf.tensors.contains_key(name))
-            .map(|name| -> anyhow::Result<Vec<f32>> {
-                let t = gguf.get_tensor(&name)?;
-                Ok(t.try_to_f32_vec()?)
-            })
+            .map(|name| load_f32(&gguf, &name))
             .transpose()?;
             if norm_order == NormOrder::PostNorm {
                 ensure!(
@@ -1120,8 +1147,8 @@ impl LlamaModel {
                 "layer {i} asymmetric QK-norm: `{q_norm_name}` and `{k_norm_name}` must both be present or both absent"
             );
             if gguf.tensors.contains_key(&q_norm_name) {
-                let q_w = gguf.get_tensor(&q_norm_name)?.try_to_f32_vec()?;
-                let k_w = gguf.get_tensor(&k_norm_name)?.try_to_f32_vec()?;
+                let q_w = load_f32(&gguf, &q_norm_name)?;
+                let k_w = load_f32(&gguf, &k_norm_name)?;
                 let q_dim = n_heads * head_dim;
                 let kv_dim = n_kv_heads * head_dim;
                 ensure!(
@@ -1156,7 +1183,7 @@ impl LlamaModel {
             let k_bias_name = format!("blk.{i}.attn_k.bias");
             let v_bias_name = format!("blk.{i}.attn_v.bias");
             if gguf.tensors.contains_key(&qkv_bias_name) {
-                let qkv_b = gguf.get_tensor(&qkv_bias_name)?.try_to_f32_vec()?;
+                let qkv_b = load_f32(&gguf, &qkv_bias_name)?;
                 ensure!(
                     qkv_b.len() == qkv_dim,
                     "invalid {qkv_bias_name} length {} for layer {i} (expected {qkv_dim})",
@@ -1185,9 +1212,9 @@ impl LlamaModel {
                     "layer {i} has a partial Q/K/V bias set (missing {}); biases must be all-or-none",
                     missing.join(", ")
                 );
-                let qb = gguf.get_tensor(&q_bias_name)?.try_to_f32_vec()?;
-                let kb = gguf.get_tensor(&k_bias_name)?.try_to_f32_vec()?;
-                let vb = gguf.get_tensor(&v_bias_name)?.try_to_f32_vec()?;
+                let qb = load_f32(&gguf, &q_bias_name)?;
+                let kb = load_f32(&gguf, &k_bias_name)?;
+                let vb = load_f32(&gguf, &v_bias_name)?;
                 ensure!(
                     qb.len() == q_dim && kb.len() == k_dim && vb.len() == v_dim,
                     "invalid Q/K/V bias lengths ({}, {}, {}) for layer {i} (expected {}, {}, {})",
@@ -1214,10 +1241,12 @@ impl LlamaModel {
             }
 
             // Optional projection and FFN biases (Mistral 3 / Phi-3).
-            let load_optional_bias =
-                |name: &str, expected_len: usize| -> Result<Option<Vec<f32>>> {
+            macro_rules! load_opt_bias {
+                ($name:expr, $expected_len:expr) => {{
+                    let name: &str = $name;
+                    let expected_len: usize = $expected_len;
                     if gguf.tensors.contains_key(name) {
-                        let b = gguf.get_tensor(name)?.try_to_f32_vec()?;
+                        let b = load_f32(&gguf, name)?;
                         ensure!(
                             b.len() == expected_len,
                             "invalid {name} length {} for layer {i} (expected {expected_len})",
@@ -1227,29 +1256,27 @@ impl LlamaModel {
                             b.iter().all(|v| v.is_finite()),
                             "non-finite value detected in {name} for layer {i}"
                         );
-                        Ok(Some(b))
+                        Some(b)
                     } else {
-                        Ok(None)
+                        None
                     }
-                };
+                }};
+            }
 
-            attn_output_bias.push(load_optional_bias(
+            attn_output_bias.push(load_opt_bias!(
                 &format!("blk.{i}.attn_output.bias"),
-                config.hidden_size,
-            )?);
+                config.hidden_size
+            ));
             let ffn_gate_bias_name = format!("blk.{i}.ffn_gate.bias");
             let ffn_up_bias_name = format!("blk.{i}.ffn_up.bias");
             if gguf.tensors.contains_key(&ffn_gate_bias_name) {
-                ffn_gate_bias.push(load_optional_bias(
+                ffn_gate_bias.push(load_opt_bias!(
                     &ffn_gate_bias_name,
-                    config.intermediate_size,
-                )?);
-                ffn_up_bias.push(load_optional_bias(
-                    &ffn_up_bias_name,
-                    config.intermediate_size,
-                )?);
+                    config.intermediate_size
+                ));
+                ffn_up_bias.push(load_opt_bias!(&ffn_up_bias_name, config.intermediate_size));
             } else if gguf.tensors.contains_key(&ffn_up_bias_name) {
-                let b = gguf.get_tensor(&ffn_up_bias_name)?.try_to_f32_vec()?;
+                let b = load_f32(&gguf, &ffn_up_bias_name)?;
                 ensure!(
                     b.iter().all(|v| v.is_finite()),
                     "non-finite value detected in {ffn_up_bias_name} for layer {i}"
@@ -1273,10 +1300,10 @@ impl LlamaModel {
                 ffn_up_bias.push(None);
             }
 
-            ffn_down_bias.push(load_optional_bias(
+            ffn_down_bias.push(load_opt_bias!(
                 &format!("blk.{i}.ffn_down.bias"),
-                config.hidden_size,
-            )?);
+                config.hidden_size
+            ));
 
             // Projection weights: support both fused `attn_qkv.weight` (Phi-3) and
             // separate `attn_q.weight`, `attn_k.weight`, `attn_v.weight`.
@@ -1509,10 +1536,11 @@ impl LlamaModel {
         // Llama-3 RoPE frequency scaling (`rope_scaling: llama3`): per-pair factors
         // that divide each rotation angle, applied by llama.cpp on every rope call.
         // Present on Llama-3.x, absent on Qwen/Mistral/Granite ⇒ None (plain RoPE).
-        let rope_freqs = gguf
-            .get_tensor("rope_freqs.weight")
-            .ok()
-            .and_then(|t| t.try_to_f32_vec().ok());
+        let rope_freqs = if gguf.tensors.contains_key("rope_freqs.weight") {
+            load_f32(&gguf, "rope_freqs.weight").ok()
+        } else {
+            None
+        };
         if let Some(rf) = &rope_freqs {
             ensure!(
                 rf.len() == head_dim / 2,

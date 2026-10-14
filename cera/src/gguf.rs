@@ -1197,11 +1197,58 @@ impl GgufFile {
         Ok((start, slice_bytes, ne1, ne0, info.dtype))
     }
 
+    /// Resolve a single expert's `[ne1, ne0]` slice within a rank-3 `[ne0, ne1, n_expert]`
+    /// stacked expert tensor (`ffn_{gate,up,down}_exps.weight`) using 64-bit byte offsets
+    /// directly from header metadata, without requiring tensor payload bytes to be resident
+    /// in `self.data`.
+    pub fn tensor_meta_expert_u64(
+        &self,
+        name: &str,
+        expert: usize,
+    ) -> Result<(u64, usize, usize, usize, DType)> {
+        let info = self
+            .tensors
+            .get(name)
+            .with_context(|| format!("tensor not found: {name}"))?;
+        let [ne0, ne1, n_expert] = match info.shape[..] {
+            [ne0, ne1, n_expert] => [ne0, ne1, n_expert],
+            _ => bail!(
+                "tensor_meta_expert: {name} must be rank 3, got rank {}",
+                info.shape.len()
+            ),
+        };
+        ensure!(
+            expert < n_expert,
+            "tensor_meta_expert: expert {expert} out of range for {name} ({n_expert} experts)"
+        );
+
+        Self::ensure_whole_blocks(name, info.dtype, ne0)?;
+        let slice_bytes = tensor_data_size(&[ne0, ne1], info.dtype)?;
+        let slice_bytes_u64 = slice_bytes as u64;
+        let tensor_end = info
+            .offset
+            .checked_add(info.size_bytes as u64)
+            .with_context(|| format!("tensor {name} end offset overflow"))?;
+        let start = (expert as u64)
+            .checked_mul(slice_bytes_u64)
+            .and_then(|off| info.offset.checked_add(off))
+            .with_context(|| format!("tensor {name} expert {expert} offset overflow"))?;
+        let end = start
+            .checked_add(slice_bytes_u64)
+            .with_context(|| format!("tensor {name} expert {expert} end offset overflow"))?;
+        ensure!(
+            end <= tensor_end,
+            "tensor {name} expert {expert} slice extends past the tensor"
+        );
+
+        Ok((start, slice_bytes, ne1, ne0, info.dtype))
+    }
+
     /// Refuse a tensor whose rows are not a whole number of `dtype` blocks. The kernels read
     /// one row at a time in whole blocks, so such a matrix cannot be read (its rows would
     /// start mid-block); an older converter wrote them when it checked only the element count.
     /// Refusing here gives a message naming the tensor instead of a panic at first use.
-    pub(crate) fn ensure_whole_blocks(name: &str, dtype: DType, row_len: usize) -> Result<()> {
+    pub fn ensure_whole_blocks(name: &str, dtype: DType, row_len: usize) -> Result<()> {
         ensure!(
             row_len.is_multiple_of(dtype.block_size()),
             "{name}: rows of {row_len} are not a whole number of {dtype:?} blocks ({}); the file \
@@ -1829,5 +1876,52 @@ mod expert_slice_tests {
         let gguf = gguf_with_expert_tensor(64, 32, 8, 0);
         let err = gguf.tensor_meta("exps").unwrap_err().to_string();
         assert!(err.contains("unexpected rank"), "{err}");
+    }
+
+    /// `tensor_meta_expert_u64` resolves expert slices from header-only GGUFs
+    /// (`data.len == 0`, as in OPFS streaming) and at offsets beyond 4 GiB
+    /// (`u32::MAX`, which would overflow 32-bit `usize` on `wasm32`).
+    #[test]
+    fn tensor_meta_expert_u64_resolves_header_only_and_above_4gib() {
+        let (ne0, ne1, n_expert) = (64usize, 32usize, 8usize);
+        let slice_bytes = ne0 * ne1 * 4;
+        let total_bytes = slice_bytes * n_expert;
+        let base_offset: u64 = 5_000_000_000; // > 4 GiB
+
+        let empty: Arc<[u8]> = Arc::from(Vec::<u8>::new().into_boxed_slice());
+        let ptr = NonNull::new(empty.as_ptr() as *mut u8).unwrap();
+        let mut tensors = HashMap::new();
+        tensors.insert(
+            "exps".to_string(),
+            TensorInfo {
+                name: "exps".to_string(),
+                shape: vec![ne0, ne1, n_expert],
+                dtype: DType::F32,
+                offset: base_offset,
+                size_bytes: total_bytes,
+                ggml_type_id: GGML_TYPE_F32,
+            },
+        );
+        let gguf = GgufFile {
+            metadata: HashMap::new(),
+            tensors,
+            data: SafeDataPtr { ptr, len: 0 },
+            _backing: Backing::Owned(empty),
+            data_offset: 4096,
+        };
+
+        for e in 0..n_expert {
+            let (start, size, rows, cols, dtype) = gguf.tensor_meta_expert_u64("exps", e).unwrap();
+            assert_eq!(start, base_offset + (e as u64) * (slice_bytes as u64));
+            assert_eq!(size, slice_bytes);
+            assert_eq!((rows, cols), (ne1, ne0));
+            assert_eq!(dtype, DType::F32);
+        }
+
+        let err = gguf
+            .tensor_meta_expert_u64("exps", n_expert)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("out of range"), "{err}");
     }
 }

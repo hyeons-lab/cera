@@ -119,6 +119,28 @@ pub trait GpuWeightSource {
             .map(std::borrow::Cow::Borrowed)
     }
 
+    /// Lazy-dequantized `MmapWeight` handle for `token_embd.weight`.
+    ///
+    /// Sources backed by a full in-memory/mmap GGUF borrow directly from `gguf_arc`;
+    /// streaming sources (such as OPFS in WebAssembly) or paired draft-model sources
+    /// override this to read from the backing store or base GGUF.
+    #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
+    fn embedding_mmap_weight(
+        &self,
+        gguf_arc: &std::sync::Arc<GgufFile>,
+    ) -> Result<crate::model::weights::MmapWeight> {
+        crate::model::weights::MmapWeight::from_gguf(gguf_arc, "token_embd.weight")
+    }
+
+    /// Lazy-dequantized `MmapWeight` handle for `output.weight` when untied.
+    #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
+    fn output_mmap_weight(
+        &self,
+        gguf_arc: &std::sync::Arc<GgufFile>,
+    ) -> Result<crate::model::weights::MmapWeight> {
+        crate::model::weights::MmapWeight::from_gguf(gguf_arc, "output.weight")
+    }
+
     // ── Raw quantized-weight access (GGUF mmap handles) ─────────────────────
     // The metal loader maps weights by absolute `wref.start` offset into its own
     // mmap buffer, so it needs neither the byte slice nor a full dequantize.

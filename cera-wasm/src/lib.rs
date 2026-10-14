@@ -3293,39 +3293,38 @@ mod webgpu {
         ) -> Result<WebGpuSession, JsError> {
             let want_dspark = quant.to_ascii_lowercase().contains("dspark");
             let clean_quant = quant.split(['+', ' ']).next().unwrap_or(&quant).trim();
-            let manifest = if let Some(known) =
+            let (manifest, base_url_owned) = if let Some(known) =
                 cera::bundle::known_bundle_manifest(&bundle_id, clean_quant)
             {
-                known
+                (
+                    known,
+                    "https://huggingface.co/LiquidAI/LeapBundles".to_string(),
+                )
             } else {
                 let manifest_url = cera::bundle::leap_bundles_manifest_url(&bundle_id, clean_quant)
                     .map_err(|e| JsError::new(&e.to_string()))?;
                 let manifest_bytes = repo
                     .read_or_download(&manifest_url, None, on_progress.as_ref())
                     .await?;
-                cera::manifest::Manifest::from_bytes(&manifest_bytes)
-                    .map_err(|e| JsError::new(&format!("parsing `{manifest_url}`: {e:#}")))?
+                let parsed = cera::manifest::Manifest::from_bytes(&manifest_bytes)
+                    .map_err(|e| JsError::new(&format!("parsing `{manifest_url}`: {e:#}")))?;
+                (parsed, manifest_url)
             };
 
-            let base_url = "https://huggingface.co/LiquidAI/LeapBundles";
+            let base_url = base_url_owned.as_str();
             let model_url = crate::bundle::join_url(base_url, &manifest.files.model)
                 .map_err(|e| JsError::new(&e))?;
 
             // Try direct OPFS -> WebGPU streaming when sync access handle is supported (Web Worker)
             let session_result = async {
-                let sync = repo
+                let raw_sync = repo
                     .open_sync_handle(&model_url, None, on_progress.as_ref())
                     .await?;
+                let sync = crate::opfs_source::OpfsSyncHandle::new(raw_sync);
                 console_info(&format!(
                     "[cera-wasm] streaming model weights directly from OPFS to WebGPU for \"{bundle_id}\"..."
                 ));
-                let gguf = match crate::bundle::read_gguf_header_from_sync_handle(&sync) {
-                    Ok(g) => g,
-                    Err(e) => {
-                        sync.close();
-                        return Err(e);
-                    }
-                };
+                let gguf = crate::bundle::read_gguf_header_from_sync_handle(sync.as_raw())?;
                 let gguf_arc = Arc::new(gguf);
                 let tokenizer = Arc::new(
                     cera::tokenizer::BpeTokenizer::from_gguf(&gguf_arc).map_err(map_err)?,
@@ -3336,6 +3335,7 @@ mod webgpu {
                     sync,
                     Arc::clone(&gguf_arc),
                     ctx_size,
+                    bundle_id.clone(),
                 )?;
                 let ctx = cera::backend::wgpu::GpuContext::new_async()
                     .await
