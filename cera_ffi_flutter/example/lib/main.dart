@@ -248,6 +248,9 @@ class _ChatPageState extends State<ChatPage> {
   static const _kVoiceModeTtsLabel = 'Text to Speech (TTS)';
   static const _kVoiceModeTextOnlyMenuLabel = 'Text Only';
   static const _kVoicePersonaTitle = 'Voice Persona';
+  static const _kVoicePersonaSingleVoiceSubtitle =
+      'This audio model uses a single built-in speaker voice (switch to LFM2.5-Audio-1.5B for US/UK speaker personas)';
+  static const _kVoicePersonaSingleVoiceBadge = 'Default Voice';
   static const _kVoicePersonaUnavailableSubtitle =
       'Load an audio generation model (such as LFM2.5-Audio-1.5B) to select a speaker voice';
   static const _kVoicePersonaUnavailableBadge = 'No Audio Model';
@@ -857,7 +860,11 @@ class _ChatPageState extends State<ChatPage> {
                                 contentPadding: EdgeInsets.zero,
                                 title: const Text(_kVoicePersonaTitle),
                                 subtitle: Text(
-                                  _kVoicePersonaUnavailableSubtitle,
+                                  (currentState.capabilities?.audioOut ??
+                                              false) ||
+                                          currentState.audioProfile != null
+                                      ? _kVoicePersonaSingleVoiceSubtitle
+                                      : _kVoicePersonaUnavailableSubtitle,
                                   style: TextStyle(
                                     fontSize: 12,
                                     color: theme.colorScheme.onSurfaceVariant,
@@ -874,7 +881,11 @@ class _ChatPageState extends State<ChatPage> {
                                     borderRadius: BorderRadius.circular(10),
                                   ),
                                   child: Text(
-                                    _kVoicePersonaUnavailableBadge,
+                                    (currentState.capabilities?.audioOut ??
+                                                false) ||
+                                            currentState.audioProfile != null
+                                        ? _kVoicePersonaSingleVoiceBadge
+                                        : _kVoicePersonaUnavailableBadge,
                                     style: TextStyle(
                                       fontSize: 11,
                                       fontWeight: FontWeight.w500,
