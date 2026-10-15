@@ -2,6 +2,7 @@ import 'dart:typed_data';
 
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart' hide ModelSource;
 
+import 'app_constants.dart';
 import 'model_source.dart';
 
 /// Telemetry stats for a single generation turn.
@@ -96,18 +97,19 @@ class DownloadedModelRecord {
   String get id => '$bundleName:$quant';
 
   Map<String, dynamic> toJson() => {
-    'bundleName': bundleName,
-    'quant': quant,
-    'displayName': displayName,
+    ModelRecordKeys.bundleName: bundleName,
+    ModelRecordKeys.quant: quant,
+    ModelRecordKeys.displayName: displayName,
   };
 
-  factory DownloadedModelRecord.fromJson(Map<String, dynamic> json) =>
-      DownloadedModelRecord(
-        bundleName: json['bundleName'] as String,
-        quant: json['quant'] as String,
-        displayName:
-            json['displayName'] as String? ?? (json['bundleName'] as String),
-      );
+  factory DownloadedModelRecord.fromJson(Map<String, dynamic> json) {
+    final bundleName = json[ModelRecordKeys.bundleName] as String;
+    return DownloadedModelRecord(
+      bundleName: bundleName,
+      quant: json[ModelRecordKeys.quant] as String,
+      displayName: json[ModelRecordKeys.displayName] as String? ?? bundleName,
+    );
+  }
 }
 
 /// Voice interaction and generation modes when an audio-capable model is loaded.
@@ -130,10 +132,14 @@ class ChatSettings {
   const ChatSettings({
     this.backend = CeraBackend.auto,
     this.turboQuant = false,
-    this.maxImageLongSize = 256,
+    this.maxImageLongSize = ChatDefaults.maxImageLongSize,
     this.audioChatMode = AudioChatMode.interleaved,
     this.chatVoice = '',
     this.ttsStudioVoice = '',
+    this.temperature,
+    this.topP,
+    this.topK,
+    this.maxTokens = ChatDefaults.maxTokens,
   });
 
   /// Which compute backend to run on.
@@ -156,6 +162,28 @@ class ChatSettings {
   /// Voice persona description for dedicated TTS Studio.
   final String ttsStudioVoice;
 
+  /// Sampling temperature override.
+  /// null uses the engine/bundle default (0.0 greedy on WebGPU text, 0.7 on audio).
+  /// 0.0 forces deterministic greedy decoding; > 0.0 enables stochastic sampling.
+  final double? temperature;
+
+  /// Top-p (nucleus) sampling threshold override.
+  final double? topP;
+
+  /// Top-k sampling cutoff override.
+  final int? topK;
+
+  /// Maximum tokens to generate per turn. Defaults to 512.
+  final int maxTokens;
+
+  /// Short human-readable label for the active sampling mode.
+  String get samplingLabel {
+    final temp = temperature;
+    if (temp == null) return AppStrings.samplingAuto;
+    if (temp <= 0.0) return AppStrings.samplingGreedy;
+    return 'T=${temp.toStringAsFixed(2)}';
+  }
+
   /// Converts settings to engine open options.
   CeraOptions get ceraOptions => CeraOptions(
     backend: backend,
@@ -163,28 +191,40 @@ class ChatSettings {
         ? CeraKvCompression.turboQuant
         : CeraKvCompression.none,
     web: const CeraWebAssets(
-      workerUrl: 'cera/cera_worker.js',
-      moduleUrl: 'cera/cera_wasm.js',
+      workerUrl: ModelFormat.workerUrl,
+      moduleUrl: ModelFormat.moduleUrl,
     ),
   );
 
   ChatSettings copyWith({
     CeraBackend? backend,
     bool? turboQuant,
-    int? Function()? maxImageLongSize,
+    int? maxImageLongSize,
+    bool clearMaxImageLongSize = false,
     AudioChatMode? audioChatMode,
     String? chatVoice,
     String? ttsStudioVoice,
+    double? temperature,
+    bool clearTemperature = false,
+    double? topP,
+    bool clearTopP = false,
+    int? topK,
+    bool clearTopK = false,
+    int? maxTokens,
   }) {
     return ChatSettings(
       backend: backend ?? this.backend,
       turboQuant: turboQuant ?? this.turboQuant,
-      maxImageLongSize: maxImageLongSize != null
-          ? maxImageLongSize()
-          : this.maxImageLongSize,
+      maxImageLongSize: clearMaxImageLongSize
+          ? null
+          : (maxImageLongSize ?? this.maxImageLongSize),
       audioChatMode: audioChatMode ?? this.audioChatMode,
       chatVoice: chatVoice ?? this.chatVoice,
       ttsStudioVoice: ttsStudioVoice ?? this.ttsStudioVoice,
+      temperature: clearTemperature ? null : (temperature ?? this.temperature),
+      topP: clearTopP ? null : (topP ?? this.topP),
+      topK: clearTopK ? null : (topK ?? this.topK),
+      maxTokens: maxTokens ?? this.maxTokens,
     );
   }
 }
@@ -202,7 +242,7 @@ enum AppUIMode {
 class ChatState {
   const ChatState({
     this.loadedModel,
-    this.status = 'Download a published model, or open a .gguf, to start.',
+    this.status = AppStrings.initialStatus,
     this.isLoading = false,
     this.isGenerating = false,
     this.downloadFraction,

@@ -16,6 +16,7 @@ import 'package:path_provider/path_provider.dart';
 
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart' hide ModelSource;
 
+import 'app_constants.dart';
 import 'chat_controller.dart';
 import 'chat_intent.dart';
 import 'chat_state.dart';
@@ -31,38 +32,39 @@ void main() => runApp(const CeraExampleApp());
 class CeraExampleApp extends StatelessWidget {
   const CeraExampleApp({super.key});
 
+  static const _kBgDark = Color(0xFF08090C);
+  static const _kSurfaceDark = Color(0xFF11141C);
+  static const _kBorderDark = Color(0xFF222736);
+  static const _kOutlineVariantDark = Color(0xFF1A1E2B);
+  static const _kTextPrimary = Color(0xFFF1F5F9);
+  static const _kTextSecondary = Color(0xFF94A3B8);
+  static const _kAccentBlue = Color(0xFF3B82F6);
+
   @override
   Widget build(BuildContext context) {
-    const bgDark = Color(0xFF0B0C0E);
-    const surfaceDark = Color(0xFF14161B);
-    const borderDark = Color(0xFF232732);
-    const textPrimary = Color(0xFFF1F5F9);
-    const textSecondary = Color(0xFF8E95A5);
-    const accentBlue = Color(0xFF3B82F6);
-
     return MaterialApp(
-      title: 'Cera',
+      title: AppStrings.appTitle,
       debugShowCheckedModeBanner: false,
       theme: ThemeData(
         brightness: Brightness.dark,
-        scaffoldBackgroundColor: bgDark,
-        canvasColor: bgDark,
-        cardColor: surfaceDark,
-        dividerColor: borderDark,
+        scaffoldBackgroundColor: _kBgDark,
+        canvasColor: _kBgDark,
+        cardColor: _kSurfaceDark,
+        dividerColor: _kBorderDark,
         colorScheme: const ColorScheme.dark(
-          primary: accentBlue,
-          surface: surfaceDark,
-          outline: borderDark,
-          outlineVariant: Color(0xFF1E222D),
-          onSurface: textPrimary,
-          onSurfaceVariant: textSecondary,
+          primary: _kAccentBlue,
+          surface: _kSurfaceDark,
+          outline: _kBorderDark,
+          outlineVariant: _kOutlineVariantDark,
+          onSurface: _kTextPrimary,
+          onSurfaceVariant: _kTextSecondary,
         ),
         appBarTheme: const AppBarTheme(
-          backgroundColor: surfaceDark,
+          backgroundColor: _kSurfaceDark,
           elevation: 0,
           scrolledUnderElevation: 0,
           titleTextStyle: TextStyle(
-            color: textPrimary,
+            color: _kTextPrimary,
             fontSize: 17,
             fontWeight: FontWeight.w600,
           ),
@@ -82,6 +84,73 @@ class ChatPage extends StatefulWidget {
 }
 
 class _ChatPageState extends State<ChatPage> {
+  static const _kPickModelDialogTitle = 'Choose a .gguf model';
+  static const _kPickImageDialogTitle = 'Select an image to attach';
+  static const _kUnreadableImageBytesError = 'Could not read image file bytes';
+
+  // AppBar & Action labels
+  static const _kChatSegmentLabel = 'Chat';
+  static const _kTtsStudioSegmentLabel = 'TTS Studio';
+  static const _kSwitchModelTooltip = 'Select or download model';
+  static const _kSelectModelLabel = 'Select Model';
+  static const _kClearTranscriptTooltip = 'Clear transcript';
+  static const _kSettingsTooltip = 'Settings & Models';
+
+  // Settings sheet section headers & copy
+  static const _kSettingsTitle = 'Settings & Models';
+  static const _kSectionModels = 'MODELS';
+  static const _kCatalogModelsTitle = 'Downloaded & Catalog Models';
+  static const _kCatalogModelsSubtitle =
+      'Switch between cached models or download new ones';
+  static const _kOpenLocalTitle = 'Open Local .gguf File...';
+  static const _kOpenLocalSubtitle = 'Pick a model file from disk storage';
+  static const _kUnloadModelTitle = 'Unload Active Model';
+  static const _kUnloadModelSubtitle = 'Release memory and close model engine';
+
+  static const _kSectionSampling = 'SAMPLING & GENERATION';
+  static const _kSamplingTemperatureTitle = 'Sampling Temperature';
+  static const _kSamplingAutoHint =
+      'Auto uses model defaults (0.0 greedy argmax on WebGPU text, 0.7 on audio).';
+  static const _kSamplingGreedyHint =
+      'Greedy (0.0): deterministic argmax decoding with GPU fast path.';
+  static const _kSamplingStochasticHint =
+      'Stochastic (> 0.0): nucleus / top-k sampling for varied responses.';
+  static const _kPresetGreedyLabel = 'Greedy (0.0)';
+  static const _kMaxOutputTokensTitle = 'Max Output Tokens';
+  static const _kMaxOutputTokensSubtitle =
+      'Maximum number of tokens generated per assistant turn.';
+
+  static const _kSectionInference = 'INFERENCE & OPTIMIZATION';
+  static const _kComputeBackendTitle = 'Compute Backend';
+  static const _kComputeBackendSubtitle =
+      'Choose between Auto (GPU / NPU / Fallback), GPU (WebGPU / Metal), NPU (Qualcomm Hexagon), or CPU.';
+  static const _kBackendAutoLabel = 'Auto (GPU / Fallback)';
+  static const _kBackendGpuLabel = 'GPU (WebGPU / Metal)';
+  static const _kBackendHexagonLabel = 'NPU (Qualcomm Hexagon)';
+  static const _kBackendCpuLabel = 'CPU (WASM / CPU)';
+  static const _kTurboQuantTitle = 'TurboQuant KV Compression';
+  static const _kTurboQuantSubtitle =
+      'Compresses KV cache to 3-bit keys / 2-bit values for lower memory footprint and faster multi-turn attention. (Default: Off)';
+  static const _kVisionMaxDimTitle = 'Vision Max Image Dimension';
+  static const _kVisionMaxDimSubtitle =
+      'Caps the long side of input images before ViT patch encoding to minimize prompt latency.';
+  static const _kImageDimFastLabel = '256 px (Fast)';
+  static const _kImageDimHdLabel = '512 px (HD)';
+  static const _kImageDimNativeLabel = 'Native / Off';
+
+  static const _kVoiceModeTitle = 'Voice Mode';
+  static const _kVoiceModeBarLabel = 'Voice Mode:';
+  static const _kVoiceModeSubtitle =
+      'Select how audio-capable models interact with speech (Speech to Text ASR, Interleaved Voice Chat, Text to Speech TTS, or Text Only).';
+  static const _kVoiceModeAsrLabel = 'Speech to Text (ASR)';
+  static const _kVoiceModeInterleavedLabel = 'Voice Chat (Interleaved)';
+  static const _kVoiceModeChatShortLabel = 'Voice Chat';
+  static const _kVoiceModeTtsLabel = 'Text to Speech (TTS)';
+  static const _kVoiceModeTextOnlyMenuLabel = 'Text Only (No Audio)';
+  static const _kVoiceModeTextOnlyChipLabel = 'Text Only';
+
+  static const _kSectionBackendDevice = 'BACKEND & DEVICE';
+
   late final ChatController _controller = ChatController(
     defaultStoreDir: _storeDir,
   );
@@ -150,19 +219,14 @@ class _ChatPageState extends State<ChatPage> {
 
   /// Opens the bundle selector dialog and dispatches load intent.
   Future<void> _pickBundle(ChatState state) async {
-    String? currentBundleName;
-    String? currentQuant;
     final loaded = state.loadedModel;
-    if (loaded is BundleModelSource) {
-      currentBundleName = loaded.bundleName;
-      currentQuant = loaded.quant;
-    }
+    final bundleModel = loaded is BundleModelSource ? loaded : null;
 
     final choice = await showDialog<BundleChoice>(
       context: context,
       builder: (_) => BundlePickerDialog(
-        currentBundleName: currentBundleName,
-        currentQuant: currentQuant,
+        currentBundleName: bundleModel?.bundleName,
+        currentQuant: bundleModel?.quant,
       ),
     );
 
@@ -181,7 +245,7 @@ class _ChatPageState extends State<ChatPage> {
   /// Opens a local .gguf file from device storage.
   Future<void> _pickLocalModel() async {
     try {
-      final source = await pickModelSource(dialogTitle: 'Choose a .gguf model');
+      final source = await pickModelSource(dialogTitle: _kPickModelDialogTitle);
       if (source != null && mounted) {
         _controller.dispatch(LoadLocalModelIntent(source));
       }
@@ -200,7 +264,7 @@ class _ChatPageState extends State<ChatPage> {
       final result = await FilePicker.platform.pickFiles(
         type: FileType.image,
         withData: true,
-        dialogTitle: 'Select an image to attach',
+        dialogTitle: _kPickImageDialogTitle,
       );
       final file = result?.files.single;
       if (file == null || !mounted) return;
@@ -209,7 +273,7 @@ class _ChatPageState extends State<ChatPage> {
       if (bytes == null) {
         if (mounted) {
           ScaffoldMessenger.of(context).showSnackBar(
-            const SnackBar(content: Text('Could not read image file bytes')),
+            const SnackBar(content: Text(_kUnreadableImageBytesError)),
           );
         }
         return;
@@ -233,6 +297,17 @@ class _ChatPageState extends State<ChatPage> {
     _controller.dispatch(SendMessageIntent(prompt));
   }
 
+  void _onSelectStarterPrompt(String prompt) {
+    _inputController.text = prompt;
+    _sendMessage();
+  }
+
+  static String _samplingHintFor(double? temp) {
+    if (temp == null) return _kSamplingAutoHint;
+    if (temp <= 0.0) return _kSamplingGreedyHint;
+    return _kSamplingStochasticHint;
+  }
+
   void _showSettingsSheet(ChatState state) {
     final theme = Theme.of(context);
     showModalBottomSheet(
@@ -248,6 +323,13 @@ class _ChatPageState extends State<ChatPage> {
           builder: (context, _) {
             final currentState = _controller.value;
             final currentSettings = currentState.settings;
+            final activeTemp = currentSettings.temperature;
+            final sliderValue = (activeTemp ?? ChatDefaults.greedyTemperature)
+                .clamp(
+                  ChatDefaults.greedyTemperature,
+                  ChatDefaults.maxSliderTemperature,
+                );
+
             return SafeArea(
               child: Padding(
                 padding: const EdgeInsets.symmetric(
@@ -279,7 +361,7 @@ class _ChatPageState extends State<ChatPage> {
                           ),
                           const SizedBox(width: 8),
                           Text(
-                            'Settings & Models',
+                            _kSettingsTitle,
                             style: TextStyle(
                               fontSize: 16,
                               fontWeight: FontWeight.w600,
@@ -290,7 +372,7 @@ class _ChatPageState extends State<ChatPage> {
                       ),
                       const SizedBox(height: 16),
                       Text(
-                        'MODELS',
+                        _kSectionModels,
                         style: TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.w600,
@@ -305,10 +387,8 @@ class _ChatPageState extends State<ChatPage> {
                           Icons.cloud_download_outlined,
                           color: theme.colorScheme.primary,
                         ),
-                        title: const Text('Downloaded & Catalog Models'),
-                        subtitle: const Text(
-                          'Switch between cached models or download new ones',
-                        ),
+                        title: const Text(_kCatalogModelsTitle),
+                        subtitle: const Text(_kCatalogModelsSubtitle),
                         onTap: () {
                           Navigator.of(context).pop();
                           _pickBundle(_controller.value);
@@ -320,10 +400,8 @@ class _ChatPageState extends State<ChatPage> {
                           Icons.folder_open_outlined,
                           color: theme.colorScheme.primary,
                         ),
-                        title: const Text('Open Local .gguf File...'),
-                        subtitle: const Text(
-                          'Pick a model file from disk storage',
-                        ),
+                        title: const Text(_kOpenLocalTitle),
+                        subtitle: const Text(_kOpenLocalSubtitle),
                         onTap: () {
                           Navigator.of(context).pop();
                           _pickLocalModel();
@@ -337,12 +415,10 @@ class _ChatPageState extends State<ChatPage> {
                             color: theme.colorScheme.error,
                           ),
                           title: Text(
-                            'Unload Active Model',
+                            _kUnloadModelTitle,
                             style: TextStyle(color: theme.colorScheme.error),
                           ),
-                          subtitle: const Text(
-                            'Release memory and close model engine',
-                          ),
+                          subtitle: const Text(_kUnloadModelSubtitle),
                           onTap: () {
                             Navigator.of(context).pop();
                             _controller.dispatch(const UnloadModelIntent());
@@ -351,7 +427,178 @@ class _ChatPageState extends State<ChatPage> {
                       ],
                       Divider(color: theme.dividerColor, height: 24),
                       Text(
-                        'INFERENCE & OPTIMIZATION',
+                        _kSectionSampling,
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 0.8,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Row(
+                        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+                        children: [
+                          Text(
+                            _kSamplingTemperatureTitle,
+                            style: TextStyle(
+                              fontSize: 14,
+                              fontWeight: FontWeight.w500,
+                              color: theme.colorScheme.onSurface,
+                            ),
+                          ),
+                          Container(
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 8,
+                              vertical: 3,
+                            ),
+                            decoration: BoxDecoration(
+                              color: theme.colorScheme.primary.withValues(
+                                alpha: 0.14,
+                              ),
+                              borderRadius: BorderRadius.circular(6),
+                              border: Border.all(
+                                color: theme.colorScheme.primary.withValues(
+                                  alpha: 0.3,
+                                ),
+                              ),
+                            ),
+                            child: Text(
+                              currentSettings.samplingLabel,
+                              style: TextStyle(
+                                fontSize: 11.5,
+                                fontWeight: FontWeight.w700,
+                                color: theme.colorScheme.primary,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      const SizedBox(height: 4),
+                      Text(
+                        _samplingHintFor(activeTemp),
+                        style: TextStyle(
+                          fontSize: 12,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                      const SizedBox(height: 10),
+                      Wrap(
+                        spacing: 8,
+                        runSpacing: 8,
+                        children: [
+                          ChoiceChip(
+                            label: const Text(
+                              AppStrings.samplingAuto,
+                              style: TextStyle(fontSize: 11.5),
+                            ),
+                            selected: activeTemp == null,
+                            onSelected: (_) => _controller.dispatch(
+                              const UpdateSettingsIntent(
+                                clearTemperature: true,
+                              ),
+                            ),
+                          ),
+                          ChoiceChip(
+                            label: const Text(
+                              _kPresetGreedyLabel,
+                              style: TextStyle(fontSize: 11.5),
+                            ),
+                            selected:
+                                activeTemp != null &&
+                                (activeTemp - ChatDefaults.greedyTemperature)
+                                        .abs() <
+                                    0.01,
+                            onSelected: (_) => _controller.dispatch(
+                              const UpdateSettingsIntent(
+                                temperature: ChatDefaults.greedyTemperature,
+                              ),
+                            ),
+                          ),
+                          ChoiceChip(
+                            label: const Text(
+                              AppStrings.samplingBalanced,
+                              style: TextStyle(fontSize: 11.5),
+                            ),
+                            selected:
+                                activeTemp != null &&
+                                (activeTemp - ChatDefaults.balancedTemperature)
+                                        .abs() <
+                                    0.01,
+                            onSelected: (_) => _controller.dispatch(
+                              const UpdateSettingsIntent(
+                                temperature: ChatDefaults.balancedTemperature,
+                              ),
+                            ),
+                          ),
+                          ChoiceChip(
+                            label: const Text(
+                              AppStrings.samplingCreative,
+                              style: TextStyle(fontSize: 11.5),
+                            ),
+                            selected:
+                                activeTemp != null &&
+                                (activeTemp - ChatDefaults.creativeTemperature)
+                                        .abs() <
+                                    0.01,
+                            onSelected: (_) => _controller.dispatch(
+                              const UpdateSettingsIntent(
+                                temperature: ChatDefaults.creativeTemperature,
+                              ),
+                            ),
+                          ),
+                        ],
+                      ),
+                      Slider(
+                        value: sliderValue,
+                        min: ChatDefaults.greedyTemperature,
+                        max: ChatDefaults.maxSliderTemperature,
+                        divisions: 30,
+                        label: sliderValue.toStringAsFixed(2),
+                        onChanged: (val) {
+                          final rounded = (val * 20).round() / 20.0;
+                          _controller.dispatch(
+                            UpdateSettingsIntent(temperature: rounded),
+                          );
+                        },
+                      ),
+                      ListTile(
+                        contentPadding: EdgeInsets.zero,
+                        title: const Text(_kMaxOutputTokensTitle),
+                        subtitle: Text(
+                          _kMaxOutputTokensSubtitle,
+                          style: TextStyle(
+                            fontSize: 12,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                        trailing: DropdownButton<int>(
+                          value:
+                              ChatDefaults.maxTokenChoices.contains(
+                                currentSettings.maxTokens,
+                              )
+                              ? currentSettings.maxTokens
+                              : ChatDefaults.maxTokens,
+                          dropdownColor: theme.colorScheme.surface,
+                          underline: const SizedBox.shrink(),
+                          items: [
+                            for (final count in ChatDefaults.maxTokenChoices)
+                              DropdownMenuItem(
+                                value: count,
+                                child: Text('$count tokens'),
+                              ),
+                          ],
+                          onChanged: (val) {
+                            if (val == null) return;
+                            _controller.dispatch(
+                              UpdateSettingsIntent(maxTokens: val),
+                            );
+                          },
+                        ),
+                      ),
+                      Divider(color: theme.dividerColor, height: 24),
+                      Text(
+                        _kSectionInference,
                         style: TextStyle(
                           fontSize: 11,
                           fontWeight: FontWeight.w600,
@@ -362,9 +609,9 @@ class _ChatPageState extends State<ChatPage> {
                       const SizedBox(height: 8),
                       ListTile(
                         contentPadding: EdgeInsets.zero,
-                        title: const Text('Compute Backend'),
+                        title: const Text(_kComputeBackendTitle),
                         subtitle: Text(
-                          'Choose between Auto (GPU / NPU / Fallback), GPU (WebGPU / Metal), NPU (Qualcomm Hexagon), or CPU.',
+                          _kComputeBackendSubtitle,
                           style: TextStyle(
                             fontSize: 12,
                             color: theme.colorScheme.onSurfaceVariant,
@@ -377,19 +624,19 @@ class _ChatPageState extends State<ChatPage> {
                           items: const [
                             DropdownMenuItem(
                               value: CeraBackend.auto,
-                              child: Text('Auto (GPU / Fallback)'),
+                              child: Text(_kBackendAutoLabel),
                             ),
                             DropdownMenuItem(
                               value: CeraBackend.gpu,
-                              child: Text('GPU (WebGPU / Metal)'),
+                              child: Text(_kBackendGpuLabel),
                             ),
                             DropdownMenuItem(
                               value: CeraBackend.hexagon,
-                              child: Text('NPU (Qualcomm Hexagon)'),
+                              child: Text(_kBackendHexagonLabel),
                             ),
                             DropdownMenuItem(
                               value: CeraBackend.cpu,
-                              child: Text('CPU (WASM / CPU)'),
+                              child: Text(_kBackendCpuLabel),
                             ),
                           ],
                           onChanged: (val) {
@@ -403,9 +650,9 @@ class _ChatPageState extends State<ChatPage> {
                       const SizedBox(height: 8),
                       SwitchListTile(
                         contentPadding: EdgeInsets.zero,
-                        title: const Text('TurboQuant KV Compression'),
+                        title: const Text(_kTurboQuantTitle),
                         subtitle: Text(
-                          'Compresses KV cache to 3-bit keys / 2-bit values for lower memory footprint and faster multi-turn attention. (Default: Off)',
+                          _kTurboQuantSubtitle,
                           style: TextStyle(
                             fontSize: 12,
                             color: theme.colorScheme.onSurfaceVariant,
@@ -421,9 +668,9 @@ class _ChatPageState extends State<ChatPage> {
                       const SizedBox(height: 8),
                       ListTile(
                         contentPadding: EdgeInsets.zero,
-                        title: const Text('Vision Max Image Dimension'),
+                        title: const Text(_kVisionMaxDimTitle),
                         subtitle: Text(
-                          'Caps the long side of input images before ViT patch encoding to minimize prompt latency.',
+                          _kVisionMaxDimSubtitle,
                           style: TextStyle(
                             fontSize: 12,
                             color: theme.colorScheme.onSurfaceVariant,
@@ -435,16 +682,16 @@ class _ChatPageState extends State<ChatPage> {
                           underline: const SizedBox.shrink(),
                           items: const [
                             DropdownMenuItem(
-                              value: 256,
-                              child: Text('256 px (Fast)'),
+                              value: ChatDefaults.maxImageLongSize,
+                              child: Text(_kImageDimFastLabel),
                             ),
                             DropdownMenuItem(
-                              value: 512,
-                              child: Text('512 px (HD)'),
+                              value: ChatDefaults.hdImageLongSize,
+                              child: Text(_kImageDimHdLabel),
                             ),
                             DropdownMenuItem(
                               value: null,
-                              child: Text('Native / Off'),
+                              child: Text(_kImageDimNativeLabel),
                             ),
                           ],
                           onChanged: (val) {
@@ -460,9 +707,9 @@ class _ChatPageState extends State<ChatPage> {
                       const SizedBox(height: 8),
                       ListTile(
                         contentPadding: EdgeInsets.zero,
-                        title: const Text('Voice Mode'),
+                        title: const Text(_kVoiceModeTitle),
                         subtitle: Text(
-                          'Select how audio-capable models interact with speech (Speech to Text ASR, Interleaved Voice Chat, Text to Speech TTS, or Text Only).',
+                          _kVoiceModeSubtitle,
                           style: TextStyle(
                             fontSize: 12,
                             color: theme.colorScheme.onSurfaceVariant,
@@ -475,19 +722,19 @@ class _ChatPageState extends State<ChatPage> {
                           items: const [
                             DropdownMenuItem(
                               value: AudioChatMode.speechToText,
-                              child: Text('Speech to Text (ASR)'),
+                              child: Text(_kVoiceModeAsrLabel),
                             ),
                             DropdownMenuItem(
                               value: AudioChatMode.interleaved,
-                              child: Text('Voice Chat (Interleaved)'),
+                              child: Text(_kVoiceModeInterleavedLabel),
                             ),
                             DropdownMenuItem(
                               value: AudioChatMode.textToSpeech,
-                              child: Text('Text to Speech (TTS)'),
+                              child: Text(_kVoiceModeTtsLabel),
                             ),
                             DropdownMenuItem(
                               value: AudioChatMode.textOnly,
-                              child: Text('Text Only (No Audio)'),
+                              child: Text(_kVoiceModeTextOnlyMenuLabel),
                             ),
                           ],
                           onChanged: (val) {
@@ -520,7 +767,7 @@ class _ChatPageState extends State<ChatPage> {
                       if (currentState.hasModel) ...[
                         Divider(color: theme.dividerColor, height: 24),
                         Text(
-                          'BACKEND & DEVICE',
+                          _kSectionBackendDevice,
                           style: TextStyle(
                             fontSize: 11,
                             fontWeight: FontWeight.w600,
@@ -553,7 +800,8 @@ class _ChatPageState extends State<ChatPage> {
                                   crossAxisAlignment: CrossAxisAlignment.start,
                                   children: [
                                     Text(
-                                      currentState.backend ?? 'Unknown Backend',
+                                      currentState.backend ??
+                                          AppStrings.unknownBackend,
                                       style: const TextStyle(
                                         fontSize: 13,
                                         fontWeight: FontWeight.w500,
@@ -595,6 +843,8 @@ class _ChatPageState extends State<ChatPage> {
       builder: (context, state, _) {
         final hasAudioIn = state.capabilities?.audioIn ?? false;
         final hasAudioOut = state.capabilities?.audioOut ?? false;
+        final loadedModelName = state.loadedModel?.name;
+
         return Scaffold(
           appBar: AppBar(
             title: Column(
@@ -603,7 +853,7 @@ class _ChatPageState extends State<ChatPage> {
                 Row(
                   mainAxisSize: MainAxisSize.min,
                   children: [
-                    const Text('Cera'),
+                    const Text(AppStrings.appTitle),
                     const SizedBox(width: 8),
                     Flexible(
                       child: Container(
@@ -616,12 +866,42 @@ class _ChatPageState extends State<ChatPage> {
                           borderRadius: BorderRadius.circular(6),
                         ),
                         child: Text(
-                          'v0.7.0',
+                          AppStrings.appVersion,
                           overflow: TextOverflow.ellipsis,
                           style: TextStyle(
                             fontSize: 10,
                             fontWeight: FontWeight.bold,
                             color: theme.colorScheme.onPrimaryContainer,
+                          ),
+                        ),
+                      ),
+                    ),
+                    const SizedBox(width: 6),
+                    InkWell(
+                      onTap: () => _showSettingsSheet(state),
+                      borderRadius: BorderRadius.circular(6),
+                      child: Container(
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 6,
+                          vertical: 2,
+                        ),
+                        decoration: BoxDecoration(
+                          color: theme.colorScheme.primary.withValues(
+                            alpha: 0.14,
+                          ),
+                          borderRadius: BorderRadius.circular(6),
+                          border: Border.all(
+                            color: theme.colorScheme.primary.withValues(
+                              alpha: 0.3,
+                            ),
+                          ),
+                        ),
+                        child: Text(
+                          state.settings.samplingLabel,
+                          style: TextStyle(
+                            fontSize: 10,
+                            fontWeight: FontWeight.w600,
+                            color: theme.colorScheme.primary,
                           ),
                         ),
                       ),
@@ -659,6 +939,49 @@ class _ChatPageState extends State<ChatPage> {
             actions: [
               Padding(
                 padding: const EdgeInsets.symmetric(vertical: 8),
+                child: Tooltip(
+                  message: _kSwitchModelTooltip,
+                  child: OutlinedButton.icon(
+                    style: OutlinedButton.styleFrom(
+                      foregroundColor: state.hasModel
+                          ? theme.colorScheme.onSurface
+                          : theme.colorScheme.primary,
+                      side: BorderSide(
+                        color: state.hasModel
+                            ? theme.colorScheme.outline
+                            : theme.colorScheme.primary.withValues(alpha: 0.5),
+                      ),
+                      padding: const EdgeInsets.symmetric(horizontal: 10),
+                      visualDensity: VisualDensity.compact,
+                      shape: RoundedRectangleBorder(
+                        borderRadius: BorderRadius.circular(8),
+                      ),
+                    ),
+                    onPressed: () => _pickBundle(state),
+                    icon: Icon(
+                      state.hasModel
+                          ? Icons.memory_rounded
+                          : Icons.cloud_download_outlined,
+                      size: 14,
+                      color: theme.colorScheme.primary,
+                    ),
+                    label: ConstrainedBox(
+                      constraints: const BoxConstraints(maxWidth: 140),
+                      child: Text(
+                        loadedModelName ?? _kSelectModelLabel,
+                        overflow: TextOverflow.ellipsis,
+                        style: const TextStyle(
+                          fontSize: 11.5,
+                          fontWeight: FontWeight.w600,
+                        ),
+                      ),
+                    ),
+                  ),
+                ),
+              ),
+              const SizedBox(width: 6),
+              Padding(
+                padding: const EdgeInsets.symmetric(vertical: 8),
                 child: SegmentedButton<AppUIMode>(
                   style: SegmentedButton.styleFrom(
                     visualDensity: VisualDensity.compact,
@@ -672,13 +995,16 @@ class _ChatPageState extends State<ChatPage> {
                   segments: const [
                     ButtonSegment<AppUIMode>(
                       value: AppUIMode.chat,
-                      label: Text('Chat', style: TextStyle(fontSize: 11.5)),
+                      label: Text(
+                        _kChatSegmentLabel,
+                        style: TextStyle(fontSize: 11.5),
+                      ),
                       icon: Icon(Icons.chat_outlined, size: 14),
                     ),
                     ButtonSegment<AppUIMode>(
                       value: AppUIMode.ttsStudio,
                       label: Text(
-                        'TTS Studio',
+                        _kTtsStudioSegmentLabel,
                         style: TextStyle(fontSize: 11.5),
                       ),
                       icon: Icon(Icons.record_voice_over_outlined, size: 14),
@@ -692,14 +1018,14 @@ class _ChatPageState extends State<ChatPage> {
               ),
               IconButton(
                 icon: const Icon(Icons.delete_sweep_rounded),
-                tooltip: 'Clear transcript',
+                tooltip: _kClearTranscriptTooltip,
                 onPressed: state.turns.isEmpty
                     ? null
                     : () => _controller.dispatch(const ClearTranscriptIntent()),
               ),
               IconButton(
                 icon: const Icon(Icons.settings_outlined),
-                tooltip: 'Settings & Models',
+                tooltip: _kSettingsTooltip,
                 onPressed: () => _showSettingsSheet(state),
               ),
             ],
@@ -717,6 +1043,11 @@ class _ChatPageState extends State<ChatPage> {
                         turns: state.turns,
                         scrollController: _scrollController,
                         audioPlayer: _controller.audioPlayer,
+                        hasModel: state.hasModel,
+                        isLoading: state.isLoading,
+                        onOpenCatalog: () => _pickBundle(state),
+                        onOpenLocalModel: _pickLocalModel,
+                        onSelectPrompt: _onSelectStarterPrompt,
                       ),
                     ),
                     if (state.hasModel && (hasAudioIn || hasAudioOut))
@@ -736,93 +1067,101 @@ class _ChatPageState extends State<ChatPage> {
                             ),
                           ),
                         ),
-                        child: Row(
-                          children: [
-                            Icon(
-                              Icons.graphic_eq_rounded,
-                              size: 15,
-                              color: theme.colorScheme.primary,
-                            ),
-                            const SizedBox(width: 6),
-                            Text(
-                              'Voice Mode:',
-                              style: TextStyle(
-                                fontSize: 11.5,
-                                fontWeight: FontWeight.w600,
-                                color: theme.colorScheme.onSurfaceVariant,
-                              ),
-                            ),
-                            const SizedBox(width: 8),
-                            Expanded(
-                              child: SingleChildScrollView(
-                                scrollDirection: Axis.horizontal,
-                                child: Row(
-                                  children: [
-                                    if (hasAudioIn && hasAudioOut) ...[
-                                      _AudioModeChip(
-                                        label: 'Voice Chat',
-                                        icon: Icons.record_voice_over_outlined,
-                                        isSelected:
-                                            state.settings.audioChatMode ==
-                                            AudioChatMode.interleaved,
-                                        onTap: () => _controller.dispatch(
-                                          const UpdateSettingsIntent(
-                                            audioChatMode:
-                                                AudioChatMode.interleaved,
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 6),
-                                    ],
-                                    if (hasAudioIn) ...[
-                                      _AudioModeChip(
-                                        label: 'Speech to Text (ASR)',
-                                        icon: Icons.transcribe_rounded,
-                                        isSelected:
-                                            state.settings.audioChatMode ==
-                                            AudioChatMode.speechToText,
-                                        onTap: () => _controller.dispatch(
-                                          const UpdateSettingsIntent(
-                                            audioChatMode:
-                                                AudioChatMode.speechToText,
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 6),
-                                    ],
-                                    if (hasAudioOut) ...[
-                                      _AudioModeChip(
-                                        label: 'Text to Speech (TTS)',
-                                        icon: Icons.volume_up_outlined,
-                                        isSelected:
-                                            state.settings.audioChatMode ==
-                                            AudioChatMode.textToSpeech,
-                                        onTap: () => _controller.dispatch(
-                                          const UpdateSettingsIntent(
-                                            audioChatMode:
-                                                AudioChatMode.textToSpeech,
-                                          ),
-                                        ),
-                                      ),
-                                      const SizedBox(width: 6),
-                                    ],
-                                    _AudioModeChip(
-                                      label: 'Text Only',
-                                      icon: Icons.chat_bubble_outline_rounded,
-                                      isSelected:
-                                          state.settings.audioChatMode ==
-                                          AudioChatMode.textOnly,
-                                      onTap: () => _controller.dispatch(
-                                        const UpdateSettingsIntent(
-                                          audioChatMode: AudioChatMode.textOnly,
-                                        ),
-                                      ),
-                                    ),
-                                  ],
+                        child: Center(
+                          child: ConstrainedBox(
+                            constraints: const BoxConstraints(maxWidth: 840),
+                            child: Row(
+                              children: [
+                                Icon(
+                                  Icons.graphic_eq_rounded,
+                                  size: 15,
+                                  color: theme.colorScheme.primary,
                                 ),
-                              ),
+                                const SizedBox(width: 6),
+                                Text(
+                                  _kVoiceModeBarLabel,
+                                  style: TextStyle(
+                                    fontSize: 11.5,
+                                    fontWeight: FontWeight.w600,
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                                const SizedBox(width: 8),
+                                Expanded(
+                                  child: SingleChildScrollView(
+                                    scrollDirection: Axis.horizontal,
+                                    child: Row(
+                                      children: [
+                                        if (hasAudioIn && hasAudioOut) ...[
+                                          _AudioModeChip(
+                                            label: _kVoiceModeChatShortLabel,
+                                            icon: Icons
+                                                .record_voice_over_outlined,
+                                            isSelected:
+                                                state.settings.audioChatMode ==
+                                                AudioChatMode.interleaved,
+                                            onTap: () => _controller.dispatch(
+                                              const UpdateSettingsIntent(
+                                                audioChatMode:
+                                                    AudioChatMode.interleaved,
+                                              ),
+                                            ),
+                                          ),
+                                          const SizedBox(width: 6),
+                                        ],
+                                        if (hasAudioIn) ...[
+                                          _AudioModeChip(
+                                            label: _kVoiceModeAsrLabel,
+                                            icon: Icons.transcribe_rounded,
+                                            isSelected:
+                                                state.settings.audioChatMode ==
+                                                AudioChatMode.speechToText,
+                                            onTap: () => _controller.dispatch(
+                                              const UpdateSettingsIntent(
+                                                audioChatMode:
+                                                    AudioChatMode.speechToText,
+                                              ),
+                                            ),
+                                          ),
+                                          const SizedBox(width: 6),
+                                        ],
+                                        if (hasAudioOut) ...[
+                                          _AudioModeChip(
+                                            label: _kVoiceModeTtsLabel,
+                                            icon: Icons.volume_up_outlined,
+                                            isSelected:
+                                                state.settings.audioChatMode ==
+                                                AudioChatMode.textToSpeech,
+                                            onTap: () => _controller.dispatch(
+                                              const UpdateSettingsIntent(
+                                                audioChatMode:
+                                                    AudioChatMode.textToSpeech,
+                                              ),
+                                            ),
+                                          ),
+                                          const SizedBox(width: 6),
+                                        ],
+                                        _AudioModeChip(
+                                          label: _kVoiceModeTextOnlyChipLabel,
+                                          icon:
+                                              Icons.chat_bubble_outline_rounded,
+                                          isSelected:
+                                              state.settings.audioChatMode ==
+                                              AudioChatMode.textOnly,
+                                          onTap: () => _controller.dispatch(
+                                            const UpdateSettingsIntent(
+                                              audioChatMode:
+                                                  AudioChatMode.textOnly,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                              ],
                             ),
-                          ],
+                          ),
                         ),
                       ),
                     MessageComposer(

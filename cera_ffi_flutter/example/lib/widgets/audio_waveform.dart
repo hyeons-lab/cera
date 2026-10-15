@@ -1,5 +1,7 @@
 import 'dart:math' as math;
+
 import 'package:flutter/material.dart';
+
 import '../services/audio_player_service.dart';
 import '../services/file_download_service.dart';
 
@@ -23,6 +25,9 @@ class RecordingWaveformIndicator extends StatefulWidget {
 
 class _RecordingWaveformIndicatorState extends State<RecordingWaveformIndicator>
     with SingleTickerProviderStateMixin {
+  static const _kReleaseToCancel = 'Release to cancel';
+  static const _kSlideToCancel = 'Slide to cancel';
+
   late final AnimationController _animController;
 
   @override
@@ -90,7 +95,7 @@ class _RecordingWaveformIndicatorState extends State<RecordingWaveformIndicator>
           ),
           const SizedBox(width: 8),
           Text(
-            widget.isCancelled ? 'Release to cancel' : 'Slide to cancel',
+            widget.isCancelled ? _kReleaseToCancel : _kSlideToCancel,
             style: TextStyle(
               fontSize: 11,
               fontWeight: FontWeight.w500,
@@ -167,6 +172,10 @@ class AudioWaveformBubble extends StatefulWidget {
 }
 
 class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
+  static const _kDownloadWavTooltip = 'Download WAV audio';
+  static const _kWavDownloadedMessage = 'WAV audio downloaded';
+  static const _kDefaultSampleRate = 24000;
+
   @override
   void initState() {
     super.initState();
@@ -258,6 +267,12 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
     return _cachedBars!;
   }
 
+  int _resolveSampleRate(List<double> samples) {
+    return (widget.durationSeconds.isFinite && widget.durationSeconds > 0.05)
+        ? (samples.length / widget.durationSeconds).round().clamp(8000, 96000)
+        : _kDefaultSampleRate;
+  }
+
   Future<void> _togglePlayback() async {
     final player = widget.audioPlayer;
     final samples = widget.samples;
@@ -266,11 +281,11 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
     if (_isPlaying) {
       player.stop();
     } else {
-      final sr =
-          (widget.durationSeconds.isFinite && widget.durationSeconds > 0.05)
-          ? (samples.length / widget.durationSeconds).round().clamp(8000, 96000)
-          : 24000;
-      await player.playPcm(samples, sampleRate: sr, source: samples);
+      await player.playPcm(
+        samples,
+        sampleRate: _resolveSampleRate(samples),
+        source: samples,
+      );
     }
   }
 
@@ -279,6 +294,7 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
     final theme = Theme.of(context);
     const numBars = 24;
     final bars = _getBars(numBars);
+    final samples = widget.samples;
 
     return Container(
       padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 8),
@@ -292,7 +308,7 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
       child: Row(
         mainAxisSize: MainAxisSize.min,
         children: [
-          if (widget.samples != null && widget.audioPlayer != null) ...[
+          if (samples != null && widget.audioPlayer != null) ...[
             InkWell(
               onTap: _togglePlayback,
               borderRadius: BorderRadius.circular(20),
@@ -331,7 +347,7 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
               color: theme.colorScheme.primary,
             ),
           ),
-          if (widget.samples != null && widget.samples!.isNotEmpty) ...[
+          if (samples != null && samples.isNotEmpty) ...[
             const SizedBox(width: 4),
             IconButton(
               icon: Icon(
@@ -341,26 +357,19 @@ class _AudioWaveformBubbleState extends State<AudioWaveformBubble> {
               ),
               padding: EdgeInsets.zero,
               constraints: const BoxConstraints(minWidth: 24, minHeight: 24),
-              tooltip: 'Download WAV audio',
+              tooltip: _kDownloadWavTooltip,
               onPressed: () async {
                 try {
-                  final sr =
-                      (widget.durationSeconds.isFinite &&
-                          widget.durationSeconds > 0.05)
-                      ? (widget.samples!.length / widget.durationSeconds)
-                            .round()
-                            .clamp(8000, 96000)
-                      : 24000;
                   await downloadAudioWav(
-                    widget.samples!,
+                    samples,
                     filename:
                         'cera_audio_${DateTime.now().millisecondsSinceEpoch}.wav',
-                    sampleRate: sr,
+                    sampleRate: _resolveSampleRate(samples),
                   );
                   if (context.mounted) {
                     ScaffoldMessenger.of(context).showSnackBar(
                       const SnackBar(
-                        content: Text('WAV audio downloaded'),
+                        content: Text(_kWavDownloadedMessage),
                         duration: Duration(seconds: 1),
                         behavior: SnackBarBehavior.floating,
                       ),

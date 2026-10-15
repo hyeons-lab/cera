@@ -1,8 +1,10 @@
 import 'dart:convert';
+
 import 'package:flutter/material.dart';
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 import 'package:shared_preferences/shared_preferences.dart';
 
+import '../app_constants.dart';
 import '../chat_state.dart';
 
 /// A bundle choice carrying identification and display properties.
@@ -36,10 +38,65 @@ class BundlePickerDialog extends StatefulWidget {
 }
 
 class _BundlePickerDialogState extends State<BundlePickerDialog> {
+  static const _kDialogTitle = 'Select Model';
+  static const _kTabDownloaded = 'Downloaded';
+  static const _kTabCatalog = 'Catalog & Download';
+  static const _kActionCancel = 'Cancel';
+  static const _kActionLoad = 'Load';
+  static const _kActionRemoveTooltip = 'Remove from list';
+  static const _kEmptyDownloadedTitle = 'No models downloaded yet';
+  static const _kEmptyDownloadedSubtitle =
+      'Download models from the catalog to run fast, offline on-device inference.';
+  static const _kBrowseCatalogButton = 'Browse Catalog to Download';
+  static const _kSearchHint =
+      'Filter models (e.g. VL, Audio, 1.2B, Thinking)...';
+  static const _kBadgeActive = 'Active';
+  static const _kBadgeDownloaded = 'Downloaded';
+  static const _kBadgeDSpark = 'DSpark';
+  static const _kBadgeDSparkSidecar = 'DSpark Sidecar';
+  static const _kBadgeVision = 'Vision';
+  static const _kBadgeAudio = 'Audio';
+  static const _kBadgeMoe = 'MoE';
+  static const _kBadgeThinking = 'Thinking';
+  static const _kMonospaceFont = 'monospace';
+  static const _kAmberAccent = Color(0xFFF59E0B);
+
+  static const _kStandardQuants = ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'];
+  static const _kCompactQuants = ['Q4_K_M', 'Q8_0', 'F16'];
+  static const _kAudioQuants = ['Q4_0', 'Q8_0', 'F16'];
+  static const _kDSparkSupportedQuants = {'Q4_K_M', 'Q8_0', 'F16'};
+
+  static const _kDefaultBundles = [
+    CeraBundle(name: 'LFM2.5-2.6B-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM2.5-2.6B-Agent-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM2.5-2.6B-Thinking-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM2.5-1.2B-Instruct-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM2.5-1.2B-Thinking-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM2.5-8B-A1B-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM2.5-8B-A1B-Instruct-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM2.5-700M-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM2.5-350M-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM2.5-230M-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM2.5-VL-3B-GGUF', quants: _kCompactQuants),
+    CeraBundle(name: 'LFM2.5-Audio-1.5B-GGUF', quants: _kAudioQuants),
+    CeraBundle(name: 'LFM2-1.2B-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM2-700M-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM2-350M-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM2-2.6B-Exp-GGUF', quants: _kCompactQuants),
+  ];
+
   late final Future<List<CeraBundle>> _bundles = _fetchBundles();
+  final TextEditingController _searchController = TextEditingController();
+  String _searchQuery = '';
   List<DownloadedModelRecord> _downloaded = [];
   bool _loadingDownloaded = true;
   _PickerTab _tab = _PickerTab.downloaded;
+
+  @override
+  void dispose() {
+    _searchController.dispose();
+    super.dispose();
+  }
 
   Future<List<CeraBundle>> _fetchBundles() async {
     List<CeraBundle> live = [];
@@ -50,94 +107,31 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
     final map = {for (final b in live) b.name: b};
 
     if (map.isEmpty) {
-      const defaults = [
-        CeraBundle(
-          name: 'LFM2.5-2.6B-GGUF',
-          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2.5-2.6B-Agent-GGUF',
-          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2.5-2.6B-Thinking-GGUF',
-          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2.5-1.2B-Instruct-GGUF',
-          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2.5-1.2B-Thinking-GGUF',
-          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2.5-8B-A1B-GGUF',
-          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2.5-8B-A1B-Instruct-GGUF',
-          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2.5-700M-GGUF',
-          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2.5-350M-GGUF',
-          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2.5-230M-GGUF',
-          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2.5-VL-3B-GGUF',
-          quants: ['Q4_K_M', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2.5-Audio-1.5B-GGUF',
-          quants: ['Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2-1.2B-GGUF',
-          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2-700M-GGUF',
-          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2-350M-GGUF',
-          quants: ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'],
-        ),
-        CeraBundle(
-          name: 'LFM2-2.6B-Exp-GGUF',
-          quants: ['Q4_K_M', 'Q8_0', 'F16'],
-        ),
-      ];
-      for (final b in defaults) {
+      for (final b in _kDefaultBundles) {
         map[b.name] = b;
       }
     }
 
     final list = map.values.toList();
-    list.sort(
-      (a, b) =>
-          a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase()),
-    );
+    final current = widget.currentBundleName;
+    list.sort((a, b) {
+      if (current != null) {
+        final aIsCurrent = a.name == current;
+        final bIsCurrent = b.name == current;
+        if (aIsCurrent != bIsCurrent) return aIsCurrent ? -1 : 1;
+      }
+      return a.displayName.toLowerCase().compareTo(b.displayName.toLowerCase());
+    });
     return list;
   }
 
   bool _hasHfDSparkDraft(String bundleName, String quant) {
     final clean = quant.split(RegExp(r'[+ ]')).first.trim().toUpperCase();
     final name = bundleName.toLowerCase();
-    // Specific model families have official DSpark draft sidecars published on Hugging Face:
-    // (LiquidAI/LFM2.5-2.6B-DSpark-GGUF, LiquidAI/LFM2.5-1.2B-Instruct-DSpark-GGUF, LiquidAI/LFM2.5-8B-A1B-DSpark-GGUF)
     if (name.contains('lfm2.5-2.6b') ||
         name.contains('lfm2.5-1.2b') ||
         name.contains('lfm2.5-8b')) {
-      return clean == 'Q4_K_M' || clean == 'Q8_0' || clean == 'F16';
+      return _kDSparkSupportedQuants.contains(clean);
     }
     return false;
   }
@@ -151,7 +145,8 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
   Future<void> _loadDownloadedModels() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final list = prefs.getStringList('cera_downloaded_models') ?? [];
+      final list =
+          prefs.getStringList(PrefKeys.downloadedModels) ?? const <String>[];
       final records = <DownloadedModelRecord>[];
       for (final s in list) {
         try {
@@ -161,19 +156,17 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
       }
 
       // If active model is loaded but not yet registered in downloaded records, include it
-      if (widget.currentBundleName != null && widget.currentQuant != null) {
-        final activeId = '${widget.currentBundleName}:${widget.currentQuant}';
+      final currentBundle = widget.currentBundleName;
+      final currentQuant = widget.currentQuant;
+      if (currentBundle != null && currentQuant != null) {
+        final activeId = '$currentBundle:$currentQuant';
         if (!records.any((r) => r.id == activeId)) {
-          final name = widget.currentBundleName!;
-          final display = name.endsWith('-GGUF')
-              ? name.substring(0, name.length - '-GGUF'.length)
-              : name;
           records.insert(
             0,
             DownloadedModelRecord(
-              bundleName: name,
-              quant: widget.currentQuant!,
-              displayName: display,
+              bundleName: currentBundle,
+              quant: currentQuant,
+              displayName: ModelFormat.stripGgufSuffix(currentBundle),
             ),
           );
         }
@@ -183,7 +176,6 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
         setState(() {
           _downloaded = records;
           _loadingDownloaded = false;
-          // If no models are downloaded yet, open catalog by default
           if (records.isEmpty) {
             _tab = _PickerTab.catalog;
           }
@@ -201,7 +193,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
     try {
       final prefs = await SharedPreferences.getInstance();
       final list = _downloaded.map((r) => jsonEncode(r.toJson())).toList();
-      await prefs.setStringList('cera_downloaded_models', list);
+      await prefs.setStringList(PrefKeys.downloadedModels, list);
     } catch (_) {}
   }
 
@@ -216,7 +208,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
         side: BorderSide(color: theme.colorScheme.outline),
       ),
       title: const Text(
-        'Select Model',
+        _kDialogTitle,
         style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
       ),
       content: SizedBox(
@@ -224,7 +216,6 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
         height: 480,
         child: Column(
           children: [
-            // Segmented Tab Switcher
             Container(
               decoration: BoxDecoration(
                 color: theme.scaffoldBackgroundColor,
@@ -236,7 +227,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                 children: [
                   Expanded(
                     child: _TabButton(
-                      label: 'Downloaded',
+                      label: _kTabDownloaded,
                       count: _downloaded.length,
                       isSelected: _tab == _PickerTab.downloaded,
                       onTap: () => setState(() => _tab = _PickerTab.downloaded),
@@ -244,7 +235,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                   ),
                   Expanded(
                     child: _TabButton(
-                      label: 'Catalog & Download',
+                      label: _kTabCatalog,
                       icon: Icons.cloud_download_outlined,
                       isSelected: _tab == _PickerTab.catalog,
                       onTap: () => setState(() => _tab = _PickerTab.catalog),
@@ -265,7 +256,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
       actions: [
         TextButton(
           onPressed: () => Navigator.of(context).pop(),
-          child: const Text('Cancel'),
+          child: const Text(_kActionCancel),
         ),
       ],
     );
@@ -294,7 +285,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
               ),
               const SizedBox(height: 12),
               Text(
-                'No models downloaded yet',
+                _kEmptyDownloadedTitle,
                 style: TextStyle(
                   fontWeight: FontWeight.w600,
                   fontSize: 15,
@@ -303,7 +294,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
               ),
               const SizedBox(height: 6),
               Text(
-                'Download models from the catalog to run fast, offline on-device inference.',
+                _kEmptyDownloadedSubtitle,
                 textAlign: TextAlign.center,
                 style: TextStyle(
                   color: theme.colorScheme.onSurfaceVariant,
@@ -325,7 +316,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                   ),
                 ),
                 icon: const Icon(Icons.cloud_download_outlined, size: 16),
-                label: const Text('Browse Catalog to Download'),
+                label: const Text(_kBrowseCatalogButton),
                 onPressed: () => setState(() => _tab = _PickerTab.catalog),
               ),
             ],
@@ -394,7 +385,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                         ),
                         const SizedBox(width: 4),
                         Text(
-                          'Active',
+                          _kBadgeActive,
                           style: TextStyle(
                             color: theme.colorScheme.primary,
                             fontSize: 11,
@@ -412,7 +403,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                 Text(
                   model.quant,
                   style: TextStyle(
-                    fontFamily: 'monospace',
+                    fontFamily: _kMonospaceFont,
                     fontSize: 12,
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
@@ -425,16 +416,16 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                       vertical: 1,
                     ),
                     decoration: BoxDecoration(
-                      color: const Color(0xFFF59E0B).withValues(alpha: 0.2),
+                      color: _kAmberAccent.withValues(alpha: 0.2),
                       borderRadius: BorderRadius.circular(4),
                       border: Border.all(
-                        color: const Color(0xFFF59E0B).withValues(alpha: 0.4),
+                        color: _kAmberAccent.withValues(alpha: 0.4),
                       ),
                     ),
                     child: const Text(
-                      'DSpark',
+                      _kBadgeDSpark,
                       style: TextStyle(
-                        color: Color(0xFFF59E0B),
+                        color: _kAmberAccent,
                         fontSize: 9,
                         fontWeight: FontWeight.w700,
                       ),
@@ -456,7 +447,10 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                       minimumSize: Size.zero,
                       tapTargetSize: MaterialTapTargetSize.shrinkWrap,
                     ),
-                    child: const Text('Load', style: TextStyle(fontSize: 12)),
+                    child: const Text(
+                      _kActionLoad,
+                      style: TextStyle(fontSize: 12),
+                    ),
                     onPressed: () => Navigator.of(context).pop(
                       BundleChoice(
                         bundleName: model.bundleName,
@@ -478,7 +472,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                     size: 18,
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
-                  tooltip: 'Remove from list',
+                  tooltip: _kActionRemoveTooltip,
                   onPressed: () => _removeDownloadedModel(model),
                 ),
               ],
@@ -502,6 +496,15 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
     );
   }
 
+  static String? _modalityBadgeFor(String bundleName) {
+    final lower = bundleName.toLowerCase();
+    if (lower.contains('-vl-')) return _kBadgeVision;
+    if (lower.contains('-audio-')) return _kBadgeAudio;
+    if (lower.contains('-8b-a1b')) return _kBadgeMoe;
+    if (lower.contains('-thinking')) return _kBadgeThinking;
+    return null;
+  }
+
   Widget _buildCatalogView(ThemeData theme) {
     return FutureBuilder<List<CeraBundle>>(
       future: _bundles,
@@ -517,8 +520,8 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
             ),
           );
         }
-        final bundles = snapshot.data;
-        if (bundles == null) {
+        final allBundles = snapshot.data;
+        if (allBundles == null) {
           return Center(
             child: CircularProgressIndicator(
               valueColor: AlwaysStoppedAnimation<Color>(
@@ -527,186 +530,137 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
             ),
           );
         }
-        return ListView.separated(
-          itemCount: bundles.length,
-          separatorBuilder: (_, _) =>
-              Divider(color: theme.colorScheme.outlineVariant, height: 1),
-          itemBuilder: (context, i) {
-            final bundle = bundles[i];
-            final isCurrentBundle = bundle.name == widget.currentBundleName;
+        final q = _searchQuery.trim().toLowerCase();
+        final bundles = q.isEmpty
+            ? allBundles
+            : allBundles.where((b) {
+                final mod = _modalityBadgeFor(b.name)?.toLowerCase() ?? '';
+                return b.displayName.toLowerCase().contains(q) ||
+                    b.name.toLowerCase().contains(q) ||
+                    mod.contains(q);
+              }).toList();
 
-            final quantOptions = <String>[];
-            int dsparkCount = 0;
-            for (final q in bundle.quants) {
-              quantOptions.add(q);
-              if (_hasHfDSparkDraft(bundle.name, q)) {
-                quantOptions.add('$q + DSpark');
-                dsparkCount++;
-              }
-            }
-            final n = bundle.quants.length;
-
-            return ExpansionTile(
-              key: PageStorageKey(bundle.name),
-              initiallyExpanded: isCurrentBundle,
-              title: Row(
-                children: [
-                  Expanded(
-                    child: Text(
-                      bundle.displayName,
-                      style: const TextStyle(fontWeight: FontWeight.w600),
-                    ),
-                  ),
-                  if (bundle.name.toLowerCase().contains('dspark') ||
-                      dsparkCount > 0) ...[
-                    const SizedBox(width: 6),
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 6,
-                        vertical: 1.5,
-                      ),
-                      decoration: BoxDecoration(
-                        color: const Color(0xFFF59E0B).withValues(alpha: 0.2),
-                        borderRadius: BorderRadius.circular(4),
-                        border: Border.all(
-                          color: const Color(0xFFF59E0B).withValues(alpha: 0.4),
-                        ),
-                      ),
-                      child: const Text(
-                        'DSpark',
-                        style: TextStyle(
-                          color: Color(0xFFF59E0B),
-                          fontSize: 10,
-                          fontWeight: FontWeight.w700,
-                        ),
-                      ),
-                    ),
-                  ],
-                  if (isCurrentBundle)
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 7,
-                        vertical: 2,
-                      ),
-                      decoration: BoxDecoration(
-                        color: theme.colorScheme.primaryContainer.withValues(
-                          alpha: 0.5,
-                        ),
-                        borderRadius: BorderRadius.circular(6),
-                        border: Border.all(
-                          color: theme.colorScheme.primary.withValues(
-                            alpha: 0.4,
-                          ),
-                        ),
-                      ),
-                      child: Row(
-                        mainAxisSize: MainAxisSize.min,
-                        children: [
-                          Icon(
-                            Icons.check_circle_rounded,
-                            size: 12,
-                            color: theme.colorScheme.primary,
-                          ),
-                          const SizedBox(width: 4),
-                          Text(
-                            'Active',
-                            style: TextStyle(
-                              color: theme.colorScheme.primary,
-                              fontSize: 11,
-                              fontWeight: FontWeight.w600,
-                            ),
-                          ),
-                        ],
-                      ),
-                    ),
-                ],
+        return Column(
+          children: [
+            TextField(
+              controller: _searchController,
+              onChanged: (val) => setState(() => _searchQuery = val),
+              style: TextStyle(
+                fontSize: 13,
+                color: theme.colorScheme.onSurface,
               ),
-              subtitle: Text(
-                dsparkCount > 0
-                    ? '$n base quants · $dsparkCount with DSpark sidecar'
-                    : '$n quantization${n == 1 ? '' : 's'}',
-                style: TextStyle(
+              decoration: InputDecoration(
+                hintText: _kSearchHint,
+                hintStyle: TextStyle(
+                  fontSize: 12.5,
                   color: theme.colorScheme.onSurfaceVariant,
-                  fontSize: 12,
+                ),
+                prefixIcon: Icon(
+                  Icons.search_rounded,
+                  size: 18,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+                suffixIcon: _searchQuery.isNotEmpty
+                    ? IconButton(
+                        icon: Icon(
+                          Icons.close_rounded,
+                          size: 16,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                        onPressed: () {
+                          _searchController.clear();
+                          setState(() => _searchQuery = '');
+                        },
+                      )
+                    : null,
+                isDense: true,
+                filled: true,
+                fillColor: theme.scaffoldBackgroundColor,
+                contentPadding: const EdgeInsets.symmetric(
+                  horizontal: 12,
+                  vertical: 10,
+                ),
+                border: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: theme.colorScheme.outline),
+                ),
+                enabledBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: theme.colorScheme.outline),
+                ),
+                focusedBorder: OutlineInputBorder(
+                  borderRadius: BorderRadius.circular(10),
+                  borderSide: BorderSide(color: theme.colorScheme.primary),
                 ),
               ),
-              children: [
-                for (final quant in quantOptions)
-                  Builder(
-                    builder: (context) {
-                      final isLoadedQuant =
-                          isCurrentBundle && quant == widget.currentQuant;
-                      final isDownloaded = _downloaded.any(
-                        (r) => r.bundleName == bundle.name && r.quant == quant,
-                      );
-                      final isDSpark = quant.contains('DSpark');
-                      final baseQuant = isDSpark
-                          ? quant.split(' ').first
-                          : quant;
+            ),
+            const SizedBox(height: 10),
+            Expanded(
+              child: bundles.isEmpty
+                  ? Center(
+                      child: Text(
+                        'No models match "$_searchQuery"',
+                        style: TextStyle(
+                          fontSize: 13,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                      ),
+                    )
+                  : ListView.separated(
+                      itemCount: bundles.length,
+                      separatorBuilder: (_, _) => Divider(
+                        color: theme.colorScheme.outlineVariant,
+                        height: 1,
+                      ),
+                      itemBuilder: (context, i) {
+                        final bundle = bundles[i];
+                        final isCurrentBundle =
+                            bundle.name == widget.currentBundleName;
+                        final modalityBadge = _modalityBadgeFor(bundle.name);
 
-                      return Material(
-                        color: isLoadedQuant
-                            ? theme.colorScheme.primary.withValues(alpha: 0.16)
-                            : Colors.transparent,
-                        child: ListTile(
-                          dense: true,
+                        final quantOptions = <String>[];
+                        int dsparkCount = 0;
+                        for (final q in bundle.quants) {
+                          quantOptions.add(q);
+                          if (_hasHfDSparkDraft(bundle.name, q)) {
+                            quantOptions.add('$q + $_kBadgeDSpark');
+                            dsparkCount++;
+                          }
+                        }
+                        final n = bundle.quants.length;
+
+                        return ExpansionTile(
+                          key: PageStorageKey(bundle.name),
+                          initiallyExpanded: isCurrentBundle,
                           title: Row(
                             children: [
-                              Text(
-                                baseQuant,
-                                style: TextStyle(
-                                  fontFamily: 'monospace',
-                                  fontWeight: isLoadedQuant
-                                      ? FontWeight.w700
-                                      : FontWeight.normal,
-                                  color: isLoadedQuant
-                                      ? theme.colorScheme.primary
-                                      : null,
+                              Expanded(
+                                child: Text(
+                                  bundle.displayName,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w600,
+                                  ),
                                 ),
                               ),
-                              if (isDSpark) ...[
-                                const SizedBox(width: 8),
+                              if (modalityBadge != null) ...[
+                                const SizedBox(width: 6),
                                 Container(
                                   padding: const EdgeInsets.symmetric(
                                     horizontal: 6,
                                     vertical: 1.5,
                                   ),
                                   decoration: BoxDecoration(
-                                    color: const Color(
-                                      0xFFF59E0B,
-                                    ).withValues(alpha: 0.2),
+                                    color: theme.colorScheme.primary.withValues(
+                                      alpha: 0.14,
+                                    ),
                                     borderRadius: BorderRadius.circular(4),
                                     border: Border.all(
-                                      color: const Color(
-                                        0xFFF59E0B,
-                                      ).withValues(alpha: 0.4),
+                                      color: theme.colorScheme.primary
+                                          .withValues(alpha: 0.35),
                                     ),
-                                  ),
-                                  child: const Text(
-                                    'DSpark Sidecar',
-                                    style: TextStyle(
-                                      color: Color(0xFFF59E0B),
-                                      fontSize: 10,
-                                      fontWeight: FontWeight.w700,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                              if (isLoadedQuant) ...[
-                                const SizedBox(width: 8),
-                                Container(
-                                  padding: const EdgeInsets.symmetric(
-                                    horizontal: 6,
-                                    vertical: 1,
-                                  ),
-                                  decoration: BoxDecoration(
-                                    color: theme.colorScheme.primary.withValues(
-                                      alpha: 0.2,
-                                    ),
-                                    borderRadius: BorderRadius.circular(4),
                                   ),
                                   child: Text(
-                                    'Active',
+                                    modalityBadge,
                                     style: TextStyle(
                                       color: theme.colorScheme.primary,
                                       fontSize: 10,
@@ -714,54 +668,235 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                                     ),
                                   ),
                                 ),
-                              ] else if (isDownloaded) ...[
-                                const SizedBox(width: 8),
+                              ],
+                              if (bundle.name.toLowerCase().contains(
+                                    'dspark',
+                                  ) ||
+                                  dsparkCount > 0) ...[
+                                const SizedBox(width: 6),
                                 Container(
                                   padding: const EdgeInsets.symmetric(
                                     horizontal: 6,
-                                    vertical: 1,
+                                    vertical: 1.5,
                                   ),
                                   decoration: BoxDecoration(
-                                    color: theme.colorScheme.outlineVariant,
+                                    color: _kAmberAccent.withValues(alpha: 0.2),
                                     borderRadius: BorderRadius.circular(4),
+                                    border: Border.all(
+                                      color: _kAmberAccent.withValues(
+                                        alpha: 0.4,
+                                      ),
+                                    ),
                                   ),
-                                  child: Text(
-                                    'Downloaded',
+                                  child: const Text(
+                                    _kBadgeDSpark,
                                     style: TextStyle(
-                                      color: theme.colorScheme.onSurfaceVariant,
+                                      color: _kAmberAccent,
                                       fontSize: 10,
-                                      fontWeight: FontWeight.w600,
+                                      fontWeight: FontWeight.w700,
                                     ),
                                   ),
                                 ),
                               ],
+                              if (isCurrentBundle)
+                                Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 7,
+                                    vertical: 2,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color: theme.colorScheme.primaryContainer
+                                        .withValues(alpha: 0.5),
+                                    borderRadius: BorderRadius.circular(6),
+                                    border: Border.all(
+                                      color: theme.colorScheme.primary
+                                          .withValues(alpha: 0.4),
+                                    ),
+                                  ),
+                                  child: Row(
+                                    mainAxisSize: MainAxisSize.min,
+                                    children: [
+                                      Icon(
+                                        Icons.check_circle_rounded,
+                                        size: 12,
+                                        color: theme.colorScheme.primary,
+                                      ),
+                                      const SizedBox(width: 4),
+                                      Text(
+                                        _kBadgeActive,
+                                        style: TextStyle(
+                                          color: theme.colorScheme.primary,
+                                          fontSize: 11,
+                                          fontWeight: FontWeight.w600,
+                                        ),
+                                      ),
+                                    ],
+                                  ),
+                                ),
                             ],
                           ),
-                          trailing: Icon(
-                            isLoadedQuant
-                                ? Icons.check_rounded
-                                : (isDownloaded
-                                      ? Icons.play_arrow_rounded
-                                      : Icons.download_rounded),
-                            size: 18,
-                            color: isLoadedQuant
-                                ? theme.colorScheme.primary
-                                : theme.colorScheme.onSurfaceVariant,
-                          ),
-                          onTap: () => Navigator.of(context).pop(
-                            BundleChoice(
-                              bundleName: bundle.name,
-                              quant: quant,
-                              displayName: bundle.displayName,
+                          subtitle: Text(
+                            dsparkCount > 0
+                                ? '$n base quants${AppStrings.metaSeparator}$dsparkCount with $_kBadgeDSpark sidecar'
+                                : '$n quantization${n == 1 ? '' : 's'}',
+                            style: TextStyle(
+                              color: theme.colorScheme.onSurfaceVariant,
+                              fontSize: 12,
                             ),
                           ),
-                        ),
-                      );
-                    },
-                  ),
-              ],
-            );
-          },
+                          children: [
+                            for (final quant in quantOptions)
+                              Builder(
+                                builder: (context) {
+                                  final isLoadedQuant =
+                                      isCurrentBundle &&
+                                      quant == widget.currentQuant;
+                                  final isDownloaded = _downloaded.any(
+                                    (r) =>
+                                        r.bundleName == bundle.name &&
+                                        r.quant == quant,
+                                  );
+                                  final isDSpark = quant.contains(
+                                    _kBadgeDSpark,
+                                  );
+                                  final baseQuant = isDSpark
+                                      ? quant.split(' ').first
+                                      : quant;
+
+                                  return Material(
+                                    color: isLoadedQuant
+                                        ? theme.colorScheme.primary.withValues(
+                                            alpha: 0.16,
+                                          )
+                                        : Colors.transparent,
+                                    child: ListTile(
+                                      dense: true,
+                                      title: Row(
+                                        children: [
+                                          Text(
+                                            baseQuant,
+                                            style: TextStyle(
+                                              fontFamily: _kMonospaceFont,
+                                              fontWeight: isLoadedQuant
+                                                  ? FontWeight.w700
+                                                  : FontWeight.normal,
+                                              color: isLoadedQuant
+                                                  ? theme.colorScheme.primary
+                                                  : null,
+                                            ),
+                                          ),
+                                          if (isDSpark) ...[
+                                            const SizedBox(width: 8),
+                                            Container(
+                                              padding:
+                                                  const EdgeInsets.symmetric(
+                                                    horizontal: 6,
+                                                    vertical: 1.5,
+                                                  ),
+                                              decoration: BoxDecoration(
+                                                color: _kAmberAccent.withValues(
+                                                  alpha: 0.2,
+                                                ),
+                                                borderRadius:
+                                                    BorderRadius.circular(4),
+                                                border: Border.all(
+                                                  color: _kAmberAccent
+                                                      .withValues(alpha: 0.4),
+                                                ),
+                                              ),
+                                              child: const Text(
+                                                _kBadgeDSparkSidecar,
+                                                style: TextStyle(
+                                                  color: _kAmberAccent,
+                                                  fontSize: 10,
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                          if (isLoadedQuant) ...[
+                                            const SizedBox(width: 8),
+                                            Container(
+                                              padding:
+                                                  const EdgeInsets.symmetric(
+                                                    horizontal: 6,
+                                                    vertical: 1,
+                                                  ),
+                                              decoration: BoxDecoration(
+                                                color: theme.colorScheme.primary
+                                                    .withValues(alpha: 0.2),
+                                                borderRadius:
+                                                    BorderRadius.circular(4),
+                                              ),
+                                              child: Text(
+                                                _kBadgeActive,
+                                                style: TextStyle(
+                                                  color:
+                                                      theme.colorScheme.primary,
+                                                  fontSize: 10,
+                                                  fontWeight: FontWeight.w700,
+                                                ),
+                                              ),
+                                            ),
+                                          ] else if (isDownloaded) ...[
+                                            const SizedBox(width: 8),
+                                            Container(
+                                              padding:
+                                                  const EdgeInsets.symmetric(
+                                                    horizontal: 6,
+                                                    vertical: 1,
+                                                  ),
+                                              decoration: BoxDecoration(
+                                                color: theme
+                                                    .colorScheme
+                                                    .outlineVariant,
+                                                borderRadius:
+                                                    BorderRadius.circular(4),
+                                              ),
+                                              child: Text(
+                                                _kBadgeDownloaded,
+                                                style: TextStyle(
+                                                  color: theme
+                                                      .colorScheme
+                                                      .onSurfaceVariant,
+                                                  fontSize: 10,
+                                                  fontWeight: FontWeight.w600,
+                                                ),
+                                              ),
+                                            ),
+                                          ],
+                                        ],
+                                      ),
+                                      trailing: Icon(
+                                        isLoadedQuant
+                                            ? Icons.check_rounded
+                                            : (isDownloaded
+                                                  ? Icons.play_arrow_rounded
+                                                  : Icons.download_rounded),
+                                        size: 18,
+                                        color: isLoadedQuant
+                                            ? theme.colorScheme.primary
+                                            : theme
+                                                  .colorScheme
+                                                  .onSurfaceVariant,
+                                      ),
+                                      onTap: () => Navigator.of(context).pop(
+                                        BundleChoice(
+                                          bundleName: bundle.name,
+                                          quant: quant,
+                                          displayName: bundle.displayName,
+                                        ),
+                                      ),
+                                    ),
+                                  );
+                                },
+                              ),
+                          ],
+                        );
+                      },
+                    ),
+            ),
+          ],
         );
       },
     );
@@ -786,6 +921,7 @@ class _TabButton extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
+    final itemCount = count ?? 0;
     return Material(
       color: isSelected ? theme.colorScheme.outlineVariant : Colors.transparent,
       borderRadius: BorderRadius.circular(7),
@@ -820,7 +956,7 @@ class _TabButton extends StatelessWidget {
                   ),
                 ),
               ),
-              if (count != null && count! > 0) ...[
+              if (itemCount > 0) ...[
                 const SizedBox(width: 6),
                 Container(
                   padding: const EdgeInsets.symmetric(
@@ -834,7 +970,7 @@ class _TabButton extends StatelessWidget {
                     borderRadius: BorderRadius.circular(10),
                   ),
                   child: Text(
-                    '$count',
+                    '$itemCount',
                     style: TextStyle(
                       fontSize: 11,
                       fontWeight: FontWeight.w700,

@@ -1,6 +1,9 @@
 import 'dart:async';
 import 'dart:typed_data';
+
 import 'package:flutter/material.dart';
+
+import '../app_constants.dart';
 import '../services/audio_recorder_service.dart';
 import 'audio_waveform.dart';
 
@@ -43,6 +46,16 @@ class MessageComposer extends StatefulWidget {
 }
 
 class _MessageComposerState extends State<MessageComposer> {
+  static const _kDefaultImageName = 'Attached image';
+  static const _kPendingImageSubtitle = 'Will be sent with next prompt';
+  static const _kRemoveImageTooltip = 'Remove attached image';
+  static const _kAttachImageTooltip = 'Attach image for vision prompt';
+  static const _kGeneratingHint = 'Model is generating response...';
+  static const _kIdleHint = 'Ask anything or attach media...';
+  static const _kStopTooltip = 'Stop generation';
+  static const _kSendTooltip = 'Send message';
+  static const double _kCancelDragThreshold = -40.0;
+
   AudioRecorderService? _localRecorder;
 
   AudioRecorderService get _audioRecorder =>
@@ -58,11 +71,10 @@ class _MessageComposerState extends State<MessageComposer> {
   @override
   void didUpdateWidget(MessageComposer oldWidget) {
     super.didUpdateWidget(oldWidget);
-    if (widget.audioRecorder != oldWidget.audioRecorder) {
-      if (widget.audioRecorder != null && _localRecorder != null) {
-        _localRecorder!.dispose();
-        _localRecorder = null;
-      }
+    if (widget.audioRecorder != oldWidget.audioRecorder &&
+        widget.audioRecorder != null) {
+      _localRecorder?.dispose();
+      _localRecorder = null;
     }
   }
 
@@ -81,7 +93,9 @@ class _MessageComposerState extends State<MessageComposer> {
     _isStartingRecording = true;
     _pointerOrigin = globalPosition;
     try {
-      await _audioRecorder.startRecording(sampleRate: 16000);
+      await _audioRecorder.startRecording(
+        sampleRate: ChatDefaults.recordingSampleRate,
+      );
       if (!mounted) {
         await _audioRecorder.cancelRecording();
         return;
@@ -114,10 +128,12 @@ class _MessageComposerState extends State<MessageComposer> {
   }
 
   void _onPointerMove(Offset currentPosition) {
-    if (!_isRecordingAudio || _pointerOrigin == null) return;
-    final diff = currentPosition - _pointerOrigin!;
+    final origin = _pointerOrigin;
+    if (!_isRecordingAudio || origin == null) return;
+    final diff = currentPosition - origin;
     // Dragging left or upwards by more than 40 pixels triggers cancel
-    final isCancel = diff.dx < -40 || diff.dy < -40;
+    final isCancel =
+        diff.dx < _kCancelDragThreshold || diff.dy < _kCancelDragThreshold;
     if (isCancel != _draggedToCancel) {
       setState(() => _draggedToCancel = isCancel);
     }
@@ -152,7 +168,7 @@ class _MessageComposerState extends State<MessageComposer> {
     try {
       final pcm = await _audioRecorder.stopRecording();
       if (pcm.isNotEmpty && mounted) {
-        widget.onSendAudio(pcm, 16000);
+        widget.onSendAudio(pcm, ChatDefaults.recordingSampleRate);
       }
     } catch (err) {
       if (mounted) {
@@ -166,180 +182,189 @@ class _MessageComposerState extends State<MessageComposer> {
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Column(
-      mainAxisSize: MainAxisSize.min,
-      children: [
-        if (widget.pendingImageBytes != null)
-          Container(
-            padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 8),
-            color: theme.colorScheme.surface,
-            child: Row(
+    final pendingBytes = widget.pendingImageBytes;
+    return Container(
+      decoration: BoxDecoration(
+        color: theme.scaffoldBackgroundColor,
+        border: Border(
+          top: BorderSide(color: theme.colorScheme.outlineVariant, width: 1),
+        ),
+      ),
+      padding: const EdgeInsets.fromLTRB(16, 10, 16, 14),
+      child: Center(
+        child: ConstrainedBox(
+          constraints: const BoxConstraints(maxWidth: 840),
+          child: Container(
+            decoration: BoxDecoration(
+              color: theme.colorScheme.surface,
+              borderRadius: BorderRadius.circular(20),
+              border: Border.all(color: theme.colorScheme.outline),
+            ),
+            padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 6),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
               children: [
-                ClipRRect(
-                  borderRadius: BorderRadius.circular(6),
-                  child: Image.memory(
-                    widget.pendingImageBytes!,
-                    width: 44,
-                    height: 44,
-                    fit: BoxFit.cover,
-                  ),
-                ),
-                const SizedBox(width: 10),
-                Expanded(
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.start,
-                    children: [
-                      Text(
-                        widget.pendingImageName ?? 'Attached image',
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                          color: theme.colorScheme.onSurface,
+                if (pendingBytes != null) ...[
+                  Padding(
+                    padding: const EdgeInsets.fromLTRB(6, 4, 4, 8),
+                    child: Row(
+                      children: [
+                        ClipRRect(
+                          borderRadius: BorderRadius.circular(8),
+                          child: Image.memory(
+                            pendingBytes,
+                            width: 44,
+                            height: 44,
+                            fit: BoxFit.cover,
+                          ),
                         ),
-                        maxLines: 1,
-                        overflow: TextOverflow.ellipsis,
-                      ),
-                      Text(
-                        'Will be sent with next prompt',
-                        style: TextStyle(
-                          fontSize: 11,
-                          color: theme.colorScheme.onSurfaceVariant,
+                        const SizedBox(width: 10),
+                        Expanded(
+                          child: Column(
+                            crossAxisAlignment: CrossAxisAlignment.start,
+                            children: [
+                              Text(
+                                widget.pendingImageName ?? _kDefaultImageName,
+                                style: TextStyle(
+                                  fontSize: 13,
+                                  fontWeight: FontWeight.w600,
+                                  color: theme.colorScheme.onSurface,
+                                ),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              Text(
+                                _kPendingImageSubtitle,
+                                style: TextStyle(
+                                  fontSize: 11,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                            ],
+                          ),
                         ),
-                      ),
-                    ],
-                  ),
-                ),
-                IconButton(
-                  icon: Icon(
-                    Icons.close_rounded,
-                    size: 18,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                  tooltip: 'Remove attached image',
-                  onPressed: widget.isBusy ? null : widget.onClearImage,
-                ),
-              ],
-            ),
-          ),
-        Container(
-          padding: const EdgeInsets.fromLTRB(16, 12, 16, 16),
-          decoration: BoxDecoration(
-            color: theme.colorScheme.surface,
-            border: Border(
-              top: BorderSide(
-                color: theme.colorScheme.outlineVariant,
-                width: 1,
-              ),
-            ),
-          ),
-          child: Row(
-            children: [
-              if (widget.canAttachImage && !_isRecordingAudio) ...[
-                IconButton(
-                  icon: Icon(
-                    Icons.add_photo_alternate_outlined,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                  tooltip: 'Attach image for vision prompt',
-                  onPressed: widget.isBusy ? null : widget.onPickImage,
-                ),
-                const SizedBox(width: 4),
-              ],
-              if (widget.canAttachAudio) ...[
-                Listener(
-                  onPointerDown: (event) => _startRecording(event.position),
-                  onPointerMove: (event) => _onPointerMove(event.position),
-                  onPointerUp: (_) => _stopRecording(),
-                  onPointerCancel: (_) => _stopRecording(),
-                  child: Container(
-                    decoration: BoxDecoration(
-                      color: _isRecordingAudio
-                          ? (_draggedToCancel
-                                ? theme.colorScheme.error
-                                : theme.colorScheme.primary)
-                          : Colors.transparent,
-                      shape: BoxShape.circle,
-                    ),
-                    padding: const EdgeInsets.all(8),
-                    child: Icon(
-                      _isRecordingAudio
-                          ? Icons.mic_rounded
-                          : Icons.mic_none_rounded,
-                      color: _isRecordingAudio
-                          ? theme.colorScheme.onPrimary
-                          : theme.colorScheme.primary,
-                      size: 22,
-                    ),
-                  ),
-                ),
-                const SizedBox(width: 6),
-              ],
-              Expanded(
-                child: _isRecordingAudio
-                    ? _buildRecordingIndicator(theme)
-                    : TextField(
-                        controller: widget.controller,
-                        decoration: InputDecoration(
-                          hintText: widget.isGenerating
-                              ? 'Model is generating response...'
-                              : 'Send a message...',
-                          hintStyle: TextStyle(
+                        IconButton(
+                          icon: Icon(
+                            Icons.close_rounded,
+                            size: 18,
                             color: theme.colorScheme.onSurfaceVariant,
                           ),
-                          filled: true,
-                          fillColor: theme.scaffoldBackgroundColor,
-                          contentPadding: const EdgeInsets.symmetric(
-                            horizontal: 16,
-                            vertical: 12,
+                          tooltip: _kRemoveImageTooltip,
+                          onPressed: widget.isBusy ? null : widget.onClearImage,
+                        ),
+                      ],
+                    ),
+                  ),
+                  Divider(color: theme.colorScheme.outlineVariant, height: 1),
+                  const SizedBox(height: 4),
+                ],
+                Row(
+                  children: [
+                    if (widget.canAttachImage && !_isRecordingAudio) ...[
+                      IconButton(
+                        icon: Icon(
+                          Icons.add_photo_alternate_outlined,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                        tooltip: _kAttachImageTooltip,
+                        onPressed: widget.isBusy ? null : widget.onPickImage,
+                      ),
+                    ],
+                    if (widget.canAttachAudio) ...[
+                      Listener(
+                        onPointerDown: (event) =>
+                            _startRecording(event.position),
+                        onPointerMove: (event) =>
+                            _onPointerMove(event.position),
+                        onPointerUp: (_) => _stopRecording(),
+                        onPointerCancel: (_) => _stopRecording(),
+                        child: Container(
+                          decoration: BoxDecoration(
+                            color: _isRecordingAudio
+                                ? (_draggedToCancel
+                                      ? theme.colorScheme.error
+                                      : theme.colorScheme.primary)
+                                : theme.colorScheme.primary.withValues(
+                                    alpha: 0.1,
+                                  ),
+                            shape: BoxShape.circle,
                           ),
-                          border: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(24),
-                            borderSide: BorderSide(
-                              color: theme.colorScheme.outline,
-                            ),
-                          ),
-                          enabledBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(24),
-                            borderSide: BorderSide(
-                              color: theme.colorScheme.outline,
-                            ),
-                          ),
-                          focusedBorder: OutlineInputBorder(
-                            borderRadius: BorderRadius.circular(24),
-                            borderSide: BorderSide(
-                              color: theme.colorScheme.primary,
-                            ),
+                          padding: const EdgeInsets.all(8),
+                          child: Icon(
+                            _isRecordingAudio
+                                ? Icons.mic_rounded
+                                : Icons.mic_none_rounded,
+                            color: _isRecordingAudio
+                                ? theme.colorScheme.onPrimary
+                                : theme.colorScheme.primary,
+                            size: 20,
                           ),
                         ),
-                        readOnly: widget.isGenerating,
-                        onSubmitted: (_) => widget.onSend(),
                       ),
-              ),
-              const SizedBox(width: 10),
-              if (widget.isGenerating)
-                IconButton.filled(
-                  style: IconButton.styleFrom(
-                    backgroundColor: theme.colorScheme.error,
-                    foregroundColor: theme.colorScheme.onError,
-                  ),
-                  icon: const Icon(Icons.stop_rounded),
-                  tooltip: 'Stop generation',
-                  onPressed: widget.onStop,
-                )
-              else if (!_isRecordingAudio)
-                IconButton.filled(
-                  style: IconButton.styleFrom(
-                    backgroundColor: theme.colorScheme.primary,
-                    foregroundColor: theme.colorScheme.onPrimary,
-                  ),
-                  icon: const Icon(Icons.arrow_upward_rounded),
-                  tooltip: 'Send message',
-                  onPressed: widget.isBusy ? null : widget.onSend,
+                      const SizedBox(width: 6),
+                    ],
+                    Expanded(
+                      child: _isRecordingAudio
+                          ? _buildRecordingIndicator(theme)
+                          : TextField(
+                              controller: widget.controller,
+                              style: TextStyle(
+                                fontSize: 14,
+                                color: theme.colorScheme.onSurface,
+                              ),
+                              decoration: InputDecoration(
+                                hintText: widget.isGenerating
+                                    ? _kGeneratingHint
+                                    : _kIdleHint,
+                                hintStyle: TextStyle(
+                                  fontSize: 14,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                                isDense: true,
+                                contentPadding: const EdgeInsets.symmetric(
+                                  horizontal: 10,
+                                  vertical: 10,
+                                ),
+                                border: InputBorder.none,
+                                enabledBorder: InputBorder.none,
+                                focusedBorder: InputBorder.none,
+                              ),
+                              readOnly: widget.isGenerating,
+                              onSubmitted: (_) => widget.onSend(),
+                            ),
+                    ),
+                    const SizedBox(width: 6),
+                    if (widget.isGenerating)
+                      IconButton.filled(
+                        style: IconButton.styleFrom(
+                          backgroundColor: theme.colorScheme.error,
+                          foregroundColor: theme.colorScheme.onError,
+                          minimumSize: const Size(36, 36),
+                          padding: EdgeInsets.zero,
+                        ),
+                        icon: const Icon(Icons.stop_rounded, size: 19),
+                        tooltip: _kStopTooltip,
+                        onPressed: widget.onStop,
+                      )
+                    else if (!_isRecordingAudio)
+                      IconButton.filled(
+                        style: IconButton.styleFrom(
+                          backgroundColor: theme.colorScheme.primary,
+                          foregroundColor: theme.colorScheme.onPrimary,
+                          minimumSize: const Size(36, 36),
+                          padding: EdgeInsets.zero,
+                        ),
+                        icon: const Icon(Icons.arrow_upward_rounded, size: 19),
+                        tooltip: _kSendTooltip,
+                        onPressed: widget.isBusy ? null : widget.onSend,
+                      ),
+                  ],
                 ),
-            ],
+              ],
+            ),
           ),
         ),
-      ],
+      ),
     );
   }
 

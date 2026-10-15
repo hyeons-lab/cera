@@ -652,10 +652,13 @@ console.log(session.adapter);  // e.g. "<adapter> (BrowserWebGpu)"
 // browser console, so this getter is the only way to tell.
 console.log(session.kvCompression);
 
-// Greedy generate. `onToken(text)` fires per decoded piece as it's
-// produced; the full string is also returned. Stateful: the on-GPU KV
-// cache persists across calls, so a second `generate()` continues the
-// same sequence rather than restarting.
+// Generate on WebGPU. Passing `temperature = 0` (or `topK = 1`) uses the
+// fast GPU argmax path (4-byte readback per token, plus optional speculative
+// decoding); passing `temperature > 0` (with optional `topP`, `topK`, `seed`)
+// reads back logits and runs full stochastic sampling on the host.
+// `onToken(text)` fires per decoded piece as it is produced; the full string
+// is also returned. Stateful: the on-GPU KV cache persists across calls, so a
+// second `generate()` continues the same sequence rather than restarting.
 const text = await session.generate('The capital of France is', 32, 0, undefined, undefined, undefined, (piece) => {
     outputEl.textContent += piece;  // stream into the DOM (browser-safe)
 });

@@ -1,6 +1,7 @@
 import 'dart:typed_data';
 
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart' hide ModelSource;
+
 import 'chat_state.dart';
 import 'model_source.dart';
 
@@ -81,7 +82,7 @@ class ClearTranscriptIntent extends ChatIntent {
   const ClearTranscriptIntent();
 }
 
-/// Intent to update runtime and engine settings (e.g. backend, TurboQuant, max image dimension, audio mode).
+/// Intent to update runtime and engine settings (e.g. backend, TurboQuant, max image dimension, audio mode, sampling).
 class UpdateSettingsIntent extends ChatIntent {
   const UpdateSettingsIntent({
     this.backend,
@@ -92,6 +93,13 @@ class UpdateSettingsIntent extends ChatIntent {
     this.chatVoice,
     this.clearChatVoice = false,
     this.ttsStudioVoice,
+    this.temperature,
+    this.clearTemperature = false,
+    this.topP,
+    this.clearTopP = false,
+    this.topK,
+    this.clearTopK = false,
+    this.maxTokens,
   });
 
   final CeraBackend? backend;
@@ -102,6 +110,13 @@ class UpdateSettingsIntent extends ChatIntent {
   final String? chatVoice;
   final bool clearChatVoice;
   final String? ttsStudioVoice;
+  final double? temperature;
+  final bool clearTemperature;
+  final double? topP;
+  final bool clearTopP;
+  final int? topK;
+  final bool clearTopK;
+  final int? maxTokens;
 }
 
 /// Intent to switch the main app UI mode (Chat vs TTS Studio).
