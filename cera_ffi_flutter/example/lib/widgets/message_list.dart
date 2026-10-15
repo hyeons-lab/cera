@@ -1,3 +1,5 @@
+import 'package:cera_ffi_flutter/cera_ffi_flutter.dart'
+    show CeraAudioProfile, CeraTtsVoice;
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
 
@@ -20,6 +22,9 @@ class MessageList extends StatelessWidget {
     this.activeBackend,
     this.isTtsMode = false,
     this.ttsSampleTexts = const <String>[],
+    this.audioProfile,
+    this.selectedVoicePrompt = '',
+    this.onVoiceChanged,
     this.onOpenCatalog,
     this.onOpenLocalModel,
     this.onSelectPrompt,
@@ -34,6 +39,9 @@ class MessageList extends StatelessWidget {
   final String? activeBackend;
   final bool isTtsMode;
   final List<String> ttsSampleTexts;
+  final CeraAudioProfile? audioProfile;
+  final String selectedVoicePrompt;
+  final ValueChanged<String?>? onVoiceChanged;
   final VoidCallback? onOpenCatalog;
   final VoidCallback? onOpenLocalModel;
   final ValueChanged<String>? onSelectPrompt;
@@ -43,6 +51,7 @@ class MessageList extends StatelessWidget {
       'Enter text below or pick a sample script to synthesize speech.';
   static const _kBrowseCatalogButton = 'Browse Models';
   static const _kOpenLocalButton = 'Open .gguf File';
+  static const _kVoicePersonaLabel = 'VOICE PERSONA';
   static const _kDefaultStarterPrompts = [
     'Explain how speculative decoding speeds up local LLMs.',
     'Write a clean Rust function to compute cosine similarity.',
@@ -68,6 +77,9 @@ class MessageList extends StatelessWidget {
       final subtitle = !hasModel
           ? (statusText ?? AppStrings.initialStatus)
           : (isTtsMode ? _kTtsReadyGreeting : _kReadyGreeting);
+      final voices = audioProfile?.voices ?? const <CeraTtsVoice>[];
+      final activeVoicePrompt =
+          audioProfile?.voiceFor(selectedVoicePrompt)?.prompt ?? '';
 
       return Center(
         child: SingleChildScrollView(
@@ -119,22 +131,67 @@ class MessageList extends StatelessWidget {
                   Container(
                     padding: const EdgeInsets.symmetric(
                       horizontal: 10,
-                      vertical: 4,
+                      vertical: 5,
                     ),
                     decoration: BoxDecoration(
                       color: theme.colorScheme.surfaceContainerLow,
                       borderRadius: BorderRadius.circular(20),
                     ),
-                    child: Text(
-                      activeBackend!,
-                      maxLines: 1,
-                      overflow: TextOverflow.ellipsis,
-                      style: TextStyle(
-                        fontSize: 11.5,
-                        fontWeight: FontWeight.w500,
-                        color: theme.colorScheme.onSurfaceVariant,
-                      ),
+                    child: Row(
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Icon(
+                          Icons.memory_rounded,
+                          size: 13,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
+                        const SizedBox(width: 5),
+                        Flexible(
+                          child: Text(
+                            activeBackend!,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 11.5,
+                              fontWeight: FontWeight.w600,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
+                      ],
                     ),
+                  ),
+                ],
+                if (hasModel &&
+                    !isLoading &&
+                    voices.isNotEmpty &&
+                    onVoiceChanged != null) ...[
+                  const SizedBox(height: 20),
+                  Text(
+                    _kVoicePersonaLabel,
+                    style: TextStyle(
+                      fontSize: 11,
+                      fontWeight: FontWeight.w600,
+                      letterSpacing: 0.8,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  Wrap(
+                    spacing: 8,
+                    runSpacing: 8,
+                    alignment: WrapAlignment.center,
+                    children: [
+                      for (final voice in voices)
+                        ChoiceChip(
+                          label: Text(
+                            voice.label,
+                            style: const TextStyle(fontSize: 12.5),
+                          ),
+                          selected: activeVoicePrompt == voice.prompt,
+                          onSelected: (_) => onVoiceChanged?.call(voice.prompt),
+                        ),
+                    ],
                   ),
                 ],
                 if (!hasModel &&
@@ -201,7 +258,7 @@ class MessageList extends StatelessWidget {
                   ),
                 ],
                 if (hasModel && !isLoading && onSelectPrompt != null) ...[
-                  const SizedBox(height: 28),
+                  const SizedBox(height: 24),
                   Wrap(
                     spacing: 8,
                     runSpacing: 8,
@@ -234,7 +291,11 @@ class MessageList extends StatelessWidget {
         return Center(
           child: ConstrainedBox(
             constraints: const BoxConstraints(maxWidth: 768),
-            child: _TurnBubble(turn: turn, audioPlayer: audioPlayer),
+            child: _TurnBubble(
+              turn: turn,
+              audioPlayer: audioPlayer,
+              activeBackend: activeBackend,
+            ),
           ),
         );
       },
@@ -290,10 +351,11 @@ class _StarterPromptPill extends StatelessWidget {
 }
 
 class _TurnBubble extends StatelessWidget {
-  const _TurnBubble({required this.turn, this.audioPlayer});
+  const _TurnBubble({required this.turn, this.audioPlayer, this.activeBackend});
 
   final Turn turn;
   final AudioPlayerService? audioPlayer;
+  final String? activeBackend;
 
   static const _kBulletSeparator = '·';
 
@@ -369,6 +431,7 @@ class _TurnBubble extends StatelessWidget {
   Widget _buildAssistantTurn(BuildContext context, ThemeData theme) {
     final audioDuration = turn.audioDurationSeconds;
     final modelName = turn.modelName;
+    final backend = activeBackend;
     final stats = turn.stats;
 
     return Padding(
@@ -404,6 +467,29 @@ class _TurnBubble extends StatelessWidget {
                   ),
                 ),
               ),
+              if (backend != null && backend.isNotEmpty) ...[
+                const SizedBox(width: 6),
+                Container(
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 7,
+                    vertical: 2,
+                  ),
+                  decoration: BoxDecoration(
+                    color: theme.colorScheme.surfaceContainerLow,
+                    borderRadius: BorderRadius.circular(10),
+                  ),
+                  child: Text(
+                    backend,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
+                    style: TextStyle(
+                      fontSize: 10.5,
+                      fontWeight: FontWeight.w600,
+                      color: theme.colorScheme.onSurfaceVariant,
+                    ),
+                  ),
+                ),
+              ],
             ],
           ),
           const SizedBox(height: 8),

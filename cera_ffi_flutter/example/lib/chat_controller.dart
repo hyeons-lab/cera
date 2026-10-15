@@ -488,11 +488,16 @@ class ChatController extends ValueNotifier<ChatState> {
         value.settings,
         cera.capabilities,
       );
+      final effectiveProfile = resolveAudioProfile(
+        cera.audioProfile,
+        modelIdentity: bundleName ?? displayName ?? modelSource.name,
+        capabilities: cera.capabilities,
+      );
 
       value = value.copyWith(
         loadedModel: () => modelSource,
         capabilities: () => cera.capabilities,
-        audioProfile: () => cera.audioProfile,
+        audioProfile: () => effectiveProfile,
         backend: () => cera.backend,
         status:
             '${modelSource.name}${AppStrings.metaSeparator}${cera.backend}$visionTag$voiceTag',
@@ -649,7 +654,7 @@ class ChatController extends ValueNotifier<ChatState> {
         settings: value.settings,
         uiMode: value.uiMode,
         isAudioPrompt: false,
-        profile: cera.audioProfile,
+        profile: value.audioProfile ?? cera.audioProfile,
       );
       final messages = <CeraMessage>[
         if (systemPrompt != null) CeraMessage.system(systemPrompt),
@@ -838,7 +843,7 @@ class ChatController extends ValueNotifier<ChatState> {
       settings: value.settings,
       uiMode: value.uiMode,
       isAudioPrompt: true,
-      profile: cera.audioProfile,
+      profile: value.audioProfile ?? cera.audioProfile,
     );
 
     try {
@@ -1242,6 +1247,73 @@ class ChatController extends ValueNotifier<ChatState> {
       default:
         return null;
     }
+  }
+
+  static const List<CeraTtsVoice> _kDefaultLfmAudioVoices = [
+    CeraTtsVoice(
+      label: AudioProfileDefaults.usFemaleLabel,
+      prompt: AudioProfileDefaults.usFemalePrompt,
+      ttsSystemPrompt: AudioProfileDefaults.usFemaleTtsSystemPrompt,
+      interleavedSystemPrompt:
+          AudioProfileDefaults.usFemaleInterleavedSystemPrompt,
+    ),
+    CeraTtsVoice(
+      label: AudioProfileDefaults.usMaleLabel,
+      prompt: AudioProfileDefaults.usMalePrompt,
+      ttsSystemPrompt: AudioProfileDefaults.usMaleTtsSystemPrompt,
+      interleavedSystemPrompt:
+          AudioProfileDefaults.usMaleInterleavedSystemPrompt,
+    ),
+    CeraTtsVoice(
+      label: AudioProfileDefaults.ukFemaleLabel,
+      prompt: AudioProfileDefaults.ukFemalePrompt,
+      ttsSystemPrompt: AudioProfileDefaults.ukFemaleTtsSystemPrompt,
+      interleavedSystemPrompt:
+          AudioProfileDefaults.ukFemaleInterleavedSystemPrompt,
+    ),
+    CeraTtsVoice(
+      label: AudioProfileDefaults.ukMaleLabel,
+      prompt: AudioProfileDefaults.ukMalePrompt,
+      ttsSystemPrompt: AudioProfileDefaults.ukMaleTtsSystemPrompt,
+      interleavedSystemPrompt:
+          AudioProfileDefaults.ukMaleInterleavedSystemPrompt,
+    ),
+  ];
+
+  /// Ensures English `LFM2*-Audio` models always expose their 4 built-in voice
+  /// personas even when loaded from raw `.gguf` bytes (`<bytes>`) or via an
+  /// older web worker `.wasm` binary that returns an empty voice list.
+  @visibleForTesting
+  static CeraAudioProfile resolveAudioProfile(
+    CeraAudioProfile profile, {
+    required String modelIdentity,
+    required CeraCapabilities capabilities,
+  }) {
+    if (profile.hasVoices || !capabilities.audioOut) {
+      return profile;
+    }
+    final tokens = modelIdentity
+        .toLowerCase()
+        .split(RegExp(r'[^a-z0-9]+'))
+        .where((t) => t.isNotEmpty)
+        .toList();
+    final hasLfm = tokens.any(
+      (t) => t.startsWith(AudioProfileDefaults.lfmToken),
+    );
+    final hasAudio = tokens.contains(AudioProfileDefaults.audioToken);
+    final isJapanese =
+        tokens.contains(AudioProfileDefaults.jpToken) ||
+        tokens.contains(AudioProfileDefaults.japaneseToken);
+    if (hasLfm && hasAudio && !isJapanese) {
+      return CeraAudioProfile(
+        ttsSystemPrompt: AudioProfileDefaults.usFemaleTtsSystemPrompt,
+        interleavedSystemPrompt:
+            AudioProfileDefaults.usFemaleInterleavedSystemPrompt,
+        voices: _kDefaultLfmAudioVoices,
+        sampleTexts: profile.sampleTexts,
+      );
+    }
+    return profile;
   }
 
   @override

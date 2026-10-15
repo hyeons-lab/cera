@@ -79,6 +79,8 @@ class _MessageComposerState extends State<MessageComposer> {
   static const _kHoldToTalkTooltip = 'Hold to record voice';
   static const _kDefaultVoiceLabel = 'Default Voice';
   static const _kDefaultVoiceCode = '__default__';
+  static const _kSelectVoiceTooltip = 'Select voice persona';
+  static const _kSelectAudioModeTooltip = 'Select audio mode';
   static const _kSampleChipLabel = 'Sample';
   static const _kModeVoiceChat = 'Voice Chat';
   static const _kModeSpeakTts = 'Speak (TTS)';
@@ -263,10 +265,7 @@ class _MessageComposerState extends State<MessageComposer> {
         widget.onAudioChatModeChanged != null;
     final voices = widget.audioProfile?.voices ?? const <CeraTtsVoice>[];
     final showVoiceSelector =
-        voices.isNotEmpty &&
-        widget.onVoiceChanged != null &&
-        (widget.audioChatMode == AudioChatMode.interleaved ||
-            widget.audioChatMode == AudioChatMode.textToSpeech);
+        voices.isNotEmpty && widget.onVoiceChanged != null;
     final activeVoice = voices
         .where((v) => v.prompt == widget.selectedVoicePrompt)
         .firstOrNull;
@@ -474,7 +473,7 @@ class _MessageComposerState extends State<MessageComposer> {
 
   Widget _buildAudioModeSelector(ThemeData theme) {
     return PopupMenuButton<AudioChatMode>(
-      tooltip: '',
+      tooltip: _kSelectAudioModeTooltip,
       color: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
       onSelected: widget.onAudioChatModeChanged,
@@ -513,11 +512,20 @@ class _MessageComposerState extends State<MessageComposer> {
     CeraTtsVoice? activeVoice,
   ) {
     return PopupMenuButton<String>(
-      tooltip: '',
+      tooltip: _kSelectVoiceTooltip,
       color: theme.colorScheme.surface,
       shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(14)),
       onSelected: (val) {
         widget.onVoiceChanged?.call(val == _kDefaultVoiceCode ? null : val);
+        if (widget.hasAudioOut &&
+            widget.audioChatMode != AudioChatMode.interleaved &&
+            widget.audioChatMode != AudioChatMode.textToSpeech) {
+          widget.onAudioChatModeChanged?.call(
+            widget.hasAudioIn
+                ? AudioChatMode.interleaved
+                : AudioChatMode.textToSpeech,
+          );
+        }
       },
       itemBuilder: (context) => [
         const PopupMenuItem(

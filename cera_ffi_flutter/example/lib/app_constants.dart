@@ -144,3 +144,38 @@ abstract final class AppStrings {
   static const copiedToClipboard = 'Copied to clipboard';
   static const copyTextTooltip = 'Copy text';
 }
+
+/// Fallback audio profile tokens and speaker voices for LFM2.5-Audio models when
+/// opened from raw bytes or an older web worker binary without manifest metadata.
+abstract final class AudioProfileDefaults {
+  static const lfmToken = 'lfm';
+  static const audioToken = 'audio';
+  static const jpToken = 'jp';
+  static const japaneseToken = 'japanese';
+
+  static const usFemaleLabel = '👩 US Female';
+  static const usFemalePrompt = 'Use the US female voice.';
+  static const usFemaleTtsSystemPrompt =
+      'Perform TTS. Use the US female voice.';
+  static const usFemaleInterleavedSystemPrompt =
+      'Respond with interleaved text and audio. Use the US female voice.';
+
+  static const usMaleLabel = '👨 US Male';
+  static const usMalePrompt = 'Use the US male voice.';
+  static const usMaleTtsSystemPrompt = 'Perform TTS. Use the US male voice.';
+  static const usMaleInterleavedSystemPrompt =
+      'Respond with interleaved text and audio. Use the US male voice.';
+
+  static const ukFemaleLabel = '👩 UK Female';
+  static const ukFemalePrompt = 'Use the UK female voice.';
+  static const ukFemaleTtsSystemPrompt =
+      'Perform TTS. Use the UK female voice.';
+  static const ukFemaleInterleavedSystemPrompt =
+      'Respond with interleaved text and audio. Use the UK female voice.';
+
+  static const ukMaleLabel = '👨 UK Male';
+  static const ukMalePrompt = 'Use the UK male voice.';
+  static const ukMaleTtsSystemPrompt = 'Perform TTS. Use the UK male voice.';
+  static const ukMaleInterleavedSystemPrompt =
+      'Respond with interleaved text and audio. Use the UK male voice.';
+}

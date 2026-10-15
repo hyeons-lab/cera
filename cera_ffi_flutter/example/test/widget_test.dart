@@ -5,7 +5,7 @@
 // is enough to catch a broken widget tree in CI.
 
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart'
-    show CeraAudioProfile, CeraTtsVoice;
+    show CeraAudioProfile, CeraCapabilities, CeraTtsVoice;
 import 'package:cera_ffi_flutter_example/chat_controller.dart';
 import 'package:cera_ffi_flutter_example/chat_state.dart';
 import 'package:cera_ffi_flutter_example/main.dart';
@@ -632,6 +632,151 @@ void main() {
       await tester.tap(find.text('Studio Warm').last);
       await tester.pumpAndSettle();
       expect(selectedVoice, 'Use the UK male voice.');
+    },
+  );
+
+  test(
+    'resolveAudioProfile populates standard LFM2.5-Audio voices when runtime returns plain profile',
+    () {
+      const audioCaps = CeraCapabilities(
+        textIn: true,
+        textOut: true,
+        imageIn: false,
+        audioIn: true,
+        audioOut: true,
+      );
+
+      final resolvedEnglish = ChatController.resolveAudioProfile(
+        plainProfile,
+        modelIdentity: 'LFM2.5-Audio-1.5B-Q4_0.gguf',
+        capabilities: audioCaps,
+      );
+      expect(resolvedEnglish.hasVoices, isTrue);
+      expect(resolvedEnglish.voices.length, 4);
+      expect(resolvedEnglish.voices.first.label, '👩 US Female');
+
+      // Japanese LFM2.5-Audio model keeps empty voices list
+      final resolvedJapanese = ChatController.resolveAudioProfile(
+        japaneseProfile,
+        modelIdentity: 'LFM2.5-Audio-1.5B-JP-GGUF',
+        capabilities: audioCaps,
+      );
+      expect(resolvedJapanese.hasVoices, isFalse);
+
+      // Non-LFM audio model keeps its original profile
+      final resolvedGeneric = ChatController.resolveAudioProfile(
+        plainProfile,
+        modelIdentity: 'SomeNewAudioModel-2B',
+        capabilities: audioCaps,
+      );
+      expect(resolvedGeneric.hasVoices, isFalse);
+    },
+  );
+
+  testWidgets(
+    'message list displays active backend badge on assistant turns and voice persona chips in empty state',
+    (WidgetTester tester) async {
+      String? pickedVoice;
+
+      // Empty state with loaded audio model and active backend
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: MessageList(
+              turns: const [],
+              scrollController: ScrollController(),
+              hasModel: true,
+              activeBackend: 'WebGPU',
+              audioProfile: englishProfile,
+              selectedVoicePrompt: 'Use the US female voice.',
+              onVoiceChanged: (v) => pickedVoice = v,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('WebGPU'), findsOneWidget);
+      expect(find.text('VOICE PERSONA'), findsOneWidget);
+      expect(find.text('Narrator'), findsOneWidget);
+      expect(find.text('Studio Warm'), findsOneWidget);
+
+      await tester.tap(find.text('Studio Warm'));
+      await tester.pumpAndSettle();
+      expect(pickedVoice, 'Use the UK male voice.');
+
+      // Non-empty transcript shows activeBackend badge next to modelName on assistant turns
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: MessageList(
+              turns: const [
+                Turn(role: 'user', text: 'Hello'),
+                Turn(
+                  role: 'assistant',
+                  text: 'Hi there!',
+                  modelName: 'LFM2.5-Audio-1.5B · Q4_0',
+                ),
+              ],
+              scrollController: ScrollController(),
+              hasModel: true,
+              activeBackend: 'Metal GPU',
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('LFM2.5-Audio-1.5B · Q4_0'), findsOneWidget);
+      expect(find.text('Metal GPU'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'message composer keeps voice persona selector visible in textOnly mode and auto-switches to voice chat when picked',
+    (WidgetTester tester) async {
+      AudioChatMode? switchedMode;
+      String? pickedVoice;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            bottomNavigationBar: MessageComposer(
+              controller: TextEditingController(),
+              isBusy: false,
+              isGenerating: false,
+              canAttachImage: false,
+              canAttachAudio: true,
+              pendingImageBytes: null,
+              pendingImageName: null,
+              hasAudioIn: true,
+              hasAudioOut: true,
+              audioChatMode: AudioChatMode.textOnly,
+              onAudioChatModeChanged: (m) => switchedMode = m,
+              audioProfile: englishProfile,
+              selectedVoicePrompt: '',
+              onVoiceChanged: (v) => pickedVoice = v,
+              onSend: () {},
+              onStop: () {},
+              onPickImage: () {},
+              onClearImage: () {},
+              onSendAudio: (_, _) {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Text Only'), findsOneWidget);
+      expect(find.text('Default Voice'), findsOneWidget);
+
+      await tester.tap(find.text('Default Voice'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Studio Warm').last);
+      await tester.pumpAndSettle();
+
+      expect(pickedVoice, 'Use the UK male voice.');
+      expect(switchedMode, AudioChatMode.interleaved);
     },
   );
 }

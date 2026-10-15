@@ -239,6 +239,7 @@ class _ChatPageState extends State<ChatPage> {
   static const _kImageDimHdLabel = '512 px (HD)';
   static const _kImageDimNativeLabel = 'Native';
 
+  static const _kSectionVoice = 'VOICE & SPEECH';
   static const _kVoiceModeTitle = 'Audio Mode';
   static const _kVoiceModeSubtitle =
       'How audio models handle speech input and output';
@@ -246,6 +247,11 @@ class _ChatPageState extends State<ChatPage> {
   static const _kVoiceModeInterleavedLabel = 'Voice Chat';
   static const _kVoiceModeTtsLabel = 'Text to Speech (TTS)';
   static const _kVoiceModeTextOnlyMenuLabel = 'Text Only';
+  static const _kVoicePersonaTitle = 'Voice Persona';
+  static const _kVoicePersonaUnavailableSubtitle =
+      'Load an audio generation model (such as LFM2.5-Audio-1.5B) to select a speaker voice';
+  static const _kVoicePersonaUnavailableBadge = 'No Audio Model';
+  static const _kActiveRuntimePrefix = 'Active backend: ';
 
   static const _kModelPlaceholderToken = '{model}';
 
@@ -481,6 +487,45 @@ class _ChatPageState extends State<ChatPage> {
                         theme: theme,
                         child: Column(
                           children: [
+                            if (currentState.hasModel)
+                              ListTile(
+                                leading: const Icon(
+                                  Icons.memory_rounded,
+                                  color: _kStatusEmerald,
+                                ),
+                                title: Text(
+                                  currentState.loadedModel?.name ??
+                                      AppStrings.unknownModel,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
+                                  style: const TextStyle(
+                                    fontWeight: FontWeight.w600,
+                                  ),
+                                ),
+                                subtitle: Text(
+                                  '$_kActiveRuntimePrefix${currentState.backend ?? AppStrings.unknownBackend}',
+                                ),
+                                trailing: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 9,
+                                    vertical: 4,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color:
+                                        theme.colorScheme.surfaceContainerHigh,
+                                    borderRadius: BorderRadius.circular(12),
+                                  ),
+                                  child: Text(
+                                    currentState.backend ??
+                                        AppStrings.unknownBackend,
+                                    style: TextStyle(
+                                      fontSize: 11.5,
+                                      fontWeight: FontWeight.w600,
+                                      color: theme.colorScheme.onSurface,
+                                    ),
+                                  ),
+                                ),
+                              ),
                             ListTile(
                               leading: Icon(
                                 Icons.cloud_download_outlined,
@@ -709,6 +754,139 @@ class _ChatPageState extends State<ChatPage> {
                         ),
                       ),
                       const SizedBox(height: 18),
+                      _SectionLabel(label: _kSectionVoice, theme: theme),
+                      const SizedBox(height: 8),
+                      _TonalCard(
+                        theme: theme,
+                        padding: const EdgeInsets.symmetric(
+                          horizontal: 16,
+                          vertical: 8,
+                        ),
+                        child: Column(
+                          children: [
+                            ListTile(
+                              contentPadding: EdgeInsets.zero,
+                              title: const Text(_kVoiceModeTitle),
+                              subtitle: Text(
+                                _kVoiceModeSubtitle,
+                                style: TextStyle(
+                                  fontSize: 12,
+                                  color: theme.colorScheme.onSurfaceVariant,
+                                ),
+                              ),
+                              trailing: ConstrainedBox(
+                                constraints: const BoxConstraints(
+                                  maxWidth: 150,
+                                ),
+                                child: DropdownButton<AudioChatMode>(
+                                  value: currentSettings.audioChatMode,
+                                  isExpanded: true,
+                                  dropdownColor: theme.colorScheme.surface,
+                                  underline: const SizedBox.shrink(),
+                                  items: const [
+                                    DropdownMenuItem(
+                                      value: AudioChatMode.speechToText,
+                                      child: Text(
+                                        _kVoiceModeAsrLabel,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: AudioChatMode.interleaved,
+                                      child: Text(
+                                        _kVoiceModeInterleavedLabel,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: AudioChatMode.textToSpeech,
+                                      child: Text(
+                                        _kVoiceModeTtsLabel,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                    DropdownMenuItem(
+                                      value: AudioChatMode.textOnly,
+                                      child: Text(
+                                        _kVoiceModeTextOnlyMenuLabel,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                    ),
+                                  ],
+                                  onChanged: (val) {
+                                    if (val == null) return;
+                                    _controller.dispatch(
+                                      UpdateSettingsIntent(audioChatMode: val),
+                                    );
+                                  },
+                                ),
+                              ),
+                            ),
+                            if (currentState.audioProfile?.hasVoices ?? false)
+                              VoicePersonaPicker(
+                                profile: currentState.audioProfile,
+                                saved: currentSettings.chatVoice,
+                                onChanged: (val) {
+                                  final hasAudioOut =
+                                      currentState.capabilities?.audioOut ??
+                                      false;
+                                  final hasAudioIn =
+                                      currentState.capabilities?.audioIn ??
+                                      false;
+                                  final shouldEnableSpeech =
+                                      hasAudioOut &&
+                                      currentSettings.audioChatMode !=
+                                          AudioChatMode.interleaved &&
+                                      currentSettings.audioChatMode !=
+                                          AudioChatMode.textToSpeech;
+                                  _controller.dispatch(
+                                    UpdateSettingsIntent(
+                                      chatVoice: val,
+                                      clearChatVoice: val == null,
+                                      audioChatMode: shouldEnableSpeech
+                                          ? (hasAudioIn
+                                                ? AudioChatMode.interleaved
+                                                : AudioChatMode.textToSpeech)
+                                          : null,
+                                    ),
+                                  );
+                                },
+                              )
+                            else
+                              ListTile(
+                                contentPadding: EdgeInsets.zero,
+                                title: const Text(_kVoicePersonaTitle),
+                                subtitle: Text(
+                                  _kVoicePersonaUnavailableSubtitle,
+                                  style: TextStyle(
+                                    fontSize: 12,
+                                    color: theme.colorScheme.onSurfaceVariant,
+                                  ),
+                                ),
+                                trailing: Container(
+                                  padding: const EdgeInsets.symmetric(
+                                    horizontal: 9,
+                                    vertical: 4,
+                                  ),
+                                  decoration: BoxDecoration(
+                                    color:
+                                        theme.colorScheme.surfaceContainerHigh,
+                                    borderRadius: BorderRadius.circular(10),
+                                  ),
+                                  child: Text(
+                                    _kVoicePersonaUnavailableBadge,
+                                    style: TextStyle(
+                                      fontSize: 11,
+                                      fontWeight: FontWeight.w500,
+                                      color: theme.colorScheme.onSurfaceVariant,
+                                    ),
+                                  ),
+                                ),
+                              ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(height: 18),
                       _SectionLabel(label: _kSectionInference, theme: theme),
                       const SizedBox(height: 8),
                       _TonalCard(
@@ -723,7 +901,10 @@ class _ChatPageState extends State<ChatPage> {
                               contentPadding: EdgeInsets.zero,
                               title: const Text(_kComputeBackendTitle),
                               subtitle: Text(
-                                _kComputeBackendSubtitle,
+                                currentState.backend != null &&
+                                        currentState.backend!.isNotEmpty
+                                    ? '$_kActiveRuntimePrefix${currentState.backend}${AppStrings.metaSeparator}$_kComputeBackendSubtitle'
+                                    : _kComputeBackendSubtitle,
                                 style: TextStyle(
                                   fontSize: 12,
                                   color: theme.colorScheme.onSurfaceVariant,
@@ -847,82 +1028,6 @@ class _ChatPageState extends State<ChatPage> {
                                 ),
                               ),
                             ),
-                            ListTile(
-                              contentPadding: EdgeInsets.zero,
-                              title: const Text(_kVoiceModeTitle),
-                              subtitle: Text(
-                                _kVoiceModeSubtitle,
-                                style: TextStyle(
-                                  fontSize: 12,
-                                  color: theme.colorScheme.onSurfaceVariant,
-                                ),
-                              ),
-                              trailing: ConstrainedBox(
-                                constraints: const BoxConstraints(
-                                  maxWidth: 150,
-                                ),
-                                child: DropdownButton<AudioChatMode>(
-                                  value: currentSettings.audioChatMode,
-                                  isExpanded: true,
-                                  dropdownColor: theme.colorScheme.surface,
-                                  underline: const SizedBox.shrink(),
-                                  items: const [
-                                    DropdownMenuItem(
-                                      value: AudioChatMode.speechToText,
-                                      child: Text(
-                                        _kVoiceModeAsrLabel,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: AudioChatMode.interleaved,
-                                      child: Text(
-                                        _kVoiceModeInterleavedLabel,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: AudioChatMode.textToSpeech,
-                                      child: Text(
-                                        _kVoiceModeTtsLabel,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                    DropdownMenuItem(
-                                      value: AudioChatMode.textOnly,
-                                      child: Text(
-                                        _kVoiceModeTextOnlyMenuLabel,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                    ),
-                                  ],
-                                  onChanged: (val) {
-                                    if (val == null) return;
-                                    _controller.dispatch(
-                                      UpdateSettingsIntent(audioChatMode: val),
-                                    );
-                                  },
-                                ),
-                              ),
-                            ),
-                            if ((currentState.audioProfile?.hasVoices ??
-                                    false) &&
-                                (currentSettings.audioChatMode ==
-                                        AudioChatMode.interleaved ||
-                                    currentSettings.audioChatMode ==
-                                        AudioChatMode.textToSpeech))
-                              VoicePersonaPicker(
-                                profile: currentState.audioProfile,
-                                saved: currentSettings.chatVoice,
-                                onChanged: (val) {
-                                  _controller.dispatch(
-                                    UpdateSettingsIntent(
-                                      chatVoice: val,
-                                      clearChatVoice: val == null,
-                                    ),
-                                  );
-                                },
-                              ),
                           ],
                         ),
                       ),
@@ -944,11 +1049,15 @@ class _ChatPageState extends State<ChatPage> {
     String? loadedModelName,
   ) {
     final isDark = theme.brightness == Brightness.dark;
+    final activeBackend = state.backend;
     final statusColor = state.isLoading
         ? _kStatusAmber
         : (state.hasModel
               ? _kStatusEmerald
               : theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.45));
+    final tooltipText = activeBackend != null && activeBackend.isNotEmpty
+        ? '$_kActiveRuntimePrefix$activeBackend${AppStrings.metaSeparator}$_kSwitchModelTooltip'
+        : _kSwitchModelTooltip;
 
     return AppBar(
       automaticallyImplyLeading: false,
@@ -973,9 +1082,9 @@ class _ChatPageState extends State<ChatPage> {
         ),
       ),
       title: ConstrainedBox(
-        constraints: const BoxConstraints(maxWidth: 260),
+        constraints: const BoxConstraints(maxWidth: 340),
         child: Tooltip(
-          message: _kSwitchModelTooltip,
+          message: tooltipText,
           child: Material(
             color: theme.colorScheme.surfaceContainerLow,
             borderRadius: BorderRadius.circular(20),
@@ -1011,6 +1120,32 @@ class _ChatPageState extends State<ChatPage> {
                         ),
                       ),
                     ),
+                    if (activeBackend != null && activeBackend.isNotEmpty) ...[
+                      const SizedBox(width: 6),
+                      ConstrainedBox(
+                        constraints: const BoxConstraints(maxWidth: 88),
+                        child: Container(
+                          padding: const EdgeInsets.symmetric(
+                            horizontal: 6,
+                            vertical: 2,
+                          ),
+                          decoration: BoxDecoration(
+                            color: theme.colorScheme.surfaceContainerHigh,
+                            borderRadius: BorderRadius.circular(10),
+                          ),
+                          child: Text(
+                            activeBackend,
+                            maxLines: 1,
+                            overflow: TextOverflow.ellipsis,
+                            style: TextStyle(
+                              fontSize: 10.5,
+                              fontWeight: FontWeight.w600,
+                              color: theme.colorScheme.onSurfaceVariant,
+                            ),
+                          ),
+                        ),
+                      ),
+                    ],
                     const SizedBox(width: 4),
                     Icon(
                       Icons.keyboard_arrow_down_rounded,
@@ -1080,6 +1215,24 @@ class _ChatPageState extends State<ChatPage> {
             state.settings.audioChatMode == AudioChatMode.textToSpeech;
         final ttsSamples = _resolvedTtsSamples(state);
 
+        void onSelectVoice(String? voice) {
+          final shouldEnableSpeech =
+              hasAudioOut &&
+              state.settings.audioChatMode != AudioChatMode.interleaved &&
+              state.settings.audioChatMode != AudioChatMode.textToSpeech;
+          _controller.dispatch(
+            UpdateSettingsIntent(
+              chatVoice: voice,
+              clearChatVoice: voice == null,
+              audioChatMode: shouldEnableSpeech
+                  ? (hasAudioIn
+                        ? AudioChatMode.interleaved
+                        : AudioChatMode.textToSpeech)
+                  : null,
+            ),
+          );
+        }
+
         return Scaffold(
           appBar: _buildMinimalistAppBar(
             context,
@@ -1100,6 +1253,9 @@ class _ChatPageState extends State<ChatPage> {
                   activeBackend: state.backend,
                   isTtsMode: isTtsMode,
                   ttsSampleTexts: ttsSamples,
+                  audioProfile: state.audioProfile,
+                  selectedVoicePrompt: state.settings.chatVoice,
+                  onVoiceChanged: onSelectVoice,
                   onOpenCatalog: () => _pickBundle(state),
                   onOpenLocalModel: _pickLocalModel,
                   onSelectPrompt: _onSelectStarterPrompt,
@@ -1121,12 +1277,7 @@ class _ChatPageState extends State<ChatPage> {
                 ),
                 audioProfile: state.audioProfile,
                 selectedVoicePrompt: state.settings.chatVoice,
-                onVoiceChanged: (voice) => _controller.dispatch(
-                  UpdateSettingsIntent(
-                    chatVoice: voice,
-                    clearChatVoice: voice == null,
-                  ),
-                ),
+                onVoiceChanged: onSelectVoice,
                 ttsSampleTexts: ttsSamples,
                 onSend: _sendMessage,
                 onStop: () =>
