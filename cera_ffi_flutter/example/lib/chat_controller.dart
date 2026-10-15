@@ -5,6 +5,7 @@ import 'package:flutter/foundation.dart';
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart' hide ModelSource;
 import 'package:shared_preferences/shared_preferences.dart';
 
+import 'app_constants.dart';
 import 'chat_intent.dart';
 import 'chat_state.dart';
 import 'model_source.dart';
@@ -17,15 +18,16 @@ class ChatController extends ValueNotifier<ChatState> {
   ChatController({Future<String?> Function()? defaultStoreDir})
     : _defaultStoreDir = defaultStoreDir ?? (() async => null),
       super(const ChatState()) {
-    const kAppRevisionBadge = 'rev28-hexagon-backend';
     debugPrint(
-      '[cera:chat:version] ChatController v0.7.0 (build: $kAppRevisionBadge)',
+      '[cera:chat:version] ChatController ${AppStrings.appVersion} (build: $_kAppRevisionBadge)',
     );
     _loadDownloadedRecords();
   }
 
+  static const _kAppRevisionBadge = 'rev28-hexagon-backend';
+
   /// Fixed output sampling rate for Cera vocoder neural audio models (24 kHz).
-  static const int vocoderSampleRate = 24000;
+  static const int vocoderSampleRate = ChatDefaults.vocoderSampleRate;
 
   final Future<String?> Function() _defaultStoreDir;
   final AudioPlayerService _audioPlayer = AudioPlayerService();
@@ -45,7 +47,8 @@ class ChatController extends ValueNotifier<ChatState> {
   Future<void> _loadDownloadedRecords() async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final list = prefs.getStringList('cera_downloaded_models') ?? [];
+      final list =
+          prefs.getStringList(PrefKeys.downloadedModels) ?? const <String>[];
       final records = <DownloadedModelRecord>[];
       for (final s in list) {
         try {
@@ -107,22 +110,19 @@ class ChatController extends ValueNotifier<ChatState> {
     _loadSessionId++;
     _generationId++;
     _audioPlayer.stop();
-    if (_generationSub != null) {
-      await _generationSub?.cancel();
-      _generationSub = null;
+    await _generationSub?.cancel();
+    _generationSub = null;
+    final completer = _generationCompleter;
+    _generationCompleter = null;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete();
     }
-    if (_generationCompleter != null && !_generationCompleter!.isCompleted) {
-      _generationCompleter!.complete();
-      _generationCompleter = null;
-    }
-    if (_ceraEngine != null) {
-      final old = _ceraEngine;
-      _ceraEngine = null;
-      try {
-        await old?.close();
-      } catch (err) {
-        debugPrint('cera: error closing previous engine: $err');
-      }
+    final old = _ceraEngine;
+    _ceraEngine = null;
+    try {
+      await old?.close();
+    } catch (err) {
+      debugPrint('cera: error closing previous engine: $err');
     }
   }
 
@@ -134,7 +134,7 @@ class ChatController extends ValueNotifier<ChatState> {
       capabilities: () => null,
       audioProfile: () => null,
       backend: () => null,
-      status: 'Model unloaded.',
+      status: AppStrings.modelUnloadedStatus,
       isLoading: false,
       isGenerating: false,
       downloadFraction: () => null,
@@ -149,49 +149,64 @@ class ChatController extends ValueNotifier<ChatState> {
       final prefs = await SharedPreferences.getInstance();
       if (_disposed || value.isLoading || _ceraEngine != null) return;
 
-      final backendStr = prefs.getString('cera_backend');
+      final backendStr = prefs.getString(PrefKeys.backend);
       final backend = switch (backendStr) {
-        'cpu' => CeraBackend.cpu,
-        'gpu' => CeraBackend.gpu,
-        'hexagon' => CeraBackend.hexagon,
+        PrefValues.backendCpu => CeraBackend.cpu,
+        PrefValues.backendGpu => CeraBackend.gpu,
+        PrefValues.backendHexagon => CeraBackend.hexagon,
         _ => CeraBackend.auto,
       };
-      final turboQuant = prefs.getBool('cera_turboquant') ?? false;
-      final maxImageDim = prefs.getInt('cera_max_image_dim');
-      final audioModeStr = prefs.getString('cera_audio_chat_mode');
+      final turboQuant = prefs.getBool(PrefKeys.turboQuant) ?? false;
+      final maxImageDim = prefs.getInt(PrefKeys.maxImageDim);
+      final audioModeStr = prefs.getString(PrefKeys.audioChatMode);
       final audioMode = switch (audioModeStr) {
-        'asr' || 'speechToText' => AudioChatMode.speechToText,
-        'tts' || 'textToSpeech' => AudioChatMode.textToSpeech,
-        'textOnly' => AudioChatMode.textOnly,
+        PrefValues.audioAsr ||
+        PrefValues.audioSpeechToText => AudioChatMode.speechToText,
+        PrefValues.audioTts ||
+        PrefValues.audioTextToSpeech => AudioChatMode.textToSpeech,
+        PrefValues.audioTextOnly => AudioChatMode.textOnly,
         _ => AudioChatMode.interleaved,
       };
       // Empty means "the loaded model's own default voice": which voices exist
       // is the model's business (see `CeraAudioProfile`), not the app's.
       final chatVoice =
-          prefs.getString('cera_chat_voice') ??
-          prefs.getString('cera_tts_voice') ??
+          prefs.getString(PrefKeys.chatVoice) ??
+          prefs.getString(PrefKeys.legacyTtsVoice) ??
           '';
-      final ttsStudioVoice = prefs.getString('cera_tts_studio_voice') ?? '';
+      final ttsStudioVoice = prefs.getString(PrefKeys.ttsStudioVoice) ?? '';
+      final savedTemp = prefs.getDouble(PrefKeys.temperature);
+      final savedTopP = prefs.getDouble(PrefKeys.topP);
+      final savedTopK = prefs.getInt(PrefKeys.topK);
+      final savedMaxTokens =
+          prefs.getInt(PrefKeys.maxTokens) ?? ChatDefaults.maxTokens;
       final restoredSettings = ChatSettings(
         backend: backend,
         turboQuant: turboQuant,
-        maxImageLongSize: maxImageDim == 0 ? null : (maxImageDim ?? 256),
+        maxImageLongSize: maxImageDim == 0
+            ? null
+            : (maxImageDim ?? ChatDefaults.maxImageLongSize),
         audioChatMode: audioMode,
         chatVoice: chatVoice,
         ttsStudioVoice: ttsStudioVoice,
+        temperature: savedTemp,
+        topP: savedTopP,
+        topK: savedTopK,
+        maxTokens: savedMaxTokens.clamp(
+          ChatDefaults.minMaxTokens,
+          ChatDefaults.maxMaxTokens,
+        ),
       );
       value = value.copyWith(settings: restoredSettings);
 
-      final bundleName = prefs.getString('cera_last_bundle_name');
-      final quant = prefs.getString('cera_last_bundle_quant');
+      final bundleName = prefs.getString(PrefKeys.lastBundleName);
+      final quant = prefs.getString(PrefKeys.lastBundleQuant);
       if (bundleName != null && quant != null) {
-        final displayName = bundleName.endsWith('-GGUF')
-            ? bundleName.substring(0, bundleName.length - '-GGUF'.length)
-            : bundleName;
+        final displayName = ModelFormat.stripGgufSuffix(bundleName);
+        final label = '$displayName${AppStrings.metaSeparator}$quant';
 
         await _load(
           modelSource: BundleModelSource(
-            name: '$displayName · $quant',
+            name: label,
             bundleName: bundleName,
             quant: quant,
             getStoreDir: _defaultStoreDir,
@@ -203,7 +218,7 @@ class ChatController extends ValueNotifier<ChatState> {
             options: restoredSettings.ceraOptions,
             onProgress: onProgress,
           ),
-          label: '$displayName · $quant',
+          label: label,
           isBundle: true,
           bundleName: bundleName,
           quant: quant,
@@ -214,53 +229,68 @@ class ChatController extends ValueNotifier<ChatState> {
       debugPrint('cera: could not restore last model: $err');
       try {
         final prefs = await SharedPreferences.getInstance();
-        await prefs.remove('cera_last_bundle_name');
-        await prefs.remove('cera_last_bundle_quant');
+        await prefs.remove(PrefKeys.lastBundleName);
+        await prefs.remove(PrefKeys.lastBundleQuant);
       } catch (_) {}
     }
   }
 
   Future<void> _onUpdateSettings(UpdateSettingsIntent intent) async {
     final current = value.settings;
-    final newBackend = intent.backend ?? current.backend;
-    final newTurbo = intent.turboQuant ?? current.turboQuant;
-    final newMaxImage = intent.clearMaxImageLongSize
-        ? null
-        : (intent.maxImageLongSize ?? current.maxImageLongSize);
-    final newAudioMode = intent.audioChatMode ?? current.audioChatMode;
-    final newChatVoice = intent.clearChatVoice
-        ? ''
-        : (intent.chatVoice ?? current.chatVoice);
-    final newTtsStudioVoice = intent.ttsStudioVoice ?? current.ttsStudioVoice;
-
     final updated = current.copyWith(
-      backend: newBackend,
-      turboQuant: newTurbo,
-      maxImageLongSize: () => newMaxImage,
-      audioChatMode: newAudioMode,
-      chatVoice: newChatVoice,
-      ttsStudioVoice: newTtsStudioVoice,
+      backend: intent.backend,
+      turboQuant: intent.turboQuant,
+      maxImageLongSize: intent.maxImageLongSize,
+      clearMaxImageLongSize: intent.clearMaxImageLongSize,
+      audioChatMode: intent.audioChatMode,
+      chatVoice: intent.clearChatVoice ? '' : intent.chatVoice,
+      ttsStudioVoice: intent.ttsStudioVoice,
+      temperature: intent.temperature,
+      clearTemperature: intent.clearTemperature,
+      topP: intent.topP,
+      clearTopP: intent.clearTopP,
+      topK: intent.topK,
+      clearTopK: intent.clearTopK,
+      maxTokens: intent.maxTokens,
     );
 
     value = value.copyWith(settings: updated);
 
     try {
       final prefs = await SharedPreferences.getInstance();
-      await prefs.setString('cera_backend', newBackend.name);
-      await prefs.setBool('cera_turboquant', newTurbo);
-      if (newMaxImage != null) {
-        await prefs.setInt('cera_max_image_dim', newMaxImage);
+      await prefs.setString(PrefKeys.backend, updated.backend.name);
+      await prefs.setBool(PrefKeys.turboQuant, updated.turboQuant);
+      await prefs.setInt(PrefKeys.maxImageDim, updated.maxImageLongSize ?? 0);
+      await prefs.setString(
+        PrefKeys.audioChatMode,
+        switch (updated.audioChatMode) {
+          AudioChatMode.speechToText => PrefValues.audioAsr,
+          AudioChatMode.textToSpeech => PrefValues.audioTts,
+          AudioChatMode.textOnly => PrefValues.audioTextOnly,
+          AudioChatMode.interleaved => PrefValues.audioInterleaved,
+        },
+      );
+      await prefs.setString(PrefKeys.chatVoice, updated.chatVoice);
+      await prefs.setString(PrefKeys.ttsStudioVoice, updated.ttsStudioVoice);
+      final newTemperature = updated.temperature;
+      if (newTemperature != null) {
+        await prefs.setDouble(PrefKeys.temperature, newTemperature);
       } else {
-        await prefs.setInt('cera_max_image_dim', 0);
+        await prefs.remove(PrefKeys.temperature);
       }
-      await prefs.setString('cera_audio_chat_mode', switch (newAudioMode) {
-        AudioChatMode.speechToText => 'asr',
-        AudioChatMode.textToSpeech => 'tts',
-        AudioChatMode.textOnly => 'textOnly',
-        AudioChatMode.interleaved => 'interleaved',
-      });
-      await prefs.setString('cera_chat_voice', newChatVoice);
-      await prefs.setString('cera_tts_studio_voice', newTtsStudioVoice);
+      final newTopP = updated.topP;
+      if (newTopP != null) {
+        await prefs.setDouble(PrefKeys.topP, newTopP);
+      } else {
+        await prefs.remove(PrefKeys.topP);
+      }
+      final newTopK = updated.topK;
+      if (newTopK != null) {
+        await prefs.setInt(PrefKeys.topK, newTopK);
+      } else {
+        await prefs.remove(PrefKeys.topK);
+      }
+      await prefs.setInt(PrefKeys.maxTokens, updated.maxTokens);
     } catch (err) {
       debugPrint('cera: error persisting settings: $err');
     }
@@ -293,7 +323,8 @@ class ChatController extends ValueNotifier<ChatState> {
     debugPrint(
       '[cera:flutter] LoadBundleIntent: bundleName=${intent.bundleName}, quant=${intent.quant}, displayName=${intent.displayName}',
     );
-    final label = '${intent.displayName} · ${intent.quant}';
+    final label =
+        '${intent.displayName}${AppStrings.metaSeparator}${intent.quant}';
     final bundleSource = BundleModelSource(
       name: label,
       bundleName: intent.bundleName,
@@ -357,17 +388,15 @@ class ChatController extends ValueNotifier<ChatState> {
     Map<String, int> knownFileSizes = {};
     if (isBundle && bundleName != null && quant != null) {
       try {
-        final cleanQuant = quant.contains(' ') ? quant.split(' ').first : quant;
+        final cleanQuant = quant.split(' ').first;
         knownFileSizes = await probeBundleFileSizes(bundleName, cleanQuant);
       } catch (_) {}
     }
 
     final uniqueSizes = <String, int>{};
     for (final entry in knownFileSizes.entries) {
-      final key = entry.key.contains('/')
-          ? entry.key.split('/').last
-          : entry.key;
-      if (!key.endsWith('.json')) {
+      final key = entry.key.split('/').last;
+      if (!key.endsWith(ModelFormat.jsonExtension)) {
         uniqueSizes[key] = entry.value;
       }
     }
@@ -383,22 +412,21 @@ class ChatController extends ValueNotifier<ChatState> {
     try {
       final cera = await openFn((progress) {
         if (_disposed || _loadSessionId != loadId) return;
-        final fileName = progress.url.contains('/')
-            ? progress.url.split('/').last
-            : progress.url;
+        final fileName = progress.url.split('/').last;
 
         // Skip tiny manifest JSON from triggering 100% false spikes
-        if (fileName.endsWith('.json') && expectedTotalBytes > 0) {
+        if (fileName.endsWith(ModelFormat.jsonExtension) &&
+            expectedTotalBytes > 0) {
           return;
         }
 
         fileDownloaded[fileName] = progress.bytesDownloaded;
-        if (progress.totalBytes != null && progress.totalBytes! > 0) {
-          fileTotals[fileName] = progress.totalBytes!;
-        } else if (knownFileSizes.containsKey(fileName)) {
-          fileTotals[fileName] = knownFileSizes[fileName]!;
-        } else if (knownFileSizes.containsKey(progress.url)) {
-          fileTotals[fileName] = knownFileSizes[progress.url]!;
+        final progressTotal = progress.totalBytes;
+        final resolvedTotal = (progressTotal != null && progressTotal > 0)
+            ? progressTotal
+            : (knownFileSizes[fileName] ?? knownFileSizes[progress.url]);
+        if (resolvedTotal != null) {
+          fileTotals[fileName] = resolvedTotal;
         }
 
         int totalBytes = expectedTotalBytes;
@@ -431,19 +459,18 @@ class ChatController extends ValueNotifier<ChatState> {
             ? '${(fraction * 100).toStringAsFixed(0)}%'
             : '$downloadedMb MB';
 
-        final totalStr = totalBytes > 0
-            ? '${(totalBytes / 1024 / 1024).toStringAsFixed(1)} MB'
-            : null;
-
-        final bytesInfo = totalStr != null
-            ? '$downloadedMb / $totalStr'
-            : '$downloadedMb MB';
-
-        final fileSuffix = fileName.isNotEmpty ? ' · $fileName' : '';
+        final totalSuffix = totalBytes > 0
+            ? ' / ${(totalBytes / 1024 / 1024).toStringAsFixed(1)} MB'
+            : ' MB';
+        final bytesInfo = '$downloadedMb$totalSuffix';
+        final fileSuffix = fileName.isNotEmpty
+            ? '${AppStrings.metaSeparator}$fileName'
+            : '';
 
         value = value.copyWith(
           downloadFraction: () => fraction,
-          status: 'Downloading $label · $pctStr ($bytesInfo)$fileSuffix',
+          status:
+              'Downloading $label${AppStrings.metaSeparator}$pctStr ($bytesInfo)$fileSuffix',
         );
       });
 
@@ -454,20 +481,26 @@ class ChatController extends ValueNotifier<ChatState> {
 
       _ceraEngine = cera;
       _sessionPhase = SessionPhase.idle;
-      final visionTag = cera.capabilities.imageIn ? ' · Vision' : '';
+      final visionTag = cera.capabilities.imageIn ? AppStrings.tagVision : '';
       final voiceTag = voiceTagFor(cera.capabilities);
 
       final effectiveSettings = alignAudioMode(
         value.settings,
         cera.capabilities,
       );
+      final effectiveProfile = resolveAudioProfile(
+        cera.audioProfile,
+        modelIdentity: bundleName ?? displayName ?? modelSource.name,
+        capabilities: cera.capabilities,
+      );
 
       value = value.copyWith(
         loadedModel: () => modelSource,
         capabilities: () => cera.capabilities,
-        audioProfile: () => cera.audioProfile,
+        audioProfile: () => effectiveProfile,
         backend: () => cera.backend,
-        status: '${modelSource.name} · ${cera.backend}$visionTag$voiceTag',
+        status:
+            '${modelSource.name}${AppStrings.metaSeparator}${cera.backend}$visionTag$voiceTag',
         isLoading: false,
         downloadFraction: () => null,
         settings: effectiveSettings,
@@ -477,16 +510,16 @@ class ChatController extends ValueNotifier<ChatState> {
       try {
         final prefs = await SharedPreferences.getInstance();
         if (isBundle && bundleName != null && quant != null) {
-          await prefs.setString('cera_last_bundle_name', bundleName);
-          await prefs.setString('cera_last_bundle_quant', quant);
+          await prefs.setString(PrefKeys.lastBundleName, bundleName);
+          await prefs.setString(PrefKeys.lastBundleQuant, quant);
           await _saveDownloadedRecord(
             bundleName,
             quant,
             displayName ?? bundleName,
           );
         } else {
-          await prefs.remove('cera_last_bundle_name');
-          await prefs.remove('cera_last_bundle_quant');
+          await prefs.remove(PrefKeys.lastBundleName);
+          await prefs.remove(PrefKeys.lastBundleQuant);
         }
       } catch (_) {}
     } catch (err, stack) {
@@ -512,26 +545,37 @@ class ChatController extends ValueNotifier<ChatState> {
   ) async {
     try {
       final prefs = await SharedPreferences.getInstance();
-      final list = prefs.getStringList('cera_downloaded_models') ?? [];
+      final list = prefs.getStringList(PrefKeys.downloadedModels) ?? <String>[];
       final exists = list.any((item) {
         try {
           final map = jsonDecode(item) as Map<String, dynamic>;
-          return map['bundleName'] == bundleName && map['quant'] == quant;
+          return map[ModelRecordKeys.bundleName] == bundleName &&
+              map[ModelRecordKeys.quant] == quant;
         } on FormatException {
           return false;
         }
       });
       if (!exists) {
-        final record = jsonEncode({
-          'bundleName': bundleName,
-          'quant': quant,
-          'displayName': displayName,
-        });
+        final record = jsonEncode(
+          DownloadedModelRecord(
+            bundleName: bundleName,
+            quant: quant,
+            displayName: displayName,
+          ).toJson(),
+        );
         list.add(record);
-        await prefs.setStringList('cera_downloaded_models', list);
+        await prefs.setStringList(PrefKeys.downloadedModels, list);
         await _loadDownloadedRecords();
       }
     } catch (_) {}
+  }
+
+  String _activeModelLabel() {
+    final loaded = value.loadedModel;
+    if (loaded is BundleModelSource) {
+      return '${loaded.bundleName} (${loaded.quant})';
+    }
+    return loaded?.name ?? AppStrings.unknownModel;
   }
 
   Future<void> _onSendMessage(String prompt) async {
@@ -549,7 +593,7 @@ class ChatController extends ValueNotifier<ChatState> {
 
     final generationId = ++_generationId;
     final userTurn = Turn(
-      role: 'user',
+      role: TurnRole.user,
       text: prompt.trim(),
       imageBytes: imageBytes,
       imageName: imageName,
@@ -564,13 +608,13 @@ class ChatController extends ValueNotifier<ChatState> {
 
     final String initialStatus;
     if (imageBytes != null) {
-      initialStatus = 'Analyzing image...';
+      initialStatus = AppStrings.statusAnalyzingImage;
     } else if (isTts) {
-      initialStatus = 'Synthesizing neural speech...';
+      initialStatus = AppStrings.statusSynthesizingSpeech;
     } else if (isInterleaved) {
-      initialStatus = 'Thinking & speaking...';
+      initialStatus = AppStrings.statusThinkingAndSpeaking;
     } else {
-      initialStatus = 'Thinking...';
+      initialStatus = AppStrings.statusThinking;
     }
 
     final rawPromptText = prompt.trim();
@@ -579,10 +623,10 @@ class ChatController extends ValueNotifier<ChatState> {
         : rawPromptText;
     final framedPromptText = promptText.isNotEmpty
         ? promptText
-        : (imageBytes != null ? 'Describe this image.' : '');
+        : (imageBytes != null ? AppStrings.defaultImagePrompt : '');
 
     final assistantTurn = Turn(
-      role: 'assistant',
+      role: TurnRole.assistant,
       text: isTts ? framedPromptText : '',
       modelName: value.loadedModel?.name,
       isGenerating: true,
@@ -596,9 +640,7 @@ class ChatController extends ValueNotifier<ChatState> {
       pendingImageName: () => null,
     );
 
-    final modelLabel = value.loadedModel is BundleModelSource
-        ? '${(value.loadedModel as BundleModelSource).bundleName} (${(value.loadedModel as BundleModelSource).quant})'
-        : (value.loadedModel?.name ?? 'unknown');
+    final modelLabel = _activeModelLabel();
 
     debugPrint(
       '[cera:chat] Submitting user message for "$modelLabel": "$framedPromptText" '
@@ -612,7 +654,7 @@ class ChatController extends ValueNotifier<ChatState> {
         settings: value.settings,
         uiMode: value.uiMode,
         isAudioPrompt: false,
-        profile: cera.audioProfile,
+        profile: value.audioProfile ?? cera.audioProfile,
       );
       final messages = <CeraMessage>[
         if (systemPrompt != null) CeraMessage.system(systemPrompt),
@@ -628,28 +670,23 @@ class ChatController extends ValueNotifier<ChatState> {
         var delta = await cera.applyChatTemplate([
           CeraMessage.user(framedPromptText),
         ]);
-        if (delta.startsWith('<|startoftext|>')) {
-          delta = delta.substring('<|startoftext|>'.length);
-        } else if (delta.startsWith('<s>')) {
-          delta = delta.substring('<s>'.length);
-        } else if (delta.startsWith('<|begin_of_text|>')) {
-          delta = delta.substring('<|begin_of_text|>'.length);
-        } else if (delta.startsWith('<bos>')) {
-          delta = delta.substring('<bos>'.length);
+        for (final prefix in ChatTemplateMarkers.bosPrefixes) {
+          if (delta.startsWith(prefix)) {
+            delta = delta.substring(prefix.length);
+            break;
+          }
         }
         if (delta.startsWith('\n')) {
           delta = delta.substring(1);
         }
         // Seal the uncommitted assistant turn with this template's delimiter.
         // Match the user header, not marker text that may occur in user content.
-        if (delta.startsWith('<|im_start|>user\n')) {
-          formattedPrompt = '<|im_end|>\n$delta';
-        } else if (delta.startsWith(
-          '<|start_header_id|>user<|end_header_id|>',
-        )) {
-          formattedPrompt = '<|eot_id|>$delta';
-        } else if (delta.startsWith('<start_of_turn>user\n')) {
-          formattedPrompt = '<end_of_turn>\n$delta';
+        if (delta.startsWith(ChatTemplateMarkers.imStartUser)) {
+          formattedPrompt = '${ChatTemplateMarkers.imEndPrefix}$delta';
+        } else if (delta.startsWith(ChatTemplateMarkers.llama3UserHeader)) {
+          formattedPrompt = '${ChatTemplateMarkers.llama3EotPrefix}$delta';
+        } else if (delta.startsWith(ChatTemplateMarkers.gemmaUserTurn)) {
+          formattedPrompt = '${ChatTemplateMarkers.gemmaEndTurnPrefix}$delta';
         } else {
           throw StateError('Unsupported continuation template');
         }
@@ -659,9 +696,7 @@ class ChatController extends ValueNotifier<ChatState> {
           (t) => t.copyWith(
             isGenerating: false,
             statusText: () => null,
-            text:
-                'This model’s chat format does not support continuing this '
-                'conversation. Start a new chat.',
+            text: AppStrings.unsupportedContinuationMessage,
           ),
         );
         value = value.copyWith(isGenerating: false);
@@ -673,7 +708,7 @@ class ChatController extends ValueNotifier<ChatState> {
     if (imageBytes != null) {
       try {
         _updateLastTurn(
-          (t) => t.copyWith(statusText: () => 'Encoding image patches...'),
+          (t) => t.copyWith(statusText: () => AppStrings.statusEncodingImage),
         );
         final maxLong = value.settings.maxImageLongSize;
         debugPrint(
@@ -691,7 +726,8 @@ class ChatController extends ValueNotifier<ChatState> {
           return;
         }
         _updateLastTurn(
-          (t) => t.copyWith(statusText: () => 'Generating response...'),
+          (t) =>
+              t.copyWith(statusText: () => AppStrings.statusGeneratingResponse),
         );
       } catch (err) {
         if (_disposed || generationId != _generationId) return;
@@ -731,18 +767,20 @@ class ChatController extends ValueNotifier<ChatState> {
 
     final generationId = ++_generationId;
     final userTurn = Turn(
-      role: 'user',
+      role: TurnRole.user,
       text: promptText,
       audioDurationSeconds: durationSec,
       audioSamples: intent.pcmSamples,
     );
 
     final assistantTurn = Turn(
-      role: 'assistant',
+      role: TurnRole.assistant,
       text: '',
       modelName: value.loadedModel?.name,
       isGenerating: true,
-      statusText: isAsr ? 'Transcribing speech...' : 'Processing audio...',
+      statusText: isAsr
+          ? AppStrings.statusTranscribingSpeech
+          : AppStrings.statusProcessingAudio,
     );
 
     final newTurns = List<Turn>.from(value.turns)
@@ -764,9 +802,10 @@ class ChatController extends ValueNotifier<ChatState> {
         if (_disposed || generationId != _generationId) return;
 
         debugPrint('[cera:chat] ASR result: "$transcribed"');
-        final recognizedText = transcribed.trim().isNotEmpty
-            ? transcribed.trim()
-            : '(No speech detected)';
+        final trimmed = transcribed.trim();
+        final recognizedText = trimmed.isNotEmpty
+            ? trimmed
+            : AppStrings.noSpeechDetected;
         _updateLastTurn(
           (t) => t.copyWith(
             text: recognizedText,
@@ -804,7 +843,7 @@ class ChatController extends ValueNotifier<ChatState> {
       settings: value.settings,
       uiMode: value.uiMode,
       isAudioPrompt: true,
-      profile: cera.audioProfile,
+      profile: value.audioProfile ?? cera.audioProfile,
     );
 
     try {
@@ -828,7 +867,8 @@ class ChatController extends ValueNotifier<ChatState> {
         return;
       }
       _updateLastTurn(
-        (t) => t.copyWith(statusText: () => 'Generating response...'),
+        (t) =>
+            t.copyWith(statusText: () => AppStrings.statusGeneratingResponse),
       );
     } catch (err) {
       if (_disposed || generationId != _generationId) return;
@@ -880,9 +920,7 @@ class ChatController extends ValueNotifier<ChatState> {
     _generationCompleter = done;
     var hasError = false;
 
-    final modelLabel = value.loadedModel is BundleModelSource
-        ? '${(value.loadedModel as BundleModelSource).bundleName} (${(value.loadedModel as BundleModelSource).quant})'
-        : (value.loadedModel?.name ?? 'unknown');
+    final modelLabel = _activeModelLabel();
 
     debugPrint(
       '[cera:chat] Prefilling prompt (${formattedPrompt.length} chars) for "$modelLabel" and starting generation...',
@@ -904,10 +942,15 @@ class ChatController extends ValueNotifier<ChatState> {
     }
 
     try {
+      final settings = value.settings;
       final stream = cera.generate(
         formattedPrompt,
-        maxTokens: 512,
-        temperature: isTts ? 0.0 : null,
+        maxTokens: settings.maxTokens,
+        temperature: isTts
+            ? ChatDefaults.greedyTemperature
+            : settings.temperature,
+        topP: isTts ? null : settings.topP,
+        topK: isTts ? null : settings.topK,
         // Must match the system prompt for this mode. Interleaving on an ASR or
         // plain-text turn corrupts the answer.
         audioMode: switch (mode) {
@@ -944,10 +987,7 @@ class ChatController extends ValueNotifier<ChatState> {
         (piece) {
           if (_disposed || _generationId != generationId) return;
           tokenCount++;
-          if (firstTokenMs == null) {
-            firstTokenMs = stopwatch.elapsedMilliseconds;
-            debugPrint('[cera:chat] First token received in ${firstTokenMs}ms');
-          }
+          firstTokenMs ??= stopwatch.elapsedMilliseconds;
           if (!isTts) {
             _updateLastTurn(
               (t) => t.copyWith(
@@ -1012,24 +1052,18 @@ class ChatController extends ValueNotifier<ChatState> {
         !_disposed &&
         _generationId == generationId &&
         value.isGenerating) {
-      final lastText = value.turns.isNotEmpty ? value.turns.last.text : '';
-      int totalTokens = 0;
+      final lastText = value.turns.lastOrNull?.text ?? '';
+      int totalTokens = tokenCount;
       if (lastText.isNotEmpty) {
         try {
           final encoded = await cera.encode(lastText, addSpecial: false);
           totalTokens = encoded.length;
-        } catch (_) {
-          totalTokens = tokenCount;
-        }
-      } else {
-        totalTokens = tokenCount;
+        } catch (_) {}
       }
 
       final totalMs = stopwatch.elapsedMilliseconds;
       final ttft = firstTokenMs ?? firstAudioMs;
-      final decodeMs = firstTokenMs != null
-          ? (totalMs - firstTokenMs!)
-          : (firstAudioMs != null ? (totalMs - firstAudioMs!) : totalMs);
+      final decodeMs = totalMs - (ttft ?? 0);
       final tps = totalTokens > 1 && decodeMs > 0
           ? ((totalTokens - 1) / (decodeMs / 1000.0))
           : (totalTokens == 1 && totalMs > 0
@@ -1043,15 +1077,13 @@ class ChatController extends ValueNotifier<ChatState> {
 
       double? audioRtf;
       if (audioDurationSec != null) {
-        double audioGenMs;
+        final double audioGenMs;
         if (firstAudioMs != null &&
             lastAudioMs != null &&
             audioChunkCount > 1) {
           final intervalMs = lastAudioMs! - firstAudioMs!;
           final perChunkMs = intervalMs / (audioChunkCount - 1);
           audioGenMs = perChunkMs * audioChunkCount;
-        } else if (firstAudioMs != null) {
-          audioGenMs = (totalMs - firstAudioMs!).toDouble();
         } else {
           audioGenMs = decodeMs.toDouble();
         }
@@ -1096,18 +1128,15 @@ class ChatController extends ValueNotifier<ChatState> {
     if (value.isGenerating) {
       _sessionPhase = SessionPhase.interrupted;
     }
-    if (_ceraEngine != null) {
-      try {
-        await _ceraEngine?.cancel();
-      } catch (_) {}
-    }
-    if (_generationSub != null) {
-      await _generationSub?.cancel();
-      _generationSub = null;
-    }
-    if (_generationCompleter != null && !_generationCompleter!.isCompleted) {
-      _generationCompleter!.complete();
-      _generationCompleter = null;
+    try {
+      await _ceraEngine?.cancel();
+    } catch (_) {}
+    await _generationSub?.cancel();
+    _generationSub = null;
+    final completer = _generationCompleter;
+    _generationCompleter = null;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete();
     }
     if (_disposed) return;
     final updatedTurns = value.turns.map((turn) {
@@ -1153,11 +1182,11 @@ class ChatController extends ValueNotifier<ChatState> {
   @visibleForTesting
   static String voiceTagFor(CeraCapabilities caps) {
     if (caps.audioIn && caps.audioOut) {
-      return ' · Voice';
+      return AppStrings.tagVoice;
     } else if (caps.audioIn) {
-      return ' · ASR';
+      return AppStrings.tagAsr;
     } else if (caps.audioOut) {
-      return ' · Audio';
+      return AppStrings.tagAudio;
     }
     return '';
   }
@@ -1220,13 +1249,81 @@ class ChatController extends ValueNotifier<ChatState> {
     }
   }
 
+  static const List<CeraTtsVoice> _kDefaultLfmAudioVoices = [
+    CeraTtsVoice(
+      label: AudioProfileDefaults.usFemaleLabel,
+      prompt: AudioProfileDefaults.usFemalePrompt,
+      ttsSystemPrompt: AudioProfileDefaults.usFemaleTtsSystemPrompt,
+      interleavedSystemPrompt:
+          AudioProfileDefaults.usFemaleInterleavedSystemPrompt,
+    ),
+    CeraTtsVoice(
+      label: AudioProfileDefaults.usMaleLabel,
+      prompt: AudioProfileDefaults.usMalePrompt,
+      ttsSystemPrompt: AudioProfileDefaults.usMaleTtsSystemPrompt,
+      interleavedSystemPrompt:
+          AudioProfileDefaults.usMaleInterleavedSystemPrompt,
+    ),
+    CeraTtsVoice(
+      label: AudioProfileDefaults.ukFemaleLabel,
+      prompt: AudioProfileDefaults.ukFemalePrompt,
+      ttsSystemPrompt: AudioProfileDefaults.ukFemaleTtsSystemPrompt,
+      interleavedSystemPrompt:
+          AudioProfileDefaults.ukFemaleInterleavedSystemPrompt,
+    ),
+    CeraTtsVoice(
+      label: AudioProfileDefaults.ukMaleLabel,
+      prompt: AudioProfileDefaults.ukMalePrompt,
+      ttsSystemPrompt: AudioProfileDefaults.ukMaleTtsSystemPrompt,
+      interleavedSystemPrompt:
+          AudioProfileDefaults.ukMaleInterleavedSystemPrompt,
+    ),
+  ];
+
+  /// Ensures English `LFM2*-Audio` models always expose their 4 built-in voice
+  /// personas even when loaded from raw `.gguf` bytes (`<bytes>`) or via an
+  /// older web worker `.wasm` binary that returns an empty voice list.
+  @visibleForTesting
+  static CeraAudioProfile resolveAudioProfile(
+    CeraAudioProfile profile, {
+    required String modelIdentity,
+    required CeraCapabilities capabilities,
+  }) {
+    if (profile.hasVoices || !capabilities.audioOut) {
+      return profile;
+    }
+    final tokens = modelIdentity
+        .toLowerCase()
+        .split(RegExp(r'[^a-z0-9]+'))
+        .where((t) => t.isNotEmpty)
+        .toList();
+    final hasLfm = tokens.any(
+      (t) => t.startsWith(AudioProfileDefaults.lfmToken),
+    );
+    final hasAudio = tokens.contains(AudioProfileDefaults.audioToken);
+    final isJapanese =
+        tokens.contains(AudioProfileDefaults.jpToken) ||
+        tokens.contains(AudioProfileDefaults.japaneseToken);
+    if (hasLfm && hasAudio && !isJapanese) {
+      return CeraAudioProfile(
+        ttsSystemPrompt: AudioProfileDefaults.usFemaleTtsSystemPrompt,
+        interleavedSystemPrompt:
+            AudioProfileDefaults.usFemaleInterleavedSystemPrompt,
+        voices: _kDefaultLfmAudioVoices,
+        sampleTexts: profile.sampleTexts,
+      );
+    }
+    return profile;
+  }
+
   @override
   void dispose() {
     _disposed = true;
     _audioPlayer.dispose();
     _generationSub?.cancel();
-    if (_generationCompleter != null && !_generationCompleter!.isCompleted) {
-      _generationCompleter!.complete();
+    final completer = _generationCompleter;
+    if (completer != null && !completer.isCompleted) {
+      completer.complete();
     }
     _ceraEngine?.terminate();
     super.dispose();

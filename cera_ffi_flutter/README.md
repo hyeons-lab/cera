@@ -287,9 +287,13 @@ CERA_FFI_LIB=../target/debug/libcera_ffi.dylib \
   dart run example/cera_chat.dart /path/to/model.gguf "Why is the sky blue?"
 ```
 
-Supported architectures match the engine: `lfm2`/`lfm2.5` (incl. vision and
-audio), `lfm2moe` (routed mixture-of-experts), `llama` (incl. classic Mistral),
-`qwen2`/`qwen3`, `granite`.
+Supported architectures match the engine: `lfm2`/`lfm2.5` (incl. vision, audio,
+and bidirectional decision models), `lfm2moe` (routed mixture-of-experts),
+`qwen2`/`qwen3`/`qwen35`, `llama` (incl. classic Mistral), `granite`,
+`minicpm`/`minicpm5`, `nanbeige`, `phi3`/`phi`, `mistral3`/`ministral3`,
+`gemma2`/`gemma4`, `olmo2`/`olmo3`, `bailingmoe3`, plus `Whisper` ASR,
+`SileroVad` v5, `Hotword` keyword spotting, and `Sortformer`/`Nemotron3`
+speaker diarization.
 
 > The callback vtable's static `NativeCallable`s keep the isolate alive, so a
 > CLI script must `exit()` explicitly (the examples do); a Flutter app stays
@@ -388,17 +392,19 @@ The vendored generator adds fixes on top of upstream 0.1.3, to be upstreamed:
 
 ## Status
 
-The full engine API works end to end on macOS and in plain Dart: model load,
-sessions, sync and async `generate`, sync and async streaming, `transcribe`,
-tokenizer access, chat templates, `BundleRepo` with download progress, and
-`fromBundleIdAsync`. CI checks that the native generator emits no placeholder
-"not implemented yet" method bodies. This does not imply every API/backend
-combination is supported: native GPU checkpoint operations are explicitly rejected.
+The full engine API works end to end on macOS, iOS, Android, and in plain Dart:
+model load, sessions, sync and async `generate`, sync and async streaming,
+`transcribe`, tokenizer access, chat templates, `BundleRepo` with download
+progress, and `fromBundleIdAsync`. CI checks that the native generator emits no
+placeholder "not implemented yet" method bodies. This does not imply every
+API/backend combination is supported: native GPU checkpoint operations are
+explicitly rejected.
 
-Not yet verified on real devices: **Android, iOS, Linux, and Windows builds.**
-The Apple manifests resolve `CeraFFI.xcframework` from a tagged release, so
-Apple targets need a published release (or a locally built xcframework) before
-they resolve.
+Verified on hardware across macOS (Apple Silicon Metal + CPU), iOS (Metal + CPU),
+and Android `arm64-v8a` (CPU, Adreno `wgpu`, and Qualcomm Hexagon NPU). Linux
+and Windows share the same UniFFI C ABI and dynamic library loader. The Apple
+manifests resolve `CeraFFI.xcframework` from a tagged release, so Apple targets
+need a published release (or a locally built xcframework) before they resolve.
 
 Web **runs**, through `Cera`; see the [Web](#web) section above for setup and
 for what is narrower there. What follows is about the *generated bindings*,

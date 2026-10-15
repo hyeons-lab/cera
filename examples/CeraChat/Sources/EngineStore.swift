@@ -129,7 +129,7 @@ final class EngineStore: ObservableObject {
         do {
             let engine = try await build()
             self.state = .loading
-            let session = engine.newSession(config: Self.defaultSessionConfig())
+            let session = try engine.newSession(config: Self.defaultSessionConfig())
             self.engine = engine
             self.session = session
             self.modelSummary = Self.describe(engine.metadata())

@@ -20,6 +20,11 @@ class VoicePersonaPicker extends StatelessWidget {
   final String saved;
   final ValueChanged<String?> onChanged;
 
+  static const _kTitle = 'Voice Persona';
+  static const _kSubtitle =
+      'Select speaker timbre and accent for synthesized speech responses.';
+  static const _kDefaultVoiceLabel = 'Default Voice';
+
   @override
   Widget build(BuildContext context) {
     final voices = profile?.voices ?? const <CeraTtsVoice>[];
@@ -27,9 +32,9 @@ class VoicePersonaPicker extends StatelessWidget {
     final theme = Theme.of(context);
     return ListTile(
       contentPadding: EdgeInsets.zero,
-      title: const Text('Voice Persona'),
+      title: const Text(_kTitle),
       subtitle: Text(
-        'Select speaker timbre and accent for synthesized speech responses.',
+        _kSubtitle,
         style: TextStyle(
           fontSize: 12,
           color: theme.colorScheme.onSurfaceVariant,
@@ -40,7 +45,7 @@ class VoicePersonaPicker extends StatelessWidget {
         dropdownColor: theme.colorScheme.surface,
         underline: const SizedBox.shrink(),
         items: [
-          const DropdownMenuItem(value: null, child: Text('Default Voice')),
+          const DropdownMenuItem(value: null, child: Text(_kDefaultVoiceLabel)),
           for (final voice in voices)
             DropdownMenuItem(value: voice.prompt, child: Text(voice.label)),
         ],

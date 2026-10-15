@@ -25,21 +25,24 @@ cargo run -p cera-cli -- tokenize --model <path.gguf> --text "text"
 
 ## Architecture
 
-Five-crate Cargo workspace:
+Six-crate Cargo workspace (plus multi-language SDK packages):
 
 - **`cera`**: core library (all inference logic)
 - **`cera-cli`**: binary (clap CLI that dispatches to `cera`)
-- **`cera-ffi`**: UniFFI bindings exposing the engine to Kotlin/Swift/etc.
+- **`cera-client`**: Rust SDK re-exporting the `cera` engine API
+- **`cera-ffi`**: UniFFI bindings exposing the engine to Kotlin/Swift/Python/Dart
 - **`cera-parity`**: cross-language parity harness (not published)
-- **`cera-wasm`**: wasm-bindgen browser/Node bindings
+- **`cera-wasm`**: `wasm-bindgen` browser/Node bindings (CPU + WebGPU + OPFS bundle store)
+- **`cera-ffi-kotlin`**, **`cera_ffi`**, **`cera_ffi_flutter`**: Gradle (JVM + Android), pure-Dart, and Flutter SDK packages
 
 ### GGUF Parsing (`gguf.rs`)
 
-GGUF files are memory-mapped via `memmap2`. Two access patterns:
+GGUF files are memory-mapped via `memmap2` (or parsed header-only for streaming weight sources). Access patterns include:
 - `get_tensor(name)`: copies data from mmap into an owned `Tensor`
 - `tensor_data(name)`: returns a zero-copy `&[u8]` slice into the mmap
+- `from_header_bytes(data, file_size)`: parses metadata and tensor descriptors from a header prefix while validating against `file_size`, releasing the header buffer afterwards so streaming backends (`OpfsGpuWeightSource`) hold zero raw weight bytes in memory
 
-Both validate offsets with checked arithmetic (`checked_add`, `usize::try_from`).
+All readers validate offsets and tensor byte counts through shared checked arithmetic (`checked_add`, `usize::try_from`, `checked_tensor_byte_size`).
 
 ### Tensor & Quantization (`tensor.rs`, `quant.rs`)
 
@@ -50,18 +53,20 @@ Both validate offsets with checked arithmetic (`checked_add`, `usize::try_from`)
 
 ### Compute Backends (`backend/`)
 
-Four tiers with runtime dispatch:
+Five tiers with runtime dispatch:
 1. **`cpu.rs`**: scalar reference implementations operating on raw `&[f32]` slices (no Tensor in the hot path)
-2. **`simd.rs`**: NEON (aarch64) and AVX2 (x86_64) optimized `vec_dot` kernels with compile-time + runtime dispatch
-3. **`wgpu.rs`**: cross-platform GPU backend (`gpu` feature). Functional: WGSL GEMV/GEMM kernels (incl. quantized `gemm_q8_0`/`gemm_q4_0`), the ViT vision encoder, and decode + batched prefill for LFM2, the routed `lfm2moe` arch and dense transformers (llama/qwen2/qwen3/granite)
-4. **`metal/`**: native Apple Metal backend (`metal` feature, macOS + iOS) with MSL kernels; the `Auto`-preferred GPU backend, running decode + batched prefill for LFM2, the routed `lfm2moe` arch and dense transformers, plus the ViT vision encoder. The shipped `CeraFFI.xcframework` (SwiftPM) is Metal-enabled across all three arm64 slices (iOS device, iOS Simulator, native macOS)
+2. **`simd/`**: NEON/dotprod/i8mm (aarch64), AVX2/AVX-512 (x86_64), and `simd128` (`wasm32`) optimized `vec_dot` and tiled GEMM kernels with compile-time + runtime dispatch
+3. **`wgpu.rs`**: cross-platform GPU backend (`gpu` feature, Vulkan/Metal/DX12/BrowserWebGpu). Functional: WGSL/SPIR-V GEMV/GEMM kernels, the ViT vision encoder, and decode + batched prefill for LFM2, routed `lfm2moe`, and dense transformers (`llama`, `qwen2`, `qwen3`, `granite`, `minicpm`/`minicpm5`, `nanbeige`, `phi3`/`phi`, `mistral3`/`ministral3`)
+4. **`metal/`**: native Apple Metal backend (`metal` feature, macOS + iOS) with MSL kernels; the `Auto`-preferred GPU backend on Apple silicon, running decode + batched prefill for LFM2, routed `lfm2moe`, and dense transformers, plus the ViT vision encoder. The shipped `CeraFFI.xcframework` (SwiftPM) is Metal-enabled across all three arm64 dynamic framework slices (`ios-arm64`, `ios-arm64-simulator`, `macos-arm64`)
+5. **`hexagon/`**: Qualcomm Hexagon NPU backend (`hexagon` feature, Android `aarch64-linux-android` on v73/v75/v79/v81/v85 cDSP) with HVX kernels via FastRPC; preferred by `Auto` (and `Npu`/`Hexagon`) when available, supporting LFM2, routed `lfm2moe` (with paged routed experts), dense transformers, ViT vision encoder, and FastConformer audio encoders (Sortformer / Nemotron-3 diarization)
 
 ### Models (`model/`)
 
-`Model` trait with `forward()` and `config()`. `ModelConfig` supports per-layer `BlockType` (Attention or GatedConv) for hybrid architectures like LFM2. The `lfm2`, `lfm2moe` and `llama` families are inference-complete across all backends (CPU, wgpu, Metal). Decode works everywhere; prefill uses batched GEMM on every backend: all GPU backends and CPU for both LFM2 and the dense transformers (`llama.rs::forward_prefill`, sharing the GEMM helpers in `transformer.rs`), with a tiled flash-attention path for long prompts:
-- **LFM2 / LFM2.5** (`lfm2` arch, hybrid attention + gated-conv), plus vision (LFM2-VL) and audio (LFM2-Audio) modalities.
-- **Routed mixture-of-experts** (`lfm2moe` arch, LFM2 with per-layer expert FFNs; LFM2.5-8B-A1B). All three backends; both GPU backends share the three expert kernels' Slang sources, are Q4_0-only, and leave routed-FFN LoRA to CPU. The routed FFN is the one block whose prefill reuses no weights: each token picks its own experts, so an expert row is read once per routed token rather than once per prompt (on GPU that is still a single dispatch per projection, just without the sharing). Grouping tokens by expert is a live follow-up.
-- **Dense transformers** (`llama` arch, also Qwen2/3, classic Mistral, Granite).
+`Model` trait with `forward()` and `config()`. `ModelConfig` supports per-layer `BlockType` (Attention or GatedConv) for hybrid architectures like LFM2. Decode works everywhere; prefill uses batched GEMM across CPU, wgpu, Metal, and Hexagon:
+- **LFM2 / LFM2.5** (`lfm2` arch, hybrid attention + gated-conv), plus vision (LFM2-VL), audio (LFM2-Audio), and bidirectional `d1` decision models.
+- **Routed mixture-of-experts** (`lfm2moe` arch, LFM2 with per-layer expert FFNs; LFM2.5-8B-A1B, plus `bailingmoe3` / Ling 3.0 Tiny on CPU). Supported on CPU, wgpu, Metal, and Hexagon NPU.
+- **Dense & hybrid transformers** (`llama`, `qwen2`, `qwen3`, `qwen35`, `granite`, `minicpm`/`minicpm5`, `nanbeige`, `phi3`/`phi`, `mistral3`/`ministral3`, `gemma2`/`gemma4`, `olmo2`/`olmo3`).
+- **Speech & audio models**: OpenAI Whisper (`model/whisper/`), Silero VAD v5 (`vad.rs`), Keyword Spotting (`hotword.rs`), and Streaming Sortformer / Nemotron-3 speaker diarization (`model/sortformer/`, `model/nemotron3_diar/`), composable via `AudioPipeline`.
 
 The default KV cache is f16 (`SessionConfig::default()` is `KvCompression::F16`; the CLI's `--kv-cache-keys auto` does the same), resolved in `Session::new`: a model whose `f16_kv_supported()` is false (wgpu, Metal, Hexagon, which keep their own cache) is configured with `KvCompression::None`, and wasm32 defaults to `None`. `KvCompression::None` always means the backend's own full-precision cache.
 

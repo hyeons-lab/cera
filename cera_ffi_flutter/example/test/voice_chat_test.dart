@@ -1,4 +1,5 @@
 import 'dart:async';
+
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart';
 import 'package:cera_ffi_flutter_example/chat_controller.dart';
 import 'package:cera_ffi_flutter_example/chat_intent.dart';

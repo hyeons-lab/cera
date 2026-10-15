@@ -517,8 +517,8 @@ cera chat --bundle-id LFM2.5-1.2B-Instruct --quant Q4_0
 # interactively (needs a terminal, and not --no-tui)
 cera chat
 
-# Pick a GPU
-cera run -m model.gguf -p "Hi" --device metal   # or: gpu, cpu, auto
+# Pick an accelerator backend
+cera run -m model.gguf -p "Hi" --device metal   # or: gpu, npu, hexagon, cpu, auto
 ```
 
 Using the library directly:
@@ -577,15 +577,21 @@ The [persistent cache examples](docs/internals/API_RESHAPE_CACHE_EXAMPLES.md) de
 | `chat` | Interactive multi-turn REPL with a persistent KV prefix cache. Given no model source at all on a terminal (and without `--no-tui`), opens a picker over the published catalog |
 | `embed` | Extract last-layer hidden-state embeddings: mean-pooled, or `--per-token` for the full matrix |
 | `logits` | Dump next-token logits over the vocabulary (single prefill), handy for cross-backend parity checks |
+| `convert` | Convert a local SafeTensors model directory to a quantized GGUF file (including `d1_omni` decision models) |
+| `decide` | Answer structured questions over text, image, or audio state using a bidirectional `d1` decision model |
 | `inspect` | Dump a GGUF's metadata, tensor shapes, and resolved backend tier |
 | `cpu` | Print the host's CPU backend tier + detected SIMD features (no model needed) |
+| `thermal` | Print current and forecast device thermal headroom on Android API 30+ (`unavailable` elsewhere) |
 | `tokenize` | Encode text to token IDs (e.g. to compare against Hugging Face) |
 | `bench` | Measure decode/prefill throughput with p10/p50/p90/mean/stddev |
+| `gemv-bench` | Microbenchmark wgpu quantized GEMV kernels (`--features gpu`) across `m,k` shapes and verify CPU parity |
+| `gemm-bench` | Microbenchmark wgpu quantized GEMM kernels (`--features gpu`) across `m,n,k` shapes and verify CPU parity |
 | `list-bundles` | List bundles available on `LiquidAI/LeapBundles` |
 | `list-hf` | Discover and list GGUF model files in a Hugging Face repository |
 | `download-bundles` | Prefetch bundle manifests + model files without loading |
 | `vad` | Voice activity detection on audio files using Silero VAD v5 |
-| `transcribe` | Speech-to-text transcription on audio files using OpenAI Whisper |
+| `diarize` | Speaker diarization on audio files using Streaming Sortformer or Nemotron-3-Diarization (plus `--compare`) |
+| `transcribe` | Speech-to-text transcription on audio files using OpenAI Whisper or LFM2-Audio |
 | `compare-quants` | Audit metadata, tensor inventory, quantization fidelity, and logit parity between Cera-converted models and reference community GGUFs |
 
 ## Tuning

@@ -1,4 +1,5 @@
 import 'dart:async';
+
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart' hide ModelSource;
 import 'package:cera_ffi_flutter_example/chat_controller.dart';
 import 'package:cera_ffi_flutter_example/chat_intent.dart';
@@ -329,6 +330,39 @@ void main() {
         controller.dispose();
       },
     );
+
+    test(
+      'forwards temperature and maxTokens settings to Cera.generate',
+      () async {
+        final fakeCera = FakeCera();
+        final controller = ChatController();
+
+        await controller.dispatch(
+          LoadLocalModelIntent(TestModelSource('test-model', fakeCera)),
+        );
+        await controller.dispatch(
+          const UpdateSettingsIntent(
+            temperature: 0.7,
+            maxTokens: 1024,
+            audioChatMode: AudioChatMode.textOnly,
+          ),
+        );
+        expect(controller.value.settings.samplingLabel, 'T=0.70');
+
+        await controller.dispatch(const SendMessageIntent('Creative prompt'));
+        expect(fakeCera.lastTemperature, 0.7);
+        expect(fakeCera.lastMaxTokens, 1024);
+
+        await controller.dispatch(
+          const UpdateSettingsIntent(clearTemperature: true),
+        );
+        expect(controller.value.settings.samplingLabel, 'Auto');
+
+        await controller.dispatch(const SendMessageIntent('Default prompt'));
+        expect(fakeCera.lastTemperature, isNull);
+        controller.dispose();
+      },
+    );
   });
 }
 
@@ -348,6 +382,8 @@ class FakeCera implements Cera {
   final List<List<CeraMessage>> templateCalls = [];
   final List<String> generatedPrompts = [];
   final List<String?> audioSystemPrompts = [];
+  double? lastTemperature;
+  int? lastMaxTokens;
   CeraAudioProfile profile = const CeraAudioProfile.plain();
   int resetCount = 0;
   bool failReset = false;
@@ -407,6 +443,8 @@ class FakeCera implements Cera {
     void Function(List<double> pcm, int sampleRate)? onAudio,
   }) async* {
     generatedPrompts.add(prompt);
+    lastTemperature = temperature;
+    lastMaxTokens = maxTokens;
     yield 'Hello ';
     if (pauseGeneration) {
       _pauseCompleter = Completer<void>();

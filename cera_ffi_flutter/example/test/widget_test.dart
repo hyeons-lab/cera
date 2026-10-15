@@ -5,13 +5,14 @@
 // is enough to catch a broken widget tree in CI.
 
 import 'package:cera_ffi_flutter/cera_ffi_flutter.dart'
-    show CeraAudioProfile, CeraTtsVoice;
+    show CeraAudioProfile, CeraCapabilities, CeraTtsVoice;
 import 'package:cera_ffi_flutter_example/chat_controller.dart';
 import 'package:cera_ffi_flutter_example/chat_state.dart';
 import 'package:cera_ffi_flutter_example/main.dart';
 import 'package:cera_ffi_flutter_example/model_source.dart';
 import 'package:cera_ffi_flutter_example/widgets/audio_waveform.dart';
 import 'package:cera_ffi_flutter_example/widgets/bundle_picker_dialog.dart';
+import 'package:cera_ffi_flutter_example/widgets/message_composer.dart';
 import 'package:cera_ffi_flutter_example/widgets/message_list.dart';
 import 'package:cera_ffi_flutter_example/widgets/tts_studio_view.dart';
 import 'package:cera_ffi_flutter_example/widgets/voice_persona_picker.dart';
@@ -496,6 +497,286 @@ void main() {
         ),
         findsOneWidget,
       );
+    },
+  );
+
+  testWidgets(
+    'top menu stays within viewport bounds on narrow mobile and desktop widths',
+    (WidgetTester tester) async {
+      SharedPreferences.setMockInitialValues({'sampling_temperature': 0.65});
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      for (final width in <double>[320, 360, 375, 412, 600, 840]) {
+        tester.view.devicePixelRatio = 1.0;
+        tester.view.physicalSize = Size(width, 800);
+
+        await tester.pumpWidget(const CeraExampleApp());
+        await tester.pumpAndSettle();
+
+        expect(
+          tester.takeException(),
+          isNull,
+          reason: 'No overflow at width=$width',
+        );
+
+        final settingsFinder = find.byIcon(Icons.settings_outlined);
+        expect(settingsFinder, findsOneWidget);
+        final settingsRect = tester.getRect(settingsFinder);
+        expect(
+          settingsRect.left,
+          greaterThanOrEqualTo(0),
+          reason: 'Settings icon left in bounds at width=$width',
+        );
+        expect(
+          settingsRect.right,
+          lessThanOrEqualTo(width),
+          reason: 'Settings icon right in bounds at width=$width',
+        );
+
+        final clearFinder = find.byIcon(Icons.delete_sweep_rounded);
+        expect(clearFinder, findsOneWidget);
+        final clearRect = tester.getRect(clearFinder);
+        expect(
+          clearRect.right,
+          lessThanOrEqualTo(width),
+          reason: 'Clear icon right in bounds at width=$width',
+        );
+
+        final modelFinder = find.text('Select Model');
+        expect(modelFinder, findsOneWidget);
+        final modelRect = tester.getRect(modelFinder);
+        expect(
+          modelRect.right,
+          lessThanOrEqualTo(width),
+          reason: 'Model picker label right in bounds at width=$width',
+        );
+      }
+    },
+  );
+
+  testWidgets('toggling theme button switches between dark and light mode', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const CeraExampleApp());
+    await tester.pumpAndSettle();
+
+    // Starts in dark mode (showing light_mode_outlined toggle button)
+    expect(find.byIcon(Icons.light_mode_outlined), findsOneWidget);
+
+    await tester.tap(find.byIcon(Icons.light_mode_outlined));
+    await tester.pumpAndSettle();
+
+    // Switched to light mode (showing dark_mode_outlined toggle button)
+    expect(find.byIcon(Icons.dark_mode_outlined), findsOneWidget);
+  });
+
+  testWidgets(
+    'message composer integrates audio mode, voice persona, and sample script pills',
+    (WidgetTester tester) async {
+      AudioChatMode? selectedMode;
+      String? selectedVoice;
+      final inputController = TextEditingController();
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            bottomNavigationBar: MessageComposer(
+              controller: inputController,
+              isBusy: false,
+              isGenerating: false,
+              canAttachImage: true,
+              canAttachAudio: true,
+              pendingImageBytes: null,
+              pendingImageName: null,
+              hasAudioIn: true,
+              hasAudioOut: true,
+              audioChatMode: AudioChatMode.textToSpeech,
+              onAudioChatModeChanged: (m) => selectedMode = m,
+              audioProfile: englishProfile,
+              selectedVoicePrompt: 'Use the US female voice.',
+              onVoiceChanged: (v) => selectedVoice = v,
+              ttsSampleTexts: const ['Synthesize this custom sample line.'],
+              onSend: () {},
+              onStop: () {},
+              onPickImage: () {},
+              onClearImage: () {},
+              onSendAudio: (_, _) {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Speak (TTS)'), findsOneWidget);
+      expect(find.text('Narrator'), findsOneWidget);
+      expect(find.text('Sample'), findsOneWidget);
+
+      // Tap Sample pill to populate TTS sample script
+      await tester.tap(find.text('Sample'));
+      await tester.pump();
+      expect(inputController.text, 'Synthesize this custom sample line.');
+
+      // Open Audio Mode menu and switch to Voice Chat
+      await tester.tap(find.text('Speak (TTS)'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Voice Chat').last);
+      await tester.pumpAndSettle();
+      expect(selectedMode, AudioChatMode.interleaved);
+
+      // Open Voice Persona menu and switch to Studio Warm
+      await tester.tap(find.text('Narrator'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Studio Warm').last);
+      await tester.pumpAndSettle();
+      expect(selectedVoice, 'Use the UK male voice.');
+    },
+  );
+
+  test(
+    'resolveAudioProfile populates standard LFM2.5-Audio voices when runtime returns plain profile',
+    () {
+      const audioCaps = CeraCapabilities(
+        textIn: true,
+        textOut: true,
+        imageIn: false,
+        audioIn: true,
+        audioOut: true,
+      );
+
+      final resolvedEnglish = ChatController.resolveAudioProfile(
+        plainProfile,
+        modelIdentity: 'LFM2.5-Audio-1.5B-Q4_0.gguf',
+        capabilities: audioCaps,
+      );
+      expect(resolvedEnglish.hasVoices, isTrue);
+      expect(resolvedEnglish.voices.length, 4);
+      expect(resolvedEnglish.voices.first.label, '👩 US Female');
+
+      // Japanese LFM2.5-Audio model keeps empty voices list
+      final resolvedJapanese = ChatController.resolveAudioProfile(
+        japaneseProfile,
+        modelIdentity: 'LFM2.5-Audio-1.5B-JP-GGUF',
+        capabilities: audioCaps,
+      );
+      expect(resolvedJapanese.hasVoices, isFalse);
+
+      // Non-LFM audio model keeps its original profile
+      final resolvedGeneric = ChatController.resolveAudioProfile(
+        plainProfile,
+        modelIdentity: 'SomeNewAudioModel-2B',
+        capabilities: audioCaps,
+      );
+      expect(resolvedGeneric.hasVoices, isFalse);
+    },
+  );
+
+  testWidgets(
+    'message list displays active backend badge on assistant turns and voice persona chips in empty state',
+    (WidgetTester tester) async {
+      String? pickedVoice;
+
+      // Empty state with loaded audio model and active backend
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: MessageList(
+              turns: const [],
+              scrollController: ScrollController(),
+              hasModel: true,
+              activeBackend: 'WebGPU',
+              audioProfile: englishProfile,
+              selectedVoicePrompt: 'Use the US female voice.',
+              onVoiceChanged: (v) => pickedVoice = v,
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('WebGPU'), findsOneWidget);
+      expect(find.text('VOICE PERSONA'), findsOneWidget);
+      expect(find.text('Narrator'), findsOneWidget);
+      expect(find.text('Studio Warm'), findsOneWidget);
+
+      await tester.tap(find.text('Studio Warm'));
+      await tester.pumpAndSettle();
+      expect(pickedVoice, 'Use the UK male voice.');
+
+      // Non-empty transcript shows activeBackend badge next to modelName on assistant turns
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            body: MessageList(
+              turns: const [
+                Turn(role: 'user', text: 'Hello'),
+                Turn(
+                  role: 'assistant',
+                  text: 'Hi there!',
+                  modelName: 'LFM2.5-Audio-1.5B · Q4_0',
+                ),
+              ],
+              scrollController: ScrollController(),
+              hasModel: true,
+              activeBackend: 'Metal GPU',
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('LFM2.5-Audio-1.5B · Q4_0'), findsOneWidget);
+      expect(find.text('Metal GPU'), findsOneWidget);
+    },
+  );
+
+  testWidgets(
+    'message composer keeps voice persona selector visible in textOnly mode and auto-switches to voice chat when picked',
+    (WidgetTester tester) async {
+      AudioChatMode? switchedMode;
+      String? pickedVoice;
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            bottomNavigationBar: MessageComposer(
+              controller: TextEditingController(),
+              isBusy: false,
+              isGenerating: false,
+              canAttachImage: false,
+              canAttachAudio: true,
+              pendingImageBytes: null,
+              pendingImageName: null,
+              hasAudioIn: true,
+              hasAudioOut: true,
+              audioChatMode: AudioChatMode.textOnly,
+              onAudioChatModeChanged: (m) => switchedMode = m,
+              audioProfile: englishProfile,
+              selectedVoicePrompt: '',
+              onVoiceChanged: (v) => pickedVoice = v,
+              onSend: () {},
+              onStop: () {},
+              onPickImage: () {},
+              onClearImage: () {},
+              onSendAudio: (_, _) {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Text Only'), findsOneWidget);
+      expect(find.text('Default Voice'), findsOneWidget);
+
+      await tester.tap(find.text('Default Voice'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Studio Warm').last);
+      await tester.pumpAndSettle();
+
+      expect(pickedVoice, 'Use the UK male voice.');
+      expect(switchedMode, AudioChatMode.interleaved);
     },
   );
 }

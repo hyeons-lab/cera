@@ -38,21 +38,19 @@ your own GPU. Closing the tab is the whole cleanup story.
    recent Firefox has it on some platforms and behind `dom.webgpu.enabled` on
    others. If the page reports the WebAssembly CPU backend, that is what
    happened.
-2. Download an **LFM2** GGUF, for example
-   [`LFM2-350M-GGUF`](https://huggingface.co/LiquidAI/LFM2-350M-GGUF) (small
-   and quick to fetch) or
+2. Pick a model from the built-in Hugging Face bundle catalog (downloads once into
+   the browser's Origin Private File System cache and streams into WebGPU), or
+   choose a local `.gguf` file from disk such as
+   [`LFM2-350M-GGUF`](https://huggingface.co/LiquidAI/LFM2-350M-GGUF) or
    [`LFM2-1.2B-GGUF`](https://huggingface.co/LiquidAI/LFM2-1.2B-GGUF).
-3. Pick the file, and chat.
+3. Start chatting.
 
-The architecture matters: the WebGPU path implements LFM2, so any other
-architecture falls back to the WebAssembly CPU path and runs roughly 40x slower
-(around 1.4 tok/s against around 58). The status line names the backend it
-ended up on.
-
-Picking a file off your own disk is a rough edge, not the design. The engine
-can already resolve a model by bundle id straight from the Hub, though only on
-the WebAssembly CPU path today, so fetching one for the WebGPU session is still
-work rather than a switch to flip.
+The architecture matters: the WebGPU backend supports `lfm2`, `lfm2moe`, and
+dense transformers (`llama`, `qwen2`, `qwen3`, `granite`, `minicpm`, `minicpm5`,
+`nanbeige`, `phi3`/`phi`, and `mistral3`/`ministral3`, with classic Mistral
+served under `llama`). Unsupported architectures or tensor layouts fall back to
+the WebAssembly CPU path and run roughly 40x slower (around 1.4 tok/s against
+around 58). The status line names the backend it ended up on.
 
 ## About this repo
 
