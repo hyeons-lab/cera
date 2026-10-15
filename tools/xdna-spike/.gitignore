@@ -1,0 +1,8 @@
+xrt/
+out/
+results/
+*.exe
+*.obj
+*.lib
+*.exp
+*.def
