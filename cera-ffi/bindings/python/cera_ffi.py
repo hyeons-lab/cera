@@ -33,6 +33,8 @@ import platform
 # Used for default argument values
 _DEFAULT = object() # type: typing.Any
 
+import ctypes
+import struct
 
 class _UniffiRustBuffer(ctypes.Structure):
     _fields_ = [
@@ -112,6 +114,49 @@ class _UniffiForeignBytes(ctypes.Structure):
 
     def __str__(self):
         return "_UniffiForeignBytes(len={}, data={})".format(self.len, self.data[0:self.len])
+
+
+class _UniffiFfiConverterByRefBytes:
+    """Zero-copy converter for `&[u8]` / `[ByRef] bytes` arguments.
+
+    Only `lower` and `check_lower` are valid — zero-copy byte buffers only
+    flow foreign -> Rust, and only in argument position. `lift`, `read`, and
+    `write` have no sound implementation here.
+
+    CPython `bytes` objects are immutable and their internal buffer doesn't
+    move for the lifetime of the object; the caller must keep the source
+    `bytes` alive for the duration of the FFI call.
+    """
+
+    @staticmethod
+    def check_lower(value):
+        # Tighter than `bytes-like`: `lower` uses `ctypes.c_char_p` which only
+        # accepts `bytes`/`None`, so fail fast with a matching check.
+        if not isinstance(value, bytes):
+            raise TypeError("a bytes object is required, not {!r}".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value):
+        fb = _UniffiForeignBytes()
+        if len(value) == 0:
+            fb.len = 0
+            fb.data = None
+        else:
+            fb.len = len(value)
+            fb.data = ctypes.cast(ctypes.c_char_p(value), ctypes.POINTER(ctypes.c_char))
+        return fb
+
+    @staticmethod
+    def lift(value):
+        raise NotImplementedError("ByRef bytes cannot be lifted: zero-copy &[u8] only flows foreign->Rust")
+
+    @staticmethod
+    def read(buf):
+        raise NotImplementedError("ByRef bytes cannot be read from a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+
+    @staticmethod
+    def write(value, buf):
+        raise NotImplementedError("ByRef bytes cannot be written to a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
 
 
 class _UniffiRustBufferStream:
@@ -204,14 +249,15 @@ class _UniffiRustBufferBuilder:
 
     def _pack_into(self, size, format, value):
         with self._reserve(size):
-            # XXX TODO: I feel like I should be able to use `struct.pack_into` here but can't figure it out.
-            for i, byte in enumerate(struct.pack(format, value)):
-                self.rbuf.data[self.rbuf.len + i] = byte
-
+            packed = struct.pack(format, value)
+            if size > 0:
+                ctypes.memmove(ctypes.addressof(self.rbuf.data.contents) + self.rbuf.len, packed, size)
+    
     def write(self, value):
-        with self._reserve(len(value)):
-            for i, byte in enumerate(value):
-                self.rbuf.data[self.rbuf.len + i] = byte
+        length = len(value)
+        with self._reserve(length):
+            if length > 0:
+                ctypes.memmove(ctypes.addressof(self.rbuf.data.contents) + self.rbuf.len, value, length)
 
     def write_i8(self, v):
         self._pack_into(1, ">b", v)
@@ -479,401 +525,401 @@ def _uniffi_check_contract_api_version(lib):
         raise InternalError("UniFFI contract version mismatch: try cleaning and rebuilding your project")
 
 def _uniffi_check_api_checksums(lib):
-    if lib.uniffi_cera_ffi_checksum_func_audio_pipeline_default_config() != 58590:
+    if lib.uniffi_cera_ffi_checksum_func_audio_pipeline_default_config() != 14804:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_cera_ffi_version() != 39330:
+    if lib.uniffi_cera_ffi_checksum_func_cera_ffi_version() != 10629:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_chat_message_assistant() != 62795:
+    if lib.uniffi_cera_ffi_checksum_func_chat_message_assistant() != 18044:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_chat_message_system() != 63071:
+    if lib.uniffi_cera_ffi_checksum_func_chat_message_system() != 56468:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_chat_message_tool() != 48057:
+    if lib.uniffi_cera_ffi_checksum_func_chat_message_tool() != 12814:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_chat_message_user() != 46361:
+    if lib.uniffi_cera_ffi_checksum_func_chat_message_user() != 32889:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_chat_message_user_audio() != 15774:
+    if lib.uniffi_cera_ffi_checksum_func_chat_message_user_audio() != 62369:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_chat_message_user_image() != 57033:
+    if lib.uniffi_cera_ffi_checksum_func_chat_message_user_image() != 34431:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_cpu_backend_report() != 61086:
+    if lib.uniffi_cera_ffi_checksum_func_cpu_backend_report() != 64719:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753:
+    if lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 37982:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 55417:
+    if lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 17978:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471:
+    if lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 39618:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934:
+    if lib.uniffi_cera_ffi_checksum_func_hotword_default_config() != 64401:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 32979:
+    if lib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 31266:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_list_leap_bundles() != 14501:
+    if lib.uniffi_cera_ffi_checksum_func_list_leap_bundles() != 11444:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_list_leap_bundles_async() != 60360:
+    if lib.uniffi_cera_ffi_checksum_func_list_leap_bundles_async() != 31026:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_parse_tool_calls() != 47579:
+    if lib.uniffi_cera_ffi_checksum_func_parse_tool_calls() != 51531:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_silero_vad_default_config() != 25300:
+    if lib.uniffi_cera_ffi_checksum_func_silero_vad_default_config() != 7093:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_tool_grammar() != 41383:
+    if lib.uniffi_cera_ffi_checksum_func_tool_grammar() != 33163:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 57787:
+    if lib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 33783:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 15544:
+    if lib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 7498:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress() != 24631:
+    if lib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache() != 6334:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364:
+    if lib.uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle() != 20230:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache() != 11512:
+    if lib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir() != 25065:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle() != 63803:
+    if lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 26540:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir() != 40876:
+    if lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress() != 64568:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id() != 60717:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template() != 18654:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 14088:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools() != 61680:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() != 53168:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_audio_profile() != 1521:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async() != 8065:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token() != 23786:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts() != 18448:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities() != 15864:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async() != 8804:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() != 28739:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache() != 47796:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async() != 48795:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 28113:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template() != 38712:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens() != 28454:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools() != 46076:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts() != 49008:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_audio_profile() != 17834:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_detect_pii() != 59395:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token() != 30744:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 19826:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities() != 65060:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special() != 42626:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() != 5238:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_eos_token() != 55523:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache() != 49295:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template() != 55941:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 47091:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_is_special_token() != 4501:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens() != 27407:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 21928:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts() != 26137:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session() != 52763:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_detect_pii() != 53563:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 55506:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 52220:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 6832:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special() != 59360:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token() != 9607:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_eos_token() != 21294:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_tool_format() != 3684:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template() != 63563:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_transcribe() != 64248:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_is_special_token() != 7395:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_vocab_size() != 11541:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 46262:
+    if lib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches() != 27632:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session() != 32339:
+    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id() != 61514:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 51022:
+    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 22573:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790:
+    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() != 35072:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token() != 23833:
+    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async() != 55200:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_tool_format() != 33648:
+    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts() != 40765:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_transcribe() != 25846:
+    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async() != 3992:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_vocab_size() != 13487:
+    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 27756:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches() != 16144:
+    if lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async() != 26538:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() != 8345:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() != 24156:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() != 4793:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_complete() != 41834:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_complete() != 7176:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async() != 45175:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async() != 39595:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json() != 47941:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json() != 52759:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_complete_json() != 8906:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_complete_json() != 12972:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint() != 22936:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint() != 34798:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 16263:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 11353:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 53642:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json() != 25545:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json() != 26943:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 23636:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size() != 53708:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size() != 39566:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 19353:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 2259:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 16821:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response() != 5490:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response() != 47361:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_into_session() != 20770:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint() != 43603:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint() != 29130:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_phase() != 2758:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_phase() != 3748:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_position() != 5506:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_position() != 55288:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_recovery_status() != 44509:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_recovery_status() != 50985:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages() != 27023:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages() != 2557:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_reset() != 23366:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 48141:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size() != 2802:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size() != 55203:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 61090:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_set_tools() != 35477:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_set_tools() != 36170:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_tool_format() != 25567:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_tool_format() != 18638:
+    if lib.uniffi_cera_ffi_checksum_method_chatsession_tools() != 49577:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_chatsession_tools() != 13384:
+    if lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 3580:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688:
+    if lib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 37554:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 42076:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance() != 5629:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer() != 59328:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 58366:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3() != 19665:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 45054:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 32213:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer() != 56903:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu() != 53013:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3() != 34038:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 33980:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance() != 27373:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer() != 31918:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 57820:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() != 26752:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 57672:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active() != 43:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 47716:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance() != 23593:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu() != 39954:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event() != 12599:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 1087:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() != 46866:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer() != 11141:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16() != 16235:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() != 57051:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() != 59725:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active() != 50875:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state() != 16398:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance() != 16879:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance() != 59416:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event() != 54239:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 31176:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() != 51752:
+    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 22101:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16() != 58081:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 9162:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() != 13673:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer() != 38831:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state() != 59212:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3() != 41691:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance() != 16840:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 5196:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer() != 52331:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 54575:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3() != 63232:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes() != 51326:
+    if lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config() != 16946:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file() != 44957:
+    if lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords() != 60107:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config() != 53986:
+    if lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window() != 29908:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords() != 45182:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes() != 63590:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window() != 21244:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file() != 53984:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files() != 12479:
+    if lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 50955:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 50343:
+    if lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() != 16380:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() != 70:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files() != 65300:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes() != 36063:
+    if lib.uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps() != 37477:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file() != 47359:
+    if lib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk() != 29313:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps() != 58406:
+    if lib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride() != 52504:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk() != 18343:
+    if lib.uniffi_cera_ffi_checksum_method_ffisilerovad_reset() != 38669:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride() != 7042:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes() != 30613:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffisilerovad_reset() != 31369:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file() != 4850:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffivaditerator_new() != 27580:
+    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_flush() != 54746:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_flush() != 29655:
+    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride() != 62647:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride() != 36793:
+    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active() != 35573:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active() != 47511:
+    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event() != 19744:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event() != 35592:
+    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk() != 30403:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk() != 7048:
+    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_reset() != 30192:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffivaditerator_reset() != 44489:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffivaditerator_new() != 28084:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes() != 50588:
+    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual() != 19817:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file() != 38235:
+    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() != 34010:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual() != 4736:
+    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 751:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() != 32663:
+    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 25034:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 11943:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes() != 15068:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 5318:
+    if lib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file() != 53431:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 60817:
+    if lib.uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 55866:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_generativemodel_engine() != 55922:
+    if lib.uniffi_cera_ffi_checksum_method_generativemodel_engine() != 8210:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 57598:
+    if lib.uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 4515:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors() != 11183:
+    if lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 23483:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 55901:
+    if lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors() != 64977:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk() != 47658:
+    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk() != 64152:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk() != 2558:
+    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk() != 5080:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 63767:
+    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 23264:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 54825:
+    if lib.uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 57244:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_modelhandle_as_generative() != 6141:
+    if lib.uniffi_cera_ffi_checksum_method_modelhandle_as_generative() != 16733:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_modelhandle_kind() != 52976:
+    if lib.uniffi_cera_ffi_checksum_method_modelhandle_kind() != 40804:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_modelloader_new() != 6200:
+    if lib.uniffi_cera_ffi_checksum_method_modelloader_build() != 15329:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_modelloader_build() != 37695:
+    if lib.uniffi_cera_ffi_checksum_method_modelloader_build_generative() != 49676:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_modelloader_build_generative() != 14372:
+    if lib.uniffi_cera_ffi_checksum_constructor_modelloader_new() != 55287:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter() != 59300:
+    if lib.uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 40599:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 60671:
+    if lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter() != 52159:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 10087:
+    if lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 24657:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 65327:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 59092:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_image() != 28033:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_image() != 13614:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 34040:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 46533:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_text() != 61919:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_append_tokens() != 1227:
+    if lib.uniffi_cera_ffi_checksum_method_session_append_tokens() != 44611:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_attach_lora() != 61634:
+    if lib.uniffi_cera_ffi_checksum_method_session_attach_lora() != 6101:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_cancel() != 44519:
+    if lib.uniffi_cera_ffi_checksum_method_session_cancel() != 21394:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_capabilities() != 8147:
+    if lib.uniffi_cera_ffi_checksum_method_session_capabilities() != 38264:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_clear_cancel() != 11168:
+    if lib.uniffi_cera_ffi_checksum_method_session_clear_cancel() != 50845:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826:
+    if lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 28546:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_disable_spec() != 57:
+    if lib.uniffi_cera_ffi_checksum_method_session_disable_spec() != 10695:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_enable_spec() != 2995:
+    if lib.uniffi_cera_ffi_checksum_method_session_enable_spec() != 47491:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819:
+    if lib.uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 53988:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_generate() != 20338:
+    if lib.uniffi_cera_ffi_checksum_method_session_generate() != 41604:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_generate_async() != 4050:
+    if lib.uniffi_cera_ffi_checksum_method_session_generate_async() != 18250:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() != 1272:
+    if lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() != 34542:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 58221:
+    if lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 30677:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_has_lora() != 13931:
+    if lib.uniffi_cera_ffi_checksum_method_session_has_lora() != 4349:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_hidden_size() != 46607:
+    if lib.uniffi_cera_ffi_checksum_method_session_hidden_size() != 23994:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 17860:
+    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 54921:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 42869:
+    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 9905:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 60330:
+    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 28258:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 34852:
+    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 48296:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246:
+    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 6204:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 61117:
+    if lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 30179:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_image_max_long_size() != 8402:
+    if lib.uniffi_cera_ffi_checksum_method_session_image_max_long_size() != 38663:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224:
+    if lib.uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 20954:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_into_chat() != 13314:
+    if lib.uniffi_cera_ffi_checksum_method_session_into_chat() != 10965:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_load_checkpoint() != 19760:
+    if lib.uniffi_cera_ffi_checksum_method_session_load_checkpoint() != 47038:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_position() != 13264:
+    if lib.uniffi_cera_ffi_checksum_method_session_position() != 16936:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068:
+    if lib.uniffi_cera_ffi_checksum_method_session_recovery_status() != 12819:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_remove_lora() != 29534:
+    if lib.uniffi_cera_ffi_checksum_method_session_remove_lora() != 4466:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_reset() != 48041:
+    if lib.uniffi_cera_ffi_checksum_method_session_reset() != 50584:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_save_checkpoint() != 10964:
+    if lib.uniffi_cera_ffi_checksum_method_session_save_checkpoint() != 39015:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_send_message() != 6919:
+    if lib.uniffi_cera_ffi_checksum_method_session_send_message() != 42720:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 43103:
+    if lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 53351:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617:
+    if lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 2757:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 26929:
+    if lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 26612:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 64571:
+    if lib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 37806:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_session_set_seed() != 54035:
+    if lib.uniffi_cera_ffi_checksum_method_session_set_seed() != 45807:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
 
 # A ctypes library to expose the extern-C FFI definitions.
@@ -901,459 +947,603 @@ _UniffiLib.ffi_cera_ffi_rustbuffer_reserve.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.ffi_cera_ffi_rustbuffer_reserve.restype = _UniffiRustBuffer
-_UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK = ctypes.CFUNCTYPE(None,ctypes.c_uint64,ctypes.c_int8,
-)
-_UNIFFI_FOREIGN_FUTURE_DROPPED_CALLBACK = ctypes.CFUNCTYPE(None,ctypes.c_uint64,
-)
-class _UniffiForeignFutureDroppedCallbackStruct(ctypes.Structure):
-    _fields_ = [
-        ("handle", ctypes.c_uint64),
-        ("free", _UNIFFI_FOREIGN_FUTURE_DROPPED_CALLBACK),
-    ]
-_UniffiLib.ffi_cera_ffi_rust_future_poll_u8.argtypes = (
-    ctypes.c_uint64,
-    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_poll_u8.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_u8.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_u8.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_complete_u8.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.ffi_cera_ffi_rust_future_complete_u8.restype = ctypes.c_uint8
-_UniffiLib.ffi_cera_ffi_rust_future_free_u8.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_free_u8.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_poll_i8.argtypes = (
-    ctypes.c_uint64,
-    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_poll_i8.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_i8.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_i8.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_complete_i8.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.ffi_cera_ffi_rust_future_complete_i8.restype = ctypes.c_int8
-_UniffiLib.ffi_cera_ffi_rust_future_free_i8.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_free_i8.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_poll_u16.argtypes = (
-    ctypes.c_uint64,
-    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_poll_u16.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_u16.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_u16.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_complete_u16.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.ffi_cera_ffi_rust_future_complete_u16.restype = ctypes.c_uint16
-_UniffiLib.ffi_cera_ffi_rust_future_free_u16.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_free_u16.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_poll_i16.argtypes = (
-    ctypes.c_uint64,
-    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_poll_i16.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_i16.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_i16.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_complete_i16.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.ffi_cera_ffi_rust_future_complete_i16.restype = ctypes.c_int16
-_UniffiLib.ffi_cera_ffi_rust_future_free_i16.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_free_i16.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_poll_u32.argtypes = (
-    ctypes.c_uint64,
-    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_poll_u32.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_u32.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_u32.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_complete_u32.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.ffi_cera_ffi_rust_future_complete_u32.restype = ctypes.c_uint32
-_UniffiLib.ffi_cera_ffi_rust_future_free_u32.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_free_u32.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_poll_i32.argtypes = (
-    ctypes.c_uint64,
-    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_poll_i32.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_i32.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_i32.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_complete_i32.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.ffi_cera_ffi_rust_future_complete_i32.restype = ctypes.c_int32
-_UniffiLib.ffi_cera_ffi_rust_future_free_i32.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_free_i32.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_poll_u64.argtypes = (
-    ctypes.c_uint64,
-    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_poll_u64.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_u64.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_u64.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_complete_u64.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.ffi_cera_ffi_rust_future_complete_u64.restype = ctypes.c_uint64
-_UniffiLib.ffi_cera_ffi_rust_future_free_u64.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_free_u64.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_poll_i64.argtypes = (
-    ctypes.c_uint64,
-    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_poll_i64.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_i64.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_i64.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_complete_i64.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.ffi_cera_ffi_rust_future_complete_i64.restype = ctypes.c_int64
-_UniffiLib.ffi_cera_ffi_rust_future_free_i64.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_free_i64.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_poll_f32.argtypes = (
-    ctypes.c_uint64,
-    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_poll_f32.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_f32.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_f32.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_complete_f32.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.ffi_cera_ffi_rust_future_complete_f32.restype = ctypes.c_float
-_UniffiLib.ffi_cera_ffi_rust_future_free_f32.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_free_f32.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_poll_f64.argtypes = (
-    ctypes.c_uint64,
-    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_poll_f64.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_f64.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_f64.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_complete_f64.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.ffi_cera_ffi_rust_future_complete_f64.restype = ctypes.c_double
-_UniffiLib.ffi_cera_ffi_rust_future_free_f64.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_free_f64.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer.argtypes = (
-    ctypes.c_uint64,
-    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_rust_buffer.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_rust_buffer.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer.restype = _UniffiRustBuffer
-_UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_poll_void.argtypes = (
-    ctypes.c_uint64,
-    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_poll_void.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_void.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_cancel_void.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_complete_void.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.ffi_cera_ffi_rust_future_complete_void.restype = None
-_UniffiLib.ffi_cera_ffi_rust_future_free_void.argtypes = (
-    ctypes.c_uint64,
-)
-_UniffiLib.ffi_cera_ffi_rust_future_free_void.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_bundlerepo.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_bundlerepo.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_bundlerepo.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_bundlerepo.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_ceraengine.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_ceraengine.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_ceraengine.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_ceraengine.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_chatsession.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_chatsession.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_chatsession.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_chatsession.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_downloadprogresssink.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_downloadprogresssink.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_downloadprogresssink.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_downloadprogresssink.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_ffiaudiopipeline.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_ffiaudiopipeline.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_ffiaudiopipeline.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_ffiaudiopipeline.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworddetector.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworddetector.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworddetector.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworddetector.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworditerator.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworditerator.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworditerator.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworditerator.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_ffisilerovad.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_ffisilerovad.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_ffisilerovad.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_ffisilerovad.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_ffivaditerator.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_ffivaditerator.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_ffivaditerator.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_ffivaditerator.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_ffiwhispermodel.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_ffiwhispermodel.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_ffiwhispermodel.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_ffiwhispermodel.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_generativemodel.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_generativemodel.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_generativemodel.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_generativemodel.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_loraadapters.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_loraadapters.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_loraadapters.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_loraadapters.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_modalitysink.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_modalitysink.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_modalitysink.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_modalitysink.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_modelhandle.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_modelhandle.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_modelhandle.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_modelhandle.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_modelloader.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_modelloader.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_modelloader.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_modelloader.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_piiclassifier.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_piiclassifier.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_piiclassifier.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_piiclassifier.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_clone_session.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_clone_session.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_free_session.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_free_session.restype = None
-_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_DOWNLOAD_PROGRESS_SINK_METHOD0 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_void_p,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UNIFFI_CALLBACK_INTERFACE_CLONE_CERA_FFI_DOWNLOAD_PROGRESS_SINK = ctypes.CFUNCTYPE(ctypes.c_uint64,ctypes.c_uint64,
-)
-_UNIFFI_CALLBACK_INTERFACE_FREE_CERA_FFI_DOWNLOAD_PROGRESS_SINK = ctypes.CFUNCTYPE(None,ctypes.c_uint64,
-)
-class _UniffiVTableCallbackInterfaceCeraFfiDownloadProgressSink(ctypes.Structure):
-    _fields_ = [
-        ("uniffi_free", _UNIFFI_CALLBACK_INTERFACE_FREE_CERA_FFI_DOWNLOAD_PROGRESS_SINK),
-        ("uniffi_clone", _UNIFFI_CALLBACK_INTERFACE_CLONE_CERA_FFI_DOWNLOAD_PROGRESS_SINK),
-        ("on_progress", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_DOWNLOAD_PROGRESS_SINK_METHOD0),
-    ]
-_UniffiLib.uniffi_cera_ffi_fn_init_callback_vtable_downloadprogresssink.argtypes = (
-    ctypes.POINTER(_UniffiVTableCallbackInterfaceCeraFfiDownloadProgressSink),
-)
-_UniffiLib.uniffi_cera_ffi_fn_init_callback_vtable_downloadprogresssink.restype = None
-_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD0 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_void_p,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD1 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_void_p,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD2 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_uint32,ctypes.c_void_p,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD3 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_void_p,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UNIFFI_CALLBACK_INTERFACE_CLONE_CERA_FFI_MODALITY_SINK = ctypes.CFUNCTYPE(ctypes.c_uint64,ctypes.c_uint64,
-)
-_UNIFFI_CALLBACK_INTERFACE_FREE_CERA_FFI_MODALITY_SINK = ctypes.CFUNCTYPE(None,ctypes.c_uint64,
-)
-class _UniffiVTableCallbackInterfaceCeraFfiModalitySink(ctypes.Structure):
-    _fields_ = [
-        ("uniffi_free", _UNIFFI_CALLBACK_INTERFACE_FREE_CERA_FFI_MODALITY_SINK),
-        ("uniffi_clone", _UNIFFI_CALLBACK_INTERFACE_CLONE_CERA_FFI_MODALITY_SINK),
-        ("on_thought_chunk", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD0),
-        ("on_text_chunk", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD1),
-        ("on_audio_frames", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD2),
-        ("on_done", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD3),
-    ]
-_UniffiLib.uniffi_cera_ffi_fn_init_callback_vtable_modalitysink.argtypes = (
-    ctypes.POINTER(_UniffiVTableCallbackInterfaceCeraFfiModalitySink),
-)
-_UniffiLib.uniffi_cera_ffi_fn_init_callback_vtable_modalitysink.restype = None
+_UniffiLib.ffi_cera_ffi_uniffi_contract_version.argtypes = (
+)
+_UniffiLib.ffi_cera_ffi_uniffi_contract_version.restype = ctypes.c_uint32
+_UniffiLib.uniffi_cera_ffi_checksum_func_audio_pipeline_default_config.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_audio_pipeline_default_config.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_cera_ffi_version.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_cera_ffi_version.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_assistant.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_assistant.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_system.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_system.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_tool.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_tool.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user_audio.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user_audio.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user_image.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user_image.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_cpu_backend_report.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_cpu_backend_report.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_detect_tool_format.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_detect_tool_format.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_install_skels.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_install_skels.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_probe.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_probe.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_hotword_default_config.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_hotword_default_config.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_list_leap_bundles.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_list_leap_bundles.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_list_leap_bundles_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_list_leap_bundles_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_parse_tool_calls.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_parse_tool_calls.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_silero_vad_default_config.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_silero_vad_default_config.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_tool_grammar.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_tool_grammar.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_audio_profile.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_audio_profile.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_context_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_context_size.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_detect_pii.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_detect_pii.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_eos_token.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_eos_token.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_is_special_token.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_is_special_token.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_metadata.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_metadata.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_new_session.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_new_session.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_tool_format.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_tool_format.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_transcribe.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_transcribe.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_vocab_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_vocab_size.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_cancel.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_cancel.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_json.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_json.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_into_session.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_into_session.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_phase.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_phase.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_position.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_position.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_recovery_status.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_recovery_status.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_reset.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_reset.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tools.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tools.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tool_format.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tool_format.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tools.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tools.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_reset.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_reset.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_flush.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_flush.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_reset.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_reset.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffivaditerator_new.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffivaditerator_new.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_generativemodel_create_session.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_generativemodel_create_session.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_generativemodel_engine.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_generativemodel_engine.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_loraadapters_target_count.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_loraadapters_target_count.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_done.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_done.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelhandle_as_generative.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelhandle_as_generative.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelhandle_kind.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelhandle_kind.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelloader_build.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelloader_build.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelloader_build_generative.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_modelloader_build_generative.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_modelloader_new.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_modelloader_new.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_piiclassifier_detect.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_piiclassifier_detect.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_audio.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_audio.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_image.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_image.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_raw_image.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_raw_image.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_text.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_text.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_tokens.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_tokens.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_attach_lora.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_attach_lora.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_cancel.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_cancel.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_capabilities.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_capabilities.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_clear_cancel.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_clear_cancel.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_default_generate_opts.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_default_generate_opts.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_disable_spec.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_disable_spec.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_enable_spec.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_enable_spec.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_export_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_export_checkpoint.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate_streaming.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate_streaming.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_has_lora.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_has_lora.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_size.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_image_max_long_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_image_max_long_size.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_import_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_import_checkpoint.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_into_chat.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_into_chat.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_load_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_load_checkpoint.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_position.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_position.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_recovery_status.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_recovery_status.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_remove_lora.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_remove_lora.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_reset.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_reset.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_save_checkpoint.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_save_checkpoint.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message_streaming.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message_streaming.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_seed.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_seed.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_fn_func_audio_pipeline_default_config.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
@@ -1449,17 +1639,6 @@ _UniffiLib.uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts.restype = _UniffiRustBuffer
-_UniffiLib.uniffi_cera_ffi_fn_constructor_bundlerepo_new.argtypes = (
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_bundlerepo_new.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_bundlerepo_with_progress.argtypes = (
-    _UniffiRustBuffer,
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_bundlerepo_with_progress.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_bundlerepo_cache_size.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1482,56 +1661,17 @@ _UniffiLib.uniffi_cera_ffi_fn_method_bundlerepo_store_dir.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_bundlerepo_store_dir.restype = _UniffiRustBuffer
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bundle_id.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
+_UniffiLib.uniffi_cera_ffi_fn_constructor_bundlerepo_new.argtypes = (
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bundle_id.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bundle_id_async.argtypes = (
+_UniffiLib.uniffi_cera_ffi_fn_constructor_bundlerepo_new.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_bundlerepo_with_progress.argtypes = (
     _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bundle_id_async.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
+    ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes_async.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes_async.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_parts.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_parts.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_parts_async.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_parts_async.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_path.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_path.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_path_async.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_path_async.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_bundlerepo_with_progress.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1676,11 +1816,56 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_wipe_all_prefix_caches.argtypes 
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ceraengine_wipe_all_prefix_caches.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_constructor_chatsession_from_session.argtypes = (
-    ctypes.c_uint64,
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bundle_id.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_cera_ffi_fn_constructor_chatsession_from_session.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bundle_id.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bundle_id_async.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bundle_id_async.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes_async.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes_async.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_parts.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_parts.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_parts_async.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_parts_async.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_path.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_path.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_path_async.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ceraengine_from_path_async.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_cancel.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -1849,6 +2034,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_tools.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_chatsession_tools.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_constructor_chatsession_from_session.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_chatsession_from_session.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_downloadprogresssink_on_progress.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -1857,62 +2047,6 @@ _UniffiLib.uniffi_cera_ffi_fn_method_downloadprogresssink_on_progress.argtypes =
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_downloadprogresssink_on_progress.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    ctypes.c_int8,
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    ctypes.c_int8,
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    ctypes.c_int8,
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    ctypes.c_int8,
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_add_utterance.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2009,16 +2143,62 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu.restype = ctypes.c_int8
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_bytes.argtypes = (
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_bytes.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_file.argtypes = (
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_int8,
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_file.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_int8,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_int8,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.c_int8,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_ffihotworddetector_default_config.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2035,13 +2215,16 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ffihotworddetector_process_window.argtypes 
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffihotworddetector_process_window.restype = _UniffiRustBuffer
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworditerator_from_files.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_bytes.argtypes = (
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworditerator_from_files.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_bytes.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_file.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_file.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_ffihotworditerator_process_chunk.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2053,16 +2236,13 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ffihotworditerator_reset.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffihotworditerator_reset.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffisilerovad_from_bytes.argtypes = (
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworditerator_from_files.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffisilerovad_from_bytes.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffisilerovad_from_file.argtypes = (
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffisilerovad_from_file.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffihotworditerator_from_files.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_ffisilerovad_get_speech_timestamps.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2091,12 +2271,16 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ffisilerovad_reset.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffisilerovad_reset.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffivaditerator_new.argtypes = (
-    _UniffiRustBuffer,
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffisilerovad_from_bytes.argtypes = (
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffivaditerator_new.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffisilerovad_from_bytes.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffisilerovad_from_file.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffisilerovad_from_file.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_flush.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2129,16 +2313,12 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_reset.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffivaditerator_reset.restype = None
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_bytes.argtypes = (
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffivaditerator_new.argtypes = (
+    _UniffiRustBuffer,
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
 )
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_bytes.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_file.argtypes = (
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_file.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffivaditerator_new.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_is_multilingual.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2162,6 +2342,16 @@ _UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe_async.argtypes =
     _UniffiRustBuffer,
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe_async.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_bytes.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_bytes.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_file.argtypes = (
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_file.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_generativemodel_create_session.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2173,6 +2363,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_generativemodel_engine.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_generativemodel_engine.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_loraadapters_target_count.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_loraadapters_target_count.restype = ctypes.c_uint32
 _UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_gguf.argtypes = (
     _UniffiRustBuffer,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2184,11 +2379,6 @@ _UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_safetensors.argtypes
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_constructor_loraadapters_from_safetensors.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_method_loraadapters_target_count.argtypes = (
-    ctypes.c_uint64,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_method_loraadapters_target_count.restype = ctypes.c_uint32
 _UniffiLib.uniffi_cera_ffi_fn_method_modalitysink_on_thought_chunk.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2224,12 +2414,6 @@ _UniffiLib.uniffi_cera_ffi_fn_method_modelhandle_kind.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_modelhandle_kind.restype = _UniffiRustBuffer
-_UniffiLib.uniffi_cera_ffi_fn_constructor_modelloader_new.argtypes = (
-    _UniffiRustBuffer,
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_constructor_modelloader_new.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_modelloader_build.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -2240,6 +2424,18 @@ _UniffiLib.uniffi_cera_ffi_fn_method_modelloader_build_generative.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_modelloader_build_generative.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_modelloader_new.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_modelloader_new.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_piiclassifier_detect.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_piiclassifier_detect.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_constructor_piiclassifier_from_base_and_adapter.argtypes = (
     _UniffiRustBuffer,
     _UniffiRustBuffer,
@@ -2251,12 +2447,6 @@ _UniffiLib.uniffi_cera_ffi_fn_constructor_piiclassifier_from_path.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_constructor_piiclassifier_from_path.restype = ctypes.c_uint64
-_UniffiLib.uniffi_cera_ffi_fn_method_piiclassifier_detect.argtypes = (
-    ctypes.c_uint64,
-    _UniffiRustBuffer,
-    ctypes.POINTER(_UniffiRustCallStatus),
-)
-_UniffiLib.uniffi_cera_ffi_fn_method_piiclassifier_detect.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_session_append_audio.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2494,603 +2684,452 @@ _UniffiLib.uniffi_cera_ffi_fn_method_session_set_seed.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_session_set_seed.restype = None
-_UniffiLib.ffi_cera_ffi_uniffi_contract_version.argtypes = (
-)
-_UniffiLib.ffi_cera_ffi_uniffi_contract_version.restype = ctypes.c_uint32
-_UniffiLib.uniffi_cera_ffi_checksum_func_audio_pipeline_default_config.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_audio_pipeline_default_config.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_cera_ffi_version.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_cera_ffi_version.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_assistant.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_assistant.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_system.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_system.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_tool.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_tool.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user_audio.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user_audio.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user_image.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_chat_message_user_image.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_cpu_backend_report.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_cpu_backend_report.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_detect_tool_format.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_detect_tool_format.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_install_skels.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_install_skels.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_probe.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_hexagon_probe.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_hotword_default_config.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_hotword_default_config.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_list_leap_bundles.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_list_leap_bundles.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_list_leap_bundles_async.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_list_leap_bundles_async.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_parse_tool_calls.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_parse_tool_calls.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_silero_vad_default_config.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_silero_vad_default_config.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_tool_grammar.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_tool_grammar.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_audio_profile.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_audio_profile.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_context_size.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_context_size.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_detect_pii.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_detect_pii.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_eos_token.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_eos_token.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_is_special_token.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_is_special_token.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_metadata.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_metadata.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_new_session.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_new_session.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_tool_format.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_tool_format.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_transcribe.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_transcribe.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_vocab_size.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_vocab_size.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_cancel.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_cancel.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_json.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_complete_json.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_into_session.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_into_session.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_phase.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_phase.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_position.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_position.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_recovery_status.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_recovery_status.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_reset.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_reset.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tools.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_set_tools.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tool_format.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tool_format.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tools.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tools.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_reset.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffisilerovad_reset.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffivaditerator_new.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffivaditerator_new.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_flush.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_flush.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_reset.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffivaditerator_reset.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_generativemodel_create_session.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_generativemodel_create_session.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_generativemodel_engine.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_generativemodel_engine.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_loraadapters_target_count.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_loraadapters_target_count.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_done.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_modalitysink_on_done.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_modelhandle_as_generative.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_modelhandle_as_generative.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_modelhandle_kind.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_modelhandle_kind.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_modelloader_new.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_modelloader_new.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_modelloader_build.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_modelloader_build.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_modelloader_build_generative.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_modelloader_build_generative.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_piiclassifier_detect.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_piiclassifier_detect.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_audio.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_audio.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_image.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_image.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_raw_image.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_raw_image.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_text.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_text.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_tokens.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_append_tokens.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_attach_lora.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_attach_lora.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_cancel.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_cancel.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_capabilities.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_capabilities.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_clear_cancel.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_clear_cancel.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_default_generate_opts.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_default_generate_opts.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_disable_spec.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_disable_spec.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_enable_spec.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_enable_spec.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_export_checkpoint.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_export_checkpoint.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate_async.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate_async.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate_streaming.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate_streaming.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_has_lora.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_has_lora.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_size.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_size.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_image_max_long_size.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_image_max_long_size.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_import_checkpoint.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_import_checkpoint.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_into_chat.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_into_chat.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_load_checkpoint.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_load_checkpoint.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_position.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_position.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_recovery_status.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_recovery_status.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_remove_lora.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_remove_lora.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_reset.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_reset.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_save_checkpoint.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_save_checkpoint.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message_streaming.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_send_message_streaming.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters.restype = ctypes.c_uint16
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_seed.argtypes = (
-)
-_UniffiLib.uniffi_cera_ffi_checksum_method_session_set_seed.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_fn_clone_bundlerepo.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_bundlerepo.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_bundlerepo.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_bundlerepo.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_ceraengine.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_ceraengine.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_ceraengine.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_ceraengine.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_chatsession.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_chatsession.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_chatsession.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_chatsession.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_downloadprogresssink.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_downloadprogresssink.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_downloadprogresssink.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_downloadprogresssink.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffiaudiopipeline.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffiaudiopipeline.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_ffiaudiopipeline.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_ffiaudiopipeline.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworddetector.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworddetector.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworddetector.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworddetector.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworditerator.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffihotworditerator.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworditerator.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_ffihotworditerator.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffisilerovad.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffisilerovad.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_ffisilerovad.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_ffisilerovad.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffivaditerator.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffivaditerator.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_ffivaditerator.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_ffivaditerator.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffiwhispermodel.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_ffiwhispermodel.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_ffiwhispermodel.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_ffiwhispermodel.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_generativemodel.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_generativemodel.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_generativemodel.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_generativemodel.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_loraadapters.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_loraadapters.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_loraadapters.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_loraadapters.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_modalitysink.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_modalitysink.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_modalitysink.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_modalitysink.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_modelhandle.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_modelhandle.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_modelhandle.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_modelhandle.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_modelloader.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_modelloader.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_modelloader.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_modelloader.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_piiclassifier.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_piiclassifier.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_piiclassifier.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_piiclassifier.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_session.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_session.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_session.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_session.restype = None
+_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_DOWNLOAD_PROGRESS_SINK_METHOD0 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UNIFFI_CALLBACK_INTERFACE_CLONE_CERA_FFI_DOWNLOAD_PROGRESS_SINK = ctypes.CFUNCTYPE(ctypes.c_uint64,ctypes.c_uint64,
+)
+_UNIFFI_CALLBACK_INTERFACE_FREE_CERA_FFI_DOWNLOAD_PROGRESS_SINK = ctypes.CFUNCTYPE(None,ctypes.c_uint64,
+)
+class _UniffiVTableCallbackInterfaceCeraFfiDownloadProgressSink(ctypes.Structure):
+    _fields_ = [
+        ("uniffi_free", _UNIFFI_CALLBACK_INTERFACE_FREE_CERA_FFI_DOWNLOAD_PROGRESS_SINK),
+        ("uniffi_clone", _UNIFFI_CALLBACK_INTERFACE_CLONE_CERA_FFI_DOWNLOAD_PROGRESS_SINK),
+        ("on_progress", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_DOWNLOAD_PROGRESS_SINK_METHOD0),
+    ]
+_UniffiLib.uniffi_cera_ffi_fn_init_callback_vtable_downloadprogresssink.argtypes = (
+    ctypes.POINTER(_UniffiVTableCallbackInterfaceCeraFfiDownloadProgressSink),
+)
+_UniffiLib.uniffi_cera_ffi_fn_init_callback_vtable_downloadprogresssink.restype = None
+_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD0 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD1 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD2 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_uint32,ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD3 = ctypes.CFUNCTYPE(None,ctypes.c_uint64,_UniffiRustBuffer,ctypes.c_void_p,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UNIFFI_CALLBACK_INTERFACE_CLONE_CERA_FFI_MODALITY_SINK = ctypes.CFUNCTYPE(ctypes.c_uint64,ctypes.c_uint64,
+)
+_UNIFFI_CALLBACK_INTERFACE_FREE_CERA_FFI_MODALITY_SINK = ctypes.CFUNCTYPE(None,ctypes.c_uint64,
+)
+class _UniffiVTableCallbackInterfaceCeraFfiModalitySink(ctypes.Structure):
+    _fields_ = [
+        ("uniffi_free", _UNIFFI_CALLBACK_INTERFACE_FREE_CERA_FFI_MODALITY_SINK),
+        ("uniffi_clone", _UNIFFI_CALLBACK_INTERFACE_CLONE_CERA_FFI_MODALITY_SINK),
+        ("on_thought_chunk", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD0),
+        ("on_text_chunk", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD1),
+        ("on_audio_frames", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD2),
+        ("on_done", _UNIFFI_CALLBACK_INTERFACE_CERA_FFI_MODALITY_SINK_METHOD3),
+    ]
+_UniffiLib.uniffi_cera_ffi_fn_init_callback_vtable_modalitysink.argtypes = (
+    ctypes.POINTER(_UniffiVTableCallbackInterfaceCeraFfiModalitySink),
+)
+_UniffiLib.uniffi_cera_ffi_fn_init_callback_vtable_modalitysink.restype = None
+_UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK = ctypes.CFUNCTYPE(None,ctypes.c_uint64,ctypes.c_int8,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_poll_u8.argtypes = (
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_poll_u8.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_u8.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_u8.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_complete_u8.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.ffi_cera_ffi_rust_future_complete_u8.restype = ctypes.c_uint8
+_UniffiLib.ffi_cera_ffi_rust_future_free_u8.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_free_u8.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_poll_i8.argtypes = (
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_poll_i8.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_i8.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_i8.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_complete_i8.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.ffi_cera_ffi_rust_future_complete_i8.restype = ctypes.c_int8
+_UniffiLib.ffi_cera_ffi_rust_future_free_i8.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_free_i8.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_poll_u16.argtypes = (
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_poll_u16.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_u16.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_u16.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_complete_u16.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.ffi_cera_ffi_rust_future_complete_u16.restype = ctypes.c_uint16
+_UniffiLib.ffi_cera_ffi_rust_future_free_u16.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_free_u16.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_poll_i16.argtypes = (
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_poll_i16.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_i16.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_i16.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_complete_i16.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.ffi_cera_ffi_rust_future_complete_i16.restype = ctypes.c_int16
+_UniffiLib.ffi_cera_ffi_rust_future_free_i16.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_free_i16.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_poll_u32.argtypes = (
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_poll_u32.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_u32.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_u32.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_complete_u32.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.ffi_cera_ffi_rust_future_complete_u32.restype = ctypes.c_uint32
+_UniffiLib.ffi_cera_ffi_rust_future_free_u32.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_free_u32.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_poll_i32.argtypes = (
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_poll_i32.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_i32.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_i32.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_complete_i32.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.ffi_cera_ffi_rust_future_complete_i32.restype = ctypes.c_int32
+_UniffiLib.ffi_cera_ffi_rust_future_free_i32.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_free_i32.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_poll_u64.argtypes = (
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_poll_u64.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_u64.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_u64.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_complete_u64.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.ffi_cera_ffi_rust_future_complete_u64.restype = ctypes.c_uint64
+_UniffiLib.ffi_cera_ffi_rust_future_free_u64.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_free_u64.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_poll_i64.argtypes = (
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_poll_i64.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_i64.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_i64.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_complete_i64.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.ffi_cera_ffi_rust_future_complete_i64.restype = ctypes.c_int64
+_UniffiLib.ffi_cera_ffi_rust_future_free_i64.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_free_i64.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_poll_f32.argtypes = (
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_poll_f32.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_f32.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_f32.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_complete_f32.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.ffi_cera_ffi_rust_future_complete_f32.restype = ctypes.c_float
+_UniffiLib.ffi_cera_ffi_rust_future_free_f32.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_free_f32.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_poll_f64.argtypes = (
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_poll_f64.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_f64.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_f64.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_complete_f64.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.ffi_cera_ffi_rust_future_complete_f64.restype = ctypes.c_double
+_UniffiLib.ffi_cera_ffi_rust_future_free_f64.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_free_f64.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer.argtypes = (
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_rust_buffer.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_rust_buffer.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer.restype = _UniffiRustBuffer
+_UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_poll_void.argtypes = (
+    ctypes.c_uint64,
+    _UNIFFI_RUST_FUTURE_CONTINUATION_CALLBACK,
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_poll_void.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_void.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_cancel_void.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_complete_void.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.ffi_cera_ffi_rust_future_complete_void.restype = None
+_UniffiLib.ffi_cera_ffi_rust_future_free_void.argtypes = (
+    ctypes.c_uint64,
+)
+_UniffiLib.ffi_cera_ffi_rust_future_free_void.restype = None
 
 _uniffi_check_contract_api_version(_UniffiLib)
 # _uniffi_check_api_checksums(_UniffiLib)
@@ -16494,19 +16533,6 @@ class _UniffiFfiConverterSequenceTypeLeapBundleEntry(_UniffiConverterRustBuffer)
         return [
             _UniffiFfiConverterTypeLeapBundleEntry.read(buf) for i in range(count)
         ]
-
-class _UniffiFfiConverterUInt8(_UniffiConverterPrimitiveInt):
-    CLASS_NAME = "u8"
-    VALUE_MIN = 0
-    VALUE_MAX = 2**8
-
-    @staticmethod
-    def read(buf):
-        return buf.read_u8()
-
-    @staticmethod
-    def write(value, buf):
-        buf.write_u8(value)
 
 class _UniffiFfiConverterOptionalTypeFfiAudioPipelineConfig(_UniffiConverterRustBuffer):
     @classmethod

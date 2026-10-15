@@ -164,9 +164,13 @@ fn extract_linked_sha256(headers: &reqwest::header::HeaderMap) -> Option<String>
 /// sidecar is available.
 pub(crate) fn sha256_file(path: &Path) -> io::Result<String> {
     let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
-    io::copy(&mut file, &mut hasher)?;
-    Ok(hex_encode(&hasher.finalize()))
+    let mut sink = io::sink();
+    let mut hashing = HashingWriter {
+        inner: &mut sink,
+        hasher: Sha256::new(),
+    };
+    io::copy(&mut file, &mut hashing)?;
+    Ok(hex_encode(&hashing.hasher.finalize()))
 }
 
 /// Stream `url` into `dest` atomically + verify the content hash +
@@ -461,8 +465,13 @@ pub(crate) fn download_to(
             // Hash the existing on-disk prefix so running SHA-256 covers the whole file.
             let prefix_file = fs::File::open(&partial)?;
             let mut reader = io::BufReader::with_capacity(128 * 1024, prefix_file);
-            let mut hasher = Sha256::new();
-            let copied = io::copy(&mut reader, &mut hasher)?;
+            let mut sink = io::sink();
+            let mut prefix_hashing = HashingWriter {
+                inner: &mut sink,
+                hasher: Sha256::new(),
+            };
+            let copied = io::copy(&mut reader, &mut prefix_hashing)?;
+            let hasher = prefix_hashing.hasher;
             if copied != existing_len {
                 drop(reader);
                 let _ = fs::remove_file(&partial);
@@ -622,7 +631,7 @@ impl<W: io::Write> io::Write for ProgressingWriter<'_, W> {
     }
 }
 
-fn hex_encode(bytes: &[u8]) -> String {
+pub(crate) fn hex_encode(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
     let mut out = String::with_capacity(bytes.len() * 2);
     for b in bytes {

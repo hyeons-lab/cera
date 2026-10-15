@@ -28,7 +28,13 @@ fn for_sources(sources: &[&GgufFile], name: &str) -> String {
             hash.update((bytes.len() as u64).to_le_bytes());
             hash.update(bytes);
         }
-        return format!("{name}:gguf-sha256-v1:{:x}", hash.finalize());
+        let digest = hash.finalize();
+        let mut hex = String::with_capacity(64);
+        for b in &digest {
+            use std::fmt::Write as _;
+            let _ = write!(hex, "{b:02x}");
+        }
+        return format!("{name}:gguf-sha256-v1:{hex}");
     }
     name.to_owned()
 }
