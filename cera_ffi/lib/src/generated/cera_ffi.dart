@@ -9133,8 +9133,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_cera_ffi_version`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_cera_ffi_version != 39330) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_cera_ffi_version`: expected 39330, got $_checksum_uniffi_cera_ffi_checksum_func_cera_ffi_version');
+    if (_checksum_uniffi_cera_ffi_checksum_func_cera_ffi_version != 10629) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_cera_ffi_version`: expected 10629, got $_checksum_uniffi_cera_ffi_checksum_func_cera_ffi_version');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_cpu_backend_report;
     try {
@@ -9143,8 +9143,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_cpu_backend_report`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_cpu_backend_report != 61086) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_cpu_backend_report`: expected 61086, got $_checksum_uniffi_cera_ffi_checksum_func_cpu_backend_report');
+    if (_checksum_uniffi_cera_ffi_checksum_func_cpu_backend_report != 64719) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_cpu_backend_report`: expected 64719, got $_checksum_uniffi_cera_ffi_checksum_func_cpu_backend_report');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_detect_tool_format;
     try {
@@ -9153,8 +9153,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_detect_tool_format`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_detect_tool_format != 18753) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_detect_tool_format`: expected 18753, got $_checksum_uniffi_cera_ffi_checksum_func_detect_tool_format');
+    if (_checksum_uniffi_cera_ffi_checksum_func_detect_tool_format != 37982) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_detect_tool_format`: expected 37982, got $_checksum_uniffi_cera_ffi_checksum_func_detect_tool_format');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels;
     try {
@@ -9163,8 +9163,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_hexagon_install_skels`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels != 55417) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_hexagon_install_skels`: expected 55417, got $_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels');
+    if (_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels != 17978) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_hexagon_install_skels`: expected 17978, got $_checksum_uniffi_cera_ffi_checksum_func_hexagon_install_skels');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_hexagon_probe;
     try {
@@ -9173,8 +9173,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_hexagon_probe`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_hexagon_probe != 27471) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_hexagon_probe`: expected 27471, got $_checksum_uniffi_cera_ffi_checksum_func_hexagon_probe');
+    if (_checksum_uniffi_cera_ffi_checksum_func_hexagon_probe != 39618) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_hexagon_probe`: expected 39618, got $_checksum_uniffi_cera_ffi_checksum_func_hexagon_probe');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_hotword_default_config;
     try {
@@ -9183,8 +9183,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_hotword_default_config`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_hotword_default_config != 25934) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_hotword_default_config`: expected 25934, got $_checksum_uniffi_cera_ffi_checksum_func_hotword_default_config');
+    if (_checksum_uniffi_cera_ffi_checksum_func_hotword_default_config != 64401) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_hotword_default_config`: expected 64401, got $_checksum_uniffi_cera_ffi_checksum_func_hotword_default_config');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles;
     try {
@@ -9193,8 +9193,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_list_leap_bundles`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles != 14501) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_list_leap_bundles`: expected 14501, got $_checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles');
+    if (_checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles != 11444) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_list_leap_bundles`: expected 11444, got $_checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles_async;
     try {
@@ -9203,8 +9203,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_list_leap_bundles_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles_async != 60360) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_list_leap_bundles_async`: expected 60360, got $_checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles_async');
+    if (_checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles_async != 31026) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_list_leap_bundles_async`: expected 31026, got $_checksum_uniffi_cera_ffi_checksum_func_list_leap_bundles_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_parse_tool_calls;
     try {
@@ -9213,8 +9213,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_parse_tool_calls`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_parse_tool_calls != 47579) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_parse_tool_calls`: expected 47579, got $_checksum_uniffi_cera_ffi_checksum_func_parse_tool_calls');
+    if (_checksum_uniffi_cera_ffi_checksum_func_parse_tool_calls != 51531) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_parse_tool_calls`: expected 51531, got $_checksum_uniffi_cera_ffi_checksum_func_parse_tool_calls');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_silero_vad_default_config;
     try {
@@ -9223,8 +9223,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_silero_vad_default_config`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_silero_vad_default_config != 25300) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_silero_vad_default_config`: expected 25300, got $_checksum_uniffi_cera_ffi_checksum_func_silero_vad_default_config');
+    if (_checksum_uniffi_cera_ffi_checksum_func_silero_vad_default_config != 7093) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_silero_vad_default_config`: expected 7093, got $_checksum_uniffi_cera_ffi_checksum_func_silero_vad_default_config');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_tool_grammar;
     try {
@@ -9233,8 +9233,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_tool_grammar`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_tool_grammar != 41383) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_tool_grammar`: expected 41383, got $_checksum_uniffi_cera_ffi_checksum_func_tool_grammar');
+    if (_checksum_uniffi_cera_ffi_checksum_func_tool_grammar != 33163) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_tool_grammar`: expected 33163, got $_checksum_uniffi_cera_ffi_checksum_func_tool_grammar');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts;
     try {
@@ -9243,8 +9243,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts != 57787) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts`: expected 57787, got $_checksum_uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts');
+    if (_checksum_uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts != 33783) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts`: expected 33783, got $_checksum_uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_audio_pipeline_default_config;
     try {
@@ -9253,8 +9253,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_audio_pipeline_default_config`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_audio_pipeline_default_config != 58590) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_audio_pipeline_default_config`: expected 58590, got $_checksum_uniffi_cera_ffi_checksum_func_audio_pipeline_default_config');
+    if (_checksum_uniffi_cera_ffi_checksum_func_audio_pipeline_default_config != 14804) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_audio_pipeline_default_config`: expected 14804, got $_checksum_uniffi_cera_ffi_checksum_func_audio_pipeline_default_config');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_chat_message_assistant;
     try {
@@ -9263,8 +9263,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_chat_message_assistant`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_assistant != 62795) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_assistant`: expected 62795, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_assistant');
+    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_assistant != 18044) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_assistant`: expected 18044, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_assistant');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_chat_message_system;
     try {
@@ -9273,8 +9273,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_chat_message_system`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_system != 63071) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_system`: expected 63071, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_system');
+    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_system != 56468) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_system`: expected 56468, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_system');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_chat_message_tool;
     try {
@@ -9283,8 +9283,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_chat_message_tool`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_tool != 48057) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_tool`: expected 48057, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_tool');
+    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_tool != 12814) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_tool`: expected 12814, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_tool');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_chat_message_user;
     try {
@@ -9293,8 +9293,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_chat_message_user`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_user != 46361) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_user`: expected 46361, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_user');
+    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_user != 32889) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_user`: expected 32889, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_user');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_chat_message_user_audio;
     try {
@@ -9303,8 +9303,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_chat_message_user_audio`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_user_audio != 15774) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_user_audio`: expected 15774, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_user_audio');
+    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_user_audio != 62369) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_user_audio`: expected 62369, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_user_audio');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_chat_message_user_image;
     try {
@@ -9313,8 +9313,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_chat_message_user_image`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_user_image != 57033) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_user_image`: expected 57033, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_user_image');
+    if (_checksum_uniffi_cera_ffi_checksum_func_chat_message_user_image != 34431) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_chat_message_user_image`: expected 34431, got $_checksum_uniffi_cera_ffi_checksum_func_chat_message_user_image');
     }
     final int _checksum_uniffi_cera_ffi_checksum_func_json_schema_to_grammar;
     try {
@@ -9323,8 +9323,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_func_json_schema_to_grammar`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_func_json_schema_to_grammar != 32979) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_json_schema_to_grammar`: expected 32979, got $_checksum_uniffi_cera_ffi_checksum_func_json_schema_to_grammar');
+    if (_checksum_uniffi_cera_ffi_checksum_func_json_schema_to_grammar != 31266) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_func_json_schema_to_grammar`: expected 31266, got $_checksum_uniffi_cera_ffi_checksum_func_json_schema_to_grammar');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_bundlerepo_cache_size;
     try {
@@ -9333,8 +9333,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_bundlerepo_cache_size`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_cache_size != 29364) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_bundlerepo_cache_size`: expected 29364, got $_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_cache_size');
+    if (_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_cache_size != 7498) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_bundlerepo_cache_size`: expected 7498, got $_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_cache_size');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache;
     try {
@@ -9343,8 +9343,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache != 11512) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache`: expected 11512, got $_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache');
+    if (_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache != 6334) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache`: expected 6334, got $_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle;
     try {
@@ -9353,8 +9353,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle != 63803) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle`: expected 63803, got $_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle');
+    if (_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle != 20230) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle`: expected 20230, got $_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_bundlerepo_store_dir;
     try {
@@ -9363,8 +9363,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_bundlerepo_store_dir`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_store_dir != 40876) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_bundlerepo_store_dir`: expected 40876, got $_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_store_dir');
+    if (_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_store_dir != 25065) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_bundlerepo_store_dir`: expected 25065, got $_checksum_uniffi_cera_ffi_checksum_method_bundlerepo_store_dir');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template;
     try {
@@ -9373,8 +9373,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template != 38712) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template`: expected 38712, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template != 18654) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template`: expected 18654, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools;
     try {
@@ -9383,8 +9383,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools != 46076) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools`: expected 46076, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools != 61680) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools`: expected 61680, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_audio_profile;
     try {
@@ -9393,8 +9393,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_audio_profile`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_audio_profile != 17834) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_audio_profile`: expected 17834, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_audio_profile');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_audio_profile != 1521) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_audio_profile`: expected 1521, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_audio_profile');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_bos_token;
     try {
@@ -9403,8 +9403,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_bos_token`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_bos_token != 30744) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_bos_token`: expected 30744, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_bos_token');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_bos_token != 23786) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_bos_token`: expected 23786, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_bos_token');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_capabilities;
     try {
@@ -9413,8 +9413,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_capabilities`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_capabilities != 65060) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_capabilities`: expected 65060, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_capabilities');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_capabilities != 15864) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_capabilities`: expected 15864, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_capabilities');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache;
     try {
@@ -9423,8 +9423,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache != 5238) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache`: expected 5238, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache != 28739) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache`: expected 28739, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache;
     try {
@@ -9433,8 +9433,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache != 49295) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache`: expected 49295, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache != 47796) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache`: expected 47796, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_context_size;
     try {
@@ -9443,8 +9443,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_context_size`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_context_size != 47091) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_context_size`: expected 47091, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_context_size');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_context_size != 28113) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_context_size`: expected 28113, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_context_size');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens;
     try {
@@ -9453,8 +9453,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens != 27407) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens`: expected 27407, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens != 28454) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens`: expected 28454, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts;
     try {
@@ -9463,8 +9463,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts != 26137) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts`: expected 26137, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts != 49008) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts`: expected 49008, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_detect_pii;
     try {
@@ -9473,8 +9473,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_detect_pii`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_detect_pii != 53563) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_detect_pii`: expected 53563, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_detect_pii');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_detect_pii != 59395) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_detect_pii`: expected 59395, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_detect_pii');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text;
     try {
@@ -9483,8 +9483,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_encode_text`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text != 52220) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_encode_text`: expected 52220, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text != 19826) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_encode_text`: expected 19826, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special;
     try {
@@ -9493,8 +9493,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special != 59360) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special`: expected 59360, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special != 42626) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special`: expected 42626, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_eos_token;
     try {
@@ -9503,8 +9503,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_eos_token`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_eos_token != 21294) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_eos_token`: expected 21294, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_eos_token');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_eos_token != 55523) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_eos_token`: expected 55523, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_eos_token');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template;
     try {
@@ -9513,8 +9513,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template != 63563) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template`: expected 63563, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template != 55941) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template`: expected 55941, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_is_special_token;
     try {
@@ -9523,8 +9523,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_is_special_token`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_is_special_token != 7395) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_is_special_token`: expected 7395, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_is_special_token');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_is_special_token != 4501) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_is_special_token`: expected 4501, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_is_special_token');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_metadata;
     try {
@@ -9533,8 +9533,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_metadata`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_metadata != 46262) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_metadata`: expected 46262, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_metadata');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_metadata != 21928) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_metadata`: expected 21928, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_metadata');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session;
     try {
@@ -9543,8 +9543,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session != 32339) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session`: expected 32339, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session != 52763) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session`: expected 52763, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_session;
     try {
@@ -9553,8 +9553,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_new_session`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_session != 51022) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_new_session`: expected 51022, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_session');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_session != 55506) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_new_session`: expected 55506, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_new_session');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_special_token_id;
     try {
@@ -9563,8 +9563,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_special_token_id`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_special_token_id != 35790) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_special_token_id`: expected 35790, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_special_token_id');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_special_token_id != 6832) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_special_token_id`: expected 6832, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_special_token_id');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token;
     try {
@@ -9573,8 +9573,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token != 23833) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token`: expected 23833, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token != 9607) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token`: expected 9607, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_format;
     try {
@@ -9583,8 +9583,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_tool_format`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_format != 33648) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_tool_format`: expected 33648, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_format');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_format != 3684) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_tool_format`: expected 3684, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_tool_format');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_transcribe;
     try {
@@ -9593,8 +9593,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_transcribe`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_transcribe != 25846) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_transcribe`: expected 25846, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_transcribe');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_transcribe != 64248) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_transcribe`: expected 64248, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_transcribe');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_vocab_size;
     try {
@@ -9603,8 +9603,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_vocab_size`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_vocab_size != 13487) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_vocab_size`: expected 13487, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_vocab_size');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_vocab_size != 11541) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_vocab_size`: expected 11541, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_vocab_size');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches;
     try {
@@ -9613,8 +9613,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches != 16144) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches`: expected 16144, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches != 27632) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches`: expected 27632, got $_checksum_uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress;
     try {
@@ -9623,8 +9623,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress != 33688) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress`: expected 33688, got $_checksum_uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress');
+    if (_checksum_uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress != 37554) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress`: expected 37554, got $_checksum_uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config;
     try {
@@ -9633,8 +9633,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config != 53986) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config`: expected 53986, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config != 16946) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config`: expected 16946, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords;
     try {
@@ -9643,8 +9643,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords != 45182) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords`: expected 45182, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords != 60107) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords`: expected 60107, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window;
     try {
@@ -9653,8 +9653,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window != 21244) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window`: expected 21244, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window != 29908) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window`: expected 29908, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk;
     try {
@@ -9663,8 +9663,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk != 50343) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk`: expected 50343, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk != 50955) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk`: expected 50955, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_reset;
     try {
@@ -9673,8 +9673,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffihotworditerator_reset`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_reset != 70) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworditerator_reset`: expected 70, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_reset');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_reset != 16380) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffihotworditerator_reset`: expected 16380, got $_checksum_uniffi_cera_ffi_checksum_method_ffihotworditerator_reset');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps;
     try {
@@ -9683,8 +9683,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps != 58406) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps`: expected 58406, got $_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps != 37477) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps`: expected 37477, got $_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk;
     try {
@@ -9693,8 +9693,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk != 18343) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk`: expected 18343, got $_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk != 29313) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk`: expected 29313, got $_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride;
     try {
@@ -9703,8 +9703,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride != 7042) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride`: expected 7042, got $_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride != 52504) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride`: expected 52504, got $_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_reset;
     try {
@@ -9713,8 +9713,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffisilerovad_reset`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_reset != 31369) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffisilerovad_reset`: expected 31369, got $_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_reset');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_reset != 38669) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffisilerovad_reset`: expected 38669, got $_checksum_uniffi_cera_ffi_checksum_method_ffisilerovad_reset');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_flush;
     try {
@@ -9723,8 +9723,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffivaditerator_flush`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_flush != 29655) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffivaditerator_flush`: expected 29655, got $_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_flush');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_flush != 54746) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffivaditerator_flush`: expected 54746, got $_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_flush');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride;
     try {
@@ -9733,8 +9733,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride != 36793) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride`: expected 36793, got $_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride != 62647) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride`: expected 62647, got $_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active;
     try {
@@ -9743,8 +9743,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active != 47511) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active`: expected 47511, got $_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active != 35573) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active`: expected 35573, got $_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event;
     try {
@@ -9753,8 +9753,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event != 35592) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event`: expected 35592, got $_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event != 19744) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event`: expected 19744, got $_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk;
     try {
@@ -9763,8 +9763,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk != 7048) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk`: expected 7048, got $_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk != 30403) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk`: expected 30403, got $_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_reset;
     try {
@@ -9773,8 +9773,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffivaditerator_reset`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_reset != 44489) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffivaditerator_reset`: expected 44489, got $_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_reset');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_reset != 30192) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffivaditerator_reset`: expected 30192, got $_checksum_uniffi_cera_ffi_checksum_method_ffivaditerator_reset');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual;
     try {
@@ -9783,8 +9783,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual != 4736) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual`: expected 4736, got $_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual != 19817) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual`: expected 19817, got $_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages;
     try {
@@ -9793,8 +9793,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages != 32663) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages`: expected 32663, got $_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages != 34010) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages`: expected 34010, got $_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe;
     try {
@@ -9803,8 +9803,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe != 11943) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe`: expected 11943, got $_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe != 751) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe`: expected 751, got $_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async;
     try {
@@ -9813,8 +9813,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async != 5318) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async`: expected 5318, got $_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async != 25034) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async`: expected 25034, got $_checksum_uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count;
     try {
@@ -9823,8 +9823,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_loraadapters_target_count`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count != 55901) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_loraadapters_target_count`: expected 55901, got $_checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count');
+    if (_checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count != 4515) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_loraadapters_target_count`: expected 4515, got $_checksum_uniffi_cera_ffi_checksum_method_loraadapters_target_count');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk;
     try {
@@ -9833,8 +9833,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk != 47658) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk`: expected 47658, got $_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk');
+    if (_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk != 64152) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk`: expected 64152, got $_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk;
     try {
@@ -9843,8 +9843,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk != 2558) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk`: expected 2558, got $_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk');
+    if (_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk != 5080) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk`: expected 5080, got $_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames;
     try {
@@ -9853,8 +9853,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames != 63767) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames`: expected 63767, got $_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames');
+    if (_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames != 23264) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames`: expected 23264, got $_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_done;
     try {
@@ -9863,8 +9863,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_modalitysink_on_done`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_done != 54825) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modalitysink_on_done`: expected 54825, got $_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_done');
+    if (_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_done != 57244) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modalitysink_on_done`: expected 57244, got $_checksum_uniffi_cera_ffi_checksum_method_modalitysink_on_done');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_piiclassifier_detect;
     try {
@@ -9873,8 +9873,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_piiclassifier_detect`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_piiclassifier_detect != 10087) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_piiclassifier_detect`: expected 10087, got $_checksum_uniffi_cera_ffi_checksum_method_piiclassifier_detect');
+    if (_checksum_uniffi_cera_ffi_checksum_method_piiclassifier_detect != 40599) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_piiclassifier_detect`: expected 40599, got $_checksum_uniffi_cera_ffi_checksum_method_piiclassifier_detect');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_append_audio;
     try {
@@ -9883,8 +9883,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_append_audio`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_audio != 65327) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_audio`: expected 65327, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_audio');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_audio != 59092) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_audio`: expected 59092, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_audio');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_append_image;
     try {
@@ -9893,8 +9893,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_append_image`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_image != 28033) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_image`: expected 28033, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_image');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_image != 13614) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_image`: expected 13614, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_image');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image;
     try {
@@ -9903,8 +9903,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_append_raw_image`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image != 34040) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_raw_image`: expected 34040, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image != 46533) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_raw_image`: expected 46533, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_raw_image');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_append_text;
     try {
@@ -9913,8 +9913,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_append_text`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_text != 13301) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_text`: expected 13301, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_text');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_text != 61919) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_text`: expected 61919, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_text');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_append_tokens;
     try {
@@ -9923,8 +9923,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_append_tokens`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_tokens != 1227) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_tokens`: expected 1227, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_tokens');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_append_tokens != 44611) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_append_tokens`: expected 44611, got $_checksum_uniffi_cera_ffi_checksum_method_session_append_tokens');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_attach_lora;
     try {
@@ -9933,8 +9933,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_attach_lora`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_attach_lora != 61634) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_attach_lora`: expected 61634, got $_checksum_uniffi_cera_ffi_checksum_method_session_attach_lora');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_attach_lora != 6101) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_attach_lora`: expected 6101, got $_checksum_uniffi_cera_ffi_checksum_method_session_attach_lora');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_cancel;
     try {
@@ -9943,8 +9943,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_cancel`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_cancel != 44519) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_cancel`: expected 44519, got $_checksum_uniffi_cera_ffi_checksum_method_session_cancel');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_cancel != 21394) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_cancel`: expected 21394, got $_checksum_uniffi_cera_ffi_checksum_method_session_cancel');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_capabilities;
     try {
@@ -9953,8 +9953,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_capabilities`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_capabilities != 8147) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_capabilities`: expected 8147, got $_checksum_uniffi_cera_ffi_checksum_method_session_capabilities');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_capabilities != 38264) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_capabilities`: expected 38264, got $_checksum_uniffi_cera_ffi_checksum_method_session_capabilities');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_clear_cancel;
     try {
@@ -9963,8 +9963,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_clear_cancel`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_clear_cancel != 11168) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_clear_cancel`: expected 11168, got $_checksum_uniffi_cera_ffi_checksum_method_session_clear_cancel');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_clear_cancel != 50845) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_clear_cancel`: expected 50845, got $_checksum_uniffi_cera_ffi_checksum_method_session_clear_cancel');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_default_generate_opts;
     try {
@@ -9973,8 +9973,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_default_generate_opts`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_default_generate_opts != 61826) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_default_generate_opts`: expected 61826, got $_checksum_uniffi_cera_ffi_checksum_method_session_default_generate_opts');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_default_generate_opts != 28546) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_default_generate_opts`: expected 28546, got $_checksum_uniffi_cera_ffi_checksum_method_session_default_generate_opts');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_disable_spec;
     try {
@@ -9983,8 +9983,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_disable_spec`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_disable_spec != 57) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_disable_spec`: expected 57, got $_checksum_uniffi_cera_ffi_checksum_method_session_disable_spec');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_disable_spec != 10695) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_disable_spec`: expected 10695, got $_checksum_uniffi_cera_ffi_checksum_method_session_disable_spec');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_enable_spec;
     try {
@@ -9993,8 +9993,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_enable_spec`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_enable_spec != 2995) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_enable_spec`: expected 2995, got $_checksum_uniffi_cera_ffi_checksum_method_session_enable_spec');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_enable_spec != 47491) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_enable_spec`: expected 47491, got $_checksum_uniffi_cera_ffi_checksum_method_session_enable_spec');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_export_checkpoint;
     try {
@@ -10003,8 +10003,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_export_checkpoint`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_export_checkpoint != 47819) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_export_checkpoint`: expected 47819, got $_checksum_uniffi_cera_ffi_checksum_method_session_export_checkpoint');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_export_checkpoint != 53988) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_export_checkpoint`: expected 53988, got $_checksum_uniffi_cera_ffi_checksum_method_session_export_checkpoint');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_generate;
     try {
@@ -10013,8 +10013,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_generate`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_generate != 20338) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_generate`: expected 20338, got $_checksum_uniffi_cera_ffi_checksum_method_session_generate');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_generate != 41604) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_generate`: expected 41604, got $_checksum_uniffi_cera_ffi_checksum_method_session_generate');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_generate_async;
     try {
@@ -10023,8 +10023,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_generate_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_generate_async != 4050) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_generate_async`: expected 4050, got $_checksum_uniffi_cera_ffi_checksum_method_session_generate_async');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_generate_async != 18250) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_generate_async`: expected 18250, got $_checksum_uniffi_cera_ffi_checksum_method_session_generate_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming;
     try {
@@ -10033,8 +10033,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_generate_streaming`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming != 1272) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_generate_streaming`: expected 1272, got $_checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming != 34542) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_generate_streaming`: expected 34542, got $_checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming_async;
     try {
@@ -10043,8 +10043,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_generate_streaming_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming_async != 58221) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_generate_streaming_async`: expected 58221, got $_checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming_async');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming_async != 30677) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_generate_streaming_async`: expected 30677, got $_checksum_uniffi_cera_ffi_checksum_method_session_generate_streaming_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_has_lora;
     try {
@@ -10053,8 +10053,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_has_lora`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_has_lora != 13931) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_has_lora`: expected 13931, got $_checksum_uniffi_cera_ffi_checksum_method_session_has_lora');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_has_lora != 4349) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_has_lora`: expected 4349, got $_checksum_uniffi_cera_ffi_checksum_method_session_has_lora');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_size;
     try {
@@ -10063,8 +10063,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_size`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_size != 46607) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_size`: expected 46607, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_size');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_size != 23994) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_size`: expected 23994, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_size');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text;
     try {
@@ -10073,8 +10073,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text != 17860) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text`: expected 17860, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text != 54921) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text`: expected 54921, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters;
     try {
@@ -10083,8 +10083,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters != 42869) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters`: expected 42869, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters != 9905) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters`: expected 9905, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens;
     try {
@@ -10093,8 +10093,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens != 60330) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens`: expected 60330, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens != 28258) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens`: expected 28258, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters;
     try {
@@ -10103,8 +10103,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters != 34852) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters`: expected 34852, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters != 48296) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters`: expected 48296, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled;
     try {
@@ -10113,8 +10113,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled != 61246) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled`: expected 61246, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled != 6204) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled`: expected 6204, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters;
     try {
@@ -10123,8 +10123,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters != 61117) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters`: expected 61117, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters != 30179) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters`: expected 30179, got $_checksum_uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_image_max_long_size;
     try {
@@ -10133,8 +10133,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_image_max_long_size`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_image_max_long_size != 8402) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_image_max_long_size`: expected 8402, got $_checksum_uniffi_cera_ffi_checksum_method_session_image_max_long_size');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_image_max_long_size != 38663) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_image_max_long_size`: expected 38663, got $_checksum_uniffi_cera_ffi_checksum_method_session_image_max_long_size');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_import_checkpoint;
     try {
@@ -10143,8 +10143,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_import_checkpoint`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_import_checkpoint != 12224) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_import_checkpoint`: expected 12224, got $_checksum_uniffi_cera_ffi_checksum_method_session_import_checkpoint');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_import_checkpoint != 20954) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_import_checkpoint`: expected 20954, got $_checksum_uniffi_cera_ffi_checksum_method_session_import_checkpoint');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_into_chat;
     try {
@@ -10153,8 +10153,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_into_chat`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_into_chat != 13314) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_into_chat`: expected 13314, got $_checksum_uniffi_cera_ffi_checksum_method_session_into_chat');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_into_chat != 10965) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_into_chat`: expected 10965, got $_checksum_uniffi_cera_ffi_checksum_method_session_into_chat');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_load_checkpoint;
     try {
@@ -10163,8 +10163,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_load_checkpoint`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_load_checkpoint != 19760) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_load_checkpoint`: expected 19760, got $_checksum_uniffi_cera_ffi_checksum_method_session_load_checkpoint');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_load_checkpoint != 47038) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_load_checkpoint`: expected 47038, got $_checksum_uniffi_cera_ffi_checksum_method_session_load_checkpoint');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_position;
     try {
@@ -10173,8 +10173,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_position`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_position != 13264) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_position`: expected 13264, got $_checksum_uniffi_cera_ffi_checksum_method_session_position');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_position != 16936) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_position`: expected 16936, got $_checksum_uniffi_cera_ffi_checksum_method_session_position');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_remove_lora;
     try {
@@ -10183,8 +10183,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_remove_lora`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_remove_lora != 29534) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_remove_lora`: expected 29534, got $_checksum_uniffi_cera_ffi_checksum_method_session_remove_lora');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_remove_lora != 4466) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_remove_lora`: expected 4466, got $_checksum_uniffi_cera_ffi_checksum_method_session_remove_lora');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_reset;
     try {
@@ -10193,8 +10193,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_reset`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_reset != 48041) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_reset`: expected 48041, got $_checksum_uniffi_cera_ffi_checksum_method_session_reset');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_reset != 50584) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_reset`: expected 50584, got $_checksum_uniffi_cera_ffi_checksum_method_session_reset');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_save_checkpoint;
     try {
@@ -10203,8 +10203,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_save_checkpoint`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_save_checkpoint != 10964) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_save_checkpoint`: expected 10964, got $_checksum_uniffi_cera_ffi_checksum_method_session_save_checkpoint');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_save_checkpoint != 39015) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_save_checkpoint`: expected 39015, got $_checksum_uniffi_cera_ffi_checksum_method_session_save_checkpoint');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_send_message;
     try {
@@ -10213,8 +10213,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_send_message`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_send_message != 6919) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_send_message`: expected 6919, got $_checksum_uniffi_cera_ffi_checksum_method_session_send_message');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_send_message != 42720) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_send_message`: expected 42720, got $_checksum_uniffi_cera_ffi_checksum_method_session_send_message');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_send_message_and_generate;
     try {
@@ -10223,8 +10223,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_send_message_and_generate`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_send_message_and_generate != 43103) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_send_message_and_generate`: expected 43103, got $_checksum_uniffi_cera_ffi_checksum_method_session_send_message_and_generate');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_send_message_and_generate != 53351) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_send_message_and_generate`: expected 53351, got $_checksum_uniffi_cera_ffi_checksum_method_session_send_message_and_generate');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_send_message_streaming;
     try {
@@ -10233,8 +10233,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_send_message_streaming`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_send_message_streaming != 26617) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_send_message_streaming`: expected 26617, got $_checksum_uniffi_cera_ffi_checksum_method_session_send_message_streaming');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_send_message_streaming != 2757) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_send_message_streaming`: expected 2757, got $_checksum_uniffi_cera_ffi_checksum_method_session_send_message_streaming');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_set_image_max_long_size;
     try {
@@ -10243,8 +10243,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_set_image_max_long_size`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_set_image_max_long_size != 26929) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_set_image_max_long_size`: expected 26929, got $_checksum_uniffi_cera_ffi_checksum_method_session_set_image_max_long_size');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_set_image_max_long_size != 26612) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_set_image_max_long_size`: expected 26612, got $_checksum_uniffi_cera_ffi_checksum_method_session_set_image_max_long_size');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_set_lora_adapters;
     try {
@@ -10253,8 +10253,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_set_lora_adapters`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_set_lora_adapters != 64571) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_set_lora_adapters`: expected 64571, got $_checksum_uniffi_cera_ffi_checksum_method_session_set_lora_adapters');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_set_lora_adapters != 37806) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_set_lora_adapters`: expected 37806, got $_checksum_uniffi_cera_ffi_checksum_method_session_set_lora_adapters');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_set_seed;
     try {
@@ -10263,8 +10263,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_set_seed`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_set_seed != 54035) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_set_seed`: expected 54035, got $_checksum_uniffi_cera_ffi_checksum_method_session_set_seed');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_set_seed != 45807) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_set_seed`: expected 45807, got $_checksum_uniffi_cera_ffi_checksum_method_session_set_seed');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_session_recovery_status;
     try {
@@ -10273,8 +10273,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_session_recovery_status`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_session_recovery_status != 30068) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_recovery_status`: expected 30068, got $_checksum_uniffi_cera_ffi_checksum_method_session_recovery_status');
+    if (_checksum_uniffi_cera_ffi_checksum_method_session_recovery_status != 12819) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_session_recovery_status`: expected 12819, got $_checksum_uniffi_cera_ffi_checksum_method_session_recovery_status');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance;
     try {
@@ -10283,8 +10283,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance != 27373) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance`: expected 27373, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance != 5629) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance`: expected 5629, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel;
     try {
@@ -10293,8 +10293,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel != 57820) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel`: expected 57820, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel != 58366) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel`: expected 58366, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel;
     try {
@@ -10303,8 +10303,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel != 57672) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel`: expected 57672, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel != 45054) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel`: expected 45054, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample;
     try {
@@ -10313,8 +10313,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample != 47716) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample`: expected 47716, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample != 32213) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample`: expected 32213, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu;
     try {
@@ -10323,8 +10323,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu != 39954) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu`: expected 39954, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu != 53013) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu`: expected 53013, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush;
     try {
@@ -10333,8 +10333,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush != 1087) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush`: expected 1087, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush != 33980) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush`: expected 33980, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer;
     try {
@@ -10343,8 +10343,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer != 11141) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer`: expected 11141, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer != 31918) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer`: expected 31918, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword;
     try {
@@ -10353,8 +10353,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword != 57051) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword`: expected 57051, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword != 26752) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword`: expected 26752, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active;
     try {
@@ -10363,8 +10363,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active != 50875) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active`: expected 50875, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active != 43) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active`: expected 43, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance;
     try {
@@ -10373,8 +10373,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance != 16879) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance`: expected 16879, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance != 23593) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance`: expected 23593, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event;
     try {
@@ -10383,8 +10383,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event != 54239) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event`: expected 54239, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event != 12599) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event`: expected 12599, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk;
     try {
@@ -10393,8 +10393,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk != 51752) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk`: expected 51752, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk != 46866) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk`: expected 46866, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16;
     try {
@@ -10403,8 +10403,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16 != 58081) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16`: expected 58081, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16 != 16235) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16`: expected 16235, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset;
     try {
@@ -10413,8 +10413,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset != 13673) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset`: expected 13673, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset != 59725) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset`: expected 59725, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state;
     try {
@@ -10423,8 +10423,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state != 59212) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state`: expected 59212, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state != 16398) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state`: expected 16398, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance;
     try {
@@ -10433,8 +10433,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance != 16840) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance`: expected 16840, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance != 59416) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance`: expected 59416, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm;
     try {
@@ -10443,8 +10443,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm != 58760) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm`: expected 58760, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm != 31176) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm`: expected 31176, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu;
     try {
@@ -10453,8 +10453,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu != 54575) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu`: expected 54575, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu');
+    if (_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu != 22101) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu`: expected 22101, got $_checksum_uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_cancel;
     try {
@@ -10463,8 +10463,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_cancel`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_cancel != 14090) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_cancel`: expected 14090, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_cancel');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_cancel != 8345) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_cancel`: expected 8345, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_cancel');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_clear_cancel;
     try {
@@ -10473,8 +10473,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_clear_cancel`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_clear_cancel != 4793) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_clear_cancel`: expected 4793, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_clear_cancel');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_clear_cancel != 24156) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_clear_cancel`: expected 24156, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_clear_cancel');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_complete;
     try {
@@ -10483,8 +10483,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_complete`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete != 7176) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_complete`: expected 7176, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete != 41834) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_complete`: expected 41834, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async;
     try {
@@ -10493,8 +10493,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_complete_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async != 39595) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_complete_async`: expected 39595, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async != 45175) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_complete_async`: expected 45175, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async_json;
     try {
@@ -10503,8 +10503,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_complete_async_json`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async_json != 52759) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_complete_async_json`: expected 52759, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async_json');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async_json != 47941) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_complete_async_json`: expected 47941, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_async_json');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_json;
     try {
@@ -10513,8 +10513,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_complete_json`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_json != 12972) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_complete_json`: expected 12972, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_json');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_json != 8906) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_complete_json`: expected 8906, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_complete_json');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint;
     try {
@@ -10523,8 +10523,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint != 34798) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint`: expected 34798, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint != 22936) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint`: expected 22936, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming;
     try {
@@ -10533,8 +10533,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming != 33536) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming`: expected 33536, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming != 16263) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming`: expected 16263, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async;
     try {
@@ -10543,8 +10543,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async != 53642) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async`: expected 53642, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async != 11353) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async`: expected 11353, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json;
     try {
@@ -10553,8 +10553,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json != 26943) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json`: expected 26943, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json != 25545) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json`: expected 25545, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json;
     try {
@@ -10563,8 +10563,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json != 49818) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json`: expected 49818, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json != 23636) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json`: expected 23636, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size;
     try {
@@ -10573,8 +10573,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size != 39566) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size`: expected 39566, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size != 53708) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size`: expected 53708, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint;
     try {
@@ -10583,8 +10583,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint != 684) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint`: expected 684, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint != 19353) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint`: expected 19353, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest;
     try {
@@ -10593,8 +10593,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_ingest`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest != 15502) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_ingest`: expected 15502, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest != 2259) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_ingest`: expected 2259, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest_messages;
     try {
@@ -10603,8 +10603,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_ingest_messages`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest_messages != 50400) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_ingest_messages`: expected 50400, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest_messages');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest_messages != 16821) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_ingest_messages`: expected 16821, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest_messages');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response;
     try {
@@ -10613,8 +10613,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response != 47361) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response`: expected 47361, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response != 5490) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response`: expected 5490, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_into_session;
     try {
@@ -10623,8 +10623,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_into_session`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_into_session != 52358) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_into_session`: expected 52358, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_into_session');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_into_session != 20770) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_into_session`: expected 20770, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_into_session');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint;
     try {
@@ -10633,8 +10633,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint != 29130) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint`: expected 29130, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint != 43603) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint`: expected 43603, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_phase;
     try {
@@ -10643,8 +10643,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_phase`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_phase != 3748) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_phase`: expected 3748, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_phase');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_phase != 2758) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_phase`: expected 2758, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_phase');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_position;
     try {
@@ -10653,8 +10653,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_position`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_position != 55288) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_position`: expected 55288, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_position');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_position != 5506) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_position`: expected 5506, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_position');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_recovery_status;
     try {
@@ -10663,8 +10663,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_recovery_status`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_recovery_status != 50985) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_recovery_status`: expected 50985, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_recovery_status');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_recovery_status != 44509) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_recovery_status`: expected 44509, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_recovery_status');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_replace_messages;
     try {
@@ -10673,8 +10673,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_replace_messages`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_replace_messages != 2557) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_replace_messages`: expected 2557, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_replace_messages');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_replace_messages != 27023) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_replace_messages`: expected 27023, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_replace_messages');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_reset;
     try {
@@ -10683,8 +10683,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_reset`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_reset != 50462) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_reset`: expected 50462, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_reset');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_reset != 23366) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_reset`: expected 23366, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_reset');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint;
     try {
@@ -10693,8 +10693,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint != 18337) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint`: expected 18337, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint != 48141) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint`: expected 48141, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size;
     try {
@@ -10703,8 +10703,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size != 55203) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size`: expected 55203, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size != 2802) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size`: expected 2802, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_set_tool_format;
     try {
@@ -10713,8 +10713,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_set_tool_format`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_set_tool_format != 31586) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_set_tool_format`: expected 31586, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_set_tool_format');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_set_tool_format != 61090) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_set_tool_format`: expected 61090, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_set_tool_format');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_set_tools;
     try {
@@ -10723,8 +10723,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_set_tools`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_set_tools != 36170) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_set_tools`: expected 36170, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_set_tools');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_set_tools != 35477) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_set_tools`: expected 35477, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_set_tools');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_tool_format;
     try {
@@ -10733,8 +10733,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_tool_format`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_tool_format != 18638) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_tool_format`: expected 18638, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_tool_format');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_tool_format != 25567) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_tool_format`: expected 25567, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_tool_format');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_chatsession_tools;
     try {
@@ -10743,8 +10743,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_chatsession_tools`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_tools != 13384) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_tools`: expected 13384, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_tools');
+    if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_tools != 49577) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_tools`: expected 49577, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_tools');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_generativemodel_create_session;
     try {
@@ -10753,8 +10753,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_generativemodel_create_session`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_generativemodel_create_session != 60817) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_generativemodel_create_session`: expected 60817, got $_checksum_uniffi_cera_ffi_checksum_method_generativemodel_create_session');
+    if (_checksum_uniffi_cera_ffi_checksum_method_generativemodel_create_session != 55866) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_generativemodel_create_session`: expected 55866, got $_checksum_uniffi_cera_ffi_checksum_method_generativemodel_create_session');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_generativemodel_engine;
     try {
@@ -10763,8 +10763,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_generativemodel_engine`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_generativemodel_engine != 55922) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_generativemodel_engine`: expected 55922, got $_checksum_uniffi_cera_ffi_checksum_method_generativemodel_engine');
+    if (_checksum_uniffi_cera_ffi_checksum_method_generativemodel_engine != 8210) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_generativemodel_engine`: expected 8210, got $_checksum_uniffi_cera_ffi_checksum_method_generativemodel_engine');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_modelhandle_as_generative;
     try {
@@ -10773,8 +10773,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_modelhandle_as_generative`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_modelhandle_as_generative != 6141) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modelhandle_as_generative`: expected 6141, got $_checksum_uniffi_cera_ffi_checksum_method_modelhandle_as_generative');
+    if (_checksum_uniffi_cera_ffi_checksum_method_modelhandle_as_generative != 16733) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modelhandle_as_generative`: expected 16733, got $_checksum_uniffi_cera_ffi_checksum_method_modelhandle_as_generative');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_modelhandle_kind;
     try {
@@ -10783,8 +10783,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_modelhandle_kind`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_modelhandle_kind != 52976) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modelhandle_kind`: expected 52976, got $_checksum_uniffi_cera_ffi_checksum_method_modelhandle_kind');
+    if (_checksum_uniffi_cera_ffi_checksum_method_modelhandle_kind != 40804) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modelhandle_kind`: expected 40804, got $_checksum_uniffi_cera_ffi_checksum_method_modelhandle_kind');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_modelloader_build;
     try {
@@ -10793,8 +10793,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_modelloader_build`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_modelloader_build != 37695) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modelloader_build`: expected 37695, got $_checksum_uniffi_cera_ffi_checksum_method_modelloader_build');
+    if (_checksum_uniffi_cera_ffi_checksum_method_modelloader_build != 15329) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modelloader_build`: expected 15329, got $_checksum_uniffi_cera_ffi_checksum_method_modelloader_build');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_modelloader_build_generative;
     try {
@@ -10803,8 +10803,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_modelloader_build_generative`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_modelloader_build_generative != 14372) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modelloader_build_generative`: expected 14372, got $_checksum_uniffi_cera_ffi_checksum_method_modelloader_build_generative');
+    if (_checksum_uniffi_cera_ffi_checksum_method_modelloader_build_generative != 49676) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_modelloader_build_generative`: expected 49676, got $_checksum_uniffi_cera_ffi_checksum_method_modelloader_build_generative');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_bundlerepo_new;
     try {
@@ -10813,8 +10813,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_bundlerepo_new`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_bundlerepo_new != 15544) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_bundlerepo_new`: expected 15544, got $_checksum_uniffi_cera_ffi_checksum_constructor_bundlerepo_new');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_bundlerepo_new != 26540) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_bundlerepo_new`: expected 26540, got $_checksum_uniffi_cera_ffi_checksum_constructor_bundlerepo_new');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress;
     try {
@@ -10823,8 +10823,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress != 24631) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress`: expected 24631, got $_checksum_uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress != 64568) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress`: expected 64568, got $_checksum_uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id;
     try {
@@ -10833,8 +10833,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id != 60717) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id`: expected 60717, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id != 61514) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id`: expected 61514, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async;
     try {
@@ -10843,8 +10843,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async != 14088) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async`: expected 14088, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async != 22573) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async`: expected 22573, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes;
     try {
@@ -10853,8 +10853,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes != 53168) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes`: expected 53168, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes != 35072) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes`: expected 35072, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async;
     try {
@@ -10863,8 +10863,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async != 8065) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async`: expected 8065, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async != 55200) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async`: expected 55200, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts;
     try {
@@ -10873,8 +10873,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts != 18448) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts`: expected 18448, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts != 40765) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts`: expected 40765, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async;
     try {
@@ -10883,8 +10883,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async != 8804) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async`: expected 8804, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async != 3992) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async`: expected 3992, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path;
     try {
@@ -10893,8 +10893,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ceraengine_from_path`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path != 64420) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_path`: expected 64420, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path != 27756) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_path`: expected 27756, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async;
     try {
@@ -10903,8 +10903,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async != 48795) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async`: expected 48795, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async != 26538) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async`: expected 26538, got $_checksum_uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes;
     try {
@@ -10913,8 +10913,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes != 51326) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes`: expected 51326, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes != 63590) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes`: expected 63590, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file;
     try {
@@ -10923,8 +10923,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file != 44957) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file`: expected 44957, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file != 53984) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file`: expected 53984, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files;
     try {
@@ -10933,8 +10933,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files != 12479) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files`: expected 12479, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files != 65300) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files`: expected 65300, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes;
     try {
@@ -10943,8 +10943,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes != 36063) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes`: expected 36063, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes != 30613) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes`: expected 30613, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file;
     try {
@@ -10953,8 +10953,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file != 47359) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file`: expected 47359, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file != 4850) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file`: expected 4850, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffivaditerator_new;
     try {
@@ -10963,8 +10963,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffivaditerator_new`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffivaditerator_new != 27580) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffivaditerator_new`: expected 27580, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffivaditerator_new');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffivaditerator_new != 28084) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffivaditerator_new`: expected 28084, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffivaditerator_new');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes;
     try {
@@ -10973,8 +10973,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes != 50588) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes`: expected 50588, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes != 15068) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes`: expected 15068, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file;
     try {
@@ -10983,8 +10983,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file != 38235) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file`: expected 38235, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file != 53431) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file`: expected 53431, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf;
     try {
@@ -10993,8 +10993,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf != 57598) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf`: expected 57598, got $_checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf != 23483) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf`: expected 23483, got $_checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors;
     try {
@@ -11003,8 +11003,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors != 11183) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors`: expected 11183, got $_checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors != 64977) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors`: expected 64977, got $_checksum_uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter;
     try {
@@ -11013,8 +11013,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter != 59300) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter`: expected 59300, got $_checksum_uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter != 52159) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter`: expected 52159, got $_checksum_uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path;
     try {
@@ -11023,8 +11023,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path != 60671) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path`: expected 60671, got $_checksum_uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path != 24657) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path`: expected 24657, got $_checksum_uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes;
     try {
@@ -11033,8 +11033,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes != 42076) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes`: expected 42076, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes != 9162) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes`: expected 9162, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer;
     try {
@@ -11043,8 +11043,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer != 59328) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer`: expected 59328, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer != 38831) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer`: expected 38831, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3;
     try {
@@ -11053,8 +11053,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3 != 19665) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3`: expected 19665, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3 != 41691) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3`: expected 41691, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files;
     try {
@@ -11063,8 +11063,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files != 15812) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files`: expected 15812, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files != 5196) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files`: expected 5196, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer;
     try {
@@ -11073,8 +11073,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer != 56903) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer`: expected 56903, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer != 52331) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer`: expected 52331, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3;
     try {
@@ -11083,8 +11083,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3 != 34038) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3`: expected 34038, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3 != 63232) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3`: expected 63232, got $_checksum_uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_chatsession_from_session;
     try {
@@ -11093,8 +11093,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_chatsession_from_session`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_chatsession_from_session != 55996) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_chatsession_from_session`: expected 55996, got $_checksum_uniffi_cera_ffi_checksum_constructor_chatsession_from_session');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_chatsession_from_session != 3580) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_chatsession_from_session`: expected 3580, got $_checksum_uniffi_cera_ffi_checksum_constructor_chatsession_from_session');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_modelloader_new;
     try {
@@ -11103,8 +11103,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_modelloader_new`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_modelloader_new != 6200) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_modelloader_new`: expected 6200, got $_checksum_uniffi_cera_ffi_checksum_constructor_modelloader_new');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_modelloader_new != 55287) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_modelloader_new`: expected 55287, got $_checksum_uniffi_cera_ffi_checksum_constructor_modelloader_new');
     }
   }
 

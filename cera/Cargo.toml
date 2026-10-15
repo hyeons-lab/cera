@@ -45,11 +45,6 @@ image = { version = "0.25", default-features = false, features = ["png", "jpeg"]
 accelerate-src = { workspace = true, optional = true }
 cblas-sys = { workspace = true, optional = true }
 
-# sha2 0.10 uses its ARM crypto backend only with `asm`. Limit the assembler
-# dependency to supported ARM Unix/Apple targets; other targets keep defaults.
-[target.'cfg(all(target_arch = "aarch64", any(target_os = "macos", target_os = "ios", target_os = "linux", target_os = "android")))'.dependencies]
-sha2 = { workspace = true, optional = true, features = ["asm"] }
-
 # FastRPC dynamic loader on Android/Linux, threadpool core pinning on Linux/Android.
 # Already in the tree transitively, so this adds no new build cost.
 [target.'cfg(unix)'.dependencies]

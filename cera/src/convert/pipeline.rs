@@ -13,6 +13,8 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 #[cfg(feature = "remote")]
+use crate::bundle::download;
+#[cfg(feature = "remote")]
 use crate::bundle::hf::fetch_model_snapshot;
 #[cfg(feature = "remote")]
 use crate::bundle::{DownloadProgress, HfSpec};
@@ -508,7 +510,7 @@ pub fn stream_quantize_hf_repo(
         hasher: Sha256::new(),
     };
     let header_bytes = writer.write_header_and_tensor_info(&mut header_hash)?;
-    let header_sha256 = format!("{:x}", header_hash.hasher.finalize());
+    let header_sha256 = download::hex_encode(&header_hash.hasher.finalize());
     let align = writer.alignment() as u64;
     let align_mask = align - 1;
 
@@ -536,7 +538,7 @@ pub fn stream_quantize_hf_repo(
             .write(true)
             .open(&tmp_gguf_path)
         && let Ok(hasher) = hash_prefix(&mut file, boundary)
-        && prefix_sha256 == &format!("{:x}", hasher.clone().finalize())
+        && prefix_sha256 == &download::hex_encode(&hasher.clone().finalize())
     {
         tracing::info!(
             "Resuming quantization of `{}/{}` ({quant_str}) from tensor {}/{}…",
@@ -698,7 +700,7 @@ pub fn stream_quantize_hf_repo(
             })?;
             let ckpt = QuantCheckpoint {
                 request: Some(request.clone()),
-                prefix_sha256: Some(format!("{:x}", buf_writer.hasher.clone().finalize())),
+                prefix_sha256: Some(download::hex_encode(&buf_writer.hasher.clone().finalize())),
                 header_sha256: Some(header_sha256.clone()),
                 quant: quant_str.to_string(),
                 strategy: strat_str.to_string(),

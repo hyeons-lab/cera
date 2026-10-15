@@ -123,6 +123,58 @@ internal open class ForeignBytes : Structure() {
         Structure.ByValue
 }
 
+// Converter for `&[u8]` / `[ByRef] bytes` arguments.
+//
+// Only `lower` is valid — zero-copy byte buffers only flow foreign -> Rust,
+// and only in argument position. `lift`, `read`, `write`, and
+// `allocationSize` have no sound implementation here and all panic at
+// runtime. The `FfiConverter` interface is implemented so that the
+// compiler enforces the full method set (rather than relying on eyeball).
+//
+// The provided `ByteBuffer` MUST be direct — only direct buffers have a
+// stable native address that JNA can expose via `getDirectBufferPointer`.
+// The returned `ForeignBytes.ByValue` is only valid for the duration of
+// the FFI call; the Rust side treats it as a borrow.
+internal object FfiConverterByRefBytes : FfiConverter<java.nio.ByteBuffer, ForeignBytes.ByValue> {
+    override fun lower(value: java.nio.ByteBuffer): ForeignBytes.ByValue {
+        require(value.isDirect) { "UniFFI zero-copy &[u8] requires a direct ByteBuffer. Use ByteBuffer.allocateDirect()." }
+        val remaining = value.remaining()
+        val fb = ForeignBytes.ByValue()
+        fb.len = remaining
+        // Zero-length direct buffers: skip getDirectBufferPointer (platform-variable behavior)
+        // and pass null. The Rust side treats (null, 0) as &[].
+        fb.data =
+            if (remaining == 0) {
+                null
+            } else {
+                com.sun.jna.Native
+                    .getDirectBufferPointer(value)
+            }
+        return fb
+    }
+
+    override fun lift(value: ForeignBytes.ByValue): java.nio.ByteBuffer =
+        error("ByRef bytes cannot be lifted: zero-copy &[u8] only flows foreign->Rust")
+
+    override fun read(buf: java.nio.ByteBuffer): java.nio.ByteBuffer =
+        error(
+            "ByRef bytes cannot be read from a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.",
+        )
+
+    override fun write(
+        value: java.nio.ByteBuffer,
+        buf: java.nio.ByteBuffer,
+    ): Unit =
+        error(
+            "ByRef bytes cannot be written to a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.",
+        )
+
+    override fun allocationSize(value: java.nio.ByteBuffer): ULong =
+        error(
+            "ByRef bytes have no RustBuffer allocation size: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.",
+        )
+}
+
 /**
  * The FfiConverter interface handles converter types to and from the FFI
  *
@@ -846,6 +898,8 @@ internal object IntegrityCheckingUniffiLib {
         uniffiCheckApiChecksums(this)
     }
 
+    internal fun ensureInitialized() = Unit
+
     external fun uniffi_cera_ffi_checksum_func_cera_ffi_version(): Int
 
     external fun uniffi_cera_ffi_checksum_func_cpu_backend_report(): Int
@@ -1256,6 +1310,8 @@ internal object UniffiLib {
         uniffiCallbackInterfaceDownloadProgressSink.register(this)
         uniffiCallbackInterfaceModalitySink.register(this)
     }
+
+    internal fun ensureInitialized() = Unit
 
     external fun uniffi_cera_ffi_fn_clone_bundlerepo(
         `handle`: Long,
@@ -2770,598 +2826,598 @@ private fun uniffiCheckContractApiVersion(lib: IntegrityCheckingUniffiLib) {
 
 @Suppress("UNUSED_PARAMETER")
 private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
-    if (lib.uniffi_cera_ffi_checksum_func_cera_ffi_version() != 39330) {
+    if ((lib.uniffi_cera_ffi_checksum_func_cera_ffi_version() and 0xFFFF) != 10629) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_cpu_backend_report() != 61086) {
+    if ((lib.uniffi_cera_ffi_checksum_func_cpu_backend_report() and 0xFFFF) != 64719) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
+    if ((lib.uniffi_cera_ffi_checksum_func_detect_tool_format() and 0xFFFF) != 37982) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 55417) {
+    if ((lib.uniffi_cera_ffi_checksum_func_hexagon_install_skels() and 0xFFFF) != 17978) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471) {
+    if ((lib.uniffi_cera_ffi_checksum_func_hexagon_probe() and 0xFFFF) != 39618) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934) {
+    if ((lib.uniffi_cera_ffi_checksum_func_hotword_default_config() and 0xFFFF) != 64401) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_list_leap_bundles() != 14501) {
+    if ((lib.uniffi_cera_ffi_checksum_func_list_leap_bundles() and 0xFFFF) != 11444) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_list_leap_bundles_async() != 60360) {
+    if ((lib.uniffi_cera_ffi_checksum_func_list_leap_bundles_async() and 0xFFFF) != 31026) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_parse_tool_calls() != 47579) {
+    if ((lib.uniffi_cera_ffi_checksum_func_parse_tool_calls() and 0xFFFF) != 51531) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_silero_vad_default_config() != 25300) {
+    if ((lib.uniffi_cera_ffi_checksum_func_silero_vad_default_config() and 0xFFFF) != 7093) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_tool_grammar() != 41383) {
+    if ((lib.uniffi_cera_ffi_checksum_func_tool_grammar() and 0xFFFF) != 33163) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 57787) {
+    if ((lib.uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() and 0xFFFF) != 33783) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_audio_pipeline_default_config() != 58590) {
+    if ((lib.uniffi_cera_ffi_checksum_func_audio_pipeline_default_config() and 0xFFFF) != 14804) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_chat_message_assistant() != 62795) {
+    if ((lib.uniffi_cera_ffi_checksum_func_chat_message_assistant() and 0xFFFF) != 18044) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_chat_message_system() != 63071) {
+    if ((lib.uniffi_cera_ffi_checksum_func_chat_message_system() and 0xFFFF) != 56468) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_chat_message_tool() != 48057) {
+    if ((lib.uniffi_cera_ffi_checksum_func_chat_message_tool() and 0xFFFF) != 12814) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_chat_message_user() != 46361) {
+    if ((lib.uniffi_cera_ffi_checksum_func_chat_message_user() and 0xFFFF) != 32889) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_chat_message_user_audio() != 15774) {
+    if ((lib.uniffi_cera_ffi_checksum_func_chat_message_user_audio() and 0xFFFF) != 62369) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_chat_message_user_image() != 57033) {
+    if ((lib.uniffi_cera_ffi_checksum_func_chat_message_user_image() and 0xFFFF) != 34431) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 32979) {
+    if ((lib.uniffi_cera_ffi_checksum_func_json_schema_to_grammar() and 0xFFFF) != 31266) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
+    if ((lib.uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() and 0xFFFF) != 7498) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache() != 11512) {
+    if ((lib.uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache() and 0xFFFF) != 6334) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle() != 63803) {
+    if ((lib.uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle() and 0xFFFF) != 20230) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir() != 40876) {
+    if ((lib.uniffi_cera_ffi_checksum_method_bundlerepo_store_dir() and 0xFFFF) != 25065) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template() != 38712) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template() and 0xFFFF) != 18654) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools() != 46076) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools() and 0xFFFF) != 61680) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_audio_profile() != 17834) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_audio_profile() and 0xFFFF) != 1521) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token() != 30744) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_bos_token() and 0xFFFF) != 23786) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities() != 65060) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_capabilities() and 0xFFFF) != 15864) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() != 5238) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() and 0xFFFF) != 28739) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache() != 49295) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache() and 0xFFFF) != 47796) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 47091) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_context_size() and 0xFFFF) != 28113) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens() != 27407) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens() and 0xFFFF) != 28454) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts() != 26137) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts() and 0xFFFF) != 49008) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_detect_pii() != 53563) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_detect_pii() and 0xFFFF) != 59395) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 52220) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text() and 0xFFFF) != 19826) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special() != 59360) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special() and 0xFFFF) != 42626) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_eos_token() != 21294) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_eos_token() and 0xFFFF) != 55523) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template() != 63563) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template() and 0xFFFF) != 55941) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_is_special_token() != 7395) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_is_special_token() and 0xFFFF) != 4501) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 46262) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_metadata() and 0xFFFF) != 21928) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session() != 32339) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session() and 0xFFFF) != 52763) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 51022) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_new_session() and 0xFFFF) != 55506) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() and 0xFFFF) != 6832) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token() != 23833) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token() and 0xFFFF) != 9607) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_tool_format() != 33648) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_tool_format() and 0xFFFF) != 3684) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_transcribe() != 25846) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_transcribe() and 0xFFFF) != 64248) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_vocab_size() != 13487) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_vocab_size() and 0xFFFF) != 11541) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches() != 16144) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches() and 0xFFFF) != 27632) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688) {
+    if ((lib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() and 0xFFFF) != 37554) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config() != 53986) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config() and 0xFFFF) != 16946) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords() != 45182) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords() and 0xFFFF) != 60107) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window() != 21244) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window() and 0xFFFF) != 29908) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 50343) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() and 0xFFFF) != 50955) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() != 70) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() and 0xFFFF) != 16380) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps() != 58406) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps() and 0xFFFF) != 37477) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk() != 18343) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk() and 0xFFFF) != 29313) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride() != 7042) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride() and 0xFFFF) != 52504) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffisilerovad_reset() != 31369) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffisilerovad_reset() and 0xFFFF) != 38669) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffivaditerator_flush() != 29655) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffivaditerator_flush() and 0xFFFF) != 54746) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride() != 36793) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride() and 0xFFFF) != 62647) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active() != 47511) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active() and 0xFFFF) != 35573) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event() != 35592) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event() and 0xFFFF) != 19744) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk() != 7048) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk() and 0xFFFF) != 30403) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffivaditerator_reset() != 44489) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffivaditerator_reset() and 0xFFFF) != 30192) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual() != 4736) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual() and 0xFFFF) != 19817) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() != 32663) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() and 0xFFFF) != 34010) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 11943) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() and 0xFFFF) != 751) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 5318) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() and 0xFFFF) != 25034) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 55901) {
+    if ((lib.uniffi_cera_ffi_checksum_method_loraadapters_target_count() and 0xFFFF) != 4515) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk() != 47658) {
+    if ((lib.uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk() and 0xFFFF) != 64152) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk() != 2558) {
+    if ((lib.uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk() and 0xFFFF) != 5080) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 63767) {
+    if ((lib.uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() and 0xFFFF) != 23264) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 54825) {
+    if ((lib.uniffi_cera_ffi_checksum_method_modalitysink_on_done() and 0xFFFF) != 57244) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 10087) {
+    if ((lib.uniffi_cera_ffi_checksum_method_piiclassifier_detect() and 0xFFFF) != 40599) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_audio() != 65327) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_append_audio() and 0xFFFF) != 59092) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_image() != 28033) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_append_image() and 0xFFFF) != 13614) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() != 34040) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_append_raw_image() and 0xFFFF) != 46533) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_append_text() and 0xFFFF) != 61919) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_append_tokens() != 1227) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_append_tokens() and 0xFFFF) != 44611) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_attach_lora() != 61634) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_attach_lora() and 0xFFFF) != 6101) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_cancel() != 44519) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_cancel() and 0xFFFF) != 21394) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_capabilities() != 8147) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_capabilities() and 0xFFFF) != 38264) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_clear_cancel() != 11168) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_clear_cancel() and 0xFFFF) != 50845) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_default_generate_opts() and 0xFFFF) != 28546) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_disable_spec() != 57) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_disable_spec() and 0xFFFF) != 10695) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_enable_spec() != 2995) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_enable_spec() and 0xFFFF) != 47491) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_export_checkpoint() and 0xFFFF) != 53988) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_generate() != 20338) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_generate() and 0xFFFF) != 41604) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_generate_async() != 4050) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_generate_async() and 0xFFFF) != 18250) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() != 1272) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_generate_streaming() and 0xFFFF) != 34542) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 58221) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_generate_streaming_async() and 0xFFFF) != 30677) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_has_lora() != 13931) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_has_lora() and 0xFFFF) != 4349) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_size() != 46607) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_hidden_size() and 0xFFFF) != 23994) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 17860) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() and 0xFFFF) != 54921) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 42869) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() and 0xFFFF) != 9905) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 60330) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() and 0xFFFF) != 28258) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 34852) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() and 0xFFFF) != 48296) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() and 0xFFFF) != 6204) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 61117) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() and 0xFFFF) != 30179) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_image_max_long_size() != 8402) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_image_max_long_size() and 0xFFFF) != 38663) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_import_checkpoint() and 0xFFFF) != 20954) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_into_chat() != 13314) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_into_chat() and 0xFFFF) != 10965) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_load_checkpoint() != 19760) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_load_checkpoint() and 0xFFFF) != 47038) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_position() != 13264) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_position() and 0xFFFF) != 16936) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_remove_lora() != 29534) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_remove_lora() and 0xFFFF) != 4466) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_reset() and 0xFFFF) != 50584) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_save_checkpoint() != 10964) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_save_checkpoint() and 0xFFFF) != 39015) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_send_message() != 6919) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_send_message() and 0xFFFF) != 42720) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 43103) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_send_message_and_generate() and 0xFFFF) != 53351) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_send_message_streaming() and 0xFFFF) != 2757) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 26929) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() and 0xFFFF) != 26612) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 64571) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_set_lora_adapters() and 0xFFFF) != 37806) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_set_seed() != 54035) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_set_seed() and 0xFFFF) != 45807) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
+    if ((lib.uniffi_cera_ffi_checksum_method_session_recovery_status() and 0xFFFF) != 12819) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance() != 27373) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance() and 0xFFFF) != 5629) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 57820) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() and 0xFFFF) != 58366) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 57672) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() and 0xFFFF) != 45054) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 47716) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() and 0xFFFF) != 32213) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu() != 39954) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu() and 0xFFFF) != 53013) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 1087) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() and 0xFFFF) != 33980) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer() != 11141) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer() and 0xFFFF) != 31918) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() != 57051) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() and 0xFFFF) != 26752) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active() != 50875) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active() and 0xFFFF) != 43) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance() != 16879) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance() and 0xFFFF) != 23593) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event() != 54239) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event() and 0xFFFF) != 12599) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() != 51752) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() and 0xFFFF) != 46866) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16() != 58081) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16() and 0xFFFF) != 16235) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() != 13673) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() and 0xFFFF) != 59725) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state() != 59212) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state() and 0xFFFF) != 16398) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance() != 16840) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance() and 0xFFFF) != 59416) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() and 0xFFFF) != 31176) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 54575) {
+    if ((lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() and 0xFFFF) != 22101) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_cancel() and 0xFFFF) != 8345) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() != 4793) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() and 0xFFFF) != 24156) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete() != 7176) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_complete() and 0xFFFF) != 41834) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async() != 39595) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async() and 0xFFFF) != 45175) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json() != 52759) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_complete_async_json() and 0xFFFF) != 47941) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_complete_json() != 12972) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_complete_json() and 0xFFFF) != 8906) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint() != 34798) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint() and 0xFFFF) != 22936) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() and 0xFFFF) != 16263) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 53642) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() and 0xFFFF) != 11353) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json() != 26943) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json() and 0xFFFF) != 25545) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() and 0xFFFF) != 23636) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size() != 39566) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size() and 0xFFFF) != 53708) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() and 0xFFFF) != 19353) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_ingest() and 0xFFFF) != 2259) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() and 0xFFFF) != 16821) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response() != 47361) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response() and 0xFFFF) != 5490) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_into_session() and 0xFFFF) != 20770) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint() != 29130) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint() and 0xFFFF) != 43603) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_phase() != 3748) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_phase() and 0xFFFF) != 2758) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_position() != 55288) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_position() and 0xFFFF) != 5506) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_recovery_status() != 50985) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_recovery_status() and 0xFFFF) != 44509) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages() != 2557) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_replace_messages() and 0xFFFF) != 27023) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_reset() and 0xFFFF) != 23366) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() and 0xFFFF) != 48141) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size() != 55203) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size() and 0xFFFF) != 2802) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() and 0xFFFF) != 61090) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_set_tools() != 36170) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_set_tools() and 0xFFFF) != 35477) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_tool_format() != 18638) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_tool_format() and 0xFFFF) != 25567) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_chatsession_tools() != 13384) {
+    if ((lib.uniffi_cera_ffi_checksum_method_chatsession_tools() and 0xFFFF) != 49577) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 60817) {
+    if ((lib.uniffi_cera_ffi_checksum_method_generativemodel_create_session() and 0xFFFF) != 55866) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_generativemodel_engine() != 55922) {
+    if ((lib.uniffi_cera_ffi_checksum_method_generativemodel_engine() and 0xFFFF) != 8210) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modelhandle_as_generative() != 6141) {
+    if ((lib.uniffi_cera_ffi_checksum_method_modelhandle_as_generative() and 0xFFFF) != 16733) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modelhandle_kind() != 52976) {
+    if ((lib.uniffi_cera_ffi_checksum_method_modelhandle_kind() and 0xFFFF) != 40804) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modelloader_build() != 37695) {
+    if ((lib.uniffi_cera_ffi_checksum_method_modelloader_build() and 0xFFFF) != 15329) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_method_modelloader_build_generative() != 14372) {
+    if ((lib.uniffi_cera_ffi_checksum_method_modelloader_build_generative() and 0xFFFF) != 49676) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 15544) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_new() and 0xFFFF) != 26540) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress() != 24631) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress() and 0xFFFF) != 64568) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id() != 60717) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id() and 0xFFFF) != 61514) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 14088) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() and 0xFFFF) != 22573) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() != 53168) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() and 0xFFFF) != 35072) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async() != 8065) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async() and 0xFFFF) != 55200) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts() != 18448) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts() and 0xFFFF) != 40765) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async() != 8804) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async() and 0xFFFF) != 3992) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() and 0xFFFF) != 27756) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async() != 48795) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async() and 0xFFFF) != 26538) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes() != 51326) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes() and 0xFFFF) != 63590) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file() != 44957) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file() and 0xFFFF) != 53984) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files() != 12479) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files() and 0xFFFF) != 65300) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes() != 36063) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes() and 0xFFFF) != 30613) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file() != 47359) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file() and 0xFFFF) != 4850) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffivaditerator_new() != 27580) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffivaditerator_new() and 0xFFFF) != 28084) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes() != 50588) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes() and 0xFFFF) != 15068) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file() != 38235) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file() and 0xFFFF) != 53431) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 57598) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() and 0xFFFF) != 23483) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors() != 11183) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors() and 0xFFFF) != 64977) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter() != 59300) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter() and 0xFFFF) != 52159) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 60671) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() and 0xFFFF) != 24657) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 42076) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() and 0xFFFF) != 9162) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer() != 59328) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer() and 0xFFFF) != 38831) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3() != 19665) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3() and 0xFFFF) != 41691) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() and 0xFFFF) != 5196) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer() != 56903) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer() and 0xFFFF) != 52331) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3() != 34038) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3() and 0xFFFF) != 63232) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() and 0xFFFF) != 3580) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if (lib.uniffi_cera_ffi_checksum_constructor_modelloader_new() != 6200) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_modelloader_new() and 0xFFFF) != 55287) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
 }
@@ -3370,10 +3426,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
  * @suppress
  */
 public fun uniffiEnsureInitialized() {
-    IntegrityCheckingUniffiLib
-    // UniffiLib() initialized as objects are used, but we still need to explicitly
-    // reference it so initialization across crates works as expected.
-    UniffiLib
+    // Call arbitrary methods on IntegrityCheckingUniffiLib and UniffiLib to ensure that
+    // their init blocks run. This ensures initialization across crates works as expected.
+    IntegrityCheckingUniffiLib.ensureInitialized()
+    UniffiLib.ensureInitialized()
 }
 
 // Async support
@@ -4020,6 +4076,11 @@ open class BundleRepo :
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -4586,6 +4647,11 @@ open class CeraEngine :
 
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
 
     override fun destroy() {
         // Only allow a single call to this method.
@@ -5797,6 +5863,11 @@ open class ChatSession :
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -6607,6 +6678,11 @@ open class DownloadProgressSinkImpl :
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -7041,6 +7117,11 @@ open class FfiAudioPipeline :
 
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
 
     override fun destroy() {
         // Only allow a single call to this method.
@@ -7764,6 +7845,11 @@ open class FfiHotwordDetector :
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -8085,6 +8171,11 @@ open class FfiHotwordIterator :
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -8401,6 +8492,11 @@ open class FfiSileroVad :
 
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
 
     override fun destroy() {
         // Only allow a single call to this method.
@@ -8782,6 +8878,11 @@ open class FfiVadIterator :
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -9139,6 +9240,11 @@ open class FfiWhisperModel :
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -9479,6 +9585,11 @@ open class GenerativeModel :
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -9753,6 +9864,11 @@ open class LoraAdapters :
 
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
 
     override fun destroy() {
         // Only allow a single call to this method.
@@ -10088,6 +10204,11 @@ open class ModalitySinkImpl :
 
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
 
     override fun destroy() {
         // Only allow a single call to this method.
@@ -10516,6 +10637,11 @@ open class ModelHandle :
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -10803,6 +10929,11 @@ open class ModelLoader :
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
 
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
+
     override fun destroy() {
         // Only allow a single call to this method.
         // TODO: maybe we should log a warning if called more than once?
@@ -11068,6 +11199,11 @@ open class PiiClassifier :
 
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
 
     override fun destroy() {
         // Only allow a single call to this method.
@@ -11915,6 +12051,11 @@ open class Session :
 
     private val wasDestroyed = AtomicBoolean(false)
     private val callCounter = AtomicLong(1)
+
+    /**
+     * Whether the current object has been destroyed and its reference is gone in the Rust side.
+     */
+    val uniffiIsDestroyed: Boolean get() = wasDestroyed.get()
 
     override fun destroy() {
         // Only allow a single call to this method.
@@ -15273,7 +15414,7 @@ public object FfiConverterTypeFfiAudioPipelineEvent : FfiConverterRustBuffer<Ffi
             }
         }
 
-    override fun allocationSize(value: FfiAudioPipelineEvent) =
+    override fun allocationSize(value: FfiAudioPipelineEvent): ULong =
         when (value) {
             is FfiAudioPipelineEvent.WakeWordDetected -> {
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
@@ -16032,7 +16173,7 @@ public object FfiConverterTypeFfiVadEvent : FfiConverterRustBuffer<FfiVadEvent> 
             }
         }
 
-    override fun allocationSize(value: FfiVadEvent) =
+    override fun allocationSize(value: FfiVadEvent): ULong =
         when (value) {
             is FfiVadEvent.SpeechStart -> {
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
@@ -16177,7 +16318,7 @@ public object FfiConverterTypeFinishReason : FfiConverterRustBuffer<FinishReason
             }
         }
 
-    override fun allocationSize(value: FinishReason) =
+    override fun allocationSize(value: FinishReason): ULong =
         when (value) {
             is FinishReason.MaxTokens -> {
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
@@ -16319,7 +16460,7 @@ public object FfiConverterTypeGenerationDefaults : FfiConverterRustBuffer<Genera
             }
         }
 
-    override fun allocationSize(value: GenerationDefaults) =
+    override fun allocationSize(value: GenerationDefaults): ULong =
         when (value) {
             is GenerationDefaults.Text -> {
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
@@ -16444,7 +16585,7 @@ public object FfiConverterTypeKvCompression : FfiConverterRustBuffer<KvCompressi
             }
         }
 
-    override fun allocationSize(value: KvCompression) =
+    override fun allocationSize(value: KvCompression): ULong =
         when (value) {
             is KvCompression.None -> {
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
@@ -16587,7 +16728,7 @@ public object FfiConverterTypeKvRewindFailure : FfiConverterRustBuffer<KvRewindF
             }
         }
 
-    override fun allocationSize(value: KvRewindFailure) =
+    override fun allocationSize(value: KvRewindFailure): ULong =
         when (value) {
             is KvRewindFailure.OutOfBounds -> {
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
@@ -17039,7 +17180,7 @@ public object FfiConverterTypeModelSource : FfiConverterRustBuffer<ModelSource> 
             }
         }
 
-    override fun allocationSize(value: ModelSource) =
+    override fun allocationSize(value: ModelSource): ULong =
         when (value) {
             is ModelSource.BundleId -> {
                 // Add the size for the Int that specifies the variant plus the size needed for all fields
@@ -17568,7 +17709,7 @@ public object FfiConverterTypeValidationError : FfiConverterRustBuffer<Validatio
             }
         }
 
-    override fun allocationSize(value: ValidationError) =
+    override fun allocationSize(value: ValidationError): ULong =
         when (value) {
             is ValidationError.UnsupportedProfile -> {
                 // Add the size for the Int that specifies the variant plus the size needed for all fields

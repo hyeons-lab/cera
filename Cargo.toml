@@ -21,24 +21,24 @@ memmap2 = "0.9"
 clap = { version = "4", features = ["derive"] }
 # `json` feature adds the `tojson` filter that tool-trained chat templates
 # (LFM2, Qwen) use to serialize tool schemas / structured content.
-minijinja = { version = "2", features = ["json"] }
+minijinja = { version = "3", features = ["json", "serde"] }
 # `pycompat` supplies the Python-style methods (`dict.get`, `str.split`,
 # `.items()`, `.strip()`, …) that chat templates are written against but
 # minijinja does not implement: it has them as filters, not methods. Without
 # it a template calling any of them fails to render at all.
-minijinja-contrib = { version = "2", features = ["pycompat"] }
+minijinja-contrib = { version = "3", features = ["pycompat"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 rand = "0.8"
 regex = "1"
 rayon = "1"
 wgpu = "30"
-pollster = "0.4"
+pollster = "1"
 # Lightweight oneshot channel (no executor) used to bridge wgpu's
 # `map_async` completion callback into an `.await` for the wasm/WebGPU
 # async readback path — see `GpuContext::download_*_async`.
 futures-channel = "0.3"
-metal = "0.31"
+metal = "0.33"
 objc = "0.2"
 rustfft = "6.4"
 flatbuffers = "25"
@@ -46,19 +46,19 @@ tempfile = "3"
 # BLAS bindings for SGEMM on Apple platforms (macOS/iOS). The `accelerate-src` provider
 # dispatches through Apple's Accelerate framework (unlocking the AMX matrix unit).
 # Non-Apple platforms (Linux, Android, Windows, WASM) use Cera's native SIMD kernels.
-cblas-sys = "0.1"
+cblas-sys = "0.3"
 accelerate-src = "0.3"
 # Optional HTTP + hashing for the `remote` feature (BundleRepo downloader).
 # Kept OpenSSL-free via rustls-tls so cross-compile (wasm, android, iOS)
 # stays straightforward.
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "rustls-tls"] }
-sha2 = "0.10"
+sha2 = "0.11"
 # Cross-platform Ctrl+C handler. cera-cli installs one in the line-REPL chat
 # loop so SIGINT cancels the in-flight turn instead of killing the process.
 ctrlc = "3"
 # UniFFI for multi-language bindings (cera-ffi crate). Version pinned to
-# a 0.31.x series — bindings are ABI-stable within a minor.
-uniffi = "0.31"
+# a 0.32.x series: bindings are ABI-stable within a minor.
+uniffi = "0.32"
 # wasm32-unknown-unknown portability deps (Phase 3 of the FFI multi-target
 # initiative). Pinned to versions paired with the corresponding native
 # transitive deps:

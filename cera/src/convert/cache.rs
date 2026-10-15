@@ -63,7 +63,7 @@ impl ConversionReceipt {
     ) -> Self {
         Self {
             request,
-            manifest_sha256: format!("{:x}", Sha256::digest(manifest_bytes)),
+            manifest_sha256: download::hex_encode(&Sha256::digest(manifest_bytes)),
             model_sha256,
         }
     }
@@ -81,7 +81,7 @@ impl ConversionReceipt {
             return None;
         }
         let manifest_bytes = fs::read(manifest_path).ok()?;
-        if format!("{:x}", Sha256::digest(&manifest_bytes)) != receipt.manifest_sha256 {
+        if download::hex_encode(&Sha256::digest(&manifest_bytes)) != receipt.manifest_sha256 {
             return None;
         }
         let mut manifest = Manifest::from_bytes(&manifest_bytes).ok()?;
