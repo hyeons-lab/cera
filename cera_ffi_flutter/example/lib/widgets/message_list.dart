@@ -6,7 +6,8 @@ import '../chat_state.dart';
 import '../services/audio_player_service.dart';
 import 'audio_waveform.dart';
 
-/// Conversation transcript list with message bubbles, stats, and empty state.
+/// Conversation transcript list with borderless editorial assistant responses,
+/// soft tonal user pills, and a clean Material 3 empty state.
 class MessageList extends StatelessWidget {
   const MessageList({
     super.key,
@@ -15,6 +16,10 @@ class MessageList extends StatelessWidget {
     this.audioPlayer,
     this.hasModel = false,
     this.isLoading = false,
+    this.statusText,
+    this.activeBackend,
+    this.isTtsMode = false,
+    this.ttsSampleTexts = const <String>[],
     this.onOpenCatalog,
     this.onOpenLocalModel,
     this.onSelectPrompt,
@@ -25,109 +30,113 @@ class MessageList extends StatelessWidget {
   final AudioPlayerService? audioPlayer;
   final bool hasModel;
   final bool isLoading;
+  final String? statusText;
+  final String? activeBackend;
+  final bool isTtsMode;
+  final List<String> ttsSampleTexts;
   final VoidCallback? onOpenCatalog;
   final VoidCallback? onOpenLocalModel;
   final ValueChanged<String>? onSelectPrompt;
 
-  static const _kHeroTitle = 'Cera On-Device AI';
-  static const _kHeroSubtitle =
-      'High-performance local LLM, Vision, and Neural Speech inference across CPU, Metal, WebGPU, and Hexagon NPU.';
-  static const _kPillAccelerated = 'GPU & NPU Accelerated';
-  static const _kPillMultimodal = 'Multimodal Vision & Voice';
-  static const _kPillPrivate = '100% Local & Private';
-  static const _kBrowseCatalogButton = 'Browse Model Catalog';
-  static const _kOpenLocalButton = 'Open Local .gguf';
-  static const _kTryPromptHeader = 'TRY A PROMPT';
-  static const _starterPrompts = [
+  static const _kReadyGreeting = 'What can I help you with?';
+  static const _kTtsReadyGreeting =
+      'Enter text below or pick a sample script to synthesize speech.';
+  static const _kBrowseCatalogButton = 'Browse Models';
+  static const _kOpenLocalButton = 'Open .gguf File';
+  static const _kDefaultStarterPrompts = [
     'Explain how speculative decoding speeds up local LLMs.',
     'Write a clean Rust function to compute cosine similarity.',
     'Compare CPU, WebGPU, and NPU execution for transformer inference.',
   ];
+  static const _kDefaultTtsSamples = [
+    'Hello, this voice was synthesized entirely on-device with Cera.',
+    'The quick brown fox jumps over the lazy dog near the riverbank.',
+    'Local neural speech synthesis runs privately with zero cloud latency.',
+  ];
+
+  List<String> get _activePrompts {
+    if (isTtsMode) {
+      return ttsSampleTexts.isNotEmpty ? ttsSampleTexts : _kDefaultTtsSamples;
+    }
+    return _kDefaultStarterPrompts;
+  }
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     if (turns.isEmpty) {
+      final subtitle = !hasModel
+          ? (statusText ?? AppStrings.initialStatus)
+          : (isTtsMode ? _kTtsReadyGreeting : _kReadyGreeting);
+
       return Center(
         child: SingleChildScrollView(
-          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 28),
+          padding: const EdgeInsets.symmetric(horizontal: 24, vertical: 32),
           child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 580),
+            constraints: const BoxConstraints(maxWidth: 620),
             child: Column(
               mainAxisSize: MainAxisSize.min,
               children: [
                 Container(
-                  width: 68,
-                  height: 68,
+                  width: 52,
+                  height: 52,
                   decoration: BoxDecoration(
-                    gradient: LinearGradient(
-                      begin: Alignment.topLeft,
-                      end: Alignment.bottomRight,
-                      colors: [
-                        theme.colorScheme.primary.withValues(alpha: 0.22),
-                        theme.colorScheme.primary.withValues(alpha: 0.06),
-                      ],
-                    ),
-                    borderRadius: BorderRadius.circular(20),
-                    border: Border.all(
-                      color: theme.colorScheme.primary.withValues(alpha: 0.35),
-                    ),
-                    boxShadow: [
-                      BoxShadow(
-                        color: theme.colorScheme.primary.withValues(
-                          alpha: 0.14,
-                        ),
-                        blurRadius: 24,
-                        spreadRadius: 2,
-                      ),
-                    ],
+                    color: theme.colorScheme.surfaceContainerHigh,
+                    borderRadius: BorderRadius.circular(16),
                   ),
                   child: Icon(
-                    Icons.auto_awesome_rounded,
-                    size: 30,
-                    color: theme.colorScheme.primary,
+                    isTtsMode
+                        ? Icons.graphic_eq_rounded
+                        : Icons.auto_awesome_rounded,
+                    size: 24,
+                    color: theme.colorScheme.onSurface,
                   ),
                 ),
-                const SizedBox(height: 18),
+                const SizedBox(height: 16),
                 Text(
-                  _kHeroTitle,
+                  AppStrings.appTitle,
                   style: TextStyle(
-                    fontSize: 21,
+                    fontSize: 22,
                     fontWeight: FontWeight.w700,
-                    letterSpacing: -0.3,
+                    letterSpacing: -0.4,
                     color: theme.colorScheme.onSurface,
                   ),
                 ),
                 const SizedBox(height: 8),
                 Text(
-                  _kHeroSubtitle,
+                  subtitle,
                   textAlign: TextAlign.center,
                   style: TextStyle(
-                    fontSize: 13.5,
+                    fontSize: 14.5,
                     color: theme.colorScheme.onSurfaceVariant,
                     height: 1.45,
                   ),
                 ),
-                const SizedBox(height: 16),
-                Wrap(
-                  spacing: 8,
-                  runSpacing: 8,
-                  alignment: WrapAlignment.center,
-                  children: const [
-                    _FeaturePill(
-                      icon: Icons.bolt_rounded,
-                      label: _kPillAccelerated,
+                if (hasModel &&
+                    activeBackend != null &&
+                    activeBackend!.isNotEmpty) ...[
+                  const SizedBox(height: 12),
+                  Container(
+                    padding: const EdgeInsets.symmetric(
+                      horizontal: 10,
+                      vertical: 4,
                     ),
-                    _FeaturePill(
-                      icon: Icons.visibility_outlined,
-                      label: _kPillMultimodal,
+                    decoration: BoxDecoration(
+                      color: theme.colorScheme.surfaceContainerLow,
+                      borderRadius: BorderRadius.circular(20),
                     ),
-                    _FeaturePill(
-                      icon: Icons.shield_outlined,
-                      label: _kPillPrivate,
+                    child: Text(
+                      activeBackend!,
+                      maxLines: 1,
+                      overflow: TextOverflow.ellipsis,
+                      style: TextStyle(
+                        fontSize: 11.5,
+                        fontWeight: FontWeight.w500,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
                     ),
-                  ],
-                ),
+                  ),
+                ],
                 if (!hasModel &&
                     !isLoading &&
                     (onOpenCatalog != null || onOpenLocalModel != null)) ...[
@@ -143,12 +152,11 @@ class MessageList extends StatelessWidget {
                             backgroundColor: theme.colorScheme.primary,
                             foregroundColor: theme.colorScheme.onPrimary,
                             padding: const EdgeInsets.symmetric(
-                              horizontal: 18,
-                              vertical: 12,
+                              horizontal: 20,
+                              vertical: 13,
                             ),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(10),
-                            ),
+                            shape: const StadiumBorder(),
+                            elevation: 0,
                           ),
                           onPressed: onOpenCatalog,
                           icon: const Icon(
@@ -158,23 +166,23 @@ class MessageList extends StatelessWidget {
                           label: const Text(
                             _kBrowseCatalogButton,
                             style: TextStyle(
-                              fontSize: 13,
+                              fontSize: 13.5,
                               fontWeight: FontWeight.w600,
                             ),
                           ),
                         ),
                       if (onOpenLocalModel != null)
-                        OutlinedButton.icon(
-                          style: OutlinedButton.styleFrom(
+                        FilledButton.tonalIcon(
+                          style: FilledButton.styleFrom(
+                            backgroundColor:
+                                theme.colorScheme.surfaceContainerHigh,
                             foregroundColor: theme.colorScheme.onSurface,
-                            side: BorderSide(color: theme.colorScheme.outline),
                             padding: const EdgeInsets.symmetric(
-                              horizontal: 16,
-                              vertical: 12,
+                              horizontal: 18,
+                              vertical: 13,
                             ),
-                            shape: RoundedRectangleBorder(
-                              borderRadius: BorderRadius.circular(10),
-                            ),
+                            shape: const StadiumBorder(),
+                            elevation: 0,
                           ),
                           onPressed: onOpenLocalModel,
                           icon: const Icon(
@@ -184,7 +192,7 @@ class MessageList extends StatelessWidget {
                           label: const Text(
                             _kOpenLocalButton,
                             style: TextStyle(
-                              fontSize: 13,
+                              fontSize: 13.5,
                               fontWeight: FontWeight.w500,
                             ),
                           ),
@@ -193,44 +201,19 @@ class MessageList extends StatelessWidget {
                   ),
                 ],
                 if (hasModel && !isLoading && onSelectPrompt != null) ...[
-                  const SizedBox(height: 24),
-                  Text(
-                    _kTryPromptHeader,
-                    style: TextStyle(
-                      fontSize: 10.5,
-                      fontWeight: FontWeight.w700,
-                      letterSpacing: 0.9,
-                      color: theme.colorScheme.onSurfaceVariant,
-                    ),
-                  ),
-                  const SizedBox(height: 10),
+                  const SizedBox(height: 28),
                   Wrap(
                     spacing: 8,
                     runSpacing: 8,
                     alignment: WrapAlignment.center,
                     children: [
-                      for (final prompt in _starterPrompts)
-                        ActionChip(
-                          avatar: Icon(
-                            Icons.north_east_rounded,
-                            size: 13,
-                            color: theme.colorScheme.primary,
-                          ),
-                          label: Text(
-                            prompt,
-                            style: TextStyle(
-                              fontSize: 12,
-                              color: theme.colorScheme.onSurface,
-                            ),
-                          ),
-                          backgroundColor: theme.colorScheme.surface,
-                          side: BorderSide(
-                            color: theme.colorScheme.outlineVariant,
-                          ),
-                          shape: RoundedRectangleBorder(
-                            borderRadius: BorderRadius.circular(10),
-                          ),
-                          onPressed: () => onSelectPrompt?.call(prompt),
+                      for (final prompt in _activePrompts)
+                        _StarterPromptPill(
+                          prompt: prompt,
+                          icon: isTtsMode
+                              ? Icons.volume_up_rounded
+                              : Icons.north_east_rounded,
+                          onTap: () => onSelectPrompt?.call(prompt),
                         ),
                     ],
                   ),
@@ -250,7 +233,7 @@ class MessageList extends StatelessWidget {
         final turn = turns[index];
         return Center(
           child: ConstrainedBox(
-            constraints: const BoxConstraints(maxWidth: 840),
+            constraints: const BoxConstraints(maxWidth: 768),
             child: _TurnBubble(turn: turn, audioPlayer: audioPlayer),
           ),
         );
@@ -259,40 +242,48 @@ class MessageList extends StatelessWidget {
   }
 }
 
-class _FeaturePill extends StatelessWidget {
-  const _FeaturePill({required this.icon, required this.label});
+class _StarterPromptPill extends StatelessWidget {
+  const _StarterPromptPill({
+    required this.prompt,
+    required this.icon,
+    required this.onTap,
+  });
 
+  final String prompt;
   final IconData icon;
-  final String label;
+  final VoidCallback onTap;
 
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
-    return Container(
-      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 5),
-      decoration: BoxDecoration(
-        color: theme.colorScheme.surface,
-        borderRadius: BorderRadius.circular(20),
-        border: Border.all(color: theme.colorScheme.outlineVariant),
-      ),
-      child: Row(
-        mainAxisSize: MainAxisSize.min,
-        children: [
-          Icon(icon, size: 13, color: theme.colorScheme.primary),
-          const SizedBox(width: 5),
-          Flexible(
-            child: Text(
-              label,
-              maxLines: 1,
-              overflow: TextOverflow.ellipsis,
-              style: TextStyle(
-                fontSize: 11.5,
-                fontWeight: FontWeight.w500,
-                color: theme.colorScheme.onSurfaceVariant,
+    return Material(
+      color: theme.colorScheme.surfaceContainerLow,
+      borderRadius: BorderRadius.circular(18),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(18),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 14, vertical: 10),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(icon, size: 14, color: theme.colorScheme.onSurfaceVariant),
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  prompt,
+                  maxLines: 2,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 13,
+                    color: theme.colorScheme.onSurface,
+                    height: 1.35,
+                  ),
+                ),
               ),
-            ),
+            ],
           ),
-        ],
+        ),
       ),
     );
   }
@@ -304,7 +295,6 @@ class _TurnBubble extends StatelessWidget {
   final Turn turn;
   final AudioPlayerService? audioPlayer;
 
-  static const _kUserGradientEnd = Color(0xFF2563EB);
   static const _kBulletSeparator = '·';
 
   void _copyToClipboard(BuildContext context) {
@@ -322,298 +312,180 @@ class _TurnBubble extends StatelessWidget {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     final isUser = turn.role == TurnRole.user;
+
+    if (isUser) {
+      return _buildUserTurn(context, theme);
+    }
+    return _buildAssistantTurn(context, theme);
+  }
+
+  Widget _buildUserTurn(BuildContext context, ThemeData theme) {
     final imageBytes = turn.imageBytes;
+    final audioDuration = turn.audioDurationSeconds;
+
+    return Padding(
+      padding: const EdgeInsets.only(bottom: 20, left: 40),
+      child: Column(
+        crossAxisAlignment: CrossAxisAlignment.end,
+        children: [
+          if (imageBytes != null) ...[
+            ClipRRect(
+              borderRadius: BorderRadius.circular(16),
+              child: Image.memory(imageBytes, width: 220, fit: BoxFit.cover),
+            ),
+            const SizedBox(height: 8),
+          ],
+          if (audioDuration != null) ...[
+            Padding(
+              padding: const EdgeInsets.only(bottom: 6),
+              child: AudioWaveformBubble(
+                durationSeconds: audioDuration,
+                samples: turn.audioSamples,
+                audioPlayer: audioPlayer,
+              ),
+            ),
+          ],
+          if (turn.text.isNotEmpty)
+            Container(
+              padding: const EdgeInsets.symmetric(horizontal: 16, vertical: 11),
+              decoration: BoxDecoration(
+                color: theme.colorScheme.surfaceContainerHigh,
+                borderRadius: BorderRadius.circular(20),
+              ),
+              child: SelectableText(
+                turn.text,
+                style: TextStyle(
+                  fontSize: 15,
+                  height: 1.48,
+                  color: theme.colorScheme.onSurface,
+                ),
+              ),
+            ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildAssistantTurn(BuildContext context, ThemeData theme) {
     final audioDuration = turn.audioDurationSeconds;
     final modelName = turn.modelName;
     final stats = turn.stats;
 
     return Padding(
-      padding: const EdgeInsets.only(bottom: 18),
-      child: Row(
+      padding: const EdgeInsets.only(bottom: 24),
+      child: Column(
         crossAxisAlignment: CrossAxisAlignment.start,
-        mainAxisAlignment: isUser
-            ? MainAxisAlignment.end
-            : MainAxisAlignment.start,
         children: [
-          if (!isUser) ...[
-            Container(
-              width: 32,
-              height: 32,
-              margin: const EdgeInsets.only(top: 2),
-              decoration: BoxDecoration(
-                gradient: LinearGradient(
-                  begin: Alignment.topLeft,
-                  end: Alignment.bottomRight,
-                  colors: [
-                    theme.colorScheme.primary.withValues(alpha: 0.22),
-                    theme.colorScheme.primary.withValues(alpha: 0.08),
-                  ],
+          Row(
+            children: [
+              Container(
+                width: 22,
+                height: 22,
+                decoration: BoxDecoration(
+                  color: theme.colorScheme.surfaceContainerHigh,
+                  borderRadius: BorderRadius.circular(7),
                 ),
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(
-                  color: theme.colorScheme.primary.withValues(alpha: 0.3),
-                ),
-              ),
-              child: Center(
                 child: Icon(
-                  Icons.smart_toy_rounded,
-                  size: 16,
-                  color: theme.colorScheme.primary,
+                  Icons.auto_awesome_rounded,
+                  size: 13,
+                  color: theme.colorScheme.onSurface,
                 ),
               ),
-            ),
-            const SizedBox(width: 10),
-          ],
-          Flexible(
-            child: ConstrainedBox(
-              constraints: const BoxConstraints(maxWidth: 680),
-              child: Column(
-                crossAxisAlignment: isUser
-                    ? CrossAxisAlignment.end
-                    : CrossAxisAlignment.start,
-                children: [
-                  if (imageBytes != null) ...[
-                    Container(
-                      decoration: BoxDecoration(
-                        borderRadius: BorderRadius.circular(12),
-                        border: Border.all(color: theme.colorScheme.outline),
-                      ),
-                      child: ClipRRect(
-                        borderRadius: BorderRadius.circular(11),
-                        child: Image.memory(
-                          imageBytes,
-                          width: 230,
-                          fit: BoxFit.cover,
-                        ),
-                      ),
-                    ),
-                    const SizedBox(height: 8),
-                  ],
-                  if (audioDuration != null) ...[
-                    Padding(
-                      padding: const EdgeInsets.only(bottom: 6),
-                      child: AudioWaveformBubble(
-                        durationSeconds: audioDuration,
-                        samples: turn.audioSamples,
-                        audioPlayer: audioPlayer,
-                      ),
-                    ),
-                  ],
-                  if (turn.text.isNotEmpty || turn.isGenerating)
-                    Container(
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 16,
-                        vertical: 12,
-                      ),
-                      decoration: BoxDecoration(
-                        gradient: isUser
-                            ? LinearGradient(
-                                begin: Alignment.topLeft,
-                                end: Alignment.bottomRight,
-                                colors: [
-                                  theme.colorScheme.primary,
-                                  _kUserGradientEnd,
-                                ],
-                              )
-                            : null,
-                        color: isUser ? null : theme.colorScheme.surface,
-                        borderRadius: BorderRadius.circular(16).copyWith(
-                          bottomRight: isUser
-                              ? const Radius.circular(4)
-                              : const Radius.circular(16),
-                          bottomLeft: !isUser
-                              ? const Radius.circular(4)
-                              : const Radius.circular(16),
-                        ),
-                        border: isUser
-                            ? null
-                            : Border.all(color: theme.colorScheme.outline),
-                      ),
-                      child: turn.isGenerating && turn.text.isEmpty
-                          ? _TypingIndicator(label: turn.statusText)
-                          : SelectableText(
-                              turn.text,
-                              style: TextStyle(
-                                fontSize: 14.5,
-                                height: 1.52,
-                                color: isUser
-                                    ? theme.colorScheme.onPrimary
-                                    : theme.colorScheme.onSurface,
-                              ),
-                            ),
-                    ),
-                  if (!isUser &&
-                      !turn.isGenerating &&
-                      (modelName != null ||
-                          stats != null ||
-                          turn.text.isNotEmpty)) ...[
-                    const SizedBox(height: 6),
-                    Wrap(
-                      crossAxisAlignment: WrapCrossAlignment.center,
-                      spacing: 8,
-                      runSpacing: 4,
-                      children: [
-                        if (modelName != null)
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 7,
-                              vertical: 2.5,
-                            ),
-                            decoration: BoxDecoration(
-                              color: theme.colorScheme.primary.withValues(
-                                alpha: 0.12,
-                              ),
-                              borderRadius: BorderRadius.circular(6),
-                              border: Border.all(
-                                color: theme.colorScheme.primary.withValues(
-                                  alpha: 0.24,
-                                ),
-                              ),
-                            ),
-                            child: Row(
-                              mainAxisSize: MainAxisSize.min,
-                              children: [
-                                Icon(
-                                  Icons.memory_rounded,
-                                  size: 11,
-                                  color: theme.colorScheme.primary,
-                                ),
-                                const SizedBox(width: 4),
-                                Flexible(
-                                  child: Text(
-                                    modelName,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: TextStyle(
-                                      fontSize: 10.5,
-                                      fontWeight: FontWeight.w600,
-                                      color: theme.colorScheme.primary,
-                                    ),
-                                  ),
-                                ),
-                              ],
-                            ),
-                          ),
-                        if (stats != null)
-                          Container(
-                            padding: const EdgeInsets.symmetric(
-                              horizontal: 7,
-                              vertical: 2.5,
-                            ),
-                            decoration: BoxDecoration(
-                              color: theme.colorScheme.surface,
-                              borderRadius: BorderRadius.circular(6),
-                              border: Border.all(
-                                color: theme.colorScheme.outlineVariant,
-                              ),
-                            ),
-                            child: Wrap(
-                              crossAxisAlignment: WrapCrossAlignment.center,
-                              spacing: 4,
-                              children: [
-                                if (stats.tokens > 0)
-                                  Text(
-                                    '${stats.tokens} tokens${AppStrings.metaSeparator}${stats.tps.toStringAsFixed(1)} tok/s',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      fontWeight: FontWeight.w600,
-                                      color: theme.colorScheme.onSurfaceVariant,
-                                    ),
-                                  ),
-                                if (stats.audioRtf != null &&
-                                    stats.audioDurationSeconds != null) ...[
-                                  if (stats.tokens > 0)
-                                    Text(
-                                      _kBulletSeparator,
-                                      style: TextStyle(
-                                        fontSize: 11,
-                                        color: theme
-                                            .colorScheme
-                                            .onSurfaceVariant
-                                            .withValues(alpha: 0.5),
-                                      ),
-                                    ),
-                                  Text(
-                                    '${stats.audioDurationSeconds!.toStringAsFixed(1)}s audio${AppStrings.metaSeparator}${stats.audioRtf!.toStringAsFixed(2)}x RTF',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      fontWeight: FontWeight.w600,
-                                      color: theme.colorScheme.primary,
-                                    ),
-                                  ),
-                                ],
-                                if (stats.ttftMs != null) ...[
-                                  Text(
-                                    '$_kBulletSeparator ${stats.tokens > 0 ? "TTFT" : "TTFA"} ${stats.ttftMs}ms',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      color: theme.colorScheme.onSurfaceVariant
-                                          .withValues(alpha: 0.8),
-                                    ),
-                                  ),
-                                ],
-                                if (stats.tokens == 0 &&
-                                    stats.audioDurationSeconds == null)
-                                  Text(
-                                    '${stats.totalMs}ms',
-                                    style: TextStyle(
-                                      fontSize: 11,
-                                      fontWeight: FontWeight.w600,
-                                      color: theme.colorScheme.onSurfaceVariant,
-                                    ),
-                                  ),
-                              ],
-                            ),
-                          ),
-                        if (turn.text.isNotEmpty)
-                          IconButton(
-                            icon: Icon(
-                              Icons.copy_rounded,
-                              size: 13,
-                              color: theme.colorScheme.onSurfaceVariant
-                                  .withValues(alpha: 0.7),
-                            ),
-                            padding: EdgeInsets.zero,
-                            constraints: const BoxConstraints(
-                              minWidth: 22,
-                              minHeight: 22,
-                            ),
-                            tooltip: AppStrings.copyTextTooltip,
-                            onPressed: () => _copyToClipboard(context),
-                          ),
-                      ],
-                    ),
-                  ],
-                  if (isUser && turn.text.isNotEmpty) ...[
-                    const SizedBox(height: 4),
-                    Row(
-                      mainAxisSize: MainAxisSize.min,
-                      mainAxisAlignment: MainAxisAlignment.end,
-                      children: [
-                        IconButton(
-                          icon: Icon(
-                            Icons.copy_rounded,
-                            size: 13,
-                            color: theme.colorScheme.onSurfaceVariant
-                                .withValues(alpha: 0.6),
-                          ),
-                          padding: EdgeInsets.zero,
-                          constraints: const BoxConstraints(
-                            minWidth: 20,
-                            minHeight: 20,
-                          ),
-                          tooltip: AppStrings.copyTextTooltip,
-                          onPressed: () => _copyToClipboard(context),
-                        ),
-                      ],
-                    ),
-                  ],
-                ],
+              const SizedBox(width: 8),
+              Flexible(
+                child: Text(
+                  modelName ?? AppStrings.appTitle,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 12.5,
+                    fontWeight: FontWeight.w600,
+                    color: theme.colorScheme.onSurfaceVariant,
+                  ),
+                ),
+              ),
+            ],
+          ),
+          const SizedBox(height: 8),
+          if (audioDuration != null) ...[
+            Padding(
+              padding: const EdgeInsets.only(bottom: 8),
+              child: AudioWaveformBubble(
+                durationSeconds: audioDuration,
+                samples: turn.audioSamples,
+                audioPlayer: audioPlayer,
               ),
             ),
-          ),
-          if (isUser) const SizedBox(width: 4),
+          ],
+          if (turn.isGenerating && turn.text.isEmpty)
+            Padding(
+              padding: const EdgeInsets.symmetric(vertical: 4),
+              child: _TypingIndicator(label: turn.statusText),
+            )
+          else if (turn.text.isNotEmpty)
+            SelectableText(
+              turn.text,
+              style: TextStyle(
+                fontSize: 15.5,
+                height: 1.6,
+                color: theme.colorScheme.onSurface,
+              ),
+            ),
+          if (!turn.isGenerating &&
+              (stats != null || turn.text.isNotEmpty)) ...[
+            const SizedBox(height: 6),
+            Wrap(
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 10,
+              runSpacing: 4,
+              children: [
+                if (turn.text.isNotEmpty)
+                  InkWell(
+                    onTap: () => _copyToClipboard(context),
+                    borderRadius: BorderRadius.circular(6),
+                    child: Padding(
+                      padding: const EdgeInsets.symmetric(
+                        horizontal: 4,
+                        vertical: 2,
+                      ),
+                      child: Icon(
+                        Icons.content_copy_rounded,
+                        size: 14,
+                        color: theme.colorScheme.onSurfaceVariant,
+                      ),
+                    ),
+                  ),
+                if (stats != null) _buildStatsLine(theme, stats),
+              ],
+            ),
+          ],
         ],
+      ),
+    );
+  }
+
+  Widget _buildStatsLine(ThemeData theme, TurnStats stats) {
+    final parts = <String>[];
+    if (stats.tokens > 0) {
+      parts.add('${stats.tps.toStringAsFixed(1)} tok/s');
+      parts.add('${stats.tokens} tok');
+    }
+    if (stats.audioRtf != null && stats.audioDurationSeconds != null) {
+      parts.add('${stats.audioDurationSeconds!.toStringAsFixed(1)}s audio');
+      parts.add('${stats.audioRtf!.toStringAsFixed(2)}x RTF');
+    }
+    if (stats.ttftMs != null) {
+      final label = stats.tokens > 0 ? 'TTFT' : 'TTFA';
+      parts.add('${stats.ttftMs}ms $label');
+    } else if (stats.tokens == 0 && stats.audioDurationSeconds == null) {
+      parts.add('${stats.totalMs}ms');
+    }
+
+    return Text(
+      parts.join(' $_kBulletSeparator '),
+      style: TextStyle(
+        fontSize: 11.5,
+        color: theme.colorScheme.onSurfaceVariant.withValues(alpha: 0.8),
       ),
     );
   }
@@ -655,7 +527,7 @@ class _TypingIndicatorState extends State<_TypingIndicator>
               maxLines: 1,
               overflow: TextOverflow.ellipsis,
               style: TextStyle(
-                fontSize: 13,
+                fontSize: 13.5,
                 color: theme.colorScheme.onSurfaceVariant,
               ),
             ),
@@ -673,10 +545,12 @@ class _TypingIndicatorState extends State<_TypingIndicator>
                 final opacity = (1.0 - (offset * 0.8)).clamp(0.2, 1.0);
                 return Container(
                   margin: const EdgeInsets.symmetric(horizontal: 2),
-                  width: 6,
-                  height: 6,
+                  width: 5.5,
+                  height: 5.5,
                   decoration: BoxDecoration(
-                    color: theme.colorScheme.primary.withValues(alpha: opacity),
+                    color: theme.colorScheme.onSurfaceVariant.withValues(
+                      alpha: opacity,
+                    ),
                     shape: BoxShape.circle,
                   ),
                 );

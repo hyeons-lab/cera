@@ -12,6 +12,7 @@ import 'package:cera_ffi_flutter_example/main.dart';
 import 'package:cera_ffi_flutter_example/model_source.dart';
 import 'package:cera_ffi_flutter_example/widgets/audio_waveform.dart';
 import 'package:cera_ffi_flutter_example/widgets/bundle_picker_dialog.dart';
+import 'package:cera_ffi_flutter_example/widgets/message_composer.dart';
 import 'package:cera_ffi_flutter_example/widgets/message_list.dart';
 import 'package:cera_ffi_flutter_example/widgets/tts_studio_view.dart';
 import 'package:cera_ffi_flutter_example/widgets/voice_persona_picker.dart';
@@ -553,6 +554,84 @@ void main() {
           reason: 'Model picker label right in bounds at width=$width',
         );
       }
+    },
+  );
+
+  testWidgets('toggling theme button switches between dark and light mode', (
+    WidgetTester tester,
+  ) async {
+    await tester.pumpWidget(const CeraExampleApp());
+    await tester.pumpAndSettle();
+
+    // Starts in dark mode (showing light_mode_outlined toggle button)
+    expect(find.byIcon(Icons.light_mode_outlined), findsOneWidget);
+
+    await tester.tap(find.byIcon(Icons.light_mode_outlined));
+    await tester.pumpAndSettle();
+
+    // Switched to light mode (showing dark_mode_outlined toggle button)
+    expect(find.byIcon(Icons.dark_mode_outlined), findsOneWidget);
+  });
+
+  testWidgets(
+    'message composer integrates audio mode, voice persona, and sample script pills',
+    (WidgetTester tester) async {
+      AudioChatMode? selectedMode;
+      String? selectedVoice;
+      final inputController = TextEditingController();
+
+      await tester.pumpWidget(
+        MaterialApp(
+          home: Scaffold(
+            bottomNavigationBar: MessageComposer(
+              controller: inputController,
+              isBusy: false,
+              isGenerating: false,
+              canAttachImage: true,
+              canAttachAudio: true,
+              pendingImageBytes: null,
+              pendingImageName: null,
+              hasAudioIn: true,
+              hasAudioOut: true,
+              audioChatMode: AudioChatMode.textToSpeech,
+              onAudioChatModeChanged: (m) => selectedMode = m,
+              audioProfile: englishProfile,
+              selectedVoicePrompt: 'Use the US female voice.',
+              onVoiceChanged: (v) => selectedVoice = v,
+              ttsSampleTexts: const ['Synthesize this custom sample line.'],
+              onSend: () {},
+              onStop: () {},
+              onPickImage: () {},
+              onClearImage: () {},
+              onSendAudio: (_, _) {},
+            ),
+          ),
+        ),
+      );
+      await tester.pumpAndSettle();
+
+      expect(find.text('Speak (TTS)'), findsOneWidget);
+      expect(find.text('Narrator'), findsOneWidget);
+      expect(find.text('Sample'), findsOneWidget);
+
+      // Tap Sample pill to populate TTS sample script
+      await tester.tap(find.text('Sample'));
+      await tester.pump();
+      expect(inputController.text, 'Synthesize this custom sample line.');
+
+      // Open Audio Mode menu and switch to Voice Chat
+      await tester.tap(find.text('Speak (TTS)'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Voice Chat').last);
+      await tester.pumpAndSettle();
+      expect(selectedMode, AudioChatMode.interleaved);
+
+      // Open Voice Persona menu and switch to Studio Warm
+      await tester.tap(find.text('Narrator'));
+      await tester.pumpAndSettle();
+      await tester.tap(find.text('Studio Warm').last);
+      await tester.pumpAndSettle();
+      expect(selectedVoice, 'Use the UK male voice.');
     },
   );
 }

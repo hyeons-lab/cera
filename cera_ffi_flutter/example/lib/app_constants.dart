@@ -17,6 +17,7 @@ abstract final class PrefKeys {
   static const maxTokens = 'cera_max_tokens';
   static const lastBundleName = 'cera_last_bundle_name';
   static const lastBundleQuant = 'cera_last_bundle_quant';
+  static const themeMode = 'cera_theme_mode';
 }
 
 /// Serialized preference token values.
@@ -31,6 +32,10 @@ abstract final class PrefValues {
   static const audioTextToSpeech = 'textToSpeech';
   static const audioTextOnly = 'textOnly';
   static const audioInterleaved = 'interleaved';
+
+  static const themeLight = 'light';
+  static const themeDark = 'dark';
+  static const themeSystem = 'system';
 }
 
 /// JSON keys for [DownloadedModelRecord] persistence.

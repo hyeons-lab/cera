@@ -28,10 +28,12 @@ class BundlePickerDialog extends StatefulWidget {
     super.key,
     this.currentBundleName,
     this.currentQuant,
+    this.onOpenLocalModel,
   });
 
   final String? currentBundleName;
   final String? currentQuant;
+  final VoidCallback? onOpenLocalModel;
 
   @override
   State<BundlePickerDialog> createState() => _BundlePickerDialogState();
@@ -39,6 +41,8 @@ class BundlePickerDialog extends StatefulWidget {
 
 class _BundlePickerDialogState extends State<BundlePickerDialog> {
   static const _kDialogTitle = 'Select Model';
+  static const _kOpenLocalTooltip = 'Open local .gguf file';
+  static const _kOpenLocalShort = 'Local .gguf';
   static const _kTabDownloaded = 'Downloaded';
   static const _kTabCatalog = 'Catalog & Download';
   static const _kActionCancel = 'Cancel';
@@ -204,13 +208,44 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
       insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
       backgroundColor: theme.colorScheme.surface,
       surfaceTintColor: Colors.transparent,
-      shape: RoundedRectangleBorder(
-        borderRadius: BorderRadius.circular(16),
-        side: BorderSide(color: theme.colorScheme.outline),
-      ),
-      title: const Text(
-        _kDialogTitle,
-        style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+      shape: RoundedRectangleBorder(borderRadius: BorderRadius.circular(24)),
+      title: Row(
+        mainAxisAlignment: MainAxisAlignment.spaceBetween,
+        children: [
+          const Flexible(
+            child: Text(
+              _kDialogTitle,
+              overflow: TextOverflow.ellipsis,
+              style: TextStyle(fontSize: 18, fontWeight: FontWeight.w600),
+            ),
+          ),
+          if (widget.onOpenLocalModel != null)
+            Tooltip(
+              message: _kOpenLocalTooltip,
+              child: FilledButton.tonalIcon(
+                style: FilledButton.styleFrom(
+                  backgroundColor: theme.colorScheme.surfaceContainerHigh,
+                  foregroundColor: theme.colorScheme.onSurface,
+                  padding: const EdgeInsets.symmetric(
+                    horizontal: 12,
+                    vertical: 6,
+                  ),
+                  minimumSize: Size.zero,
+                  tapTargetSize: MaterialTapTargetSize.shrinkWrap,
+                  shape: const StadiumBorder(),
+                ),
+                onPressed: () {
+                  Navigator.of(context).pop();
+                  widget.onOpenLocalModel?.call();
+                },
+                icon: const Icon(Icons.folder_open_outlined, size: 15),
+                label: const Text(
+                  _kOpenLocalShort,
+                  style: TextStyle(fontSize: 12, fontWeight: FontWeight.w500),
+                ),
+              ),
+            ),
+        ],
       ),
       content: SizedBox(
         width: 460,
@@ -219,11 +254,10 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
           children: [
             Container(
               decoration: BoxDecoration(
-                color: theme.scaffoldBackgroundColor,
-                borderRadius: BorderRadius.circular(10),
-                border: Border.all(color: theme.colorScheme.outline),
+                color: theme.colorScheme.surfaceContainerLow,
+                borderRadius: BorderRadius.circular(14),
               ),
-              padding: const EdgeInsets.all(3),
+              padding: const EdgeInsets.all(4),
               child: Row(
                 children: [
                   Expanded(
@@ -578,21 +612,21 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                     : null,
                 isDense: true,
                 filled: true,
-                fillColor: theme.scaffoldBackgroundColor,
+                fillColor: theme.colorScheme.surfaceContainerLow,
                 contentPadding: const EdgeInsets.symmetric(
-                  horizontal: 12,
+                  horizontal: 14,
                   vertical: 10,
                 ),
                 border: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: BorderSide(color: theme.colorScheme.outline),
+                  borderRadius: BorderRadius.circular(14),
+                  borderSide: BorderSide.none,
                 ),
                 enabledBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
-                  borderSide: BorderSide(color: theme.colorScheme.outline),
+                  borderRadius: BorderRadius.circular(14),
+                  borderSide: BorderSide.none,
                 ),
                 focusedBorder: OutlineInputBorder(
-                  borderRadius: BorderRadius.circular(10),
+                  borderRadius: BorderRadius.circular(14),
                   borderSide: BorderSide(color: theme.colorScheme.primary),
                 ),
               ),
@@ -927,11 +961,13 @@ class _TabButton extends StatelessWidget {
     final theme = Theme.of(context);
     final itemCount = count ?? 0;
     return Material(
-      color: isSelected ? theme.colorScheme.outlineVariant : Colors.transparent,
-      borderRadius: BorderRadius.circular(7),
+      color: isSelected
+          ? theme.colorScheme.surfaceContainerHigh
+          : Colors.transparent,
+      borderRadius: BorderRadius.circular(10),
       child: InkWell(
         onTap: onTap,
-        borderRadius: BorderRadius.circular(7),
+        borderRadius: BorderRadius.circular(10),
         child: Padding(
           padding: const EdgeInsets.symmetric(vertical: 8),
           child: Row(
