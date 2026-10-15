@@ -498,4 +498,61 @@ void main() {
       );
     },
   );
+
+  testWidgets(
+    'top menu stays within viewport bounds on narrow mobile and desktop widths',
+    (WidgetTester tester) async {
+      SharedPreferences.setMockInitialValues({'sampling_temperature': 0.65});
+      addTearDown(() {
+        tester.view.resetPhysicalSize();
+        tester.view.resetDevicePixelRatio();
+      });
+
+      for (final width in <double>[320, 360, 375, 412, 600, 840]) {
+        tester.view.devicePixelRatio = 1.0;
+        tester.view.physicalSize = Size(width, 800);
+
+        await tester.pumpWidget(const CeraExampleApp());
+        await tester.pumpAndSettle();
+
+        expect(
+          tester.takeException(),
+          isNull,
+          reason: 'No overflow at width=$width',
+        );
+
+        final settingsFinder = find.byIcon(Icons.settings_outlined);
+        expect(settingsFinder, findsOneWidget);
+        final settingsRect = tester.getRect(settingsFinder);
+        expect(
+          settingsRect.left,
+          greaterThanOrEqualTo(0),
+          reason: 'Settings icon left in bounds at width=$width',
+        );
+        expect(
+          settingsRect.right,
+          lessThanOrEqualTo(width),
+          reason: 'Settings icon right in bounds at width=$width',
+        );
+
+        final clearFinder = find.byIcon(Icons.delete_sweep_rounded);
+        expect(clearFinder, findsOneWidget);
+        final clearRect = tester.getRect(clearFinder);
+        expect(
+          clearRect.right,
+          lessThanOrEqualTo(width),
+          reason: 'Clear icon right in bounds at width=$width',
+        );
+
+        final modelFinder = find.text('Select Model');
+        expect(modelFinder, findsOneWidget);
+        final modelRect = tester.getRect(modelFinder);
+        expect(
+          modelRect.right,
+          lessThanOrEqualTo(width),
+          reason: 'Model picker label right in bounds at width=$width',
+        );
+      }
+    },
+  );
 }

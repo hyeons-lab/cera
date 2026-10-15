@@ -91,10 +91,13 @@ class _ChatPageState extends State<ChatPage> {
   // AppBar & Action labels
   static const _kChatSegmentLabel = 'Chat';
   static const _kTtsStudioSegmentLabel = 'TTS Studio';
+  static const _kTtsShortSegmentLabel = 'TTS';
   static const _kSwitchModelTooltip = 'Select or download model';
   static const _kSelectModelLabel = 'Select Model';
   static const _kClearTranscriptTooltip = 'Clear transcript';
   static const _kSettingsTooltip = 'Settings & Models';
+  static const double _kCompactHeaderBreakpoint = 680.0;
+  static const double _kUltraCompactHeaderBreakpoint = 400.0;
 
   // Settings sheet section headers & copy
   static const _kSettingsTitle = 'Settings & Models';
@@ -439,14 +442,18 @@ class _ChatPageState extends State<ChatPage> {
                       Row(
                         mainAxisAlignment: MainAxisAlignment.spaceBetween,
                         children: [
-                          Text(
-                            _kSamplingTemperatureTitle,
-                            style: TextStyle(
-                              fontSize: 14,
-                              fontWeight: FontWeight.w500,
-                              color: theme.colorScheme.onSurface,
+                          Flexible(
+                            child: Text(
+                              _kSamplingTemperatureTitle,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 14,
+                                fontWeight: FontWeight.w500,
+                                color: theme.colorScheme.onSurface,
+                              ),
                             ),
                           ),
+                          const SizedBox(width: 8),
                           Container(
                             padding: const EdgeInsets.symmetric(
                               horizontal: 8,
@@ -617,34 +624,50 @@ class _ChatPageState extends State<ChatPage> {
                             color: theme.colorScheme.onSurfaceVariant,
                           ),
                         ),
-                        trailing: DropdownButton<CeraBackend>(
-                          value: currentSettings.backend,
-                          dropdownColor: theme.colorScheme.surface,
-                          underline: const SizedBox.shrink(),
-                          items: const [
-                            DropdownMenuItem(
-                              value: CeraBackend.auto,
-                              child: Text(_kBackendAutoLabel),
-                            ),
-                            DropdownMenuItem(
-                              value: CeraBackend.gpu,
-                              child: Text(_kBackendGpuLabel),
-                            ),
-                            DropdownMenuItem(
-                              value: CeraBackend.hexagon,
-                              child: Text(_kBackendHexagonLabel),
-                            ),
-                            DropdownMenuItem(
-                              value: CeraBackend.cpu,
-                              child: Text(_kBackendCpuLabel),
-                            ),
-                          ],
-                          onChanged: (val) {
-                            if (val == null) return;
-                            _controller.dispatch(
-                              UpdateSettingsIntent(backend: val),
-                            );
-                          },
+                        trailing: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 160),
+                          child: DropdownButton<CeraBackend>(
+                            value: currentSettings.backend,
+                            isExpanded: true,
+                            dropdownColor: theme.colorScheme.surface,
+                            underline: const SizedBox.shrink(),
+                            items: const [
+                              DropdownMenuItem(
+                                value: CeraBackend.auto,
+                                child: Text(
+                                  _kBackendAutoLabel,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              DropdownMenuItem(
+                                value: CeraBackend.gpu,
+                                child: Text(
+                                  _kBackendGpuLabel,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              DropdownMenuItem(
+                                value: CeraBackend.hexagon,
+                                child: Text(
+                                  _kBackendHexagonLabel,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              DropdownMenuItem(
+                                value: CeraBackend.cpu,
+                                child: Text(
+                                  _kBackendCpuLabel,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ],
+                            onChanged: (val) {
+                              if (val == null) return;
+                              _controller.dispatch(
+                                UpdateSettingsIntent(backend: val),
+                              );
+                            },
+                          ),
                         ),
                       ),
                       const SizedBox(height: 8),
@@ -676,32 +699,45 @@ class _ChatPageState extends State<ChatPage> {
                             color: theme.colorScheme.onSurfaceVariant,
                           ),
                         ),
-                        trailing: DropdownButton<int?>(
-                          value: currentSettings.maxImageLongSize,
-                          dropdownColor: theme.colorScheme.surface,
-                          underline: const SizedBox.shrink(),
-                          items: const [
-                            DropdownMenuItem(
-                              value: ChatDefaults.maxImageLongSize,
-                              child: Text(_kImageDimFastLabel),
-                            ),
-                            DropdownMenuItem(
-                              value: ChatDefaults.hdImageLongSize,
-                              child: Text(_kImageDimHdLabel),
-                            ),
-                            DropdownMenuItem(
-                              value: null,
-                              child: Text(_kImageDimNativeLabel),
-                            ),
-                          ],
-                          onChanged: (val) {
-                            _controller.dispatch(
-                              UpdateSettingsIntent(
-                                maxImageLongSize: val,
-                                clearMaxImageLongSize: val == null,
+                        trailing: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 140),
+                          child: DropdownButton<int?>(
+                            value: currentSettings.maxImageLongSize,
+                            isExpanded: true,
+                            dropdownColor: theme.colorScheme.surface,
+                            underline: const SizedBox.shrink(),
+                            items: const [
+                              DropdownMenuItem(
+                                value: ChatDefaults.maxImageLongSize,
+                                child: Text(
+                                  _kImageDimFastLabel,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
                               ),
-                            );
-                          },
+                              DropdownMenuItem(
+                                value: ChatDefaults.hdImageLongSize,
+                                child: Text(
+                                  _kImageDimHdLabel,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              DropdownMenuItem(
+                                value: null,
+                                child: Text(
+                                  _kImageDimNativeLabel,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ],
+                            onChanged: (val) {
+                              _controller.dispatch(
+                                UpdateSettingsIntent(
+                                  maxImageLongSize: val,
+                                  clearMaxImageLongSize: val == null,
+                                ),
+                              );
+                            },
+                          ),
                         ),
                       ),
                       const SizedBox(height: 8),
@@ -715,34 +751,50 @@ class _ChatPageState extends State<ChatPage> {
                             color: theme.colorScheme.onSurfaceVariant,
                           ),
                         ),
-                        trailing: DropdownButton<AudioChatMode>(
-                          value: currentSettings.audioChatMode,
-                          dropdownColor: theme.colorScheme.surface,
-                          underline: const SizedBox.shrink(),
-                          items: const [
-                            DropdownMenuItem(
-                              value: AudioChatMode.speechToText,
-                              child: Text(_kVoiceModeAsrLabel),
-                            ),
-                            DropdownMenuItem(
-                              value: AudioChatMode.interleaved,
-                              child: Text(_kVoiceModeInterleavedLabel),
-                            ),
-                            DropdownMenuItem(
-                              value: AudioChatMode.textToSpeech,
-                              child: Text(_kVoiceModeTtsLabel),
-                            ),
-                            DropdownMenuItem(
-                              value: AudioChatMode.textOnly,
-                              child: Text(_kVoiceModeTextOnlyMenuLabel),
-                            ),
-                          ],
-                          onChanged: (val) {
-                            if (val == null) return;
-                            _controller.dispatch(
-                              UpdateSettingsIntent(audioChatMode: val),
-                            );
-                          },
+                        trailing: ConstrainedBox(
+                          constraints: const BoxConstraints(maxWidth: 160),
+                          child: DropdownButton<AudioChatMode>(
+                            value: currentSettings.audioChatMode,
+                            isExpanded: true,
+                            dropdownColor: theme.colorScheme.surface,
+                            underline: const SizedBox.shrink(),
+                            items: const [
+                              DropdownMenuItem(
+                                value: AudioChatMode.speechToText,
+                                child: Text(
+                                  _kVoiceModeAsrLabel,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              DropdownMenuItem(
+                                value: AudioChatMode.interleaved,
+                                child: Text(
+                                  _kVoiceModeInterleavedLabel,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              DropdownMenuItem(
+                                value: AudioChatMode.textToSpeech,
+                                child: Text(
+                                  _kVoiceModeTtsLabel,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                              DropdownMenuItem(
+                                value: AudioChatMode.textOnly,
+                                child: Text(
+                                  _kVoiceModeTextOnlyMenuLabel,
+                                  overflow: TextOverflow.ellipsis,
+                                ),
+                              ),
+                            ],
+                            onChanged: (val) {
+                              if (val == null) return;
+                              _controller.dispatch(
+                                UpdateSettingsIntent(audioChatMode: val),
+                              );
+                            },
+                          ),
                         ),
                       ),
                       if ((currentState.audioProfile?.hasVoices ?? false) &&
@@ -835,6 +887,221 @@ class _ChatPageState extends State<ChatPage> {
     );
   }
 
+  PreferredSizeWidget _buildResponsiveAppBar(
+    BuildContext context,
+    ThemeData theme,
+    ChatState state,
+    String? loadedModelName,
+  ) {
+    final screenWidth = MediaQuery.sizeOf(context).width;
+    final isCompact = screenWidth < _kCompactHeaderBreakpoint;
+    final isUltraCompact = screenWidth < _kUltraCompactHeaderBreakpoint;
+    final toolbarHeight = isCompact ? 92.0 : 60.0;
+
+    return AppBar(
+      automaticallyImplyLeading: false,
+      titleSpacing: 0,
+      toolbarHeight: toolbarHeight,
+      title: Padding(
+        padding: EdgeInsets.symmetric(
+          horizontal: isCompact ? 12 : 16,
+          vertical: isCompact ? 6 : 8,
+        ),
+        child: isCompact
+            ? Column(
+                mainAxisSize: MainAxisSize.min,
+                crossAxisAlignment: CrossAxisAlignment.stretch,
+                children: [
+                  Row(
+                    children: [
+                      Expanded(
+                        child: Column(
+                          crossAxisAlignment: CrossAxisAlignment.start,
+                          mainAxisSize: MainAxisSize.min,
+                          children: [
+                            Row(
+                              children: [
+                                Flexible(
+                                  child: Text(
+                                    AppStrings.appTitle,
+                                    maxLines: 1,
+                                    overflow: TextOverflow.ellipsis,
+                                    style: TextStyle(
+                                      fontSize: 16,
+                                      fontWeight: FontWeight.w700,
+                                      color: theme.colorScheme.onSurface,
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(width: 6),
+                                Flexible(child: _VersionBadge(theme: theme)),
+                                const SizedBox(width: 6),
+                                Flexible(
+                                  child: _SamplingBadge(
+                                    label: state.settings.samplingLabel,
+                                    onTap: () => _showSettingsSheet(state),
+                                  ),
+                                ),
+                              ],
+                            ),
+                            const SizedBox(height: 2),
+                            Text(
+                              state.status,
+                              maxLines: 1,
+                              overflow: TextOverflow.ellipsis,
+                              style: TextStyle(
+                                fontSize: 11,
+                                fontWeight: FontWeight.normal,
+                                color: theme.colorScheme.onSurfaceVariant,
+                              ),
+                            ),
+                          ],
+                        ),
+                      ),
+                      const SizedBox(width: 6),
+                      _HeaderIconButton(
+                        icon: Icons.delete_sweep_rounded,
+                        tooltip: _kClearTranscriptTooltip,
+                        onPressed: state.turns.isEmpty
+                            ? null
+                            : () => _controller.dispatch(
+                                const ClearTranscriptIntent(),
+                              ),
+                      ),
+                      _HeaderIconButton(
+                        icon: Icons.settings_outlined,
+                        tooltip: _kSettingsTooltip,
+                        onPressed: () => _showSettingsSheet(state),
+                      ),
+                    ],
+                  ),
+                  const SizedBox(height: 6),
+                  Row(
+                    children: [
+                      Expanded(
+                        child: _ModelPickerButton(
+                          label: loadedModelName ?? _kSelectModelLabel,
+                          tooltip: _kSwitchModelTooltip,
+                          hasModel: state.hasModel,
+                          expandLabel: true,
+                          onTap: () => _pickBundle(state),
+                        ),
+                      ),
+                      const SizedBox(width: 8),
+                      _ModeSwitcher(
+                        uiMode: state.uiMode,
+                        chatLabel: _kChatSegmentLabel,
+                        ttsLabel: isUltraCompact
+                            ? _kTtsShortSegmentLabel
+                            : _kTtsStudioSegmentLabel,
+                        onChanged: (mode) =>
+                            _controller.dispatch(SetUIModeIntent(mode)),
+                      ),
+                    ],
+                  ),
+                ],
+              )
+            : Row(
+                children: [
+                  Expanded(
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.start,
+                      mainAxisSize: MainAxisSize.min,
+                      children: [
+                        Row(
+                          children: [
+                            Flexible(
+                              child: Text(
+                                AppStrings.appTitle,
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                                style: TextStyle(
+                                  fontSize: 17,
+                                  fontWeight: FontWeight.w700,
+                                  color: theme.colorScheme.onSurface,
+                                ),
+                              ),
+                            ),
+                            const SizedBox(width: 8),
+                            Flexible(child: _VersionBadge(theme: theme)),
+                            const SizedBox(width: 6),
+                            Flexible(
+                              child: _SamplingBadge(
+                                label: state.settings.samplingLabel,
+                                onTap: () => _showSettingsSheet(state),
+                              ),
+                            ),
+                          ],
+                        ),
+                        const SizedBox(height: 2),
+                        Text(
+                          state.status,
+                          maxLines: 1,
+                          overflow: TextOverflow.ellipsis,
+                          style: TextStyle(
+                            fontSize: 11,
+                            fontWeight: FontWeight.normal,
+                            color: theme.colorScheme.onSurfaceVariant,
+                          ),
+                        ),
+                      ],
+                    ),
+                  ),
+                  const SizedBox(width: 12),
+                  ConstrainedBox(
+                    constraints: BoxConstraints(
+                      maxWidth: (screenWidth * 0.26).clamp(130.0, 240.0),
+                    ),
+                    child: _ModelPickerButton(
+                      label: loadedModelName ?? _kSelectModelLabel,
+                      tooltip: _kSwitchModelTooltip,
+                      hasModel: state.hasModel,
+                      expandLabel: false,
+                      onTap: () => _pickBundle(state),
+                    ),
+                  ),
+                  const SizedBox(width: 8),
+                  _ModeSwitcher(
+                    uiMode: state.uiMode,
+                    chatLabel: _kChatSegmentLabel,
+                    ttsLabel: _kTtsStudioSegmentLabel,
+                    onChanged: (mode) =>
+                        _controller.dispatch(SetUIModeIntent(mode)),
+                  ),
+                  const SizedBox(width: 4),
+                  _HeaderIconButton(
+                    icon: Icons.delete_sweep_rounded,
+                    tooltip: _kClearTranscriptTooltip,
+                    onPressed: state.turns.isEmpty
+                        ? null
+                        : () => _controller.dispatch(
+                            const ClearTranscriptIntent(),
+                          ),
+                  ),
+                  _HeaderIconButton(
+                    icon: Icons.settings_outlined,
+                    tooltip: _kSettingsTooltip,
+                    onPressed: () => _showSettingsSheet(state),
+                  ),
+                ],
+              ),
+      ),
+      bottom: PreferredSize(
+        preferredSize: const Size.fromHeight(3),
+        child: state.isLoading
+            ? LinearProgressIndicator(
+                value: state.downloadFraction,
+                minHeight: 3,
+                backgroundColor: theme.colorScheme.outlineVariant,
+                valueColor: AlwaysStoppedAnimation<Color>(
+                  theme.colorScheme.primary,
+                ),
+              )
+            : Container(color: theme.colorScheme.outlineVariant, height: 1),
+      ),
+    );
+  }
+
   @override
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
@@ -846,189 +1113,11 @@ class _ChatPageState extends State<ChatPage> {
         final loadedModelName = state.loadedModel?.name;
 
         return Scaffold(
-          appBar: AppBar(
-            title: Column(
-              crossAxisAlignment: CrossAxisAlignment.start,
-              children: [
-                Row(
-                  mainAxisSize: MainAxisSize.min,
-                  children: [
-                    const Text(AppStrings.appTitle),
-                    const SizedBox(width: 8),
-                    Flexible(
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
-                        decoration: BoxDecoration(
-                          color: theme.colorScheme.primaryContainer,
-                          borderRadius: BorderRadius.circular(6),
-                        ),
-                        child: Text(
-                          AppStrings.appVersion,
-                          overflow: TextOverflow.ellipsis,
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: FontWeight.bold,
-                            color: theme.colorScheme.onPrimaryContainer,
-                          ),
-                        ),
-                      ),
-                    ),
-                    const SizedBox(width: 6),
-                    InkWell(
-                      onTap: () => _showSettingsSheet(state),
-                      borderRadius: BorderRadius.circular(6),
-                      child: Container(
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 6,
-                          vertical: 2,
-                        ),
-                        decoration: BoxDecoration(
-                          color: theme.colorScheme.primary.withValues(
-                            alpha: 0.14,
-                          ),
-                          borderRadius: BorderRadius.circular(6),
-                          border: Border.all(
-                            color: theme.colorScheme.primary.withValues(
-                              alpha: 0.3,
-                            ),
-                          ),
-                        ),
-                        child: Text(
-                          state.settings.samplingLabel,
-                          style: TextStyle(
-                            fontSize: 10,
-                            fontWeight: FontWeight.w600,
-                            color: theme.colorScheme.primary,
-                          ),
-                        ),
-                      ),
-                    ),
-                  ],
-                ),
-                const SizedBox(height: 2),
-                Text(
-                  state.status,
-                  style: TextStyle(
-                    fontSize: 11,
-                    fontWeight: FontWeight.normal,
-                    color: theme.colorScheme.onSurfaceVariant,
-                  ),
-                  overflow: TextOverflow.ellipsis,
-                ),
-              ],
-            ),
-            bottom: PreferredSize(
-              preferredSize: const Size.fromHeight(3),
-              child: state.isLoading
-                  ? LinearProgressIndicator(
-                      value: state.downloadFraction,
-                      minHeight: 3,
-                      backgroundColor: theme.colorScheme.outlineVariant,
-                      valueColor: AlwaysStoppedAnimation<Color>(
-                        theme.colorScheme.primary,
-                      ),
-                    )
-                  : Container(
-                      color: theme.colorScheme.outlineVariant,
-                      height: 1,
-                    ),
-            ),
-            actions: [
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                child: Tooltip(
-                  message: _kSwitchModelTooltip,
-                  child: OutlinedButton.icon(
-                    style: OutlinedButton.styleFrom(
-                      foregroundColor: state.hasModel
-                          ? theme.colorScheme.onSurface
-                          : theme.colorScheme.primary,
-                      side: BorderSide(
-                        color: state.hasModel
-                            ? theme.colorScheme.outline
-                            : theme.colorScheme.primary.withValues(alpha: 0.5),
-                      ),
-                      padding: const EdgeInsets.symmetric(horizontal: 10),
-                      visualDensity: VisualDensity.compact,
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                    ),
-                    onPressed: () => _pickBundle(state),
-                    icon: Icon(
-                      state.hasModel
-                          ? Icons.memory_rounded
-                          : Icons.cloud_download_outlined,
-                      size: 14,
-                      color: theme.colorScheme.primary,
-                    ),
-                    label: ConstrainedBox(
-                      constraints: const BoxConstraints(maxWidth: 140),
-                      child: Text(
-                        loadedModelName ?? _kSelectModelLabel,
-                        overflow: TextOverflow.ellipsis,
-                        style: const TextStyle(
-                          fontSize: 11.5,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                    ),
-                  ),
-                ),
-              ),
-              const SizedBox(width: 6),
-              Padding(
-                padding: const EdgeInsets.symmetric(vertical: 8),
-                child: SegmentedButton<AppUIMode>(
-                  style: SegmentedButton.styleFrom(
-                    visualDensity: VisualDensity.compact,
-                    padding: const EdgeInsets.symmetric(horizontal: 6),
-                    side: BorderSide(color: theme.colorScheme.outlineVariant),
-                    selectedBackgroundColor: theme.colorScheme.primary
-                        .withValues(alpha: 0.16),
-                    selectedForegroundColor: theme.colorScheme.primary,
-                  ),
-                  showSelectedIcon: false,
-                  segments: const [
-                    ButtonSegment<AppUIMode>(
-                      value: AppUIMode.chat,
-                      label: Text(
-                        _kChatSegmentLabel,
-                        style: TextStyle(fontSize: 11.5),
-                      ),
-                      icon: Icon(Icons.chat_outlined, size: 14),
-                    ),
-                    ButtonSegment<AppUIMode>(
-                      value: AppUIMode.ttsStudio,
-                      label: Text(
-                        _kTtsStudioSegmentLabel,
-                        style: TextStyle(fontSize: 11.5),
-                      ),
-                      icon: Icon(Icons.record_voice_over_outlined, size: 14),
-                    ),
-                  ],
-                  selected: {state.uiMode},
-                  onSelectionChanged: (selection) {
-                    _controller.dispatch(SetUIModeIntent(selection.first));
-                  },
-                ),
-              ),
-              IconButton(
-                icon: const Icon(Icons.delete_sweep_rounded),
-                tooltip: _kClearTranscriptTooltip,
-                onPressed: state.turns.isEmpty
-                    ? null
-                    : () => _controller.dispatch(const ClearTranscriptIntent()),
-              ),
-              IconButton(
-                icon: const Icon(Icons.settings_outlined),
-                tooltip: _kSettingsTooltip,
-                onPressed: () => _showSettingsSheet(state),
-              ),
-            ],
+          appBar: _buildResponsiveAppBar(
+            context,
+            theme,
+            state,
+            loadedModelName,
           ),
           body: state.uiMode == AppUIMode.ttsStudio
               ? TtsStudioView(
@@ -1256,6 +1345,288 @@ class _AudioModeChip extends StatelessWidget {
           ],
         ),
       ),
+    );
+  }
+}
+
+class _VersionBadge extends StatelessWidget {
+  const _VersionBadge({required this.theme});
+
+  final ThemeData theme;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 5, vertical: 1.5),
+      decoration: BoxDecoration(
+        color: theme.colorScheme.primaryContainer,
+        borderRadius: BorderRadius.circular(5),
+      ),
+      child: Text(
+        AppStrings.appVersion,
+        maxLines: 1,
+        overflow: TextOverflow.ellipsis,
+        style: TextStyle(
+          fontSize: 10,
+          fontWeight: FontWeight.bold,
+          color: theme.colorScheme.onPrimaryContainer,
+        ),
+      ),
+    );
+  }
+}
+
+class _SamplingBadge extends StatelessWidget {
+  const _SamplingBadge({required this.label, required this.onTap});
+
+  final String label;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Material(
+      color: theme.colorScheme.primary.withValues(alpha: 0.14),
+      borderRadius: BorderRadius.circular(6),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: Container(
+          padding: const EdgeInsets.symmetric(horizontal: 7, vertical: 3.5),
+          decoration: BoxDecoration(
+            borderRadius: BorderRadius.circular(6),
+            border: Border.all(
+              color: theme.colorScheme.primary.withValues(alpha: 0.3),
+            ),
+          ),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                Icons.tune_rounded,
+                size: 11,
+                color: theme.colorScheme.primary,
+              ),
+              const SizedBox(width: 4),
+              Flexible(
+                child: Text(
+                  label,
+                  maxLines: 1,
+                  overflow: TextOverflow.ellipsis,
+                  style: TextStyle(
+                    fontSize: 10.5,
+                    fontWeight: FontWeight.w600,
+                    color: theme.colorScheme.primary,
+                  ),
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ModelPickerButton extends StatelessWidget {
+  const _ModelPickerButton({
+    required this.label,
+    required this.tooltip,
+    required this.hasModel,
+    required this.expandLabel,
+    required this.onTap,
+  });
+
+  final String label;
+  final String tooltip;
+  final bool hasModel;
+  final bool expandLabel;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    final labelWidget = Text(
+      label,
+      maxLines: 1,
+      overflow: TextOverflow.ellipsis,
+      style: TextStyle(
+        fontSize: 11.5,
+        fontWeight: FontWeight.w600,
+        color: hasModel
+            ? theme.colorScheme.onSurface
+            : theme.colorScheme.primary,
+      ),
+    );
+
+    return Tooltip(
+      message: tooltip,
+      child: Material(
+        color: Colors.transparent,
+        borderRadius: BorderRadius.circular(8),
+        child: InkWell(
+          onTap: onTap,
+          borderRadius: BorderRadius.circular(8),
+          child: Container(
+            padding: const EdgeInsets.symmetric(horizontal: 9, vertical: 5.5),
+            decoration: BoxDecoration(
+              borderRadius: BorderRadius.circular(8),
+              border: Border.all(
+                color: hasModel
+                    ? theme.colorScheme.outline
+                    : theme.colorScheme.primary.withValues(alpha: 0.5),
+              ),
+            ),
+            child: Row(
+              mainAxisSize: expandLabel ? MainAxisSize.max : MainAxisSize.min,
+              children: [
+                Icon(
+                  hasModel
+                      ? Icons.memory_rounded
+                      : Icons.cloud_download_outlined,
+                  size: 14,
+                  color: theme.colorScheme.primary,
+                ),
+                const SizedBox(width: 6),
+                if (expandLabel)
+                  Expanded(child: labelWidget)
+                else
+                  Flexible(child: labelWidget),
+                const SizedBox(width: 4),
+                Icon(
+                  Icons.unfold_more_rounded,
+                  size: 14,
+                  color: theme.colorScheme.onSurfaceVariant,
+                ),
+              ],
+            ),
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _ModeSwitcher extends StatelessWidget {
+  const _ModeSwitcher({
+    required this.uiMode,
+    required this.chatLabel,
+    required this.ttsLabel,
+    required this.onChanged,
+  });
+
+  final AppUIMode uiMode;
+  final String chatLabel;
+  final String ttsLabel;
+  final ValueChanged<AppUIMode> onChanged;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Container(
+      padding: const EdgeInsets.all(2),
+      decoration: BoxDecoration(
+        color: theme.scaffoldBackgroundColor,
+        borderRadius: BorderRadius.circular(8),
+        border: Border.all(color: theme.colorScheme.outlineVariant),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          _ModePillSegment(
+            icon: Icons.chat_outlined,
+            label: chatLabel,
+            isSelected: uiMode == AppUIMode.chat,
+            onTap: () => onChanged(AppUIMode.chat),
+          ),
+          const SizedBox(width: 2),
+          _ModePillSegment(
+            icon: Icons.record_voice_over_outlined,
+            label: ttsLabel,
+            isSelected: uiMode == AppUIMode.ttsStudio,
+            onTap: () => onChanged(AppUIMode.ttsStudio),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _ModePillSegment extends StatelessWidget {
+  const _ModePillSegment({
+    required this.icon,
+    required this.label,
+    required this.isSelected,
+    required this.onTap,
+  });
+
+  final IconData icon;
+  final String label;
+  final bool isSelected;
+  final VoidCallback onTap;
+
+  @override
+  Widget build(BuildContext context) {
+    final theme = Theme.of(context);
+    return Material(
+      color: isSelected
+          ? theme.colorScheme.primary.withValues(alpha: 0.18)
+          : Colors.transparent,
+      borderRadius: BorderRadius.circular(6),
+      child: InkWell(
+        onTap: onTap,
+        borderRadius: BorderRadius.circular(6),
+        child: Padding(
+          padding: const EdgeInsets.symmetric(horizontal: 8, vertical: 4.5),
+          child: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              Icon(
+                icon,
+                size: 13,
+                color: isSelected
+                    ? theme.colorScheme.primary
+                    : theme.colorScheme.onSurfaceVariant,
+              ),
+              const SizedBox(width: 4),
+              Text(
+                label,
+                style: TextStyle(
+                  fontSize: 11,
+                  fontWeight: isSelected ? FontWeight.w600 : FontWeight.w500,
+                  color: isSelected
+                      ? theme.colorScheme.primary
+                      : theme.colorScheme.onSurfaceVariant,
+                ),
+              ),
+            ],
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _HeaderIconButton extends StatelessWidget {
+  const _HeaderIconButton({
+    required this.icon,
+    required this.tooltip,
+    required this.onPressed,
+  });
+
+  final IconData icon;
+  final String tooltip;
+  final VoidCallback? onPressed;
+
+  @override
+  Widget build(BuildContext context) {
+    return IconButton(
+      icon: Icon(icon, size: 19),
+      tooltip: tooltip,
+      padding: EdgeInsets.zero,
+      constraints: const BoxConstraints.tightFor(width: 34, height: 34),
+      visualDensity: VisualDensity.compact,
+      onPressed: onPressed,
     );
   }
 }

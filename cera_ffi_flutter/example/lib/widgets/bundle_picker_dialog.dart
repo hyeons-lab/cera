@@ -201,6 +201,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
   Widget build(BuildContext context) {
     final theme = Theme.of(context);
     return AlertDialog(
+      insetPadding: const EdgeInsets.symmetric(horizontal: 16, vertical: 24),
       backgroundColor: theme.colorScheme.surface,
       surfaceTintColor: Colors.transparent,
       shape: RoundedRectangleBorder(
@@ -354,6 +355,8 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                 Expanded(
                   child: Text(
                     model.displayName,
+                    maxLines: 1,
+                    overflow: TextOverflow.ellipsis,
                     style: TextStyle(
                       fontWeight: isActive ? FontWeight.w700 : FontWeight.w600,
                       color: isActive ? theme.colorScheme.primary : null,
@@ -397,8 +400,10 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                   ),
               ],
             ),
-            subtitle: Row(
-              mainAxisSize: MainAxisSize.min,
+            subtitle: Wrap(
+              crossAxisAlignment: WrapCrossAlignment.center,
+              spacing: 6,
+              runSpacing: 4,
               children: [
                 Text(
                   model.quant,
@@ -408,8 +413,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                     color: theme.colorScheme.onSurfaceVariant,
                   ),
                 ),
-                if (model.quant.toLowerCase().contains('dspark')) ...[
-                  const SizedBox(width: 6),
+                if (model.quant.toLowerCase().contains('dspark'))
                   Container(
                     padding: const EdgeInsets.symmetric(
                       horizontal: 5,
@@ -431,7 +435,6 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                       ),
                     ),
                   ),
-                ],
               ],
             ),
             trailing: Row(
@@ -637,6 +640,8 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                               Expanded(
                                 child: Text(
                                   bundle.displayName,
+                                  maxLines: 1,
+                                  overflow: TextOverflow.ellipsis,
                                   style: const TextStyle(
                                     fontWeight: FontWeight.w600,
                                   ),
@@ -771,7 +776,11 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                                         : Colors.transparent,
                                     child: ListTile(
                                       dense: true,
-                                      title: Row(
+                                      title: Wrap(
+                                        crossAxisAlignment:
+                                            WrapCrossAlignment.center,
+                                        spacing: 8,
+                                        runSpacing: 4,
                                         children: [
                                           Text(
                                             baseQuant,
@@ -785,8 +794,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                                                   : null,
                                             ),
                                           ),
-                                          if (isDSpark) ...[
-                                            const SizedBox(width: 8),
+                                          if (isDSpark)
                                             Container(
                                               padding:
                                                   const EdgeInsets.symmetric(
@@ -813,9 +821,7 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                                                 ),
                                               ),
                                             ),
-                                          ],
-                                          if (isLoadedQuant) ...[
-                                            const SizedBox(width: 8),
+                                          if (isLoadedQuant)
                                             Container(
                                               padding:
                                                   const EdgeInsets.symmetric(
@@ -837,9 +843,8 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                                                   fontWeight: FontWeight.w700,
                                                 ),
                                               ),
-                                            ),
-                                          ] else if (isDownloaded) ...[
-                                            const SizedBox(width: 8),
+                                            )
+                                          else if (isDownloaded)
                                             Container(
                                               padding:
                                                   const EdgeInsets.symmetric(
@@ -864,7 +869,6 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
                                                 ),
                                               ),
                                             ),
-                                          ],
                                         ],
                                       ),
                                       trailing: Icon(

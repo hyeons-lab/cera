@@ -425,71 +425,82 @@ class _TtsStudioViewState extends State<TtsStudioView> {
               ],
 
               // Action Buttons
-              Row(
+              Wrap(
+                spacing: 10,
+                runSpacing: 8,
+                alignment: WrapAlignment.spaceBetween,
+                crossAxisAlignment: WrapCrossAlignment.center,
                 children: [
-                  FilledButton.icon(
-                    style: FilledButton.styleFrom(
-                      backgroundColor: theme.colorScheme.primary,
-                      foregroundColor: theme.colorScheme.onPrimary,
-                      padding: const EdgeInsets.symmetric(
-                        horizontal: 20,
-                        vertical: 12,
-                      ),
-                      shape: RoundedRectangleBorder(
-                        borderRadius: BorderRadius.circular(8),
-                      ),
-                    ),
-                    icon: state.isGenerating
-                        ? SizedBox(
-                            width: 16,
-                            height: 16,
-                            child: CircularProgressIndicator(
-                              strokeWidth: 2,
-                              color: theme.colorScheme.onPrimary,
+                  Row(
+                    mainAxisSize: MainAxisSize.min,
+                    children: [
+                      Flexible(
+                        child: FilledButton.icon(
+                          style: FilledButton.styleFrom(
+                            backgroundColor: theme.colorScheme.primary,
+                            foregroundColor: theme.colorScheme.onPrimary,
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 18,
+                              vertical: 12,
                             ),
-                          )
-                        : const Icon(Icons.volume_up_rounded, size: 18),
-                    label: Text(
-                      state.isGenerating
-                          ? _kSynthesizingLabel
-                          : _kSynthesizeLabel,
-                      style: const TextStyle(
-                        fontSize: 13,
-                        fontWeight: FontWeight.w600,
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                          ),
+                          icon: state.isGenerating
+                              ? SizedBox(
+                                  width: 16,
+                                  height: 16,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 2,
+                                    color: theme.colorScheme.onPrimary,
+                                  ),
+                                )
+                              : const Icon(Icons.volume_up_rounded, size: 18),
+                          label: Text(
+                            state.isGenerating
+                                ? _kSynthesizingLabel
+                                : _kSynthesizeLabel,
+                            overflow: TextOverflow.ellipsis,
+                            style: const TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          onPressed: (state.isBusy || !hasAudioOut)
+                              ? null
+                              : _synthesize,
+                        ),
                       ),
-                    ),
-                    onPressed: (state.isBusy || !hasAudioOut)
-                        ? null
-                        : _synthesize,
+                      if (state.isGenerating) ...[
+                        const SizedBox(width: 10),
+                        OutlinedButton.icon(
+                          style: OutlinedButton.styleFrom(
+                            foregroundColor: theme.colorScheme.error,
+                            side: BorderSide(color: theme.colorScheme.error),
+                            padding: const EdgeInsets.symmetric(
+                              horizontal: 14,
+                              vertical: 12,
+                            ),
+                            shape: RoundedRectangleBorder(
+                              borderRadius: BorderRadius.circular(8),
+                            ),
+                          ),
+                          icon: const Icon(Icons.stop_rounded, size: 18),
+                          label: const Text(
+                            _kStopLabel,
+                            style: TextStyle(
+                              fontSize: 13,
+                              fontWeight: FontWeight.w600,
+                            ),
+                          ),
+                          onPressed: () => widget.controller.dispatch(
+                            const StopGenerationIntent(),
+                          ),
+                        ),
+                      ],
+                    ],
                   ),
-                  if (state.isGenerating) ...[
-                    const SizedBox(width: 10),
-                    OutlinedButton.icon(
-                      style: OutlinedButton.styleFrom(
-                        foregroundColor: theme.colorScheme.error,
-                        side: BorderSide(color: theme.colorScheme.error),
-                        padding: const EdgeInsets.symmetric(
-                          horizontal: 14,
-                          vertical: 12,
-                        ),
-                        shape: RoundedRectangleBorder(
-                          borderRadius: BorderRadius.circular(8),
-                        ),
-                      ),
-                      icon: const Icon(Icons.stop_rounded, size: 18),
-                      label: const Text(
-                        _kStopLabel,
-                        style: TextStyle(
-                          fontSize: 13,
-                          fontWeight: FontWeight.w600,
-                        ),
-                      ),
-                      onPressed: () => widget.controller.dispatch(
-                        const StopGenerationIntent(),
-                      ),
-                    ),
-                  ],
-                  const Spacer(),
                   TextButton.icon(
                     icon: const Icon(Icons.clear_all_rounded, size: 16),
                     label: const Text(
@@ -511,13 +522,16 @@ class _TtsStudioViewState extends State<TtsStudioView> {
                 Row(
                   mainAxisAlignment: MainAxisAlignment.spaceBetween,
                   children: [
-                    Text(
-                      _kOutputsHeader,
-                      style: TextStyle(
-                        fontSize: 11,
-                        fontWeight: FontWeight.w600,
-                        letterSpacing: 0.8,
-                        color: theme.colorScheme.onSurfaceVariant,
+                    Flexible(
+                      child: Text(
+                        _kOutputsHeader,
+                        overflow: TextOverflow.ellipsis,
+                        style: TextStyle(
+                          fontSize: 11,
+                          fontWeight: FontWeight.w600,
+                          letterSpacing: 0.8,
+                          color: theme.colorScheme.onSurfaceVariant,
+                        ),
                       ),
                     ),
                     TextButton.icon(
@@ -572,14 +586,18 @@ class _TtsStudioViewState extends State<TtsStudioView> {
                                         ),
                                       ),
                                       const SizedBox(width: 8),
-                                      Text(
-                                        turn.statusText ??
-                                            _kDefaultSynthesizingStatus,
-                                        style: TextStyle(
-                                          fontSize: 12,
-                                          color: theme
-                                              .colorScheme
-                                              .onSurfaceVariant,
+                                      Expanded(
+                                        child: Text(
+                                          turn.statusText ??
+                                              _kDefaultSynthesizingStatus,
+                                          maxLines: 1,
+                                          overflow: TextOverflow.ellipsis,
+                                          style: TextStyle(
+                                            fontSize: 12,
+                                            color: theme
+                                                .colorScheme
+                                                .onSurfaceVariant,
+                                          ),
                                         ),
                                       ),
                                     ],
