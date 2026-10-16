@@ -432,3 +432,71 @@ On the same method, the trivial read-only kernel is 0.416 J/GB gross at 23.0 W, 
 **Outcome.** A real Q4 kernel reaches the read ceiling, so speed is no longer the obstacle, but on the bar as proposed the recommendation in 3d stands. Two grounds could still justify continuing, and both are product decisions, not measurements: (1) counting energy net of the idle floor (2.3 to 3.1x the GPU), which is right when the machine would be awake anyway, for example while other work runs; (2) valuing the NPU's low absolute power (about 12 W above idle against about 51 W for the GPU) for running a model alongside GPU or CPU work, rather than as a faster or more efficient replacement for them. Not yet accounted for in any projection: attention, normalization, RoPE, activation quantization on the NPU, and demonstrated dispatch fusion, all of which would lower the projected rates.
 
 **Decision (2026-10-12):** proceed with an optimized XDNA backend, on ground (2). The bar's gross-energy criterion is not met and is not claimed to be.
+
+## 4. Backend decision record (0b close-out, 2026-10-14)
+
+This section closes the 0b exit criteria left open at the end of 3d, before any backend engine code. The backend proceeds on ground (2) of 3e (low absolute power alongside CPU/GPU work); the failed gross-energy bar of 3d is replaced by the explicit numeric bar below, not carried forward silently.
+
+**Environment re-verification (2026-10-14, `feat/xdna-backend`).** NPU driver still 32.0.203.311 (`oem205.inf`), power plan still Turbo (`6fecc5ae-f350-48a5-b669-b472cb895ccf`), sleep on AC still never. `spike q4gemv` rebuilt from `tools/xdna-spike/` and re-run at 16 runs in flight (65,536 x 2,048): **54.79 GB/s at p50** (recorded 54.76), correctness PASS, worst error 1.66e-7 of row magnitude (recorded 1.66e-7). The Phase 0 numbers still hold on this machine.
+
+**Weight format.** `int8 x int4` as validated by the 3e spike: signed int4 weights (Q4_0's `q - 8`), one scale per 32-weight block per row, blocks-then-scales layout (128-byte loads stay 64-byte aligned), host converts Q4_0's f16 scales to bf16 (XDNA2 has no float16 vector type). `bfp16ebs8` is not used. This format must not foreclose a future prefill GEMM, but no GEMM design is owed in this pass.
+
+**Activation quantization.** Q8_0-style: int8 activations, one f32 scale per 32-element block, llama.cpp Q8_0 rounding, matching the spike.
+
+**Tensor-type policy** (target file is mixed-type: 110 Q4_0 tensors, Q6_K `token_embd.weight` 128256x2048 tied to the LM head, Q4_1 `ffn_down` in blocks 0-1). Embedding lookup stays a host gather from the original Q6_K data; only the LM-head matmul needs an NPU form, and section 5 shows it streaming at 53.6 GB/s in the padded (131072-row) Q4 form, so the head is converted from Q6_K into the Q4 repack once at load and the parity cost of that conversion is measured at the full-logits oracle. Streaming the head from the host CPU per token (~200 MB/token) is not an accepted fallback. For the two Q4_1 tensors, both options are priced before the backend kernel work: the NPU min-term epilogue (needs a per-block activation sum) against host fallback for 2 of 112 GEMVs per token; the choice and its measured cost are recorded in an addendum when section 5's numbers are in.
+
+**Prefill placement.** Prefill runs on the CPU from the original GGUF weights; attention and the KV cache are host-side in both phases, so the cache never changes owner and the NPU path is entered only at decode. The final bench reports CPU prefill and NPU decode separately. (Amended 2026-10-14; the first backend plan left this unstated.)
+
+**Projection formula.** Token time = sum over shape classes of (bytes / measured dependent rate) + dependent-link count x measured per-link cost, with hardware-context switches counted as links at their measured cost. Energy is gross package power over the whole run (idle floor reported alongside, never subtracted for the bar). Section 5 evaluates the per-shape architecture under this formula (9.1 tok/s; fails), and section 6 the fused one (~47-51 tok/s projected; passes the speed leg).
+
+**Parity policy.** Never bit-exact (0b exit criteria). Teacher-forced: a fixed prompt is run on the CPU reference, its greedy token sequence is forced as input to both implementations, and logits are compared per forced position: top-1 agreement except where the CPU top-2 logit margin falls inside the tie window, and top-10 overlap of at least 9/10, over at least 512 forced positions. (Amended 2026-10-14 from per-position comparison over generated tokens, which is not well-defined once greedy trajectories diverge.)
+
+**Numeric bar for the backend.** End-to-end Llama-3.2-1B-Instruct Q4_0 decode of at least 35 tok/s at at least 1.5 gross tok/J on the decode-dominant run (Turbo, Phase 0 method, fresh process per measurement, gross package power with the adjacent idle floor reported). Below CPU speed is accepted; low absolute draw alongside other work is the point. The thresholds are ratified here and are not renegotiated downward after measurement. `--device npu` is never selected silently by `Auto`, reports unavailable-with-a-reason on driverless or unsupported machines, and support is gated by attempting to load the npu2 xclbin, never by BDF or device-name strings.
+
+**Test baseline.** `cargo test -p cera --lib` on Windows carries the two pre-existing failures recorded in section 1 (`model::lfm2::no_repack_tests::no_repack_skips_cpu_repacks`, `engine::tests::resolution::resolve_all_manifest_files_walks_every_field`). Backend validation claims mean: no failures beyond that recorded set, unless those two are fixed first.
+
+**Non-goals this pass.** Prefill on the NPU, LFM2/hybrid models, Linux, non-Strix Halo XDNA silicon.
+
+## 5. Dependent-chain spike (backend plan step 2, 2026-10-14)
+
+The kill gate the backend plan required before any backend engine code: Q4 GEMV chains with data-dependent submissions at true Llama-3.2-1B shapes, submitted the way decode submits. The Q4 design was generalized first (same kernel and host code for every shape): the output-element grouping now shrinks for small row counts (16/8/4/2/1 tiles), and K wider than 2048 streams in 2048-column chunks that the kernel accumulates (split-K), so one design serves K = 2048 and K = 8192. The head runs at its padded row count 131072. All shapes verified against the CPU reference (worst error at most 1.76e-7 of row magnitude), `spike q4gemv`, one run at a time (start+wait):
+
+| Shape (rows x K) | Used for | p50 per run | Streamed | GB/s at p50 |
+|---|---|---|---|---|
+| 512 x 2048 | K/V projections | 90.8 us | 0.56 MiB | 6.5 |
+| 2048 x 2048 | Q/O projections | 135.9 us | 2.25 MiB | 17.4 |
+| 8192 x 2048 | gate/up | 272.4 us | 9.00 MiB | 34.6 |
+| 2048 x 8192 | down | 263.6 us | 9.00 MiB | 35.8 |
+| 131072 x 2048 | LM head (padded from 128256) | 2816.3 us | 144.00 MiB | 53.6 |
+
+Small shapes are dispatch-bound (a ~90-140 us floor per run); only the head streams near the 3e ceiling. `spike q4chain` then runs a full token of dependent GEMVs (16 layers x q/k/v/o/gate/up/down, then the head; 113 links, 666 MiB streamed per token), each link's f32 output host-quantized into the next link's input, one start+wait per link:
+
+| Submission pattern | Per token (p50) | Decode rate | Per link (mean) | Effective streaming |
+|---|---|---|---|---|
+| Mixed shapes (5 kernels, as a per-shape backend submits) | 109.9 ms | **9.1 tok/s** | 971.9 us | 6.35 GB/s |
+| Same kernel repeated 113x (`SPIKE_Q4CHAIN_SAME=1`, diagnostic) | 16.5 ms | 60.5 tok/s (this shape only) | 146.4 us | 16.13 GB/s |
+
+**Finding: switching the xclbin (hardware context) between GEMVs costs roughly 800 us per switch, and it dominates everything else.** Dependence itself is cheap: with one kernel, a dependent link costs the same ~146 us as the standalone start+wait measurement, host quantization and buffer syncs included. With five kernels alternating the way a per-shape backend would submit, each link pays a context switch (an AIE array reconfiguration, on this evidence) and decode collapses to 9.1 tok/s. No amount of intra-layer pipelining repairs that, because the layer's stages still alternate shapes.
+
+**Gate verdict: the plan's stop criterion is met for the architecture the plan assumed** (per-shape kernels, host-dependent submission): 9.1 tok/s projected against the section 4 bar of 35 tok/s, and 6.35 GB/s effective against the 40 GB/s guideline. Gross J/GB was not measured for the chain; at 9.1 tok/s the speed leg already fails. Per the plan, backend engine work stops here unless the architecture changes. The constraint the spike actually establishes is narrower and more useful than "the NPU is slow": **all GEMVs in a token must run under one xclbin**, either as one fused design (dependent GEMVs inside a single run, the direction of the WSL `q4chain` prototype, which chains square 2048x2048 GEMVs on-device with on-core quantization) or as a single design whose shapes are runtime parameters. The Q6_K head question is moot until that exists; the head at padded Q4 shapes already streams at 53.6 GB/s.
+
+Two build lessons worth keeping: the IRON JIT cache (the `.prj` directory next to a built xclbin) does not notice kernel-source changes, so a rebuilt shape can silently reuse a stale kernel (delete the `.prj` when `q4gemv.cc` changes; this cost a long detour here, found by checking the NPU output against a reference that repeats x chunk 0, `SPIKE_Q4_REF_MODE=1`), and `tools/xdna-spike/fix_and_build.sh` builds the designs from this Windows (CRLF) checkout inside WSL.
+
+## 6. Fused single-xclbin layer (backend plan step 2b, 2026-10-14)
+
+The section 5 constraint (all GEMVs in a token under one xclbin) taken as a design: `iron/q4layer/` runs all seven GEMV stages of a Llama-3.2-1B layer in **one run**, with activations in f32 slots in DDR, each stage's input broadcast to the 16 workers and quantized on the core between stages. Stage chaining follows the real data flow with attention proxied by its input (this measures GEMV streaming, submission, and on-device chaining, not attention): q/k/v read the hidden slot, o reads q's slot, gate/up read o's slot, down (split-K, K=8192) reads gate's slot. `spike q4layer` checks every stage's output slot against a host simulation of the same chain, then times the run:
+
+| Measurement | Value |
+|---|---|
+| Stage verification (7 stages, worst error over all rows) | PASS, at most 1.66e-7 of row magnitude |
+| Per layer run (start+wait, p50, n=50) | **1.064 ms** |
+| Weights streamed per run | 32.62 MiB at 32.16 GB/s |
+| Projection: 16 layers + head (2.82 ms) + 2 context switches (~1.6 ms) | ~21.4 ms/token, **~47 tok/s**, before host RMSNorm/RoPE/attention/KV work |
+
+Against the section 4 bar (35 tok/s), the fused architecture clears the speed leg with headroom for the host work not yet measured; per-shape submission (section 5) failed it at 9.1 tok/s. Gross energy was not measured for the fused run (the section 4 power leg stays a manual gate for the backend proper). The head remains a separate xclbin in this accounting (one run per token at 53.6 GB/s, section 5); folding it into the layer design or accepting two switches per token is a backend-step decision.
+
+Two kernel lessons from getting here, both measured: (1) A drain smaller than the out fifo's element leaves the fifo inconsistent and the *next* stage silently produces zeros; the design therefore uses a fixed two-tile output grouping so every drain consumes whole elements (the q4gemv pattern). (2) On-core activation quantization must be vectorized: the scalar loop cost ~150 ns per element (~294 us per stage, more than the GEMV itself), while `aie::to_fixed<int8>` brings a 2048-wide quantization to ~18 us. (An `accum::to_vector<int32>` conversion produced wrong values and was abandoned; `to_fixed` is the working float-to-int8 path.)
+
+## 7. Resumption verification (2026-10-16)
+
+Sections 4 to 6 were written in a prior session and left uncommitted on this branch. On resumption, the three decisive measurements were re-run from the committed `spike.exe` and artifacts, with the power plan confirmed as Turbo (`6fecc5ae-f350-48a5-b669-b472cb895ccf`): Q4 GEMV at 16 runs in flight (65,536 x 2,048) reproduced at **54.82 GB/s** at p50 with the reference check passing (recorded: 54.76 to 54.79); `spike q4chain out` reproduced at **110.15 ms/token, 9.1 tok/s** (recorded: 109.9 ms, 9.1); and `spike q4layer` reproduced all seven stage checks passing at **1.047 ms/layer** at p50 (recorded: 1.064 ms), projecting 51.1 tok/s by the spike's own accounting. The prior session's numbers and the section 5 verdict stand: per-shape submission fails the bar through xclbin switching cost, and the fused single-xclbin layer is the architecture the backend is built on. Section 4 was also amended on resumption (prefill placement, teacher-forced parity, gross-energy bar, projection formula); sections 5 and 6 are unchanged.

@@ -35,6 +35,8 @@ static const char kUsage[] =
     "  spike readbw       <xclbin> <insts> <n_int32> <workers> [tile] [iters]  read-dominant design, checked\n"
     "  spike gemvchain    <xclbin> <insts> <M> <K> <iters> <L>...  dependent int16 GEMV chains\n"
     "  spike q4gemv       <xclbin> <insts> <M> <K> [iters]       Q4_0-style GEMV (iron/q4gemv), checked\n"
+    "  spike q4chain      <artifact-dir> [tokens]               dependent Q4 GEMV chain at Llama-3.2-1B shapes\n"
+    "  spike q4layer      <xclbin> <insts> [iters]              fused Q4 layer (iron/q4layer), checked\n"
     "Shapes passed to the IRON commands must match the ones the xclbin was built for.\n";
 
 using clk = std::chrono::steady_clock;
@@ -490,6 +492,92 @@ static int cmd_gemvchain(const char* xclbin_path, const char* insts_path, int M,
 // per worker in consumption order, and checks the NPU against a CPU reference
 // that uses the same quantized values (so a mismatch is the kernel's, not
 // quantization error).
+static uint16_t f32_to_bf16(float f);  // defined below, with the Q4 section
+
+// Shared Q4 shape rules, mirroring q4gemv.py: weight tiles stream in chunks
+// of at most 2048 columns (the kernel accumulates split-K chunks), and the
+// output-element grouping shrinks for small row counts.
+static int q4_chunk_k(int K) { return K < 2048 ? K : 2048; }
+
+static int q4_out_tiles(int M) {
+  const int tiles_per_worker = (M / 16) / 16;  // 16 workers, 16 rows per tile
+  const int cands[] = {16, 8, 4, 2, 1};
+  for (int cand : cands)
+    if (tiles_per_worker % cand == 0 && tiles_per_worker / cand >= 2) return cand;
+  return 0;
+}
+
+// Random Q4_0-style weights for one shape: wq holds q - 8 in [-8, 7], wd the
+// bf16 scale of each 32-weight block, generated like cmd_q4gemv does.
+static void q4_gen_weights(int M, int K, uint32_t seed, std::vector<int8_t>& wq, std::vector<uint16_t>& wd) {
+  const int QB = 32, nb = K / QB;
+  wq.assign(size_t(M) * K, 0);
+  wd.assign(size_t(M) * nb, 0);
+  uint32_t s = seed;
+  auto frand = [&]() { s = s * 1664525u + 1013904223u; return float((s >> 8) & 0xFFFF) / 32768.0f - 1.0f; };
+  std::vector<float> wrow(K);
+  for (int r = 0; r < M; ++r) {
+    for (int kk = 0; kk < K; ++kk) wrow[kk] = frand();
+    for (int b = 0; b < nb; ++b) {
+      float amax = 0, mx = 0;
+      for (int j = 0; j < QB; ++j) {
+        float v = wrow[b * QB + j];
+        if (std::fabs(v) > amax) { amax = std::fabs(v); mx = v; }
+      }
+      float d = mx / -8.0f, id = d ? 1.0f / d : 0.0f;
+      wd[size_t(r) * nb + b] = f32_to_bf16(d);
+      for (int j = 0; j < QB; ++j) {
+        int q = int(wrow[b * QB + j] * id + 8.5f);
+        q = q < 0 ? 0 : (q > 15 ? 15 : q);
+        wq[size_t(r) * K + b * QB + j] = int8_t(q - 8);
+      }
+    }
+  }
+}
+
+// Packs wq/wd into the stream layout q4gemv.py consumes: worker w owns rows
+// [w*rpw, (w+1)*rpw); each 16-row tile is sent as K-chunk slices holding, per
+// 32-block, two 16x16 int4 B matrices then the 16 bf16 row scales.
+static void q4_pack_weights(const std::vector<int8_t>& wq, const std::vector<uint16_t>& wd, int M, int K,
+                            uint8_t* w, bool bt, bool hi_first) {
+  const int QB = 32, ROWS = 16, nb = K / QB;
+  const int chunk_k = q4_chunk_k(K), chunks = K / chunk_k, nb_chunk = chunk_k / QB;
+  const size_t tb = size_t(nb_chunk) * (2 * 128 + ROWS * 2);
+  for (int tile = 0; tile < M / ROWS; ++tile) {
+    int r0 = tile * ROWS;
+    for (int ch = 0; ch < chunks; ++ch) {
+      uint8_t* tp = w + size_t(tile * chunks + ch) * tb;
+      for (int lb = 0; lb < nb_chunk; ++lb) {
+        int b = ch * nb_chunk + lb;
+        uint8_t* bp = tp + size_t(lb) * 256;
+        for (int h = 0; h < 2; ++h)
+          for (int kk = 0; kk < 16; ++kk)
+            for (int n = 0; n < 16; ++n) {
+              int e = bt ? n * 16 + kk : kk * 16 + n;
+              uint8_t nib = uint8_t(wq[size_t(r0 + n) * K + b * QB + h * 16 + kk]) & 0xF;
+              bool high = ((e & 1) != 0) != hi_first;
+              bp[h * 128 + e / 2] |= high ? uint8_t(nib << 4) : nib;
+            }
+        auto* sp = reinterpret_cast<uint16_t*>(tp + size_t(nb_chunk) * 256 + size_t(lb) * ROWS * 2);
+        for (int n = 0; n < 16; ++n) sp[n] = wd[size_t(r0 + n) * nb + b];
+      }
+    }
+  }
+}
+
+// Q8_0-style quantization of an f32 vector (cycled to length K): one f32
+// scale per 32 elements, q = round-half-away(x / d) clamped to [-127, 127].
+static void q4_quantize_f32(const float* in, int in_len, int K, int8_t* xq, float* xd) {
+  const int QB = 32;
+  for (int b = 0; b < K / QB; ++b) {
+    float amax = 0;
+    for (int j = 0; j < QB; ++j) amax = std::max(amax, std::fabs(in[(b * QB + j) % in_len]));
+    float d = amax / 127.0f, id = d ? 1.0f / d : 0.0f;
+    xd[b] = d;
+    for (int j = 0; j < QB; ++j) xq[b * QB + j] = int8_t(std::lround(in[(b * QB + j) % in_len] * id));
+  }
+}
+
 static uint16_t f32_to_bf16(float f) {
   uint32_t u;
   std::memcpy(&u, &f, 4);
@@ -504,14 +592,15 @@ static float bf16_to_f32(uint16_t h) {
 }
 
 static int cmd_q4gemv(const char* xclbin_path, const char* insts_path, int M, int K, int iters) {
-  // q4gemv.py: 16 workers x 16 rows per tile x 16 tiles per output element,
-  // at least two output elements per worker; load_x copies x 64 bytes at a time.
-  const int QB = 32, ROWS = 16, WORKERS = 16, OUT_TILES = 16;
-  if (M % (WORKERS * ROWS * OUT_TILES) || M < 2 * WORKERS * ROWS * OUT_TILES)
-    throw std::invalid_argument("M must be a multiple of 4096 and at least 8192");
+  // q4gemv.py: 16 workers x 16 rows per tile; the output-element grouping
+  // and the split-K chunking follow q4_out_tiles / q4_chunk_k above.
+  const int QB = 32, ROWS = 16, WORKERS = 16;
+  if (M % (WORKERS * ROWS) || q4_out_tiles(M) == 0)
+    throw std::invalid_argument("M must be a multiple of 256 with a workable output tiling (see q4gemv.py)");
   if (K % 64) throw std::invalid_argument("K must be a multiple of 64");
-  const int nb = K / QB;
-  const size_t tb = size_t(nb) * (2 * 128 + ROWS * 2);
+  const int nb = K / QB, nb_chunk = q4_chunk_k(K) / QB, CHUNKS = K / q4_chunk_k(K);
+  const size_t tb = size_t(nb_chunk) * (2 * 128 + ROWS * 2);
+  if (size_t(K) + size_t(nb) * 4 > tb) throw std::invalid_argument("K too wide for one x slot");
 
   // Random weights and activations, quantized like Q4_0 / Q8_0.
   uint32_t s = 2024;
@@ -558,7 +647,7 @@ static int cmd_q4gemv(const char* xclbin_path, const char* insts_path, int M, in
   }
 
   auto k = open_mlir_aie(xclbin_path, insts_path);
-  const size_t w_bytes = size_t(M / ROWS) * tb;
+  const size_t w_bytes = size_t(M / ROWS) * CHUNKS * tb;
   auto bo_w = host_bo(k, w_bytes, 3);
   auto bo_x = host_bo(k, tb, 4);
   auto bo_y = host_bo(k, size_t(M) * 4, 5);
@@ -569,23 +658,7 @@ static int cmd_q4gemv(const char* xclbin_path, const char* insts_path, int M, in
   // 16 bf16 row scales of every block.
   auto* w = bo_w.map<uint8_t*>();
   std::memset(w, 0, w_bytes);
-  for (int tile = 0; tile < M / ROWS; ++tile) {
-    int r0 = tile * ROWS;
-    uint8_t* tp = w + size_t(tile) * tb;
-    for (int b = 0; b < nb; ++b) {
-      uint8_t* bp = tp + size_t(b) * 256;
-      for (int h = 0; h < 2; ++h)
-        for (int kk = 0; kk < 16; ++kk)
-          for (int n = 0; n < 16; ++n) {
-            int e = bt ? n * 16 + kk : kk * 16 + n;
-            uint8_t nib = uint8_t(wq[size_t(r0 + n) * K + b * QB + h * 16 + kk]) & 0xF;
-            bool high = ((e & 1) != 0) != hi_first;
-            bp[h * 128 + e / 2] |= high ? uint8_t(nib << 4) : nib;
-          }
-      auto* sp = reinterpret_cast<uint16_t*>(tp + size_t(nb) * 256 + size_t(b) * ROWS * 2);
-      for (int n = 0; n < 16; ++n) sp[n] = wd[size_t(r0 + n) * nb + b];
-    }
-  }
+  q4_pack_weights(wq, wd, M, K, w, bt, hi_first);
   auto* xs = bo_x.map<uint8_t*>();
   std::memset(xs, 0, tb);
   std::memcpy(xs, xq.data(), K);
@@ -613,12 +686,21 @@ static int cmd_q4gemv(const char* xclbin_path, const char* insts_path, int M, in
   int bad = 0;
   double worst = 0;
   bool any_nan = false;
+  // Reference-range diagnostics (env): SPIKE_Q4_REF_FROM / SPIKE_Q4_REF_BLOCKS
+  // limit the blocks summed; SPIKE_Q4_REF_MODE=1 uses x chunk 0 for every
+  // chunk, =2 uses weight chunk 0 for every chunk (both assume 64-block
+  // chunks). They exist to tell a stale or misindexed kernel from a bad one.
+  const int nb_ref = std::getenv("SPIKE_Q4_REF_BLOCKS") ? int(parse_pos(std::getenv("SPIKE_Q4_REF_BLOCKS"), "blocks")) : nb;
+  const int b_from = std::getenv("SPIKE_Q4_REF_FROM") ? int(std::strtol(std::getenv("SPIKE_Q4_REF_FROM"), nullptr, 10)) : 0;
+  const int ref_mode = std::getenv("SPIKE_Q4_REF_MODE") ? int(parse_pos(std::getenv("SPIKE_Q4_REF_MODE"), "mode")) : 0;
   for (int r = 0; r < M; ++r) {
     double ref = 0, mag = 0;
-    for (int b = 0; b < nb; ++b) {
+    for (int b = b_from; b < nb_ref; ++b) {
       int32_t dot = 0;
-      for (int j = 0; j < QB; ++j) dot += int32_t(wq[size_t(r) * K + b * QB + j]) * xq[b * QB + j];
-      double term = double(dot) * bf16_to_f32(wd[size_t(r) * nb + b]) * xd[b];
+      const int bx = ref_mode == 1 ? b % 64 : b;
+      const int bw = ref_mode == 2 ? b % 64 : b;
+      for (int j = 0; j < QB; ++j) dot += int32_t(wq[size_t(r) * K + bw * QB + j]) * xq[bx * QB + j];
+      double term = double(dot) * bf16_to_f32(wd[size_t(r) * nb + b]) * xd[bx];
       ref += term;
       mag += std::fabs(term);
     }
@@ -656,6 +738,250 @@ static int cmd_q4gemv(const char* xclbin_path, const char* insts_path, int M, in
 
 // ---------------------------------------------------------------------------
 
+// Dependent Q4 GEMV chain at Llama-3.2-1B decode shapes: one full token of
+// GEMVs (16 layers x q/k/v/o/gate/up/down, then the tied head at its padded
+// row count 131072), each link's f32 output host-quantized into the next
+// link's input, submitted start+wait the way a dependent decode step forces.
+// This is the submission pattern the 3e spike could not measure (it kept
+// independent runs in flight). Norms, RoPE and attention are host work in
+// the planned backend too but are not timed here; per-shape correctness is
+// covered by q4gemv. Artifact names follow iron/build.sh in <dir>.
+static int cmd_q4chain(const char* dir, int tokens) {
+  struct Shape { int M, K; };
+  const Shape shapes[] = {{2048, 2048}, {512, 2048}, {8192, 2048}, {2048, 8192}, {131072, 2048}};
+  struct Link {
+    AieKernel kern;
+    int M = 0, K = 0;
+    size_t w_bytes = 0, tb = 0;
+    xrt::bo bo_w, bo_x, bo_y;
+    std::vector<float> y;
+  };
+  std::vector<Link> links;
+  for (const auto& sh : shapes) {
+    char name[64], xcl[1024], ins[1024];
+    std::snprintf(name, sizeof name, "q4gemv_%dx%d", sh.M, sh.K);
+    std::snprintf(xcl, sizeof xcl, "%s/%s.xclbin", dir, name);
+    std::snprintf(ins, sizeof ins, "%s/insts_%s.bin", dir, name);
+    Link L;
+    L.M = sh.M; L.K = sh.K;
+    std::printf("loading %s ...\n", name);
+    L.kern = open_mlir_aie(xcl, ins);
+    const int ROWS = 16, nb_chunk = q4_chunk_k(sh.K) / 32, chunks = sh.K / q4_chunk_k(sh.K);
+    L.tb = size_t(nb_chunk) * (2 * 128 + ROWS * 2);
+    L.w_bytes = size_t(sh.M / ROWS) * chunks * L.tb;
+    std::vector<int8_t> wq;
+    std::vector<uint16_t> wd;
+    q4_gen_weights(sh.M, sh.K, 2024u + unsigned(sh.M), wq, wd);
+    L.bo_w = host_bo(L.kern, L.w_bytes, 3);
+    L.bo_x = host_bo(L.kern, L.tb, 4);
+    L.bo_y = host_bo(L.kern, size_t(sh.M) * 4, 5);
+    auto* w = L.bo_w.map<uint8_t*>();
+    std::memset(w, 0, L.w_bytes);
+    q4_pack_weights(wq, wd, sh.M, sh.K, w, false, false);
+    L.bo_w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    L.y.assign(sh.M, 0.0f);
+    links.push_back(std::move(L));
+  }
+  auto by_shape = [&](int M, int K) -> Link* {
+    for (auto& L : links)
+      if (L.M == M && L.K == K) return &L;
+    throw std::runtime_error("shape not loaded");
+  };
+  // One token: 16 layers of q, k, v, o, gate, up, down, then the head.
+  std::vector<Link*> seq;
+  for (int layer = 0; layer < 16; ++layer) {
+    seq.push_back(by_shape(2048, 2048));
+    seq.push_back(by_shape(512, 2048));
+    seq.push_back(by_shape(512, 2048));
+    seq.push_back(by_shape(2048, 2048));
+    seq.push_back(by_shape(8192, 2048));
+    seq.push_back(by_shape(8192, 2048));
+    seq.push_back(by_shape(2048, 8192));
+  }
+  seq.push_back(by_shape(131072, 2048));
+  if (std::getenv("SPIKE_Q4CHAIN_SAME")) seq.assign(113, by_shape(2048, 2048));  // diagnostic: no context switches
+  double bytes_per_token = 0;
+  for (auto* L : seq) bytes_per_token += double(L->w_bytes);
+
+  std::vector<float> cur(2048);
+  uint32_t s = 7;
+  for (auto& v : cur) { s = s * 1664525u + 1013904223u; v = float((s >> 8) & 0xFFFF) / 32768.0f - 1.0f; }
+  std::vector<int8_t> xq;
+  std::vector<float> xd;
+  auto run_token = [&]() {
+    for (auto* L : seq) {
+      xq.assign(L->K, 0);
+      xd.assign(L->K / 32, 0.0f);
+      q4_quantize_f32(cur.data(), int(cur.size()), L->K, xq.data(), xd.data());
+      auto* xs = L->bo_x.map<uint8_t*>();
+      std::memset(xs, 0, L->tb);
+      std::memcpy(xs, xq.data(), L->K);
+      std::memcpy(xs + L->K, xd.data(), size_t(L->K / 32) * 4);
+      L->bo_x.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+      auto run = aie_run(L->kern);
+      run.set_arg(3, L->bo_w);
+      run.set_arg(4, L->bo_x);
+      run.set_arg(5, L->bo_y);
+      run.start();
+      run.wait();
+      L->bo_y.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+      const float* y = L->bo_y.map<float*>();
+      cur.assign(y, y + L->M);
+    }
+  };
+  for (int i = 0; i < 3; ++i) run_token();  // warmup tokens, untimed
+  std::vector<double> per_token_ms;
+  for (int i = 0; i < tokens; ++i) {
+    auto t0 = clk::now();
+    run_token();
+    per_token_ms.push_back(std::chrono::duration<double, std::milli>(clk::now() - t0).count());
+  }
+  std::vector<double> sorted = per_token_ms;
+  std::sort(sorted.begin(), sorted.end());
+  double p50 = sorted[sorted.size() / 2], mean = 0;
+  for (double v : per_token_ms) mean += v;
+  mean /= per_token_ms.size();
+  std::printf("q4chain: %zu links/token, %.2f MiB streamed/token, n=%d tokens\n", seq.size(),
+              bytes_per_token / 1048576.0, tokens);
+  std::printf("  per token: p50 %.2f ms, mean %.2f ms -> %.1f tok/s at p50, %.2f us/link mean\n", p50, mean,
+              1000.0 / p50, mean * 1000.0 / seq.size());
+  std::printf("  effective streaming: %.2f GB/s at p50 (host quantize included, norms/attention not timed)\n",
+              bytes_per_token / (p50 / 1000.0) / 1e9);
+  return 0;
+}
+
+// Fused Q4 layer (iron/q4layer): all seven GEMV stages of one Llama-3.2-1B
+// layer in a single run under one xclbin, activations quantized on the core
+// between stages. Checked against a host simulation of the same stage chain
+// (attention is proxied by its input, as in the design), then timed.
+static int cmd_q4layer(const char* xclbin_path, const char* insts_path, int iters) {
+  struct Stage { int in_slot, M, K, out_slot; };
+  // SPIKE_Q4LAYER_SPEC="in:M:K:out;..." overrides the stage list (build the
+  // xclbin with the matching Q4LAYER_SPEC) for isolating stage behavior.
+  std::vector<Stage> stages = {{0, 2048, 2048, 1}, {0, 512, 2048, 2}, {0, 512, 2048, 3}, {1, 2048, 2048, 4},
+                               {4, 8192, 2048, 5}, {4, 8192, 2048, 6}, {5, 2048, 8192, 7}};
+  if (const char* spec = std::getenv("SPIKE_Q4LAYER_SPEC")) {
+    stages.clear();
+    std::string str = spec;
+    size_t pos = 0;
+    while (pos <= str.size()) {
+      size_t semi = str.find(';', pos);
+      std::string part = str.substr(pos, semi == std::string::npos ? std::string::npos : semi - pos);
+      if (!part.empty()) {
+        int in_s, M, K, out_s;
+        if (std::sscanf(part.c_str(), "%d:%d:%d:%d", &in_s, &M, &K, &out_s) != 4)
+          throw std::invalid_argument("bad SPIKE_Q4LAYER_SPEC stage: " + part);
+        stages.push_back({in_s, M, K, out_s});
+      }
+      if (semi == std::string::npos) break;
+      pos = semi + 1;
+    }
+  }
+  const int ACT_SLOT = 8192, N_SLOTS = 8, TILE_BYTES = 18432;
+  auto kern = open_mlir_aie(xclbin_path, insts_path);
+
+  size_t w_bytes = 0;
+  for (const auto& st : stages) w_bytes += size_t(st.M / 16) * (st.K / 2048) * TILE_BYTES;
+  auto bo_w = host_bo(kern, w_bytes, 3);
+  auto bo_y = host_bo(kern, size_t(N_SLOTS * ACT_SLOT) * 4, 4);
+  auto* w = bo_w.map<uint8_t*>();
+  std::memset(w, 0, w_bytes);
+
+  // Host simulation state, kept per stage for verification.
+  struct Sim { std::vector<int8_t> wq; std::vector<uint16_t> wd; };
+  std::vector<Sim> sims;
+  size_t base = 0;
+  for (const auto& st : stages) {
+    Sim s;
+    q4_gen_weights(st.M, st.K, 2024u + unsigned(st.M * 31 + st.K), s.wq, s.wd);
+    q4_pack_weights(s.wq, s.wd, st.M, st.K, w + base, false, false);
+    base += size_t(st.M / 16) * (st.K / 2048) * TILE_BYTES;
+    sims.push_back(std::move(s));
+  }
+  bo_w.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+  auto* y = bo_y.map<float*>();
+  std::memset(y, 0, size_t(N_SLOTS * ACT_SLOT) * 4);
+  uint32_t s = 7;
+  for (int i = 0; i < 2048; ++i) { s = s * 1664525u + 1013904223u; y[i] = float((s >> 8) & 0xFFFF) / 32768.0f - 1.0f; }
+  bo_y.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+  auto the_run = aie_run(kern);
+  the_run.set_arg(3, bo_w);
+  the_run.set_arg(4, bo_y);
+  auto run_once = [&]() {
+    the_run.start();
+    return the_run.wait();
+  };
+  auto state = run_once();
+  bo_y.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+
+  // Host simulation: quantize each stage's input slot the way the core does
+  // (f32 math, round half away from zero), then the Q4 GEMV in double.
+  std::vector<float> slots(y, y + size_t(N_SLOTS * ACT_SLOT));
+  int bad_total = 0;
+  for (size_t si = 0; si < stages.size(); ++si) {
+    const auto& st = stages[si];
+    const float* in = &slots[size_t(st.in_slot) * ACT_SLOT];
+    std::vector<int8_t> xq(st.K);
+    std::vector<float> xd(st.K / 32);
+    for (int b = 0; b < st.K / 32; ++b) {
+      float amax = 0;
+      for (int j = 0; j < 32; ++j) amax = std::max(amax, std::fabs(in[b * 32 + j]));
+      float d = amax / 127.0f, id = d ? 1.0f / d : 0.0f;
+      xd[b] = d;
+      for (int j = 0; j < 32; ++j) {
+        float v = in[b * 32 + j] * id;
+        int q = int(v >= 0.0f ? v + 0.5f : v - 0.5f);
+        xq[b * 32 + j] = int8_t(q > 127 ? 127 : (q < -127 ? -127 : q));
+      }
+    }
+    float* out = &slots[size_t(st.out_slot) * ACT_SLOT];
+    int bad = 0;
+    double worst = 0;
+    for (int r = 0; r < st.M; ++r) {
+      double ref = 0, mag = 0;
+      for (int b = 0; b < st.K / 32; ++b) {
+        int32_t dot = 0;
+        for (int j = 0; j < 32; ++j) dot += int32_t(sims[si].wq[size_t(r) * st.K + b * 32 + j]) * xq[b * 32 + j];
+        double term = double(dot) * bf16_to_f32(sims[si].wd[size_t(r) * (st.K / 32) + b]) * xd[b];
+        ref += term;
+        mag += std::fabs(term);
+      }
+      out[r] = float(ref);
+      double err = std::fabs(double(y[size_t(st.out_slot) * ACT_SLOT + r]) - ref) / (mag > 0 ? mag : 1);
+      if (!(err <= 1e-4) && r < 3) std::printf("    row %d: npu=%.6f ref=%.6f\n", r, y[size_t(st.out_slot) * ACT_SLOT + r], ref);
+      if (!(err <= 1e-4)) ++bad;
+      else worst = std::max(worst, err);
+      if (std::isnan(err)) ++bad;
+    }
+    std::printf("  stage %zu (%dx%d -> slot %d): %d of %d rows off (worst ok %.2e) %s\n", si, st.M, st.K,
+                st.out_slot, bad, st.M, worst, bad ? "FAIL" : "PASS");
+    bad_total += bad;
+  }
+  std::printf("kernel %s, state=%d, fused layer verify: %s\n", kern.name.c_str(), int(state),
+              bad_total ? "FAIL" : "PASS");
+
+  std::vector<xrt::run> one;
+  auto t = [&]() {
+    std::vector<double> v;
+    for (int i = 0; i < 3 + iters; ++i) {
+      auto t0 = clk::now();
+      run_once();
+      if (i >= 3) v.push_back(us_since(t0));
+    }
+    return v;
+  }();
+  auto sorted = report("q4layer start+wait", t, 1.0);
+  double p50_us = pct(sorted, 0.5);
+  std::printf("weights %.2f MiB streamed per run: %.2f GB/s at p50\n", w_bytes / 1048576.0,
+              w_bytes / (p50_us * 1e3));
+  std::printf("projection: 16 layers + head (2816 us, one switch) = %.2f ms/token -> %.1f tok/s "
+              "(host norms/RoPE/attention not included)\n",
+              (16 * p50_us + 2816.0) / 1000.0, 1e6 / (16 * p50_us + 2816.0));
+  return bad_total ? 1 : 0;
+}
+
 static std::vector<int> parse_lens(int argc, char** argv, int first) {
   std::vector<int> lens;
   for (int i = first; i < argc; ++i) lens.push_back(int(parse_pos(argv[i], "chain length")));
@@ -683,6 +1009,10 @@ int main(int argc, char** argv) {
     if (cmd == "gemvchain" && need(8))
       return cmd_gemvchain(argv[2], argv[3], int(parse_pos(argv[4], "M")), int(parse_pos(argv[5], "K")),
                            int(parse_pos(argv[6], "iters")), parse_lens(argc, argv, 7));
+    if (cmd == "q4chain" && need(3))
+      return cmd_q4chain(argv[2], argc > 3 ? int(parse_pos(argv[3], "tokens")) : 20);
+    if (cmd == "q4layer" && need(4))
+      return cmd_q4layer(argv[2], argv[3], argc > 4 ? int(parse_pos(argv[4], "iters")) : 30);
     if (cmd == "q4gemv" && need(6))
       return cmd_q4gemv(argv[2], argv[3], int(parse_pos(argv[4], "M")), int(parse_pos(argv[5], "K")),
                         argc > 6 ? int(parse_pos(argv[6], "iters")) : 200);
