@@ -29,9 +29,18 @@ spike q4gemv       <xclbin> <insts.bin> <M> <K> [iters]    Q4_0-style GEMV (iron
                                                            are layout diagnostics
 spike gemvchain    <xclbin> <insts.bin> <M> <K> <iters> <L> [<L>...]
                                                            L dependent GEMVs (run i+1 reads run i's output), runlist and stream
+spike q4layer      <xclbin> <insts> [iters]                 fused Q4 layer (iron/q4layer): all 7 GEMV stages of one
+                                                           Llama-3.2-1B layer in a single run, checked per stage
+spike q4chain      <artifact-dir> [tokens]                  dependent Q4 GEMV chain at Llama-3.2-1B shapes:
+                                                           113 GEMVs per token across the 5 q4gemv shapes in
+                                                           <artifact-dir>, each output host-quantized into the
+                                                           next input. SPIKE_Q4CHAIN_SAME=1 repeats one kernel
+                                                           (isolates the xclbin-switch cost; see the results doc)
 ```
 
-Each command prints min, p50, p90, p99, max and mean in microseconds, and exits 1 if its check fails. Sizes are printed in binary units (KiB, MiB) and bandwidth in decimal GB/s (10^9 bytes per second). Run one process per series. Shapes passed to the IRON commands must match the ones the xclbin was built for; the host cannot read them back from the xclbin.
+Each command prints min, p50, p90, p99, max and mean in microseconds, and exits 1 if its check fails.
+
+The Q4 design (iron/q4gemv/) takes any M that is a multiple of 256 with a workable output tiling and any K that is a multiple of 2048 (or 2048 itself): the output-element grouping shrinks for small row counts, and wider K streams in 2048-column chunks the kernel accumulates. SPIKE_Q4_MAX_OT caps the grouping (a build diagnostic). When q4gemv.cc changes, delete the shape's .prj directory before rebuilding: the IRON JIT cache does not notice kernel-source changes and will silently reuse the stale kernel. From this Windows (CRLF) checkout, `fix_and_build.sh 2048,2048 512,2048 ...` builds designs inside WSL. Sizes are printed in binary units (KiB, MiB) and bandwidth in decimal GB/s (10^9 bytes per second). Run one process per series. Shapes passed to the IRON commands must match the ones the xclbin was built for; the host cannot read them back from the xclbin.
 
 The nop job is the one `xrt-smi validate`'s latency test uses (`TestNPULatency.cpp` at XRT `77c7088`): `validate_17f0_*.xclbin` from the driver package, kernel `DPU_PDI_0`, DPU-sequence opcode 1, an all-zero instruction buffer. The validate xclbin is at `C:\Windows\System32\DriverStore\FileRepository\kipudrv.inf_amd64_*\validate_17f0_10.xclbin`.
 

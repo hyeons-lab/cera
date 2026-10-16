@@ -22,6 +22,9 @@
 #ifndef KMAX
 #define KMAX 2048
 #endif
+#ifndef KCHUNKS
+#define KCHUNKS 1
+#endif
 #define ROWS 16
 #define QBLK 32
 #define BLOCK_W_BYTES 256
@@ -42,8 +45,14 @@ static void load_x(const uint8_t *slot, int32_t k) {
     x_d[b] = xd[b];
 }
 
-// One tile: 16 rows x k columns -> out[16 t .. 16 t + 15].
+// One chunk of a tile: 16 rows x k columns. t counts chunks across the whole
+// output element: tile index t / KCHUNKS, chunk t % KCHUNKS. Chunk 0 stores
+// its result; later chunks add theirs into out (split-K accumulation, so a
+// tile stream element never has to hold more than 2048 columns).
 static void gemv_tile(const uint8_t *tile, float *out, int32_t k, int32_t t) {
+  const int32_t tile_t = t / KCHUNKS;
+  const bool accumulate = (t % KCHUNKS) != 0;
+  const int32_t blk0 = (t % KCHUNKS) * (k / QBLK);  // this chunk's first x block
   using MMUL = aie::mmul<4, 16, 16, int8, int4>;
   aie::accum<accfloat, ROWS> facc = aie::zeros<accfloat, ROWS>();
   const uint8_t *p = tile;
@@ -51,8 +60,8 @@ static void gemv_tile(const uint8_t *tile, float *out, int32_t k, int32_t t) {
   for (int b = 0; b < k / QBLK; ++b) chess_prepare_for_pipelining {
       aie::vector<int8, 64> a0 = aie::zeros<int8, 64>();
       aie::vector<int8, 64> a1 = aie::zeros<int8, 64>();
-      a0.insert(0, aie::load_v<16>(x_q + b * QBLK));
-      a1.insert(0, aie::load_v<16>(x_q + b * QBLK + 16));
+      a0.insert(0, aie::load_v<16>(x_q + (blk0 + b) * QBLK));
+      a1.insert(0, aie::load_v<16>(x_q + (blk0 + b) * QBLK + 16));
       aie::vector<int4, 256> b0 = aie::load_v<256>((const int4 *)p);
       aie::vector<int4, 256> b1 = aie::load_v<256>((const int4 *)(p + 128));
       MMUL m;
@@ -63,12 +72,17 @@ static void gemv_tile(const uint8_t *tile, float *out, int32_t k, int32_t t) {
       aie::vector<bfloat16, 16> ws = aie::load_v<16>((const bfloat16 *)ps);
       aie::accum<accfloat, 16> wsa;
       wsa.from_vector(ws);
-      aie::vector<float, 16> scale = aie::mul(wsa.template to_vector<float>(), x_d[b]).template to_vector<float>();
+      aie::vector<float, 16> scale = aie::mul(wsa.template to_vector<float>(), x_d[blk0 + b]).template to_vector<float>();
       facc = aie::mac(facc, rf, scale);
       p += BLOCK_W_BYTES;
       ps += BLOCK_S_BYTES;
     }
-  aie::store_v(out + ROWS * t, facc.template to_vector<float>());
+  if (accumulate) {
+    aie::vector<float, ROWS> prev = aie::load_v<ROWS>(out + ROWS * tile_t);
+    aie::store_v(out + ROWS * tile_t, aie::add(prev, facc.template to_vector<float>()));
+  } else {
+    aie::store_v(out + ROWS * tile_t, facc.template to_vector<float>());
+  }
 }
 
 extern "C" {
