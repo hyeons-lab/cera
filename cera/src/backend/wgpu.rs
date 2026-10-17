@@ -684,9 +684,46 @@ impl GpuContext {
         })
     }
 
+    /// Flush pending `queue.write_buffer` staging copies and reclaim their
+    /// temporary staging buffers on native targets so `gpu-allocator` does not
+    /// interleave temporary staging sub-allocations with persistent weight
+    /// buffers across `VkDeviceMemory` slabs.
+    #[cfg(not(target_arch = "wasm32"))]
+    pub(crate) fn flush_uploads(&self) {
+        if self.device_is_lost() {
+            return;
+        }
+        self.queue.submit([]);
+        self.device.poll_wait();
+    }
+
     /// Upload data to a GPU storage buffer.
     pub fn upload_storage(&self, data: &[u8], label: &str) -> wgpu::Buffer {
         self.assert_within_max_buffer(data.len() as u64, label);
+        #[cfg(not(target_arch = "wasm32"))]
+        if data.len() >= 256 * 1024 {
+            self.flush_uploads();
+            let aligned_size = (data.len() as u64).div_ceil(4) * 4;
+            let buffer = self.create_storage_rw(aligned_size, label);
+            const CHUNK_BYTES: usize = 8 * 1024 * 1024;
+            let mut offset = 0usize;
+            while offset < data.len() {
+                let end = (offset + CHUNK_BYTES).min(data.len());
+                let chunk = &data[offset..end];
+                if chunk.len().is_multiple_of(4) {
+                    self.queue.write_buffer(&buffer, offset as u64, chunk);
+                } else {
+                    let padded_len = chunk.len().div_ceil(4) * 4;
+                    let mut padded = Vec::with_capacity(padded_len);
+                    padded.extend_from_slice(chunk);
+                    padded.resize(padded_len, 0);
+                    self.queue.write_buffer(&buffer, offset as u64, &padded);
+                }
+                self.flush_uploads();
+                offset = end;
+            }
+            return buffer;
+        }
         self.device
             .create_buffer_init(&wgpu::util::BufferInitDescriptor {
                 label: Some(label),
@@ -710,6 +747,10 @@ impl GpuContext {
         let byte_size = (data.len() * 2) as u64;
         let aligned_size = byte_size.div_ceil(4) * 4;
         self.assert_within_max_buffer(aligned_size, label);
+        #[cfg(not(target_arch = "wasm32"))]
+        if aligned_size >= 256 * 1024 {
+            self.flush_uploads();
+        }
         let buffer = self.device.create_buffer(&wgpu::BufferDescriptor {
             label: Some(label),
             size: aligned_size,
@@ -740,6 +781,14 @@ impl GpuContext {
                     bytemuck::cast_slice(&f16_chunk),
                 );
             }
+            #[cfg(not(target_arch = "wasm32"))]
+            if (i + 1) % 8 == 0 {
+                self.flush_uploads();
+            }
+        }
+        #[cfg(not(target_arch = "wasm32"))]
+        if aligned_size >= 256 * 1024 {
+            self.flush_uploads();
         }
         buffer
     }
@@ -922,6 +971,43 @@ impl GpuContext {
             );
             Vec::new()
         };
+        staging.unmap();
+        result
+    }
+
+    /// Read f32 data from a pre-staged `MAP_READ` buffer without creating an
+    /// encoder or issuing a second GPU submission. The caller must have already
+    /// submitted the `copy_buffer_to_buffer` into `staging`.
+    pub fn read_mapped_f32(&self, staging: &wgpu::Buffer, count: usize) -> Vec<f32> {
+        if self.device_is_lost() {
+            return vec![0.0f32; count];
+        }
+        let size = (count * std::mem::size_of::<f32>()) as u64;
+        assert!(
+            staging.size() >= size,
+            "readback buffer is {} bytes but {size} were requested",
+            staging.size(),
+        );
+        io_stats::record_readback(size);
+        let slice = staging.slice(0..size);
+        let (tx, rx) = std::sync::mpsc::channel();
+        slice.map_async(wgpu::MapMode::Read, move |r| {
+            tx.send(r).ok();
+        });
+        self.device.poll_wait();
+        let map_res = rx.recv().ok();
+        if map_res.and_then(|r| r.ok()).is_none() {
+            self.warn_readback_zeros("read_mapped_f32", count);
+            return vec![0.0f32; count];
+        }
+
+        let mut result = vec![0.0f32; count];
+        if let Ok(data) = slice.get_mapped_range() {
+            bytemuck::cast_slice_mut(&mut result).copy_from_slice(&data[0..size as usize]);
+            drop(data);
+        } else {
+            self.warn_mapped_range_zeros("read_mapped_f32", count);
+        }
         staging.unmap();
         result
     }
@@ -1231,6 +1317,109 @@ impl GpuContext {
         }
         staging.unmap();
         result
+    }
+
+    /// Read multiple 4-byte-aligned byte ranges back from GPU buffers in
+    /// batched submissions (capped at 16 MiB per submission so the shared
+    /// staging buffer stays bounded). Used by `snapshot_state_locked` so a
+    /// 16-layer prefix-cache snapshot issues 1 submission instead of 22.
+    pub(crate) fn download_bytes_batched(&self, slices: &[(&wgpu::Buffer, usize)]) -> Vec<Vec<u8>> {
+        use std::sync::atomic::Ordering;
+        if slices.is_empty() {
+            return Vec::new();
+        }
+        if self.device_is_lost() {
+            return slices.iter().map(|&(_, len)| vec![0u8; len]).collect();
+        }
+        const MAX_BATCH_BYTES: u64 = 16 * 1024 * 1024;
+        let max_batch = MAX_BATCH_BYTES.min(self.max_buffer_size);
+        let mut out: Vec<Vec<u8>> = Vec::with_capacity(slices.len());
+        let mut idx = 0usize;
+        while idx < slices.len() {
+            let mut batch_end = idx;
+            let mut batch_bytes = 0u64;
+            while batch_end < slices.len() {
+                let len = slices[batch_end].1;
+                let aligned = (len as u64).div_ceil(4) * 4;
+                if batch_end > idx && batch_bytes + aligned > max_batch {
+                    break;
+                }
+                batch_bytes += aligned;
+                batch_end += 1;
+            }
+            if batch_bytes == 0 {
+                for &(_, len) in &slices[idx..batch_end] {
+                    out.push(vec![0u8; len]);
+                }
+                idx = batch_end;
+                continue;
+            }
+            let staging_guard = {
+                let mut guard = self.staging.lock().unwrap_or_else(|e| e.into_inner());
+                if guard
+                    .as_ref()
+                    .map(|b| b.size() < batch_bytes)
+                    .unwrap_or(true)
+                {
+                    *guard = Some(self.device.create_buffer(&wgpu::BufferDescriptor {
+                        label: Some("staging-download"),
+                        size: batch_bytes,
+                        usage: wgpu::BufferUsages::MAP_READ | wgpu::BufferUsages::COPY_DST,
+                        mapped_at_creation: false,
+                    }));
+                    self.staging_size.store(batch_bytes, Ordering::Relaxed);
+                }
+                guard
+            };
+            let staging = staging_guard.as_ref().unwrap();
+            let mut encoder = self
+                .device
+                .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("download_bytes_batched"),
+                });
+            let mut dst_off = 0u64;
+            for &(buf, len) in &slices[idx..batch_end] {
+                let aligned = (len as u64).div_ceil(4) * 4;
+                if aligned > 0 {
+                    encoder.copy_buffer_to_buffer(buf, 0, staging, dst_off, aligned);
+                    dst_off += aligned;
+                }
+            }
+            self.submit_encoder(encoder);
+            io_stats::record_readback(batch_bytes);
+            let slice = staging.slice(0..batch_bytes);
+            let (tx, rx) = std::sync::mpsc::channel();
+            slice.map_async(wgpu::MapMode::Read, move |r| {
+                tx.send(r).ok();
+            });
+            self.device.poll_wait();
+            let map_res = rx.recv().ok();
+            if map_res.and_then(|r| r.ok()).is_none() {
+                self.warn_readback_zeros("download_bytes_batched", (batch_bytes / 4) as usize);
+                for &(_, len) in &slices[idx..batch_end] {
+                    out.push(vec![0u8; len]);
+                }
+                idx = batch_end;
+                continue;
+            }
+            if let Ok(data) = slice.get_mapped_range() {
+                let mut read_off = 0usize;
+                for &(_, len) in &slices[idx..batch_end] {
+                    let aligned = len.div_ceil(4) * 4;
+                    out.push(data[read_off..read_off + len].to_vec());
+                    read_off += aligned;
+                }
+                drop(data);
+            } else {
+                self.warn_mapped_range_zeros("download_bytes_batched", (batch_bytes / 4) as usize);
+                for &(_, len) in &slices[idx..batch_end] {
+                    out.push(vec![0u8; len]);
+                }
+            }
+            staging.unmap();
+            idx = batch_end;
+        }
+        out
     }
 
     /// Read f16 data back from a GPU buffer and convert to f32 (blocking).
@@ -2487,6 +2676,101 @@ impl GpuContext {
                 },
                 cache: None,
             })
+    }
+
+    /// Q8_0 decode GEMV over the resident stream layout (`spirv/gemv_q8_0_stream.slang`, entry `main`).
+    /// 5-binding interface (q, d, x, y, params), ROWS_PER_WG=16 dispatch.
+    ///
+    /// # Safety
+    /// The module must be spirv-val-clean with the binding interface above
+    /// (our slangc-compiled `gemv_q8_0_stream.slang`). Only call when
+    /// `supports_spirv_passthrough()` is true.
+    pub fn gemv_q8_0_stream_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "gemv_q8_0_stream_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_q8_0_stream.spv")),
+            &[true, true, true, false, true],
+        )
+    }
+
+    /// Fused Q8_0 Gate+Up+SwiGLU decode GEMV over the resident stream layout (`spirv/gemv_q8_0_stream_gateup.slang`).
+    /// 7-binding interface (gate_q, gate_d, up_q, up_d, x, y, params), ROWS_PER_WG=16 dispatch.
+    pub fn gemv_q8_0_stream_gateup_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "gemv_q8_0_stream_gateup_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_q8_0_stream_gateup.spv")),
+            &[true, true, true, true, true, false, true],
+        )
+    }
+
+    /// Fused Q4_0 Gate+Up+SwiGLU decode GEMV over the resident stream layout (`spirv/gemv_q4_0_stream_gateup.slang`).
+    /// 7-binding interface (gate_q, gate_d, up_q, up_d, x, y, params), ROWS_PER_WG=16 dispatch.
+    pub fn gemv_q4_0_stream_gateup_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "gemv_q4_0_stream_gateup_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_q4_0_stream_gateup.spv")),
+            &[true, true, true, true, true, false, true],
+        )
+    }
+
+    /// Q6_K decode GEMV over the resident stream layout (`spirv/gemv_q6_k_stream.slang`, entry `main`).
+    /// 5-binding interface (q, d, x, y, params), ROWS_PER_WG=16 dispatch.
+    pub fn gemv_q6_k_stream_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "gemv_q6_k_stream_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_q6_k_stream.spv")),
+            &[true, true, true, false, true],
+        )
+    }
+
+    /// Q5_K decode GEMV over the resident stream layout (`spirv/gemv_q5_k_stream.slang`, entry `main`).
+    /// 5-binding interface (q, d, x, y, params), ROWS_PER_WG=16 dispatch.
+    pub fn gemv_q5_k_stream_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "gemv_q5_k_stream_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_q5_k_stream.spv")),
+            &[true, true, true, false, true],
+        )
+    }
+
+    /// Streaming Q6_K prefill GEMM over the resident stream layout (`spirv/gemm_stream_q6_k_k64.slang`, entry `main`).
+    /// 5-binding interface (src_q, src_d, src_b, dst, params), 256x32 output tile.
+    pub fn gemm_stream_q6_k_k64_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "gemm_stream_q6_k_k64_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemm_stream_q6_k_k64.spv")),
+            &[true, true, true, false, true],
+        )
+    }
+
+    /// Streaming Q5_K prefill GEMM over the resident stream layout (`spirv/gemm_stream_q5_k.slang`, entry `main`).
+    /// 5-binding interface (src_q, src_d, src_b, dst, params), 256x32 output tile.
+    pub fn gemm_stream_q5_k_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "gemm_stream_q5_k_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemm_stream_q5_k.spv")),
+            &[true, true, true, false, true],
+        )
+    }
+
+    /// Fast 64-thread subgroup F16 decode GEMV (`spirv/gemv_f16.slang`, entry `main`).
+    /// 4-binding interface (a, x, y, params), NR=8 rows per workgroup.
+    pub fn gemv_f16_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "gemv_f16_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_f16.spv")),
+            &[true, true, false, true],
+        )
+    }
+
+    /// Fast 64-thread subgroup F32 decode GEMV (`spirv/gemv_f32.slang`, entry `main`).
+    /// 4-binding interface (a, x, y, params), NR=8 rows per workgroup.
+    pub fn gemv_f32_passthrough(&self) -> wgpu::ComputePipeline {
+        self.passthrough_pipeline(
+            "gemv_f32_passthrough",
+            wgpu::include_spirv_raw!(concat!(env!("OUT_DIR"), "/gemv_f32.spv")),
+            &[true, true, false, true],
+        )
     }
 
     /// Fast Q4_K decode GEMV for raw weights with subgroup reduction (`spirv/gemv_q4_k.slang`).

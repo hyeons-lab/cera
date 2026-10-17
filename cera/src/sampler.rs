@@ -145,6 +145,66 @@ impl Sampler {
             self.apply_repetition_penalty(logits);
         }
 
+        // Fast candidate path when top_k is small relative to vocab size:
+        // finds the k-th largest scaled logit in one read-only scan and runs
+        // top-p, min-p, ggml_expf softmax, and weighted sampling on the ~k
+        // surviving candidates without allocating or scanning the full vocab.
+        if let Some(token) = self.sample_top_k_fast(logits) {
+            if self.penalty_active() {
+                self.history.insert(token);
+            }
+            return token;
+        }
+
+        self.sample_dense_after_penalty(logits)
+    }
+
+    /// Sample a token while leaving `logits` bit-for-bit unchanged upon return.
+    /// Avoids copying `logits` into `scratch` when the fast `top_k` candidate
+    /// path succeeds.
+    pub fn sample_preserving(&mut self, logits: &mut [f32], scratch: &mut Vec<f32>) -> u32 {
+        assert!(!logits.is_empty(), "cannot sample from empty logits");
+        if !self.config.temperature.is_finite()
+            || self.config.temperature <= 0.0
+            || self.config.top_k == 1
+        {
+            return argmax(logits);
+        }
+
+        let mut saved: Vec<(usize, f32)> = Vec::new();
+        if self.penalty_active() && !self.history.is_empty() {
+            let penalty = self.config.repetition_penalty;
+            saved.reserve(self.history.len());
+            for &token in &self.history {
+                let idx = token as usize;
+                if let Some(logit) = logits.get_mut(idx) {
+                    saved.push((idx, *logit));
+                    if *logit > 0.0 {
+                        *logit /= penalty;
+                    } else {
+                        *logit *= penalty;
+                    }
+                }
+            }
+        }
+
+        let fast = self.sample_top_k_fast(logits);
+        for (idx, orig) in saved {
+            logits[idx] = orig;
+        }
+        if let Some(token) = fast {
+            if self.penalty_active() {
+                self.history.insert(token);
+            }
+            return token;
+        }
+
+        scratch.clear();
+        scratch.extend_from_slice(logits);
+        self.sample(scratch)
+    }
+
+    fn sample_dense_after_penalty(&mut self, logits: &mut [f32]) -> u32 {
         // Temperature scaling
         let inv_temp = 1.0 / self.config.temperature;
         for l in logits.iter_mut() {
@@ -175,6 +235,149 @@ impl Sampler {
             self.history.insert(token);
         }
         token
+    }
+
+    fn sample_top_k_fast(&mut self, logits: &[f32]) -> Option<u32> {
+        const MAX_FAST_K: usize = 256;
+        let k = self.config.top_k;
+        if k == 0 || k > MAX_FAST_K || k >= logits.len() {
+            return None;
+        }
+
+        let inv_temp = 1.0 / self.config.temperature;
+        if !inv_temp.is_finite() {
+            return None;
+        }
+
+        let mut top_vals = [f32::NEG_INFINITY; MAX_FAST_K];
+        let mut min_pos = 0usize;
+        let mut min_val = f32::INFINITY;
+        for (i, &raw) in logits[..k].iter().enumerate() {
+            let v = raw * inv_temp;
+            if v.is_nan() {
+                return None;
+            }
+            top_vals[i] = v;
+            if v < min_val {
+                min_val = v;
+                min_pos = i;
+            }
+        }
+
+        for &raw in &logits[k..] {
+            let v = raw * inv_temp;
+            if v > min_val {
+                top_vals[min_pos] = v;
+                let mut new_min_pos = 0usize;
+                let mut new_min_val = top_vals[0];
+                for (j, &tv) in top_vals[..k].iter().enumerate().skip(1) {
+                    if tv < new_min_val {
+                        new_min_val = tv;
+                        new_min_pos = j;
+                    }
+                }
+                min_pos = new_min_pos;
+                min_val = new_min_val;
+            } else if v.is_nan() {
+                return None;
+            }
+        }
+
+        let threshold = min_val;
+        if !threshold.is_finite() {
+            return None;
+        }
+
+        let mut candidates: Vec<(usize, f32)> = Vec::with_capacity(k + 8);
+        for (idx, &raw) in logits.iter().enumerate() {
+            let v = raw * inv_temp;
+            if v >= threshold {
+                if !v.is_finite() || candidates.len() >= MAX_FAST_K {
+                    return None;
+                }
+                candidates.push((idx, v));
+            }
+        }
+        if candidates.is_empty() {
+            return None;
+        }
+
+        if self.config.top_p < 1.0 {
+            let mut order: Vec<usize> = (0..candidates.len()).collect();
+            order.sort_unstable_by(|&a, &b| {
+                candidates[b]
+                    .1
+                    .partial_cmp(&candidates[a].1)
+                    .unwrap_or(std::cmp::Ordering::Equal)
+            });
+
+            let max_val = candidates[order[0]].1;
+            let mut probs: Vec<f32> = order
+                .iter()
+                .map(|&c| (candidates[c].1 - max_val).exp())
+                .collect();
+            let sum: f32 = probs.iter().sum();
+            for p in probs.iter_mut() {
+                *p /= sum;
+            }
+
+            let mut cutoff_idx = probs.len();
+            let mut cumsum = 0.0f32;
+            for (i, &p) in probs.iter().enumerate() {
+                cumsum += p;
+                if cumsum >= self.config.top_p {
+                    cutoff_idx = i + 1;
+                    break;
+                }
+            }
+
+            for &c in &order[cutoff_idx..] {
+                candidates[c].1 = f32::NEG_INFINITY;
+            }
+            candidates.retain(|&(_, v)| v.is_finite());
+        }
+
+        if self.config.min_p > 0.0 && self.config.min_p <= 1.0 {
+            let max_logit = candidates
+                .iter()
+                .map(|&(_, v)| v)
+                .fold(f32::NEG_INFINITY, f32::max);
+            if max_logit.is_finite() {
+                let min_p_thresh = max_logit + self.config.min_p.ln();
+                candidates.retain(|&(_, v)| v >= min_p_thresh);
+            }
+        }
+
+        if candidates.is_empty() {
+            return None;
+        }
+
+        let max = candidates
+            .iter()
+            .fold(f32::NEG_INFINITY, |a, &(_, b)| a.max(b));
+        let mut sum = 0.0f64;
+        for (_, v) in candidates.iter_mut() {
+            let e = cpu::ggml_expf(*v - max);
+            *v = e;
+            sum += e as f64;
+        }
+        let inv_sum = (1.0 / sum) as f32;
+        for (_, v) in candidates.iter_mut() {
+            *v *= inv_sum;
+        }
+
+        let r: f32 = self.rng.r#gen();
+        if r <= 0.0 {
+            return Some(0);
+        }
+        let mut cumsum = 0.0f32;
+        for &(idx, p) in &candidates {
+            cumsum += p;
+            if cumsum >= r {
+                return Some(idx as u32);
+            }
+        }
+        Some((logits.len() - 1) as u32)
     }
 
     /// Whether the repetition penalty is in effect: finite, positive, and not
@@ -502,5 +705,50 @@ mod tests {
         assert_eq!(a, b, "identical seeds must reproduce");
         let c = stochastic_stream(Some(12), 16);
         assert_ne!(a, c, "different seeds must diverge");
+    }
+
+    #[test]
+    fn top_k_fast_matches_dense_bit_for_bit() {
+        let mut logit_rng = StdRng::seed_from_u64(0xC0FFEE);
+        for &(temp, top_k, top_p, min_p, rep_pen) in &[
+            (0.7f32, 40usize, 0.95f32, 0.05f32, 1.05f32),
+            (0.1f32, 40usize, 0.90f32, 0.15f32, 1.10f32),
+            (1.2f32, 8usize, 1.0f32, 0.0f32, 1.0f32),
+            (0.8f32, 64usize, 0.85f32, 0.02f32, 1.2f32),
+        ] {
+            let cfg = SamplerConfig {
+                temperature: temp,
+                top_k,
+                top_p,
+                min_p,
+                repetition_penalty: rep_pen,
+                seed: Some(12345),
+            };
+            let mut s_fast = Sampler::new(cfg.clone());
+            let mut s_dense = Sampler::new(cfg);
+
+            for step in 0..64 {
+                let mut base: Vec<f32> = (0..4096)
+                    .map(|i| {
+                        if step % 7 == 0 && i % 128 == 0 {
+                            5.0 // deliberate ties near the top
+                        } else {
+                            logit_rng.gen_range(-12.0f32..8.0f32)
+                        }
+                    })
+                    .collect();
+                let mut dense_logits = base.clone();
+
+                let fast_tok = s_fast.sample(&mut base);
+                if s_dense.penalty_active() && !s_dense.history.is_empty() {
+                    s_dense.apply_repetition_penalty(&mut dense_logits);
+                }
+                let dense_tok = s_dense.sample_dense_after_penalty(&mut dense_logits);
+                assert_eq!(
+                    fast_tok, dense_tok,
+                    "mismatch at step {step} for cfg=({temp}, {top_k}, {top_p}, {min_p}, {rep_pen})"
+                );
+            }
+        }
     }
 }

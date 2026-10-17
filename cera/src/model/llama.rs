@@ -1459,9 +1459,9 @@ impl LlamaModel {
             None
         };
 
-        let embd_ref = transformer::resolve_weight(&gguf, "token_embd.weight")?;
+        let mut embd_ref = transformer::resolve_weight(&gguf, "token_embd.weight")?;
         // Separate output projection when present, else tied embeddings.
-        let output_ref = if gguf.tensors.contains_key("output.weight") {
+        let mut output_ref = if gguf.tensors.contains_key("output.weight") {
             Some(transformer::resolve_weight(&gguf, "output.weight")?)
         } else {
             None
@@ -1518,6 +1518,11 @@ impl LlamaModel {
             // against its block size rather than its per-row `k`, so a
             // Q4_0/Q8_0 head with an unaligned `hidden_size` clears every other
             // gate.
+        }
+        if let Some(out) = output_ref.take() {
+            output_ref = Some(out.with_dec4_if(&gguf, repack));
+        } else {
+            embd_ref = embd_ref.with_dec4_if(&gguf, repack);
         }
 
         // Llama-3 RoPE frequency scaling (`rope_scaling: llama3`): per-pair factors

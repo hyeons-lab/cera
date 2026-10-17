@@ -166,18 +166,58 @@ impl MmapWeight {
     }
 
     /// The weight repacked for the smmla (i8mm) GEMM, built on first call and kept: `(packed,
-    /// scales)` in the layout `repack_q8_0_smmla_8x8` documents. `None` for anything that is not a
-    /// Q8_0 weight the i8mm tier can run (wrong dtype, rows not a multiple of 8, a host without
-    /// i8mm), in which case callers keep the standard layout. Costs one extra copy of the weight.
+    /// scales)` in the layout `repack_q8_0_smmla_8x8` documents. Supports `Q8_0` weights (`cols %
+    /// 32 == 0`) and `F16` weights (zero-padded to `cols.next_multiple_of(32)` and quantized to
+    /// `Q8_0`, matching the GPU and Hexagon ViT paths for unaligned `ffn_down` layers).
     pub(crate) fn smmla_repacked(&self) -> Option<(&[u8], &[f32])> {
         #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
         {
             let cached = self.smmla.get_or_init(|| {
-                (self.dtype == DType::Q8_0
-                    && crate::backend::cpu::q8_0_smmla_repack_supported(self.rows, self.cols))
-                .then(|| {
-                    crate::backend::cpu::repack_q8_0_smmla_8x8(self.data(), self.rows, self.cols)
-                })
+                if self.dtype == DType::Q8_0
+                    && crate::backend::cpu::q8_0_smmla_repack_supported(self.rows, self.cols)
+                {
+                    Some(crate::backend::cpu::repack_q8_0_smmla_8x8(
+                        self.data(),
+                        self.rows,
+                        self.cols,
+                    ))
+                } else if self.dtype == DType::F16 && self.cols > 0 {
+                    let cols_pad = self.cols.next_multiple_of(32);
+                    crate::backend::cpu::q8_0_smmla_repack_supported(self.rows, cols_pad).then(
+                        || {
+                            let nb = cols_pad / 32;
+                            let bsz = std::mem::size_of::<crate::quant::BlockQ8_0>();
+                            let mut q8_bytes = vec![0u8; self.rows * nb * bsz];
+                            let mut row_f32 = vec![0.0f32; cols_pad];
+                            let mut scales = vec![0.0f32; nb];
+                            let mut quants = vec![0i8; cols_pad];
+                            for r in 0..self.rows {
+                                row_f32[self.cols..].fill(0.0);
+                                self.dequantize_row(r, &mut row_f32[..self.cols]);
+                                crate::backend::cpu::quantize_f32_to_q8_0_into(
+                                    &row_f32,
+                                    &mut scales,
+                                    &mut quants,
+                                );
+                                let dst_row = &mut q8_bytes[r * nb * bsz..(r + 1) * nb * bsz];
+                                for (b, &d) in scales.iter().enumerate() {
+                                    let dst_blk = &mut dst_row[b * bsz..(b + 1) * bsz];
+                                    dst_blk[..2].copy_from_slice(
+                                        &half::f16::from_f32(d).to_bits().to_le_bytes(),
+                                    );
+                                    dst_blk[2..].copy_from_slice(bytemuck::cast_slice::<i8, u8>(
+                                        &quants[b * 32..(b + 1) * 32],
+                                    ));
+                                }
+                            }
+                            crate::backend::cpu::repack_q8_0_smmla_8x8(
+                                &q8_bytes, self.rows, cols_pad,
+                            )
+                        },
+                    )
+                } else {
+                    None
+                }
             });
             cached.as_ref().map(|(p, s)| (p.as_slice(), s.as_slice()))
         }

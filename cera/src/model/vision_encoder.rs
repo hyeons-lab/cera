@@ -350,11 +350,8 @@ pub struct VisionEncoderWeights {
 
 impl VisionEncoderWeights {
     /// Load every vision-encoder tensor from a multimodal_projector
-    /// GGUF. Errors if any required tensor or metadata key is
-    /// missing — no silent defaults. Per-tensor `with_context`
-    /// surfaces the first missing name at the top of the error
-    /// chain.
-    pub fn from_gguf(gguf: &Arc<GgufFile>) -> Result<Self> {
+    /// GGUF without eagerly building CPU `smmla` repacks.
+    pub(crate) fn from_gguf_unprepared(gguf: &Arc<GgufFile>) -> Result<Self> {
         let config = VisionEncoderConfig::from_gguf(gguf)?;
 
         // Patch embed Conv2D kernel `[kw, kh, ic, oc]` in GGUF
@@ -518,13 +515,19 @@ impl VisionEncoderWeights {
             post_ln_b,
             projector,
         };
+        Ok(weights)
+    }
+
+    /// Parse a LFM2-VL `mmproj` GGUF and pre-build the CPU `smmla` repacks.
+    pub fn from_gguf(gguf: &Arc<GgufFile>) -> Result<Self> {
+        let weights = Self::from_gguf_unprepared(gguf)?;
         weights.prepare_int8();
         Ok(weights)
     }
 
     /// Build the smmla-repacked copy of every Q8_0 linear now, so the first image does not pay for
     /// it. A no-op unless the int8 path is on and the host has i8mm.
-    fn prepare_int8(&self) {
+    pub(crate) fn prepare_int8(&self) {
         let cfg = &self.config;
         let dims = [cfg.n_embd, cfg.n_ff];
         if !Q8Act::for_dims(&dims, 0).enabled {
@@ -1054,14 +1057,16 @@ impl Q8Act {
     /// An int8 activation buffer for token rows of any of `dims` floats.
     fn for_dims(dims: &[usize], n_tokens: usize) -> Self {
         let max_dim = dims.iter().copied().max().unwrap_or(0);
+        let max_dim_pad = max_dim.next_multiple_of(32);
         let enabled = crate::backend::cpu::int8_gemm_available()
-            && dims.iter().all(|d| d.is_multiple_of(32))
+            && max_dim > 0
+            && dims.iter().all(|&d| d > 0)
             && !crate::backend::cpu_features::env_disabled("CERA_VIT_INT8");
         let (n_scales, n_quants, n_out) = if enabled {
             (
-                n_tokens * (max_dim / 32),
-                n_tokens * max_dim,
-                n_tokens * max_dim,
+                n_tokens * (max_dim_pad / 32),
+                n_tokens * max_dim_pad,
+                n_tokens * max_dim_pad,
             )
         } else {
             (0, 0, 0)
@@ -1079,12 +1084,36 @@ impl Q8Act {
     /// Quantize `n` token rows of `dim` floats each. Call once per distinct input, before the
     /// [`vit_linear`] calls that consume it.
     fn quantize(&mut self, x: &[f32], dim: usize, n: usize) {
-        if !self.enabled {
+        if !self.enabled || dim == 0 || n == 0 {
+            self.dim = 0;
+            self.n = 0;
             return;
         }
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
-            crate::model::transformer::quantize_rows(x, dim, n, &mut self.scales, &mut self.quants);
+            if dim.is_multiple_of(32) {
+                crate::model::transformer::quantize_rows(
+                    x,
+                    dim,
+                    n,
+                    &mut self.scales,
+                    &mut self.quants,
+                );
+            } else {
+                let dim_pad = dim.next_multiple_of(32);
+                let mut padded = vec![0.0f32; n * dim_pad];
+                for t in 0..n {
+                    padded[t * dim_pad..t * dim_pad + dim]
+                        .copy_from_slice(&x[t * dim..(t + 1) * dim]);
+                }
+                crate::model::transformer::quantize_rows(
+                    &padded,
+                    dim_pad,
+                    n,
+                    &mut self.scales,
+                    &mut self.quants,
+                );
+            }
             self.dim = dim;
             self.n = n;
         }
@@ -1095,31 +1124,34 @@ impl Q8Act {
     /// `y[tokens][rows] = x · wᵀ` from the activations last quantized. Returns `false` (and leaves
     /// `y` untouched) when this weight or host cannot take the int8 path.
     fn matmul(&mut self, w: &MmapWeight, y: &mut [f32]) -> bool {
-        if !self.enabled
-            || w.dtype != crate::tensor::DType::Q8_0
-            || w.cols != self.dim
-            || self.n == 0
-        {
+        if !self.enabled || w.cols != self.dim || self.n == 0 {
             return false;
         }
         let (rows, n, dim) = (w.rows, self.n, self.dim);
+        let dim_pad = dim.next_multiple_of(32);
         debug_assert_eq!(y.len(), rows * n);
         // Repacked smmla kernel (i8mm hosts): 8 weight rows by 4 tokens per tile, written straight
         // into `y` row-major, so there is no transpose pass either.
         #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
-        if let Some((packed, scales)) = w.smmla_repacked()
+        if matches!(
+            w.dtype,
+            crate::tensor::DType::Q8_0 | crate::tensor::DType::F16
+        ) && let Some((packed, scales)) = w.smmla_repacked()
             && crate::backend::cpu::gemm_preq_repacked_q8_0_smmla_rowmajor_dispatch(
                 packed,
                 scales,
-                &self.scales[..n * (dim / 32)],
-                &self.quants[..n * dim],
+                &self.scales[..n * (dim_pad / 32)],
+                &self.quants[..n * dim_pad],
                 y,
                 n,
                 rows,
-                dim,
+                dim_pad,
             )
         {
             return true;
+        }
+        if w.dtype != crate::tensor::DType::Q8_0 || !dim.is_multiple_of(32) {
+            return false;
         }
         let needed = rows * n;
         if self.out_t.len() < needed {

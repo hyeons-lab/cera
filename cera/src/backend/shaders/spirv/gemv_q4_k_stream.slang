@@ -21,7 +21,7 @@
 
 [[vk::binding(0, 0)]] StructuredBuffer<uint>    q;
 [[vk::binding(1, 0)]] StructuredBuffer<uint>    d;
-[[vk::binding(2, 0)]] StructuredBuffer<float>   x;
+[[vk::binding(2, 0)]] StructuredBuffer<float4>  x;
 [[vk::binding(3, 0)]] RWStructuredBuffer<float> y;
 [[vk::binding(4, 0)]] StructuredBuffer<uint4>   params;
 
@@ -48,8 +48,8 @@ void main(
     uint tid = lid.x;
     uint f = tid % FIBERS;
     uint s = tid / FIBERS;
-    uint row0 = get_wid(wid) * ROWS_PER_WG + f * ROWS_PER_THREAD;
-    uint row1 = row0 + 1u;
+    uint row0 = get_wid(wid) * ROWS_PER_WG + f;
+    uint row1 = row0 + FIBERS;
 
     uint nb = k / 32u;
     uint nb_per_split = (nb + K_SPLITS - 1u) / K_SPLITS;
@@ -74,7 +74,7 @@ void main(
     float m1 = 0.0f;
 
     for (uint b = b0; b < b1; b++) {
-        uint xbase = b * 32u;
+        uint xbase4 = b * 8u;
         uint qi = b * 4u * m;
 
         uint pd0 = live0 ? d[b * m + row0c] : 0u;
@@ -89,15 +89,17 @@ void main(
 
         [unroll]
         for (uint p = 0u; p < 4u; p++) {
-            uint xb = xbase + p * 8u;
-            float a0 = x[xb];        float y0 = a0;
-            float a1 = x[xb + 1u];   float y1 = a1 * 0.0625f;
-            float a2 = x[xb + 2u];   float y2 = a2 * 0.00390625f;
-            float a3 = x[xb + 3u];   float y3 = a3 * 0.000244140625f;
-            float a4 = x[xb + 4u];   float y4 = a4 * 0.0000152587890625f;
-            float a5 = x[xb + 5u];   float y5 = a5 * 9.5367431640625e-7f;
-            float a6 = x[xb + 6u];   float y6 = a6 * 5.960464477539063e-8f;
-            float a7 = x[xb + 7u];   float y7 = a7 * 3.725290298461914e-9f;
+            uint xb4 = xbase4 + p * 2u;
+            float4 a03 = x[xb4];
+            float4 a47 = x[xb4 + 1u];
+            float a0 = a03.x;        float y0 = a0;
+            float a1 = a03.y;        float y1 = a1 * 0.0625f;
+            float a2 = a03.z;        float y2 = a2 * 0.00390625f;
+            float a3 = a03.w;        float y3 = a3 * 0.000244140625f;
+            float a4 = a47.x;        float y4 = a4 * 0.0000152587890625f;
+            float a5 = a47.y;        float y5 = a5 * 9.5367431640625e-7f;
+            float a6 = a47.z;        float y6 = a6 * 5.960464477539063e-8f;
+            float a7 = a47.w;        float y7 = a7 * 3.725290298461914e-9f;
             sumy_b += (a0 + a1) + (a2 + a3) + (a4 + a5) + (a6 + a7);
 
             uint q0w = q[qi + p * m + row0c];
@@ -129,9 +131,8 @@ void main(
         m1 += mn1 * sumy_b;
     }
 
-    uint r0 = f * ROWS_PER_THREAD;
-    split_scratch[r0 * K_SPLITS + s] = (d00 + d01) + (d02 + d03) - m0;
-    split_scratch[(r0 + 1u) * K_SPLITS + s] = (d10 + d11) + (d12 + d13) - m1;
+    split_scratch[f * K_SPLITS + s] = (d00 + d01) + (d02 + d03) - m0;
+    split_scratch[(f + FIBERS) * K_SPLITS + s] = (d10 + d11) + (d12 + d13) - m1;
     GroupMemoryBarrierWithGroupSync();
 
     if (tid < ROWS_PER_WG) {

@@ -194,10 +194,29 @@ unsafe fn trampoline<F: Fn(usize, &mut [f32]) + Sync>(
 ) {
     let f = unsafe { &*(closure as *const F) };
     for row in start..end {
-        // SAFETY: `row < total_rows` ⇒ `row * n + n <= y.len()`; disjoint ranges
+        // SAFETY: `row < total_rows` => `row * n + n <= y.len()`; disjoint ranges
         // guarantee no other thread holds an overlapping `&mut`.
         let slice = unsafe { std::slice::from_raw_parts_mut(y_ptr.add(row * n), n) };
         f(row, slice);
+    }
+}
+
+/// Runs the erased range closure `(start_row, count)` over a worker's claimed range.
+///
+/// # Safety
+/// - `closure` must point to a live `&F` for the whole call.
+/// - `[start, end)` must be within `[0, total_rows)` and disjoint from every other
+///   worker's range this dispatch.
+unsafe fn trampoline_range<F: Fn(usize, usize) + Sync>(
+    closure: *const (),
+    _y_ptr: *mut f32,
+    _n: usize,
+    start: usize,
+    end: usize,
+) {
+    let f = unsafe { &*(closure as *const F) };
+    if end > start {
+        f(start, end - start);
     }
 }
 
@@ -1290,16 +1309,27 @@ impl RowPool {
     /// (plus one relaxed load while another thread holds the claim). No-op
     /// when the platform has no affinity (`caller_pin == None`).
     fn pin_caller_once(&self) {
-        /// Releases the claim when the holding thread exits.
-        struct ClaimGuard;
+        /// Releases the claim when the holding thread exits, if it still owns the pin.
+        struct ClaimGuard {
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            tid: i64,
+        }
         impl Drop for ClaimGuard {
             fn drop(&mut self) {
                 #[cfg(any(target_os = "linux", target_os = "android"))]
                 {
-                    CALLER_PIN_OWNER.store(-1, Ordering::Release);
-                    CALLER_PIN_CORE.store(usize::MAX, Ordering::Release);
+                    if CALLER_PIN_OWNER
+                        .compare_exchange(self.tid, -1, Ordering::AcqRel, Ordering::Relaxed)
+                        .is_ok()
+                    {
+                        CALLER_PIN_CORE.store(usize::MAX, Ordering::Release);
+                        CALLER_PIN_CLAIMED.store(false, Ordering::Release);
+                    }
                 }
-                CALLER_PIN_CLAIMED.store(false, Ordering::Release);
+                #[cfg(not(any(target_os = "linux", target_os = "android")))]
+                {
+                    CALLER_PIN_CLAIMED.store(false, Ordering::Release);
+                }
             }
         }
         struct CallerClaim {
@@ -1329,14 +1359,23 @@ impl RowPool {
         };
         CLAIM.with(|c| {
             let mut claim = c.borrow_mut();
+            #[cfg(any(target_os = "linux", target_os = "android"))]
+            if let Some(g) = &claim.guard
+                && CALLER_PIN_OWNER.load(Ordering::Relaxed) != g.tid
+            {
+                // Another thread took over the caller pin while this thread was
+                // idle in a host pool (e.g. Dispatchers.IO -> spawn_blocking).
+                claim.guard = None;
+                claim.retry_cooldown = 0;
+            }
             if claim.retry_cooldown > 0 {
                 claim.retry_cooldown -= 1;
                 return;
             }
             if claim.guard.is_some() {
                 // Periodically RE-ASSERT the held pin: Android cpuset cgroup
-                // migrations (background ↔ foreground) overwrite per-thread
-                // affinity masks wholesale, silently revoking it. One ~µs
+                // migrations (background <-> foreground) overwrite per-thread
+                // affinity masks wholesale, silently revoking it. One ~us
                 // syscall per PIN_RETRY_BACKOFF dispatches (~10 tokens).
                 let _ = pin_current_thread_to_core(core);
                 claim.retry_cooldown = PIN_RETRY_BACKOFF;
@@ -1348,16 +1387,19 @@ impl RowPool {
                     .is_ok()
             {
                 if pin_current_thread_to_core(core) {
-                    claim.guard = Some(ClaimGuard);
+                    #[cfg(any(target_os = "linux", target_os = "android"))]
+                    let tid = unsafe { libc::gettid() } as i64;
+                    claim.guard = Some(ClaimGuard {
+                        #[cfg(any(target_os = "linux", target_os = "android"))]
+                        tid,
+                    });
                     // Record the claim for the allowance probe (see
                     // `thread_self_pinned`): the pinning thread's tid and
                     // core, so a leader mask that is exactly our own pin
                     // is never mistaken for an external restriction.
                     #[cfg(any(target_os = "linux", target_os = "android"))]
                     {
-                        // SAFETY: `gettid` always succeeds.
-                        let tid = unsafe { libc::gettid() };
-                        CALLER_PIN_OWNER.store(tid as i64, Ordering::Release);
+                        CALLER_PIN_OWNER.store(tid, Ordering::Release);
                         CALLER_PIN_CORE.store(core, Ordering::Release);
                     }
                     claim.retry_cooldown = PIN_RETRY_BACKOFF;
@@ -1367,8 +1409,171 @@ impl RowPool {
                     CALLER_PIN_CLAIMED.store(false, Ordering::Release);
                     claim.retry_cooldown = PIN_RETRY_BACKOFF;
                 }
+            } else {
+                // Handoff across recycled host thread pools (e.g. Kotlin Dispatchers.IO
+                // during prefill -> tokio::spawn_blocking during decode): if the pool is
+                // currently idle (no concurrent session is mid-dispatch), transfer the
+                // caller pin to this thread and widen the previous owner's mask back to
+                // all pinned cores so it does not squat on the prime core.
+                #[cfg(any(target_os = "linux", target_os = "android"))]
+                if idle_guard(self).is_some() {
+                    let my_tid = unsafe { libc::gettid() } as i64;
+                    let old_owner = CALLER_PIN_OWNER.load(Ordering::Acquire);
+                    if old_owner > 0
+                        && old_owner != my_tid
+                        && CALLER_PIN_OWNER
+                            .compare_exchange(
+                                old_owner,
+                                my_tid,
+                                Ordering::AcqRel,
+                                Ordering::Relaxed,
+                            )
+                            .is_ok()
+                    {
+                        let _ =
+                            set_thread_affinity_for_tid(old_owner as libc::pid_t, pinned_cores());
+                        if pin_current_thread_to_core(core) {
+                            CALLER_PIN_CORE.store(core, Ordering::Release);
+                            CALLER_PIN_CLAIMED.store(true, Ordering::Release);
+                            claim.guard = Some(ClaimGuard { tid: my_tid });
+                            claim.retry_cooldown = PIN_RETRY_BACKOFF;
+                        } else {
+                            CALLER_PIN_OWNER.store(-1, Ordering::Release);
+                            CALLER_PIN_CORE.store(usize::MAX, Ordering::Release);
+                            CALLER_PIN_CLAIMED.store(false, Ordering::Release);
+                            claim.retry_cooldown = PIN_RETRY_BACKOFF;
+                        }
+                    }
+                }
             }
         });
+    }
+
+    /// Run `f(start_row, count)` over contiguous sub-ranges partitioning `0..total_rows`
+    /// in parallel across the pool via dynamic work-stealing and per-worker capacity
+    /// weighting.
+    pub fn dispatch_range<F>(&self, total_rows: usize, min_rows: usize, f: F)
+    where
+        F: Fn(usize, usize) + Sync,
+    {
+        self.dispatch_range_inner(total_rows, min_rows, 1, 0, &f);
+    }
+
+    /// Like [`RowPool::dispatch_range`], but with an explicit cap on active workers.
+    pub fn dispatch_range_active<F>(
+        &self,
+        total_rows: usize,
+        min_rows: usize,
+        max_active: usize,
+        f: F,
+    ) where
+        F: Fn(usize, usize) + Sync,
+    {
+        self.dispatch_range_inner(total_rows, min_rows, 1, max_active, &f);
+    }
+
+    fn dispatch_range_inner<F>(
+        &self,
+        total_rows: usize,
+        min_rows: usize,
+        min_chunk_rows: usize,
+        max_active: usize,
+        f: &F,
+    ) where
+        F: Fn(usize, usize) + Sync,
+    {
+        if total_rows == 0 {
+            return;
+        }
+        self.pin_caller_once();
+        let min_rows = min_rows.max(1);
+        let rows_per_worker = total_rows.div_ceil(self.num_threads).max(min_rows);
+        let mut active = total_rows.div_ceil(rows_per_worker).min(self.num_threads);
+        if max_active > 0 {
+            active = active.min(max_active);
+        }
+
+        let wanted_fanout = active > 1;
+        let guard = if wanted_fanout {
+            idle_guard(self)
+        } else {
+            None
+        };
+
+        if wanted_fanout {
+            let macs = total_rows as u64;
+            stats::FANOUT_DISPATCHES.fetch_add(1, Ordering::Relaxed);
+            stats::FANOUT_MACS.fetch_add(macs, Ordering::Relaxed);
+            if guard.is_none() {
+                stats::SERIAL_FALLBACKS.fetch_add(1, Ordering::Relaxed);
+                stats::SERIAL_MACS.fetch_add(macs, Ordering::Relaxed);
+            }
+        }
+
+        let Some(_guard) = guard else {
+            f(0, total_rows);
+            return;
+        };
+
+        let min_chunk_rows = min_chunk_rows.max(1);
+        let chunk_rows = total_rows
+            .div_ceil(active * STEAL_CHUNKS_PER_WORKER)
+            .max(min_chunk_rows);
+
+        let closure_ptr = (f as *const F).cast::<()>();
+        let job = Job {
+            y_ptr: std::ptr::null_mut(),
+            n: 1,
+            chunk_rows,
+            min_chunk_rows,
+            total_rows,
+            active,
+            closure: closure_ptr,
+            run: trampoline_range::<F>,
+        };
+        if self.shared.panicked.load(Ordering::Relaxed) {
+            drop(self.take_panic_payload());
+        }
+        unsafe {
+            *self.shared.job.get() = Some(job);
+        }
+        self.shared.next_row.store(0, Ordering::Relaxed);
+        if self.shared.active_barrier {
+            self.shared.pending.store(active - 1, Ordering::Release);
+            let next_epoch = state_epoch(self.shared.state.load(Ordering::Relaxed)) + 1;
+            self.shared
+                .state
+                .store(pack_state(next_epoch, active), Ordering::SeqCst);
+            if self.shared.parked_count.load(Ordering::SeqCst) > 0 {
+                for h in self.workers.iter().take(active - 1) {
+                    h.thread().unpark();
+                }
+            }
+        } else {
+            self.shared
+                .pending
+                .store(self.num_threads - 1, Ordering::Release);
+            self.shared.state.fetch_add(1, Ordering::SeqCst);
+            if self.shared.parked_count.load(Ordering::SeqCst) > 0 {
+                for h in &self.workers {
+                    h.thread().unpark();
+                }
+            }
+        }
+
+        {
+            let _drain = DrainGuard {
+                shared: &self.shared,
+            };
+            steal_and_run(&self.shared, &job, 0);
+        }
+
+        if self.shared.panicked.load(Ordering::Relaxed) {
+            match self.take_panic_payload() {
+                Some(payload) => std::panic::resume_unwind(payload),
+                None => panic!("cera RowPool: a range closure panicked on a worker thread"),
+            }
+        }
     }
 
     /// Run `f` over each of the `y.len() / n` rows of `y`, in parallel across the
@@ -1397,7 +1602,7 @@ impl RowPool {
     /// `dispatch_rows` floors the steal chunk at `MIN_CHUNK_ROWS` (tuned for many
     /// *cheap* rows, e.g. a GEMV's output rows, where sub-`MIN_CHUNK_ROWS` chunks
     /// would spend more on steal bookkeeping than on the row). That floor
-    /// *under-parallelizes* the opposite shape — few rows, each expensive: flash
+    /// *under-parallelizes* the opposite shape: few rows, each expensive: flash
     /// attention hands one whole *head* per row, so 32 heads at a 16-row floor
     /// collapse to 2 steal chunks = 2 busy workers, 14 idle. Such callers pass
     /// `min_chunk_rows = 1` so every heavy row is its own steal unit and all
@@ -1450,7 +1655,7 @@ impl RowPool {
     /// `y.len() * depth` MACs, capped at `total_macs / GEMM_WORK_PER_WORKER`
     /// workers. Under the active-sized barrier only those workers take part, so
     /// trimming the count for a narrow GEMM directly sheds the barrier +
-    /// memory-bus contention its work can't amortize — on a tiny model (or a
+    /// memory-bus contention its work can't amortize: on a tiny model (or a
     /// short prompt) a large prefill win. Uses the default steal-chunk floor.
     ///
     /// `depth == 0` disables the work cap (the plain row-count gate), so callers
@@ -2039,6 +2244,11 @@ pub(crate) fn perf_pinned_cores() -> &'static [usize] {
 /// an empty core list have nothing to assert anyway.
 #[cfg(any(target_os = "linux", target_os = "android"))]
 pub(crate) fn set_current_thread_affinity(cores: &[usize]) -> bool {
+    set_thread_affinity_for_tid(0, cores)
+}
+
+#[cfg(any(target_os = "linux", target_os = "android"))]
+fn set_thread_affinity_for_tid(tid: libc::pid_t, cores: &[usize]) -> bool {
     if cores.is_empty() {
         return false;
     }
@@ -2049,8 +2259,8 @@ pub(crate) fn set_current_thread_affinity(cores: &[usize]) -> bool {
     // one cast of it is redundant-free on both.
     let capacity = std::mem::size_of::<libc::cpu_set_t>() * 8;
     // SAFETY: `set` is zero-initialized then populated via the libc CPU_SET
-    // macro, only at in-bounds indices; `sched_setaffinity(0, ...)` targets
-    // the current thread.
+    // macro, only at in-bounds indices; `sched_setaffinity(tid, ...)` targets
+    // the specified thread (`0` = current thread).
     unsafe {
         let mut set: libc::cpu_set_t = std::mem::zeroed();
         let mut any = false;
@@ -2060,7 +2270,7 @@ pub(crate) fn set_current_thread_affinity(cores: &[usize]) -> bool {
                 any = true;
             }
         }
-        any && libc::sched_setaffinity(0, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
+        any && libc::sched_setaffinity(tid, std::mem::size_of::<libc::cpu_set_t>(), &set) == 0
     }
 }
 

@@ -96,7 +96,16 @@ const SLANG_KERNELS: &[&str] = &[
     "gemv_q4_0_stream",
     "gemv_q4_k",
     "gemv_q4_k_stream",
+    "gemv_q5_k_stream",
+    "gemv_q6_k_stream",
+    "gemv_q8_0_stream",
+    "gemm_stream_q5_k",
+    "gemm_stream_q6_k_k64",
+    "gemv_f16",
+    "gemv_f32",
     "mul_mat_reg_tile_q4_0_stream",
+    "gemv_q8_0_stream_gateup",
+    "gemv_q4_0_stream_gateup",
 ];
 
 fn compile_slang_kernels() {
