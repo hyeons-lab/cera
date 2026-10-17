@@ -8038,8 +8038,9 @@ pub(crate) mod neon {
 
     /// Dispatches `sr_count` super-rows across worker threads.
     ///
-    /// For multi-token batches (`n >= 2`), scheduling uses a disjoint dummy buffer
-    /// sized to avoid borrowing the output slice during concurrent raw pointer writes.
+    /// Single-token decode (`n == 1`) uses [`crate::backend::cpu::par_range`] across
+    /// all workers, while multi-token batches (`n >= 2`) cap active worker threads via
+    /// [`crate::backend::cpu::par_range_prefill_active`].
     #[cfg_attr(not(test), allow(dead_code))]
     #[inline(always)]
     fn dispatch_smmla_super_rows<F>(sr_count: usize, n: usize, compute_super_row: F)

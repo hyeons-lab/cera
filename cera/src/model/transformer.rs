@@ -477,6 +477,7 @@ impl WeightRef {
     /// the 8-bit `Q4_0` prefill repack (`self.repacked`). Used for large tied
     /// `token_embd.weight` / `output.weight` tables that only run `gemv_preq`
     /// on decode and at the end of prefill.
+    #[allow(unused_mut)]
     pub(crate) fn with_dec4_if(mut self, gguf: &GgufFile, do_repack: bool) -> Self {
         #[cfg(all(target_arch = "aarch64", not(has_blas)))]
         if do_repack && self.dtype == DType::Q4_0 && cpu::q4_0_dec4_supported(self.m, self.k) {

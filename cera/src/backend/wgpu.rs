@@ -2679,7 +2679,7 @@ impl GpuContext {
     }
 
     /// Q8_0 decode GEMV over the resident stream layout (`spirv/gemv_q8_0_stream.slang`, entry `main`).
-    /// 5-binding interface (q, d, x, y, params), ROWS_PER_WG=16 dispatch.
+    /// 5-binding interface (q, d, x, y, params), ROWS_PER_WG=32 dispatch.
     ///
     /// # Safety
     /// The module must be spirv-val-clean with the binding interface above
@@ -2694,7 +2694,7 @@ impl GpuContext {
     }
 
     /// Fused Q8_0 Gate+Up+SwiGLU decode GEMV over the resident stream layout (`spirv/gemv_q8_0_stream_gateup.slang`).
-    /// 7-binding interface (gate_q, gate_d, up_q, up_d, x, y, params), ROWS_PER_WG=16 dispatch.
+    /// 7-binding interface (gate_q, gate_d, up_q, up_d, x, y, params), ROWS_PER_WG=32 dispatch.
     pub fn gemv_q8_0_stream_gateup_passthrough(&self) -> wgpu::ComputePipeline {
         self.passthrough_pipeline(
             "gemv_q8_0_stream_gateup_passthrough",

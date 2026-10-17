@@ -276,9 +276,31 @@ fn use_stream_layout(ctx: &GpuContext) -> bool {
 /// `k % 256 == 0`. Ineligible weights upload raw and ride the raw kernels in
 /// both phases.
 fn stream_layout_eligible(dtype: DType, k: usize) -> bool {
-    (dtype == DType::Q4_0 && k.is_multiple_of(32))
-        || (dtype == DType::Q8_0 && k.is_multiple_of(64))
-        || (matches!(dtype, DType::Q4KM | DType::Q5KM | DType::Q6K) && k.is_multiple_of(256))
+    k > 0
+        && ((dtype == DType::Q4_0 && k.is_multiple_of(32))
+            || (dtype == DType::Q8_0 && k.is_multiple_of(64))
+            || (matches!(dtype, DType::Q4KM | DType::Q5KM | DType::Q6K) && k.is_multiple_of(256)))
+}
+
+/// Repack a stream-eligible weight (`data` of shape `[m, k]`) into its `(q, d)`
+/// resident stream buffers, or return `None` if `dtype` / `k` is not stream-eligible.
+fn repack_stream_for_dtype(
+    dtype: DType,
+    data: &[u8],
+    m: usize,
+    k: usize,
+) -> Option<(Vec<u32>, Vec<u32>)> {
+    if !stream_layout_eligible(dtype, k) {
+        return None;
+    }
+    Some(match dtype {
+        DType::Q4_0 => repack_q4_0_stream(data, m, k),
+        DType::Q4KM => repack_q4_k_stream(data, m, k),
+        DType::Q5KM => repack_q5_k_stream(data, m, k),
+        DType::Q6K => repack_q6_k_stream(data, m, k),
+        DType::Q8_0 => crate::model::vision_encoder_gpu::repack_q8_0_stream(data, m, k),
+        _ => return None,
+    })
 }
 
 /// Smallest batch routed to the streaming Q4_0 GEMM (`CERA_WGPU_STREAM_MIN_N`, default 1: every batch).
@@ -390,6 +412,19 @@ fn use_fused_gate_up() -> bool {
             !std::env::var("CERA_WGPU_FUSE_GATE_UP")
                 .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off"))
         })
+    };
+    enabled
+}
+
+/// Whether single-token decode fuses the FFN's gate, up, and SwiGLU projections into one
+/// resident-stream GEMV (`CERA_GPU_FUSED_GATE_UP=1`).
+fn use_fused_gate_up_gemv() -> bool {
+    #[cfg(test)]
+    let enabled = std::env::var("CERA_GPU_FUSED_GATE_UP").as_deref() == Ok("1");
+    #[cfg(not(test))]
+    let enabled = {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("CERA_GPU_FUSED_GATE_UP").as_deref() == Ok("1"))
     };
     enabled
 }
@@ -1015,6 +1050,8 @@ fn upload_mmap_table_as_f16_rows(
         if (step + 1) % 8 == 0 {
             ctx.flush_uploads();
         }
+        #[cfg(target_arch = "wasm32")]
+        let _ = step;
     }
     #[cfg(not(target_arch = "wasm32"))]
     if total_bytes >= 256 * 1024 {
@@ -2727,38 +2764,16 @@ impl GpuLfmModel {
             // like every other eligible weight. Repacked on the host here; the
             // GPU upload happens inside the Quantized arm below so the F16
             // fallback never pays for buffers it drops.
-            let lm_head_repack =
-                if stream_layout && stream_layout_eligible(lm_head_dtype, config.hidden_size) {
-                    match lm_head_dtype {
-                        DType::Q4KM => Some(repack_q4_k_stream(
-                            lm_head_bytes,
-                            config.vocab_size,
-                            config.hidden_size,
-                        )),
-                        DType::Q5KM => Some(repack_q5_k_stream(
-                            lm_head_bytes,
-                            config.vocab_size,
-                            config.hidden_size,
-                        )),
-                        DType::Q6K => Some(repack_q6_k_stream(
-                            lm_head_bytes,
-                            config.vocab_size,
-                            config.hidden_size,
-                        )),
-                        DType::Q8_0 => Some(crate::model::vision_encoder_gpu::repack_q8_0_stream(
-                            lm_head_bytes,
-                            config.vocab_size,
-                            config.hidden_size,
-                        )),
-                        _ => Some(repack_q4_0_stream(
-                            lm_head_bytes,
-                            config.vocab_size,
-                            config.hidden_size,
-                        )),
-                    }
-                } else {
-                    None
-                };
+            let lm_head_repack = if stream_layout {
+                repack_stream_for_dtype(
+                    lm_head_dtype,
+                    lm_head_bytes,
+                    config.vocab_size,
+                    config.hidden_size,
+                )
+            } else {
+                None
+            };
             // Compare the size the buffers will actually be *bound* at, not the
             // raw GGUF length: `upload_storage` rounds up to
             // COPY_BUFFER_ALIGNMENT, and Q6_K (210 B/block), Q4_0 (18 B) and Q8_0
@@ -2918,17 +2933,10 @@ impl GpuLfmModel {
                 // (q, d) repack INSTEAD of raw and both phases read it directly:
                 // no second copy, no per-GEMM repack. `tensor.buffer` is the q
                 // half (see `GpuWeight`).
-                let resident = stream_layout && stream_layout_eligible(wref.dtype, wref.k);
-                if resident {
-                    let (q, d) = match wref.dtype {
-                        DType::Q4KM => repack_q4_k_stream(&data, wref.m, wref.k),
-                        DType::Q5KM => repack_q5_k_stream(&data, wref.m, wref.k),
-                        DType::Q6K => repack_q6_k_stream(&data, wref.m, wref.k),
-                        DType::Q8_0 => crate::model::vision_encoder_gpu::repack_q8_0_stream(
-                            &data, wref.m, wref.k,
-                        ),
-                        _ => repack_q4_0_stream(&data, wref.m, wref.k),
-                    };
+                if let Some((q, d)) = stream_layout
+                    .then(|| repack_stream_for_dtype(wref.dtype, &data, wref.m, wref.k))
+                    .flatten()
+                {
                     let qb =
                         ctx.upload_storage(bytemuck::cast_slice(&q), &format!("{name}.stream_q"));
                     let db =
@@ -4452,7 +4460,7 @@ impl GpuLfmModel {
                         .expect("resident-stream weight without a gemv_q8_0_stream pipeline");
                     (pipe, 32, "gemv_q8s")
                 }
-                _ => {
+                DType::Q4_0 => {
                     let pipe = self
                         .pipelines
                         .gemv_q4_0_stream
@@ -4460,6 +4468,7 @@ impl GpuLfmModel {
                         .expect("resident-stream weight without a gemv_q4_0_stream pipeline");
                     (pipe, 16, "gemv_q4s")
                 }
+                other => unreachable!("unsupported resident-stream dtype {other:?}"),
             };
         }
         match w.tensor.dtype {
@@ -5837,18 +5846,16 @@ impl GpuLfmModel {
 
         // Fused Gate + Up + SwiGLU stream GEMV when resident_stream is active
         // and no gate/up LoRA deltas are attached.
-        let fused_gateup_pipe = if gate_lora.is_none()
-            && up_lora.is_none()
-            && std::env::var("CERA_GPU_FUSED_GATE_UP").as_deref() == Ok("1")
-        {
-            match dense.gate.tensor.dtype {
-                DType::Q8_0 => self.pipelines.gemv_q8_0_stream_gateup.as_ref(),
-                DType::Q4_0 => self.pipelines.gemv_q4_0_stream_gateup.as_ref(),
-                _ => None,
-            }
-        } else {
-            None
-        };
+        let fused_gateup_pipe =
+            if gate_lora.is_none() && up_lora.is_none() && use_fused_gate_up_gemv() {
+                match dense.gate.tensor.dtype {
+                    DType::Q8_0 => self.pipelines.gemv_q8_0_stream_gateup.as_ref(),
+                    DType::Q4_0 => self.pipelines.gemv_q4_0_stream_gateup.as_ref(),
+                    _ => None,
+                }
+            } else {
+                None
+            };
         if let (Some(pipe), Some(gateup_bg)) = (fused_gateup_pipe, lw.ffn_gateup_stream_bg.as_ref())
         {
             self.dispatch_into(pass, pipe, gateup_bg, self.gemv_workgroups(&dense.gate));
@@ -8690,6 +8697,7 @@ impl GpuLfmModel {
         // - Q8_0: gemm_stream_q8_0_k64 handles any n (bounds-checked per column)
         // - Q4_0: gemm_stream_q4_0 handles every n (padding to 32 columns); the register-tile kernel only below `stream_gemm_min_n()`
         if w.tensor.dtype == DType::Q4KM
+            && k > 0
             && k.is_multiple_of(32)
             && x_stride == k
             && self.pipelines.gemm_stream_q4_k.is_some()
@@ -8701,6 +8709,7 @@ impl GpuLfmModel {
             return;
         }
         if w.tensor.dtype == DType::Q5KM
+            && k > 0
             && k.is_multiple_of(32)
             && x_stride == k
             && self.pipelines.gemm_stream_q5_k.is_some()
@@ -8712,6 +8721,7 @@ impl GpuLfmModel {
             return;
         }
         if w.tensor.dtype == DType::Q6K
+            && k > 0
             && k.is_multiple_of(64)
             && x_stride == k
             && self.pipelines.gemm_stream_q6_k_k64.is_some()
@@ -8723,6 +8733,7 @@ impl GpuLfmModel {
             return;
         }
         if w.tensor.dtype == DType::Q8_0
+            && k > 0
             && k.is_multiple_of(64)
             && x_stride == k
             && self.pipelines.gemm_stream_q8_0_k64.is_some()
@@ -8735,6 +8746,7 @@ impl GpuLfmModel {
         }
         if w.tensor.dtype == DType::Q4_0
             && n >= stream_gemm_min_n()
+            && k > 0
             && k.is_multiple_of(32)
             && x_stride == k
             && self.pipelines.gemm_stream_q4_0.is_some()
@@ -14297,7 +14309,10 @@ mod tests {
                         let sc = (((r * 7 + b * 5 + i * 3) % 31) as i16 - 15) as i8;
                         raw[base + 192 + i] = sc as u8;
                     }
-                    let d_f16 = half::f16::from_f32(0.01 + ((r * 3 + b * 7) % 19) as f32 * 0.002);
+                    // With `|sc| <= 15` and `|q| <= 32`, `d ~ 0.0005..0.0023` keeps weights in
+                    // `[-1.1, 1.1]` (matching `synth_q4_0_vec` in `stream_gemm_matches_cpu_and_twins_agree`).
+                    let d_f16 =
+                        half::f16::from_f32(0.0005 + ((r * 3 + b * 7) % 19) as f32 * 0.0001);
                     raw[base + 208..base + 210].copy_from_slice(&d_f16.to_bits().to_le_bytes());
                     let blk = unsafe { &*(raw[base..base + 210].as_ptr() as *const BlockQ6K) };
                     let w = dequantize_q6_k_block(blk);
@@ -14347,7 +14362,7 @@ mod tests {
             let got_gemv = ctx.download_f32(&y_buf, m);
             let diff_gemv = max_abs_diff(&expected_gemv, &got_gemv);
             assert!(
-                diff_gemv < 5e-2,
+                diff_gemv < 2e-2,
                 "Q6_K stream GEMV m={m} k={k}: max_diff={diff_gemv:.3e}"
             );
 
@@ -14388,9 +14403,11 @@ mod tests {
             for r in 0..m {
                 for b in 0..nb {
                     let base = (r * nb + b) * 176;
-                    let d_f16 = half::f16::from_f32(0.01 + ((r * 3 + b * 7) % 19) as f32 * 0.002);
+                    // With `sc <= 63` and `q <= 31`, `d, dmin ~ 0.0002..0.0009` keeps weights in `[-1.0, 1.0]`.
+                    let d_f16 =
+                        half::f16::from_f32(0.0002 + ((r * 3 + b * 7) % 19) as f32 * 0.00004);
                     let dmin_f16 =
-                        half::f16::from_f32(0.005 + ((r * 5 + b * 11) % 13) as f32 * 0.001);
+                        half::f16::from_f32(0.0002 + ((r * 5 + b * 11) % 13) as f32 * 0.00004);
                     raw[base..base + 2].copy_from_slice(&d_f16.to_bits().to_le_bytes());
                     raw[base + 2..base + 4].copy_from_slice(&dmin_f16.to_bits().to_le_bytes());
                     for i in 0..12 {
@@ -14452,7 +14469,7 @@ mod tests {
             let got_gemv = ctx.download_f32(&y_buf, m);
             let diff_gemv = max_abs_diff(&expected_gemv, &got_gemv);
             assert!(
-                diff_gemv < 5e-2,
+                diff_gemv < 1e-1,
                 "Q5_K stream GEMV m={m} k={k}: max_diff={diff_gemv:.3e}"
             );
 

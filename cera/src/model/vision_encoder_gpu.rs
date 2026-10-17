@@ -909,10 +909,9 @@ pub enum WgpuVitWeight {
 /// Requires `k % 32 == 0`; when `k % 64 == 32`, the trailing 32-element half-slice is zero-padded.
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn repack_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
-    assert_eq!(
-        k % 32,
-        0,
-        "q8_0 streaming repack needs k % 32 == 0, got k={k}"
+    assert!(
+        m > 0 && k > 0 && k.is_multiple_of(32),
+        "q8_0 streaming repack needs m > 0, k > 0, and k % 32 == 0, got m={m}, k={k}"
     );
     let k_pad = k.next_multiple_of(64);
     let blocks_per_row = k / 32;
@@ -948,6 +947,10 @@ pub(crate) fn repack_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, 
 /// LFM2.5-VL-1.6B's `ffn_down` with `k = 4304`).
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn repack_f16_as_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
+    assert!(
+        m > 0 && k > 0,
+        "f16 streaming repack needs m > 0 and k > 0, got m={m}, k={k}"
+    );
     assert_eq!(
         data.len(),
         m * k * 2,
@@ -1585,7 +1588,12 @@ impl VitGpuOps for WgpuVitOps {
         use crate::tensor::DType;
         match w.dtype {
             // Streaming layout when the fp16 kernel is available (k padded to a 64-slice).
-            DType::Q8_0 if self.p_gemm_q8_stream.is_some() && w.cols.is_multiple_of(32) => {
+            DType::Q8_0
+                if self.p_gemm_q8_stream.is_some()
+                    && w.rows > 0
+                    && w.cols > 0
+                    && w.cols.is_multiple_of(32) =>
+            {
                 let (q, d) = repack_q8_0_stream(w.data(), w.rows, w.cols);
                 WgpuVitWeight::QuantStream {
                     q: self
@@ -1596,7 +1604,7 @@ impl VitGpuOps for WgpuVitOps {
                         .upload_storage(bytemuck::cast_slice(&d), "vit_wd_stream"),
                 }
             }
-            DType::F16 if self.p_gemm_q8_stream.is_some() => {
+            DType::F16 if self.p_gemm_q8_stream.is_some() && w.rows > 0 && w.cols > 0 => {
                 let (q, d) = repack_f16_as_q8_0_stream(w.data(), w.rows, w.cols);
                 WgpuVitWeight::QuantStream {
                     q: self
@@ -3472,8 +3480,11 @@ mod tests {
         );
     }
 
-    /// Q8_0 linear weights on wgpu → exercises the `gemm_q8_0` GEMM path
-    /// (packed bytes, no dequant-to-f32 upload).
+    /// Q8_0 linear weights on wgpu → exercises the `gemm_q8_0` / `QuantStream`
+    /// GEMM path (packed bytes, no dequant-to-f32 upload). On Vulkan passthrough
+    /// (`lavapipe` / Adreno), all 14 `k % 32 == 0` linears (including `n_embd = 32`)
+    /// run `transpose_cast_f16` + `gemm_stream_q8_0_k64` (fp16 activations and fp16
+    /// accumulators) against the CPU's int8-activation `Q8Act` reference.
     #[cfg(feature = "gpu")]
     #[test]
     fn test_gpu_encode_image_parity_q8_0() {
@@ -3481,8 +3492,8 @@ mod tests {
         run_parity(
             &WgpuVitOps::new(ctx).expect("build wgpu vit ops"),
             &synth_encoder_quant(Some(DType::Q8_0)),
-            5e-2,
-            2e-2, // f16-GEMM noise scales with magnitude (see run_parity)
+            6e-2,
+            2.5e-2, // fp16-GEMM noise scales with magnitude (see run_parity)
         );
     }
 

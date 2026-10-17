@@ -61,6 +61,14 @@ fn prefill_splits_mul_mat_passes_past_128_tokens() {
     let Some(path) = common::fixture_or_skip(FIXTURE, "gpu-lfm2") else {
         return;
     };
+    // With resident streaming GEMMs covering Q4_K, Q5_K, Q6_K, and Q8_0 on
+    // Vulkan passthrough, every linear in `LFM2.5-230M-Q4_K_M` now dispatches
+    // `gemm_stream_*` by default (which merges safely without splitting). Force
+    // the register-tiled `mul_mat_*` path here so the `mul_mat_*` Adreno pass
+    // split in `emit_prefill_cmds` is still exercised on Vulkan (`lavapipe`).
+    unsafe {
+        std::env::set_var("CERA_WGPU_STREAM_GEMM", "0");
+    }
     let toks = common::prompt_tokens(&path, 129);
 
     let Some((p128, s128)) = prefill_passes(&path, &toks[..128]) else {
