@@ -26,7 +26,7 @@ use crate::model::weights::MmapWeight;
 use crate::session::CeraError;
 use crate::tensor::DType;
 
-pub use crate::backend::hexagon::HexagonWeightFormat;
+use crate::backend::hexagon::HexagonWeightFormat;
 /// The ViT emits one op over all tokens (see `dispatch::TokenTile`); only the
 /// Whisper encoder tiles. Every `dispatch::*` call here passes this constant.
 const VIT_TILE: TokenTile = TokenTile::Whole;
@@ -134,31 +134,61 @@ fn pad_rows_raw(src: &[u8], spec: RowPadSpec) -> Result<Vec<u8>, CeraError> {
         row_bytes,
         rows_pad,
     } = spec;
-    if src.len() < rows * row_bytes || rows_pad < rows {
+    let src_bytes = rows.checked_mul(row_bytes).ok_or_else(|| {
+        CeraError::Backend(format!(
+            "ViT weight byte count overflow for {rows} rows of {row_bytes} bytes"
+        ))
+    })?;
+    let pad_bytes = rows_pad.checked_mul(row_bytes).ok_or_else(|| {
+        CeraError::Backend(format!(
+            "ViT padded weight byte count overflow for {rows_pad} rows of {row_bytes} bytes"
+        ))
+    })?;
+    if src.len() < src_bytes || rows_pad < rows {
         return Err(CeraError::Backend(format!(
             "ViT weight ({} bytes) too short for {rows} rows of {row_bytes} bytes (padded to {rows_pad})",
             src.len()
         )));
     }
-    let mut out = vec![0u8; rows_pad * row_bytes];
-    out[..rows * row_bytes].copy_from_slice(&src[..rows * row_bytes]);
+    let mut out = vec![0u8; pad_bytes];
+    out[..src_bytes].copy_from_slice(&src[..src_bytes]);
     Ok(out)
 }
 
 /// Copy an F16 `[rows, cols]` matrix, zero-padding each row to `cols_pad` columns.
 fn pad_f16_cols(w: &MmapWeight, cols_pad: usize) -> Result<Vec<u8>, CeraError> {
+    if w.dtype != DType::F16 {
+        return Err(CeraError::Backend(format!(
+            "pad_f16_cols requires F16 weight, got {:?}",
+            w.dtype
+        )));
+    }
     let (rows, cols) = (w.rows, w.cols);
     let bytes = w.data();
-    if bytes.len() < rows * cols * 2 || cols_pad < cols {
+    let row_bytes = cols.checked_mul(2).ok_or_else(|| {
+        CeraError::Backend(format!("f16 ViT weight column byte overflow ({cols})"))
+    })?;
+    let src_bytes = rows.checked_mul(row_bytes).ok_or_else(|| {
+        CeraError::Backend(format!("f16 ViT weight byte overflow ({rows}x{cols})"))
+    })?;
+    let pad_row_bytes = cols_pad.checked_mul(2).ok_or_else(|| {
+        CeraError::Backend(format!("f16 ViT padded column byte overflow ({cols_pad})"))
+    })?;
+    let pad_bytes = rows.checked_mul(pad_row_bytes).ok_or_else(|| {
+        CeraError::Backend(format!(
+            "f16 ViT padded weight byte overflow ({rows}x{cols_pad})"
+        ))
+    })?;
+    if bytes.len() < src_bytes || cols_pad < cols {
         return Err(CeraError::Backend(format!(
             "f16 ViT weight {rows}x{cols} ({} bytes) cannot pad to {cols_pad} columns",
             bytes.len()
         )));
     }
-    let mut out = vec![0u8; rows * cols_pad * 2];
+    let mut out = vec![0u8; pad_bytes];
     for r in 0..rows {
-        out[r * cols_pad * 2..r * cols_pad * 2 + cols * 2]
-            .copy_from_slice(&bytes[r * cols * 2..(r + 1) * cols * 2]);
+        out[r * pad_row_bytes..r * pad_row_bytes + row_bytes]
+            .copy_from_slice(&bytes[r * row_bytes..(r + 1) * row_bytes]);
     }
     Ok(out)
 }
@@ -166,17 +196,34 @@ fn pad_f16_cols(w: &MmapWeight, cols_pad: usize) -> Result<Vec<u8>, CeraError> {
 /// Dequantize an F16 `[rows, cols]` matrix, zero-pad each row to `cols_pad` and
 /// quantize it to linear GGUF Q8_0 blocks.
 fn f16_matrix_to_padded_q8_0(w: &MmapWeight, cols_pad: usize) -> Result<Vec<u8>, CeraError> {
+    if w.dtype != DType::F16 {
+        return Err(CeraError::Backend(format!(
+            "f16_matrix_to_padded_q8_0 requires F16 weight, got {:?}",
+            w.dtype
+        )));
+    }
     let (rows, cols) = (w.rows, w.cols);
     let bytes = w.data();
-    if bytes.len() < rows * cols * 2 || cols_pad < cols {
+    let row_bytes = cols.checked_mul(2).ok_or_else(|| {
+        CeraError::Backend(format!("f16 ViT weight column byte overflow ({cols})"))
+    })?;
+    let src_bytes = rows.checked_mul(row_bytes).ok_or_else(|| {
+        CeraError::Backend(format!("f16 ViT weight byte overflow ({rows}x{cols})"))
+    })?;
+    let pad_elems = rows.checked_mul(cols_pad).ok_or_else(|| {
+        CeraError::Backend(format!(
+            "f16 ViT padded element overflow ({rows}x{cols_pad})"
+        ))
+    })?;
+    if bytes.len() < src_bytes || cols_pad < cols {
         return Err(CeraError::Backend(format!(
             "f16 ViT weight too short: {} bytes for {rows}x{cols} (padded to {cols_pad})",
             bytes.len()
         )));
     }
-    let mut vals = vec![0f32; rows * cols_pad];
+    let mut vals = vec![0f32; pad_elems];
     for r in 0..rows {
-        let src = &bytes[r * cols * 2..(r + 1) * cols * 2];
+        let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
         let dst = &mut vals[r * cols_pad..r * cols_pad + cols];
         for (d, &c) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
             *d = crate::quant::f16_to_f32(u16::from_le_bytes(c));
@@ -294,7 +341,9 @@ impl HexagonVitWeightOffsets {
             )?;
             let ffn_up_b_off = plan_vec_f32(&mut cur_off, ffn_pad);
             let ffn_down_w = match (blk.ffn_down_w.dtype, f16_policy) {
-                (DType::F16, VitF16Policy::NativeF16) => {
+                (DType::F16, VitF16Policy::NativeF16)
+                    if blk.ffn_down_w.rows > 0 && blk.ffn_down_w.rows.is_multiple_of(32) =>
+                {
                     let rows = blk.ffn_down_w.rows;
                     let size_bytes = rows * ffn_pad * 2;
                     let off = cur_off;
@@ -307,7 +356,7 @@ impl HexagonVitWeightOffsets {
                         cols: ffn_pad,
                     }
                 }
-                (DType::F16, VitF16Policy::RequantQ8_0) => plan_linear_dims(
+                (DType::F16, _) => plan_linear_dims(
                     &mut cur_off,
                     QuantLinearDims {
                         dtype: DType::Q8_0,
@@ -512,10 +561,15 @@ impl HexagonVisionEncoder {
         weights: &VisionEncoderWeights,
     ) -> Result<Self, CeraError> {
         let cfg = &weights.config;
-        // F16 weights are only read by the HMX matmul; without HMX they are requantized.
+        // F16 weights are only read by the HMX matmul; without HMX (or when rows are not
+        // 32-aligned for HMX tiles) they are requantized.
         let f16_policy = {
             let mut dev = device.lock_or_recover();
-            if vit_hmx(dev.queue_session_mut()).is_some() {
+            let ffn_down_hmx_aligned = weights
+                .blocks
+                .iter()
+                .all(|b| b.ffn_down_w.rows > 0 && b.ffn_down_w.rows.is_multiple_of(32));
+            if vit_hmx(dev.queue_session_mut()).is_some() && ffn_down_hmx_aligned {
                 VitF16Policy::NativeF16
             } else {
                 VitF16Policy::RequantQ8_0
@@ -611,12 +665,12 @@ impl HexagonVisionEncoder {
                 bias.resize(ffn_pad, 0.0);
                 copy_vec_f32(buf_slice, blk_offs.ffn_up_b_off, &bias);
             }
-            match (blk_weights.ffn_down_w.dtype, f16_policy) {
-                (DType::F16, VitF16Policy::NativeF16) => {
+            match (blk_weights.ffn_down_w.dtype, blk_offs.ffn_down_w.format) {
+                (DType::F16, HexagonVitWeightFormat::F16) => {
                     let f16 = pad_f16_cols(&blk_weights.ffn_down_w, blk_offs.ffn_down_w.cols)?;
                     repack_raw(buf_slice, blk_offs.ffn_down_w, &f16)?;
                 }
-                (DType::F16, VitF16Policy::RequantQ8_0) => {
+                (DType::F16, _) => {
                     let q8 = f16_matrix_to_padded_q8_0(&blk_weights.ffn_down_w, ffn_pad)?;
                     repack_raw(buf_slice, blk_offs.ffn_down_w, &q8)?;
                 }
@@ -1504,6 +1558,7 @@ impl HexagonVisionEncoder {
 
         if stop_after_blocks.is_some() {
             if let Some(d) = dump {
+                scratch_guard.invalidate_cpu_cache(0, so.total_bytes);
                 let all: &[f32] = bytemuck::cast_slice(scratch_guard.as_slice());
                 let region = |off: usize, floats: usize| all[off / 4..off / 4 + floats].to_vec();
                 let n = n_patches * n_embd;
@@ -2000,6 +2055,10 @@ mod tests {
         assert_eq!(&out[6..8], &[0, 0]);
         assert_eq!(&out[8..14], &[7, 8, 9, 10, 11, 12]);
         assert_eq!(&out[14..16], &[0, 0]);
+
+        let q8 = MmapWeight::from_owned_bytes(vec![0u8; 34], DType::Q8_0, 1, 32);
+        assert!(pad_f16_cols(&q8, 32).is_err());
+        assert!(f16_matrix_to_padded_q8_0(&q8, 32).is_err());
     }
 
     #[test]
@@ -2025,7 +2084,7 @@ mod tests {
             image_min_pixels: 32 * 32,
             image_max_pixels: 32 * 32,
         };
-        let weights = VisionEncoderWeights {
+        let mut weights = VisionEncoderWeights {
             config: cfg,
             patch_embed: PatchEmbedWeights {
                 conv_w: vec![0.0f32; 3 * 16 * 16 * 64],
@@ -2085,5 +2144,15 @@ mod tests {
         assert_eq!(rblk.ffn_down_w.cols, 128);
         assert_eq!(rblk.ffn_down_w.rows, 64);
         assert_eq!(rblk.ffn_down_w.format, HexagonVitWeightFormat::RepackedQ8_0);
+
+        // If `ffn_down_w.rows` is not a multiple of 32 (e.g. 48), NativeF16 falls back to RepackedQ8_0.
+        weights.blocks[0].ffn_down_w =
+            MmapWeight::from_owned_bytes(vec![0u8; 48 * 112 * 2], DType::F16, 48, 112);
+        let unaligned_rows = HexagonVitWeightOffsets::plan_with(&weights, VitF16Policy::NativeF16)
+            .expect("unaligned rows fallback plan");
+        assert_eq!(
+            unaligned_rows.blocks[0].ffn_down_w.format,
+            HexagonVitWeightFormat::RepackedQ8_0
+        );
     }
 }

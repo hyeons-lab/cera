@@ -1521,7 +1521,9 @@ pub fn mm_is_hmx_eligible(wtype: HtpDataType, k: usize, n: usize, m: usize) -> b
             | HtpDataType::Q4K
             | HtpDataType::Q6K
             | HtpDataType::F16
-    ) && k.is_multiple_of(HMX_TILE)
+    ) && k > 0
+        && n > 0
+        && k.is_multiple_of(HMX_TILE)
         && n.is_multiple_of(HMX_TILE)
         && m >= HMX_MM_MIN_NROWS
 }
