@@ -1124,31 +1124,33 @@ impl Q8Act {
     /// `y[tokens][rows] = x · wᵀ` from the activations last quantized. Returns `false` (and leaves
     /// `y` untouched) when this weight or host cannot take the int8 path.
     fn matmul(&mut self, w: &MmapWeight, y: &mut [f32]) -> bool {
-        if !self.enabled || w.cols != self.dim || self.n == 0 {
+        if !self.enabled || self.dim == 0 || w.rows == 0 || w.cols != self.dim || self.n == 0 {
             return false;
         }
         let (rows, n, dim) = (w.rows, self.n, self.dim);
-        let dim_pad = dim.next_multiple_of(32);
         debug_assert_eq!(y.len(), rows * n);
         // Repacked smmla kernel (i8mm hosts): 8 weight rows by 4 tokens per tile, written straight
         // into `y` row-major, so there is no transpose pass either.
         #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
-        if matches!(
-            w.dtype,
-            crate::tensor::DType::Q8_0 | crate::tensor::DType::F16
-        ) && let Some((packed, scales)) = w.smmla_repacked()
-            && crate::backend::cpu::gemm_preq_repacked_q8_0_smmla_rowmajor_dispatch(
-                packed,
-                scales,
-                &self.scales[..n * (dim_pad / 32)],
-                &self.quants[..n * dim_pad],
-                y,
-                n,
-                rows,
-                dim_pad,
-            )
         {
-            return true;
+            let dim_pad = dim.next_multiple_of(32);
+            if matches!(
+                w.dtype,
+                crate::tensor::DType::Q8_0 | crate::tensor::DType::F16
+            ) && let Some((packed, scales)) = w.smmla_repacked()
+                && crate::backend::cpu::gemm_preq_repacked_q8_0_smmla_rowmajor_dispatch(
+                    packed,
+                    scales,
+                    &self.scales[..n * (dim_pad / 32)],
+                    &self.quants[..n * dim_pad],
+                    y,
+                    n,
+                    rows,
+                    dim_pad,
+                )
+            {
+                return true;
+            }
         }
         if w.dtype != crate::tensor::DType::Q8_0 || !dim.is_multiple_of(32) {
             return false;

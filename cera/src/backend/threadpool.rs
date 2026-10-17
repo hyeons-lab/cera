@@ -1416,7 +1416,7 @@ impl RowPool {
                 // caller pin to this thread and widen the previous owner's mask back to
                 // all pinned cores so it does not squat on the prime core.
                 #[cfg(any(target_os = "linux", target_os = "android"))]
-                if idle_guard(self).is_some() {
+                if let Some(_idle) = idle_guard(self) {
                     let my_tid = unsafe { libc::gettid() } as i64;
                     let old_owner = CALLER_PIN_OWNER.load(Ordering::Acquire);
                     if old_owner > 0

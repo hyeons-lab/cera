@@ -3066,7 +3066,8 @@ impl Session {
         }
 
         let mut reserved = total_text_tokens;
-        let mut rows = Vec::new();
+        let text_floats: usize = embedded_text.iter().map(Vec::len).sum();
+        let mut rows = Vec::with_capacity(text_floats);
         let mut n_rows = 0usize;
         let mut text_ids = Vec::with_capacity(total_text_tokens);
         let mut text_iter = embedded_text.into_iter();

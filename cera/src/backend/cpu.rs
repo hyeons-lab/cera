@@ -1582,12 +1582,12 @@ pub(crate) fn repack_q4_0_smmla_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>,
 #[cfg_attr(has_blas, allow(dead_code))]
 pub(crate) fn repack_q8_0_smmla_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
     assert!(
-        m.is_multiple_of(8),
-        "repack_q8_0_smmla_8x8: m must be a multiple of 8"
+        m > 0 && m.is_multiple_of(8),
+        "repack_q8_0_smmla_8x8: m must be a positive multiple of 8"
     );
     assert!(
-        k.is_multiple_of(32),
-        "repack_q8_0_smmla_8x8: k must be a multiple of 32"
+        k > 0 && k.is_multiple_of(32),
+        "repack_q8_0_smmla_8x8: k must be a positive multiple of 32"
     );
     let nb = k / 32;
     let bsz = size_of::<crate::quant::BlockQ8_0>();
@@ -1727,12 +1727,12 @@ pub fn q4_0_dec4_supported(m: usize, k: usize) -> bool {
 #[cfg_attr(has_blas, allow(dead_code))]
 pub fn repack_q4_0_dec4(src: &[u8], m: usize, k: usize) -> Vec<u8> {
     assert!(
-        m.is_multiple_of(4),
-        "repack_q4_0_dec4: m must be a multiple of 4"
+        m > 0 && m.is_multiple_of(4),
+        "repack_q4_0_dec4: m must be a positive multiple of 4"
     );
     assert!(
-        k.is_multiple_of(32),
-        "repack_q4_0_dec4: k must be a multiple of 32"
+        k > 0 && k.is_multiple_of(32),
+        "repack_q4_0_dec4: k must be a positive multiple of 32"
     );
     let nb = k / 32;
     let bsz = size_of::<crate::quant::BlockQ4_0>();
@@ -1830,6 +1830,9 @@ pub(crate) fn repack_q4_0_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f
 /// the standard kernel — correctness is identical, only prefill is slower.
 #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
 pub(crate) fn q4_0_repack_supported(m: usize, k: usize) -> bool {
+    if m == 0 || k == 0 {
+        return false;
+    }
     #[cfg(target_arch = "aarch64")]
     return m.is_multiple_of(16) && k.is_multiple_of(32);
     #[cfg(target_arch = "x86_64")]
@@ -3057,6 +3060,9 @@ pub(crate) fn repack_q6_k_smmla_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>,
 /// super-blocks (`k % 256 == 0`).
 #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
 pub(crate) fn q4_k_repack_supported(m: usize, k: usize) -> bool {
+    if m == 0 || k == 0 {
+        return false;
+    }
     #[cfg(target_arch = "aarch64")]
     return m.is_multiple_of(8)
         && k.is_multiple_of(256)
@@ -3071,7 +3077,9 @@ pub(crate) fn q4_k_repack_supported(m: usize, k: usize) -> bool {
 pub(crate) fn q6_k_repack_supported(m: usize, k: usize) -> bool {
     let _ = (m, k);
     #[cfg(target_arch = "aarch64")]
-    return m.is_multiple_of(8)
+    return m > 0
+        && k > 0
+        && m.is_multiple_of(8)
         && k.is_multiple_of(256)
         && crate::backend::simd::neon::k_quant_gemm_available();
     #[cfg(target_arch = "x86_64")]
@@ -4161,6 +4169,7 @@ pub fn gemv_q4_0_dec4_with_q8(
 ) {
     let nb = k / 32;
     if k == 0
+        || m == 0
         || !k.is_multiple_of(32)
         || !m.is_multiple_of(16)
         || packed.len() < m / 4 * nb * Q4_0_DEC4_RECORD
@@ -4201,6 +4210,7 @@ pub fn gemv_q4_0_dec4_gate_up_swiglu_with_q8(
 ) {
     let nb = k / 32;
     if k == 0
+        || m == 0
         || !k.is_multiple_of(32)
         || !m.is_multiple_of(16)
         || gate.len() < m / 4 * nb * Q4_0_DEC4_RECORD
@@ -4249,6 +4259,9 @@ pub fn gemv_q4_0_dec4_concat3_with_q8(
 ) {
     let nb = k / 32;
     if k == 0
+        || m1 == 0
+        || m2 == 0
+        || m3 == 0
         || !k.is_multiple_of(32)
         || !(m1.is_multiple_of(16) && m2.is_multiple_of(16) && m3.is_multiple_of(16))
         || a1.len() < m1 / 4 * nb * Q4_0_DEC4_RECORD
@@ -4311,6 +4324,9 @@ pub fn gemv_q4_0_smmla_concat3_with_q8(
     }
     let nb = k / 32;
     if k == 0
+        || m1 == 0
+        || m2 == 0
+        || m3 == 0
         || !k.is_multiple_of(32)
         || !(m1.is_multiple_of(8) && m2.is_multiple_of(8) && m3.is_multiple_of(8))
         || p1.len() < (m1 / 8) * nb * 256
@@ -11288,6 +11304,64 @@ mod tests {
                 t.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 "concat3 third matrix"
             );
+        }
+
+        /// The fused 3-matrix smmla GEMV (`gemv_q4_0_smmla_concat3_with_q8`) must match three
+        /// separate single-token `gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch` calls bit for
+        /// bit across asymmetric row counts and decline invalid dimensions cleanly.
+        #[test]
+        fn smmla_concat3_matches_repacked_rowmajor_gemm_at_n1() {
+            if crate::backend::cpu_features::cpu_features().tier
+                != crate::backend::cpu_features::CpuTier::NeonI8mm
+            {
+                return;
+            }
+            let (m1, m2, m3, k) = (48usize, 24usize, 16usize, 1024usize);
+            let mut st = 0x5aa1_a333u64;
+            let (p1, s1) = repack_q8_0_smmla_8x8(&weights(DType::Q8_0, m1, k, &mut st), m1, k);
+            let (p2, s2) = repack_q8_0_smmla_8x8(&weights(DType::Q8_0, m2, k, &mut st), m2, k);
+            let (p3, s3) = repack_q8_0_smmla_8x8(&weights(DType::Q8_0, m3, k, &mut st), m3, k);
+            let (bs, bq) = quantized_cols(k, 1, &mut st);
+
+            let (mut y1, mut y2, mut y3) = (vec![0.0f32; m1], vec![0.0f32; m2], vec![0.0f32; m3]);
+            assert!(gemv_q4_0_smmla_concat3_with_q8(
+                &p1, &s1, &p2, &s2, &p3, &s3, &bs, &bq, &mut y1, &mut y2, &mut y3, m1, m2, m3, k,
+            ));
+
+            let single = |p: &[u8], s: &[f32], rows: usize| {
+                let mut out = vec![0.0f32; rows];
+                assert!(gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
+                    p, s, &bs, &bq, &mut out, 1, rows, k,
+                ));
+                out
+            };
+            let (w1, w2, w3) = (
+                single(&p1, &s1, m1),
+                single(&p2, &s2, m2),
+                single(&p3, &s3, m3),
+            );
+            assert_eq!(
+                y1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                w1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "smmla concat3 matrix 1"
+            );
+            assert_eq!(
+                y2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                w2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "smmla concat3 matrix 2"
+            );
+            assert_eq!(
+                y3.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                w3.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "smmla concat3 matrix 3"
+            );
+
+            assert!(!gemv_q4_0_smmla_concat3_with_q8(
+                &p1, &s1, &p2, &s2, &p3, &s3, &bs, &bq, &mut y1, &mut y2, &mut y3, 0, m2, m3, k,
+            ));
+            assert!(!gemv_q4_0_smmla_concat3_with_q8(
+                &p1, &s1, &p2, &s2, &p3, &s3, &bs, &bq, &mut y1, &mut y2, &mut y3, 7, m2, m3, k,
+            ));
         }
 
         /// Against the standard-layout decode GEMV the results differ only by float summation order.

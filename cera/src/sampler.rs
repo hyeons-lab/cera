@@ -159,6 +159,8 @@ impl Sampler {
         self.sample_dense_after_penalty(logits)
     }
 
+    const MAX_FAST_K: usize = 256;
+
     /// Sample a token while leaving `logits` bit-for-bit unchanged upon return.
     /// Avoids copying `logits` into `scratch` when the fast `top_k` candidate
     /// path succeeds.
@@ -169,6 +171,13 @@ impl Sampler {
             || self.config.top_k == 1
         {
             return argmax(logits);
+        }
+
+        let k = self.config.top_k;
+        if k == 0 || k > Self::MAX_FAST_K || k >= logits.len() {
+            scratch.clear();
+            scratch.extend_from_slice(logits);
+            return self.sample(scratch);
         }
 
         let mut saved: Vec<(usize, f32)> = Vec::new();
@@ -238,9 +247,8 @@ impl Sampler {
     }
 
     fn sample_top_k_fast(&mut self, logits: &[f32]) -> Option<u32> {
-        const MAX_FAST_K: usize = 256;
         let k = self.config.top_k;
-        if k == 0 || k > MAX_FAST_K || k >= logits.len() {
+        if k == 0 || k > Self::MAX_FAST_K || k >= logits.len() {
             return None;
         }
 
@@ -249,7 +257,7 @@ impl Sampler {
             return None;
         }
 
-        let mut top_vals = [f32::NEG_INFINITY; MAX_FAST_K];
+        let mut top_vals = [f32::NEG_INFINITY; Self::MAX_FAST_K];
         let mut min_pos = 0usize;
         let mut min_val = f32::INFINITY;
         for (i, &raw) in logits[..k].iter().enumerate() {
@@ -292,7 +300,7 @@ impl Sampler {
         for (idx, &raw) in logits.iter().enumerate() {
             let v = raw * inv_temp;
             if v >= threshold {
-                if !v.is_finite() || candidates.len() >= MAX_FAST_K {
+                if !v.is_finite() || candidates.len() >= Self::MAX_FAST_K {
                     return None;
                 }
                 candidates.push((idx, v));
@@ -367,17 +375,22 @@ impl Sampler {
         }
 
         let r: f32 = self.rng.r#gen();
-        if r <= 0.0 {
-            return Some(0);
-        }
+        Some(Self::select_candidate_by_draw(&candidates, r))
+    }
+
+    fn select_candidate_by_draw(candidates: &[(usize, f32)], r: f32) -> u32 {
         let mut cumsum = 0.0f32;
-        for &(idx, p) in &candidates {
-            cumsum += p;
-            if cumsum >= r {
-                return Some(idx as u32);
+        let mut last_idx = candidates.first().map_or(0, |&(idx, _)| idx as u32);
+        for &(idx, p) in candidates {
+            if p > 0.0 {
+                last_idx = idx as u32;
+                cumsum += p;
+                if cumsum >= r {
+                    return idx as u32;
+                }
             }
         }
-        Some((logits.len() - 1) as u32)
+        last_idx
     }
 
     /// Whether the repetition penalty is in effect: finite, positive, and not
@@ -485,18 +498,26 @@ impl Sampler {
     }
 
     fn weighted_sample(&mut self, probs: &[f32]) -> u32 {
+        let r: f32 = self.rng.r#gen();
+        Self::select_dense_by_draw(probs, r)
+    }
+
+    fn select_dense_by_draw(probs: &[f32], r: f32) -> u32 {
         if probs.is_empty() {
             return 0;
         }
-        let r: f32 = self.rng.r#gen();
         let mut cumsum = 0.0f32;
+        let mut last_idx = (probs.len() - 1) as u32;
         for (i, &p) in probs.iter().enumerate() {
-            cumsum += p;
-            if cumsum >= r {
-                return i as u32;
+            if p > 0.0 {
+                last_idx = i as u32;
+                cumsum += p;
+                if cumsum >= r {
+                    return i as u32;
+                }
             }
         }
-        (probs.len() - 1) as u32
+        last_idx
     }
 }
 
@@ -750,5 +771,24 @@ mod tests {
                 );
             }
         }
+    }
+
+    #[test]
+    fn boundary_draws_never_pick_excluded_tokens() {
+        // Tokens 0 and 3 are excluded (p == 0.0); only tokens 1 and 2 survive.
+        let candidates = [(1usize, 0.4999999f32), (2usize, 0.4999999f32)];
+        let dense = [0.0f32, 0.4999999f32, 0.4999999f32, 0.0f32];
+
+        // At r = 0.0, both paths must pick the first positive-probability candidate (1), not 0.
+        assert_eq!(Sampler::select_candidate_by_draw(&candidates, 0.0), 1);
+        assert_eq!(Sampler::select_dense_by_draw(&dense, 0.0), 1);
+
+        // When float roundoff leaves cumsum slightly below r, both paths must fall back
+        // to the last positive-probability candidate (2), not vocab_len - 1 (3).
+        assert_eq!(
+            Sampler::select_candidate_by_draw(&candidates, 0.99999994),
+            2
+        );
+        assert_eq!(Sampler::select_dense_by_draw(&dense, 0.99999994), 2);
     }
 }
