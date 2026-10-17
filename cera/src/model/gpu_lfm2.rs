@@ -272,11 +272,35 @@ fn use_stream_layout(ctx: &GpuContext) -> bool {
 }
 
 /// Whether one weight qualifies for the resident stream layout: Q4_0 with
-/// `k % 32 == 0` or Q4_K_M with `k % 256 == 0`. Ineligible weights upload
-/// raw and ride the raw kernels in both phases.
+/// `k % 32 == 0`, Q8_0 with `k % 64 == 0`, or Q4_K_M / Q5_K_M / Q6_K with
+/// `k % 256 == 0`. Ineligible weights upload raw and ride the raw kernels in
+/// both phases.
 fn stream_layout_eligible(dtype: DType, k: usize) -> bool {
-    (dtype == DType::Q4_0 && k.is_multiple_of(32))
-        || (dtype == DType::Q4KM && k.is_multiple_of(256))
+    k > 0
+        && ((dtype == DType::Q4_0 && k.is_multiple_of(32))
+            || (dtype == DType::Q8_0 && k.is_multiple_of(64))
+            || (matches!(dtype, DType::Q4KM | DType::Q5KM | DType::Q6K) && k.is_multiple_of(256)))
+}
+
+/// Repack a stream-eligible weight (`data` of shape `[m, k]`) into its `(q, d)`
+/// resident stream buffers, or return `None` if `dtype` / `k` is not stream-eligible.
+fn repack_stream_for_dtype(
+    dtype: DType,
+    data: &[u8],
+    m: usize,
+    k: usize,
+) -> Option<(Vec<u32>, Vec<u32>)> {
+    if !stream_layout_eligible(dtype, k) {
+        return None;
+    }
+    Some(match dtype {
+        DType::Q4_0 => repack_q4_0_stream(data, m, k),
+        DType::Q4KM => repack_q4_k_stream(data, m, k),
+        DType::Q5KM => repack_q5_k_stream(data, m, k),
+        DType::Q6K => repack_q6_k_stream(data, m, k),
+        DType::Q8_0 => crate::model::vision_encoder_gpu::repack_q8_0_stream(data, m, k),
+        _ => return None,
+    })
 }
 
 /// Smallest batch routed to the streaming Q4_0 GEMM (`CERA_WGPU_STREAM_MIN_N`, default 1: every batch).
@@ -388,6 +412,19 @@ fn use_fused_gate_up() -> bool {
             !std::env::var("CERA_WGPU_FUSE_GATE_UP")
                 .is_ok_and(|v| matches!(v.as_str(), "0" | "false" | "off"))
         })
+    };
+    enabled
+}
+
+/// Whether single-token decode fuses the FFN's gate, up, and SwiGLU projections into one
+/// resident-stream GEMV (`CERA_GPU_FUSED_GATE_UP=1`).
+fn use_fused_gate_up_gemv() -> bool {
+    #[cfg(test)]
+    let enabled = std::env::var("CERA_GPU_FUSED_GATE_UP").as_deref() == Ok("1");
+    #[cfg(not(test))]
+    let enabled = {
+        static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        *ENABLED.get_or_init(|| std::env::var("CERA_GPU_FUSED_GATE_UP").as_deref() == Ok("1"))
     };
     enabled
 }
@@ -539,6 +576,142 @@ fn repack_q4_k_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
                     }
                     q[(kb0 * 4 + p) * m + row] = v0;
                     q[(kb1 * 4 + p) * m + row] = v1;
+                }
+            }
+        }
+    }
+    (q, d)
+}
+
+/// Repack Q6_K weights from GGUF super-block order into the resident stream layout:
+/// - `q[(k/4)*m]`: 4 signed 6-bit integers (`[-32, 31]`) packed as little-endian `i8` bytes per `u32`,
+///   row-consecutive (`q[(b*8 + w)*m + row]`)
+/// - `d[(k/32)*m]`: paired `f16` scales for the two 16-element sub-blocks of 32-element block `b`
+///   (`half(d * sc[2*b]) | (half(d * sc[2*b + 1]) << 16)`), row-consecutive (`d[b*m + row]`).
+fn repack_q6_k_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
+    assert_eq!(k % 256, 0, "streaming repack needs k % 256 == 0, got k={k}");
+    let blocks_256 = k / 256;
+    let block_size = 210usize; // BlockQ6K
+    debug_assert_eq!(data.len(), m * blocks_256 * block_size);
+
+    let mut q = vec![0u32; m * (k / 4)];
+    let mut d = vec![0u32; m * (k / 32)];
+
+    for row in 0..m {
+        for b in 0..blocks_256 {
+            let base = (row * blocks_256 + b) * block_size;
+            let block_bytes = &data[base..base + block_size];
+            let ql = &block_bytes[0..128];
+            let qh = &block_bytes[128..192];
+            let sc = &block_bytes[192..208];
+            let d_val =
+                half::f16::from_bits(u16::from_le_bytes([block_bytes[208], block_bytes[209]]))
+                    .to_f32();
+
+            let mut quants = [0i8; 256];
+            for n in 0..2 {
+                let y_off = n * 128;
+                let ql_off = n * 64;
+                let qh_off = n * 32;
+                for l in 0..32 {
+                    let q1 = ((ql[ql_off + l] & 0xF) | ((qh[qh_off + l] & 3) << 4)) as i8 - 32;
+                    let q2 = ((ql[ql_off + l + 32] & 0xF) | (((qh[qh_off + l] >> 2) & 3) << 4))
+                        as i8
+                        - 32;
+                    let q3 =
+                        ((ql[ql_off + l] >> 4) | (((qh[qh_off + l] >> 4) & 3) << 4)) as i8 - 32;
+                    let q4 = ((ql[ql_off + l + 32] >> 4) | (((qh[qh_off + l] >> 6) & 3) << 4))
+                        as i8
+                        - 32;
+                    quants[y_off + l] = q1;
+                    quants[y_off + l + 32] = q2;
+                    quants[y_off + l + 64] = q3;
+                    quants[y_off + l + 96] = q4;
+                }
+            }
+
+            for sub32 in 0..8 {
+                let kb = b * 8 + sub32;
+                let sc_lo = d_val * (sc[2 * sub32] as i8 as f32);
+                let sc_hi = d_val * (sc[2 * sub32 + 1] as i8 as f32);
+                let lo_bits = half::f16::from_f32(sc_lo).to_bits() as u32;
+                let hi_bits = half::f16::from_f32(sc_hi).to_bits() as u32;
+                d[kb * m + row] = lo_bits | (hi_bits << 16);
+                for w in 0..8 {
+                    let base_q = sub32 * 32 + w * 4;
+                    q[(kb * 8 + w) * m + row] = u32::from_le_bytes([
+                        quants[base_q] as u8,
+                        quants[base_q + 1] as u8,
+                        quants[base_q + 2] as u8,
+                        quants[base_q + 3] as u8,
+                    ]);
+                }
+            }
+        }
+    }
+    (q, d)
+}
+
+/// Repack Q5_K weights from GGUF super-block order into the resident stream layout:
+/// - `q[(k/4)*m]`: 4 unsigned 5-bit integers (`0..31`) packed as little-endian bytes per `u32`,
+///   row-consecutive (`q[(b*8 + w)*m + row]`)
+/// - `d[(k/32)*m]`: 1 `u32` per 32-element sub-block holding `half(scale) | (half(min) << 16)`,
+///   row-consecutive (`d[b*m + row]`).
+fn repack_q5_k_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
+    assert_eq!(k % 256, 0, "streaming repack needs k % 256 == 0, got k={k}");
+    let blocks_256 = k / 256;
+    let block_size = 176usize; // BlockQ5K
+    debug_assert_eq!(data.len(), m * blocks_256 * block_size);
+
+    let mut q = vec![0u32; m * (k / 4)];
+    let mut d = vec![0u32; m * (k / 32)];
+
+    for row in 0..m {
+        for b in 0..blocks_256 {
+            let base = (row * blocks_256 + b) * block_size;
+            let block_bytes = &data[base..base + block_size];
+            let d_val =
+                half::f16::from_bits(u16::from_le_bytes([block_bytes[0], block_bytes[1]])).to_f32();
+            let dmin_val =
+                half::f16::from_bits(u16::from_le_bytes([block_bytes[2], block_bytes[3]])).to_f32();
+
+            let mut scales = [0u8; 12];
+            scales.copy_from_slice(&block_bytes[4..16]);
+            let (sc, mn) = crate::quant::decode_q4km_scales(&scales);
+            let qh = &block_bytes[16..48]; // 32 bytes
+            let ql = &block_bytes[48..176]; // 128 bytes
+
+            for j in 0..4 {
+                let u1 = 1u8 << (2 * j);
+                let u2 = 2u8 << (2 * j);
+
+                let kb0 = b * 8 + 2 * j;
+                let sc0 = d_val * sc[2 * j] as f32;
+                let mn0 = dmin_val * mn[2 * j] as f32;
+                let sc0_f16 = half::f16::from_f32(sc0).to_bits() as u32;
+                let mn0_f16 = half::f16::from_f32(mn0).to_bits() as u32;
+                d[kb0 * m + row] = sc0_f16 | (mn0_f16 << 16);
+
+                let kb1 = b * 8 + 2 * j + 1;
+                let sc1 = d_val * sc[2 * j + 1] as f32;
+                let mn1 = dmin_val * mn[2 * j + 1] as f32;
+                let sc1_f16 = half::f16::from_f32(sc1).to_bits() as u32;
+                let mn1_f16 = half::f16::from_f32(mn1).to_bits() as u32;
+                d[kb1 * m + row] = sc1_f16 | (mn1_f16 << 16);
+
+                for w in 0..8 {
+                    let mut bytes0 = [0u8; 4];
+                    let mut bytes1 = [0u8; 4];
+                    for t in 0..4 {
+                        let l = w * 4 + t;
+                        let q_byte = ql[j * 32 + l];
+                        let hi0 = if (qh[l] & u1) != 0 { 16u8 } else { 0u8 };
+                        let hi1 = if (qh[l] & u2) != 0 { 16u8 } else { 0u8 };
+                        bytes0[t] = (q_byte & 0x0F) | hi0;
+                        bytes1[t] = (q_byte >> 4) | hi1;
+                    }
+                    q[(kb0 * 8 + w) * m + row] = u32::from_le_bytes(bytes0);
+                    q[(kb1 * 8 + w) * m + row] = u32::from_le_bytes(bytes1);
                 }
             }
         }
@@ -857,10 +1030,15 @@ fn upload_mmap_table_as_f16_rows(
     );
     let vocab = rows as u64;
     let hs = table.cols as u64;
-    let buf = ctx.create_storage_rw(vocab * hs * 2, label);
+    let total_bytes = vocab * hs * 2;
+    #[cfg(not(target_arch = "wasm32"))]
+    if total_bytes >= 256 * 1024 {
+        ctx.flush_uploads();
+    }
+    let buf = ctx.create_storage_rw(total_bytes, label);
     let mut row = vec![0.0f32; table.cols];
     let mut chunk: Vec<f16> = Vec::with_capacity(ROWS_PER_WRITE * table.cols);
-    for start in (0..rows).step_by(ROWS_PER_WRITE) {
+    for (step, start) in (0..rows).step_by(ROWS_PER_WRITE).enumerate() {
         chunk.clear();
         for r in start..(start + ROWS_PER_WRITE).min(rows) {
             table.dequantize_row(r, &mut row);
@@ -868,6 +1046,16 @@ fn upload_mmap_table_as_f16_rows(
         }
         ctx.queue
             .write_buffer(&buf, start as u64 * hs * 2, bytemuck::cast_slice(&chunk));
+        #[cfg(not(target_arch = "wasm32"))]
+        if (step + 1) % 8 == 0 {
+            ctx.flush_uploads();
+        }
+        #[cfg(target_arch = "wasm32")]
+        let _ = step;
+    }
+    #[cfg(not(target_arch = "wasm32"))]
+    if total_bytes >= 256 * 1024 {
+        ctx.flush_uploads();
     }
     buf
 }
@@ -1285,6 +1473,7 @@ struct GpuLayerWeights {
     attn_out_add_bg: Option<wgpu::BindGroup>,
     silu_bg: Option<wgpu::BindGroup>,
     ffn_swiglu_bg: Option<wgpu::BindGroup>,
+    ffn_gateup_stream_bg: Option<wgpu::BindGroup>,
     attn_bg: Option<wgpu::BindGroup>,
     /// The split-K attention's group for this layer's KV slabs (`None` where `attn_bg` is, or when the
     /// split kernel is off).
@@ -1623,16 +1812,29 @@ struct GpuPipelines {
     /// Q4_0 decode GEMV over the resident stream layout. `None` unless
     /// `use_stream_layout` (passthrough-only; SPIR-V has no WGSL twin).
     gemv_q4_0_stream: Option<wgpu::ComputePipeline>,
+    /// Fused Q4_0 Gate+Up+SwiGLU decode GEMV over the resident stream layout.
+    gemv_q4_0_stream_gateup: Option<wgpu::ComputePipeline>,
     gemv_q4_k: wgpu::ComputePipeline,
     /// Q4_K decode GEMV over the resident stream layout. None unless
     /// `use_stream_layout` (passthrough-only; SPIR-V has no WGSL twin).
     gemv_q4_k_stream: Option<wgpu::ComputePipeline>,
     gemv_q5_k: wgpu::ComputePipeline,
+    /// Q5_K decode GEMV over the resident stream layout. None unless
+    /// `use_stream_layout` (passthrough-only; SPIR-V has no WGSL twin).
+    gemv_q5_k_stream: Option<wgpu::ComputePipeline>,
     gemv_q6_k: wgpu::ComputePipeline,
     /// Q6_K decode GEMV over the flat-planes LM-head twin. `None` unless
     /// `use_flat_q6k` (passthrough-only; SPIR-V has no WGSL twin).
     gemv_q6_k_flat: Option<wgpu::ComputePipeline>,
+    /// Q6_K decode GEMV over the resident stream layout. None unless
+    /// `use_stream_layout` (passthrough-only; SPIR-V has no WGSL twin).
+    gemv_q6_k_stream: Option<wgpu::ComputePipeline>,
     gemv_q8_0: wgpu::ComputePipeline,
+    /// Q8_0 decode GEMV over the resident stream layout. None unless
+    /// `use_stream_layout` (passthrough-only; SPIR-V has no WGSL twin).
+    gemv_q8_0_stream: Option<wgpu::ComputePipeline>,
+    /// Fused Q8_0 Gate+Up+SwiGLU decode GEMV over the resident stream layout.
+    gemv_q8_0_stream_gateup: Option<wgpu::ComputePipeline>,
     add_inplace: wgpu::ComputePipeline,
     /// Residual add with a scalar on the addend (`a += s*b`). Used for the
     /// attention/FFN residual adds so Granite's residual multiplier folds in;
@@ -1708,6 +1910,12 @@ struct GpuPipelines {
     gemm_stream_q4_0_k64_gateup: Option<wgpu::ComputePipeline>,
     /// Streaming fp16 Q4_K prefill GEMM. None unless `use_stream_layout`.
     gemm_stream_q4_k: Option<wgpu::ComputePipeline>,
+    /// Streaming fp16 Q5_K prefill GEMM. None unless `use_stream_layout`.
+    gemm_stream_q5_k: Option<wgpu::ComputePipeline>,
+    /// Streaming fp16 Q6_K prefill GEMM (k-slice-64). None unless `use_stream_layout`.
+    gemm_stream_q6_k_k64: Option<wgpu::ComputePipeline>,
+    /// Streaming fp16 Q8_0 prefill GEMM (k-slice-64). None unless `use_stream_layout`.
+    gemm_stream_q8_0_k64: Option<wgpu::ComputePipeline>,
     /// Transpose + f32->f16 cast feeding the streaming GEMM's B16 scratch.
     /// Same `None`-unless-streaming convention as `gemm_stream_q4_0`.
     transpose_cast_f16: Option<wgpu::ComputePipeline>,
@@ -1973,6 +2181,10 @@ pub struct GpuLfmModel {
     kv_shift_scratch: wgpu::Buffer,
     attn_out_buf: wgpu::Buffer, // [hidden_size]
     logits_buf: wgpu::Buffer,   // [vocab_size]
+    /// `vocab_size * 4`-byte `MAP_READ` sink that `logits_buf` is copied into inside
+    /// the decode step's single submission when full-logits readback (`TailArgmax::StageLogits`)
+    /// is requested, avoiding a second encoder and submit in `forward_inner`.
+    logits_readback_buf: wgpu::Buffer,
     /// 4 bytes — receives argmax(logits) as a single u32. Cached so
     /// `forward_greedy` doesn't allocate per call. The `download_u32`
     /// readback over this 4-byte buffer is the wasm-async-friendly
@@ -1992,6 +2204,8 @@ pub struct GpuLfmModel {
     /// Cached bind group for the argmax kernel — bindings never change
     /// (logits_buf, argmax_out_buf, argmax_params), so build it once.
     argmax_bg: wgpu::BindGroup,
+    /// Cached bind group for `encode_rmsnorm_into` over `(hidden_buf, output_norm, rmsnorm_hs_params)`.
+    output_norm_bg: wgpu::BindGroup,
     // Pre-allocated shader params (avoids upload_storage per dispatch).
     rmsnorm_hs_params: wgpu::Buffer,     // [hs, eps_bits, 0, 0]
     elementwise_hs_params: wgpu::Buffer, // [hs, 0]
@@ -2182,8 +2396,10 @@ enum HiddenSeed<'a> {
 /// from staging as well.
 #[derive(Clone, Copy, PartialEq, Eq)]
 enum TailArgmax {
-    /// Nothing — the caller wants the full logits buffer.
+    /// Nothing: the caller leaves logits in `logits_buf` on the GPU.
     None,
+    /// Stage the full `logits_buf` row into `logits_readback_buf` in the same submission.
+    StageLogits,
     /// Argmax dispatch only.
     Dispatch,
     /// Argmax dispatch plus the copy that stages its result for readback.
@@ -2548,24 +2764,16 @@ impl GpuLfmModel {
             // like every other eligible weight. Repacked on the host here; the
             // GPU upload happens inside the Quantized arm below so the F16
             // fallback never pays for buffers it drops.
-            let lm_head_repack =
-                if stream_layout && stream_layout_eligible(lm_head_dtype, config.hidden_size) {
-                    if lm_head_dtype == DType::Q4KM {
-                        Some(repack_q4_k_stream(
-                            lm_head_bytes,
-                            config.vocab_size,
-                            config.hidden_size,
-                        ))
-                    } else {
-                        Some(repack_q4_0_stream(
-                            lm_head_bytes,
-                            config.vocab_size,
-                            config.hidden_size,
-                        ))
-                    }
-                } else {
-                    None
-                };
+            let lm_head_repack = if stream_layout {
+                repack_stream_for_dtype(
+                    lm_head_dtype,
+                    lm_head_bytes,
+                    config.vocab_size,
+                    config.hidden_size,
+                )
+            } else {
+                None
+            };
             // Compare the size the buffers will actually be *bound* at, not the
             // raw GGUF length: `upload_storage` rounds up to
             // COPY_BUFFER_ALIGNMENT, and Q6_K (210 B/block), Q4_0 (18 B) and Q8_0
@@ -2602,12 +2810,14 @@ impl GpuLfmModel {
                         false,
                     ),
                 };
-                // Flat-planes Q6_K twin for decode GEMV (passthrough only): the
-                // same bytes as the interleaved upload, de-interleaved, so the
-                // flat kernel reads aligned words with no funnel shifts. The
-                // interleaved buffer stays as `main` for the prefill GEMM's
-                // reg-tile loader, which expects GGUF block order.
-                let flat = if lm_head_dtype == DType::Q6K && use_flat_q6k(&ctx) {
+                // Flat-planes Q6_K twin for decode GEMV (passthrough only when
+                // stream layout is disabled): the same bytes as the interleaved
+                // upload, de-interleaved, so the flat kernel reads aligned words
+                // with no funnel shifts. When `resident_stream` is active, `main`
+                // already rides `gemv_q6_k_stream` and `gemm_stream_q6_k_k64`,
+                // so no duplicate flat buffer is uploaded.
+                let flat = if !resident_stream && lm_head_dtype == DType::Q6K && use_flat_q6k(&ctx)
+                {
                     let flat_bytes =
                         repack_q6_k_flat(lm_head_bytes, config.vocab_size, config.hidden_size);
                     Some(Box::new(GpuWeight {
@@ -2719,17 +2929,14 @@ impl GpuLfmModel {
                 // (18 B/block), and Q8_0 (34 B/block) are not, and rely on that
                 // round-up guarantee.
                 let data = src.weight_bytes(wref)?;
-                // Resident stream layout: eligible Q4_0 and Q4_K_M upload the (q, d)
-                // repack INSTEAD of raw (same bytes, transposed) and both
-                // phases read it directly: no second copy, no per-GEMM
-                // repack. `tensor.buffer` is the q half (see `GpuWeight`).
-                let resident = stream_layout && stream_layout_eligible(wref.dtype, wref.k);
-                if resident {
-                    let (q, d) = if wref.dtype == DType::Q4KM {
-                        repack_q4_k_stream(&data, wref.m, wref.k)
-                    } else {
-                        repack_q4_0_stream(&data, wref.m, wref.k)
-                    };
+                // Resident stream layout: eligible quantized weights upload the
+                // (q, d) repack INSTEAD of raw and both phases read it directly:
+                // no second copy, no per-GEMM repack. `tensor.buffer` is the q
+                // half (see `GpuWeight`).
+                if let Some((q, d)) = stream_layout
+                    .then(|| repack_stream_for_dtype(wref.dtype, &data, wref.m, wref.k))
+                    .flatten()
+                {
                     let qb =
                         ctx.upload_storage(bytemuck::cast_slice(&q), &format!("{name}.stream_q"));
                     let db =
@@ -2995,6 +3202,7 @@ impl GpuLfmModel {
                 attn_out_add_bg: None,
                 silu_bg: None,
                 ffn_swiglu_bg: None,
+                ffn_gateup_stream_bg: None,
                 attn_bg: None,
                 attn_split_bg: None,
                 k_append_bg: None,
@@ -3181,6 +3389,8 @@ impl GpuLfmModel {
             ctx.create_storage_rw((MAX_PREFILL_TOKENS * 4).max(64) as u64, "argmax_out");
         let argmax_readback_buf =
             ctx.create_readback_buffer((MAX_PREFILL_TOKENS * 4).max(64) as u64, "argmax_readback");
+        let logits_readback_buf =
+            ctx.create_readback_buffer((config.vocab_size * 4).max(64) as u64, "logits_readback");
         let argmax_params = ctx.upload_storage(
             bytemuck::cast_slice(&[config.vocab_size as u32, 0u32]),
             "argmax_params",
@@ -3189,13 +3399,21 @@ impl GpuLfmModel {
         // Compile compute pipelines after all fallible weight reads and
         // scratch-sizing validations have succeeded.
         let pipelines = GpuPipelines {
-            gemv_f32: ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32"),
-            gemv_f16: ctx.create_pipeline_with_defines(
-                shaders::GEMV_F32,
-                "gemv_f32",
-                "gemv_f16",
-                &[("F16_A", "1")],
-            ),
+            gemv_f32: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
+                ctx.gemv_f32_passthrough()
+            } else {
+                ctx.create_pipeline(shaders::GEMV_F32, "gemv_f32", "gemv_f32")
+            },
+            gemv_f16: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
+                ctx.gemv_f16_passthrough()
+            } else {
+                ctx.create_pipeline_with_defines(
+                    shaders::GEMV_F32,
+                    "gemv_f32",
+                    "gemv_f16",
+                    &[("F16_A", "1")],
+                )
+            },
             gemv_f32_accum: ctx.create_pipeline(
                 shaders::GEMV_F32,
                 "gemv_f32_accum",
@@ -3222,6 +3440,12 @@ impl GpuLfmModel {
             } else {
                 None
             },
+            gemv_q4_0_stream_gateup: if stream_layout {
+                tracing::debug!("gemv_q4_0_stream_gateup: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q4_0_stream_gateup_passthrough())
+            } else {
+                None
+            },
             gemv_q4_k: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
                 ctx.gemv_q4_k_passthrough()
             } else {
@@ -3234,6 +3458,12 @@ impl GpuLfmModel {
                 None
             },
             gemv_q5_k: ctx.create_pipeline(shaders::GEMV_Q5_K, "gemv_q5_k", "gemv_q5_k"),
+            gemv_q5_k_stream: if stream_layout {
+                tracing::debug!("gemv_q5_k_stream: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q5_k_stream_passthrough())
+            } else {
+                None
+            },
             gemv_q6_k: if ctx.supports_spirv_passthrough() && ctx.has_subgroup {
                 // Vulkan: 64-thread subgroup twin via passthrough. Same
                 // bindings, NR=1 (WGSL fallback is NR=2: the rows gate in
@@ -3248,7 +3478,25 @@ impl GpuLfmModel {
             } else {
                 None
             },
+            gemv_q6_k_stream: if stream_layout {
+                tracing::debug!("gemv_q6_k_stream: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q6_k_stream_passthrough())
+            } else {
+                None
+            },
             gemv_q8_0: ctx.create_pipeline(shaders::GEMV_Q8_0, "gemv_q8_0", "gemv_q8_0"),
+            gemv_q8_0_stream: if stream_layout {
+                tracing::debug!("gemv_q8_0_stream: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q8_0_stream_passthrough())
+            } else {
+                None
+            },
+            gemv_q8_0_stream_gateup: if stream_layout {
+                tracing::debug!("gemv_q8_0_stream_gateup: SPIR-V passthrough (slang)");
+                Some(ctx.gemv_q8_0_stream_gateup_passthrough())
+            } else {
+                None
+            },
             add_inplace: ctx.create_pipeline(shaders::ELEMENTWISE, "add_inplace", "add"),
             scaled_add_inplace: ctx.create_pipeline(
                 shaders::ELEMENTWISE,
@@ -3371,6 +3619,24 @@ impl GpuLfmModel {
             gemm_stream_q4_k: if stream_layout {
                 tracing::debug!("gemm_stream_q4_k: SPIR-V passthrough (slang)");
                 Some(ctx.gemm_stream_q4_k_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q5_k: if stream_layout {
+                tracing::debug!("gemm_stream_q5_k: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q5_k_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q6_k_k64: if stream_layout {
+                tracing::debug!("gemm_stream_q6_k_k64: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q6_k_k64_passthrough())
+            } else {
+                None
+            },
+            gemm_stream_q8_0_k64: if stream_layout {
+                tracing::debug!("gemm_stream_q8_0_k64: SPIR-V passthrough (slang)");
+                Some(ctx.gemm_stream_q8_0_k64_passthrough())
             } else {
                 None
             },
@@ -3507,6 +3773,24 @@ impl GpuLfmModel {
                 },
             ],
         });
+        let output_norm_bg = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("output_norm_bg"),
+            layout: &pipelines.rmsnorm.get_bind_group_layout(0),
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: hidden_buf.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: output_norm.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: rmsnorm_hs_params.as_entire_binding(),
+                },
+            ],
+        });
 
         // Build the prefix cache before constructing `Self` so we can
         // borrow `&config` here without conflicting with the upcoming
@@ -3563,10 +3847,12 @@ impl GpuLfmModel {
             kv_shift_scratch,
             attn_out_buf,
             logits_buf,
+            logits_readback_buf,
             argmax_out_buf,
             argmax_readback_buf,
             argmax_params,
             argmax_bg,
+            output_norm_bg,
             rmsnorm_hs_params,
             elementwise_hs_params,
             elementwise_is_params,
@@ -4129,8 +4415,8 @@ impl GpuLfmModel {
     ) -> (&wgpu::ComputePipeline, u32, &'static str) {
         // rows-per-workgroup MUST match each shader's `NR`/`ROWS_PER_WG`
         // constant: gemv_q4_0_fast=8, gemv_q4_0_stream=16, gemv_q4_k_stream=16,
-        // gemv_q8_0=8, gemv_q4_k=4 on passthrough (2 on WGSL), gemv_q5_k=2,
-        // gemv_q6_k=1 on the SPIR-V passthrough (2 on the WGSL fallback: gated below),
+        // gemv_q8_0_stream=32, gemv_q8_0=8, gemv_q4_k=4 on passthrough (2 on WGSL),
+        // gemv_q5_k=2, gemv_q6_k=1 on the SPIR-V passthrough (2 on the WGSL fallback: gated below),
         // gemv_q6_k_flat=8, gemv_f32=8. Too large and
         // rows are silently dropped, in every kernel here. Too small
         // over-dispatches, and what that costs is per kernel:
@@ -4141,21 +4427,49 @@ impl GpuLfmModel {
         if w.resident_stream {
             // Resident layout implies passthrough implies the pipeline
             // exists (same `stream_layout` gate at load).
-            if w.tensor.dtype == DType::Q4KM {
-                let pipe = self
-                    .pipelines
-                    .gemv_q4_k_stream
-                    .as_ref()
-                    .expect("resident-stream weight without a gemv_q4_k_stream pipeline");
-                return (pipe, 16, "gemv_q4ks");
-            } else {
-                let pipe = self
-                    .pipelines
-                    .gemv_q4_0_stream
-                    .as_ref()
-                    .expect("resident-stream weight without a gemv_q4_0_stream pipeline");
-                return (pipe, 16, "gemv_q4s");
-            }
+            return match w.tensor.dtype {
+                DType::Q4KM => {
+                    let pipe = self
+                        .pipelines
+                        .gemv_q4_k_stream
+                        .as_ref()
+                        .expect("resident-stream weight without a gemv_q4_k_stream pipeline");
+                    (pipe, 16, "gemv_q4ks")
+                }
+                DType::Q5KM => {
+                    let pipe = self
+                        .pipelines
+                        .gemv_q5_k_stream
+                        .as_ref()
+                        .expect("resident-stream weight without a gemv_q5_k_stream pipeline");
+                    (pipe, 16, "gemv_q5ks")
+                }
+                DType::Q6K => {
+                    let pipe = self
+                        .pipelines
+                        .gemv_q6_k_stream
+                        .as_ref()
+                        .expect("resident-stream weight without a gemv_q6_k_stream pipeline");
+                    (pipe, 16, "gemv_q6ks")
+                }
+                DType::Q8_0 => {
+                    let pipe = self
+                        .pipelines
+                        .gemv_q8_0_stream
+                        .as_ref()
+                        .expect("resident-stream weight without a gemv_q8_0_stream pipeline");
+                    (pipe, 32, "gemv_q8s")
+                }
+                DType::Q4_0 => {
+                    let pipe = self
+                        .pipelines
+                        .gemv_q4_0_stream
+                        .as_ref()
+                        .expect("resident-stream weight without a gemv_q4_0_stream pipeline");
+                    (pipe, 16, "gemv_q4s")
+                }
+                other => unreachable!("unsupported resident-stream dtype {other:?}"),
+            };
         }
         match w.tensor.dtype {
             DType::Q4_0 => (&self.pipelines.gemv_q4_0_fast, 8, "gemv_q4"),
@@ -4498,12 +4812,69 @@ impl GpuLfmModel {
                 } else {
                     None
                 };
+                let ffn_gateup_stream_bg = if d.gate.resident_stream
+                    && d.up.resident_stream
+                    && d.gate.tensor.dtype == d.up.tensor.dtype
+                {
+                    let pipe = match d.gate.tensor.dtype {
+                        DType::Q8_0 => self.pipelines.gemv_q8_0_stream_gateup.as_ref(),
+                        DType::Q4_0 => self.pipelines.gemv_q4_0_stream_gateup.as_ref(),
+                        _ => None,
+                    };
+                    if let (Some(pipe), Some(gate_d), Some(up_d)) =
+                        (pipe, d.gate.stream_d.as_ref(), d.up.stream_d.as_ref())
+                    {
+                        Some(
+                            self.ctx
+                                .device
+                                .create_bind_group(&wgpu::BindGroupDescriptor {
+                                    label: Some("ffn_gateup_stream"),
+                                    layout: &pipe.get_bind_group_layout(0),
+                                    entries: &[
+                                        wgpu::BindGroupEntry {
+                                            binding: 0,
+                                            resource: d.gate.tensor.buffer.as_entire_binding(),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 1,
+                                            resource: gate_d.as_entire_binding(),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 2,
+                                            resource: d.up.tensor.buffer.as_entire_binding(),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 3,
+                                            resource: up_d.as_entire_binding(),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 4,
+                                            resource: self.ffn_input_buf.as_entire_binding(),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 5,
+                                            resource: self.gate_buf.as_entire_binding(),
+                                        },
+                                        wgpu::BindGroupEntry {
+                                            binding: 6,
+                                            resource: d.gate.params_buf.as_entire_binding(),
+                                        },
+                                    ],
+                                }),
+                        )
+                    } else {
+                        None
+                    }
+                } else {
+                    None
+                };
                 if let GpuFfn::Dense(d) = &mut self.layers[i].ffn {
                     d.gate.cached_bg = Some(gate_bg);
                     d.up.cached_bg = Some(up_bg);
                     d.down.cached_bg = Some(down_bg);
                 }
                 self.layers[i].ffn_swiglu_bg = ffn_swiglu_bg;
+                self.layers[i].ffn_gateup_stream_bg = ffn_gateup_stream_bg;
             }
 
             if cfg.block_types[i] == BlockType::GatedConv {
@@ -5385,6 +5756,15 @@ impl GpuLfmModel {
         x: &wgpu::Buffer,
         weight: &wgpu::Buffer,
     ) {
+        if std::ptr::eq(x, &self.hidden_buf) && std::ptr::eq(weight, &self.output_norm) {
+            self.dispatch_into(
+                pass,
+                &self.pipelines.rmsnorm,
+                &self.output_norm_bg,
+                (1, 1, 1),
+            );
+            return;
+        }
         // Use pre-allocated params buffer (n and eps are always hs and config.rms_norm_eps).
         let params_buf = &self.rmsnorm_hs_params;
         let bg = self
@@ -5441,23 +5821,6 @@ impl GpuLfmModel {
         let GpuFfn::Dense(dense) = &lw.ffn else {
             unreachable!()
         };
-        let gate_bg_tmp;
-        let gate_bg = match dense.gate.cached_bg.as_ref() {
-            Some(bg) => bg,
-            None => {
-                gate_bg_tmp = self.make_gemv_bg(&dense.gate, &self.ffn_input_buf, &self.gate_buf);
-                &gate_bg_tmp
-            }
-        };
-        let up_bg_tmp;
-        let up_bg = match dense.up.cached_bg.as_ref() {
-            Some(bg) => bg,
-            None => {
-                up_bg_tmp = self.make_gemv_bg(&dense.up, &self.ffn_input_buf, &self.up_buf);
-                &up_bg_tmp
-            }
-        };
-        let silu_bg = lw.silu_bg.as_ref().unwrap();
         let down_bg_tmp;
         let down_bg = match dense.down.cached_bg.as_ref() {
             Some(bg) => bg,
@@ -5475,40 +5838,76 @@ impl GpuLfmModel {
         let gate_lora = Self::lora_target(lora.as_ref(), layer, LoraTarget::FfnGate);
         let up_lora = Self::lora_target(lora.as_ref(), layer, LoraTarget::FfnUp);
         let down_lora = Self::lora_target(lora.as_ref(), layer, LoraTarget::FfnDown);
-        let gate_lora_bgs = gate_lora.map(|t| {
-            (
-                t,
-                self.lora_target_bgs(t, &self.ffn_input_buf, &self.gate_buf),
-            )
-        });
-        let up_lora_bgs = up_lora.map(|t| {
-            (
-                t,
-                self.lora_target_bgs(t, &self.ffn_input_buf, &self.up_buf),
-            )
-        });
         let down_lora_bgs =
             down_lora.map(|t| (t, self.lora_target_bgs(t, &self.gate_buf, &self.hidden_buf)));
 
         // rmsnorm
         self.dispatch_into(pass, &self.pipelines.rmsnorm_out, norm_bg, (1, 1, 1));
-        // gate + up GEMVs
-        self.dispatch_gemv_into(pass, &dense.gate, gate_bg);
-        self.dispatch_gemv_into(pass, &dense.up, up_bg);
-        // LoRA gate/up deltas on the raw projections, before silu_mul.
-        if let Some((t, (bg_a, bg_b))) = gate_lora_bgs.as_ref() {
-            self.dispatch_lora_into(pass, t, bg_a, bg_b);
+
+        // Fused Gate + Up + SwiGLU stream GEMV when resident_stream is active
+        // and no gate/up LoRA deltas are attached.
+        let fused_gateup_pipe =
+            if gate_lora.is_none() && up_lora.is_none() && use_fused_gate_up_gemv() {
+                match dense.gate.tensor.dtype {
+                    DType::Q8_0 => self.pipelines.gemv_q8_0_stream_gateup.as_ref(),
+                    DType::Q4_0 => self.pipelines.gemv_q4_0_stream_gateup.as_ref(),
+                    _ => None,
+                }
+            } else {
+                None
+            };
+        if let (Some(pipe), Some(gateup_bg)) = (fused_gateup_pipe, lw.ffn_gateup_stream_bg.as_ref())
+        {
+            self.dispatch_into(pass, pipe, gateup_bg, self.gemv_workgroups(&dense.gate));
+        } else {
+            let gate_bg_tmp;
+            let gate_bg = match dense.gate.cached_bg.as_ref() {
+                Some(bg) => bg,
+                None => {
+                    gate_bg_tmp =
+                        self.make_gemv_bg(&dense.gate, &self.ffn_input_buf, &self.gate_buf);
+                    &gate_bg_tmp
+                }
+            };
+            let up_bg_tmp;
+            let up_bg = match dense.up.cached_bg.as_ref() {
+                Some(bg) => bg,
+                None => {
+                    up_bg_tmp = self.make_gemv_bg(&dense.up, &self.ffn_input_buf, &self.up_buf);
+                    &up_bg_tmp
+                }
+            };
+            let silu_bg = lw.silu_bg.as_ref().unwrap();
+            let gate_lora_bgs = gate_lora.map(|t| {
+                (
+                    t,
+                    self.lora_target_bgs(t, &self.ffn_input_buf, &self.gate_buf),
+                )
+            });
+            let up_lora_bgs = up_lora.map(|t| {
+                (
+                    t,
+                    self.lora_target_bgs(t, &self.ffn_input_buf, &self.up_buf),
+                )
+            });
+            // gate + up GEMVs
+            self.dispatch_gemv_into(pass, &dense.gate, gate_bg);
+            self.dispatch_gemv_into(pass, &dense.up, up_bg);
+            // LoRA gate/up deltas on the raw projections, before silu_mul.
+            if let Some((t, (bg_a, bg_b))) = gate_lora_bgs.as_ref() {
+                self.dispatch_lora_into(pass, t, bg_a, bg_b);
+            }
+            if let Some((t, (bg_a, bg_b))) = up_lora_bgs.as_ref() {
+                self.dispatch_lora_into(pass, t, bg_a, bg_b);
+            }
+            // silu_mul
+            self.dispatch_into(
+                pass,
+                &self.pipelines.silu_mul_inplace,
+                silu_bg,
+                ((dense.gate.tensor.shape[0] as u32).div_ceil(256), 1, 1),
+            );
         }
-        if let Some((t, (bg_a, bg_b))) = up_lora_bgs.as_ref() {
-            self.dispatch_lora_into(pass, t, bg_a, bg_b);
-        }
-        // silu_mul
-        self.dispatch_into(
-            pass,
-            &self.pipelines.silu_mul_inplace,
-            silu_bg,
-            ((dense.gate.tensor.shape[0] as u32).div_ceil(256), 1, 1),
-        );
         // down GEMV
         self.dispatch_gemv_into(pass, &dense.down, down_bg);
         // residual add
@@ -5832,9 +6231,14 @@ impl GpuLfmModel {
     /// reentrant, so calling `Model::forward` from inside this body
     /// would deadlock.
     fn forward_inner(&self, tokens: &[u32], pos: usize, state: &mut InferenceState) -> Vec<f32> {
-        self.forward_inner_compute(tokens, pos, state);
+        self.forward_inner_compute_tail(
+            tokens,
+            pos,
+            state,
+            DecodeTail::Logits(TailArgmax::StageLogits),
+        );
         self.ctx
-            .download_f32(&self.logits_buf, self.config.vocab_size)
+            .read_mapped_f32(&self.logits_readback_buf, self.config.vocab_size)
     }
 
     /// Lazily build (once) the hidden-states scratch caches — same shapes as the
@@ -6029,7 +6433,7 @@ impl GpuLfmModel {
     ) {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _lora_guard = self.resolve_lora(state);
-        self.seed_embeddings_locked(embeddings, n_tokens, start_pos, state, false);
+        self.seed_embeddings_locked(embeddings, n_tokens, start_pos, state, true, false);
     }
 
     /// [`Self::seed_embeddings`] with `infer_lock` and the LoRA guard already
@@ -6041,6 +6445,7 @@ impl GpuLfmModel {
         n_tokens: usize,
         start_pos: usize,
         state: &mut InferenceState,
+        compute_logits: bool,
         download_logits: bool,
     ) -> Vec<f32> {
         let hidden_size = self.config.hidden_size;
@@ -6060,12 +6465,17 @@ impl GpuLfmModel {
         // path has no prefix-cache restore to overwrite them.
         if start_pos == 0 {
             self.gpu_state.seq_len.store(0, Ordering::Relaxed);
+            state.seq_len = 0;
             self.zero_conv_buffers_locked();
         }
 
-        if let Some(logits) =
-            self.prefill_embeddings_batched_locked(embeddings, n_tokens, state, download_logits)
-        {
+        if let Some(logits) = self.prefill_embeddings_batched_locked(
+            embeddings,
+            n_tokens,
+            state,
+            compute_logits,
+            download_logits,
+        ) {
             return logits;
         }
 
@@ -6295,7 +6705,10 @@ impl GpuLfmModel {
         // so `finish` (about 1.6 ms of host time on Adreno 830) is off the critical path. Plain
         // greedy / full-logits decode only: LoRA and profiling record different commands.
         if let DecodeTail::Logits(argmax) = tail
-            && matches!(argmax, TailArgmax::None | TailArgmax::DispatchAndStage)
+            && matches!(
+                argmax,
+                TailArgmax::None | TailArgmax::DispatchAndStage | TailArgmax::StageLogits
+            )
             && lora.is_none()
             && !self.ctx.profiling()
             && prebuild_enabled()
@@ -6309,7 +6722,9 @@ impl GpuLfmModel {
             state.seq_len += 1;
             let next = self.encode_decode_step(&lora, tail).finish();
             self.store_prebuilt(key, next);
-            self.ctx.device.poll_wait();
+            if matches!(argmax, TailArgmax::None) {
+                self.ctx.device.poll_wait();
+            }
             return None;
         }
 
@@ -6342,6 +6757,273 @@ impl GpuLfmModel {
         }
     }
 
+    fn encode_conv_layer_decode_into(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        i: usize,
+        lora: &Option<Arc<WgpuLoraAdapter>>,
+        include_ffn: bool,
+    ) {
+        let cfg = &self.config;
+        let hs32 = cfg.hidden_size as u32;
+        let lw = &self.layers[i];
+        let norm_bg = lw.attn_norm_bg.as_ref().unwrap();
+        let in_w = lw.conv_in_proj.as_ref().unwrap();
+        let in_bg_tmp;
+        let in_bg = match in_w.cached_bg.as_ref() {
+            Some(b) => b,
+            None => {
+                in_bg_tmp = self.make_gemv_bg(in_w, &self.normed_buf, &self.conv_proj_buf);
+                &in_bg_tmp
+            }
+        };
+        let in_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::ShortconvInProj);
+        let in_lora_bgs = in_lora.map(|t| {
+            (
+                t,
+                self.lora_target_bgs(t, &self.normed_buf, &self.conv_proj_buf),
+            )
+        });
+
+        let conv_fused_bg = lw.conv_fused_bg.as_ref().unwrap();
+        let out_w = lw.conv_out_proj.as_ref().unwrap();
+        let out_bg_tmp;
+        let out_bg = match out_w.cached_bg.as_ref() {
+            Some(b) => b,
+            None => {
+                out_bg_tmp = self.make_gemv_bg(out_w, &self.conv_gate_buf, &self.out_buf);
+                &out_bg_tmp
+            }
+        };
+        let out_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::ShortconvOutProj);
+        let out_lora_bgs = out_lora.map(|t| {
+            (
+                t,
+                self.lora_target_bgs(t, &self.conv_gate_buf, &self.out_buf),
+            )
+        });
+        let add_bg = lw.conv_add_bg.as_ref().unwrap();
+
+        self.dispatch_into(pass, &self.pipelines.rmsnorm_out, norm_bg, (1, 1, 1));
+        self.dispatch_gemv_into(pass, in_w, in_bg);
+        if let Some((t, (bg_a, bg_b))) = &in_lora_bgs {
+            self.dispatch_lora_into(pass, t, bg_a, bg_b);
+        }
+        self.dispatch_into(
+            pass,
+            &self.pipelines.conv1d_fused,
+            conv_fused_bg,
+            (hs32.div_ceil(256), 1, 1),
+        );
+        self.dispatch_gemv_into(pass, out_w, out_bg);
+        if let Some((t, (bg_a, bg_b))) = &out_lora_bgs {
+            self.dispatch_lora_into(pass, t, bg_a, bg_b);
+        }
+        self.dispatch_into(
+            pass,
+            &self.pipelines.add_inplace,
+            add_bg,
+            (hs32.div_ceil(256), 1, 1),
+        );
+        if include_ffn {
+            self.encode_ffn_decode_into(pass, lw, lora, i, hs32);
+        }
+    }
+
+    fn encode_attn_layer_decode_into(
+        &self,
+        pass: &mut wgpu::ComputePass<'_>,
+        i: usize,
+        lora: &Option<Arc<WgpuLoraAdapter>>,
+        include_ffn: bool,
+    ) {
+        let cfg = &self.config;
+        let hs32 = cfg.hidden_size as u32;
+        let head_dim = cfg.head_dim as u32;
+        let n_heads = cfg.n_heads as u32;
+        let n_kv_heads = cfg
+            .kv_heads_per_layer
+            .iter()
+            .copied()
+            .find(|&h| h > 0)
+            .unwrap_or(cfg.n_kv_heads) as u32;
+        let kv_dim = n_kv_heads * head_dim;
+        let q_dim = n_heads * head_dim;
+        let lw = &self.layers[i];
+
+        let norm_bg = lw.attn_norm_bg.as_ref().unwrap();
+        let q_w = lw.attn_q.as_ref().unwrap();
+        let q_bg_tmp;
+        let q_bg = match q_w.cached_bg.as_ref() {
+            Some(b) => b,
+            None => {
+                q_bg_tmp = self.make_gemv_bg(q_w, &self.normed_buf, &self.q_buf);
+                &q_bg_tmp
+            }
+        };
+        let k_w = lw.attn_k.as_ref().unwrap();
+        let k_bg_tmp;
+        let k_bg = match k_w.cached_bg.as_ref() {
+            Some(b) => b,
+            None => {
+                k_bg_tmp = self.make_gemv_bg(k_w, &self.normed_buf, &self.k_buf);
+                &k_bg_tmp
+            }
+        };
+        let v_w = lw.attn_v.as_ref().unwrap();
+        let v_bg_tmp;
+        let v_bg = match v_w.cached_bg.as_ref() {
+            Some(b) => b,
+            None => {
+                v_bg_tmp = self.make_gemv_bg(v_w, &self.normed_buf, &self.v_buf);
+                &v_bg_tmp
+            }
+        };
+
+        let max_pairs = std::cmp::max(n_heads, n_kv_heads) * (head_dim / 2);
+        let q_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::AttnQ);
+        let k_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::AttnK);
+        let v_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::AttnV);
+        let q_lora_bgs =
+            q_lora.map(|t| (t, self.lora_target_bgs(t, &self.normed_buf, &self.q_buf)));
+        let k_lora_bgs =
+            k_lora.map(|t| (t, self.lora_target_bgs(t, &self.normed_buf, &self.k_buf)));
+        let v_lora_bgs =
+            v_lora.map(|t| (t, self.lora_target_bgs(t, &self.normed_buf, &self.v_buf)));
+
+        let pre = AttnPreDecode {
+            lw,
+            norm_bg,
+            q_w,
+            q_bg,
+            k_w,
+            k_bg,
+            v_w,
+            v_bg,
+            q_lora: &q_lora_bgs,
+            k_lora: &k_lora_bgs,
+            v_lora: &v_lora_bgs,
+            q_dim,
+            kv_dim,
+            n_heads,
+            n_kv_heads,
+            max_pairs,
+        };
+        let out_w = lw.attn_output.as_ref().unwrap();
+        let out_bg_tmp;
+        let out_bg = match out_w.cached_bg.as_ref() {
+            Some(b) => b,
+            None => {
+                out_bg_tmp = self.make_gemv_bg(out_w, &self.attn_out_buf, &self.out_buf);
+                &out_bg_tmp
+            }
+        };
+        let add_bg = lw.attn_out_add_bg.as_ref().unwrap();
+        let o_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::AttnOutput);
+        let o_lora_bgs = o_lora.map(|t| {
+            (
+                t,
+                self.lora_target_bgs(t, &self.attn_out_buf, &self.hidden_buf),
+            )
+        });
+
+        let flash_bg_tmp;
+        let flash_bg = if self.use_hs_scratch.load(Ordering::Relaxed) {
+            let (k_buf, v_buf) = self.active_kv(i);
+            flash_bg_tmp = self
+                .ctx
+                .device
+                .create_bind_group(&wgpu::BindGroupDescriptor {
+                    label: Some("flash_attention_hs_bg"),
+                    layout: &self.pipelines.flash_attention.get_bind_group_layout(0),
+                    entries: &[
+                        wgpu::BindGroupEntry {
+                            binding: 0,
+                            resource: self.q_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 1,
+                            resource: k_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 2,
+                            resource: v_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 3,
+                            resource: self.attn_out_buf.as_entire_binding(),
+                        },
+                        wgpu::BindGroupEntry {
+                            binding: 4,
+                            resource: self.attn_params.as_entire_binding(),
+                        },
+                    ],
+                });
+            &flash_bg_tmp
+        } else {
+            lw.attn_bg.as_ref().unwrap()
+        };
+        let k_app_tmp;
+        let v_app_tmp;
+        let (k_app_bg, v_app_bg) = if self.use_hs_scratch.load(Ordering::Relaxed) {
+            let (k_cache, v_cache) = self.active_kv(i);
+            k_app_tmp = self.make_kv_append_bg(&self.k_buf, k_cache);
+            v_app_tmp = self.make_kv_append_bg(&self.v_buf, v_cache);
+            (&k_app_tmp, &v_app_tmp)
+        } else {
+            (
+                lw.k_append_bg.as_ref().unwrap(),
+                lw.v_append_bg.as_ref().unwrap(),
+            )
+        };
+
+        self.encode_attn_pre_into(pass, &pre);
+        let append_grid = ((kv_dim / 2).div_ceil(256), 1, 1);
+        self.dispatch_into(pass, &self.pipelines.kv_append, k_app_bg, append_grid);
+        self.dispatch_into(pass, &self.pipelines.kv_append, v_app_bg, append_grid);
+        if self.attn_split {
+            let split_bg_tmp;
+            let split_bg = if self.use_hs_scratch.load(Ordering::Relaxed) {
+                let (k_buf, v_buf) = self.active_kv(i);
+                split_bg_tmp = self.make_attn_split_bg(k_buf, v_buf);
+                &split_bg_tmp
+            } else {
+                lw.attn_split_bg.as_ref().unwrap()
+            };
+            let merge_bg_tmp;
+            let merge_bg = match self.attn_merge_bg.as_ref() {
+                Some(bg) => bg,
+                None => {
+                    merge_bg_tmp = self.make_attn_merge_bg();
+                    &merge_bg_tmp
+                }
+            };
+            self.dispatch_into(
+                pass,
+                &self.pipelines.flash_attention_split,
+                split_bg,
+                (n_heads, ATTN_SPLITS, 1),
+            );
+            self.dispatch_into(
+                pass,
+                &self.pipelines.flash_attention_merge,
+                merge_bg,
+                (n_heads, 1, 1),
+            );
+        } else {
+            self.dispatch_into(
+                pass,
+                &self.pipelines.flash_attention,
+                flash_bg,
+                (n_heads, 1, 1),
+            );
+        }
+        self.encode_attn_out_into(pass, out_w, out_bg, add_bg, &o_lora_bgs, hs32);
+        if include_ffn {
+            self.encode_ffn_decode_into(pass, lw, lora, i, hs32);
+        }
+    }
+
     /// Record one decode step (every layer plus the tail) into a fresh encoder. A pure function of the
     /// model's static buffers and bind groups: nothing recorded depends on the position or sequence
     /// length (those reach the shaders through the params buffers written by the caller), so the
@@ -6363,65 +7045,78 @@ impl GpuLfmModel {
             .unwrap_or(cfg.n_kv_heads) as u32;
         let kv_dim = n_kv_heads * head_dim;
         let mut enc = self.new_encoder();
+        let profiling = self.ctx.profiling();
+
+        if !profiling
+            && self.tq_cache().is_none()
+            && std::env::var("CERA_GPU_SINGLE_PASS_DECODE").as_deref() == Ok("1")
+        {
+            let scale_bg = self
+                .logit_scale_params
+                .as_ref()
+                .map(|params| self.logit_scale_bg(params));
+            {
+                let mut pass = self.ctx.begin_pass(&mut enc, "decode_step");
+                for i in 0..cfg.n_layers {
+                    if cfg.block_types[i] == BlockType::GatedConv {
+                        self.encode_conv_layer_decode_into(&mut pass, i, lora, true);
+                    } else {
+                        self.encode_attn_layer_decode_into(&mut pass, i, lora, true);
+                    }
+                    if self
+                        .loop_norm_interval
+                        .is_some_and(|n_phys| (i + 1) % n_phys == 0)
+                        && (i + 1) < cfg.n_layers
+                    {
+                        self.encode_rmsnorm_into(&mut pass, &self.hidden_buf, &self.output_norm);
+                    }
+                }
+                self.encode_rmsnorm_into(&mut pass, &self.hidden_buf, &self.output_norm);
+                if let DecodeTail::Logits(argmax) | DecodeTail::LogitsUnsubmitted(argmax) = tail {
+                    self.encode_lm_head_into(&mut pass, &self.hidden_buf, &self.logits_buf);
+                    if let Some(scale_bg) = scale_bg.as_ref() {
+                        self.dispatch_into(
+                            &mut pass,
+                            &self.pipelines.scale_f32,
+                            scale_bg,
+                            ((cfg.vocab_size as u32).div_ceil(256), 1, 1),
+                        );
+                    }
+                    if matches!(argmax, TailArgmax::Dispatch | TailArgmax::DispatchAndStage) {
+                        self.encode_argmax_into(&mut pass);
+                    }
+                }
+            }
+            if let DecodeTail::Logits(argmax) | DecodeTail::LogitsUnsubmitted(argmax) = tail {
+                match argmax {
+                    TailArgmax::DispatchAndStage => {
+                        enc.copy_buffer_to_buffer(
+                            &self.argmax_out_buf,
+                            0,
+                            &self.argmax_readback_buf,
+                            0,
+                            4,
+                        );
+                    }
+                    TailArgmax::StageLogits => {
+                        enc.copy_buffer_to_buffer(
+                            &self.logits_buf,
+                            0,
+                            &self.logits_readback_buf,
+                            0,
+                            (cfg.vocab_size * 4) as u64,
+                        );
+                    }
+                    TailArgmax::None | TailArgmax::Dispatch => {}
+                }
+            }
+            return enc;
+        }
+
         for i in 0..cfg.n_layers {
             let lw = &self.layers[i];
 
             if cfg.block_types[i] == BlockType::GatedConv {
-                let kernel_size = cfg.conv_kernel_size.unwrap_or(3) as u32;
-                let _d_conv = kernel_size - 1;
-                let norm_bg = lw.attn_norm_bg.as_ref().unwrap();
-                let in_w = lw.conv_in_proj.as_ref().unwrap();
-                let in_bg_tmp;
-                let in_bg = match in_w.cached_bg.as_ref() {
-                    Some(b) => b,
-                    None => {
-                        in_bg_tmp = self.make_gemv_bg(in_w, &self.normed_buf, &self.conv_proj_buf);
-                        &in_bg_tmp
-                    }
-                };
-                // LoRA conv in_proj delta (`conv_proj_buf += scale·B·(A·normed)`),
-                // added into the full 3·hidden projection before the fused conv
-                // reads the B/C/x gates. Bind groups built before the pass opens.
-                let in_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::ShortconvInProj);
-                let in_lora_bgs = in_lora.map(|t| {
-                    (
-                        t,
-                        self.lora_target_bgs(t, &self.normed_buf, &self.conv_proj_buf),
-                    )
-                });
-
-                let conv_fused_bg = lw.conv_fused_bg.as_ref().unwrap();
-                let out_w = lw.conv_out_proj.as_ref().unwrap();
-                let out_bg_tmp;
-                let out_bg = match out_w.cached_bg.as_ref() {
-                    Some(b) => b,
-                    None => {
-                        out_bg_tmp = self.make_gemv_bg(out_w, &self.conv_gate_buf, &self.out_buf);
-                        &out_bg_tmp
-                    }
-                };
-                // LoRA conv out_proj delta (`out_buf += scale·B·(A·conv_gate)`),
-                // added before the plain `add_inplace` folds `out_buf` into the
-                // residual — scale-only (not residual_mult), matching the CPU path.
-                let out_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::ShortconvOutProj);
-                let out_lora_bgs = out_lora.map(|t| {
-                    (
-                        t,
-                        self.lora_target_bgs(t, &self.conv_gate_buf, &self.out_buf),
-                    )
-                });
-                let add_bg = lw.conv_add_bg.as_ref().unwrap();
-
-                // The whole conv layer in ONE compute pass: rmsnorm (out of
-                // `hidden`, straight into `normed`), in_proj, the fused conv,
-                // out_proj + residual add, then the FFN chain. These were two
-                // passes (`conv` + `ffn`) split by a hidden->scratch blit — a
-                // pass boundary is not free (2.65x, measured M1 Max) and the
-                // blit is gone now that both norms read `hidden` directly.
-                // WebGPU orders dispatches within a pass and makes each one's
-                // writes visible to the next. Profile runs split mixer from
-                // FFN for attribution; production keeps the merged pass.
-                let profiling = self.ctx.profiling();
                 {
                     let mut pass = self.ctx.begin_pass(
                         &mut enc,
@@ -6431,42 +7126,15 @@ impl GpuLfmModel {
                             "layer_conv"
                         },
                     );
-                    self.dispatch_into(&mut pass, &self.pipelines.rmsnorm_out, norm_bg, (1, 1, 1));
-                    self.dispatch_gemv_into(&mut pass, in_w, in_bg);
-                    if let Some((t, (bg_a, bg_b))) = &in_lora_bgs {
-                        self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
-                    }
-                    self.dispatch_into(
-                        &mut pass,
-                        &self.pipelines.conv1d_fused,
-                        conv_fused_bg,
-                        (hs32.div_ceil(256), 1, 1),
-                    );
-                    self.dispatch_gemv_into(&mut pass, out_w, out_bg);
-                    if let Some((t, (bg_a, bg_b))) = &out_lora_bgs {
-                        self.dispatch_lora_into(&mut pass, t, bg_a, bg_b);
-                    }
-                    self.dispatch_into(
-                        &mut pass,
-                        &self.pipelines.add_inplace,
-                        add_bg,
-                        (hs32.div_ceil(256), 1, 1),
-                    );
-                    // FFN — same pass (dense and MoE both), except on profile
-                    // runs, where it gets its own pass below.
-                    if !profiling {
-                        self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
-                    }
+                    self.encode_conv_layer_decode_into(&mut pass, i, lora, !profiling);
                 }
                 if profiling {
                     let mut pass = self.ctx.begin_pass(&mut enc, "conv_ffn");
                     self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
                 }
-            } else {
-                // Attention block — one `layer_attn` pass (uncompressed KV),
-                // or the `attn_pre`/`attn_post` split under TurboQuant.
+            } else if self.tq_cache().is_some() {
+                // Attention block under TurboQuant (`attn_pre`/`attn_post` split).
                 let q_dim = n_heads * head_dim;
-
                 let norm_bg = lw.attn_norm_bg.as_ref().unwrap();
                 let q_w = lw.attn_q.as_ref().unwrap();
                 let q_bg_tmp;
@@ -6495,14 +7163,7 @@ impl GpuLfmModel {
                         &v_bg_tmp
                     }
                 };
-
                 let max_pairs = std::cmp::max(n_heads, n_kv_heads) * (head_dim / 2);
-
-                // LoRA Q/K/V deltas: `+= scale·B·(A·normed)` on the raw
-                // projections, before QK-norm/RoPE (additive, so it commutes
-                // with the Qwen2 bias-add below). Bind groups are built here
-                // (immutable `self` borrow) so they can be dispatched inside the
-                // `attn_pre` pass, which mutably borrows `enc`.
                 let q_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::AttnQ);
                 let k_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::AttnK);
                 let v_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::AttnV);
@@ -6512,8 +7173,6 @@ impl GpuLfmModel {
                     k_lora.map(|t| (t, self.lora_target_bgs(t, &self.normed_buf, &self.k_buf)));
                 let v_lora_bgs =
                     v_lora.map(|t| (t, self.lora_target_bgs(t, &self.normed_buf, &self.v_buf)));
-
-                // Pre-chain inputs shared by both shapes below.
                 let pre = AttnPreDecode {
                     lw,
                     norm_bg,
@@ -6532,8 +7191,6 @@ impl GpuLfmModel {
                     n_kv_heads,
                     max_pairs,
                 };
-                // out_proj + add — both shapes. Bind groups built before the
-                // pass opens.
                 let out_w = lw.attn_output.as_ref().unwrap();
                 let out_bg_tmp;
                 let out_bg = match out_w.cached_bg.as_ref() {
@@ -6544,10 +7201,6 @@ impl GpuLfmModel {
                     }
                 };
                 let add_bg = lw.attn_out_add_bg.as_ref().unwrap();
-                // LoRA attn-output delta: input is the attention output (o_proj
-                // input), added into the post-residual hidden state. The
-                // `residual_mult` fold at upload matches the base o_proj's
-                // `scaled_add_inplace` scaling.
                 let o_lora = Self::lora_target(lora.as_ref(), i, LoraTarget::AttnOutput);
                 let o_lora_bgs = o_lora.map(|t| {
                     (
@@ -6555,189 +7208,49 @@ impl GpuLfmModel {
                         self.lora_target_bgs(t, &self.attn_out_buf, &self.hidden_buf),
                     )
                 });
-
-                if self.tq_cache().is_some() {
-                    // TurboQuant split: attention runs in its own encode
-                    // passes, so pre and post stay split.
-                    {
-                        let mut pass = self.ctx.begin_pass(&mut enc, "attn_pre");
-                        self.encode_attn_pre_into(&mut pass, &pre);
-                    }
-                    // Compressed path: the two f32 memcpys become encode
-                    // dispatches, and attention reads the packed cache. Params for
-                    // every layer were staged once before this encoder (see
-                    // `forward_inner_compute`).
-                    let tq = self.tq_cache().unwrap();
-                    tq.encode_kv(&self.ctx, &mut enc, i, &self.k_buf, &self.v_buf, 1);
-                    tq.rotate_queries(&self.ctx, &mut enc, i, &self.q_buf, 1, n_heads as usize);
-                    tq.attention(
-                        &self.ctx,
+                {
+                    let mut pass = self.ctx.begin_pass(&mut enc, "attn_pre");
+                    self.encode_attn_pre_into(&mut pass, &pre);
+                }
+                let tq = self.tq_cache().unwrap();
+                tq.encode_kv(&self.ctx, &mut enc, i, &self.k_buf, &self.v_buf, 1);
+                tq.rotate_queries(&self.ctx, &mut enc, i, &self.q_buf, 1, n_heads as usize);
+                tq.attention(
+                    &self.ctx,
+                    &mut enc,
+                    i,
+                    &self.attn_out_buf,
+                    1,
+                    n_heads as usize,
+                );
+                {
+                    let mut pass = self.ctx.begin_pass(
                         &mut enc,
-                        i,
-                        &self.attn_out_buf,
-                        1,
-                        n_heads as usize,
-                    );
-                    let profiling = self.ctx.profiling();
-                    {
-                        let mut pass = self.ctx.begin_pass(
-                            &mut enc,
-                            if profiling {
-                                "attn_post_out"
-                            } else {
-                                "attn_post"
-                            },
-                        );
-                        self.encode_attn_out_into(
-                            &mut pass,
-                            out_w,
-                            out_bg,
-                            add_bg,
-                            &o_lora_bgs,
-                            hs32,
-                        );
-                        if !profiling {
-                            self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
-                        }
-                    }
-                    if profiling {
-                        let mut pass = self.ctx.begin_pass(&mut enc, "attn_post_ffn");
-                        self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
-                    }
-                } else {
-                    // Whole attn layer in ONE pass: the KV cache write is a
-                    // `kv_append` dispatch now, not an encoder-level blit, so
-                    // nothing splits pre from post. WebGPU orders dispatches
-                    // within a pass; flash_attention reads the row appended
-                    // two dispatches earlier.
-                    let flash_bg_tmp;
-                    let flash_bg = if self.use_hs_scratch.load(Ordering::Relaxed) {
-                        let (k_buf, v_buf) = self.active_kv(i);
-                        flash_bg_tmp =
-                            self.ctx
-                                .device
-                                .create_bind_group(&wgpu::BindGroupDescriptor {
-                                    label: Some("flash_attention_hs_bg"),
-                                    layout: &self
-                                        .pipelines
-                                        .flash_attention
-                                        .get_bind_group_layout(0),
-                                    entries: &[
-                                        wgpu::BindGroupEntry {
-                                            binding: 0,
-                                            resource: self.q_buf.as_entire_binding(),
-                                        },
-                                        wgpu::BindGroupEntry {
-                                            binding: 1,
-                                            resource: k_buf.as_entire_binding(),
-                                        },
-                                        wgpu::BindGroupEntry {
-                                            binding: 2,
-                                            resource: v_buf.as_entire_binding(),
-                                        },
-                                        wgpu::BindGroupEntry {
-                                            binding: 3,
-                                            resource: self.attn_out_buf.as_entire_binding(),
-                                        },
-                                        wgpu::BindGroupEntry {
-                                            binding: 4,
-                                            resource: self.attn_params.as_entire_binding(),
-                                        },
-                                    ],
-                                });
-                        &flash_bg_tmp
-                    } else {
-                        lw.attn_bg.as_ref().unwrap()
-                    };
-                    let k_app_tmp;
-                    let v_app_tmp;
-                    let (k_app_bg, v_app_bg) = if self.use_hs_scratch.load(Ordering::Relaxed) {
-                        let (k_cache, v_cache) = self.active_kv(i);
-                        k_app_tmp = self.make_kv_append_bg(&self.k_buf, k_cache);
-                        v_app_tmp = self.make_kv_append_bg(&self.v_buf, v_cache);
-                        (&k_app_tmp, &v_app_tmp)
-                    } else {
-                        (
-                            lw.k_append_bg.as_ref().unwrap(),
-                            lw.v_append_bg.as_ref().unwrap(),
-                        )
-                    };
-                    let profiling = self.ctx.profiling();
-                    {
-                        let mut pass = self.ctx.begin_pass(
-                            &mut enc,
-                            if profiling { "attn_core" } else { "layer_attn" },
-                        );
-                        self.encode_attn_pre_into(&mut pass, &pre);
-                        // One thread per packed word: kv_dim/2 threads.
-                        let append_grid = ((kv_dim / 2).div_ceil(256), 1, 1);
-                        self.dispatch_into(
-                            &mut pass,
-                            &self.pipelines.kv_append,
-                            k_app_bg,
-                            append_grid,
-                        );
-                        self.dispatch_into(
-                            &mut pass,
-                            &self.pipelines.kv_append,
-                            v_app_bg,
-                            append_grid,
-                        );
-                        if self.attn_split {
-                            // Split-K: `ATTN_SPLITS` workgroups per head over the keys, then a merge.
-                            // The grid is fixed; the sequence length is read from `attn_params`.
-                            let split_bg_tmp;
-                            let split_bg = if self.use_hs_scratch.load(Ordering::Relaxed) {
-                                let (k_buf, v_buf) = self.active_kv(i);
-                                split_bg_tmp = self.make_attn_split_bg(k_buf, v_buf);
-                                &split_bg_tmp
-                            } else {
-                                lw.attn_split_bg.as_ref().unwrap()
-                            };
-                            let merge_bg_tmp;
-                            let merge_bg = match self.attn_merge_bg.as_ref() {
-                                Some(bg) => bg,
-                                None => {
-                                    merge_bg_tmp = self.make_attn_merge_bg();
-                                    &merge_bg_tmp
-                                }
-                            };
-                            self.dispatch_into(
-                                &mut pass,
-                                &self.pipelines.flash_attention_split,
-                                split_bg,
-                                (n_heads, ATTN_SPLITS, 1),
-                            );
-                            self.dispatch_into(
-                                &mut pass,
-                                &self.pipelines.flash_attention_merge,
-                                merge_bg,
-                                (n_heads, 1, 1),
-                            );
+                        if profiling {
+                            "attn_post_out"
                         } else {
-                            self.dispatch_into(
-                                &mut pass,
-                                &self.pipelines.flash_attention,
-                                flash_bg,
-                                (n_heads, 1, 1),
-                            );
-                        }
-                        self.encode_attn_out_into(
-                            &mut pass,
-                            out_w,
-                            out_bg,
-                            add_bg,
-                            &o_lora_bgs,
-                            hs32,
-                        );
-                        if !profiling {
-                            self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
-                        }
-                    }
-                    if profiling {
-                        let mut pass = self.ctx.begin_pass(&mut enc, "attn_ffn");
+                            "attn_post"
+                        },
+                    );
+                    self.encode_attn_out_into(&mut pass, out_w, out_bg, add_bg, &o_lora_bgs, hs32);
+                    if !profiling {
                         self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
                     }
+                }
+                if profiling {
+                    let mut pass = self.ctx.begin_pass(&mut enc, "attn_post_ffn");
+                    self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
+                }
+            } else {
+                {
+                    let mut pass = self
+                        .ctx
+                        .begin_pass(&mut enc, if profiling { "attn_core" } else { "layer_attn" });
+                    self.encode_attn_layer_decode_into(&mut pass, i, lora, !profiling);
+                }
+                if profiling {
+                    let mut pass = self.ctx.begin_pass(&mut enc, "attn_ffn");
+                    self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
                 }
             }
 
@@ -6756,19 +7269,6 @@ impl GpuLfmModel {
             }
         }
 
-        // 3. Output norm + projection. Untied models project through
-        // `output.weight`; tied models reuse the embedding table.
-        //
-        // The norm runs for both tails: it is the last step of the CPU model's
-        // `run_layers`, so it is inside what `forward_embedding` returns, not
-        // part of the projection that `DecodeTail::Hidden` is declining. Only
-        // the projection and the argmax below are conditional.
-        //
-        // The Logits tail runs norm + projection + optional scale + optional
-        // argmax in ONE pass: a sequential RAW chain, and WebGPU orders
-        // dispatches within a pass (same guarantee the merged `conv` pass
-        // relies on). Profile runs split the three stages for attribution;
-        // production saves the per-pass host overhead on every token.
         let norm_only = matches!(tail, DecodeTail::Hidden | DecodeTail::HiddenUnsubmitted);
         if norm_only {
             self.encode_rmsnorm(
@@ -6786,7 +7286,6 @@ impl GpuLfmModel {
                 .logit_scale_params
                 .as_ref()
                 .map(|params| self.logit_scale_bg(params));
-            let profiling = self.ctx.profiling();
             {
                 let mut pass = self
                     .ctx
@@ -6802,7 +7301,7 @@ impl GpuLfmModel {
                             ((cfg.vocab_size as u32).div_ceil(256), 1, 1),
                         );
                     }
-                    if argmax != TailArgmax::None {
+                    if matches!(argmax, TailArgmax::Dispatch | TailArgmax::DispatchAndStage) {
                         self.encode_argmax_into(&mut pass);
                     }
                 }
@@ -6822,14 +7321,31 @@ impl GpuLfmModel {
                             ((cfg.vocab_size as u32).div_ceil(256), 1, 1),
                         );
                     }
-                    if argmax != TailArgmax::None {
+                    if matches!(argmax, TailArgmax::Dispatch | TailArgmax::DispatchAndStage) {
                         self.encode_argmax_into(&mut pass);
                     }
                 }
             }
-            if argmax == TailArgmax::DispatchAndStage {
-                // Stage the 4-byte result in this same submission.
-                enc.copy_buffer_to_buffer(&self.argmax_out_buf, 0, &self.argmax_readback_buf, 0, 4);
+            match argmax {
+                TailArgmax::DispatchAndStage => {
+                    enc.copy_buffer_to_buffer(
+                        &self.argmax_out_buf,
+                        0,
+                        &self.argmax_readback_buf,
+                        0,
+                        4,
+                    );
+                }
+                TailArgmax::StageLogits => {
+                    enc.copy_buffer_to_buffer(
+                        &self.logits_buf,
+                        0,
+                        &self.logits_readback_buf,
+                        0,
+                        (cfg.vocab_size * 4) as u64,
+                    );
+                }
+                TailArgmax::None | TailArgmax::Dispatch => {}
             }
         }
         enc
@@ -7859,14 +8375,16 @@ impl GpuLfmModel {
         );
     }
 
-    /// Streaming fp16 Q4_K_M GEMM (`gemm_stream_q4_k`). Same contract as
-    /// `encode_mul_mat_reg_tile` for the Q4KM case: `y[n, m] = x[n, k] @
-    /// w[m, k]^T` with token-major strides. Grid `(ceil(m/256), ceil(n/32))`.
+    /// Shared 256x32 streaming fp16 GEMM dispatch helper (`transpose_cast_f16` +
+    /// 5-binding `(q, d, b16, y, params)` GEMM on a `(ceil(m/256), ceil(n/32))`
+    /// grid) used by `Q4_K`, `Q5_K`, `Q6_K`, and `Q8_0`.
     #[allow(clippy::too_many_arguments)]
-    fn encode_gemm_stream_q4_k<'a>(
+    fn encode_gemm_stream_256x32<'a>(
         &'a self,
         cmds: &mut Vec<PrefillCmd<'a>>,
         w: &GpuWeight,
+        gemm: &'a wgpu::ComputePipeline,
+        gemm_label: &'static str,
         x: &wgpu::Buffer,
         y: &wgpu::Buffer,
         n: u32,
@@ -7875,12 +8393,6 @@ impl GpuLfmModel {
         all_logits: bool,
     ) {
         let m = w.tensor.shape[0] as u32;
-        let gemm = self
-            .pipelines
-            .gemm_stream_q4_k
-            .as_ref()
-            .expect("streaming Q4_K GEMM dispatched without a pipeline");
-        let gemm_label = "gemm_stream_q4_k";
         let transpose = self
             .pipelines
             .transpose_cast_f16
@@ -7894,11 +8406,6 @@ impl GpuLfmModel {
             (Some(q), Some(d)) => (q, d),
             _ => panic!("streaming GEMM dispatched without resident (q, d) buffers"),
         };
-        debug_assert_eq!(k % 32, 0);
-        let nq = m.checked_mul(k / 8).expect("repack q count exceeds u32");
-        let nd = m.checked_mul(k / 32).expect("repack d count exceeds u32");
-        debug_assert!(u64::from(nq) * 4 <= sq.size());
-        debug_assert!(u64::from(nd) * 4 <= sd.size());
         let n_pad = n.next_multiple_of(32);
         let t_params: [u32; 4] = [n, n_pad, k, 0];
         let t_buf = self.next_prefill_params(bytemuck::cast_slice(&t_params));
@@ -7982,7 +8489,7 @@ impl GpuLfmModel {
         Self::push_prefill_dispatch(
             cmds,
             transpose,
-            t_bg.expect("the Q4_K streaming GEMM always transposes"),
+            t_bg.expect("256x32 streaming GEMM always transposes"),
             (n_pad / 32, k.div_ceil(32), 1),
             "transpose_cast_f16",
         );
@@ -7992,6 +8499,174 @@ impl GpuLfmModel {
             bg,
             (m.div_ceil(256), n.div_ceil(32), 1),
             gemm_label,
+        );
+    }
+
+    /// Streaming fp16 Q4_K_M GEMM (`gemm_stream_q4_k`).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemm_stream_q4_k<'a>(
+        &'a self,
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        w: &GpuWeight,
+        x: &wgpu::Buffer,
+        y: &wgpu::Buffer,
+        n: u32,
+        k: u32,
+        y_stride: u32,
+        all_logits: bool,
+    ) {
+        let m = w.tensor.shape[0] as u32;
+        let gemm = self
+            .pipelines
+            .gemm_stream_q4_k
+            .as_ref()
+            .expect("streaming Q4_K GEMM dispatched without a pipeline");
+        let (sq, sd) = (
+            w.stream_q.as_ref().expect("missing stream_q"),
+            w.stream_d.as_ref().expect("missing stream_d"),
+        );
+        debug_assert_eq!(k % 32, 0);
+        let nq = m.checked_mul(k / 8).expect("repack q count exceeds u32");
+        let nd = m.checked_mul(k / 32).expect("repack d count exceeds u32");
+        debug_assert!(u64::from(nq) * 4 <= sq.size());
+        debug_assert!(u64::from(nd) * 4 <= sd.size());
+        self.encode_gemm_stream_256x32(
+            cmds,
+            w,
+            gemm,
+            "gemm_stream_q4_k",
+            x,
+            y,
+            n,
+            k,
+            y_stride,
+            all_logits,
+        );
+    }
+
+    /// Streaming fp16 Q5_K_M GEMM (`gemm_stream_q5_k`).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemm_stream_q5_k<'a>(
+        &'a self,
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        w: &GpuWeight,
+        x: &wgpu::Buffer,
+        y: &wgpu::Buffer,
+        n: u32,
+        k: u32,
+        y_stride: u32,
+        all_logits: bool,
+    ) {
+        let m = w.tensor.shape[0] as u32;
+        let gemm = self
+            .pipelines
+            .gemm_stream_q5_k
+            .as_ref()
+            .expect("streaming Q5_K GEMM dispatched without a pipeline");
+        let (sq, sd) = (
+            w.stream_q.as_ref().expect("missing stream_q"),
+            w.stream_d.as_ref().expect("missing stream_d"),
+        );
+        debug_assert_eq!(k % 32, 0);
+        let nq = m.checked_mul(k / 4).expect("repack q count exceeds u32");
+        let nd = m.checked_mul(k / 32).expect("repack d count exceeds u32");
+        debug_assert!(u64::from(nq) * 4 <= sq.size());
+        debug_assert!(u64::from(nd) * 4 <= sd.size());
+        self.encode_gemm_stream_256x32(
+            cmds,
+            w,
+            gemm,
+            "gemm_stream_q5_k",
+            x,
+            y,
+            n,
+            k,
+            y_stride,
+            all_logits,
+        );
+    }
+
+    /// Streaming fp16 Q6_K GEMM (`gemm_stream_q6_k_k64`).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemm_stream_q6_k<'a>(
+        &'a self,
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        w: &GpuWeight,
+        x: &wgpu::Buffer,
+        y: &wgpu::Buffer,
+        n: u32,
+        k: u32,
+        y_stride: u32,
+        all_logits: bool,
+    ) {
+        let m = w.tensor.shape[0] as u32;
+        let gemm = self
+            .pipelines
+            .gemm_stream_q6_k_k64
+            .as_ref()
+            .expect("streaming Q6_K GEMM dispatched without a pipeline");
+        let (sq, sd) = (
+            w.stream_q.as_ref().expect("missing stream_q"),
+            w.stream_d.as_ref().expect("missing stream_d"),
+        );
+        debug_assert_eq!(k % 64, 0);
+        let nq = m.checked_mul(k / 4).expect("repack q count exceeds u32");
+        let nd = m.checked_mul(k / 32).expect("repack d count exceeds u32");
+        debug_assert!(u64::from(nq) * 4 <= sq.size());
+        debug_assert!(u64::from(nd) * 4 <= sd.size());
+        self.encode_gemm_stream_256x32(
+            cmds,
+            w,
+            gemm,
+            "gemm_stream_q6_k_k64",
+            x,
+            y,
+            n,
+            k,
+            y_stride,
+            all_logits,
+        );
+    }
+
+    /// Streaming fp16 Q8_0 GEMM (`gemm_stream_q8_0_k64`).
+    #[allow(clippy::too_many_arguments)]
+    fn encode_gemm_stream_q8_0<'a>(
+        &'a self,
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        w: &GpuWeight,
+        x: &wgpu::Buffer,
+        y: &wgpu::Buffer,
+        n: u32,
+        k: u32,
+        y_stride: u32,
+        all_logits: bool,
+    ) {
+        let m = w.tensor.shape[0] as u32;
+        let gemm = self
+            .pipelines
+            .gemm_stream_q8_0_k64
+            .as_ref()
+            .expect("streaming Q8_0 GEMM dispatched without a pipeline");
+        let (sq, sd) = (
+            w.stream_q.as_ref().expect("missing stream_q"),
+            w.stream_d.as_ref().expect("missing stream_d"),
+        );
+        debug_assert_eq!(k % 64, 0);
+        let nq = m.checked_mul(k / 4).expect("repack q count exceeds u32");
+        let nd = m.checked_mul(k / 64).expect("repack d count exceeds u32");
+        debug_assert!(u64::from(nq) * 4 <= sq.size());
+        debug_assert!(u64::from(nd) * 4 <= sd.size());
+        self.encode_gemm_stream_256x32(
+            cmds,
+            w,
+            gemm,
+            "gemm_stream_q8_0_k64",
+            x,
+            y,
+            n,
+            k,
+            y_stride,
+            all_logits,
         );
     }
 
@@ -8017,8 +8692,12 @@ impl GpuLfmModel {
     ) {
         // Streaming fp16 fast path:
         // - Q4_K_M: gemm_stream_q4_k handles any n (bounds-checked per column)
+        // - Q5_K_M: gemm_stream_q5_k handles any n (bounds-checked per column)
+        // - Q6_K: gemm_stream_q6_k_k64 handles any n (bounds-checked per column)
+        // - Q8_0: gemm_stream_q8_0_k64 handles any n (bounds-checked per column)
         // - Q4_0: gemm_stream_q4_0 handles every n (padding to 32 columns); the register-tile kernel only below `stream_gemm_min_n()`
         if w.tensor.dtype == DType::Q4KM
+            && k > 0
             && k.is_multiple_of(32)
             && x_stride == k
             && self.pipelines.gemm_stream_q4_k.is_some()
@@ -8029,8 +8708,45 @@ impl GpuLfmModel {
             self.encode_gemm_stream_q4_k(cmds, w, x, y, n, k, y_stride, all_logits);
             return;
         }
+        if w.tensor.dtype == DType::Q5KM
+            && k > 0
+            && k.is_multiple_of(32)
+            && x_stride == k
+            && self.pipelines.gemm_stream_q5_k.is_some()
+            && self.pipelines.transpose_cast_f16.is_some()
+            && w.stream_q.is_some()
+            && w.stream_d.is_some()
+        {
+            self.encode_gemm_stream_q5_k(cmds, w, x, y, n, k, y_stride, all_logits);
+            return;
+        }
+        if w.tensor.dtype == DType::Q6K
+            && k > 0
+            && k.is_multiple_of(64)
+            && x_stride == k
+            && self.pipelines.gemm_stream_q6_k_k64.is_some()
+            && self.pipelines.transpose_cast_f16.is_some()
+            && w.stream_q.is_some()
+            && w.stream_d.is_some()
+        {
+            self.encode_gemm_stream_q6_k(cmds, w, x, y, n, k, y_stride, all_logits);
+            return;
+        }
+        if w.tensor.dtype == DType::Q8_0
+            && k > 0
+            && k.is_multiple_of(64)
+            && x_stride == k
+            && self.pipelines.gemm_stream_q8_0_k64.is_some()
+            && self.pipelines.transpose_cast_f16.is_some()
+            && w.stream_q.is_some()
+            && w.stream_d.is_some()
+        {
+            self.encode_gemm_stream_q8_0(cmds, w, x, y, n, k, y_stride, all_logits);
+            return;
+        }
         if w.tensor.dtype == DType::Q4_0
             && n >= stream_gemm_min_n()
+            && k > 0
             && k.is_multiple_of(32)
             && x_stride == k
             && self.pipelines.gemm_stream_q4_0.is_some()
@@ -8043,7 +8759,7 @@ impl GpuLfmModel {
         }
         debug_assert!(
             !w.resident_stream || w.tensor.dtype == DType::Q4_0,
-            "resident-stream reg-tile fallback is only valid for Q4_0; Q4KM must ride gemm_stream_q4_k"
+            "resident-stream reg-tile fallback is only valid for Q4_0; Q8_0, Q6K, Q5KM, and Q4KM must ride their streaming GEMMs"
         );
         debug_assert!(
             matches!(
@@ -9429,6 +10145,7 @@ impl GpuLfmModel {
         embeddings: &[f32],
         n_tokens: usize,
         state: &mut InferenceState,
+        compute_logits: bool,
         download_logits: bool,
     ) -> Option<Vec<f32>> {
         if !self.batched_prefill || self.unbatchable_matmul_weight().is_some() {
@@ -9452,7 +10169,7 @@ impl GpuLfmModel {
                 pos,
                 state,
                 false,
-                is_last,
+                is_last && compute_logits,
             );
             if host_prof {
                 eprintln!(
@@ -9685,6 +10402,38 @@ impl GpuLfmModel {
             |buf: &wgpu::Buffer, count: usize| -> Vec<f32> { self.ctx.download_f32(buf, count) };
 
         let tq = self.tq_cache();
+        if tq.is_none() {
+            let mut requests: Vec<(&wgpu::Buffer, usize)> = Vec::with_capacity(cfg.n_layers * 2);
+            for i in 0..cfg.n_layers {
+                if cfg.block_types[i] == BlockType::Attention {
+                    let kv_dim = cfg.kv_heads_per_layer[i] * head_dim;
+                    let n_bytes = (seq_len * kv_dim / 2) * std::mem::size_of::<u32>();
+                    let (k_buf, v_buf) = self.active_kv(i);
+                    requests.push((k_buf, n_bytes));
+                    requests.push((v_buf, n_bytes));
+                } else {
+                    let n_bytes = d_conv * cfg.hidden_size * std::mem::size_of::<f32>();
+                    let conv_buf = self.gpu_state.conv_buffers[i]
+                        .as_ref()
+                        .expect("conv layer must have rolling buffer");
+                    requests.push((conv_buf, n_bytes));
+                }
+            }
+            let mut blobs = self.ctx.download_bytes_batched(&requests).into_iter();
+            let mut layers = Vec::with_capacity(cfg.n_layers);
+            for i in 0..cfg.n_layers {
+                if cfg.block_types[i] == BlockType::Attention {
+                    let k_data = blobs.next().unwrap_or_default();
+                    let v_data = blobs.next().unwrap_or_default();
+                    layers.push(LayerSnapshot::AttentionF16 { k_data, v_data });
+                } else {
+                    let buffer = blobs.next().unwrap_or_default();
+                    layers.push(LayerSnapshot::Conv { buffer });
+                }
+            }
+            return StateSnapshot::new(layers, seq_len);
+        }
+
         let mut layers = Vec::with_capacity(cfg.n_layers);
         for i in 0..cfg.n_layers {
             if cfg.block_types[i] == BlockType::Attention {
@@ -10896,9 +11645,14 @@ impl Model for GpuLfmModel {
         // embeddings are appended at the cache's current end, and callers
         // splicing an image into a prompt track position through the state.
         let pos = state.seq_len;
-        self.forward_inner_compute_from_embedding(embedding, pos, state);
+        self.forward_inner_compute_tail_seeded(
+            HiddenSeed::Embedding(embedding),
+            pos,
+            state,
+            DecodeTail::Logits(TailArgmax::StageLogits),
+        );
         self.ctx
-            .download_f32(&self.logits_buf, self.config.vocab_size)
+            .read_mapped_f32(&self.logits_readback_buf, self.config.vocab_size)
     }
 
     /// The audio path's counterpart to [`Model::forward`]: same layer stack and
@@ -10979,9 +11733,27 @@ impl Model for GpuLfmModel {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
+        self.forward_prefill_from_embeddings_chunk(embeddings, n_tokens, start_pos, state, true)
+    }
+
+    fn forward_prefill_from_embeddings_chunk(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+        need_logits: bool,
+    ) -> Vec<f32> {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         let _lora_guard = self.resolve_lora(state);
-        self.seed_embeddings_locked(embeddings, n_tokens, start_pos, state, true)
+        self.seed_embeddings_locked(
+            embeddings,
+            n_tokens,
+            start_pos,
+            state,
+            need_logits,
+            need_logits,
+        )
     }
 
     fn forward_prefill(
@@ -11010,9 +11782,14 @@ impl Model for GpuLfmModel {
         // Reset internal seq_len so repeated generate() calls (bench) work.
         self.gpu_state.seq_len.store(start_pos, Ordering::Relaxed);
 
+        let full_tokens = tokens;
+        let cache_eligible = start_pos == 0 && !lora_active;
+        let mut start_pos = start_pos;
+        let mut tokens = tokens;
+
         // Fresh-prefill-only work: the prefix-cache lookup and zeroing the conv
         // rolling buffers. The batched-GEMM path itself runs at ANY `start_pos`
-        // (see below) — including with a LoRA active, which applies in-batch (two
+        // (see below) including with a LoRA active, which applies in-batch (two
         // NT GEMMs per target) rather than forcing the per-token fallback. The
         // prefix cache is still bypassed with an adapter: cached KV is
         // base-model-only, so restoring it and adapting only the tail would
@@ -11025,64 +11802,51 @@ impl Model for GpuLfmModel {
                     self.prefix_cache
                         .lock()
                         .unwrap_or_else(|e| e.into_inner())
-                        .find_longest_prefix(tokens)
+                        .find_longest_prefix(full_tokens)
                 })
                 .flatten()
                 // Compression-mode gate. `cache_namespace` now folds the mode and
                 // seed into the disk fingerprint, so a cross-mode entry should be
-                // unreachable — this is a defensive backstop, not the primary
+                // unreachable; this is a defensive backstop, not the primary
                 // guard, because the alternative on a namespace bug is
                 // `restore_state_locked` panicking or restoring a cache the
                 // kernels misread. Keep both: the filter is nearly free, and it
                 // degrades a namespacing regression to a cold prefill.
                 .filter(|(snapshot, _)| snapshot.is_compressed() == self.tq_cache().is_some());
-            if let Some((snapshot, prefix_len)) = hit {
+            if let Some((snapshot, prefix_len)) = hit
+                && prefix_len < full_tokens.len()
+                && prefix_len > 0
+            {
                 // Strict-prefix hits only. A `prefix_len == tokens.len()`
                 // hit would force `use_len = tokens.len() - 1`, but the
-                // restored state already reflects "after all tokens" —
+                // restored state already reflects "after all tokens";
                 // re-running the last token would advance the conv
                 // rolling buffer one position past where it should be
                 // and overwrite already-correct attention KV cells.
                 // The conv layer state isn't seq_len-gated, so the
                 // off-by-one would corrupt logits.
-                if prefix_len < tokens.len() && prefix_len > 0 {
-                    let use_len = prefix_len;
-                    self.restore_state_locked(&snapshot);
-                    // `restore_state_locked` set `gpu_state.seq_len`
-                    // to `snapshot.seq_len == prefix_len`, which
-                    // matches `use_len` in this strict-prefix path.
-                    // (Kept explicit so future use_len-vs-prefix_len
-                    // splits don't drift.)
-                    self.gpu_state.seq_len.store(use_len, Ordering::Relaxed);
-                    state.seq_len = use_len;
-                    // Skip the per-token vocab-sized download_f32 for
-                    // every prefill step except the last — only the
-                    // final logits are returned to the caller.
-                    // `prefix_len < tokens.len()` is enforced above, so
-                    // `remaining` is always >= 1 here.
-                    let remaining = &tokens[use_len..];
-                    let last = remaining.len() - 1;
-                    let mut logits = Vec::new();
-                    for (j, &token) in remaining.iter().enumerate() {
-                        if j == last {
-                            logits = self.forward_inner(&[token], use_len + j, state);
-                        } else {
-                            self.forward_inner_compute(&[token], use_len + j, state);
-                        }
-                    }
-                    self.maybe_snapshot_prefix_locked(tokens);
-                    return logits;
-                }
+                let use_len = prefix_len;
+                self.restore_state_locked(&snapshot);
+                // `restore_state_locked` set `gpu_state.seq_len`
+                // to `snapshot.seq_len == prefix_len`, which
+                // matches `use_len` in this strict-prefix path.
+                // (Kept explicit so future use_len-vs-prefix_len
+                // splits don't drift.)
+                self.gpu_state.seq_len.store(use_len, Ordering::Relaxed);
+                state.seq_len = use_len;
+                start_pos = use_len;
+                tokens = &full_tokens[use_len..];
+            } else {
+                // Cache miss on a fresh prefill: zero the GPU conv
+                // rolling buffers so stale state from a prior
+                // generation can't leak in. Cache hits skip this
+                // (`restore_state_locked` rewrites the buffers from
+                // the snapshot). Mirrors the equivalent fix on Metal.
+                //
+                // A continuation (`start_pos > 0`) must NOT reach here: its conv
+                // rolling state is exactly what the previous chunk left behind.
+                self.zero_conv_buffers_locked();
             }
-            // Cache miss on a fresh prefill: zero the GPU conv
-            // rolling buffers so stale state from a prior
-            // generation can't leak in. Cache hits skip this
-            // (`restore_state_locked` rewrites the buffers from
-            // the snapshot). Mirrors the equivalent fix on Metal.
-            //
-            // A continuation (`start_pos > 0`) must NOT reach here: its conv
-            // rolling state is exactly what the previous chunk left behind.
-            self.zero_conv_buffers_locked();
         }
 
         // Try the batched prefill path. Preconditions:
@@ -11123,7 +11887,7 @@ impl Model for GpuLfmModel {
                 layer,
                 tensor = name,
                 ?dtype,
-                "no batched prefill GEMM for this dtype — falling back to the \
+                "no batched prefill GEMM for this dtype: falling back to the \
                  per-token loop, which issues ~340x the GPU submits and makes \
                  prefill no faster than decode. Add a batched kernel for {dtype:?} \
                  to put this model back on the fast path.",
@@ -11131,7 +11895,7 @@ impl Model for GpuLfmModel {
         }
         if !tokens.is_empty() && self.batched_prefill && unbatchable.is_none() {
             // Chunk size respects both the static MAX_PREFILL_TOKENS
-            // budget AND the model's actual `max_seq_len` — otherwise
+            // budget AND the model's actual `max_seq_len`; otherwise
             // a caller with `--context-size < 512` would dispatch
             // batched chunks larger than the KV cache and OOB on the
             // copy_buffer_to_buffer write.
@@ -11150,30 +11914,30 @@ impl Model for GpuLfmModel {
                 );
                 pos = end;
             }
-            // Only cache base-model KV — an adapted run's KV must never be
-            // reused — and only for a prefill that started at 0, since the cache
+            // Only cache base-model KV (an adapted run's KV must never be
+            // reused) and only for a prefill that started at 0, since the cache
             // key is the whole prefix. A continuation chunk's `tokens` is a
             // fragment, not a prefix.
-            if start_pos == 0 && !lora_active {
-                self.maybe_snapshot_prefix_locked(tokens);
+            if cache_eligible {
+                self.maybe_snapshot_prefix_locked(full_tokens);
             }
             return logits;
         }
 
         // Per-token fallback. Reached only when the batched path above declined:
         // empty input, a model without `batched_prefill`, or an unbatchable dtype.
-        // Continuation chunks no longer land here — they take the batched path.
-        // Sequential single-token forward via the lock-free body — calling
+        // Continuation chunks no longer land here; they take the batched path.
+        // Sequential single-token forward via the lock-free body; calling
         // `self.forward()` here would re-acquire the (non-reentrant)
         // `infer_lock` we already hold and deadlock.
         //
         // For every step except the last, drive the GPU via
         // `forward_inner_compute` so the per-token vocab-sized
-        // `download_f32` is skipped — only the final iteration's
+        // `download_f32` is skipped; only the final iteration's
         // logits make it back to the caller. At p=4096 this drops
         // 4095 vocab-sized blocking readbacks (vocab × 4 bytes ×
         // 4095 = ~1 GB at vocab=65536). Empty `tokens` makes
-        // `last` underflow — guarded by `if !tokens.is_empty()`.
+        // `last` underflow; guarded by `if !tokens.is_empty()`.
         let mut logits = Vec::new();
         if !tokens.is_empty() {
             let last = tokens.len() - 1;
@@ -11187,8 +11951,8 @@ impl Model for GpuLfmModel {
         }
         // Skip the cache insert with a LoRA active: the snapshot's KV reflects
         // the adapter, not the base model, and would poison later base runs.
-        if start_pos == 0 && !lora_active {
-            self.maybe_snapshot_prefix_locked(tokens);
+        if cache_eligible {
+            self.maybe_snapshot_prefix_locked(full_tokens);
         }
         logits
     }
@@ -12263,6 +13027,9 @@ mod tests {
             "gemm_stream_q4_0",
             "gemm_stream_q4_0_k64",
             "gemm_stream_q4_k",
+            "gemm_stream_q5_k",
+            "gemm_stream_q6_k_k64",
+            "gemm_stream_q8_0_k64",
             "transpose_cast_f16",
             "rmsnorm_batch",
             "attention_prefill",
@@ -12590,6 +13357,122 @@ mod tests {
                         let exp = ref_weights[elem_idx];
                         assert!(
                             (got - exp).abs() < 1e-3,
+                            "row {row} elem {elem_idx}: got {got}, exp {exp}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `repack_q5_k_stream` must place every 4-bit low nibble, 1-bit high bit,
+    /// scale, and min where the streaming kernels index them, matching CPU
+    /// `dequantize_q5_k_block`.
+    #[test]
+    fn stream_repack_q5_k_layout() {
+        use super::repack_q5_k_stream;
+        use crate::quant::{BlockQ5K, dequantize_q5_k_block};
+        let (m, k) = (2usize, 256usize);
+        let mut data = vec![0u8; m * 176];
+
+        for row in 0..m {
+            let base = row * 176;
+            let d_f16 = 0x3C00u16; // 1.0 in f16
+            let dmin_f16 = 0x3800u16; // 0.5 in f16
+            data[base..base + 2].copy_from_slice(&d_f16.to_le_bytes());
+            data[base + 2..base + 4].copy_from_slice(&dmin_f16.to_le_bytes());
+            for i in 0..12 {
+                data[base + 4 + i] = ((row * 12 + i) % 64) as u8;
+            }
+            for i in 0..32 {
+                data[base + 16 + i] = ((row * 31 + i * 17) & 0xFF) as u8;
+            }
+            for i in 0..128 {
+                let lo = ((row + i) % 16) as u8;
+                let hi = ((row * 2 + i * 3) % 16) as u8;
+                data[base + 48 + i] = lo | (hi << 4);
+            }
+        }
+
+        let (q, d) = repack_q5_k_stream(&data, m, k);
+        assert_eq!(q.len(), m * (k / 4));
+        assert_eq!(d.len(), m * (k / 32));
+
+        for row in 0..m {
+            let base = row * 176;
+            let block = unsafe { &*(data[base..base + 176].as_ptr() as *const BlockQ5K) };
+            let ref_weights = dequantize_q5_k_block(block);
+
+            for kb in 0..8 {
+                let pd = d[kb * m + row];
+                let scale = half::f16::from_bits((pd & 0xFFFF) as u16).to_f32();
+                let minv = half::f16::from_bits((pd >> 16) as u16).to_f32();
+                for w in 0..8 {
+                    let pq = q[(kb * 8 + w) * m + row].to_le_bytes();
+                    for (t, &q_byte) in pq.iter().enumerate() {
+                        let q5 = q_byte as f32;
+                        let got = q5 * scale - minv;
+                        let elem_idx = kb * 32 + w * 4 + t;
+                        let exp = ref_weights[elem_idx];
+                        assert!(
+                            (got - exp).abs() < 1e-3,
+                            "row {row} elem {elem_idx}: got {got}, exp {exp}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// `repack_q6_k_stream` must place every signed `i8` `(q6 - 32)` and
+    /// paired `f16(d * sc)` scale where the streaming kernels index them,
+    /// matching CPU `dequantize_q6_k_block`.
+    #[test]
+    fn stream_repack_q6_k_layout() {
+        use super::repack_q6_k_stream;
+        use crate::quant::{BlockQ6K, dequantize_q6_k_block};
+        let (m, k) = (2usize, 256usize);
+        let mut data = vec![0u8; m * 210];
+
+        for row in 0..m {
+            let base = row * 210;
+            for i in 0..128 {
+                data[base + i] = ((row * 17 + i * 5) & 0xFF) as u8;
+            }
+            for i in 0..64 {
+                data[base + 128 + i] = ((row * 29 + i * 11) & 0xFF) as u8;
+            }
+            for i in 0..16 {
+                let sc = (((row * 7 + i * 3) % 31) as i16 - 15) as i8;
+                data[base + 192 + i] = sc as u8;
+            }
+            let d_f16 = half::f16::from_f32(0.05 + row as f32 * 0.02);
+            data[base + 208..base + 210].copy_from_slice(&d_f16.to_bits().to_le_bytes());
+        }
+
+        let (q, d) = repack_q6_k_stream(&data, m, k);
+        assert_eq!(q.len(), m * (k / 4));
+        assert_eq!(d.len(), m * (k / 32));
+
+        for row in 0..m {
+            let base = row * 210;
+            let block = unsafe { &*(data[base..base + 210].as_ptr() as *const BlockQ6K) };
+            let ref_weights = dequantize_q6_k_block(block);
+
+            for kb in 0..8 {
+                let pd = d[kb * m + row];
+                let scale_lo = half::f16::from_bits((pd & 0xFFFF) as u16).to_f32();
+                let scale_hi = half::f16::from_bits((pd >> 16) as u16).to_f32();
+                for p in 0..8 {
+                    let scale = if p < 4 { scale_lo } else { scale_hi };
+                    let word = q[(kb * 8 + p) * m + row].to_le_bytes();
+                    for (j, &w_byte) in word.iter().enumerate() {
+                        let qv = (w_byte as i8) as f32;
+                        let got = qv * scale;
+                        let elem_idx = kb * 32 + p * 4 + j;
+                        let exp = ref_weights[elem_idx];
+                        assert!(
+                            (got - exp).abs() < 1e-2,
                             "row {row} elem {elem_idx}: got {got}, exp {exp}"
                         );
                     }
@@ -13141,9 +14024,10 @@ mod tests {
         );
     }
 
-    /// Resident stream layout eligibility: Q4_0 with `k % 32 == 0` or Q4_K_M
-    /// with `k % 256 == 0`. There is no size gate: the repack is the
-    /// same bytes transposed, so small and large models alike qualify.
+    /// Resident stream layout eligibility: Q4_0 with `k % 32 == 0`, Q8_0 with
+    /// `k % 64 == 0`, or Q4_K_M / Q5_K_M / Q6_K with `k % 256 == 0`. There is no
+    /// size gate: the repack is the same bytes transposed, so small and large
+    /// models alike qualify.
     #[test]
     fn stream_layout_eligibility() {
         use super::stream_layout_eligible;
@@ -13153,11 +14037,16 @@ mod tests {
         assert!(stream_layout_eligible(DType::Q4_0, 10752));
         assert!(!stream_layout_eligible(DType::Q4_0, 100));
         assert!(!stream_layout_eligible(DType::Q4_0, 2056));
-        assert!(stream_layout_eligible(DType::Q4KM, 256));
-        assert!(stream_layout_eligible(DType::Q4KM, 2048));
-        assert!(!stream_layout_eligible(DType::Q4KM, 100));
-        assert!(!stream_layout_eligible(DType::Q4KM, 2056));
-        assert!(!stream_layout_eligible(DType::Q8_0, 2048));
+        for dt in [DType::Q4KM, DType::Q5KM, DType::Q6K] {
+            assert!(stream_layout_eligible(dt, 256));
+            assert!(stream_layout_eligible(dt, 2048));
+            assert!(!stream_layout_eligible(dt, 100));
+            assert!(!stream_layout_eligible(dt, 2056));
+        }
+        assert!(stream_layout_eligible(DType::Q8_0, 64));
+        assert!(stream_layout_eligible(DType::Q8_0, 2048));
+        assert!(!stream_layout_eligible(DType::Q8_0, 32));
+        assert!(!stream_layout_eligible(DType::Q8_0, 4304));
         assert!(!stream_layout_eligible(DType::F32, 2048));
     }
 
@@ -13319,6 +14208,407 @@ mod tests {
                 max_diff < 1e-2,
                 "m={m} k={k}: max_diff={max_diff:.3e} exceeds f32-order noise"
             );
+        }
+    }
+
+    /// The resident-stream Q8_0 decode kernel (`gemv_q8_0_stream`) matches the
+    /// CPU dequant+dot reference on synthetic Q8_0: exact-multiple rows plus a
+    /// ragged row count (exercises the per-row guards).
+    #[test]
+    fn stream_gemv_q8_0_matches_cpu() {
+        use super::{SYNTH_SALT_INPUTS, synth_q4_0_vec};
+        use crate::model::vision_encoder_gpu::repack_q8_0_stream;
+        let Some(ctx) = passthrough_ctx_or_skip("gemv_q8_0_stream") else {
+            return;
+        };
+        for (m, k) in [(256usize, 256usize), (200, 128)] {
+            let nb = k / 32;
+            let mut raw = Vec::with_capacity(m * nb * 34);
+            let mut dequant = vec![0.0f32; m * k];
+            for r in 0..m {
+                for b in 0..nb {
+                    let scale = 0.01 + ((r * 3 + b * 11) % 97) as f32 * 0.001;
+                    let delta = half::f16::from_f32(scale);
+                    let ds = crate::quant::f16_to_f32(delta.to_bits());
+                    raw.extend_from_slice(&delta.to_bits().to_le_bytes());
+                    for c in 0..32 {
+                        let qv = (((r * 7 + b * 13 + c * 5) % 251) as i16 - 125) as i8;
+                        raw.push(qv as u8);
+                        dequant[r * k + b * 32 + c] = qv as f32 * ds;
+                    }
+                }
+            }
+            let (q, d) = repack_q8_0_stream(&raw, m, k);
+            let x = synth_q4_0_vec(k, SYNTH_SALT_INPUTS);
+            let expected: Vec<f32> = (0..m)
+                .map(|r| {
+                    dequant[r * k..(r + 1) * k]
+                        .iter()
+                        .zip(&x)
+                        .map(|(&w, &xv)| w * xv)
+                        .sum()
+                })
+                .collect();
+            let pipe = ctx.gemv_q8_0_stream_passthrough();
+            let q_buf = ctx.upload_storage(bytemuck::cast_slice(&q), "test.q8_q");
+            let d_buf = ctx.upload_storage(bytemuck::cast_slice(&d), "test.q8_d");
+            let x_buf = ctx.upload_f32(&x, "test.q8_x");
+            let y_buf = ctx.create_storage_rw(m as u64 * 4, "test.q8_y");
+            let params_buf = ctx.upload_storage(
+                bytemuck::cast_slice(&[m as u32, k as u32, 0u32, 0u32]),
+                "test.q8_params",
+            );
+            let bg = bind_stream_qdxyp(&ctx, &pipe, &q_buf, &d_buf, &x_buf, &y_buf, &params_buf);
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&pipe);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups((m as u32).div_ceil(32), 1, 1);
+            }
+            ctx.submit_encoder(enc);
+            ctx.device.poll_wait();
+            let got = ctx.download_f32(&y_buf, m);
+            assert_eq!(got.len(), m);
+            let max_diff = max_abs_diff(&expected, &got);
+            assert!(
+                max_diff < 1e-2,
+                "m={m} k={k}: max_diff={max_diff:.3e} exceeds f32-order noise"
+            );
+        }
+    }
+
+    /// The resident-stream Q6_K and Q5_K decode + prefill kernels
+    /// (`gemv_q6_k_stream`, `gemm_stream_q6_k_k64`, `gemv_q5_k_stream`,
+    /// `gemm_stream_q5_k`) and the SPIR-V passthrough `gemv_f16` / `gemv_f32`
+    /// kernels match their CPU reference implementations across aligned and
+    /// ragged shapes.
+    #[test]
+    fn stream_q6_k_q5_k_and_dense_gemv_match_cpu() {
+        use super::{SYNTH_SALT_INPUTS, repack_q5_k_stream, repack_q6_k_stream, synth_q4_0_vec};
+        use crate::quant::{BlockQ5K, BlockQ6K, dequantize_q5_k_block, dequantize_q6_k_block};
+        let Some(ctx) = passthrough_ctx_or_skip("stream_q6_k_q5_k_and_dense_gemv") else {
+            return;
+        };
+
+        // 1. Q6_K stream GEMV + GEMM
+        for (m, n, k) in [(256usize, 32usize, 256usize), (200, 48, 512)] {
+            let nb = k / 256;
+            let mut raw = vec![0u8; m * nb * 210];
+            let mut dequant = vec![0.0f32; m * k];
+            for r in 0..m {
+                for b in 0..nb {
+                    let base = (r * nb + b) * 210;
+                    for i in 0..128 {
+                        raw[base + i] = ((r * 17 + b * 31 + i * 5) & 0xFF) as u8;
+                    }
+                    for i in 0..64 {
+                        raw[base + 128 + i] = ((r * 29 + b * 13 + i * 11) & 0xFF) as u8;
+                    }
+                    for i in 0..16 {
+                        let sc = (((r * 7 + b * 5 + i * 3) % 31) as i16 - 15) as i8;
+                        raw[base + 192 + i] = sc as u8;
+                    }
+                    let d_f16 = half::f16::from_f32(0.01 + ((r * 3 + b * 7) % 19) as f32 * 0.002);
+                    raw[base + 208..base + 210].copy_from_slice(&d_f16.to_bits().to_le_bytes());
+                    let blk = unsafe { &*(raw[base..base + 210].as_ptr() as *const BlockQ6K) };
+                    let w = dequantize_q6_k_block(blk);
+                    dequant[r * k + b * 256..r * k + (b + 1) * 256].copy_from_slice(&w);
+                }
+            }
+            let (q, d) = repack_q6_k_stream(&raw, m, k);
+            let q_buf = ctx.upload_storage(bytemuck::cast_slice(&q), "test.q6_q");
+            let d_buf = ctx.upload_storage(bytemuck::cast_slice(&d), "test.q6_d");
+
+            // GEMV
+            let x = synth_q4_0_vec(k, SYNTH_SALT_INPUTS);
+            let expected_gemv: Vec<f32> = (0..m)
+                .map(|r| {
+                    dequant[r * k..(r + 1) * k]
+                        .iter()
+                        .zip(&x)
+                        .map(|(&w, &xv)| w * xv)
+                        .sum()
+                })
+                .collect();
+            let gemv_pipe = ctx.gemv_q6_k_stream_passthrough();
+            let x_buf = ctx.upload_f32(&x, "test.q6_x");
+            let y_buf = ctx.create_storage_rw(m as u64 * 4, "test.q6_y");
+            let params_buf = ctx.upload_storage(
+                bytemuck::cast_slice(&[m as u32, k as u32, 0u32, 0u32]),
+                "test.q6_params",
+            );
+            let bg = bind_stream_qdxyp(
+                &ctx,
+                &gemv_pipe,
+                &q_buf,
+                &d_buf,
+                &x_buf,
+                &y_buf,
+                &params_buf,
+            );
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&gemv_pipe);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups((m as u32).div_ceil(16), 1, 1);
+            }
+            ctx.submit_encoder(enc);
+            ctx.device.poll_wait();
+            let got_gemv = ctx.download_f32(&y_buf, m);
+            let diff_gemv = max_abs_diff(&expected_gemv, &got_gemv);
+            assert!(
+                diff_gemv < 5e-2,
+                "Q6_K stream GEMV m={m} k={k}: max_diff={diff_gemv:.3e}"
+            );
+
+            // GEMM
+            let b16 = b16_buffer(&ctx, n, k, SYNTH_SALT_INPUTS);
+            let b_host = synth_q4_0_vec(n * k, SYNTH_SALT_INPUTS);
+            let gemm_pipe = ctx.gemm_stream_q6_k_k64_passthrough();
+            let got_gemm = run_stream_gemm(
+                &ctx,
+                &gemm_pipe,
+                &[&q_buf, &d_buf],
+                (m as u32, n as u32, k as u32),
+                256,
+                &b16,
+            );
+            let mut max_gemm_diff = 0.0f32;
+            for c in 0..n {
+                for r in 0..m {
+                    let exp: f32 = dequant[r * k..(r + 1) * k]
+                        .iter()
+                        .zip(&b_host[c * k..(c + 1) * k])
+                        .map(|(&w, &xv)| w * xv)
+                        .sum();
+                    max_gemm_diff = max_gemm_diff.max((exp - got_gemm[c * m + r]).abs());
+                }
+            }
+            assert!(
+                max_gemm_diff < 0.5,
+                "Q6_K stream GEMM m={m} n={n} k={k}: max_diff={max_gemm_diff:.3e}"
+            );
+        }
+
+        // 2. Q5_K stream GEMV + GEMM
+        for (m, n, k) in [(256usize, 32usize, 256usize), (200, 48, 512)] {
+            let nb = k / 256;
+            let mut raw = vec![0u8; m * nb * 176];
+            let mut dequant = vec![0.0f32; m * k];
+            for r in 0..m {
+                for b in 0..nb {
+                    let base = (r * nb + b) * 176;
+                    let d_f16 = half::f16::from_f32(0.01 + ((r * 3 + b * 7) % 19) as f32 * 0.002);
+                    let dmin_f16 =
+                        half::f16::from_f32(0.005 + ((r * 5 + b * 11) % 13) as f32 * 0.001);
+                    raw[base..base + 2].copy_from_slice(&d_f16.to_bits().to_le_bytes());
+                    raw[base + 2..base + 4].copy_from_slice(&dmin_f16.to_bits().to_le_bytes());
+                    for i in 0..12 {
+                        raw[base + 4 + i] = ((r * 12 + b * 7 + i) % 64) as u8;
+                    }
+                    for i in 0..32 {
+                        raw[base + 16 + i] = ((r * 31 + b * 19 + i * 17) & 0xFF) as u8;
+                    }
+                    for i in 0..128 {
+                        let lo = ((r + b + i) % 16) as u8;
+                        let hi = ((r * 2 + b * 3 + i * 3) % 16) as u8;
+                        raw[base + 48 + i] = lo | (hi << 4);
+                    }
+                    let blk = unsafe { &*(raw[base..base + 176].as_ptr() as *const BlockQ5K) };
+                    let w = dequantize_q5_k_block(blk);
+                    dequant[r * k + b * 256..r * k + (b + 1) * 256].copy_from_slice(&w);
+                }
+            }
+            let (q, d) = repack_q5_k_stream(&raw, m, k);
+            let q_buf = ctx.upload_storage(bytemuck::cast_slice(&q), "test.q5_q");
+            let d_buf = ctx.upload_storage(bytemuck::cast_slice(&d), "test.q5_d");
+
+            // GEMV
+            let x = synth_q4_0_vec(k, SYNTH_SALT_INPUTS);
+            let expected_gemv: Vec<f32> = (0..m)
+                .map(|r| {
+                    dequant[r * k..(r + 1) * k]
+                        .iter()
+                        .zip(&x)
+                        .map(|(&w, &xv)| w * xv)
+                        .sum()
+                })
+                .collect();
+            let gemv_pipe = ctx.gemv_q5_k_stream_passthrough();
+            let x_buf = ctx.upload_f32(&x, "test.q5_x");
+            let y_buf = ctx.create_storage_rw(m as u64 * 4, "test.q5_y");
+            let params_buf = ctx.upload_storage(
+                bytemuck::cast_slice(&[m as u32, k as u32, 0u32, 0u32]),
+                "test.q5_params",
+            );
+            let bg = bind_stream_qdxyp(
+                &ctx,
+                &gemv_pipe,
+                &q_buf,
+                &d_buf,
+                &x_buf,
+                &y_buf,
+                &params_buf,
+            );
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&gemv_pipe);
+                pass.set_bind_group(0, &bg, &[]);
+                pass.dispatch_workgroups((m as u32).div_ceil(16), 1, 1);
+            }
+            ctx.submit_encoder(enc);
+            ctx.device.poll_wait();
+            let got_gemv = ctx.download_f32(&y_buf, m);
+            let diff_gemv = max_abs_diff(&expected_gemv, &got_gemv);
+            assert!(
+                diff_gemv < 5e-2,
+                "Q5_K stream GEMV m={m} k={k}: max_diff={diff_gemv:.3e}"
+            );
+
+            // GEMM
+            let b16 = b16_buffer(&ctx, n, k, SYNTH_SALT_INPUTS);
+            let b_host = synth_q4_0_vec(n * k, SYNTH_SALT_INPUTS);
+            let gemm_pipe = ctx.gemm_stream_q5_k_passthrough();
+            let got_gemm = run_stream_gemm(
+                &ctx,
+                &gemm_pipe,
+                &[&q_buf, &d_buf],
+                (m as u32, n as u32, k as u32),
+                256,
+                &b16,
+            );
+            let mut max_gemm_diff = 0.0f32;
+            for c in 0..n {
+                for r in 0..m {
+                    let exp: f32 = dequant[r * k..(r + 1) * k]
+                        .iter()
+                        .zip(&b_host[c * k..(c + 1) * k])
+                        .map(|(&w, &xv)| w * xv)
+                        .sum();
+                    max_gemm_diff = max_gemm_diff.max((exp - got_gemm[c * m + r]).abs());
+                }
+            }
+            assert!(
+                max_gemm_diff < 0.5,
+                "Q5_K stream GEMM m={m} n={n} k={k}: max_diff={max_gemm_diff:.3e}"
+            );
+        }
+
+        // 3. Dense gemv_f16 and gemv_f32 passthrough (including non-multiple-of-4 k and row_offset)
+        for (m, k, row_offset) in [(64usize, 128usize, 0usize), (37, 99, 5)] {
+            let weights_f32 = synth_q4_0_vec(m * k, 0x4242);
+            let weights_f16: Vec<u16> = weights_f32
+                .iter()
+                .map(|&v| half::f16::from_f32(v).to_bits())
+                .collect();
+            let mut weights_f16_u32 = vec![0u32; weights_f16.len().div_ceil(2)];
+            for (i, chunk) in weights_f16.chunks(2).enumerate() {
+                let lo = chunk[0] as u32;
+                let hi = chunk.get(1).copied().unwrap_or(0) as u32;
+                weights_f16_u32[i] = lo | (hi << 16);
+            }
+            let x = synth_q4_0_vec(k, SYNTH_SALT_INPUTS);
+            let total_rows = row_offset + m;
+
+            // gemv_f32
+            let f32_pipe = ctx.gemv_f32_passthrough();
+            let w_f32_buf = ctx.upload_f32(&weights_f32, "test.w_f32");
+            let x_buf = ctx.upload_f32(&x, "test.x_dense");
+            let y_f32_buf = ctx.create_storage_rw(total_rows as u64 * 4, "test.y_f32");
+            let p_f32_buf = ctx.upload_storage(
+                bytemuck::cast_slice(&[m as u32, k as u32, row_offset as u32, 0u32]),
+                "test.p_f32",
+            );
+            let bg_f32 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &f32_pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: w_f32_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: x_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: y_f32_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: p_f32_buf.as_entire_binding(),
+                    },
+                ],
+            });
+            // gemv_f16
+            let f16_pipe = ctx.gemv_f16_passthrough();
+            let w_f16_buf =
+                ctx.upload_storage(bytemuck::cast_slice(&weights_f16_u32), "test.w_f16");
+            let y_f16_buf = ctx.create_storage_rw(total_rows as u64 * 4, "test.y_f16");
+            let bg_f16 = ctx.device.create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &f16_pipe.get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: w_f16_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: x_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: y_f16_buf.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 3,
+                        resource: p_f32_buf.as_entire_binding(),
+                    },
+                ],
+            });
+
+            let mut enc = ctx.device.create_command_encoder(&Default::default());
+            {
+                let mut pass = enc.begin_compute_pass(&Default::default());
+                pass.set_pipeline(&f32_pipe);
+                pass.set_bind_group(0, &bg_f32, &[]);
+                pass.dispatch_workgroups((m as u32).div_ceil(8), 1, 1);
+                pass.set_pipeline(&f16_pipe);
+                pass.set_bind_group(0, &bg_f16, &[]);
+                pass.dispatch_workgroups((m as u32).div_ceil(8), 1, 1);
+            }
+            ctx.submit_encoder(enc);
+            ctx.device.poll_wait();
+
+            let got_f32 = ctx.download_f32(&y_f32_buf, total_rows);
+            let got_f16 = ctx.download_f32(&y_f16_buf, total_rows);
+            for r in 0..m {
+                let exp_f32: f32 = weights_f32[r * k..(r + 1) * k]
+                    .iter()
+                    .zip(&x)
+                    .map(|(&w, &xv)| w * xv)
+                    .sum();
+                let exp_f16: f32 = weights_f16[r * k..(r + 1) * k]
+                    .iter()
+                    .zip(&x)
+                    .map(|(&w, &xv)| half::f16::from_bits(w).to_f32() * xv)
+                    .sum();
+                assert!(
+                    (got_f32[row_offset + r] - exp_f32).abs() < 1e-3,
+                    "gemv_f32 m={m} k={k} off={row_offset} r={r}: got {} exp {exp_f32}",
+                    got_f32[row_offset + r]
+                );
+                assert!(
+                    (got_f16[row_offset + r] - exp_f16).abs() < 1e-3,
+                    "gemv_f16 m={m} k={k} off={row_offset} r={r}: got {} exp {exp_f16}",
+                    got_f16[row_offset + r]
+                );
+            }
         }
     }
 

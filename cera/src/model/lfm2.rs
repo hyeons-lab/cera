@@ -871,7 +871,8 @@ impl LfmModel {
 
         let layer_refs =
             Self::resolve_all_layer_refs_with_loader(&gguf, &config, repack, &mut load_f32)?;
-        let embd_ref = Self::resolve_weight(&gguf, "token_embd.weight")?;
+        let embd_ref =
+            Self::resolve_weight(&gguf, "token_embd.weight")?.with_dec4_if(&gguf, repack);
         ensure!(
             embd_ref.k == hs,
             "token_embd.weight has k={} but hidden_size is {hs}",
@@ -1840,6 +1841,8 @@ impl LfmModel {
         let in_proj = refs.shortconv_in_proj.as_ref().unwrap();
         let out_proj = refs.shortconv_out_proj.as_ref().unwrap();
         let conv_weight = self.conv_weights_transposed[layer].as_ref().unwrap();
+        #[cfg(target_arch = "aarch64")]
+        let conv_tap_first = self.conv_weights[layer].as_ref().unwrap();
 
         // Cloned once (cheap Arc bump) so the adapter can be read while the base
         // scratch buffers stay mutably borrowed — same pattern as
@@ -1915,43 +1918,11 @@ impl LfmModel {
                 while ch + 3 < hidden_size {
                     let mut vsum = vdupq_n_f32(0.0);
                     for k in 0..d_conv {
-                        let mut vw = vdupq_n_f32(0.0);
-                        vw = vsetq_lane_f32::<0>(
-                            *conv_weight.get_unchecked(ch * kernel_size + k),
-                            vw,
-                        );
-                        vw = vsetq_lane_f32::<1>(
-                            *conv_weight.get_unchecked((ch + 1) * kernel_size + k),
-                            vw,
-                        );
-                        vw = vsetq_lane_f32::<2>(
-                            *conv_weight.get_unchecked((ch + 2) * kernel_size + k),
-                            vw,
-                        );
-                        vw = vsetq_lane_f32::<3>(
-                            *conv_weight.get_unchecked((ch + 3) * kernel_size + k),
-                            vw,
-                        );
+                        let vw = vld1q_f32(conv_tap_first.as_ptr().add(k * hidden_size + ch));
                         let vbuf = vld1q_f32(buffer.as_ptr().add(k * hidden_size + ch));
                         vsum = vfmaq_f32(vsum, vbuf, vw);
                     }
-                    let mut vw_last = vdupq_n_f32(0.0);
-                    vw_last = vsetq_lane_f32::<0>(
-                        *conv_weight.get_unchecked(ch * kernel_size + d_conv),
-                        vw_last,
-                    );
-                    vw_last = vsetq_lane_f32::<1>(
-                        *conv_weight.get_unchecked((ch + 1) * kernel_size + d_conv),
-                        vw_last,
-                    );
-                    vw_last = vsetq_lane_f32::<2>(
-                        *conv_weight.get_unchecked((ch + 2) * kernel_size + d_conv),
-                        vw_last,
-                    );
-                    vw_last = vsetq_lane_f32::<3>(
-                        *conv_weight.get_unchecked((ch + 3) * kernel_size + d_conv),
-                        vw_last,
-                    );
+                    let vw_last = vld1q_f32(conv_tap_first.as_ptr().add(d_conv * hidden_size + ch));
                     let vcur = vld1q_f32(conv_scratch.as_ptr().add(ch));
                     vsum = vfmaq_f32(vsum, vcur, vw_last);
                     vst1q_f32(out_buf.as_mut_ptr().add(ch), vsum);
@@ -2162,27 +2133,71 @@ impl LfmModel {
                     cfg.hidden_size,
                 );
             } else {
-                self.gemv_preq(
-                    q_ref,
-                    hidden,
-                    &state.scratch.q8_scales,
-                    &state.scratch.q8_quants,
-                    q,
-                );
-                self.gemv_preq(
-                    k_ref,
-                    hidden,
-                    &state.scratch.q8_scales,
-                    &state.scratch.q8_quants,
-                    k,
-                );
-                self.gemv_preq(
-                    v_ref,
-                    hidden,
-                    &state.scratch.q8_scales,
-                    &state.scratch.q8_quants,
-                    v,
-                );
+                #[cfg(not(has_blas))]
+                let smmla_done = if valid_dims
+                    && q_ref.dec4_bytes().is_none()
+                    && let (Some(q_rp), Some(k_rp), Some(v_rp)) =
+                        (&q_ref.repacked, &k_ref.repacked, &v_ref.repacked)
+                    && let (
+                        transformer::Repacked::Q40Smmla {
+                            packed: qp,
+                            scales: qs,
+                        },
+                        transformer::Repacked::Q40Smmla {
+                            packed: kp,
+                            scales: ks,
+                        },
+                        transformer::Repacked::Q40Smmla {
+                            packed: vp,
+                            scales: vs,
+                        },
+                    ) = (&q_rp.kind, &k_rp.kind, &v_rp.kind)
+                {
+                    cpu::gemv_q4_0_smmla_concat3_with_q8(
+                        qp,
+                        qs,
+                        kp,
+                        ks,
+                        vp,
+                        vs,
+                        &state.scratch.q8_scales,
+                        &state.scratch.q8_quants,
+                        q,
+                        k,
+                        v,
+                        cfg.hidden_size,
+                        kv_dim,
+                        kv_dim,
+                        cfg.hidden_size,
+                    )
+                } else {
+                    false
+                };
+                #[cfg(has_blas)]
+                let smmla_done = false;
+                if !smmla_done {
+                    self.gemv_preq(
+                        q_ref,
+                        hidden,
+                        &state.scratch.q8_scales,
+                        &state.scratch.q8_quants,
+                        q,
+                    );
+                    self.gemv_preq(
+                        k_ref,
+                        hidden,
+                        &state.scratch.q8_scales,
+                        &state.scratch.q8_quants,
+                        k,
+                    );
+                    self.gemv_preq(
+                        v_ref,
+                        hidden,
+                        &state.scratch.q8_scales,
+                        &state.scratch.q8_quants,
+                        v,
+                    );
+                }
             }
         }
         #[cfg(not(target_arch = "aarch64"))]
@@ -5906,9 +5921,8 @@ impl Model for LfmModel {
     }
 
     /// The rows the token prefill feeds the first layer: a dequantized embedding-table row per token,
-    /// with no scaling (see `forward_prefill_inner`). Offered for the image markers of a tiled image only;
-    /// this model keeps its per-segment prompt route, so `embed_token_rows` stays unimplemented.
-    fn embed_image_marker_rows(&self, tokens: &[u32]) -> Option<Vec<f32>> {
+    /// with no scaling (see `forward_prefill_inner`).
+    fn embed_token_rows(&self, tokens: &[u32]) -> Option<Vec<f32>> {
         let hs = self.config.hidden_size;
         if tokens.iter().any(|&t| t as usize >= self.embd_ref.m) {
             return None;
@@ -5927,6 +5941,17 @@ impl Model for LfmModel {
         start_pos: usize,
         state: &mut InferenceState,
     ) -> Vec<f32> {
+        self.forward_prefill_from_embeddings_chunk(embeddings, n_tokens, start_pos, state, true)
+    }
+
+    fn forward_prefill_from_embeddings_chunk(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+        need_logits: bool,
+    ) -> Vec<f32> {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let n = n_tokens;
@@ -5943,12 +5968,13 @@ impl Model for LfmModel {
             hs
         );
 
-        // An active LoRA is applied in-batch by `prefill_layers_and_logits` (via
-        // `apply_prefill` after each projection GEMM), so embedding-input
-        // (multimodal) spans get the adapter too — no per-frame fallback needed.
-
-        let hidden = embeddings.to_vec();
-        self.prefill_layers_and_logits(hidden, n, start_pos, state)
+        let mut hidden = embeddings.to_vec();
+        if need_logits {
+            self.prefill_layers_and_logits(hidden, n, start_pos, state)
+        } else {
+            self.prefill_layers_loop(&mut hidden, n, start_pos, state);
+            Vec::new()
+        }
     }
 
     fn config(&self) -> &ModelConfig {

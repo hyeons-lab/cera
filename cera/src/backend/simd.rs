@@ -2854,6 +2854,115 @@ pub(crate) mod neon {
             let compute_slice = move |(start_row, chunk): (usize, &mut [f32])| unsafe {
                 let num_rows = chunk.len();
                 let mut r = 0usize;
+                let z = vdupq_n_s32(0);
+
+                while r + 3 < num_rows {
+                    let r0 = start_row + r;
+                    let row0_start = r0 * row_bytes;
+                    let row1_start = row0_start + row_bytes;
+                    let row2_start = row1_start + row_bytes;
+                    let row3_start = row2_start + row_bytes;
+
+                    let mut sum0_v0 = vdupq_n_f32(0.0);
+                    let mut sum0_v1 = vdupq_n_f32(0.0);
+                    let mut sum1_v0 = vdupq_n_f32(0.0);
+                    let mut sum1_v1 = vdupq_n_f32(0.0);
+                    let mut sum2_v0 = vdupq_n_f32(0.0);
+                    let mut sum2_v1 = vdupq_n_f32(0.0);
+                    let mut sum3_v0 = vdupq_n_f32(0.0);
+                    let mut sum3_v1 = vdupq_n_f32(0.0);
+
+                    for bi in (0..n_blocks).step_by(2) {
+                        let b_off0 = bi * size_of::<BlockQ8_0>();
+                        let wb0_0 = &*(ptrs.a().add(row0_start + b_off0) as *const BlockQ8_0);
+                        let wb1_0 = &*(ptrs.a().add(row1_start + b_off0) as *const BlockQ8_0);
+                        let wb2_0 = &*(ptrs.a().add(row2_start + b_off0) as *const BlockQ8_0);
+                        let wb3_0 = &*(ptrs.a().add(row3_start + b_off0) as *const BlockQ8_0);
+
+                        core::arch::asm!(
+                            "prfm pldl1keep, [{0}, #136]",
+                            "prfm pldl1keep, [{1}, #136]",
+                            "prfm pldl1keep, [{2}, #136]",
+                            "prfm pldl1keep, [{3}, #136]",
+                            in(reg) (wb0_0 as *const BlockQ8_0),
+                            in(reg) (wb1_0 as *const BlockQ8_0),
+                            in(reg) (wb2_0 as *const BlockQ8_0),
+                            in(reg) (wb3_0 as *const BlockQ8_0),
+                            options(nostack, preserves_flags)
+                        );
+
+                        let x0_lo = vld1q_s8(ptrs.xq().add(bi * 32));
+                        let x0_hi = vld1q_s8(ptrs.xq().add(bi * 32 + 16));
+
+                        let w0_0_lo = vld1q_s8(wb0_0.quants.as_ptr());
+                        let w0_0_hi = vld1q_s8(wb0_0.quants.as_ptr().add(16));
+                        let w1_0_lo = vld1q_s8(wb1_0.quants.as_ptr());
+                        let w1_0_hi = vld1q_s8(wb1_0.quants.as_ptr().add(16));
+                        let w2_0_lo = vld1q_s8(wb2_0.quants.as_ptr());
+                        let w2_0_hi = vld1q_s8(wb2_0.quants.as_ptr().add(16));
+                        let w3_0_lo = vld1q_s8(wb3_0.quants.as_ptr());
+                        let w3_0_hi = vld1q_s8(wb3_0.quants.as_ptr().add(16));
+
+                        let p0_0 = vdotq_s32(vdotq_s32(z, w0_0_lo, x0_lo), w0_0_hi, x0_hi);
+                        let p1_0 = vdotq_s32(vdotq_s32(z, w1_0_lo, x0_lo), w1_0_hi, x0_hi);
+                        let p2_0 = vdotq_s32(vdotq_s32(z, w2_0_lo, x0_lo), w2_0_hi, x0_hi);
+                        let p3_0 = vdotq_s32(vdotq_s32(z, w3_0_lo, x0_lo), w3_0_hi, x0_hi);
+
+                        let xs0 = *ptrs.xs().add(bi);
+                        let d0_0 = crate::quant::f16_to_f32(wb0_0.delta) * xs0;
+                        let d1_0 = crate::quant::f16_to_f32(wb1_0.delta) * xs0;
+                        let d2_0 = crate::quant::f16_to_f32(wb2_0.delta) * xs0;
+                        let d3_0 = crate::quant::f16_to_f32(wb3_0.delta) * xs0;
+
+                        sum0_v0 = vmlaq_n_f32(sum0_v0, vcvtq_f32_s32(p0_0), d0_0);
+                        sum1_v0 = vmlaq_n_f32(sum1_v0, vcvtq_f32_s32(p1_0), d1_0);
+                        sum2_v0 = vmlaq_n_f32(sum2_v0, vcvtq_f32_s32(p2_0), d2_0);
+                        sum3_v0 = vmlaq_n_f32(sum3_v0, vcvtq_f32_s32(p3_0), d3_0);
+
+                        if bi + 1 < n_blocks {
+                            let b_off1 = (bi + 1) * size_of::<BlockQ8_0>();
+                            let wb0_1 = &*(ptrs.a().add(row0_start + b_off1) as *const BlockQ8_0);
+                            let wb1_1 = &*(ptrs.a().add(row1_start + b_off1) as *const BlockQ8_0);
+                            let wb2_1 = &*(ptrs.a().add(row2_start + b_off1) as *const BlockQ8_0);
+                            let wb3_1 = &*(ptrs.a().add(row3_start + b_off1) as *const BlockQ8_0);
+
+                            let x1_lo = vld1q_s8(ptrs.xq().add((bi + 1) * 32));
+                            let x1_hi = vld1q_s8(ptrs.xq().add((bi + 1) * 32 + 16));
+
+                            let w0_1_lo = vld1q_s8(wb0_1.quants.as_ptr());
+                            let w0_1_hi = vld1q_s8(wb0_1.quants.as_ptr().add(16));
+                            let w1_1_lo = vld1q_s8(wb1_1.quants.as_ptr());
+                            let w1_1_hi = vld1q_s8(wb1_1.quants.as_ptr().add(16));
+                            let w2_1_lo = vld1q_s8(wb2_1.quants.as_ptr());
+                            let w2_1_hi = vld1q_s8(wb2_1.quants.as_ptr().add(16));
+                            let w3_1_lo = vld1q_s8(wb3_1.quants.as_ptr());
+                            let w3_1_hi = vld1q_s8(wb3_1.quants.as_ptr().add(16));
+
+                            let p0_1 = vdotq_s32(vdotq_s32(z, w0_1_lo, x1_lo), w0_1_hi, x1_hi);
+                            let p1_1 = vdotq_s32(vdotq_s32(z, w1_1_lo, x1_lo), w1_1_hi, x1_hi);
+                            let p2_1 = vdotq_s32(vdotq_s32(z, w2_1_lo, x1_lo), w2_1_hi, x1_hi);
+                            let p3_1 = vdotq_s32(vdotq_s32(z, w3_1_lo, x1_lo), w3_1_hi, x1_hi);
+
+                            let xs1 = *ptrs.xs().add(bi + 1);
+                            let d0_1 = crate::quant::f16_to_f32(wb0_1.delta) * xs1;
+                            let d1_1 = crate::quant::f16_to_f32(wb1_1.delta) * xs1;
+                            let d2_1 = crate::quant::f16_to_f32(wb2_1.delta) * xs1;
+                            let d3_1 = crate::quant::f16_to_f32(wb3_1.delta) * xs1;
+
+                            sum0_v1 = vmlaq_n_f32(sum0_v1, vcvtq_f32_s32(p0_1), d0_1);
+                            sum1_v1 = vmlaq_n_f32(sum1_v1, vcvtq_f32_s32(p1_1), d1_1);
+                            sum2_v1 = vmlaq_n_f32(sum2_v1, vcvtq_f32_s32(p2_1), d2_1);
+                            sum3_v1 = vmlaq_n_f32(sum3_v1, vcvtq_f32_s32(p3_1), d3_1);
+                        }
+                    }
+
+                    chunk[r] = vaddvq_f32(sum0_v0) + vaddvq_f32(sum0_v1);
+                    chunk[r + 1] = vaddvq_f32(sum1_v0) + vaddvq_f32(sum1_v1);
+                    chunk[r + 2] = vaddvq_f32(sum2_v0) + vaddvq_f32(sum2_v1);
+                    chunk[r + 3] = vaddvq_f32(sum3_v0) + vaddvq_f32(sum3_v1);
+                    r += 4;
+                }
+
                 while r + 1 < num_rows {
                     let r0 = start_row + r;
                     let r1 = start_row + r + 1;
@@ -3062,29 +3171,144 @@ pub(crate) mod neon {
                 let d1 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(r1.add(64) as *const u16)));
 
                 let mut a0 = init;
-                a0 = vdotq_laneq_s32::<0>(a0, vreinterpretq_s8_u8(vandq_u8(w00, m0f)), ylo);
-                a0 = vdotq_laneq_s32::<0>(a0, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w00)), yhi);
-                a0 = vdotq_laneq_s32::<1>(a0, vreinterpretq_s8_u8(vandq_u8(w01, m0f)), ylo);
-                a0 = vdotq_laneq_s32::<1>(a0, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w01)), yhi);
-                a0 = vdotq_laneq_s32::<2>(a0, vreinterpretq_s8_u8(vandq_u8(w02, m0f)), ylo);
-                a0 = vdotq_laneq_s32::<2>(a0, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w02)), yhi);
-                a0 = vdotq_laneq_s32::<3>(a0, vreinterpretq_s8_u8(vandq_u8(w03, m0f)), ylo);
-                a0 = vdotq_laneq_s32::<3>(a0, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w03)), yhi);
-
                 let mut a1 = init;
+                a0 = vdotq_laneq_s32::<0>(a0, vreinterpretq_s8_u8(vandq_u8(w00, m0f)), ylo);
                 a1 = vdotq_laneq_s32::<0>(a1, vreinterpretq_s8_u8(vandq_u8(w10, m0f)), ylo);
+                a0 = vdotq_laneq_s32::<0>(a0, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w00)), yhi);
                 a1 = vdotq_laneq_s32::<0>(a1, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w10)), yhi);
+                a0 = vdotq_laneq_s32::<1>(a0, vreinterpretq_s8_u8(vandq_u8(w01, m0f)), ylo);
                 a1 = vdotq_laneq_s32::<1>(a1, vreinterpretq_s8_u8(vandq_u8(w11, m0f)), ylo);
+                a0 = vdotq_laneq_s32::<1>(a0, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w01)), yhi);
                 a1 = vdotq_laneq_s32::<1>(a1, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w11)), yhi);
+                a0 = vdotq_laneq_s32::<2>(a0, vreinterpretq_s8_u8(vandq_u8(w02, m0f)), ylo);
                 a1 = vdotq_laneq_s32::<2>(a1, vreinterpretq_s8_u8(vandq_u8(w12, m0f)), ylo);
+                a0 = vdotq_laneq_s32::<2>(a0, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w02)), yhi);
                 a1 = vdotq_laneq_s32::<2>(a1, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w12)), yhi);
+                a0 = vdotq_laneq_s32::<3>(a0, vreinterpretq_s8_u8(vandq_u8(w03, m0f)), ylo);
                 a1 = vdotq_laneq_s32::<3>(a1, vreinterpretq_s8_u8(vandq_u8(w13, m0f)), ylo);
+                a0 = vdotq_laneq_s32::<3>(a0, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w03)), yhi);
                 a1 = vdotq_laneq_s32::<3>(a1, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w13)), yhi);
 
                 f0 = vfmaq_f32(f0, vcvtq_f32_s32(a0), vmulq_n_f32(d0, xsb));
                 f1 = vfmaq_f32(f1, vcvtq_f32_s32(a1), vmulq_n_f32(d1, xsb));
             }
             (f0, f1)
+        }
+    }
+
+    /// Four 4-row groups (`p0`, `p1`, `p2`, `p3`, each `nb * 72` bytes) in lockstep over the shared
+    /// Q8_0 activation: halves activation loads relative to [`dec4_pair`] and keeps 4 independent
+    /// `SDOT` accumulator chains in flight while preserving bit-identical per-group accumulation.
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,dotprod,fp16")]
+    unsafe fn dec4_quad(
+        p0: *const u8,
+        p1: *const u8,
+        p2: *const u8,
+        p3: *const u8,
+        nb: usize,
+        xq: *const i8,
+        xs: *const f32,
+        neg8: *const i32,
+    ) -> (float32x4_t, float32x4_t, float32x4_t, float32x4_t) {
+        unsafe {
+            let m0f = vdupq_n_u8(0x0F);
+            let mut f0 = vdupq_n_f32(0.0);
+            let mut f1 = vdupq_n_f32(0.0);
+            let mut f2 = vdupq_n_f32(0.0);
+            let mut f3 = vdupq_n_f32(0.0);
+            for b in 0..nb {
+                let ylo = vld1q_s8(xq.add(b * 32));
+                let yhi = vld1q_s8(xq.add(b * 32 + 16));
+                let init = vld1q_dup_s32(neg8.add(b));
+                let xsb = *xs.add(b);
+                let r0 = p0.add(b * 72);
+                let r1 = p1.add(b * 72);
+                let r2 = p2.add(b * 72);
+                let r3 = p3.add(b * 72);
+                core::arch::asm!(
+                    "prfm pldl1keep, [{0}, #384]",
+                    "prfm pldl1keep, [{1}, #384]",
+                    "prfm pldl1keep, [{2}, #384]",
+                    "prfm pldl1keep, [{3}, #384]",
+                    in(reg) r0,
+                    in(reg) r1,
+                    in(reg) r2,
+                    in(reg) r3,
+                    options(nostack, preserves_flags)
+                );
+
+                let mut a0 = init;
+                let mut a1 = init;
+                let mut a2 = init;
+                let mut a3 = init;
+
+                let (w00, w10, w20, w30) = (vld1q_u8(r0), vld1q_u8(r1), vld1q_u8(r2), vld1q_u8(r3));
+                a0 = vdotq_laneq_s32::<0>(a0, vreinterpretq_s8_u8(vandq_u8(w00, m0f)), ylo);
+                a1 = vdotq_laneq_s32::<0>(a1, vreinterpretq_s8_u8(vandq_u8(w10, m0f)), ylo);
+                a2 = vdotq_laneq_s32::<0>(a2, vreinterpretq_s8_u8(vandq_u8(w20, m0f)), ylo);
+                a3 = vdotq_laneq_s32::<0>(a3, vreinterpretq_s8_u8(vandq_u8(w30, m0f)), ylo);
+                a0 = vdotq_laneq_s32::<0>(a0, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w00)), yhi);
+                a1 = vdotq_laneq_s32::<0>(a1, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w10)), yhi);
+                a2 = vdotq_laneq_s32::<0>(a2, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w20)), yhi);
+                a3 = vdotq_laneq_s32::<0>(a3, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w30)), yhi);
+
+                let (w01, w11, w21, w31) = (
+                    vld1q_u8(r0.add(16)),
+                    vld1q_u8(r1.add(16)),
+                    vld1q_u8(r2.add(16)),
+                    vld1q_u8(r3.add(16)),
+                );
+                a0 = vdotq_laneq_s32::<1>(a0, vreinterpretq_s8_u8(vandq_u8(w01, m0f)), ylo);
+                a1 = vdotq_laneq_s32::<1>(a1, vreinterpretq_s8_u8(vandq_u8(w11, m0f)), ylo);
+                a2 = vdotq_laneq_s32::<1>(a2, vreinterpretq_s8_u8(vandq_u8(w21, m0f)), ylo);
+                a3 = vdotq_laneq_s32::<1>(a3, vreinterpretq_s8_u8(vandq_u8(w31, m0f)), ylo);
+                a0 = vdotq_laneq_s32::<1>(a0, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w01)), yhi);
+                a1 = vdotq_laneq_s32::<1>(a1, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w11)), yhi);
+                a2 = vdotq_laneq_s32::<1>(a2, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w21)), yhi);
+                a3 = vdotq_laneq_s32::<1>(a3, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w31)), yhi);
+
+                let (w02, w12, w22, w32) = (
+                    vld1q_u8(r0.add(32)),
+                    vld1q_u8(r1.add(32)),
+                    vld1q_u8(r2.add(32)),
+                    vld1q_u8(r3.add(32)),
+                );
+                a0 = vdotq_laneq_s32::<2>(a0, vreinterpretq_s8_u8(vandq_u8(w02, m0f)), ylo);
+                a1 = vdotq_laneq_s32::<2>(a1, vreinterpretq_s8_u8(vandq_u8(w12, m0f)), ylo);
+                a2 = vdotq_laneq_s32::<2>(a2, vreinterpretq_s8_u8(vandq_u8(w22, m0f)), ylo);
+                a3 = vdotq_laneq_s32::<2>(a3, vreinterpretq_s8_u8(vandq_u8(w32, m0f)), ylo);
+                a0 = vdotq_laneq_s32::<2>(a0, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w02)), yhi);
+                a1 = vdotq_laneq_s32::<2>(a1, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w12)), yhi);
+                a2 = vdotq_laneq_s32::<2>(a2, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w22)), yhi);
+                a3 = vdotq_laneq_s32::<2>(a3, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w32)), yhi);
+
+                let (w03, w13, w23, w33) = (
+                    vld1q_u8(r0.add(48)),
+                    vld1q_u8(r1.add(48)),
+                    vld1q_u8(r2.add(48)),
+                    vld1q_u8(r3.add(48)),
+                );
+                a0 = vdotq_laneq_s32::<3>(a0, vreinterpretq_s8_u8(vandq_u8(w03, m0f)), ylo);
+                a1 = vdotq_laneq_s32::<3>(a1, vreinterpretq_s8_u8(vandq_u8(w13, m0f)), ylo);
+                a2 = vdotq_laneq_s32::<3>(a2, vreinterpretq_s8_u8(vandq_u8(w23, m0f)), ylo);
+                a3 = vdotq_laneq_s32::<3>(a3, vreinterpretq_s8_u8(vandq_u8(w33, m0f)), ylo);
+                a0 = vdotq_laneq_s32::<3>(a0, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w03)), yhi);
+                a1 = vdotq_laneq_s32::<3>(a1, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w13)), yhi);
+                a2 = vdotq_laneq_s32::<3>(a2, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w23)), yhi);
+                a3 = vdotq_laneq_s32::<3>(a3, vreinterpretq_s8_u8(vshrq_n_u8::<4>(w33)), yhi);
+
+                let d0 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(r0.add(64) as *const u16)));
+                let d1 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(r1.add(64) as *const u16)));
+                let d2 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(r2.add(64) as *const u16)));
+                let d3 = vcvt_f32_f16(vreinterpret_f16_u16(vld1_u16(r3.add(64) as *const u16)));
+                f0 = vfmaq_f32(f0, vcvtq_f32_s32(a0), vmulq_n_f32(d0, xsb));
+                f1 = vfmaq_f32(f1, vcvtq_f32_s32(a1), vmulq_n_f32(d1, xsb));
+                f2 = vfmaq_f32(f2, vcvtq_f32_s32(a2), vmulq_n_f32(d2, xsb));
+                f3 = vfmaq_f32(f3, vcvtq_f32_s32(a3), vmulq_n_f32(d3, xsb));
+            }
+            (f0, f1, f2, f3)
         }
     }
 
@@ -3144,7 +3368,27 @@ pub(crate) mod neon {
                 y.as_mut_ptr() as usize,
             );
             dec4_for_pairs(m / 8, move |first, count| unsafe {
-                for pair in first..first + count {
+                let end = first + count;
+                let mut pair = first;
+                while pair + 2 <= end {
+                    let g = 2 * pair;
+                    let (f0, f1, f2, f3) = dec4_quad(
+                        (pk as *const u8).add(g * nb * 72),
+                        (pk as *const u8).add((g + 1) * nb * 72),
+                        (pk as *const u8).add((g + 2) * nb * 72),
+                        (pk as *const u8).add((g + 3) * nb * 72),
+                        nb,
+                        xq as *const i8,
+                        xsp as *const f32,
+                        n8 as *const i32,
+                    );
+                    vst1q_f32((yp as *mut f32).add(4 * g), f0);
+                    vst1q_f32((yp as *mut f32).add(4 * g + 4), f1);
+                    vst1q_f32((yp as *mut f32).add(4 * g + 8), f2);
+                    vst1q_f32((yp as *mut f32).add(4 * g + 12), f3);
+                    pair += 2;
+                }
+                while pair < end {
                     let g = 2 * pair;
                     let (f0, f1) = dec4_pair(
                         (pk as *const u8).add(g * nb * 72),
@@ -3156,6 +3400,7 @@ pub(crate) mod neon {
                     );
                     vst1q_f32((yp as *mut f32).add(4 * g), f0);
                     vst1q_f32((yp as *mut f32).add(4 * g + 4), f1);
+                    pair += 1;
                 }
             });
         }
@@ -3203,26 +3448,26 @@ pub(crate) mod neon {
             );
             dec4_for_pairs(m / 8, move |first, count| unsafe {
                 for pair in first..first + count {
-                    for half in 0..2 {
-                        let g = 2 * pair + half;
-                        // Gate and up of the same 4-row group share the activation: the pair kernel
-                        // takes them as its two "groups".
-                        let (fg, fu) = dec4_pair(
-                            (gp as *const u8).add(g * nb * 72),
-                            (upp as *const u8).add(g * nb * 72),
-                            nb,
-                            xq as *const i8,
-                            xsp as *const f32,
-                            n8 as *const i32,
-                        );
-                        let mut gl = [0.0f32; 4];
-                        let mut ul = [0.0f32; 4];
-                        vst1q_f32(gl.as_mut_ptr(), fg);
-                        vst1q_f32(ul.as_mut_ptr(), fu);
-                        for r in 0..4 {
-                            *(op as *mut f32).add(4 * g + r) =
-                                (gl[r] / (1.0 + crate::backend::cpu::ggml_expf(-gl[r]))) * ul[r];
-                        }
+                    let g = 2 * pair;
+                    let (fg0, fu0, fg1, fu1) = dec4_quad(
+                        (gp as *const u8).add(g * nb * 72),
+                        (upp as *const u8).add(g * nb * 72),
+                        (gp as *const u8).add((g + 1) * nb * 72),
+                        (upp as *const u8).add((g + 1) * nb * 72),
+                        nb,
+                        xq as *const i8,
+                        xsp as *const f32,
+                        n8 as *const i32,
+                    );
+                    let mut gl = [0.0f32; 8];
+                    let mut ul = [0.0f32; 8];
+                    vst1q_f32(gl.as_mut_ptr(), fg0);
+                    vst1q_f32(gl.as_mut_ptr().add(4), fg1);
+                    vst1q_f32(ul.as_mut_ptr(), fu0);
+                    vst1q_f32(ul.as_mut_ptr().add(4), fu1);
+                    for r in 0..8 {
+                        *(op as *mut f32).add(4 * g + r) =
+                            (gl[r] / (1.0 + crate::backend::cpu::ggml_expf(-gl[r]))) * ul[r];
                     }
                 }
             });
@@ -3279,26 +3524,51 @@ pub(crate) mod neon {
                 neg8.as_ptr() as usize,
             );
             let (p1, p2, p3) = (m1 / 8, m2 / 8, m3 / 8);
+            let bounds = [p1, p1 + p2, p1 + p2 + p3];
             dec4_for_pairs(p1 + p2 + p3, move |first, count| unsafe {
-                for pair in first..first + count {
-                    let (mat, local) = if pair < p1 {
-                        (0, pair)
-                    } else if pair < p1 + p2 {
-                        (1, pair - p1)
+                let end = first + count;
+                let mut pair = first;
+                while pair < end {
+                    let (mat, base_p, lim_p) = if pair < bounds[0] {
+                        (0, 0, bounds[0])
+                    } else if pair < bounds[1] {
+                        (1, bounds[0], bounds[1])
                     } else {
-                        (2, pair - p1 - p2)
+                        (2, bounds[1], bounds[2])
                     };
-                    let g = 2 * local;
-                    let (f0, f1) = dec4_pair(
-                        (ws[mat] as *const u8).add(g * nb * 72),
-                        (ws[mat] as *const u8).add((g + 1) * nb * 72),
-                        nb,
-                        xq as *const i8,
-                        xsp as *const f32,
-                        n8 as *const i32,
-                    );
-                    vst1q_f32((ys[mat] as *mut f32).add(4 * g), f0);
-                    vst1q_f32((ys[mat] as *mut f32).add(4 * g + 4), f1);
+                    let seg_end = end.min(lim_p);
+                    while pair + 2 <= seg_end {
+                        let g = 2 * (pair - base_p);
+                        let (f0, f1, f2, f3) = dec4_quad(
+                            (ws[mat] as *const u8).add(g * nb * 72),
+                            (ws[mat] as *const u8).add((g + 1) * nb * 72),
+                            (ws[mat] as *const u8).add((g + 2) * nb * 72),
+                            (ws[mat] as *const u8).add((g + 3) * nb * 72),
+                            nb,
+                            xq as *const i8,
+                            xsp as *const f32,
+                            n8 as *const i32,
+                        );
+                        vst1q_f32((ys[mat] as *mut f32).add(4 * g), f0);
+                        vst1q_f32((ys[mat] as *mut f32).add(4 * g + 4), f1);
+                        vst1q_f32((ys[mat] as *mut f32).add(4 * g + 8), f2);
+                        vst1q_f32((ys[mat] as *mut f32).add(4 * g + 12), f3);
+                        pair += 2;
+                    }
+                    if pair < seg_end {
+                        let g = 2 * (pair - base_p);
+                        let (f0, f1) = dec4_pair(
+                            (ws[mat] as *const u8).add(g * nb * 72),
+                            (ws[mat] as *const u8).add((g + 1) * nb * 72),
+                            nb,
+                            xq as *const i8,
+                            xsp as *const f32,
+                            n8 as *const i32,
+                        );
+                        vst1q_f32((ys[mat] as *mut f32).add(4 * g), f0);
+                        vst1q_f32((ys[mat] as *mut f32).add(4 * g + 4), f1);
+                        pair += 1;
+                    }
                 }
             });
         }
@@ -7576,10 +7846,16 @@ pub(crate) mod neon {
         t: &mut [f32; 8],
     ) {
         unsafe {
-            let mut facc = [vdupq_n_f32(0.0); 4];
+            let mut facc0 = vdupq_n_f32(0.0);
+            let mut facc1 = vdupq_n_f32(0.0);
             for b in 0..nb {
                 let mut acc = [vdupq_n_s32(0); 4];
                 let w_base = p_ptr.add((sr * nb + b) * 256);
+                core::arch::asm!(
+                    "prfm pldl1keep, [{p}, #512]",
+                    p = in(reg) w_base,
+                    options(nostack, preserves_flags),
+                );
                 for c in 0..4usize {
                     let k_off = b * 32 + c * 8;
                     let b8 = vld1_s8(bq_ptr.add(j * k + k_off));
@@ -7593,26 +7869,89 @@ pub(crate) mod neon {
                 let s_off = (sr * nb + b) * 8;
                 let d0 = vld1q_f32(s_ptr.add(s_off));
                 let d1 = vld1q_f32(s_ptr.add(s_off + 4));
-                let db = *bs_ptr.add(j * nb + b);
-                let dbv = vdupq_n_f32(db);
-                let dw_p0 = vzip1q_f32(d0, d0);
-                facc[0] = vfmaq_f32(facc[0], vcvtq_f32_s32(acc[0]), vmulq_f32(dw_p0, dbv));
-                let dw_p1 = vzip2q_f32(d0, d0);
-                facc[1] = vfmaq_f32(facc[1], vcvtq_f32_s32(acc[1]), vmulq_f32(dw_p1, dbv));
-                let dw_p2 = vzip1q_f32(d1, d1);
-                facc[2] = vfmaq_f32(facc[2], vcvtq_f32_s32(acc[2]), vmulq_f32(dw_p2, dbv));
-                let dw_p3 = vzip2q_f32(d1, d1);
-                facc[3] = vfmaq_f32(facc[3], vcvtq_f32_s32(acc[3]), vmulq_f32(dw_p3, dbv));
+                let dbv = vdupq_n_f32(*bs_ptr.add(j * nb + b));
+                let a01 = vuzp1q_s32(acc[0], acc[1]);
+                let a23 = vuzp1q_s32(acc[2], acc[3]);
+                facc0 = vfmaq_f32(facc0, vcvtq_f32_s32(a01), vmulq_f32(d0, dbv));
+                facc1 = vfmaq_f32(facc1, vcvtq_f32_s32(a23), vmulq_f32(d1, dbv));
             }
 
-            let mut tmp = [[0.0f32; 4]; 4];
-            for p in 0..4 {
-                vst1q_f32(tmp[p].as_mut_ptr(), facc[p]);
+            vst1q_f32(t.as_mut_ptr(), facc0);
+            vst1q_f32(t.as_mut_ptr().add(4), facc1);
+        }
+    }
+
+    /// Fused gate + up single-token smmla tile: shares the RHS activation load and
+    /// block scale across `gate` and `up` in each k-block while keeping the exact
+    /// per-block summation order of [`smmla_q4_0_tile_8x1`].
+    #[inline]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    unsafe fn smmla_q4_0_gate_up_tile_8x1(
+        gp_ptr: *const i8,
+        gs_ptr: *const f32,
+        up_ptr: *const i8,
+        us_ptr: *const f32,
+        bq_ptr: *const i8,
+        bs_ptr: *const f32,
+        sr: usize,
+        j: usize,
+        nb: usize,
+        k: usize,
+        gt: &mut [f32; 8],
+        ut: &mut [f32; 8],
+    ) {
+        unsafe {
+            let mut gf0 = vdupq_n_f32(0.0);
+            let mut gf1 = vdupq_n_f32(0.0);
+            let mut uf0 = vdupq_n_f32(0.0);
+            let mut uf1 = vdupq_n_f32(0.0);
+            for b in 0..nb {
+                let mut g_acc = [vdupq_n_s32(0); 4];
+                let mut u_acc = [vdupq_n_s32(0); 4];
+                let blk_idx = sr * nb + b;
+                let gw_base = gp_ptr.add(blk_idx * 256);
+                let uw_base = up_ptr.add(blk_idx * 256);
+                core::arch::asm!(
+                    "prfm pldl1keep, [{gp}, #512]",
+                    "prfm pldl1keep, [{up}, #512]",
+                    gp = in(reg) gw_base,
+                    up = in(reg) uw_base,
+                    options(nostack, preserves_flags),
+                );
+                for c in 0..4usize {
+                    let k_off = b * 32 + c * 8;
+                    let b8 = vld1_s8(bq_ptr.add(j * k + k_off));
+                    let rhs = vcombine_s8(b8, b8);
+                    for p in 0..4usize {
+                        let off = c * 64 + p * 16;
+                        let g_lhs = vld1q_s8(gw_base.add(off));
+                        let u_lhs = vld1q_s8(uw_base.add(off));
+                        g_acc[p] = vmmlaq_s32(g_acc[p], g_lhs, rhs);
+                        u_acc[p] = vmmlaq_s32(u_acc[p], u_lhs, rhs);
+                    }
+                }
+
+                let s_off = blk_idx * 8;
+                let dbv = vdupq_n_f32(*bs_ptr.add(j * nb + b));
+                let gd0 = vld1q_f32(gs_ptr.add(s_off));
+                let gd1 = vld1q_f32(gs_ptr.add(s_off + 4));
+                let ud0 = vld1q_f32(us_ptr.add(s_off));
+                let ud1 = vld1q_f32(us_ptr.add(s_off + 4));
+                let ga01 = vuzp1q_s32(g_acc[0], g_acc[1]);
+                let ga23 = vuzp1q_s32(g_acc[2], g_acc[3]);
+                let ua01 = vuzp1q_s32(u_acc[0], u_acc[1]);
+                let ua23 = vuzp1q_s32(u_acc[2], u_acc[3]);
+                gf0 = vfmaq_f32(gf0, vcvtq_f32_s32(ga01), vmulq_f32(gd0, dbv));
+                gf1 = vfmaq_f32(gf1, vcvtq_f32_s32(ga23), vmulq_f32(gd1, dbv));
+                uf0 = vfmaq_f32(uf0, vcvtq_f32_s32(ua01), vmulq_f32(ud0, dbv));
+                uf1 = vfmaq_f32(uf1, vcvtq_f32_s32(ua23), vmulq_f32(ud1, dbv));
             }
-            for p in 0..4 {
-                t[2 * p] = tmp[p][0];
-                t[2 * p + 1] = tmp[p][2];
-            }
+
+            vst1q_f32(gt.as_mut_ptr(), gf0);
+            vst1q_f32(gt.as_mut_ptr().add(4), gf1);
+            vst1q_f32(ut.as_mut_ptr(), uf0);
+            vst1q_f32(ut.as_mut_ptr().add(4), uf1);
         }
     }
 
@@ -7699,8 +8038,9 @@ pub(crate) mod neon {
 
     /// Dispatches `sr_count` super-rows across worker threads.
     ///
-    /// For multi-token batches (`n >= 2`), scheduling uses a disjoint dummy buffer
-    /// sized to avoid borrowing the output slice during concurrent raw pointer writes.
+    /// Single-token decode (`n == 1`) uses [`crate::backend::cpu::par_range`] across
+    /// all workers, while multi-token batches (`n >= 2`) cap active worker threads via
+    /// [`crate::backend::cpu::par_range_prefill_active`].
     #[cfg_attr(not(test), allow(dead_code))]
     #[inline(always)]
     fn dispatch_smmla_super_rows<F>(sr_count: usize, n: usize, compute_super_row: F)
@@ -7716,32 +8056,16 @@ pub(crate) mod neon {
                 });
             } else {
                 let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
-                let nth = crate::backend::cpu::prefill_par_threads()
-                    .max(1)
-                    .min(max_active);
-                let chunk = sr_count.div_ceil(nth * 4).max(1);
-                let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
-                let mut dummy = [0.0f32; 4096];
-                if sr_count <= dummy.len() {
-                    crate::backend::cpu::par_rows_n_chunked_active(
-                        &mut dummy[..sr_count],
-                        1,
-                        1,
-                        chunk,
-                        max_active,
-                        compute,
-                    );
-                } else {
-                    let mut dummy_vec = vec![0.0f32; sr_count];
-                    crate::backend::cpu::par_rows_n_chunked_active(
-                        &mut dummy_vec,
-                        1,
-                        1,
-                        chunk,
-                        max_active,
-                        compute,
-                    );
-                }
+                crate::backend::cpu::par_range_prefill_active(
+                    sr_count,
+                    1,
+                    max_active,
+                    |start_sr, count| {
+                        for sr in start_sr..start_sr + count {
+                            compute_super_row(sr);
+                        }
+                    },
+                );
             }
         } else {
             (0..sr_count).for_each(compute_super_row);
@@ -7749,7 +8073,7 @@ pub(crate) mod neon {
     }
 
     /// Smmla (i8mm) twin of [`gemm_q4_0_8x8_q8_0_rowmajor`]: repacked 8-row Q4_0
-    /// × Q8_0 batched GEMM writing directly in row-major `out[n, m]` layout,
+    /// x Q8_0 batched GEMM writing directly in row-major `out[n, m]` layout,
     /// with B quants packed by
     /// [`crate::model::transformer::quantize_rows`].
     #[cfg_attr(not(test), allow(dead_code))]
@@ -7774,8 +8098,7 @@ pub(crate) mod neon {
         debug_assert_eq!(out.len(), m * n);
         debug_assert_eq!(packed.len(), (m / 8) * nb * 256);
         debug_assert_eq!(scales.len(), (m / 8) * nb * 8);
-        debug_assert_eq!(b_quants.len(), n * k);
-        debug_assert_eq!(b_scales.len(), n * nb);
+        debug_assert!(b_quants.len() >= n * k && b_scales.len() >= n * nb);
 
         let p_base = packed.as_ptr() as usize;
         let s_base = scales.as_ptr() as usize;
@@ -7899,38 +8222,7 @@ pub(crate) mod neon {
             }
         };
 
-        let sr_count = m / 8;
-        if sr_count >= 2 {
-            let max_active = crate::backend::cpu::prefill_threads_for_tokens(n);
-            let nth = crate::backend::cpu::prefill_par_threads()
-                .max(1)
-                .min(max_active);
-            let chunk = sr_count.div_ceil(nth * 4).max(1);
-            let compute = move |(sr, _): (usize, &mut [f32])| compute_super_row(sr);
-            if sr_count <= 4096 {
-                let mut tickets = [0.0f32; 4096];
-                crate::backend::cpu::par_rows_n_chunked_active(
-                    &mut tickets[..sr_count],
-                    1,
-                    1,
-                    chunk,
-                    max_active,
-                    compute,
-                );
-            } else {
-                let mut tickets = vec![0.0f32; sr_count];
-                crate::backend::cpu::par_rows_n_chunked_active(
-                    &mut tickets,
-                    1,
-                    1,
-                    chunk,
-                    max_active,
-                    compute,
-                );
-            }
-        } else {
-            (0..sr_count).for_each(compute_super_row);
-        }
+        dispatch_smmla_super_rows(m / 8, n, compute_super_row);
     }
 
     /// [`gemm_q4_0_smmla_8x4_q8_0_rowmajor`] with the activations also given interleaved per 4-token tile
@@ -8084,8 +8376,9 @@ pub(crate) mod neon {
             for j in tiles * 4..n {
                 let mut gt = [0.0f32; 8];
                 let mut ut = [0.0f32; 8];
-                smmla_q4_0_tile_8x1(gp_ptr, gs_ptr, bq_ptr, bs_ptr, sr, j, nb, k, &mut gt);
-                smmla_q4_0_tile_8x1(up_ptr, us_ptr, bq_ptr, bs_ptr, sr, j, nb, k, &mut ut);
+                smmla_q4_0_gate_up_tile_8x1(
+                    gp_ptr, gs_ptr, up_ptr, us_ptr, bq_ptr, bs_ptr, sr, j, nb, k, &mut gt, &mut ut,
+                );
                 for r in 0..8 {
                     let g_val = gt[r];
                     *out_ptr.add(j * m + base_row + r) =
@@ -8098,11 +8391,11 @@ pub(crate) mod neon {
     }
 
     /// Smmla (i8mm) twin of [`gemm_q4_0_gate_up_silu_rowmajor`]: fused Gate +
-    /// Up + SiLU repacked Q4_0 × Q8_0 batched GEMM writing directly into
+    /// Up + SiLU repacked Q4_0 x Q8_0 batched GEMM writing directly into
     /// `out[n, m]`, with B quants packed by
     /// [`crate::model::transformer::quantize_rows`].
     ///
-    /// Computes `out[tok, r] = silu(gate[r] · act[tok]) * (up[r] · act[tok])`
+    /// Computes `out[tok, r] = silu(gate[r] * act[tok]) * (up[r] * act[tok])`
     /// directly in registers, eliminating intermediate memory allocations,
     /// store/load rounds, and cache thrashing for `up_mat`.
     #[cfg_attr(not(test), allow(dead_code))]
@@ -8139,8 +8432,7 @@ pub(crate) mod neon {
         debug_assert_eq!(gate_scales.len(), (m / 8) * nb * 8);
         debug_assert_eq!(up_packed.len(), (m / 8) * nb * 256);
         debug_assert_eq!(up_scales.len(), (m / 8) * nb * 8);
-        debug_assert_eq!(b_quants.len(), n * k);
-        debug_assert_eq!(b_scales.len(), n * nb);
+        debug_assert!(b_quants.len() >= n * k && b_scales.len() >= n * nb);
 
         let gp_base = gate_packed.as_ptr() as usize;
         let gs_base = gate_scales.as_ptr() as usize;
@@ -8186,8 +8478,9 @@ pub(crate) mod neon {
             while j < n {
                 let mut gt = [0.0f32; 8];
                 let mut ut = [0.0f32; 8];
-                smmla_q4_0_tile_8x1(gp_ptr, gs_ptr, bq_ptr, bs_ptr, sr, j, nb, k, &mut gt);
-                smmla_q4_0_tile_8x1(up_ptr, us_ptr, bq_ptr, bs_ptr, sr, j, nb, k, &mut ut);
+                smmla_q4_0_gate_up_tile_8x1(
+                    gp_ptr, gs_ptr, up_ptr, us_ptr, bq_ptr, bs_ptr, sr, j, nb, k, &mut gt, &mut ut,
+                );
 
                 let base_row = 8 * sr;
                 for r in 0..8 {
@@ -8202,6 +8495,87 @@ pub(crate) mod neon {
         };
 
         dispatch_smmla_super_rows(m / 8, n, compute_super_row);
+    }
+
+    /// Fused 3-matrix single-token GEMV over the smmla repack (`Repacked::Q40Smmla`).
+    #[cfg_attr(not(test), allow(dead_code))]
+    #[allow(clippy::too_many_arguments)]
+    #[target_feature(enable = "neon,i8mm")]
+    pub unsafe fn gemv_q4_0_smmla_concat3_neon(
+        p1: &[u8],
+        s1: &[f32],
+        p2: &[u8],
+        s2: &[f32],
+        p3: &[u8],
+        s3: &[f32],
+        b_scales: &[f32],
+        b_quants: &[i8],
+        y1: &mut [f32],
+        y2: &mut [f32],
+        y3: &mut [f32],
+        m1: usize,
+        m2: usize,
+        m3: usize,
+        k: usize,
+    ) {
+        let nb = k / 32;
+        let sr1 = m1 / 8;
+        let sr2 = m2 / 8;
+        let sr3 = m3 / 8;
+        let sr_total = sr1 + sr2 + sr3;
+        let ps = [
+            p1.as_ptr() as usize,
+            p2.as_ptr() as usize,
+            p3.as_ptr() as usize,
+        ];
+        let ss = [
+            s1.as_ptr() as usize,
+            s2.as_ptr() as usize,
+            s3.as_ptr() as usize,
+        ];
+        let ys = [
+            y1.as_mut_ptr() as usize,
+            y2.as_mut_ptr() as usize,
+            y3.as_mut_ptr() as usize,
+        ];
+        let bq_base = b_quants.as_ptr() as usize;
+        let bs_base = b_scales.as_ptr() as usize;
+        let bounds = [sr1, sr1 + sr2, sr_total];
+
+        let run_range = move |start_sr: usize, count: usize| unsafe {
+            let bq_ptr = bq_base as *const i8;
+            let bs_ptr = bs_base as *const f32;
+            for sr in start_sr..start_sr + count {
+                let (mat, base_sr) = if sr < bounds[0] {
+                    (0, 0)
+                } else if sr < bounds[1] {
+                    (1, bounds[0])
+                } else {
+                    (2, bounds[1])
+                };
+                let local_sr = sr - base_sr;
+                let mut t = [0.0f32; 8];
+                smmla_q4_0_tile_8x1(
+                    ps[mat] as *const i8,
+                    ss[mat] as *const f32,
+                    bq_ptr,
+                    bs_ptr,
+                    local_sr,
+                    0,
+                    nb,
+                    k,
+                    &mut t,
+                );
+                let y_ptr = (ys[mat] as *mut f32).add(8 * local_sr);
+                core::ptr::copy_nonoverlapping(t.as_ptr(), y_ptr, 8);
+            }
+        };
+
+        if sr_total >= 2 {
+            crate::backend::cpu::par_range(sr_total, 1, run_range);
+        } else {
+            run_range(0, sr_total);
+        }
     }
 
     /// Is the K-quant (Q4_K/Q6_K) int8 GEMM usable on this CPU?

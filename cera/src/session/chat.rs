@@ -1772,6 +1772,9 @@ impl Execution for CoreExecution {
         self.session.last_ingest_recovery = None;
         self.session
             .with_ingest_recovery(|session| {
+                if let Some(res) = session.try_append_fused_segments(segments) {
+                    return res;
+                }
                 for seg in segments {
                     match *seg {
                         IngestSegment::Tokens(toks) => {

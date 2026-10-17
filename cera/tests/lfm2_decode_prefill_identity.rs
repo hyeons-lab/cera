@@ -20,8 +20,7 @@
 //!     pinned directly by `moe_prefill_identity_tests` in `model/lfm2.rs`, which
 //!     compares the FFN output bits; the end-to-end MoE test here is a coarser
 //!     consistency check, because on a tiny model the next quantization absorbs
-//!     a last-bit difference. The MoE model is loaded without the CPU repacks,
-//!     whose prefill GEMMs reorder sums on purpose.
+//!     a last-bit difference.
 //!
 //! Exactness is asserted on aarch64 without BLAS (the arithmetic this was written
 //! against); elsewhere the test only checks the paths agree closely. It skips when
@@ -248,10 +247,8 @@ fn lfm2moe_batched_prefill_matches_decode() {
     let Some(model_file) = synthetic_model(true) else {
         return;
     };
-    // No CPU repacks: see the module docs.
-    let model =
-        LfmModel::from_gguf_no_repack(GgufFile::open(&model_file.0).expect("open gguf"), 512)
-            .expect("load synthetic lfm2moe");
+    let model = LfmModel::from_gguf(GgufFile::open(&model_file.0).expect("open gguf"), 512)
+        .expect("load synthetic lfm2moe");
     assert!(
         model.config().moe.is_some(),
         "the synthetic model must be routed"

@@ -839,6 +839,22 @@ pub trait Model: Send + Sync {
         logits
     }
 
+    /// Like [`Self::forward_prefill_from_embeddings`], but when `need_logits` is
+    /// `false` (intermediate chunks of a chunked embedding prefill), backends
+    /// may skip the final output-norm and LM-head projection and return an empty
+    /// `Vec`.
+    fn forward_prefill_from_embeddings_chunk(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        start_pos: usize,
+        state: &mut InferenceState,
+        need_logits: bool,
+    ) -> Vec<f32> {
+        let _ = need_logits;
+        self.forward_prefill_from_embeddings(embeddings, n_tokens, start_pos, state)
+    }
+
     /// Static capability probe: does this backend implement
     /// [`Self::hidden_states`]? Default `false`; text backends opt in so an
     /// unsupported backend surfaces a typed error instead of the default panic.

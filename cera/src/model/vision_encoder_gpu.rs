@@ -906,22 +906,22 @@ pub enum WgpuVitWeight {
 /// Repack Q8_0 GGUF bytes into the streaming-GEMM layout of `gemm_stream_q8_0_k64.slang`.
 /// Returns `(q, d)`: `q[(k/4) * m + row]` is the row's weights `k..k+3` as four little-endian int8
 /// bytes, and `d[(k/64) * m + row]` is `half(scale of block 2s) | half(scale of block 2s+1) << 16`.
-/// Requires `k % 64 == 0`. Same bytes as the GGUF (34 per 32 weights), transposed.
+/// Requires `k % 32 == 0`; when `k % 64 == 32`, the trailing 32-element half-slice is zero-padded.
 #[cfg(any(feature = "gpu", test))]
 pub(crate) fn repack_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
-    assert_eq!(
-        k % 64,
-        0,
-        "q8_0 streaming repack needs k % 64 == 0, got k={k}"
+    assert!(
+        m > 0 && k > 0 && k.is_multiple_of(32),
+        "q8_0 streaming repack needs m > 0, k > 0, and k % 32 == 0, got m={m}, k={k}"
     );
+    let k_pad = k.next_multiple_of(64);
     let blocks_per_row = k / 32;
     assert_eq!(
         data.len(),
         m * blocks_per_row * 34,
         "q8_0 repack: wrong byte count"
     );
-    let mut q = vec![0u32; m * k / 4];
-    let mut d = vec![0u32; m * (k / 64)];
+    let mut q = vec![0u32; m * k_pad / 4];
+    let mut d = vec![0u32; m * (k_pad / 64)];
     for row in 0..m {
         for b in 0..blocks_per_row {
             let base = (row * blocks_per_row + b) * 34;
@@ -935,6 +935,65 @@ pub(crate) fn repack_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, 
             for w in 0..8 {
                 let src = &data[base + 2 + w * 4..base + 2 + w * 4 + 4];
                 q[(b * 8 + w) * m + row] = u32::from_le_bytes([src[0], src[1], src[2], src[3]]);
+            }
+        }
+    }
+    (q, d)
+}
+
+/// Quantize and repack row-major F16 `[m, k]` weights into the Q8_0 streaming layout of
+/// `gemm_stream_q8_0_k64.slang`, zero-padding each row from `k` to `k.next_multiple_of(64)`.
+/// Used for ViT linear layers stored as F16 in GGUF because `k` is not a multiple of 32 (such as
+/// LFM2.5-VL-1.6B's `ffn_down` with `k = 4304`).
+#[cfg(any(feature = "gpu", test))]
+pub(crate) fn repack_f16_as_q8_0_stream(data: &[u8], m: usize, k: usize) -> (Vec<u32>, Vec<u32>) {
+    assert!(
+        m > 0 && k > 0,
+        "f16 streaming repack needs m > 0 and k > 0, got m={m}, k={k}"
+    );
+    assert_eq!(
+        data.len(),
+        m * k * 2,
+        "f16 streaming repack: wrong byte count"
+    );
+    let k_pad = k.next_multiple_of(64);
+    let blocks_per_row = k.div_ceil(32);
+    let mut q = vec![0u32; m * k_pad / 4];
+    let mut d = vec![0u32; m * (k_pad / 64)];
+    for row in 0..m {
+        let row_bytes = &data[row * k * 2..(row + 1) * k * 2];
+        for b in 0..blocks_per_row {
+            let col_start = b * 32;
+            let valid = (k - col_start).min(32);
+            let mut block = [0.0f32; 32];
+            let mut amax = 0.0f32;
+            for (i, dst) in block[..valid].iter_mut().enumerate() {
+                let off = (col_start + i) * 2;
+                let bits = u16::from_le_bytes([row_bytes[off], row_bytes[off + 1]]);
+                let val = half::f16::from_bits(bits).to_f32();
+                *dst = val;
+                let a = val.abs();
+                if a > amax {
+                    amax = a;
+                }
+            }
+            let scale_f32 = amax / 127.0;
+            let scale_f16 = half::f16::from_f32(scale_f32);
+            let scale_bits = scale_f16.to_bits() as u32;
+            let inv_scale = if amax > 0.0 { 127.0 / amax } else { 0.0 };
+            let pair = b / 2;
+            if b % 2 == 0 {
+                d[pair * m + row] = scale_bits;
+            } else {
+                d[pair * m + row] |= scale_bits << 16;
+            }
+            for w in 0..8 {
+                let mut bytes = [0u8; 4];
+                for j in 0..4 {
+                    let qi = (block[w * 4 + j] * inv_scale).round().clamp(-127.0, 127.0) as i8;
+                    bytes[j] = qi as u8;
+                }
+                q[(b * 8 + w) * m + row] = u32::from_le_bytes(bytes);
             }
         }
     }
@@ -1528,9 +1587,25 @@ impl VitGpuOps for WgpuVitOps {
     fn upload_weight(&self, w: &MmapWeight) -> Self::Weight {
         use crate::tensor::DType;
         match w.dtype {
-            // Streaming layout when the fp16 kernel can take it (k in whole 64-slices).
-            DType::Q8_0 if self.p_gemm_q8_stream.is_some() && w.cols.is_multiple_of(64) => {
+            // Streaming layout when the fp16 kernel is available (k padded to a 64-slice).
+            DType::Q8_0
+                if self.p_gemm_q8_stream.is_some()
+                    && w.rows > 0
+                    && w.cols > 0
+                    && w.cols.is_multiple_of(32) =>
+            {
                 let (q, d) = repack_q8_0_stream(w.data(), w.rows, w.cols);
+                WgpuVitWeight::QuantStream {
+                    q: self
+                        .ctx
+                        .upload_storage(bytemuck::cast_slice(&q), "vit_wq_stream"),
+                    d: self
+                        .ctx
+                        .upload_storage(bytemuck::cast_slice(&d), "vit_wd_stream"),
+                }
+            }
+            DType::F16 if self.p_gemm_q8_stream.is_some() && w.rows > 0 && w.cols > 0 => {
+                let (q, d) = repack_f16_as_q8_0_stream(w.data(), w.rows, w.cols);
                 WgpuVitWeight::QuantStream {
                     q: self
                         .ctx
@@ -1587,12 +1662,19 @@ impl VitGpuOps for WgpuVitOps {
                         .as_ref()
                         .expect("stream weight without a pipeline"),
                 );
-                // Activations become f16 k-major `[k][pad_tokens]` for the GEMM's 32-wide fibers.
-                let b16 = self.rw_buf((in_dim * pad_tokens * 2) as u64, "vit_b16");
+                let k_pad = in_dim.next_multiple_of(64);
+                // Activations become f16 k-major `[k_pad][pad_tokens]` for the GEMM's 32-wide
+                // fibers; zero-clear when `k_pad > in_dim` so the padded rows hold 0.0h rather
+                // than recycled non-finite bits.
+                let b16 = if k_pad == in_dim {
+                    self.rw_buf((k_pad * pad_tokens * 2) as u64, "vit_b16")
+                } else {
+                    self.rw_buf_zeroed((k_pad * pad_tokens * 2) as u64, "vit_b16")
+                };
                 let t_params: [u32; 4] = [tokens as u32, pad_tokens as u32, in_dim as u32, 0];
                 let g_params: [u32; 5] = [
                     out_dim as u32,
-                    in_dim as u32,
+                    k_pad as u32,
                     tokens as u32,
                     pad_tokens as u32,
                     out_dim as u32,
@@ -3822,6 +3904,78 @@ mod q8_stream_repack_tests {
                 };
                 let got = w * half::f16::from_bits(bits as u16).to_f32();
                 assert_eq!(got, want[kk], "row {row} k {kk}");
+            }
+        }
+    }
+
+    #[test]
+    fn repack_q8_0_stream_pads_odd_block_to_64() {
+        let (m, k) = (5usize, 96usize);
+        let k_pad = 128usize;
+        let blocks = k / 32;
+        let mut data = Vec::with_capacity(m * blocks * 34);
+        for b in 0..m * blocks {
+            let scale = half::f16::from_f32(0.05 * (b as f32 + 1.0));
+            data.extend_from_slice(&scale.to_bits().to_le_bytes());
+            for j in 0..32 {
+                data.push((j as i8 - 16) as u8);
+            }
+        }
+        let (q, d) = repack_q8_0_stream(&data, m, k);
+        assert_eq!(q.len(), m * k_pad / 4);
+        assert_eq!(d.len(), m * (k_pad / 64));
+        for row in 0..m {
+            for kk in k..k_pad {
+                assert_eq!(
+                    q[(kk / 4) * m + row],
+                    0,
+                    "padded q word at row {row} k {kk}"
+                );
+            }
+            assert_eq!(
+                d[(k / 64) * m + row] >> 16,
+                0,
+                "padded high scale at row {row}"
+            );
+        }
+    }
+
+    #[test]
+    fn repack_f16_as_q8_0_stream_quantizes_and_zero_pads() {
+        use super::repack_f16_as_q8_0_stream;
+        let (m, k) = (4usize, 80usize);
+        let k_pad = 128usize;
+        let mut f16_bytes = Vec::with_capacity(m * k * 2);
+        let mut want = Vec::with_capacity(m * k);
+        for i in 0..m * k {
+            let v = ((i as f32 * 0.13).sin()) * 2.5;
+            let h = half::f16::from_f32(v);
+            want.push(h.to_f32());
+            f16_bytes.extend_from_slice(&h.to_bits().to_le_bytes());
+        }
+        let (q, d) = repack_f16_as_q8_0_stream(&f16_bytes, m, k);
+        assert_eq!(q.len(), m * k_pad / 4);
+        assert_eq!(d.len(), m * (k_pad / 64));
+        for row in 0..m {
+            for kk in 0..k_pad {
+                let word = q[(kk / 4) * m + row];
+                let w = ((word >> (8 * (kk % 4))) as u8 as i8) as f32;
+                let pair = d[(kk / 64) * m + row];
+                let bits = if (kk / 32) % 2 == 0 {
+                    pair & 0xFFFF
+                } else {
+                    pair >> 16
+                };
+                let got = w * half::f16::from_bits(bits as u16).to_f32();
+                if kk < k {
+                    let ref_v = want[row * k + kk];
+                    assert!(
+                        (got - ref_v).abs() < 0.03,
+                        "row {row} k {kk}: got {got} vs {ref_v}"
+                    );
+                } else {
+                    assert_eq!(got, 0.0, "padded tail at row {row} k {kk} must be 0.0");
+                }
             }
         }
     }

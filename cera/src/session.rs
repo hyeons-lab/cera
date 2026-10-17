@@ -2326,14 +2326,16 @@ impl Session {
         while ti < n_tokens {
             Self::resize_pools_for_cpuset();
             let end = (ti + chunk_size).min(n_tokens);
+            let is_last = end == n_tokens;
             let chunk = &embeddings[ti * hidden_size..end * hidden_size];
             let prefill_start = Instant::now();
             self.note_ingest_mutation(false);
-            let logits = self.model.forward_prefill_from_embeddings(
+            let logits = self.model.forward_prefill_from_embeddings_chunk(
                 chunk,
                 end - ti,
                 self.current_pos,
                 &mut self.state,
+                is_last,
             );
             // Drain BEFORE advancing: on fault this chunk's KV may not
             // exist, so position and accounting must not advance over the
@@ -3019,6 +3021,102 @@ impl Session {
         Ok(())
     }
 
+    /// Fuse a mixed `[Tokens, Image, ...]` ingest batch into a single
+    /// [`Self::append_embeddings`] call when `vl-preprocess` is enabled and the
+    /// backend supports `embed_token_rows`. Returns `None` when fusion does not
+    /// apply so the caller falls back to the per-segment loop.
+    #[cfg(feature = "vl-preprocess")]
+    pub(crate) fn try_append_fused_segments(
+        &mut self,
+        segments: &[chat::IngestSegment<'_>],
+    ) -> Option<Result<(), CeraError>> {
+        if std::env::var_os("CERA_VL_SPLIT_PREFILL").is_some()
+            || !self.capabilities.image_in
+            || !self.model.supports_embedding_input()
+        {
+            return None;
+        }
+        let mut has_image = false;
+        let mut total_text_tokens = 0usize;
+        for seg in segments {
+            match *seg {
+                chat::IngestSegment::Tokens(toks) => {
+                    total_text_tokens += toks.len();
+                }
+                chat::IngestSegment::Image(_) => {
+                    has_image = true;
+                }
+                chat::IngestSegment::Audio { .. } => return None,
+            }
+        }
+        if !has_image || total_text_tokens == 0 {
+            return None;
+        }
+
+        // Pre-embed all token segments first; if any token ID cannot be embedded,
+        // bail out before running the vision encoder so fallback doesn't double-encode.
+        let mut embedded_text: Vec<Vec<f32>> = Vec::new();
+        for seg in segments {
+            if let chat::IngestSegment::Tokens(toks) = *seg
+                && !toks.is_empty()
+            {
+                let rows = self.model.embed_token_rows(toks)?;
+                embedded_text.push(rows);
+            }
+        }
+
+        let mut reserved = total_text_tokens;
+        let text_floats: usize = embedded_text.iter().map(Vec::len).sum();
+        let mut rows = Vec::with_capacity(text_floats);
+        let mut n_rows = 0usize;
+        let mut text_ids = Vec::with_capacity(total_text_tokens);
+        let mut text_iter = embedded_text.into_iter();
+
+        for seg in segments {
+            match *seg {
+                chat::IngestSegment::Tokens(toks) => {
+                    if !toks.is_empty() {
+                        let tok_rows = text_iter.next().expect("matched non-empty token segment");
+                        rows.extend_from_slice(&tok_rows);
+                        n_rows += toks.len();
+                        text_ids.extend_from_slice(toks);
+                    }
+                }
+                chat::IngestSegment::Image(bytes) => {
+                    let (img_rows, img_n) =
+                        match self.encode_image_rows(bytes, self.image_max_long_size, reserved) {
+                            Ok(v) => v,
+                            Err(e) => return Some(Err(e)),
+                        };
+                    reserved += img_n;
+                    rows.extend_from_slice(&img_rows);
+                    n_rows += img_n;
+                }
+                chat::IngestSegment::Audio { .. } => unreachable!(),
+            }
+        }
+
+        let prefill_start = Instant::now();
+        if let Err(e) = self.append_embeddings(&rows, n_rows) {
+            return Some(Err(e));
+        }
+        let prefill_ms = prefill_start.elapsed().as_secs_f64() * 1000.0;
+        self.token_history.extend_from_slice(&text_ids);
+        vl_timing_update(|t| {
+            t.image_prefill_ms += prefill_ms;
+            t.text_tokens += text_ids.len();
+        });
+        Some(Ok(()))
+    }
+
+    #[cfg(not(feature = "vl-preprocess"))]
+    pub(crate) fn try_append_fused_segments(
+        &mut self,
+        _segments: &[chat::IngestSegment<'_>],
+    ) -> Option<Result<(), CeraError>> {
+        None
+    }
+
     /// Stub for builds without `vl-preprocess`. Same signature so
     /// shared code (wasm / mobile) that conditionally calls into
     /// VL still type-checks; always returns `UnsupportedModality`.
@@ -3547,28 +3645,29 @@ impl Session {
             began_step = true;
             let token = if greedy {
                 greedy_next
-            } else {
+            } else if armed
+                && let Some(state) = grammar_state.as_ref()
+                && let Some(mask) = grammar_mask.as_ref()
+            {
                 sample_scratch.clear();
                 sample_scratch.extend_from_slice(&logits);
-                // Mask only while armed. During the lazy pre-trigger phase (or
-                // after a completed tool call) decode is unconstrained.
-                if armed
-                    && let Some(state) = grammar_state.as_ref()
-                    && let Some(mask) = grammar_mask.as_ref()
-                {
-                    // Mask logits to grammar-allowed tokens (EOS only when complete).
-                    let allowed =
-                        mask.apply_with_stop_tokens(state, &mut sample_scratch, &opts.stop_tokens);
-                    if allowed == 0 {
-                        finish = FinishReason::GrammarDeadEnd;
-                        break;
-                    }
+                // Mask logits to grammar-allowed tokens (EOS only when complete).
+                let allowed =
+                    mask.apply_with_stop_tokens(state, &mut sample_scratch, &opts.stop_tokens);
+                if allowed == 0 {
+                    finish = FinishReason::GrammarDeadEnd;
+                    break;
                 }
                 if want_greedy {
                     crate::sampler::argmax(&sample_scratch)
                 } else {
                     self.sampler.sample(&mut sample_scratch)
                 }
+            } else if want_greedy {
+                crate::sampler::argmax(&logits)
+            } else {
+                self.sampler
+                    .sample_preserving(&mut logits, &mut sample_scratch)
             };
 
             // A trigger token pending in the lazy pre-trigger phase must arm the
