@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.1
+
+- Include the `cera_ffi` 0.7.1 additions: NVIDIA Nemotron-3-Diarization add-on diarizer, open `d1-omni` decision model support on CPU/Metal/wgpu, Hexagon ViT unaligned FFN and F16 weight support, and GPU/CPU stream and SMMLA decode performance improvements.
+- Align platform manifests and the dependency on `cera_ffi` at 0.7.1.
+
 ## 0.7.0
 
 - Add Qualcomm Hexagon NPU backend preference support.
