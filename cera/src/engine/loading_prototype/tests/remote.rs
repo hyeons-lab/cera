@@ -14,7 +14,7 @@ mod snapshots;
 use http::{MAIN_COMMIT, RELEASE_COMMIT, count, isolated};
 
 fn digest(bytes: &[u8]) -> String {
-    format!("{:x}", Sha256::digest(bytes))
+    crate::bundle::download::hex_encode(&Sha256::digest(bytes))
 }
 
 #[derive(Debug, Default)]

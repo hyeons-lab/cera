@@ -940,8 +940,8 @@ pub fn apply_chat_template_with_tools<M: serde::Serialize>(
         .unwrap_or_default();
 
     let ctx = minijinja::context! {
-        messages => messages,
-        tools => tools,
+        messages => minijinja::value::Serde(messages),
+        tools => minijinja::value::Serde(tools),
         bos_token => bos_token,
         eos_token => eos_token,
         add_generation_prompt => add_generation_prompt,

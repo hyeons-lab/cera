@@ -46,7 +46,7 @@ git init -q . && git add -A && git commit -qm base   # snapshot the current stat
 # …make the change…
 git add -A && git commit -m "fix(dart): …"
 git format-patch --no-signature --zero-commit -1 \
-    -o ../patches --start-number 9
+    -o ../patches --start-number 10
 rm -rf .git
 ```
 
@@ -82,3 +82,6 @@ dropped, which is the point of keeping them separable.
 8. **listener for constructor-stored callbacks**: a callback handed to an
    object's *constructor* outlives that call, so the constructor being
    synchronous says nothing about which thread later invokes it.
+9. **upgrade `uniffi_bindgen` to 0.32.2**: bumps `uniffi_bindgen` to match the
+   workspace `uniffi = "0.32"` upgrade and adds match arms for
+   `Literal::EmptySet`, `Type::Box`, and `Type::Set`.

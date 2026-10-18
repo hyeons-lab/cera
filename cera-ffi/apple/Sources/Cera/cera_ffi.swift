@@ -39,6 +39,52 @@ fileprivate extension ForeignBytes {
     init(bufferPointer: UnsafeBufferPointer<UInt8>) {
         self.init(len: Int32(bufferPointer.count), data: bufferPointer.baseAddress)
     }
+
+    init(rawBufferPointer: UnsafeRawBufferPointer) {
+        self.init(
+            len: Int32(rawBufferPointer.count),
+            data: rawBufferPointer.baseAddress?.assumingMemoryBound(to: UInt8.self)
+        )
+    }
+}
+
+// Converter for `&[u8]` / `[ByRef] bytes` arguments.
+//
+// Conforms to `FfiConverter` so the compiler enforces the full converter
+// method set. Only the scope-bound `lower(_:_body:)` overload is sound —
+// zero-copy byte buffers only flow foreign -> Rust, and only in argument
+// position. The four protocol-witness methods (`lift`, `lower`, `read`,
+// `write`) `fatalError` at runtime if anyone reaches them.
+//
+// The scope-bound `lower` takes a closure because the `ForeignBytes`
+// pointer is only guaranteed valid for the duration of
+// `Data.withUnsafeBytes`. Callers must run the full FFI call inside
+// the closure body.
+fileprivate enum FfiConverterByRefBytes: FfiConverter {
+    typealias SwiftType = Data
+    typealias FfiType = ForeignBytes
+
+    static func lower<R>(_ value: Data, _ body: (ForeignBytes) throws -> R) rethrows -> R {
+        return try value.withUnsafeBytes { rawBuf in
+            try body(ForeignBytes(rawBufferPointer: rawBuf))
+        }
+    }
+
+    static func lower(_ value: Data) -> ForeignBytes {
+        fatalError("ByRef bytes cannot use the plain lower: returning ForeignBytes escapes the Data.withUnsafeBytes scope. Use the scope-bound lower(_:_body:) overload instead.")
+    }
+
+    static func lift(_ value: ForeignBytes) throws -> Data {
+        fatalError("ByRef bytes cannot be lifted: zero-copy &[u8] only flows foreign->Rust")
+    }
+
+    static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> Data {
+        fatalError("ByRef bytes cannot be read from a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+    }
+
+    static func write(_ value: Data, into buf: inout [UInt8]) {
+        fatalError("ByRef bytes cannot be written to a buffer: zero-copy &[u8] is only supported in argument position, not nested in records/options/etc.")
+    }
 }
 
 // For every type used in the interface, we provide helper methods for conveniently
@@ -704,8 +750,9 @@ open class BundleRepo: BundleRepoProtocol, @unchecked Sendable {
 public convenience init(storeDir: String) {
     let handle =
         try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_bundlerepo_new(
-        FfiConverterString.lower(storeDir),$0
+        FfiConverterString.lower(storeDir),uniffiCallStatus
     )
 }
     self.init(unsafeFromHandle: handle)
@@ -740,9 +787,10 @@ public convenience init(storeDir: String) {
      */
 public static func withProgress(storeDir: String, progress: DownloadProgressSink) -> BundleRepo  {
     return try!  FfiConverterTypeBundleRepo_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_bundlerepo_with_progress(
         FfiConverterString.lower(storeDir),
-        FfiConverterTypeDownloadProgressSink_lower(progress),$0
+        FfiConverterTypeDownloadProgressSink_lower(progress),uniffiCallStatus
     )
 })
 }
@@ -764,8 +812,9 @@ public static func withProgress(storeDir: String, progress: DownloadProgressSink
      */
 open func cacheSize()throws  -> UInt64  {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_bundlerepo_cache_size(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -782,8 +831,9 @@ open func cacheSize()throws  -> UInt64  {
      * action is user-driven.
      */
 open func clearCache()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_bundlerepo_clear_cache(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -793,10 +843,11 @@ open func clearCache()throws   {try rustCallWithError(FfiConverterTypeFfiError_l
      * without loading model weights into memory or creating an engine.
      */
 open func downloadBundle(bundleId: String, quant: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_bundlerepo_download_bundle(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(bundleId),
-        FfiConverterString.lower(quant),$0
+        FfiConverterString.lower(quant),uniffiCallStatus
     )
 }
 }
@@ -808,8 +859,9 @@ open func downloadBundle(bundleId: String, quant: String)throws   {try rustCallW
      */
 open func storeDir() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_bundlerepo_store_dir(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1154,10 +1206,11 @@ open class CeraEngine: CeraEngineProtocol, @unchecked Sendable {
      */
 public static func fromBundleId(bundleId: String, quant: String, config: EngineConfig)throws  -> CeraEngine  {
     return try  FfiConverterTypeCeraEngine_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ceraengine_from_bundle_id(
         FfiConverterString.lower(bundleId),
         FfiConverterString.lower(quant),
-        FfiConverterTypeEngineConfig_lower(config),$0
+        FfiConverterTypeEngineConfig_lower(config),uniffiCallStatus
     )
 })
 }
@@ -1238,9 +1291,10 @@ public static func fromBundleIdAsync(bundleId: String, quant: String, config: En
      */
 public static func fromBytes(bytes: Data, config: EngineConfig)throws  -> CeraEngine  {
     return try  FfiConverterTypeCeraEngine_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ceraengine_from_bytes(
         FfiConverterData.lower(bytes),
-        FfiConverterTypeEngineConfig_lower(config),$0
+        FfiConverterTypeEngineConfig_lower(config),uniffiCallStatus
     )
 })
 }
@@ -1309,11 +1363,12 @@ public static func fromBytesAsync(bytes: Data, config: EngineConfig)async throws
      */
 public static func fromParts(bytes: Data, multimodalProjector: Data?, inferenceType: String?, config: EngineConfig)throws  -> CeraEngine  {
     return try  FfiConverterTypeCeraEngine_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ceraengine_from_parts(
         FfiConverterData.lower(bytes),
         FfiConverterOptionData.lower(multimodalProjector),
         FfiConverterOptionString.lower(inferenceType),
-        FfiConverterTypeEngineConfig_lower(config),$0
+        FfiConverterTypeEngineConfig_lower(config),uniffiCallStatus
     )
 })
 }
@@ -1355,9 +1410,10 @@ public static func fromPartsAsync(bytes: Data, multimodalProjector: Data?, infer
      */
 public static func fromPath(path: String, config: EngineConfig)throws  -> CeraEngine  {
     return try  FfiConverterTypeCeraEngine_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ceraengine_from_path(
         FfiConverterString.lower(path),
-        FfiConverterTypeEngineConfig_lower(config),$0
+        FfiConverterTypeEngineConfig_lower(config),uniffiCallStatus
     )
 })
 }
@@ -1409,10 +1465,11 @@ public static func fromPathAsync(path: String, config: EngineConfig)async throws
      */
 open func applyChatTemplate(messages: [ChatMessage], addGenerationPrompt: Bool)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template(
             self.uniffiCloneHandle(),
         FfiConverterSequenceTypeChatMessage.lower(messages),
-        FfiConverterBool.lower(addGenerationPrompt),$0
+        FfiConverterBool.lower(addGenerationPrompt),uniffiCallStatus
     )
 })
 }
@@ -1424,11 +1481,12 @@ open func applyChatTemplate(messages: [ChatMessage], addGenerationPrompt: Bool)t
      */
 open func applyChatTemplateWithTools(messages: [ChatMessage], tools: [ToolDef], addGenerationPrompt: Bool)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_apply_chat_template_with_tools(
             self.uniffiCloneHandle(),
         FfiConverterSequenceTypeChatMessage.lower(messages),
         FfiConverterSequenceTypeToolDef.lower(tools),
-        FfiConverterBool.lower(addGenerationPrompt),$0
+        FfiConverterBool.lower(addGenerationPrompt),uniffiCallStatus
     )
 })
 }
@@ -1440,8 +1498,9 @@ open func applyChatTemplateWithTools(messages: [ChatMessage], tools: [ToolDef], 
      */
 open func audioProfile() -> AudioProfile  {
     return try!  FfiConverterTypeAudioProfile_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_audio_profile(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1454,8 +1513,9 @@ open func audioProfile() -> AudioProfile  {
      */
 open func bosToken() -> UInt32?  {
     return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_bos_token(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1466,8 +1526,9 @@ open func bosToken() -> UInt32?  {
      */
 open func capabilities() -> ModalityCapabilities  {
     return try!  FfiConverterTypeModalityCapabilities_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_capabilities(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1478,8 +1539,9 @@ open func capabilities() -> ModalityCapabilities  {
      * or Android `onTrimMemory`) to immediately free RAM without losing persistent cached prefixes.
      */
 open func clearPrefixCache()  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_clear_prefix_cache(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -1491,10 +1553,11 @@ open func clearPrefixCache()  {try! rustCall() {
      * When `max_warm_entries` is Some(0) and `cache_dir` is None, prefix caching is disabled.
      */
 open func configurePrefixCache(cacheDir: String?, maxWarmEntries: UInt32?)  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_configure_prefix_cache(
             self.uniffiCloneHandle(),
         FfiConverterOptionString.lower(cacheDir),
-        FfiConverterOptionUInt32.lower(maxWarmEntries),$0
+        FfiConverterOptionUInt32.lower(maxWarmEntries),uniffiCallStatus
     )
 }
 }
@@ -1518,8 +1581,9 @@ open func configurePrefixCache(cacheDir: String?, maxWarmEntries: UInt32?)  {try
      */
 open func contextSize() -> UInt64  {
     return try!  FfiConverterUInt64.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_context_size(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1533,9 +1597,10 @@ open func contextSize() -> UInt64  {
      */
 open func decodeTokens(tokens: [UInt32]) -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_decode_tokens(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceUInt32.lower(tokens),$0
+        FfiConverterSequenceUInt32.lower(tokens),uniffiCallStatus
     )
 })
 }
@@ -1546,8 +1611,9 @@ open func decodeTokens(tokens: [UInt32]) -> String  {
      */
 open func defaultGenerateOpts() -> GenerateOpts  {
     return try!  FfiConverterTypeGenerateOpts_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_default_generate_opts(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1557,9 +1623,10 @@ open func defaultGenerateOpts() -> GenerateOpts  {
      */
 open func detectPii(text: String)throws  -> [FfiEntitySpan]  {
     return try  FfiConverterSequenceTypeFfiEntitySpan.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_detect_pii(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(text),$0
+        FfiConverterString.lower(text),uniffiCallStatus
     )
 })
 }
@@ -1570,9 +1637,10 @@ open func detectPii(text: String)throws  -> [FfiEntitySpan]  {
      */
 open func encodeText(text: String) -> [UInt32]  {
     return try!  FfiConverterSequenceUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_encode_text(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(text),$0
+        FfiConverterString.lower(text),uniffiCallStatus
     )
 })
 }
@@ -1588,10 +1656,11 @@ open func encodeText(text: String) -> [UInt32]  {
      */
 open func encodeTextSpecial(text: String, addSpecial: Bool) -> [UInt32]  {
     return try!  FfiConverterSequenceUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_encode_text_special(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(text),
-        FfiConverterBool.lower(addSpecial),$0
+        FfiConverterBool.lower(addSpecial),uniffiCallStatus
     )
 })
 }
@@ -1603,8 +1672,9 @@ open func encodeTextSpecial(text: String, addSpecial: Bool) -> [UInt32]  {
      */
 open func eosToken() -> UInt32?  {
     return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_eos_token(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1616,8 +1686,9 @@ open func eosToken() -> UInt32?  {
      */
 open func hasChatTemplate() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_has_chat_template(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1636,9 +1707,10 @@ open func hasChatTemplate() -> Bool  {
      */
 open func isSpecialToken(id: UInt32) -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_is_special_token(
             self.uniffiCloneHandle(),
-        FfiConverterUInt32.lower(id),$0
+        FfiConverterUInt32.lower(id),uniffiCallStatus
     )
 })
 }
@@ -1649,8 +1721,9 @@ open func isSpecialToken(id: UInt32) -> Bool  {
      */
 open func metadata() -> ModelMetadata  {
     return try!  FfiConverterTypeModelMetadata_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_metadata(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1660,9 +1733,10 @@ open func metadata() -> ModelMetadata  {
      */
 open func newChatSession(config: SessionConfig)throws  -> ChatSession  {
     return try  FfiConverterTypeChatSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_new_chat_session(
             self.uniffiCloneHandle(),
-        FfiConverterTypeSessionConfig_lower(config),$0
+        FfiConverterTypeSessionConfig_lower(config),uniffiCallStatus
     )
 })
 }
@@ -1675,9 +1749,10 @@ open func newChatSession(config: SessionConfig)throws  -> ChatSession  {
      */
 open func newSession(config: SessionConfig)throws  -> Session  {
     return try  FfiConverterTypeSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_new_session(
             self.uniffiCloneHandle(),
-        FfiConverterTypeSessionConfig_lower(config),$0
+        FfiConverterTypeSessionConfig_lower(config),uniffiCallStatus
     )
 })
 }
@@ -1689,9 +1764,10 @@ open func newSession(config: SessionConfig)throws  -> Session  {
      */
 open func specialTokenId(name: String) -> UInt32?  {
     return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_special_token_id(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(name),$0
+        FfiConverterString.lower(name),uniffiCallStatus
     )
 })
 }
@@ -1704,9 +1780,10 @@ open func specialTokenId(name: String) -> UInt32?  {
      */
 open func toolCallStartToken(format: ToolFormat) -> UInt32?  {
     return try!  FfiConverterOptionUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_tool_call_start_token(
             self.uniffiCloneHandle(),
-        FfiConverterTypeToolFormat_lower(format),$0
+        FfiConverterTypeToolFormat_lower(format),uniffiCallStatus
     )
 })
 }
@@ -1717,8 +1794,9 @@ open func toolCallStartToken(format: ToolFormat) -> UInt32?  {
      */
 open func toolFormat() -> ToolFormat?  {
     return try!  FfiConverterOptionTypeToolFormat.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_tool_format(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1735,10 +1813,11 @@ open func toolFormat() -> ToolFormat?  {
      */
 open func transcribe(pcm: [Float], sampleRate: UInt32)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_transcribe(
             self.uniffiCloneHandle(),
         FfiConverterSequenceFloat.lower(pcm),
-        FfiConverterUInt32.lower(sampleRate),$0
+        FfiConverterUInt32.lower(sampleRate),uniffiCallStatus
     )
 })
 }
@@ -1752,8 +1831,9 @@ open func transcribe(pcm: [Float], sampleRate: UInt32)throws  -> String  {
      */
 open func vocabSize() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_vocab_size(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -1762,8 +1842,9 @@ open func vocabSize() -> UInt32  {
      * Wipe all KV prefix caches (both in-memory RAM tier and on-disk files).
      */
 open func wipeAllPrefixCaches()  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ceraengine_wipe_all_prefix_caches(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -2043,8 +2124,9 @@ open class ChatSession: ChatSessionProtocol, @unchecked Sendable {
      */
 public static func fromSession(session: Session)throws  -> ChatSession  {
     return try  FfiConverterTypeChatSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_chatsession_from_session(
-        FfiConverterTypeSession_lower(session),$0
+        FfiConverterTypeSession_lower(session),uniffiCallStatus
     )
 })
 }
@@ -2058,8 +2140,9 @@ public static func fromSession(session: Session)throws  -> ChatSession  {
      * via `into_session()`, this call is a no-op to prevent cross-session cancellation.
      */
 open func cancel()  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_cancel(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -2068,8 +2151,9 @@ open func cancel()  {try! rustCall() {
      * Clear pending cancellation.
      */
 open func clearCancel()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_clear_cancel(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -2079,9 +2163,10 @@ open func clearCancel()throws   {try rustCallWithError(FfiConverterTypeFfiError_
      */
 open func complete(opts: GenerateOpts)throws  -> TurnResult  {
     return try  FfiConverterTypeTurnResult_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_complete(
             self.uniffiCloneHandle(),
-        FfiConverterTypeGenerateOpts_lower(opts),$0
+        FfiConverterTypeGenerateOpts_lower(opts),uniffiCallStatus
     )
 })
 }
@@ -2094,8 +2179,7 @@ open func completeAsync(opts: GenerateOpts)async throws  -> TurnResult  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_cera_ffi_fn_method_chatsession_complete_async(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeGenerateOpts_lower(opts)
+                        self.uniffiCloneHandle(),FfiConverterTypeGenerateOpts_lower(opts)
                 )
             },
             pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
@@ -2114,8 +2198,7 @@ open func completeAsyncJson(opts: GenerateOpts, schemaJson: String)async throws 
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_cera_ffi_fn_method_chatsession_complete_async_json(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeGenerateOpts_lower(opts),FfiConverterString.lower(schemaJson)
+                        self.uniffiCloneHandle(),FfiConverterTypeGenerateOpts_lower(opts),FfiConverterString.lower(schemaJson)
                 )
             },
             pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
@@ -2131,10 +2214,11 @@ open func completeAsyncJson(opts: GenerateOpts, schemaJson: String)async throws 
      */
 open func completeJson(opts: GenerateOpts, schemaJson: String)throws  -> TurnResult  {
     return try  FfiConverterTypeTurnResult_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_complete_json(
             self.uniffiCloneHandle(),
         FfiConverterTypeGenerateOpts_lower(opts),
-        FfiConverterString.lower(schemaJson),$0
+        FfiConverterString.lower(schemaJson),uniffiCallStatus
     )
 })
 }
@@ -2144,8 +2228,9 @@ open func completeJson(opts: GenerateOpts, schemaJson: String)throws  -> TurnRes
      */
 open func exportCheckpoint()throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_export_checkpoint(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -2155,10 +2240,11 @@ open func exportCheckpoint()throws  -> Data  {
      */
 open func generateStreaming(opts: GenerateOpts, sink: ModalitySink)throws  -> GenerateSummary  {
     return try  FfiConverterTypeGenerateSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_generate_streaming(
             self.uniffiCloneHandle(),
         FfiConverterTypeGenerateOpts_lower(opts),
-        FfiConverterTypeModalitySink_lower(sink),$0
+        FfiConverterTypeModalitySink_lower(sink),uniffiCallStatus
     )
 })
 }
@@ -2171,8 +2257,7 @@ open func generateStreamingAsync(opts: GenerateOpts, sink: ModalitySink)async th
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeGenerateOpts_lower(opts),FfiConverterTypeModalitySink_lower(sink)
+                        self.uniffiCloneHandle(),FfiConverterTypeGenerateOpts_lower(opts),FfiConverterTypeModalitySink_lower(sink)
                 )
             },
             pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
@@ -2191,8 +2276,7 @@ open func generateStreamingAsyncJson(opts: GenerateOpts, schemaJson: String, sin
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_cera_ffi_fn_method_chatsession_generate_streaming_async_json(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeGenerateOpts_lower(opts),FfiConverterString.lower(schemaJson),FfiConverterTypeModalitySink_lower(sink)
+                        self.uniffiCloneHandle(),FfiConverterTypeGenerateOpts_lower(opts),FfiConverterString.lower(schemaJson),FfiConverterTypeModalitySink_lower(sink)
                 )
             },
             pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
@@ -2208,11 +2292,12 @@ open func generateStreamingAsyncJson(opts: GenerateOpts, schemaJson: String, sin
      */
 open func generateStreamingJson(opts: GenerateOpts, schemaJson: String, sink: ModalitySink)throws  -> GenerateSummary  {
     return try  FfiConverterTypeGenerateSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_generate_streaming_json(
             self.uniffiCloneHandle(),
         FfiConverterTypeGenerateOpts_lower(opts),
         FfiConverterString.lower(schemaJson),
-        FfiConverterTypeModalitySink_lower(sink),$0
+        FfiConverterTypeModalitySink_lower(sink),uniffiCallStatus
     )
 })
 }
@@ -2222,8 +2307,9 @@ open func generateStreamingJson(opts: GenerateOpts, schemaJson: String, sink: Mo
      */
 open func imageMaxLongSize()throws  -> UInt32?  {
     return try  FfiConverterOptionUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_image_max_long_size(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -2232,9 +2318,10 @@ open func imageMaxLongSize()throws  -> UInt32?  {
      * Import and restore a chat session checkpoint from serialized binary bytes.
      */
 open func importCheckpoint(data: Data)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_import_checkpoint(
             self.uniffiCloneHandle(),
-        FfiConverterData.lower(data),$0
+        FfiConverterData.lower(data),uniffiCallStatus
     )
 }
 }
@@ -2248,9 +2335,10 @@ open func importCheckpoint(data: Data)throws   {try rustCallWithError(FfiConvert
      */
 open func ingest(message: Message)throws  -> IngestSummary  {
     return try  FfiConverterTypeIngestSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_ingest(
             self.uniffiCloneHandle(),
-        FfiConverterTypeMessage_lower(message),$0
+        FfiConverterTypeMessage_lower(message),uniffiCallStatus
     )
 })
 }
@@ -2260,9 +2348,10 @@ open func ingest(message: Message)throws  -> IngestSummary  {
      */
 open func ingestMessages(messages: [Message])throws  -> IngestSummary  {
     return try  FfiConverterTypeIngestSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_ingest_messages(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceTypeMessage.lower(messages),$0
+        FfiConverterSequenceTypeMessage.lower(messages),uniffiCallStatus
     )
 })
 }
@@ -2272,10 +2361,11 @@ open func ingestMessages(messages: [Message])throws  -> IngestSummary  {
      */
 open func ingestToolResponse(name: String, content: String)throws  -> IngestSummary  {
     return try  FfiConverterTypeIngestSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_ingest_tool_response(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(name),
-        FfiConverterString.lower(content),$0
+        FfiConverterString.lower(content),uniffiCallStatus
     )
 })
 }
@@ -2285,8 +2375,9 @@ open func ingestToolResponse(name: String, content: String)throws  -> IngestSumm
      */
 open func intoSession()throws  -> Session  {
     return try  FfiConverterTypeSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_into_session(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -2295,9 +2386,10 @@ open func intoSession()throws  -> Session  {
      * Load and restore a chat session checkpoint from a file.
      */
 open func loadCheckpoint(path: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_load_checkpoint(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(path),$0
+        FfiConverterString.lower(path),uniffiCallStatus
     )
 }
 }
@@ -2309,8 +2401,9 @@ open func loadCheckpoint(path: String)throws   {try rustCallWithError(FfiConvert
      */
 open func phase()throws  -> SessionPhase  {
     return try  FfiConverterTypeSessionPhase_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_phase(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -2322,8 +2415,9 @@ open func phase()throws  -> SessionPhase  {
      */
 open func position()throws  -> UInt32  {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_position(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -2335,8 +2429,9 @@ open func position()throws  -> UInt32  {
      */
 open func recoveryStatus()throws  -> SessionRecoveryStatus  {
     return try  FfiConverterTypeSessionRecoveryStatus_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_recovery_status(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -2346,9 +2441,10 @@ open func recoveryStatus()throws  -> SessionRecoveryStatus  {
      */
 open func replaceMessages(messages: [Message])throws  -> IngestSummary  {
     return try  FfiConverterTypeIngestSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_replace_messages(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceTypeMessage.lower(messages),$0
+        FfiConverterSequenceTypeMessage.lower(messages),uniffiCallStatus
     )
 })
 }
@@ -2357,8 +2453,9 @@ open func replaceMessages(messages: [Message])throws  -> IngestSummary  {
      * Reset execution state and return to Idle phase.
      */
 open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_reset(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -2367,9 +2464,10 @@ open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) 
      * Save current chat session checkpoint to a file.
      */
 open func saveCheckpoint(path: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_save_checkpoint(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(path),$0
+        FfiConverterString.lower(path),uniffiCallStatus
     )
 }
 }
@@ -2378,9 +2476,10 @@ open func saveCheckpoint(path: String)throws   {try rustCallWithError(FfiConvert
      * Set an optional resolution cap on the longest side of encoded images.
      */
 open func setImageMaxLongSize(maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_set_image_max_long_size(
             self.uniffiCloneHandle(),
-        FfiConverterOptionUInt32.lower(maxLongSize),$0
+        FfiConverterOptionUInt32.lower(maxLongSize),uniffiCallStatus
     )
 }
 }
@@ -2389,9 +2488,10 @@ open func setImageMaxLongSize(maxLongSize: UInt32?)throws   {try rustCallWithErr
      * Set tool wire format explicitly.
      */
 open func setToolFormat(format: ToolFormat)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_set_tool_format(
             self.uniffiCloneHandle(),
-        FfiConverterTypeToolFormat_lower(format),$0
+        FfiConverterTypeToolFormat_lower(format),uniffiCallStatus
     )
 }
 }
@@ -2400,9 +2500,10 @@ open func setToolFormat(format: ToolFormat)throws   {try rustCallWithError(FfiCo
      * Register tools for function calling.
      */
 open func setTools(tools: [ToolDef])throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_set_tools(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceTypeToolDef.lower(tools),$0
+        FfiConverterSequenceTypeToolDef.lower(tools),uniffiCallStatus
     )
 }
 }
@@ -2412,8 +2513,9 @@ open func setTools(tools: [ToolDef])throws   {try rustCallWithError(FfiConverter
      */
 open func toolFormat()throws  -> ToolFormat  {
     return try  FfiConverterTypeToolFormat_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_tool_format(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -2423,8 +2525,9 @@ open func toolFormat()throws  -> ToolFormat  {
      */
 open func tools()throws  -> [ToolDef]  {
     return try  FfiConverterSequenceTypeToolDef.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_chatsession_tools(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -2594,11 +2697,12 @@ open class DownloadProgressSinkImpl: DownloadProgressSink, @unchecked Sendable {
      * final byte count.
      */
 open func onProgress(url: String, bytesDownloaded: UInt64, totalBytes: UInt64?)  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_downloadprogresssink_on_progress(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(url),
         FfiConverterUInt64.lower(bytesDownloaded),
-        FfiConverterOptionUInt64.lower(totalBytes),$0
+        FfiConverterOptionUInt64.lower(totalBytes),uniffiCallStatus
     )
 }
 }
@@ -2910,11 +3014,12 @@ open class FfiAudioPipeline: FfiAudioPipelineProtocol, @unchecked Sendable {
      */
 public static func fromBytes(vadBytes: Data?, hotwordBytes: Data?, whisperBytes: Data?, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
     return try  FfiConverterTypeFfiAudioPipeline_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes(
         FfiConverterOptionData.lower(vadBytes),
         FfiConverterOptionData.lower(hotwordBytes),
         FfiConverterOptionData.lower(whisperBytes),
-        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),$0
+        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),uniffiCallStatus
     )
 })
 }
@@ -2930,13 +3035,14 @@ public static func fromBytes(vadBytes: Data?, hotwordBytes: Data?, whisperBytes:
      */
 public static func fromBytesWithDiarizer(vadBytes: Data?, hotwordBytes: Data?, whisperBytes: Data?, diarizerBytes: Data, preferNpu: Bool, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
     return try  FfiConverterTypeFfiAudioPipeline_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer(
         FfiConverterOptionData.lower(vadBytes),
         FfiConverterOptionData.lower(hotwordBytes),
         FfiConverterOptionData.lower(whisperBytes),
         FfiConverterData.lower(diarizerBytes),
         FfiConverterBool.lower(preferNpu),
-        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),$0
+        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),uniffiCallStatus
     )
 })
 }
@@ -2953,13 +3059,14 @@ public static func fromBytesWithDiarizer(vadBytes: Data?, hotwordBytes: Data?, w
      */
 public static func fromBytesWithDiarizerNemotron3(vadBytes: Data?, hotwordBytes: Data?, whisperBytes: Data?, diarizerBytes: Data, preferNpu: Bool, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
     return try  FfiConverterTypeFfiAudioPipeline_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3(
         FfiConverterOptionData.lower(vadBytes),
         FfiConverterOptionData.lower(hotwordBytes),
         FfiConverterOptionData.lower(whisperBytes),
         FfiConverterData.lower(diarizerBytes),
         FfiConverterBool.lower(preferNpu),
-        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),$0
+        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),uniffiCallStatus
     )
 })
 }
@@ -2969,11 +3076,12 @@ public static func fromBytesWithDiarizerNemotron3(vadBytes: Data?, hotwordBytes:
      */
 public static func fromFiles(vadPath: String?, hotwordPath: String?, whisperPath: String?, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
     return try  FfiConverterTypeFfiAudioPipeline_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files(
         FfiConverterOptionString.lower(vadPath),
         FfiConverterOptionString.lower(hotwordPath),
         FfiConverterOptionString.lower(whisperPath),
-        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),$0
+        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),uniffiCallStatus
     )
 })
 }
@@ -2989,13 +3097,14 @@ public static func fromFiles(vadPath: String?, hotwordPath: String?, whisperPath
      */
 public static func fromFilesWithDiarizer(vadPath: String?, hotwordPath: String?, whisperPath: String?, diarizerPath: String, preferNpu: Bool, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
     return try  FfiConverterTypeFfiAudioPipeline_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer(
         FfiConverterOptionString.lower(vadPath),
         FfiConverterOptionString.lower(hotwordPath),
         FfiConverterOptionString.lower(whisperPath),
         FfiConverterString.lower(diarizerPath),
         FfiConverterBool.lower(preferNpu),
-        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),$0
+        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),uniffiCallStatus
     )
 })
 }
@@ -3012,13 +3121,14 @@ public static func fromFilesWithDiarizer(vadPath: String?, hotwordPath: String?,
      */
 public static func fromFilesWithDiarizerNemotron3(vadPath: String?, hotwordPath: String?, whisperPath: String?, diarizerPath: String, preferNpu: Bool, config: FfiAudioPipelineConfig?)throws  -> FfiAudioPipeline  {
     return try  FfiConverterTypeFfiAudioPipeline_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3(
         FfiConverterOptionString.lower(vadPath),
         FfiConverterOptionString.lower(hotwordPath),
         FfiConverterOptionString.lower(whisperPath),
         FfiConverterString.lower(diarizerPath),
         FfiConverterBool.lower(preferNpu),
-        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),$0
+        FfiConverterOptionTypeFfiAudioPipelineConfig.lower(config),uniffiCallStatus
     )
 })
 }
@@ -3032,11 +3142,12 @@ public static func fromFilesWithDiarizerNemotron3(vadPath: String?, hotwordPath:
      */
 open func addUtterance(text: String, startMs: Float, endMs: Float)throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_add_utterance(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(text),
         FfiConverterFloat.lower(startMs),
-        FfiConverterFloat.lower(endMs),$0
+        FfiConverterFloat.lower(endMs),uniffiCallStatus
     )
 })
 }
@@ -3048,8 +3159,9 @@ open func addUtterance(text: String, startMs: Float, endMs: Float)throws  -> Boo
      * before subsequent speech segments to resume transcription.
      */
 open func cancel()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_cancel(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -3058,8 +3170,9 @@ open func cancel()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift)
      * Clear cooperative cancellation flag.
      */
 open func clearCancel()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_clear_cancel(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -3069,8 +3182,9 @@ open func clearCancel()throws   {try rustCallWithError(FfiConverterTypeFfiError_
      */
 open func currentSample()throws  -> UInt64  {
     return try  FfiConverterUInt64.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_current_sample(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3081,8 +3195,9 @@ open func currentSample()throws  -> UInt64  {
      */
 open func diarizerOnNpu() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_diarizer_on_npu(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3092,8 +3207,9 @@ open func diarizerOnNpu() -> Bool  {
      */
 open func flush()throws  -> [FfiAudioPipelineEvent]  {
     return try  FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_flush(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3104,8 +3220,9 @@ open func flush()throws  -> [FfiAudioPipelineEvent]  {
      */
 open func hasDiarizer()throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_has_diarizer(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3115,8 +3232,9 @@ open func hasDiarizer()throws  -> Bool  {
      */
 open func isListeningForHotword()throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_listening_for_hotword(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3126,8 +3244,9 @@ open func isListeningForHotword()throws  -> Bool  {
      */
 open func isSpeechActive()throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_is_speech_active(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3137,8 +3256,9 @@ open func isSpeechActive()throws  -> Bool  {
      */
 open func lastUtterance()throws  -> [Float]  {
     return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_last_utterance(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3148,8 +3268,9 @@ open func lastUtterance()throws  -> [Float]  {
      */
 open func popEvent()throws  -> FfiAudioPipelineEvent?  {
     return try  FfiConverterOptionTypeFfiAudioPipelineEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_pop_event(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3159,9 +3280,10 @@ open func popEvent()throws  -> FfiAudioPipelineEvent?  {
      */
 open func processChunk(chunk: [Float])throws  -> [FfiAudioPipelineEvent]  {
     return try  FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceFloat.lower(chunk),$0
+        FfiConverterSequenceFloat.lower(chunk),uniffiCallStatus
     )
 })
 }
@@ -3180,9 +3302,10 @@ open func processChunk(chunk: [Float])throws  -> [FfiAudioPipelineEvent]  {
      */
 open func processChunkPcm16(pcm: Data)throws  -> [FfiAudioPipelineEvent]  {
     return try  FfiConverterSequenceTypeFfiAudioPipelineEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_process_chunk_pcm16(
             self.uniffiCloneHandle(),
-        FfiConverterData.lower(pcm),$0
+        FfiConverterData.lower(pcm),uniffiCallStatus
     )
 })
 }
@@ -3191,8 +3314,9 @@ open func processChunkPcm16(pcm: Data)throws  -> [FfiAudioPipelineEvent]  {
      * Reset stream state, VAD recurrent state, KWS ring buffer, and speech accumulators.
      */
 open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_reset(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -3202,8 +3326,9 @@ open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) 
      */
 open func state()throws  -> FfiAudioPipelineState  {
     return try  FfiConverterTypeFfiAudioPipelineState_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_state(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3213,8 +3338,9 @@ open func state()throws  -> FfiAudioPipelineState  {
      */
 open func takeLastUtterance()throws  -> [Float]  {
     return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_take_last_utterance(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3224,9 +3350,10 @@ open func takeLastUtterance()throws  -> [Float]  {
      */
 open func transcribePcm(pcm: [Float])throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_transcribe_pcm(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceFloat.lower(pcm),$0
+        FfiConverterSequenceFloat.lower(pcm),uniffiCallStatus
     )
 })
 }
@@ -3237,8 +3364,9 @@ open func transcribePcm(pcm: [Float])throws  -> String  {
      */
 open func vadOnNpu() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiaudiopipeline_vad_on_npu(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3373,8 +3501,9 @@ open class FfiHotwordDetector: FfiHotwordDetectorProtocol, @unchecked Sendable {
      */
 public static func fromBytes(bytes: Data)throws  -> FfiHotwordDetector  {
     return try  FfiConverterTypeFfiHotwordDetector_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_bytes(
-        FfiConverterData.lower(bytes),$0
+        FfiConverterData.lower(bytes),uniffiCallStatus
     )
 })
 }
@@ -3384,8 +3513,9 @@ public static func fromBytes(bytes: Data)throws  -> FfiHotwordDetector  {
      */
 public static func fromFile(path: String)throws  -> FfiHotwordDetector  {
     return try  FfiConverterTypeFfiHotwordDetector_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffihotworddetector_from_file(
-        FfiConverterString.lower(path),$0
+        FfiConverterString.lower(path),uniffiCallStatus
     )
 })
 }
@@ -3397,8 +3527,9 @@ public static func fromFile(path: String)throws  -> FfiHotwordDetector  {
      */
 open func defaultConfig()throws  -> FfiHotwordConfig  {
     return try  FfiConverterTypeFfiHotwordConfig_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffihotworddetector_default_config(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3408,8 +3539,9 @@ open func defaultConfig()throws  -> FfiHotwordConfig  {
      */
 open func keywords()throws  -> [String]  {
     return try  FfiConverterSequenceString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffihotworddetector_keywords(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3419,9 +3551,10 @@ open func keywords()throws  -> [String]  {
      */
 open func processWindow(window: [Float])throws  -> [Float]  {
     return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffihotworddetector_process_window(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceFloat.lower(window),$0
+        FfiConverterSequenceFloat.lower(window),uniffiCallStatus
     )
 })
 }
@@ -3565,10 +3698,11 @@ open class FfiHotwordIterator: FfiHotwordIteratorProtocol, @unchecked Sendable {
      */
 public static func fromFiles(modelPath: String, vadModelPath: String?, config: FfiHotwordConfig?)throws  -> FfiHotwordIterator  {
     return try  FfiConverterTypeFfiHotwordIterator_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffihotworditerator_from_files(
         FfiConverterString.lower(modelPath),
         FfiConverterOptionString.lower(vadModelPath),
-        FfiConverterOptionTypeFfiHotwordConfig.lower(config),$0
+        FfiConverterOptionTypeFfiHotwordConfig.lower(config),uniffiCallStatus
     )
 })
 }
@@ -3586,9 +3720,10 @@ public static func fromFiles(modelPath: String, vadModelPath: String?, config: F
      */
 open func processChunk(chunk: [Float])throws  -> FfiHotwordEvent?  {
     return try  FfiConverterOptionTypeFfiHotwordEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffihotworditerator_process_chunk(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceFloat.lower(chunk),$0
+        FfiConverterSequenceFloat.lower(chunk),uniffiCallStatus
     )
 })
 }
@@ -3597,8 +3732,9 @@ open func processChunk(chunk: [Float])throws  -> FfiHotwordEvent?  {
      * Reset iterator state, ring buffer, and debounce timers.
      */
 open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffihotworditerator_reset(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -3741,8 +3877,9 @@ open class FfiSileroVad: FfiSileroVadProtocol, @unchecked Sendable {
      */
 public static func fromBytes(bytes: Data)throws  -> FfiSileroVad  {
     return try  FfiConverterTypeFfiSileroVad_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffisilerovad_from_bytes(
-        FfiConverterData.lower(bytes),$0
+        FfiConverterData.lower(bytes),uniffiCallStatus
     )
 })
 }
@@ -3752,8 +3889,9 @@ public static func fromBytes(bytes: Data)throws  -> FfiSileroVad  {
      */
 public static func fromFile(path: String)throws  -> FfiSileroVad  {
     return try  FfiConverterTypeFfiSileroVad_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffisilerovad_from_file(
-        FfiConverterString.lower(path),$0
+        FfiConverterString.lower(path),uniffiCallStatus
     )
 })
 }
@@ -3765,11 +3903,12 @@ public static func fromFile(path: String)throws  -> FfiSileroVad  {
      */
 open func getSpeechTimestamps(audio: [Float], rate: FfiVadSampleRate, config: FfiVadConfig?)throws  -> [FfiSpeechTimestamp]  {
     return try  FfiConverterSequenceTypeFfiSpeechTimestamp.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffisilerovad_get_speech_timestamps(
             self.uniffiCloneHandle(),
         FfiConverterSequenceFloat.lower(audio),
         FfiConverterTypeFfiVadSampleRate_lower(rate),
-        FfiConverterOptionTypeFfiVadConfig.lower(config),$0
+        FfiConverterOptionTypeFfiVadConfig.lower(config),uniffiCallStatus
     )
 })
 }
@@ -3782,10 +3921,11 @@ open func getSpeechTimestamps(audio: [Float], rate: FfiVadSampleRate, config: Ff
      */
 open func processChunk(chunk: [Float], rate: FfiVadSampleRate)throws  -> Float  {
     return try  FfiConverterFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk(
             self.uniffiCloneHandle(),
         FfiConverterSequenceFloat.lower(chunk),
-        FfiConverterTypeFfiVadSampleRate_lower(rate),$0
+        FfiConverterTypeFfiVadSampleRate_lower(rate),uniffiCallStatus
     )
 })
 }
@@ -3795,11 +3935,12 @@ open func processChunk(chunk: [Float], rate: FfiVadSampleRate)throws  -> Float  
      */
 open func processChunkWithStride(chunk: [Float], rate: FfiVadSampleRate, stride: UInt32)throws  -> Float  {
     return try  FfiConverterFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffisilerovad_process_chunk_with_stride(
             self.uniffiCloneHandle(),
         FfiConverterSequenceFloat.lower(chunk),
         FfiConverterTypeFfiVadSampleRate_lower(rate),
-        FfiConverterUInt32.lower(stride),$0
+        FfiConverterUInt32.lower(stride),uniffiCallStatus
     )
 })
 }
@@ -3808,8 +3949,9 @@ open func processChunkWithStride(chunk: [Float], rate: FfiVadSampleRate, stride:
      * Reset recurrent state tensors and streaming context to zeros.
      */
 open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffisilerovad_reset(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -3948,9 +4090,10 @@ open class FfiVadIterator: FfiVadIteratorProtocol, @unchecked Sendable {
 public convenience init(rate: FfiVadSampleRate, config: FfiVadConfig?) {
     let handle =
         try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffivaditerator_new(
         FfiConverterTypeFfiVadSampleRate_lower(rate),
-        FfiConverterOptionTypeFfiVadConfig.lower(config),$0
+        FfiConverterOptionTypeFfiVadConfig.lower(config),uniffiCallStatus
     )
 }
     self.init(unsafeFromHandle: handle)
@@ -3973,8 +4116,9 @@ public convenience init(rate: FfiVadSampleRate, config: FfiVadConfig?) {
      */
 open func flush()throws  -> FfiVadEvent?  {
     return try  FfiConverterOptionTypeFfiVadEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffivaditerator_flush(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3984,8 +4128,9 @@ open func flush()throws  -> FfiVadEvent?  {
      */
 open func frameStride()throws  -> UInt32  {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffivaditerator_frame_stride(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -3995,8 +4140,9 @@ open func frameStride()throws  -> UInt32  {
      */
 open func isSpeechActive()throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffivaditerator_is_speech_active(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -4006,8 +4152,9 @@ open func isSpeechActive()throws  -> Bool  {
      */
 open func popEvent()throws  -> FfiVadEvent?  {
     return try  FfiConverterOptionTypeFfiVadEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffivaditerator_pop_event(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -4017,10 +4164,11 @@ open func popEvent()throws  -> FfiVadEvent?  {
      */
 open func processChunk(vad: FfiSileroVad, chunk: [Float])throws  -> FfiVadEvent?  {
     return try  FfiConverterOptionTypeFfiVadEvent.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffivaditerator_process_chunk(
             self.uniffiCloneHandle(),
         FfiConverterTypeFfiSileroVad_lower(vad),
-        FfiConverterSequenceFloat.lower(chunk),$0
+        FfiConverterSequenceFloat.lower(chunk),uniffiCallStatus
     )
 })
 }
@@ -4029,8 +4177,9 @@ open func processChunk(vad: FfiSileroVad, chunk: [Float])throws  -> FfiVadEvent?
      * Reset iterator state.
      */
 open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffivaditerator_reset(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -4173,8 +4322,9 @@ open class FfiWhisperModel: FfiWhisperModelProtocol, @unchecked Sendable {
      */
 public static func fromBytes(bytes: Data)throws  -> FfiWhisperModel  {
     return try  FfiConverterTypeFfiWhisperModel_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_bytes(
-        FfiConverterData.lower(bytes),$0
+        FfiConverterData.lower(bytes),uniffiCallStatus
     )
 })
 }
@@ -4184,8 +4334,9 @@ public static func fromBytes(bytes: Data)throws  -> FfiWhisperModel  {
      */
 public static func fromFile(path: String)throws  -> FfiWhisperModel  {
     return try  FfiConverterTypeFfiWhisperModel_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_ffiwhispermodel_from_file(
-        FfiConverterString.lower(path),$0
+        FfiConverterString.lower(path),uniffiCallStatus
     )
 })
 }
@@ -4197,8 +4348,9 @@ public static func fromFile(path: String)throws  -> FfiWhisperModel  {
      */
 open func isMultilingual() -> Bool  {
     return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiwhispermodel_is_multilingual(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -4208,8 +4360,9 @@ open func isMultilingual() -> Bool  {
      */
 open func languages() -> [String]  {
     return try!  FfiConverterSequenceString.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiwhispermodel_languages(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -4220,10 +4373,11 @@ open func languages() -> [String]  {
      */
 open func transcribe(pcm: [Float], opts: FfiWhisperTranscribeOpts?)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe(
             self.uniffiCloneHandle(),
         FfiConverterSequenceFloat.lower(pcm),
-        FfiConverterOptionTypeFfiWhisperTranscribeOpts.lower(opts),$0
+        FfiConverterOptionTypeFfiWhisperTranscribeOpts.lower(opts),uniffiCallStatus
     )
 })
 }
@@ -4238,8 +4392,7 @@ open func transcribeAsync(pcm: [Float], opts: FfiWhisperTranscribeOpts?)async th
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_cera_ffi_fn_method_ffiwhispermodel_transcribe_async(
-                    self.uniffiCloneHandle(),
-                    FfiConverterSequenceFloat.lower(pcm),FfiConverterOptionTypeFfiWhisperTranscribeOpts.lower(opts)
+                        self.uniffiCloneHandle(),FfiConverterSequenceFloat.lower(pcm),FfiConverterOptionTypeFfiWhisperTranscribeOpts.lower(opts)
                 )
             },
             pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
@@ -4381,9 +4534,10 @@ open class GenerativeModel: GenerativeModelProtocol, @unchecked Sendable {
      */
 open func createSession(config: SessionConfig)throws  -> Session  {
     return try  FfiConverterTypeSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_generativemodel_create_session(
             self.uniffiCloneHandle(),
-        FfiConverterTypeSessionConfig_lower(config),$0
+        FfiConverterTypeSessionConfig_lower(config),uniffiCallStatus
     )
 })
 }
@@ -4393,8 +4547,9 @@ open func createSession(config: SessionConfig)throws  -> Session  {
      */
 open func engine() -> CeraEngine  {
     return try!  FfiConverterTypeCeraEngine_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_generativemodel_engine(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -4528,8 +4683,9 @@ open class LoraAdapters: LoraAdaptersProtocol, @unchecked Sendable {
      */
 public static func fromGguf(path: String)throws  -> LoraAdapters  {
     return try  FfiConverterTypeLoraAdapters_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_loraadapters_from_gguf(
-        FfiConverterString.lower(path),$0
+        FfiConverterString.lower(path),uniffiCallStatus
     )
 })
 }
@@ -4541,9 +4697,10 @@ public static func fromGguf(path: String)throws  -> LoraAdapters  {
      */
 public static func fromSafetensors(path: String, alpha: Float?)throws  -> LoraAdapters  {
     return try  FfiConverterTypeLoraAdapters_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_loraadapters_from_safetensors(
         FfiConverterString.lower(path),
-        FfiConverterOptionFloat.lower(alpha),$0
+        FfiConverterOptionFloat.lower(alpha),uniffiCallStatus
     )
 })
 }
@@ -4556,8 +4713,9 @@ public static func fromSafetensors(path: String, alpha: Float?)throws  -> LoraAd
      */
 open func targetCount() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_loraadapters_target_count(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -4736,9 +4894,10 @@ open class ModalitySinkImpl: ModalitySink, @unchecked Sendable {
      * extracted from thinking delimiters (<think>...</think>).
      */
 open func onThoughtChunk(text: String)  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_modalitysink_on_thought_chunk(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(text),$0
+        FfiConverterString.lower(text),uniffiCallStatus
     )
 }
 }
@@ -4748,9 +4907,10 @@ open func onThoughtChunk(text: String)  {try! rustCall() {
      * as soon as valid characters are produced.
      */
 open func onTextChunk(text: String)  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_modalitysink_on_text_chunk(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(text),$0
+        FfiConverterString.lower(text),uniffiCallStatus
     )
 }
 }
@@ -4763,10 +4923,11 @@ open func onTextChunk(text: String)  {try! rustCall() {
      * call.
      */
 open func onAudioFrames(pcm: [Float], sampleRate: UInt32)  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_modalitysink_on_audio_frames(
             self.uniffiCloneHandle(),
         FfiConverterSequenceFloat.lower(pcm),
-        FfiConverterUInt32.lower(sampleRate),$0
+        FfiConverterUInt32.lower(sampleRate),uniffiCallStatus
     )
 }
 }
@@ -4780,9 +4941,10 @@ open func onAudioFrames(pcm: [Float], sampleRate: UInt32)  {try! rustCall() {
      * end-of-stream signal regardless of how the call exits.
      */
 open func onDone(reason: FinishReason)  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_modalitysink_on_done(
             self.uniffiCloneHandle(),
-        FfiConverterTypeFinishReason_lower(reason),$0
+        FfiConverterTypeFinishReason_lower(reason),uniffiCallStatus
     )
 }
 }
@@ -5069,8 +5231,9 @@ open class ModelHandle: ModelHandleProtocol, @unchecked Sendable {
      */
 open func asGenerative() -> GenerativeModel?  {
     return try!  FfiConverterOptionTypeGenerativeModel.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_modelhandle_as_generative(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -5080,8 +5243,9 @@ open func asGenerative() -> GenerativeModel?  {
      */
 open func kind() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_modelhandle_kind(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -5203,9 +5367,10 @@ open class ModelLoader: ModelLoaderProtocol, @unchecked Sendable {
 public convenience init(source: ModelSource, config: EngineConfig) {
     let handle =
         try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_modelloader_new(
         FfiConverterTypeModelSource_lower(source),
-        FfiConverterTypeEngineConfig_lower(config),$0
+        FfiConverterTypeEngineConfig_lower(config),uniffiCallStatus
     )
 }
     self.init(unsafeFromHandle: handle)
@@ -5228,8 +5393,9 @@ public convenience init(source: ModelSource, config: EngineConfig) {
      */
 open func build()throws  -> ModelHandle  {
     return try  FfiConverterTypeModelHandle_lift(try rustCallWithError(FfiConverterTypeLoadError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_modelloader_build(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -5239,8 +5405,9 @@ open func build()throws  -> ModelHandle  {
      */
 open func buildGenerative()throws  -> GenerativeModel  {
     return try  FfiConverterTypeGenerativeModel_lift(try rustCallWithError(FfiConverterTypeLoadError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_modelloader_build_generative(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -5365,9 +5532,10 @@ open class PiiClassifier: PiiClassifierProtocol, @unchecked Sendable {
      */
 public static func fromBaseAndAdapter(basePath: String, adapterPath: String)throws  -> PiiClassifier  {
     return try  FfiConverterTypePiiClassifier_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_piiclassifier_from_base_and_adapter(
         FfiConverterString.lower(basePath),
-        FfiConverterString.lower(adapterPath),$0
+        FfiConverterString.lower(adapterPath),uniffiCallStatus
     )
 })
 }
@@ -5377,8 +5545,9 @@ public static func fromBaseAndAdapter(basePath: String, adapterPath: String)thro
      */
 public static func fromPath(path: String)throws  -> PiiClassifier  {
     return try  FfiConverterTypePiiClassifier_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_constructor_piiclassifier_from_path(
-        FfiConverterString.lower(path),$0
+        FfiConverterString.lower(path),uniffiCallStatus
     )
 })
 }
@@ -5390,9 +5559,10 @@ public static func fromPath(path: String)throws  -> PiiClassifier  {
      */
 open func detect(text: String)throws  -> [FfiEntitySpan]  {
     return try  FfiConverterSequenceTypeFfiEntitySpan.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_piiclassifier_detect(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(text),$0
+        FfiConverterString.lower(text),uniffiCallStatus
     )
 })
 }
@@ -6096,10 +6266,11 @@ open class Session: SessionProtocol, @unchecked Sendable {
      * as `Backend`, not `Cancelled`).
      */
 open func appendAudio(samples: [Float], sampleRate: UInt32)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_append_audio(
             self.uniffiCloneHandle(),
         FfiConverterSequenceFloat.lower(samples),
-        FfiConverterUInt32.lower(sampleRate),$0
+        FfiConverterUInt32.lower(sampleRate),uniffiCallStatus
     )
 }
 }
@@ -6166,10 +6337,11 @@ open func appendAudio(samples: [Float], sampleRate: UInt32)throws   {try rustCal
      * as `Backend`, not `Cancelled`).
      */
 open func appendImage(bytes: Data, maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_append_image(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(bytes),
-        FfiConverterOptionUInt32.lower(maxLongSize),$0
+        FfiConverterOptionUInt32.lower(maxLongSize),uniffiCallStatus
     )
 }
 }
@@ -6205,13 +6377,14 @@ open func appendImage(bytes: Data, maxLongSize: UInt32?)throws   {try rustCallWi
      * only the leading bytes are read and the excess is ignored.
      */
 open func appendRawImage(pixels: Data, width: UInt32, height: UInt32, format: PixelFormat, maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_append_raw_image(
             self.uniffiCloneHandle(),
         FfiConverterData.lower(pixels),
         FfiConverterUInt32.lower(width),
         FfiConverterUInt32.lower(height),
         FfiConverterTypePixelFormat_lower(format),
-        FfiConverterOptionUInt32.lower(maxLongSize),$0
+        FfiConverterOptionUInt32.lower(maxLongSize),uniffiCallStatus
     )
 }
 }
@@ -6221,9 +6394,10 @@ open func appendRawImage(pixels: Data, width: UInt32, height: UInt32, format: Pi
      * the new tokens. `EmptyInput` error if `text` is empty.
      */
 open func appendText(text: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_append_text(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(text),$0
+        FfiConverterString.lower(text),uniffiCallStatus
     )
 }
 }
@@ -6233,9 +6407,10 @@ open func appendText(text: String)throws   {try rustCallWithError(FfiConverterTy
      * tokenizer + chat-template pipeline.
      */
 open func appendTokens(tokens: [UInt32])throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_append_tokens(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceUInt32.lower(tokens),$0
+        FfiConverterSequenceUInt32.lower(tokens),uniffiCallStatus
     )
 }
 }
@@ -6257,9 +6432,10 @@ open func appendTokens(tokens: [UInt32])throws   {try rustCallWithError(FfiConve
      * at all (bert, qwen35, gemma4, bailingmoe3), where no backend runs it.
      */
 open func attachLora(adapters: LoraAdapters)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_attach_lora(
             self.uniffiCloneHandle(),
-        FfiConverterTypeLoraAdapters_lower(adapters),$0
+        FfiConverterTypeLoraAdapters_lower(adapters),uniffiCallStatus
     )
 }
 }
@@ -6272,8 +6448,9 @@ open func attachLora(adapters: LoraAdapters)throws   {try rustCallWithError(FfiC
      * successful `reset()`. A moved Session handle cannot cancel its new owner.
      */
 open func cancel()  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_cancel(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -6284,8 +6461,9 @@ open func cancel()  {try! rustCall() {
      */
 open func capabilities() -> ModalityCapabilities  {
     return try!  FfiConverterTypeModalityCapabilities_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_capabilities(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -6313,8 +6491,9 @@ open func capabilities() -> ModalityCapabilities  {
      * any thread (mirrors the shape of [`Self::cancel`]).
      */
 open func clearCancel()  {try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_clear_cancel(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -6325,8 +6504,9 @@ open func clearCancel()  {try! rustCall() {
      */
 open func defaultGenerateOpts()throws  -> GenerateOpts  {
     return try  FfiConverterTypeGenerateOpts_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_default_generate_opts(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -6336,8 +6516,9 @@ open func defaultGenerateOpts()throws  -> GenerateOpts  {
      * drafter is kept, so [`Self::enable_spec`] restores it.
      */
 open func disableSpec()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_disable_spec(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -6347,8 +6528,9 @@ open func disableSpec()throws   {try rustCallWithError(FfiConverterTypeFfiError_
      * disabled), using the attached drafter if there is one.
      */
 open func enableSpec()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_enable_spec(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -6358,8 +6540,9 @@ open func enableSpec()throws   {try rustCallWithError(FfiConverterTypeFfiError_l
      */
 open func exportCheckpoint()throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_export_checkpoint(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -6371,9 +6554,10 @@ open func exportCheckpoint()throws  -> Data  {
      */
 open func generate(opts: GenerateOpts)throws  -> GenerateOutput  {
     return try  FfiConverterTypeGenerateOutput_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_generate(
             self.uniffiCloneHandle(),
-        FfiConverterTypeGenerateOpts_lower(opts),$0
+        FfiConverterTypeGenerateOpts_lower(opts),uniffiCallStatus
     )
 })
 }
@@ -6407,8 +6591,7 @@ open func generateAsync(opts: GenerateOpts)async throws  -> GenerateOutput  {
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_cera_ffi_fn_method_session_generate_async(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeGenerateOpts_lower(opts)
+                        self.uniffiCloneHandle(),FfiConverterTypeGenerateOpts_lower(opts)
                 )
             },
             pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
@@ -6454,10 +6637,11 @@ open func generateAsync(opts: GenerateOpts)async throws  -> GenerateOutput  {
      */
 open func generateStreaming(opts: GenerateOpts, sink: ModalitySink)throws  -> GenerateSummary  {
     return try  FfiConverterTypeGenerateSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_generate_streaming(
             self.uniffiCloneHandle(),
         FfiConverterTypeGenerateOpts_lower(opts),
-        FfiConverterTypeModalitySink_lower(sink),$0
+        FfiConverterTypeModalitySink_lower(sink),uniffiCallStatus
     )
 })
 }
@@ -6494,8 +6678,7 @@ open func generateStreamingAsync(opts: GenerateOpts, sink: ModalitySink)async th
         try  await uniffiRustCallAsync(
             rustFutureFunc: {
                 uniffi_cera_ffi_fn_method_session_generate_streaming_async(
-                    self.uniffiCloneHandle(),
-                    FfiConverterTypeGenerateOpts_lower(opts),FfiConverterTypeModalitySink_lower(sink)
+                        self.uniffiCloneHandle(),FfiConverterTypeGenerateOpts_lower(opts),FfiConverterTypeModalitySink_lower(sink)
                 )
             },
             pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
@@ -6511,8 +6694,9 @@ open func generateStreamingAsync(opts: GenerateOpts, sink: ModalitySink)async th
      */
 open func hasLora()throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_has_lora(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -6525,8 +6709,9 @@ open func hasLora()throws  -> Bool  {
      */
 open func hiddenSize() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_hidden_size(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -6537,9 +6722,10 @@ open func hiddenSize() -> UInt32  {
      */
 open func hiddenStatesForText(text: String)throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_hidden_states_for_text(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(text),$0
+        FfiConverterString.lower(text),uniffiCallStatus
     )
 })
 }
@@ -6550,10 +6736,11 @@ open func hiddenStatesForText(text: String)throws  -> Data  {
      */
 open func hiddenStatesForTextWithAdapters(text: String, adapters: [LoraAdapterEntry])throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_hidden_states_for_text_with_adapters(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(text),
-        FfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),$0
+        FfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),uniffiCallStatus
     )
 })
 }
@@ -6580,9 +6767,10 @@ open func hiddenStatesForTextWithAdapters(text: String, adapters: [LoraAdapterEn
      */
 open func hiddenStatesForTokens(tokens: [UInt32])throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceUInt32.lower(tokens),$0
+        FfiConverterSequenceUInt32.lower(tokens),uniffiCallStatus
     )
 })
 }
@@ -6600,10 +6788,11 @@ open func hiddenStatesForTokens(tokens: [UInt32])throws  -> Data  {
      */
 open func hiddenStatesForTokensWithAdapters(tokens: [UInt32], adapters: [LoraAdapterEntry])throws  -> Data  {
     return try  FfiConverterData.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_hidden_states_for_tokens_with_adapters(
             self.uniffiCloneHandle(),
         FfiConverterSequenceUInt32.lower(tokens),
-        FfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),$0
+        FfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),uniffiCallStatus
     )
 })
 }
@@ -6615,9 +6804,10 @@ open func hiddenStatesForTokensWithAdapters(tokens: [UInt32], adapters: [LoraAda
      */
 open func hiddenStatesMeanPooled(tokens: [UInt32])throws  -> [Float]  {
     return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceUInt32.lower(tokens),$0
+        FfiConverterSequenceUInt32.lower(tokens),uniffiCallStatus
     )
 })
 }
@@ -6628,10 +6818,11 @@ open func hiddenStatesMeanPooled(tokens: [UInt32])throws  -> [Float]  {
      */
 open func hiddenStatesMeanPooledWithAdapters(tokens: [UInt32], adapters: [LoraAdapterEntry])throws  -> [Float]  {
     return try  FfiConverterSequenceFloat.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_hidden_states_mean_pooled_with_adapters(
             self.uniffiCloneHandle(),
         FfiConverterSequenceUInt32.lower(tokens),
-        FfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),$0
+        FfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),uniffiCallStatus
     )
 })
 }
@@ -6641,8 +6832,9 @@ open func hiddenStatesMeanPooledWithAdapters(tokens: [UInt32], adapters: [LoraAd
      */
 open func imageMaxLongSize()throws  -> UInt32?  {
     return try  FfiConverterOptionUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_image_max_long_size(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -6651,9 +6843,10 @@ open func imageMaxLongSize()throws  -> UInt32?  {
      * Import and restore an inference session checkpoint from serialized binary bytes.
      */
 open func importCheckpoint(data: Data)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_import_checkpoint(
             self.uniffiCloneHandle(),
-        FfiConverterData.lower(data),$0
+        FfiConverterData.lower(data),uniffiCallStatus
     )
 }
 }
@@ -6667,8 +6860,9 @@ open func importCheckpoint(data: Data)throws   {try rustCallWithError(FfiConvert
      */
 open func intoChat()throws  -> ChatSession  {
     return try  FfiConverterTypeChatSession_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_into_chat(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -6677,9 +6871,10 @@ open func intoChat()throws  -> ChatSession  {
      * Load and restore an inference session checkpoint from a file.
      */
 open func loadCheckpoint(path: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_load_checkpoint(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(path),$0
+        FfiConverterString.lower(path),uniffiCallStatus
     )
 }
 }
@@ -6691,8 +6886,9 @@ open func loadCheckpoint(path: String)throws   {try rustCallWithError(FfiConvert
      */
 open func position() -> UInt32  {
     return try!  FfiConverterUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_position(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -6701,8 +6897,9 @@ open func position() -> UInt32  {
      * Remove any attached LoRA adapter, returning to base-model inference.
      */
 open func removeLora()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_remove_lora(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -6716,8 +6913,9 @@ open func removeLora()throws   {try rustCallWithError(FfiConverterTypeFfiError_l
      * instead of panicking across the FFI boundary.
      */
 open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_reset(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 }
 }
@@ -6726,9 +6924,10 @@ open func reset()throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) 
      * Save current inference session checkpoint to a file.
      */
 open func saveCheckpoint(path: String)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_save_checkpoint(
             self.uniffiCloneHandle(),
-        FfiConverterString.lower(path),$0
+        FfiConverterString.lower(path),uniffiCallStatus
     )
 }
 }
@@ -6741,9 +6940,10 @@ open func saveCheckpoint(path: String)throws   {try rustCallWithError(FfiConvert
      * multi-turn conversations with delta-only prompt evaluation and live KV retention.
      */
 open func sendMessage(message: UserMessage)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_send_message(
             self.uniffiCloneHandle(),
-        FfiConverterTypeUserMessage_lower(message),$0
+        FfiConverterTypeUserMessage_lower(message),uniffiCallStatus
     )
 }
 }
@@ -6757,10 +6957,11 @@ open func sendMessage(message: UserMessage)throws   {try rustCallWithError(FfiCo
      */
 open func sendMessageAndGenerate(message: UserMessage, opts: GenerateOpts)throws  -> GenerateOutput  {
     return try  FfiConverterTypeGenerateOutput_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_send_message_and_generate(
             self.uniffiCloneHandle(),
         FfiConverterTypeUserMessage_lower(message),
-        FfiConverterTypeGenerateOpts_lower(opts),$0
+        FfiConverterTypeGenerateOpts_lower(opts),uniffiCallStatus
     )
 })
 }
@@ -6774,11 +6975,12 @@ open func sendMessageAndGenerate(message: UserMessage, opts: GenerateOpts)throws
      */
 open func sendMessageStreaming(message: UserMessage, opts: GenerateOpts, sink: ModalitySink)throws  -> GenerateSummary  {
     return try  FfiConverterTypeGenerateSummary_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_send_message_streaming(
             self.uniffiCloneHandle(),
         FfiConverterTypeUserMessage_lower(message),
         FfiConverterTypeGenerateOpts_lower(opts),
-        FfiConverterTypeModalitySink_lower(sink),$0
+        FfiConverterTypeModalitySink_lower(sink),uniffiCallStatus
     )
 })
 }
@@ -6788,9 +6990,10 @@ open func sendMessageStreaming(message: UserMessage, opts: GenerateOpts, sink: M
      * image, in pixels (`None` = no cap).
      */
 open func setImageMaxLongSize(maxLongSize: UInt32?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_set_image_max_long_size(
             self.uniffiCloneHandle(),
-        FfiConverterOptionUInt32.lower(maxLongSize),$0
+        FfiConverterOptionUInt32.lower(maxLongSize),uniffiCallStatus
     )
 }
 }
@@ -6814,9 +7017,10 @@ open func setImageMaxLongSize(maxLongSize: UInt32?)throws   {try rustCallWithErr
      * without routed-FFN hooks (retry on CPU).
      */
 open func setLoraAdapters(adapters: [LoraAdapterEntry])throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_set_lora_adapters(
             self.uniffiCloneHandle(),
-        FfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),$0
+        FfiConverterSequenceTypeLoraAdapterEntry.lower(adapters),uniffiCallStatus
     )
 }
 }
@@ -6828,9 +7032,10 @@ open func setLoraAdapters(adapters: [LoraAdapterEntry])throws   {try rustCallWit
      * `reset()`, unlike a per-request `GenerateOpts.seed`.
      */
 open func setSeed(seed: UInt64?)throws   {try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_set_seed(
             self.uniffiCloneHandle(),
-        FfiConverterOptionUInt64.lower(seed),$0
+        FfiConverterOptionUInt64.lower(seed),uniffiCallStatus
     )
 }
 }
@@ -6848,8 +7053,9 @@ open func setSeed(seed: UInt64?)throws   {try rustCallWithError(FfiConverterType
      */
 open func recoveryStatus()throws  -> SessionRecoveryStatus  {
     return try  FfiConverterTypeSessionRecoveryStatus_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_method_session_recovery_status(
-            self.uniffiCloneHandle(),$0
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -9884,8 +10090,7 @@ public func FfiConverterTypeUserMessage_lower(_ value: UserMessage) -> RustBuffe
     return FfiConverterTypeUserMessage.lower(value)
 }
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * How a session with an audio decoder produces output. Mirrors
  * [`cera::AudioOutputMode`].
@@ -9973,8 +10178,7 @@ public func FfiConverterTypeAudioOutputMode_lower(_ value: AudioOutputMode) -> R
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * Compute-backend selector. Mirrors [`cera::BackendPreference`];
  * kept as a separate type so the `cera` crate doesn't carry UniFFI
@@ -10090,8 +10294,7 @@ public func FfiConverterTypeBackendPreference_lower(_ value: BackendPreference) 
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * An event emitted by the unified audio pipeline.
  */
@@ -10298,8 +10501,7 @@ public func FfiConverterTypeFfiAudioPipelineEvent_lower(_ value: FfiAudioPipelin
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * Active state of the streaming audio pipeline.
  */
@@ -10420,7 +10622,8 @@ public func FfiConverterTypeFfiAudioPipelineState_lower(_ value: FfiAudioPipelin
  * error originates from cera directly or routes through the FFI
  * wrapper. Pinned by `ffi_error_display_matches_cera_error_for_every_shared_variant`.
  */
-public enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+public 
+enum FfiError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
@@ -10752,8 +10955,7 @@ public func FfiConverterTypeFfiError_lower(_ value: FfiError) -> RustBuffer {
     return FfiConverterTypeFfiError.lower(value)
 }
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * A speech boundary event emitted during streaming audio processing.
  */
@@ -10832,8 +11034,7 @@ public func FfiConverterTypeFfiVadEvent_lower(_ value: FfiVadEvent) -> RustBuffe
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * Audio sample rate supported by Silero VAD.
  */
@@ -10902,8 +11103,7 @@ public func FfiConverterTypeFfiVadSampleRate_lower(_ value: FfiVadSampleRate) ->
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * Why a decode loop exited. Mirrors [`cera::FinishReason`].
  */
@@ -11008,8 +11208,7 @@ public func FfiConverterTypeFinishReason_lower(_ value: FinishReason) -> RustBuf
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 
 public enum GenerationDefaults: Equatable, Hashable {
     
@@ -11094,8 +11293,7 @@ public func FfiConverterTypeGenerationDefaults_lower(_ value: GenerationDefaults
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * KV-cache compression mode. Mirrors [`cera::kv_cache::KvCompression`].
  * `TurboQuant` is honored by the CPU backend and by both GPU backends (wgpu
@@ -11196,8 +11394,7 @@ public func FfiConverterTypeKvCompression_lower(_ value: KvCompression) -> RustB
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * Why checked tail rewind was unavailable. Numeric positions are token counts.
  */
@@ -11317,7 +11514,8 @@ public func FfiConverterTypeKvRewindFailure_lower(_ value: KvRewindFailure) -> R
 
 
 
-public enum LoadError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+public 
+enum LoadError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
     
     
@@ -11470,8 +11668,7 @@ public func FfiConverterTypeLoadError_lower(_ value: LoadError) -> RustBuffer {
     return FfiConverterTypeLoadError.lower(value)
 }
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 
 public enum ModelSource: Equatable, Hashable {
     
@@ -11586,8 +11783,7 @@ public func FfiConverterTypeModelSource_lower(_ value: ModelSource) -> RustBuffe
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * Supported pixel layouts for uncompressed raw image buffers.
  */
@@ -11682,8 +11878,7 @@ public func FfiConverterTypePixelFormat_lower(_ value: PixelFormat) -> RustBuffe
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * Execution state after a failed whole-message append.
  */
@@ -11776,8 +11971,7 @@ public func FfiConverterTypeRecoveryOutcome_lower(_ value: RecoveryOutcome) -> R
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * Message author role in conversational chat.
  */
@@ -11872,8 +12066,7 @@ public func FfiConverterTypeRole_lower(_ value: Role) -> RustBuffer {
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * Lifecycle phase of a stateful chat coordinator.
  */
@@ -11988,8 +12181,7 @@ public func FfiConverterTypeSessionPhase_lower(_ value: SessionPhase) -> RustBuf
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * The tool-call wire format a model family uses. Mirrors
  * [`cera::tools::ToolFormat`]. Get one from
@@ -12069,8 +12261,7 @@ public func FfiConverterTypeToolFormat_lower(_ value: ToolFormat) -> RustBuffer 
 }
 
 
-// Note that we don't yet support `indirect` for enums.
-// See https://github.com/mozilla/uniffi-rs/issues/396 for further discussion.
+
 /**
  * Validation failure during chat construction, preparation, or decode.
  */
@@ -13277,7 +13468,8 @@ fileprivate func uniffiFutureContinuationCallback(handle: UInt64, pollResult: In
  */
 public func ceraFfiVersion() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_cera_ffi_fn_func_cera_ffi_version($0
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_func_cera_ffi_version(uniffiCallStatus
     )
 })
 }
@@ -13289,7 +13481,8 @@ public func ceraFfiVersion() -> String  {
  */
 public func cpuBackendReport() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
-    uniffi_cera_ffi_fn_func_cpu_backend_report($0
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_func_cpu_backend_report(uniffiCallStatus
     )
 })
 }
@@ -13300,8 +13493,9 @@ public func cpuBackendReport() -> String  {
  */
 public func detectToolFormat(architecture: String) -> ToolFormat?  {
     return try!  FfiConverterOptionTypeToolFormat.lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_func_detect_tool_format(
-        FfiConverterString.lower(architecture),$0
+        FfiConverterString.lower(architecture),uniffiCallStatus
     )
 })
 }
@@ -13322,8 +13516,9 @@ public func detectToolFormat(architecture: String) -> ToolFormat?  {
  */
 public func hexagonInstallSkels(dir: String)throws  -> UInt32  {
     return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_func_hexagon_install_skels(
-        FfiConverterString.lower(dir),$0
+        FfiConverterString.lower(dir),uniffiCallStatus
     )
 })
 }
@@ -13338,7 +13533,8 @@ public func hexagonInstallSkels(dir: String)throws  -> UInt32  {
  */
 public func hexagonProbe()throws  -> HexagonProbeInfo  {
     return try  FfiConverterTypeHexagonProbeInfo_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
-    uniffi_cera_ffi_fn_func_hexagon_probe($0
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_func_hexagon_probe(uniffiCallStatus
     )
 })
 }
@@ -13347,7 +13543,8 @@ public func hexagonProbe()throws  -> HexagonProbeInfo  {
  */
 public func hotwordDefaultConfig() -> FfiHotwordConfig  {
     return try!  FfiConverterTypeFfiHotwordConfig_lift(try! rustCall() {
-    uniffi_cera_ffi_fn_func_hotword_default_config($0
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_func_hotword_default_config(uniffiCallStatus
     )
 })
 }
@@ -13367,7 +13564,8 @@ public func hotwordDefaultConfig() -> FfiHotwordConfig  {
  */
 public func listLeapBundles()throws  -> [LeapBundleEntry]  {
     return try  FfiConverterSequenceTypeLeapBundleEntry.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
-    uniffi_cera_ffi_fn_func_list_leap_bundles($0
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_func_list_leap_bundles(uniffiCallStatus
     )
 })
 }
@@ -13412,9 +13610,10 @@ public func listLeapBundlesAsync()async throws  -> [LeapBundleEntry]  {
  */
 public func parseToolCalls(text: String, format: ToolFormat)throws  -> [ToolCall]  {
     return try  FfiConverterSequenceTypeToolCall.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_func_parse_tool_calls(
         FfiConverterString.lower(text),
-        FfiConverterTypeToolFormat_lower(format),$0
+        FfiConverterTypeToolFormat_lower(format),uniffiCallStatus
     )
 })
 }
@@ -13423,7 +13622,8 @@ public func parseToolCalls(text: String, format: ToolFormat)throws  -> [ToolCall
  */
 public func sileroVadDefaultConfig() -> FfiVadConfig  {
     return try!  FfiConverterTypeFfiVadConfig_lift(try! rustCall() {
-    uniffi_cera_ffi_fn_func_silero_vad_default_config($0
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_func_silero_vad_default_config(uniffiCallStatus
     )
 })
 }
@@ -13435,9 +13635,10 @@ public func sileroVadDefaultConfig() -> FfiVadConfig  {
  */
 public func toolGrammar(tools: [ToolDef], format: ToolFormat)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_func_tool_grammar(
         FfiConverterSequenceTypeToolDef.lower(tools),
-        FfiConverterTypeToolFormat_lower(format),$0
+        FfiConverterTypeToolFormat_lower(format),uniffiCallStatus
     )
 })
 }
@@ -13446,7 +13647,8 @@ public func toolGrammar(tools: [ToolDef], format: ToolFormat)throws  -> String  
  */
 public func whisperDefaultTranscribeOpts() -> FfiWhisperTranscribeOpts  {
     return try!  FfiConverterTypeFfiWhisperTranscribeOpts_lift(try! rustCall() {
-    uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts($0
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_func_whisper_default_transcribe_opts(uniffiCallStatus
     )
 })
 }
@@ -13455,7 +13657,8 @@ public func whisperDefaultTranscribeOpts() -> FfiWhisperTranscribeOpts  {
  */
 public func audioPipelineDefaultConfig() -> FfiAudioPipelineConfig  {
     return try!  FfiConverterTypeFfiAudioPipelineConfig_lift(try! rustCall() {
-    uniffi_cera_ffi_fn_func_audio_pipeline_default_config($0
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_func_audio_pipeline_default_config(uniffiCallStatus
     )
 })
 }
@@ -13464,8 +13667,9 @@ public func audioPipelineDefaultConfig() -> FfiAudioPipelineConfig  {
  */
 public func chatMessageAssistant(content: String) -> Message  {
     return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_func_chat_message_assistant(
-        FfiConverterString.lower(content),$0
+        FfiConverterString.lower(content),uniffiCallStatus
     )
 })
 }
@@ -13474,8 +13678,9 @@ public func chatMessageAssistant(content: String) -> Message  {
  */
 public func chatMessageSystem(content: String) -> Message  {
     return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_func_chat_message_system(
-        FfiConverterString.lower(content),$0
+        FfiConverterString.lower(content),uniffiCallStatus
     )
 })
 }
@@ -13484,8 +13689,9 @@ public func chatMessageSystem(content: String) -> Message  {
  */
 public func chatMessageTool(content: String) -> Message  {
     return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_func_chat_message_tool(
-        FfiConverterString.lower(content),$0
+        FfiConverterString.lower(content),uniffiCallStatus
     )
 })
 }
@@ -13494,8 +13700,9 @@ public func chatMessageTool(content: String) -> Message  {
  */
 public func chatMessageUser(content: String) -> Message  {
     return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_func_chat_message_user(
-        FfiConverterString.lower(content),$0
+        FfiConverterString.lower(content),uniffiCallStatus
     )
 })
 }
@@ -13504,10 +13711,11 @@ public func chatMessageUser(content: String) -> Message  {
  */
 public func chatMessageUserAudio(audioPcm: [Float], sampleRate: UInt32, text: String?) -> Message  {
     return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_func_chat_message_user_audio(
         FfiConverterSequenceFloat.lower(audioPcm),
         FfiConverterUInt32.lower(sampleRate),
-        FfiConverterOptionString.lower(text),$0
+        FfiConverterOptionString.lower(text),uniffiCallStatus
     )
 })
 }
@@ -13516,9 +13724,10 @@ public func chatMessageUserAudio(audioPcm: [Float], sampleRate: UInt32, text: St
  */
 public func chatMessageUserImage(imageBytes: Data, text: String?) -> Message  {
     return try!  FfiConverterTypeMessage_lift(try! rustCall() {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_func_chat_message_user_image(
         FfiConverterData.lower(imageBytes),
-        FfiConverterOptionString.lower(text),$0
+        FfiConverterOptionString.lower(text),uniffiCallStatus
     )
 })
 }
@@ -13527,8 +13736,9 @@ public func chatMessageUserImage(imageBytes: Data, text: String?) -> Message  {
  */
 public func jsonSchemaToGrammar(schemaJson: String)throws  -> String  {
     return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
     uniffi_cera_ffi_fn_func_json_schema_to_grammar(
-        FfiConverterString.lower(schemaJson),$0
+        FfiConverterString.lower(schemaJson),uniffiCallStatus
     )
 })
 }
@@ -13548,598 +13758,598 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_cera_ffi_version() != 39330) {
+    if (uniffi_cera_ffi_checksum_func_cera_ffi_version() != 10629) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_cpu_backend_report() != 61086) {
+    if (uniffi_cera_ffi_checksum_func_cpu_backend_report() != 64719) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_detect_tool_format() != 18753) {
+    if (uniffi_cera_ffi_checksum_func_detect_tool_format() != 37982) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 55417) {
+    if (uniffi_cera_ffi_checksum_func_hexagon_install_skels() != 17978) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_hexagon_probe() != 27471) {
+    if (uniffi_cera_ffi_checksum_func_hexagon_probe() != 39618) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_hotword_default_config() != 25934) {
+    if (uniffi_cera_ffi_checksum_func_hotword_default_config() != 64401) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_list_leap_bundles() != 14501) {
+    if (uniffi_cera_ffi_checksum_func_list_leap_bundles() != 11444) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_list_leap_bundles_async() != 60360) {
+    if (uniffi_cera_ffi_checksum_func_list_leap_bundles_async() != 31026) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_parse_tool_calls() != 47579) {
+    if (uniffi_cera_ffi_checksum_func_parse_tool_calls() != 51531) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_silero_vad_default_config() != 25300) {
+    if (uniffi_cera_ffi_checksum_func_silero_vad_default_config() != 7093) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_tool_grammar() != 41383) {
+    if (uniffi_cera_ffi_checksum_func_tool_grammar() != 33163) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 57787) {
+    if (uniffi_cera_ffi_checksum_func_whisper_default_transcribe_opts() != 33783) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_audio_pipeline_default_config() != 58590) {
+    if (uniffi_cera_ffi_checksum_func_audio_pipeline_default_config() != 14804) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_chat_message_assistant() != 62795) {
+    if (uniffi_cera_ffi_checksum_func_chat_message_assistant() != 18044) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_chat_message_system() != 63071) {
+    if (uniffi_cera_ffi_checksum_func_chat_message_system() != 56468) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_chat_message_tool() != 48057) {
+    if (uniffi_cera_ffi_checksum_func_chat_message_tool() != 12814) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_chat_message_user() != 46361) {
+    if (uniffi_cera_ffi_checksum_func_chat_message_user() != 32889) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_chat_message_user_audio() != 15774) {
+    if (uniffi_cera_ffi_checksum_func_chat_message_user_audio() != 62369) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_chat_message_user_image() != 57033) {
+    if (uniffi_cera_ffi_checksum_func_chat_message_user_image() != 34431) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 32979) {
+    if (uniffi_cera_ffi_checksum_func_json_schema_to_grammar() != 31266) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 29364) {
+    if (uniffi_cera_ffi_checksum_method_bundlerepo_cache_size() != 7498) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache() != 11512) {
+    if (uniffi_cera_ffi_checksum_method_bundlerepo_clear_cache() != 6334) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle() != 63803) {
+    if (uniffi_cera_ffi_checksum_method_bundlerepo_download_bundle() != 20230) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_bundlerepo_store_dir() != 40876) {
+    if (uniffi_cera_ffi_checksum_method_bundlerepo_store_dir() != 25065) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template() != 38712) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template() != 18654) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools() != 46076) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_apply_chat_template_with_tools() != 61680) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_audio_profile() != 17834) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_audio_profile() != 1521) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_bos_token() != 30744) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_bos_token() != 23786) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_capabilities() != 65060) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_capabilities() != 15864) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() != 5238) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_clear_prefix_cache() != 28739) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache() != 49295) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_configure_prefix_cache() != 47796) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 47091) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_context_size() != 28113) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens() != 27407) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_decode_tokens() != 28454) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts() != 26137) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_default_generate_opts() != 49008) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_detect_pii() != 53563) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_detect_pii() != 59395) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 52220) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_encode_text() != 19826) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special() != 59360) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_encode_text_special() != 42626) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_eos_token() != 21294) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_eos_token() != 55523) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template() != 63563) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_has_chat_template() != 55941) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_is_special_token() != 7395) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_is_special_token() != 4501) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 46262) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_metadata() != 21928) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session() != 32339) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_new_chat_session() != 52763) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 51022) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_new_session() != 55506) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 35790) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_special_token_id() != 6832) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token() != 23833) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_tool_call_start_token() != 9607) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_tool_format() != 33648) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_tool_format() != 3684) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_transcribe() != 25846) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_transcribe() != 64248) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_vocab_size() != 13487) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_vocab_size() != 11541) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches() != 16144) {
+    if (uniffi_cera_ffi_checksum_method_ceraengine_wipe_all_prefix_caches() != 27632) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 33688) {
+    if (uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 37554) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config() != 53986) {
+    if (uniffi_cera_ffi_checksum_method_ffihotworddetector_default_config() != 16946) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords() != 45182) {
+    if (uniffi_cera_ffi_checksum_method_ffihotworddetector_keywords() != 60107) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window() != 21244) {
+    if (uniffi_cera_ffi_checksum_method_ffihotworddetector_process_window() != 29908) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 50343) {
+    if (uniffi_cera_ffi_checksum_method_ffihotworditerator_process_chunk() != 50955) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() != 70) {
+    if (uniffi_cera_ffi_checksum_method_ffihotworditerator_reset() != 16380) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps() != 58406) {
+    if (uniffi_cera_ffi_checksum_method_ffisilerovad_get_speech_timestamps() != 37477) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk() != 18343) {
+    if (uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk() != 29313) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride() != 7042) {
+    if (uniffi_cera_ffi_checksum_method_ffisilerovad_process_chunk_with_stride() != 52504) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffisilerovad_reset() != 31369) {
+    if (uniffi_cera_ffi_checksum_method_ffisilerovad_reset() != 38669) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffivaditerator_flush() != 29655) {
+    if (uniffi_cera_ffi_checksum_method_ffivaditerator_flush() != 54746) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride() != 36793) {
+    if (uniffi_cera_ffi_checksum_method_ffivaditerator_frame_stride() != 62647) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active() != 47511) {
+    if (uniffi_cera_ffi_checksum_method_ffivaditerator_is_speech_active() != 35573) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event() != 35592) {
+    if (uniffi_cera_ffi_checksum_method_ffivaditerator_pop_event() != 19744) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk() != 7048) {
+    if (uniffi_cera_ffi_checksum_method_ffivaditerator_process_chunk() != 30403) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffivaditerator_reset() != 44489) {
+    if (uniffi_cera_ffi_checksum_method_ffivaditerator_reset() != 30192) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual() != 4736) {
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_is_multilingual() != 19817) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() != 32663) {
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_languages() != 34010) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 11943) {
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe() != 751) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 5318) {
+    if (uniffi_cera_ffi_checksum_method_ffiwhispermodel_transcribe_async() != 25034) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 55901) {
+    if (uniffi_cera_ffi_checksum_method_loraadapters_target_count() != 4515) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk() != 47658) {
+    if (uniffi_cera_ffi_checksum_method_modalitysink_on_thought_chunk() != 64152) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk() != 2558) {
+    if (uniffi_cera_ffi_checksum_method_modalitysink_on_text_chunk() != 5080) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 63767) {
+    if (uniffi_cera_ffi_checksum_method_modalitysink_on_audio_frames() != 23264) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 54825) {
+    if (uniffi_cera_ffi_checksum_method_modalitysink_on_done() != 57244) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 10087) {
+    if (uniffi_cera_ffi_checksum_method_piiclassifier_detect() != 40599) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_append_audio() != 65327) {
+    if (uniffi_cera_ffi_checksum_method_session_append_audio() != 59092) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_append_image() != 28033) {
+    if (uniffi_cera_ffi_checksum_method_session_append_image() != 13614) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_append_raw_image() != 34040) {
+    if (uniffi_cera_ffi_checksum_method_session_append_raw_image() != 46533) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_append_text() != 13301) {
+    if (uniffi_cera_ffi_checksum_method_session_append_text() != 61919) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_append_tokens() != 1227) {
+    if (uniffi_cera_ffi_checksum_method_session_append_tokens() != 44611) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_attach_lora() != 61634) {
+    if (uniffi_cera_ffi_checksum_method_session_attach_lora() != 6101) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_cancel() != 44519) {
+    if (uniffi_cera_ffi_checksum_method_session_cancel() != 21394) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_capabilities() != 8147) {
+    if (uniffi_cera_ffi_checksum_method_session_capabilities() != 38264) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_clear_cancel() != 11168) {
+    if (uniffi_cera_ffi_checksum_method_session_clear_cancel() != 50845) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 61826) {
+    if (uniffi_cera_ffi_checksum_method_session_default_generate_opts() != 28546) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_disable_spec() != 57) {
+    if (uniffi_cera_ffi_checksum_method_session_disable_spec() != 10695) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_enable_spec() != 2995) {
+    if (uniffi_cera_ffi_checksum_method_session_enable_spec() != 47491) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 47819) {
+    if (uniffi_cera_ffi_checksum_method_session_export_checkpoint() != 53988) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_generate() != 20338) {
+    if (uniffi_cera_ffi_checksum_method_session_generate() != 41604) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_generate_async() != 4050) {
+    if (uniffi_cera_ffi_checksum_method_session_generate_async() != 18250) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_generate_streaming() != 1272) {
+    if (uniffi_cera_ffi_checksum_method_session_generate_streaming() != 34542) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 58221) {
+    if (uniffi_cera_ffi_checksum_method_session_generate_streaming_async() != 30677) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_has_lora() != 13931) {
+    if (uniffi_cera_ffi_checksum_method_session_has_lora() != 4349) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_hidden_size() != 46607) {
+    if (uniffi_cera_ffi_checksum_method_session_hidden_size() != 23994) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 17860) {
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_text() != 54921) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 42869) {
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_text_with_adapters() != 9905) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 60330) {
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens() != 28258) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 34852) {
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_for_tokens_with_adapters() != 48296) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 61246) {
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled() != 6204) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 61117) {
+    if (uniffi_cera_ffi_checksum_method_session_hidden_states_mean_pooled_with_adapters() != 30179) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_image_max_long_size() != 8402) {
+    if (uniffi_cera_ffi_checksum_method_session_image_max_long_size() != 38663) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 12224) {
+    if (uniffi_cera_ffi_checksum_method_session_import_checkpoint() != 20954) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_into_chat() != 13314) {
+    if (uniffi_cera_ffi_checksum_method_session_into_chat() != 10965) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_load_checkpoint() != 19760) {
+    if (uniffi_cera_ffi_checksum_method_session_load_checkpoint() != 47038) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_position() != 13264) {
+    if (uniffi_cera_ffi_checksum_method_session_position() != 16936) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_remove_lora() != 29534) {
+    if (uniffi_cera_ffi_checksum_method_session_remove_lora() != 4466) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_reset() != 48041) {
+    if (uniffi_cera_ffi_checksum_method_session_reset() != 50584) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_save_checkpoint() != 10964) {
+    if (uniffi_cera_ffi_checksum_method_session_save_checkpoint() != 39015) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_send_message() != 6919) {
+    if (uniffi_cera_ffi_checksum_method_session_send_message() != 42720) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 43103) {
+    if (uniffi_cera_ffi_checksum_method_session_send_message_and_generate() != 53351) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 26617) {
+    if (uniffi_cera_ffi_checksum_method_session_send_message_streaming() != 2757) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 26929) {
+    if (uniffi_cera_ffi_checksum_method_session_set_image_max_long_size() != 26612) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 64571) {
+    if (uniffi_cera_ffi_checksum_method_session_set_lora_adapters() != 37806) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_set_seed() != 54035) {
+    if (uniffi_cera_ffi_checksum_method_session_set_seed() != 45807) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_session_recovery_status() != 30068) {
+    if (uniffi_cera_ffi_checksum_method_session_recovery_status() != 12819) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance() != 27373) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance() != 5629) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 57820) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_cancel() != 58366) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 57672) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_clear_cancel() != 45054) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 47716) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_current_sample() != 32213) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu() != 39954) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_diarizer_on_npu() != 53013) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 1087) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_flush() != 33980) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer() != 11141) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_has_diarizer() != 31918) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() != 57051) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_listening_for_hotword() != 26752) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active() != 50875) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_is_speech_active() != 43) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance() != 16879) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_last_utterance() != 23593) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event() != 54239) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_pop_event() != 12599) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() != 51752) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk() != 46866) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16() != 58081) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_process_chunk_pcm16() != 16235) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() != 13673) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_reset() != 59725) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state() != 59212) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_state() != 16398) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance() != 16840) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_take_last_utterance() != 59416) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 58760) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_transcribe_pcm() != 31176) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 54575) {
+    if (uniffi_cera_ffi_checksum_method_ffiaudiopipeline_vad_on_npu() != 22101) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_cancel() != 14090) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_cancel() != 8345) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() != 4793) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_clear_cancel() != 24156) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_complete() != 7176) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_complete() != 41834) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_complete_async() != 39595) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_complete_async() != 45175) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_complete_async_json() != 52759) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_complete_async_json() != 47941) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_complete_json() != 12972) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_complete_json() != 8906) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint() != 34798) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_export_checkpoint() != 22936) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 33536) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming() != 16263) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 53642) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async() != 11353) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json() != 26943) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_async_json() != 25545) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 49818) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_generate_streaming_json() != 23636) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size() != 39566) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_image_max_long_size() != 53708) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 684) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_import_checkpoint() != 19353) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_ingest() != 15502) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_ingest() != 2259) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 50400) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_ingest_messages() != 16821) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response() != 47361) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_ingest_tool_response() != 5490) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_into_session() != 52358) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_into_session() != 20770) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint() != 29130) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_load_checkpoint() != 43603) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_phase() != 3748) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_phase() != 2758) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_position() != 55288) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_position() != 5506) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_recovery_status() != 50985) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_recovery_status() != 44509) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_replace_messages() != 2557) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_replace_messages() != 27023) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_reset() != 50462) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_reset() != 23366) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 18337) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_save_checkpoint() != 48141) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size() != 55203) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_set_image_max_long_size() != 2802) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 31586) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_set_tool_format() != 61090) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_set_tools() != 36170) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_set_tools() != 35477) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_tool_format() != 18638) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_tool_format() != 25567) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_chatsession_tools() != 13384) {
+    if (uniffi_cera_ffi_checksum_method_chatsession_tools() != 49577) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 60817) {
+    if (uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 55866) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_generativemodel_engine() != 55922) {
+    if (uniffi_cera_ffi_checksum_method_generativemodel_engine() != 8210) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_modelhandle_as_generative() != 6141) {
+    if (uniffi_cera_ffi_checksum_method_modelhandle_as_generative() != 16733) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_modelhandle_kind() != 52976) {
+    if (uniffi_cera_ffi_checksum_method_modelhandle_kind() != 40804) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_modelloader_build() != 37695) {
+    if (uniffi_cera_ffi_checksum_method_modelloader_build() != 15329) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_modelloader_build_generative() != 14372) {
+    if (uniffi_cera_ffi_checksum_method_modelloader_build_generative() != 49676) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 15544) {
+    if (uniffi_cera_ffi_checksum_constructor_bundlerepo_new() != 26540) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress() != 24631) {
+    if (uniffi_cera_ffi_checksum_constructor_bundlerepo_with_progress() != 64568) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id() != 60717) {
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id() != 61514) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 14088) {
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bundle_id_async() != 22573) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() != 53168) {
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes() != 35072) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async() != 8065) {
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_bytes_async() != 55200) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts() != 18448) {
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts() != 40765) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async() != 8804) {
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_parts_async() != 3992) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 64420) {
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path() != 27756) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async() != 48795) {
+    if (uniffi_cera_ffi_checksum_constructor_ceraengine_from_path_async() != 26538) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes() != 51326) {
+    if (uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_bytes() != 63590) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file() != 44957) {
+    if (uniffi_cera_ffi_checksum_constructor_ffihotworddetector_from_file() != 53984) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files() != 12479) {
+    if (uniffi_cera_ffi_checksum_constructor_ffihotworditerator_from_files() != 65300) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes() != 36063) {
+    if (uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_bytes() != 30613) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file() != 47359) {
+    if (uniffi_cera_ffi_checksum_constructor_ffisilerovad_from_file() != 4850) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffivaditerator_new() != 27580) {
+    if (uniffi_cera_ffi_checksum_constructor_ffivaditerator_new() != 28084) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes() != 50588) {
+    if (uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_bytes() != 15068) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file() != 38235) {
+    if (uniffi_cera_ffi_checksum_constructor_ffiwhispermodel_from_file() != 53431) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 57598) {
+    if (uniffi_cera_ffi_checksum_constructor_loraadapters_from_gguf() != 23483) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors() != 11183) {
+    if (uniffi_cera_ffi_checksum_constructor_loraadapters_from_safetensors() != 64977) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter() != 59300) {
+    if (uniffi_cera_ffi_checksum_constructor_piiclassifier_from_base_and_adapter() != 52159) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 60671) {
+    if (uniffi_cera_ffi_checksum_constructor_piiclassifier_from_path() != 24657) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 42076) {
+    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes() != 9162) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer() != 59328) {
+    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer() != 38831) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3() != 19665) {
+    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_bytes_with_diarizer_nemotron3() != 41691) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 15812) {
+    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files() != 5196) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer() != 56903) {
+    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer() != 52331) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3() != 34038) {
+    if (uniffi_cera_ffi_checksum_constructor_ffiaudiopipeline_from_files_with_diarizer_nemotron3() != 63232) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 55996) {
+    if (uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 3580) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_modelloader_new() != 6200) {
+    if (uniffi_cera_ffi_checksum_constructor_modelloader_new() != 55287) {
         return InitializationResult.apiChecksumMismatch
     }
 
