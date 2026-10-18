@@ -472,6 +472,25 @@ impl WeightRef {
         }
         self
     }
+
+    /// Attach the 4-row `Q4_0` decode repack (`self.dec4`) without allocating
+    /// the 8-bit `Q4_0` prefill repack (`self.repacked`). Used for large tied
+    /// `token_embd.weight` / `output.weight` tables that only run `gemv_preq`
+    /// on decode and at the end of prefill.
+    #[allow(unused_mut)]
+    pub(crate) fn with_dec4_if(mut self, gguf: &GgufFile, do_repack: bool) -> Self {
+        #[cfg(all(target_arch = "aarch64", not(has_blas)))]
+        if do_repack && self.dtype == DType::Q4_0 && cpu::q4_0_dec4_supported(self.m, self.k) {
+            self.dec4 = Some(std::sync::Arc::new(Dec4Packed(cpu::repack_q4_0_dec4(
+                weight_data(gguf, &self),
+                self.m,
+                self.k,
+            ))));
+        }
+        #[cfg(not(all(target_arch = "aarch64", not(has_blas))))]
+        let _ = (gguf, do_repack);
+        self
+    }
 }
 
 /// Resolve a tensor name to a byte range in `data`, returning the weight's
@@ -814,6 +833,23 @@ pub(crate) fn gemv_preq(
         && y.len() >= wref.m
     {
         cpu::gemv_q4_0_dec4_with_q8(dec4, q8s, q8q, y, wref.m, wref.k);
+        return;
+    }
+    #[cfg(not(has_blas))]
+    if let Some(rp) = &wref.repacked
+        && let Repacked::Q40Smmla { packed, scales } = &rp.kind
+        && y.len() >= wref.m
+        && cpu::gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
+            packed,
+            scales,
+            q8s,
+            q8q,
+            &mut y[..wref.m],
+            1,
+            wref.m,
+            wref.k,
+        )
+    {
         return;
     }
     let data = weight_data(gguf, wref);
@@ -2695,30 +2731,78 @@ pub(crate) fn forward_attn_block(
                 weights.attn_q.k,
             );
         } else {
-            gemv_preq(
-                gguf,
-                weights.attn_q,
-                hidden,
-                &state.scratch.q8_scales,
-                &state.scratch.q8_quants,
-                q,
-            );
-            gemv_preq(
-                gguf,
-                weights.attn_k,
-                hidden,
-                &state.scratch.q8_scales,
-                &state.scratch.q8_quants,
-                k,
-            );
-            gemv_preq(
-                gguf,
-                weights.attn_v,
-                hidden,
-                &state.scratch.q8_scales,
-                &state.scratch.q8_quants,
-                v,
-            );
+            #[cfg(not(has_blas))]
+            let smmla_done = if lora.is_none()
+                && valid_dims
+                && weights.attn_q.dec4_bytes().is_none()
+                && let (Some(q_rp), Some(k_rp), Some(v_rp)) = (
+                    &weights.attn_q.repacked,
+                    &weights.attn_k.repacked,
+                    &weights.attn_v.repacked,
+                )
+                && let (
+                    Repacked::Q40Smmla {
+                        packed: qp,
+                        scales: qs,
+                    },
+                    Repacked::Q40Smmla {
+                        packed: kp,
+                        scales: ks,
+                    },
+                    Repacked::Q40Smmla {
+                        packed: vp,
+                        scales: vs,
+                    },
+                ) = (&q_rp.kind, &k_rp.kind, &v_rp.kind)
+            {
+                cpu::gemv_q4_0_smmla_concat3_with_q8(
+                    qp,
+                    qs,
+                    kp,
+                    ks,
+                    vp,
+                    vs,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    q,
+                    k,
+                    v,
+                    q_dim,
+                    kv_dim,
+                    kv_dim,
+                    weights.attn_q.k,
+                )
+            } else {
+                false
+            };
+            #[cfg(has_blas)]
+            let smmla_done = false;
+            if !smmla_done {
+                gemv_preq(
+                    gguf,
+                    weights.attn_q,
+                    hidden,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    q,
+                );
+                gemv_preq(
+                    gguf,
+                    weights.attn_k,
+                    hidden,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    k,
+                );
+                gemv_preq(
+                    gguf,
+                    weights.attn_v,
+                    hidden,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    v,
+                );
+            }
         }
     }
     #[cfg(not(target_arch = "aarch64"))]
@@ -3013,7 +3097,7 @@ pub(crate) fn forward_ffn_block(
     let lora = state.lora.clone();
 
     #[cfg(target_arch = "aarch64")]
-    let fused_swiglu_done = activation == FfnActivation::Swiglu
+    let mut fused_swiglu_done = activation == FfnActivation::Swiglu
         && lora.is_none()
         && extras.gate_bias.is_none()
         && extras.up_bias.is_none()
@@ -3022,13 +3106,32 @@ pub(crate) fn forward_ffn_block(
         && weights.ffn_gate.k == hidden_size
         && weights.ffn_up.k == hidden_size
         && ((weights.ffn_gate.dtype == DType::Q4_0 && weights.ffn_up.dtype == DType::Q4_0)
+            || (weights.ffn_gate.dtype == DType::Q8_0 && weights.ffn_up.dtype == DType::Q8_0)
             || (weights.ffn_gate.dtype == DType::Q4KM && weights.ffn_up.dtype == DType::Q4KM)
             || (weights.ffn_gate.dtype == DType::Q5KM && weights.ffn_up.dtype == DType::Q5KM));
     #[cfg(not(target_arch = "aarch64"))]
     let fused_swiglu_done = false;
     #[cfg(target_arch = "aarch64")]
     {
-        if fused_swiglu_done {
+        if fused_swiglu_done && weights.ffn_gate.dtype == DType::Q8_0 {
+            #[cfg(not(has_blas))]
+            {
+                fused_swiglu_done = try_repacked_gate_up_silu_rowmajor(
+                    weights.ffn_gate,
+                    weights.ffn_up,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    &mut state.scratch.gate[..intermediate_size],
+                    1,
+                    intermediate_size,
+                    hidden_size,
+                );
+            }
+            #[cfg(has_blas)]
+            {
+                fused_swiglu_done = false;
+            }
+        } else if fused_swiglu_done {
             let g_data = weight_data(gguf, weights.ffn_gate);
             let u_data = weight_data(gguf, weights.ffn_up);
             if weights.ffn_gate.dtype == DType::Q5KM {
@@ -3074,42 +3177,45 @@ pub(crate) fn forward_ffn_block(
                     hidden_size,
                 );
             }
-        } else if weights.ffn_gate.dtype == DType::Q4_0
-            && weights.ffn_up.dtype == DType::Q4_0
-            && weights.ffn_gate.m == intermediate_size
-            && weights.ffn_up.m == intermediate_size
-            && weights.ffn_gate.k == hidden_size
-            && weights.ffn_up.k == hidden_size
-        {
-            let g_data = weight_data(gguf, weights.ffn_gate);
-            let u_data = weight_data(gguf, weights.ffn_up);
-            cpu::gemv_q4_0_fused2_with_q8(
-                g_data,
-                u_data,
-                &state.scratch.q8_scales,
-                &state.scratch.q8_quants,
-                &mut state.scratch.gate[..intermediate_size],
-                &mut state.scratch.up[..intermediate_size],
-                intermediate_size,
-                hidden_size,
-            );
-        } else {
-            gemv_preq(
-                gguf,
-                weights.ffn_gate,
-                ffn_input,
-                &state.scratch.q8_scales,
-                &state.scratch.q8_quants,
-                &mut state.scratch.gate[..intermediate_size],
-            );
-            gemv_preq(
-                gguf,
-                weights.ffn_up,
-                ffn_input,
-                &state.scratch.q8_scales,
-                &state.scratch.q8_quants,
-                &mut state.scratch.up[..intermediate_size],
-            );
+        }
+        if !fused_swiglu_done {
+            if weights.ffn_gate.dtype == DType::Q4_0
+                && weights.ffn_up.dtype == DType::Q4_0
+                && weights.ffn_gate.m == intermediate_size
+                && weights.ffn_up.m == intermediate_size
+                && weights.ffn_gate.k == hidden_size
+                && weights.ffn_up.k == hidden_size
+            {
+                let g_data = weight_data(gguf, weights.ffn_gate);
+                let u_data = weight_data(gguf, weights.ffn_up);
+                cpu::gemv_q4_0_fused2_with_q8(
+                    g_data,
+                    u_data,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    &mut state.scratch.gate[..intermediate_size],
+                    &mut state.scratch.up[..intermediate_size],
+                    intermediate_size,
+                    hidden_size,
+                );
+            } else {
+                gemv_preq(
+                    gguf,
+                    weights.ffn_gate,
+                    ffn_input,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    &mut state.scratch.gate[..intermediate_size],
+                );
+                gemv_preq(
+                    gguf,
+                    weights.ffn_up,
+                    ffn_input,
+                    &state.scratch.q8_scales,
+                    &state.scratch.q8_quants,
+                    &mut state.scratch.up[..intermediate_size],
+                );
+            }
         }
     }
 

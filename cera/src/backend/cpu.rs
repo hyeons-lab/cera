@@ -407,11 +407,26 @@ pub fn par_rows_slice(
     }
     let total_rows = y.len();
     let y_ptr = y.as_mut_ptr() as usize;
-    par_range(total_rows, min_rows, move |start, count| {
-        let slice =
-            unsafe { core::slice::from_raw_parts_mut((y_ptr as *mut f32).add(start), count) };
-        f((start, slice));
-    });
+    let groups = total_rows / 4;
+    if groups > 0 {
+        let min_groups = min_rows.div_ceil(4).max(1);
+        super::threadpool::RowPool::decode().dispatch_range(
+            groups,
+            min_groups,
+            |g_start, g_count| {
+                let start = g_start * 4;
+                let count = g_count * 4;
+                let slice = unsafe {
+                    core::slice::from_raw_parts_mut((y_ptr as *mut f32).add(start), count)
+                };
+                f((start, slice));
+            },
+        );
+    }
+    let tail_start = groups * 4;
+    if tail_start < total_rows {
+        f((tail_start, &mut y[tail_start..]));
+    }
 }
 
 /// Row-parallel range dispatch: executes `f(start_row, num_rows)` across the worker pool
@@ -421,29 +436,7 @@ pub fn par_range(total_rows: usize, min_rows: usize, f: impl Fn(usize, usize) + 
     if total_rows == 0 {
         return;
     }
-    let pool = super::threadpool::RowPool::decode();
-    let nth = pool.num_threads().max(1);
-    let chunk = total_rows.div_ceil(nth).max(min_rows).max(1);
-    let n_chunks = total_rows.div_ceil(chunk);
-    let mut dummy_chunks = [0.0f32; 128];
-    if n_chunks <= dummy_chunks.len() {
-        pool.dispatch_rows_chunked(&mut dummy_chunks[..n_chunks], 1, 1, 1, |t, slice| {
-            let m_start = t * chunk;
-            let count = (total_rows.saturating_sub(m_start)).min(chunk * slice.len());
-            if count > 0 {
-                f(m_start, count);
-            }
-        });
-    } else {
-        let mut dummy = vec![0.0f32; n_chunks];
-        pool.dispatch_rows_chunked(&mut dummy, 1, 1, 1, |t, slice| {
-            let m_start = t * chunk;
-            let count = (total_rows.saturating_sub(m_start)).min(chunk * slice.len());
-            if count > 0 {
-                f(m_start, count);
-            }
-        });
-    }
+    super::threadpool::RowPool::decode().dispatch_range(total_rows, min_rows, f);
 }
 
 /// Wasm32 fallback for `par_range`: runs serially on the calling thread.
@@ -506,36 +499,8 @@ pub fn par_range_prefill_active(
     if total_rows == 0 {
         return;
     }
-    let pool = super::threadpool::RowPool::prefill();
-    let nth = pool.num_threads().max(1).min(max_active);
-    let chunk = total_rows.div_ceil(nth).max(min_rows).max(1);
-    let n_chunks = total_rows.div_ceil(chunk);
-    let mut dummy_chunks = [0.0f32; 128];
-    if n_chunks <= dummy_chunks.len() {
-        pool.dispatch_rows_chunked_active(
-            &mut dummy_chunks[..n_chunks],
-            1,
-            1,
-            1,
-            max_active,
-            |t, slice| {
-                let m_start = t * chunk;
-                let count = (total_rows.saturating_sub(m_start)).min(chunk * slice.len());
-                if count > 0 {
-                    f(m_start, count);
-                }
-            },
-        );
-    } else {
-        let mut dummy = vec![0.0f32; n_chunks];
-        pool.dispatch_rows_chunked_active(&mut dummy, 1, 1, 1, max_active, |t, slice| {
-            let m_start = t * chunk;
-            let count = (total_rows.saturating_sub(m_start)).min(chunk * slice.len());
-            if count > 0 {
-                f(m_start, count);
-            }
-        });
-    }
+    super::threadpool::RowPool::prefill()
+        .dispatch_range_active(total_rows, min_rows, max_active, f);
 }
 
 /// Wasm32 fallback for `par_range_prefill_active`: runs serially on the calling thread.
@@ -1617,12 +1582,12 @@ pub(crate) fn repack_q4_0_smmla_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>,
 #[cfg_attr(has_blas, allow(dead_code))]
 pub(crate) fn repack_q8_0_smmla_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f32>) {
     assert!(
-        m.is_multiple_of(8),
-        "repack_q8_0_smmla_8x8: m must be a multiple of 8"
+        m > 0 && m.is_multiple_of(8),
+        "repack_q8_0_smmla_8x8: m must be a positive multiple of 8"
     );
     assert!(
-        k.is_multiple_of(32),
-        "repack_q8_0_smmla_8x8: k must be a multiple of 32"
+        k > 0 && k.is_multiple_of(32),
+        "repack_q8_0_smmla_8x8: k must be a positive multiple of 32"
     );
     let nb = k / 32;
     let bsz = size_of::<crate::quant::BlockQ8_0>();
@@ -1762,12 +1727,12 @@ pub fn q4_0_dec4_supported(m: usize, k: usize) -> bool {
 #[cfg_attr(has_blas, allow(dead_code))]
 pub fn repack_q4_0_dec4(src: &[u8], m: usize, k: usize) -> Vec<u8> {
     assert!(
-        m.is_multiple_of(4),
-        "repack_q4_0_dec4: m must be a multiple of 4"
+        m > 0 && m.is_multiple_of(4),
+        "repack_q4_0_dec4: m must be a positive multiple of 4"
     );
     assert!(
-        k.is_multiple_of(32),
-        "repack_q4_0_dec4: k must be a multiple of 32"
+        k > 0 && k.is_multiple_of(32),
+        "repack_q4_0_dec4: k must be a positive multiple of 32"
     );
     let nb = k / 32;
     let bsz = size_of::<crate::quant::BlockQ4_0>();
@@ -1865,6 +1830,9 @@ pub(crate) fn repack_q4_0_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>, Vec<f
 /// the standard kernel — correctness is identical, only prefill is slower.
 #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
 pub(crate) fn q4_0_repack_supported(m: usize, k: usize) -> bool {
+    if m == 0 || k == 0 {
+        return false;
+    }
     #[cfg(target_arch = "aarch64")]
     return m.is_multiple_of(16) && k.is_multiple_of(32);
     #[cfg(target_arch = "x86_64")]
@@ -3092,6 +3060,9 @@ pub(crate) fn repack_q6_k_smmla_8x8(src: &[u8], m: usize, k: usize) -> (Vec<u8>,
 /// super-blocks (`k % 256 == 0`).
 #[cfg(all(any(target_arch = "x86_64", target_arch = "aarch64"), not(has_blas)))]
 pub(crate) fn q4_k_repack_supported(m: usize, k: usize) -> bool {
+    if m == 0 || k == 0 {
+        return false;
+    }
     #[cfg(target_arch = "aarch64")]
     return m.is_multiple_of(8)
         && k.is_multiple_of(256)
@@ -3106,7 +3077,9 @@ pub(crate) fn q4_k_repack_supported(m: usize, k: usize) -> bool {
 pub(crate) fn q6_k_repack_supported(m: usize, k: usize) -> bool {
     let _ = (m, k);
     #[cfg(target_arch = "aarch64")]
-    return m.is_multiple_of(8)
+    return m > 0
+        && k > 0
+        && m.is_multiple_of(8)
         && k.is_multiple_of(256)
         && crate::backend::simd::neon::k_quant_gemm_available();
     #[cfg(target_arch = "x86_64")]
@@ -4196,6 +4169,7 @@ pub fn gemv_q4_0_dec4_with_q8(
 ) {
     let nb = k / 32;
     if k == 0
+        || m == 0
         || !k.is_multiple_of(32)
         || !m.is_multiple_of(16)
         || packed.len() < m / 4 * nb * Q4_0_DEC4_RECORD
@@ -4236,6 +4210,7 @@ pub fn gemv_q4_0_dec4_gate_up_swiglu_with_q8(
 ) {
     let nb = k / 32;
     if k == 0
+        || m == 0
         || !k.is_multiple_of(32)
         || !m.is_multiple_of(16)
         || gate.len() < m / 4 * nb * Q4_0_DEC4_RECORD
@@ -4284,6 +4259,9 @@ pub fn gemv_q4_0_dec4_concat3_with_q8(
 ) {
     let nb = k / 32;
     if k == 0
+        || m1 == 0
+        || m2 == 0
+        || m3 == 0
         || !k.is_multiple_of(32)
         || !(m1.is_multiple_of(16) && m2.is_multiple_of(16) && m3.is_multiple_of(16))
         || a1.len() < m1 / 4 * nb * Q4_0_DEC4_RECORD
@@ -4318,6 +4296,73 @@ pub fn gemv_q4_0_dec4_concat3_with_q8(
             k,
         )
     }
+}
+
+/// Fused Q, K and V GEMVs over the smmla repack (`Repacked::Q40Smmla`) in one dispatch.
+#[cfg(target_arch = "aarch64")]
+#[cfg_attr(has_blas, allow(dead_code))]
+#[allow(clippy::too_many_arguments)]
+pub fn gemv_q4_0_smmla_concat3_with_q8(
+    p1: &[u8],
+    s1: &[f32],
+    p2: &[u8],
+    s2: &[f32],
+    p3: &[u8],
+    s3: &[f32],
+    x_scales: &[f32],
+    x_quants: &[i8],
+    y1: &mut [f32],
+    y2: &mut [f32],
+    y3: &mut [f32],
+    m1: usize,
+    m2: usize,
+    m3: usize,
+    k: usize,
+) -> bool {
+    if super::cpu_features::cpu_features().tier != super::cpu_features::CpuTier::NeonI8mm {
+        return false;
+    }
+    let nb = k / 32;
+    if k == 0
+        || m1 == 0
+        || m2 == 0
+        || m3 == 0
+        || !k.is_multiple_of(32)
+        || !(m1.is_multiple_of(8) && m2.is_multiple_of(8) && m3.is_multiple_of(8))
+        || p1.len() < (m1 / 8) * nb * 256
+        || s1.len() < (m1 / 8) * nb * 8
+        || p2.len() < (m2 / 8) * nb * 256
+        || s2.len() < (m2 / 8) * nb * 8
+        || p3.len() < (m3 / 8) * nb * 256
+        || s3.len() < (m3 / 8) * nb * 8
+        || x_scales.len() < nb
+        || x_quants.len() < k
+        || y1.len() < m1
+        || y2.len() < m2
+        || y3.len() < m3
+    {
+        return false;
+    }
+    unsafe {
+        crate::backend::simd::neon::gemv_q4_0_smmla_concat3_neon(
+            p1,
+            s1,
+            p2,
+            s2,
+            p3,
+            s3,
+            x_scales,
+            x_quants,
+            &mut y1[..m1],
+            &mut y2[..m2],
+            &mut y3[..m3],
+            m1,
+            m2,
+            m3,
+            k,
+        );
+    }
+    true
 }
 
 /// Unified 3-matrix Q4_K GEMV with pre-quantized Q8_0 input (for Q, K, V projections).
@@ -5765,12 +5810,18 @@ pub fn softplus(x: f32) -> f32 {
 pub fn softmax_inplace(x: &mut [f32]) {
     // Find max for numerical stability
     let max = x.iter().fold(f32::NEG_INFINITY, |a, &b| a.max(b));
+    let max_finite = max.is_finite();
 
     // Exponentiate using ggml's polynomial exp and sum with f64 (matches ggml_float)
     let mut sum = 0.0f64;
     for v in x.iter_mut() {
-        *v = ggml_expf(*v - max);
-        sum += *v as f64;
+        if *v == f32::NEG_INFINITY && max_finite {
+            *v = 0.0;
+        } else {
+            let e = ggml_expf(*v - max);
+            *v = e;
+            sum += e as f64;
+        }
     }
 
     // Normalize
@@ -11253,6 +11304,64 @@ mod tests {
                 t.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
                 "concat3 third matrix"
             );
+        }
+
+        /// The fused 3-matrix smmla GEMV (`gemv_q4_0_smmla_concat3_with_q8`) must match three
+        /// separate single-token `gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch` calls bit for
+        /// bit across asymmetric row counts and decline invalid dimensions cleanly.
+        #[test]
+        fn smmla_concat3_matches_repacked_rowmajor_gemm_at_n1() {
+            if crate::backend::cpu_features::cpu_features().tier
+                != crate::backend::cpu_features::CpuTier::NeonI8mm
+            {
+                return;
+            }
+            let (m1, m2, m3, k) = (48usize, 24usize, 16usize, 1024usize);
+            let mut st = 0x5aa1_a333u64;
+            let (p1, s1) = repack_q8_0_smmla_8x8(&weights(DType::Q8_0, m1, k, &mut st), m1, k);
+            let (p2, s2) = repack_q8_0_smmla_8x8(&weights(DType::Q8_0, m2, k, &mut st), m2, k);
+            let (p3, s3) = repack_q8_0_smmla_8x8(&weights(DType::Q8_0, m3, k, &mut st), m3, k);
+            let (bs, bq) = quantized_cols(k, 1, &mut st);
+
+            let (mut y1, mut y2, mut y3) = (vec![0.0f32; m1], vec![0.0f32; m2], vec![0.0f32; m3]);
+            assert!(gemv_q4_0_smmla_concat3_with_q8(
+                &p1, &s1, &p2, &s2, &p3, &s3, &bs, &bq, &mut y1, &mut y2, &mut y3, m1, m2, m3, k,
+            ));
+
+            let single = |p: &[u8], s: &[f32], rows: usize| {
+                let mut out = vec![0.0f32; rows];
+                assert!(gemm_preq_repacked_q4_0_smmla_rowmajor_dispatch(
+                    p, s, &bs, &bq, &mut out, 1, rows, k,
+                ));
+                out
+            };
+            let (w1, w2, w3) = (
+                single(&p1, &s1, m1),
+                single(&p2, &s2, m2),
+                single(&p3, &s3, m3),
+            );
+            assert_eq!(
+                y1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                w1.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "smmla concat3 matrix 1"
+            );
+            assert_eq!(
+                y2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                w2.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "smmla concat3 matrix 2"
+            );
+            assert_eq!(
+                y3.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                w3.iter().map(|v| v.to_bits()).collect::<Vec<_>>(),
+                "smmla concat3 matrix 3"
+            );
+
+            assert!(!gemv_q4_0_smmla_concat3_with_q8(
+                &p1, &s1, &p2, &s2, &p3, &s3, &bs, &bq, &mut y1, &mut y2, &mut y3, 0, m2, m3, k,
+            ));
+            assert!(!gemv_q4_0_smmla_concat3_with_q8(
+                &p1, &s1, &p2, &s2, &p3, &s3, &bs, &bq, &mut y1, &mut y2, &mut y3, 7, m2, m3, k,
+            ));
         }
 
         /// Against the standard-layout decode GEMV the results differ only by float summation order.

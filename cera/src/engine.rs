@@ -818,6 +818,11 @@ impl CeraEngine {
         let gpu_vision_encoder = vision_encoder.as_ref().and_then(|w| {
             crate::model::vision_encoder_gpu::build_gpu_vision_encoder(w, cfg.backend)
         });
+        if gpu_vision_encoder.is_none()
+            && let Some(ref w) = vision_encoder
+        {
+            w.prepare_int8();
+        }
         let gpu_audio_encoder = audio_encoder
             .as_ref()
             .and_then(|w| crate::model::audio_encoder_gpu::build_gpu_audio_encoder(w, cfg.backend));
@@ -2179,7 +2184,7 @@ fn try_parse_vision_encoder(
     gguf: &Arc<GgufFile>,
     path: Option<&str>,
 ) -> Option<Arc<VisionEncoderWeights>> {
-    match VisionEncoderWeights::from_gguf(gguf) {
+    match VisionEncoderWeights::from_gguf_unprepared(gguf) {
         Ok(w) => Some(Arc::new(w)),
         Err(e) => {
             tracing::warn!(

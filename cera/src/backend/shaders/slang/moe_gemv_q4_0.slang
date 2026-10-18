@@ -91,18 +91,16 @@ float block_sum(uint tid, float v) {
     return result;
 }
 
-uint load_byte(uint byte_off) {
+/// `byte_off` must be 2-byte aligned. Every Q4_0 block start (and every even
+/// byte inside `qs`) is: blocks are 18 bytes, rows are a whole number of
+/// blocks, and an expert slice is a whole number of rows.
+uint load_u16(uint byte_off) {
     uint word = w[byte_off >> 2u];
-    return (word >> ((byte_off & 3u) * 8u)) & 0xFFu;
+    return ((byte_off & 2u) != 0u) ? (word >> 16u) : (word & 0xFFFFu);
 }
 
-/// `byte_off` must be 2-byte aligned. Every Q4_0 block start is: blocks are 18
-/// bytes, rows are a whole number of blocks, and an expert slice is a whole
-/// number of rows, so every offset this is called with is even.
 float load_f16(uint byte_off) {
-    uint word = w[byte_off >> 2u];
-    uint h = ((byte_off & 2u) != 0u) ? (word >> 16u) : (word & 0xFFFFu);
-    return f16tof32(h);
+    return f16tof32(load_u16(byte_off));
 }
 
 [shader("compute")]
@@ -135,16 +133,25 @@ void moe_gemv_q4_0(uint3 lid : SV_GroupThreadID, uint3 grp : SV_GroupID) {
         uint blk = base + bi * BLOCK_BYTES;
         uint col = x_base + bi * 32u;
 
-        // Accumulate the integer-scaled products first and apply the block
-        // scale once, rather than scaling each of the 32 weights. Same value up
-        // to rounding, one multiply instead of 32.
+        // Accumulate the unsigned nibble products and activation sum first,
+        // then apply the -8 zero-point offset and block scale once per block.
         float acc = 0.0f;
-        for (uint i = 0u; i < 16u; ++i) {
-            uint byte = load_byte(blk + 2u + i);
-            acc += (float(byte & 0xFu) - 8.0f) * x[col + i];
-            acc += (float(byte >> 4u) - 8.0f) * x[col + i + 16u];
+        float xsum = 0.0f;
+        [unroll]
+        for (uint i = 0u; i < 8u; ++i) {
+            uint q16 = load_u16(blk + 2u + i * 2u);
+            uint idx = col + i * 2u;
+            float x0 = x[idx];
+            float x1 = x[idx + 1u];
+            float x16 = x[idx + 16u];
+            float x17 = x[idx + 17u];
+            xsum += (x0 + x1) + (x16 + x17);
+            acc += float(q16 & 0xFu) * x0
+                 + float((q16 >> 8u) & 0xFu) * x1
+                 + float((q16 >> 4u) & 0xFu) * x16
+                 + float(q16 >> 12u) * x17;
         }
-        sum += acc * load_f16(blk);
+        sum += (acc - 8.0f * xsum) * load_f16(blk);
     }
 
     float total = block_sum(lid.x, sum);

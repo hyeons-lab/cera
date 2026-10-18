@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.1
+
+- Add NVIDIA Nemotron-3-Diarization add-on diarizer (`NemotronDiarizer`) and open `d1-omni` bidirectional decision model support across CPU, Metal, and wgpu.
+- Support unaligned FFN widths and F16 weights in the Hexagon ViT vision encoder.
+- Add wgpu and Metal `Q8_0`/`Q6_K`/`Q5_K` resident-stream kernels, 64-thread `gemv_f16`/`gemv_f32` decode kernels, ARMv8.6 I8MM SMMLA `Q8_0` and fused `Q4_0` decode kernels, fast top-k sampling, and fused multimodal `[Tokens, Image]` prefill.
+- Align package and native artifact versions at 0.7.1.
+
 ## 0.7.0
 
 - Add Qualcomm Hexagon NPU backend and FastRPC runtime integration. The backend is implemented for LFM2/LFM2.5, LFM2-MoE, dense transformers and Qwen 3.5 hybrid models, plus the vision encoder and audio detokenizer. The dense, MoE and Qwen 3.5 paths are covered by host tests and still need validation on hardware; see `docs/HEXAGON_NPU.md` for per-architecture status. Set `CERA_DISABLE_HEXAGON=1` (alias `CERA_NO_HEXAGON`) to force the CPU/GPU path.
