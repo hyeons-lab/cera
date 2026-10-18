@@ -26,12 +26,29 @@ use crate::model::weights::MmapWeight;
 use crate::session::CeraError;
 use crate::tensor::DType;
 
-pub use crate::backend::hexagon::HexagonWeightFormat;
+use crate::backend::hexagon::HexagonWeightFormat;
 /// The ViT emits one op over all tokens (see `dispatch::TokenTile`); only the
 /// Whisper encoder tiles. Every `dispatch::*` call here passes this constant.
 const VIT_TILE: TokenTile = TokenTile::Whole;
 
-pub use crate::backend::hexagon::types::HexagonWeightDesc as HexagonVitWeightDesc;
+/// Weight layout in the ViT's rpcmem weights buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HexagonVitWeightFormat {
+    RepackedQ8_0,
+    RepackedQ4_0,
+    /// Plain row-major F16, no repack. Only the HMX matmul reads it.
+    F16,
+}
+
+/// Placement of one ViT linear weight in the weights buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct HexagonVitWeightDesc {
+    pub offset: usize,
+    pub size_bytes: usize,
+    pub format: HexagonVitWeightFormat,
+    pub rows: usize,
+    pub cols: usize,
+}
 
 /// The HMX matmul option for a ViT projection: on when the DSP has HMX, off with
 /// `CERA_HEXAGON_VIT_MM=hvx` to compare against the HVX matmul.
@@ -95,9 +112,156 @@ pub struct HexagonVitWeightOffsets {
     pub total_bytes: usize,
 }
 
+/// FFN width rounded up to the 32-wide tile the DSP matmul works in.
+fn ffn_padded_width(n_ff: usize) -> usize {
+    n_ff.next_multiple_of(32)
+}
+
+/// Row layout for zero-padding a 2D byte buffer along the row axis.
+#[derive(Debug, Clone, Copy)]
+struct RowPadSpec {
+    rows: usize,
+    row_bytes: usize,
+    rows_pad: usize,
+}
+
+/// Copy `spec.rows` rows of `spec.row_bytes` bytes and append zero rows up to `spec.rows_pad`.
+///
+/// A zero Q8_0/Q4_0 block (zero scale, zero quants) decodes to exactly 0.
+fn pad_rows_raw(src: &[u8], spec: RowPadSpec) -> Result<Vec<u8>, CeraError> {
+    let RowPadSpec {
+        rows,
+        row_bytes,
+        rows_pad,
+    } = spec;
+    let src_bytes = rows.checked_mul(row_bytes).ok_or_else(|| {
+        CeraError::Backend(format!(
+            "ViT weight byte count overflow for {rows} rows of {row_bytes} bytes"
+        ))
+    })?;
+    let pad_bytes = rows_pad.checked_mul(row_bytes).ok_or_else(|| {
+        CeraError::Backend(format!(
+            "ViT padded weight byte count overflow for {rows_pad} rows of {row_bytes} bytes"
+        ))
+    })?;
+    if src.len() < src_bytes || rows_pad < rows {
+        return Err(CeraError::Backend(format!(
+            "ViT weight ({} bytes) too short for {rows} rows of {row_bytes} bytes (padded to {rows_pad})",
+            src.len()
+        )));
+    }
+    let mut out = vec![0u8; pad_bytes];
+    out[..src_bytes].copy_from_slice(&src[..src_bytes]);
+    Ok(out)
+}
+
+/// Copy an F16 `[rows, cols]` matrix, zero-padding each row to `cols_pad` columns.
+fn pad_f16_cols(w: &MmapWeight, cols_pad: usize) -> Result<Vec<u8>, CeraError> {
+    if w.dtype != DType::F16 {
+        return Err(CeraError::Backend(format!(
+            "pad_f16_cols requires F16 weight, got {:?}",
+            w.dtype
+        )));
+    }
+    let (rows, cols) = (w.rows, w.cols);
+    let bytes = w.data();
+    let row_bytes = cols.checked_mul(2).ok_or_else(|| {
+        CeraError::Backend(format!("f16 ViT weight column byte overflow ({cols})"))
+    })?;
+    let src_bytes = rows.checked_mul(row_bytes).ok_or_else(|| {
+        CeraError::Backend(format!("f16 ViT weight byte overflow ({rows}x{cols})"))
+    })?;
+    let pad_row_bytes = cols_pad.checked_mul(2).ok_or_else(|| {
+        CeraError::Backend(format!("f16 ViT padded column byte overflow ({cols_pad})"))
+    })?;
+    let pad_bytes = rows.checked_mul(pad_row_bytes).ok_or_else(|| {
+        CeraError::Backend(format!(
+            "f16 ViT padded weight byte overflow ({rows}x{cols_pad})"
+        ))
+    })?;
+    if bytes.len() < src_bytes || cols_pad < cols {
+        return Err(CeraError::Backend(format!(
+            "f16 ViT weight {rows}x{cols} ({} bytes) cannot pad to {cols_pad} columns",
+            bytes.len()
+        )));
+    }
+    let mut out = vec![0u8; pad_bytes];
+    for r in 0..rows {
+        out[r * pad_row_bytes..r * pad_row_bytes + row_bytes]
+            .copy_from_slice(&bytes[r * row_bytes..(r + 1) * row_bytes]);
+    }
+    Ok(out)
+}
+
+/// Dequantize an F16 `[rows, cols]` matrix, zero-pad each row to `cols_pad` and
+/// quantize it to linear GGUF Q8_0 blocks.
+fn f16_matrix_to_padded_q8_0(w: &MmapWeight, cols_pad: usize) -> Result<Vec<u8>, CeraError> {
+    if w.dtype != DType::F16 {
+        return Err(CeraError::Backend(format!(
+            "f16_matrix_to_padded_q8_0 requires F16 weight, got {:?}",
+            w.dtype
+        )));
+    }
+    let (rows, cols) = (w.rows, w.cols);
+    let bytes = w.data();
+    let row_bytes = cols.checked_mul(2).ok_or_else(|| {
+        CeraError::Backend(format!("f16 ViT weight column byte overflow ({cols})"))
+    })?;
+    let src_bytes = rows.checked_mul(row_bytes).ok_or_else(|| {
+        CeraError::Backend(format!("f16 ViT weight byte overflow ({rows}x{cols})"))
+    })?;
+    let pad_elems = rows.checked_mul(cols_pad).ok_or_else(|| {
+        CeraError::Backend(format!(
+            "f16 ViT padded element overflow ({rows}x{cols_pad})"
+        ))
+    })?;
+    if bytes.len() < src_bytes || cols_pad < cols {
+        return Err(CeraError::Backend(format!(
+            "f16 ViT weight too short: {} bytes for {rows}x{cols} (padded to {cols_pad})",
+            bytes.len()
+        )));
+    }
+    let mut vals = vec![0f32; pad_elems];
+    for r in 0..rows {
+        let src = &bytes[r * row_bytes..(r + 1) * row_bytes];
+        let dst = &mut vals[r * cols_pad..r * cols_pad + cols];
+        for (d, &c) in dst.iter_mut().zip(src.as_chunks::<2>().0) {
+            *d = crate::quant::f16_to_f32(u16::from_le_bytes(c));
+        }
+    }
+    crate::backend::hexagon::quantize_f32_to_q8_0(&vals, cols_pad, rows)
+}
+
+/// How F16 `ffn_down` weights are stored in the ViT rpcmem weights buffer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum VitF16Policy {
+    /// Keep row-major F16 (zero-padded to 32-wide tiles) for the HMX matmul unit.
+    NativeF16,
+    /// Requantize F16 weights to Q8_0 (zero-padded to 32-wide tiles) when HMX is unavailable.
+    RequantQ8_0,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct QuantLinearDims {
+    dtype: DType,
+    rows: usize,
+    cols: usize,
+}
+
 impl HexagonVitWeightOffsets {
-    /// Compute memory layout and byte offsets for all ViT weights in shared rpcmem.
+    /// Compute memory layout and byte offsets for all ViT weights in shared rpcmem,
+    /// keeping F16 `ffn_down` weights in native F16 for the HMX matmul path.
     pub fn plan(weights: &VisionEncoderWeights) -> Result<Self, CeraError> {
+        Self::plan_with(weights, VitF16Policy::NativeF16)
+    }
+
+    /// Like [`Self::plan`], with `f16_policy` selecting whether an F16 `ffn_down`
+    /// stays F16 (zero-padded to the 32-wide tile) for the HMX matmul or is
+    /// requantized to Q8_0 when HMX is unavailable.
+    pub fn plan_with(
+        weights: &VisionEncoderWeights,
+        f16_policy: VitF16Policy,
+    ) -> Result<Self, CeraError> {
         let mut cur_off = 0;
 
         let plan_vec_f32 = |cur_off: &mut usize, len: usize| -> usize {
@@ -106,32 +270,45 @@ impl HexagonVitWeightOffsets {
             off
         };
 
+        let plan_linear_dims = |cur_off: &mut usize,
+                                dims: QuantLinearDims|
+         -> Result<HexagonVitWeightDesc, CeraError> {
+            let QuantLinearDims { dtype, rows, cols } = dims;
+            let off = *cur_off;
+            let (fmt, sz) = match dtype {
+                DType::Q8_0 => {
+                    let sz = repacked_matrix_size_q8_0(cols, rows)?;
+                    (HexagonVitWeightFormat::RepackedQ8_0, sz)
+                }
+                DType::Q4_0 => {
+                    let sz = repacked_matrix_size_q4_0(cols, rows)?;
+                    (HexagonVitWeightFormat::RepackedQ4_0, sz)
+                }
+                other => {
+                    return Err(CeraError::Backend(format!(
+                        "Hexagon ViT linear weight requires Q8_0 or Q4_0, got {other:?}"
+                    )));
+                }
+            };
+            *cur_off += align128(sz);
+            Ok(HexagonVitWeightDesc {
+                offset: off,
+                size_bytes: sz,
+                format: fmt,
+                rows,
+                cols,
+            })
+        };
         let plan_linear =
             |cur_off: &mut usize, w: &MmapWeight| -> Result<HexagonVitWeightDesc, CeraError> {
-                let off = *cur_off;
-                let (fmt, sz) = match w.dtype {
-                    DType::Q8_0 => {
-                        let sz = repacked_matrix_size_q8_0(w.cols, w.rows)?;
-                        (HexagonWeightFormat::RepackedQ8_0, sz)
-                    }
-                    DType::Q4_0 => {
-                        let sz = repacked_matrix_size_q4_0(w.cols, w.rows)?;
-                        (HexagonWeightFormat::RepackedQ4_0, sz)
-                    }
-                    other => {
-                        return Err(CeraError::Backend(format!(
-                            "Hexagon ViT linear weight requires Q8_0 or Q4_0, got {other:?}"
-                        )));
-                    }
-                };
-                *cur_off += align128(sz);
-                Ok(HexagonVitWeightDesc {
-                    offset: off,
-                    size_bytes: sz,
-                    format: fmt,
-                    rows: w.rows,
-                    cols: w.cols,
-                })
+                plan_linear_dims(
+                    cur_off,
+                    QuantLinearDims {
+                        dtype: w.dtype,
+                        rows: w.rows,
+                        cols: w.cols,
+                    },
+                )
             };
 
         let mut block_offsets = Vec::with_capacity(weights.blocks.len());
@@ -148,9 +325,47 @@ impl HexagonVitWeightOffsets {
             let o_b_off = plan_vec_f32(&mut cur_off, blk.o_b.len());
             let ln2_w_off = plan_vec_f32(&mut cur_off, blk.ln2_w.len());
             let ln2_b_off = plan_vec_f32(&mut cur_off, blk.ln2_b.len());
-            let ffn_up_w = plan_linear(&mut cur_off, &blk.ffn_up_w)?;
-            let ffn_up_b_off = plan_vec_f32(&mut cur_off, blk.ffn_up_b.len());
-            let ffn_down_w = plan_linear(&mut cur_off, &blk.ffn_down_w)?;
+            // The FFN width is padded to the DSP's 32-wide tiles (zero rows in
+            // ffn_up and zero columns in ffn_down are exact no-ops), and an F16
+            // ffn_down is F16 in the GGUF whenever the width is not a multiple of 32 (Q8_0
+            // blocks are 32 wide, e.g. 4304). It stays F16 for the HMX matmul, or is
+            // requantized to Q8_0 when native F16 is unavailable.
+            let ffn_pad = ffn_padded_width(blk.ffn_up_w.rows);
+            let ffn_up_w = plan_linear_dims(
+                &mut cur_off,
+                QuantLinearDims {
+                    dtype: blk.ffn_up_w.dtype,
+                    rows: ffn_pad,
+                    cols: blk.ffn_up_w.cols,
+                },
+            )?;
+            let ffn_up_b_off = plan_vec_f32(&mut cur_off, ffn_pad);
+            let ffn_down_w = match (blk.ffn_down_w.dtype, f16_policy) {
+                (DType::F16, VitF16Policy::NativeF16)
+                    if blk.ffn_down_w.rows > 0 && blk.ffn_down_w.rows.is_multiple_of(32) =>
+                {
+                    let rows = blk.ffn_down_w.rows;
+                    let size_bytes = rows * ffn_pad * 2;
+                    let off = cur_off;
+                    cur_off += align128(size_bytes);
+                    HexagonVitWeightDesc {
+                        offset: off,
+                        size_bytes,
+                        format: HexagonVitWeightFormat::F16,
+                        rows,
+                        cols: ffn_pad,
+                    }
+                }
+                (DType::F16, _) => plan_linear_dims(
+                    &mut cur_off,
+                    QuantLinearDims {
+                        dtype: DType::Q8_0,
+                        rows: blk.ffn_down_w.rows,
+                        cols: ffn_pad,
+                    },
+                )?,
+                _ => plan_linear(&mut cur_off, &blk.ffn_down_w)?,
+            };
             let ffn_down_b_off = plan_vec_f32(&mut cur_off, blk.ffn_down_b.len());
 
             block_offsets.push(HexagonVitBlockOffsets {
@@ -184,7 +399,8 @@ impl HexagonVitWeightOffsets {
             // The projector's hidden activation reuses the feed-forward's
             // scratch and its GELU works through scratch sized by `n_ff`, so a
             // wider one cannot run.
-            if weights.projector.mm1_w.rows > weights.config.n_ff {
+            let n_ff_pad = ffn_padded_width(weights.config.n_ff);
+            if weights.projector.mm1_w.rows > n_ff_pad {
                 return Err(CeraError::Backend(format!(
                     "ViT projector hidden width {} exceeds the feed-forward width {}",
                     weights.projector.mm1_w.rows, weights.config.n_ff
@@ -319,6 +535,8 @@ pub struct HexagonVisionEncoder {
     patch_embed: PatchEmbedWeights,
     position_embed: Arc<[f32]>,
     projector: ProjectorWeights,
+    /// FFN width after padding to the 32-wide DSP tile (equals `n_ff` when aligned).
+    n_ff_pad: usize,
 }
 
 impl Drop for HexagonVisionEncoder {
@@ -343,12 +561,27 @@ impl HexagonVisionEncoder {
         weights: &VisionEncoderWeights,
     ) -> Result<Self, CeraError> {
         let cfg = &weights.config;
-        let scratch_offsets = HexagonVitScratchOffsets::new(cfg.n_embd, cfg.n_ff);
+        // F16 weights are only read by the HMX matmul; without HMX (or when rows are not
+        // 32-aligned for HMX tiles) they are requantized.
+        let f16_policy = {
+            let mut dev = device.lock_or_recover();
+            let ffn_down_hmx_aligned = weights
+                .blocks
+                .iter()
+                .all(|b| b.ffn_down_w.rows > 0 && b.ffn_down_w.rows.is_multiple_of(32));
+            if vit_hmx(dev.queue_session_mut()).is_some() && ffn_down_hmx_aligned {
+                VitF16Policy::NativeF16
+            } else {
+                VitF16Policy::RequantQ8_0
+            }
+        };
+        let n_ff_pad = ffn_padded_width(cfg.n_ff);
+        let scratch_offsets = HexagonVitScratchOffsets::new(cfg.n_embd, n_ff_pad);
         let scratch_buf =
             RpcmemBuffer::alloc(Arc::clone(&driver), scratch_offsets.total_bytes, true)?;
 
         // Plan weights buffer layout
-        let weights_offsets = HexagonVitWeightOffsets::plan(weights)?;
+        let weights_offsets = HexagonVitWeightOffsets::plan_with(weights, f16_policy)?;
         let mut weights_buf =
             RpcmemBuffer::alloc(Arc::clone(&driver), weights_offsets.total_bytes, true)?;
 
@@ -358,23 +591,37 @@ impl HexagonVisionEncoder {
             dst[off..off + bytes.len()].copy_from_slice(bytes);
         };
 
-        let copy_linear = |dst: &mut [u8],
-                           desc: HexagonVitWeightDesc,
-                           w: &MmapWeight|
+        let repack_raw = |dst: &mut [u8],
+                          desc: HexagonVitWeightDesc,
+                          data: &[u8]|
          -> Result<(), CeraError> {
             let dst_slice = &mut dst[desc.offset..desc.offset + desc.size_bytes];
             match desc.format {
-                HexagonWeightFormat::RepackedQ8_0 => {
-                    repack_q8_0(w.data(), w.cols, w.rows, dst_slice)
+                HexagonVitWeightFormat::RepackedQ8_0 => {
+                    repack_q8_0(data, desc.cols, desc.rows, dst_slice)
                         .map_err(|e| CeraError::Backend(format!("ViT repack Q8_0 failed: {e}")))?;
                 }
-                HexagonWeightFormat::RepackedQ4_0 => {
-                    repack_q4_0(w.data(), w.cols, w.rows, dst_slice)
+                HexagonVitWeightFormat::RepackedQ4_0 => {
+                    repack_q4_0(data, desc.cols, desc.rows, dst_slice)
                         .map_err(|e| CeraError::Backend(format!("ViT repack Q4_0 failed: {e}")))?;
+                }
+                HexagonVitWeightFormat::F16 => {
+                    if data.len() != desc.size_bytes {
+                        return Err(CeraError::Backend(format!(
+                            "ViT F16 weight is {} bytes, expected {}",
+                            data.len(),
+                            desc.size_bytes
+                        )));
+                    }
+                    dst_slice.copy_from_slice(data);
                 }
             }
             Ok(())
         };
+        let copy_linear = |dst: &mut [u8],
+                           desc: HexagonVitWeightDesc,
+                           w: &MmapWeight|
+         -> Result<(), CeraError> { repack_raw(dst, desc, w.data()) };
 
         let buf_slice = weights_buf.as_mut_slice();
         for (blk_weights, blk_offs) in weights.blocks.iter().zip(weights_offsets.blocks.iter()) {
@@ -390,9 +637,47 @@ impl HexagonVisionEncoder {
             copy_vec_f32(buf_slice, blk_offs.o_b_off, &blk_weights.o_b);
             copy_vec_f32(buf_slice, blk_offs.ln2_w_off, &blk_weights.ln2_w);
             copy_vec_f32(buf_slice, blk_offs.ln2_b_off, &blk_weights.ln2_b);
-            copy_linear(buf_slice, blk_offs.ffn_up_w, &blk_weights.ffn_up_w)?;
-            copy_vec_f32(buf_slice, blk_offs.ffn_up_b_off, &blk_weights.ffn_up_b);
-            copy_linear(buf_slice, blk_offs.ffn_down_w, &blk_weights.ffn_down_w)?;
+            let ffn_pad = blk_offs.ffn_up_w.rows;
+            if ffn_pad == blk_weights.ffn_up_w.rows {
+                copy_linear(buf_slice, blk_offs.ffn_up_w, &blk_weights.ffn_up_w)?;
+                copy_vec_f32(buf_slice, blk_offs.ffn_up_b_off, &blk_weights.ffn_up_b);
+            } else {
+                let w = &blk_weights.ffn_up_w;
+                let block_bytes = match w.dtype {
+                    DType::Q8_0 => 34,
+                    DType::Q4_0 => 18,
+                    other => {
+                        return Err(CeraError::Backend(format!(
+                            "ViT ffn_up padding: unsupported dtype {other:?}"
+                        )));
+                    }
+                };
+                let padded = pad_rows_raw(
+                    w.data(),
+                    RowPadSpec {
+                        rows: w.rows,
+                        row_bytes: w.cols / 32 * block_bytes,
+                        rows_pad: ffn_pad,
+                    },
+                )?;
+                repack_raw(buf_slice, blk_offs.ffn_up_w, &padded)?;
+                let mut bias = blk_weights.ffn_up_b.clone();
+                bias.resize(ffn_pad, 0.0);
+                copy_vec_f32(buf_slice, blk_offs.ffn_up_b_off, &bias);
+            }
+            match (blk_weights.ffn_down_w.dtype, blk_offs.ffn_down_w.format) {
+                (DType::F16, HexagonVitWeightFormat::F16) => {
+                    let f16 = pad_f16_cols(&blk_weights.ffn_down_w, blk_offs.ffn_down_w.cols)?;
+                    repack_raw(buf_slice, blk_offs.ffn_down_w, &f16)?;
+                }
+                (DType::F16, _) => {
+                    let q8 = f16_matrix_to_padded_q8_0(&blk_weights.ffn_down_w, ffn_pad)?;
+                    repack_raw(buf_slice, blk_offs.ffn_down_w, &q8)?;
+                }
+                _ => {
+                    copy_linear(buf_slice, blk_offs.ffn_down_w, &blk_weights.ffn_down_w)?;
+                }
+            }
             copy_vec_f32(buf_slice, blk_offs.ffn_down_b_off, &blk_weights.ffn_down_b);
         }
 
@@ -426,6 +711,7 @@ impl HexagonVisionEncoder {
                 mm2_w: weights.projector.mm2_w.clone(),
                 mm2_b: weights.projector.mm2_b.clone(),
             },
+            n_ff_pad,
         })
     }
 
@@ -474,6 +760,120 @@ impl HexagonVisionEncoder {
         Ok(())
     }
 
+    /// Dispatch linear layer `dst[tokens, rows] = x[tokens, cols] . Wt + bias`.
+    ///
+    /// Quantized weights go through [`dispatch::linear_m_with`]; plain F16 weights
+    /// (`ffn_down` when the feed-forward width is not a multiple of 32) have no
+    /// HVX repack path and run on the HMX matmul unit directly.
+    #[allow(clippy::too_many_arguments)]
+    fn dispatch_linear_m(
+        session: &mut HexagonQueueSession,
+        x: &RpcmemBuffer,
+        x_offset: usize,
+        weights: &RpcmemBuffer,
+        w_desc: HexagonVitWeightDesc,
+        b_offset: usize,
+        dst: &RpcmemBuffer,
+        dst_offset: usize,
+        n_tokens: usize,
+    ) -> Result<(), CeraError> {
+        let format = match w_desc.format {
+            HexagonVitWeightFormat::RepackedQ8_0 => Some(HexagonWeightFormat::RepackedQ8_0),
+            HexagonVitWeightFormat::RepackedQ4_0 => Some(HexagonWeightFormat::RepackedQ4_0),
+            HexagonVitWeightFormat::F16 => None,
+        };
+        if let Some(format) = format {
+            return dispatch::linear_m_with(
+                session,
+                x,
+                x_offset,
+                weights,
+                crate::backend::hexagon::HexagonWeightDesc {
+                    offset: w_desc.offset,
+                    size_bytes: w_desc.size_bytes,
+                    format,
+                    rows: w_desc.rows,
+                    cols: w_desc.cols,
+                },
+                b_offset,
+                dst,
+                dst_offset,
+                n_tokens,
+                VIT_TILE,
+                vit_hmx(session),
+            );
+        }
+
+        let (ne0, ne1) = (w_desc.cols, w_desc.rows);
+        let hmx_kparams = vit_hmx(session)
+            .filter(|_| {
+                crate::backend::hexagon::mm_is_hmx_eligible(HtpDataType::F16, ne0, ne1, n_tokens)
+            })
+            .and_then(|h| {
+                crate::backend::hexagon::build_hmx_mm_kernel_params(
+                    HtpDataType::F16,
+                    ne0,
+                    ne1,
+                    n_tokens.next_multiple_of(32),
+                    n_tokens,
+                    session.dsp_threads(),
+                    h.vtcm_budget,
+                )
+            })
+            .ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "F16 ViT matmul {ne0}x{ne1} (M={n_tokens}) needs the HMX path, which did not fit"
+                ))
+            })?;
+
+        let row_bytes = crate::backend::hexagon::mm_hmx_nb1(HtpDataType::F16, ne0);
+        let w_tot = ne1 * row_bytes;
+        let w_ti = session.add_tensor(
+            weights,
+            w_desc.offset,
+            w_desc.size_bytes,
+            HTP_TENSOR_WEIGHT,
+            HtpDataType::F16 as u32,
+            [ne0 as u32, ne1 as u32, 1, 1],
+            [2, row_bytes as u32, w_tot as u32, w_tot as u32],
+        )?;
+
+        let x_bytes = n_tokens * ne0 * 4;
+        let x_ti = session.add_tensor(
+            x,
+            x_offset,
+            x_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            [ne0 as u32, n_tokens as u32, 1, 1],
+            [4, (ne0 * 4) as u32, x_bytes as u32, x_bytes as u32],
+        )?;
+
+        let dst_bytes = n_tokens * ne1 * 4;
+        let dst_ti = session.add_tensor(
+            dst,
+            dst_offset,
+            dst_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            [ne1 as u32, n_tokens as u32, 1, 1],
+            [4, (ne1 * 4) as u32, dst_bytes as u32, dst_bytes as u32],
+        )?;
+
+        session
+            .enqueue_op(
+                HtpOpCode::MulMat as u32,
+                &[w_ti, x_ti],
+                &[dst_ti],
+                [0i32; 16],
+                hmx_kparams,
+            )
+            .map_err(|e| CeraError::Backend(format!("dispatch_linear_m (F16): {e}")))?;
+
+        Self::dispatch_bias_add(session, dst_ti, weights, b_offset, ne1)?;
+        session.end_group()
+    }
+
     /// Dispatch fused linear QKV matmuls via MulMatNx followed by bias additions.
     #[allow(clippy::too_many_arguments)]
     fn dispatch_linear_qkv_m(
@@ -493,76 +893,51 @@ impl HexagonVisionEncoder {
         v_dst_off: usize,
         n_tokens: usize,
     ) -> Result<(), CeraError> {
-        let fused_dtype = match q_w.format {
-            HexagonWeightFormat::RepackedQ8_0 => HtpDataType::Q8_0,
-            HexagonWeightFormat::RepackedQ4_0 => HtpDataType::Q4_0,
+        let fused_quant = match q_w.format {
+            HexagonVitWeightFormat::RepackedQ8_0 => {
+                Some((HtpDataType::Q8_0, 34usize, 32 * 34usize))
+            }
+            HexagonVitWeightFormat::RepackedQ4_0 => {
+                Some((HtpDataType::Q4_0, 18usize, 32 * 18usize))
+            }
+            HexagonVitWeightFormat::F16 => None,
         };
         // The fused kernel cannot chunk its activation rows, so past what its
         // VTCM layout holds the three projections run on their own (each
         // chunks itself): a few hundred tokens of a large image.
-        let fits_fused = qkv_fits_fused(fused_dtype, q_w.cols, n_tokens, session.dsp_threads());
+        let fits_fused = fused_quant.is_some_and(|(fused_dtype, _, _)| {
+            qkv_fits_fused(fused_dtype, q_w.cols, n_tokens, session.dsp_threads())
+        });
         // The HMX matmul beats the fused HVX kernel once there are rows to feed it.
         let hmx_matmul = vit_hmx(session).is_some()
-            && crate::backend::hexagon::mm_is_hmx_eligible(
-                fused_dtype,
-                q_w.cols,
-                q_w.rows,
-                n_tokens,
-            );
-        if !(fits_fused
-            && !hmx_matmul
-            && q_w.cols == k_w.cols
-            && k_w.cols == v_w.cols
-            && q_w.rows == k_w.rows
-            && k_w.rows == v_w.rows
-            && q_w.format == k_w.format
-            && k_w.format == v_w.format)
-        {
-            dispatch::linear_m_with(
-                session,
-                x,
-                x_offset,
-                weights,
-                q_w,
-                q_b_off,
-                dst,
-                q_dst_off,
-                n_tokens,
-                VIT_TILE,
-                vit_hmx(session),
+            && fused_quant.is_some_and(|(fused_dtype, _, _)| {
+                crate::backend::hexagon::mm_is_hmx_eligible(
+                    fused_dtype,
+                    q_w.cols,
+                    q_w.rows,
+                    n_tokens,
+                )
+            });
+        let Some((w_dtype, block_bytes, tile_size)) = fused_quant.filter(|_| {
+            fits_fused
+                && !hmx_matmul
+                && q_w.cols == k_w.cols
+                && k_w.cols == v_w.cols
+                && q_w.rows == k_w.rows
+                && k_w.rows == v_w.rows
+                && q_w.format == k_w.format
+                && k_w.format == v_w.format
+        }) else {
+            Self::dispatch_linear_m(
+                session, x, x_offset, weights, q_w, q_b_off, dst, q_dst_off, n_tokens,
             )?;
-            dispatch::linear_m_with(
-                session,
-                x,
-                x_offset,
-                weights,
-                k_w,
-                k_b_off,
-                dst,
-                k_dst_off,
-                n_tokens,
-                VIT_TILE,
-                vit_hmx(session),
+            Self::dispatch_linear_m(
+                session, x, x_offset, weights, k_w, k_b_off, dst, k_dst_off, n_tokens,
             )?;
-            dispatch::linear_m_with(
-                session,
-                x,
-                x_offset,
-                weights,
-                v_w,
-                v_b_off,
-                dst,
-                v_dst_off,
-                n_tokens,
-                VIT_TILE,
-                vit_hmx(session),
+            Self::dispatch_linear_m(
+                session, x, x_offset, weights, v_w, v_b_off, dst, v_dst_off, n_tokens,
             )?;
             return Ok(());
-        }
-
-        let (w_dtype, block_bytes, tile_size) = match q_w.format {
-            HexagonWeightFormat::RepackedQ8_0 => (HtpDataType::Q8_0, 34usize, 32 * 34usize),
-            HexagonWeightFormat::RepackedQ4_0 => (HtpDataType::Q4_0, 18usize, 32 * 18usize),
         };
 
         let ne0 = q_w.cols;
@@ -1038,7 +1413,7 @@ impl HexagonVisionEncoder {
                 )?;
 
                 // Out projection + bias: attn_out -> proj_out
-                dispatch::linear_m_with(
+                Self::dispatch_linear_m(
                     session,
                     scratch_guard,
                     so.attn_out_off,
@@ -1048,8 +1423,6 @@ impl HexagonVisionEncoder {
                     scratch_guard,
                     so.proj_out_off,
                     n_patches,
-                    VIT_TILE,
-                    vit_hmx(session),
                 )?;
 
                 // Residual add: tokens += proj_out
@@ -1087,7 +1460,7 @@ impl HexagonVisionEncoder {
                 )?;
 
                 // FFN up projection: pre_norm -> ffn_mid
-                dispatch::linear_m_with(
+                Self::dispatch_linear_m(
                     session,
                     scratch_guard,
                     so.pre_norm_off,
@@ -1097,8 +1470,6 @@ impl HexagonVisionEncoder {
                     scratch_guard,
                     so.ffn_mid_off,
                     n_patches,
-                    VIT_TILE,
-                    vit_hmx(session),
                 )?;
 
                 // GELU activation on ffn_mid
@@ -1108,15 +1479,15 @@ impl HexagonVisionEncoder {
                     so.ffn_mid_off,
                     scratch_guard,
                     so.gelu_tmp_off,
-                    dispatch::gelu_tmp_rows(so.gelu_tmp_bytes, cfg.n_ff)?,
+                    dispatch::gelu_tmp_rows(so.gelu_tmp_bytes, self.n_ff_pad)?,
                     TokenShape {
-                        dim: cfg.n_ff,
+                        dim: self.n_ff_pad,
                         n_tokens: n_patches,
                     },
                 )?;
 
                 // FFN down projection: ffn_mid -> ffn_out
-                dispatch::linear_m_with(
+                Self::dispatch_linear_m(
                     session,
                     scratch_guard,
                     so.ffn_mid_off,
@@ -1126,8 +1497,6 @@ impl HexagonVisionEncoder {
                     scratch_guard,
                     so.ffn_out_off,
                     n_patches,
-                    VIT_TILE,
-                    vit_hmx(session),
                 )?;
 
                 // Residual add: tokens += ffn_out
@@ -1189,16 +1558,22 @@ impl HexagonVisionEncoder {
 
         if stop_after_blocks.is_some() {
             if let Some(d) = dump {
+                scratch_guard.invalidate_cpu_cache(0, so.total_bytes);
                 let all: &[f32] = bytemuck::cast_slice(scratch_guard.as_slice());
                 let region = |off: usize, floats: usize| all[off / 4..off / 4 + floats].to_vec();
-                let (n, ff) = (n_patches * n_embd, n_patches * cfg.n_ff);
+                let n = n_patches * n_embd;
                 d.q = region(so.q_off, n);
                 d.k = region(so.k_off, n);
                 d.v = region(so.v_off, n);
                 d.attn_out = region(so.attn_out_off, n);
                 d.attn_proj = region(so.proj_out_off, n);
                 d.ln2 = region(so.pre_norm_off, n);
-                d.ffn_mid = region(so.ffn_mid_off, ff);
+                d.ffn_mid = (0..n_patches)
+                    .flat_map(|r| {
+                        let base = so.ffn_mid_off / 4 + r * self.n_ff_pad;
+                        all[base..base + cfg.n_ff].iter().copied()
+                    })
+                    .collect();
                 d.ffn_out = region(so.ffn_out_off, n);
                 d.tokens = normed_slice.to_vec();
             }
@@ -1226,7 +1601,7 @@ impl HexagonVisionEncoder {
                 scratch_guard.flush_cpu_cache(so.tokens_off, in_bytes);
 
                 let proj_res = (|| -> Result<(), CeraError> {
-                    dispatch::linear_m_with(
+                    Self::dispatch_linear_m(
                         session,
                         &scratch_guard,
                         so.tokens_off,
@@ -1236,8 +1611,6 @@ impl HexagonVisionEncoder {
                         &scratch_guard,
                         so.proj_mid_off,
                         n_tokens,
-                        VIT_TILE,
-                        vit_hmx(session),
                     )?;
                     dispatch::gelu_tanh(
                         session,
@@ -1251,7 +1624,7 @@ impl HexagonVisionEncoder {
                             n_tokens,
                         },
                     )?;
-                    dispatch::linear_m_with(
+                    Self::dispatch_linear_m(
                         session,
                         &scratch_guard,
                         so.proj_mid_off,
@@ -1261,8 +1634,6 @@ impl HexagonVisionEncoder {
                         &scratch_guard,
                         so.proj_final_off,
                         n_tokens,
-                        VIT_TILE,
-                        vit_hmx(session),
                     )?;
                     session.flush()?;
                     Ok(())
@@ -1600,8 +1971,8 @@ mod tests {
         assert_eq!(plan.blocks.len(), 1);
         assert!(plan.projector.is_some());
         let proj = plan.projector.unwrap();
-        assert_eq!(proj.mm1_w.format, HexagonWeightFormat::RepackedQ8_0);
-        assert_eq!(proj.mm2_w.format, HexagonWeightFormat::RepackedQ8_0);
+        assert_eq!(proj.mm1_w.format, HexagonVitWeightFormat::RepackedQ8_0);
+        assert_eq!(proj.mm2_w.format, HexagonVitWeightFormat::RepackedQ8_0);
         assert!(plan.total_bytes > proj.mm2_b_off);
 
         // A projector wider than the feed-forward has no scratch to run in.
@@ -1611,5 +1982,177 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("projector hidden width 256"), "{err}");
+    }
+
+    #[test]
+    fn test_ffn_padded_width_rounds_to_dsp_tile() {
+        assert_eq!(ffn_padded_width(4304), 4320);
+        assert_eq!(ffn_padded_width(4320), 4320);
+        assert_eq!(ffn_padded_width(3072), 3072);
+    }
+
+    #[test]
+    fn test_pad_rows_raw_appends_zero_rows() {
+        let src: Vec<u8> = (1..=12).collect(); // 3 rows of 4 bytes
+        let spec = RowPadSpec {
+            rows: 3,
+            row_bytes: 4,
+            rows_pad: 5,
+        };
+        let out = pad_rows_raw(&src, spec).expect("pad rows");
+        assert_eq!(out.len(), 20);
+        assert_eq!(&out[..12], src.as_slice());
+        assert!(out[12..].iter().all(|&b| b == 0));
+        assert!(pad_rows_raw(&src[..8], spec).is_err());
+    }
+
+    #[test]
+    fn test_f16_matrix_to_padded_q8_0_zero_pads_and_keeps_values() {
+        // 2 rows x 48 cols of F16 (cols not a multiple of 32), padded to 64.
+        let rows = 2usize;
+        let cols = 48usize;
+        let cols_pad = 64usize;
+        // F16 bit patterns for 1.0, 2.0, 0.5 and -1.0.
+        let pattern = [0x3C00u16, 0x4000, 0x3800, 0xBC00];
+        let mut bytes = Vec::with_capacity(rows * cols * 2);
+        for i in 0..rows * cols {
+            bytes.extend_from_slice(&pattern[i % pattern.len()].to_le_bytes());
+        }
+        let w = MmapWeight::from_owned_bytes(bytes, DType::F16, rows, cols);
+        let q8 = f16_matrix_to_padded_q8_0(&w, cols_pad).expect("quantize");
+        let blocks_per_row = cols_pad / 32;
+        assert_eq!(q8.len(), rows * blocks_per_row * 34);
+
+        for r in 0..rows {
+            for b in 0..blocks_per_row {
+                let off = (r * blocks_per_row + b) * 34;
+                let delta = crate::quant::f16_to_f32(u16::from_le_bytes([q8[off], q8[off + 1]]));
+                for j in 0..32 {
+                    let col = b * 32 + j;
+                    let got = delta * (q8[off + 2 + j] as i8) as f32;
+                    if col >= cols {
+                        assert_eq!(got, 0.0, "padded column {col} must be exactly zero");
+                    } else {
+                        let want = crate::quant::f16_to_f32(pattern[(r * cols + col) % 4]);
+                        assert!(
+                            (got - want).abs() < 0.02,
+                            "row {r} col {col}: {got} vs {want}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_pad_f16_cols_keeps_values_and_zero_pads() {
+        // 2 rows x 3 cols of F16, padded to 4 columns.
+        let bytes: Vec<u8> = (1u8..=12).collect();
+        let w = MmapWeight::from_owned_bytes(bytes, DType::F16, 2, 3);
+        let out = pad_f16_cols(&w, 4).expect("pad");
+        assert_eq!(out.len(), 2 * 4 * 2);
+        assert_eq!(&out[0..6], &[1, 2, 3, 4, 5, 6]);
+        assert_eq!(&out[6..8], &[0, 0]);
+        assert_eq!(&out[8..14], &[7, 8, 9, 10, 11, 12]);
+        assert_eq!(&out[14..16], &[0, 0]);
+
+        let q8 = MmapWeight::from_owned_bytes(vec![0u8; 34], DType::Q8_0, 1, 32);
+        assert!(pad_f16_cols(&q8, 32).is_err());
+        assert!(f16_matrix_to_padded_q8_0(&q8, 32).is_err());
+    }
+
+    #[test]
+    fn test_plan_native_f16_and_requant_fallback_for_unaligned_ffn() {
+        let make_q8 = |rows: usize, cols: usize| -> MmapWeight {
+            let n_blocks = (rows * cols) / 32;
+            MmapWeight::from_owned_bytes(vec![0u8; n_blocks * 34], DType::Q8_0, rows, cols)
+        };
+        // n_ff = 112 is not a multiple of 32, so ffn_down is F16 in the GGUF.
+        let cfg = VisionEncoderConfig {
+            n_layer: 1,
+            n_embd: 64,
+            n_ff: 112,
+            n_head: 2,
+            eps: 1e-5,
+            image_size: 32,
+            patch_size: 16,
+            n_trained_patches: 4,
+            projection_dim: 32,
+            scale_factor: 2,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: 32 * 32,
+            image_max_pixels: 32 * 32,
+        };
+        let mut weights = VisionEncoderWeights {
+            config: cfg,
+            patch_embed: PatchEmbedWeights {
+                conv_w: vec![0.0f32; 3 * 16 * 16 * 64],
+                conv_b: vec![0.0f32; 64],
+            },
+            position_embed: vec![0.0f32; 4 * 64],
+            blocks: vec![VitBlockWeights {
+                ln1_w: vec![1.0f32; 64],
+                ln1_b: vec![0.0f32; 64],
+                q_w: make_q8(64, 64),
+                q_b: vec![0.0f32; 64],
+                k_w: make_q8(64, 64),
+                k_b: vec![0.0f32; 64],
+                v_w: make_q8(64, 64),
+                v_b: vec![0.0f32; 64],
+                o_w: make_q8(64, 64),
+                o_b: vec![0.0f32; 64],
+                ln2_w: vec![1.0f32; 64],
+                ln2_b: vec![0.0f32; 64],
+                ffn_up_w: make_q8(112, 64),
+                ffn_up_b: vec![0.0f32; 112],
+                ffn_down_w: MmapWeight::from_owned_bytes(
+                    vec![0u8; 64 * 112 * 2],
+                    DType::F16,
+                    64,
+                    112,
+                ),
+                ffn_down_b: vec![0.0f32; 64],
+            }],
+            post_ln_w: vec![1.0f32; 64],
+            post_ln_b: vec![0.0f32; 64],
+            projector: ProjectorWeights {
+                mm1_w: make_q8(64, 256),
+                mm1_b: vec![0.0f32; 64],
+                mm2_w: make_q8(32, 64),
+                mm2_b: vec![0.0f32; 32],
+            },
+        };
+
+        // Default `plan` keeps F16 `ffn_down` in native F16, padded to 128 cols.
+        let native = HexagonVitWeightOffsets::plan(&weights).expect("native f16 plan");
+        let blk = &native.blocks[0];
+        assert_eq!(
+            blk.ffn_up_w.rows, 128,
+            "ffn_up rows padded to the 32-wide tile"
+        );
+        assert_eq!(blk.ffn_down_w.format, HexagonVitWeightFormat::F16);
+        assert_eq!(blk.ffn_down_w.cols, 128, "K padded to the 32-wide tile");
+        assert_eq!(blk.ffn_down_w.rows, 64);
+        assert_eq!(blk.ffn_down_w.size_bytes, 64 * 128 * 2);
+
+        // `plan_with(..., VitF16Policy::RequantQ8_0)` requantizes F16 `ffn_down` to padded Q8_0.
+        let requant = HexagonVitWeightOffsets::plan_with(&weights, VitF16Policy::RequantQ8_0)
+            .expect("requant plan");
+        let rblk = &requant.blocks[0];
+        assert_eq!(rblk.ffn_up_w.rows, 128);
+        assert_eq!(rblk.ffn_down_w.cols, 128);
+        assert_eq!(rblk.ffn_down_w.rows, 64);
+        assert_eq!(rblk.ffn_down_w.format, HexagonVitWeightFormat::RepackedQ8_0);
+
+        // If `ffn_down_w.rows` is not a multiple of 32 (e.g. 48), NativeF16 falls back to RepackedQ8_0.
+        weights.blocks[0].ffn_down_w =
+            MmapWeight::from_owned_bytes(vec![0u8; 48 * 112 * 2], DType::F16, 48, 112);
+        let unaligned_rows = HexagonVitWeightOffsets::plan_with(&weights, VitF16Policy::NativeF16)
+            .expect("unaligned rows fallback plan");
+        assert_eq!(
+            unaligned_rows.blocks[0].ffn_down_w.format,
+            HexagonVitWeightFormat::RepackedQ8_0
+        );
     }
 }

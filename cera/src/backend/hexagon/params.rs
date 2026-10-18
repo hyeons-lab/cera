@@ -993,6 +993,9 @@ fn mm_tile_sizes(wtype: HtpDataType) -> (u32, u32) {
         HtpDataType::Q4K => (TILE_SIZE_Q4_K as u32, 640),
         HtpDataType::Q6K => (TILE_SIZE_Q6_K as u32, 896),
         HtpDataType::Q8_0 => (TILE_SIZE_Q8_0 as u32, 1152),
+        // F16 weights are plain row-major rows with no tiling (upstream's
+        // `htp_mm_get_weight_tile_size` / `_aligned_tile_size` return 0 for F16).
+        HtpDataType::F16 => (0, 0),
         other => {
             // New weight type without a tile entry: fail loudly in debug
             // rather than silently emitting Q8_0-sized tiles.
@@ -1029,6 +1032,9 @@ fn mm_act_tiled_row_size(wtype: HtpDataType, ne: usize) -> usize {
 /// GGML row size for Q4_0/Q8_0, `(k/32) * (tile/32)` for K quants; both
 /// spellings coincide since 576/32 = 18 and 1088/32 = 34.
 pub fn mm_hmx_nb1(wtype: HtpDataType, k: usize) -> usize {
+    if wtype == HtpDataType::F16 {
+        return k * 2;
+    }
     let (tile_size, _) = mm_tile_sizes(wtype);
     (k / 32) * (tile_size as usize / 32)
 }
@@ -1506,12 +1512,18 @@ const HMX_DMA_ACT_MULT: usize = 4;
 /// Tiled K quantum for the weight row stride (`QK_Q4_0_TILED`).
 const QK_TILED: usize = 256;
 
-/// HMX weight types we emit (`ggml_hexagon_is_hmx_weight_type`, repack subset).
+/// HMX weight types we emit (`ggml_hexagon_is_hmx_weight_type`, repack subset plus F16).
 pub fn mm_is_hmx_eligible(wtype: HtpDataType, k: usize, n: usize, m: usize) -> bool {
     matches!(
         wtype,
-        HtpDataType::Q4_0 | HtpDataType::Q8_0 | HtpDataType::Q4K | HtpDataType::Q6K
-    ) && k.is_multiple_of(HMX_TILE)
+        HtpDataType::Q4_0
+            | HtpDataType::Q8_0
+            | HtpDataType::Q4K
+            | HtpDataType::Q6K
+            | HtpDataType::F16
+    ) && k > 0
+        && n > 0
+        && k.is_multiple_of(HMX_TILE)
         && n.is_multiple_of(HMX_TILE)
         && m >= HMX_MM_MIN_NROWS
 }
@@ -3060,6 +3072,12 @@ mod tests {
         assert!(mm_is_hmx_eligible(HtpDataType::Q4_0, 4608, 1024, 32));
         assert!(mm_is_hmx_eligible(HtpDataType::Q4K, 1024, 4608, 8));
         assert!(mm_is_hmx_eligible(HtpDataType::Q6K, 1024, 1024, 32));
+        assert!(mm_is_hmx_eligible(HtpDataType::F16, 4320, 1152, 32));
+        assert_eq!(mm_hmx_nb1(HtpDataType::F16, 4320), 4320 * 2);
+        assert!(
+            build_hmx_mm_kernel_params(HtpDataType::F16, 4320, 1152, 768, 768, 6, 8 << 20)
+                .is_some()
+        );
         assert!(!mm_is_hmx_eligible(HtpDataType::Q8_0, 1024, 4608, 7)); // M < 8: HVX
         assert!(!mm_is_hmx_eligible(HtpDataType::Q8_0, 1024, 4608, 4)); // M < 8: HVX
         assert!(!mm_is_hmx_eligible(HtpDataType::Q8_0, 1000, 4608, 32)); // K % 32
