@@ -10037,7 +10037,7 @@ pub fn rope_neox_freq_factors(
         .enumerate()
         .fold(pos as f32, |theta, (i, slot)| {
             let factor = freq_factors.map_or(1.0, |f| f[i]);
-            *slot = (theta / factor).sin_cos();
+            *slot = rope_sin_cos(theta / factor);
             theta * theta_scale
         });
 
@@ -10511,9 +10511,10 @@ pub fn rope_norm_yarn(
 }
 
 /// `theta.sin_cos()` behind a call boundary, so the split-halves paths that must agree
-/// share one trig evaluation: [`apply_rope_to_head`] and [`rope_table`] bit for bit
-/// (pinned by `test_rope_table_matches_direct`); [`apply_rope_delta_to_head`]'s composed
-/// rotations agree with direct application only within epsilon.
+/// share one trig evaluation: [`apply_rope_to_head`], [`rope_neox_freq_factors`], and
+/// [`rope_table`] bit for bit (pinned by `test_rope_table_matches_direct` and
+/// `rope_neox_freq_factors_none_and_unit_match_plain_rope`); [`apply_rope_delta_to_head`]'s
+/// composed rotations agree with direct application only within epsilon.
 /// Other RoPE implementations (YaRN, NORM, model-local rotations) keep their own calls.
 ///
 /// A bare `sin_cos` is not a stable value: where LLVM sees both halves of one argument it may
@@ -13578,7 +13579,7 @@ mod tests {
 
         rope_neox_freq_factors(&mut q, &mut k, pos, (1, 1), 2, 10_000.0, Some(&[factor]));
 
-        let (s, c) = (pos as f32 / factor).sin_cos();
+        let (s, c) = rope_sin_cos(pos as f32 / factor);
         let want = |x: &[f32]| [x[0] * c - x[1] * s, x[0] * s + x[1] * c];
         assert_eq!(q.as_slice(), want(&q0));
         assert_eq!(k.as_slice(), want(&k0));
