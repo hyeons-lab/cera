@@ -2481,6 +2481,62 @@ mod cache_tag_tests {
             KvCompression::None.cache_tag()
         );
     }
+
+    #[test]
+    fn prefill_scratch_ensure_sizes_for_decoupled_q_dim_and_moe_expert_ff_len() {
+        use super::PrefillScratch;
+        use crate::model::{ModelConfig, MoeConfig, ScalarMultipliers};
+
+        let cfg = ModelConfig {
+            architecture: "qwen35".to_string(),
+            n_layers: 1,
+            hidden_size: 128,
+            intermediate_size: 0,
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 64, // q_dim = 4 * 64 = 256 > hidden_size (128)
+            vocab_size: 256,
+            max_seq_len: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            block_types: Vec::new(),
+            kv_heads_per_layer: vec![2],
+            conv_kernel_size: None,
+            scalars: ScalarMultipliers::default(),
+            moe: Some(MoeConfig {
+                n_expert: 4,
+                n_expert_used: 2,
+                expert_ff_len: 512, // > intermediate_size (0)
+                is_moe_layer: vec![true],
+            }),
+            ssm: None,
+            is_causal: true,
+            class_labels: Vec::new(),
+        };
+
+        let n = 3;
+        let mut scratch = PrefillScratch::default();
+        scratch.ensure(n, &cfg);
+
+        let q_dim = cfg.n_heads * cfg.head_dim; // 256
+        let max_act_dim = cfg.hidden_size.max(q_dim); // 256
+        let max_kv_dim = 2 * cfg.head_dim; // 128
+        let is = 512;
+
+        assert_eq!(scratch.q_mat.len(), q_dim * n);
+        assert_eq!(scratch.q_col.len(), q_dim * n);
+        assert_eq!(scratch.out_proj_input.len(), max_act_dim * n);
+        assert_eq!(scratch.flash_out.len(), max_act_dim * n);
+        assert_eq!(scratch.bq_quants.len(), max_act_dim * n);
+        assert_eq!(scratch.bq_scales.len(), max_act_dim.div_ceil(32) * n);
+        assert_eq!(scratch.proj_mat.len(), (q_dim + 2 * max_kv_dim) * n);
+        assert_eq!(scratch.gate_col.len(), is);
+        assert_eq!(scratch.up_col.len(), is);
+        assert_eq!(scratch.gate_mat.len(), is * n);
+        assert_eq!(scratch.up_mat.len(), is * n);
+        assert_eq!(scratch.dq_quants.len(), is * n);
+        assert_eq!(scratch.dq_scales.len(), is.div_ceil(32) * n);
+    }
 }
 
 // ── KV Prefix Cache ─────────────────────────────────────────────────────

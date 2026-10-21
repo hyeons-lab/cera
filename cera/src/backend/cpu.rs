@@ -10015,10 +10015,29 @@ pub fn rope_neox_freq_factors(
     freq_factors: Option<&[f32]>,
 ) {
     let (n_heads, n_kv_heads) = heads;
-    debug_assert_eq!(q.len(), n_heads * head_dim);
-    debug_assert_eq!(k.len(), n_kv_heads * head_dim);
+    assert!(
+        head_dim > 0 && head_dim.is_multiple_of(2),
+        "rope_neox_freq_factors requires a positive even head_dim, got {head_dim}"
+    );
+    assert_eq!(
+        q.len(),
+        n_heads * head_dim,
+        "rope_neox_freq_factors q slice length {} must equal n_heads * head_dim ({})",
+        q.len(),
+        n_heads * head_dim
+    );
+    assert_eq!(
+        k.len(),
+        n_kv_heads * head_dim,
+        "rope_neox_freq_factors k slice length {} must equal n_kv_heads * head_dim ({})",
+        k.len(),
+        n_kv_heads * head_dim
+    );
     let half_dim = head_dim / 2;
-    debug_assert!(freq_factors.is_none_or(|f| f.len() == half_dim));
+    assert!(
+        freq_factors.is_none_or(|f| f.len() == half_dim),
+        "rope_neox_freq_factors freq_factors length must equal head_dim / 2 ({half_dim})"
+    );
     let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
 
     // The angles depend on the position and the pair, not the head: compute each
@@ -13583,6 +13602,31 @@ mod tests {
         let want = |x: &[f32]| [x[0] * c - x[1] * s, x[0] * s + x[1] * c];
         assert_eq!(q.as_slice(), want(&q0));
         assert_eq!(k.as_slice(), want(&k0));
+    }
+
+    #[test]
+    #[should_panic(expected = "positive even head_dim")]
+    fn rope_neox_freq_factors_rejects_zero_head_dim() {
+        let mut q = Vec::new();
+        let mut k = Vec::new();
+        rope_neox_freq_factors(&mut q, &mut k, 0, (1, 1), 0, 10_000.0, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "positive even head_dim")]
+    fn rope_neox_freq_factors_rejects_odd_head_dim() {
+        let mut q = vec![0.0f32; 15];
+        let mut k = vec![0.0f32; 15];
+        rope_neox_freq_factors(&mut q, &mut k, 0, (1, 1), 15, 10_000.0, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "freq_factors length must equal head_dim / 2")]
+    fn rope_neox_freq_factors_rejects_mismatched_freq_factors_len() {
+        let mut q = vec![0.0f32; 8];
+        let mut k = vec![0.0f32; 8];
+        let bad_factors = [1.0f32; 3];
+        rope_neox_freq_factors(&mut q, &mut k, 0, (1, 1), 8, 10_000.0, Some(&bad_factors));
     }
 
     #[test]

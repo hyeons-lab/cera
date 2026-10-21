@@ -1366,6 +1366,12 @@ impl crate::model::audio_decoder::AudioAccelerator for WgpuAudioDecoder {
         }
     }
 
+    fn seed_rng(&self, seed: u64) {
+        if let Some(ref df) = self.depthformer {
+            df.seed_rng(seed);
+        }
+    }
+
     fn reset_detokenizer(&self) {
         self.reset();
     }
@@ -1423,6 +1429,7 @@ pub struct WgpuDepthformer {
     logits_buf: Buffer,
     kv_k: Vec<Buffer>,
     kv_v: Vec<Buffer>,
+    rng_state: std::sync::atomic::AtomicU64,
 }
 
 impl WgpuDepthformer {
@@ -1874,7 +1881,17 @@ impl WgpuDepthformer {
             logits_buf,
             kv_k,
             kv_v,
+            rng_state: std::sync::atomic::AtomicU64::new(
+                crate::model::audio_decoder::non_zero_rng_seed(rand::random::<u64>()),
+            ),
         })
+    }
+
+    pub fn seed_rng(&self, seed: u64) {
+        self.rng_state.store(
+            crate::model::audio_decoder::non_zero_rng_seed(seed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub fn reset(&self) {}
@@ -1922,7 +1939,8 @@ impl WgpuDepthformer {
 
         if use_sampling {
             for j in 0..self.dec_cfg.n_codebook {
-                let rand_val = rand::random::<f32>();
+                let rand_val =
+                    crate::model::audio_decoder::next_atomic_xorshift64_f32_01(&self.rng_state);
                 let params = [self.dec_cfg.n_vocab as f32, j as f32, inv_temp, rand_val];
                 self.ctx.queue.write_buffer(
                     &self.sample_params_bufs[j],

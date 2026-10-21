@@ -966,6 +966,11 @@ impl Session {
                 "TurboQuant KV compression was requested, but this model configuration \
                  resolves it to the plain uncompressed cache (e.g. non-power-of-two head_dim)"
             );
+            eprintln!(
+                "[cera::session] TurboQuant KV compression downgraded to plain uncompressed cache for architecture '{}' (head_dim: {})",
+                model_cfg.architecture.as_str(),
+                model_cfg.head_dim
+            );
         }
         let max_seq_len = config
             .max_seq_len
@@ -3621,9 +3626,11 @@ impl Session {
                 40,
                 self.config.gpu_depthformer,
             );
-            if let Some(seed) = opts.seed.or(self.config.seed) {
-                out_dec.seed_rng(seed);
-            }
+            let seed = opts
+                .seed
+                .or(self.config.seed)
+                .unwrap_or_else(rand::random::<u64>);
+            out_dec.seed_rng(seed);
             Some(out_dec)
         } else {
             None
