@@ -83,7 +83,8 @@ impl TargetQuant {
 
     /// Select the appropriate GGML type for a tensor, checking per-tensor overrides first.
     /// An override is an explicit instruction and is honoured as written: it can narrow a
-    /// 1-D norm that the default selection keeps in F32 (which llama.cpp then rejects).
+    /// 1-D norm that the default selection keeps in F32 (which llama.cpp then rejects). The one
+    /// exception is `rope_freqs.weight`, whose 1e30 entries would overflow F16 to infinity.
     pub fn select_ggml_type_with_overrides(
         &self,
         tensor_name: &str,
@@ -92,6 +93,10 @@ impl TargetQuant {
         row_len: usize,
         overrides: &[(String, TargetQuant)],
     ) -> u32 {
+        // not even an explicit override may narrow it (see `select_ggml_type`)
+        if tensor_name == "rope_freqs.weight" {
+            return GGML_TYPE_F32;
+        }
         for (pattern, target) in overrides {
             if matches_tensor_pattern(pattern, tensor_name) {
                 return match target {
@@ -120,6 +125,11 @@ impl TargetQuant {
         num_elements: usize,
         row_len: usize,
     ) -> u32 {
+        // A table of RoPE divisors, whose 1e30 entries (a pair that must not rotate)
+        // overflow F16 to infinity. llama.cpp keeps it F32 for every file type.
+        if tensor_name == "rope_freqs.weight" {
+            return GGML_TYPE_F32;
+        }
         // llama.cpp's graph multiplies activations by norm weights in F32 and aborts on
         // an F16 norm, so a 1-D tensor (and the short-conv kernel) is never narrowed.
         let keep_f32 = num_dims <= 1
@@ -1597,5 +1607,33 @@ mod tests {
             f16.select_ggml_type("token_embd.weight", 2, 1 << 20, 1 << 10),
             GGML_TYPE_F16
         );
+    }
+
+    #[test]
+    fn rope_freqs_stays_f32_for_every_target() {
+        for quant in [
+            TargetQuant::F16,
+            TargetQuant::F32,
+            TargetQuant::Q8_0,
+            TargetQuant::Q4_0,
+            TargetQuant::Q4_K_M,
+        ] {
+            // a 1-D tensor is kept F32 by rank anyway; a 2-D shape reaches the name guard
+            for dims in [1, 2] {
+                assert_eq!(
+                    quant.select_ggml_type("rope_freqs.weight", dims, 64, 64),
+                    GGML_TYPE_F32,
+                    "{quant:?} with {dims} dims"
+                );
+            }
+            // and not even an override may narrow the table (its 1e30 entries would
+            // overflow F16 to infinity), whether it names the tensor or matches everything
+            let narrow = [("*".to_string(), TargetQuant::F16)];
+            assert_eq!(
+                quant.select_ggml_type_with_overrides("rope_freqs.weight", 1, 64, 64, &narrow),
+                GGML_TYPE_F32,
+                "{quant:?} with an override"
+            );
+        }
     }
 }

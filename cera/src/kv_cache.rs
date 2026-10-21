@@ -194,6 +194,14 @@ impl KvCompression {
         }
     }
 
+    /// Whether this request asked for TurboQuant compression and a model with `config`
+    /// resolves it to the plain cache (see [`Self::resolved_for`]): the model cannot serve
+    /// it. `Session::new` reports it, since a caller that asked for compression to fit
+    /// memory would otherwise run an uncompressed cache silently.
+    pub fn is_downgraded_for(&self, config: &ModelConfig) -> bool {
+        self.flags() != (false, false) && self.resolved_for(config).flags() == (false, false)
+    }
+
     /// Prefix-cache namespace tag for this mode — `""` for plain f32, else a
     /// `"…:"`-terminated discriminator to prepend to a backend's cache id.
     ///
@@ -509,12 +517,16 @@ impl PrefillScratch {
     /// Resizes buffers only when their length differs, preserving allocated capacity.
     pub fn ensure(&mut self, n: usize, config: &ModelConfig) {
         let hs = config.hidden_size;
-        let is = config.intermediate_size;
+        let is = config
+            .intermediate_size
+            .max(config.moe.as_ref().map_or(0, |m| m.expert_ff_len));
         let head_dim = if config.head_dim > 0 {
             config.head_dim
         } else {
             hs.checked_div(config.n_heads).unwrap_or(64)
         };
+        let q_dim = config.n_heads * head_dim;
+        let max_act_dim = hs.max(q_dim);
         let max_kv_heads = config
             .kv_heads_per_layer
             .iter()
@@ -522,8 +534,8 @@ impl PrefillScratch {
             .max()
             .unwrap_or(config.n_kv_heads);
         let max_kv_dim = max_kv_heads * head_dim;
-        let proj_rows = (3 * hs).max(hs + 2 * max_kv_dim);
-        let nb_hs = hs.div_ceil(32);
+        let proj_rows = (3 * hs).max(q_dim + 2 * max_kv_dim);
+        let nb_hs = max_act_dim.div_ceil(32);
         let nb_is = is.div_ceil(32);
 
         Self::resize_f32(&mut self.normed, hs * n);
@@ -535,20 +547,20 @@ impl PrefillScratch {
         Self::resize_f32(&mut self.up_col, is);
         Self::resize_f32(&mut self.out_col, hs);
         Self::resize_f32(&mut self.proj_mat, proj_rows * n);
-        Self::resize_f32(&mut self.out_proj_input, hs * n);
-        Self::resize_f32(&mut self.q_mat, hs * n);
+        Self::resize_f32(&mut self.out_proj_input, max_act_dim * n);
+        Self::resize_f32(&mut self.q_mat, q_dim * n);
         Self::resize_f32(&mut self.k_mat, max_kv_dim * n);
         Self::resize_f32(&mut self.v_mat, max_kv_dim * n);
         Self::resize_f32(&mut self.bq_scales, n * nb_hs);
-        Self::resize_i8(&mut self.bq_quants, n * hs);
+        Self::resize_i8(&mut self.bq_quants, n * max_act_dim);
         Self::resize_f32(&mut self.gate_mat, is * n);
         Self::resize_f32(&mut self.up_mat, is * n);
         #[cfg(has_blas)]
         Self::resize_f32(&mut self.gate_up_mat, 2 * is * n);
         Self::resize_f32(&mut self.dq_scales, n * nb_is);
         Self::resize_i8(&mut self.dq_quants, n * is);
-        Self::resize_f32(&mut self.flash_out, hs * n);
-        Self::resize_f32(&mut self.q_col, hs * n);
+        Self::resize_f32(&mut self.flash_out, max_act_dim * n);
+        Self::resize_f32(&mut self.q_col, q_dim * n);
         self.kv_widen_k.clear();
         self.kv_widen_v.clear();
     }

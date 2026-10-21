@@ -2459,6 +2459,56 @@ mod tests {
         );
     }
 
+    /// A model that runs LoRA (dense targets) and, optionally, routed-FFN deltas.
+    struct LoraStub {
+        config: crate::model::ModelConfig,
+        moe: bool,
+    }
+
+    impl crate::model::Model for LoraStub {
+        fn forward(
+            &self,
+            _tokens: &[u32],
+            _pos: usize,
+            _state: &mut crate::kv_cache::InferenceState,
+        ) -> Vec<f32> {
+            unreachable!("the adapter guard never runs the model")
+        }
+        fn config(&self) -> &crate::model::ModelConfig {
+            &self.config
+        }
+        fn supports_lora(&self) -> bool {
+            true
+        }
+        fn supports_moe_lora(&self) -> bool {
+            self.moe
+        }
+    }
+
+    /// The shared attach guard (`Session` and `CeraEngine::detect_pii_with_lora`) also refuses
+    /// routed-FFN deltas on a model without routed-FFN hooks: the GPU backends would drop the
+    /// whole adapter and log only through `tracing`, which an FFI host never sees, leaving
+    /// silent base-model output.
+    #[test]
+    fn the_attach_guard_refuses_routed_ffn_deltas_without_hooks() {
+        let adapter = adapter_for(2, LoraTarget::FfnGateInp, 8, 3, 1);
+        assert!(adapter.has_moe_deltas());
+        let without = LoraStub {
+            config: moe_config(),
+            moe: false,
+        };
+        let err = crate::session::ensure_adapter_runs(&without, &adapter).unwrap_err();
+        assert!(
+            matches!(&err, crate::CeraError::LoraUnsupportedByBackend(d) if d.contains("mixture-of-experts")),
+            "{err:?}"
+        );
+        let with = LoraStub {
+            config: moe_config(),
+            moe: true,
+        };
+        crate::session::ensure_adapter_runs(&with, &adapter).unwrap();
+    }
+
     /// Build a one-layer adapter carrying `target` with the given dims, for
     /// `n_slices` experts (1 = dense).
     fn adapter_for(

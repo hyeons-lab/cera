@@ -433,6 +433,7 @@ pub struct DepthformerState {
     normed: Vec<f32>,
     logits: Vec<f32>,
     indices: Vec<usize>,
+    rng_state: u64,
 }
 
 impl DepthformerState {
@@ -467,6 +468,7 @@ impl DepthformerState {
             normed: vec![0.0; n_embd],
             logits: vec![0.0; 2049],
             indices: Vec::with_capacity(2049),
+            rng_state: 0x853c_49e6_748f_ea9b,
         }
     }
 
@@ -476,6 +478,28 @@ impl DepthformerState {
             layer.v.fill(0.0);
         }
         self.n_past = 0;
+    }
+
+    /// Seed the internal PRNG used for stochastic codebook sampling.
+    pub fn seed_rng(&mut self, seed: u64) {
+        self.rng_state = if seed == 0 {
+            0x853c_49e6_748f_ea9b
+        } else {
+            seed
+        };
+    }
+
+    #[inline]
+    fn next_f32_01(&mut self) -> f32 {
+        let mut x = self.rng_state;
+        if x == 0 {
+            x = 0x853c_49e6_748f_ea9b;
+        }
+        x ^= x << 13;
+        x ^= x >> 7;
+        x ^= x << 17;
+        self.rng_state = x;
+        ((x >> 40) as u32) as f32 / ((1u32 << 24) as f32)
     }
 }
 
@@ -778,9 +802,10 @@ pub fn sample_audio_frame(
                     state.logits[b].total_cmp(&state.logits[a])
                 });
             }
+            let r_u01 = state.next_f32_01();
             let top_indices = &state.indices[..k];
             let sum: f32 = top_indices.iter().map(|&i| state.logits[i]).sum();
-            let mut r = rand::random::<f32>() * sum;
+            let mut r = r_u01 * sum;
             let mut picked = top_indices[0];
             for &i in top_indices {
                 r -= state.logits[i];

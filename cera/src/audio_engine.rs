@@ -330,6 +330,11 @@ impl<'a> AudioOutputDecoder<'a> {
         self.watchdog.is_safety_limit_reached()
     }
 
+    /// Seed the internal Depthformer PRNG for deterministic audio codebook sampling.
+    pub fn seed_rng(&mut self, seed: u64) {
+        self.df_state.seed_rng(seed);
+    }
+
     pub fn new(
         weights: &'a AudioDecoderWeights,
         detok_weights: &'a DetokenizerWeights,

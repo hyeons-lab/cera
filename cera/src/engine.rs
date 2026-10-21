@@ -474,10 +474,10 @@ impl CeraEngine {
             .filter(|_| mmproj_can_matter)
             .and_then(|bytes| parse_aux_gguf(bytes, "multimodal projector"));
 
-        let inference_type = resolve_parts_inference_type(
+        let inference_type = resolve_parts_inference_type_with_mmproj(
             parts.inference_type.clone(),
             gguf.get_str("general.architecture").unwrap_or(""),
-            mmproj.is_some(),
+            mmproj.as_deref(),
         );
         check_inference_type_supported(&inference_type)?;
 
@@ -549,7 +549,7 @@ impl CeraEngine {
                 });
 
             let acc = if dec.is_some() && detok.is_some() {
-                voc_arc.as_ref().and_then(|g| {
+                voc_arc.as_ref().or(mmproj.as_ref()).and_then(|g| {
                     crate::model::audio_decoder::build_audio_accelerator(g, cfg.backend)
                 })
             } else {
@@ -569,7 +569,8 @@ impl CeraEngine {
                 drafter: None,
             },
             (InferenceType::LlamaCppLfm2AudioV1, Some(g)) => AuxWeights {
-                vision_mmproj: None,
+                vision_mmproj: (g.get_bool("clip.has_vision_encoder") == Some(true))
+                    .then(|| Arc::clone(&g)),
                 audio_encoder: try_parse_audio_encoder(&g, None),
                 audio_decoder: None,
                 detok_weights: None,
@@ -1283,6 +1284,9 @@ impl CeraEngine {
         text: &str,
         lora: Option<Arc<crate::lora::LoraAdapterWeights>>,
     ) -> Result<Vec<crate::classifier::EntitySpan>, CeraError> {
+        if let Some(adapter) = lora.as_deref() {
+            crate::session::ensure_adapter_runs(self.model.as_ref(), adapter)?;
+        }
         let mut state = crate::kv_cache::InferenceState::from_config(self.model.config())?;
         state.lora = lora;
         crate::classifier::detect_pii(
@@ -2230,6 +2234,28 @@ fn open_for_inference_type(model_path: &Path) -> Result<GgufFile, CeraError> {
     })
 }
 
+fn is_audio_mmproj_gguf(gguf: &GgufFile) -> bool {
+    gguf.get_bool("clip.has_audio_encoder") == Some(true)
+        || gguf.tensors.contains_key("a.conv1d.0.weight")
+}
+
+fn resolve_parts_inference_type_with_mmproj(
+    explicit: Option<InferenceType>,
+    arch: &str,
+    mmproj: Option<&GgufFile>,
+) -> InferenceType {
+    if let Some(it) = explicit {
+        return it;
+    }
+    let detected = inference_type_for_arch(arch);
+    match (&detected, mmproj) {
+        (InferenceType::LlamaCppTextToText, Some(g)) if is_audio_mmproj_gguf(g) => {
+            InferenceType::LlamaCppLfm2AudioV1
+        }
+        _ => resolve_parts_inference_type(None, arch, mmproj.is_some()),
+    }
+}
+
 /// Decide a [`ModelBytes`] bundle's inference type. See
 /// [`CeraEngine::from_parts`] for the reasoning, in particular why an mmproj
 /// upgrades a text detection to VL. Pure, so the policy is testable without a
@@ -3001,5 +3027,32 @@ mod tests {
             inference_type_for_arch("modernbert"),
             InferenceType::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn audio_mmproj_upgrades_text_arch_to_audio_inference_type() {
+        let mut w_audio = crate::convert::writer::GgufWriter::new();
+        w_audio.add_bool("clip.has_audio_encoder", true);
+        let mut bytes_audio = Vec::new();
+        w_audio
+            .write_header_and_tensor_info(&mut bytes_audio)
+            .unwrap();
+        let audio_mmproj = GgufFile::from_bytes(bytes_audio.into()).unwrap();
+        assert_eq!(
+            resolve_parts_inference_type_with_mmproj(None, "lfm2", Some(&audio_mmproj)),
+            InferenceType::LlamaCppLfm2AudioV1
+        );
+
+        let mut w_vision = crate::convert::writer::GgufWriter::new();
+        w_vision.add_bool("clip.has_vision_encoder", true);
+        let mut bytes_vision = Vec::new();
+        w_vision
+            .write_header_and_tensor_info(&mut bytes_vision)
+            .unwrap();
+        let vision_mmproj = GgufFile::from_bytes(bytes_vision.into()).unwrap();
+        assert_eq!(
+            resolve_parts_inference_type_with_mmproj(None, "lfm2", Some(&vision_mmproj)),
+            InferenceType::LlamaCppImageToText
+        );
     }
 }

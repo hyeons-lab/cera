@@ -356,11 +356,49 @@ impl MmapWeight {
         if n_tokens == 0 || self.rows == 0 || self.cols == 0 {
             return;
         }
+        if n_tokens == 1 {
+            self.gemv(x, y);
+            return;
+        }
 
-        #[cfg(feature = "parallel")]
+        #[cfg(has_blas)]
+        {
+            if self.dtype == DType::F32
+                && let Some(w_f32) = self.try_as_f32()
+            {
+                crate::backend::blas::sgemm_rowmajor_nt_parallel(
+                    n_tokens, self.rows, self.cols, x, w_f32, y,
+                );
+                return;
+            }
+
+            let mat_elems = self.rows * self.cols;
+            let mut local_mat;
+            let w_buf: &mut [f32] = match scratch {
+                Some(buf) if buf.len() >= mat_elems => &mut buf[..mat_elems],
+                _ => {
+                    local_mat = vec![0.0f32; mat_elems];
+                    &mut local_mat[..]
+                }
+            };
+            if self.cols.is_multiple_of(self.dtype.block_size())
+                && let Some(dequant) = crate::model::transformer::blas_dequantizer(self.dtype)
+            {
+                dequant(self.data(), self.rows, self.cols, w_buf);
+            } else {
+                for r in 0..self.rows {
+                    self.dequantize_row(r, &mut w_buf[r * self.cols..(r + 1) * self.cols]);
+                }
+            }
+            crate::backend::blas::sgemm_rowmajor_nt_parallel(
+                n_tokens, self.rows, self.cols, x, w_buf, y,
+            );
+        }
+
+        #[cfg(all(feature = "parallel", not(has_blas)))]
         {
             let num_threads = crate::par::current_num_threads();
-            let min_chunk = 16;
+            let min_chunk = 8;
             if num_threads > 1 && n_tokens >= min_chunk {
                 use rayon::prelude::*;
                 let chunk_tokens = (n_tokens / num_threads).max(min_chunk);
@@ -409,34 +447,37 @@ impl MmapWeight {
         }
 
         // Fast path if already contiguous and properly aligned F32
-        if self.dtype == DType::F32
-            && let Some(w_f32) = self.try_as_f32()
+        #[cfg(not(has_blas))]
         {
+            if self.dtype == DType::F32
+                && let Some(w_f32) = self.try_as_f32()
+            {
+                for r in 0..self.rows {
+                    let w_row = &w_f32[r * self.cols..(r + 1) * self.cols];
+                    for t in 0..n_tokens {
+                        let x_row = &x[t * self.cols..(t + 1) * self.cols];
+                        y[t * self.rows + r] = crate::backend::cpu::dot_f32(x_row, w_row);
+                    }
+                }
+                return;
+            }
+
+            // Quantized path: dequantize each row into scratch ONCE
+            let mut local_buf;
+            let row_buf: &mut [f32] = match scratch {
+                Some(buf) if buf.len() >= self.cols => &mut buf[..self.cols],
+                _ => {
+                    local_buf = vec![0.0f32; self.cols];
+                    &mut local_buf[..]
+                }
+            };
+
             for r in 0..self.rows {
-                let w_row = &w_f32[r * self.cols..(r + 1) * self.cols];
+                self.dequantize_row(r, row_buf);
                 for t in 0..n_tokens {
                     let x_row = &x[t * self.cols..(t + 1) * self.cols];
-                    y[t * self.rows + r] = crate::backend::cpu::dot_f32(x_row, w_row);
+                    y[t * self.rows + r] = crate::backend::cpu::dot_f32(x_row, row_buf);
                 }
-            }
-            return;
-        }
-
-        // Quantized path: dequantize each row into scratch ONCE
-        let mut local_buf;
-        let row_buf: &mut [f32] = match scratch {
-            Some(buf) if buf.len() >= self.cols => &mut buf[..self.cols],
-            _ => {
-                local_buf = vec![0.0f32; self.cols];
-                &mut local_buf[..]
-            }
-        };
-
-        for r in 0..self.rows {
-            self.dequantize_row(r, row_buf);
-            for t in 0..n_tokens {
-                let x_row = &x[t * self.cols..(t + 1) * self.cols];
-                y[t * self.rows + r] = crate::backend::cpu::dot_f32(x_row, row_buf);
             }
         }
     }
@@ -739,5 +780,36 @@ mod tests {
         let q4_bytes = vec![0u8; std::mem::size_of::<BlockQ4_0>()];
         let q4_w = MmapWeight::from_owned_bytes(q4_bytes, DType::Q4_0, 1, 32);
         assert!(q4_w.try_as_f32().is_none());
+    }
+
+    #[test]
+    fn batched_matmul_matches_gemv_for_single_and_multi_tokens() {
+        let rows = 6;
+        let cols = 32;
+        let w_data: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32) * 0.13).sin())
+            .collect();
+        let w = MmapWeight::from_owned_f32(w_data, rows, cols);
+
+        for n_tokens in [1usize, 4, 19] {
+            let x: Vec<f32> = (0..n_tokens * cols)
+                .map(|i| ((i as f32) * 0.07).cos())
+                .collect();
+            let mut y_batched = vec![0.0f32; n_tokens * rows];
+            let mut scratch = vec![0.0f32; rows * cols];
+            w.batched_matmul_with_scratch(&x, &mut y_batched, n_tokens, Some(&mut scratch));
+
+            for t in 0..n_tokens {
+                let mut y_ref = vec![0.0f32; rows];
+                w.gemv(&x[t * cols..(t + 1) * cols], &mut y_ref);
+                let got = &y_batched[t * rows..(t + 1) * rows];
+                for (a, b) in got.iter().zip(y_ref.iter()) {
+                    assert!(
+                        (a - b).abs() < 1e-4,
+                        "mismatch at n_tokens={n_tokens}: {a} vs {b}"
+                    );
+                }
+            }
+        }
     }
 }

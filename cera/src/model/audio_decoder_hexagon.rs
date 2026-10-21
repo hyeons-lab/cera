@@ -124,10 +124,17 @@ impl HexagonDetokWeightOffsets {
                 let out_proj = lw.conv_out_proj.as_ref().ok_or_else(|| {
                     CeraError::Backend("missing conv_out_proj in detok conv layer".into())
                 })?;
-                let _conv_w = lw.conv_weight.as_ref().ok_or_else(|| {
+                let conv_w = lw.conv_weight.as_ref().ok_or_else(|| {
                     CeraError::Backend("missing conv_weight in detok conv layer".into())
                 })?;
                 let n_embd = in_proj.cols;
+                if conv_w.len() != 3 * n_embd {
+                    return Err(CeraError::Backend(format!(
+                        "hexagon detokenizer requires 3-tap conv kernel (expected {} weights, got {})",
+                        3 * n_embd,
+                        conv_w.len()
+                    )));
+                }
                 (
                     Some(plan_linear(&mut cur_off, in_proj)?),
                     Some(plan_linear(&mut cur_off, out_proj)?),
