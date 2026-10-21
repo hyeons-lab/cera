@@ -342,8 +342,10 @@ impl MmapWeight {
     /// and token rows in the inner loop), each quantized weight row is dequantized
     /// and loaded into CPU cache **once** rather than `n_tokens` times.
     ///
-    /// If `scratch` is provided and has `scratch.len() >= self.cols`, it is used
-    /// directly to avoid allocating on the heap.
+    /// If `scratch` is provided with `scratch.len() >= self.rows * self.cols` on
+    /// BLAS builds, the weight matrix is bulk-dequantized into `scratch` for
+    /// `sgemm`; otherwise a `scratch` with `scratch.len() >= self.cols` is used
+    /// directly for row-wise dequantization without heap allocation.
     pub fn batched_matmul_with_scratch(
         &self,
         x: &[f32],
@@ -356,11 +358,47 @@ impl MmapWeight {
         if n_tokens == 0 || self.rows == 0 || self.cols == 0 {
             return;
         }
+        if n_tokens == 1 {
+            self.gemv(x, y);
+            return;
+        }
+
+        #[cfg(has_blas)]
+        if self.dtype == DType::F32
+            && let Some(w_f32) = self.try_as_f32()
+        {
+            crate::backend::blas::sgemm_rowmajor_nt_parallel(
+                n_tokens, self.rows, self.cols, x, w_f32, y,
+            );
+            return;
+        }
+
+        #[cfg(has_blas)]
+        let scratch = match scratch {
+            Some(buf) if buf.len() >= self.rows * self.cols => {
+                let mat_elems = self.rows * self.cols;
+                let w_buf = &mut buf[..mat_elems];
+                if self.cols.is_multiple_of(self.dtype.block_size())
+                    && let Some(dequant) = crate::model::transformer::blas_dequantizer(self.dtype)
+                {
+                    dequant(self.data(), self.rows, self.cols, w_buf);
+                } else {
+                    for r in 0..self.rows {
+                        self.dequantize_row(r, &mut w_buf[r * self.cols..(r + 1) * self.cols]);
+                    }
+                }
+                crate::backend::blas::sgemm_rowmajor_nt_parallel(
+                    n_tokens, self.rows, self.cols, x, w_buf, y,
+                );
+                return;
+            }
+            other => other,
+        };
 
         #[cfg(feature = "parallel")]
         {
             let num_threads = crate::par::current_num_threads();
-            let min_chunk = 16;
+            let min_chunk = 8;
             if num_threads > 1 && n_tokens >= min_chunk {
                 use rayon::prelude::*;
                 let chunk_tokens = (n_tokens / num_threads).max(min_chunk);
@@ -739,5 +777,78 @@ mod tests {
         let q4_bytes = vec![0u8; std::mem::size_of::<BlockQ4_0>()];
         let q4_w = MmapWeight::from_owned_bytes(q4_bytes, DType::Q4_0, 1, 32);
         assert!(q4_w.try_as_f32().is_none());
+    }
+
+    #[test]
+    fn batched_matmul_matches_gemv_for_single_and_multi_tokens() {
+        let rows = 6;
+        let cols = 32;
+        let w_data: Vec<f32> = (0..rows * cols)
+            .map(|i| ((i as f32) * 0.13).sin())
+            .collect();
+        let w_f32 = MmapWeight::from_owned_f32(w_data, rows, cols);
+
+        let block_size = std::mem::size_of::<BlockQ4_0>();
+        let mut q4_bytes = vec![0u8; rows * block_size];
+        for r in 0..rows {
+            let off = r * block_size;
+            let d = half::f16::from_f32(0.125 * (r as f32 + 1.0)).to_le_bytes();
+            q4_bytes[off..off + 2].copy_from_slice(&d);
+            for b in 0..16 {
+                q4_bytes[off + 2 + b] = (((b + r) & 0x0f) | (((15 - b) & 0x0f) << 4)) as u8;
+            }
+        }
+        let w_q4 = MmapWeight::from_owned_bytes(q4_bytes, DType::Q4_0, rows, cols);
+
+        for w in [&w_f32, &w_q4] {
+            for n_tokens in [1usize, 4, 19] {
+                let x: Vec<f32> = (0..n_tokens * cols)
+                    .map(|i| ((i as f32) * 0.07).cos())
+                    .collect();
+
+                for scratch_len in [0usize, cols, rows * cols] {
+                    let mut y_batched = vec![0.0f32; n_tokens * rows];
+                    let mut scratch = vec![0.0f32; scratch_len];
+                    let scratch_opt = (scratch_len > 0).then_some(scratch.as_mut_slice());
+                    w.batched_matmul_with_scratch(&x, &mut y_batched, n_tokens, scratch_opt);
+
+                    if w.dtype == DType::Q4_0 && n_tokens == 4 && scratch_len == cols {
+                        assert!(
+                            scratch.iter().any(|&v| v != 0.0),
+                            "single-row scratch must be reused on quantized fallback path"
+                        );
+                    }
+                    #[cfg(has_blas)]
+                    if w.dtype == DType::Q4_0 && n_tokens == 4 && scratch_len == rows * cols {
+                        assert!(
+                            scratch[cols..].iter().any(|&v| v != 0.0),
+                            "full-matrix scratch must be populated on BLAS bulk-dequant path"
+                        );
+                    }
+
+                    let mut row_buf = vec![0.0f32; cols];
+                    for t in 0..n_tokens {
+                        let x_row = &x[t * cols..(t + 1) * cols];
+                        let mut y_ref = vec![0.0f32; rows];
+                        if n_tokens == 1 {
+                            w.gemv(x_row, &mut y_ref);
+                        } else {
+                            for (r, y_out) in y_ref.iter_mut().enumerate() {
+                                w.dequantize_row(r, &mut row_buf);
+                                *y_out = crate::backend::cpu::dot_f32(x_row, &row_buf);
+                            }
+                        }
+                        let got = &y_batched[t * rows..(t + 1) * rows];
+                        for (a, b) in got.iter().zip(y_ref.iter()) {
+                            assert!(
+                                (a - b).abs() < 1e-4,
+                                "mismatch at dtype={:?} n_tokens={n_tokens} scratch_len={scratch_len}: {a} vs {b}",
+                                w.dtype
+                            );
+                        }
+                    }
+                }
+            }
+        }
     }
 }

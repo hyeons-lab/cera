@@ -89,6 +89,9 @@ pub trait AudioAccelerator: Send + Sync {
     /// Reset detokenizer state (conv buffers + KV caches, called per generation).
     fn reset_detokenizer(&self);
 
+    /// Seed the internal depthformer PRNG used for stochastic codebook sampling.
+    fn seed_rng(&self, _seed: u64) {}
+
     /// Whether [`Self::sample_audio_frame`] is actually implemented here.
     fn supports_depthformer(&self) -> bool;
 
@@ -433,6 +436,52 @@ pub struct DepthformerState {
     normed: Vec<f32>,
     logits: Vec<f32>,
     indices: Vec<usize>,
+    rng_state: u64,
+}
+
+pub(crate) const DEFAULT_AUDIO_RNG_SEED: u64 = 0x853c_49e6_748f_ea9b;
+
+#[inline]
+pub(crate) fn non_zero_rng_seed(seed: u64) -> u64 {
+    if seed == 0 {
+        DEFAULT_AUDIO_RNG_SEED
+    } else {
+        seed
+    }
+}
+
+#[inline]
+pub(crate) fn next_xorshift64_f32_01(rng_state: &mut u64) -> f32 {
+    let mut x = non_zero_rng_seed(*rng_state);
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    *rng_state = x;
+    ((x >> 40) as u32) as f32 / ((1u32 << 24) as f32)
+}
+
+#[cfg(any(
+    test,
+    feature = "gpu",
+    feature = "hexagon",
+    all(feature = "metal", any(target_os = "macos", target_os = "ios"))
+))]
+#[inline]
+pub(crate) fn next_atomic_xorshift64_f32_01(rng_state: &std::sync::atomic::AtomicU64) -> f32 {
+    let mut cur = rng_state.load(std::sync::atomic::Ordering::Relaxed);
+    loop {
+        let mut next = cur;
+        let val = next_xorshift64_f32_01(&mut next);
+        match rng_state.compare_exchange_weak(
+            cur,
+            next,
+            std::sync::atomic::Ordering::Relaxed,
+            std::sync::atomic::Ordering::Relaxed,
+        ) {
+            Ok(_) => return val,
+            Err(actual) => cur = actual,
+        }
+    }
 }
 
 impl DepthformerState {
@@ -467,6 +516,7 @@ impl DepthformerState {
             normed: vec![0.0; n_embd],
             logits: vec![0.0; 2049],
             indices: Vec::with_capacity(2049),
+            rng_state: non_zero_rng_seed(rand::random::<u64>()),
         }
     }
 
@@ -476,6 +526,16 @@ impl DepthformerState {
             layer.v.fill(0.0);
         }
         self.n_past = 0;
+    }
+
+    /// Seed the internal PRNG used for stochastic codebook sampling.
+    pub fn seed_rng(&mut self, seed: u64) {
+        self.rng_state = non_zero_rng_seed(seed);
+    }
+
+    #[inline]
+    fn next_f32_01(&mut self) -> f32 {
+        next_xorshift64_f32_01(&mut self.rng_state)
     }
 }
 
@@ -778,10 +838,11 @@ pub fn sample_audio_frame(
                     state.logits[b].total_cmp(&state.logits[a])
                 });
             }
+            let r_u01 = state.next_f32_01();
             let top_indices = &state.indices[..k];
             let sum: f32 = top_indices.iter().map(|&i| state.logits[i]).sum();
-            let mut r = rand::random::<f32>() * sum;
-            let mut picked = top_indices[0];
+            let mut r = r_u01 * sum;
+            let mut picked = *top_indices.last().unwrap_or(&0);
             for &i in top_indices {
                 r -= state.logits[i];
                 if r <= 0.0 {
@@ -1974,5 +2035,39 @@ mod tests {
         assert_eq!(&output[2..4], &[5.0, 15.0]);
         assert_eq!(&output[4..6], &[10.0, 20.0]);
         assert_eq!(&output[6..8], &[10.0, 20.0]);
+    }
+
+    #[test]
+    fn unseeded_depthformer_states_draw_distinct_streams_and_seeded_states_match() {
+        let cfg = DepthformerConfig {
+            n_layer: 1,
+            n_embd: 32,
+            n_head: 1,
+            n_head_kv: 1,
+            n_embd_head: 32,
+            ffn_dim: 64,
+            rms_norm_eps: 1e-5,
+            rope_freq_base: 10_000.0,
+            max_seq_len: 8,
+        };
+        let mut s1 = DepthformerState::new(&cfg);
+        let mut s2 = DepthformerState::new(&cfg);
+        let draw1: Vec<u32> = (0..8).map(|_| s1.next_f32_01().to_bits()).collect();
+        let draw2: Vec<u32> = (0..8).map(|_| s2.next_f32_01().to_bits()).collect();
+        assert_ne!(
+            draw1, draw2,
+            "fresh unseeded DepthformerState instances must not share a fixed constant seed"
+        );
+
+        s1.seed_rng(12345);
+        s2.seed_rng(12345);
+        let atomic_rng = std::sync::atomic::AtomicU64::new(non_zero_rng_seed(12345));
+        let seeded1: Vec<u32> = (0..8).map(|_| s1.next_f32_01().to_bits()).collect();
+        let seeded2: Vec<u32> = (0..8).map(|_| s2.next_f32_01().to_bits()).collect();
+        let seeded_atomic: Vec<u32> = (0..8)
+            .map(|_| next_atomic_xorshift64_f32_01(&atomic_rng).to_bits())
+            .collect();
+        assert_eq!(seeded1, seeded2);
+        assert_eq!(seeded1, seeded_atomic);
     }
 }

@@ -1125,6 +1125,7 @@ pub struct MetalDepthformer {
     kv_k: Vec<Buffer>,
     kv_v: Vec<Buffer>,
     n_past: AtomicUsize,
+    rng_state: std::sync::atomic::AtomicU64,
     // Params
     rmsnorm_params: Buffer,
     elementwise_is: Buffer,
@@ -1321,9 +1322,19 @@ impl MetalDepthformer {
             kv_k,
             kv_v,
             n_past: std::sync::atomic::AtomicUsize::new(0),
+            rng_state: std::sync::atomic::AtomicU64::new(
+                crate::model::audio_decoder::non_zero_rng_seed(rand::random::<u64>()),
+            ),
             rmsnorm_params,
             elementwise_is,
         })
+    }
+
+    pub fn seed_rng(&self, seed: u64) {
+        self.rng_state.store(
+            crate::model::audio_decoder::non_zero_rng_seed(seed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub fn reset(&self) {
@@ -1530,8 +1541,10 @@ impl MetalDepthformer {
                 let k = top_k.clamp(1, logits_vec.len());
                 indices.truncate(k);
                 let sum: f32 = indices.iter().map(|&i| logits_vec[i]).sum();
-                let mut r = rand::random::<f32>() * sum;
-                let mut picked = indices.first().copied().unwrap_or(0);
+                let mut r =
+                    crate::model::audio_decoder::next_atomic_xorshift64_f32_01(&self.rng_state)
+                        * sum;
+                let mut picked = indices.last().copied().unwrap_or(0);
                 for &i in &indices {
                     r -= logits_vec[i];
                     if r <= 0.0 {
@@ -1637,6 +1650,12 @@ impl crate::model::audio_decoder::AudioAccelerator for MetalAudioDecoder {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
         if let Some(df) = &self.depthformer {
             df.reset();
+        }
+    }
+
+    fn seed_rng(&self, seed: u64) {
+        if let Some(df) = &self.depthformer {
+            df.seed_rng(seed);
         }
     }
 

@@ -330,6 +330,14 @@ impl<'a> AudioOutputDecoder<'a> {
         self.watchdog.is_safety_limit_reached()
     }
 
+    /// Seed the internal Depthformer PRNG for deterministic audio codebook sampling.
+    pub fn seed_rng(&mut self, seed: u64) {
+        self.df_state.seed_rng(seed);
+        if let Some(acc) = self.accelerator {
+            acc.seed_rng(seed);
+        }
+    }
+
     pub fn new(
         weights: &'a AudioDecoderWeights,
         detok_weights: &'a DetokenizerWeights,
@@ -338,10 +346,12 @@ impl<'a> AudioOutputDecoder<'a> {
         audio_top_k: usize,
         gpu_depthformer: bool,
     ) -> Self {
+        let initial_seed = crate::model::audio_decoder::non_zero_rng_seed(rand::random::<u64>());
         let active_accelerator = match accelerator {
             Some(a) if a.try_acquire_session() => {
                 a.reset_detokenizer();
                 a.reset_depthformer();
+                a.seed_rng(initial_seed);
                 Some(a)
             }
             Some(_) => {
@@ -352,7 +362,8 @@ impl<'a> AudioOutputDecoder<'a> {
             }
             None => None,
         };
-        let df_state = DepthformerState::new(&weights.depthformer_config);
+        let mut df_state = DepthformerState::new(&weights.depthformer_config);
+        df_state.seed_rng(initial_seed);
         let detok_state = DetokenizerState::new(&detok_weights.config);
         let streamer = crate::model::audio_decoder::IstftStreamer::new(
             detok_weights.config.n_fft,

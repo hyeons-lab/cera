@@ -124,10 +124,23 @@ impl HexagonDetokWeightOffsets {
                 let out_proj = lw.conv_out_proj.as_ref().ok_or_else(|| {
                     CeraError::Backend("missing conv_out_proj in detok conv layer".into())
                 })?;
-                let _conv_w = lw.conv_weight.as_ref().ok_or_else(|| {
+                let conv_w = lw.conv_weight.as_ref().ok_or_else(|| {
                     CeraError::Backend("missing conv_weight in detok conv layer".into())
                 })?;
                 let n_embd = in_proj.cols;
+                if lw.operator_norm.len() != n_embd {
+                    return Err(CeraError::Backend(format!(
+                        "hexagon detokenizer operator_norm length mismatch (expected {n_embd}, got {})",
+                        lw.operator_norm.len()
+                    )));
+                }
+                if conv_w.len() != 3 * n_embd {
+                    return Err(CeraError::Backend(format!(
+                        "hexagon detokenizer requires 3-tap conv kernel (expected {} weights, got {})",
+                        3 * n_embd,
+                        conv_w.len()
+                    )));
+                }
                 (
                     Some(plan_linear(&mut cur_off, in_proj)?),
                     Some(plan_linear(&mut cur_off, out_proj)?),
@@ -202,6 +215,107 @@ impl HexagonDetokWeightOffsets {
             lin_b_off,
             total_bytes: cur_off,
         })
+    }
+
+    /// Stage detokenizer weights into a contiguous byte slice according to this plan.
+    pub fn copy_to_slice(
+        &self,
+        slice: &mut [u8],
+        weights: &DetokenizerWeights,
+    ) -> Result<(), CeraError> {
+        let copy_vec_f32 = |dst: &mut [u8], off: usize, src: &[f32]| {
+            let bytes = bytemuck::cast_slice(src);
+            dst[off..off + bytes.len()].copy_from_slice(bytes);
+        };
+
+        let copy_linear = |dst: &mut [u8],
+                           desc: HexagonDetokWeightDesc,
+                           w: &MmapWeight|
+         -> Result<(), CeraError> {
+            let dst_slice = &mut dst[desc.offset..desc.offset + desc.size_bytes];
+            match desc.format {
+                HexagonWeightFormat::RepackedQ8_0 => {
+                    repack_q8_0(w.data(), w.cols, w.rows, dst_slice).map_err(|e| {
+                        CeraError::Backend(format!("detok repack Q8_0 failed: {e}"))
+                    })?;
+                }
+                HexagonWeightFormat::RepackedQ4_0 => {
+                    repack_q4_0(w.data(), w.cols, w.rows, dst_slice).map_err(|e| {
+                        CeraError::Backend(format!("detok repack Q4_0 failed: {e}"))
+                    })?;
+                }
+            }
+            Ok(())
+        };
+
+        for (lw, lo) in weights.layers.iter().zip(self.layers.iter()) {
+            copy_vec_f32(slice, lo.op_norm_off, &lw.operator_norm);
+            copy_vec_f32(slice, lo.ffn_norm_off, &lw.ffn_norm);
+            copy_linear(slice, lo.ffn_w1, &lw.ffn_w1)?;
+            copy_linear(slice, lo.ffn_w2, &lw.ffn_w2)?;
+            copy_linear(slice, lo.ffn_w3, &lw.ffn_w3)?;
+
+            if lo.is_conv {
+                if let (Some(cin_desc), Some(cin_w)) = (lo.conv_in_proj, lw.conv_in_proj.as_ref()) {
+                    copy_linear(slice, cin_desc, cin_w)?;
+                }
+                if let (Some(cout_desc), Some(cout_w)) =
+                    (lo.conv_out_proj, lw.conv_out_proj.as_ref())
+                {
+                    copy_linear(slice, cout_desc, cout_w)?;
+                }
+                if let (Some(w0_off), Some(cw)) = (lo.conv_w0_off, lw.conv_weight.as_ref()) {
+                    let hs = lw.operator_norm.len();
+                    if cw.len() != 3 * hs {
+                        return Err(CeraError::Backend(format!(
+                            "hexagon detokenizer requires 3-tap conv kernel matching operator_norm (expected {} weights, got {})",
+                            3 * hs,
+                            cw.len()
+                        )));
+                    }
+                    let mut w0 = vec![0.0f32; hs];
+                    let mut w1 = vec![0.0f32; hs];
+                    let mut w2 = vec![0.0f32; hs];
+                    for ch in 0..hs {
+                        w0[ch] = cw[ch * 3];
+                        w1[ch] = cw[ch * 3 + 1];
+                        w2[ch] = cw[ch * 3 + 2];
+                    }
+                    copy_vec_f32(slice, w0_off, &w0);
+                    if let Some(w1_off) = lo.conv_w1_off {
+                        copy_vec_f32(slice, w1_off, &w1);
+                    }
+                    if let Some(w2_off) = lo.conv_w2_off {
+                        copy_vec_f32(slice, w2_off, &w2);
+                    }
+                }
+            } else {
+                if let (Some(wq_desc), Some(wq_w)) = (lo.wq, lw.wq.as_ref()) {
+                    copy_linear(slice, wq_desc, wq_w)?;
+                }
+                if let (Some(wk_desc), Some(wk_w)) = (lo.wk, lw.wk.as_ref()) {
+                    copy_linear(slice, wk_desc, wk_w)?;
+                }
+                if let (Some(wv_desc), Some(wv_w)) = (lo.wv, lw.wv.as_ref()) {
+                    copy_linear(slice, wv_desc, wv_w)?;
+                }
+                if let (Some(wo_desc), Some(wo_w)) = (lo.wo, lw.wo.as_ref()) {
+                    copy_linear(slice, wo_desc, wo_w)?;
+                }
+                if let (Some(qn_off), Some(qn)) = (lo.q_norm_off, lw.q_norm.as_ref()) {
+                    copy_vec_f32(slice, qn_off, qn);
+                }
+                if let (Some(kn_off), Some(kn)) = (lo.k_norm_off, lw.k_norm.as_ref()) {
+                    copy_vec_f32(slice, kn_off, kn);
+                }
+            }
+        }
+
+        copy_vec_f32(slice, self.output_norm_off, &weights.output_norm);
+        copy_linear(slice, self.lin_w, &weights.lin_w)?;
+        copy_vec_f32(slice, self.lin_b_off, &weights.lin_b);
+
+        Ok(())
     }
 }
 
@@ -675,6 +789,7 @@ pub struct HexagonDepthformer {
     state_offsets: HexagonDepthformerStateOffsets,
     weights: Arc<AudioDecoderWeights>,
     n_past: std::sync::atomic::AtomicUsize,
+    rng_state: std::sync::atomic::AtomicU64,
     logits_scratch: Mutex<Vec<f32>>,
     indices_scratch: Mutex<Vec<usize>>,
     emb_scratch: Mutex<Vec<f32>>,
@@ -746,10 +861,20 @@ impl HexagonDepthformer {
             state_offsets,
             weights,
             n_past: std::sync::atomic::AtomicUsize::new(0),
+            rng_state: std::sync::atomic::AtomicU64::new(
+                crate::model::audio_decoder::non_zero_rng_seed(rand::random::<u64>()),
+            ),
             logits_scratch: Mutex::new(Vec::with_capacity(n_vocab)),
             indices_scratch: Mutex::new(Vec::with_capacity(n_vocab)),
             emb_scratch: Mutex::new(Vec::with_capacity(n_embd)),
         })
+    }
+
+    pub fn seed_rng(&self, seed: u64) {
+        self.rng_state.store(
+            crate::model::audio_decoder::non_zero_rng_seed(seed),
+            std::sync::atomic::Ordering::Relaxed,
+        );
     }
 
     pub fn reset(&self) {
@@ -1335,8 +1460,10 @@ impl HexagonDepthformer {
                 }
                 let top_indices = &indices_scratch[..k];
                 let sum: f32 = top_indices.iter().map(|&i| logits_scratch[i]).sum();
-                let mut r = rand::random::<f32>() * sum;
-                let mut picked = top_indices[0];
+                let mut r =
+                    crate::model::audio_decoder::next_atomic_xorshift64_f32_01(&self.rng_state)
+                        * sum;
+                let mut picked = *top_indices.last().unwrap_or(&0);
                 for &i in top_indices {
                     r -= logits_scratch[i];
                     if r <= 0.0 {
@@ -1480,95 +1607,7 @@ impl HexagonAudioDecoder {
         offsets: &HexagonDetokWeightOffsets,
         weights: &DetokenizerWeights,
     ) -> Result<(), CeraError> {
-        let copy_vec_f32 = |dst: &mut [u8], off: usize, src: &[f32]| {
-            let bytes = bytemuck::cast_slice(src);
-            dst[off..off + bytes.len()].copy_from_slice(bytes);
-        };
-
-        let copy_linear = |dst: &mut [u8],
-                           desc: HexagonDetokWeightDesc,
-                           w: &MmapWeight|
-         -> Result<(), CeraError> {
-            let dst_slice = &mut dst[desc.offset..desc.offset + desc.size_bytes];
-            match desc.format {
-                HexagonWeightFormat::RepackedQ8_0 => {
-                    repack_q8_0(w.data(), w.cols, w.rows, dst_slice).map_err(|e| {
-                        CeraError::Backend(format!("detok repack Q8_0 failed: {e}"))
-                    })?;
-                }
-                HexagonWeightFormat::RepackedQ4_0 => {
-                    repack_q4_0(w.data(), w.cols, w.rows, dst_slice).map_err(|e| {
-                        CeraError::Backend(format!("detok repack Q4_0 failed: {e}"))
-                    })?;
-                }
-            }
-            Ok(())
-        };
-
-        let slice = buf.as_mut_slice();
-        for (lw, lo) in weights.layers.iter().zip(offsets.layers.iter()) {
-            copy_vec_f32(slice, lo.op_norm_off, &lw.operator_norm);
-            copy_vec_f32(slice, lo.ffn_norm_off, &lw.ffn_norm);
-            copy_linear(slice, lo.ffn_w1, &lw.ffn_w1)?;
-            copy_linear(slice, lo.ffn_w2, &lw.ffn_w2)?;
-            copy_linear(slice, lo.ffn_w3, &lw.ffn_w3)?;
-
-            if lo.is_conv {
-                if let (Some(cin_desc), Some(cin_w)) = (lo.conv_in_proj, lw.conv_in_proj.as_ref()) {
-                    copy_linear(slice, cin_desc, cin_w)?;
-                }
-                if let (Some(cout_desc), Some(cout_w)) =
-                    (lo.conv_out_proj, lw.conv_out_proj.as_ref())
-                {
-                    copy_linear(slice, cout_desc, cout_w)?;
-                }
-                if let (Some(w0_off), Some(cw)) = (lo.conv_w0_off, lw.conv_weight.as_ref()) {
-                    let hs = lw.operator_norm.len();
-                    if cw.len() == 3 * hs {
-                        let mut w0 = vec![0.0f32; hs];
-                        let mut w1 = vec![0.0f32; hs];
-                        let mut w2 = vec![0.0f32; hs];
-                        for ch in 0..hs {
-                            w0[ch] = cw[ch * 3];
-                            w1[ch] = cw[ch * 3 + 1];
-                            w2[ch] = cw[ch * 3 + 2];
-                        }
-                        copy_vec_f32(slice, w0_off, &w0);
-                        if let Some(w1_off) = lo.conv_w1_off {
-                            copy_vec_f32(slice, w1_off, &w1);
-                        }
-                        if let Some(w2_off) = lo.conv_w2_off {
-                            copy_vec_f32(slice, w2_off, &w2);
-                        }
-                    }
-                }
-            } else {
-                if let (Some(wq_desc), Some(wq_w)) = (lo.wq, lw.wq.as_ref()) {
-                    copy_linear(slice, wq_desc, wq_w)?;
-                }
-                if let (Some(wk_desc), Some(wk_w)) = (lo.wk, lw.wk.as_ref()) {
-                    copy_linear(slice, wk_desc, wk_w)?;
-                }
-                if let (Some(wv_desc), Some(wv_w)) = (lo.wv, lw.wv.as_ref()) {
-                    copy_linear(slice, wv_desc, wv_w)?;
-                }
-                if let (Some(wo_desc), Some(wo_w)) = (lo.wo, lw.wo.as_ref()) {
-                    copy_linear(slice, wo_desc, wo_w)?;
-                }
-                if let (Some(qn_off), Some(qn)) = (lo.q_norm_off, lw.q_norm.as_ref()) {
-                    copy_vec_f32(slice, qn_off, qn);
-                }
-                if let (Some(kn_off), Some(kn)) = (lo.k_norm_off, lw.k_norm.as_ref()) {
-                    copy_vec_f32(slice, kn_off, kn);
-                }
-            }
-        }
-
-        copy_vec_f32(slice, offsets.output_norm_off, &weights.output_norm);
-        copy_linear(slice, offsets.lin_w, &weights.lin_w)?;
-        copy_vec_f32(slice, offsets.lin_b_off, &weights.lin_b);
-
-        Ok(())
+        offsets.copy_to_slice(buf.as_mut_slice(), weights)
     }
 
     /// Access the underlying Hexagon driver.
@@ -2782,6 +2821,12 @@ impl AudioAccelerator for HexagonAudioDecoder {
         }
     }
 
+    fn seed_rng(&self, seed: u64) {
+        if let Some(ref df) = self.depthformer {
+            df.seed_rng(seed);
+        }
+    }
+
     fn reset_detokenizer(&self) {
         // The buffer is fully overwritten with zeros, so a poisoned lock is
         // recoverable; skipping it would reset the counters over stale state.
@@ -3009,6 +3054,82 @@ mod tests {
         let plan_res = HexagonDetokWeightOffsets::plan(&weights);
         let err = plan_res.unwrap_err().to_string();
         assert!(err.contains("requires Q8_0 or Q4_0"));
+    }
+
+    #[test]
+    fn test_weight_offsets_plan_and_copy_to_slice_reject_mismatched_conv_weights() {
+        use crate::model::audio_decoder::DetokLayerWeights;
+        let cfg = DetokenizerConfig {
+            n_layer: 1,
+            n_embd: 64,
+            n_head: 2,
+            n_head_kv: 2,
+            n_embd_head: 32,
+            ffn_dim: 128,
+            d_conv: 2,
+            rms_norm_eps: 1e-5,
+            rope_freq_base: 1_000_000.0,
+            swa_window_size: 30,
+            n_codes: 8,
+            n_fft: 128,
+            hop_length: 32,
+            sample_rate: 24000,
+            layer_is_conv: vec![true],
+        };
+        let mut weights = DetokenizerWeights {
+            config: cfg,
+            output_norm: vec![1.0f32; 64],
+            emb_weight: MmapWeight::from_owned_bytes(
+                vec![0u8; 8 * 2048 * 2 * 18],
+                DType::Q4_0,
+                8 * 2048,
+                64,
+            ),
+            lin_w: MmapWeight::from_owned_bytes(vec![0u8; 130 * 2 * 18], DType::Q4_0, 130, 64),
+            lin_b: vec![0.0f32; 130],
+            layers: vec![DetokLayerWeights {
+                operator_norm: vec![1.0f32; 32],
+                ffn_norm: vec![1.0f32; 64],
+                ffn_w1: MmapWeight::from_owned_bytes(vec![0u8; 128 * 2 * 18], DType::Q4_0, 128, 64),
+                ffn_w2: MmapWeight::from_owned_bytes(vec![0u8; 64 * 4 * 18], DType::Q4_0, 64, 128),
+                ffn_w3: MmapWeight::from_owned_bytes(vec![0u8; 128 * 2 * 18], DType::Q4_0, 128, 64),
+                conv_in_proj: Some(MmapWeight::from_owned_bytes(
+                    vec![0u8; 192 * 2 * 18],
+                    DType::Q4_0,
+                    192,
+                    64,
+                )),
+                conv_out_proj: Some(MmapWeight::from_owned_bytes(
+                    vec![0u8; 64 * 2 * 18],
+                    DType::Q4_0,
+                    64,
+                    64,
+                )),
+                conv_weight: Some(vec![0.0f32; 3 * 64]),
+                wq: None,
+                wk: None,
+                wv: None,
+                wo: None,
+                q_norm: None,
+                k_norm: None,
+            }],
+        };
+
+        let err = HexagonDetokWeightOffsets::plan(&weights)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("operator_norm length mismatch"));
+
+        weights.layers[0].operator_norm = vec![1.0f32; 64];
+        let offsets = HexagonDetokWeightOffsets::plan(&weights).expect("valid plan");
+
+        weights.layers[0].conv_weight = Some(vec![0.0f32; 3 * 32]);
+        let mut buf = vec![0u8; offsets.total_bytes];
+        let copy_err = offsets
+            .copy_to_slice(&mut buf, &weights)
+            .unwrap_err()
+            .to_string();
+        assert!(copy_err.contains("3-tap conv kernel matching operator_norm"));
     }
 
     #[test]

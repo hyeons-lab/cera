@@ -194,6 +194,14 @@ impl KvCompression {
         }
     }
 
+    /// Whether this request asked for TurboQuant compression and a model with `config`
+    /// resolves it to the plain cache (see [`Self::resolved_for`]): the model cannot serve
+    /// it. `Session::new` reports it, since a caller that asked for compression to fit
+    /// memory would otherwise run an uncompressed cache silently.
+    pub fn is_downgraded_for(&self, config: &ModelConfig) -> bool {
+        self.flags() != (false, false) && self.resolved_for(config).flags() == (false, false)
+    }
+
     /// Prefix-cache namespace tag for this mode — `""` for plain f32, else a
     /// `"…:"`-terminated discriminator to prepend to a backend's cache id.
     ///
@@ -509,12 +517,16 @@ impl PrefillScratch {
     /// Resizes buffers only when their length differs, preserving allocated capacity.
     pub fn ensure(&mut self, n: usize, config: &ModelConfig) {
         let hs = config.hidden_size;
-        let is = config.intermediate_size;
+        let is = config
+            .intermediate_size
+            .max(config.moe.as_ref().map_or(0, |m| m.expert_ff_len));
         let head_dim = if config.head_dim > 0 {
             config.head_dim
         } else {
             hs.checked_div(config.n_heads).unwrap_or(64)
         };
+        let q_dim = config.n_heads * head_dim;
+        let max_act_dim = hs.max(q_dim);
         let max_kv_heads = config
             .kv_heads_per_layer
             .iter()
@@ -522,8 +534,8 @@ impl PrefillScratch {
             .max()
             .unwrap_or(config.n_kv_heads);
         let max_kv_dim = max_kv_heads * head_dim;
-        let proj_rows = (3 * hs).max(hs + 2 * max_kv_dim);
-        let nb_hs = hs.div_ceil(32);
+        let proj_rows = (3 * hs).max(q_dim + 2 * max_kv_dim);
+        let nb_hs = max_act_dim.div_ceil(32);
         let nb_is = is.div_ceil(32);
 
         Self::resize_f32(&mut self.normed, hs * n);
@@ -535,20 +547,20 @@ impl PrefillScratch {
         Self::resize_f32(&mut self.up_col, is);
         Self::resize_f32(&mut self.out_col, hs);
         Self::resize_f32(&mut self.proj_mat, proj_rows * n);
-        Self::resize_f32(&mut self.out_proj_input, hs * n);
-        Self::resize_f32(&mut self.q_mat, hs * n);
+        Self::resize_f32(&mut self.out_proj_input, max_act_dim * n);
+        Self::resize_f32(&mut self.q_mat, q_dim * n);
         Self::resize_f32(&mut self.k_mat, max_kv_dim * n);
         Self::resize_f32(&mut self.v_mat, max_kv_dim * n);
         Self::resize_f32(&mut self.bq_scales, n * nb_hs);
-        Self::resize_i8(&mut self.bq_quants, n * hs);
+        Self::resize_i8(&mut self.bq_quants, n * max_act_dim);
         Self::resize_f32(&mut self.gate_mat, is * n);
         Self::resize_f32(&mut self.up_mat, is * n);
         #[cfg(has_blas)]
         Self::resize_f32(&mut self.gate_up_mat, 2 * is * n);
         Self::resize_f32(&mut self.dq_scales, n * nb_is);
         Self::resize_i8(&mut self.dq_quants, n * is);
-        Self::resize_f32(&mut self.flash_out, hs * n);
-        Self::resize_f32(&mut self.q_col, hs * n);
+        Self::resize_f32(&mut self.flash_out, max_act_dim * n);
+        Self::resize_f32(&mut self.q_col, q_dim * n);
         self.kv_widen_k.clear();
         self.kv_widen_v.clear();
     }
@@ -2468,6 +2480,62 @@ mod cache_tag_tests {
             .cache_tag(),
             KvCompression::None.cache_tag()
         );
+    }
+
+    #[test]
+    fn prefill_scratch_ensure_sizes_for_decoupled_q_dim_and_moe_expert_ff_len() {
+        use super::PrefillScratch;
+        use crate::model::{ModelConfig, MoeConfig, ScalarMultipliers};
+
+        let cfg = ModelConfig {
+            architecture: "qwen35".to_string(),
+            n_layers: 1,
+            hidden_size: 128,
+            intermediate_size: 0,
+            n_heads: 4,
+            n_kv_heads: 2,
+            head_dim: 64, // q_dim = 4 * 64 = 256 > hidden_size (128)
+            vocab_size: 256,
+            max_seq_len: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            block_types: Vec::new(),
+            kv_heads_per_layer: vec![2],
+            conv_kernel_size: None,
+            scalars: ScalarMultipliers::default(),
+            moe: Some(MoeConfig {
+                n_expert: 4,
+                n_expert_used: 2,
+                expert_ff_len: 512, // > intermediate_size (0)
+                is_moe_layer: vec![true],
+            }),
+            ssm: None,
+            is_causal: true,
+            class_labels: Vec::new(),
+        };
+
+        let n = 3;
+        let mut scratch = PrefillScratch::default();
+        scratch.ensure(n, &cfg);
+
+        let q_dim = cfg.n_heads * cfg.head_dim; // 256
+        let max_act_dim = cfg.hidden_size.max(q_dim); // 256
+        let max_kv_dim = 2 * cfg.head_dim; // 128
+        let is = 512;
+
+        assert_eq!(scratch.q_mat.len(), q_dim * n);
+        assert_eq!(scratch.q_col.len(), q_dim * n);
+        assert_eq!(scratch.out_proj_input.len(), max_act_dim * n);
+        assert_eq!(scratch.flash_out.len(), max_act_dim * n);
+        assert_eq!(scratch.bq_quants.len(), max_act_dim * n);
+        assert_eq!(scratch.bq_scales.len(), max_act_dim.div_ceil(32) * n);
+        assert_eq!(scratch.proj_mat.len(), (q_dim + 2 * max_kv_dim) * n);
+        assert_eq!(scratch.gate_col.len(), is);
+        assert_eq!(scratch.up_col.len(), is);
+        assert_eq!(scratch.gate_mat.len(), is * n);
+        assert_eq!(scratch.up_mat.len(), is * n);
+        assert_eq!(scratch.dq_quants.len(), is * n);
+        assert_eq!(scratch.dq_scales.len(), is.div_ceil(32) * n);
     }
 }
 

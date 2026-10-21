@@ -57,6 +57,7 @@ pub enum MetadataValue {
     StringArray(Vec<String>),
     Float32Array(Vec<f32>),
     Int32Array(Vec<i32>),
+    BoolArray(Vec<bool>),
 }
 
 /// Tensor descriptor registered before writing data.
@@ -174,6 +175,12 @@ impl GgufWriter {
     pub fn add_i32_array(&mut self, key: impl Into<String>, val: Vec<i32>) {
         self.metadata
             .insert(key.into(), MetadataValue::Int32Array(val));
+    }
+
+    /// Add an array of bool metadata key-value pair.
+    pub fn add_bool_array(&mut self, key: impl Into<String>, val: Vec<bool>) {
+        self.metadata
+            .insert(key.into(), MetadataValue::BoolArray(val));
     }
 
     /// Register a tensor and compute its aligned data offset.
@@ -396,6 +403,16 @@ fn write_metadata_value<W: Write>(
             for &i in arr {
                 w.write_all(&i.to_le_bytes())?;
                 *written += 4;
+            }
+        }
+        MetadataValue::BoolArray(arr) => {
+            w.write_all(&GGUF_TYPE_ARRAY.to_le_bytes())?;
+            w.write_all(&GGUF_TYPE_BOOL.to_le_bytes())?;
+            w.write_all(&(arr.len() as u64).to_le_bytes())?;
+            *written += 4 + 4 + 8;
+            for &b in arr {
+                w.write_all(&[u8::from(b)])?;
+                *written += 1;
             }
         }
     }
