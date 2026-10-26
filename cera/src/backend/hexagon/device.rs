@@ -45,6 +45,18 @@ impl HexagonArch {
         }
     }
 
+    /// The architecture a DSP reports for `ARCH_VER`: its version as hex digits, `0x79` for v79.
+    pub fn from_dsp_version(version: u32) -> Option<Self> {
+        match version {
+            0x73 => Some(Self::V73),
+            0x75 => Some(Self::V75),
+            0x79 => Some(Self::V79),
+            0x81 => Some(Self::V81),
+            0x85 => Some(Self::V85),
+            _ => None,
+        }
+    }
+
     pub fn from_u32(val: u32) -> Option<Self> {
         match val {
             73 => Some(Self::V73),
@@ -372,13 +384,13 @@ pub(crate) fn probe_device_with(
     get: impl Fn(&str) -> Option<std::ffi::OsString>,
 ) -> Result<HexagonDevice, CeraError> {
     super::ensure_not_disabled_with(get)?;
-    let probe_archs: &[HexagonArch] = match arch_override {
-        Some(ref arch) => std::slice::from_ref(arch),
-        None => &super::skels::PROBE_ARCHS,
+    let probe_archs = match arch_override {
+        Some(arch) => vec![arch],
+        None => super::skels::probe_order(driver.detect_arch()),
     };
     let mut device_opt = None;
     let mut probed_errors = Vec::new();
-    for &arch in probe_archs {
+    for arch in probe_archs {
         match HexagonDevice::new(Arc::clone(driver), arch) {
             Ok(dev) => {
                 tracing::info!(arch = ?arch, "initialized Hexagon NPU device");
@@ -412,6 +424,85 @@ mod tests {
         assert_eq!(get(Some("  75\n")), Some(HexagonArch::V75));
         assert_eq!(get(Some("garbage")), None);
         assert_eq!(get(Some("99")), None);
+    }
+
+    /// On a phone: the driver names the DSP's architecture, and the probe opens that skel.
+    /// `CERA_EXPECT_DSP_ARCH` (e.g. `79`) pins the expectation.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_reports_its_architecture() {
+        let driver = FastRpcDriver::load().expect("FastRPC driver");
+        for attribute in 0..16u32 {
+            eprintln!(
+                "capability {attribute}: {:?}",
+                driver.dsp_capability(attribute)
+            );
+        }
+        let detected = driver.detect_arch();
+        eprintln!("detected DSP architecture: {detected:?}");
+        let detected = detected.expect("the driver names the DSP architecture");
+        if let Some(want) = arch_override_with(|_| std::env::var("CERA_EXPECT_DSP_ARCH").ok()) {
+            assert_eq!(detected, want);
+        }
+        let dev = probe_device(&driver, None).expect("probe");
+        eprintln!("probe opened {:?}", dev.arch());
+        assert_eq!(dev.arch(), detected);
+    }
+
+    #[test]
+    fn dsp_versions_map_to_archs() {
+        assert_eq!(HexagonArch::from_dsp_version(0x79), Some(HexagonArch::V79));
+        assert_eq!(HexagonArch::from_dsp_version(0x81), Some(HexagonArch::V81));
+        // decimal 79 is not the hex digits the driver reports
+        assert_eq!(HexagonArch::from_dsp_version(79), None);
+        assert_eq!(HexagonArch::from_dsp_version(0x68), None);
+    }
+
+    #[test]
+    fn probe_opens_the_skel_of_the_dsp_architecture() {
+        fake::reset();
+        fake::with(|s| s.dsp_arch_ver = Some(0x81));
+        let dev = probe_device_with(&fake::driver(), None, |_| None).unwrap();
+        assert_eq!(dev.arch(), HexagonArch::V81);
+        let opened = fake::with(|s| s.open_skels.clone());
+        assert_eq!(opened.len(), 1, "no wrong skel was tried first: {opened:?}");
+        assert!(opened[0].contains("libcera-htp-v81.so"), "{opened:?}");
+    }
+
+    /// A DSP that names an architecture whose skel will not open still gets a working
+    /// device: the rest of the probe order follows.
+    #[test]
+    fn probe_falls_back_when_the_detected_skel_is_refused() {
+        fake::reset();
+        fake::with(|s| {
+            s.dsp_arch_ver = Some(0x81);
+            s.refuse_skels = vec!["v81"];
+        });
+        let dev = probe_device_with(&fake::driver(), None, |_| None).unwrap();
+        assert_eq!(dev.arch(), HexagonArch::V79);
+        let opened = fake::with(|s| s.open_skels.clone());
+        assert!(
+            opened[0].contains("v81") && opened[1].contains("v79"),
+            "{opened:?}"
+        );
+    }
+
+    /// Without the query (an old driver, a refusal) the order is the old one.
+    #[test]
+    fn probe_keeps_the_old_order_when_the_query_fails() {
+        fake::reset();
+        fake::with(|s| s.dsp_arch_ver = None);
+        let dev = probe_device_with(&fake::driver(), None, |_| None).unwrap();
+        assert_eq!(dev.arch(), HexagonArch::V79);
+    }
+
+    /// `CERA_HEXAGON_ARCH` stays the last word, and asks the DSP nothing.
+    #[test]
+    fn probe_override_beats_the_dsp_architecture() {
+        fake::reset();
+        fake::with(|s| s.dsp_arch_ver = Some(0x81));
+        let dev = probe_device_with(&fake::driver(), Some(HexagonArch::V75), |_| None).unwrap();
+        assert_eq!(dev.arch(), HexagonArch::V75);
     }
 
     /// The FFI `arch` wire strings are pinned literals: mobile clients

@@ -68,9 +68,44 @@ pub(crate) fn plan_vec(cur: &mut usize, len: usize) -> usize {
     off
 }
 
-/// A repacked Q4_0 or Q8_0 linear weight in `weights_buf`.
+/// The type the DSP stores a weight of file type `dtype` as: Q4_0 and Q8_0 as they are, anything
+/// else (F32 and F16 matrices, such as a conformer's pointwise convolutions) rounded to Q8_0.
+fn npu_dtype(dtype: DType) -> DType {
+    match dtype {
+        DType::Q4_0 | DType::Q8_0 => dtype,
+        _ => DType::Q8_0,
+    }
+}
+
+/// Rows `lo..hi` of `w` as the Q8_0 or Q4_0 blocks the DSP repacks: the file's own blocks when it
+/// has them, else the rows rounded once to Q8_0.
+fn npu_rows(w: &MmapWeight, lo: usize, hi: usize) -> Result<std::borrow::Cow<'_, [u8]>, CeraError> {
+    let block_bytes = match w.dtype {
+        DType::Q4_0 => 18,
+        DType::Q8_0 => 34,
+        _ => {
+            let dense = w.to_dense_f32();
+            let rows = &dense[lo * w.cols..hi * w.cols];
+            return crate::backend::hexagon::quantize_f32_to_q8_0(rows, w.cols, hi - lo)
+                .map(std::borrow::Cow::Owned);
+        }
+    };
+    let row_bytes = w.cols / 32 * block_bytes;
+    Ok(std::borrow::Cow::Borrowed(
+        &w.data()[lo * row_bytes..hi * row_bytes],
+    ))
+}
+
+/// A repacked Q4_0 or Q8_0 linear weight in `weights_buf`; a dense one is refused (the other
+/// Hexagon encoders that share this planner stage their weights as stored).
 pub(crate) fn plan_linear(cur: &mut usize, w: &MmapWeight) -> Result<HexagonWeightDesc, CeraError> {
     plan_matrix(cur, w.dtype, w.rows, w.cols)
+}
+
+/// [`plan_linear`] for this encoder, which also takes an F32 or F16 matrix (rounded once to Q8_0
+/// when it is staged, see [`put_linear`]).
+fn plan_linear_npu(cur: &mut usize, w: &MmapWeight) -> Result<HexagonWeightDesc, CeraError> {
+    plan_matrix(cur, npu_dtype(w.dtype), w.rows, w.cols)
 }
 
 /// A `rows x cols` matrix of `dtype`, repacked, in `weights_buf`.
@@ -217,9 +252,9 @@ impl WeightOffsets {
                 Ok(FfnOffsets {
                     norm_w: plan_vec(&mut cur, norm_w.len()),
                     norm_b: plan_vec(&mut cur, norm_b.len()),
-                    up_w: plan_linear(&mut cur, up_w)?,
+                    up_w: plan_linear_npu(&mut cur, up_w)?,
                     up_b: plan_vec(&mut cur, up_b.len()),
-                    down_w: plan_linear(&mut cur, down_w)?,
+                    down_w: plan_linear_npu(&mut cur, down_w)?,
                     down_b: plan_vec(&mut cur, down_b.len()),
                 })
             };
@@ -252,31 +287,31 @@ impl WeightOffsets {
             let conv = ConvOffsets {
                 norm_w: plan_vec(&mut cur, l.norm_conv_w.len()),
                 norm_b: plan_vec(&mut cur, l.norm_conv_b.len()),
-                pw1a_w: plan_matrix(&mut cur, pw1_dtype, half_rows, pw1_cols)?,
+                pw1a_w: plan_matrix(&mut cur, npu_dtype(pw1_dtype), half_rows, pw1_cols)?,
                 pw1a_b: plan_vec(&mut cur, half_rows),
-                pw1b_w: plan_matrix(&mut cur, pw1_dtype, half_rows, pw1_cols)?,
+                pw1b_w: plan_matrix(&mut cur, npu_dtype(pw1_dtype), half_rows, pw1_cols)?,
                 pw1b_b: plan_vec(&mut cur, half_rows),
                 dw_w: plan_vec(&mut cur, l.conv_dw_w.len()),
                 dw_b: plan_vec(&mut cur, l.conv_dw_b.len()),
                 conv_norm_w: plan_vec(&mut cur, l.conv_norm_w.len()),
                 conv_norm_b: plan_vec(&mut cur, l.conv_norm_b.len()),
-                pw2_w: plan_linear(&mut cur, &l.conv_pw2_w)?,
+                pw2_w: plan_linear_npu(&mut cur, &l.conv_pw2_w)?,
                 pw2_b: plan_vec(&mut cur, l.conv_pw2_b.len()),
             };
             let attn = AttnOffsets {
                 ln_w: plan_vec(&mut cur, l.ln1_w.len()),
                 ln_b: plan_vec(&mut cur, l.ln1_b.len()),
-                q_w: plan_linear(&mut cur, &l.attn_q_w)?,
+                q_w: plan_linear_npu(&mut cur, &l.attn_q_w)?,
                 q_b: plan_vec(&mut cur, l.attn_q_b.len()),
-                k_w: plan_linear(&mut cur, &l.attn_k_w)?,
+                k_w: plan_linear_npu(&mut cur, &l.attn_k_w)?,
                 k_b: plan_vec(&mut cur, l.attn_k_b.len()),
-                v_w: plan_linear(&mut cur, &l.attn_v_w)?,
+                v_w: plan_linear_npu(&mut cur, &l.attn_v_w)?,
                 v_b: plan_vec(&mut cur, l.attn_v_b.len()),
-                o_w: plan_linear(&mut cur, &l.attn_o_w)?,
+                o_w: plan_linear_npu(&mut cur, &l.attn_o_w)?,
                 o_b: plan_vec(&mut cur, l.attn_o_b.len()),
                 pos_bias_u: plan_vec(&mut cur, l.pos_bias_u.len()),
                 pos_bias_v: plan_vec(&mut cur, l.pos_bias_v.len()),
-                linear_pos_w: plan_linear(&mut cur, &l.linear_pos_w)?,
+                linear_pos_w: plan_linear_npu(&mut cur, &l.linear_pos_w)?,
             };
             layers.push(LayerOffsets {
                 ffn1,
@@ -310,9 +345,9 @@ impl WeightOffsets {
                 Ok(AdapterOffsets {
                     norm_w: plan_vec(&mut cur, ad.norm_w.len()),
                     norm_b: plan_vec(&mut cur, ad.norm_b.len()),
-                    up_w: plan_linear(&mut cur, &ad.up_w)?,
+                    up_w: plan_linear_npu(&mut cur, &ad.up_w)?,
                     up_b: plan_vec(&mut cur, ad.up_b.len()),
-                    down_w: plan_linear(&mut cur, &ad.down_w)?,
+                    down_w: plan_linear_npu(&mut cur, &ad.down_w)?,
                     down_b: plan_vec(&mut cur, ad.down_b.len()),
                 })
             })
@@ -1059,9 +1094,10 @@ pub(crate) fn put_linear(
     w: &MmapWeight,
 ) -> Result<(), CeraError> {
     let slot = &mut dst[desc.offset..desc.offset + desc.size_bytes];
+    let blocks = npu_rows(w, 0, w.rows)?;
     match desc.format {
-        HexagonWeightFormat::RepackedQ8_0 => repack_q8_0(w.data(), w.cols, w.rows, slot),
-        HexagonWeightFormat::RepackedQ4_0 => repack_q4_0(w.data(), w.cols, w.rows, slot),
+        HexagonWeightFormat::RepackedQ8_0 => repack_q8_0(&blocks, w.cols, w.rows, slot),
+        HexagonWeightFormat::RepackedQ4_0 => repack_q4_0(&blocks, w.cols, w.rows, slot),
     }
     .map_err(|e| CeraError::Backend(format!("audio encoder repack failed: {e}")))
 }
@@ -1091,21 +1127,11 @@ fn put_linear_rows(
     lo: usize,
     hi: usize,
 ) -> Result<(), CeraError> {
-    let block_bytes = match w.dtype {
-        DType::Q4_0 => 18,
-        DType::Q8_0 => 34,
-        other => {
-            return Err(CeraError::Backend(format!(
-                "audio encoder row split needs Q4_0 or Q8_0, got {other:?}"
-            )));
-        }
-    };
-    let row_bytes = w.cols / 32 * block_bytes;
-    let rows = &w.data()[lo * row_bytes..hi * row_bytes];
+    let rows = npu_rows(w, lo, hi)?;
     let slot = &mut dst[desc.offset..desc.offset + desc.size_bytes];
     match desc.format {
-        HexagonWeightFormat::RepackedQ8_0 => repack_q8_0(rows, w.cols, hi - lo, slot),
-        HexagonWeightFormat::RepackedQ4_0 => repack_q4_0(rows, w.cols, hi - lo, slot),
+        HexagonWeightFormat::RepackedQ8_0 => repack_q8_0(&rows, w.cols, hi - lo, slot),
+        HexagonWeightFormat::RepackedQ4_0 => repack_q4_0(&rows, w.cols, hi - lo, slot),
     }
     .map_err(|e| CeraError::Backend(format!("audio encoder repack failed: {e}")))
 }
@@ -2648,11 +2674,33 @@ mod tests {
         assert!(so.gelu_tmp_rows(0).is_err());
     }
 
+    /// A dense matrix is staged as the Q8_0 the same values round to, and a Q8_0 one as it is.
     #[test]
-    fn linear_planning_rejects_dense_weights() {
-        let w = MmapWeight::from_owned_f32(vec![0.0; 64 * 64], 64, 64);
-        let mut cur = 0;
-        let err = plan_linear(&mut cur, &w).unwrap_err().to_string();
-        assert!(err.contains("Q8_0 or Q4_0"), "{err}");
+    fn linear_planning_rounds_dense_weights_to_q8_0() {
+        let values: Vec<f32> = (0..64 * 64)
+            .map(|i| ((i * 37 % 101) as f32 - 50.0) / 25.0)
+            .collect();
+        let dense = MmapWeight::from_owned_f32(values.clone(), 64, 64);
+        let q8 = crate::backend::hexagon::quantize_f32_to_q8_0(&values, 64, 64).unwrap();
+        let rounded = MmapWeight::from_owned_bytes(q8, DType::Q8_0, 64, 64);
+        let (mut cur_dense, mut cur_q8) = (0, 0);
+        assert!(plan_linear(&mut 0, &dense).is_err());
+        let desc = plan_linear_npu(&mut cur_dense, &dense).unwrap();
+        assert_eq!(desc.format, HexagonWeightFormat::RepackedQ8_0);
+        assert_eq!(desc, plan_linear_npu(&mut cur_q8, &rounded).unwrap());
+        let (mut a, mut b) = (vec![0u8; cur_dense], vec![0u8; cur_q8]);
+        put_linear(&mut a, desc, &dense).unwrap();
+        put_linear(&mut b, desc, &rounded).unwrap();
+        assert_eq!(a, b);
+        assert!(a.iter().any(|&x| x != 0));
+        // a row range of a dense matrix is the rows rounded on their own
+        let half = plan_matrix(&mut cur_q8, DType::Q8_0, 32, 64).unwrap();
+        let mut slot = vec![0u8; cur_q8];
+        put_linear_rows(&mut slot, half, &dense, 32, 64).unwrap();
+        assert!(
+            slot[half.offset..half.offset + half.size_bytes]
+                .iter()
+                .any(|&x| x != 0)
+        );
     }
 }

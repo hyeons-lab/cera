@@ -18,10 +18,12 @@ use crate::backend::hexagon::{
     repacked_matrix_size_q8_0,
 };
 use crate::model::vision_encoder::{
-    PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionEncoderWeights, VitStageDump,
-    interpolate_pos_embed_2d, patch_embed_compute, pixel_shuffle,
+    PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionEncoderWeights,
+    VitBlockWeights, VitStageDump, interpolate_pos_embed_2d, patch_embed_compute, pixel_shuffle,
 };
-use crate::model::vision_encoder_gpu::{MAX_VIT_TOKENS, VisionGpuEncode};
+use crate::model::vision_encoder_gpu::{
+    MAX_VIT_TOKENS, VisionGpuEncode, VitStack, VitStackActivation, VitStackSpec,
+};
 use crate::model::weights::MmapWeight;
 use crate::session::CeraError;
 use crate::tensor::DType;
@@ -456,9 +458,14 @@ pub struct HexagonVitScratchOffsets {
 impl HexagonVitScratchOffsets {
     /// Compute scratch allocation sized for up to `MAX_VIT_TOKENS` patches.
     pub fn new(n_embd: usize, n_ff: usize) -> Self {
-        let token_bytes = align128(MAX_VIT_TOKENS * n_embd * 4);
-        let token_f16_bytes = align128(MAX_VIT_TOKENS * n_embd * 2);
-        let ffn_mid_bytes = align128(MAX_VIT_TOKENS * n_ff * 4);
+        Self::with_rows(n_embd, n_ff, MAX_VIT_TOKENS)
+    }
+
+    /// Compute scratch allocation sized for up to `rows` tokens.
+    pub fn with_rows(n_embd: usize, n_ff: usize, rows: usize) -> Self {
+        let token_bytes = align128(rows * n_embd * 4);
+        let token_f16_bytes = align128(rows * n_embd * 2);
+        let ffn_mid_bytes = align128(rows * n_ff * 4);
 
         let mut off = 0;
         let tokens_off = off;
@@ -537,6 +544,12 @@ pub struct HexagonVisionEncoder {
     projector: ProjectorWeights,
     /// FFN width after padding to the 32-wide DSP tile (equals `n_ff` when aligned).
     n_ff_pad: usize,
+    /// Most tokens one pass takes: the scratch is sized for it.
+    max_rows: usize,
+    /// What sits between a block's two feed-forward projections.
+    activation: VitStackActivation,
+    /// Whether the blocks end in the final LayerNorm.
+    post_ln: bool,
 }
 
 impl Drop for HexagonVisionEncoder {
@@ -560,6 +573,16 @@ impl HexagonVisionEncoder {
         device: Arc<Mutex<HexagonDevice>>,
         weights: &VisionEncoderWeights,
     ) -> Result<Self, CeraError> {
+        Self::with_rows(driver, device, weights, MAX_VIT_TOKENS)
+    }
+
+    /// [`Self::new`] with scratch for `max_rows` tokens per pass.
+    pub fn with_rows(
+        driver: Arc<FastRpcDriver>,
+        device: Arc<Mutex<HexagonDevice>>,
+        weights: &VisionEncoderWeights,
+        max_rows: usize,
+    ) -> Result<Self, CeraError> {
         let cfg = &weights.config;
         // F16 weights are only read by the HMX matmul; without HMX (or when rows are not
         // 32-aligned for HMX tiles) they are requantized.
@@ -576,7 +599,7 @@ impl HexagonVisionEncoder {
             }
         };
         let n_ff_pad = ffn_padded_width(cfg.n_ff);
-        let scratch_offsets = HexagonVitScratchOffsets::new(cfg.n_embd, n_ff_pad);
+        let scratch_offsets = HexagonVitScratchOffsets::with_rows(cfg.n_embd, n_ff_pad, max_rows);
         let scratch_buf =
             RpcmemBuffer::alloc(Arc::clone(&driver), scratch_offsets.total_bytes, true)?;
 
@@ -712,6 +735,9 @@ impl HexagonVisionEncoder {
                 mm2_b: weights.projector.mm2_b.clone(),
             },
             n_ff_pad,
+            max_rows,
+            activation: VitStackActivation::GeluTanh,
+            post_ln: true,
         })
     }
 
@@ -1185,6 +1211,10 @@ impl HexagonVisionEncoder {
 }
 
 impl VisionGpuEncode for HexagonVisionEncoder {
+    fn backend_label(&self) -> &'static str {
+        "hexagon"
+    }
+
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
         self.encode_with(pixels, grid_w, grid_h, None, None)
     }
@@ -1219,88 +1249,28 @@ impl HexagonVisionEncoder {
         Ok(dump)
     }
 
-    /// The whole encoder, or with `stop_after_blocks` just the blocks and the
-    /// raw `[patches, n_embd]` tokens they leave.
-    fn encode_with(
+    /// The blocks (and the final LayerNorm, when the encoder has one) over `n_patches` rows of
+    /// `tokens` (`[n_patches, n_embd]`, already embedded), read back as the rows they leave; with
+    /// `stop_after_blocks` just that many blocks and no final norm.
+    fn run_blocks(
         &self,
-        pixels: &[f32],
-        grid_w: usize,
-        grid_h: usize,
+        tokens: &[f32],
+        n_patches: usize,
         stop_after_blocks: Option<usize>,
         dump: Option<&mut VitStageDump>,
     ) -> Result<Vec<f32>> {
         let cfg = &self.config;
-        ensure!(grid_w > 0 && grid_h > 0, "grid dims must be > 0");
         ensure!(
-            cfg.scale_factor > 0,
-            "vision encoder config has scale_factor=0"
+            n_patches <= self.max_rows,
+            "{n_patches} tokens exceed the encoder's {} rows",
+            self.max_rows
         );
         ensure!(
-            grid_w.is_multiple_of(cfg.scale_factor) && grid_h.is_multiple_of(cfg.scale_factor),
-            "grid {grid_w}x{grid_h} not divisible by scale_factor ({})",
-            cfg.scale_factor,
-        );
-
-        let p = cfg.patch_size;
-        let n_patches = grid_w * grid_h;
-        let expected_pixels = grid_w
-            .checked_mul(p)
-            .and_then(|w| w.checked_mul(grid_h))
-            .and_then(|wh| wh.checked_mul(p))
-            .and_then(|whp| whp.checked_mul(3))
-            .ok_or_else(|| anyhow!("encode_image: integer overflow in image dimensions"))?;
-        ensure!(
-            pixels.len() == expected_pixels,
-            "encode_image: pixels length {} != expected {}",
-            pixels.len(),
-            expected_pixels
-        );
-        ensure!(
-            n_patches <= MAX_VIT_TOKENS,
-            "encode_image: {n_patches} patches exceeds MAX_VIT_TOKENS ({MAX_VIT_TOKENS})"
-        );
-
-        let vit_timing = std::env::var_os("CERA_HEXAGON_VIT_TIMING").is_some();
-        let host_start = std::time::Instant::now();
-        // 1. Patch embedding on host CPU
-        let mut tokens = patch_embed_compute(pixels, &self.patch_embed, cfg, grid_w, grid_h);
-        let patch_embed_ms = host_start.elapsed().as_secs_f64() * 1000.0;
-
-        // 2. Add interpolated position embeddings
-        let trained_side = (cfg.n_trained_patches as f64).sqrt().round() as usize;
-        ensure!(
-            trained_side * trained_side == cfg.n_trained_patches,
-            "non-square trained pos-embed grid is not supported"
-        );
-        let pos: std::borrow::Cow<'_, [f32]> = if grid_w == trained_side && grid_h == trained_side {
-            std::borrow::Cow::Borrowed(self.position_embed.as_ref())
-        } else {
-            std::borrow::Cow::Owned(interpolate_pos_embed_2d(
-                &self.position_embed,
-                trained_side,
-                trained_side,
-                grid_h,
-                grid_w,
-                cfg.n_embd,
-            ))
-        };
-        ensure!(
-            tokens.len() == pos.len(),
-            "encode_image: tokens length {} != pos embedding length {}",
+            tokens.len() == n_patches * cfg.n_embd,
+            "{} values are not {n_patches} rows of {}",
             tokens.len(),
-            pos.len()
+            cfg.n_embd
         );
-        for (t, p) in tokens.iter_mut().zip(pos.iter()) {
-            *t += *p;
-        }
-
-        let host_pre_ms = host_start.elapsed().as_secs_f64() * 1000.0;
-        let mut dump = dump;
-        if let Some(d) = dump.as_deref_mut() {
-            d.x0 = tokens.clone();
-        }
-
-        // 3. Hexagon NPU ViT blocks execution
         let n_embd = cfg.n_embd;
         let n_head = cfg.n_head;
         let head_dim = n_embd / n_head;
@@ -1316,7 +1286,7 @@ impl HexagonVisionEncoder {
         {
             let scratch_slice =
                 &mut scratch_guard.as_mut_slice()[so.tokens_off..so.tokens_off + tokens_bytes];
-            scratch_slice.copy_from_slice(bytemuck::cast_slice(&tokens));
+            scratch_slice.copy_from_slice(bytemuck::cast_slice(tokens));
         }
         scratch_guard.flush_cpu_cache(so.tokens_off, tokens_bytes);
 
@@ -1472,19 +1442,31 @@ impl HexagonVisionEncoder {
                     n_patches,
                 )?;
 
-                // GELU activation on ffn_mid
-                dispatch::gelu_tanh(
-                    session,
-                    scratch_guard,
-                    so.ffn_mid_off,
-                    scratch_guard,
-                    so.gelu_tmp_off,
-                    dispatch::gelu_tmp_rows(so.gelu_tmp_bytes, self.n_ff_pad)?,
-                    TokenShape {
-                        dim: self.n_ff_pad,
-                        n_tokens: n_patches,
-                    },
-                )?;
+                // The feed-forward activation on ffn_mid
+                match self.activation {
+                    VitStackActivation::GeluTanh => dispatch::gelu_tanh(
+                        session,
+                        scratch_guard,
+                        so.ffn_mid_off,
+                        scratch_guard,
+                        so.gelu_tmp_off,
+                        dispatch::gelu_tmp_rows(so.gelu_tmp_bytes, self.n_ff_pad)?,
+                        TokenShape {
+                            dim: self.n_ff_pad,
+                            n_tokens: n_patches,
+                        },
+                    )?,
+                    VitStackActivation::Relu => dispatch::relu(
+                        session,
+                        scratch_guard,
+                        so.ffn_mid_off,
+                        TokenShape {
+                            dim: self.n_ff_pad,
+                            n_tokens: n_patches,
+                        },
+                        VIT_TILE,
+                    )?,
+                }
 
                 // FFN down projection: ffn_mid -> ffn_out
                 Self::dispatch_linear_m(
@@ -1515,7 +1497,7 @@ impl HexagonVisionEncoder {
             }
 
             // Post-LN on tokens (the debug entry stops before it).
-            if stop_after_blocks.is_none() {
+            if stop_after_blocks.is_none() && self.post_ln {
                 dispatch::layer_norm(
                     session,
                     LayerNormArgs {
@@ -1541,10 +1523,7 @@ impl HexagonVisionEncoder {
             Ok(())
         };
 
-        let blocks_start = std::time::Instant::now();
         let vit_res = run_vit_blocks(session, &mut scratch_guard);
-        let blocks_ms = blocks_start.elapsed().as_secs_f64() * 1000.0;
-        let post_start = std::time::Instant::now();
         if vit_res.is_err() {
             session.drop_pending_batch();
         }
@@ -1580,94 +1559,195 @@ impl HexagonVisionEncoder {
             return Ok(normed_slice.to_vec());
         }
 
-        // 4. Pixel-shuffle pool over dynamic grid
-        let pooled = pixel_shuffle(normed_slice, cfg, grid_w, grid_h);
+        Ok(normed_slice.to_vec())
+    }
 
-        // 5. 2-layer MLP Projector to LLM embedding dimension
-        if let Some(proj_offs) = self.weights_offsets.projector {
-            let in_dim = proj_offs.mm1_w.cols;
-            let mid_dim = proj_offs.mm1_w.rows;
-            let out_dim = cfg.projection_dim;
-            if in_dim > 0 && !pooled.is_empty() && pooled.len().is_multiple_of(in_dim) {
-                let n_tokens = pooled.len() / in_dim;
-                let in_bytes = pooled.len() * 4;
-                let out_bytes = n_tokens * out_dim * 4;
+    /// The whole encoder, or with `stop_after_blocks` just the blocks and the
+    /// raw `[patches, n_embd]` tokens they leave.
+    fn encode_with(
+        &self,
+        pixels: &[f32],
+        grid_w: usize,
+        grid_h: usize,
+        stop_after_blocks: Option<usize>,
+        dump: Option<&mut VitStageDump>,
+    ) -> Result<Vec<f32>> {
+        let cfg = &self.config;
+        ensure!(grid_w > 0 && grid_h > 0, "grid dims must be > 0");
+        ensure!(
+            cfg.scale_factor > 0,
+            "vision encoder config has scale_factor=0"
+        );
+        ensure!(
+            grid_w.is_multiple_of(cfg.scale_factor) && grid_h.is_multiple_of(cfg.scale_factor),
+            "grid {grid_w}x{grid_h} not divisible by scale_factor ({})",
+            cfg.scale_factor,
+        );
 
-                let session = dev_guard.queue_session_mut();
-                session.drop_pending_batch();
+        let p = cfg.patch_size;
+        let n_patches = grid_w * grid_h;
+        let expected_pixels = grid_w
+            .checked_mul(p)
+            .and_then(|w| w.checked_mul(grid_h))
+            .and_then(|wh| wh.checked_mul(p))
+            .and_then(|whp| whp.checked_mul(3))
+            .ok_or_else(|| anyhow!("encode_image: integer overflow in image dimensions"))?;
+        ensure!(
+            pixels.len() == expected_pixels,
+            "encode_image: pixels length {} != expected {}",
+            pixels.len(),
+            expected_pixels
+        );
+        ensure!(
+            n_patches <= self.max_rows,
+            "encode_image: {n_patches} patches exceeds the encoder's {} rows",
+            self.max_rows
+        );
 
-                scratch_guard.as_mut_slice()[so.tokens_off..so.tokens_off + in_bytes]
-                    .copy_from_slice(bytemuck::cast_slice(&pooled));
-                scratch_guard.flush_cpu_cache(so.tokens_off, in_bytes);
+        let vit_timing = std::env::var_os("CERA_HEXAGON_VIT_TIMING").is_some();
+        let host_start = std::time::Instant::now();
+        // 1. Patch embedding on host CPU
+        let mut tokens = patch_embed_compute(pixels, &self.patch_embed, cfg, grid_w, grid_h);
+        let patch_embed_ms = host_start.elapsed().as_secs_f64() * 1000.0;
 
-                let proj_res = (|| -> Result<(), CeraError> {
-                    Self::dispatch_linear_m(
-                        session,
-                        &scratch_guard,
-                        so.tokens_off,
-                        &self.weights_buf,
-                        proj_offs.mm1_w,
-                        proj_offs.mm1_b_off,
-                        &scratch_guard,
-                        so.proj_mid_off,
-                        n_tokens,
-                    )?;
-                    dispatch::gelu_tanh(
-                        session,
-                        &scratch_guard,
-                        so.proj_mid_off,
-                        &scratch_guard,
-                        so.gelu_tmp_off,
-                        dispatch::gelu_tmp_rows(so.gelu_tmp_bytes, mid_dim)?,
-                        TokenShape {
-                            dim: mid_dim,
-                            n_tokens,
-                        },
-                    )?;
-                    Self::dispatch_linear_m(
-                        session,
-                        &scratch_guard,
-                        so.proj_mid_off,
-                        &self.weights_buf,
-                        proj_offs.mm2_w,
-                        proj_offs.mm2_b_off,
-                        &scratch_guard,
-                        so.proj_final_off,
-                        n_tokens,
-                    )?;
-                    session.flush()?;
-                    Ok(())
-                })();
-
-                match proj_res {
-                    Ok(()) => {
-                        scratch_guard.invalidate_cpu_cache(so.proj_final_off, out_bytes);
-                        let out_slice: &[f32] = bytemuck::cast_slice(
-                            &scratch_guard.as_slice()
-                                [so.proj_final_off..so.proj_final_off + out_bytes],
-                        );
-                        if vit_timing {
-                            eprintln!(
-                                "ViT timing: patch_embed {patch_embed_ms:.1} ms | host_pre {host_pre_ms:.1} ms | dsp_blocks {blocks_ms:.1} ms | post (readback, pixel shuffle, projector) {:.1} ms",
-                                post_start.elapsed().as_secs_f64() * 1000.0
-                            );
-                        }
-                        return Ok(out_slice.to_vec());
-                    }
-                    Err(e) => {
-                        crate::backend::hexagon::hexagon_warn!(
-                            "HexagonVisionEncoder: DSP projector failed ({e}), falling back to CPU"
-                        );
-                        session.drop_pending_batch();
-                    }
-                }
-            }
+        // 2. Add interpolated position embeddings
+        let trained_side = (cfg.n_trained_patches as f64).sqrt().round() as usize;
+        ensure!(
+            trained_side * trained_side == cfg.n_trained_patches,
+            "non-square trained pos-embed grid is not supported"
+        );
+        let pos: std::borrow::Cow<'_, [f32]> = if grid_w == trained_side && grid_h == trained_side {
+            std::borrow::Cow::Borrowed(self.position_embed.as_ref())
+        } else {
+            std::borrow::Cow::Owned(interpolate_pos_embed_2d(
+                &self.position_embed,
+                trained_side,
+                trained_side,
+                grid_h,
+                grid_w,
+                cfg.n_embd,
+            ))
+        };
+        ensure!(
+            tokens.len() == pos.len(),
+            "encode_image: tokens length {} != pos embedding length {}",
+            tokens.len(),
+            pos.len()
+        );
+        for (t, p) in tokens.iter_mut().zip(pos.iter()) {
+            *t += *p;
         }
 
-        drop(scratch_guard);
-        drop(dev_guard);
+        let host_pre_ms = host_start.elapsed().as_secs_f64() * 1000.0;
+        let mut dump = dump;
+        if let Some(d) = dump.as_deref_mut() {
+            d.x0 = tokens.clone();
+        }
 
+        let blocks_start = std::time::Instant::now();
+        let normed = self.run_blocks(&tokens, n_patches, stop_after_blocks, dump)?;
+        let blocks_ms = blocks_start.elapsed().as_secs_f64() * 1000.0;
+        let post_start = std::time::Instant::now();
+        if stop_after_blocks.is_some() {
+            return Ok(normed);
+        }
+        // 4. Pixel-shuffle pool over dynamic grid
+        let pooled = pixel_shuffle(&normed, cfg, grid_w, grid_h);
+
+        // 5. 2-layer MLP Projector to LLM embedding dimension
+        match self.device_projector(&pooled) {
+            Ok(Some(out)) => {
+                if vit_timing {
+                    eprintln!(
+                        "ViT timing: patch_embed {patch_embed_ms:.1} ms | host_pre {host_pre_ms:.1} ms | dsp_blocks {blocks_ms:.1} ms | post (readback, pixel shuffle, projector) {:.1} ms",
+                        post_start.elapsed().as_secs_f64() * 1000.0
+                    );
+                }
+                return Ok(out);
+            }
+            Ok(None) => {}
+            Err(e) => crate::backend::hexagon::hexagon_warn!(
+                "HexagonVisionEncoder: DSP projector failed ({e}), falling back to CPU"
+            ),
+        }
         Ok(self.projector.forward(&pooled, cfg.projection_dim))
+    }
+
+    /// The projector (two matmuls and a GELU) on the DSP over `pooled` rows (`[n, mm1 cols]`), or
+    /// `None` when this encoder has no projector on the device or `pooled` does not fit it.
+    fn device_projector(&self, pooled: &[f32]) -> Result<Option<Vec<f32>>, CeraError> {
+        let Some(proj_offs) = self.weights_offsets.projector else {
+            return Ok(None);
+        };
+        let in_dim = proj_offs.mm1_w.cols;
+        let mid_dim = proj_offs.mm1_w.rows;
+        let out_dim = self.config.projection_dim;
+        if in_dim == 0 || pooled.is_empty() || !pooled.len().is_multiple_of(in_dim) {
+            return Ok(None);
+        }
+        let n_tokens = pooled.len() / in_dim;
+        if n_tokens * in_dim > self.max_rows * self.config.n_embd {
+            return Ok(None);
+        }
+        let in_bytes = pooled.len() * 4;
+        let out_bytes = n_tokens * out_dim * 4;
+        let so = self.scratch_offsets;
+        let mut dev_guard = self.device.lock_or_recover();
+        let mut scratch_guard = self.scratch_buf.lock_or_recover();
+        let session = dev_guard.queue_session_mut();
+        session.drop_pending_batch();
+
+        scratch_guard.as_mut_slice()[so.tokens_off..so.tokens_off + in_bytes]
+            .copy_from_slice(bytemuck::cast_slice(pooled));
+        scratch_guard.flush_cpu_cache(so.tokens_off, in_bytes);
+
+        let run = (|| -> Result<(), CeraError> {
+            Self::dispatch_linear_m(
+                session,
+                &scratch_guard,
+                so.tokens_off,
+                &self.weights_buf,
+                proj_offs.mm1_w,
+                proj_offs.mm1_b_off,
+                &scratch_guard,
+                so.proj_mid_off,
+                n_tokens,
+            )?;
+            dispatch::gelu_tanh(
+                session,
+                &scratch_guard,
+                so.proj_mid_off,
+                &scratch_guard,
+                so.gelu_tmp_off,
+                dispatch::gelu_tmp_rows(so.gelu_tmp_bytes, mid_dim)?,
+                TokenShape {
+                    dim: mid_dim,
+                    n_tokens,
+                },
+            )?;
+            Self::dispatch_linear_m(
+                session,
+                &scratch_guard,
+                so.proj_mid_off,
+                &self.weights_buf,
+                proj_offs.mm2_w,
+                proj_offs.mm2_b_off,
+                &scratch_guard,
+                so.proj_final_off,
+                n_tokens,
+            )?;
+            session.flush()?;
+            Ok(())
+        })();
+        if let Err(e) = run {
+            session.drop_pending_batch();
+            return Err(e);
+        }
+        scratch_guard.invalidate_cpu_cache(so.proj_final_off, out_bytes);
+        let out: &[f32] = bytemuck::cast_slice(
+            &scratch_guard.as_slice()[so.proj_final_off..so.proj_final_off + out_bytes],
+        );
+        Ok(Some(out.to_vec()))
     }
 }
 
@@ -1709,6 +1789,154 @@ pub fn try_new_hexagon_vision_encoder(
         Ok(encoder) => Some(encoder),
         Err(e) => {
             crate::backend::hexagon::hexagon_error!("failed to create HexagonVisionEncoder: {e}");
+            None
+        }
+    }
+}
+
+/// A [`VitStackSpec`] on the Hexagon NPU: the blocks (and the final LayerNorm, when the spec has
+/// one) of a transformer whose tokens the caller embeds, as the d1 vision tower and the d1
+/// decision head need. It is the ViT encoder above without the patch embedding, the position
+/// table and the projector, with ReLU available between a block's feed-forward projections.
+/// The matrices run as the file stores them when they are Q8_0 or Q4_0; an F16 or F32 file's are
+/// rounded once to Q8_0 when they are staged.
+pub struct HexagonVitStack {
+    encoder: HexagonVisionEncoder,
+}
+
+impl HexagonVitStack {
+    /// Stage `spec` on `device`, with scratch for `rows` tokens per pass.
+    pub fn new(
+        driver: Arc<FastRpcDriver>,
+        device: Arc<Mutex<HexagonDevice>>,
+        spec: &VitStackSpec,
+        rows: usize,
+    ) -> Result<Self, CeraError> {
+        let weights =
+            stack_weights(spec).map_err(|e| CeraError::Backend(format!("ViT stack: {e:#}")))?;
+        let mut encoder = HexagonVisionEncoder::with_rows(driver, device, &weights, rows)?;
+        encoder.activation = spec.activation;
+        encoder.post_ln = spec.post.is_some();
+        Ok(Self { encoder })
+    }
+}
+
+impl VitStack for HexagonVitStack {
+    fn run(&self, x: &[f32], tokens: usize) -> Result<Vec<f32>> {
+        self.encoder.run_blocks(x, tokens, None, None)
+    }
+
+    fn run_projector(&self, pooled: &[f32]) -> Result<Option<Vec<f32>>> {
+        Ok(self.encoder.device_projector(pooled)?)
+    }
+}
+
+/// A weight the DSP takes as it is (Q8_0 or Q4_0), or the weight rounded once to Q8_0.
+pub(crate) fn npu_weight(w: &MmapWeight) -> Result<MmapWeight, CeraError> {
+    if matches!(w.dtype, DType::Q8_0 | DType::Q4_0) {
+        return Ok(w.clone());
+    }
+    let bytes = crate::backend::hexagon::quantize_f32_to_q8_0(&w.to_dense_f32(), w.cols, w.rows)?;
+    Ok(MmapWeight::from_owned_bytes(
+        bytes,
+        DType::Q8_0,
+        w.rows,
+        w.cols,
+    ))
+}
+
+/// The weights a [`VitStackSpec`] describes, in the shape the encoder plans from. The patch
+/// embedding, positions and projector are never read by a stack pass, so they are empty.
+fn stack_weights(spec: &VitStackSpec) -> Result<VisionEncoderWeights> {
+    ensure!(
+        !spec.blocks.is_empty(),
+        "a ViT stack needs at least one block"
+    );
+    let config = VisionEncoderConfig {
+        n_layer: spec.blocks.len(),
+        n_embd: spec.width,
+        n_ff: spec.ffn,
+        n_head: spec.heads,
+        eps: spec.eps,
+        image_size: 0,
+        patch_size: 1,
+        n_trained_patches: 1,
+        projection_dim: spec.projector.as_ref().map_or(spec.width, |p| p.mm2.rows),
+        scale_factor: 1,
+        image_mean: [0.0; 3],
+        image_std: [1.0; 3],
+        image_min_pixels: 0,
+        image_max_pixels: 0,
+    };
+    let blocks = spec
+        .blocks
+        .iter()
+        .map(|b| {
+            Ok(VitBlockWeights {
+                ln1_w: b.ln1_w.clone(),
+                ln1_b: b.ln1_b.clone(),
+                q_w: npu_weight(&b.q)?,
+                q_b: b.q_b.clone(),
+                k_w: npu_weight(&b.k)?,
+                k_b: b.k_b.clone(),
+                v_w: npu_weight(&b.v)?,
+                v_b: b.v_b.clone(),
+                o_w: npu_weight(&b.o)?,
+                o_b: b.o_b.clone(),
+                ln2_w: b.ln2_w.clone(),
+                ln2_b: b.ln2_b.clone(),
+                ffn_up_w: npu_weight(&b.up)?,
+                ffn_up_b: b.up_b.clone(),
+                ffn_down_w: npu_weight(&b.down)?,
+                ffn_down_b: b.down_b.clone(),
+            })
+        })
+        .collect::<Result<Vec<_>, CeraError>>()?;
+    let (post_ln_w, post_ln_b) = spec.post.clone().unwrap_or_default();
+    let unused = || MmapWeight::from_owned_f32(Vec::new(), 0, 0);
+    Ok(VisionEncoderWeights {
+        config,
+        patch_embed: PatchEmbedWeights {
+            conv_w: Vec::new(),
+            conv_b: Vec::new(),
+        },
+        position_embed: Vec::new(),
+        blocks,
+        post_ln_w,
+        post_ln_b,
+        projector: match &spec.projector {
+            Some(p) => ProjectorWeights {
+                mm1_w: npu_weight(&p.mm1)?,
+                mm1_b: p.mm1_b.clone(),
+                mm2_w: npu_weight(&p.mm2)?,
+                mm2_b: p.mm2_b.clone(),
+            },
+            None => ProjectorWeights {
+                mm1_w: unused(),
+                mm1_b: Vec::new(),
+                mm2_w: unused(),
+                mm2_b: Vec::new(),
+            },
+        },
+    })
+}
+
+/// Stage `spec` on the Hexagon NPU, or say why not. `rows` is the most tokens one pass takes.
+pub(crate) fn try_hexagon_vit_stack(spec: &VitStackSpec, rows: usize) -> Option<Arc<dyn VitStack>> {
+    let context = HexagonContext::new()
+        .inspect_err(|e| crate::backend::hexagon::log_context_unavailable("HexagonVitStack", e))
+        .ok()?;
+    let dev = crate::backend::hexagon::probe_device(
+        context.driver(),
+        crate::backend::hexagon::arch_override(),
+    )
+    .inspect_err(|e| tracing::info!("HexagonVitStack: DSP device unavailable ({e})"))
+    .ok()?;
+    let device = Arc::new(Mutex::new(dev));
+    match HexagonVitStack::new(Arc::clone(context.driver()), device, spec, rows) {
+        Ok(stack) => Some(Arc::new(stack)),
+        Err(e) => {
+            crate::backend::hexagon::hexagon_error!("failed to create HexagonVitStack: {e}");
             None
         }
     }
@@ -2154,5 +2382,93 @@ mod tests {
             unaligned_rows.blocks[0].ffn_down_w.format,
             HexagonVitWeightFormat::RepackedQ8_0
         );
+    }
+
+    #[test]
+    fn a_dense_matrix_is_rounded_once_to_q8_0_and_a_quantized_one_kept() {
+        let values: Vec<f32> = (0..64 * 32)
+            .map(|i| ((i * 29 % 97) as f32 - 48.0) / 24.0)
+            .collect();
+        let dense = MmapWeight::from_owned_f32(values.clone(), 64, 32);
+        let rounded = npu_weight(&dense).unwrap();
+        assert_eq!(
+            (rounded.dtype, rounded.rows, rounded.cols),
+            (DType::Q8_0, 64, 32)
+        );
+        // dequantizing the rounded matrix stays within a Q8_0 step of the original
+        let back = rounded.to_dense_f32();
+        let worst = values
+            .iter()
+            .zip(&back)
+            .map(|(a, b)| (a - b).abs())
+            .fold(0f32, f32::max);
+        assert!(worst <= 2.0 / 127.0 + 1e-6, "worst error {worst}");
+        // a matrix that is already Q8_0 is the same bytes
+        let again = npu_weight(&rounded).unwrap();
+        assert_eq!(again.data(), rounded.data());
+    }
+
+    #[test]
+    fn a_stack_spec_becomes_weights_with_its_activation_widths_and_projector() {
+        use crate::model::vision_encoder_gpu::{VitStackBlock, VitStackProjector};
+        let (d, ff) = (64usize, 128usize);
+        let w = |rows: usize, cols: usize| {
+            MmapWeight::from_owned_f32(vec![0.25; rows * cols], rows, cols)
+        };
+        let vec = |n: usize| vec![1.0f32; n];
+        let block = || VitStackBlock {
+            ln1_w: vec(d),
+            ln1_b: vec(d),
+            q: w(d, d),
+            q_b: vec(d),
+            k: w(d, d),
+            k_b: vec(d),
+            v: w(d, d),
+            v_b: vec(d),
+            o: w(d, d),
+            o_b: vec(d),
+            ln2_w: vec(d),
+            ln2_b: vec(d),
+            up: w(ff, d),
+            up_b: vec(ff),
+            down: w(d, ff),
+            down_b: vec(d),
+        };
+        let mut spec = VitStackSpec {
+            width: d,
+            heads: 1,
+            ffn: ff,
+            eps: 1e-5,
+            activation: VitStackActivation::Relu,
+            blocks: vec![block(), block()],
+            post: None,
+            projector: Some(VitStackProjector {
+                mm1: w(96, d * 4),
+                mm1_b: vec(96),
+                mm2: w(32, 96),
+                mm2_b: vec(32),
+            }),
+        };
+        let weights = stack_weights(&spec).unwrap();
+        assert_eq!(weights.blocks.len(), 2);
+        assert_eq!((weights.config.n_embd, weights.config.n_ff), (d, ff));
+        assert_eq!(weights.config.projection_dim, 32);
+        assert!(weights.blocks.iter().all(|b| b.q_w.dtype == DType::Q8_0));
+        assert_eq!(weights.projector.mm1_w.dtype, DType::Q8_0);
+        // the planner takes the projector and the dense blocks as Q8_0
+        let offsets = HexagonVitWeightOffsets::plan(&weights).unwrap();
+        assert!(offsets.projector.is_some());
+        // without a projector the planner sees none
+        spec.projector = None;
+        let plain = stack_weights(&spec).unwrap();
+        assert!(
+            HexagonVitWeightOffsets::plan(&plain)
+                .unwrap()
+                .projector
+                .is_none()
+        );
+        // a stack needs a block
+        spec.blocks.clear();
+        assert!(stack_weights(&spec).is_err());
     }
 }

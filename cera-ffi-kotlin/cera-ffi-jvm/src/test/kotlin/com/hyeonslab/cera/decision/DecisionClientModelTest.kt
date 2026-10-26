@@ -26,7 +26,7 @@ class DecisionClientModelTest {
         block: suspend (DecisionClient) -> Unit,
     ) {
         assumeTrue("set CERA_FFI_LIB_DIR and CERA_D1_OMNI_GGUF to run", gguf != null && libDir != null)
-        runBlocking { DecisionClient.open(gguf!!, mmprojPath).use { block(it) } }
+        runBlocking { DecisionClient.open(gguf!!, mmprojPath, BackendPreference.CPU).use { block(it) } }
     }
 
     @Test
@@ -64,13 +64,21 @@ class DecisionClientModelTest {
     }
 
     @Test
-    fun `an accelerator is refused before any file is read`() {
+    fun `a backend report says where the model runs`() =
+        withClient { client ->
+            assertTrue(client.backendReport, client.backendReport.contains("trunk ${client.backendName}"))
+        }
+
+    @Test
+    fun `a missing file is named whatever the backend`() {
         assumeTrue("set CERA_FFI_LIB_DIR to run", libDir != null)
-        try {
-            runBlocking { DecisionClient.open("/no/such/d1.gguf", backend = BackendPreference.GPU) }
-            fail("expected FfiException")
-        } catch (e: FfiException) {
-            assertTrue(e.message.orEmpty(), e.message.orEmpty().contains("run on the CPU"))
+        for (backend in BackendPreference.values()) {
+            try {
+                runBlocking { DecisionClient.open("/no/such/d1.gguf", backend = backend) }
+                fail("expected FfiException for $backend")
+            } catch (e: FfiException) {
+                assertTrue(e.message.orEmpty(), e.message.orEmpty().contains("/no/such/d1.gguf"))
+            }
         }
     }
 

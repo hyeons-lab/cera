@@ -33,6 +33,17 @@ pub const PROBE_ARCHS: [HexagonArch; 5] = [
     HexagonArch::V85,
 ];
 
+/// The skels to try, in order: the DSP's own architecture first when the driver named it
+/// (`detected`, see [`FastRpcDriver::detect_arch`]), then [`PROBE_ARCHS`] in its order. FastRPC
+/// accepts a skel built for an older architecture on a newer DSP, so the order alone would
+/// pick `v79` on a `v81` device.
+pub(crate) fn probe_order(detected: Option<HexagonArch>) -> Vec<HexagonArch> {
+    detected
+        .into_iter()
+        .chain(PROBE_ARCHS.into_iter().filter(|a| Some(*a) != detected))
+        .collect()
+}
+
 /// Serializes `install_skels`: two concurrent installs must neither
 /// interleave a `var`/`set_var` pair (lost prepend) nor share a `.so.tmp`
 /// path mid-write.
@@ -632,6 +643,22 @@ mod tests {
         // Env restore is the `_restore` guard's `Drop` (panic-safe).
     }
 
+    #[test]
+    fn probe_order_puts_the_detected_arch_first() {
+        assert_eq!(probe_order(None), PROBE_ARCHS);
+        assert_eq!(
+            probe_order(Some(HexagonArch::V81)),
+            [
+                HexagonArch::V81,
+                HexagonArch::V79,
+                HexagonArch::V75,
+                HexagonArch::V73,
+                HexagonArch::V85,
+            ]
+        );
+        assert_eq!(probe_order(Some(HexagonArch::V79)), PROBE_ARCHS);
+    }
+
     /// A staging dir containing `;`, `=`, or `\0` fails closed instead of
     /// corrupting the loader path list.
     #[test]
@@ -699,7 +726,7 @@ pub(crate) fn probe_with(
     super::ensure_not_disabled_with(get)?;
     let driver = load()?;
     let mut errors = Vec::new();
-    for arch in PROBE_ARCHS {
+    for arch in probe_order(driver.detect_arch()) {
         match HexagonDevice::new(Arc::clone(&driver), arch) {
             Ok(dev) => {
                 let hw = dev.hw_info();

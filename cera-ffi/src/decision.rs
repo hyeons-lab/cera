@@ -6,8 +6,21 @@
 //! `/v1/systemone` request body llama.cpp serves and returns its response body.
 //!
 //! The public models are `d1-omni-600M` (a GGUF plus its `mmproj` GGUF, which carries the vision
-//! and speech towers) and `d1-3B`. Both run on the CPU in this version: `open` accepts
-//! `Auto` and `Cpu` and refuses an accelerator by name.
+//! and speech towers) and `d1-3B` (a GGUF plus its `mmproj` GGUF for images).
+//!
+//! Backends: `open` takes a [`BackendPreference`]. `Cpu`, `Gpu` (wgpu: Vulkan, or Metal through
+//! wgpu), `Metal` and `Hexagon` / `Npu` open on that backend or fail with the reason, and nothing
+//! falls back behind the caller's back. `Auto` takes the best accelerator that loads the model and
+//! survives a warm-up request, and otherwise the CPU; [`DecisionEngine::backend_report`] says where
+//! each part runs and why `Auto` landed on the CPU if it did. What runs where:
+//!
+//! - d1-omni, trunk: Metal, wgpu or the Hexagon NPU (a bidirectional pass over all rows).
+//! - d1-omni, head and the vision and speech towers: on the trunk's backend (Metal, wgpu or the
+//!   Hexagon NPU; no mixing, so an NPU phone runs all of d1-omni on the NPU). A part the NPU
+//!   cannot take stays on the CPU and the report says which and why. Small host-side steps remain
+//!   (patch embedding, log-mel, the head scorer; the head takes 4096 rows a pass on the NPU).
+//! - d1-3B, trunk and vision tower: Metal, wgpu or the Hexagon NPU, as the engine's causal
+//!   LFM2-VL graph runs them. It has no head.
 //!
 //! Threading: one request runs at a time per engine (a second call waits for the first), and a
 //! request uses the engine's worker pool for its matrix products. [`DecisionEngine::decide_json`]
@@ -59,11 +72,12 @@ impl DecisionEngine {
 
 #[uniffi::export]
 impl DecisionEngine {
-    /// Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of a `d1-omni` model
-    /// for image and speech requests (`None` answers text only).
+    /// Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of the model for image
+    /// (and, for `d1-omni`, speech) requests (`None` answers text only).
     ///
-    /// Blocks while the weights load; use [`DecisionEngine::open_async`] from a UI thread.
-    /// `backend` must be `Cpu` or `Auto` (which runs on the CPU).
+    /// Blocks while the weights load and, for `Auto`, run a warm-up request; use
+    /// [`DecisionEngine::open_async`] from a UI thread. `backend` is a request, see the module
+    /// documentation.
     #[uniffi::constructor]
     pub fn open(
         model_path: String,
@@ -98,9 +112,16 @@ impl DecisionEngine {
         self.inner.supports_audio()
     }
 
-    /// The backend the model runs on: `cpu`.
+    /// The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
     pub fn backend_name(&self) -> String {
         self.inner.backend_name().to_string()
+    }
+
+    /// Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+    /// hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+    /// CPU. For logs and diagnostics; the wording is not a stable format.
+    pub fn backend_report(&self) -> String {
+        self.inner.report().to_string()
     }
 }
 
@@ -170,8 +191,11 @@ mod tests {
     }
 
     #[test]
-    fn open_refuses_an_accelerator_before_touching_any_file() {
+    fn every_backend_preference_reaches_the_engine() {
+        // a missing file is the first refusal whatever the backend, so the path is named
         for backend in [
+            BackendPreference::Auto,
+            BackendPreference::Cpu,
             BackendPreference::Gpu,
             BackendPreference::Metal,
             BackendPreference::Hexagon,
@@ -181,7 +205,7 @@ mod tests {
                 .err()
                 .expect("expected a refusal");
             assert!(
-                err.to_string().contains("run on the CPU"),
+                err.to_string().contains("/no/such/d1.gguf"),
                 "{backend:?}: {err}"
             );
         }

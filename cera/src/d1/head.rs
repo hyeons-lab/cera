@@ -364,6 +364,7 @@ impl Head {
             activation: VitStackActivation::Relu,
             blocks,
             post: None,
+            projector: None,
         })
     }
 

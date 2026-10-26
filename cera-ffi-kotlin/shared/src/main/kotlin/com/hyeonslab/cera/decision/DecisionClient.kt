@@ -30,8 +30,14 @@ class DecisionClient private constructor(
     /** Whether speech requests can be answered (the model's speech tower is loaded). */
     val supportsAudio: Boolean get() = engine.supportsAudio()
 
-    /** The backend the model runs on. Always `cpu` in this version. */
+    /** The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`. */
     val backendName: String get() = engine.backendName()
+
+    /**
+     * Where each part of the model runs (trunk, head, vision and speech towers), and why an
+     * [BackendPreference.AUTO] open ended on the CPU if it did. For logs; not a stable format.
+     */
+    val backendReport: String get() = engine.backendReport()
 
     /**
      * Answer a `/v1/systemone` request and return the response JSON, off the calling thread.
@@ -51,16 +57,20 @@ class DecisionClient private constructor(
 
     companion object {
         /**
-         * Load a decision model on [Dispatchers.IO]. [mmprojPath] is the `mmproj` GGUF of a
-         * `d1-omni` model, which carries its vision and speech towers; without it the model
-         * answers text only. [backend] must be [BackendPreference.CPU] or
-         * [BackendPreference.AUTO] (which runs on the CPU): the d1 head and towers have no
-         * accelerated path yet, and an accelerator is refused with an `FfiException`.
+         * Load a decision model on [Dispatchers.IO]. [mmprojPath] is the `mmproj` GGUF of the
+         * model, which carries its vision tower (and, for `d1-omni`, its speech tower); without
+         * it the model answers text only.
+         *
+         * [backend] is a request. [BackendPreference.CPU], [BackendPreference.GPU] (wgpu),
+         * [BackendPreference.METAL] and [BackendPreference.HEXAGON] / [BackendPreference.NPU]
+         * open on that backend or throw `FfiException` with the reason. [BackendPreference.AUTO]
+         * takes the best accelerator that loads the model and answers a warm-up request, else
+         * the CPU; see [backendReport] for what it chose and why.
          */
         suspend fun open(
             modelPath: String,
             mmprojPath: String? = null,
-            backend: BackendPreference = BackendPreference.CPU,
+            backend: BackendPreference = BackendPreference.AUTO,
         ): DecisionClient =
             withContext(Dispatchers.IO) {
                 DecisionClient(DecisionEngine.openAsync(modelPath, mmprojPath, backend))

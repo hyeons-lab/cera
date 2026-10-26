@@ -401,6 +401,14 @@ pub struct D1Model {
     audio_text_length: usize,
 }
 
+/// One timing line on stderr when `CERA_D1_TRACE` is set (read once).
+pub(crate) fn trace(line: std::fmt::Arguments<'_>) {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("CERA_D1_TRACE").is_some()) {
+        eprintln!("cera-d1: {line}");
+    }
+}
+
 /// Text positions that must survive the media prefix; below this the request is refused.
 const MIN_TEXT_ROOM: usize = 64;
 
@@ -752,7 +760,12 @@ impl D1Model {
                     r.width,
                     r.height
                 );
+                let t_tower = std::time::Instant::now();
                 prefix.extend(tower.encode(std::slice::from_ref(&r))?);
+                trace(format_args!(
+                    "vision tower: {:?} for image {i}",
+                    t_tower.elapsed()
+                ));
             }
             ensure!(
                 prefix.len() / hidden_size == predicted,
@@ -770,7 +783,9 @@ impl D1Model {
             let pcm = audio::prepare_clip(&samples, rate)?;
             let predicted = audio::prefix_rows(pcm.len());
             ensure_media_fits(budget, predicted)?;
+            let t_tower = std::time::Instant::now();
             let prefix = tower.encode(&pcm)?;
+            trace(format_args!("speech tower: {:?}", t_tower.elapsed()));
             // debug-only: `encode` above already refuses a row-count disagreement, so
             // this pins the plumbing; the vision path needs its `ensure!` because its
             // tower does no self-check.
@@ -803,6 +818,7 @@ impl D1Model {
             let (ids, markers) =
                 prompt::encode_with_state_ids(tokenizer, &self.ids, &state_ids, q, max_len, media)
                     .with_context(|| format!("question `{name}`"))?;
+            let t_trunk = std::time::Instant::now();
             let hidden = if has_media {
                 session
                     .hidden_states_with_prefix(&prefix, &ids)
@@ -812,10 +828,17 @@ impl D1Model {
                     .hidden_states_for_tokens(&ids)
                     .with_context(|| format!("question `{name}`"))?
             };
+            let t_head = std::time::Instant::now();
             let scores = self
                 .head
                 .scores(&hidden, ids.len(), q.kind.index(), &markers)
                 .with_context(|| format!("question `{name}` (hidden size {hidden_size})"))?;
+            trace(format_args!(
+                "question `{name}`: trunk {:?} ({} rows + {prefix_rows} prefix), head {:?}",
+                t_head - t_trunk,
+                ids.len(),
+                t_head.elapsed()
+            ));
             // the calibration was fitted on text; media answers are the raw softmax
             let temperature = if has_media { 1.0 } else { self.temperature(q) };
             all.push(

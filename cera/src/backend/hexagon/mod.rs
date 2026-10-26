@@ -454,3 +454,19 @@ mod tests {
         ])));
     }
 }
+
+/// Set by a caller whose work is not interactive: every Hexagon component that waits for the
+/// device on a request (the encoder passes, the ViT stacks) sleeps between polls instead of
+/// busy-polling a short pass. It trades a millisecond or two of wall time per pass for most of
+/// its CPU time, which matters where the OS demotes busy threads.
+static LOW_CPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// See [`LOW_CPU`].
+pub fn set_low_cpu(on: bool) {
+    LOW_CPU.store(on, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Whether [`set_low_cpu`] is on.
+pub fn low_cpu() -> bool {
+    LOW_CPU.load(std::sync::atomic::Ordering::Relaxed)
+}

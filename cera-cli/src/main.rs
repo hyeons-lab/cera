@@ -960,11 +960,12 @@ enum Command {
         #[arg(short, long, default_value = "-")]
         request: String,
 
-        /// Device to use: cpu, gpu, metal, or auto (defaults to cpu; d1 models run on CPU in this version).
+        /// Device to use: cpu, gpu (wgpu), metal, npu / hexagon, or auto (the best accelerator
+        /// that runs the model, else the CPU; the run says what it picked on stderr).
         #[arg(long, default_value = "cpu")]
         device: String,
 
-        /// Longest prompt in tokens. The model supports up to its trained 16384.
+        /// Unused: the context is the model's own (16384 for d1-omni, 8192 for d1-3B).
         #[arg(long, default_value_t = 16384)]
         context_size: usize,
 
@@ -3598,29 +3599,6 @@ fn load_decide_media(
     Ok(request)
 }
 
-/// Refuse a Decide run on an explicitly accelerated backend before any weight
-/// load: the pipeline gates would refuse it after GBs of loads. `cpu`, `auto`,
-/// and unknown spellings (which the engine reports) fall through. GPU and
-/// Metal support arrives with bidirectional extractors, which relax this.
-fn decide_device_ok(device: &str, wants_media: bool) -> anyhow::Result<()> {
-    // match on the engine's own parser, not a re-spelled table: a new
-    // accelerated spelling then refuses here without a second edit
-    let reason = match BackendPreference::parse_str(device) {
-        Ok(BackendPreference::Gpu | BackendPreference::Metal) => {
-            cera::d1::BIDIRECTIONAL_STATES_REASON
-        }
-        Ok(BackendPreference::Hexagon | BackendPreference::Npu) => cera::d1::HIDDEN_STATES_REASON,
-        Ok(BackendPreference::Cpu | BackendPreference::Auto) | Err(_) => return Ok(()),
-    };
-    if wants_media {
-        anyhow::bail!(
-            "media questions need `--device cpu` (this backend {})",
-            cera::d1::MEDIA_PREFIX_REASON
-        );
-    }
-    anyhow::bail!("d1 questions need `--device cpu` (this backend {reason})")
-}
-
 fn main() -> Result<()> {
     #[cfg(target_os = "android")]
     relax_oom_score();
@@ -4527,7 +4505,7 @@ fn main() -> Result<()> {
             mmproj,
             request,
             device,
-            context_size,
+            context_size: _,
             images,
             audio,
         } => {
@@ -4546,52 +4524,11 @@ fn main() -> Result<()> {
             // the pipeline refuses the combination after the model load, so the
             // arm checks here, before reading any media files or loading the model
             let request = load_decide_media(&images, &audio, request)?;
-            // d1 decision models currently run their bidirectional trunk on CPU only;
-            // auto selects CPU so the default CLI run works on Metal and GPU hosts.
-            let run_device = if device == "auto" { "cpu" } else { &device };
-            // same fail-early for the backend: an accelerated device would only
-            // be refused after the tower and trunk weights load below
-            decide_device_ok(
-                run_device,
-                !request.images.is_empty() || request.audio.is_some(),
-            )?;
-            let gguf = std::sync::Arc::new(cera::gguf::GgufFile::open(Path::new(&model))?);
-            // the public causal d1 model answers from the next token and has no head to place:
-            // the one-call engine runs it
-            if cera::d1::public::decision_type(&gguf) == Some(cera::d1::public::CAUSAL_TYPE) {
-                let engine = cera::d1::D1Engine::open(
-                    Path::new(&model),
-                    mmproj.as_deref(),
-                    cera::engine::BackendPreference::Cpu,
-                )?;
-                println!("{}", engine.decide(&request)?.to_json().dumps());
-                return Ok(());
-            }
-            let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
-            let backend = cera::engine::BackendPreference::parse_str(&device)
-                .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let mmproj = mmproj
-                .as_deref()
-                .map(cera::gguf::GgufFile::open_arc)
-                .transpose()?;
-            let mut d1 = cera::d1::D1Model::open(&gguf, mmproj.as_ref(), &tokenizer)?;
-            d1.accelerate_with(&gguf, mmproj.as_ref(), backend);
-            let (head, vision, audio) = d1.accelerated();
-            eprintln!("d1 towers accelerated: head={head} vision={vision} audio={audio}");
-            let engine = resolve_engine(
-                Some(&model),
-                None,
-                None,
-                None,
-                None,
-                None,
-                None,
-                run_device,
-                context_size.min(d1.max_length()),
-            )?;
-            let mut session = engine.new_session(cera::SessionConfig::default())?;
-            let response = d1.answer(&mut session, &tokenizer, &request)?;
-            println!("{}", response.to_json().dumps());
+            let backend =
+                BackendPreference::parse_str(&device).map_err(|e| anyhow::anyhow!("{e}"))?;
+            let engine = cera::d1::D1Engine::open(Path::new(&model), mmproj.as_deref(), backend)?;
+            eprintln!("d1 {}: {}", engine.kind(), engine.report());
+            println!("{}", engine.decide(&request)?.to_json().dumps());
         }
         Command::Cpu => {
             println!("{}", cera::cpu_features().report());
@@ -9360,43 +9297,6 @@ mod tests {
             err.to_string().contains("reading the clip"),
             "unexpected message: {err}"
         );
-    }
-
-    #[test]
-    fn decide_device_ok_refuses_accelerated_backends_before_any_load() {
-        // every spelling the engine accepts, plus a case variant: each refuses
-        // before the weight loads with the reason the pipeline would give late
-        for (device, reason) in [
-            ("gpu", "causal hidden states only"),
-            ("wgpu", "causal hidden states only"),
-            ("metal", "causal hidden states only"),
-            ("hexagon", "cannot read hidden states"),
-            ("htp", "cannot read hidden states"),
-            ("npu", "cannot read hidden states"),
-            ("GPU", "causal hidden states only"),
-        ] {
-            let err = super::decide_device_ok(device, false)
-                .expect_err("expected the device check to refuse");
-            assert!(
-                err.to_string().contains("need `--device cpu`"),
-                "unexpected message: {err}"
-            );
-            assert!(
-                err.to_string().contains(reason),
-                "unexpected message: {err}"
-            );
-            let err = super::decide_device_ok(device, true)
-                .expect_err("expected the device check to refuse");
-            assert!(
-                err.to_string().contains("cannot read a media prefix"),
-                "unexpected message: {err}"
-            );
-        }
-        // cpu, auto, empty, and unknown spellings fall through to the engine
-        for device in ["cpu", "auto", "", "bogus"] {
-            super::decide_device_ok(device, false).unwrap();
-            super::decide_device_ok(device, true).unwrap();
-        }
     }
 
     /// `bench` stamps the first text token or audio frame arrival for TTFT: empty batches must not

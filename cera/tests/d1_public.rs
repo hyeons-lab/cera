@@ -10,6 +10,7 @@
 //!   `resp-omni-{text,image,audio}.json` / `resp-3b-{text,image}.json` answers `llama-server`
 //!   gave for them.
 //! - `CERA_D1_3B_GGUF`, `CERA_D1_3B_MMPROJ`: the `d1-3B` model and its mmproj, for the 3B tests.
+//! - `CERA_D1_BACKEND` (optional, default `cpu`): `cpu`, `gpu`, `metal`, `npu` or `auto`.
 //! - `CERA_D1_TOLERANCE` (optional, default 0.05): the largest absolute difference allowed
 //!   between a probability, a `noul` or a `score` here and in the golden answer. On Q8_0 files
 //!   the two engines differ by up to 0.043 without BLAS and 0.023 with `--features blas` (each
@@ -20,6 +21,15 @@ use std::path::{Path, PathBuf};
 
 use cera::d1::{D1Engine, Json};
 use cera::engine::BackendPreference;
+
+/// The backend under test: `CERA_D1_BACKEND` (`cpu`, `gpu`, `metal`, `npu`, `auto`), default `cpu`.
+fn backend() -> BackendPreference {
+    std::env::var("CERA_D1_BACKEND")
+        .ok()
+        .map_or(BackendPreference::Cpu, |v| {
+            BackendPreference::parse_str(&v).expect("a backend name")
+        })
+}
 
 fn env_path(name: &str) -> Option<PathBuf> {
     std::env::var_os(name).map(PathBuf::from)
@@ -121,7 +131,7 @@ fn the_public_omni_files_answer_like_llama_server() {
         panic!("set CERA_D1_OMNI_GGUF and CERA_D1_GOLDEN_DIR");
     };
     let mmproj = env_path("CERA_D1_OMNI_MMPROJ");
-    let engine = D1Engine::open(&model, mmproj.as_deref(), BackendPreference::Cpu)
+    let engine = D1Engine::open(&model, mmproj.as_deref(), backend())
         .expect("opening the public d1-omni model");
     assert_eq!(engine.kind(), "lfm2-d1-omni");
     let tol = tolerance();
@@ -141,8 +151,7 @@ fn the_public_omni_files_answer_like_llama_server() {
 fn engine_3b(with_mmproj: bool) -> D1Engine {
     let model = env_path("CERA_D1_3B_GGUF").expect("set CERA_D1_3B_GGUF");
     let mmproj = env_path("CERA_D1_3B_MMPROJ").filter(|_| with_mmproj);
-    D1Engine::open(&model, mmproj.as_deref(), BackendPreference::Cpu)
-        .expect("opening the public d1-3B model")
+    D1Engine::open(&model, mmproj.as_deref(), backend()).expect("opening the public d1-3B model")
 }
 
 #[test]

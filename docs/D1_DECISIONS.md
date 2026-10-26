@@ -210,7 +210,7 @@ those two images about 10 s (F16).
 
 ## Backends
 
-`cera decide --device` takes `cpu`, `metal`, `gpu` (wgpu) or `auto`. The same GGUF runs on all of
+`cera decide --device` takes `cpu`, `metal`, `gpu` (wgpu), `npu` (or `hexagon`) or `auto`. The same GGUF runs on all of
 them and the CPU is the reference.
 
 | | Trunk (text, and the rows after a prefix) | Vision tower blocks | Speech encoder | Head layers |
@@ -218,7 +218,7 @@ them and the CPU is the reference.
 | CPU | yes | yes | yes | yes |
 | Metal | yes | yes | yes | yes |
 | wgpu | yes | yes | yes | yes (head_dim 64, desktop adapters and Adreno) |
-| Hexagon NPU | refused | not run | falls back to the CPU | CPU |
+| Hexagon NPU | yes (Q8_0 and F16, text and a media prefix) | yes | yes | yes (up to 4096 rows a pass, the host above) |
 
 The trunk is bidirectional, which the GPU LFM2 graphs were not: they are causal and ignored the
 model's attention mask, so a d1 model used to load on Metal or wgpu and answer a different question
@@ -228,7 +228,8 @@ rule; wgpu uses a register-tiled flash kernel for head_dim 64, `attention_flash_
 same rule), a centred 3-tap gated convolution, and a pass that runs all rows at once: the projections and the
 feed-forward in chunks of the prefill buffers, attention and the convolution as one dispatch over
 every row. A loader refuses a bidirectional checkpoint where it has no such pass (the routed
-`lfm2moe` arch, and the Hexagon NPU), so `--device auto` falls back instead of answering wrongly.
+`lfm2moe` arch), so `--device auto` falls back instead of answering wrongly. The Hexagon NPU has
+the pass too, for the d1 trunk only (see "The public models on every backend").
 
 Against the reference, with identical token counts (Q8_0 over the whole corpus, F16 over ten
 requests that cover text, tiled images and speech):
@@ -349,12 +350,58 @@ every desktop adapter with 30336 bytes of workgroup storage (`GpuContext::suppor
 and off on wasm32 where the build cannot be checked; other Android GPUs use the scalar
 kernel, which is now safe on long prompts but up to twice as slow.
 
+## The public models on every backend
+
+`cera::d1::D1Engine::open(model, mmproj, backend)` (the FFI's `DecisionEngine.open`, Kotlin's
+`DecisionClient.open`) runs the public `d1-omni-600M` and `d1-3B` GGUFs on a backend that is a
+request, not a hope: `Cpu`, `Gpu` (wgpu), `Metal` and `Hexagon` / `Npu` open on that backend or
+fail with the reason, and `Auto` takes the best accelerator that loads the model and answers a
+one-question warm-up request, otherwise the CPU, with the reason in `D1Engine::report()`
+(`DecisionEngine.backendReport()`).
+
+What runs where:
+
+| | trunk | head | vision tower | speech tower |
+|---|---|---|---|---|
+| d1-omni, Metal | Metal | Metal | Metal | Metal |
+| d1-omni, wgpu | wgpu | wgpu | wgpu | wgpu |
+| d1-omni, Hexagon NPU (explicit, or `Auto` with an NPU) | NPU | NPU | NPU | NPU |
+| d1-3B, Metal / wgpu / NPU | that backend | host (scores the trunk's hidden states) | that backend | none (no speech input) |
+
+The NPU trunk is the bidirectional encoder pass of the decision branch's Hexagon backend (the
+generic part: a symmetric 3-tap convolution, a host-built mask without the causal triangle, a
+media prefix encoded on its own and kept as K/V rows and conv state, and a layer-outer driver for
+passes over more than 512 rows). On an NPU phone d1-omni runs on the NPU end to end: the
+trunk, the decision head's layers, the vision tower's blocks and projector, and the speech
+tower's conformer layers, and `Auto` does not mix in the GPU. What stays on the host there is
+small: the patch embedding, the position resize and the pixel shuffle of the vision tower, the
+speech tower's front end (log-mel, the subsampling convolutions) and its residual MLP, and the
+head's scorer (a LayerNorm, one linear and a GELU on a few rows). The head takes up to 4096 rows
+a pass (its scratch is sized for that, about 210 MB); a longer prompt runs the head on the host
+and `report()` says "host above 4096 rows". The matrices the file stores as F32 or F16 (the
+public mmproj's vision linears and its speech pointwise convolutions) are rounded once to Q8_0
+when they are staged on the DSP, so those parts differ from the CPU by Q8_0 rounding (worst
+logit-probability difference 0.003 against the phone CPU on the test image). A part the NPU
+cannot take (the DSP address space is full, a missing op) stays on the CPU, and `report()`
+names it with a note; an explicit NPU request does not hide that either. asked for. d1-3B is the engine's ordinary causal LFM2-VL graph on each backend, with its own
+vision tower. A GPU session cannot be checkpointed, so on Metal, wgpu and the NPU every question
+of a d1-3B request prefills its prompt again (the images are encoded once per request); on the CPU
+the shared prefix is prefilled once.
+
+Limits found on a Snapdragon phone: d1-3B on wgpu runs text but an image of 1024 px or more
+(tiled, about 1800 rows) loses the GPU device on the causal prefill (the mobile GPU watchdog),
+and a 512 px image runs slower than on the CPU, so `Auto` does not choose wgpu for the 3B there; d1-3B
+Q8_0 needs 2.87 GB of the DSP's address space and `fastrpc_mmap` refuses it when another process
+holds enough of it, in which case `Auto` falls back to the CPU and an explicit NPU request fails
+with that error.
+
 ## Not done yet
 
-* The Hexagon NPU refuses a bidirectional checkpoint (so `--device npu` reports why), and no
-  bidirectional pass is written for it.
-* The flash kernel is head_dim 64 only, and on Android only Adreno has been checked (an Adreno
-  830); other head widths and other mobile GPUs use the older kernels.
+* The NPU path leaves the front ends of the towers (patch embedding, position resize, pixel
+  shuffle, log-mel and the subsampling convolutions), the speech tower's residual MLP and the
+  head's scorer on the host.
+* The flash kernel is head_dim 64 only, and on Android only Adreno has been checked (one Adreno
+  phone GPU); other head widths and other mobile GPUs use the older kernels.
 * The media prefix (an image's or a clip's) is recomputed through the trunk for every question; it
   depends only on the media, so it could be computed once.
 * `cera run --hf` and the other streaming conversions refuse a d1 checkpoint: download the

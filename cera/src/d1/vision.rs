@@ -20,7 +20,7 @@ use crate::engine::BackendPreference;
 use crate::gguf::GgufFile;
 use crate::model::pii::matmul_nt_f32;
 use crate::model::vision_encoder_gpu::{
-    VitStack, VitStackActivation, VitStackBlock, VitStackSpec, build_vit_stack,
+    VitStack, VitStackActivation, VitStackBlock, VitStackProjector, VitStackSpec, build_vit_stack,
 };
 use crate::model::weights::MmapWeight;
 use crate::par::*;
@@ -739,6 +739,28 @@ impl VisionTower {
             activation: VitStackActivation::GeluTanh,
             blocks,
             post: Some((self.post_w.clone(), self.post_b.clone())),
+            projector: self.projector_spec(),
+        })
+    }
+
+    /// The projector for backends that run it beside the blocks, when the tower holds the whole
+    /// of it (a block-less test tower may not).
+    fn projector_spec(&self) -> Option<VitStackProjector> {
+        let merged = self.width * UNSHUFFLE * UNSHUFFLE;
+        if self.mm1_w.len() != self.projector_hidden * merged
+            || self.mm2_w.len() != self.out_width * self.projector_hidden
+        {
+            return None;
+        }
+        Some(VitStackProjector {
+            mm1: MmapWeight::from_owned_f32(self.mm1_w.clone(), self.projector_hidden, merged),
+            mm1_b: self.mm1_b.clone(),
+            mm2: MmapWeight::from_owned_f32(
+                self.mm2_w.clone(),
+                self.out_width,
+                self.projector_hidden,
+            ),
+            mm2_b: self.mm2_b.clone(),
         })
     }
 
@@ -885,6 +907,15 @@ impl VisionTower {
             }
         }
         let n = oy * ox;
+        if let Some(gpu) = &self.gpu {
+            match gpu.run_projector(&grouped) {
+                Ok(Some(out)) => return out,
+                Ok(None) => {}
+                Err(e) => crate::d1::warn_cpu_fallback(format_args!(
+                    "the projector of a crop of {n} tokens runs on the CPU: {e:#}"
+                )),
+            }
+        }
         let mut mid = vec![0f32; n * self.projector_hidden];
         matmul_nt_f32(
             n,
@@ -919,12 +950,18 @@ impl VisionTower {
         let mut prefix = Vec::new();
         for image in images {
             for crop in crops(image)? {
+                let started = std::time::Instant::now();
                 let (tokens, rows, cols) = self.tower(&crop);
+                let towered = started.elapsed();
                 ensure!(
                     rows % UNSHUFFLE == 0 && cols % UNSHUFFLE == 0,
                     "a {rows} x {cols} patch grid cannot be unshuffled"
                 );
                 prefix.extend(self.project(&tokens, rows, cols));
+                super::trace(format_args!(
+                    "vision crop {rows}x{cols}: tower {towered:?}, projector {:?}",
+                    started.elapsed() - towered
+                ));
             }
         }
         Ok(prefix)

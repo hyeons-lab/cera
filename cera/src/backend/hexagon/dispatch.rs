@@ -12,11 +12,12 @@
 //! device is needed to check the emitted op sequence.
 
 use super::{
-    HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonQueueSession,
-    HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode, MulMatF32Shape, RpcmemBuffer,
-    build_binary_kernel_params, build_hmx_mm_kernel_params, build_layer_norm_params,
-    build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params, build_softmax_kernel_params,
-    build_ssm_conv_kernel_params, build_unary_kernel_params, mm_hmx_nb1, mm_is_hmx_eligible,
+    HMX_MM_MIN_NROWS, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT,
+    HexagonQueueSession, HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode,
+    MulMatF32Shape, RpcmemBuffer, build_binary_kernel_params, build_hmx_mm_kernel_params,
+    build_layer_norm_params, build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params,
+    build_softmax_kernel_params, build_ssm_conv_kernel_params, build_unary_kernel_params,
+    mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::session::CeraError;
 
@@ -230,11 +231,11 @@ pub(crate) fn linear_m<S: OpSink>(
 
 /// [`linear_m`] that may run the matmul on the HMX matrix unit.
 ///
-/// With `hmx` set, a whole-batch (`TokenTile::Whole`) projection whose dims are 32
-/// aligned and whose batch has at least [`mm_is_hmx_eligible`]'s minimum rows runs the
-/// DSP's HMX matmul, as the LFM2 prefill does: the same repacked weights feed both
-/// kernels and only the dim-1 weight stride differs. Anything else, or a chunking
-/// that does not fit the budget, keeps the HVX matmul.
+/// With `hmx` set, every token run whose dims are 32 aligned and that has at least
+/// [`mm_is_hmx_eligible`]'s minimum rows runs the DSP's HMX matmul, as the LFM2 prefill
+/// does: the same repacked weights feed both kernels and only the dim-1 weight stride
+/// differs. The other runs (a short tile remainder, unaligned dims), a run whose chunking
+/// does not fit the budget, and every run when `hmx` is `None`, keep the HVX matmul.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn linear_m_with<S: OpSink>(
     session: &mut S,
@@ -256,44 +257,59 @@ pub(crate) fn linear_m_with<S: OpSink>(
     let (cols, rows) = (w_desc.cols, w_desc.rows);
     let tiled_row_bytes = cols.div_ceil(32) * tile_size;
     let w_tot = rows.div_ceil(32) * tiled_row_bytes;
-    // One whole-batch run only: the weight tensor's stride is registered once and the
-    // HMX kernel reads it differently from the HVX one.
-    let hmx_kparams = match (hmx, tile) {
-        (Some(h), TokenTile::Whole) if mm_is_hmx_eligible(w_dtype, cols, rows, n_tokens) => {
-            build_hmx_mm_kernel_params(
-                w_dtype,
-                cols,
-                rows,
-                n_tokens.next_multiple_of(32),
-                n_tokens,
-                session.dsp_threads(),
-                h.vtcm_budget,
-            )
+    // Plan every run up front: the kernel parameters (HMX where the run is eligible and a
+    // chunking fits the budget) decide which weight descriptor the run needs.
+    let plan: Vec<(usize, usize, Option<[i32; 32]>)> = token_runs(n_tokens, tile)
+        .map(|(start, run)| {
+            let hmx_kparams = match hmx {
+                Some(h) if mm_is_hmx_eligible(w_dtype, cols, rows, run) => {
+                    build_hmx_mm_kernel_params(
+                        w_dtype,
+                        cols,
+                        rows,
+                        run.next_multiple_of(32),
+                        run,
+                        session.dsp_threads(),
+                        h.vtcm_budget,
+                    )
+                }
+                _ => None,
+            };
+            (start, run, hmx_kparams)
+        })
+        .collect();
+    // The same repacked weights feed both kernels, but HVX walks N rows of K tiles
+    // (`tiled_row_bytes` apart) while HMX addresses N-tile starts as `nc * nb[1]`, so each
+    // needs its own descriptor. Registered in first-use order, before anything else.
+    let mut w_tis: [Option<u16>; 2] = [None, None];
+    for &(_, _, hmx_kparams) in &plan {
+        let for_hmx = hmx_kparams.is_some();
+        if w_tis[usize::from(for_hmx)].is_none() {
+            let nb1 = if for_hmx {
+                mm_hmx_nb1(w_dtype, cols)
+            } else {
+                tiled_row_bytes
+            };
+            w_tis[usize::from(for_hmx)] = Some(session.add_tensor(
+                weights,
+                w_desc.offset,
+                w_desc.size_bytes,
+                HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+                w_dtype as u32,
+                [cols as u32, rows as u32, 1, 1],
+                [block_bytes as u32, nb1 as u32, w_tot as u32, w_tot as u32],
+            )?);
         }
-        _ => None,
-    };
-    let w_nb1 = if hmx_kparams.is_some() {
-        mm_hmx_nb1(w_dtype, cols)
-    } else {
-        tiled_row_bytes
-    };
-    let w_ti = session.add_tensor(
-        weights,
-        w_desc.offset,
-        w_desc.size_bytes,
-        HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
-        w_dtype as u32,
-        [cols as u32, rows as u32, 1, 1],
-        [block_bytes as u32, w_nb1 as u32, w_tot as u32, w_tot as u32],
-    )?;
+    }
     let b_ti = match bias_offset.into() {
         Some(b_off) => Some(add_f32_vector(session, weights, b_off, rows)?),
         None => None,
     };
 
-    for (start, run) in token_runs(n_tokens, tile) {
+    for (start, run, hmx_kparams) in plan {
         let x_ti = add_f32_rows(session, x, x_offset + start * cols * 4, cols, run)?;
         let dst_ti = add_f32_rows(session, dst, dst_offset + start * rows * 4, rows, run)?;
+        let w_ti = w_tis[usize::from(hmx_kparams.is_some())].expect("registered above");
         let kparams = hmx_kparams.unwrap_or_else(|| {
             build_mul_mat_kernel_params(
                 w_dtype,
@@ -319,6 +335,36 @@ pub(crate) fn linear_m_with<S: OpSink>(
         }
     }
     session.end_group().map_err(|e| op_err("linear_m", e))
+}
+
+/// Whether a `[rows, cols]` plain-F16 weight can take [`linear_m_f16`]: the HMX tile edge
+/// divides both dimensions.
+pub(crate) fn f16_mm_shape_ok(rows: usize, cols: usize) -> bool {
+    rows != 0 && cols != 0 && rows.is_multiple_of(32) && cols.is_multiple_of(32)
+}
+
+/// [`f16_mm_kernel_params`] against an explicit VTCM budget (the LFM2 engine sizes its
+/// kernels for the device's whole VTCM).
+pub(crate) fn f16_mm_kernel_params_in(
+    rows: usize,
+    cols: usize,
+    m: usize,
+    threads: u32,
+    vtcm_budget: usize,
+) -> Option<[i32; 32]> {
+    (f16_mm_shape_ok(rows, cols) && m >= HMX_MM_MIN_NROWS)
+        .then(|| {
+            build_hmx_mm_kernel_params(
+                HtpDataType::F16,
+                cols,
+                rows,
+                m.next_multiple_of(32),
+                m,
+                threads,
+                vtcm_budget,
+            )
+        })
+        .flatten()
 }
 
 /// Arguments for [`layer_norm`]: `dst = norm(src) * weight + bias`.
@@ -1424,12 +1470,12 @@ mod tests {
             64usize.div_ceil(32) * 32 * 34
         );
 
-        // Too few rows for the matrix unit, unaligned dims and a tiled batch stay HVX.
+        // Too few rows for the matrix unit and unaligned dims stay HVX (a tiled batch
+        // takes the HMX kernel per run, see `linear_m_with_hmx_picks_the_kernel_per_run`).
         for (tokens, rows, cols, tile) in [
             (4, 96, 64, TokenTile::Whole),
             (280, 96, 48, TokenTile::Whole),
             (280, 90, 64, TokenTile::Whole),
-            (280, 96, 64, TokenTile::Tiles(64)),
         ] {
             let s = run(tokens, rows, cols, tile, hmx);
             assert!(
@@ -1480,6 +1526,105 @@ mod tests {
         let expect =
             build_mul_mat_kernel_params(HtpDataType::Q8_0, 32, 130, 1, 32 * 4, 8, VTCM_BUDGET);
         assert_eq!(s.ops[0].kparams, expect);
+    }
+
+    /// No `hmx` option is `linear_m`, op for op and tensor for tensor.
+    #[test]
+    fn linear_m_with_hmx_off_is_linear_m() {
+        let (mut a, mut b) = (RecordingSink::default(), RecordingSink::default());
+        linear_m(
+            &mut a,
+            &"x",
+            8,
+            &"w",
+            desc(96, 64),
+            512usize,
+            &"y",
+            16,
+            130,
+            TILE_64,
+        )
+        .unwrap();
+        linear_m_with(
+            &mut b,
+            &"x",
+            8,
+            &"w",
+            desc(96, 64),
+            512usize,
+            &"y",
+            16,
+            130,
+            TILE_64,
+            None,
+        )
+        .unwrap();
+        assert_eq!(a.tensors, b.tensors);
+        assert_eq!(a.ops, b.ops);
+    }
+
+    /// An eligible run takes the HMX kernel and a weight descriptor striding
+    /// by the HMX row size; a run under `HMX_MM_MIN_NROWS` stays on HVX with
+    /// the HVX descriptor. Both descriptors are registered once, on first use.
+    #[test]
+    fn linear_m_with_hmx_picks_the_kernel_per_run() {
+        let mut s = RecordingSink::default();
+        // Runs of 64, 64 and 2 tokens.
+        linear_m_with(
+            &mut s,
+            &"x",
+            0,
+            &"w",
+            desc(96, 64),
+            None,
+            &"y",
+            0,
+            130,
+            TILE_64,
+            Some(HmxMm {
+                vtcm_budget: VTCM_BUDGET,
+            }),
+        )
+        .unwrap();
+        assert_eq!(s.opcodes(), vec![OP_MULMAT; 3]);
+        let hmx = build_hmx_mm_kernel_params(HtpDataType::Q8_0, 64, 96, 64, 64, 8, VTCM_BUDGET)
+            .expect("a 64-row Q8_0 matmul fits the VTCM");
+        let hvx = build_mul_mat_kernel_params(HtpDataType::Q8_0, 64, 2, 1, 96 * 4, 8, VTCM_BUDGET);
+        assert_eq!(s.ops[0].kparams, hmx);
+        assert_eq!(s.ops[1].kparams, hmx);
+        assert_eq!(s.ops[2].kparams, hvx);
+        let (w_hmx, w_hvx) = (s.src(0, 0), s.src(2, 0));
+        assert_ne!(w_hmx, w_hvx);
+        assert_eq!(s.src(1, 0), w_hmx, "the HMX descriptor is shared");
+        assert_eq!(w_hmx.nb[1] as usize, mm_hmx_nb1(HtpDataType::Q8_0, 64));
+        assert_eq!(w_hvx.nb[1] as usize, (64 / 32) * 32 * 34);
+        assert_eq!(w_hmx.offset, 4096);
+        assert_eq!(w_hmx.flags, HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK);
+        assert_eq!(s.tensors.iter().filter(|t| t.offset == 4096).count(), 2);
+    }
+
+    /// Dims that are not multiples of 32 are HVX-only, whatever the caller asks.
+    #[test]
+    fn linear_m_with_hmx_leaves_odd_dims_on_hvx() {
+        let mut s = RecordingSink::default();
+        linear_m_with(
+            &mut s,
+            &"x",
+            0,
+            &"w",
+            desc(96, 48),
+            None,
+            &"y",
+            0,
+            64,
+            TokenTile::Whole,
+            Some(HmxMm {
+                vtcm_budget: VTCM_BUDGET,
+            }),
+        )
+        .unwrap();
+        let hvx = build_mul_mat_kernel_params(HtpDataType::Q8_0, 48, 64, 1, 96 * 4, 8, VTCM_BUDGET);
+        assert_eq!(s.ops[0].kparams, hvx);
     }
 
     #[test]

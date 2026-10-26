@@ -27,7 +27,7 @@ use minijinja::Environment;
 use super::json::Json;
 use super::prompt::{Question, QuestionType};
 use super::{Cancelled, D1Request, D1Response, public};
-use crate::session::Session;
+use crate::session::{EncodedImage, Session};
 use crate::tokenizer::BpeTokenizer;
 
 /// The text in the rendered prompt that stands for one image.
@@ -131,6 +131,17 @@ impl CausalD1 {
         for (name, _) in &request.questions {
             ensure!(seen.insert(name), "duplicate question `{name}`");
         }
+        // each image goes through the vision tower once, however many questions follow it
+        let images = request
+            .images
+            .iter()
+            .enumerate()
+            .map(|(i, bytes)| {
+                session
+                    .encode_image(bytes)
+                    .with_context(|| format!("images[{i}]"))
+            })
+            .collect::<Result<Vec<_>>>()?;
         let prepared = request
             .questions
             .iter()
@@ -161,9 +172,12 @@ impl CausalD1 {
         } else {
             0
         };
-        let prefix_checkpoint = if shared > 0 && prepared.len() > 1 {
+        // A session whose key-value state lives on the device (Metal, wgpu, the NPU) cannot be
+        // checkpointed: its questions each start over, which the device's prefill makes cheap.
+        let prefix_checkpoint = if shared > 0 && prepared.len() > 1 && session.checkpoint().is_ok()
+        {
             ensure!(!cancel.load(Ordering::Relaxed), Cancelled);
-            feed(session, &prepared[0].items[..shared], &request.images)?;
+            feed(session, &prepared[0].items[..shared], &images)?;
             Some(
                 session
                     .checkpoint()
@@ -171,6 +185,11 @@ impl CausalD1 {
             )
         } else {
             None
+        };
+        let shared = if prefix_checkpoint.is_some() {
+            shared
+        } else {
+            0
         };
 
         let mut answers = Vec::with_capacity(prepared.len());
@@ -189,7 +208,7 @@ impl CausalD1 {
                     0
                 }
             };
-            feed(session, &prompt.items[from..], &request.images)
+            feed(session, &prompt.items[from..], &images)
                 .with_context(|| format!("question `{name}`"))?;
             input_tokens = input_tokens.saturating_add(session.position() as usize);
             let logits = session
@@ -290,8 +309,8 @@ struct Prepared {
     groups: Vec<Vec<u32>>,
 }
 
-/// Append `items` to the session: runs of tokens in one call, an image by its own encode.
-fn feed(session: &mut Session, items: &[Item], images: &[Vec<u8>]) -> Result<()> {
+/// Append `items` to the session: runs of tokens in one call, an image as its encoded rows.
+fn feed(session: &mut Session, items: &[Item], images: &[EncodedImage]) -> Result<()> {
     let mut run: Vec<u32> = Vec::new();
     for item in items {
         match item {
@@ -300,9 +319,9 @@ fn feed(session: &mut Session, items: &[Item], images: &[Vec<u8>]) -> Result<()>
                 if !run.is_empty() {
                     session.append_tokens(&std::mem::take(&mut run))?;
                 }
-                let bytes = images.get(*i).context("the prompt names a missing image")?;
+                let image = images.get(*i).context("the prompt names a missing image")?;
                 session
-                    .append_image(bytes)
+                    .append_encoded_image(image)
                     .with_context(|| format!("images[{i}]"))?;
             }
         }

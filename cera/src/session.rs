@@ -55,6 +55,20 @@ thread_local! {
     static VL_TIMING: std::cell::Cell<VlTiming> = std::cell::Cell::new(VlTiming::default());
 }
 
+/// An image already run through the vision tower: the embedding rows for the context.
+#[derive(Debug, Clone)]
+pub struct EncodedImage {
+    rows: Vec<f32>,
+    n_tokens: usize,
+}
+
+impl EncodedImage {
+    /// How many context positions the image takes.
+    pub fn n_tokens(&self) -> usize {
+        self.n_tokens
+    }
+}
+
 /// The phase times of the most recent image ingest on the calling thread.
 pub fn last_vl_timing() -> VlTiming {
     VL_TIMING.with(|t| t.get())
@@ -2511,6 +2525,37 @@ impl Session {
         Ok(std::sync::Arc::clone(encoder))
     }
 
+    /// Encode an image into the embedding rows [`Self::append_encoded_image`] appends, without
+    /// touching the context. A caller that puts the same image in front of several prompts
+    /// encodes it once and appends the rows each time.
+    #[cfg(feature = "vl-preprocess")]
+    pub fn encode_image(&self, bytes: &[u8]) -> Result<EncodedImage, CeraError> {
+        self.ensure_usable()?;
+        let (rows, n_tokens) = self.encode_image_rows(bytes, self.image_max_long_size, 0)?;
+        Ok(EncodedImage { rows, n_tokens })
+    }
+
+    /// Append an image encoded by [`Self::encode_image`] on a session of the same model.
+    #[cfg(feature = "vl-preprocess")]
+    pub fn append_encoded_image(&mut self, image: &EncodedImage) -> Result<(), CeraError> {
+        self.ensure_usable()?;
+        self.append_image_rows(&image.rows, image.n_tokens)
+    }
+
+    /// Stub of [`Self::encode_image`] for builds without `vl-preprocess`.
+    #[cfg(not(feature = "vl-preprocess"))]
+    pub fn encode_image(&self, _bytes: &[u8]) -> Result<EncodedImage, CeraError> {
+        self.ensure_usable()?;
+        Err(CeraError::UnsupportedModality)
+    }
+
+    /// Stub of [`Self::append_encoded_image`] for builds without `vl-preprocess`.
+    #[cfg(not(feature = "vl-preprocess"))]
+    pub fn append_encoded_image(&mut self, _image: &EncodedImage) -> Result<(), CeraError> {
+        self.ensure_usable()?;
+        Err(CeraError::UnsupportedModality)
+    }
+
     /// Stub `append_image_with_opts` for builds without `vl-preprocess`.
     #[cfg(not(feature = "vl-preprocess"))]
     pub fn append_image_with_opts(
@@ -2630,15 +2675,14 @@ impl Session {
     }
 
     /// Whether this session can lay a large image out as tiles: the tokenizer resolves the marker
-    /// tokens and the model hands out their embedding rows (CPU, wgpu and Hexagon; native Metal does
-    /// not). Checked before preprocessing so a model that cannot tile never builds tiles it would drop.
+    /// tokens and the model hands out their embedding rows (CPU, wgpu, native Metal and Hexagon). Checked before preprocessing so a model that cannot tile never builds tiles it would drop.
     #[cfg(feature = "vl-preprocess")]
     fn tiling_available(&self) -> bool {
         match self.tile_marker_rows(1, 1) {
             Ok(_) => true,
             Err(why) => {
-                // Not a warning: native Metal never has the rows. A vocabulary that lacks the marker
-                // tokens shows up here too, which is why the reason is kept.
+                // Not a warning: a vocabulary that lacks the marker tokens, or a model that cannot hand
+                // out its embedding rows, is a supported way to run. The reason is kept for the log.
                 tracing::debug!(
                     "tiling unavailable ({why}); large images are encoded as one image"
                 );
