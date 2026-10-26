@@ -72,6 +72,50 @@ impl Json {
         out
     }
 
+    /// Python's `json.dumps(self, ensure_ascii=False, indent=indent)`: one item per line, the
+    /// separators `","` and `": "`, and `[]` / `{}` for an empty container.
+    pub fn dumps_indent(&self, indent: usize) -> String {
+        let mut out = String::new();
+        self.write_indented(&mut out, indent, 0);
+        out
+    }
+
+    fn write_indented(&self, out: &mut String, indent: usize, level: usize) {
+        let pad = |out: &mut String, level: usize| {
+            out.push('\n');
+            out.extend(std::iter::repeat_n(' ', indent * level));
+        };
+        match self {
+            Json::Array(items) if !items.is_empty() => {
+                out.push('[');
+                for (i, item) in items.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    pad(out, level + 1);
+                    item.write_indented(out, indent, level + 1);
+                }
+                pad(out, level);
+                out.push(']');
+            }
+            Json::Object(entries) if !entries.is_empty() => {
+                out.push('{');
+                for (i, (key, value)) in entries.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    pad(out, level + 1);
+                    write_string(out, key);
+                    out.push_str(": ");
+                    value.write_indented(out, indent, level + 1);
+                }
+                pad(out, level);
+                out.push('}');
+            }
+            scalar_or_empty => scalar_or_empty.write_to(out),
+        }
+    }
+
     fn write_to(&self, out: &mut String) {
         match self {
             Json::Null => out.push_str("null"),
@@ -576,5 +620,17 @@ mod tests {
         }
         let deep = "[".repeat(300) + &"]".repeat(300);
         assert!(Json::parse(&deep).is_err());
+    }
+
+    #[test]
+    fn indented_output_is_pythons_json_dumps_with_an_indent() {
+        let value =
+            Json::parse(r#"{"a": [1, 2, {"b": null}], "c": {}, "d": [], "e": "é"}"#).unwrap();
+        assert_eq!(
+            value.dumps_indent(2),
+            "{\n  \"a\": [\n    1,\n    2,\n    {\n      \"b\": null\n    }\n  ],\n  \"c\": {},\n  \"d\": [],\n  \"e\": \"é\"\n}"
+        );
+        assert_eq!(Json::Int("7".into()).dumps_indent(2), "7");
+        assert_eq!(Json::Str("x".into()).dumps_indent(2), "\"x\"");
     }
 }

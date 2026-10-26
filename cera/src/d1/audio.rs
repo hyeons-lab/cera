@@ -267,6 +267,38 @@ pub(crate) fn wav_pcm16_mono_16k_for_test(data: &[u8]) -> Vec<u8> {
     wav_bytes_for_test(1, 1, 16_000, 16, data)
 }
 
+/// Where a file keeps the residual block after the speech adapter.
+#[derive(Debug, Clone, Copy)]
+struct ResidualNames {
+    norm_w: &'static str,
+    norm_b: &'static str,
+    down: &'static str,
+    down_b: &'static str,
+    up: &'static str,
+    up_b: &'static str,
+}
+
+impl ResidualNames {
+    /// A cera-converted file.
+    const CONVERTED: Self = Self {
+        norm_w: "d1.a.res.norm.weight",
+        norm_b: "d1.a.res.norm.bias",
+        down: "d1.a.res.down.weight",
+        down_b: "d1.a.res.down.bias",
+        up: "d1.a.res.up.weight",
+        up_b: "d1.a.res.up.bias",
+    };
+    /// The public mmproj, where the residual continues the adapter's `mm.a.mlp` numbering.
+    const PUBLIC: Self = Self {
+        norm_w: "mm.a.mlp.4.weight",
+        norm_b: "mm.a.mlp.4.bias",
+        down: "mm.a.mlp.5.weight",
+        down_b: "mm.a.mlp.5.bias",
+        up: "mm.a.mlp.6.weight",
+        up_b: "mm.a.mlp.6.bias",
+    };
+}
+
 impl AudioTower {
     /// A tower over an all-zero 8-bin encoder (no conformer blocks) for tests: any
     /// clip encodes to zeros, so the pipeline legs answer evenly through it.
@@ -366,6 +398,45 @@ impl AudioTower {
         // with the cheap scalar reads, before the encoder: a zero residual width
         // would otherwise load and then answer through a degenerate adapter
         let hidden = super::setting_u32(gguf, "d1.audio.residual_width")?;
+        Self::load(gguf, out_width, hidden, ResidualNames::CONVERTED)
+    }
+
+    /// Whether `mmproj` is the `clip` projector of a public d1-omni model with a speech tower.
+    pub fn is_present_public(mmproj: &GgufFile) -> bool {
+        mmproj.get_bool("clip.has_audio_encoder") == Some(true)
+            && mmproj.get_str("clip.audio.projector_type") == Some("d1omni_a")
+    }
+
+    /// Read the speech tower from the mmproj of a public d1-omni model: the standard `clip`
+    /// audio encoder and adapter, then the residual block the model adds after them
+    /// (`mm.a.mlp.4` to `mm.a.mlp.6`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_gguf`].
+    pub fn from_public(mmproj: &Arc<GgufFile>, out_width: usize) -> Result<Self> {
+        // the residual's inner width is the rows of its down projection
+        let hidden = mmproj
+            .tensors
+            .get(ResidualNames::PUBLIC.down)
+            .and_then(|t| t.shape.get(1).copied())
+            .with_context(|| {
+                format!(
+                    "the speech tower needs the tensor `{}`",
+                    ResidualNames::PUBLIC.down
+                )
+            })?;
+        Self::load(mmproj, out_width, hidden, ResidualNames::PUBLIC)
+    }
+
+    fn load(
+        gguf: &Arc<GgufFile>,
+        out_width: usize,
+        hidden: usize,
+        names: ResidualNames,
+    ) -> Result<Self> {
+        // before the encoder: a zero residual width would otherwise load and then answer
+        // through a degenerate adapter
         ensure!(hidden >= 1, "the speech tower has no residual width");
         let encoder = AudioEncoderWeights::from_gguf(gguf).context("the speech encoder")?;
         let width = encoder.config.llm_hidden_size;
@@ -384,12 +455,12 @@ impl AudioTower {
             gpu: None,
             width,
             hidden,
-            norm_w: t("d1.a.res.norm.weight", &[width])?,
-            norm_b: t("d1.a.res.norm.bias", &[width])?,
-            down_w: t("d1.a.res.down.weight", &[hidden, width])?,
-            down_b: t("d1.a.res.down.bias", &[hidden])?,
-            up_w: t("d1.a.res.up.weight", &[width, hidden])?,
-            up_b: t("d1.a.res.up.bias", &[width])?,
+            norm_w: t(names.norm_w, &[width])?,
+            norm_b: t(names.norm_b, &[width])?,
+            down_w: t(names.down, &[hidden, width])?,
+            down_b: t(names.down_b, &[hidden])?,
+            up_w: t(names.up, &[width, hidden])?,
+            up_b: t(names.up_b, &[width])?,
         })
     }
 

@@ -443,8 +443,35 @@ pub fn probabilities(q: &Question, scores: &[f32], temperature: f32) -> Result<V
     Ok(p)
 }
 
+/// TypeSafe's confidence of a `choice`: how far the top probability is above uniform, scaled so
+/// uniform is 0 and certainty is 1.
+fn confidence_choice(p: &[f32]) -> f64 {
+    let n = p.len() as f64;
+    let top = p.iter().copied().map(f64::from).fold(0.0, f64::max);
+    ((top - 1.0 / n) / (1.0 - 1.0 / n)).max(0.0)
+}
+
+/// TypeSafe's confidence of a `score`: 1 minus the mean distance to the most likely level,
+/// relative to that of a uniform distribution around the middle level.
+fn confidence_score(p: &[f32]) -> f64 {
+    let n = p.len() as f64;
+    let mode = p
+        .iter()
+        .enumerate()
+        .fold(0, |best, (i, v)| if *v > p[best] { i } else { best });
+    let dist: f64 = p
+        .iter()
+        .enumerate()
+        .map(|(i, v)| f64::from(*v) * (i as f64 - mode as f64).abs())
+        .sum();
+    let uniform: f64 = (0..p.len())
+        .map(|i| (i as f64 - (n - 1.0) / 2.0).abs() / n)
+        .sum();
+    (1.0 - dist / uniform).max(0.0)
+}
+
 /// A question's answer as the response object: a `noul`'s P(yes); a `choice`'s pick, its
-/// confidence and its probabilities; a `score`'s expected level, its confidence, its
+/// confidence (TypeSafe's formulas) and its probabilities; a `score`'s expected level, its confidence, its
 /// probabilities and the legend of the levels.
 ///
 /// # Errors
@@ -480,7 +507,7 @@ pub fn answer(q: &Question, p: &[f32]) -> Result<Json> {
         return Ok(Json::Object(vec![
             kind("choice"),
             ("choice".into(), Json::Str(names[best].clone())),
-            ("confidence".into(), f(p[best])),
+            ("confidence".into(), Json::Float(confidence_choice(p))),
             ("probabilities".into(), probabilities(names)),
         ]));
     }
@@ -490,13 +517,13 @@ pub fn answer(q: &Question, p: &[f32]) -> Result<Json> {
         q.criteria
             .iter()
             .enumerate()
-            .map(|(i, (_, level))| (i.to_string(), Json::Str(render_value(level))))
+            .map(|(i, (_, level))| (i.to_string(), level.clone()))
             .collect(),
     );
     Ok(Json::Object(vec![
         kind("score"),
         ("score".into(), f(expected)),
-        ("confidence".into(), f(p[best])),
+        ("confidence".into(), Json::Float(confidence_score(p))),
         ("probabilities".into(), probabilities(levels)),
         ("legend".into(), legend),
     ]))
@@ -982,6 +1009,47 @@ mod tests {
         assert!(
             err.to_string().contains("(has 1)"),
             "unexpected message: {err}"
+        );
+    }
+
+    /// TypeSafe's formulas: uniform is 0, certainty is 1, and a score is scored by how
+    /// concentrated it is around its mode.
+    #[test]
+    fn confidences_follow_the_typesafe_formulas() {
+        let choice =
+            q(r#"{"type":"choice","instructions":"?","criteria":{"a":null,"b":null,"c":null}}"#);
+        let answer_of = |q: &Question, p: &[f32]| answer(q, p).unwrap();
+        let confidence = |a: &Json| match a.get("confidence") {
+            Some(Json::Float(v)) => *v,
+            other => panic!("no float confidence: {other:?}"),
+        };
+        let uniform = answer_of(&choice, &[1.0 / 3.0; 3]);
+        assert!(confidence(&uniform).abs() < 1e-6);
+        let sure = answer_of(&choice, &[1.0, 0.0, 0.0]);
+        assert!((confidence(&sure) - 1.0).abs() < 1e-9);
+        // (0.8 - 1/3) / (1 - 1/3)
+        let likely = answer_of(&choice, &[0.8, 0.1, 0.1]);
+        assert!((confidence(&likely) - 0.7).abs() < 1e-6);
+        let score = q(r#"{"type":"score","instructions":"?","criteria":["a","b","c"]}"#);
+        let sure = answer_of(&score, &[0.0, 1.0, 0.0]);
+        assert!((confidence(&sure) - 1.0).abs() < 1e-9);
+        // the mode is level 0 (first maximum), the mean distance to it 0.5 * 2, and a uniform
+        // distribution around the middle level has (1 + 0 + 1) / 3
+        let spread = answer_of(&score, &[0.5, 0.0, 0.5]);
+        assert_eq!(confidence(&spread), 0.0);
+        let mild = answer_of(&score, &[0.7, 0.2, 0.1]);
+        let want = 1.0 - (0.2 * 1.0 + 0.1 * 2.0) / (2.0 / 3.0);
+        assert!((confidence(&mild) - want).abs() < 1e-6);
+    }
+
+    /// A score's legend returns the level descriptions as given, structured ones included.
+    #[test]
+    fn a_score_legend_keeps_structured_levels() {
+        let q = q(r#"{"type":"score","instructions":"?","criteria":["low",{"x":1}]}"#);
+        let a = answer(&q, &[0.5, 0.5]).unwrap();
+        assert_eq!(
+            a.get("legend").unwrap().dumps(),
+            r#"{"0": "low", "1": {"x": 1}}"#
         );
     }
 }

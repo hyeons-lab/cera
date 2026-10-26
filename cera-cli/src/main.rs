@@ -947,9 +947,14 @@ enum Command {
     /// `--request` (a file, or `-` for stdin) and prints the answers as JSON. Each question is
     /// one forward pass over the bidirectional trunk; nothing is generated.
     Decide {
-        /// Path to the d1 model `.gguf` (see `convert`).
+        /// Path to the d1 model `.gguf`: a file made by `convert`, or the public d1-omni model.
         #[arg(short, long)]
         model: String,
+
+        /// The `mmproj` GGUF of a public d1-omni model, which carries its vision and speech
+        /// towers. A converted model has them inside and takes none.
+        #[arg(long)]
+        mmproj: Option<PathBuf>,
 
         /// Request JSON file, or `-` to read it from stdin.
         #[arg(short, long, default_value = "-")]
@@ -4519,6 +4524,7 @@ fn main() -> Result<()> {
         }
         Command::Decide {
             model,
+            mmproj,
             request,
             device,
             context_size,
@@ -4550,11 +4556,26 @@ fn main() -> Result<()> {
                 !request.images.is_empty() || request.audio.is_some(),
             )?;
             let gguf = std::sync::Arc::new(cera::gguf::GgufFile::open(Path::new(&model))?);
+            // the public causal d1 model answers from the next token and has no head to place:
+            // the one-call engine runs it
+            if cera::d1::public::decision_type(&gguf) == Some(cera::d1::public::CAUSAL_TYPE) {
+                let engine = cera::d1::D1Engine::open(
+                    Path::new(&model),
+                    mmproj.as_deref(),
+                    cera::engine::BackendPreference::Cpu,
+                )?;
+                println!("{}", engine.decide(&request)?.to_json().dumps());
+                return Ok(());
+            }
             let tokenizer = cera::tokenizer::BpeTokenizer::from_gguf(&gguf)?;
             let backend = cera::engine::BackendPreference::parse_str(&device)
                 .map_err(|e| anyhow::anyhow!("{e}"))?;
-            let mut d1 = cera::d1::D1Model::from_gguf(&gguf, &tokenizer)?;
-            d1.accelerate(&gguf, backend);
+            let mmproj = mmproj
+                .as_deref()
+                .map(cera::gguf::GgufFile::open_arc)
+                .transpose()?;
+            let mut d1 = cera::d1::D1Model::open(&gguf, mmproj.as_ref(), &tokenizer)?;
+            d1.accelerate_with(&gguf, mmproj.as_ref(), backend);
             let (head, vision, audio) = d1.accelerated();
             eprintln!("d1 towers accelerated: head={head} vision={vision} audio={audio}");
             let engine = resolve_engine(

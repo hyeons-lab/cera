@@ -19,7 +19,7 @@
 //! feed-forward for the marker rows alone; every earlier layer needs all rows because the next
 //! layer attends over them.
 
-use anyhow::{Result, ensure};
+use anyhow::{Context, Result, ensure};
 
 use std::sync::Arc;
 
@@ -68,8 +68,32 @@ pub struct Head {
     cls_b: Vec<f32>,
     out_w: Vec<f32>,
     out_b: f32,
+    /// Where the block tensors live, for [`Head::accelerate`].
+    blocks: BlockNames,
     /// The transformer layers on a GPU, when [`Head::accelerate`] found one.
     gpu: Option<Arc<dyn VitStack>>,
+}
+
+/// Where a file keeps the head's block tensors: `{prefix}.{first + i}.{name}.weight`.
+#[derive(Debug, Clone, Copy)]
+struct BlockNames {
+    prefix: &'static str,
+    first: usize,
+}
+
+/// Where a file keeps the head: its settings and the names of its tensors. The converted layout
+/// is `d1.*`; the public one sits beside the trunk (see [`super::public`]).
+#[derive(Debug, Clone, Copy)]
+struct Layout {
+    blocks: usize,
+    n_heads: usize,
+    ffn: usize,
+    eps: f32,
+    names: BlockNames,
+    /// `{cls}.norm.weight`, `{cls}.weight`, `{cls}.bias`, `{cls}.output.weight`, `{cls}.output.bias`.
+    cls: &'static str,
+    /// The question-type table.
+    types: &'static str,
 }
 
 impl std::fmt::Debug for Head {
@@ -126,9 +150,71 @@ impl Head {
     /// present epsilon is not positive and finite.
     pub fn from_gguf(gguf: &GgufFile, n_embd: usize) -> Result<Self> {
         let setting = |key: &str| super::setting_u32(gguf, key);
-        let blocks = setting("d1.head.block_count")?;
-        let n_heads = setting("d1.head.attention.head_count")?;
-        let ffn = setting("d1.head.feed_forward_length")?;
+        let layout = Layout {
+            blocks: setting("d1.head.block_count")?,
+            n_heads: setting("d1.head.attention.head_count")?,
+            ffn: setting("d1.head.feed_forward_length")?,
+            eps: gguf.get_f32("d1.head.layer_norm_epsilon").unwrap_or(1e-5),
+            names: BlockNames {
+                prefix: "d1.blk",
+                first: 0,
+            },
+            cls: "d1.cls",
+            types: "d1.question_type.weight",
+        };
+        Self::load(gguf, n_embd, layout)
+    }
+
+    /// Read the head of a public d1-omni file (`lfm2.decision.*`, `blk.{trunk + i}`, `cls.*`,
+    /// `token_types.weight`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_gguf`], and when the file has no blocks after the trunk's.
+    pub fn from_public(gguf: &GgufFile, n_embd: usize) -> Result<Self> {
+        let blocks = super::setting_u32(gguf, "lfm2.decision.block_count")?;
+        let stored = super::setting_u32(gguf, "lfm2.block_count")?;
+        let first = stored
+            .checked_sub(blocks)
+            .context("lfm2.decision.block_count exceeds lfm2.block_count")?;
+        // the width is the first head block's `ffn_up` output rows: `lfm2.feed_forward_length` is
+        // a per-block array in these files
+        let ffn = if blocks == 0 {
+            0
+        } else {
+            let name = format!("blk.{first}.ffn_up.weight");
+            gguf.tensors
+                .get(&name)
+                .and_then(|t| t.shape.get(1).copied())
+                .with_context(|| format!("the head needs the tensor `{name}`"))?
+        };
+        let layout = Layout {
+            blocks,
+            n_heads: super::setting_u32(gguf, "lfm2.attention.head_count")?,
+            ffn,
+            eps: gguf
+                .get_f32("lfm2.attention.layer_norm_epsilon")
+                .unwrap_or(1e-5),
+            names: BlockNames {
+                prefix: "blk",
+                first,
+            },
+            cls: "cls",
+            types: "token_types.weight",
+        };
+        Self::load(gguf, n_embd, layout)
+    }
+
+    fn load(gguf: &GgufFile, n_embd: usize, layout: Layout) -> Result<Self> {
+        let Layout {
+            blocks,
+            n_heads,
+            ffn,
+            eps,
+            names,
+            cls,
+            types,
+        } = layout;
         ensure!(n_embd >= 1, "the head is 0 wide");
         // checked: `n_heads` is file-declared, and the multiply wraps on 32-bit
         // (67108865 heads * 64 reads back as 64 wide), passing a hostile count
@@ -143,7 +229,6 @@ impl Head {
             blocks == 0 || ffn >= 1,
             "the head has no feed-forward width"
         );
-        let eps = gguf.get_f32("d1.head.layer_norm_epsilon").unwrap_or(1e-5);
         // old files without the key still default; a present-but-bad value would
         // silently degenerate every score (+inf zeroes each norm to its bias), so refuse it here
         ensure!(
@@ -158,7 +243,7 @@ impl Head {
             // element counts multiply file-declared widths, so they route
             // through the checked product: the plain multiply wraps on 32-bit
             let t = |suffix: &str, factors: &[usize]| {
-                let name = format!("d1.blk.{i}.{suffix}");
+                let name = format!("{}.{}.{suffix}", names.prefix, names.first + i);
                 let elements = super::checked_len(&name, factors)?;
                 super::load_f32(gguf, "head", &name, elements)
             };
@@ -177,30 +262,27 @@ impl Head {
                 down_b: t("ffn_down.bias", &[d])?,
             });
         }
-        let out_b = super::load_f32(gguf, "head", "d1.cls.output.bias", 1)?[0];
+        let cls_name = |suffix: &str| format!("{cls}.{suffix}");
+        let out_b = super::load_f32(gguf, "head", &cls_name("output.bias"), 1)?[0];
         Ok(Self {
             n_embd,
             n_heads,
             ffn,
             eps,
-            types: super::load_f32(
-                gguf,
-                "head",
-                "d1.question_type.weight",
-                super::checked_len("d1.question_type.weight", &[TYPES, d])?,
-            )?,
+            types: super::load_f32(gguf, "head", types, super::checked_len(types, &[TYPES, d])?)?,
             layers,
-            cls_norm_w: super::load_f32(gguf, "head", "d1.cls.norm.weight", d)?,
-            cls_norm_b: super::load_f32(gguf, "head", "d1.cls.norm.bias", d)?,
+            cls_norm_w: super::load_f32(gguf, "head", &cls_name("norm.weight"), d)?,
+            cls_norm_b: super::load_f32(gguf, "head", &cls_name("norm.bias"), d)?,
             cls_w: super::load_f32(
                 gguf,
                 "head",
-                "d1.cls.weight",
-                super::checked_len("d1.cls.weight", &[d, d])?,
+                &cls_name("weight"),
+                super::checked_len(&cls_name("weight"), &[d, d])?,
             )?,
-            cls_b: super::load_f32(gguf, "head", "d1.cls.bias", d)?,
-            out_w: super::load_f32(gguf, "head", "d1.cls.output.weight", d)?,
+            cls_b: super::load_f32(gguf, "head", &cls_name("bias"), d)?,
+            out_w: super::load_f32(gguf, "head", &cls_name("output.weight"), d)?,
             out_b,
+            blocks: names,
             gpu: None,
         })
     }
@@ -215,7 +297,15 @@ impl Head {
             return;
         }
         let from_file = |i: usize, name: &str, rows: usize, cols: usize| -> Result<MmapWeight> {
-            crate::d1::block_weight(gguf, "d1.blk", "head", i, name, rows, cols)
+            crate::d1::block_weight(
+                gguf,
+                self.blocks.prefix,
+                "head",
+                self.blocks.first + i,
+                name,
+                rows,
+                cols,
+            )
         };
         match self.stack_spec(from_file) {
             // A backend that cannot build must not clear a working stack: only `Some` sticks.
@@ -598,6 +688,10 @@ mod tests {
             cls_b: zeros(d),
             out_w: ones(d),
             out_b: 0.25,
+            blocks: BlockNames {
+                prefix: "d1.blk",
+                first: 0,
+            },
             gpu: None,
         }
     }
@@ -694,6 +788,10 @@ mod tests {
             cls_b: noise(d, 11, 0.1),
             out_w: noise(d, 12, 0.3),
             out_b: 0.1,
+            blocks: BlockNames {
+                prefix: "d1.blk",
+                first: 0,
+            },
             gpu: None,
         }
     }
@@ -993,5 +1091,117 @@ mod tests {
                 "unexpected message: {err}"
             );
         }
+    }
+
+    /// One head block's tensors as `(suffix, dims, values)`, shared by both file layouts.
+    fn block_tensors(d: usize, ffn: usize) -> Vec<(&'static str, Vec<usize>, Vec<f32>)> {
+        let ones = |n: usize| {
+            noise(n, 3, 0.05)
+                .iter()
+                .map(|v| v + 1.0)
+                .collect::<Vec<_>>()
+        };
+        vec![
+            ("attn_norm.weight", vec![d], ones(d)),
+            ("attn_norm.bias", vec![d], noise(d, 4, 0.05)),
+            ("attn_qkv.weight", vec![d, 3 * d], noise(3 * d * d, 5, 0.1)),
+            ("attn_qkv.bias", vec![3 * d], noise(3 * d, 6, 0.05)),
+            ("attn_output.weight", vec![d, d], noise(d * d, 7, 0.1)),
+            ("attn_output.bias", vec![d], noise(d, 8, 0.05)),
+            ("ffn_norm.weight", vec![d], ones(d)),
+            ("ffn_norm.bias", vec![d], noise(d, 9, 0.05)),
+            ("ffn_up.weight", vec![d, ffn], noise(ffn * d, 10, 0.1)),
+            ("ffn_up.bias", vec![ffn], noise(ffn, 11, 0.05)),
+            ("ffn_down.weight", vec![ffn, d], noise(d * ffn, 12, 0.1)),
+            ("ffn_down.bias", vec![d], noise(d, 13, 0.05)),
+        ]
+    }
+
+    /// The scorer tensors: `(suffix, dims, values)` under the layout's `cls` prefix.
+    fn scorer_tensors(d: usize) -> Vec<(&'static str, Vec<usize>, Vec<f32>)> {
+        vec![
+            (
+                "norm.weight",
+                vec![d],
+                noise(d, 14, 0.05).iter().map(|v| v + 1.0).collect(),
+            ),
+            ("norm.bias", vec![d], noise(d, 15, 0.05)),
+            ("weight", vec![d, d], noise(d * d, 16, 0.1)),
+            ("bias", vec![d], noise(d, 17, 0.05)),
+            ("output.weight", vec![d], noise(d, 18, 0.2)),
+            ("output.bias", vec![1], vec![0.125]),
+        ]
+    }
+
+    /// The same one-block head in both layouts: converted `d1.*`, and public with two trunk
+    /// blocks stored ahead of the head block.
+    fn both_layouts() -> (crate::gguf::GgufFile, crate::gguf::GgufFile) {
+        let (d, ffn) = (HEAD_DIM, 128);
+        let types = noise(TYPES * d, 19, 0.2);
+        let mut converted = crate::gguf::GgufBuilder::new()
+            .kv_u32("d1.head.block_count", 1)
+            .kv_u32("d1.head.attention.head_count", 1)
+            .kv_u32("d1.head.feed_forward_length", ffn as u32)
+            .tensor_f32("d1.question_type.weight", &[TYPES, d], &types);
+        let mut public = crate::gguf::GgufBuilder::new()
+            .kv_u32("lfm2.block_count", 3)
+            .kv_u32("lfm2.decision.block_count", 1)
+            .kv_u32("lfm2.attention.head_count", 1)
+            .kv_f32("lfm2.attention.layer_norm_epsilon", 1e-5)
+            .tensor_f32("token_types.weight", &[d, TYPES], &types);
+        for (suffix, dims, values) in block_tensors(d, ffn) {
+            converted = converted.tensor_f32(format!("d1.blk.0.{suffix}"), &dims, &values);
+            public = public.tensor_f32(format!("blk.2.{suffix}"), &dims, &values);
+        }
+        for (suffix, dims, values) in scorer_tensors(d) {
+            converted = converted.tensor_f32(format!("d1.cls.{suffix}"), &dims, &values);
+            public = public.tensor_f32(format!("cls.{suffix}"), &dims, &values);
+        }
+        (converted.build(), public.build())
+    }
+
+    /// A public file's head scores exactly what the same weights score in the converted layout.
+    #[test]
+    fn the_public_layout_scores_like_the_converted_one() {
+        let (converted, public) = both_layouts();
+        let from_converted = Head::from_gguf(&converted, HEAD_DIM).unwrap();
+        let from_public = Head::from_public(&public, HEAD_DIM).unwrap();
+        let n = 6;
+        let hidden = noise(n * HEAD_DIM, 21, 1.0);
+        for question_type in 0..TYPES {
+            let want = from_converted
+                .scores(&hidden, n, question_type, &[1, 3, 4])
+                .unwrap();
+            let got = from_public
+                .scores(&hidden, n, question_type, &[1, 3, 4])
+                .unwrap();
+            assert_eq!(want, got, "question type {question_type}");
+        }
+    }
+
+    /// The head blocks sit at the end of `lfm2.block_count`, so a missing block is named.
+    #[test]
+    fn a_public_file_missing_its_head_block_names_the_tensor() {
+        let public = crate::gguf::GgufBuilder::new()
+            .kv_u32("lfm2.block_count", 3)
+            .kv_u32("lfm2.decision.block_count", 1)
+            .kv_u32("lfm2.attention.head_count", 1)
+            .build();
+        let err = Head::from_public(&public, HEAD_DIM).expect_err("expected a refusal");
+        assert!(
+            err.to_string().contains("blk.2.ffn_up.weight"),
+            "unexpected message: {err}"
+        );
+        // more head blocks than blocks is a corrupt count
+        let public = crate::gguf::GgufBuilder::new()
+            .kv_u32("lfm2.block_count", 1)
+            .kv_u32("lfm2.decision.block_count", 2)
+            .kv_u32("lfm2.attention.head_count", 1)
+            .build();
+        let err = Head::from_public(&public, HEAD_DIM).expect_err("expected a refusal");
+        assert!(
+            err.to_string().contains("exceeds"),
+            "unexpected message: {err}"
+        );
     }
 }

@@ -9,7 +9,8 @@
 //!
 //! The trunk is an ordinary non-causal `lfm2` model, so it runs wherever the engine does: this
 //! module only adds what sits on top of it, reading the `d1.*` tensors and settings of a GGUF
-//! made by [`crate::convert::d1`].
+//! made by [`crate::convert::d1`], or the head and towers of the public `d1-omni` files
+//! ([`public`]: the model GGUF, and the `clip` mmproj that holds the vision and speech towers).
 //!
 //! ```no_run
 //! # fn main() -> anyhow::Result<()> {
@@ -28,13 +29,17 @@
 //! ```
 
 pub mod audio;
+pub mod causal;
+pub mod engine;
 pub mod head;
 pub mod json;
 pub mod prompt;
+pub mod public;
 pub mod vision;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use anyhow::{Context, Result, ensure};
 
@@ -44,6 +49,7 @@ use crate::model::weights::MmapWeight;
 use crate::session::Session;
 use crate::tokenizer::BpeTokenizer;
 
+pub use engine::D1Engine;
 pub use json::Json;
 pub use prompt::{Question, QuestionType};
 
@@ -214,7 +220,9 @@ pub struct D1Request {
 
 impl D1Request {
     /// Parse `{"state": <any JSON>, "questions": {name: {"type", "instructions", "criteria"}},
-    /// "images": [<base64 data URL>, ...], "audio": <base64 data URL of a WAV>}`. A missing or
+    /// "images": [<base64 data URL>, ...], "audio": <base64 data URL of a WAV>}`. `files` is an
+    /// alias of `images`, and an `images` entry that is a `data:audio/...` URL is the speech clip,
+    /// as in llama.cpp's `/v1/systemone`. A missing or
     /// null `state` is no state: the empty string, or `{}` after speech, as the model was
     /// trained.
     ///
@@ -237,35 +245,50 @@ impl D1Request {
                     .with_context(|| format!("question `{name}`"))
             })
             .collect::<Result<_>>()?;
-        // the combo refusal runs on key presence, before either payload decodes:
-        // a both-media body reports the combo error, never a base64 error, and
-        // no refused byte is decoded (presence matches the decoded check exactly:
-        // each array entry yields one image, each non-null audio yields the clip)
-        let images_present =
-            matches!(body.get("images"), Some(Json::Array(urls)) if !urls.is_empty());
-        let audio_present = !matches!(body.get("audio"), None | Some(Json::Null));
+        // `images` and its alias `files` carry the media as data URLs, and an `audio/` one is the
+        // speech clip (llama.cpp's request); `audio` is the clip on its own. The combo refusal
+        // runs on the URLs' presence, before any payload decodes: a both-media body reports the
+        // combo error, never a base64 error, and no refused byte is decoded.
+        let urls = ["files", "images"]
+            .into_iter()
+            .map(|key| match body.get(key) {
+                None | Some(Json::Null) => Ok(Vec::new()),
+                Some(Json::Array(urls)) => urls
+                    .iter()
+                    .enumerate()
+                    .map(|(i, url)| {
+                        url.as_str()
+                            .map(|url| (format!("{key}[{i}]"), url))
+                            .with_context(|| format!("{key}[{i}] must be a base64 data URL"))
+                    })
+                    .collect::<Result<Vec<_>>>(),
+                Some(_) => anyhow::bail!("\"{key}\" must be an array of base64 data URLs"),
+            })
+            .collect::<Result<Vec<_>>>()?
+            .concat();
+        let (clips, pictures): (Vec<_>, Vec<_>) = urls
+            .into_iter()
+            .partition(|(_, url)| vision::is_audio_data_url(url));
+        let audio_key_present = !matches!(body.get("audio"), None | Some(Json::Null));
         ensure!(
-            Self::media_combo_ok(images_present, audio_present),
+            Self::media_combo_ok(!pictures.is_empty(), audio_key_present || !clips.is_empty()),
             "{}",
             Self::MEDIA_COMBO_ERR
         );
-        let images = match body.get("images") {
-            None | Some(Json::Null) => Vec::new(),
-            Some(Json::Array(urls)) => urls
-                .iter()
-                .enumerate()
-                .map(|(i, url)| {
-                    let url = url
-                        .as_str()
-                        .with_context(|| format!("images[{i}] must be a base64 data URL"))?;
-                    vision::decode_data_url(url).with_context(|| format!("images[{i}]"))
-                })
-                .collect::<Result<_>>()?,
-            Some(_) => anyhow::bail!("\"images\" must be an array of base64 data URLs"),
-        };
-        let audio = match body.get("audio") {
-            None | Some(Json::Null) => None,
-            Some(url) => {
+        ensure!(
+            clips.len() + usize::from(audio_key_present) <= 1,
+            "a request carries one speech clip"
+        );
+        let images: Vec<Vec<u8>> = pictures
+            .iter()
+            .map(|(label, url)| vision::decode_data_url(url).with_context(|| label.clone()))
+            .collect::<Result<_>>()?;
+        let audio = match (body.get("audio"), clips.first()) {
+            (None | Some(Json::Null), None) => None,
+            (None | Some(Json::Null), Some((label, url))) => {
+                Some(vision::decode_data_url(url).with_context(|| label.clone())?)
+            }
+            (Some(url), _) => {
                 let url = url
                     .as_str()
                     .context("\"audio\" must be a base64 data URL of a WAV file")?;
@@ -349,6 +372,18 @@ impl D1Response {
         ])
     }
 }
+
+/// A request stopped between two forward passes because its cancel flag was set.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Cancelled;
+
+impl std::fmt::Display for Cancelled {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("cancelled")
+    }
+}
+
+impl std::error::Error for Cancelled {}
 
 /// The d1 half of a loaded model: the head, the calibration and the prompt's token ids.
 pub struct D1Model {
@@ -460,6 +495,83 @@ impl D1Model {
         })
     }
 
+    /// Read a public `d1-omni` model: `gguf` is the model file and `mmproj` the `clip` file that
+    /// carries its vision and speech towers. Without an mmproj the model answers text only.
+    ///
+    /// # Errors
+    ///
+    /// Fails when `gguf` is not a public d1-omni file, its tokenizer lacks a d1 delimiter, its
+    /// trunk is causal, a tensor or setting is missing, or `mmproj` carries neither tower.
+    pub fn from_public(
+        gguf: &Arc<GgufFile>,
+        mmproj: Option<&Arc<GgufFile>>,
+        tokenizer: &BpeTokenizer,
+    ) -> Result<Self> {
+        ensure!(
+            public::is_omni(gguf),
+            "not a public d1-omni model (lfm2.decision.type is {:?})",
+            gguf.get_str("lfm2.decision.type")
+        );
+        let ids = prompt::PromptTokens::from_tokenizer(tokenizer)?;
+        ensure!(
+            !crate::model::lfm2::gguf_is_causal(gguf, "lfm2"),
+            "a d1 decision model needs a bidirectional trunk (lfm2.attention.causal)"
+        );
+        let n_embd = setting_u32(gguf, "lfm2.embedding_length")?;
+        ensure!(n_embd >= 1, "lfm2.embedding_length is 0");
+        let temperatures = public::temperatures(gguf)?;
+        let head = head::Head::from_public(gguf, n_embd)?;
+        let vision = mmproj
+            .filter(|m| vision::VisionTower::is_present_public(m))
+            .map(|m| vision::VisionTower::from_public(m, n_embd))
+            .transpose()?;
+        let audio = mmproj
+            .filter(|m| audio::AudioTower::is_present_public(m))
+            .map(|m| audio::AudioTower::from_public(m, n_embd))
+            .transpose()?;
+        ensure!(
+            mmproj.is_none() || vision.is_some() || audio.is_some(),
+            "the mmproj has neither a d1-omni vision nor a speech tower"
+        );
+        Ok(Self {
+            head,
+            n_embd,
+            vision,
+            temperatures,
+            ids,
+            max_length: public::OMNI_MAX_LENGTH,
+            image_text_length: public::OMNI_IMAGE_TEXT_LENGTH,
+            audio,
+            audio_text_length: public::OMNI_AUDIO_TEXT_LENGTH,
+        })
+    }
+
+    /// Read a d1 model of either layout: a cera-converted file (`mmproj` must be `None`, its
+    /// towers are inside) or a public `d1-omni` pair.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_gguf`] or [`Self::from_public`], and when `gguf` is neither.
+    pub fn open(
+        gguf: &Arc<GgufFile>,
+        mmproj: Option<&Arc<GgufFile>>,
+        tokenizer: &BpeTokenizer,
+    ) -> Result<Self> {
+        if public::is_omni(gguf) {
+            return Self::from_public(gguf, mmproj, tokenizer);
+        }
+        ensure!(
+            Self::is_d1(gguf),
+            "not a d1 model (no d1.head.block_count, and lfm2.decision.type is {:?})",
+            gguf.get_str("lfm2.decision.type")
+        );
+        ensure!(
+            mmproj.is_none(),
+            "a converted d1 model carries its own towers; an mmproj belongs to a public d1 model"
+        );
+        Self::from_gguf(gguf, tokenizer)
+    }
+
     /// Which towers run on an accelerator: (head, vision, audio). A tower the model lacks reports false.
     pub fn accelerated(&self) -> (bool, bool, bool) {
         (
@@ -479,13 +591,33 @@ impl D1Model {
     /// model was loaded from: stack weights are matched by shape only, so a different
     /// same-geometry file would silently mix its weights with this model's biases.
     pub fn accelerate(&mut self, gguf: &Arc<GgufFile>, backend: BackendPreference) {
+        self.accelerate_with(gguf, None, backend);
+    }
+
+    /// As [`Self::accelerate`] for a public model, whose vision tower weights are in `mmproj`.
+    pub fn accelerate_with(
+        &mut self,
+        gguf: &Arc<GgufFile>,
+        mmproj: Option<&Arc<GgufFile>>,
+        backend: BackendPreference,
+    ) {
         self.head.accelerate(gguf, backend);
         if let Some(vision) = &mut self.vision {
-            vision.accelerate(gguf, backend);
+            vision.accelerate(mmproj.unwrap_or(gguf), backend);
         }
         if let Some(audio) = &mut self.audio {
             audio.accelerate(backend);
         }
+    }
+
+    /// Whether the vision tower is loaded.
+    pub fn supports_images(&self) -> bool {
+        self.vision.is_some()
+    }
+
+    /// Whether the speech tower is loaded.
+    pub fn supports_audio(&self) -> bool {
+        self.audio.is_some()
     }
 
     /// The longest prompt, in tokens.
@@ -522,6 +654,23 @@ impl D1Model {
         session: &mut Session,
         tokenizer: &BpeTokenizer,
         request: &D1Request,
+    ) -> Result<(Vec<Vec<f32>>, usize)> {
+        self.probabilities_cancellable(session, tokenizer, request, &AtomicBool::new(false))
+    }
+
+    /// As [`Self::probabilities`], stopping with [`Cancelled`] when `cancel` is set. The flag
+    /// is read before the media encode and before each question's forward pass, never inside
+    /// one: a pass in flight runs to its end.
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::probabilities`], and [`Cancelled`] when the flag is set.
+    pub fn probabilities_cancellable(
+        &self,
+        session: &mut Session,
+        tokenizer: &BpeTokenizer,
+        request: &D1Request,
+        cancel: &AtomicBool,
     ) -> Result<(Vec<Vec<f32>>, usize)> {
         let hidden_size = session.hidden_size();
         ensure!(
@@ -575,11 +724,11 @@ impl D1Model {
         let budget = self.max_length.min(session.model().config().max_seq_len);
         // the media are encoded once for all the questions, but only after the budget
         // says they fit: a full tower forward is too late to discover they do not
+        ensure!(!cancel.load(Ordering::Relaxed), Cancelled);
         let (media, prefix, text_cap) = if !request.images.is_empty() {
-            let tower = self
-                .vision
-                .as_ref()
-                .context("this model has no vision tower (reconvert it with images)")?;
+            let tower = self.vision.as_ref().context(
+                "this model has no vision tower (load its mmproj, or reconvert it with images)",
+            )?;
             // budget from the header dims, then decode, encode, and drop one image at
             // a time: rows add up, so a refusing prefix implies a refusing total, the
             // tail is never decoded, and only one image's pixels are ever resident
@@ -613,10 +762,9 @@ impl D1Model {
             );
             (prompt::Media::Image, prefix, self.image_text_length)
         } else if let Some(bytes) = &request.audio {
-            let tower = self
-                .audio
-                .as_ref()
-                .context("this model has no speech tower (reconvert it with speech)")?;
+            let tower = self.audio.as_ref().context(
+                "this model has no speech tower (load its mmproj, or reconvert it with speech)",
+            )?;
             let (samples, rate) =
                 audio::decode_wav_capped(bytes, audio::MAX_SECONDS).context("audio")?;
             let pcm = audio::prepare_clip(&samples, rate)?;
@@ -651,6 +799,7 @@ impl D1Model {
         // the state tokenizes once; each question only takes the room its options leave
         let state_ids = prompt::encode_state(tokenizer, &self.ids, &state);
         for (name, q) in &request.questions {
+            ensure!(!cancel.load(Ordering::Relaxed), Cancelled);
             let (ids, markers) =
                 prompt::encode_with_state_ids(tokenizer, &self.ids, &state_ids, q, max_len, media)
                     .with_context(|| format!("question `{name}`"))?;
@@ -689,7 +838,24 @@ impl D1Model {
         tokenizer: &BpeTokenizer,
         request: &D1Request,
     ) -> Result<D1Response> {
-        let (all, input_tokens) = self.probabilities(session, tokenizer, request)?;
+        self.answer_cancellable(session, tokenizer, request, &AtomicBool::new(false))
+    }
+
+    /// As [`Self::answer`], stopping with [`Cancelled`] when `cancel` is set (see
+    /// [`Self::probabilities_cancellable`]).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::answer`], and [`Cancelled`] when the flag is set.
+    pub fn answer_cancellable(
+        &self,
+        session: &mut Session,
+        tokenizer: &BpeTokenizer,
+        request: &D1Request,
+        cancel: &AtomicBool,
+    ) -> Result<D1Response> {
+        let (all, input_tokens) =
+            self.probabilities_cancellable(session, tokenizer, request, cancel)?;
         let answers = request
             .questions
             .iter()
@@ -1704,6 +1870,76 @@ mod tests {
         assert!(
             err.to_string().contains("send less"),
             "unexpected message: {err}"
+        );
+    }
+
+    const WAV_URL: &str = "data:audio/wav;base64,AAAA";
+    const PNG_URL: &str = "data:image/png;base64,AAAA";
+
+    fn media_request(media: &str) -> String {
+        format!(
+            r#"{{"state": "s", {media}, "questions": {{"q": {{"type": "noul", "instructions": "i"}}}}}}"#
+        )
+    }
+
+    /// llama.cpp's request carries a speech clip as an `audio/` entry of `images` (or `files`).
+    #[test]
+    fn an_audio_data_url_in_images_is_the_speech_clip() {
+        for key in ["images", "files"] {
+            let r =
+                D1Request::parse(&media_request(&format!(r#""{key}": ["{WAV_URL}"]"#))).unwrap();
+            assert!(r.images.is_empty(), "{key}");
+            assert_eq!(r.audio.as_deref(), Some(&[0u8, 0, 0][..]), "{key}");
+        }
+        // the uppercase scheme of a hand-written URL
+        assert!(vision::is_audio_data_url("DATA:AUDIO/wav;base64,AAAA"));
+        assert!(!vision::is_audio_data_url(PNG_URL));
+        assert!(!vision::is_audio_data_url("data:"));
+    }
+
+    #[test]
+    fn files_is_an_alias_of_images_and_both_may_be_given() {
+        let r = D1Request::parse(&media_request(&format!(
+            r#""files": ["{PNG_URL}"], "images": ["{PNG_URL}", "{PNG_URL}"]"#
+        )))
+        .unwrap();
+        assert_eq!(r.images.len(), 3);
+        assert!(r.audio.is_none());
+    }
+
+    #[test]
+    fn images_and_a_speech_clip_do_not_combine_however_they_are_spelled() {
+        for media in [
+            format!(r#""images": ["{PNG_URL}", "{WAV_URL}"]"#),
+            format!(r#""images": ["{PNG_URL}"], "audio": "{WAV_URL}""#),
+            format!(r#""files": ["{PNG_URL}"], "images": ["{WAV_URL}"]"#),
+        ] {
+            let err = D1Request::parse(&media_request(&media)).expect_err(&media);
+            assert!(
+                err.to_string().contains(D1Request::MEDIA_COMBO_ERR),
+                "{media}: {err}"
+            );
+        }
+        let err = D1Request::parse(&media_request(&format!(
+            r#""images": ["{WAV_URL}", "{WAV_URL}"]"#
+        )))
+        .expect_err("two clips");
+        assert!(err.to_string().contains("one speech clip"), "{err}");
+    }
+
+    #[test]
+    fn open_names_what_a_non_d1_file_is_missing() {
+        let gguf = Arc::new(crate::gguf::GgufBuilder::new().build());
+        let err = D1Model::from_public(
+            &gguf,
+            None,
+            &BpeTokenizer::with_custom_template_for_test("", None),
+        )
+        .err()
+        .expect("expected a refusal");
+        assert!(
+            err.to_string().contains("not a public d1-omni model"),
+            "{err}"
         );
     }
 }

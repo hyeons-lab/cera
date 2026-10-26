@@ -10746,6 +10746,66 @@ class CeraFfiFfi {
     if (_checksum_uniffi_cera_ffi_checksum_method_chatsession_tools != 49577) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_chatsession_tools`: expected 49577, got $_checksum_uniffi_cera_ffi_checksum_method_chatsession_tools');
     }
+    final int _checksum_uniffi_cera_ffi_checksum_method_decisionengine_backend_name;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_decisionengine_backend_name');
+      _checksum_uniffi_cera_ffi_checksum_method_decisionengine_backend_name = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_decisionengine_backend_name`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_decisionengine_backend_name != 35606) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_decisionengine_backend_name`: expected 35606, got $_checksum_uniffi_cera_ffi_checksum_method_decisionengine_backend_name');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_decisionengine_decide_json;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_decisionengine_decide_json');
+      _checksum_uniffi_cera_ffi_checksum_method_decisionengine_decide_json = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_decisionengine_decide_json`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_decisionengine_decide_json != 37995) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_decisionengine_decide_json`: expected 37995, got $_checksum_uniffi_cera_ffi_checksum_method_decisionengine_decide_json');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_decisionengine_decide_json_async;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_decisionengine_decide_json_async');
+      _checksum_uniffi_cera_ffi_checksum_method_decisionengine_decide_json_async = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_decisionengine_decide_json_async`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_decisionengine_decide_json_async != 57969) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_decisionengine_decide_json_async`: expected 57969, got $_checksum_uniffi_cera_ffi_checksum_method_decisionengine_decide_json_async');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_decisionengine_decision_type;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_decisionengine_decision_type');
+      _checksum_uniffi_cera_ffi_checksum_method_decisionengine_decision_type = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_decisionengine_decision_type`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_decisionengine_decision_type != 19792) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_decisionengine_decision_type`: expected 19792, got $_checksum_uniffi_cera_ffi_checksum_method_decisionengine_decision_type');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_decisionengine_supports_audio;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_decisionengine_supports_audio');
+      _checksum_uniffi_cera_ffi_checksum_method_decisionengine_supports_audio = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_decisionengine_supports_audio`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_decisionengine_supports_audio != 15593) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_decisionengine_supports_audio`: expected 15593, got $_checksum_uniffi_cera_ffi_checksum_method_decisionengine_supports_audio');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_decisionengine_supports_images;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_decisionengine_supports_images');
+      _checksum_uniffi_cera_ffi_checksum_method_decisionengine_supports_images = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_decisionengine_supports_images`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_decisionengine_supports_images != 18359) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_decisionengine_supports_images`: expected 18359, got $_checksum_uniffi_cera_ffi_checksum_method_decisionengine_supports_images');
+    }
     final int _checksum_uniffi_cera_ffi_checksum_method_generativemodel_create_session;
     try {
       final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_generativemodel_create_session');
@@ -11095,6 +11155,26 @@ class CeraFfiFfi {
     }
     if (_checksum_uniffi_cera_ffi_checksum_constructor_chatsession_from_session != 3580) {
       throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_chatsession_from_session`: expected 3580, got $_checksum_uniffi_cera_ffi_checksum_constructor_chatsession_from_session');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_constructor_decisionengine_open;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_decisionengine_open');
+      _checksum_uniffi_cera_ffi_checksum_constructor_decisionengine_open = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_decisionengine_open`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_decisionengine_open != 17291) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_decisionengine_open`: expected 17291, got $_checksum_uniffi_cera_ffi_checksum_constructor_decisionengine_open');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_constructor_decisionengine_open_async;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_constructor_decisionengine_open_async');
+      _checksum_uniffi_cera_ffi_checksum_constructor_decisionengine_open_async = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_decisionengine_open_async`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_decisionengine_open_async != 3135) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_decisionengine_open_async`: expected 3135, got $_checksum_uniffi_cera_ffi_checksum_constructor_decisionengine_open_async');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_modelloader_new;
     try {
@@ -30825,6 +30905,918 @@ class CeraFfiFfi {
     }
   }
 
+  late final void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _decisionEngineFreeRaw = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('uniffi_cera_ffi_fn_free_decisionengine');
+  late final void Function(int handle) _decisionEngineFree = (int handle) {
+    final statusPtr = calloc<_UniFfiRustCallStatus>();
+    statusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+    statusPtr.ref.errorBuf
+      ..capacity = 0
+      ..len = 0
+      ..data = ffi.nullptr;
+    _decisionEngineFreeRaw(handle, statusPtr);
+    calloc.free(statusPtr);
+  };
+
+  late final int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _decisionEngineClone = _lib.lookupFunction<ffi.Uint64 Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('uniffi_cera_ffi_fn_clone_decisionengine');
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _decisionEngineCtorOpenFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_constructor_decisionengine_open');
+
+  DecisionEngine decisionEngineCreateOpen(String modelPath, String? mmprojPath, BackendPreference backend) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(9);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final Uint8List modelPathBytes = Uint8List.fromList(utf8.encode(modelPath));
+      final ffi.Pointer<ffi.Uint8> modelPathPtr = modelPathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(modelPathBytes.length);
+      if (modelPathBytes.isNotEmpty) { modelPathPtr.asTypedList(modelPathBytes.length).setAll(0, modelPathBytes); }
+      foreignArgPtrs.add(modelPathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> modelPathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      modelPathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      modelPathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> modelPathForeignPtr = calloc<_UniFfiForeignBytes>();
+      modelPathForeignPtr.ref
+        ..len = modelPathBytes.length
+        ..data = modelPathPtr;
+      final _UniFfiRustBuffer modelPathRustBuffer = _uniFfiRustBufferFromBytes(modelPathForeignPtr.ref, modelPathFromBytesStatusPtr);
+      calloc.free(modelPathForeignPtr);
+      final int modelPathFromBytesCode = modelPathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer modelPathFromBytesErrBuf = modelPathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(modelPathFromBytesStatusPtr);
+      if (modelPathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> modelPathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        modelPathFromBytesErrBufPtr.ref
+          ..capacity = modelPathFromBytesErrBuf.capacity
+          ..len = modelPathFromBytesErrBuf.len
+          ..data = modelPathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(modelPathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $modelPathFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = modelPathRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = modelPathRustBuffer.len;
+      (argBuf + 2).ref.ptr = modelPathRustBuffer.data.cast<ffi.Void>();
+      final mmprojPathWriter = _UniFfiBinaryWriter();
+      if (mmprojPath == null) {
+        mmprojPathWriter.writeI8(0);
+      } else {
+        mmprojPathWriter.writeI8(1);
+        mmprojPathWriter.writeString(mmprojPath!);
+      }
+      final Uint8List mmprojPathBytes = mmprojPathWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> mmprojPathPtr = mmprojPathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(mmprojPathBytes.length);
+      if (mmprojPathBytes.isNotEmpty) { mmprojPathPtr.asTypedList(mmprojPathBytes.length).setAll(0, mmprojPathBytes); }
+      foreignArgPtrs.add(mmprojPathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> mmprojPathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      mmprojPathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      mmprojPathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> mmprojPathForeignPtr = calloc<_UniFfiForeignBytes>();
+      mmprojPathForeignPtr.ref
+        ..len = mmprojPathBytes.length
+        ..data = mmprojPathPtr;
+      final _UniFfiRustBuffer mmprojPathRustBuffer = _uniFfiRustBufferFromBytes(mmprojPathForeignPtr.ref, mmprojPathFromBytesStatusPtr);
+      calloc.free(mmprojPathForeignPtr);
+      final int mmprojPathFromBytesCode = mmprojPathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer mmprojPathFromBytesErrBuf = mmprojPathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(mmprojPathFromBytesStatusPtr);
+      if (mmprojPathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> mmprojPathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        mmprojPathFromBytesErrBufPtr.ref
+          ..capacity = mmprojPathFromBytesErrBuf.capacity
+          ..len = mmprojPathFromBytesErrBuf.len
+          ..data = mmprojPathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(mmprojPathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $mmprojPathFromBytesCode');
+      }
+      (argBuf + 3).ref.u64 = mmprojPathRustBuffer.capacity;
+      (argBuf + 4).ref.u64 = mmprojPathRustBuffer.len;
+      (argBuf + 5).ref.ptr = mmprojPathRustBuffer.data.cast<ffi.Void>();
+      final Uint8List backendBytes = _uniffiEncodeBackendPreference(backend);
+      final ffi.Pointer<ffi.Uint8> backendPtr = backendBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(backendBytes.length);
+      if (backendBytes.isNotEmpty) { backendPtr.asTypedList(backendBytes.length).setAll(0, backendBytes); }
+      foreignArgPtrs.add(backendPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> backendFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      backendFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      backendFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> backendForeignPtr = calloc<_UniFfiForeignBytes>();
+      backendForeignPtr.ref
+        ..len = backendBytes.length
+        ..data = backendPtr;
+      final _UniFfiRustBuffer backendRustBuffer = _uniFfiRustBufferFromBytes(backendForeignPtr.ref, backendFromBytesStatusPtr);
+      calloc.free(backendForeignPtr);
+      final int backendFromBytesCode = backendFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer backendFromBytesErrBuf = backendFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(backendFromBytesStatusPtr);
+      if (backendFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> backendFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        backendFromBytesErrBufPtr.ref
+          ..capacity = backendFromBytesErrBuf.capacity
+          ..len = backendFromBytesErrBuf.len
+          ..data = backendFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(backendFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $backendFromBytesCode');
+      }
+      (argBuf + 6).ref.u64 = backendRustBuffer.capacity;
+      (argBuf + 7).ref.u64 = backendRustBuffer.len;
+      (argBuf + 8).ref.ptr = backendRustBuffer.data.cast<ffi.Void>();
+      _decisionEngineCtorOpenFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final int handle = (returnBuf + 0).ref.u64;
+      return DecisionEngine._(this, handle);
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _decisionEngineCtorOpenAsyncFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_constructor_decisionengine_open_async');
+  late final void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData) _decisionEngineCtorOpenAsyncFfiBufferRustFuturePoll = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, ffi.Uint64 callbackData), void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData)>('ffi_cera_ffi_rust_future_poll_u64');
+  late final void Function(int handle) _decisionEngineCtorOpenAsyncFfiBufferRustFutureCancel = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_cancel_u64');
+  late final int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _decisionEngineCtorOpenAsyncFfiBufferRustFutureComplete = _lib.lookupFunction<ffi.Uint64 Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), int Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('ffi_cera_ffi_rust_future_complete_u64');
+  late final void Function(int handle) _decisionEngineCtorOpenAsyncFfiBufferRustFutureFree = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_free_u64');
+
+  Future<DecisionEngine> decisionEngineCreateOpenAsync(String modelPath, String? mmprojPath, BackendPreference backend) async {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(9);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final Uint8List modelPathBytes = Uint8List.fromList(utf8.encode(modelPath));
+      final ffi.Pointer<ffi.Uint8> modelPathPtr = modelPathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(modelPathBytes.length);
+      if (modelPathBytes.isNotEmpty) { modelPathPtr.asTypedList(modelPathBytes.length).setAll(0, modelPathBytes); }
+      foreignArgPtrs.add(modelPathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> modelPathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      modelPathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      modelPathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> modelPathForeignPtr = calloc<_UniFfiForeignBytes>();
+      modelPathForeignPtr.ref
+        ..len = modelPathBytes.length
+        ..data = modelPathPtr;
+      final _UniFfiRustBuffer modelPathRustBuffer = _uniFfiRustBufferFromBytes(modelPathForeignPtr.ref, modelPathFromBytesStatusPtr);
+      calloc.free(modelPathForeignPtr);
+      final int modelPathFromBytesCode = modelPathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer modelPathFromBytesErrBuf = modelPathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(modelPathFromBytesStatusPtr);
+      if (modelPathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> modelPathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        modelPathFromBytesErrBufPtr.ref
+          ..capacity = modelPathFromBytesErrBuf.capacity
+          ..len = modelPathFromBytesErrBuf.len
+          ..data = modelPathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(modelPathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $modelPathFromBytesCode');
+      }
+      (argBuf + 0).ref.u64 = modelPathRustBuffer.capacity;
+      (argBuf + 1).ref.u64 = modelPathRustBuffer.len;
+      (argBuf + 2).ref.ptr = modelPathRustBuffer.data.cast<ffi.Void>();
+      final mmprojPathWriter = _UniFfiBinaryWriter();
+      if (mmprojPath == null) {
+        mmprojPathWriter.writeI8(0);
+      } else {
+        mmprojPathWriter.writeI8(1);
+        mmprojPathWriter.writeString(mmprojPath!);
+      }
+      final Uint8List mmprojPathBytes = mmprojPathWriter.toBytes();
+      final ffi.Pointer<ffi.Uint8> mmprojPathPtr = mmprojPathBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(mmprojPathBytes.length);
+      if (mmprojPathBytes.isNotEmpty) { mmprojPathPtr.asTypedList(mmprojPathBytes.length).setAll(0, mmprojPathBytes); }
+      foreignArgPtrs.add(mmprojPathPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> mmprojPathFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      mmprojPathFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      mmprojPathFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> mmprojPathForeignPtr = calloc<_UniFfiForeignBytes>();
+      mmprojPathForeignPtr.ref
+        ..len = mmprojPathBytes.length
+        ..data = mmprojPathPtr;
+      final _UniFfiRustBuffer mmprojPathRustBuffer = _uniFfiRustBufferFromBytes(mmprojPathForeignPtr.ref, mmprojPathFromBytesStatusPtr);
+      calloc.free(mmprojPathForeignPtr);
+      final int mmprojPathFromBytesCode = mmprojPathFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer mmprojPathFromBytesErrBuf = mmprojPathFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(mmprojPathFromBytesStatusPtr);
+      if (mmprojPathFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> mmprojPathFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        mmprojPathFromBytesErrBufPtr.ref
+          ..capacity = mmprojPathFromBytesErrBuf.capacity
+          ..len = mmprojPathFromBytesErrBuf.len
+          ..data = mmprojPathFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(mmprojPathFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $mmprojPathFromBytesCode');
+      }
+      (argBuf + 3).ref.u64 = mmprojPathRustBuffer.capacity;
+      (argBuf + 4).ref.u64 = mmprojPathRustBuffer.len;
+      (argBuf + 5).ref.ptr = mmprojPathRustBuffer.data.cast<ffi.Void>();
+      final Uint8List backendBytes = _uniffiEncodeBackendPreference(backend);
+      final ffi.Pointer<ffi.Uint8> backendPtr = backendBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(backendBytes.length);
+      if (backendBytes.isNotEmpty) { backendPtr.asTypedList(backendBytes.length).setAll(0, backendBytes); }
+      foreignArgPtrs.add(backendPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> backendFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      backendFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      backendFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> backendForeignPtr = calloc<_UniFfiForeignBytes>();
+      backendForeignPtr.ref
+        ..len = backendBytes.length
+        ..data = backendPtr;
+      final _UniFfiRustBuffer backendRustBuffer = _uniFfiRustBufferFromBytes(backendForeignPtr.ref, backendFromBytesStatusPtr);
+      calloc.free(backendForeignPtr);
+      final int backendFromBytesCode = backendFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer backendFromBytesErrBuf = backendFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(backendFromBytesStatusPtr);
+      if (backendFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> backendFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        backendFromBytesErrBufPtr.ref
+          ..capacity = backendFromBytesErrBuf.capacity
+          ..len = backendFromBytesErrBuf.len
+          ..data = backendFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(backendFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $backendFromBytesCode');
+      }
+      (argBuf + 6).ref.u64 = backendRustBuffer.capacity;
+      (argBuf + 7).ref.u64 = backendRustBuffer.len;
+      (argBuf + 8).ref.ptr = backendRustBuffer.data.cast<ffi.Void>();
+      _decisionEngineCtorOpenAsyncFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer async start failed with status $statusCode');
+      }
+      final int futureHandle = (returnBuf + 0).ref.u64;
+      final StreamController<int> pollEvents = StreamController<int>.broadcast();
+      final callback = ffi.NativeCallable<ffi.Void Function(ffi.Uint64, ffi.Int8)>.listener((int _, int pollResult) {
+        pollEvents.add(pollResult);
+      });
+      try {
+        _decisionEngineCtorOpenAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+        while (true) {
+          final int pollResult = await pollEvents.stream.first;
+          if (pollResult == _rustFuturePollReady) {
+            break;
+          }
+          if (pollResult == _rustFuturePollWake) {
+            _decisionEngineCtorOpenAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+            continue;
+          }
+          throw StateError('Rust future poll returned invalid status for open_async: $pollResult');
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> outStatusPtr = calloc<_UniFfiRustCallStatus>();
+        outStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        outStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        try {
+          final int resultValue = _decisionEngineCtorOpenAsyncFfiBufferRustFutureComplete(futureHandle, outStatusPtr);
+          final int completeStatusCode = outStatusPtr.ref.code;
+          if (completeStatusCode == _uniFfiRustCallStatusSuccess) {
+            return DecisionEngine._(this, resultValue);
+          }
+          if (completeStatusCode == _uniFfiRustCallStatusCancelled) {
+            throw StateError('Rust future was cancelled for open_async');
+          }
+          final _UniFfiRustBuffer errorBuf = outStatusPtr.ref.errorBuf;
+          if (!(errorBuf.data == ffi.nullptr && errorBuf.len == 0 && errorBuf.capacity == 0)) {
+            final ffi.Pointer<_UniFfiRustBuffer> errorBufPtr = calloc<_UniFfiRustBuffer>();
+            errorBufPtr.ref
+              ..capacity = errorBuf.capacity
+              ..len = errorBuf.len
+              ..data = errorBuf.data;
+            rustRetBufferPtrs.add(errorBufPtr);
+            final Uint8List errorBytes = errorBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errorBufPtr.ref.data.asTypedList(errorBufPtr.ref.len));
+            if (completeStatusCode == _uniFfiRustCallStatusError && errorBytes.isNotEmpty) {
+              throw _uniffiLiftFfiErrorException(errorBytes);
+            }
+            if (errorBytes.isNotEmpty) {
+              throw StateError(utf8.decode(errorBytes, allowMalformed: true));
+            }
+          }
+          throw StateError('Rust future failed for open_async with status code: $completeStatusCode');
+        } finally {
+          calloc.free(outStatusPtr);
+        }
+      } catch (_) {
+        _decisionEngineCtorOpenAsyncFfiBufferRustFutureCancel(futureHandle);
+        rethrow;
+      } finally {
+        await pollEvents.close();
+        callback.close();
+        _decisionEngineCtorOpenAsyncFfiBufferRustFutureFree(futureHandle);
+      }
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _decisionEngineBackendNameFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_decisionengine_backend_name');
+
+  String decisionEngineInvokeBackendName(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _decisionEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _decisionEngineBackendNameFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = utf8.decode(retBytes);
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _decisionEngineDecideJsonFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_decisionengine_decide_json');
+
+  String decisionEngineInvokeDecideJson(int handle, String requestJson) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _decisionEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final Uint8List requestJsonBytes = Uint8List.fromList(utf8.encode(requestJson));
+      final ffi.Pointer<ffi.Uint8> requestJsonPtr = requestJsonBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(requestJsonBytes.length);
+      if (requestJsonBytes.isNotEmpty) { requestJsonPtr.asTypedList(requestJsonBytes.length).setAll(0, requestJsonBytes); }
+      foreignArgPtrs.add(requestJsonPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> requestJsonFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      requestJsonFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      requestJsonFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> requestJsonForeignPtr = calloc<_UniFfiForeignBytes>();
+      requestJsonForeignPtr.ref
+        ..len = requestJsonBytes.length
+        ..data = requestJsonPtr;
+      final _UniFfiRustBuffer requestJsonRustBuffer = _uniFfiRustBufferFromBytes(requestJsonForeignPtr.ref, requestJsonFromBytesStatusPtr);
+      calloc.free(requestJsonForeignPtr);
+      final int requestJsonFromBytesCode = requestJsonFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer requestJsonFromBytesErrBuf = requestJsonFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(requestJsonFromBytesStatusPtr);
+      if (requestJsonFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> requestJsonFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        requestJsonFromBytesErrBufPtr.ref
+          ..capacity = requestJsonFromBytesErrBuf.capacity
+          ..len = requestJsonFromBytesErrBuf.len
+          ..data = requestJsonFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(requestJsonFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $requestJsonFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = requestJsonRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = requestJsonRustBuffer.len;
+      (argBuf + 3).ref.ptr = requestJsonRustBuffer.data.cast<ffi.Void>();
+      _decisionEngineDecideJsonFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        if (statusCode == _uniFfiRustCallStatusError) {
+          final Uint8List errBytes = errBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errBufPtr.ref.data.asTypedList(errBufPtr.ref.len));
+          throw _uniffiLiftFfiErrorException(errBytes);
+        }
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = utf8.decode(retBytes);
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _decisionEngineDecideJsonAsyncFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_decisionengine_decide_json_async');
+  late final void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData) _decisionEngineDecideJsonAsyncFfiBufferRustFuturePoll = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, ffi.Uint64 callbackData), void Function(int handle, ffi.Pointer<ffi.NativeFunction<ffi.Void Function(ffi.Uint64 callbackData, ffi.Int8 pollResult)>> callback, int callbackData)>('ffi_cera_ffi_rust_future_poll_rust_buffer');
+  late final void Function(int handle) _decisionEngineDecideJsonAsyncFfiBufferRustFutureCancel = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_cancel_rust_buffer');
+  late final _UniFfiRustBuffer Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _decisionEngineDecideJsonAsyncFfiBufferRustFutureComplete = _lib.lookupFunction<_UniFfiRustBuffer Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), _UniFfiRustBuffer Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('ffi_cera_ffi_rust_future_complete_rust_buffer');
+  late final void Function(int handle) _decisionEngineDecideJsonAsyncFfiBufferRustFutureFree = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle), void Function(int handle)>('ffi_cera_ffi_rust_future_free_rust_buffer');
+
+  Future<String> decisionEngineInvokeDecideJsonAsync(int handle, String requestJson) async {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(4);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _decisionEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      final Uint8List requestJsonBytes = Uint8List.fromList(utf8.encode(requestJson));
+      final ffi.Pointer<ffi.Uint8> requestJsonPtr = requestJsonBytes.isEmpty ? ffi.nullptr : calloc<ffi.Uint8>(requestJsonBytes.length);
+      if (requestJsonBytes.isNotEmpty) { requestJsonPtr.asTypedList(requestJsonBytes.length).setAll(0, requestJsonBytes); }
+      foreignArgPtrs.add(requestJsonPtr);
+      final ffi.Pointer<_UniFfiRustCallStatus> requestJsonFromBytesStatusPtr = calloc<_UniFfiRustCallStatus>();
+      requestJsonFromBytesStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+      requestJsonFromBytesStatusPtr.ref.errorBuf
+        ..capacity = 0
+        ..len = 0
+        ..data = ffi.nullptr;
+      final ffi.Pointer<_UniFfiForeignBytes> requestJsonForeignPtr = calloc<_UniFfiForeignBytes>();
+      requestJsonForeignPtr.ref
+        ..len = requestJsonBytes.length
+        ..data = requestJsonPtr;
+      final _UniFfiRustBuffer requestJsonRustBuffer = _uniFfiRustBufferFromBytes(requestJsonForeignPtr.ref, requestJsonFromBytesStatusPtr);
+      calloc.free(requestJsonForeignPtr);
+      final int requestJsonFromBytesCode = requestJsonFromBytesStatusPtr.ref.code;
+      final _UniFfiRustBuffer requestJsonFromBytesErrBuf = requestJsonFromBytesStatusPtr.ref.errorBuf;
+      calloc.free(requestJsonFromBytesStatusPtr);
+      if (requestJsonFromBytesCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> requestJsonFromBytesErrBufPtr = calloc<_UniFfiRustBuffer>();
+        requestJsonFromBytesErrBufPtr.ref
+          ..capacity = requestJsonFromBytesErrBuf.capacity
+          ..len = requestJsonFromBytesErrBuf.len
+          ..data = requestJsonFromBytesErrBuf.data;
+        rustRetBufferPtrs.add(requestJsonFromBytesErrBufPtr);
+        throw StateError('UniFFI rustbuffer_from_bytes failed with status $requestJsonFromBytesCode');
+      }
+      (argBuf + 1).ref.u64 = requestJsonRustBuffer.capacity;
+      (argBuf + 2).ref.u64 = requestJsonRustBuffer.len;
+      (argBuf + 3).ref.ptr = requestJsonRustBuffer.data.cast<ffi.Void>();
+      _decisionEngineDecideJsonAsyncFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer async start failed with status $statusCode');
+      }
+      final int futureHandle = (returnBuf + 0).ref.u64;
+      final StreamController<int> pollEvents = StreamController<int>.broadcast();
+      final callback = ffi.NativeCallable<ffi.Void Function(ffi.Uint64, ffi.Int8)>.listener((int _, int pollResult) {
+        pollEvents.add(pollResult);
+      });
+      try {
+        _decisionEngineDecideJsonAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+        while (true) {
+          final int pollResult = await pollEvents.stream.first;
+          if (pollResult == _rustFuturePollReady) {
+            break;
+          }
+          if (pollResult == _rustFuturePollWake) {
+            _decisionEngineDecideJsonAsyncFfiBufferRustFuturePoll(futureHandle, callback.nativeFunction, 0);
+            continue;
+          }
+          throw StateError('Rust future poll returned invalid status for decide_json_async: $pollResult');
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> outStatusPtr = calloc<_UniFfiRustCallStatus>();
+        outStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        outStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        try {
+          final _UniFfiRustBuffer resultValue = _decisionEngineDecideJsonAsyncFfiBufferRustFutureComplete(futureHandle, outStatusPtr);
+          final int completeStatusCode = outStatusPtr.ref.code;
+          if (completeStatusCode == _uniFfiRustCallStatusSuccess) {
+            final ffi.Pointer<_UniFfiRustBuffer> resultBufPtr = calloc<_UniFfiRustBuffer>();
+            resultBufPtr.ref
+              ..capacity = resultValue.capacity
+              ..len = resultValue.len
+              ..data = resultValue.data;
+            rustRetBufferPtrs.add(resultBufPtr);
+            final Uint8List resultBytes = resultBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(resultBufPtr.ref.data.asTypedList(resultBufPtr.ref.len));
+            return utf8.decode(resultBytes);
+          }
+          if (completeStatusCode == _uniFfiRustCallStatusCancelled) {
+            throw StateError('Rust future was cancelled for decide_json_async');
+          }
+          final _UniFfiRustBuffer errorBuf = outStatusPtr.ref.errorBuf;
+          if (!(errorBuf.data == ffi.nullptr && errorBuf.len == 0 && errorBuf.capacity == 0)) {
+            final ffi.Pointer<_UniFfiRustBuffer> errorBufPtr = calloc<_UniFfiRustBuffer>();
+            errorBufPtr.ref
+              ..capacity = errorBuf.capacity
+              ..len = errorBuf.len
+              ..data = errorBuf.data;
+            rustRetBufferPtrs.add(errorBufPtr);
+            final Uint8List errorBytes = errorBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(errorBufPtr.ref.data.asTypedList(errorBufPtr.ref.len));
+            if (completeStatusCode == _uniFfiRustCallStatusError && errorBytes.isNotEmpty) {
+              throw _uniffiLiftFfiErrorException(errorBytes);
+            }
+            if (errorBytes.isNotEmpty) {
+              throw StateError(utf8.decode(errorBytes, allowMalformed: true));
+            }
+          }
+          throw StateError('Rust future failed for decide_json_async with status code: $completeStatusCode');
+        } finally {
+          calloc.free(outStatusPtr);
+        }
+      } catch (_) {
+        _decisionEngineDecideJsonAsyncFfiBufferRustFutureCancel(futureHandle);
+        rethrow;
+      } finally {
+        await pollEvents.close();
+        callback.close();
+        _decisionEngineDecideJsonAsyncFfiBufferRustFutureFree(futureHandle);
+      }
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _decisionEngineDecisionTypeFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_decisionengine_decision_type');
+
+  String decisionEngineInvokeDecisionType(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _decisionEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _decisionEngineDecisionTypeFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = utf8.decode(retBytes);
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _decisionEngineSupportsAudioFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_decisionengine_supports_audio');
+
+  bool decisionEngineInvokeSupportsAudio(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _decisionEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _decisionEngineSupportsAudioFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return (returnBuf + 0).ref.i8 == 1;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _decisionEngineSupportsImagesFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_decisionengine_supports_images');
+
+  bool decisionEngineInvokeSupportsImages(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(5);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _decisionEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _decisionEngineSupportsImagesFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 1).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 2).ref.u64
+          ..len = (returnBuf + 3).ref.u64
+          ..data = (returnBuf + 4).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      return (returnBuf + 0).ref.i8 == 1;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus) _generativeModelFreeRaw = _lib.lookupFunction<ffi.Void Function(ffi.Uint64 handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus), void Function(int handle, ffi.Pointer<_UniFfiRustCallStatus> outStatus)>('uniffi_cera_ffi_fn_free_generativemodel');
   late final void Function(int handle) _generativeModelFree = (int handle) {
     final statusPtr = calloc<_UniFfiRustCallStatus>();
@@ -34101,6 +35093,110 @@ final class ChatSessionFfiCodec {
   static int lower(ChatSession value) => value._handle;
 
   static ChatSession lift(int handle) => ChatSession._(_bindings(), handle);
+}
+
+final class _DecisionEngineFinalizerToken {
+  const _DecisionEngineFinalizerToken(this.free, this.handle);
+  final void Function(int) free;
+  final int handle;
+}
+
+/// A loaded public d1 decision model.
+final class DecisionEngine {
+  DecisionEngine._(this._ffi, this._handle) {
+    _finalizer.attach(this, _DecisionEngineFinalizerToken(_ffi._decisionEngineFree, _handle), detach: this);
+  }
+
+  final CeraFfiFfi _ffi;
+  int _handle;
+  bool _closed = false;
+
+  static final Finalizer<_DecisionEngineFinalizerToken> _finalizer = Finalizer((token) {
+    token.free(token.handle);
+  });
+
+  bool get isClosed => _closed;
+
+  void close() {
+    if (_closed) {
+      return;
+    }
+    _closed = true;
+    _finalizer.detach(this);
+    _ffi._decisionEngineFree(_handle);
+  }
+
+  void _ensureOpen() {
+    if (_closed) {
+      throw StateError('DecisionEngine is closed');
+    }
+  }
+
+  /// Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of a `d1-omni` model
+  /// for image and speech requests (`None` answers text only).
+  ///
+  /// Blocks while the weights load; use [`DecisionEngine::open_async`] from a UI thread.
+  /// `backend` must be `Cpu` or `Auto` (which runs on the CPU).
+  static DecisionEngine open(String modelPath, String? mmprojPath, BackendPreference backend) {
+    return _bindings().decisionEngineCreateOpen(modelPath, mmprojPath, backend);
+  }
+
+  /// Async [`DecisionEngine::open`]: the load runs on a tokio blocking worker, so a UI thread
+  /// never waits on it. Dropping the future aborts the load only while it is still queued.
+  static Future<DecisionEngine> openAsync(String modelPath, String? mmprojPath, BackendPreference backend) {
+    return _bindings().decisionEngineCreateOpenAsync(modelPath, mmprojPath, backend);
+  }
+
+  /// The backend the model runs on: `cpu`.
+  String backendName() {
+    _ensureOpen();
+    return _ffi.decisionEngineInvokeBackendName(_handle);
+  }
+
+  /// Answer a `/v1/systemone` request given as JSON (`state`, `questions`, optionally `images`
+  /// as data URLs, an `audio/` data URL being a speech clip) and return the response JSON
+  /// (`answers` and `usage`).
+  ///
+  /// Blocks for the duration of the forward passes. An invalid request is a
+  /// [`FfiError::Backend`] whose detail says what is wrong.
+  String decideJson(String requestJson) {
+    _ensureOpen();
+    return _ffi.decisionEngineInvokeDecideJson(_handle, requestJson);
+  }
+
+  /// Async [`DecisionEngine::decide_json`] on a tokio blocking worker. Dropping the future
+  /// cancels the request before its next question (see the module documentation).
+  Future<String> decideJsonAsync(String requestJson) {
+    _ensureOpen();
+    return _ffi.decisionEngineInvokeDecideJsonAsync(_handle, requestJson);
+  }
+
+  /// The model type from the file: `lfm2-d1-omni`, `lfm2-d1` or `converted`.
+  String decisionType() {
+    _ensureOpen();
+    return _ffi.decisionEngineInvokeDecisionType(_handle);
+  }
+
+  /// Whether speech requests can be answered (the speech tower is loaded).
+  bool supportsAudio() {
+    _ensureOpen();
+    return _ffi.decisionEngineInvokeSupportsAudio(_handle);
+  }
+
+  /// Whether image requests can be answered (the vision tower is loaded).
+  bool supportsImages() {
+    _ensureOpen();
+    return _ffi.decisionEngineInvokeSupportsImages(_handle);
+  }
+
+}
+
+final class DecisionEngineFfiCodec {
+  const DecisionEngineFfiCodec._();
+
+  static int lower(DecisionEngine value) => value._handle;
+
+  static DecisionEngine lift(int handle) => DecisionEngine._(_bindings(), handle);
 }
 
 final class _GenerativeModelFinalizerToken {

@@ -503,6 +503,7 @@ dependencies = [
 name = "cera-ffi"
 version = "0.7.1"
 dependencies = [
+ "anyhow",
  "bytemuck",
  "cera",
  "serde_json",

@@ -28,6 +28,8 @@ android {
             // are staged into the default `src/main/jniLibs/<abi>/` by
             // `just android-libs` (gitignored): no custom srcDir needed.
             kotlin.directories.add("../../cera-ffi/bindings/kotlin")
+            // Hand-written helpers shared with the JVM module (decisions).
+            kotlin.directories.add("../shared/src/main/kotlin")
         }
     }
     // Release-variant publishing (+ sources/javadoc jars) is configured by the
