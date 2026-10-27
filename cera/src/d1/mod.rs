@@ -764,7 +764,7 @@ impl D1Model {
                     r.width,
                     r.height
                 );
-                let t_tower = std::time::Instant::now();
+                let t_tower = crate::time::Instant::now();
                 prefix.extend(tower.encode(std::slice::from_ref(&r))?);
                 trace(format_args!(
                     "vision tower: {:?} for image {i}",
@@ -787,7 +787,7 @@ impl D1Model {
             let pcm = audio::prepare_clip(&samples, rate)?;
             let predicted = audio::prefix_rows(pcm.len());
             ensure_media_fits(budget, predicted)?;
-            let t_tower = std::time::Instant::now();
+            let t_tower = crate::time::Instant::now();
             let prefix = tower.encode(&pcm)?;
             trace(format_args!("speech tower: {:?}", t_tower.elapsed()));
             // debug-only: `encode` above already refuses a row-count disagreement, so
@@ -822,7 +822,7 @@ impl D1Model {
             let (ids, markers) =
                 prompt::encode_with_state_ids(tokenizer, &self.ids, &state_ids, q, max_len, media)
                     .with_context(|| format!("question `{name}`"))?;
-            let t_trunk = std::time::Instant::now();
+            let t_trunk = crate::time::Instant::now();
             let hidden = if has_media {
                 session
                     .hidden_states_with_prefix(&prefix, &ids)
@@ -832,7 +832,7 @@ impl D1Model {
                     .hidden_states_for_tokens(&ids)
                     .with_context(|| format!("question `{name}`"))?
             };
-            let t_head = std::time::Instant::now();
+            let t_head = crate::time::Instant::now();
             let scores = self
                 .head
                 .scores(&hidden, ids.len(), q.kind.index(), &markers)

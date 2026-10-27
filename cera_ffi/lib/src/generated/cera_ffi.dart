@@ -10753,8 +10753,18 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_decisionengine_backend_name`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_method_decisionengine_backend_name != 35606) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_decisionengine_backend_name`: expected 35606, got $_checksum_uniffi_cera_ffi_checksum_method_decisionengine_backend_name');
+    if (_checksum_uniffi_cera_ffi_checksum_method_decisionengine_backend_name != 23371) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_decisionengine_backend_name`: expected 23371, got $_checksum_uniffi_cera_ffi_checksum_method_decisionengine_backend_name');
+    }
+    final int _checksum_uniffi_cera_ffi_checksum_method_decisionengine_backend_report;
+    try {
+      final int Function() checksumFn = lib.lookupFunction<ffi.Uint16 Function(), int Function()>('uniffi_cera_ffi_checksum_method_decisionengine_backend_report');
+      _checksum_uniffi_cera_ffi_checksum_method_decisionengine_backend_report = checksumFn();
+    } catch (err) {
+      throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_method_decisionengine_backend_report`: $err');
+    }
+    if (_checksum_uniffi_cera_ffi_checksum_method_decisionengine_backend_report != 13889) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_method_decisionengine_backend_report`: expected 13889, got $_checksum_uniffi_cera_ffi_checksum_method_decisionengine_backend_report');
     }
     final int _checksum_uniffi_cera_ffi_checksum_method_decisionengine_decide_json;
     try {
@@ -11163,8 +11173,8 @@ class CeraFfiFfi {
     } catch (err) {
       throw StateError('Missing or invalid UniFFI checksum symbol `uniffi_cera_ffi_checksum_constructor_decisionengine_open`: $err');
     }
-    if (_checksum_uniffi_cera_ffi_checksum_constructor_decisionengine_open != 17291) {
-      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_decisionengine_open`: expected 17291, got $_checksum_uniffi_cera_ffi_checksum_constructor_decisionengine_open');
+    if (_checksum_uniffi_cera_ffi_checksum_constructor_decisionengine_open != 39396) {
+      throw StateError('UniFFI API checksum mismatch for `uniffi_cera_ffi_checksum_constructor_decisionengine_open`: expected 39396, got $_checksum_uniffi_cera_ffi_checksum_constructor_decisionengine_open');
     }
     final int _checksum_uniffi_cera_ffi_checksum_constructor_decisionengine_open_async;
     try {
@@ -31349,6 +31359,77 @@ class CeraFfiFfi {
     }
   }
 
+  late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _decisionEngineBackendReportFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_decisionengine_backend_report');
+
+  String decisionEngineInvokeBackendReport(int handle) {
+    final ffi.Pointer<_UniFfiFfiBufferElement> argBuf = calloc<_UniFfiFfiBufferElement>(1);
+    final ffi.Pointer<_UniFfiFfiBufferElement> returnBuf = calloc<_UniFfiFfiBufferElement>(7);
+    final foreignArgPtrs = <ffi.Pointer<ffi.Uint8>>[];
+    final rustRetBufferPtrs = <ffi.Pointer<_UniFfiRustBuffer>>[];
+    try {
+      final int clonedHandle;
+      {
+        final cloneStatusPtr = calloc<_UniFfiRustCallStatus>();
+        try {
+          cloneStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+          cloneStatusPtr.ref.errorBuf
+            ..capacity = 0
+            ..len = 0
+            ..data = ffi.nullptr;
+          clonedHandle = _decisionEngineClone(handle, cloneStatusPtr);
+          if (cloneStatusPtr.ref.code != _uniFfiRustCallStatusSuccess) {
+            throw StateError('UniFFI clone failed with status ${cloneStatusPtr.ref.code}');
+          }
+        } finally {
+          calloc.free(cloneStatusPtr);
+        }
+      }
+      (argBuf + 0).ref.u64 = clonedHandle;
+      _decisionEngineBackendReportFfiBuffer(argBuf, returnBuf);
+      final int statusCode = (returnBuf + 3).ref.i8;
+      if (statusCode != _uniFfiRustCallStatusSuccess) {
+        final ffi.Pointer<_UniFfiRustBuffer> errBufPtr = calloc<_UniFfiRustBuffer>();
+        errBufPtr.ref
+          ..capacity = (returnBuf + 4).ref.u64
+          ..len = (returnBuf + 5).ref.u64
+          ..data = (returnBuf + 6).ref.ptr.cast<ffi.Uint8>();
+        rustRetBufferPtrs.add(errBufPtr);
+        throw StateError('UniFFI ffibuffer call failed with status $statusCode');
+      }
+      final ffi.Pointer<_UniFfiRustBuffer> retBufPtr = calloc<_UniFfiRustBuffer>();
+      retBufPtr.ref
+        ..capacity = (returnBuf + 0).ref.u64
+        ..len = (returnBuf + 1).ref.u64
+        ..data = (returnBuf + 2).ref.ptr.cast<ffi.Uint8>();
+      rustRetBufferPtrs.add(retBufPtr);
+      final Uint8List retBytes = retBufPtr.ref.len == 0 ? Uint8List(0) : Uint8List.fromList(retBufPtr.ref.data.asTypedList(retBufPtr.ref.len));
+      final decodedValue = utf8.decode(retBytes);
+      return decodedValue;
+    } finally {
+      for (final ptr in foreignArgPtrs) {
+        if (ptr != ffi.nullptr) {
+          calloc.free(ptr);
+        }
+      }
+      for (final bufPtr in rustRetBufferPtrs) {
+        if (bufPtr.ref.data == ffi.nullptr && bufPtr.ref.len == 0 && bufPtr.ref.capacity == 0) {
+          continue;
+        }
+        final ffi.Pointer<_UniFfiRustCallStatus> freeStatusPtr = calloc<_UniFfiRustCallStatus>();
+        freeStatusPtr.ref.code = _uniFfiRustCallStatusSuccess;
+        freeStatusPtr.ref.errorBuf
+          ..capacity = 0
+          ..len = 0
+          ..data = ffi.nullptr;
+        _uniFfiRustBufferFree(bufPtr.ref, freeStatusPtr);
+        calloc.free(freeStatusPtr);
+        calloc.free(bufPtr);
+      }
+      calloc.free(argBuf);
+      calloc.free(returnBuf);
+    }
+  }
+
   late final void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr) _decisionEngineDecideJsonFfiBuffer = _lib.lookupFunction<ffi.Void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr), void Function(ffi.Pointer<_UniFfiFfiBufferElement> argPtr, ffi.Pointer<_UniFfiFfiBufferElement> returnPtr)>('uniffi_ffibuffer_cera_ffi_fn_method_decisionengine_decide_json');
 
   String decisionEngineInvokeDecideJson(int handle, String requestJson) {
@@ -35132,11 +35213,12 @@ final class DecisionEngine {
     }
   }
 
-  /// Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of a `d1-omni` model
-  /// for image and speech requests (`None` answers text only).
+  /// Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of the model for image
+  /// (and, for `d1-omni`, speech) requests (`None` answers text only).
   ///
-  /// Blocks while the weights load; use [`DecisionEngine::open_async`] from a UI thread.
-  /// `backend` must be `Cpu` or `Auto` (which runs on the CPU).
+  /// Blocks while the weights load and, for `Auto`, run a warm-up request; use
+  /// [`DecisionEngine::open_async`] from a UI thread. `backend` is a request, see the module
+  /// documentation.
   static DecisionEngine open(String modelPath, String? mmprojPath, BackendPreference backend) {
     return _bindings().decisionEngineCreateOpen(modelPath, mmprojPath, backend);
   }
@@ -35147,10 +35229,18 @@ final class DecisionEngine {
     return _bindings().decisionEngineCreateOpenAsync(modelPath, mmprojPath, backend);
   }
 
-  /// The backend the model runs on: `cpu`.
+  /// The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
   String backendName() {
     _ensureOpen();
     return _ffi.decisionEngineInvokeBackendName(_handle);
+  }
+
+  /// Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+  /// hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+  /// CPU. For logs and diagnostics; the wording is not a stable format.
+  String backendReport() {
+    _ensureOpen();
+    return _ffi.decisionEngineInvokeBackendReport(_handle);
   }
 
   /// Answer a `/v1/systemone` request given as JSON (`state`, `questions`, optionally `images`

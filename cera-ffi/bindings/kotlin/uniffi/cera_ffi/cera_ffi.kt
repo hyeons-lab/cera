@@ -1226,6 +1226,8 @@ internal object IntegrityCheckingUniffiLib {
 
     external fun uniffi_cera_ffi_checksum_method_decisionengine_backend_name(): Int
 
+    external fun uniffi_cera_ffi_checksum_method_decisionengine_backend_report(): Int
+
     external fun uniffi_cera_ffi_checksum_method_decisionengine_decide_json(): Int
 
     external fun uniffi_cera_ffi_checksum_method_decisionengine_decide_json_async(): Int
@@ -2511,6 +2513,11 @@ internal object UniffiLib {
         uniffi_out_err: UniffiRustCallStatus,
     ): RustBuffer.ByValue
 
+    external fun uniffi_cera_ffi_fn_method_decisionengine_backend_report(
+        `ptr`: Long,
+        uniffi_out_err: UniffiRustCallStatus,
+    ): RustBuffer.ByValue
+
     external fun uniffi_cera_ffi_fn_method_decisionengine_decide_json(
         `ptr`: Long,
         `requestJson`: RustBuffer.ByValue,
@@ -3382,7 +3389,10 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_cera_ffi_checksum_method_chatsession_tools() and 0xFFFF) != 49577) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_cera_ffi_checksum_method_decisionengine_backend_name() and 0xFFFF) != 35606) {
+    if ((lib.uniffi_cera_ffi_checksum_method_decisionengine_backend_name() and 0xFFFF) != 23371) {
+        throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    }
+    if ((lib.uniffi_cera_ffi_checksum_method_decisionengine_backend_report() and 0xFFFF) != 13889) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_cera_ffi_checksum_method_decisionengine_decide_json() and 0xFFFF) != 37995) {
@@ -3505,7 +3515,7 @@ private fun uniffiCheckApiChecksums(lib: IntegrityCheckingUniffiLib) {
     if ((lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() and 0xFFFF) != 3580) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
-    if ((lib.uniffi_cera_ffi_checksum_constructor_decisionengine_open() and 0xFFFF) != 17291) {
+    if ((lib.uniffi_cera_ffi_checksum_constructor_decisionengine_open() and 0xFFFF) != 39396) {
         throw RuntimeException("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     }
     if ((lib.uniffi_cera_ffi_checksum_constructor_decisionengine_open_async() and 0xFFFF) != 3135) {
@@ -6692,9 +6702,16 @@ public object FfiConverterTypeChatSession : FfiConverter<ChatSession, Long> {
  */
 public interface DecisionEngineInterface {
     /**
-     * The backend the model runs on: `cpu`.
+     * The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
      */
     fun `backendName`(): kotlin.String
+
+    /**
+     * Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+     * hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+     * CPU. For logs and diagnostics; the wording is not a stable format.
+     */
+    fun `backendReport`(): kotlin.String
 
     /**
      * Answer a `/v1/systemone` request given as JSON (`state`, `questions`, optionally `images`
@@ -6838,13 +6855,30 @@ open class DecisionEngine :
     }
 
     /**
-     * The backend the model runs on: `cpu`.
+     * The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
      */
     override fun `backendName`(): kotlin.String =
         FfiConverterString.lift(
             callWithHandle {
                 uniffiRustCall { _status ->
                     UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_name(
+                        it,
+                        _status,
+                    )
+                }
+            },
+        )
+
+    /**
+     * Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+     * hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+     * CPU. For logs and diagnostics; the wording is not a stable format.
+     */
+    override fun `backendReport`(): kotlin.String =
+        FfiConverterString.lift(
+            callWithHandle {
+                uniffiRustCall { _status ->
+                    UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_report(
                         it,
                         _status,
                     )
@@ -6944,11 +6978,12 @@ open class DecisionEngine :
 
     companion object {
         /**
-         * Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of a `d1-omni` model
-         * for image and speech requests (`None` answers text only).
+         * Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of the model for image
+         * (and, for `d1-omni`, speech) requests (`None` answers text only).
          *
-         * Blocks while the weights load; use [`DecisionEngine::open_async`] from a UI thread.
-         * `backend` must be `Cpu` or `Auto` (which runs on the CPU).
+         * Blocks while the weights load and, for `Auto`, run a warm-up request; use
+         * [`DecisionEngine::open_async`] from a UI thread. `backend` is a request, see the module
+         * documentation.
          */
         @Throws(FfiException::class)
         fun `open`(

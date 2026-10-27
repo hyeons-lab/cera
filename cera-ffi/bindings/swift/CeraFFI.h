@@ -1329,6 +1329,11 @@ uint64_t uniffi_cera_ffi_fn_constructor_decisionengine_open_async(RustBuffer mod
 RustBuffer uniffi_cera_ffi_fn_method_decisionengine_backend_name(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_DECISIONENGINE_BACKEND_REPORT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_DECISIONENGINE_BACKEND_REPORT
+RustBuffer uniffi_cera_ffi_fn_method_decisionengine_backend_report(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_DECISIONENGINE_DECIDE_JSON
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_FN_METHOD_DECISIONENGINE_DECIDE_JSON
 RustBuffer uniffi_cera_ffi_fn_method_decisionengine_decide_json(uint64_t ptr, RustBuffer request_json, RustCallStatus *_Nonnull out_status
@@ -2763,6 +2768,12 @@ uint16_t uniffi_cera_ffi_checksum_method_chatsession_tools(void
 #ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_DECISIONENGINE_BACKEND_NAME
 #define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_DECISIONENGINE_BACKEND_NAME
 uint16_t uniffi_cera_ffi_checksum_method_decisionengine_backend_name(void
+    
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_DECISIONENGINE_BACKEND_REPORT
+#define UNIFFI_FFIDEF_UNIFFI_CERA_FFI_CHECKSUM_METHOD_DECISIONENGINE_BACKEND_REPORT
+uint16_t uniffi_cera_ffi_checksum_method_decisionengine_backend_report(void
     
 );
 #endif

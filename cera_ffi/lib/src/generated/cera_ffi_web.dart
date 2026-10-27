@@ -7607,19 +7607,25 @@ final class DecisionEngine {
 
   void close() => _unsupportedOnWeb('DecisionEngine.close');
 
-  /// Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of a `d1-omni` model
-  /// for image and speech requests (`None` answers text only).
+  /// Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of the model for image
+  /// (and, for `d1-omni`, speech) requests (`None` answers text only).
   ///
-  /// Blocks while the weights load; use [`DecisionEngine::open_async`] from a UI thread.
-  /// `backend` must be `Cpu` or `Auto` (which runs on the CPU).
+  /// Blocks while the weights load and, for `Auto`, run a warm-up request; use
+  /// [`DecisionEngine::open_async`] from a UI thread. `backend` is a request, see the module
+  /// documentation.
   static DecisionEngine open(String modelPath, String? mmprojPath, BackendPreference backend) => _unsupportedOnWeb('DecisionEngine.open');
 
   /// Async [`DecisionEngine::open`]: the load runs on a tokio blocking worker, so a UI thread
   /// never waits on it. Dropping the future aborts the load only while it is still queued.
   static Future<DecisionEngine> openAsync(String modelPath, String? mmprojPath, BackendPreference backend) => _unsupportedOnWeb('DecisionEngine.openAsync');
 
-  /// The backend the model runs on: `cpu`.
+  /// The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
   String backendName() => _unsupportedOnWeb('DecisionEngine.backendName');
+
+  /// Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+  /// hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+  /// CPU. For logs and diagnostics; the wording is not a stable format.
+  String backendReport() => _unsupportedOnWeb('DecisionEngine.backendReport');
 
   /// Answer a `/v1/systemone` request given as JSON (`state`, `questions`, optionally `images`
   /// as data URLs, an `audio/` data URL being a speech clip) and return the response JSON

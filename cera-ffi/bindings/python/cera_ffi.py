@@ -703,7 +703,9 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 3580:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_method_decisionengine_backend_name() != 35606:
+    if lib.uniffi_cera_ffi_checksum_method_decisionengine_backend_name() != 23371:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_decisionengine_backend_report() != 13889:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_decisionengine_decide_json() != 37995:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -715,7 +717,7 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_decisionengine_supports_images() != 18359:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
-    if lib.uniffi_cera_ffi_checksum_constructor_decisionengine_open() != 17291:
+    if lib.uniffi_cera_ffi_checksum_constructor_decisionengine_open() != 39396:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_decisionengine_open_async() != 3135:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
@@ -1236,6 +1238,9 @@ _UniffiLib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session.restype
 _UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_backend_name.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_backend_name.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_backend_report.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_backend_report.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_decide_json.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_decide_json.restype = ctypes.c_uint16
@@ -2084,6 +2089,11 @@ _UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_name.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_name.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_report.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_report.restype = _UniffiRustBuffer
 _UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_decide_json.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -14191,7 +14201,14 @@ class DecisionEngineProtocol(typing.Protocol):
     
     def backend_name(self, ) -> str:
         """
-        The backend the model runs on: `cpu`.
+        The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
+"""
+        raise NotImplementedError
+    def backend_report(self, ) -> str:
+        """
+        Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+        hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+        CPU. For logs and diagnostics; the wording is not a stable format.
 """
         raise NotImplementedError
     def decide_json(self, request_json: str) -> str:
@@ -14235,11 +14252,12 @@ class DecisionEngine(DecisionEngineProtocol):
     @classmethod
     def open(cls, model_path: str,mmproj_path: typing.Optional[str],backend: BackendPreference) -> DecisionEngine:
         """
-        Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of a `d1-omni` model
-        for image and speech requests (`None` answers text only).
+        Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of the model for image
+        (and, for `d1-omni`, speech) requests (`None` answers text only).
 
-        Blocks while the weights load; use [`DecisionEngine::open_async`] from a UI thread.
-        `backend` must be `Cpu` or `Auto` (which runs on the CPU).
+        Blocks while the weights load and, for `Auto`, run a warm-up request; use
+        [`DecisionEngine::open_async`] from a UI thread. `backend` is a request, see the module
+        documentation.
 """
         
         _UniffiFfiConverterString.check_lower(model_path)
@@ -14310,7 +14328,7 @@ class DecisionEngine(DecisionEngineProtocol):
         return inst
     def backend_name(self, ) -> str:
         """
-        The backend the model runs on: `cpu`.
+        The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
 """
         _uniffi_lowered_args = (
             self._uniffi_clone_handle(),
@@ -14320,6 +14338,23 @@ class DecisionEngine(DecisionEngineProtocol):
         _uniffi_ffi_result = _uniffi_rust_call_with_error(
             _uniffi_error_converter,
             _UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_name,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def backend_report(self, ) -> str:
+        """
+        Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+        hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+        CPU. For logs and diagnostics; the wording is not a stable format.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterString.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_report,
             *_uniffi_lowered_args,
         )
         return _uniffi_lift_return(_uniffi_ffi_result)

@@ -951,7 +951,7 @@ impl VisionTower {
         let mut prefix = Vec::new();
         for image in images {
             for crop in crops(image)? {
-                let started = std::time::Instant::now();
+                let started = crate::time::Instant::now();
                 let (tokens, rows, cols) = self.tower(&crop);
                 let towered = started.elapsed();
                 ensure!(

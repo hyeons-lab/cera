@@ -2588,9 +2588,16 @@ public func FfiConverterTypeChatSession_lower(_ value: ChatSession) -> UInt64 {
 public protocol DecisionEngineProtocol: AnyObject, Sendable {
     
     /**
-     * The backend the model runs on: `cpu`.
+     * The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
      */
     func backendName()  -> String
+    
+    /**
+     * Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+     * hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+     * CPU. For logs and diagnostics; the wording is not a stable format.
+     */
+    func backendReport()  -> String
     
     /**
      * Answer a `/v1/systemone` request given as JSON (`state`, `questions`, optionally `images`
@@ -2679,11 +2686,12 @@ open class DecisionEngine: DecisionEngineProtocol, @unchecked Sendable {
 
     
     /**
-     * Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of a `d1-omni` model
-     * for image and speech requests (`None` answers text only).
+     * Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of the model for image
+     * (and, for `d1-omni`, speech) requests (`None` answers text only).
      *
-     * Blocks while the weights load; use [`DecisionEngine::open_async`] from a UI thread.
-     * `backend` must be `Cpu` or `Auto` (which runs on the CPU).
+     * Blocks while the weights load and, for `Auto`, run a warm-up request; use
+     * [`DecisionEngine::open_async`] from a UI thread. `backend` is a request, see the module
+     * documentation.
      */
 public static func `open`(modelPath: String, mmprojPath: String?, backend: BackendPreference)throws  -> DecisionEngine  {
     return try  FfiConverterTypeDecisionEngine_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
@@ -2718,12 +2726,26 @@ public static func openAsync(modelPath: String, mmprojPath: String?, backend: Ba
 
     
     /**
-     * The backend the model runs on: `cpu`.
+     * The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
      */
 open func backendName() -> String  {
     return try!  FfiConverterString.lift(try! rustCall() {
         uniffiCallStatus in
     uniffi_cera_ffi_fn_method_decisionengine_backend_name(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+     * hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+     * CPU. For logs and diagnostics; the wording is not a stable format.
+     */
+open func backendReport() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_method_decisionengine_backend_report(
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
@@ -14515,7 +14537,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_chatsession_tools() != 49577) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_method_decisionengine_backend_name() != 35606) {
+    if (uniffi_cera_ffi_checksum_method_decisionengine_backend_name() != 23371) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_decisionengine_backend_report() != 13889) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_method_decisionengine_decide_json() != 37995) {
@@ -14638,7 +14663,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 3580) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_cera_ffi_checksum_constructor_decisionengine_open() != 17291) {
+    if (uniffi_cera_ffi_checksum_constructor_decisionengine_open() != 39396) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_decisionengine_open_async() != 3135) {
