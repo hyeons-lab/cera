@@ -182,6 +182,7 @@ impl Head {
         let ffn = if blocks == 0 {
             0
         } else {
+            // `shape[1]` is the output width: GGUF lists a matrix's dimensions innermost first
             let name = format!("blk.{first}.ffn_up.weight");
             gguf.tensors
                 .get(&name)

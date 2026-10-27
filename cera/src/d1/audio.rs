@@ -415,7 +415,9 @@ impl AudioTower {
     ///
     /// As [`Self::from_gguf`].
     pub fn from_public(mmproj: &Arc<GgufFile>, out_width: usize) -> Result<Self> {
-        // the residual's inner width is the rows of its down projection
+        // the residual's inner width is the rows of its down projection (GGUF lists a matrix's
+        // dimensions innermost first, so a linear layer is `[inputs, outputs]` and `shape[1]` is its
+        // output width)
         let hidden = mmproj
             .tensors
             .get(ResidualNames::PUBLIC.down)

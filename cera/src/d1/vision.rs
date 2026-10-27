@@ -546,6 +546,7 @@ impl VisionTower {
         let patch = setting("clip.vision.patch_size")?;
         // the position table is a square grid of patches covering `image_size`
         let image_size = setting("clip.vision.image_size")?;
+        // `shape[1]` is the output width: GGUF lists a matrix's dimensions innermost first
         let projector_hidden = mmproj
             .tensors
             .get("mm.1.weight")
