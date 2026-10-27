@@ -30,6 +30,9 @@
 
 pub mod audio;
 pub mod causal;
+/// Opens the model files from disk, so it needs the `mmap` feature (wasm and other builds without
+/// file I/O use the lower-level model types).
+#[cfg(feature = "mmap")]
 pub mod engine;
 pub mod head;
 pub mod json;
@@ -49,6 +52,7 @@ use crate::model::weights::MmapWeight;
 use crate::session::Session;
 use crate::tokenizer::BpeTokenizer;
 
+#[cfg(feature = "mmap")]
 pub use engine::D1Engine;
 pub use json::Json;
 pub use prompt::{Question, QuestionType};

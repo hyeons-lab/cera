@@ -17,6 +17,8 @@
 //!   rounds its activations its own way, and llama.cpp's own Q8_0 answer sits 0.008 from its
 //!   F16 one); on the F16 files they agree to 0.004. The choices must match exactly.
 
+#![cfg(feature = "mmap")]
+
 use std::path::{Path, PathBuf};
 
 use cera::d1::{D1Engine, Json};

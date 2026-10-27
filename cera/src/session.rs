@@ -56,6 +56,7 @@ thread_local! {
 }
 
 /// An image already run through the vision tower: the embedding rows for the context.
+#[cfg_attr(not(feature = "vl-preprocess"), allow(dead_code))]
 #[derive(Debug, Clone)]
 pub struct EncodedImage {
     rows: Vec<f32>,
