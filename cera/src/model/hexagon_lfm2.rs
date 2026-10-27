@@ -29,7 +29,7 @@ use crate::kv_cache::{InferenceState, KvCompression};
 use crate::model::gpu_weight_source::GpuWeightSource;
 use crate::model::session_gate::{ModelSessionGate, ModelSessionLease};
 use crate::model::transformer::{FfnActivation, WeightRef};
-use crate::model::{BlockType, Model, ModelConfig, record_first_fault, take_fault};
+use crate::model::{BlockType, EncoderInput, Model, ModelConfig, record_first_fault, take_fault};
 use crate::session::CeraError;
 
 /// Type alias exposing the generalized Hexagon NPU model engine.
@@ -43,6 +43,31 @@ struct HexagonWeight {
     wire_dtype: HtpDataType,
     block_bytes: usize,
     tile_size: usize,
+}
+
+impl HexagonWeight {
+    /// The stand-in for a weight that is deliberately not uploaded (`out_dim == 0`). Nothing
+    /// may dispatch it; see [`HexagonLfmModel::lm_head_weight`].
+    fn unplanned(in_dim: usize) -> Self {
+        Self {
+            offset: 0,
+            in_dim,
+            out_dim: 0,
+            wire_dtype: HtpDataType::F32,
+            block_bytes: 0,
+            tile_size: 0,
+        }
+    }
+
+    fn is_planned(&self) -> bool {
+        self.out_dim != 0
+    }
+
+    /// A plain row-major F16 matrix (no repack, no tiles) for the HMX kernel: only the
+    /// decision model's encoder passes plan these (see `weights::F16Weights`).
+    fn is_plain_f16(&self) -> bool {
+        self.wire_dtype == HtpDataType::F16
+    }
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -366,6 +391,9 @@ struct HexagonKnobs {
     use_ssm_conv: bool,
     /// `CERA_HEXAGON_HMX` (default on): HMX kernels for prefill.
     use_hmx: bool,
+    /// `CERA_HEXAGON_DECISION_F16` (default on): a decision model's F16 matmuls run as plain F16
+    /// on the HMX; off runs them as Q8_0 (the earlier behavior), for A/B comparison.
+    decision_f16: bool,
     /// `CERA_HEXAGON_ARCH`: skeleton architecture override (numeric id).
     arch_override: Option<HexagonArch>,
     /// `CERA_HEXAGON_KV_Q8` (opt-in): Q8_0 KV cache instead of F16.
@@ -386,6 +414,9 @@ struct HexagonKnobs {
     /// the conv state writeback stopped sharing a scratch row, see
     /// `ScratchOffsets::conv_stage`).
     batch_tensors: Option<usize>,
+    /// The same knob as it applies to the encoder and head passes: unset means
+    /// [`ENCODER_MAX_TENSORS_PER_FLUSH`], `0` unbounded, a positive N that cap.
+    encoder_batch_tensors: Option<usize>,
 }
 
 impl HexagonKnobs {
@@ -416,6 +447,7 @@ impl HexagonKnobs {
                 .unwrap_or(10_000_000),
             use_ssm_conv: default_on("CERA_HEXAGON_SSM_CONV"),
             use_hmx: default_on("CERA_HEXAGON_HMX"),
+            decision_f16: default_on("CERA_HEXAGON_DECISION_F16"),
             arch_override: crate::backend::hexagon::arch_override_with(&get),
             kv_q8: opt_in("CERA_HEXAGON_KV_Q8"),
             decode_ops: get("CERA_HEXAGON_DECODE_OPS")
@@ -432,6 +464,14 @@ impl HexagonKnobs {
                         );
                         None
                     }
+                },
+            },
+            encoder_batch_tensors: match get("CERA_HEXAGON_BATCH_TENSORS") {
+                None => Some(ENCODER_MAX_TENSORS_PER_FLUSH),
+                Some(raw) => match raw.trim().parse::<usize>() {
+                    Ok(0) => None,
+                    Ok(n) => Some(n),
+                    Err(_) => Some(ENCODER_MAX_TENSORS_PER_FLUSH),
                 },
             },
         }
@@ -833,6 +873,16 @@ const SMALL_M_FLUSH_CAP_ROWS: usize = 32;
 /// Ops-per-flush cap for small-M prefill chunks (see above).
 const MAX_OPS_PER_FLUSH: usize = 24;
 
+/// Tensors per DSP batch for the bidirectional encoder and the decision head, unless
+/// `CERA_HEXAGON_BATCH_TENSORS` says otherwise (`0` is unbounded). Those emitters register
+/// a weight or a scratch tensor once and reuse it across the ops of a group, so the
+/// small-M ops cap (`MAX_OPS_PER_FLUSH`) must never fire in the middle of a group: it would
+/// clear the tensor table under the later ops. The tensor cap ends a batch at a group
+/// boundary long before 24 ops accumulate, which keeps that cap from firing; it is also
+/// the setting these passes were verified with on the device. The generative paths keep
+/// the uncapped default.
+const ENCODER_MAX_TENSORS_PER_FLUSH: usize = 32;
+
 pub const MAX_ALL_LOGITS_TOKENS: usize = 64;
 
 #[derive(Clone, Copy, Debug)]
@@ -1174,7 +1224,9 @@ struct FlashAttnPatch {
 
 /// Hexagon NPU accelerated model instance for LFM2 dense hybrid transformers.
 pub struct HexagonLfmModel {
-    device: Mutex<HexagonDevice>,
+    /// Shared with the decision head ([`head::HexagonHead`]), which runs between trunk
+    /// passes on the same session under the same lock.
+    device: Arc<Mutex<HexagonDevice>>,
     config: ModelConfig,
     session_gate: ModelSessionGate,
 
@@ -1237,6 +1289,8 @@ pub struct HexagonLfmModel {
     /// Tensors per DSP batch for decode and every prefill chunk
     /// (`CERA_HEXAGON_BATCH_TENSORS`, `None` = unbounded).
     batch_tensor_cap: Option<usize>,
+    /// The tensor cap of the encoder and head passes (see [`ENCODER_MAX_TENSORS_PER_FLUSH`]).
+    encoder_batch_tensor_cap: Option<usize>,
     current_seq_len: AtomicUsize,
     /// Set when a forward failed mid-flight on a model with recurrent (conv or
     /// DeltaNet) layers: those states advance in `kv_state_buf` op by op while
@@ -1258,6 +1312,17 @@ pub struct HexagonLfmModel {
     decode_template: Mutex<Option<DecodeTemplate>>,
     /// Cached static command queue template for zero-allocation greedy (on-DSP argmax) decode forward passes.
     greedy_decode_template: Mutex<Option<DecodeTemplate>>,
+    /// Process-unique id stamped on the encoder prefixes this instance makes.
+    encoder_id: u64,
+    /// The long buffer of a layer-outer encoder pass (residual stream of every
+    /// row, see `encoder::LongLayout`): allocated on the first long pass, grown
+    /// on demand and released after a pass that needed a large one. Locked only
+    /// under the device lock.
+    encoder_long: Mutex<Option<RpcmemBuffer>>,
+    /// `(prefix id, queue dispatch count)` when the last encoder pass left the device holding
+    /// exactly that prefix's K/V rows and conv state (see `restore_encoder_state`). Locked
+    /// only under the device lock.
+    encoder_resident: Mutex<Option<(u64, u64)>>,
 }
 
 unsafe impl Send for HexagonLfmModel {}
@@ -1288,6 +1353,7 @@ enum DecodeResult {
 }
 
 mod blocks;
+mod encoder;
 mod host;
 mod ops;
 mod pager;
@@ -1318,10 +1384,26 @@ impl Drop for HexagonLfmModel {
         if let Some(pager) = &self.pager {
             pager.release_dsp_references(session);
         }
+        let long = self.encoder_long.lock().unwrap_or_else(|e| e.into_inner());
+        session.release_dsp_references(long.iter().collect::<Vec<_>>());
     }
 }
 
 impl HexagonLfmModel {
+    /// The LM head, or a typed error for a model loaded for bidirectional encoding only (a
+    /// decision model, whose head is never uploaded).
+    fn lm_head_weight(&self) -> Result<&HexagonWeight, CeraError> {
+        if self.lm_head.is_planned() {
+            Ok(&self.lm_head)
+        } else {
+            Err(CeraError::Backend(
+                "this model was loaded for bidirectional encoding only (a decision model): \
+                 its LM head is not on the NPU, so decode and prefill logits are not available"
+                    .into(),
+            ))
+        }
+    }
+
     /// True when any layer keeps recurrent (conv or DeltaNet) state in `kv_state_buf`.
     fn has_recurrent_layers(&self) -> bool {
         self.layers
@@ -1405,7 +1487,7 @@ impl HexagonLfmModel {
     ) -> Self {
         Self {
             vtcm_budget: device.hw_info().vtcm_size as usize,
-            device: Mutex::new(device),
+            device: Arc::new(Mutex::new(device)),
             has_moe: any_moe(&p.layers),
             config: p.config,
             session_gate: ModelSessionGate::default(),
@@ -1433,6 +1515,7 @@ impl HexagonLfmModel {
             dump_act: knobs.dump_act,
             decode_ops_cap: knobs.decode_ops,
             batch_tensor_cap: knobs.batch_tensors,
+            encoder_batch_tensor_cap: knobs.encoder_batch_tensors,
             current_seq_len: AtomicUsize::new(0),
             state_torn: AtomicBool::new(false),
             rope_scratch: Mutex::default(),
@@ -1440,6 +1523,9 @@ impl HexagonLfmModel {
             kv_dtype: p.kv_dtype,
             decode_template: Mutex::new(None),
             greedy_decode_template: Mutex::new(None),
+            encoder_id: encoder::next_encoder_model_id(),
+            encoder_long: Mutex::new(None),
+            encoder_resident: Mutex::new(None),
         }
     }
 
@@ -1534,7 +1620,7 @@ impl HexagonLfmModel {
 
         let Backend {
             driver,
-            device,
+            mut device,
             knobs,
             adpf,
         } = backend;
@@ -1600,7 +1686,18 @@ impl HexagonLfmModel {
         if paged && !paging.allow_paged {
             return Err(paging_refused(gguf_bytes, kv_bytes, &paging));
         }
-        let mut plan = WeightPlanner::new(&src).with_paged_experts(paged);
+        // A decision or d1 model's trunk may be an F16 file: its encoder passes run those
+        // matmuls on the HMX from the file's own bytes (any other model refuses an F16 matmul
+        // tensor).
+        let f16_policy = if crate::model::is_encoder_trunk(&gguf) {
+            let threads = device.queue_session_mut().dsp_threads();
+            decision_f16_policy(knobs.use_hmx, knobs.decision_f16, device.hw_info(), threads)
+        } else {
+            F16Weights::Refuse
+        };
+        let mut plan = WeightPlanner::new(&src)
+            .with_paged_experts(paged)
+            .with_f16(f16_policy);
         let mut kv = KvPlanner::new(kv_dtype, max_seq_len);
         let state_size = align256(hidden_size * 4);
         let moe_dims = |i: usize| {
@@ -1691,7 +1788,15 @@ impl HexagonLfmModel {
             return Err(CeraError::Backend("missing output_norm tensor".into()));
         };
         let output_norm_offset = plan.vector(output_norm_name, hidden_size);
-        let lm_head = plan.weight(lm_head_name, hidden_size, vocab_size)?;
+        // A decision or d1 model is only ever run through the encoder pass: the embedding table
+        // is read on the host, the head is host-side, and no logits are computed. Its LM head
+        // (the tied embedding, 65536 rows) would be uploaded and never read, so it is not
+        // planned, and the causal paths that would read it refuse (`lm_head_weight`).
+        let lm_head = if crate::model::is_encoder_trunk(&gguf) {
+            HexagonWeight::unplanned(hidden_size)
+        } else {
+            plan.weight(lm_head_name, hidden_size, vocab_size)?
+        };
 
         // The estimate that chose paging must be the plan's own total.
         debug_assert_eq!(kv.total, kv_bytes);
@@ -2391,6 +2496,9 @@ impl HexagonLfmModel {
 
         let mut device = self.lock_device();
         self.ensure_state_intact(&device)?;
+        if start_pos == 0 {
+            self.zero_recurrent_layers();
+        }
 
         let so = self.scratch_offsets;
         let scratch = &self.scratch_buf;
@@ -2534,7 +2642,7 @@ impl HexagonLfmModel {
                 self.dispatch_mul_mat_m(
                     session,
                     &self.weights_buf,
-                    &self.lm_head,
+                    self.lm_head_weight()?,
                     scratch,
                     final_normed,
                     scratch,
@@ -2545,7 +2653,7 @@ impl HexagonLfmModel {
                 self.dispatch_mul_mat(
                     session,
                     &self.weights_buf,
-                    &self.lm_head,
+                    self.lm_head_weight()?,
                     scratch,
                     final_normed,
                     scratch,
@@ -2555,7 +2663,7 @@ impl HexagonLfmModel {
                 self.dispatch_mul_mat(
                     session,
                     &self.weights_buf,
-                    &self.lm_head,
+                    self.lm_head_weight()?,
                     scratch,
                     final_normed + (m - 1) * hs * 4,
                     scratch,
@@ -2699,6 +2807,9 @@ impl HexagonLfmModel {
 
         let mut device = self.lock_device();
         self.ensure_state_intact(&device)?;
+        if pos == 0 {
+            self.zero_recurrent_layers();
+        }
 
         let so = self.scratch_offsets;
         let scratch = &self.scratch_buf;
@@ -2793,9 +2904,11 @@ impl HexagonLfmModel {
                 if let Err(e) =
                     session.flush_staged_resident(tpl.resident_id, &tpl.staged, &tpl.patch_ranges)
                 {
-                    // The only pre-dispatch exit of a replay is the staging
-                    // size check, unreachable with fixture-sized batches, so
-                    // this site is covered by the seam test
+                    // The pre-dispatch exits of a replay are the staging size
+                    // check (unreachable with fixture-sized batches) and the
+                    // drain of a pipelined batch that failed earlier (decode
+                    // runs unpipelined, so none is in flight here), so this
+                    // site is covered by the seam test
                     // `torn_only_when_a_dispatch_was_attempted`.
                     self.mark_state_torn_if_dispatched(session, dispatches_before);
                     return Err(CeraError::Backend(format!(
@@ -2909,7 +3022,7 @@ impl HexagonLfmModel {
                 self.dispatch_mul_mat(
                     session,
                     &self.weights_buf,
-                    &self.lm_head,
+                    self.lm_head_weight()?,
                     scratch,
                     final_normed,
                     scratch,
@@ -3435,6 +3548,67 @@ impl Model for HexagonLfmModel {
         true
     }
 
+    fn backend_label(&self) -> &'static str {
+        "hexagon"
+    }
+
+    fn set_encoder_low_cpu(&self, on: bool) -> bool {
+        crate::backend::hexagon::set_low_cpu(on);
+        true
+    }
+
+    /// A bidirectional model's rows, hidden states after the final norm, from the encoder pass
+    /// (see the `encoder` module): the whole sequence in one go, as the d1 trunk needs.
+    fn supports_hidden_states(&self) -> bool {
+        self.supports_bidirectional_encode()
+    }
+
+    fn supports_bidirectional_hidden_states(&self) -> bool {
+        self.supports_bidirectional_encode()
+    }
+
+    fn supports_media_prefix(&self) -> bool {
+        self.supports_bidirectional_encode()
+    }
+
+    fn hidden_states(&self, tokens: &[u32], state: &mut InferenceState) -> Vec<f32> {
+        match self.encode_rows(EncoderInput::Tokens(tokens), None, state) {
+            Ok(rows) => rows,
+            Err(e) => {
+                hexagon_error!("bidirectional hidden states failed, returning zeros: {e}");
+                // The trait returns bare vectors: record the fault so `Session` surfaces an
+                // `Err` instead of handing the zeros to a caller that would score them.
+                record_first_fault(&self.decode_error, e);
+                vec![0.0; tokens.len() * self.config.hidden_size]
+            }
+        }
+    }
+
+    /// The prefix is encoded on its own (its rows attend each other and nothing else, and the
+    /// convolution at its last row does not read the first token), then the tokens attend the
+    /// prefix and each other.
+    fn hidden_states_with_prefix(
+        &self,
+        prefix: &[f32],
+        tokens: &[u32],
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let run = |state: &mut InferenceState| {
+            let kept = self.encode_prefix(EncoderInput::Embeddings(prefix), state)?;
+            self.encode_rows(EncoderInput::Tokens(tokens), Some(&kept), state)
+        };
+        match run(state) {
+            Ok(rows) => rows,
+            Err(e) => {
+                hexagon_error!("bidirectional hidden states failed, returning zeros: {e}");
+                // The trait returns bare vectors: record the fault so `Session` surfaces an
+                // `Err` instead of handing the zeros to a caller that would score them.
+                record_first_fault(&self.decode_error, e);
+                vec![0.0; tokens.len() * self.config.hidden_size]
+            }
+        }
+    }
+
     fn check_kv_rewind(
         &self,
         state: &InferenceState,
@@ -3570,6 +3744,10 @@ impl HexagonLfmModel {
             self.state_torn.store(true, Ordering::SeqCst);
             return Err(e);
         }
+        *self
+            .encoder_resident
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         unsafe {
             std::ptr::write_bytes(self.kv_state_buf.as_mut_ptr(), 0, self.kv_state_buf.size());
         }
@@ -3577,6 +3755,47 @@ impl HexagonLfmModel {
             .flush_cpu_cache(0, self.kv_state_buf.size());
         self.state_torn.store(false, Ordering::SeqCst);
         Ok(())
+    }
+
+    /// Zero the recurrent (short-conv and DeltaNet) state of every layer and nothing else: the
+    /// start of a sequence. That state lives on the model, not in the session's
+    /// `InferenceState`, so a new session, or any prefill that starts at position 0 without a
+    /// `reset()`, would otherwise begin with the last request's conv history, and the same prompt
+    /// would give different logits depending on what ran before it. The KV slabs need no clearing:
+    /// attention reads only the positions this sequence has written.
+    ///
+    /// Does not quiesce: the callers have just passed `ensure_state_intact`, so no timed-out batch
+    /// can still be writing (the full reset, `reset_recurrent_state`, quiesces for that case).
+    fn zero_recurrent_layers(&self) {
+        // The conv slabs hold the resident encoder prefix's left neighbour: zeroing them makes
+        // that resident copy stale, as in `reset_recurrent_state`.
+        *self
+            .encoder_resident
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
+        let zero = |offset: usize, len: usize| unsafe {
+            std::ptr::write_bytes(self.kv_state_buf.as_mut_ptr().add(offset), 0, len);
+            self.kv_state_buf.flush_cpu_cache(offset, len);
+        };
+        for layer in &self.layers {
+            match layer {
+                HexagonLayer::Attention(_) => {}
+                // the slab the planner reserves: a `[C, 2]` plane pair, one plane padded to 256 bytes
+                HexagonLayer::Conv(conv) => {
+                    zero(conv.state_offset, 2 * align256(self.config.hidden_size * 4));
+                }
+                HexagonLayer::DeltaNet(dn) => {
+                    zero(
+                        dn.conv_state_offset,
+                        align256(dn.conv_dim * dn.d_conv.saturating_sub(1) * 4),
+                    );
+                    zero(
+                        dn.ssm_state_offset,
+                        align256(dn.dt_rank * dn.d_state * dn.d_state * 4),
+                    );
+                }
+            }
+        }
     }
 
     /// Move the position to `len`, zeroing recurrent state on a full rewind.
@@ -3599,6 +3818,8 @@ impl HexagonLfmModel {
 
 #[cfg(test)]
 mod constructor_golden_tests;
+#[cfg(test)]
+mod encoder_tests;
 #[cfg(test)]
 mod forward_golden_tests;
 #[cfg(test)]

@@ -12,6 +12,7 @@
         "AUDIO_MARKER_CANDIDATES": "pub const AUDIO_MARKER_CANDIDATES: [&'static str; 4]",
         "audio_encoder": "pub fn audio_encoder(&self) -> Option<&Arc<AudioEncoderWeights>>",
         "audio_profile": "pub fn audio_profile(&self) -> crate::audio_profile::AudioProfile",
+        "backend_name": "pub fn backend_name(&self) -> &'static str",
         "capabilities": "pub fn capabilities(&self) -> ModalityCapabilities",
         "clear_cache": "pub fn clear_cache(&self)",
         "clear_warm_cache": "pub fn clear_warm_cache(&self)",
@@ -41,6 +42,7 @@
         "tokenizer": "pub fn tokenizer(&self) -> &BpeTokenizer",
         "tokenizer_arc": "pub fn tokenizer_arc(&self) -> Arc<BpeTokenizer>",
         "transcribe": "pub fn transcribe(&self, pcm: &[f32], sample_rate: u32) -> Result<String, CeraError>",
+        "vision_backend_name": "pub fn vision_backend_name(&self) -> Option<&'static str>",
         "vision_encoder": "pub fn vision_encoder(&self) -> Option<&Arc<VisionEncoderWeights>>",
         "vision_encoder_gguf": "pub fn vision_encoder_gguf(&self) -> Option<&Arc<GgufFile>>"
       }

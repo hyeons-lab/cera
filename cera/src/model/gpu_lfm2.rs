@@ -11559,6 +11559,16 @@ impl Model for GpuLfmModel {
         out
     }
 
+    fn backend_label(&self) -> &'static str {
+        "wgpu"
+    }
+
+    /// A bidirectional model's `hidden_states` run the bidirectional trunk, which only a dense
+    /// model has (no routed-FFN path), so the answer is the same as for `hidden_states`.
+    fn supports_bidirectional_hidden_states(&self) -> bool {
+        self.supports_hidden_states()
+    }
+
     /// Only a bidirectional model reads a media prefix this way, and only a dense one:
     /// the bidirectional trunk has no routed-FFN path.
     fn supports_media_prefix(&self) -> bool {

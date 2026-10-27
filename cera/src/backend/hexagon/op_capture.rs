@@ -3,12 +3,27 @@
 //! can pin the exact op sequence a forward pass emits without a device,
 //! including the queue's own capped and step-mode flushes.
 
-use crate::backend::hexagon::{HexagonDevice, HexagonQueueSession, HtpOpCode};
+use crate::backend::hexagon::{
+    HexagonDevice, HexagonQueueSession, HtpBufDesc, HtpOpCode, HtpOpDesc, HtpTensor,
+};
 use std::cell::{Cell, RefCell};
+
+/// Test-side executor of a flushed batch: the buffers, tensors and ops of the
+/// batch, in order (see [`set_executor`]).
+pub(crate) type Executor = Box<dyn FnMut(&[HtpBufDesc], &[HtpTensor], &[HtpOpDesc])>;
 
 thread_local! {
     static BATCHES: RefCell<Vec<String>> = const { RefCell::new(Vec::new()) };
     static PANIC_ON_RECORD: Cell<bool> = const { Cell::new(false) };
+    static EXECUTOR: RefCell<Option<Executor>> = const { RefCell::new(None) };
+}
+
+/// Install (or, with `None`, remove) an executor that [`record`] hands every
+/// flushed batch to, before the batch's text is recorded. The fake driver runs
+/// nothing; a test that wants the numbers of a pass interprets the ops here, in
+/// flush order, on the host memory behind the batch's buffers.
+pub(crate) fn set_executor(executor: Option<Executor>) {
+    EXECUTOR.with(|e| *e.borrow_mut() = executor);
 }
 
 /// Make the next [`record`] on this thread panic: an unwind from inside a
@@ -27,6 +42,11 @@ pub(crate) fn record(session: &HexagonQueueSession) {
         panic!("op_capture: injected panic");
     }
     let (bufs, _map, tens, ops) = session.export_batch();
+    EXECUTOR.with(|e| {
+        if let Some(run) = e.borrow_mut().as_mut() {
+            run(&bufs, &tens, &ops);
+        }
+    });
     let mut out = String::new();
     for op in &ops {
         let name = HtpOpCode::from_u32(op.opcode).map_or("?", |o| o.name());
@@ -73,6 +93,7 @@ pub(crate) fn fresh_device() -> (
     use crate::backend::hexagon::{HexagonArch, sys::fake};
     fake::reset();
     take();
+    set_executor(None);
     PANIC_ON_RECORD.with(|p| p.set(false));
     let driver = fake::driver();
     let mut device = HexagonDevice::new(std::sync::Arc::clone(&driver), HexagonArch::V79).unwrap();

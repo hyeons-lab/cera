@@ -931,7 +931,7 @@ fn test_batch_tensor_cap_knob() {
 fn test_knob_boolean_rule() {
     let d = knobs(&[]);
     assert!(!d.cpu_rope && !d.debug_barriers && !d.dump_act && !d.kv_q8);
-    assert!(d.use_ssm_conv && d.use_hmx);
+    assert!(d.use_ssm_conv && d.use_hmx && d.decision_f16);
     assert_eq!(d.adpf_target_nanos, 10_000_000);
     assert_eq!(d.arch_override, None);
     assert_eq!(d.kv_dtype(), HtpDataType::F16);
@@ -955,13 +955,21 @@ fn test_knob_boolean_rule() {
         assert!(!k.cpu_rope && !k.dump_act, "{off:?}");
     }
     for off in ["0", "false", "FALSE", " 0 "] {
-        let k = knobs(&[("CERA_HEXAGON_SSM_CONV", off), ("CERA_HEXAGON_HMX", off)]);
-        assert!(!k.use_ssm_conv && !k.use_hmx, "{off:?}");
+        let k = knobs(&[
+            ("CERA_HEXAGON_SSM_CONV", off),
+            ("CERA_HEXAGON_HMX", off),
+            ("CERA_HEXAGON_DECISION_F16", off),
+        ]);
+        assert!(!k.use_ssm_conv && !k.use_hmx && !k.decision_f16, "{off:?}");
     }
     // Default-on knobs stay on for anything else.
     for keep in ["1", "true", "", "off", "no"] {
-        let k = knobs(&[("CERA_HEXAGON_SSM_CONV", keep), ("CERA_HEXAGON_HMX", keep)]);
-        assert!(k.use_ssm_conv && k.use_hmx, "{keep:?}");
+        let k = knobs(&[
+            ("CERA_HEXAGON_SSM_CONV", keep),
+            ("CERA_HEXAGON_HMX", keep),
+            ("CERA_HEXAGON_DECISION_F16", keep),
+        ]);
+        assert!(k.use_ssm_conv && k.use_hmx && k.decision_f16, "{keep:?}");
     }
 }
 

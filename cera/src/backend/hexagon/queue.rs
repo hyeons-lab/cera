@@ -3,7 +3,7 @@
 //! Batches operations into `htp_opbatch_req` descriptors and dispatches
 //! to the DSP hardware via FastRPC `dspqueue`.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::sync::Arc;
 
 use super::params::{build_concat_kernel_params, build_copy_kernel_params};
@@ -18,6 +18,12 @@ use crate::session::CeraError;
 
 /// Staging buffer size for batch queue serialization (4 MB).
 const STAGING_BUFFER_SIZE: usize = 4 * 1024 * 1024;
+
+/// Most batches a pipelined session leaves unanswered before it reads the oldest
+/// response (see [`HexagonQueueSession::set_pipelined`]). A batch takes tens of
+/// bytes of the request queue and a response about as much, so this is far
+/// under what either queue holds.
+const MAX_INFLIGHT: usize = 32;
 
 /// Cap on consecutive stale responses drained in one flush. Stale responses
 /// are bounded by prior timeouts (one per timed-out batch); anything past
@@ -71,6 +77,16 @@ fn stale_drain_action(rsp_seq: u64, expected: u64, drained: u32) -> StaleDrainAc
     } else {
         StaleDrainAction::Future
     }
+}
+
+/// A batch written to the DSP whose response has not been read yet.
+#[derive(Debug)]
+struct InFlight {
+    seq: u64,
+    /// Where the batch's profile descriptors sit in the staging buffer.
+    prof_offset: usize,
+    n_ops: usize,
+    started: std::time::Instant,
 }
 
 /// Inline flat-array buffer map avoiding heap allocations on the hot path.
@@ -294,6 +310,18 @@ pub struct HexagonQueueSession {
     prof_host_us: u64,
     prof_dsp_us: u64,
     prof_flushes: u64,
+    /// Nanoseconds spent writing batches and waiting for their responses, over the
+    /// session's life (always on: two clock reads per flush).
+    wait_ns: u64,
+    /// Capped auto-flushes write their batch and return without waiting for the response
+    /// (see [`Self::set_pipelined`]).
+    pipelined: bool,
+    /// Pipelined batches awaiting their response, oldest first.
+    inflight: VecDeque<InFlight>,
+    /// Where the next pipelined batch goes in the staging buffer: each batch of a run
+    /// gets its own region, so the DSP can still be reading one while the host writes
+    /// the next.
+    stage_cursor: usize,
     /// DSP worker threads from `htp_iface_hwinfo` (llama's `sess->n_threads`).
     /// kparams thread counts derive from this; the default is llama's
     /// hwinfo-failure fallback until `HexagonDevice` overwrites it.
@@ -308,6 +336,9 @@ pub struct HexagonQueueSession {
     /// core busy for the whole batch; a queue running long, latency-tolerant
     /// batches (the audio encoder in a background task) would rather free it.
     blocking_wait: bool,
+    /// Wait by polling and napping this many microseconds between polls (see
+    /// [`Self::set_nap_wait`]); takes precedence over `blocking_wait`'s kernel sleep.
+    nap_us: u64,
     /// Flush after every op (`CERA_HEXAGON_STEP`). A field, not a per-call
     /// env read, so tests can drive the step-mode error path.
     step_mode: bool,
@@ -365,11 +396,16 @@ impl HexagonQueueSession {
             prof_host_us: 0,
             prof_dsp_us: 0,
             prof_flushes: 0,
+            wait_ns: 0,
+            pipelined: false,
+            inflight: VecDeque::new(),
+            stage_cursor: 0,
             dsp_threads: 8,
             dsp_hmx: 0,
             dsp_vtcm_bytes: 8 * 1024 * 1024,
             resident_staged_id: None,
             blocking_wait: false,
+            nap_us: 0,
             step_mode: step_enabled(),
             outstanding: 0,
             #[cfg(test)]
@@ -473,6 +509,13 @@ impl HexagonQueueSession {
         self.seq
     }
 
+    /// Nanoseconds this session has spent writing batches to the DSP and waiting
+    /// for their responses (a difference of two reads is a phase's device time,
+    /// round trips included).
+    pub fn wait_ns(&self) -> u64 {
+        self.wait_ns
+    }
+
     /// Record the skel handle `htp_iface` calls about this queue's buffers go
     /// through.
     pub(crate) fn set_skel_handle(&mut self, handle: super::sys::RemoteHandle64) {
@@ -571,6 +614,7 @@ impl HexagonQueueSession {
                 })?;
             self.outstanding -= 1;
         }
+        self.inflight.clear();
         Ok(())
     }
 
@@ -711,6 +755,9 @@ impl HexagonQueueSession {
     /// Dispatch a pre-staged command batch without rebuilding or re-serializing descriptors.
     pub fn flush_staged(&mut self, staged: &StagedBatch) -> Result<(), CeraError> {
         self.resident_staged_id = None;
+        // Staging offset 0 is about to be reused, so a pipelined batch still reading it must
+        // have answered first.
+        self.drain()?;
         staged.validate()?;
         let total_bytes = staged.total_bytes;
         if total_bytes > self.staging_capacity() {
@@ -747,6 +794,7 @@ impl HexagonQueueSession {
         staged: &StagedBatch,
         patch_ranges: &[std::ops::Range<usize>],
     ) -> Result<(), CeraError> {
+        self.drain()?;
         staged.validate()?;
         let total_bytes = staged.total_bytes;
         if total_bytes > self.staging_capacity() {
@@ -904,7 +952,7 @@ impl HexagonQueueSession {
         op.dst[..dst.len()].copy_from_slice(dst);
         self.ops.push(op);
         if self.max_ops_per_flush.is_some_and(|m| self.ops.len() >= m) {
-            self.flush().map_err(|e| {
+            self.flush_with(!self.pipelined).map_err(|e| {
                 CeraError::Backend(format!(
                     "HTP capped flush failed (cap={:?}): {e}",
                     self.max_ops_per_flush
@@ -929,7 +977,7 @@ impl HexagonQueueSession {
                 && self.tens.len() >= cap
             {
                 let pending = self.tens.len();
-                return self.flush().map_err(|e| {
+                return self.flush_with(!self.pipelined).map_err(|e| {
                     CeraError::Backend(format!(
                         "HTP tensor-capped flush failed (cap={cap}, tensors={pending}): {e}"
                     ))
@@ -951,6 +999,14 @@ impl HexagonQueueSession {
         std::mem::replace(&mut self.blocking_wait, blocking)
     }
 
+    /// Wait for responses by polling the queue and napping `nap_us` microseconds between polls
+    /// (0 turns it off; it applies when the session is not spinning). Cheap in CPU like a
+    /// sleeping read but without its wake-up cost, which matters when every batch of a pass
+    /// is waited for. Returns the previous setting.
+    pub fn set_nap_wait(&mut self, nap_us: u64) -> u64 {
+        std::mem::replace(&mut self.nap_us, nap_us)
+    }
+
     fn spin_for_responses(&self) -> bool {
         self.driver.polls_responses() && !self.blocking_wait
     }
@@ -969,18 +1025,117 @@ impl HexagonQueueSession {
         self.step_mode = on;
     }
 
-    /// Flush all queued operations in a single atomic batch execution.
+    /// Flush all queued operations in a single atomic batch execution, and wait until the
+    /// DSP has answered it and every batch pipelined before it.
     pub fn flush(&mut self) -> Result<(), CeraError> {
+        self.flush_with(true)
+    }
+
+    /// Let the capped auto-flushes of this session (the ones `enqueue_op` and `end_group`
+    /// make when a cap is reached) write their batch and carry on without waiting for the
+    /// DSP's response, so the host builds the next batch while the DSP runs the last: the
+    /// DSP's queue runs batches in order, so the results are the same, and the round trip of
+    /// every flush but the last stops being time the DSP sits idle. An explicit
+    /// [`Self::flush`] (or [`Self::drain`]) waits for everything written so far; a caller that
+    /// reads what the DSP wrote must end with one. Returns the previous setting.
+    ///
+    /// Turning it off does not wait: call [`Self::drain`] (an error path that drops the
+    /// batch being built must too, or the responses of what was written stay unread).
+    pub fn set_pipelined(&mut self, on: bool) -> bool {
+        std::mem::replace(&mut self.pipelined, on)
+    }
+
+    /// Wait for the response of every pipelined batch. After the first batch that failed it
+    /// still reads the rest, so the queue and the sequence numbers stay in step, and
+    /// returns that failure. A response that does not arrive (the read's hang guard) ends
+    /// the wait with that error and leaves the rest outstanding for [`Self::quiesce`].
+    pub fn drain(&mut self) -> Result<(), CeraError> {
+        let mut failed = None;
+        while !self.inflight.is_empty() {
+            match self.complete_oldest() {
+                Ok(None) => {}
+                Ok(Some(e)) => {
+                    failed.get_or_insert(e);
+                }
+                Err(e) => return Err(failed.unwrap_or(e)),
+            }
+        }
+        failed.map_or(Ok(()), Err)
+    }
+
+    /// Read the oldest pipelined batch's response. `Ok(Some(_))` is a batch the DSP
+    /// answered with an error status; `Err(_)` is a response that never came (everything
+    /// still in flight is then unaccounted for, see [`Self::quiesce`]).
+    fn complete_oldest(&mut self) -> Result<Option<CeraError>, CeraError> {
+        let Some(batch) = self.inflight.pop_front() else {
+            return Ok(None);
+        };
+        let started = std::time::Instant::now();
+        let rsp = self.await_response(batch.seq);
+        self.wait_ns += started.elapsed().as_nanos() as u64;
+        let rsp = match rsp {
+            Ok(rsp) => rsp,
+            Err(e) => {
+                self.inflight.clear();
+                return Err(e);
+            }
+        };
+        if profile_enabled() {
+            self.staging_buf.invalidate_cpu_cache(
+                batch.prof_offset,
+                batch.n_ops * std::mem::size_of::<HtpProfDesc>(),
+            );
+        }
+        if rsp.status != HtpStatus::Ok as u32 {
+            let status_detail = HtpStatus::from_u32(rsp.status)
+                .map(|s| format!("{s:?} ({})", rsp.status))
+                .unwrap_or_else(|| rsp.status.to_string());
+            return Ok(Some(CeraError::Backend(format!(
+                "HTP batch seq {} failed with status {status_detail}",
+                rsp.seq
+            ))));
+        }
+        if profile_enabled() {
+            self.record_profile(
+                rsp.seq,
+                batch.n_ops,
+                rsp.usecs,
+                rsp.cycles_stop.saturating_sub(rsp.cycles_start),
+                batch.started.elapsed(),
+                batch.prof_offset,
+            );
+        }
+        Ok(None)
+    }
+
+    /// Where the next batch of `total_bytes` goes in the staging buffer. Always the start
+    /// unless pipelined batches are still in flight, which keep their regions until they
+    /// answer: the cursor moves past them, and wraps (after waiting for them) when the
+    /// buffer is full.
+    fn reserve_stage(&mut self, total_bytes: usize) -> Result<usize, CeraError> {
+        if self.inflight.is_empty() {
+            self.stage_cursor = 0;
+        } else if self.stage_cursor + total_bytes > self.staging_capacity() {
+            self.drain()?;
+            self.stage_cursor = 0;
+        }
+        let at = self.stage_cursor;
+        self.stage_cursor = (at + total_bytes).next_multiple_of(256);
+        Ok(at)
+    }
+
+    /// [`Self::flush`], optionally without waiting for the response (`sync` false: the
+    /// batch joins the pipelined ones, see [`Self::set_pipelined`]).
+    fn flush_with(&mut self, sync: bool) -> Result<(), CeraError> {
         // Test-only op capture at the one choke point every flush passes
         // through (explicit, capped and step-mode alike), so goldens see
         // queue-internal auto-flushes too.
         self.resident_staged_id = None;
         if self.ops.is_empty() {
-            return Ok(());
+            return if sync { self.drain() } else { Ok(()) };
         }
         #[cfg(test)]
         super::op_capture::record(self);
-
         if debug_enabled() {
             eprintln!(
                 "cera-hexagon: flush bufs={} tens={} ops={}",
@@ -1036,9 +1191,10 @@ impl HexagonQueueSession {
                 self.staging_capacity()
             )));
         }
+        let stage_at = self.reserve_stage(total_bytes)?;
 
         unsafe {
-            let base = self.staging_buf.as_mut_ptr();
+            let base = self.staging_buf.as_mut_ptr().add(stage_at);
             std::ptr::copy_nonoverlapping(self.bufs.as_ptr() as *const u8, base, bufs_bytes);
             std::ptr::copy_nonoverlapping(
                 self.tens.as_ptr() as *const u8,
@@ -1056,13 +1212,72 @@ impl HexagonQueueSession {
         let n_bufs = self.bufs.len() as u32;
         let n_tensors = self.tens.len() as u32;
         let n_ops = self.ops.len() as u32;
-        let prof_offset = bufs_bytes + tens_bytes + ops_bytes;
+        let prof_offset = stage_at + bufs_bytes + tens_bytes + ops_bytes;
 
         // Attempts are single-shot: drop the pending batch whether dispatch
         // succeeded or failed.
         self.drop_pending_batch();
 
-        self.dispatch_batch_buffer(total_bytes, n_bufs, n_tensors, n_ops, prof_offset)
+        if sync && self.inflight.is_empty() {
+            return self.dispatch_batch_buffer(total_bytes, n_bufs, n_tensors, n_ops, prof_offset);
+        }
+        self.dispatch_batch_async(stage_at, total_bytes, n_bufs, n_tensors, n_ops, prof_offset)?;
+        if sync { self.drain() } else { Ok(()) }
+    }
+
+    /// Write a batch (already in the staging buffer at `stage_at`) to the DSP and return
+    /// without its response, which [`Self::drain`] reads later. Keeps at most
+    /// [`MAX_INFLIGHT`] batches unanswered.
+    fn dispatch_batch_async(
+        &mut self,
+        stage_at: usize,
+        total_bytes: usize,
+        n_bufs: u32,
+        n_tensors: u32,
+        n_ops: u32,
+        prof_offset: usize,
+    ) -> Result<(), CeraError> {
+        self.staging_buf.flush_cpu_cache(stage_at, total_bytes);
+        let dbuf = DspQueueBuffer {
+            fd: self.staging_buf.fd() as u32,
+            size: total_bytes as u32,
+            offset: stage_at as u32,
+            flags: DSPQUEUE_BUFFER_FLAG_FLUSH_SENDER | DSPQUEUE_BUFFER_FLAG_INVALIDATE_RECIPIENT,
+            ptr: unsafe { self.staging_buf.as_mut_ptr().add(stage_at) } as *mut std::ffi::c_void,
+        };
+        let req = HtpOpBatchReq {
+            seq: self.seq,
+            n_bufs,
+            n_tensors,
+            n_ops,
+            n_traces: 0,
+        };
+        let req_bytes = unsafe {
+            std::slice::from_raw_parts(
+                &req as *const _ as *const u8,
+                std::mem::size_of::<HtpOpBatchReq>(),
+            )
+        };
+        let started = std::time::Instant::now();
+        let write_res = self.driver.write_dsp_queue(self.queue, &[dbuf], req_bytes);
+        let seq = self.seq;
+        // Attempts are single-shot: advance `seq` whether this one succeeded or failed.
+        self.seq += 1;
+        self.wait_ns += started.elapsed().as_nanos() as u64;
+        write_res?;
+        self.outstanding += 1;
+        self.inflight.push_back(InFlight {
+            seq,
+            prof_offset,
+            n_ops: n_ops as usize,
+            started,
+        });
+        if self.inflight.len() >= MAX_INFLIGHT
+            && let Some(e) = self.complete_oldest()?
+        {
+            return Err(e);
+        }
+        Ok(())
     }
 
     /// Internal batch submission and response polling helper shared by `flush` and `flush_staged`.
@@ -1102,79 +1317,19 @@ impl HexagonQueueSession {
         let host_start = std::time::Instant::now();
         let write_res = self.driver.write_dsp_queue(self.queue, &[dbuf], req_bytes);
 
+        // Drain stale responses from prior timed-out batches, then require the response for THIS
+        // batch (see `await_response`).
         let mut rsp = HtpOpBatchRsp::default();
-        let mut resp_bufs = [DspQueueBuffer::default(); 1];
-
-        // Drain stale responses from prior timed-out batches, then require
-        // the response for THIS batch. In blocking mode a 30s timeout
-        // returns Err while the DSP may still complete the batch later; its
-        // response then sits in the queue, and without the drain the next
-        // flush would consume it as its own, permanently desyncing status
-        // attribution by one batch.
         let mut read_res: Result<(), CeraError> = Ok(());
         if write_res.is_ok() {
             self.outstanding += 1;
-            let mut stale_drained = 0u32;
-            loop {
-                let rsp_bytes = unsafe {
-                    std::slice::from_raw_parts_mut(
-                        &mut rsp as *mut _ as *mut u8,
-                        std::mem::size_of::<HtpOpBatchRsp>(),
-                    )
-                };
-                match self.driver.read_dsp_queue_with(
-                    self.queue,
-                    &mut resp_bufs,
-                    rsp_bytes,
-                    self.spin_for_responses(),
-                ) {
-                    Err(e) => {
-                        read_res = Err(e);
-                        break;
-                    }
-                    Ok(n_read) => {
-                        // Any message read consumed one outstanding response.
-                        self.outstanding = self.outstanding.saturating_sub(1);
-                        if (n_read as usize) < std::mem::size_of::<HtpOpBatchRsp>() {
-                            read_res = Err(CeraError::Backend(format!(
-                                "DSP queue response truncated: got {n_read} bytes, expected at least {}",
-                                std::mem::size_of::<HtpOpBatchRsp>()
-                            )));
-                            break;
-                        }
-                        match stale_drain_action(rsp.seq, self.seq, stale_drained) {
-                            StaleDrainAction::DrainStale => {
-                                stale_drained += 1;
-                                super::hexagon_warn!(
-                                    "drained stale DSP queue response \
-                                     (stale_seq={}, expected_seq={})",
-                                    rsp.seq,
-                                    self.seq
-                                );
-                                continue;
-                            }
-                            StaleDrainAction::CapExceeded => {
-                                stale_drained += 1;
-                                read_res = Err(CeraError::Backend(format!(
-                                    "DSP queue returned {stale_drained} consecutive stale \
-                                     responses (expected seq {})",
-                                    self.seq
-                                )));
-                                break;
-                            }
-                            StaleDrainAction::Current => break,
-                            StaleDrainAction::Future => {
-                                read_res = Err(CeraError::Backend(format!(
-                                    "DSP queue sequence mismatch (expected {}, got {})",
-                                    self.seq, rsp.seq
-                                )));
-                                break;
-                            }
-                        }
-                    }
-                }
+            match self.await_response(self.seq) {
+                Ok(r) => rsp = r,
+                Err(e) => read_res = Err(e),
             }
         }
+
+        self.wait_ns += host_start.elapsed().as_nanos() as u64;
 
         if profile_enabled() && total_bytes > prof_offset {
             self.staging_buf
@@ -1210,6 +1365,65 @@ impl HexagonQueueSession {
         }
 
         Ok(())
+    }
+
+    /// Read from the DSP queue until the response for batch `expected` arrives. Responses
+    /// of older batches (left unread by a timeout) are drained and discarded; one of a
+    /// newer batch is a desync. Counts every message read against `outstanding`.
+    fn await_response(&mut self, expected: u64) -> Result<HtpOpBatchRsp, CeraError> {
+        let mut rsp = HtpOpBatchRsp::default();
+        let mut resp_bufs = [DspQueueBuffer::default(); 1];
+        // In blocking mode a 30s timeout returns Err while the DSP may still complete the
+        // batch later; its response then sits in the queue, and without the drain the next
+        // flush would consume it as its own, permanently desyncing status attribution by one
+        // batch.
+        let mut stale_drained = 0u32;
+        loop {
+            let rsp_bytes = unsafe {
+                std::slice::from_raw_parts_mut(
+                    &mut rsp as *mut _ as *mut u8,
+                    std::mem::size_of::<HtpOpBatchRsp>(),
+                )
+            };
+            let n_read = self.driver.read_dsp_queue_napping(
+                self.queue,
+                &mut resp_bufs,
+                rsp_bytes,
+                self.spin_for_responses(),
+                self.nap_us,
+            )?;
+            // Any message read consumed one outstanding response.
+            self.outstanding = self.outstanding.saturating_sub(1);
+            if (n_read as usize) < std::mem::size_of::<HtpOpBatchRsp>() {
+                return Err(CeraError::Backend(format!(
+                    "DSP queue response truncated: got {n_read} bytes, expected at least {}",
+                    std::mem::size_of::<HtpOpBatchRsp>()
+                )));
+            }
+            match stale_drain_action(rsp.seq, expected, stale_drained) {
+                StaleDrainAction::DrainStale => {
+                    stale_drained += 1;
+                    super::hexagon_warn!(
+                        "drained stale DSP queue response (stale_seq={}, expected_seq={})",
+                        rsp.seq,
+                        expected
+                    );
+                }
+                StaleDrainAction::CapExceeded => {
+                    return Err(CeraError::Backend(format!(
+                        "DSP queue returned {} consecutive stale responses (expected seq {expected})",
+                        stale_drained + 1
+                    )));
+                }
+                StaleDrainAction::Current => return Ok(rsp),
+                StaleDrainAction::Future => {
+                    return Err(CeraError::Backend(format!(
+                        "DSP queue sequence mismatch (expected {expected}, got {})",
+                        rsp.seq
+                    )));
+                }
+            }
+        }
     }
 
     /// Aggregate DSP-side per-op timing from the profile descriptors the
@@ -1896,6 +2110,123 @@ mod tests {
             q.flush().unwrap_err();
             assert_eq!(q.dispatch_attempts(), start + 2 + n as u64, "failure {n}");
         }
+    }
+
+    fn reads() -> usize {
+        fake::with(|s| s.read_timeouts.len())
+    }
+
+    /// A pipelined session's capped flushes write their batch and return without reading the
+    /// response; an explicit flush waits for all of them, in order.
+    #[test]
+    fn pipelined_capped_flushes_write_now_and_answer_at_the_explicit_flush() {
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let mut q = test_session();
+        q.set_max_tensors_per_flush(Some(1));
+        let start = q.dispatch_attempts();
+        assert!(!q.set_pipelined(true));
+        for _ in 0..5 {
+            enqueue_with_tensor(&mut q, &buf).unwrap();
+        }
+        assert_eq!(q.dispatch_attempts(), start + 5, "five batches written");
+        assert_eq!(reads(), 0, "none of them waited for");
+        assert_eq!(q.outstanding_batches(), 5);
+        // the last batch's explicit flush (nothing pending: a pure wait) reads all five
+        q.flush().unwrap();
+        assert_eq!(reads(), 5);
+        assert_eq!(q.outstanding_batches(), 0);
+        // without the flag every batch is waited for before the call returns
+        q.set_pipelined(false);
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        assert_eq!(reads(), 6);
+    }
+
+    /// Pipelined batches sit in their own regions of the staging buffer until answered, and
+    /// the buffer wraps (after a wait) when it is full.
+    #[test]
+    fn pipelined_batches_keep_their_own_staging_regions() {
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let mut q = test_session();
+        q.set_max_tensors_per_flush(Some(1));
+        q.set_pipelined(true);
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        let first = q.stage_cursor;
+        assert!(first > 0 && first.is_multiple_of(256), "{first}");
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        assert!(q.stage_cursor > first, "the second batch is past the first");
+        // a batch that no longer fits makes the session wait for what is in flight, and restart
+        q.set_staging_capacity_for_test(Some(q.stage_cursor + 64));
+        let before = reads();
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        assert_eq!(reads() - before, 2, "wrapping waited for both batches");
+        assert!(
+            q.stage_cursor <= first,
+            "the new batch starts at the top again"
+        );
+        q.flush().unwrap();
+        assert_eq!(q.outstanding_batches(), 0);
+    }
+
+    /// A staged flush reuses staging offset 0 and waits for its own response, so it has to
+    /// collect the pipelined batches in front of it first: otherwise it overwrites a region the
+    /// DSP may still read, consumes an older response as its own, and leaves a stale entry
+    /// behind that the next drain waits on for the whole hang guard.
+    #[test]
+    fn a_staged_flush_collects_pipelined_batches_first() {
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let mut q = test_session();
+        q.set_max_tensors_per_flush(Some(1));
+        q.set_pipelined(true);
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        assert!(q.outstanding_batches() > 0, "one batch is in flight");
+        q.flush_staged(&staged(1, 1)).unwrap();
+        assert!(q.inflight.is_empty(), "the pipelined batch was collected");
+        assert_eq!(q.outstanding_batches(), 0);
+        let before = reads();
+        q.drain().unwrap();
+        assert_eq!(reads(), before, "nothing is left to wait for");
+    }
+
+    /// A pipelined session never has more than `MAX_INFLIGHT` batches unanswered.
+    #[test]
+    fn pipelining_is_bounded() {
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let mut q = test_session();
+        q.set_max_tensors_per_flush(Some(1));
+        q.set_pipelined(true);
+        for _ in 0..MAX_INFLIGHT * 2 {
+            enqueue_with_tensor(&mut q, &buf).unwrap();
+            assert!(q.outstanding_batches() <= MAX_INFLIGHT as u64);
+        }
+        q.flush().unwrap();
+        assert_eq!(q.outstanding_batches(), 0);
+    }
+
+    /// A batch the DSP answered with an error is reported by the wait that reads it, after the
+    /// rest were read (so the queue and the sequence numbers stay in step).
+    #[test]
+    fn a_pipelined_failure_surfaces_at_the_wait_and_leaves_the_queue_in_step() {
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let mut q = test_session();
+        q.set_max_tensors_per_flush(Some(1));
+        q.set_pipelined(true);
+        fake::with(|s| s.rsp_status = Some(HtpStatus::InvalParams as u32));
+        for _ in 0..3 {
+            enqueue_with_tensor(&mut q, &buf).unwrap();
+        }
+        let err = q.drain().unwrap_err().to_string();
+        assert!(err.contains("failed with status"), "{err}");
+        assert_eq!(q.outstanding_batches(), 0, "all three were read");
+        // the session carries on
+        fake::with(|s| s.rsp_status = None);
+        q.set_pipelined(false);
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        q.flush().unwrap();
     }
 
     /// A tensor cap flushes at the first op-group boundary at or past it, never

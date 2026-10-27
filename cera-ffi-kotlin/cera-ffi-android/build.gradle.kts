@@ -13,6 +13,7 @@ android {
 
     defaultConfig {
         minSdk = libs.versions.minSdk.get().toInt()
+        testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
     }
 
     lint {
@@ -28,6 +29,8 @@ android {
             // are staged into the default `src/main/jniLibs/<abi>/` by
             // `just android-libs` (gitignored): no custom srcDir needed.
             kotlin.directories.add("../../cera-ffi/bindings/kotlin")
+            // Hand-written helpers shared with the JVM module (decisions).
+            kotlin.directories.add("../shared/src/main/kotlin")
         }
     }
     // Release-variant publishing (+ sources/javadoc jars) is configured by the
@@ -44,6 +47,10 @@ dependencies {
     api("net.java.dev.jna:jna:${libs.versions.jna.get()}@aar")
     api(libs.kotlinx.coroutines.core)
     testImplementation(libs.junit)
+    // The on-device d1 test (`src/androidTest`): staged models, run by `connectedDebugAndroidTest`.
+    androidTestImplementation(libs.androidx.test.ext.junit)
+    androidTestImplementation(libs.androidx.test.runner)
+    androidTestImplementation(libs.kotlinx.coroutines.core)
 }
 
 mavenPublishing {

@@ -7599,6 +7599,61 @@ final class ChatSessionFfiCodec {
   static ChatSession lift(int handle) => _unsupportedOnWeb('ChatSessionFfiCodec.lift');
 }
 
+/// A loaded public d1 decision model.
+final class DecisionEngine {
+  DecisionEngine._();
+
+  bool get isClosed => _unsupportedOnWeb('DecisionEngine.isClosed');
+
+  void close() => _unsupportedOnWeb('DecisionEngine.close');
+
+  /// Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of the model for image
+  /// (and, for `d1-omni`, speech) requests (`None` answers text only).
+  ///
+  /// Blocks while the weights load and, for `Auto`, run a warm-up request; use
+  /// [`DecisionEngine::open_async`] from a UI thread. `backend` is a request, see the module
+  /// documentation.
+  static DecisionEngine open(String modelPath, String? mmprojPath, BackendPreference backend) => _unsupportedOnWeb('DecisionEngine.open');
+
+  /// Async [`DecisionEngine::open`]: the load runs on a tokio blocking worker, so a UI thread
+  /// never waits on it. Dropping the future aborts the load only while it is still queued.
+  static Future<DecisionEngine> openAsync(String modelPath, String? mmprojPath, BackendPreference backend) => _unsupportedOnWeb('DecisionEngine.openAsync');
+
+  /// The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
+  String backendName() => _unsupportedOnWeb('DecisionEngine.backendName');
+
+  /// Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+  /// hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+  /// CPU. For logs and diagnostics; the wording is not a stable format.
+  String backendReport() => _unsupportedOnWeb('DecisionEngine.backendReport');
+
+  /// Answer a `/v1/systemone` request given as JSON (`state`, `questions`, optionally `images`
+  /// as data URLs, an `audio/` data URL being a speech clip) and return the response JSON
+  /// (`answers` and `usage`).
+  ///
+  /// Blocks for the duration of the forward passes. An invalid request is a
+  /// [`FfiError::Backend`] whose detail says what is wrong.
+  String decideJson(String requestJson) => _unsupportedOnWeb('DecisionEngine.decideJson');
+
+  /// Async [`DecisionEngine::decide_json`] on a tokio blocking worker. Dropping the future
+  /// cancels the request before its next question (see the module documentation).
+  Future<String> decideJsonAsync(String requestJson) => _unsupportedOnWeb('DecisionEngine.decideJsonAsync');
+
+  /// The model type from the file: `lfm2-d1-omni`, `lfm2-d1` or `converted`.
+  String decisionType() => _unsupportedOnWeb('DecisionEngine.decisionType');
+
+  /// Whether speech requests can be answered (the speech tower is loaded).
+  bool supportsAudio() => _unsupportedOnWeb('DecisionEngine.supportsAudio');
+
+  /// Whether image requests can be answered (the vision tower is loaded).
+  bool supportsImages() => _unsupportedOnWeb('DecisionEngine.supportsImages');
+}
+
+final class DecisionEngineFfiCodec {
+  static int lower(DecisionEngine value) => _unsupportedOnWeb('DecisionEngineFfiCodec.lower');
+  static DecisionEngine lift(int handle) => _unsupportedOnWeb('DecisionEngineFfiCodec.lift');
+}
+
 /// A shared generative engine. Creating handles never reloads the source or copies live KV.
 final class GenerativeModel {
   GenerativeModel._();

@@ -421,9 +421,16 @@ impl LfmModel {
         );
         let prefix = arch.as_str();
 
-        let n_layers =
+        let stored_blocks =
             gguf.get_u32(&format!("{prefix}.block_count"))
                 .with_context(|| format!("missing {prefix}.block_count"))? as usize;
+        // a public d1-omni file stores its head blocks after the trunk's, inside block_count
+        let head_blocks = crate::d1::public::stored_head_blocks(gguf, prefix);
+        ensure!(
+            head_blocks < stored_blocks,
+            "{prefix}.decision.block_count ({head_blocks}) leaves no trunk in {prefix}.block_count ({stored_blocks})"
+        );
+        let n_layers = stored_blocks - head_blocks;
         let hidden_size = gguf
             .get_u32(&format!("{prefix}.embedding_length"))
             .with_context(|| format!("missing {prefix}.embedding_length"))?
@@ -6994,5 +7001,39 @@ pub(crate) mod bidirectional_float_tests {
             let cosine = dot / (norm(f) * norm(q));
             assert!(cosine > 0.995, "token {t}: cosine {cosine}");
         }
+    }
+
+    /// A public d1-omni file counts its head blocks in `block_count`; the trunk is the rest.
+    #[test]
+    fn a_public_d1_omni_trunk_excludes_the_head_blocks() {
+        use crate::gguf::GgufBuilder;
+        let base = || {
+            GgufBuilder::new()
+                .kv_str("general.architecture", "lfm2")
+                .kv_u32("lfm2.block_count", 3)
+                .kv_u32("lfm2.embedding_length", 128)
+                .kv_u32("lfm2.feed_forward_length", 256)
+                .kv_u32("lfm2.attention.head_count", 2)
+                .kv_i32_array("lfm2.attention.head_count_kv", vec![0, 0, 2])
+                .kv_u32("lfm2.shortconv.l_cache", 3)
+                .kv_u32("lfm2.vocab_size", 64)
+                .kv_u32("lfm2.decision.block_count", 1)
+                .kv_bool("lfm2.attention.causal", false)
+        };
+        let omni = base().kv_str("lfm2.decision.type", "lfm2-d1-omni").build();
+        let config = LfmModel::parse_config(&omni, 64).unwrap();
+        assert_eq!(config.n_layers, 2);
+        assert_eq!(config.block_types.len(), 2);
+        assert!(!config.is_causal);
+        // the same settings without the public type are an ordinary three-block model
+        let plain = base().build();
+        assert_eq!(LfmModel::parse_config(&plain, 64).unwrap().n_layers, 3);
+        // a head count that leaves no trunk is refused
+        let all_head = base()
+            .kv_str("lfm2.decision.type", "lfm2-d1-omni")
+            .kv_u32("lfm2.decision.block_count", 3)
+            .build();
+        let err = LfmModel::parse_config(&all_head, 64).unwrap_err();
+        assert!(err.to_string().contains("leaves no trunk"), "{err}");
     }
 }

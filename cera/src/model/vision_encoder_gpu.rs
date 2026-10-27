@@ -2282,6 +2282,11 @@ impl VitGpuOps for MetalVitOps {
 /// Wraps a backend's ops + uploaded weights so the whole ViT runs on the GPU.
 /// Implementors are `Send + Sync` so the engine can share them across sessions.
 pub trait VisionGpuEncode: Send + Sync {
+    /// The backend this encoder runs on: `metal`, `wgpu` or `hexagon`.
+    fn backend_label(&self) -> &'static str {
+        "gpu"
+    }
+
     /// Encode preprocessed pixels (`[3·H·W]` NCHW, normalized) at the given
     /// patch grid. Output matches [`VisionEncoderWeights::encode_image`].
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>>;
@@ -2314,6 +2319,10 @@ struct WgpuVisionEncoder {
 
 #[cfg(feature = "gpu")]
 impl VisionGpuEncode for WgpuVisionEncoder {
+    fn backend_label(&self) -> &'static str {
+        "wgpu"
+    }
+
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
         let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Drain the readback slot around the encode (mirrors Session's
@@ -2359,6 +2368,10 @@ struct MetalVisionEncoder {
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
 impl VisionGpuEncode for MetalVisionEncoder {
+    fn backend_label(&self) -> &'static str {
+        "metal"
+    }
+
     fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
         let _serial = self.encode_lock.lock().unwrap_or_else(|e| e.into_inner());
         // Drain the command-error slot around the encode (mirrors
@@ -2414,6 +2427,22 @@ pub struct VitStackSpec {
     pub blocks: Vec<VitStackBlock>,
     /// The final LayerNorm's weight and bias, when the stack ends in one.
     pub post: Option<(Vec<f32>, Vec<f32>)>,
+    /// A projector for [`VitStack::run_projector`], for the backends that can run one beside the
+    /// blocks; the others ignore it and the caller projects.
+    pub projector: Option<VitStackProjector>,
+}
+
+/// The projector of a [`VitStackSpec`]: `Linear(GELU(Linear(x)))` per row.
+///
+/// The GELU is the exact (erf) form of `torch.nn.GELU()`, on every backend: the Hexagon stack
+/// runs the skels' native erf op (measured on a device against the exact GELU: worst error
+/// 4.8e-7 over +-12). A backend that cannot be exact returns `Ok(None)` from
+/// [`VitStack::run_projector`] and the caller projects on the host.
+pub struct VitStackProjector {
+    pub mm1: MmapWeight,
+    pub mm1_b: Vec<f32>,
+    pub mm2: MmapWeight,
+    pub mm2_b: Vec<f32>,
 }
 
 /// The feed-forward activation of a [`VitStackSpec`].
@@ -2434,6 +2463,18 @@ pub trait VitStack: Send + Sync {
     /// Fails when `tokens` is over what the attention kernel holds or a pass needs a buffer the
     /// device cannot make, or the device faults; the caller falls back to the CPU.
     fn run(&self, x: &[f32], tokens: usize) -> Result<Vec<f32>>;
+
+    /// Run the spec's projector (two linears with a GELU between, see
+    /// [`VitStackSpec::projector`]) over `pooled` rows (`[n, first linear's input width]`), when
+    /// this backend holds one. `Ok(None)` leaves the projector to the caller.
+    ///
+    /// # Errors
+    ///
+    /// Fails when the device faults; the caller then projects on the host.
+    fn run_projector(&self, pooled: &[f32]) -> Result<Option<Vec<f32>>> {
+        let _ = pooled;
+        Ok(None)
+    }
 }
 
 #[cfg(any(
@@ -2476,12 +2517,14 @@ struct GpuStack<O: VitGpuOps> {
 
 #[cfg(any(
     feature = "gpu",
+    feature = "hexagon",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 /// The caller-supplied public spec is enforced before uploading: a zero head count would
 /// divide by zero in `run`, and a ragged geometry or short vector would misread on the
-/// device. Pure so a host test can pin it without a device.
-fn check_spec(spec: &VitStackSpec) -> Result<()> {
+/// device. Pure so a host test can pin it without a device. Every device builder runs it,
+/// the Hexagon stack included.
+pub(crate) fn check_spec(spec: &VitStackSpec) -> Result<()> {
     anyhow::ensure!(
         spec.width > 0 && spec.ffn > 0,
         "width {} and ffn {} must be positive",
@@ -2703,8 +2746,11 @@ pub fn build_vit_stack(
     match backend {
         BP::Metal => try_metal_stack(spec),
         BP::Gpu => try_wgpu_stack(spec, false),
-        BP::Auto => try_metal_stack(spec).or_else(|| try_wgpu_stack(spec, false)),
-        BP::Cpu | BP::Hexagon | BP::Npu => None,
+        BP::Auto => try_metal_stack(spec)
+            .or_else(|| try_hexagon_stack(spec, MAX_VIT_TOKENS))
+            .or_else(|| try_wgpu_stack(spec, false)),
+        BP::Hexagon | BP::Npu => try_hexagon_stack(spec, MAX_VIT_TOKENS),
+        BP::Cpu => None,
     }
 }
 
@@ -2721,8 +2767,11 @@ pub fn build_vit_stack_fast(
     match backend {
         BP::Metal => try_metal_stack(spec),
         BP::Gpu => try_wgpu_stack(spec, true),
-        BP::Auto => try_metal_stack(spec).or_else(|| try_wgpu_stack(spec, true)),
-        BP::Cpu | BP::Hexagon | BP::Npu => None,
+        BP::Auto => try_metal_stack(spec)
+            .or_else(|| try_hexagon_stack(spec, LONG_STACK_ROWS))
+            .or_else(|| try_wgpu_stack(spec, true)),
+        BP::Hexagon | BP::Npu => try_hexagon_stack(spec, LONG_STACK_ROWS),
+        BP::Cpu => None,
     }
 }
 
@@ -2750,6 +2799,20 @@ pub fn build_vit_stack_native(
     backend: crate::engine::BackendPreference,
 ) -> Option<std::sync::Arc<dyn VitStack>> {
     build_vit_stack_fast(spec, backend)
+}
+
+/// Tokens per pass of a stack that sees long sequences on the NPU (the d1 decision head over an
+/// image prefix): its scratch is about 52 KB a row at the head's widths, so this is about 210 MB.
+pub(crate) const LONG_STACK_ROWS: usize = 4096;
+
+#[cfg(feature = "hexagon")]
+fn try_hexagon_stack(spec: &VitStackSpec, rows: usize) -> Option<std::sync::Arc<dyn VitStack>> {
+    crate::model::vision_encoder_hexagon::try_hexagon_vit_stack(spec, rows)
+}
+
+#[cfg(not(feature = "hexagon"))]
+fn try_hexagon_stack(_spec: &VitStackSpec, _rows: usize) -> Option<std::sync::Arc<dyn VitStack>> {
+    None
 }
 
 #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
@@ -3650,6 +3713,7 @@ mod tests {
                 down_b: vec(d),
             }],
             post: Some((vec(d), vec(d))),
+            projector: None,
         }
     }
 

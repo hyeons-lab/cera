@@ -16,6 +16,15 @@ pub const DOMAIN_CDSP: i32 = 3;
 /// One GiB.
 const GIB: usize = 1 << 30;
 
+/// `DSPRPC_GET_DSP_INFO` of `remote_handle_control`: read one DSP capability.
+const DSPRPC_GET_DSP_INFO: u32 = 2;
+/// `ARCH_VER` of `remote_dsp_attributes`: the DSP's architecture version in the low byte, as hex
+/// digits (`0x8c79` on a v79; the S25 Ultra's attribute scan found it at 6, the other attributes
+/// holding no `0x79`). The upper bits are other data, so callers mask.
+const ARCH_VER: u32 = 6;
+/// FastRPC's domain id of the compute DSP.
+const CDSP_DOMAIN_ID: u32 = 3;
+
 /// Hard ceiling on the bytes this process can have mapped into the CDSP at
 /// once. Measured on an S25 Ultra: one buffer maps up to about 3.9 GiB when
 /// nothing else is mapped, and several smaller buffers stop sooner (three
@@ -80,6 +89,7 @@ type RemoteHandle64InvokeFn =
     extern "C" fn(h: RemoteHandle64, dw_scalars: u32, pra: *mut RemoteArg) -> i32;
 type RemoteHandle64CloseFn = extern "C" fn(h: RemoteHandle64) -> i32;
 type RemoteSessionControlFn = extern "C" fn(req: u32, data: *mut c_void, datalen: u32) -> i32;
+type RemoteHandleControlFn = extern "C" fn(req: u32, data: *mut c_void, datalen: u32) -> i32;
 
 type DspqueueCreateFn = extern "C" fn(
     domain: i32,
@@ -133,6 +143,7 @@ pub struct FastRpcDriver {
     remote_handle64_invoke: RemoteHandle64InvokeFn,
     remote_handle64_close: RemoteHandle64CloseFn,
     remote_session_control: Option<RemoteSessionControlFn>,
+    remote_handle_control: Option<RemoteHandleControlFn>,
 
     // DSP queue
     dspqueue_create: DspqueueCreateFn,
@@ -257,6 +268,10 @@ impl FastRpcDriver {
                     remote_session_control: resolve_opt!(
                         "remote_session_control",
                         RemoteSessionControlFn
+                    ),
+                    remote_handle_control: resolve_opt!(
+                        "remote_handle_control",
+                        RemoteHandleControlFn
                     ),
 
                     dspqueue_create: resolve!("dspqueue_create", DspqueueCreateFn),
@@ -411,6 +426,49 @@ impl FastRpcDriver {
         } else {
             Ok(())
         }
+    }
+
+    /// One CDSP capability from FastRPC's `remote_handle_control(DSPRPC_GET_DSP_INFO)`: the
+    /// value, or the driver's error code (`i32::MIN` when the driver has no such call).
+    pub(crate) fn dsp_capability(&self, attribute_id: u32) -> Result<u32, i32> {
+        let control = self.remote_handle_control.ok_or(i32::MIN)?;
+        #[repr(C)]
+        struct DspCapability {
+            domain: u32,
+            attribute_id: u32,
+            capability: u32,
+        }
+        let mut cap = DspCapability {
+            domain: CDSP_DOMAIN_ID,
+            attribute_id,
+            capability: 0,
+        };
+        let ret = control(
+            DSPRPC_GET_DSP_INFO,
+            &mut cap as *mut _ as *mut c_void,
+            std::mem::size_of::<DspCapability>() as u32,
+        );
+        if ret == 0 {
+            Ok(cap.capability)
+        } else {
+            Err(ret)
+        }
+    }
+
+    /// The CDSP's own architecture, from FastRPC's capability query (`ARCH_VER`), or `None` when
+    /// the driver has no such call, refuses it, or names an architecture no skel is shipped for.
+    /// A hint only: the skel that opens still decides (the probe order in `skels::probe_order`).
+    pub fn detect_arch(&self) -> Option<super::device::HexagonArch> {
+        let capability = match self.dsp_capability(ARCH_VER) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!("Hexagon DSP architecture query failed (error 0x{e:08x})");
+                return None;
+            }
+        };
+        let arch = super::device::HexagonArch::from_dsp_version(capability & 0xff);
+        tracing::debug!(capability, ?arch, "Hexagon DSP architecture query");
+        arch
     }
 
     /// Enable Qualcomm Unsigned Process Domain (Unsigned PD) for the given domain.
@@ -632,12 +690,33 @@ impl FastRpcDriver {
         msg: &mut [u8],
         spin: bool,
     ) -> Result<u32, CeraError> {
+        self.read_dsp_queue_napping(queue, buffers, msg, spin, 0)
+    }
+
+    /// [`Self::read_dsp_queue_with`] with a third way to wait: with `nap_us > 0` and no
+    /// `spin`, the read polls without blocking and sleeps `nap_us` microseconds between
+    /// attempts. A sleeping kernel read costs a few hundred microseconds of CPU and of
+    /// wake-up latency each time (measured on the S25 Ultra); a nap-poll costs a few
+    /// microseconds of CPU per nap and at most one nap of latency.
+    pub fn read_dsp_queue_napping(
+        &self,
+        queue: DspQueueHandle,
+        buffers: &mut [super::types::DspQueueBuffer],
+        msg: &mut [u8],
+        spin: bool,
+        nap_us: u64,
+    ) -> Result<u32, CeraError> {
         let mut flags: u32 = 0;
         let mut n_bufs: u32 = 0;
         let mut msg_len: u32 = 0;
+        let nap_wait = !spin && nap_us > 0;
         // Oppoll: timeout 0 turns the read non-blocking; the retry loop
         // below spins on EWOULDBLOCK until the response lands.
-        let mut timeout = if spin { 0 } else { DSPQUEUE_TIMEOUT_US };
+        let mut timeout = if spin || nap_wait {
+            0
+        } else {
+            DSPQUEUE_TIMEOUT_US
+        };
         // Hang guard: 30s wall-clock budget for both oppoll and blocking modes.
         // Without it, repeated AEE_EINTERRUPTED or a wedged DSP can spin or loop
         // forever without bound. Checked at the top of every iteration.
@@ -674,6 +753,10 @@ impl FastRpcDriver {
             {
                 // ETIMEDOUT, AEE_EEXPIRED, AEE_EWOULDBLOCK: DSP is still
                 // processing.
+                if nap_wait {
+                    std::thread::sleep(std::time::Duration::from_micros(nap_us));
+                    continue;
+                }
                 if spin {
                     spins += 1;
                     if spins > 500_000 {
@@ -749,8 +832,18 @@ pub(crate) mod fake {
         /// `fastrpc_mmap` / `fastrpc_munmap` answer with an error.
         pub fail_mmap: bool,
         pub fail_munmap: bool,
+        /// `fastrpc_munmap` is refused (error 1, as on a device) for a buffer whose fd the DSP
+        /// has not been told to release (`htp_iface_munmap`, method 5): the DSP's hold.
+        pub munmap_needs_release: bool,
+        released: std::collections::HashSet<i32>,
         /// The timeout argument of every `dspqueue_read` (0 = polled read).
         pub read_timeouts: Vec<u32>,
+        /// What the fake DSP answers the `ARCH_VER` query with (`None` = the call fails).
+        pub dsp_arch_ver: Option<u32>,
+        /// Skel file names `remote_handle64_open` was asked for, in order.
+        pub open_skels: Vec<String>,
+        /// Skel file names the fake DSP refuses to open (substring match).
+        pub refuse_skels: Vec<&'static str>,
         /// `rpcmem_alloc` calls the fake has served.
         pub allocs: usize,
         /// Hand every buffer its own fd (default: all 42, which the captured
@@ -760,6 +853,9 @@ pub(crate) mod fake {
         /// Status word the fake DSP answers batches with (`None` = Ok).
         pub rsp_status: Option<u32>,
         last_seq: u64,
+        /// Batches written and not answered yet, oldest first: a read answers the oldest
+        /// (a read with none outstanding repeats the last write's seq).
+        written: std::collections::VecDeque<u64>,
     }
 
     thread_local! {
@@ -808,14 +904,21 @@ pub(crate) mod fake {
         0
     }
     extern "C" fn munmap(_d: i32, fd: i32, _a: *mut c_void, _l: usize) -> i32 {
-        if with(|s| s.fail_munmap) {
+        if with(|s| s.fail_munmap || (s.munmap_needs_release && !s.released.contains(&fd))) {
             return -1;
         }
         log(Event::Unmap(fd));
         0
     }
-    extern "C" fn open(_name: *const c_char, ph: *mut RemoteHandle64) -> i32 {
-        if with(|s| s.fail_open) {
+    extern "C" fn open(name: *const c_char, ph: *mut RemoteHandle64) -> i32 {
+        let name = unsafe { std::ffi::CStr::from_ptr(name) }
+            .to_string_lossy()
+            .into_owned();
+        let refused = with(|s| {
+            s.open_skels.push(name.clone());
+            s.fail_open || s.refuse_skels.iter().any(|r| name.contains(r))
+        });
+        if refused {
             return -1;
         }
         log(Event::OpenSkel);
@@ -828,6 +931,7 @@ pub(crate) mod fake {
         if method == 5 {
             // The one in-buffer argument is the u32 fd to release.
             let fd = unsafe { *((*pra).buf.buf as *const u32) };
+            with(|s| s.released.insert(fd as i32));
             log(Event::Release(fd as i32));
         }
         if with(|s| s.fail_invoke_method) == Some(method) {
@@ -849,6 +953,18 @@ pub(crate) mod fake {
             _ => {}
         }
         0
+    }
+    extern "C" fn handle_control(req: u32, data: *mut c_void, _len: u32) -> i32 {
+        // `DspCapability { domain, attribute_id, capability }`
+        let cap = data as *mut u32;
+        let (attribute, answer) = unsafe { (*cap.add(1), with(|s| s.dsp_arch_ver)) };
+        match (req, attribute, answer) {
+            (DSPRPC_GET_DSP_INFO, ARCH_VER, Some(v)) => {
+                unsafe { *cap.add(2) = v };
+                0
+            }
+            _ => -1,
+        }
     }
     extern "C" fn q_create(
         _d: i32,
@@ -885,6 +1001,9 @@ pub(crate) mod fake {
         with(|s| {
             s.last_seq = req.seq;
             s.events.push(Event::Write(req.seq));
+            if !s.fail_write {
+                s.written.push_back(req.seq);
+            }
         });
         if with(|s| s.fail_write) { -1 } else { 0 }
     }
@@ -904,7 +1023,7 @@ pub(crate) mod fake {
             return -1;
         }
         let rsp = super::super::types::HtpOpBatchRsp {
-            seq: with(|s| s.last_seq),
+            seq: with(|s| s.written.pop_front().unwrap_or(s.last_seq)),
             status: with(|s| s.rsp_status).unwrap_or(super::super::types::HtpStatus::Ok as u32),
             ..Default::default()
         };
@@ -937,6 +1056,7 @@ pub(crate) mod fake {
             remote_handle64_invoke: invoke,
             remote_handle64_close: close,
             remote_session_control: Some(control),
+            remote_handle_control: Some(handle_control),
             dspqueue_create: q_create,
             dspqueue_close: q_close,
             dspqueue_export: q_export,

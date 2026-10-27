@@ -15,13 +15,13 @@ use crate::backend::hexagon::sys::fake;
 use crate::model::{ModelConfig, ScalarMultipliers, SsmConfig};
 use crate::tensor::DType;
 
-const HS: usize = 64;
-const N_HEADS: usize = 2;
-const HEAD_DIM: usize = 32;
-const KV_HEADS: usize = 1;
-const INTER: usize = 128;
-const VOCAB: usize = 64;
-const MAX_SEQ: usize = 64;
+pub(super) const HS: usize = 64;
+pub(super) const N_HEADS: usize = 2;
+pub(super) const HEAD_DIM: usize = 32;
+pub(super) const KV_HEADS: usize = 1;
+pub(super) const INTER: usize = 128;
+pub(super) const VOCAB: usize = 64;
+pub(super) const MAX_SEQ: usize = 64;
 const PREFILL_M: usize = 32;
 // DeltaNet dims: conv_dim = 2 * n_group * d_state + dt_rank * d_state.
 const DN_GROUP: usize = 2;
@@ -33,24 +33,29 @@ const DN_D_CONV: usize = 4;
 
 /// Which optional dense-path semantics a test layer carries.
 #[derive(Clone, Copy, Default)]
-struct Extras {
-    biases: bool,
-    qk_norm: bool,
-    qk_norm_full: bool,
-    swa: bool,
-    yarn: bool,
-    q_gate: bool,
+pub(super) struct Extras {
+    pub(super) biases: bool,
+    pub(super) qk_norm: bool,
+    pub(super) qk_norm_full: bool,
+    pub(super) swa: bool,
+    pub(super) yarn: bool,
+    pub(super) q_gate: bool,
 }
 
-struct Plan {
+pub(super) struct Plan {
     weights: usize,
     kv: usize,
+    max_seq: usize,
+    dtype: DType,
 }
 
 impl Plan {
-    fn weight(&mut self, in_dim: usize, out_dim: usize) -> HexagonWeight {
-        let (size, wire_dtype, block_bytes, tile_size) =
-            wire_plan(DType::Q4_0, in_dim, out_dim, "w").unwrap();
+    pub(super) fn weight(&mut self, in_dim: usize, out_dim: usize) -> HexagonWeight {
+        let (size, wire_dtype, block_bytes, tile_size) = if self.dtype == DType::F16 {
+            f16_plain_plan(in_dim, out_dim)
+        } else {
+            wire_plan(self.dtype, in_dim, out_dim, "w").unwrap()
+        };
         HexagonWeight {
             offset: plan_offset(&mut self.weights, size),
             in_dim,
@@ -80,7 +85,7 @@ impl Plan {
         })
     }
 
-    fn attention(&mut self, extras: Extras) -> HexagonLayer {
+    pub(super) fn attention(&mut self, extras: Extras) -> HexagonLayer {
         let q_dim = N_HEADS * HEAD_DIM;
         let kv_dim = KV_HEADS * HEAD_DIM;
         let attn_norm_offset = self.vec(HS);
@@ -104,7 +109,7 @@ impl Plan {
         let out_bias = extras.biases.then(|| self.vec(HS));
         let ffn_norm_offset = self.vec(HS);
         let ffn = self.ffn(extras);
-        let slab = (MAX_SEQ * kv_dim * 2 + 255) & !255;
+        let slab = (self.max_seq * kv_dim * 2 + 255) & !255;
         let k_offset = self.kv(slab);
         let v_offset = self.kv(slab);
         HexagonLayer::Attention(HexagonAttentionLayer {
@@ -136,7 +141,7 @@ impl Plan {
         })
     }
 
-    fn conv(&mut self) -> HexagonLayer {
+    pub(super) fn conv(&mut self) -> HexagonLayer {
         let attn_norm_offset = self.vec(HS);
         let in_proj = self.weight(HS, 3 * HS);
         let out_proj = self.weight(HS, HS);
@@ -203,7 +208,7 @@ impl Plan {
     }
 }
 
-fn config(block_types: Vec<BlockType>, deltanet: bool) -> ModelConfig {
+fn config(block_types: Vec<BlockType>, deltanet: bool, max_seq: usize) -> ModelConfig {
     let n_layers = block_types.len();
     ModelConfig {
         architecture: "test".into(),
@@ -214,7 +219,7 @@ fn config(block_types: Vec<BlockType>, deltanet: bool) -> ModelConfig {
         n_kv_heads: KV_HEADS,
         head_dim: HEAD_DIM,
         vocab_size: VOCAB,
-        max_seq_len: MAX_SEQ,
+        max_seq_len: max_seq,
         rope_theta: 10_000.0,
         rms_norm_eps: 1e-5,
         block_types,
@@ -235,10 +240,11 @@ fn config(block_types: Vec<BlockType>, deltanet: bool) -> ModelConfig {
 }
 
 /// Everything a test model needs beyond its layers.
-struct Spec {
+pub(super) struct Spec {
     layers: Vec<HexagonLayer>,
     plan: Plan,
-    config: ModelConfig,
+    max_seq: usize,
+    pub(super) config: ModelConfig,
     dense: DenseSemantics,
     cpu_rope: bool,
     has_deltanet: bool,
@@ -258,11 +264,11 @@ fn embd_table() -> EmbeddingTable {
 /// is off here. The goldens pin the op stream and the batch structure of one
 /// whole-token decode (and the resident template); the cap, which splits a
 /// decode into several batches without changing its ops, has its own tests.
-fn golden_knobs() -> HexagonKnobs {
+pub(super) fn golden_knobs() -> HexagonKnobs {
     HexagonKnobs::from_lookup(|k| (k == "CERA_HEXAGON_BATCH_TENSORS").then(|| "0".to_string()))
 }
 
-fn build(spec: Spec) -> HexagonLfmModel {
+pub(super) fn build(spec: Spec) -> HexagonLfmModel {
     build_with(spec, &golden_knobs())
 }
 
@@ -270,10 +276,10 @@ thread_local! {
     /// Give each buffer `build_with` allocates its own fd (the fake driver
     /// hands out one shared fd unless asked, and `fresh_device` resets it), for
     /// tests that follow a particular buffer through the fake's event log.
-    static DISTINCT_FDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+    pub(super) static DISTINCT_FDS: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
 }
 
-fn build_with(mut spec: Spec, knobs: &HexagonKnobs) -> HexagonLfmModel {
+pub(super) fn build_with(mut spec: Spec, knobs: &HexagonKnobs) -> HexagonLfmModel {
     let (driver, device) = op_capture::fresh_device();
     fake::with(|s| s.distinct_fds = DISTINCT_FDS.with(|d| d.get()));
     let q_dim = N_HEADS * HEAD_DIM;
@@ -283,17 +289,17 @@ fn build_with(mut spec: Spec, knobs: &HexagonKnobs) -> HexagonLfmModel {
         KV_HEADS * HEAD_DIM,
         INTER,
         VOCAB,
-        MAX_SEQ,
+        spec.max_seq,
         None,
         spec.has_deltanet.then_some(DN_CONV),
     );
     if spec.with_swa_mask {
-        so = so.with_swa_mask(MAX_SEQ);
+        so = so.with_swa_mask(spec.max_seq);
     }
     let alloc = |size: usize| RpcmemBuffer::alloc(Arc::clone(&driver), size.max(256), true);
     let output_norm_offset = spec.plan.vec(HS);
     let lm_head = spec.plan.weight(HS, VOCAB);
-    let mask_size = (MAX_SEQ * 2).max(128);
+    let mask_size = (spec.max_seq * 2).max(128);
     if spec.with_swa_mask {
         spec.dense.mask_swa = Some(alloc(mask_size).unwrap());
     }
@@ -328,8 +334,25 @@ fn build_with(mut spec: Spec, knobs: &HexagonKnobs) -> HexagonLfmModel {
     )
 }
 
-fn spec(layers: impl FnOnce(&mut Plan) -> Vec<HexagonLayer>, deltanet: bool) -> Spec {
-    let mut plan = Plan { weights: 0, kv: 0 };
+pub(super) fn spec(layers: impl FnOnce(&mut Plan) -> Vec<HexagonLayer>, deltanet: bool) -> Spec {
+    spec_with(layers, deltanet, MAX_SEQ, DType::Q4_0)
+}
+
+/// [`spec`] with a context length and the wire dtype of the planned weights
+/// (the goldens use [`MAX_SEQ`] and Q4_0; the numeric encoder tests a longer
+/// context and Q8_0, which their interpreter can decode).
+pub(super) fn spec_with(
+    layers: impl FnOnce(&mut Plan) -> Vec<HexagonLayer>,
+    deltanet: bool,
+    max_seq: usize,
+    dtype: DType,
+) -> Spec {
+    let mut plan = Plan {
+        weights: 0,
+        kv: 0,
+        max_seq,
+        dtype,
+    };
     let layers = layers(&mut plan);
     let block_types = layers
         .iter()
@@ -341,7 +364,8 @@ fn spec(layers: impl FnOnce(&mut Plan) -> Vec<HexagonLayer>, deltanet: bool) -> 
     Spec {
         layers,
         plan,
-        config: config(block_types, deltanet),
+        max_seq,
+        config: config(block_types, deltanet, max_seq),
         dense: DenseSemantics::default(),
         cpu_rope: false,
         has_deltanet: deltanet,
@@ -454,7 +478,7 @@ fn capture() -> Captured {
     Captured { batches, key }
 }
 
-fn fresh_state(model: &HexagonLfmModel) -> InferenceState {
+pub(super) fn fresh_state(model: &HexagonLfmModel) -> InferenceState {
     InferenceState::from_config_capped(&model.config, &KvCompression::None, MAX_SEQ).unwrap()
 }
 
@@ -1396,4 +1420,117 @@ fn nx_falls_back_to_unfused_when_the_rows_do_not_fit() {
     assert!(roomy_nx > 0, "fused when the rows fit");
     assert_eq!(tight_nx, 0, "unfused when they do not");
     assert!(tight_mm > roomy_mm, "the separate matmuls took over");
+}
+
+/// Fill the whole KV/state buffer with a marker, standing in for what a previous request left.
+fn leave_marker_state(model: &HexagonLfmModel) {
+    unsafe {
+        std::ptr::write_bytes(
+            model.kv_state_buf.as_mut_ptr(),
+            0xAB,
+            model.kv_state_buf.size(),
+        );
+    }
+}
+
+/// `(offset, len)` byte ranges of the KV/state buffer.
+type Slabs = Vec<(usize, usize)>;
+
+/// `(offset, len)` of every recurrent slab and of every attention K slab of `model`, as the
+/// fixtures' planner laid them out.
+fn slabs(model: &HexagonLfmModel) -> (Slabs, Slabs) {
+    let (mut recurrent, mut attention) = (Vec::new(), Vec::new());
+    for layer in &model.layers {
+        match layer {
+            HexagonLayer::Conv(c) => recurrent.push((c.state_offset, 2 * ((HS * 4 + 255) & !255))),
+            HexagonLayer::DeltaNet(d) => {
+                recurrent.push((
+                    d.conv_state_offset,
+                    (DN_CONV * (DN_D_CONV - 1) * 4 + 255) & !255,
+                ));
+                recurrent.push((
+                    d.ssm_state_offset,
+                    (DN_RANK * DN_STATE * DN_STATE * 4 + 255) & !255,
+                ));
+            }
+            HexagonLayer::Attention(a) => {
+                attention.push((a.k_offset, (MAX_SEQ * KV_HEADS * HEAD_DIM * 2 + 255) & !255))
+            }
+        }
+    }
+    (recurrent, attention)
+}
+
+fn all_bytes(model: &HexagonLfmModel, (offset, len): (usize, usize), value: u8) -> bool {
+    model.kv_state_buf.as_slice()[offset..offset + len]
+        .iter()
+        .all(|&b| b == value)
+}
+
+/// Clearing the recurrent state clears exactly the recurrent slabs (short-conv and DeltaNet) and
+/// leaves the KV slabs alone.
+#[test]
+fn zeroing_recurrent_layers_clears_only_the_recurrent_slabs() {
+    for (name, spec) in [("conv", conv_spec()), ("deltanet", deltanet_spec())] {
+        let model = build(spec);
+        let (recurrent, attention) = slabs(&model);
+        assert!(!recurrent.is_empty() && !attention.is_empty(), "{name}");
+        leave_marker_state(&model);
+        model.zero_recurrent_layers();
+        for &slab in &recurrent {
+            assert!(all_bytes(&model, slab, 0), "{name}: {slab:?} not cleared");
+        }
+        for &slab in &attention {
+            assert!(
+                all_bytes(&model, slab, 0xAB),
+                "{name}: KV slab {slab:?} was cleared"
+            );
+        }
+    }
+}
+
+/// The recurrent state is the model's, not the session's, so a sequence that starts at position 0
+/// must clear it itself: a new session (no `reset()`) used to begin with the previous request's
+/// short-conv history, and the same prompt then gave different logits depending on what ran before
+/// it (the NPU's greedy "nondeterminism" across requests in one process, and tool choices that
+/// flipped with it). A continuation (position > 0) must clear nothing. Checked on the short-conv
+/// layers, whose slab the host never writes itself.
+#[test]
+fn a_sequence_starting_at_position_zero_does_not_inherit_recurrent_state() {
+    let tokens: Vec<u32> = (0..8).collect();
+    let model = build(conv_spec());
+    let (recurrent, _) = slabs(&model);
+    let cleared = |model: &HexagonLfmModel| recurrent.iter().all(|&s| all_bytes(model, s, 0));
+    let untouched = |model: &HexagonLfmModel| recurrent.iter().all(|&s| all_bytes(model, s, 0xAB));
+
+    leave_marker_state(&model);
+    let mut state = fresh_state(&model);
+    model
+        .try_forward_prefill_chunk(&tokens, 0, &mut state)
+        .unwrap();
+    assert!(
+        cleared(&model),
+        "a prefill from position 0 kept the old state"
+    );
+
+    leave_marker_state(&model);
+    let mut state = state_at(&model, 8);
+    model
+        .try_forward_prefill_chunk(&tokens, 8, &mut state)
+        .unwrap();
+    assert!(untouched(&model), "a continued prefill cleared the state");
+
+    leave_marker_state(&model);
+    let mut state = fresh_state(&model);
+    model
+        .try_forward_input(DecodeInput::Token(3), DecodeOutput::Logits, 0, &mut state)
+        .unwrap();
+    assert!(cleared(&model), "a first decode kept the old state");
+
+    leave_marker_state(&model);
+    let mut state = state_at(&model, 3);
+    model
+        .try_forward_input(DecodeInput::Token(3), DecodeOutput::Logits, 3, &mut state)
+        .unwrap();
+    assert!(untouched(&model), "a later decode cleared the state");
 }

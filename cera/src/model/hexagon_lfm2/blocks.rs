@@ -1,6 +1,7 @@
 //! Per-block emitters (attention, FFN, short-conv, DeltaNet) composed from the
 //! op emitters, for decode and prefill.
 
+use super::encoder::{AttnRoute, AttnStage, ConvWindow, EncoderShape, LongBuf, LongChunk};
 use super::*;
 
 impl HexagonLfmModel {
@@ -236,6 +237,40 @@ impl HexagonLfmModel {
         cur_normed: usize,
         pass: AttnPass<'_>,
     ) -> Result<(), CeraError> {
+        self.emit_attention_stage(
+            session,
+            attn,
+            layer_idx,
+            cur_act,
+            next_act,
+            cur_normed,
+            pass,
+            AttnStage::Whole,
+            &AttnRoute::default(),
+        )
+    }
+
+    /// [`Self::emit_attention_block`], optionally split at the K/V write. The
+    /// layer-outer encoder pass runs a layer over several row chunks in two
+    /// sweeps: [`AttnStage::Front`] (norm, QKV projections, Q/K norms, RoPE, K/V
+    /// write) for every chunk, then [`AttnStage::Back`] (flash attention over
+    /// every slot, output projection, residual, FFN) for every chunk, because a
+    /// bidirectional query attends rows of later chunks. [`AttnStage::Whole`]
+    /// with the default route is the one emission decode, causal prefill and the
+    /// single-chunk encoder pass use; the route fields only redirect operands, so
+    /// the pinned forward goldens cover it.
+    pub(super) fn emit_attention_stage(
+        &self,
+        session: &mut HexagonQueueSession,
+        attn: &HexagonAttentionLayer,
+        layer_idx: usize,
+        cur_act: usize,
+        next_act: usize,
+        cur_normed: usize,
+        pass: AttnPass<'_>,
+        stage: AttnStage,
+        route: &AttnRoute<'_>,
+    ) -> Result<(), CeraError> {
         let so = self.scratch_offsets;
         let scratch = &self.scratch_buf;
         let hs = self.config.hidden_size;
@@ -253,253 +288,260 @@ impl HexagonLfmModel {
             AttnPass::Decode { pos, patches } => (pos, 1, patches),
             AttnPass::Prefill { start_pos, m } => (start_pos, m, None),
         };
-        let kv_len = first_pos + rows;
+        let kv_len = route.kv_len.unwrap_or(first_pos + rows);
+        let (pos_buf, pos_off) = route.pos.unwrap_or((scratch, so.pos));
+        let (q_buf, q_off) = route.q.unwrap_or((scratch, so.q));
 
-        // Block norm (post-norm architectures, Olmo 2/3, project the raw
-        // residual stream and norm the block output instead).
-        let attn_in = if self.dense.post_norm {
-            cur_act
-        } else {
-            Self::dispatch_rms_norm_mul(
+        if stage != AttnStage::Back {
+            // Block norm (post-norm architectures, Olmo 2/3, project the raw
+            // residual stream and norm the block output instead).
+            let attn_in = if self.dense.post_norm {
+                cur_act
+            } else {
+                Self::dispatch_rms_norm_mul(
+                    session,
+                    scratch,
+                    cur_act,
+                    &self.weights_buf,
+                    attn.attn_norm_offset,
+                    scratch,
+                    cur_normed,
+                    eps,
+                    hs,
+                    rows,
+                )?;
+                cur_normed
+            };
+            self.debug_barrier(session, "attention attn_norm")?;
+
+            // Projections: Q, K, V (fused NX: one shared-activation op).
+            self.dispatch_mul_mat_nx(
                 session,
-                scratch,
-                cur_act,
                 &self.weights_buf,
-                attn.attn_norm_offset,
+                &[&attn.attn_q, &attn.attn_k, &attn.attn_v],
                 scratch,
-                cur_normed,
-                eps,
-                hs,
+                attn_in,
+                scratch,
+                &[so.q, so.k, so.v],
                 rows,
             )?;
-            cur_normed
-        };
-        self.debug_barrier(session, "attention attn_norm")?;
-
-        // Projections: Q, K, V (fused NX: one shared-activation op).
-        self.dispatch_mul_mat_nx(
-            session,
-            &self.weights_buf,
-            &[&attn.attn_q, &attn.attn_k, &attn.attn_v],
-            scratch,
-            attn_in,
-            scratch,
-            &[so.q, so.k, so.v],
-            rows,
-        )?;
-        self.debug_barrier(session, "attention QKV proj")?;
-        if let Some([q_bias, k_bias, v_bias]) = attn.qkv_bias {
-            self.dispatch_bias_add(session, scratch, so.q, q_bias, q_dim, rows)?;
-            self.dispatch_bias_add(session, scratch, so.k, k_bias, kv_dim, rows)?;
-            self.dispatch_bias_add(session, scratch, so.v, v_bias, kv_dim, rows)?;
-        }
-        if attn.has_q_gate {
-            // Qwen 3.5 fuses the output gate into Q: per row `[head, (q | gate)]`.
-            for mm in 0..rows {
-                let row_full_off = so.q + mm * 2 * q_dim * 4;
-                let row_q_off = so.conv_in + mm * q_dim * 4;
-                let row_gate_off = so.conv_bx + mm * q_dim * 4;
-                Self::dispatch_cpy_2d(
-                    session,
-                    scratch,
-                    row_full_off,
-                    head_dim,
-                    n_heads,
-                    4,
-                    2 * head_dim * 4,
-                    scratch,
-                    row_q_off,
-                    4,
-                    head_dim * 4,
-                )?;
-                Self::dispatch_cpy_2d(
-                    session,
-                    scratch,
-                    row_full_off + head_dim * 4,
-                    head_dim,
-                    n_heads,
-                    4,
-                    2 * head_dim * 4,
-                    scratch,
-                    row_gate_off,
-                    4,
-                    head_dim * 4,
-                )?;
+            self.debug_barrier(session, "attention QKV proj")?;
+            if let Some([q_bias, k_bias, v_bias]) = attn.qkv_bias {
+                self.dispatch_bias_add(session, scratch, so.q, q_bias, q_dim, rows)?;
+                self.dispatch_bias_add(session, scratch, so.k, k_bias, kv_dim, rows)?;
+                self.dispatch_bias_add(session, scratch, so.v, v_bias, kv_dim, rows)?;
             }
-            Self::dispatch_cpy(session, scratch, so.conv_in, scratch, so.q, rows * q_dim)?;
-        }
-
-        // Optional Q/K norm: per head, or over the whole vector (Olmo 2/3).
-        if let Some(qn_offset) = attn.attn_q_norm_offset {
-            let (norm_dim, norm_rows) = if attn.qk_norm_full {
-                (q_dim, rows)
-            } else {
-                (head_dim, rows * n_heads)
-            };
-            Self::dispatch_rms_norm_mul(
-                session,
-                scratch,
-                so.q,
-                &self.weights_buf,
-                qn_offset,
-                scratch,
-                so.q,
-                eps,
-                norm_dim,
-                norm_rows,
-            )?;
-        }
-        if let Some(kn_offset) = attn.attn_k_norm_offset {
-            let (norm_dim, norm_rows) = if attn.qk_norm_full {
-                (kv_dim, rows)
-            } else {
-                (head_dim, rows * n_kv_heads)
-            };
-            Self::dispatch_rms_norm_mul(
-                session,
-                scratch,
-                so.k,
-                &self.weights_buf,
-                kn_offset,
-                scratch,
-                so.k,
-                eps,
-                norm_dim,
-                norm_rows,
-            )?;
-        }
-        self.debug_barrier(session, "attention QK norm")?;
-
-        // RoPE on Q and K: DSP kernel by default, with a host-CPU route
-        // (CERA_HEXAGON_CPU_ROPE=1, or a model that needs YaRN / frequency
-        // factors / partial rotary) using the same cpu::rope the CPU backend uses.
-        if self.cpu_rope {
-            // Host-CPU RoPE reads DSP-produced Q/K in place, so this barrier is
-            // mandatory even in fused mode.
-            session
-                .flush()
-                .map_err(|e| CeraError::Backend(format!("attention pre-RoPE flush failed: {e}")))?;
-            let q_bytes = q_dim * rows * 4;
-            let k_bytes = kv_dim * rows * 4;
-            scratch.invalidate_cpu_cache(so.q, q_bytes);
-            scratch.invalidate_cpu_cache(so.k, k_bytes);
-            let mut rope_scratch = self.rope_scratch.lock().unwrap_or_else(|e| e.into_inner());
-            unsafe {
+            if attn.has_q_gate {
+                // Qwen 3.5 fuses the output gate into Q: per row `[head, (q | gate)]`.
                 for mm in 0..rows {
-                    let q = std::slice::from_raw_parts_mut(
-                        scratch.as_mut_ptr().add(so.q + mm * q_dim * 4) as *mut f32,
-                        q_dim,
-                    );
-                    let k = std::slice::from_raw_parts_mut(
-                        scratch.as_mut_ptr().add(so.k + mm * kv_dim * 4) as *mut f32,
-                        kv_dim,
-                    );
-                    host_rope(
-                        &mut rope_scratch,
-                        self.rope_type,
-                        attn.yarn.as_ref(),
-                        self.dense.rope_freqs.as_deref(),
-                        q,
-                        k,
-                        first_pos + mm,
-                        n_heads,
-                        n_kv_heads,
+                    let row_full_off = so.q + mm * 2 * q_dim * 4;
+                    let row_q_off = so.conv_in + mm * q_dim * 4;
+                    let row_gate_off = so.conv_bx + mm * q_dim * 4;
+                    Self::dispatch_cpy_2d(
+                        session,
+                        scratch,
+                        row_full_off,
                         head_dim,
-                        self.dense.rope_dim.unwrap_or(head_dim),
-                        rope_theta,
-                    );
+                        n_heads,
+                        4,
+                        2 * head_dim * 4,
+                        scratch,
+                        row_q_off,
+                        4,
+                        head_dim * 4,
+                    )?;
+                    Self::dispatch_cpy_2d(
+                        session,
+                        scratch,
+                        row_full_off + head_dim * 4,
+                        head_dim,
+                        n_heads,
+                        4,
+                        2 * head_dim * 4,
+                        scratch,
+                        row_gate_off,
+                        4,
+                        head_dim * 4,
+                    )?;
                 }
+                Self::dispatch_cpy(session, scratch, so.conv_in, scratch, so.q, rows * q_dim)?;
             }
-            scratch.flush_cpu_cache(so.q, q_bytes);
-            scratch.flush_cpu_cache(so.k, k_bytes);
-        } else {
-            let rope_mode = self.rope_type.htp_mode();
-            for (act, heads) in [(so.q, n_heads), (so.k, n_kv_heads)] {
+
+            // Optional Q/K norm: per head, or over the whole vector (Olmo 2/3).
+            if let Some(qn_offset) = attn.attn_q_norm_offset {
+                let (norm_dim, norm_rows) = if attn.qk_norm_full {
+                    (q_dim, rows)
+                } else {
+                    (head_dim, rows * n_heads)
+                };
+                Self::dispatch_rms_norm_mul(
+                    session,
+                    scratch,
+                    so.q,
+                    &self.weights_buf,
+                    qn_offset,
+                    scratch,
+                    so.q,
+                    eps,
+                    norm_dim,
+                    norm_rows,
+                )?;
+            }
+            if let Some(kn_offset) = attn.attn_k_norm_offset {
+                let (norm_dim, norm_rows) = if attn.qk_norm_full {
+                    (kv_dim, rows)
+                } else {
+                    (head_dim, rows * n_kv_heads)
+                };
+                Self::dispatch_rms_norm_mul(
+                    session,
+                    scratch,
+                    so.k,
+                    &self.weights_buf,
+                    kn_offset,
+                    scratch,
+                    so.k,
+                    eps,
+                    norm_dim,
+                    norm_rows,
+                )?;
+            }
+            self.debug_barrier(session, "attention QK norm")?;
+
+            // RoPE on Q and K: DSP kernel by default, with a host-CPU route
+            // (CERA_HEXAGON_CPU_ROPE=1, or a model that needs YaRN / frequency
+            // factors / partial rotary) using the same cpu::rope the CPU backend uses.
+            if self.cpu_rope {
+                // Host-CPU RoPE reads DSP-produced Q/K in place, so this barrier is
+                // mandatory even in fused mode.
+                session.flush().map_err(|e| {
+                    CeraError::Backend(format!("attention pre-RoPE flush failed: {e}"))
+                })?;
+                let q_bytes = q_dim * rows * 4;
+                let k_bytes = kv_dim * rows * 4;
+                scratch.invalidate_cpu_cache(so.q, q_bytes);
+                scratch.invalidate_cpu_cache(so.k, k_bytes);
+                let mut rope_scratch = self.rope_scratch.lock().unwrap_or_else(|e| e.into_inner());
+                unsafe {
+                    for mm in 0..rows {
+                        let q = std::slice::from_raw_parts_mut(
+                            scratch.as_mut_ptr().add(so.q + mm * q_dim * 4) as *mut f32,
+                            q_dim,
+                        );
+                        let k = std::slice::from_raw_parts_mut(
+                            scratch.as_mut_ptr().add(so.k + mm * kv_dim * 4) as *mut f32,
+                            kv_dim,
+                        );
+                        host_rope(
+                            &mut rope_scratch,
+                            self.rope_type,
+                            attn.yarn.as_ref(),
+                            self.dense.rope_freqs.as_deref(),
+                            q,
+                            k,
+                            first_pos + mm,
+                            n_heads,
+                            n_kv_heads,
+                            head_dim,
+                            self.dense.rope_dim.unwrap_or(head_dim),
+                            rope_theta,
+                        );
+                    }
+                }
+                scratch.flush_cpu_cache(so.q, q_bytes);
+                scratch.flush_cpu_cache(so.k, k_bytes);
+            } else {
+                let rope_mode = self.rope_type.htp_mode();
+                for (act, heads) in [(so.q, n_heads), (so.k, n_kv_heads)] {
+                    if decode {
+                        Self::dispatch_rope(
+                            session,
+                            scratch,
+                            act,
+                            pos_buf,
+                            pos_off,
+                            head_dim,
+                            heads,
+                            max_seq_len,
+                            rope_theta,
+                            rope_mode,
+                        )?;
+                    } else {
+                        Self::dispatch_rope_m(
+                            session,
+                            scratch,
+                            act,
+                            pos_buf,
+                            pos_off,
+                            head_dim,
+                            heads,
+                            rows,
+                            max_seq_len,
+                            rope_theta,
+                            rope_mode,
+                        )?;
+                    }
+                }
+                self.debug_barrier(session, "attention RoPE")?;
+            }
+
+            // Attention temperature (Mistral 3): Q rows scaled after RoPE.
+            if self.dense.attn_temp.is_some() {
+                let factors: Vec<(usize, f32)> = (0..rows)
+                    .filter_map(|mm| {
+                        attn_temp_q_scale(first_pos + mm, self.dense.attn_temp).map(|f| (mm, f))
+                    })
+                    .collect();
+                Self::host_scale_rows(session, scratch, so.q, q_dim, &factors)?;
+            }
+
+            // Append the K/V rows to the cache (slots == positions: the pos vector).
+            for (act, cache_offset) in [(so.k, attn.k_offset), (so.v, attn.v_offset)] {
                 if decode {
-                    Self::dispatch_rope(
+                    Self::dispatch_set_rows_typed(
                         session,
                         scratch,
                         act,
-                        scratch,
-                        so.pos,
+                        pos_buf,
+                        pos_off,
+                        &self.kv_state_buf,
+                        cache_offset,
                         head_dim,
-                        heads,
+                        n_kv_heads,
                         max_seq_len,
-                        rope_theta,
-                        rope_mode,
+                        self.kv_dtype,
                     )?;
                 } else {
-                    Self::dispatch_rope_m(
+                    Self::dispatch_set_rows_m_typed(
                         session,
                         scratch,
                         act,
-                        scratch,
-                        so.pos,
+                        pos_buf,
+                        pos_off,
+                        &self.kv_state_buf,
+                        cache_offset,
                         head_dim,
-                        heads,
+                        n_kv_heads,
                         rows,
                         max_seq_len,
-                        rope_theta,
-                        rope_mode,
+                        self.kv_dtype,
                     )?;
                 }
             }
-            self.debug_barrier(session, "attention RoPE")?;
-        }
-
-        // Attention temperature (Mistral 3): Q rows scaled after RoPE.
-        if self.dense.attn_temp.is_some() {
-            let factors: Vec<(usize, f32)> = (0..rows)
-                .filter_map(|mm| {
-                    attn_temp_q_scale(first_pos + mm, self.dense.attn_temp).map(|f| (mm, f))
-                })
-                .collect();
-            Self::host_scale_rows(session, scratch, so.q, q_dim, &factors)?;
-        }
-
-        // Append the K/V rows to the cache (slots == positions: the pos vector).
-        for (act, cache_offset) in [(so.k, attn.k_offset), (so.v, attn.v_offset)] {
-            if decode {
-                Self::dispatch_set_rows_typed(
+            self.debug_barrier(session, "attention SetRows")?;
+            if !decode {
+                self.dump_hidden(
                     session,
                     scratch,
-                    act,
-                    scratch,
-                    so.pos,
-                    &self.kv_state_buf,
-                    cache_offset,
-                    head_dim,
-                    n_kv_heads,
-                    max_seq_len,
-                    self.kv_dtype,
-                )?;
-            } else {
-                Self::dispatch_set_rows_m_typed(
-                    session,
-                    scratch,
-                    act,
-                    scratch,
-                    so.pos,
-                    &self.kv_state_buf,
-                    cache_offset,
-                    head_dim,
-                    n_kv_heads,
-                    rows,
-                    max_seq_len,
-                    self.kv_dtype,
-                )?;
+                    layer_idx,
+                    "(attn) prefill v-proj",
+                    so.v,
+                    rows * kv_dim,
+                );
             }
-        }
-        self.debug_barrier(session, "attention SetRows")?;
-        if !decode {
-            self.dump_hidden(
-                session,
-                scratch,
-                layer_idx,
-                "(attn) prefill v-proj",
-                so.v,
-                rows * kv_dim,
-            );
+            if stage == AttnStage::Front {
+                return Ok(());
+            }
         }
 
         // Attention over the valid prefix (sliding-window layers use the
@@ -542,8 +584,8 @@ impl HexagonLfmModel {
         } else {
             self.dispatch_flash_attn_m(
                 session,
-                scratch,
-                so.q,
+                q_buf,
+                q_off,
                 &self.kv_state_buf,
                 attn.k_offset,
                 &self.kv_state_buf,
@@ -1304,6 +1346,399 @@ impl HexagonLfmModel {
             false,
         )?;
         Ok(())
+    }
+
+    /// The symmetric centred 3-tap short-conv of a bidirectional encoder pass,
+    /// from the `in_proj` output in `conv_in` to the pre-gate conv output in
+    /// `conv_ssm_y` (`[m, hidden]` row-major; rows past `n_real` are padding and
+    /// carry no meaning). Per row `t`:
+    /// `y[t] = bx[t-1] * w0 + bx[t] * w1 + bx[t+1] * w2`, with `bx = b * x`, the
+    /// left neighbour of row 0 read from slot 0 of the layer's state slab and the
+    /// right neighbour of the last real row zero. See the encoder module docs for
+    /// the window construction; `save_state` additionally stores the last real
+    /// `bx` row into slot 0 (a prefix pass, read back by the host afterwards).
+    pub(super) fn emit_conv_window(
+        &self,
+        session: &mut HexagonQueueSession,
+        conv: &HexagonConvLayer,
+        shape: &EncoderShape,
+        win: &ConvWindow,
+        save_state: bool,
+    ) -> Result<(), CeraError> {
+        let so = self.scratch_offsets;
+        let scratch = &self.scratch_buf;
+        let hs = self.config.hidden_size;
+        let row = hs * 4;
+        let EncoderShape { m, n_real, .. } = *shape;
+        // bx = b * x for the real rows only, straight out of the strided
+        // in_proj thirds. Padding rows keep their host-zeroed bx, so the last
+        // real row's right neighbour is exactly zero at every layer.
+        Self::dispatch_mul_m_strided(
+            session,
+            scratch,
+            so.conv_in,
+            HTP_TENSOR_COMPUTE,
+            scratch,
+            so.conv_in + 2 * row,
+            HTP_TENSOR_COMPUTE,
+            scratch,
+            win.bx,
+            hs,
+            n_real,
+            3 * row,
+            3 * row,
+        )?;
+        // State slab slot 1 := bx_0, so the slab reads [left, bx_0] (slot 0
+        // was written by the host, or by the previous pass's `save_state`).
+        Self::dispatch_cpy_2d(
+            session,
+            scratch,
+            win.bx,
+            hs,
+            1,
+            4,
+            row,
+            &self.kv_state_buf,
+            conv.state_offset + 4,
+            8,
+            8,
+        )?;
+        // Window x = [left, bx_0, bx_1 .. bx_{m-1}, 0]: the slab, then the bx
+        // rows from the second one (m rows, the last being the zero row).
+        Self::dispatch_concat_2d(
+            session,
+            &self.kv_state_buf,
+            conv.state_offset,
+            2,
+            scratch,
+            win.bx + row,
+            m,
+            row,
+            4,
+            scratch,
+            win.window,
+            hs,
+        )?;
+        self.dispatch_ssm_conv(
+            session,
+            &self.weights_buf,
+            conv.conv_ssm_offset,
+            scratch,
+            win.window,
+            scratch,
+            so.conv_ssm_y,
+            3,
+            hs,
+            m,
+        )?;
+        if save_state {
+            // After the concat read slot 0: leave the last real bx there.
+            Self::dispatch_cpy_2d(
+                session,
+                scratch,
+                win.bx + (n_real - 1) * row,
+                hs,
+                1,
+                4,
+                row,
+                &self.kv_state_buf,
+                conv.state_offset,
+                8,
+                8,
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Bidirectional encoder-pass ops of one Conv layer (`shape.m` rows): the
+    /// causal prefill's block with [`Self::emit_conv_window`] in place of the
+    /// state prepend plus causal SsmConv, and no recurrent-state writeback.
+    pub(super) fn emit_conv_encode(
+        &self,
+        session: &mut HexagonQueueSession,
+        conv: &HexagonConvLayer,
+        layer_idx: usize,
+        cur_act: usize,
+        next_act: usize,
+        cur_normed: usize,
+        shape: &EncoderShape,
+        win: &ConvWindow,
+        save_state: bool,
+    ) -> Result<(), CeraError> {
+        let so = self.scratch_offsets;
+        let scratch = &self.scratch_buf;
+        let hs = self.config.hidden_size;
+        let eps = self.config.rms_norm_eps;
+        let m = shape.m;
+        Self::dispatch_rms_norm_mul(
+            session,
+            scratch,
+            cur_act,
+            &self.weights_buf,
+            conv.attn_norm_offset,
+            scratch,
+            cur_normed,
+            eps,
+            hs,
+            m,
+        )?;
+        self.dispatch_mul_mat_m(
+            session,
+            &self.weights_buf,
+            &conv.in_proj,
+            scratch,
+            cur_normed,
+            scratch,
+            so.conv_in,
+            m,
+        )?;
+        self.debug_barrier(session, "encoder conv/in-proj")?;
+        self.emit_conv_window(session, conv, shape, win, save_state)?;
+        self.debug_barrier(session, "encoder conv/window")?;
+        // Gate with the strided c third in place.
+        Self::dispatch_mul_m_strided(
+            session,
+            scratch,
+            so.conv_ssm_y,
+            HTP_TENSOR_COMPUTE,
+            scratch,
+            so.conv_in + hs * 4,
+            HTP_TENSOR_COMPUTE,
+            scratch,
+            so.conv_ssm_y,
+            hs,
+            m,
+            hs * 4,
+            3 * hs * 4,
+        )?;
+        self.dispatch_mul_mat_m(
+            session,
+            &self.weights_buf,
+            &conv.out_proj,
+            scratch,
+            so.conv_ssm_y,
+            scratch,
+            cur_normed,
+            m,
+        )?;
+        Self::dispatch_add_m(
+            session, scratch, cur_act, scratch, cur_normed, scratch, next_act, hs, m,
+        )?;
+        self.emit_ffn_block(
+            session,
+            &conv.ffn,
+            conv.ffn_norm_offset,
+            None,
+            layer_idx,
+            next_act,
+            cur_normed,
+            m,
+            false,
+        )
+    }
+
+    /// Sweep 1 of a conv layer in the layer-outer encoder pass, for one chunk:
+    /// block norm and `in_proj` over the chunk's rows (the residual rows are
+    /// already in `cur_act`), with the projection written straight into the long
+    /// buffer's `[n, 3 * hidden]` store, then `bx = b * x` for those rows into the
+    /// long buffer's `bx` rows. The `c` third of the store waits there for the
+    /// gate in sweep 2.
+    pub(super) fn emit_conv_long_front(
+        &self,
+        session: &mut HexagonQueueSession,
+        conv: &HexagonConvLayer,
+        cur_act: usize,
+        cur_normed: usize,
+        chunk: &LongChunk,
+        lb: &LongBuf<'_>,
+    ) -> Result<(), CeraError> {
+        let scratch = &self.scratch_buf;
+        let hs = self.config.hidden_size;
+        let row = hs * 4;
+        let s = chunk.rows;
+        Self::dispatch_rms_norm_mul(
+            session,
+            scratch,
+            cur_act,
+            &self.weights_buf,
+            conv.attn_norm_offset,
+            scratch,
+            cur_normed,
+            self.config.rms_norm_eps,
+            hs,
+            s,
+        )?;
+        let cin = lb.lay.ucin + chunk.first * 3 * row;
+        self.dispatch_mul_mat_m(
+            session,
+            &self.weights_buf,
+            &conv.in_proj,
+            scratch,
+            cur_normed,
+            lb.buf,
+            cin,
+            s,
+        )?;
+        Self::dispatch_mul_m_strided(
+            session,
+            lb.buf,
+            cin,
+            HTP_TENSOR_COMPUTE,
+            lb.buf,
+            cin + 2 * row,
+            HTP_TENSOR_COMPUTE,
+            lb.buf,
+            lb.lay.ubx + chunk.first * row,
+            hs,
+            s,
+            3 * row,
+            3 * row,
+        )
+    }
+
+    /// Sweep 2 of a conv layer in the layer-outer encoder pass, for one chunk
+    /// (`cur_act` holds the chunk's residual rows): the symmetric conv window
+    /// `[left, bx_0 .. bx_{s-1}, right]` with the neighbours taken from the
+    /// adjacent chunks' `bx` rows (the state slab's slot 0 for the first chunk,
+    /// the zero row after the last), the conv, the gate with the stored `c` third,
+    /// `out_proj` , the residual add and the FFN. `last` marks the final
+    /// chunk, which leaves the last real `bx` in slot 0 when `save_state` is set
+    /// (a prefix pass). Every chunk's window goes through the layer's state slab:
+    /// the same two-slot-slab-plus-bx-rows concat the single-chunk window uses,
+    /// with slot 0 refreshed from the previous chunk's last `bx` row.
+    pub(super) fn emit_conv_long_back(
+        &self,
+        session: &mut HexagonQueueSession,
+        conv: &HexagonConvLayer,
+        layer_idx: usize,
+        cur_act: usize,
+        next_act: usize,
+        cur_normed: usize,
+        chunk: &LongChunk,
+        lb: &LongBuf<'_>,
+        save_state: bool,
+    ) -> Result<(), CeraError> {
+        let so = self.scratch_offsets;
+        let scratch = &self.scratch_buf;
+        let hs = self.config.hidden_size;
+        let row = hs * 4;
+        let s = chunk.rows;
+        let bx = lb.lay.ubx + chunk.first * row;
+        if chunk.first > 0 {
+            // slot 0 := the previous chunk's last bx (the left neighbour).
+            Self::dispatch_cpy_2d(
+                session,
+                lb.buf,
+                bx - row,
+                hs,
+                1,
+                4,
+                row,
+                &self.kv_state_buf,
+                conv.state_offset,
+                8,
+                8,
+            )?;
+        }
+        // slot 1 := bx_0, so the slab reads [left, bx_0].
+        Self::dispatch_cpy_2d(
+            session,
+            lb.buf,
+            bx,
+            hs,
+            1,
+            4,
+            row,
+            &self.kv_state_buf,
+            conv.state_offset + 4,
+            8,
+            8,
+        )?;
+        // Window x = [left, bx_0, bx_1 .. bx_{s-1}, right]: the slab, then the
+        // bx rows from the second one, s rows (the last is the next chunk's
+        // first row, or the zero row past the end).
+        Self::dispatch_concat_2d(
+            session,
+            &self.kv_state_buf,
+            conv.state_offset,
+            2,
+            lb.buf,
+            bx + row,
+            s,
+            row,
+            4,
+            scratch,
+            so.conv_x,
+            hs,
+        )?;
+        self.dispatch_ssm_conv(
+            session,
+            &self.weights_buf,
+            conv.conv_ssm_offset,
+            scratch,
+            so.conv_x,
+            scratch,
+            so.conv_ssm_y,
+            3,
+            hs,
+            s,
+        )?;
+        if save_state && chunk.last {
+            // After the concat read slot 0: leave the last real bx there.
+            Self::dispatch_cpy_2d(
+                session,
+                lb.buf,
+                bx + (s - 1) * row,
+                hs,
+                1,
+                4,
+                row,
+                &self.kv_state_buf,
+                conv.state_offset,
+                8,
+                8,
+            )?;
+        }
+        // Gate with the stored c third.
+        Self::dispatch_mul_m_strided(
+            session,
+            scratch,
+            so.conv_ssm_y,
+            HTP_TENSOR_COMPUTE,
+            lb.buf,
+            lb.lay.ucin + chunk.first * 3 * row + row,
+            HTP_TENSOR_COMPUTE,
+            scratch,
+            so.conv_ssm_y,
+            hs,
+            s,
+            row,
+            3 * row,
+        )?;
+        self.dispatch_mul_mat_m(
+            session,
+            &self.weights_buf,
+            &conv.out_proj,
+            scratch,
+            so.conv_ssm_y,
+            scratch,
+            cur_normed,
+            s,
+        )?;
+        Self::dispatch_add_m(
+            session, scratch, cur_act, scratch, cur_normed, scratch, next_act, hs, s,
+        )?;
+        self.emit_ffn_block(
+            session,
+            &conv.ffn,
+            conv.ffn_norm_offset,
+            None,
+            layer_idx,
+            next_act,
+            cur_normed,
+            s,
+            false,
+        )
     }
 
     /// Decode-pass ops of one DeltaNet layer (a single token at `pos`).

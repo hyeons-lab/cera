@@ -12,11 +12,12 @@
 //! device is needed to check the emitted op sequence.
 
 use super::{
-    HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonQueueSession,
-    HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode, MulMatF32Shape, RpcmemBuffer,
-    build_binary_kernel_params, build_hmx_mm_kernel_params, build_layer_norm_params,
-    build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params, build_softmax_kernel_params,
-    build_ssm_conv_kernel_params, build_unary_kernel_params, mm_hmx_nb1, mm_is_hmx_eligible,
+    HMX_MM_MIN_NROWS, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT,
+    HexagonQueueSession, HexagonWeightDesc, HexagonWeightFormat, HtpDataType, HtpOpCode,
+    MulMatF32Shape, RpcmemBuffer, build_binary_kernel_params, build_hmx_mm_kernel_params,
+    build_layer_norm_params, build_mul_mat_f32_kernel_params, build_mul_mat_kernel_params,
+    build_softmax_kernel_params, build_ssm_conv_kernel_params, build_unary_kernel_params,
+    mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::session::CeraError;
 
@@ -230,11 +231,11 @@ pub(crate) fn linear_m<S: OpSink>(
 
 /// [`linear_m`] that may run the matmul on the HMX matrix unit.
 ///
-/// With `hmx` set, a whole-batch (`TokenTile::Whole`) projection whose dims are 32
-/// aligned and whose batch has at least [`mm_is_hmx_eligible`]'s minimum rows runs the
-/// DSP's HMX matmul, as the LFM2 prefill does: the same repacked weights feed both
-/// kernels and only the dim-1 weight stride differs. Anything else, or a chunking
-/// that does not fit the budget, keeps the HVX matmul.
+/// With `hmx` set, every token run whose dims are 32 aligned and that has at least
+/// [`mm_is_hmx_eligible`]'s minimum rows runs the DSP's HMX matmul, as the LFM2 prefill
+/// does: the same repacked weights feed both kernels and only the dim-1 weight stride
+/// differs. The other runs (a short tile remainder, unaligned dims), a run whose chunking
+/// does not fit the budget, and every run when `hmx` is `None`, keep the HVX matmul.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn linear_m_with<S: OpSink>(
     session: &mut S,
@@ -256,44 +257,59 @@ pub(crate) fn linear_m_with<S: OpSink>(
     let (cols, rows) = (w_desc.cols, w_desc.rows);
     let tiled_row_bytes = cols.div_ceil(32) * tile_size;
     let w_tot = rows.div_ceil(32) * tiled_row_bytes;
-    // One whole-batch run only: the weight tensor's stride is registered once and the
-    // HMX kernel reads it differently from the HVX one.
-    let hmx_kparams = match (hmx, tile) {
-        (Some(h), TokenTile::Whole) if mm_is_hmx_eligible(w_dtype, cols, rows, n_tokens) => {
-            build_hmx_mm_kernel_params(
-                w_dtype,
-                cols,
-                rows,
-                n_tokens.next_multiple_of(32),
-                n_tokens,
-                session.dsp_threads(),
-                h.vtcm_budget,
-            )
+    // Plan every run up front: the kernel parameters (HMX where the run is eligible and a
+    // chunking fits the budget) decide which weight descriptor the run needs.
+    let plan: Vec<(usize, usize, Option<[i32; 32]>)> = token_runs(n_tokens, tile)
+        .map(|(start, run)| {
+            let hmx_kparams = match hmx {
+                Some(h) if mm_is_hmx_eligible(w_dtype, cols, rows, run) => {
+                    build_hmx_mm_kernel_params(
+                        w_dtype,
+                        cols,
+                        rows,
+                        run.next_multiple_of(32),
+                        run,
+                        session.dsp_threads(),
+                        h.vtcm_budget,
+                    )
+                }
+                _ => None,
+            };
+            (start, run, hmx_kparams)
+        })
+        .collect();
+    // The same repacked weights feed both kernels, but HVX walks N rows of K tiles
+    // (`tiled_row_bytes` apart) while HMX addresses N-tile starts as `nc * nb[1]`, so each
+    // needs its own descriptor. Registered in first-use order, before anything else.
+    let mut w_tis: [Option<u16>; 2] = [None, None];
+    for &(_, _, hmx_kparams) in &plan {
+        let for_hmx = hmx_kparams.is_some();
+        if w_tis[usize::from(for_hmx)].is_none() {
+            let nb1 = if for_hmx {
+                mm_hmx_nb1(w_dtype, cols)
+            } else {
+                tiled_row_bytes
+            };
+            w_tis[usize::from(for_hmx)] = Some(session.add_tensor(
+                weights,
+                w_desc.offset,
+                w_desc.size_bytes,
+                HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
+                w_dtype as u32,
+                [cols as u32, rows as u32, 1, 1],
+                [block_bytes as u32, nb1 as u32, w_tot as u32, w_tot as u32],
+            )?);
         }
-        _ => None,
-    };
-    let w_nb1 = if hmx_kparams.is_some() {
-        mm_hmx_nb1(w_dtype, cols)
-    } else {
-        tiled_row_bytes
-    };
-    let w_ti = session.add_tensor(
-        weights,
-        w_desc.offset,
-        w_desc.size_bytes,
-        HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK,
-        w_dtype as u32,
-        [cols as u32, rows as u32, 1, 1],
-        [block_bytes as u32, w_nb1 as u32, w_tot as u32, w_tot as u32],
-    )?;
+    }
     let b_ti = match bias_offset.into() {
         Some(b_off) => Some(add_f32_vector(session, weights, b_off, rows)?),
         None => None,
     };
 
-    for (start, run) in token_runs(n_tokens, tile) {
+    for (start, run, hmx_kparams) in plan {
         let x_ti = add_f32_rows(session, x, x_offset + start * cols * 4, cols, run)?;
         let dst_ti = add_f32_rows(session, dst, dst_offset + start * rows * 4, rows, run)?;
+        let w_ti = w_tis[usize::from(hmx_kparams.is_some())].expect("registered above");
         let kparams = hmx_kparams.unwrap_or_else(|| {
             build_mul_mat_kernel_params(
                 w_dtype,
@@ -319,6 +335,36 @@ pub(crate) fn linear_m_with<S: OpSink>(
         }
     }
     session.end_group().map_err(|e| op_err("linear_m", e))
+}
+
+/// Whether a `[rows, cols]` plain-F16 weight can take [`linear_m_f16`]: the HMX tile edge
+/// divides both dimensions.
+pub(crate) fn f16_mm_shape_ok(rows: usize, cols: usize) -> bool {
+    rows != 0 && cols != 0 && rows.is_multiple_of(32) && cols.is_multiple_of(32)
+}
+
+/// [`f16_mm_kernel_params`] against an explicit VTCM budget (the LFM2 engine sizes its
+/// kernels for the device's whole VTCM).
+pub(crate) fn f16_mm_kernel_params_in(
+    rows: usize,
+    cols: usize,
+    m: usize,
+    threads: u32,
+    vtcm_budget: usize,
+) -> Option<[i32; 32]> {
+    (f16_mm_shape_ok(rows, cols) && m >= HMX_MM_MIN_NROWS)
+        .then(|| {
+            build_hmx_mm_kernel_params(
+                HtpDataType::F16,
+                cols,
+                rows,
+                m.next_multiple_of(32),
+                m,
+                threads,
+                vtcm_budget,
+            )
+        })
+        .flatten()
 }
 
 /// Arguments for [`layer_norm`]: `dst = norm(src) * weight + bias`.
@@ -459,9 +505,9 @@ pub(crate) fn gelu_tmp_rows(bytes: usize, dim: usize) -> Result<usize, CeraError
 /// 5e-4 of, absolute). The `UNARY_GELU` of the skels this crate bundled before the rebuild was
 /// not this: it was the quick approximation `x * sigmoid(1.702 x)`, up to about 2% per element
 /// away, which a wide down-projection turned into a 20% error in the vision transformer. The
-/// bundled skels now implement `UNARY_GELU` as the tanh form (and have `UnaryGeluErf`), so one
-/// native op could replace the sequence below once it is checked on a device against the CPU;
-/// until then this stays the verified path.
+/// bundled skels now implement `UNARY_GELU` as the tanh form and have `UnaryGeluErf`, which
+/// [`gelu_erf`] drives and which is the exact form (see there for the device measurement); the
+/// ViT blocks, trained with the tanh form, keep the sequence below.
 ///
 /// Computed as
 /// `x * sigmoid(2 sqrt(2/pi) * x * (1 + 0.044715 x^2))`, since
@@ -502,6 +548,29 @@ pub(crate) fn gelu_tanh<S: OpSink>(
         mul_inplace(session, buf, x_off, tmp, tmp_offset, rows, TokenTile::Whole)?;
     }
     Ok(())
+}
+
+/// In-place GELU, exact (erf) form, by the skels' native `UnaryGeluErf`: one op per tile and no
+/// scratch, against [`gelu_tanh`]'s five ops through a scratch region. This is the form
+/// `torch.nn.GELU()` uses, so no 5e-4 approximation error enters where a model was trained with
+/// it. Measured on a phone by the `device_gelu_*` tests: worst error against the exact GELU 4.8e-7
+/// over +-12 (the tanh sequence: 4.7e-4), and 1.8 ms against 4.0 ms for 1024 rows of 4096.
+pub(crate) fn gelu_erf<S: OpSink>(
+    session: &mut S,
+    buf: &S::Buf,
+    offset: usize,
+    shape: TokenShape,
+    tile: TokenTile,
+) -> Result<(), CeraError> {
+    unary_inplace(
+        session,
+        HtpOpCode::UnaryGeluErf,
+        "gelu_erf",
+        buf,
+        offset,
+        shape,
+        tile,
+    )
 }
 
 /// In-place natural logarithm: `buf = ln(buf)` (the inputs must be positive).
@@ -1424,12 +1493,12 @@ mod tests {
             64usize.div_ceil(32) * 32 * 34
         );
 
-        // Too few rows for the matrix unit, unaligned dims and a tiled batch stay HVX.
+        // Too few rows for the matrix unit and unaligned dims stay HVX (a tiled batch
+        // takes the HMX kernel per run, see `linear_m_with_hmx_picks_the_kernel_per_run`).
         for (tokens, rows, cols, tile) in [
             (4, 96, 64, TokenTile::Whole),
             (280, 96, 48, TokenTile::Whole),
             (280, 90, 64, TokenTile::Whole),
-            (280, 96, 64, TokenTile::Tiles(64)),
         ] {
             let s = run(tokens, rows, cols, tile, hmx);
             assert!(
@@ -1480,6 +1549,105 @@ mod tests {
         let expect =
             build_mul_mat_kernel_params(HtpDataType::Q8_0, 32, 130, 1, 32 * 4, 8, VTCM_BUDGET);
         assert_eq!(s.ops[0].kparams, expect);
+    }
+
+    /// No `hmx` option is `linear_m`, op for op and tensor for tensor.
+    #[test]
+    fn linear_m_with_hmx_off_is_linear_m() {
+        let (mut a, mut b) = (RecordingSink::default(), RecordingSink::default());
+        linear_m(
+            &mut a,
+            &"x",
+            8,
+            &"w",
+            desc(96, 64),
+            512usize,
+            &"y",
+            16,
+            130,
+            TILE_64,
+        )
+        .unwrap();
+        linear_m_with(
+            &mut b,
+            &"x",
+            8,
+            &"w",
+            desc(96, 64),
+            512usize,
+            &"y",
+            16,
+            130,
+            TILE_64,
+            None,
+        )
+        .unwrap();
+        assert_eq!(a.tensors, b.tensors);
+        assert_eq!(a.ops, b.ops);
+    }
+
+    /// An eligible run takes the HMX kernel and a weight descriptor striding
+    /// by the HMX row size; a run under `HMX_MM_MIN_NROWS` stays on HVX with
+    /// the HVX descriptor. Both descriptors are registered once, on first use.
+    #[test]
+    fn linear_m_with_hmx_picks_the_kernel_per_run() {
+        let mut s = RecordingSink::default();
+        // Runs of 64, 64 and 2 tokens.
+        linear_m_with(
+            &mut s,
+            &"x",
+            0,
+            &"w",
+            desc(96, 64),
+            None,
+            &"y",
+            0,
+            130,
+            TILE_64,
+            Some(HmxMm {
+                vtcm_budget: VTCM_BUDGET,
+            }),
+        )
+        .unwrap();
+        assert_eq!(s.opcodes(), vec![OP_MULMAT; 3]);
+        let hmx = build_hmx_mm_kernel_params(HtpDataType::Q8_0, 64, 96, 64, 64, 8, VTCM_BUDGET)
+            .expect("a 64-row Q8_0 matmul fits the VTCM");
+        let hvx = build_mul_mat_kernel_params(HtpDataType::Q8_0, 64, 2, 1, 96 * 4, 8, VTCM_BUDGET);
+        assert_eq!(s.ops[0].kparams, hmx);
+        assert_eq!(s.ops[1].kparams, hmx);
+        assert_eq!(s.ops[2].kparams, hvx);
+        let (w_hmx, w_hvx) = (s.src(0, 0), s.src(2, 0));
+        assert_ne!(w_hmx, w_hvx);
+        assert_eq!(s.src(1, 0), w_hmx, "the HMX descriptor is shared");
+        assert_eq!(w_hmx.nb[1] as usize, mm_hmx_nb1(HtpDataType::Q8_0, 64));
+        assert_eq!(w_hvx.nb[1] as usize, (64 / 32) * 32 * 34);
+        assert_eq!(w_hmx.offset, 4096);
+        assert_eq!(w_hmx.flags, HTP_TENSOR_WEIGHT | HTP_TENSOR_REPACK);
+        assert_eq!(s.tensors.iter().filter(|t| t.offset == 4096).count(), 2);
+    }
+
+    /// Dims that are not multiples of 32 are HVX-only, whatever the caller asks.
+    #[test]
+    fn linear_m_with_hmx_leaves_odd_dims_on_hvx() {
+        let mut s = RecordingSink::default();
+        linear_m_with(
+            &mut s,
+            &"x",
+            0,
+            &"w",
+            desc(96, 48),
+            None,
+            &"y",
+            0,
+            64,
+            TokenTile::Whole,
+            Some(HmxMm {
+                vtcm_budget: VTCM_BUDGET,
+            }),
+        )
+        .unwrap();
+        let hvx = build_mul_mat_kernel_params(HtpDataType::Q8_0, 48, 64, 1, 96 * 4, 8, VTCM_BUDGET);
+        assert_eq!(s.ops[0].kparams, hvx);
     }
 
     #[test]
@@ -1896,6 +2064,274 @@ mod tests {
         // The final multiply writes the activation back in place.
         assert_eq!(s.dst(s.ops.len() - 1).offset, 96 * 64 * 2 * 4);
         assert_eq!(s.tensors[s.ops[s.ops.len() - 1].dst[0] as usize].buf, "x");
+    }
+
+    /// The native erf GELU is one op per row tile, in place, with no scratch.
+    #[test]
+    fn gelu_erf_is_one_in_place_op_per_tile() {
+        let mut s = RecordingSink::default();
+        let shape = TokenShape {
+            dim: 96,
+            n_tokens: 130,
+        };
+        gelu_erf(&mut s, &"x", 0, shape, TokenTile::Tiles(64)).unwrap();
+        assert_eq!(s.opcodes(), vec![HtpOpCode::UnaryGeluErf as u32; 3]);
+        for i in 0..3 {
+            assert_eq!(s.src(i, 0).offset, s.dst(i).offset, "in place");
+            assert_eq!(s.src(i, 0).buf, "x");
+        }
+    }
+
+    // ---- on a phone: the native erf GELU against the exact GELU and the tanh sequence ----
+    //
+    // Four steps, each its own test so a fault names the step. The first dispatch of an op no
+    // device test had run took a test phone down to a crash dump, so: step 1 runs only the
+    // known-good tanh sequence on a few vectors (the harness), step 2 one tiny `gelu_erf`,
+    // step 3 the accuracy sweep, step 4 the cost. Every step appends a line to the trace file
+    // and syncs it, so the last line names how far a crash got.
+    //
+    // Run: `cargo ndk -t arm64-v8a test -p cera --features hexagon --lib --no-run --release`,
+    // push the test binary, then `<bin> device_gelu_1 --ignored --nocapture`, and so on.
+
+    fn gelu_trace(line: &str) {
+        use std::io::Write as _;
+        eprintln!("{line}");
+        let path = std::env::var("CERA_GELU_TRACE")
+            .unwrap_or_else(|_| "/data/local/tmp/gelu-trace.log".into());
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{line}");
+            let _ = f.sync_all();
+        }
+    }
+
+    struct GeluRig {
+        // the device closes its session on drop, so it must drop before the driver it uses:
+        // fields drop in declaration order
+        device: crate::backend::hexagon::HexagonDevice,
+        driver: std::sync::Arc<crate::backend::hexagon::FastRpcDriver>,
+    }
+
+    impl GeluRig {
+        fn open() -> Self {
+            use crate::backend::hexagon::{FastRpcDriver, probe_device};
+            // the skels travel inside the binary: stage them where the DSP's loader looks
+            let skels = std::env::var("CERA_SKEL_DIR")
+                .unwrap_or_else(|_| "/data/local/tmp/cera-gelu-skels".into());
+            gelu_trace("staging the skels");
+            crate::backend::hexagon::install_skels(std::path::Path::new(&skels))
+                .expect("stage the skels");
+            gelu_trace("loading the FastRPC driver");
+            let driver = FastRpcDriver::load().expect("FastRPC driver");
+            gelu_trace("opening a DSP session");
+            let device = probe_device(&driver, None).expect("open a DSP session");
+            gelu_trace("session open");
+            Self { device, driver }
+        }
+
+        /// Every buffer a batch names must be mapped into the CDSP (`map_to_dsp = true`): the
+        /// queue passes the DSP a file descriptor and never maps for the caller, and a batch over
+        /// an unmapped buffer faults the DSP (a hard crash of the test phone).
+        fn alloc(&self, bytes: usize) -> RpcmemBuffer {
+            RpcmemBuffer::alloc(self.driver.clone(), bytes, true).unwrap()
+        }
+
+        /// Give the buffers back to the DSP while the session is still open, as a model's
+        /// `Drop` does; unmapping them after the session is gone fails and ends in a segfault.
+        fn release(&mut self, bufs: &[&RpcmemBuffer]) {
+            self.device
+                .queue_session_mut()
+                .release_dsp_references(bufs.iter().copied());
+        }
+    }
+
+    use crate::backend::hexagon::RpcmemBuffer;
+
+    fn gelu_upload(buf: &RpcmemBuffer, values: &[f32]) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr().cast::<u8>(),
+                buf.as_mut_ptr(),
+                values.len() * 4,
+            );
+        }
+        buf.flush_cpu_cache(0, values.len() * 4);
+    }
+
+    fn gelu_download(buf: &RpcmemBuffer, n: usize) -> Vec<f32> {
+        buf.invalidate_cpu_cache(0, n * 4);
+        let mut out = vec![0f32; n];
+        unsafe { std::ptr::copy_nonoverlapping(buf.as_mut_ptr(), out.as_mut_ptr().cast(), n * 4) };
+        out
+    }
+
+    /// `(worst absolute error, the x it is at, rms)` of `got` against the exact GELU of `input`.
+    fn gelu_error(got: &[f32], input: &[f32]) -> (f32, f32, f64) {
+        let mut exact = input.to_vec();
+        crate::d1::gelu_exact_inplace(&mut exact);
+        let (mut worst, mut at, mut sum_sq) = (0f32, 0f32, 0f64);
+        for ((g, e), x) in got.iter().zip(&exact).zip(input) {
+            let d = (g - e).abs();
+            if d > worst {
+                (worst, at) = (d, *x);
+            }
+            sum_sq += f64::from(d * d);
+        }
+        (worst, at, (sum_sq / got.len() as f64).sqrt())
+    }
+
+    fn gelu_ramp(n: usize, lo: f32, hi: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| lo + (hi - lo) * i as f32 / (n - 1) as f32)
+            .collect()
+    }
+
+    /// Step 1, the harness: the known-good tanh sequence on 2 rows of 128.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_gelu_1_harness_with_the_known_good_tanh_form() {
+        gelu_trace("== step 1: tanh GELU on 2x128");
+        let mut rig = GeluRig::open();
+        let (dim, tokens) = (128usize, 2usize);
+        let input = gelu_ramp(dim * tokens, -4.0, 4.0);
+        let buf = rig.alloc(dim * tokens * 4);
+        let tmp = rig.alloc(tokens * dim * 4);
+        gelu_upload(&buf, &input);
+        let session = rig.device.queue_session_mut();
+        let shape = TokenShape {
+            dim,
+            n_tokens: tokens,
+        };
+        gelu_trace("enqueue tanh");
+        gelu_tanh(session, &buf, 0, &tmp, 0, tokens, shape).unwrap();
+        gelu_trace("flush");
+        session.flush().unwrap();
+        gelu_trace("flushed");
+        let (worst, at, rms) = gelu_error(&gelu_download(&buf, dim * tokens), &input);
+        gelu_trace(&format!(
+            "step 1 done: tanh vs exact worst {worst:.3e} at x={at:.3}, rms {rms:.3e}"
+        ));
+        rig.release(&[&buf, &tmp]);
+        assert!(worst < 2e-3, "the tanh sequence is off by {worst}");
+    }
+
+    /// Step 2: one `gelu_erf` over the same 2x128.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_gelu_2_native_erf_on_a_few_vectors() {
+        gelu_trace("== step 2: native erf GELU on 2x128");
+        let mut rig = GeluRig::open();
+        let (dim, tokens) = (128usize, 2usize);
+        let input = gelu_ramp(dim * tokens, -4.0, 4.0);
+        let buf = rig.alloc(dim * tokens * 4);
+        gelu_upload(&buf, &input);
+        let session = rig.device.queue_session_mut();
+        let shape = TokenShape {
+            dim,
+            n_tokens: tokens,
+        };
+        gelu_trace("enqueue erf");
+        gelu_erf(session, &buf, 0, shape, TokenTile::Whole).unwrap();
+        gelu_trace("flush");
+        session.flush().unwrap();
+        gelu_trace("flushed");
+        let out = gelu_download(&buf, dim * tokens);
+        let (worst, at, rms) = gelu_error(&out, &input);
+        gelu_trace(&format!(
+            "step 2 done: erf vs exact worst {worst:.3e} at x={at:.3}, rms {rms:.3e}"
+        ));
+        rig.release(&[&buf]);
+        assert!(out.iter().all(|v| v.is_finite()), "non-finite output");
+    }
+
+    /// Step 3: accuracy of both forms over a wide ramp.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_gelu_3_accuracy_of_erf_against_tanh() {
+        gelu_trace("== step 3: accuracy on 8x4096, +-12");
+        let mut rig = GeluRig::open();
+        let (dim, tokens) = (4096usize, 8usize);
+        let n = dim * tokens;
+        let input: Vec<f32> = (0..n)
+            .map(|i| {
+                let u = i as f32 / (n - 1) as f32;
+                if i % 2 == 0 {
+                    -12.0 + 24.0 * u
+                } else {
+                    (u - 0.5) * 6.0
+                }
+            })
+            .collect();
+        let buf = rig.alloc(n * 4);
+        let tmp = rig.alloc(8 * dim * 4);
+        let session = rig.device.queue_session_mut();
+        let shape = TokenShape {
+            dim,
+            n_tokens: tokens,
+        };
+        gelu_upload(&buf, &input);
+        gelu_erf(session, &buf, 0, shape, TokenTile::Whole).unwrap();
+        session.flush().unwrap();
+        let erf_out = gelu_download(&buf, n);
+        gelu_upload(&buf, &input);
+        gelu_tanh(session, &buf, 0, &tmp, 0, 8, shape).unwrap();
+        session.flush().unwrap();
+        let tanh_out = gelu_download(&buf, n);
+        let (ea, ex, er) = gelu_error(&erf_out, &input);
+        let (ta, tx, tr) = gelu_error(&tanh_out, &input);
+        gelu_trace(&format!(
+            "native erf : worst abs {ea:.3e} at x={ex:.3}, rms {er:.3e}"
+        ));
+        gelu_trace(&format!(
+            "tanh (5 op): worst abs {ta:.3e} at x={tx:.3}, rms {tr:.3e}"
+        ));
+        rig.release(&[&buf, &tmp]);
+        assert!(erf_out.iter().all(|v| v.is_finite()), "non-finite output");
+        assert!(
+            ea <= ta,
+            "the native erf op ({ea:.3e}) is coarser than the tanh sequence ({ta:.3e})"
+        );
+    }
+
+    /// Step 4: cost of both at a projector's shape, 1024 rows of 4096, in place.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_gelu_4_cost_of_erf_against_tanh() {
+        use std::time::Instant;
+        gelu_trace("== step 4: cost on 1024x4096");
+        let mut rig = GeluRig::open();
+        let (dim, tokens, reps) = (4096usize, 1024usize, 20u32);
+        let big = rig.alloc(dim * tokens * 4);
+        let scratch = rig.alloc(64 * dim * 4);
+        let fill: Vec<f32> = (0..dim * tokens)
+            .map(|i| ((i % 977) as f32 - 488.0) / 61.0)
+            .collect();
+        gelu_upload(&big, &fill);
+        let session = rig.device.queue_session_mut();
+        let shape = TokenShape {
+            dim,
+            n_tokens: tokens,
+        };
+        let mut time = |run: &mut dyn FnMut(&mut HexagonQueueSession)| {
+            run(session);
+            session.flush().unwrap();
+            let start = Instant::now();
+            for _ in 0..reps {
+                run(session);
+                session.flush().unwrap();
+            }
+            start.elapsed().as_secs_f64() * 1e3 / f64::from(reps)
+        };
+        let erf_ms = time(&mut |s| gelu_erf(s, &big, 0, shape, TokenTile::Whole).unwrap());
+        gelu_trace(&format!("native erf {erf_ms:.3} ms"));
+        let tanh_ms = time(&mut |s| gelu_tanh(s, &big, 0, &scratch, 0, 64, shape).unwrap());
+        gelu_trace(&format!(
+            "step 4 done: native erf {erf_ms:.3} ms, tanh sequence {tanh_ms:.3} ms"
+        ));
+        rig.release(&[&big, &scratch]);
     }
 
     /// The sequence computes the tanh GELU (not the DSP's quick GELU, which is

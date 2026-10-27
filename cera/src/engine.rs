@@ -816,8 +816,16 @@ impl CeraEngine {
         // device is available. Uploading the mmproj to the GPU here (once)
         // keeps it off the per-image hot path. Falls back to `None` (CPU
         // encode) for `Cpu`, disabled features, or device-init failure.
+        // Under `Auto` the vision encoder goes where the trunk went, so a model on the NPU does
+        // not end up with its tower on another accelerator when the NPU has no room for it.
+        let vision_backend = match (cfg.backend, model.backend_label()) {
+            (BackendPreference::Auto, "metal") => BackendPreference::Metal,
+            (BackendPreference::Auto, "hexagon") => BackendPreference::Hexagon,
+            (BackendPreference::Auto, "wgpu") => BackendPreference::Gpu,
+            (other, _) => other,
+        };
         let gpu_vision_encoder = vision_encoder.as_ref().and_then(|w| {
-            crate::model::vision_encoder_gpu::build_gpu_vision_encoder(w, cfg.backend)
+            crate::model::vision_encoder_gpu::build_gpu_vision_encoder(w, vision_backend)
         });
         if gpu_vision_encoder.is_none()
             && let Some(ref w) = vision_encoder
@@ -1146,6 +1154,11 @@ impl CeraEngine {
         self.gpu_vision_encoder.is_some()
     }
 
+    /// The backend the GPU/NPU vision encoder runs on, or `None` when images use the CPU encoder.
+    pub fn vision_backend_name(&self) -> Option<&'static str> {
+        self.gpu_vision_encoder.as_ref().map(|e| e.backend_label())
+    }
+
     /// Whether a GPU audio encoder was built at construction (true when an audio
     /// mmproj loaded, `cfg.backend` selected a supported GPU backend, and the
     /// device was available). When false, PCM input falls back to the CPU
@@ -1271,6 +1284,12 @@ impl CeraEngine {
     /// Clear the model's KV prefix cache (both warm memory and cold disk tiers).
     pub fn clear_cache(&self) {
         self.model.clear_cache();
+    }
+
+    /// The backend the loaded model runs on (`"cpu"`, `"metal"`, `"wgpu"` or `"hexagon"`),
+    /// which is what an `Auto` load resolved to.
+    pub fn backend_name(&self) -> &'static str {
+        self.model.backend_label()
     }
 
     /// Run PII detection on input text using the loaded model and tokenizer.

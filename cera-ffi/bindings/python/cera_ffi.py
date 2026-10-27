@@ -703,6 +703,24 @@ def _uniffi_check_api_checksums(lib):
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 3580:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_decisionengine_backend_name() != 23371:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_decisionengine_backend_report() != 13889:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_decisionengine_decide_json() != 37995:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_decisionengine_decide_json_async() != 57969:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_decisionengine_decision_type() != 19792:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_decisionengine_supports_audio() != 15593:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_method_decisionengine_supports_images() != 18359:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_decisionengine_open() != 39396:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
+    if lib.uniffi_cera_ffi_checksum_constructor_decisionengine_open_async() != 3135:
+        raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress() != 37554:
         raise InternalError("UniFFI API checksum mismatch: try cleaning and rebuilding your project")
     if lib.uniffi_cera_ffi_checksum_method_ffiaudiopipeline_add_utterance() != 5629:
@@ -1217,6 +1235,33 @@ _UniffiLib.uniffi_cera_ffi_checksum_method_chatsession_tools.restype = ctypes.c_
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_constructor_chatsession_from_session.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_backend_name.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_backend_name.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_backend_report.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_backend_report.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_decide_json.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_decide_json.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_decide_json_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_decide_json_async.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_decision_type.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_decision_type.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_supports_audio.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_supports_audio.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_supports_images.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_method_decisionengine_supports_images.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_decisionengine_open.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_decisionengine_open.restype = ctypes.c_uint16
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_decisionengine_open_async.argtypes = (
+)
+_UniffiLib.uniffi_cera_ffi_checksum_constructor_decisionengine_open_async.restype = ctypes.c_uint16
 _UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.argtypes = (
 )
 _UniffiLib.uniffi_cera_ffi_checksum_method_downloadprogresssink_on_progress.restype = ctypes.c_uint16
@@ -2039,6 +2084,55 @@ _UniffiLib.uniffi_cera_ffi_fn_constructor_chatsession_from_session.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_constructor_chatsession_from_session.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_name.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_name.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_report.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_report.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_decide_json.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_decide_json.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_decide_json_async.argtypes = (
+    ctypes.c_uint64,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_decide_json_async.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_decision_type.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_decision_type.restype = _UniffiRustBuffer
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_supports_audio.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_supports_audio.restype = ctypes.c_int8
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_supports_images.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_supports_images.restype = ctypes.c_int8
+_UniffiLib.uniffi_cera_ffi_fn_constructor_decisionengine_open.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_decisionengine_open.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_constructor_decisionengine_open_async.argtypes = (
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+    _UniffiRustBuffer,
+)
+_UniffiLib.uniffi_cera_ffi_fn_constructor_decisionengine_open_async.restype = ctypes.c_uint64
 _UniffiLib.uniffi_cera_ffi_fn_method_downloadprogresssink_on_progress.argtypes = (
     ctypes.c_uint64,
     _UniffiRustBuffer,
@@ -2714,6 +2808,16 @@ _UniffiLib.uniffi_cera_ffi_fn_free_chatsession.argtypes = (
     ctypes.POINTER(_UniffiRustCallStatus),
 )
 _UniffiLib.uniffi_cera_ffi_fn_free_chatsession.restype = None
+_UniffiLib.uniffi_cera_ffi_fn_clone_decisionengine.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_clone_decisionengine.restype = ctypes.c_uint64
+_UniffiLib.uniffi_cera_ffi_fn_free_decisionengine.argtypes = (
+    ctypes.c_uint64,
+    ctypes.POINTER(_UniffiRustCallStatus),
+)
+_UniffiLib.uniffi_cera_ffi_fn_free_decisionengine.restype = None
 _UniffiLib.uniffi_cera_ffi_fn_clone_downloadprogresssink.argtypes = (
     ctypes.c_uint64,
     ctypes.POINTER(_UniffiRustCallStatus),
@@ -14090,6 +14194,290 @@ class _UniffiFfiConverterTypeCeraEngine:
         buf.write_u64(cls.lower(value))
 
 
+class DecisionEngineProtocol(typing.Protocol):
+    """
+    A loaded public d1 decision model.
+"""
+    
+    def backend_name(self, ) -> str:
+        """
+        The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
+"""
+        raise NotImplementedError
+    def backend_report(self, ) -> str:
+        """
+        Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+        hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+        CPU. For logs and diagnostics; the wording is not a stable format.
+"""
+        raise NotImplementedError
+    def decide_json(self, request_json: str) -> str:
+        """
+        Answer a `/v1/systemone` request given as JSON (`state`, `questions`, optionally `images`
+        as data URLs, an `audio/` data URL being a speech clip) and return the response JSON
+        (`answers` and `usage`).
+
+        Blocks for the duration of the forward passes. An invalid request is a
+        [`FfiError::Backend`] whose detail says what is wrong.
+"""
+        raise NotImplementedError
+    async def decide_json_async(self, request_json: str) -> str:
+        """
+        Async [`DecisionEngine::decide_json`] on a tokio blocking worker. Dropping the future
+        cancels the request before its next question (see the module documentation).
+"""
+        raise NotImplementedError
+    def decision_type(self, ) -> str:
+        """
+        The model type from the file: `lfm2-d1-omni`, `lfm2-d1` or `converted`.
+"""
+        raise NotImplementedError
+    def supports_audio(self, ) -> bool:
+        """
+        Whether speech requests can be answered (the speech tower is loaded).
+"""
+        raise NotImplementedError
+    def supports_images(self, ) -> bool:
+        """
+        Whether image requests can be answered (the vision tower is loaded).
+"""
+        raise NotImplementedError
+
+class DecisionEngine(DecisionEngineProtocol):
+    """
+    A loaded public d1 decision model.
+"""
+    
+    _handle: ctypes.c_uint64
+    @classmethod
+    def open(cls, model_path: str,mmproj_path: typing.Optional[str],backend: BackendPreference) -> DecisionEngine:
+        """
+        Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of the model for image
+        (and, for `d1-omni`, speech) requests (`None` answers text only).
+
+        Blocks while the weights load and, for `Auto`, run a warm-up request; use
+        [`DecisionEngine::open_async`] from a UI thread. `backend` is a request, see the module
+        documentation.
+"""
+        
+        _UniffiFfiConverterString.check_lower(model_path)
+
+        _UniffiFfiConverterOptionalString.check_lower(mmproj_path)
+
+        _UniffiFfiConverterTypeBackendPreference.check_lower(backend)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(model_path),
+            _UniffiFfiConverterOptionalString.lower(mmproj_path),
+            _UniffiFfiConverterTypeBackendPreference.lower(backend),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeDecisionEngine.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_decisionengine_open,
+            *_uniffi_lowered_args,
+        )
+        return cls._uniffi_make_instance(_uniffi_ffi_result)
+    @classmethod
+    async def open_async(cls, model_path: str,mmproj_path: typing.Optional[str],backend: BackendPreference) -> DecisionEngine:
+        """
+        Async [`DecisionEngine::open`]: the load runs on a tokio blocking worker, so a UI thread
+        never waits on it. Dropping the future aborts the load only while it is still queued.
+"""
+        
+        _UniffiFfiConverterString.check_lower(model_path)
+
+        _UniffiFfiConverterOptionalString.check_lower(mmproj_path)
+
+        _UniffiFfiConverterTypeBackendPreference.check_lower(backend)
+        _uniffi_lowered_args = (
+            _UniffiFfiConverterString.lower(model_path),
+            _UniffiFfiConverterOptionalString.lower(mmproj_path),
+            _UniffiFfiConverterTypeBackendPreference.lower(backend),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterTypeDecisionEngine.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_cera_ffi_fn_constructor_decisionengine_open_async(*_uniffi_lowered_args),
+            _UniffiLib.ffi_cera_ffi_rust_future_poll_u64,
+            _UniffiLib.ffi_cera_ffi_rust_future_complete_u64,
+            _UniffiLib.ffi_cera_ffi_rust_future_free_u64,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
+    
+    def __init__(self, *args, **kwargs):
+        raise ValueError("This class has no default constructor")
+
+    def __del__(self):
+        # In case of partial initialization of instances.
+        handle = getattr(self, "_handle", None)
+        if handle is not None:
+            _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_free_decisionengine, handle)
+
+    def _uniffi_clone_handle(self):
+        return _uniffi_rust_call(_UniffiLib.uniffi_cera_ffi_fn_clone_decisionengine, self._handle)
+
+    # Used by alternative constructors or any methods which return this type.
+    @classmethod
+    def _uniffi_make_instance(cls, handle):
+        # Lightly yucky way to bypass the usual __init__ logic
+        # and just create a new instance with the required handle.
+        inst = cls.__new__(cls)
+        inst._handle = handle
+        return inst
+    def backend_name(self, ) -> str:
+        """
+        The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterString.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_name,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def backend_report(self, ) -> str:
+        """
+        Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+        hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+        CPU. For logs and diagnostics; the wording is not a stable format.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterString.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_backend_report,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def decide_json(self, request_json: str) -> str:
+        """
+        Answer a `/v1/systemone` request given as JSON (`state`, `questions`, optionally `images`
+        as data URLs, an `audio/` data URL being a speech clip) and return the response JSON
+        (`answers` and `usage`).
+
+        Blocks for the duration of the forward passes. An invalid request is a
+        [`FfiError::Backend`] whose detail says what is wrong.
+"""
+        
+        _UniffiFfiConverterString.check_lower(request_json)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(request_json),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterString.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_decide_json,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    async def decide_json_async(self, request_json: str) -> str:
+        """
+        Async [`DecisionEngine::decide_json`] on a tokio blocking worker. Dropping the future
+        cancels the request before its next question (see the module documentation).
+"""
+        
+        _UniffiFfiConverterString.check_lower(request_json)
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+            _UniffiFfiConverterString.lower(request_json),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterString.lift
+        _uniffi_error_converter = _UniffiFfiConverterTypeFfiError
+        return await _uniffi_rust_call_async(
+            _UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_decide_json_async(*_uniffi_lowered_args),
+            _UniffiLib.ffi_cera_ffi_rust_future_poll_rust_buffer,
+            _UniffiLib.ffi_cera_ffi_rust_future_complete_rust_buffer,
+            _UniffiLib.ffi_cera_ffi_rust_future_free_rust_buffer,
+            _uniffi_lift_return,
+            _uniffi_error_converter,
+        )
+    def decision_type(self, ) -> str:
+        """
+        The model type from the file: `lfm2-d1-omni`, `lfm2-d1` or `converted`.
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterString.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_decision_type,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def supports_audio(self, ) -> bool:
+        """
+        Whether speech requests can be answered (the speech tower is loaded).
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_supports_audio,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+    def supports_images(self, ) -> bool:
+        """
+        Whether image requests can be answered (the vision tower is loaded).
+"""
+        _uniffi_lowered_args = (
+            self._uniffi_clone_handle(),
+        )
+        _uniffi_lift_return = _UniffiFfiConverterBoolean.lift
+        _uniffi_error_converter = None
+        _uniffi_ffi_result = _uniffi_rust_call_with_error(
+            _uniffi_error_converter,
+            _UniffiLib.uniffi_cera_ffi_fn_method_decisionengine_supports_images,
+            *_uniffi_lowered_args,
+        )
+        return _uniffi_lift_return(_uniffi_ffi_result)
+
+
+
+
+
+class _UniffiFfiConverterTypeDecisionEngine:
+    @staticmethod
+    def lift(value: int) -> DecisionEngine:
+        return DecisionEngine._uniffi_make_instance(value)
+
+    @staticmethod
+    def check_lower(value: DecisionEngine):
+        if not isinstance(value, DecisionEngine):
+            raise TypeError("Expected DecisionEngine instance, {} found".format(type(value).__name__))
+
+    @staticmethod
+    def lower(value: DecisionEngine) -> ctypes.c_uint64:
+        return value._uniffi_clone_handle()
+
+    @classmethod
+    def read(cls, buf: _UniffiRustBuffer) -> DecisionEngine:
+        ptr = buf.read_u64()
+        if ptr == 0:
+            raise InternalError("Raw handle value was null")
+        return cls.lift(ptr)
+
+    @classmethod
+    def write(cls, value: DecisionEngine, buf: _UniffiRustBuffer):
+        buf.write_u64(cls.lower(value))
+
+
 class DownloadProgressSink():
     """
     Foreign-trait callback for download progress events from
@@ -17034,6 +17422,8 @@ __all__ = [
     "ChatSessionProtocol",
     "CeraEngine",
     "CeraEngineProtocol",
+    "DecisionEngine",
+    "DecisionEngineProtocol",
     "DownloadProgressSinkImpl",
     "DownloadProgressSink",
     "FfiAudioPipeline",

@@ -2583,6 +2583,299 @@ public func FfiConverterTypeChatSession_lower(_ value: ChatSession) -> UInt64 {
 
 
 /**
+ * A loaded public d1 decision model.
+ */
+public protocol DecisionEngineProtocol: AnyObject, Sendable {
+    
+    /**
+     * The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
+     */
+    func backendName()  -> String
+    
+    /**
+     * Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+     * hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+     * CPU. For logs and diagnostics; the wording is not a stable format.
+     */
+    func backendReport()  -> String
+    
+    /**
+     * Answer a `/v1/systemone` request given as JSON (`state`, `questions`, optionally `images`
+     * as data URLs, an `audio/` data URL being a speech clip) and return the response JSON
+     * (`answers` and `usage`).
+     *
+     * Blocks for the duration of the forward passes. An invalid request is a
+     * [`FfiError::Backend`] whose detail says what is wrong.
+     */
+    func decideJson(requestJson: String) throws  -> String
+    
+    /**
+     * Async [`DecisionEngine::decide_json`] on a tokio blocking worker. Dropping the future
+     * cancels the request before its next question (see the module documentation).
+     */
+    func decideJsonAsync(requestJson: String) async throws  -> String
+    
+    /**
+     * The model type from the file: `lfm2-d1-omni`, `lfm2-d1` or `converted`.
+     */
+    func decisionType()  -> String
+    
+    /**
+     * Whether speech requests can be answered (the speech tower is loaded).
+     */
+    func supportsAudio()  -> Bool
+    
+    /**
+     * Whether image requests can be answered (the vision tower is loaded).
+     */
+    func supportsImages()  -> Bool
+    
+}
+/**
+ * A loaded public d1 decision model.
+ */
+open class DecisionEngine: DecisionEngineProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_cera_ffi_fn_clone_decisionengine(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_cera_ffi_fn_free_decisionengine(handle, $0) }
+    }
+
+    
+    /**
+     * Load a d1 decision model from a GGUF path, plus the `mmproj` GGUF of the model for image
+     * (and, for `d1-omni`, speech) requests (`None` answers text only).
+     *
+     * Blocks while the weights load and, for `Auto`, run a warm-up request; use
+     * [`DecisionEngine::open_async`] from a UI thread. `backend` is a request, see the module
+     * documentation.
+     */
+public static func `open`(modelPath: String, mmprojPath: String?, backend: BackendPreference)throws  -> DecisionEngine  {
+    return try  FfiConverterTypeDecisionEngine_lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_constructor_decisionengine_open(
+        FfiConverterString.lower(modelPath),
+        FfiConverterOptionString.lower(mmprojPath),
+        FfiConverterTypeBackendPreference_lower(backend),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Async [`DecisionEngine::open`]: the load runs on a tokio blocking worker, so a UI thread
+     * never waits on it. Dropping the future aborts the load only while it is still queued.
+     */
+public static func openAsync(modelPath: String, mmprojPath: String?, backend: BackendPreference)async throws  -> DecisionEngine  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_constructor_decisionengine_open_async(FfiConverterString.lower(modelPath),FfiConverterOptionString.lower(mmprojPath),FfiConverterTypeBackendPreference_lower(backend)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_u64,
+            completeFunc: ffi_cera_ffi_rust_future_complete_u64,
+            freeFunc: ffi_cera_ffi_rust_future_free_u64,
+            liftFunc: FfiConverterTypeDecisionEngine_lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+
+    
+    /**
+     * The backend the trunk runs on: `cpu`, `metal`, `wgpu` or `hexagon`.
+     */
+open func backendName() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_method_decisionengine_backend_name(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Where each part of the model runs, for example `requested Auto: trunk hexagon, head
+     * hexagon, vision hexagon, audio hexagon`, with the reason in brackets when `Auto` fell back to the
+     * CPU. For logs and diagnostics; the wording is not a stable format.
+     */
+open func backendReport() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_method_decisionengine_backend_report(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Answer a `/v1/systemone` request given as JSON (`state`, `questions`, optionally `images`
+     * as data URLs, an `audio/` data URL being a speech clip) and return the response JSON
+     * (`answers` and `usage`).
+     *
+     * Blocks for the duration of the forward passes. An invalid request is a
+     * [`FfiError::Backend`] whose detail says what is wrong.
+     */
+open func decideJson(requestJson: String)throws  -> String  {
+    return try  FfiConverterString.lift(try rustCallWithError(FfiConverterTypeFfiError_lift) {
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_method_decisionengine_decide_json(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(requestJson),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Async [`DecisionEngine::decide_json`] on a tokio blocking worker. Dropping the future
+     * cancels the request before its next question (see the module documentation).
+     */
+open func decideJsonAsync(requestJson: String)async throws  -> String  {
+    return
+        try  await uniffiRustCallAsync(
+            rustFutureFunc: {
+                uniffi_cera_ffi_fn_method_decisionengine_decide_json_async(
+                        self.uniffiCloneHandle(),FfiConverterString.lower(requestJson)
+                )
+            },
+            pollFunc: ffi_cera_ffi_rust_future_poll_rust_buffer,
+            completeFunc: ffi_cera_ffi_rust_future_complete_rust_buffer,
+            freeFunc: ffi_cera_ffi_rust_future_free_rust_buffer,
+            liftFunc: FfiConverterString.lift,
+            errorHandler: FfiConverterTypeFfiError_lift
+        )
+}
+    
+    /**
+     * The model type from the file: `lfm2-d1-omni`, `lfm2-d1` or `converted`.
+     */
+open func decisionType() -> String  {
+    return try!  FfiConverterString.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_method_decisionengine_decision_type(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Whether speech requests can be answered (the speech tower is loaded).
+     */
+open func supportsAudio() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_method_decisionengine_supports_audio(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+    /**
+     * Whether image requests can be answered (the vision tower is loaded).
+     */
+open func supportsImages() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_cera_ffi_fn_method_decisionengine_supports_images(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+    
+
+    
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeDecisionEngine: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = DecisionEngine
+
+    public static func lift(_ handle: UInt64) throws -> DecisionEngine {
+        return DecisionEngine(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: DecisionEngine) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> DecisionEngine {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: DecisionEngine, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDecisionEngine_lift(_ handle: UInt64) throws -> DecisionEngine {
+    return try FfiConverterTypeDecisionEngine.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeDecisionEngine_lower(_ value: DecisionEngine) -> UInt64 {
+    return FfiConverterTypeDecisionEngine.lower(value)
+}
+
+
+
+
+
+
+/**
  * Foreign-trait callback for download progress events from
  * [`BundleRepo::with_progress`]. Implementers (Kotlin class, Swift
  * class, Python subclass) drive a progress UI from these events.
@@ -14244,6 +14537,27 @@ private let initializationResult: InitializationResult = {
     if (uniffi_cera_ffi_checksum_method_chatsession_tools() != 49577) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_cera_ffi_checksum_method_decisionengine_backend_name() != 23371) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_decisionengine_backend_report() != 13889) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_decisionengine_decide_json() != 37995) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_decisionengine_decide_json_async() != 57969) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_decisionengine_decision_type() != 19792) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_decisionengine_supports_audio() != 15593) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_method_decisionengine_supports_images() != 18359) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_cera_ffi_checksum_method_generativemodel_create_session() != 55866) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -14347,6 +14661,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_chatsession_from_session() != 3580) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_decisionengine_open() != 39396) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_cera_ffi_checksum_constructor_decisionengine_open_async() != 3135) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_cera_ffi_checksum_constructor_modelloader_new() != 55287) {

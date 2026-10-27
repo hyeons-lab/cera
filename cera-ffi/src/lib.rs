@@ -99,6 +99,7 @@ uniffi::setup_scaffolding!();
 
 mod audio_pipeline;
 mod chat;
+mod decision;
 mod loading;
 mod recovery;
 pub use audio_pipeline::{
@@ -109,6 +110,7 @@ pub use chat::{
     ChatSession, IngestSummary, Message, Role, SessionPhase, TurnResult, ValidationError,
     chat_message_assistant, chat_message_system, chat_message_tool, chat_message_user,
 };
+pub use decision::DecisionEngine;
 pub use loading::{
     GenerationDefaults, GenerativeModel, LoadError, ModelFiles, ModelHandle, ModelLoader,
     ModelParts, ModelSource, SamplingDefaults,

@@ -20,7 +20,7 @@ use crate::engine::BackendPreference;
 use crate::gguf::GgufFile;
 use crate::model::pii::matmul_nt_f32;
 use crate::model::vision_encoder_gpu::{
-    VitStack, VitStackActivation, VitStackBlock, VitStackSpec, build_vit_stack,
+    VitStack, VitStackActivation, VitStackBlock, VitStackProjector, VitStackSpec, build_vit_stack,
 };
 use crate::model::weights::MmapWeight;
 use crate::par::*;
@@ -139,6 +139,12 @@ pub fn decode_image(bytes: &[u8]) -> Result<Rgb> {
 #[cfg(not(feature = "vl-preprocess"))]
 pub fn decode_image(_bytes: &[u8]) -> Result<Rgb> {
     bail!("this build cannot decode images (the `vl-preprocess` feature is off)")
+}
+
+/// Whether a data URL carries an audio clip (`data:audio/...`) rather than an image.
+pub fn is_audio_data_url(url: &str) -> bool {
+    url.get(..11)
+        .is_some_and(|head| head.eq_ignore_ascii_case("data:audio/"))
 }
 
 /// The bytes of a `data:<type>;base64,<payload>` URL, or of bare base64.
@@ -398,6 +404,18 @@ fn patchify(crop: &Rgb) -> (Vec<f32>, usize, usize) {
     (out, rows, cols)
 }
 
+/// A patch kernel stored `[out, channel, y, x]` as `[out, y, x, channel]`, the order the patches
+/// are flattened in.
+fn channels_last(kernel: &[f32], out: usize) -> Vec<f32> {
+    let per_out = 3 * PATCH * PATCH;
+    (0..out)
+        .flat_map(|o| {
+            let row = &kernel[o * per_out..][..per_out];
+            (0..PATCH * PATCH).flat_map(move |yx| (0..3).map(move |c| row[c * PATCH * PATCH + yx]))
+        })
+        .collect()
+}
+
 #[derive(Debug)]
 struct Block {
     ln1_w: Vec<f32>,
@@ -437,8 +455,32 @@ pub struct VisionTower {
     mm1_b: Vec<f32>,
     mm2_w: Vec<f32>,
     mm2_b: Vec<f32>,
+    /// Where the block tensors live, for [`Self::accelerate`].
+    block_prefix: &'static str,
     /// The blocks on a GPU, when [`Self::accelerate`] found one.
     gpu: Option<Arc<dyn VitStack>>,
+}
+
+/// Where a file keeps the tower: its settings and the names of its tensors. The converted layout
+/// is `d1.v.*`; the public mmproj is the `clip` layout (`v.*`, `mm.*`).
+#[derive(Debug, Clone, Copy)]
+struct TowerLayout {
+    width: usize,
+    blocks: usize,
+    heads: usize,
+    ffn: usize,
+    projector_hidden: usize,
+    patch: usize,
+    position_side: usize,
+    eps: f32,
+    /// `{prefix}.patch_embd.*`, `{prefix}.position_embd.weight`, `{prefix}.post_ln.*`.
+    prefix: &'static str,
+    /// `{prefix}.blk.{i}.*`.
+    block_prefix: &'static str,
+    /// `{mm}.1.*` and `{mm}.2.*`: the projector.
+    mm: &'static str,
+    /// The patch kernel is `[out, channel, y, x]`, not the converted `[out, y, x, channel]`.
+    patch_channels_first: bool,
 }
 
 impl std::fmt::Debug for VisionTower {
@@ -471,14 +513,81 @@ impl VisionTower {
     /// and finite.
     pub fn from_gguf(gguf: &GgufFile, out_width: usize) -> Result<Self> {
         let setting = |key: &str| super::setting_u32(gguf, key);
-        let width = setting("d1.vision.embedding_length")?;
-        let blocks = setting("d1.vision.block_count")?;
-        let heads = setting("d1.vision.attention.head_count")?;
-        let ffn = setting("d1.vision.feed_forward_length")?;
-        let projector_hidden = setting("d1.vision.projector_hidden_length")?;
+        let layout = TowerLayout {
+            width: setting("d1.vision.embedding_length")?,
+            blocks: setting("d1.vision.block_count")?,
+            heads: setting("d1.vision.attention.head_count")?,
+            ffn: setting("d1.vision.feed_forward_length")?,
+            projector_hidden: setting("d1.vision.projector_hidden_length")?,
+            patch: setting("d1.vision.patch_size")?,
+            position_side: setting("d1.vision.position_side")?,
+            eps: gguf.get_f32("d1.vision.layer_norm_epsilon").unwrap_or(1e-6),
+            prefix: "d1.v",
+            block_prefix: "d1.v.blk",
+            mm: "d1.v.mm",
+            patch_channels_first: false,
+        };
+        Self::load(gguf, out_width, layout)
+    }
+
+    /// Whether `mmproj` is the `clip` projector of a public d1-omni model.
+    pub fn is_present_public(mmproj: &GgufFile) -> bool {
+        mmproj.get_bool("clip.has_vision_encoder") == Some(true)
+            && mmproj.get_str("clip.vision.projector_type") == Some("d1omni_v")
+    }
+
+    /// Read the tower from the mmproj of a public d1-omni model (`clip.vision.*`, `v.*`, `mm.*`).
+    ///
+    /// # Errors
+    ///
+    /// As [`Self::from_gguf`].
+    pub fn from_public(mmproj: &GgufFile, out_width: usize) -> Result<Self> {
+        let setting = |key: &str| super::setting_u32(mmproj, key);
+        let patch = setting("clip.vision.patch_size")?;
+        // the position table is a square grid of patches covering `image_size`
+        let image_size = setting("clip.vision.image_size")?;
+        // `shape[1]` is the output width: GGUF lists a matrix's dimensions innermost first
+        let projector_hidden = mmproj
+            .tensors
+            .get("mm.1.weight")
+            .and_then(|t| t.shape.get(1).copied())
+            .context("the vision tower needs the tensor `mm.1.weight`")?;
+        let layout = TowerLayout {
+            width: setting("clip.vision.embedding_length")?,
+            blocks: setting("clip.vision.block_count")?,
+            heads: setting("clip.vision.attention.head_count")?,
+            ffn: setting("clip.vision.feed_forward_length")?,
+            projector_hidden,
+            patch,
+            position_side: image_size.checked_div(patch).unwrap_or(0),
+            eps: mmproj
+                .get_f32("clip.vision.attention.layer_norm_epsilon")
+                .unwrap_or(1e-6),
+            prefix: "v",
+            block_prefix: "v.blk",
+            mm: "mm",
+            patch_channels_first: true,
+        };
+        Self::load(mmproj, out_width, layout)
+    }
+
+    fn load(gguf: &GgufFile, out_width: usize, layout: TowerLayout) -> Result<Self> {
+        let TowerLayout {
+            width,
+            blocks,
+            heads,
+            ffn,
+            projector_hidden,
+            patch,
+            position_side,
+            eps,
+            prefix,
+            block_prefix,
+            mm,
+            patch_channels_first,
+        } = layout;
         ensure!(
-            setting("d1.vision.patch_size")? == PATCH
-                && setting("d1.vision.position_side")? == POSITION_SIDE,
+            patch == PATCH && position_side == POSITION_SIDE,
             "the vision tower is not 16 px patches on a 16 x 16 position table"
         );
         ensure!(heads >= 1, "the vision tower has no heads");
@@ -494,7 +603,6 @@ impl VisionTower {
             projector_hidden >= 1,
             "the vision tower has no projector width"
         );
-        let eps = gguf.get_f32("d1.vision.layer_norm_epsilon").unwrap_or(1e-6);
         // old files without the key still default; a present-but-bad value would
         // NaN every vision prefix, so refuse it here
         ensure!(
@@ -511,7 +619,7 @@ impl VisionTower {
         // turns a corrupt GGUF into an aborted process instead of a load error
         let mut layers = Vec::new();
         for i in 0..blocks {
-            let b = |s: &str, n: &[usize]| t(&format!("d1.v.blk.{i}.{s}"), n);
+            let b = |s: &str, n: &[usize]| t(&format!("{block_prefix}.{i}.{s}"), n);
             layers.push(Block {
                 ln1_w: b("ln1.weight", &[width])?,
                 ln1_b: b("ln1.bias", &[width])?,
@@ -532,6 +640,10 @@ impl VisionTower {
             });
         }
         let merged = super::checked_len("d1.v merged width", &[width, UNSHUFFLE, UNSHUFFLE])?;
+        let patch_w = t(
+            &format!("{prefix}.patch_embd.weight"),
+            &[width, PATCH, PATCH, 3],
+        )?;
         Ok(Self {
             width,
             heads,
@@ -539,19 +651,24 @@ impl VisionTower {
             eps,
             out_width,
             projector_hidden,
-            patch_w: t("d1.v.patch_embd.weight", &[width, PATCH, PATCH, 3])?,
-            patch_b: t("d1.v.patch_embd.bias", &[width])?,
+            patch_w: if patch_channels_first {
+                channels_last(&patch_w, width)
+            } else {
+                patch_w
+            },
+            patch_b: t(&format!("{prefix}.patch_embd.bias"), &[width])?,
             position: t(
-                "d1.v.position_embd.weight",
+                &format!("{prefix}.position_embd.weight"),
                 &[POSITION_SIDE, POSITION_SIDE, width],
             )?,
             blocks: layers,
-            post_w: t("d1.v.post_ln.weight", &[width])?,
-            post_b: t("d1.v.post_ln.bias", &[width])?,
-            mm1_w: t("d1.v.mm.1.weight", &[projector_hidden, merged])?,
-            mm1_b: t("d1.v.mm.1.bias", &[projector_hidden])?,
-            mm2_w: t("d1.v.mm.2.weight", &[out_width, projector_hidden])?,
-            mm2_b: t("d1.v.mm.2.bias", &[out_width])?,
+            post_w: t(&format!("{prefix}.post_ln.weight"), &[width])?,
+            post_b: t(&format!("{prefix}.post_ln.bias"), &[width])?,
+            mm1_w: t(&format!("{mm}.1.weight"), &[projector_hidden, merged])?,
+            mm1_b: t(&format!("{mm}.1.bias"), &[projector_hidden])?,
+            mm2_w: t(&format!("{mm}.2.weight"), &[out_width, projector_hidden])?,
+            mm2_b: t(&format!("{mm}.2.bias"), &[out_width])?,
+            block_prefix,
             gpu: None,
         })
     }
@@ -567,7 +684,7 @@ impl VisionTower {
             return;
         }
         let from_file = |i: usize, name: &str, rows: usize, cols: usize| -> Result<MmapWeight> {
-            crate::d1::block_weight(gguf, "d1.v.blk", "vision tower", i, name, rows, cols)
+            crate::d1::block_weight(gguf, self.block_prefix, "vision tower", i, name, rows, cols)
         };
         match self.stack_spec(from_file) {
             // A backend that cannot build must not clear a working stack: only `Some` sticks.
@@ -623,6 +740,28 @@ impl VisionTower {
             activation: VitStackActivation::GeluTanh,
             blocks,
             post: Some((self.post_w.clone(), self.post_b.clone())),
+            projector: self.projector_spec(),
+        })
+    }
+
+    /// The projector for backends that run it beside the blocks, when the tower holds the whole
+    /// of it (a block-less test tower may not).
+    fn projector_spec(&self) -> Option<VitStackProjector> {
+        let merged = self.width * UNSHUFFLE * UNSHUFFLE;
+        if self.mm1_w.len() != self.projector_hidden * merged
+            || self.mm2_w.len() != self.out_width * self.projector_hidden
+        {
+            return None;
+        }
+        Some(VitStackProjector {
+            mm1: MmapWeight::from_owned_f32(self.mm1_w.clone(), self.projector_hidden, merged),
+            mm1_b: self.mm1_b.clone(),
+            mm2: MmapWeight::from_owned_f32(
+                self.mm2_w.clone(),
+                self.out_width,
+                self.projector_hidden,
+            ),
+            mm2_b: self.mm2_b.clone(),
         })
     }
 
@@ -769,6 +908,15 @@ impl VisionTower {
             }
         }
         let n = oy * ox;
+        if let Some(gpu) = &self.gpu {
+            match gpu.run_projector(&grouped) {
+                Ok(Some(out)) => return out,
+                Ok(None) => {}
+                Err(e) => crate::d1::warn_cpu_fallback(format_args!(
+                    "the projector of a crop of {n} tokens runs on the CPU: {e:#}"
+                )),
+            }
+        }
         let mut mid = vec![0f32; n * self.projector_hidden];
         matmul_nt_f32(
             n,
@@ -803,12 +951,18 @@ impl VisionTower {
         let mut prefix = Vec::new();
         for image in images {
             for crop in crops(image)? {
+                let started = crate::time::Instant::now();
                 let (tokens, rows, cols) = self.tower(&crop);
+                let towered = started.elapsed();
                 ensure!(
                     rows % UNSHUFFLE == 0 && cols % UNSHUFFLE == 0,
                     "a {rows} x {cols} patch grid cannot be unshuffled"
                 );
                 prefix.extend(self.project(&tokens, rows, cols));
+                super::trace(format_args!(
+                    "vision crop {rows}x{cols}: tower {towered:?}, projector {:?}",
+                    started.elapsed() - towered
+                ));
             }
         }
         Ok(prefix)
@@ -942,6 +1096,7 @@ mod tests {
             mm1_b: Vec::new(),
             mm2_w: Vec::new(),
             mm2_b: Vec::new(),
+            block_prefix: "d1.v.blk",
             gpu: None,
         }
     }
@@ -1127,6 +1282,7 @@ mod tests {
             mm1_b: vec![0.0; 12],
             mm2_w: (0..12 * 12).map(|i| f32::from(i / 12 == i % 12)).collect(),
             mm2_b: vec![0.0; 12],
+            block_prefix: "d1.v.blk",
             gpu: None,
         };
         let out = tower.project(&tokens, rows, cols);
@@ -1369,6 +1525,117 @@ mod tests {
         assert!(
             err.to_string().contains("no projector width"),
             "unexpected message: {err}"
+        );
+    }
+
+    /// The mmproj of a public model keeps the patch kernel as `[out, channel, y, x]`; the
+    /// converted file as `[out, y, x, channel]`.
+    #[test]
+    fn a_channel_first_kernel_is_reordered_channel_last() {
+        let out = 2;
+        let kernel: Vec<f32> = (0..out * 3 * PATCH * PATCH).map(|i| i as f32).collect();
+        let got = channels_last(&kernel, out);
+        assert_eq!(got.len(), kernel.len());
+        for (o, y, x, c) in [
+            (0, 0, 0, 0),
+            (0, 0, 0, 2),
+            (0, 3, 5, 1),
+            (1, 15, 15, 2),
+            (1, 7, 0, 1),
+        ] {
+            let from = ((o * 3 + c) * PATCH + y) * PATCH + x;
+            let to = ((o * PATCH + y) * PATCH + x) * 3 + c;
+            assert_eq!(got[to], kernel[from], "o={o} y={y} x={x} c={c}");
+        }
+    }
+
+    /// The same tower in both layouts reads an image to the same prefix.
+    #[test]
+    fn the_public_layout_encodes_like_the_converted_one() {
+        use crate::gguf::GgufBuilder;
+        let (d, hidden) = (64usize, 64usize);
+        let channel_first = noise(d * 3 * PATCH * PATCH, 1, 0.05);
+        let mut channel_last = vec![0f32; channel_first.len()];
+        for o in 0..d {
+            for c in 0..3 {
+                for y in 0..PATCH {
+                    for x in 0..PATCH {
+                        channel_last[((o * PATCH + y) * PATCH + x) * 3 + c] =
+                            channel_first[((o * 3 + c) * PATCH + y) * PATCH + x];
+                    }
+                }
+            }
+        }
+        let bias = noise(d, 2, 0.05);
+        let position = noise(POSITION_SIDE * POSITION_SIDE * d, 3, 0.2);
+        let post_w: Vec<f32> = noise(d, 4, 0.1).iter().map(|v| v + 1.0).collect();
+        let post_b = noise(d, 5, 0.1);
+        let mm1 = noise(hidden * d * 4, 6, 0.1);
+        let mm1_b = noise(hidden, 7, 0.05);
+        let mm2 = noise(d * hidden, 8, 0.1);
+        let mm2_b = noise(d, 9, 0.05);
+        let converted = GgufBuilder::new()
+            .kv_u32("d1.vision.block_count", 0)
+            .kv_u32("d1.vision.embedding_length", d as u32)
+            .kv_u32("d1.vision.feed_forward_length", d as u32)
+            .kv_u32("d1.vision.attention.head_count", 1)
+            .kv_u32("d1.vision.patch_size", 16)
+            .kv_u32("d1.vision.position_side", 16)
+            .kv_u32("d1.vision.projector_hidden_length", hidden as u32)
+            .tensor_f32(
+                "d1.v.patch_embd.weight",
+                &[channel_last.len()],
+                &channel_last,
+            )
+            .tensor_f32("d1.v.patch_embd.bias", &[d], &bias)
+            .tensor_f32("d1.v.position_embd.weight", &[position.len()], &position)
+            .tensor_f32("d1.v.post_ln.weight", &[d], &post_w)
+            .tensor_f32("d1.v.post_ln.bias", &[d], &post_b)
+            .tensor_f32("d1.v.mm.1.weight", &[mm1.len()], &mm1)
+            .tensor_f32("d1.v.mm.1.bias", &[hidden], &mm1_b)
+            .tensor_f32("d1.v.mm.2.weight", &[mm2.len()], &mm2)
+            .tensor_f32("d1.v.mm.2.bias", &[d], &mm2_b)
+            .build();
+        let public = GgufBuilder::new()
+            .kv_str("clip.vision.projector_type", "d1omni_v")
+            .kv_bool("clip.has_vision_encoder", true)
+            .kv_u32("clip.vision.block_count", 0)
+            .kv_u32("clip.vision.embedding_length", d as u32)
+            .kv_u32("clip.vision.feed_forward_length", d as u32)
+            .kv_u32("clip.vision.attention.head_count", 1)
+            .kv_u32("clip.vision.patch_size", 16)
+            .kv_u32("clip.vision.image_size", 256)
+            .kv_f32("clip.vision.attention.layer_norm_epsilon", 1e-6)
+            .tensor_f32("v.patch_embd.weight", &[16, 16, 3, d], &channel_first)
+            .tensor_f32("v.patch_embd.bias", &[d], &bias)
+            .tensor_f32("v.position_embd.weight", &[d, 256], &position)
+            .tensor_f32("v.post_ln.weight", &[d], &post_w)
+            .tensor_f32("v.post_ln.bias", &[d], &post_b)
+            .tensor_f32("mm.1.weight", &[4 * d, hidden], &mm1)
+            .tensor_f32("mm.1.bias", &[hidden], &mm1_b)
+            .tensor_f32("mm.2.weight", &[hidden, d], &mm2)
+            .tensor_f32("mm.2.bias", &[d], &mm2_b)
+            .build();
+        assert!(VisionTower::is_present_public(&public));
+        assert!(!VisionTower::is_present_public(&converted));
+        let from_converted = VisionTower::from_gguf(&converted, d).unwrap();
+        let from_public = VisionTower::from_public(&public, d).unwrap();
+        // a gradient, so every channel and every patch position differs
+        let (w, h) = (96usize, 64usize);
+        let rgb = Rgb {
+            width: w,
+            height: h,
+            data: (0..w * h * 3)
+                .map(|i| ((i * 7 + (i / 3 % w) * 13 + (i / (3 * w)) * 29) % 251) as u8)
+                .collect(),
+        };
+        let want = from_converted.encode(std::slice::from_ref(&rgb)).unwrap();
+        let got = from_public.encode(std::slice::from_ref(&rgb)).unwrap();
+        assert_eq!(want.len(), got.len());
+        assert!(want.iter().zip(&got).all(|(a, b)| (a - b).abs() <= 1e-6));
+        assert!(
+            want.iter().any(|v| v.abs() > 1e-3),
+            "the prefix is not all zeros"
         );
     }
 }

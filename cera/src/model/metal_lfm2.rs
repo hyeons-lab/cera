@@ -4025,6 +4025,16 @@ impl Model for MetalLfmModel {
         out
     }
 
+    fn backend_label(&self) -> &'static str {
+        "metal"
+    }
+
+    /// A bidirectional model's `hidden_states` run the bidirectional trunk, which only a dense
+    /// model has (no routed-FFN path), so the answer is the same as for `hidden_states`.
+    fn supports_bidirectional_hidden_states(&self) -> bool {
+        self.supports_hidden_states()
+    }
+
     /// Only a bidirectional model reads a media prefix this way, and only a dense one:
     /// the bidirectional trunk has no routed-FFN path.
     fn supports_media_prefix(&self) -> bool {
@@ -4218,6 +4228,27 @@ impl Model for MetalLfmModel {
 
     fn supports_embedding_input(&self) -> bool {
         true
+    }
+
+    /// The marker rows of a tiled image: a dequantized row of the embedding table per token, which
+    /// is what this backend's token prefill stages. Only this hook is offered, not
+    /// `embed_token_rows`: the tiled image needs just these rows, and handing out the token rows too
+    /// would also switch a VL prompt to the fused text-and-image route, a separate change. Refused
+    /// (`None`) for an id outside the vocabulary and for a model that scales its embeddings, whose
+    /// rows would no longer be a plain lookup.
+    fn embed_image_marker_rows(&self, tokens: &[u32]) -> Option<Vec<f32>> {
+        let hs = self.config.hidden_size;
+        if self.scalars.embedding != 1.0
+            || hs != self.state.embedding_hidden_size
+            || tokens.iter().any(|&t| t as usize >= self.config.vocab_size)
+        {
+            return None;
+        }
+        let mut rows = vec![0.0f32; tokens.len() * hs];
+        for (row, &t) in rows.chunks_exact_mut(hs).zip(tokens) {
+            self.dequant_embedding_row(t as usize, row);
+        }
+        Some(rows)
     }
 
     fn forward_from_embedding(
@@ -8225,5 +8256,88 @@ mod bidirectional_tests {
                 );
             }
         }
+    }
+}
+
+/// The rows a tiled image splices into its prompt, against the CPU model's. Without them Metal
+/// encodes a large image as one downscaled image (see `Session::tiling_available`).
+#[cfg(test)]
+mod marker_row_tests {
+    use super::MetalLfmModel;
+    use crate::kv_cache::InferenceState;
+    use crate::model::Model;
+    use crate::model::lfm2::LfmModel;
+    use crate::model::lfm2::release_tests::synthetic_lfm2_gguf;
+
+    fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+        assert_eq!(a.len(), b.len());
+        a.iter()
+            .zip(b)
+            .map(|(x, y)| {
+                let d = (x - y).abs();
+                if d.is_nan() { f32::INFINITY } else { d }
+            })
+            .fold(0.0f32, f32::max)
+    }
+
+    fn models() -> Option<(LfmModel, MetalLfmModel)> {
+        let cpu = LfmModel::from_gguf(synthetic_lfm2_gguf(), 256).unwrap();
+        match MetalLfmModel::from_gguf(synthetic_lfm2_gguf(), None, 256) {
+            Ok(metal) => Some((cpu, metal)),
+            Err(e) => {
+                assert!(
+                    std::env::var("CERA_REQUIRE_METAL").as_deref() != Ok("1"),
+                    "CERA_REQUIRE_METAL=1 is set but no Metal device is available ({e})"
+                );
+                eprintln!("SKIPPED: no Metal device ({e})");
+                None
+            }
+        }
+    }
+
+    #[test]
+    fn marker_rows_are_the_cpu_models_rows() {
+        let Some((cpu, metal)) = models() else {
+            return;
+        };
+        let tokens: Vec<u32> = vec![3, 17, 42, 5, 17];
+        let want = cpu.embed_image_marker_rows(&tokens).expect("cpu rows");
+        let got = metal.embed_image_marker_rows(&tokens).expect("metal rows");
+        assert_eq!(got.len(), tokens.len() * metal.config().hidden_size);
+        assert!(
+            max_abs_diff(&want, &got) < 1e-6,
+            "the table row of a token is the same row on both backends"
+        );
+        assert!(metal.embed_image_marker_rows(&[]).unwrap().is_empty());
+    }
+
+    #[test]
+    fn marker_rows_refuse_ids_outside_the_vocabulary() {
+        let Some((_, metal)) = models() else {
+            return;
+        };
+        let vocab = metal.config().vocab_size as u32;
+        assert!(metal.embed_image_marker_rows(&[vocab]).is_none());
+        assert!(metal.embed_image_marker_rows(&[1, u32::MAX]).is_none());
+        assert!(metal.embed_image_marker_rows(&[vocab - 1]).is_some());
+    }
+
+    /// Feeding the rows through the embedding-seeded prefill is the token prefill: a scaling or
+    /// lookup slip would still give a fluent but wrong tiled prompt.
+    #[test]
+    fn marker_rows_reproduce_the_token_prefill() {
+        let Some((_, metal)) = models() else {
+            return;
+        };
+        let tokens: Vec<u32> = vec![3, 17, 42, 5];
+        let rows = metal.embed_image_marker_rows(&tokens).unwrap();
+        let mut by_tokens = InferenceState::from_config(metal.config()).unwrap();
+        let want = metal.forward_prefill(&tokens, 0, &mut by_tokens);
+        let mut by_rows = InferenceState::from_config(metal.config()).unwrap();
+        let got = metal.forward_prefill_from_embeddings(&rows, tokens.len(), 0, &mut by_rows);
+        assert!(
+            max_abs_diff(&want, &got) < 1e-3,
+            "marker rows diverge from the token prefill"
+        );
     }
 }

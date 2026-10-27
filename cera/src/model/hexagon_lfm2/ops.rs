@@ -1202,6 +1202,9 @@ impl HexagonLfmModel {
         out_act: &RpcmemBuffer,
         out_offset: usize,
     ) -> Result<(), CeraError> {
+        if w.is_plain_f16() {
+            return Err(plain_f16_needs_rows());
+        }
         let in_dim = w.in_dim;
         let out_dim = w.out_dim;
         // Tiled wire format: dims padded to 32, row stride = K tiles wide.
@@ -1287,6 +1290,18 @@ impl HexagonLfmModel {
         out_offset: usize,
         n_rows: usize,
     ) -> Result<(), CeraError> {
+        if w.is_plain_f16() {
+            return dispatch_f16_matmul(
+                session,
+                weights,
+                w,
+                (in_act, in_offset),
+                (out_act, out_offset),
+                n_rows,
+                self.use_hmx,
+                self.vtcm_budget,
+            );
+        }
         let in_dim = w.in_dim;
         let out_dim = w.out_dim;
         // Tiled wire format: dims padded to 32, row stride = K tiles wide.
@@ -1428,6 +1443,7 @@ impl HexagonLfmModel {
         let hmx0 = self.use_hmx && mm_is_hmx_eligible(wtype, pad32(k), pad32(w0.out_dim), n_rows);
         let fusable = (2..=4).contains(&n)
             && out_offsets.len() == n
+            && !w0.is_plain_f16() // plain F16 weights have no fused kernel
             && ws.iter().all(|w| w.in_dim == k && w.wire_dtype == wtype)
             && ws.iter().all(|w| w.out_dim <= w0.out_dim)
             && ws.iter().all(|w| {
@@ -2328,4 +2344,85 @@ impl super::pager::PagerHost for SessionHost<'_> {
     fn release(&mut self, buf: &RpcmemBuffer) {
         self.0.release_dsp_reference(buf);
     }
+}
+
+fn plain_f16_needs_rows() -> CeraError {
+    CeraError::Backend(
+        "a plain F16 weight runs only as a batched HMX matmul (the decision model's encoder \
+         passes), not as a single-row or routed matmul"
+            .into(),
+    )
+}
+
+/// `out[rows, w.out_dim] = in[rows, w.in_dim] . W` with `w` a plain row-major F16 matrix on the
+/// HMX (`HTP_MM_KERNEL_HMX_2D`, no repack: `nb1` is the row stride in bytes).
+///
+/// The kernel's smallest run is [`HMX_MM_MIN_NROWS`] rows (below it the HMX worker is racy and
+/// the HVX path has no F16 weight kernel), so a pass of fewer rows is an error here: the encoder
+/// passes pad to that many (see `ENCODER_MIN_ROWS`) and never reach it. The matmul has no HVX
+/// fallback, so no plan for this shape at this row count is also an error; the planner checked
+/// every chunk size when it chose plain F16.
+#[allow(clippy::too_many_arguments)]
+pub(super) fn dispatch_f16_matmul(
+    session: &mut HexagonQueueSession,
+    weights: &RpcmemBuffer,
+    w: &HexagonWeight,
+    (in_act, in_offset): (&RpcmemBuffer, usize),
+    (out_act, out_offset): (&RpcmemBuffer, usize),
+    n_rows: usize,
+    use_hmx: bool,
+    vtcm_budget: usize,
+) -> Result<(), CeraError> {
+    let (rows, cols) = (w.out_dim, w.in_dim);
+    if !use_hmx || n_rows < crate::backend::hexagon::HMX_MM_MIN_NROWS {
+        return Err(CeraError::Backend(format!(
+            "F16 matmul {rows}x{cols} over {n_rows} rows: needs the HMX and at least {} rows",
+            crate::backend::hexagon::HMX_MM_MIN_NROWS
+        )));
+    }
+    let kparams =
+        dispatch::f16_mm_kernel_params_in(rows, cols, n_rows, session.dsp_threads(), vtcm_budget)
+            .ok_or_else(|| {
+            CeraError::Backend(format!(
+                "F16 matmul {rows}x{cols} over {n_rows} rows has no HMX plan"
+            ))
+        })?;
+    let w_bytes = rows * cols * 2;
+    let w_ti = session.add_tensor(
+        weights,
+        w.offset,
+        w_bytes,
+        HTP_TENSOR_WEIGHT,
+        HtpDataType::F16 as u32,
+        [cols as u32, rows as u32, 1, 1],
+        [2, (cols * 2) as u32, w_bytes as u32, w_bytes as u32],
+    )?;
+    let (x_bytes, out_bytes) = (cols * n_rows * 4, rows * n_rows * 4);
+    let in_ti = session.add_tensor(
+        in_act,
+        in_offset,
+        x_bytes,
+        HTP_TENSOR_COMPUTE,
+        HtpDataType::F32 as u32,
+        [cols as u32, n_rows as u32, 1, 1],
+        [4, (cols * 4) as u32, x_bytes as u32, x_bytes as u32],
+    )?;
+    let out_ti = session.add_tensor(
+        out_act,
+        out_offset,
+        out_bytes,
+        HTP_TENSOR_COMPUTE,
+        HtpDataType::F32 as u32,
+        [rows as u32, n_rows as u32, 1, 1],
+        [4, (rows * 4) as u32, out_bytes as u32, out_bytes as u32],
+    )?;
+    HexagonLfmModel::enqueue_labeled(
+        session,
+        "dispatch_f16_matmul",
+        HtpOpCode::MulMat as u32,
+        &[w_ti, in_ti],
+        &[out_ti],
+        [0i32; 16],
+        kparams,
+    )
 }

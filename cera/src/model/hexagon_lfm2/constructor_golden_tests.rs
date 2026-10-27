@@ -918,11 +918,11 @@ fn grouped_weight_without_a_pager_is_an_error() {
 #[test]
 fn long_routed_prefill_chunk_flushes_between_rows() {
     let file = lfm2_gguf_layers(true, 4);
-    let mut model = HexagonLfmModel::from_gguf_on(backend(), file, 64).unwrap();
+    let model = HexagonLfmModel::from_gguf_on(backend(), file, 64).unwrap();
     let cap = 128 * 1024;
     model
         .device
-        .get_mut()
+        .lock()
         .unwrap()
         .queue_session_mut()
         .set_staging_capacity_for_test(Some(cap));

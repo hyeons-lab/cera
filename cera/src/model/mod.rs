@@ -437,6 +437,63 @@ pub(crate) fn take_fault(
         .take()
 }
 
+/// Input rows for a bidirectional encoder pass on an accelerator.
+#[derive(Debug, Clone, Copy)]
+pub enum EncoderInput<'a> {
+    /// Text: ids looked up in the token embedding table.
+    Tokens(&'a [u32]),
+    /// Rows already in the model's embedding space (a media prefix), row-major
+    /// `[rows * hidden_size]`.
+    Embeddings(&'a [f32]),
+}
+
+impl EncoderInput<'_> {
+    /// Number of rows, given the model's hidden size.
+    pub fn rows(&self, hidden_size: usize) -> usize {
+        match self {
+            EncoderInput::Tokens(t) => t.len(),
+            EncoderInput::Embeddings(e) => e.len().checked_div(hidden_size).unwrap_or(0),
+        }
+    }
+}
+
+/// What a bidirectional pass leaves behind for a later pass to continue from.
+/// Opaque and backend-owned (device buffers or host copies of K/V and conv state);
+/// only the backend that made it can read it, and it is not portable between
+/// backends or models.
+pub struct EncoderPrefix {
+    n_rows: usize,
+    inner: Box<dyn std::any::Any + Send + Sync>,
+}
+
+impl EncoderPrefix {
+    /// Wrap a backend's state for a prefix of `n_rows` rows.
+    pub fn new<T: std::any::Any + Send + Sync>(n_rows: usize, state: T) -> Self {
+        Self {
+            n_rows,
+            inner: Box::new(state),
+        }
+    }
+
+    /// Rows in the prefix: the position the next pass starts at.
+    pub fn n_rows(&self) -> usize {
+        self.n_rows
+    }
+
+    /// The backend's state, if it is a `T`.
+    pub fn downcast_ref<T: std::any::Any>(&self) -> Option<&T> {
+        self.inner.downcast_ref()
+    }
+}
+
+impl std::fmt::Debug for EncoderPrefix {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("EncoderPrefix")
+            .field("n_rows", &self.n_rows)
+            .finish_non_exhaustive()
+    }
+}
+
 /// Trait for loaded models that can run forward passes.
 ///
 /// `Send + Sync` is required so `std::sync::Arc<dyn Model>` is itself
@@ -855,6 +912,11 @@ pub trait Model: Send + Sync {
         self.forward_prefill_from_embeddings(embeddings, n_tokens, start_pos, state)
     }
 
+    /// Which backend runs this model: `"cpu"`, `"metal"`, `"wgpu"` or `"hexagon"`.
+    fn backend_label(&self) -> &'static str {
+        "cpu"
+    }
+
     /// Static capability probe: does this backend implement
     /// [`Self::hidden_states`]? Default `false`; text backends opt in so an
     /// unsupported backend surfaces a typed error instead of the default panic.
@@ -879,6 +941,16 @@ pub trait Model: Send + Sync {
     fn hidden_states(&self, tokens: &[u32], state: &mut InferenceState) -> Vec<f32> {
         let _ = (tokens, state);
         unimplemented!("hidden_states not supported by this backend")
+    }
+
+    /// Trade a little latency for CPU time on the bidirectional passes: a backend that waits for
+    /// a device (the Hexagon NPU, which otherwise busy-polls a short pass) sleeps between polls
+    /// instead, so a pass costs about a tenth of the CPU for a millisecond or two more wall time.
+    /// For callers whose work is batch work, such as a background service on a phone whose
+    /// scheduler demotes busy threads. Returns whether this backend acts on it; the default is
+    /// `false`.
+    fn set_encoder_low_cpu(&self, _on: bool) -> bool {
+        false
     }
 
     /// Static capability probe: does this backend implement
@@ -1202,6 +1274,14 @@ fn reject_bidirectional_lfm2(
     Ok(())
 }
 
+/// Whether `gguf` is a d1 trunk read only through the bidirectional hidden-state passes: a public
+/// `d1-omni` file or a cera-converted d1 file. Such a model has no use for a language-model head,
+/// and the Hexagon loader lets it through where it refuses every other bidirectional LFM2.
+#[cfg(feature = "hexagon")]
+pub(crate) fn is_encoder_trunk(gguf: &GgufFile) -> bool {
+    crate::d1::public::is_omni(gguf) || crate::d1::head::Head::is_present(gguf)
+}
+
 /// Load a model with GPU acceleration.
 ///
 /// `path` (when supplied) is used as the model identifier for prefix-cache
@@ -1318,7 +1398,11 @@ fn load_model_hexagon_impl(
         .get_str("general.architecture")
         .unwrap_or("unknown")
         .to_string();
-    reject_bidirectional_lfm2(&gguf, &arch, "Hexagon NPU", false)?;
+    // A d1 model's bidirectional trunk runs on the NPU through the encoder pass
+    // (`hidden_states` / `hidden_states_with_prefix`), which reads the whole sequence. Any
+    // other bidirectional LFM2 would be read by the generation graph, which is causal.
+    let encoder_trunk = arch == "lfm2" && is_encoder_trunk(&gguf);
+    reject_bidirectional_lfm2(&gguf, &arch, "Hexagon NPU", encoder_trunk)?;
     match arch.as_str() {
         "lfm2" | "lfm2moe" if auto => Ok(Box::new(hexagon_lfm2::HexagonLfmModel::from_gguf_auto(
             gguf,

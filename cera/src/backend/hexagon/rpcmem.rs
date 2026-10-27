@@ -122,6 +122,13 @@ impl RpcmemBuffer {
         self.ptr
     }
 
+    /// The driver this buffer was allocated from, so a model can allocate more
+    /// buffers on the same device after load (the encoder pass's long-row
+    /// storage and LoRA weights).
+    pub(crate) fn driver(&self) -> &Arc<FastRpcDriver> {
+        &self.driver
+    }
+
     /// Buffer size in bytes.
     pub fn size(&self) -> usize {
         self.size
