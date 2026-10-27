@@ -1,5 +1,13 @@
 # Changelog
 
+## 0.7.2
+
+- Run the public `d1-omni-600M` and `d1-3B` decision models directly from their GGUFs (no conversion step) on CPU, Metal, wgpu and the Hexagon NPU, through `D1Engine`, the `DecisionEngine` FFI object and the Kotlin `DecisionClient`. Converted `d1.*` files keep working.
+- Add a BLAS `batched_matmul` fast path, and apply attached LoRA adapters on Metal for multimodal embedding-input turns.
+- Make audio codebook sampling deterministic for a given seed on the CPU, Metal, wgpu and Hexagon decoders, mixing the seed so small seeds no longer start the sampler near zero.
+- Select the audio multimodal inference type automatically from an audio mmproj GGUF, and preserve `rope_freqs.weight` as F32 when quantizing.
+- Align package and native artifact versions at 0.7.2.
+
 ## 0.7.1
 
 - Add NVIDIA Nemotron-3-Diarization add-on diarizer (`NemotronDiarizer`) and open `d1-omni` bidirectional decision model support across CPU, Metal, and wgpu.

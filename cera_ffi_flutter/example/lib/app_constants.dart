@@ -103,7 +103,7 @@ abstract final class ChatTemplateMarkers {
 /// Shared user-facing strings and status labels.
 abstract final class AppStrings {
   static const appTitle = 'Cera';
-  static const appVersion = 'v0.7.1';
+  static const appVersion = 'v0.7.2';
   static const metaSeparator = ' · ';
 
   // Status & lifecycle messages

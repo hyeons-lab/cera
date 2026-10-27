@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.2
+
+- Include the `cera_ffi` 0.7.2 additions: public `d1-omni-600M` and `d1-3B` decision models on CPU, Metal, wgpu and the Hexagon NPU, deterministic seeded audio sampling, and a BLAS batched-matmul fast path.
+- Align platform manifests and the dependency on `cera_ffi` at 0.7.2.
+
 ## 0.7.1
 
 - Include the `cera_ffi` 0.7.1 additions: NVIDIA Nemotron-3-Diarization add-on diarizer, open `d1-omni` decision model support on CPU/Metal/wgpu, Hexagon ViT unaligned FFN and F16 weight support, and GPU/CPU stream and SMMLA decode performance improvements.
