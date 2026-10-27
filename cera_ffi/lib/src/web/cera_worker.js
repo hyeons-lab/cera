@@ -31,7 +31,7 @@
 
 'use strict';
 
-console.info('[cera:worker:version] v0.7.1 (build: 2026-09-26-hexagon-backend)');
+console.info('[cera:worker:version] v0.7.2 (build: 2026-09-26-hexagon-backend)');
 
 const LOCAL_MODELS_DIR = '/models-local';
 
