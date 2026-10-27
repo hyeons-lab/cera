@@ -450,6 +450,20 @@ pub(crate) fn non_zero_rng_seed(seed: u64) -> u64 {
     }
 }
 
+/// The PRNG state for a caller-supplied seed. A small seed fed straight into xorshift64 starts
+/// the stream near zero: the first draw is exactly 0.0 for any seed below 1024 and still tiny
+/// (under 1e-3) for every seed below about 2^23, so the first sampled codebook of a run seeded
+/// with 1, 42 or 12345 would take the first candidate whatever the distribution. A splitmix64
+/// round spreads the seed over all 64 bits first. Entropy-drawn seeds are already uniform and
+/// need no mixing.
+#[inline]
+pub(crate) fn seed_to_rng_state(seed: u64) -> u64 {
+    let mut z = seed.wrapping_add(0x9E37_79B9_7F4A_7C15);
+    z = (z ^ (z >> 30)).wrapping_mul(0xBF58_476D_1CE4_E5B9);
+    z = (z ^ (z >> 27)).wrapping_mul(0x94D0_49BB_1331_11EB);
+    non_zero_rng_seed(z ^ (z >> 31))
+}
+
 #[inline]
 pub(crate) fn next_xorshift64_f32_01(rng_state: &mut u64) -> f32 {
     let mut x = non_zero_rng_seed(*rng_state);
@@ -530,7 +544,7 @@ impl DepthformerState {
 
     /// Seed the internal PRNG used for stochastic codebook sampling.
     pub fn seed_rng(&mut self, seed: u64) {
-        self.rng_state = non_zero_rng_seed(seed);
+        self.rng_state = seed_to_rng_state(seed);
     }
 
     #[inline]
@@ -2061,7 +2075,7 @@ mod tests {
 
         s1.seed_rng(12345);
         s2.seed_rng(12345);
-        let atomic_rng = std::sync::atomic::AtomicU64::new(non_zero_rng_seed(12345));
+        let atomic_rng = std::sync::atomic::AtomicU64::new(seed_to_rng_state(12345));
         let seeded1: Vec<u32> = (0..8).map(|_| s1.next_f32_01().to_bits()).collect();
         let seeded2: Vec<u32> = (0..8).map(|_| s2.next_f32_01().to_bits()).collect();
         let seeded_atomic: Vec<u32> = (0..8)
@@ -2069,5 +2083,24 @@ mod tests {
             .collect();
         assert_eq!(seeded1, seeded2);
         assert_eq!(seeded1, seeded_atomic);
+    }
+
+    #[test]
+    fn a_small_seed_does_not_start_the_stream_at_zero() {
+        // raw xorshift64 draws exactly 0.0 first for a seed below 1024 and under 1e-3 for any
+        // seed below ~2^23
+        for seed in [1u64, 2, 42, 12345, 0xFFFF, 1 << 20] {
+            let mut raw = seed;
+            assert!(
+                next_xorshift64_f32_01(&mut raw) < 1e-3,
+                "seed {seed}: the unmixed first draw is the near-zero one this test guards against"
+            );
+            let mut state = seed_to_rng_state(seed);
+            let first = next_xorshift64_f32_01(&mut state);
+            assert!(first > 1e-3, "seed {seed}: first draw {first}");
+        }
+        // nearby seeds give different streams, and seed 0 is still a valid one
+        assert_ne!(seed_to_rng_state(1), seed_to_rng_state(2));
+        assert_ne!(seed_to_rng_state(0), 0);
     }
 }

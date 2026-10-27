@@ -90,7 +90,8 @@ pub struct SessionConfig {
     pub kv_compression: KvCompression,
     /// Number of tokens pinned at the front on context shift overflow (e.g. system prompt).
     pub n_keep: u32,
-    /// Optional deterministic seed for the sampler.
+    /// Optional deterministic seed for the sampler. Audio codebook sampling in an audio-output
+    /// call is seeded from it too, but restarts from it on every call (see [`GenerateOpts::seed`]).
     pub seed: Option<u64>,
     /// Micro-batch size for chunked prompt prefill.
     pub ubatch_size: u32,
@@ -188,6 +189,11 @@ pub struct GenerateOpts {
     /// stochastic call continues). A per-request seed does not change the
     /// session default: [`Session::reset`] still rebuilds the sampler from
     /// [`SessionConfig::seed`].
+    ///
+    /// Audio codebook sampling does not continue a stream across calls: each audio-output call
+    /// seeds it from this seed, else from [`SessionConfig::seed`], else from entropy. A session
+    /// with a configured seed therefore repeats the same codebook randomness in every audio turn
+    /// while its text stream advances.
     pub seed: Option<u64>,
     pub temperature: f32,
     pub top_p: f32,

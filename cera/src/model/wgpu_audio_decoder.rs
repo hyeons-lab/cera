@@ -1889,7 +1889,7 @@ impl WgpuDepthformer {
 
     pub fn seed_rng(&self, seed: u64) {
         self.rng_state.store(
-            crate::model::audio_decoder::non_zero_rng_seed(seed),
+            crate::model::audio_decoder::seed_to_rng_state(seed),
             std::sync::atomic::Ordering::Relaxed,
         );
     }
