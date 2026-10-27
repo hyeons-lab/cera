@@ -549,7 +549,7 @@ impl CeraEngine {
                 });
 
             let acc = if dec.is_some() && detok.is_some() {
-                voc_arc.as_ref().and_then(|g| {
+                voc_arc.as_ref().or(mmproj.as_ref()).and_then(|g| {
                     crate::model::audio_decoder::build_audio_accelerator(g, cfg.backend)
                 })
             } else {
@@ -569,7 +569,8 @@ impl CeraEngine {
                 drafter: None,
             },
             (InferenceType::LlamaCppLfm2AudioV1, Some(g)) => AuxWeights {
-                vision_mmproj: None,
+                vision_mmproj: (g.get_bool("clip.has_vision_encoder") == Some(true))
+                    .then(|| Arc::clone(&g)),
                 audio_encoder: try_parse_audio_encoder(&g, None),
                 audio_decoder: None,
                 detok_weights: None,
@@ -1283,6 +1284,9 @@ impl CeraEngine {
         text: &str,
         lora: Option<Arc<crate::lora::LoraAdapterWeights>>,
     ) -> Result<Vec<crate::classifier::EntitySpan>, CeraError> {
+        if let Some(adapter) = lora.as_deref() {
+            crate::session::ensure_adapter_runs(self.model.as_ref(), adapter)?;
+        }
         let mut state = crate::kv_cache::InferenceState::from_config(self.model.config())?;
         state.lora = lora;
         crate::classifier::detect_pii(

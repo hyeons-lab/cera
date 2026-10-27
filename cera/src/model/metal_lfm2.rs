@@ -4138,6 +4138,7 @@ impl Model for MetalLfmModel {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _lora_guard = self.resolve_lora(state);
         assert_eq!(tokens.len(), 1);
         let token_id = tokens[0] as usize;
         let cfg = &self.config;
@@ -4188,6 +4189,7 @@ impl Model for MetalLfmModel {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _lora_guard = self.resolve_lora(state);
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         assert_eq!(embedding.len(), hs);
@@ -4225,6 +4227,7 @@ impl Model for MetalLfmModel {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
+        let _lora_guard = self.resolve_lora(state);
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         assert_eq!(embedding.len(), hs);

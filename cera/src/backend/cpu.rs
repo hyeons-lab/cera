@@ -9998,6 +9998,79 @@ pub fn rope(
     }
 }
 
+/// NEOX-layout RoPE for Q and K with optional per-pair frequency factors.
+///
+/// Pair `i` rotates by `pos * freq_base^(-2i/head_dim) / freq_factors[i]`, which
+/// is how ggml applies a `rope_freqs` tensor (`ggml_rope_ext`). A factor of 1
+/// leaves the pair alone; a huge factor (`1e30` used to mask trailing pairs
+/// of a partially rotated head) drives the angle to ~0, so the pair passes
+/// through unrotated. `None` is exactly [`rope`].
+pub fn rope_neox_freq_factors(
+    q: &mut [f32],
+    k: &mut [f32],
+    pos: usize,
+    heads: (usize, usize),
+    head_dim: usize,
+    freq_base: f32,
+    freq_factors: Option<&[f32]>,
+) {
+    let (n_heads, n_kv_heads) = heads;
+    assert!(
+        head_dim > 0 && head_dim.is_multiple_of(2),
+        "rope_neox_freq_factors requires a positive even head_dim, got {head_dim}"
+    );
+    assert_eq!(
+        q.len(),
+        n_heads * head_dim,
+        "rope_neox_freq_factors q slice length {} must equal n_heads * head_dim ({})",
+        q.len(),
+        n_heads * head_dim
+    );
+    assert_eq!(
+        k.len(),
+        n_kv_heads * head_dim,
+        "rope_neox_freq_factors k slice length {} must equal n_kv_heads * head_dim ({})",
+        k.len(),
+        n_kv_heads * head_dim
+    );
+    let half_dim = head_dim / 2;
+    assert!(
+        freq_factors.is_none_or(|f| f.len() == half_dim),
+        "rope_neox_freq_factors freq_factors length must equal head_dim / 2 ({half_dim})"
+    );
+    let theta_scale = freq_base.powf(-2.0 / head_dim as f32);
+
+    // The angles depend on the position and the pair, not the head: compute each
+    // pair's (sin, cos) once and rotate every head with it. A missing factor is
+    // 1.0, which leaves the angle bit-identical to `rope`'s.
+    let mut stack = [(0.0f32, 1.0f32); 128];
+    let mut heap;
+    let table: &mut [(f32, f32)] = if half_dim <= stack.len() {
+        &mut stack[..half_dim]
+    } else {
+        heap = vec![(0.0f32, 1.0f32); half_dim];
+        &mut heap
+    };
+    table
+        .iter_mut()
+        .enumerate()
+        .fold(pos as f32, |theta, (i, slot)| {
+            let factor = freq_factors.map_or(1.0, |f| f[i]);
+            *slot = rope_sin_cos(theta / factor);
+            theta * theta_scale
+        });
+
+    let rotate = |head: &mut [f32]| {
+        table.iter().enumerate().for_each(|(i, &(sin_t, cos_t))| {
+            let (x0, x1) = (head[i], head[i + half_dim]);
+            head[i] = x0 * cos_t - x1 * sin_t;
+            head[i + half_dim] = x0 * sin_t + x1 * cos_t;
+        });
+    };
+    q.chunks_exact_mut(head_dim).for_each(rotate);
+    k.chunks_exact_mut(head_dim).for_each(rotate);
+}
+
 /// Parameters for YaRN (Yet another RoPE extensioN) rotary embeddings.
 #[derive(Clone, Copy, Debug, PartialEq)]
 pub struct YarnParams {
@@ -10457,9 +10530,10 @@ pub fn rope_norm_yarn(
 }
 
 /// `theta.sin_cos()` behind a call boundary, so the split-halves paths that must agree
-/// share one trig evaluation: [`apply_rope_to_head`] and [`rope_table`] bit for bit
-/// (pinned by `test_rope_table_matches_direct`); [`apply_rope_delta_to_head`]'s composed
-/// rotations agree with direct application only within epsilon.
+/// share one trig evaluation: [`apply_rope_to_head`], [`rope_neox_freq_factors`], and
+/// [`rope_table`] bit for bit (pinned by `test_rope_table_matches_direct` and
+/// `rope_neox_freq_factors_none_and_unit_match_plain_rope`); [`apply_rope_delta_to_head`]'s
+/// composed rotations agree with direct application only within epsilon.
 /// Other RoPE implementations (YaRN, NORM, model-local rotations) keep their own calls.
 ///
 /// A bare `sin_cos` is not a stable value: where LLVM sees both halves of one argument it may
@@ -13452,6 +13526,107 @@ mod tests {
 
         // q should have been rotated — not identical anymore
         assert!((q[0] - 1.0).abs() > 1e-3 || (q[2]).abs() > 1e-3);
+    }
+
+    /// Deterministic, non-degenerate query (`n_heads`) and key (`n_kv_heads`) input.
+    fn rope_fixture(n_heads: usize, n_kv_heads: usize, head_dim: usize) -> (Vec<f32>, Vec<f32>) {
+        let fill = |n: usize, salt: f32| -> Vec<f32> {
+            (0..n)
+                .map(|i| ((i as f32 + salt) * 0.37).sin() + 0.25)
+                .collect()
+        };
+        (
+            fill(n_heads * head_dim, 1.0),
+            fill(n_kv_heads * head_dim, 7.0),
+        )
+    }
+
+    #[test]
+    fn rope_neox_freq_factors_none_and_unit_match_plain_rope() {
+        let (head_dim, pos, base) = (8, 37, 10_000.0);
+        let (q0, k0) = rope_fixture(4, 2, head_dim);
+
+        let (mut q_ref, mut k_ref) = (q0.clone(), k0.clone());
+        rope(&mut q_ref, &mut k_ref, pos, 4, 2, head_dim, base);
+
+        let unit = vec![1.0f32; head_dim / 2];
+        [None, Some(unit.as_slice())].into_iter().for_each(|ff| {
+            let (mut q, mut k) = (q0.clone(), k0.clone());
+            rope_neox_freq_factors(&mut q, &mut k, pos, (4, 2), head_dim, base, ff);
+            assert_eq!(q, q_ref);
+            assert_eq!(k, k_ref);
+        });
+    }
+
+    #[test]
+    fn rope_neox_freq_factors_huge_factor_leaves_the_pair_unrotated() {
+        // Masking the trailing pairs of a head with 1e30 leaves them unrotated
+        // so only a fraction of the head rotates.
+        let (head_dim, pos, base) = (8, 513, 1_000_000.0);
+        let (q0, k0) = rope_fixture(2, 1, head_dim);
+        let factors = [1.0, 1.0, 1e30, 1e30];
+
+        let (mut q, mut k) = (q0.clone(), k0.clone());
+        rope_neox_freq_factors(&mut q, &mut k, pos, (2, 1), head_dim, base, Some(&factors));
+
+        let half = head_dim / 2;
+        q.chunks_exact(head_dim)
+            .zip(q0.chunks_exact(head_dim))
+            .chain(k.chunks_exact(head_dim).zip(k0.chunks_exact(head_dim)))
+            .for_each(|(got, orig)| {
+                // pairs 2 and 3 (indices i and i + half) are untouched
+                (2..half).for_each(|i| {
+                    assert!((got[i] - orig[i]).abs() < 1e-6, "pair {i} low half moved");
+                    assert!(
+                        (got[i + half] - orig[i + half]).abs() < 1e-6,
+                        "pair {i} high half moved"
+                    );
+                });
+                // pair 0 rotates
+                assert!((got[0] - orig[0]).abs() > 1e-3 || (got[half] - orig[half]).abs() > 1e-3);
+            });
+    }
+
+    #[test]
+    fn rope_neox_freq_factors_divides_the_angle_by_the_factor() {
+        // One pair, head_dim 2: the angle is pos / factor, checked against sin/cos
+        // computed here rather than through `rope`.
+        let (pos, factor) = (5usize, 4.0f32);
+        let mut q = vec![0.6f32, -1.3];
+        let mut k = vec![0.2f32, 0.9];
+        let (q0, k0) = (q.clone(), k.clone());
+
+        rope_neox_freq_factors(&mut q, &mut k, pos, (1, 1), 2, 10_000.0, Some(&[factor]));
+
+        let (s, c) = rope_sin_cos(pos as f32 / factor);
+        let want = |x: &[f32]| [x[0] * c - x[1] * s, x[0] * s + x[1] * c];
+        assert_eq!(q.as_slice(), want(&q0));
+        assert_eq!(k.as_slice(), want(&k0));
+    }
+
+    #[test]
+    #[should_panic(expected = "positive even head_dim")]
+    fn rope_neox_freq_factors_rejects_zero_head_dim() {
+        let mut q = Vec::new();
+        let mut k = Vec::new();
+        rope_neox_freq_factors(&mut q, &mut k, 0, (1, 1), 0, 10_000.0, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "positive even head_dim")]
+    fn rope_neox_freq_factors_rejects_odd_head_dim() {
+        let mut q = vec![0.0f32; 15];
+        let mut k = vec![0.0f32; 15];
+        rope_neox_freq_factors(&mut q, &mut k, 0, (1, 1), 15, 10_000.0, None);
+    }
+
+    #[test]
+    #[should_panic(expected = "freq_factors length must equal head_dim / 2")]
+    fn rope_neox_freq_factors_rejects_mismatched_freq_factors_len() {
+        let mut q = vec![0.0f32; 8];
+        let mut k = vec![0.0f32; 8];
+        let bad_factors = [1.0f32; 3];
+        rope_neox_freq_factors(&mut q, &mut k, 0, (1, 1), 8, 10_000.0, Some(&bad_factors));
     }
 
     #[test]

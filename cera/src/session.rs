@@ -90,7 +90,8 @@ pub struct SessionConfig {
     pub kv_compression: KvCompression,
     /// Number of tokens pinned at the front on context shift overflow (e.g. system prompt).
     pub n_keep: u32,
-    /// Optional deterministic seed for the sampler.
+    /// Optional deterministic seed for the sampler. Audio codebook sampling in an audio-output
+    /// call is seeded from it too, but restarts from it on every call (see [`GenerateOpts::seed`]).
     pub seed: Option<u64>,
     /// Micro-batch size for chunked prompt prefill.
     pub ubatch_size: u32,
@@ -188,6 +189,11 @@ pub struct GenerateOpts {
     /// stochastic call continues). A per-request seed does not change the
     /// session default: [`Session::reset`] still rebuilds the sampler from
     /// [`SessionConfig::seed`].
+    ///
+    /// Audio codebook sampling does not continue a stream across calls: each audio-output call
+    /// seeds it from this seed, else from [`SessionConfig::seed`], else from entropy. A session
+    /// with a configured seed therefore repeats the same codebook randomness in every audio turn
+    /// while its text stream advances.
     pub seed: Option<u64>,
     pub temperature: f32,
     pub top_p: f32,
@@ -893,6 +899,33 @@ fn splice_tiled_rows(
     (rows, n_rows)
 }
 
+/// Validate that `model` can execute `adapter` (`supports_lora`, dimension match,
+/// and `supports_moe_lora` when routed-FFN deltas are present). Shared by
+/// [`Session`] and [`crate::CeraEngine::detect_pii_with_lora`].
+pub(crate) fn ensure_adapter_runs(
+    model: &dyn Model,
+    adapter: &crate::lora::LoraAdapterWeights,
+) -> Result<(), CeraError> {
+    if !model.supports_lora() {
+        return Err(CeraError::LoraUnsupportedByBackend(format!(
+            "model architecture '{}' has no LoRA apply hooks, so the adapter would be \
+             silently ignored; no backend runs it",
+            model.config().architecture
+        )));
+    }
+    adapter
+        .validate_dims(model.config())
+        .map_err(|e| CeraError::LoraDimMismatch(e.to_string()))?;
+    if adapter.has_moe_deltas() && !model.supports_moe_lora() {
+        return Err(CeraError::LoraUnsupportedByBackend(
+            "the adapter carries mixture-of-experts deltas (router and/or per-expert \
+             factors) and this backend has no routed-FFN hooks; the CPU backend applies them"
+                .to_string(),
+        ));
+    }
+    Ok(())
+}
+
 impl Session {
     /// Construct a new session backed by an already-loaded model + tokenizer.
     /// Both are taken by `Arc` — in-process callers typically clone from
@@ -930,6 +963,20 @@ impl Session {
         // `config.kv_compression` (reset, fingerprint, prefix-cache tag) see the real mode.
         if matches!(config.kv_compression, KvCompression::F16) && !model.f16_kv_supported() {
             config.kv_compression = KvCompression::None;
+        }
+        if config.kv_compression.is_downgraded_for(model_cfg) {
+            tracing::warn!(
+                target: "cera::session",
+                architecture = model_cfg.architecture.as_str(),
+                head_dim = model_cfg.head_dim,
+                "TurboQuant KV compression was requested, but this model configuration \
+                 resolves it to the plain uncompressed cache (e.g. non-power-of-two head_dim)"
+            );
+            eprintln!(
+                "[cera::session] TurboQuant KV compression downgraded to plain uncompressed cache for architecture '{}' (head_dim: {})",
+                model_cfg.architecture.as_str(),
+                model_cfg.head_dim
+            );
         }
         let max_seq_len = config
             .max_seq_len
@@ -1251,31 +1298,7 @@ impl Session {
         &self,
         adapter: &crate::lora::LoraAdapterWeights,
     ) -> Result<(), CeraError> {
-        // Backends without any LoRA hooks would install the adapter and then
-        // silently produce base-model output, so refuse up front (before the
-        // dimension check: capability is the more fundamental fact).
-        if !self.model.supports_lora() {
-            return Err(CeraError::LoraUnsupportedByBackend(format!(
-                "model architecture '{}' has no LoRA apply hooks, so the adapter would be \
-                 silently ignored; no backend runs it",
-                self.model.config().architecture
-            )));
-        }
-        adapter
-            .validate_dims(self.model.config())
-            .map_err(|e| CeraError::LoraDimMismatch(e.to_string()))?;
-        // Routed-FFN deltas have no hook on the GPU backends. Both the router
-        // and the per-expert factors would upload without complaint and then
-        // never be applied, which is an adapter that quietly does part of its
-        // job, so refuse the whole thing here.
-        if adapter.has_moe_deltas() && !self.model.supports_moe_lora() {
-            return Err(CeraError::LoraUnsupportedByBackend(
-                "the adapter carries mixture-of-experts deltas (router and/or per-expert \
-                 factors) and this backend has no routed-FFN hooks; the CPU backend applies them"
-                    .to_string(),
-            ));
-        }
-        Ok(())
+        ensure_adapter_runs(self.model.as_ref(), adapter)
     }
 
     /// Remove any attached LoRA adapter, returning to base-model inference.
@@ -3601,14 +3624,20 @@ impl Session {
             None
         } else if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
             let acc_ref = self.audio_accelerator.as_deref();
-            Some(crate::audio_engine::AudioOutputDecoder::new(
+            let mut out_dec = crate::audio_engine::AudioOutputDecoder::new(
                 dec,
                 detok,
                 acc_ref,
                 0.7,
                 40,
                 self.config.gpu_depthformer,
-            ))
+            );
+            let seed = opts
+                .seed
+                .or(self.config.seed)
+                .unwrap_or_else(rand::random::<u64>);
+            out_dec.seed_rng(seed);
+            Some(out_dec)
         } else {
             None
         };
