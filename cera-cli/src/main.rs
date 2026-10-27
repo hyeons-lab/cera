@@ -965,9 +965,9 @@ enum Command {
         #[arg(long, default_value = "cpu")]
         device: String,
 
-        /// Unused: the context is the model's own (16384 for d1-omni, 8192 for d1-3B).
-        #[arg(long, default_value_t = 16384)]
-        context_size: usize,
+        /// Ignored: the context is the model's own (16384 for d1-omni, 8192 for d1-3B).
+        #[arg(long, hide = true)]
+        context_size: Option<usize>,
 
         /// An image (PNG or JPEG) to read ahead of the text; repeatable, in order. These are
         /// added to any `images` in the request.
@@ -4505,10 +4505,13 @@ fn main() -> Result<()> {
             mmproj,
             request,
             device,
-            context_size: _,
+            context_size,
             images,
             audio,
         } => {
+            if context_size.is_some() {
+                eprintln!("warning: --context-size is ignored; the context is the model's own");
+            }
             use std::io::Read as _;
             let text = if request == "-" {
                 let mut text = String::new();

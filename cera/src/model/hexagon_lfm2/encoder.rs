@@ -376,8 +376,8 @@ pub(super) fn balanced_chunks(n: usize, chunk_rows: usize) -> Vec<(usize, usize)
 }
 
 /// Plan a pass of `n_real` rows after `start_pos` rows, with chunks of at most
-/// `chunk_rows` (production passes [`ENCODER_CHUNK_ROWS`]; tests a small one to
-/// exercise the layer-outer driver on tiny inputs).
+/// `chunk_rows` (production passes [`ENCODER_CHUNK_ROWS`]; the planner tests use a small one so
+/// that tiny inputs take the layer-outer path).
 pub(super) fn plan_pass(
     start_pos: usize,
     n_real: usize,
@@ -684,7 +684,7 @@ impl HexagonLfmModel {
     }
 
     /// [`Self::encoder_pass`] with a chunk size: a pass of more rows than
-    /// `chunk_rows` runs layer-outer. Tests use a small one.
+    /// `chunk_rows` runs layer-outer. The planner tests use a small one.
     pub(super) fn encoder_pass_chunked(
         &self,
         input: EncoderInput<'_>,
@@ -1310,6 +1310,11 @@ impl HexagonLfmModel {
 
     /// Release a long buffer too large to keep (see [`LONG_BUFFER_KEEP_BYTES`]).
     fn trim_long_buffer(&self, session: &mut HexagonQueueSession) {
+        // A batch that never answered (a hung DSP) may still be writing the buffer, and
+        // dropping it unmaps memory the DSP owns: keep it until the queue has quiesced.
+        if session.outstanding_batches() > 0 {
+            return;
+        }
         let mut guard = self.encoder_long.lock().unwrap_or_else(|e| e.into_inner());
         if guard
             .as_ref()

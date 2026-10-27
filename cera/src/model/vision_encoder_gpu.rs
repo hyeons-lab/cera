@@ -2433,6 +2433,12 @@ pub struct VitStackSpec {
 }
 
 /// The projector of a [`VitStackSpec`]: `Linear(GELU(Linear(x)))` per row.
+///
+/// The GELU is the exact (erf) form of `torch.nn.GELU()`. The Hexagon stack runs the tanh form
+/// instead, because its verified kernel is the tanh one; the two differ by up to about 5e-4 per
+/// activation, small against the Q8_0 rounding the NPU towers already carry (the d1 answers
+/// match the reference). A backend that must be exact returns `Ok(None)` from
+/// [`VitStack::run_projector`] and the caller projects on the host.
 pub struct VitStackProjector {
     pub mm1: MmapWeight,
     pub mm1_b: Vec<f32>,
@@ -2512,12 +2518,14 @@ struct GpuStack<O: VitGpuOps> {
 
 #[cfg(any(
     feature = "gpu",
+    feature = "hexagon",
     all(feature = "metal", any(target_os = "macos", target_os = "ios"))
 ))]
 /// The caller-supplied public spec is enforced before uploading: a zero head count would
 /// divide by zero in `run`, and a ragged geometry or short vector would misread on the
-/// device. Pure so a host test can pin it without a device.
-fn check_spec(spec: &VitStackSpec) -> Result<()> {
+/// device. Pure so a host test can pin it without a device. Every device builder runs it,
+/// the Hexagon stack included.
+pub(crate) fn check_spec(spec: &VitStackSpec) -> Result<()> {
     anyhow::ensure!(
         spec.width > 0 && spec.ffn > 0,
         "width {} and ffn {} must be positive",

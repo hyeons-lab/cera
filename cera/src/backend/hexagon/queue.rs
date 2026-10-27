@@ -755,6 +755,9 @@ impl HexagonQueueSession {
     /// Dispatch a pre-staged command batch without rebuilding or re-serializing descriptors.
     pub fn flush_staged(&mut self, staged: &StagedBatch) -> Result<(), CeraError> {
         self.resident_staged_id = None;
+        // Staging offset 0 is about to be reused, so a pipelined batch still reading it must
+        // have answered first.
+        self.drain()?;
         staged.validate()?;
         let total_bytes = staged.total_bytes;
         if total_bytes > self.staging_capacity() {
@@ -791,6 +794,7 @@ impl HexagonQueueSession {
         staged: &StagedBatch,
         patch_ranges: &[std::ops::Range<usize>],
     ) -> Result<(), CeraError> {
+        self.drain()?;
         staged.validate()?;
         let total_bytes = staged.total_bytes;
         if total_bytes > self.staging_capacity() {
@@ -2163,6 +2167,27 @@ mod tests {
         );
         q.flush().unwrap();
         assert_eq!(q.outstanding_batches(), 0);
+    }
+
+    /// A staged flush reuses staging offset 0 and waits for its own response, so it has to
+    /// collect the pipelined batches in front of it first: otherwise it overwrites a region the
+    /// DSP may still read, consumes an older response as its own, and leaves a stale entry
+    /// behind that the next drain waits on for the whole hang guard.
+    #[test]
+    fn a_staged_flush_collects_pipelined_batches_first() {
+        fake::reset();
+        let buf = RpcmemBuffer::alloc(fake::driver(), 4096, false).unwrap();
+        let mut q = test_session();
+        q.set_max_tensors_per_flush(Some(1));
+        q.set_pipelined(true);
+        enqueue_with_tensor(&mut q, &buf).unwrap();
+        assert!(q.outstanding_batches() > 0, "one batch is in flight");
+        q.flush_staged(&staged(1, 1)).unwrap();
+        assert!(q.inflight.is_empty(), "the pipelined batch was collected");
+        assert_eq!(q.outstanding_batches(), 0);
+        let before = reads();
+        q.drain().unwrap();
+        assert_eq!(reads(), before, "nothing is left to wait for");
     }
 
     /// A pipelined session never has more than `MAX_INFLIGHT` batches unanswered.

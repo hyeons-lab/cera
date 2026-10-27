@@ -13,7 +13,8 @@
 //! * whole passes through a queue session on the fake FastRPC driver, pinning
 //!   the op stream and checking the host plumbing (padding, positions, mask,
 //!   prefix capture and restore, refusals). Numerics are not checked there
-//!   (all weights are zero); on-device parity is `tests/hexagon_encoder_parity.rs`.
+//!   (all weights are zero); on a device, run `cera/tests/d1_public.rs` with `CERA_D1_BACKEND=npu`
+//!   (ignored by default) for end-to-end parity with llama.cpp.
 
 use super::encoder::*;
 use super::forward_golden_tests as fx;
@@ -61,7 +62,7 @@ fn shape_refuses_what_does_not_fit_with_typed_errors() {
         Err(CeraError::EmptyInput)
     ));
     // The single-chunk shape is for up to one chunk; longer passes are planned
-    // layer-outer (`plan_pass`, see `encoder_long_tests`).
+    // layer-outer (`plan_pass`, tested below).
     let err = EncoderShape::plan(0, 513, 4096).unwrap_err().to_string();
     assert!(
         err.contains("single-chunk encoder pass takes at most 512"),
@@ -154,6 +155,67 @@ fn state_slab_slots_interleave_per_channel() {
     assert_eq!(got, a);
     slab_read_slot(&slab, 1, &mut got);
     assert_eq!(got, b);
+}
+
+#[test]
+fn balanced_chunks_cover_every_row_and_are_never_tiny() {
+    for (n, c) in [
+        (17, 16),
+        (33, 16),
+        (40, 16),
+        (513, 512),
+        (1025, 512),
+        (16384, 512),
+    ] {
+        let chunks = balanced_chunks(n, c);
+        assert_eq!(chunks.len(), n.div_ceil(c), "{n} rows in chunks of {c}");
+        // contiguous, covering exactly n rows
+        let mut next = 0;
+        for &(first, rows) in &chunks {
+            assert_eq!(first, next);
+            next += rows;
+        }
+        assert_eq!(next, n);
+        // sizes differ by at most one, and none is under the DSP's 8-row minimum
+        let (lo, hi) = (
+            chunks.iter().map(|c| c.1).min().unwrap(),
+            chunks.iter().map(|c| c.1).max().unwrap(),
+        );
+        assert!(hi - lo <= 1, "{chunks:?}");
+        assert!(lo >= ENCODER_MIN_ROWS && hi <= c, "{chunks:?}");
+    }
+    // a pass that fits one chunk stays one chunk
+    assert_eq!(balanced_chunks(16, 16), vec![(0, 16)]);
+}
+
+#[test]
+fn a_pass_plans_single_up_to_one_chunk_and_layer_outer_beyond() {
+    let single = plan_pass(0, 16, 4096, 16).unwrap();
+    assert!(matches!(single, PassPlan::Single(_)), "{single:?}");
+    match plan_pass(10, 40, 4096, 16).unwrap() {
+        PassPlan::Long(long) => {
+            assert_eq!((long.start_pos, long.n), (10, 40));
+            assert_eq!(long.chunks, balanced_chunks(40, 16));
+        }
+        other => panic!("{other:?}"),
+    }
+    // refusals are typed: nothing, the cache, the pass limit, a bad chunk size
+    assert!(matches!(
+        plan_pass(0, 0, 4096, 16),
+        Err(CeraError::EmptyInput)
+    ));
+    assert!(matches!(
+        plan_pass(4090, 40, 4096, 16),
+        Err(CeraError::ContextOverflow { by: 34, .. })
+    ));
+    assert!(matches!(
+        plan_pass(0, ENCODER_MAX_PASS_ROWS + 1, 1 << 20, 512),
+        Err(CeraError::ContextOverflow { by: 1, .. })
+    ));
+    for bad in [0, 2 * ENCODER_MIN_ROWS - 1, PREFILL_MAX_ROWS + 1] {
+        let err = plan_pass(0, 40, 4096, bad).unwrap_err().to_string();
+        assert!(err.contains("outside"), "{err}");
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -874,6 +936,23 @@ fn the_conv_left_neighbour_is_restored_into_every_slab() {
         slab_read_slot(slab(&model, &conv_layer(&model, i)), 0, &mut got);
         assert_eq!(&got, want, "conv layer {i}");
     }
+}
+
+#[test]
+fn a_failed_hidden_states_pass_records_its_fault_for_the_session() {
+    use crate::model::Model as _;
+    let model = build_encoder(4);
+    let mut state = text_state(&model);
+    assert!(model.take_decode_error().is_none());
+    // The trait returns bare vectors, so a refused pass comes back as zeros: the fault has to
+    // be recorded or `Session` would hand the zeros to the d1 head as a real answer.
+    let rows = model.hidden_states(&[1, fx::VOCAB as u32], &mut state);
+    assert_eq!(rows, vec![0.0; 2 * HS]);
+    assert!(model.take_decode_error().is_some(), "an invalid token");
+    // an empty prefix is refused by the pass too
+    let rows = model.hidden_states_with_prefix(&[], &[1, 2], &mut state);
+    assert_eq!(rows, vec![0.0; 2 * HS]);
+    assert!(model.take_decode_error().is_some(), "an empty prefix");
 }
 
 #[test]

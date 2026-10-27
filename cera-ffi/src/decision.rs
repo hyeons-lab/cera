@@ -47,6 +47,21 @@ fn to_ffi(error: anyhow::Error) -> FfiError {
     if error.downcast_ref::<cera::d1::Cancelled>().is_some() {
         return FfiError::Cancelled;
     }
+    // keep the typed variants (out of memory, context overflow, busy, ...) the other entry
+    // points expose, so a caller can branch on them; a plain `Backend` keeps its full context
+    // chain in the formatted error below
+    if let Some(typed) = error.downcast_ref::<cera::CeraError>()
+        && !matches!(
+            typed,
+            cera::CeraError::Backend(_)
+                | cera::CeraError::Format(_)
+                | cera::CeraError::Io(_)
+                | cera::CeraError::LoraDimMismatch(_)
+                | cera::CeraError::LoraCompose(_)
+        )
+    {
+        return FfiError::from(typed);
+    }
     FfiError::Backend {
         detail: format!("{error:#}"),
     }
@@ -181,6 +196,43 @@ impl DecisionEngine {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn typed_engine_errors_keep_their_variant_at_the_boundary() {
+        use anyhow::Context as _;
+        let overflow = anyhow::Error::new(cera::CeraError::ContextOverflow {
+            max_seq_len: 64,
+            by: 3,
+        })
+        .context("answering");
+        assert!(matches!(
+            to_ffi(overflow),
+            FfiError::ContextOverflow {
+                max_seq_len: 64,
+                by: 3
+            }
+        ));
+        let oom = Err::<(), _>(cera::CeraError::OutOfMemory { requested_bytes: 1 })
+            .context("loading")
+            .unwrap_err();
+        assert!(matches!(to_ffi(oom), FfiError::OutOfMemory { .. }));
+        // a plain backend error keeps its whole message
+        let backend =
+            anyhow::Error::new(cera::CeraError::Backend("no device".into())).context("opening");
+        match to_ffi(backend) {
+            FfiError::Backend { detail } => {
+                assert!(
+                    detail.contains("opening") && detail.contains("no device"),
+                    "{detail}"
+                )
+            }
+            other => panic!("{other:?}"),
+        }
+        assert!(matches!(
+            to_ffi(anyhow::Error::new(cera::d1::Cancelled)),
+            FfiError::Cancelled
+        ));
+    }
 
     #[test]
     fn open_refuses_a_missing_file_with_its_path() {

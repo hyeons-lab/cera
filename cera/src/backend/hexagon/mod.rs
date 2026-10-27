@@ -303,6 +303,74 @@ pub(crate) fn stage_diarizer_accelerator<T>(
     Some(staged)
 }
 
+/// A count of callers that hold the low-CPU mode. A count, not a flag: two engines in one
+/// process can overlap, and the first to finish must not clear the mode for the other.
+struct LowCpuCount(std::sync::atomic::AtomicUsize);
+
+impl LowCpuCount {
+    const fn new() -> Self {
+        Self(std::sync::atomic::AtomicUsize::new(0))
+    }
+
+    fn set(&self, on: bool) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if on {
+            self.0.fetch_add(1, Relaxed);
+        } else {
+            // saturate at zero so an unbalanced `false` cannot wrap the count
+            let mut n = self.0.load(Relaxed);
+            while n > 0 {
+                match self.0.compare_exchange_weak(n, n - 1, Relaxed, Relaxed) {
+                    Ok(_) => break,
+                    Err(current) => n = current,
+                }
+            }
+        }
+    }
+
+    fn on(&self) -> bool {
+        self.0.load(std::sync::atomic::Ordering::Relaxed) > 0
+    }
+}
+
+static LOW_CPU: LowCpuCount = LowCpuCount::new();
+
+/// Set by a caller whose work is not interactive: the LFM2 encoder passes
+/// (`PassWait::for_rows`) sleep between polls instead of busy-polling a short pass. It trades a
+/// millisecond or two of wall time per pass for most of its CPU time, which matters where the OS
+/// demotes busy threads. The setting is process-wide: calls nest, and every `true` must be
+/// matched by a `false`.
+pub(crate) fn set_low_cpu(on: bool) {
+    LOW_CPU.set(on);
+}
+
+/// Whether any caller holds [`set_low_cpu`].
+pub(crate) fn low_cpu() -> bool {
+    LOW_CPU.on()
+}
+
+#[cfg(test)]
+mod low_cpu_tests {
+    use super::LowCpuCount;
+
+    #[test]
+    fn the_mode_nests_and_the_first_release_does_not_clear_it() {
+        let count = LowCpuCount::new();
+        assert!(!count.on());
+        count.set(true);
+        count.set(true);
+        count.set(false);
+        assert!(count.on(), "one holder is left");
+        count.set(false);
+        assert!(!count.on());
+        // an extra release cannot wrap the count around
+        count.set(false);
+        assert!(!count.on());
+        count.set(true);
+        assert!(count.on());
+    }
+}
+
 #[cfg(test)]
 mod poison_tests {
     use super::*;
@@ -453,20 +521,4 @@ mod tests {
             ("CERA_NO_HEXAGON", "1"),
         ])));
     }
-}
-
-/// Set by a caller whose work is not interactive: every Hexagon component that waits for the
-/// device on a request (the encoder passes, the ViT stacks) sleeps between polls instead of
-/// busy-polling a short pass. It trades a millisecond or two of wall time per pass for most of
-/// its CPU time, which matters where the OS demotes busy threads.
-static LOW_CPU: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
-
-/// See [`LOW_CPU`].
-pub fn set_low_cpu(on: bool) {
-    LOW_CPU.store(on, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// Whether [`set_low_cpu`] is on.
-pub fn low_cpu() -> bool {
-    LOW_CPU.load(std::sync::atomic::Ordering::Relaxed)
 }

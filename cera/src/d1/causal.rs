@@ -355,17 +355,18 @@ fn options_and_groups(
     };
     match q.kind {
         QuestionType::Noul => {
-            let side = |key: &str| {
-                q.criteria
+            // the request parser accepts `yes`/`no` for `true`/`false`, as the omni prompt does
+            let side = |names: [&str; 2]| {
+                names
                     .iter()
-                    .find(|(k, _)| k == key)
+                    .find_map(|n| q.criteria.iter().find(|(k, _)| k == n))
                     .map_or(serde_json::Value::Null, |(_, v)| value(v))
             };
             // the template shows `true` first; the answer reads `false` then `true`, which
             // `prompt::probabilities` turns back into [true, false]
             let options = vec![
-                serde_json::json!({"key": "true", "description": side("true"), "label": "true"}),
-                serde_json::json!({"key": "false", "description": side("false"), "label": "false"}),
+                serde_json::json!({"key": "true", "description": side(["true", "yes"]), "label": "true"}),
+                serde_json::json!({"key": "false", "description": side(["false", "no"]), "label": "false"}),
             ];
             let no = single(&["no", "No", "NO"]);
             let yes = single(&["yes", "Yes", "YES"]);
@@ -551,6 +552,20 @@ mod tests {
             0,
         );
         assert!(half.contains("\nYes: asked\nNo: None\n"), "{half}");
+    }
+
+    #[test]
+    fn a_noul_prompt_reads_yes_and_no_as_true_and_false() {
+        // the request parser and the omni prompt accept both spellings
+        let yes_no = render(
+            r#"{"type":"noul","instructions":"Refund?","criteria":{"yes":"asked","no":"nothing"}}"#,
+            &Json::Str("s".into()),
+            0,
+        );
+        assert!(
+            yes_no.contains("Refund?\nYes: asked\nNo: nothing\n\nReply with yes or no only."),
+            "{yes_no}"
+        );
     }
 
     #[test]

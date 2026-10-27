@@ -131,34 +131,22 @@ pub(super) fn f16_plain_plan(ne0: usize, ne1: usize) -> SlicePlan {
     (ne0 * ne1 * 2, HtpDataType::F16, 2, 0)
 }
 
-/// Whether the F16 environment opt-out is off: `CERA_HEXAGON_DECISION_F16=0` runs an F16
-/// decision model's matmuls as Q8_0 (the earlier behavior), for A/B comparison.
-pub(super) fn decision_f16_enabled() -> bool {
-    !std::env::var("CERA_HEXAGON_DECISION_F16").is_ok_and(|v| {
-        let v = v.trim();
-        v == "0" || v.eq_ignore_ascii_case("false")
-    })
+/// Whether the HMX path can run on `hw`: the device has an HMX and a VTCM large enough for the
+/// HMX parameter solvers, which size their chunks for `VTCM_BUDGET`.
+fn hmx_available(hw: &crate::backend::hexagon::HtpHwInfo) -> bool {
+    hw.n_hmx > 0 && hw.vtcm_size as usize >= crate::backend::hexagon::dispatch::VTCM_BUDGET
 }
 
-/// Whether the HMX path is in use on `hw`: the device has an HMX and a VTCM large enough for the
-/// HMX parameter solvers, which size their chunks for `VTCM_BUDGET`, and `CERA_HEXAGON_HMX` does
-/// not turn it off.
-fn hmx_in_use(hw: &crate::backend::hexagon::HtpHwInfo) -> bool {
-    let off = std::env::var("CERA_HEXAGON_HMX").is_ok_and(|v| {
-        let v = v.trim();
-        v == "0" || v.eq_ignore_ascii_case("false")
-    });
-    hw.n_hmx > 0 && hw.vtcm_size as usize >= crate::backend::hexagon::dispatch::VTCM_BUDGET && !off
-}
-
-/// Pick the F16 policy of a decision model on a device: plain F16 where the HMX is in use
-/// (and the opt-out is not set), Q8_0 otherwise.
+/// Pick the F16 policy of a decision model on a device: plain F16 where the HMX is available and
+/// the knobs allow it (`use_hmx`, `CERA_HEXAGON_HMX`; `decision_f16`,
+/// `CERA_HEXAGON_DECISION_F16`, the A/B opt-out that runs the matmuls as Q8_0), Q8_0 otherwise.
 pub(super) fn decision_f16_policy(
     use_hmx: bool,
+    decision_f16: bool,
     hw: &crate::backend::hexagon::HtpHwInfo,
     threads: u32,
 ) -> F16Weights {
-    if use_hmx && decision_f16_enabled() && hmx_in_use(hw) {
+    if use_hmx && decision_f16 && hmx_available(hw) {
         F16Weights::Plain {
             vtcm_budget: hw.vtcm_size as usize,
             threads,

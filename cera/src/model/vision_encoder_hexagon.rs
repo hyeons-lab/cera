@@ -1260,6 +1260,7 @@ impl HexagonVisionEncoder {
         dump: Option<&mut VitStageDump>,
     ) -> Result<Vec<f32>> {
         let cfg = &self.config;
+        ensure!(n_patches > 0, "a ViT pass needs at least one token");
         ensure!(
             n_patches <= self.max_rows,
             "{n_patches} tokens exceed the encoder's {} rows",
@@ -1852,6 +1853,9 @@ fn stack_weights(spec: &VitStackSpec) -> Result<VisionEncoderWeights> {
         !spec.blocks.is_empty(),
         "a ViT stack needs at least one block"
     );
+    // the same check every GPU builder runs: without it `run_blocks` divides by zero on a
+    // zero head count and the DSP reads ragged weights and short vectors as if they fit
+    crate::model::vision_encoder_gpu::check_spec(spec)?;
     let config = VisionEncoderConfig {
         n_layer: spec.blocks.len(),
         n_embd: spec.width,
@@ -2467,7 +2471,23 @@ mod tests {
                 .projector
                 .is_none()
         );
-        // a stack needs a block
+        // a stack needs a block, and heads that divide its width
+        let mut headless = VitStackSpec {
+            width: d,
+            heads: 0,
+            ffn: ff,
+            eps: 1e-5,
+            activation: VitStackActivation::Relu,
+            blocks: vec![block()],
+            post: None,
+            projector: None,
+        };
+        let err = stack_weights(&headless).err().unwrap().to_string();
+        assert!(err.contains("heads"), "{err}");
+        headless.heads = 3; // 64 is not a multiple of 3
+        assert!(stack_weights(&headless).is_err());
+        headless.heads = 4;
+        assert!(stack_weights(&headless).is_ok());
         spec.blocks.clear();
         assert!(stack_weights(&spec).is_err());
     }

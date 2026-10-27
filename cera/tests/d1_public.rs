@@ -1,7 +1,8 @@
 //! The public `d1-omni` and `d1-3B` files against llama.cpp's `/v1/systemone`.
 //!
 //! These need the real models, so every test is `#[ignore]`d and reads its inputs from the
-//! environment; run them with `cargo test -p cera --test d1_public -- --ignored`:
+//! environment; run them with `cargo test -p cera --test d1_public -- --ignored --nocapture`
+//! (`--nocapture` shows the backend each model ran on):
 //!
 //! - `CERA_D1_OMNI_GGUF`: the model, e.g. `d1-omni-600M-Q8_0.gguf`.
 //! - `CERA_D1_OMNI_MMPROJ`: its `mmproj-d1-omni-600M-*.gguf` (image and speech requests are
@@ -38,10 +39,16 @@ fn env_path(name: &str) -> Option<PathBuf> {
 }
 
 fn tolerance() -> f64 {
-    std::env::var("CERA_D1_TOLERANCE")
-        .ok()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0.05)
+    std::env::var("CERA_D1_TOLERANCE").ok().map_or(0.05, |v| {
+        let tol: f64 = v
+            .parse()
+            .unwrap_or_else(|e| panic!("CERA_D1_TOLERANCE `{v}`: {e}"));
+        assert!(
+            tol.is_finite() && tol >= 0.0,
+            "CERA_D1_TOLERANCE must be finite and non-negative"
+        );
+        tol
+    })
 }
 
 fn number(v: &Json) -> f64 {
@@ -90,10 +97,19 @@ fn compare(name: &str, got: &Json, want: &Json, tol: f64) -> f64 {
             want_answer.get("choice"),
             "{name}.{id}: the choice"
         );
-        for ((label, want_v), (_, got_v)) in probabilities(want_answer)
-            .into_iter()
-            .zip(probabilities(got_answer))
-        {
+        // a response that lost a field must not pass by comparing nothing
+        let (want_p, got_p) = (probabilities(want_answer), probabilities(got_answer));
+        assert_eq!(
+            want_p.iter().map(|(l, _)| l).collect::<Vec<_>>(),
+            got_p.iter().map(|(l, _)| l).collect::<Vec<_>>(),
+            "{name}.{id}: the probability labels"
+        );
+        assert_eq!(
+            want_answer.get("confidence").is_some(),
+            got_answer.get("confidence").is_some(),
+            "{name}.{id}: confidence presence"
+        );
+        for ((label, want_v), (_, got_v)) in want_p.into_iter().zip(got_p) {
             let diff = (want_v - got_v).abs();
             worst = worst.max(diff);
             assert!(
@@ -135,6 +151,8 @@ fn the_public_omni_files_answer_like_llama_server() {
     let mmproj = env_path("CERA_D1_OMNI_MMPROJ");
     let engine = D1Engine::open(&model, mmproj.as_deref(), backend())
         .expect("opening the public d1-omni model");
+    // an `auto` run can fall back to the CPU, so say where the model ran
+    eprintln!("backend: {}", engine.report());
     assert_eq!(engine.kind(), "lfm2-d1-omni");
     let tol = tolerance();
     let cases: Vec<&str> = ["text", "image", "audio"]
@@ -153,7 +171,10 @@ fn the_public_omni_files_answer_like_llama_server() {
 fn engine_3b(with_mmproj: bool) -> D1Engine {
     let model = env_path("CERA_D1_3B_GGUF").expect("set CERA_D1_3B_GGUF");
     let mmproj = env_path("CERA_D1_3B_MMPROJ").filter(|_| with_mmproj);
-    D1Engine::open(&model, mmproj.as_deref(), backend()).expect("opening the public d1-3B model")
+    let engine = D1Engine::open(&model, mmproj.as_deref(), backend())
+        .expect("opening the public d1-3B model");
+    eprintln!("backend: {}", engine.report());
+    engine
 }
 
 #[test]
@@ -185,6 +206,10 @@ fn the_3b_shared_prefix_does_not_change_an_answer() {
     let Some(Json::Object(questions)) = request.get("questions") else {
         panic!("no questions");
     };
+    assert!(
+        questions.len() > 1,
+        "req-image.json needs at least two questions to share a prefix"
+    );
     for (id, question) in questions {
         let Json::Object(mut alone) = request.clone() else {
             panic!("not an object");

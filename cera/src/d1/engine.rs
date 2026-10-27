@@ -124,6 +124,14 @@ enum Model {
     Causal { model: Box<CausalD1>, images: bool },
 }
 
+/// Whether an `Auto` load of an image-capable d1-3B must leave wgpu: on Android a phone GPU
+/// loses the device on large images, and the warm-up request has no image to show it. The vision
+/// tower can sit on wgpu under a CPU trunk, so both placements count; a model without a vision
+/// tower has no image path to protect.
+fn keep_off_wgpu(android: bool, takes_images: bool, trunk: &str, vision: Option<&str>) -> bool {
+    android && takes_images && (trunk == "wgpu" || vision == Some("wgpu"))
+}
+
 impl D1Engine {
     /// Open a d1 model: a public `d1-omni` GGUF (plus its `mmproj` GGUF for images and speech), a
     /// public `d1-3B` GGUF (plus its `mmproj` GGUF for images), or a cera-converted file (which
@@ -167,6 +175,26 @@ impl D1Engine {
         }
         // Auto: the best accelerator that loads the model and answers a request, else the CPU
         match Self::build(&files, BackendPreference::Auto, backend, None) {
+            // d1-3B on a phone GPU runs text, but an image of 1024 px or more loses the device
+            // (the mobile GPU watchdog) and a 512 px one is slower than the CPU; the warm-up
+            // request has no image, so it cannot catch that. Keep an image-capable 3B off wgpu
+            // on Android: the vision tower can land on wgpu even when the trunk is on the CPU
+            // (an `Auto` load follows the device, not the trunk), so test both. A text-only 3B
+            // has no image path to protect and keeps its GPU.
+            Ok(engine)
+                if keep_off_wgpu(
+                    cfg!(target_os = "android"),
+                    matches!(engine.model, Model::Causal { images: true, .. }),
+                    engine.report.trunk,
+                    engine.report.vision,
+                ) =>
+            {
+                let note =
+                    "wgpu on a phone loses the device on large images for d1-3B; using the CPU"
+                        .to_string();
+                drop(engine);
+                Self::build(&files, BackendPreference::Cpu, backend, Some(note))
+            }
             Ok(mut engine) if engine.report.trunk == "cpu" => {
                 // the engine's own Auto order found no accelerator for the trunk (none present, or
                 // none could hold the model); say so rather than leave a bare "cpu"
@@ -177,20 +205,6 @@ impl D1Engine {
                     );
                 }
                 Ok(engine)
-            }
-            // d1-3B on a phone GPU runs text, but an image of 1024 px or more loses the device
-            // (the mobile GPU watchdog) and a 512 px one is slower than the CPU; the warm-up
-            // request has no image, so it cannot catch that: keep the 3B off wgpu on Android
-            Ok(engine)
-                if cfg!(target_os = "android")
-                    && engine.report.trunk == "wgpu"
-                    && matches!(engine.model, Model::Causal { .. }) =>
-            {
-                let note =
-                    "wgpu on a phone loses the device on large images for d1-3B; using the CPU"
-                        .to_string();
-                drop(engine);
-                Self::build(&files, BackendPreference::Cpu, backend, Some(note))
             }
             Ok(engine) => match engine.decide_json(WARMUP_REQUEST) {
                 Ok(_) => Ok(engine),
@@ -470,6 +484,19 @@ mod tests {
         // an Auto request that ended on the CPU keeps the towers there
         assert_eq!(tower_preference("cpu", Auto), Cpu);
         assert_eq!(tower_preference("cpu", Cpu), Cpu);
+    }
+
+    #[test]
+    fn an_image_capable_3b_leaves_wgpu_on_android_whichever_part_is_on_it() {
+        // the trunk on wgpu, the vision tower on wgpu under a CPU trunk, or both
+        assert!(keep_off_wgpu(true, true, "wgpu", Some("wgpu")));
+        assert!(keep_off_wgpu(true, true, "wgpu", None));
+        assert!(keep_off_wgpu(true, true, "cpu", Some("wgpu")));
+        // nothing on wgpu, no image path, or not a phone: leave the placement alone
+        assert!(!keep_off_wgpu(true, true, "hexagon", Some("hexagon")));
+        assert!(!keep_off_wgpu(true, true, "cpu", Some("cpu")));
+        assert!(!keep_off_wgpu(true, false, "wgpu", None));
+        assert!(!keep_off_wgpu(false, true, "wgpu", Some("wgpu")));
     }
 
     #[test]

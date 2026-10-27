@@ -391,6 +391,9 @@ struct HexagonKnobs {
     use_ssm_conv: bool,
     /// `CERA_HEXAGON_HMX` (default on): HMX kernels for prefill.
     use_hmx: bool,
+    /// `CERA_HEXAGON_DECISION_F16` (default on): a decision model's F16 matmuls run as plain F16
+    /// on the HMX; off runs them as Q8_0 (the earlier behavior), for A/B comparison.
+    decision_f16: bool,
     /// `CERA_HEXAGON_ARCH`: skeleton architecture override (numeric id).
     arch_override: Option<HexagonArch>,
     /// `CERA_HEXAGON_KV_Q8` (opt-in): Q8_0 KV cache instead of F16.
@@ -444,6 +447,7 @@ impl HexagonKnobs {
                 .unwrap_or(10_000_000),
             use_ssm_conv: default_on("CERA_HEXAGON_SSM_CONV"),
             use_hmx: default_on("CERA_HEXAGON_HMX"),
+            decision_f16: default_on("CERA_HEXAGON_DECISION_F16"),
             arch_override: crate::backend::hexagon::arch_override_with(&get),
             kv_q8: opt_in("CERA_HEXAGON_KV_Q8"),
             decode_ops: get("CERA_HEXAGON_DECODE_OPS")
@@ -1687,7 +1691,7 @@ impl HexagonLfmModel {
         // tensor).
         let f16_policy = if crate::model::is_encoder_trunk(&gguf) {
             let threads = device.queue_session_mut().dsp_threads();
-            decision_f16_policy(knobs.use_hmx, device.hw_info(), threads)
+            decision_f16_policy(knobs.use_hmx, knobs.decision_f16, device.hw_info(), threads)
         } else {
             F16Weights::Refuse
         };
@@ -2900,9 +2904,11 @@ impl HexagonLfmModel {
                 if let Err(e) =
                     session.flush_staged_resident(tpl.resident_id, &tpl.staged, &tpl.patch_ranges)
                 {
-                    // The only pre-dispatch exit of a replay is the staging
-                    // size check, unreachable with fixture-sized batches, so
-                    // this site is covered by the seam test
+                    // The pre-dispatch exits of a replay are the staging size
+                    // check (unreachable with fixture-sized batches) and the
+                    // drain of a pipelined batch that failed earlier (decode
+                    // runs unpipelined, so none is in flight here), so this
+                    // site is covered by the seam test
                     // `torn_only_when_a_dispatch_was_attempted`.
                     self.mark_state_torn_if_dispatched(session, dispatches_before);
                     return Err(CeraError::Backend(format!(
@@ -3570,6 +3576,9 @@ impl Model for HexagonLfmModel {
             Ok(rows) => rows,
             Err(e) => {
                 hexagon_error!("bidirectional hidden states failed, returning zeros: {e}");
+                // The trait returns bare vectors: record the fault so `Session` surfaces an
+                // `Err` instead of handing the zeros to a caller that would score them.
+                record_first_fault(&self.decode_error, e);
                 vec![0.0; tokens.len() * self.config.hidden_size]
             }
         }
@@ -3592,6 +3601,9 @@ impl Model for HexagonLfmModel {
             Ok(rows) => rows,
             Err(e) => {
                 hexagon_error!("bidirectional hidden states failed, returning zeros: {e}");
+                // The trait returns bare vectors: record the fault so `Session` surfaces an
+                // `Err` instead of handing the zeros to a caller that would score them.
+                record_first_fault(&self.decode_error, e);
                 vec![0.0; tokens.len() * self.config.hidden_size]
             }
         }
@@ -3755,6 +3767,12 @@ impl HexagonLfmModel {
     /// Does not quiesce: the callers have just passed `ensure_state_intact`, so no timed-out batch
     /// can still be writing (the full reset, `reset_recurrent_state`, quiesces for that case).
     fn zero_recurrent_layers(&self) {
+        // The conv slabs hold the resident encoder prefix's left neighbour: zeroing them makes
+        // that resident copy stale, as in `reset_recurrent_state`.
+        *self
+            .encoder_resident
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = None;
         let zero = |offset: usize, len: usize| unsafe {
             std::ptr::write_bytes(self.kv_state_buf.as_mut_ptr().add(offset), 0, len);
             self.kv_state_buf.flush_cpu_cache(offset, len);
