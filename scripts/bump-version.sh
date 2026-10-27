@@ -54,7 +54,9 @@ GRADLE_PROPS="$ROOT/cera-ffi-kotlin/gradle.properties"
 # Dependent crates carrying an internal `cera` path-dep pin.
 PIN_CRATES=(cera-cli cera-ffi cera-wasm cera-parity)
 
-# Flutter plugin platform manifests, one entry per version *site*: a file with
+# Flutter plugin platform manifests, plus the user-visible version literals that
+# are not manifests (the web worker's startup banner and the example app's
+# version label), one entry per version *site*: a file with
 # two references appears twice. Format is "<label>|<path from ROOT>|<regex>",
 # where the regex names three captures — `pre`, `ver`, `post` — so the single
 # pattern serves as both reader and writer and the two cannot drift apart.
@@ -75,6 +77,8 @@ PLUGIN_SITES=(
   "macos podspec s.version|cera_ffi_flutter/macos/cera_ffi_flutter.podspec|(?<pre>^\s*s\.version\s*=\s*')(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>')"
   "ios CeraFFIPlugin version|cera_ffi_flutter/ios/cera_ffi_flutter/Sources/cera_ffi_flutter/CeraFFIPlugin.swift|(?<pre>^\s*static\s+let\s+version\s*=\s*\")(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>\")"
   "macos CeraFFIPlugin version|cera_ffi_flutter/macos/cera_ffi_flutter/Sources/cera_ffi_flutter/CeraFFIPlugin.swift|(?<pre>^\s*static\s+let\s+version\s*=\s*\")(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>\")"
+  "web worker version banner|cera_ffi/lib/src/web/cera_worker.js|(?<pre>^console\.info\('\[cera:worker:version\] v)(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post> \()"
+  "flutter example appVersion|cera_ffi_flutter/example/lib/app_constants.dart|(?<pre>^\s*static const appVersion = 'v)(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>';)"
   "CeraChat project.yml from version|examples/CeraChat/project.yml|(?<pre>^\s*from:\s*\")(?<ver>[0-9]+\.[0-9]+\.[0-9]+)(?<post>\")"
 )
 
@@ -248,7 +252,7 @@ echo "  VERSION"
 echo "  Cargo.toml        (workspace.package + ${#PIN_CRATES[@]} internal cera pins)"
 echo "  pubspec.yaml      ${VERSION}${psuffix}"
 echo "  gradle.properties ${VERSION}${gsuffix}"
-echo "  cera_ffi_flutter  ${#PLUGIN_SITES[@]} pubspec + platform-manifest sites"
+echo "  plugin/web/example ${#PLUGIN_SITES[@]} pubspec, platform-manifest and display-literal sites"
 echo
 echo "Cargo.lock is tracked and records these crate versions, so refresh it before"
 echo "committing:  cargo metadata --offline >/dev/null  (then include it in the diff)."
