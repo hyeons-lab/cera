@@ -457,7 +457,7 @@ impl FastRpcDriver {
 
     /// The CDSP's own architecture, from FastRPC's capability query (`ARCH_VER`), or `None` when
     /// the driver has no such call, refuses it, or names an architecture no skel is shipped for.
-    /// A hint only: the skel that opens still decides ([`super::skels::probe_order`]).
+    /// A hint only: the skel that opens still decides (the probe order in `skels::probe_order`).
     pub fn detect_arch(&self) -> Option<super::device::HexagonArch> {
         let capability = match self.dsp_capability(ARCH_VER) {
             Ok(c) => c,

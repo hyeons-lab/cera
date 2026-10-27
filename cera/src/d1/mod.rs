@@ -30,8 +30,9 @@
 
 pub mod audio;
 pub mod causal;
-/// Opens the model files from disk, so it needs the `mmap` feature (wasm and other builds without
-/// file I/O use the lower-level model types).
+// Opens the model files from disk, so it needs the `mmap` feature (wasm and other builds without
+// file I/O use the lower-level model types). A plain comment: an outer doc here would merge with
+// the module's own docs and resolve their links from this scope.
 #[cfg(feature = "mmap")]
 pub mod engine;
 pub mod head;
