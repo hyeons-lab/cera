@@ -1714,17 +1714,17 @@ impl HexagonVisionEncoder {
                 so.proj_mid_off,
                 n_tokens,
             )?;
-            dispatch::gelu_tanh(
+            // the projector's GELU is the exact (erf) form, as the host projector's is: the
+            // skels' native op, one pass and no scratch
+            dispatch::gelu_erf(
                 session,
                 &scratch_guard,
                 so.proj_mid_off,
-                &scratch_guard,
-                so.gelu_tmp_off,
-                dispatch::gelu_tmp_rows(so.gelu_tmp_bytes, mid_dim)?,
                 TokenShape {
                     dim: mid_dim,
                     n_tokens,
                 },
+                TokenTile::Whole,
             )?;
             Self::dispatch_linear_m(
                 session,

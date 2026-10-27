@@ -505,9 +505,9 @@ pub(crate) fn gelu_tmp_rows(bytes: usize, dim: usize) -> Result<usize, CeraError
 /// 5e-4 of, absolute). The `UNARY_GELU` of the skels this crate bundled before the rebuild was
 /// not this: it was the quick approximation `x * sigmoid(1.702 x)`, up to about 2% per element
 /// away, which a wide down-projection turned into a 20% error in the vision transformer. The
-/// bundled skels now implement `UNARY_GELU` as the tanh form (and have `UnaryGeluErf`), so one
-/// native op could replace the sequence below once it is checked on a device against the CPU;
-/// until then this stays the verified path.
+/// bundled skels now implement `UNARY_GELU` as the tanh form and have `UnaryGeluErf`, which
+/// [`gelu_erf`] drives and which is the exact form (see there for the device measurement); the
+/// ViT blocks, trained with the tanh form, keep the sequence below.
 ///
 /// Computed as
 /// `x * sigmoid(2 sqrt(2/pi) * x * (1 + 0.044715 x^2))`, since
@@ -548,6 +548,29 @@ pub(crate) fn gelu_tanh<S: OpSink>(
         mul_inplace(session, buf, x_off, tmp, tmp_offset, rows, TokenTile::Whole)?;
     }
     Ok(())
+}
+
+/// In-place GELU, exact (erf) form, by the skels' native `UnaryGeluErf`: one op per tile and no
+/// scratch, against [`gelu_tanh`]'s five ops through a scratch region. This is the form
+/// `torch.nn.GELU()` uses, so no 5e-4 approximation error enters where a model was trained with
+/// it. Measured on a phone by the `device_gelu_*` tests: worst error against the exact GELU 4.8e-7
+/// over +-12 (the tanh sequence: 4.7e-4), and 1.8 ms against 4.0 ms for 1024 rows of 4096.
+pub(crate) fn gelu_erf<S: OpSink>(
+    session: &mut S,
+    buf: &S::Buf,
+    offset: usize,
+    shape: TokenShape,
+    tile: TokenTile,
+) -> Result<(), CeraError> {
+    unary_inplace(
+        session,
+        HtpOpCode::UnaryGeluErf,
+        "gelu_erf",
+        buf,
+        offset,
+        shape,
+        tile,
+    )
 }
 
 /// In-place natural logarithm: `buf = ln(buf)` (the inputs must be positive).
@@ -2041,6 +2064,274 @@ mod tests {
         // The final multiply writes the activation back in place.
         assert_eq!(s.dst(s.ops.len() - 1).offset, 96 * 64 * 2 * 4);
         assert_eq!(s.tensors[s.ops[s.ops.len() - 1].dst[0] as usize].buf, "x");
+    }
+
+    /// The native erf GELU is one op per row tile, in place, with no scratch.
+    #[test]
+    fn gelu_erf_is_one_in_place_op_per_tile() {
+        let mut s = RecordingSink::default();
+        let shape = TokenShape {
+            dim: 96,
+            n_tokens: 130,
+        };
+        gelu_erf(&mut s, &"x", 0, shape, TokenTile::Tiles(64)).unwrap();
+        assert_eq!(s.opcodes(), vec![HtpOpCode::UnaryGeluErf as u32; 3]);
+        for i in 0..3 {
+            assert_eq!(s.src(i, 0).offset, s.dst(i).offset, "in place");
+            assert_eq!(s.src(i, 0).buf, "x");
+        }
+    }
+
+    // ---- on a phone: the native erf GELU against the exact GELU and the tanh sequence ----
+    //
+    // Four steps, each its own test so a fault names the step. The first dispatch of an op no
+    // device test had run took a test phone down to a crash dump, so: step 1 runs only the
+    // known-good tanh sequence on a few vectors (the harness), step 2 one tiny `gelu_erf`,
+    // step 3 the accuracy sweep, step 4 the cost. Every step appends a line to the trace file
+    // and syncs it, so the last line names how far a crash got.
+    //
+    // Run: `cargo ndk -t arm64-v8a test -p cera --features hexagon --lib --no-run --release`,
+    // push the test binary, then `<bin> device_gelu_1 --ignored --nocapture`, and so on.
+
+    fn gelu_trace(line: &str) {
+        use std::io::Write as _;
+        eprintln!("{line}");
+        let path = std::env::var("CERA_GELU_TRACE")
+            .unwrap_or_else(|_| "/data/local/tmp/gelu-trace.log".into());
+        if let Ok(mut f) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
+        {
+            let _ = writeln!(f, "{line}");
+            let _ = f.sync_all();
+        }
+    }
+
+    struct GeluRig {
+        // the device closes its session on drop, so it must drop before the driver it uses:
+        // fields drop in declaration order
+        device: crate::backend::hexagon::HexagonDevice,
+        driver: std::sync::Arc<crate::backend::hexagon::FastRpcDriver>,
+    }
+
+    impl GeluRig {
+        fn open() -> Self {
+            use crate::backend::hexagon::{FastRpcDriver, probe_device};
+            // the skels travel inside the binary: stage them where the DSP's loader looks
+            let skels = std::env::var("CERA_SKEL_DIR")
+                .unwrap_or_else(|_| "/data/local/tmp/cera-gelu-skels".into());
+            gelu_trace("staging the skels");
+            crate::backend::hexagon::install_skels(std::path::Path::new(&skels))
+                .expect("stage the skels");
+            gelu_trace("loading the FastRPC driver");
+            let driver = FastRpcDriver::load().expect("FastRPC driver");
+            gelu_trace("opening a DSP session");
+            let device = probe_device(&driver, None).expect("open a DSP session");
+            gelu_trace("session open");
+            Self { device, driver }
+        }
+
+        /// Every buffer a batch names must be mapped into the CDSP (`map_to_dsp = true`): the
+        /// queue passes the DSP a file descriptor and never maps for the caller, and a batch over
+        /// an unmapped buffer faults the DSP (a hard crash of the test phone).
+        fn alloc(&self, bytes: usize) -> RpcmemBuffer {
+            RpcmemBuffer::alloc(self.driver.clone(), bytes, true).unwrap()
+        }
+
+        /// Give the buffers back to the DSP while the session is still open, as a model's
+        /// `Drop` does; unmapping them after the session is gone fails and ends in a segfault.
+        fn release(&mut self, bufs: &[&RpcmemBuffer]) {
+            self.device
+                .queue_session_mut()
+                .release_dsp_references(bufs.iter().copied());
+        }
+    }
+
+    use crate::backend::hexagon::RpcmemBuffer;
+
+    fn gelu_upload(buf: &RpcmemBuffer, values: &[f32]) {
+        unsafe {
+            std::ptr::copy_nonoverlapping(
+                values.as_ptr().cast::<u8>(),
+                buf.as_mut_ptr(),
+                values.len() * 4,
+            );
+        }
+        buf.flush_cpu_cache(0, values.len() * 4);
+    }
+
+    fn gelu_download(buf: &RpcmemBuffer, n: usize) -> Vec<f32> {
+        buf.invalidate_cpu_cache(0, n * 4);
+        let mut out = vec![0f32; n];
+        unsafe { std::ptr::copy_nonoverlapping(buf.as_mut_ptr(), out.as_mut_ptr().cast(), n * 4) };
+        out
+    }
+
+    /// `(worst absolute error, the x it is at, rms)` of `got` against the exact GELU of `input`.
+    fn gelu_error(got: &[f32], input: &[f32]) -> (f32, f32, f64) {
+        let mut exact = input.to_vec();
+        crate::d1::gelu_exact_inplace(&mut exact);
+        let (mut worst, mut at, mut sum_sq) = (0f32, 0f32, 0f64);
+        for ((g, e), x) in got.iter().zip(&exact).zip(input) {
+            let d = (g - e).abs();
+            if d > worst {
+                (worst, at) = (d, *x);
+            }
+            sum_sq += f64::from(d * d);
+        }
+        (worst, at, (sum_sq / got.len() as f64).sqrt())
+    }
+
+    fn gelu_ramp(n: usize, lo: f32, hi: f32) -> Vec<f32> {
+        (0..n)
+            .map(|i| lo + (hi - lo) * i as f32 / (n - 1) as f32)
+            .collect()
+    }
+
+    /// Step 1, the harness: the known-good tanh sequence on 2 rows of 128.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_gelu_1_harness_with_the_known_good_tanh_form() {
+        gelu_trace("== step 1: tanh GELU on 2x128");
+        let mut rig = GeluRig::open();
+        let (dim, tokens) = (128usize, 2usize);
+        let input = gelu_ramp(dim * tokens, -4.0, 4.0);
+        let buf = rig.alloc(dim * tokens * 4);
+        let tmp = rig.alloc(tokens * dim * 4);
+        gelu_upload(&buf, &input);
+        let session = rig.device.queue_session_mut();
+        let shape = TokenShape {
+            dim,
+            n_tokens: tokens,
+        };
+        gelu_trace("enqueue tanh");
+        gelu_tanh(session, &buf, 0, &tmp, 0, tokens, shape).unwrap();
+        gelu_trace("flush");
+        session.flush().unwrap();
+        gelu_trace("flushed");
+        let (worst, at, rms) = gelu_error(&gelu_download(&buf, dim * tokens), &input);
+        gelu_trace(&format!(
+            "step 1 done: tanh vs exact worst {worst:.3e} at x={at:.3}, rms {rms:.3e}"
+        ));
+        rig.release(&[&buf, &tmp]);
+        assert!(worst < 2e-3, "the tanh sequence is off by {worst}");
+    }
+
+    /// Step 2: one `gelu_erf` over the same 2x128.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_gelu_2_native_erf_on_a_few_vectors() {
+        gelu_trace("== step 2: native erf GELU on 2x128");
+        let mut rig = GeluRig::open();
+        let (dim, tokens) = (128usize, 2usize);
+        let input = gelu_ramp(dim * tokens, -4.0, 4.0);
+        let buf = rig.alloc(dim * tokens * 4);
+        gelu_upload(&buf, &input);
+        let session = rig.device.queue_session_mut();
+        let shape = TokenShape {
+            dim,
+            n_tokens: tokens,
+        };
+        gelu_trace("enqueue erf");
+        gelu_erf(session, &buf, 0, shape, TokenTile::Whole).unwrap();
+        gelu_trace("flush");
+        session.flush().unwrap();
+        gelu_trace("flushed");
+        let out = gelu_download(&buf, dim * tokens);
+        let (worst, at, rms) = gelu_error(&out, &input);
+        gelu_trace(&format!(
+            "step 2 done: erf vs exact worst {worst:.3e} at x={at:.3}, rms {rms:.3e}"
+        ));
+        rig.release(&[&buf]);
+        assert!(out.iter().all(|v| v.is_finite()), "non-finite output");
+    }
+
+    /// Step 3: accuracy of both forms over a wide ramp.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_gelu_3_accuracy_of_erf_against_tanh() {
+        gelu_trace("== step 3: accuracy on 8x4096, +-12");
+        let mut rig = GeluRig::open();
+        let (dim, tokens) = (4096usize, 8usize);
+        let n = dim * tokens;
+        let input: Vec<f32> = (0..n)
+            .map(|i| {
+                let u = i as f32 / (n - 1) as f32;
+                if i % 2 == 0 {
+                    -12.0 + 24.0 * u
+                } else {
+                    (u - 0.5) * 6.0
+                }
+            })
+            .collect();
+        let buf = rig.alloc(n * 4);
+        let tmp = rig.alloc(8 * dim * 4);
+        let session = rig.device.queue_session_mut();
+        let shape = TokenShape {
+            dim,
+            n_tokens: tokens,
+        };
+        gelu_upload(&buf, &input);
+        gelu_erf(session, &buf, 0, shape, TokenTile::Whole).unwrap();
+        session.flush().unwrap();
+        let erf_out = gelu_download(&buf, n);
+        gelu_upload(&buf, &input);
+        gelu_tanh(session, &buf, 0, &tmp, 0, 8, shape).unwrap();
+        session.flush().unwrap();
+        let tanh_out = gelu_download(&buf, n);
+        let (ea, ex, er) = gelu_error(&erf_out, &input);
+        let (ta, tx, tr) = gelu_error(&tanh_out, &input);
+        gelu_trace(&format!(
+            "native erf : worst abs {ea:.3e} at x={ex:.3}, rms {er:.3e}"
+        ));
+        gelu_trace(&format!(
+            "tanh (5 op): worst abs {ta:.3e} at x={tx:.3}, rms {tr:.3e}"
+        ));
+        rig.release(&[&buf, &tmp]);
+        assert!(erf_out.iter().all(|v| v.is_finite()), "non-finite output");
+        assert!(
+            ea <= ta,
+            "the native erf op ({ea:.3e}) is coarser than the tanh sequence ({ta:.3e})"
+        );
+    }
+
+    /// Step 4: cost of both at a projector's shape, 1024 rows of 4096, in place.
+    #[test]
+    #[ignore = "needs a Hexagon NPU"]
+    fn device_gelu_4_cost_of_erf_against_tanh() {
+        use std::time::Instant;
+        gelu_trace("== step 4: cost on 1024x4096");
+        let mut rig = GeluRig::open();
+        let (dim, tokens, reps) = (4096usize, 1024usize, 20u32);
+        let big = rig.alloc(dim * tokens * 4);
+        let scratch = rig.alloc(64 * dim * 4);
+        let fill: Vec<f32> = (0..dim * tokens)
+            .map(|i| ((i % 977) as f32 - 488.0) / 61.0)
+            .collect();
+        gelu_upload(&big, &fill);
+        let session = rig.device.queue_session_mut();
+        let shape = TokenShape {
+            dim,
+            n_tokens: tokens,
+        };
+        let mut time = |run: &mut dyn FnMut(&mut HexagonQueueSession)| {
+            run(session);
+            session.flush().unwrap();
+            let start = Instant::now();
+            for _ in 0..reps {
+                run(session);
+                session.flush().unwrap();
+            }
+            start.elapsed().as_secs_f64() * 1e3 / f64::from(reps)
+        };
+        let erf_ms = time(&mut |s| gelu_erf(s, &big, 0, shape, TokenTile::Whole).unwrap());
+        gelu_trace(&format!("native erf {erf_ms:.3} ms"));
+        let tanh_ms = time(&mut |s| gelu_tanh(s, &big, 0, &scratch, 0, 64, shape).unwrap());
+        gelu_trace(&format!(
+            "step 4 done: native erf {erf_ms:.3} ms, tanh sequence {tanh_ms:.3} ms"
+        ));
+        rig.release(&[&big, &scratch]);
     }
 
     /// The sequence computes the tanh GELU (not the DSP's quick GELU, which is
