@@ -939,6 +939,10 @@ enum Command {
         /// `blk.*.ffn_down.weight=q8_0`); repeatable, first match wins.
         #[arg(long = "tensor-override")]
         tensor_overrides: Vec<String>,
+
+        /// Convert the multimodal projector (`mmproj`) instead of the text backbone.
+        #[arg(long)]
+        mmproj: bool,
     },
 
     /// Answer named questions about a state with a d1 decision model.
@@ -3550,6 +3554,22 @@ fn check_vad_npu_dropout(npu: bool, accelerated: bool) -> Result<()> {
     Ok(())
 }
 
+/// The `convert` flag that `--mmproj` would silently ignore: the projector is written with
+/// the plain `--quant` policy, so a non-default `--strategy` or any `--tensor-override`
+/// is refused rather than producing a file that does not honour it.
+fn mmproj_ignored_flag(
+    strategy: cera::convert::QuantStrategy,
+    tensor_overrides: &[String],
+) -> Option<&'static str> {
+    if !matches!(strategy, cera::convert::QuantStrategy::Auto) {
+        Some("--strategy")
+    } else if !tensor_overrides.is_empty() {
+        Some("--tensor-override")
+    } else {
+        None
+    }
+}
+
 /// The `--quant`/`--strategy` pair the Convert and parity arms share, parsed together so a
 /// new spelling or message cannot land in one arm and not the other.
 fn parse_quant_pair(
@@ -4045,7 +4065,8 @@ fn main() -> Result<()> {
                 // would overreport the prefill frame count.
                 let kv_after_prefill = session.position();
 
-                let opts = build_opts(&engine, grammar_compiled.clone(), Vec::new());
+                let mut opts = build_opts(&engine, grammar_compiled.clone(), Vec::new());
+                opts.audio_mode = cera::AudioOutputMode::TextOnly;
 
                 let mut sink = StdoutSink::new(tokenizer, session.cancel_handle());
                 let summary = session.generate(&opts, &mut sink)?;
@@ -4249,7 +4270,9 @@ fn main() -> Result<()> {
 
                 let mut all_pcm = Vec::new();
                 let sys = system.as_deref().unwrap_or("");
-                let mode = if sys.contains("interleaved") {
+                let mode = if sys.contains("interleaved")
+                    || sys.eq_ignore_ascii_case("Respond with both text and audio.")
+                {
                     cera::audio_engine::AudioMode::Interleaved
                 } else {
                     cera::audio_engine::AudioMode::Sequential
@@ -4405,7 +4428,8 @@ fn main() -> Result<()> {
                         (grammar_compiled.clone(), Vec::new())
                     };
 
-                let opts = build_opts(&engine, effective_grammar, trigger_tokens);
+                let mut opts = build_opts(&engine, effective_grammar, trigger_tokens);
+                opts.audio_mode = cera::AudioOutputMode::TextOnly;
 
                 // With tools, collect the reply (ChatSink streams + buffers) so
                 // tool calls can be parsed out afterward. Stream it to stderr so
@@ -4449,7 +4473,7 @@ fn main() -> Result<()> {
                 // The human summary goes to stderr. `writeln!` (not `println!`)
                 // so a closed pipe surfaces as an ignored error, not a panic.
                 if let (Some(fmt), Some(text)) = (tool_format, reply_text) {
-                    let calls = cera::tools::parse_tool_calls(&text, fmt)
+                    let calls = cera::tools::parse_tool_calls_with_tools(&text, fmt, &tool_defs)
                         .context("parsing tool calls from model reply")?;
                     if calls.is_empty() {
                         eprintln!("--- (no tool calls in reply)");
@@ -4484,19 +4508,28 @@ fn main() -> Result<()> {
             quant,
             strategy,
             tensor_overrides,
+            mmproj,
         } => {
             let (quant, strategy) = parse_quant_pair(&quant, &strategy)?;
-            let overrides = tensor_overrides
-                .iter()
-                .map(|s| {
-                    cera::convert::parse_tensor_override(s)
-                        .ok_or_else(|| anyhow::anyhow!("bad --tensor-override `{s}`"))
-                })
-                .collect::<anyhow::Result<Vec<_>>>()?;
-            cera::convert::quantize_safetensors_to_gguf_with_strategy(
-                &input, &output, quant, strategy, &overrides,
-            )
-            .context("converting the SafeTensors model")?;
+            if mmproj {
+                if let Some(flag) = mmproj_ignored_flag(strategy, &tensor_overrides) {
+                    anyhow::bail!("{flag} does not apply to --mmproj");
+                }
+                cera::convert::mmproj::convert_mmproj(&input, &output, quant)
+                    .context("converting the SafeTensors mmproj")?;
+            } else {
+                let overrides = tensor_overrides
+                    .iter()
+                    .map(|s| {
+                        cera::convert::parse_tensor_override(s)
+                            .ok_or_else(|| anyhow::anyhow!("bad --tensor-override `{s}`"))
+                    })
+                    .collect::<anyhow::Result<Vec<_>>>()?;
+                cera::convert::quantize_safetensors_to_gguf_with_strategy(
+                    &input, &output, quant, strategy, &overrides,
+                )
+                .context("converting the SafeTensors model")?;
+            }
             let bytes = std::fs::metadata(&output).map(|m| m.len()).unwrap_or(0);
             println!("{} ({bytes} bytes)", output.display());
         }
@@ -6728,6 +6761,21 @@ mod tests {
     };
     use cera::tokenizer::ChatMessage;
     use clap::Parser;
+
+    #[test]
+    fn mmproj_refuses_the_convert_flags_it_would_ignore() {
+        use super::mmproj_ignored_flag;
+        use cera::convert::QuantStrategy;
+        assert_eq!(mmproj_ignored_flag(QuantStrategy::Auto, &[]), None);
+        assert_eq!(
+            mmproj_ignored_flag(QuantStrategy::Hqq, &[]),
+            Some("--strategy")
+        );
+        assert_eq!(
+            mmproj_ignored_flag(QuantStrategy::Auto, &["blk.*=q4_0".to_string()]),
+            Some("--tensor-override")
+        );
+    }
 
     /// Write a metadata-only GGUF with the given string and u32 keys.
     fn write_whisper_fixture(path: &Path, strings: &[(&str, &str)], u32s: &[(&str, u32)]) {

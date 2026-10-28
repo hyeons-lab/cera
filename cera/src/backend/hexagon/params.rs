@@ -610,6 +610,57 @@ pub fn build_binary_kernel_params(
     kparams
 }
 
+/// `htp_binary_kernel_params::kernel_type` of the per-row scalar worker
+/// (`HTP_BINARY_KERNEL_SCALAR_DMA`): `src1` is a contiguous `[1, ne11]` table that
+/// the DSP stages in VTCM, and row `i` of `src0` is combined with `table[i % ne11]`.
+pub(crate) const HTP_BINARY_KERNEL_SCALAR_DMA: i32 = 2;
+
+/// Kernel parameters for a binary op whose second operand is a per-row scalar
+/// table (`src1 = [1, ne11]`, contiguous), as `ggml_hexagon_precompute_binary_params`
+/// builds them for `HTP_BINARY_KERNEL_SCALAR_DMA`.
+///
+/// `rows_per_buffer` is capped at 16 so the reported footprint stays small. The DSP
+/// recomputes the real block size from its own VTCM size and ignores `kparams[2]` and
+/// `kparams[7]` (they are reported values only), so what this checks is that the staged
+/// `src1` table plus one double-buffered row per thread fits `vtcm_size`: `None` when it
+/// does not, as for [`build_binary_scalar_kernel_params`], rather than a DSP
+/// `VTCM_TOO_SMALL` at run time.
+pub(crate) fn build_binary_scalar_dma_kernel_params(
+    ne00: usize,
+    ne11: usize,
+    elem_size: usize,
+    vtcm_size: usize,
+    n_threads: u32,
+) -> Option<[i32; 32]> {
+    const MAX_ROWS_PER_BUFFER: usize = 16;
+    let mut kparams = [0i32; 32];
+    let n_threads = n_threads.max(1) as usize;
+
+    let src0_row_size_aligned = align128(ne00 * elem_size);
+    let src1_row_size_aligned = align128(elem_size);
+    let dst_row_size_aligned = align128(ne00 * elem_size);
+    let src1_size = align128(ne11 * elem_size);
+
+    let spad_row_total = 2 * (src0_row_size_aligned + dst_row_size_aligned);
+    if src1_size + spad_row_total * n_threads > vtcm_size {
+        return None;
+    }
+    let avail = vtcm_size - src1_size;
+    let rows_per_buffer =
+        (avail / (spad_row_total * n_threads).max(1)).clamp(1, MAX_ROWS_PER_BUFFER);
+    let total_vtcm = rows_per_buffer * spad_row_total * n_threads + src1_size;
+
+    kparams[0] = HTP_BINARY_KERNEL_SCALAR_DMA;
+    kparams[1] = n_threads as i32;
+    kparams[2] = rows_per_buffer as i32;
+    kparams[3] = src0_row_size_aligned as i32;
+    kparams[4] = src1_row_size_aligned as i32;
+    kparams[5] = dst_row_size_aligned as i32;
+    kparams[6] = src1_size as i32;
+    kparams[7] = total_vtcm as i32;
+    Some(kparams)
+}
+
 /// Host-computed parameters for RoPE positional embeddings.
 pub fn build_rope_params(
     n_dims: usize,
@@ -633,14 +684,29 @@ pub fn build_rope_params(
 
 /// Build kernel parameters for RoPE dispatch.
 ///
-/// Mirrors `htp_rope_kernel_params` plus `htp_rope_vtcm_layout_build` with no
-/// frequency factors (plain RoPE, no YaRN scaling).
+/// Mirrors `htp_rope_kernel_params` plus `htp_rope_vtcm_layout_build` (plain
+/// RoPE, no YaRN scaling, no frequency factors).
 pub fn build_rope_kernel_params(
     n_dims: usize,
     nrows: usize,
     ne1: usize,
     ne2: usize,
     n_threads: u32,
+) -> [i32; 32] {
+    build_rope_kernel_params_with_freq_factors(n_dims, nrows, ne1, ne2, n_threads, 0)
+}
+
+/// [`build_rope_kernel_params`] with the optional frequency-factor source (`lfm3`'s
+/// partial rotary on its global layers): `n_freq_factors` is its length in `f32`s (`0` =
+/// none). Its 256-aligned slot follows the per-thread slabs and the total grows by the
+/// same amount.
+pub fn build_rope_kernel_params_with_freq_factors(
+    n_dims: usize,
+    nrows: usize,
+    ne1: usize,
+    ne2: usize,
+    n_threads: u32,
+    n_freq_factors: usize,
 ) -> [i32; 32] {
     let mut kparams = [0i32; 32];
     let n_threads = n_threads.max(1) as usize;
@@ -649,7 +715,9 @@ pub fn build_rope_kernel_params(
     let theta_aligned = align256(row_size);
     // HTP_ROPE_SPAD_NROWS = HTP_ROPE_SPAD_BLOCK(8) * HTP_ROPE_SPAD_NSLOTS(4)
     let bytes_per_thread = theta_aligned + 32 * row_aligned;
-    let total = bytes_per_thread * n_threads;
+    // the optional frequency-factor vector sits after the per-thread slabs
+    let freq_factors_size = align256(n_freq_factors * 4);
+    let total = bytes_per_thread * n_threads + freq_factors_size;
 
     kparams[0] = n_threads as i32;
     kparams[1] = nrows as i32;
@@ -659,7 +727,7 @@ pub fn build_rope_kernel_params(
     kparams[5] = theta_aligned as i32;
     kparams[6] = row_aligned as i32;
     kparams[7] = (bytes_per_thread * n_threads) as i32;
-    kparams[8] = 0;
+    kparams[8] = freq_factors_size as i32;
     let div_ne2_ne1 = init_fastdiv((ne2 * ne1) as u32);
     kparams[9] = div_ne2_ne1.mp as i32;
     kparams[10] = div_ne2_ne1.l as i32;
@@ -2821,6 +2889,25 @@ mod tests {
         assert!(build_binary_scalar_kernel_params(64, 1000, 8).is_none());
     }
 
+    /// The per-row scalar worker's descriptor: kernel type 2, the staged table size and
+    /// row sizes aligned to 128, and a refusal when one row per thread cannot fit.
+    #[test]
+    fn scalar_dma_kernel_params_follow_the_host_precompute() {
+        // 128 floats per row (512 B), a 64-entry table (256 B), 4 threads
+        let k = build_binary_scalar_dma_kernel_params(128, 64, 4, 8 << 20, 4).unwrap();
+        assert_eq!((k[0], k[1], k[2]), (HTP_BINARY_KERNEL_SCALAR_DMA, 4, 16));
+        assert_eq!((k[3], k[4], k[5], k[6]), (512, 128, 512, 256));
+        assert_eq!(k[7] as usize, 16 * 2 * (512 + 512) * 4 + 256);
+        // a wide row shrinks the block to what fits
+        let k = build_binary_scalar_dma_kernel_params(65536, 8, 4, 8 << 20, 4).unwrap();
+        assert!(k[2] >= 1 && k[2] < 16, "{}", k[2]);
+        assert!(k[7] as usize <= 8 << 20);
+        // not even one double-buffered row per thread: a refusal, not a clipped layout
+        assert!(build_binary_scalar_dma_kernel_params(65536, 8, 4, 1 << 20, 4).is_none());
+        // the table alone overflowing is a refusal too
+        assert!(build_binary_scalar_dma_kernel_params(128, 1 << 20, 4, 1 << 20, 1).is_none());
+    }
+
     #[test]
     fn test_fastdiv_basic() {
         let divisors = [1, 2, 3, 5, 7, 10, 16, 32, 64, 128, 256, 1024, 4096];
@@ -2879,6 +2966,20 @@ mod tests {
         assert_eq!(rope[4], 4096);
         assert_eq!(rope[5], (10000.0f32).to_bits() as i32);
         assert_eq!(rope[6], (1.0f32).to_bits() as i32);
+
+        // No factors: the slot is empty and sits right after the 4 per-thread slabs.
+        let plain = build_rope_kernel_params(128, 16, 16, 1, 4);
+        assert_eq!((plain[3], plain[7], plain[8]), (4 * 16896, 4 * 16896, 0));
+        // 64 factors (one per pair of a 128-wide head): a 256-byte slot after the
+        // slabs, counted in the total VTCM size and nowhere else.
+        let ff = build_rope_kernel_params_with_freq_factors(128, 16, 16, 1, 4, 64);
+        assert_eq!((ff[3], ff[7], ff[8]), (4 * 16896 + 256, 4 * 16896, 256));
+        assert_eq!(ff[4], plain[4]);
+        // 65 factors spill into a second aligned block.
+        assert_eq!(
+            build_rope_kernel_params_with_freq_factors(128, 16, 16, 1, 4, 65)[8],
+            512
+        );
 
         let mm = build_mul_mat_kernel_params(HtpDataType::Q8_0, 1024, 1, 1, 4096, 4, 8 << 20);
         let mm = MmKernelParams::from_words(&mm);

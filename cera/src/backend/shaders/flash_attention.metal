@@ -88,6 +88,7 @@ inline void flash_attention_impl(
     uint kv_dim = params.kv_dim;
     uint seq_len = params.seq_len;
     float scale = as_type<float>(params.scale_bits);
+    uint min_pos = params._pad0;
 
     uint group_size = n_heads / n_kv_heads;
     uint kv_head = head / group_size;
@@ -100,7 +101,7 @@ inline void flash_attention_impl(
     // Defensive early returns for dispatches that would corrupt TG memory
     // or produce NaN. The Rust side asserts these preconditions at dispatch
     // (encode_attention / encode_attention_q_offset), so these branches are
-    // belt-and-suspenders — but the cost is one compare+branch per thread.
+    // belt-and-suspenders, and the cost is one compare+branch per thread.
     //
     // head_dim > MAX_HEAD_DIM would overflow both the static q_shared
     // array (written at line ~100) and the partials_tg array (indexed
@@ -110,16 +111,16 @@ inline void flash_attention_impl(
     if (head_dim > MAX_HEAD_DIM) {
         return;
     }
-    // seq_len=0 leaves running_sum=0 → inv_sum=inf → NaN in the epilogue.
+    // seq_len <= min_pos leaves running_sum=0 -> inv_sum=inf -> NaN in the epilogue.
     // Write zeros and bail.
-    if (seq_len == 0u) {
+    if (seq_len <= min_pos) {
         if (tid < head_dim) {
             out[q_offset + tid] = 0.0f;
         }
         return;
     }
 
-    // Load Q once into shared memory. head_dim ≤ MAX_HEAD_DIM=128 is
+    // Load Q once into shared memory. head_dim <= MAX_HEAD_DIM=128 is
     // guaranteed by both the host-side assertion in encode_attention() and
     // the in-kernel early return above, so this q_shared write and the
     // partials_tg indexing in the epilogue are always within static bounds.
@@ -136,13 +137,12 @@ inline void flash_attention_impl(
     // Ceil-div so head_dim not a multiple of 32 is still fully covered
     // by the generic V-accum path (the `if (d < head_dim)` bounds check
     // masks the tail lanes). Classic attention.metal uses floor-div, which
-    // silently drops dims 32..hd-1 for hd like 48 or 80 — not triggered by
-    // any current LFM2 model but worth fixing here.
+    // silently drops dims 32..hd-1 for hd like 48 or 80.
     uint dims_per_lane = (head_dim + 31u) / 32u;
     if (dims_per_lane > 8u) dims_per_lane = 8u;
     uint hd4 = head_dim / 4u;
 
-    for (uint tile_start = 0u; tile_start < seq_len; tile_start += TILE) {
+    for (uint tile_start = min_pos; tile_start < seq_len; tile_start += TILE) {
         uint tile_len = min(TILE, seq_len - tile_start);
 
         // --- Phase 1: QK scoring (all 256 threads). ---

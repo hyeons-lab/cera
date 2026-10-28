@@ -4,6 +4,14 @@
 use super::encoder::{AttnRoute, AttnStage, ConvWindow, EncoderShape, LongBuf, LongChunk};
 use super::*;
 
+/// Where the next short-conv state sits inside the `[taps - 1 + m, C]` window just
+/// built for a chunk of `m` tokens: the last `taps - 1` columns of every channel
+/// row. Returns `(byte offset of the first kept column, byte stride between channel
+/// rows)`. Exact for every `m >= 1`, so decode (`m = 1`) and prefill share it.
+pub(super) fn conv_state_writeback(taps: usize, m: usize) -> (usize, usize) {
+    (m * 4, (taps - 1 + m) * 4)
+}
+
 impl HexagonLfmModel {
     /// Softmax scale of the attention layers.
     pub(super) fn attn_scale(&self) -> f32 {
@@ -221,6 +229,51 @@ impl HexagonLfmModel {
         Ok(())
     }
 
+    /// Host-CPU RoPE of one row's Q and K (`CERA_HEXAGON_CPU_ROPE=1`, or a model that needs
+    /// it). `lfm3`'s global layers rotate NEOX with the `rope_freqs` partial-rotary mask
+    /// (the shared host route ignores factors for NEOX, like the CPU reference does for every
+    /// other model); every other layer takes the shared route.
+    #[allow(clippy::too_many_arguments)]
+    pub(super) fn host_rope_row(
+        &self,
+        attn: &HexagonAttentionLayer,
+        rope_scratch: &mut crate::model::llama::RopeGather,
+        q: &mut [f32],
+        k: &mut [f32],
+        pos: usize,
+        heads: (usize, usize),
+        head_dim: usize,
+        rope_theta: f32,
+    ) {
+        let (n_heads, n_kv_heads) = heads;
+        if attn.rope_freqs_offset.is_some() && self.rope_type == RopeType::Neox {
+            crate::backend::cpu::rope_neox_freq_factors(
+                q,
+                k,
+                pos,
+                heads,
+                head_dim,
+                rope_theta,
+                self.dense.rope_freqs.as_deref(),
+            );
+        } else {
+            host_rope(
+                rope_scratch,
+                self.rope_type,
+                attn.yarn.as_ref(),
+                self.dense.rope_freqs.as_deref(),
+                q,
+                k,
+                pos,
+                n_heads,
+                n_kv_heads,
+                head_dim,
+                self.dense.rope_dim.unwrap_or(head_dim),
+                rope_theta,
+            );
+        }
+    }
+
     /// Ops of one attention layer for either pass. Shared: block norm, QKV
     /// projections and biases, the Qwen 3.5 output-gate split, Q/K norms, host
     /// RoPE, attention temperature, the gate multiply, the output bias,
@@ -278,7 +331,7 @@ impl HexagonLfmModel {
         let head_dim = self.config.head_dim;
         let n_heads = self.config.n_heads;
         let max_seq_len = self.config.max_seq_len;
-        let rope_theta = self.config.rope_theta;
+        let rope_theta = attn.rope_theta.unwrap_or(self.config.rope_theta);
         let attn_scale = self.attn_scale();
         let n_kv_heads = attn.kv_dim / head_dim;
         let q_dim = attn.q_dim;
@@ -292,6 +345,9 @@ impl HexagonLfmModel {
         let (pos_buf, pos_off) = route.pos.unwrap_or((scratch, so.pos));
         let (q_buf, q_off) = route.q.unwrap_or((scratch, so.q));
 
+        // `lfm3`'s per-head gate values, computed with the front of the layer and read by its back;
+        // a layer-outer encoder pass splits the two, and its blocker refuses a gated layer
+        let mut head_gate_values: Option<usize> = None;
         if stage != AttnStage::Back {
             // Block norm (post-norm architectures, Olmo 2/3, project the raw
             // residual stream and norm the block output instead).
@@ -330,6 +386,67 @@ impl HexagonLfmModel {
                 self.dispatch_bias_add(session, scratch, so.q, q_bias, q_dim, rows)?;
                 self.dispatch_bias_add(session, scratch, so.k, k_bias, kv_dim, rows)?;
                 self.dispatch_bias_add(session, scratch, so.v, v_bias, kv_dim, rows)?;
+            }
+            // `lfm3`'s per-head gate, from the block input: `gate = sigmoid(attn_gate @ x)`,
+            // one value per head, later scaling that head's attention output. The weight
+            // is planned padded to 32 outputs (a multiple of the matmul tile; the extra
+            // rows are zero), so the projection lands as `[rows, 32]` and prefill packs the
+            // valid heads into a contiguous `[rows * n_heads]` table, the layout the
+            // per-row scalar multiply reads.
+            let head_gate_table = so.conv_t0;
+            let head_gate_packed = so.conv_t1;
+            head_gate_values = match attn.head_gate {
+                Some(gate) if decode => {
+                    self.dispatch_mul_mat(
+                        session,
+                        &self.weights_buf,
+                        &gate,
+                        scratch,
+                        attn_in,
+                        scratch,
+                        head_gate_table,
+                    )?;
+                    Some(head_gate_table)
+                }
+                Some(gate) => {
+                    self.dispatch_mul_mat_m(
+                        session,
+                        &self.weights_buf,
+                        &gate,
+                        scratch,
+                        attn_in,
+                        scratch,
+                        head_gate_table,
+                        rows,
+                    )?;
+                    Self::dispatch_cpy_2d(
+                        session,
+                        scratch,
+                        head_gate_table,
+                        n_heads,
+                        rows,
+                        4,
+                        gate.out_dim * 4,
+                        scratch,
+                        head_gate_packed,
+                        4,
+                        n_heads * 4,
+                    )?;
+                    Some(head_gate_packed)
+                }
+                None => None,
+            };
+            if let Some(values) = head_gate_values {
+                Self::dispatch_unary_rows(
+                    session,
+                    scratch,
+                    values,
+                    scratch,
+                    values,
+                    n_heads,
+                    rows,
+                    HtpOpCode::UnarySigmoid,
+                )?;
             }
             if attn.has_q_gate {
                 // Qwen 3.5 fuses the output gate into Q: per row `[head, (q | gate)]`.
@@ -432,18 +549,14 @@ impl HexagonLfmModel {
                             scratch.as_mut_ptr().add(so.k + mm * kv_dim * 4) as *mut f32,
                             kv_dim,
                         );
-                        host_rope(
+                        self.host_rope_row(
+                            attn,
                             &mut rope_scratch,
-                            self.rope_type,
-                            attn.yarn.as_ref(),
-                            self.dense.rope_freqs.as_deref(),
                             q,
                             k,
                             first_pos + mm,
-                            n_heads,
-                            n_kv_heads,
+                            (n_heads, n_kv_heads),
                             head_dim,
-                            self.dense.rope_dim.unwrap_or(head_dim),
                             rope_theta,
                         );
                     }
@@ -452,6 +565,11 @@ impl HexagonLfmModel {
                 scratch.flush_cpu_cache(so.k, k_bytes);
             } else {
                 let rope_mode = self.rope_type.htp_mode();
+                // `head_dim / 2` factors, one per rotated pair (checked against the
+                // GGUF at load)
+                let freq_factors = attn
+                    .rope_freqs_offset
+                    .map(|offset| (&self.weights_buf, offset, head_dim / 2));
                 for (act, heads) in [(so.q, n_heads), (so.k, n_kv_heads)] {
                     if decode {
                         Self::dispatch_rope(
@@ -465,6 +583,7 @@ impl HexagonLfmModel {
                             max_seq_len,
                             rope_theta,
                             rope_mode,
+                            freq_factors,
                         )?;
                     } else {
                         Self::dispatch_rope_m(
@@ -479,6 +598,7 @@ impl HexagonLfmModel {
                             max_seq_len,
                             rope_theta,
                             rope_mode,
+                            freq_factors,
                         )?;
                     }
                 }
@@ -622,6 +742,20 @@ impl HexagonLfmModel {
             );
         }
 
+        if let Some(values) = head_gate_values {
+            // attn_out is `[rows][n_heads][head_dim]`: one row per (token, head).
+            Self::dispatch_mul_per_row_scalar(
+                session,
+                scratch,
+                so.attn_out,
+                scratch,
+                values,
+                scratch,
+                so.attn_out,
+                head_dim,
+                rows * n_heads,
+            )?;
+        }
         if attn.has_q_gate {
             Self::dispatch_unary_rows(
                 session,
@@ -794,7 +928,70 @@ impl HexagonLfmModel {
             3 * hs,
         );
 
-        if self.use_ssm_conv {
+        if conv.d_conv != 3 {
+            // Any other kernel width (`lfm3`'s 7 taps): the state is the previous
+            // `d_conv - 1` bx values per channel, `[C, d_conv - 1]` channel-major.
+            // Prepend it to bx with one CONCAT into `conv_x [d_conv, C]`, run SsmConv,
+            // then the next state is simply conv_x's last `d_conv - 1` columns: one
+            // strided copy out of scratch, with no overlapping read/write in the
+            // state slab (the 3-tap sequence below needs a staged shift for that).
+            let taps = conv.d_conv;
+            let slots = taps - 1;
+            Self::dispatch_mul(
+                session,
+                scratch,
+                so.conv_in,
+                HTP_TENSOR_COMPUTE,
+                scratch,
+                so.conv_in + 2 * hs * 4,
+                HTP_TENSOR_COMPUTE,
+                scratch,
+                so.conv_bx,
+                hs,
+            )?;
+            Self::dispatch_concat_2d(
+                session,
+                &self.kv_state_buf,
+                conv.state_offset,
+                slots,
+                scratch,
+                so.conv_bx,
+                1,
+                hs * 4,
+                4,
+                scratch,
+                so.conv_x,
+                hs,
+            )?;
+            self.dispatch_ssm_conv(
+                session,
+                &self.weights_buf,
+                conv.conv_ssm_offset,
+                scratch,
+                so.conv_x,
+                scratch,
+                so.conv_ssm_y,
+                taps,
+                hs,
+                1,
+            )?;
+            Self::dispatch_cpy(session, scratch, so.conv_ssm_y, scratch, so.conv_y, hs)?;
+            self.dump_hidden(session, scratch, layer_idx, "(conv) ssm-y", so.conv_y, hs);
+            let (src_offset, src_nb1) = conv_state_writeback(taps, 1);
+            Self::dispatch_cpy_2d(
+                session,
+                scratch,
+                so.conv_x + src_offset,
+                slots,
+                hs,
+                4,
+                src_nb1,
+                &self.kv_state_buf,
+                conv.state_offset,
+                4,
+                slots * 4,
+            )?;
+        } else if self.use_ssm_conv {
             // bx = b * x (M=1 rows are contiguous, as in the manual path)
             Self::dispatch_mul(
                 session,
@@ -1042,6 +1239,21 @@ impl HexagonLfmModel {
             cur_normed,
         )?;
 
+        if let Some(post_norm_offset) = conv.post_norm_offset {
+            Self::dispatch_rms_norm_mul(
+                session,
+                scratch,
+                cur_normed,
+                &self.weights_buf,
+                post_norm_offset,
+                scratch,
+                cur_normed,
+                eps,
+                hs,
+                1,
+            )?;
+        }
+
         self.dump_hidden(
             session,
             scratch,
@@ -1068,7 +1280,7 @@ impl HexagonLfmModel {
             session,
             &conv.ffn,
             conv.ffn_norm_offset,
-            None,
+            conv.ffn_post_norm_offset,
             layer_idx,
             next_act,
             cur_normed,
@@ -1154,127 +1366,177 @@ impl HexagonLfmModel {
             3 * hs * 4,
             3 * hs * 4,
         )?;
-        // State prepend: CONCAT(state-as-[2, hs] + bx-as-[m,
-        // hs]) into conv_x `[ncs, hs]`, time-inner: one op
-        // replacing the s0/s1 scatter plus the bx transpose.
-        Self::dispatch_concat_2d(
-            session,
-            &self.kv_state_buf,
-            conv.state_offset,
-            2,
-            scratch,
-            so.conv_bx,
-            m,
-            hs * 4,
-            4,
-            scratch,
-            so.conv_x,
-            hs,
-        )?;
-        self.debug_barrier(session, "prefill conv/scatter")?;
-        self.dispatch_ssm_conv(
-            session,
-            &self.weights_buf,
-            conv.conv_ssm_offset,
-            scratch,
-            so.conv_x,
-            scratch,
-            so.conv_ssm_y,
-            3,
-            hs,
-            m,
-        )?;
-        self.debug_barrier(session, "prefill conv/ssm-only")?;
-        // No transpose: the SsmConv worker writes token t's C
-        // values at `t * C` (dst dim-1 stride is the token
-        // stride), so `conv_ssm_y` already holds [M, C]
-        // row-major. The gate and out_proj below read it
-        // directly; the old strided copy was an identity that
-        // took the firmware's scalar reshape path (10x wall
-        // past m=128).
-        // State writeback into the interleaved `[C, 2]` slots
-        // (slot t at `state + c*8 + t*4`): last two bx rows
-        // when m>=2, else shift + insert.
-        if m >= 2 {
-            // The last two rows are adjacent: one contiguous copy into this layer's slot.
-            Self::dispatch_cpy(
+        if conv.d_conv != 3 {
+            // Any other kernel width: prepend the `d_conv - 1` state columns to the
+            // m bx rows (`conv_x [d_conv - 1 + m, hs]`), run SsmConv, and keep the
+            // last `d_conv - 1` columns as the next state (see the decode path).
+            let taps = conv.d_conv;
+            let slots = taps - 1;
+            Self::dispatch_concat_2d(
                 session,
-                scratch,
-                so.conv_bx + (m - 2) * hs * 4,
-                scratch,
-                stage,
-                2 * hs,
-            )?;
-            Self::dispatch_cpy_2d(
-                session,
-                scratch,
-                stage,
-                hs,
-                1,
-                4,
-                hs * 4,
                 &self.kv_state_buf,
                 conv.state_offset,
-                8,
-                8,
+                slots,
+                scratch,
+                so.conv_bx,
+                m,
+                hs * 4,
+                4,
+                scratch,
+                so.conv_x,
+                hs,
             )?;
+            self.debug_barrier(session, "prefill conv/scatter")?;
+            self.dispatch_ssm_conv(
+                session,
+                &self.weights_buf,
+                conv.conv_ssm_offset,
+                scratch,
+                so.conv_x,
+                scratch,
+                so.conv_ssm_y,
+                taps,
+                hs,
+                m,
+            )?;
+            self.debug_barrier(session, "prefill conv/ssm-only")?;
+            let (src_offset, src_nb1) = conv_state_writeback(taps, m);
             Self::dispatch_cpy_2d(
                 session,
                 scratch,
-                stage + hs * 4,
+                so.conv_x + src_offset,
+                slots,
                 hs,
-                1,
                 4,
-                hs * 4,
+                src_nb1,
                 &self.kv_state_buf,
-                conv.state_offset + 4,
-                8,
-                8,
+                conv.state_offset,
+                4,
+                slots * 4,
             )?;
         } else {
-            Self::dispatch_cpy(session, scratch, so.conv_bx, scratch, stage, hs)?;
-            // Shift via scratch temp: odd->even overlaps in
-            // the state slab, and CPY has memcpy (not
-            // memmove) semantics.
-            Self::dispatch_cpy_2d(
+            // State prepend: CONCAT(state-as-[2, hs] + bx-as-[m,
+            // hs]) into conv_x `[ncs, hs]`, time-inner: one op
+            // replacing the s0/s1 scatter plus the bx transpose.
+            Self::dispatch_concat_2d(
                 session,
-                &self.kv_state_buf,
-                conv.state_offset + 4,
-                hs,
-                1,
-                8,
-                8,
-                scratch,
-                so.conv_t0,
-                4,
-                hs * 4,
-            )?;
-            Self::dispatch_cpy_2d(
-                session,
-                scratch,
-                so.conv_t0,
-                hs,
-                1,
-                4,
-                hs * 4,
                 &self.kv_state_buf,
                 conv.state_offset,
-                8,
-                8,
-            )?;
-            Self::dispatch_cpy_2d(
-                session,
+                2,
                 scratch,
-                stage,
-                hs,
-                1,
-                4,
+                so.conv_bx,
+                m,
                 hs * 4,
-                &self.kv_state_buf,
-                conv.state_offset + 4,
-                8,
-                8,
+                4,
+                scratch,
+                so.conv_x,
+                hs,
             )?;
+            self.debug_barrier(session, "prefill conv/scatter")?;
+            self.dispatch_ssm_conv(
+                session,
+                &self.weights_buf,
+                conv.conv_ssm_offset,
+                scratch,
+                so.conv_x,
+                scratch,
+                so.conv_ssm_y,
+                3,
+                hs,
+                m,
+            )?;
+            self.debug_barrier(session, "prefill conv/ssm-only")?;
+            // No transpose: the SsmConv worker writes token t's C
+            // values at `t * C` (dst dim-1 stride is the token
+            // stride), so `conv_ssm_y` already holds [M, C]
+            // row-major. The gate and out_proj below read it
+            // directly; the old strided copy was an identity that
+            // took the firmware's scalar reshape path (10x wall
+            // past m=128).
+            // State writeback into the interleaved `[C, 2]` slots
+            // (slot t at `state + c*8 + t*4`): last two bx rows
+            // when m>=2, else shift + insert.
+            if m >= 2 {
+                // The last two rows are adjacent: one contiguous copy into this layer's slot.
+                Self::dispatch_cpy(
+                    session,
+                    scratch,
+                    so.conv_bx + (m - 2) * hs * 4,
+                    scratch,
+                    stage,
+                    2 * hs,
+                )?;
+                Self::dispatch_cpy_2d(
+                    session,
+                    scratch,
+                    stage,
+                    hs,
+                    1,
+                    4,
+                    hs * 4,
+                    &self.kv_state_buf,
+                    conv.state_offset,
+                    8,
+                    8,
+                )?;
+                Self::dispatch_cpy_2d(
+                    session,
+                    scratch,
+                    stage + hs * 4,
+                    hs,
+                    1,
+                    4,
+                    hs * 4,
+                    &self.kv_state_buf,
+                    conv.state_offset + 4,
+                    8,
+                    8,
+                )?;
+            } else {
+                Self::dispatch_cpy(session, scratch, so.conv_bx, scratch, stage, hs)?;
+                // Shift via scratch temp: odd->even overlaps in
+                // the state slab, and CPY has memcpy (not
+                // memmove) semantics.
+                Self::dispatch_cpy_2d(
+                    session,
+                    &self.kv_state_buf,
+                    conv.state_offset + 4,
+                    hs,
+                    1,
+                    8,
+                    8,
+                    scratch,
+                    so.conv_t0,
+                    4,
+                    hs * 4,
+                )?;
+                Self::dispatch_cpy_2d(
+                    session,
+                    scratch,
+                    so.conv_t0,
+                    hs,
+                    1,
+                    4,
+                    hs * 4,
+                    &self.kv_state_buf,
+                    conv.state_offset,
+                    8,
+                    8,
+                )?;
+                Self::dispatch_cpy_2d(
+                    session,
+                    scratch,
+                    stage,
+                    hs,
+                    1,
+                    4,
+                    hs * 4,
+                    &self.kv_state_buf,
+                    conv.state_offset + 4,
+                    8,
+                    8,
+                )?;
+            }
         }
         // Gate with the strided c third in place (no materialize).
         Self::dispatch_mul_m_strided(
@@ -1322,6 +1584,20 @@ impl HexagonLfmModel {
                 hs,
             );
         }
+        if let Some(post_norm_offset) = conv.post_norm_offset {
+            Self::dispatch_rms_norm_mul(
+                session,
+                scratch,
+                cur_normed,
+                &self.weights_buf,
+                post_norm_offset,
+                scratch,
+                cur_normed,
+                eps,
+                hs,
+                m,
+            )?;
+        }
         Self::dispatch_add_m(
             session, scratch, cur_act, scratch, cur_normed, scratch, next_act, hs, m,
         )?;
@@ -1338,7 +1614,7 @@ impl HexagonLfmModel {
             session,
             &conv.ffn,
             conv.ffn_norm_offset,
-            None,
+            conv.ffn_post_norm_offset,
             layer_idx,
             next_act,
             cur_normed,

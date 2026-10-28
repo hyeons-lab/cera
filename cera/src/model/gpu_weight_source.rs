@@ -189,6 +189,37 @@ pub trait GpuWeightSource {
     fn attn_k_ref(&self, layer: usize) -> Option<&WeightRef>;
     fn attn_v_ref(&self, layer: usize) -> Option<&WeightRef>;
     fn attn_output_ref(&self, layer: usize) -> Option<&WeightRef>;
+    /// Per-head attention gate projection (`blk.N.attn_gate.weight`, `[n_heads, hidden_size]`),
+    /// present on LFM3 attention layers.
+    #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
+    fn attn_gate_ref(&self, _layer: usize) -> Option<&WeightRef> {
+        None
+    }
+
+    // ── Per-layer attention / RoPE overrides (LFM3 hybrid SWA + global) ────
+    /// Per-layer RoPE base theta (LFM3 uses 10_000 on SWA layers and 1_000_000 on global layers).
+    #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
+    fn layer_rope_theta(&self, _layer: usize) -> f32 {
+        self.config().rope_theta
+    }
+    /// Whether this layer applies the model's `gpu_rope_freqs()` table.
+    #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
+    fn layer_has_rope_freqs(&self, _layer: usize) -> bool {
+        self.gpu_rope_freqs().is_some()
+    }
+    /// Per-layer causal sliding-window size (for example, `Some(256)` on LFM3 SWA layers).
+    #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
+    fn layer_sliding_window(&self, _layer: usize) -> Option<usize> {
+        None
+    }
+    /// Whether this attention layer runs bidirectional (non-causal) prefill attention.
+    /// For LFM2 `d1`, all attention layers are non-causal when `!config().is_causal`.
+    /// For LFM3 `d1`, only global attention layers (`window.is_none()`) are non-causal;
+    /// sliding-window attention layers remain causal with window `256`.
+    #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(dead_code))]
+    fn layer_is_non_causal(&self, _layer: usize) -> bool {
+        !self.config().is_causal
+    }
 
     // ── RoPE layout + prefill capability ───────────────────────────────────
     fn rope_type(&self) -> RopeType;

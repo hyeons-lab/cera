@@ -440,6 +440,37 @@ fn test_hexagon_glu_opcode_selection() {
     }
 }
 
+/// `lfm3`'s per-head gate dispatch sizes its VTCM layout before it registers anything, so a
+/// row that cannot fit is a typed refusal that leaves the pending batch untouched (the
+/// caller drops the batch on any error, but nothing half-registered should exist to drop).
+#[test]
+fn a_scalar_gate_that_does_not_fit_vtcm_registers_nothing() {
+    use crate::backend::hexagon::op_capture;
+    let (driver, mut device) = op_capture::fresh_device();
+    let buf = RpcmemBuffer::alloc(driver, 4096, false).unwrap();
+    let session = device.queue_session_mut();
+    let before = session.pending_bytes();
+    // a row of 4M floats is far wider than the 8 MiB VTCM budget the dispatch assumes
+    let err = HexagonLfmModel::dispatch_mul_per_row_scalar(
+        session,
+        &buf,
+        0,
+        &buf,
+        0,
+        &buf,
+        0,
+        1 << 22,
+        4,
+    )
+    .unwrap_err();
+    assert!(err.to_string().contains("does not fit VTCM"), "{err}");
+    assert_eq!(
+        session.pending_bytes(),
+        before,
+        "a refusal registered tensors"
+    );
+}
+
 #[test]
 fn test_hexagon_flash_attn_softcap_params() {
     let softcap = 50.0f32;
@@ -1044,4 +1075,118 @@ fn conv_layers_that_share_a_stage_slot_are_refused() {
     attn.n_layers = CONV_STAGE_SLOTS + 8;
     attn.block_types = vec![BlockType::Attention; CONV_STAGE_SLOTS + 8];
     assert!(check_conv_stage_slots(&attn).is_ok());
+}
+
+/// The generic short-conv state update (concat the state with the chunk, convolve the
+/// window, keep its last `d_conv - 1` columns) against a plain history-based
+/// convolution, over a mix of decode and prefill chunk sizes. The ops are emulated
+/// from their documented layouts, so this pins the offsets and strides
+/// `blocks::conv_state_writeback` produces, not the DSP kernels.
+#[test]
+fn test_generic_conv_state_update_matches_a_history_convolution() {
+    for taps in [3usize, 7, 9] {
+        let channels = 5;
+        let slots = taps - 1;
+        let weights: Vec<f32> = (0..channels * taps)
+            .map(|i| 0.07 * (i % 11) as f32 - 0.3)
+            .collect(); // [C][taps], oldest tap first, as the GGUF stores it
+        let mut state = vec![0.0f32; channels * slots]; // [C][slots], channel-major
+        let mut history: Vec<Vec<f32>> = vec![vec![0.0; slots]; channels];
+        let mut next_input = 0.0f32;
+        for m in [1usize, 1, 5, 1, 32, 2, 1, 9] {
+            // the chunk's bx values, token-major [m][C]
+            let bx: Vec<f32> = (0..m * channels)
+                .map(|_| {
+                    next_input += 1.0;
+                    (next_input * 0.37).sin()
+                })
+                .collect();
+            // CONCAT: conv_x[c] = state[c] ++ bx[.., c], row length `slots + m`
+            let ncs = slots + m;
+            let mut conv_x = vec![0.0f32; channels * ncs];
+            for c in 0..channels {
+                conv_x[c * ncs..c * ncs + slots]
+                    .copy_from_slice(&state[c * slots..(c + 1) * slots]);
+                for t in 0..m {
+                    conv_x[c * ncs + slots + t] = bx[t * channels + c];
+                }
+            }
+            // SsmConv: y[t][c] = sum_j conv_x[c][t + j] * w[c][j]
+            let mut y = vec![0.0f32; m * channels];
+            for t in 0..m {
+                for c in 0..channels {
+                    y[t * channels + c] = (0..taps)
+                        .map(|j| conv_x[c * ncs + t + j] * weights[c * taps + j])
+                        .sum();
+                }
+            }
+            // reference: convolve the explicit history
+            for c in 0..channels {
+                history[c].extend((0..m).map(|t| bx[t * channels + c]));
+                for t in 0..m {
+                    let end = history[c].len() - m + t + 1;
+                    let want: f32 = (0..taps)
+                        .map(|j| history[c][end - taps + j] * weights[c * taps + j])
+                        .sum();
+                    assert_eq!(y[t * channels + c], want, "taps {taps} m {m} t {t} c {c}");
+                }
+            }
+            // write-back, from exactly the offsets the emitter uses: ne0 = slots,
+            // ne1 = channels, src nb = [4, src_nb1], dst nb = [4, slots * 4]
+            let (src_off, src_nb1) = super::blocks::conv_state_writeback(taps, m);
+            let (src_off, src_nb1) = (src_off / 4, src_nb1 / 4);
+            for c in 0..channels {
+                for j in 0..slots {
+                    state[c * slots + j] = conv_x[src_off + c * src_nb1 + j];
+                }
+            }
+            for c in 0..channels {
+                let tail = &history[c][history[c].len() - slots..];
+                assert_eq!(
+                    &state[c * slots..(c + 1) * slots],
+                    tail,
+                    "taps {taps} m {m} c {c}"
+                );
+            }
+        }
+    }
+}
+
+/// The sequence reset must clear the whole conv slab the planner reserves: the 7-tap kernel
+/// keeps six history planes, and clearing two leaves most channels with the last request's history.
+#[test]
+fn the_conv_slab_a_reset_clears_is_the_slab_the_planner_reserves() {
+    for (hidden, d_conv) in [(8usize, 3usize), (8, 7), (1024, 3), (2048, 7), (100, 7)] {
+        let mut config = tiny_config();
+        config.hidden_size = hidden;
+        config.n_layers = 1;
+        config.block_types = vec![BlockType::GatedConv];
+        config.kv_heads_per_layer = vec![0];
+        config.conv_kernel_size = Some(d_conv);
+        let reserved = kv_state_bytes(&config, HtpDataType::F32);
+        assert!(reserved >= conv_state_slab_bytes(hidden, d_conv));
+        // the planner's own accounting for one conv layer is exactly the slab
+        let mut plan = KvPlanner::new(HtpDataType::F32, config.max_seq_len);
+        let offset = plan.conv_slots(align256(hidden * 4), d_conv - 1);
+        assert_eq!(offset, 0);
+        assert_eq!(plan.total, align256(conv_state_slab_bytes(hidden, d_conv)));
+        assert_eq!(
+            conv_state_slab_bytes(hidden, d_conv),
+            (d_conv - 1) * align256(hidden * 4)
+        );
+    }
+    // six planes for LFM3, two for LFM2
+    assert_eq!(conv_state_slab_bytes(256, 7), 6 * 1024);
+    assert_eq!(conv_state_slab_bytes(256, 3), 2 * 1024);
+}
+
+/// The head-gate output is written into scratch of `hidden_size` values per row, whatever the
+/// attention width: a wide q_dim must not widen the bound.
+#[test]
+fn the_head_gate_must_fit_the_hidden_wide_scratch() {
+    assert!(head_gate_fits_scratch(32, 64));
+    assert!(head_gate_fits_scratch(64, 64));
+    // 40 heads pad to 64: fits a 64-wide hidden but not a 32-wide one, even with q_dim = 2048
+    assert!(!head_gate_fits_scratch(64, 32));
+    assert!(!head_gate_fits_scratch(32, 16));
 }

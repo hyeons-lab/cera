@@ -16,12 +16,12 @@ use crate::backend::cpu::RopeType;
 use crate::backend::hexagon::{
     AdpfSession, HTP_TENSOR_COMPUTE, HTP_TENSOR_REPACK, HTP_TENSOR_WEIGHT, HexagonArch,
     HexagonContext, HexagonDevice, HexagonQueueSession, HtpDataType, HtpOpCode, LockOrRecover,
-    RpcmemBuffer, StagedBatch, build_binary_kernel_params, build_binary_scalar_kernel_params,
-    build_flash_attn_kernel_params_with_softcap, build_get_rows_f32_kernel_params,
-    build_hmx_fa_kernel_params_with_softcap, build_hmx_mm_kernel_params,
-    build_mul_mat_kernel_params, build_rms_norm_params, build_rope_kernel_params,
-    build_rope_params, build_set_rows_kernel_params, build_unary_kernel_params, fa_is_hmx_eligible,
-    lock_or_discard, mm_hmx_nb1, mm_is_hmx_eligible,
+    RpcmemBuffer, StagedBatch, build_binary_kernel_params, build_binary_scalar_dma_kernel_params,
+    build_binary_scalar_kernel_params, build_flash_attn_kernel_params_with_softcap,
+    build_get_rows_f32_kernel_params, build_hmx_fa_kernel_params_with_softcap,
+    build_hmx_mm_kernel_params, build_mul_mat_kernel_params, build_rms_norm_params,
+    build_rope_kernel_params_with_freq_factors, build_rope_params, build_set_rows_kernel_params,
+    build_unary_kernel_params, fa_is_hmx_eligible, lock_or_discard, mm_hmx_nb1, mm_is_hmx_eligible,
 };
 use crate::backend::hexagon::{hexagon_error, hexagon_warn};
 use crate::gguf::GgufFile;
@@ -145,6 +145,19 @@ struct HexagonAttentionLayer {
     swa: bool,
     /// YaRN RoPE parameters for this layer (`None` = plain RoPE).
     yarn: Option<crate::backend::cpu::YarnParams>,
+    /// RoPE base of this layer when it differs from the model's (`lfm3`'s sliding
+    /// layers rotate with `rope.freq_base_swa`).
+    rope_theta: Option<f32>,
+    /// Weights-buffer offset of the model's `rope_freqs.weight` (`head_dim / 2` F32
+    /// factors) when this layer rotates with them (`lfm3`'s global layers: the factors
+    /// are a partial-rotary mask, `1e30` on the pairs that stay unrotated). The DSP
+    /// rope op takes them as its third source.
+    rope_freqs_offset: Option<usize>,
+    /// `lfm3`'s per-head attention gate: an `[hidden -> n_heads]` projection of the
+    /// block input whose sigmoid scales each head's output before the output
+    /// projection. Distinct from [`Self::has_q_gate`] (Qwen 3.5), whose gate is
+    /// fused into Q and has one value per element.
+    head_gate: Option<HexagonWeight>,
 }
 
 impl HexagonAttentionLayer {
@@ -182,6 +195,9 @@ impl HexagonAttentionLayer {
             qk_norm_full: false,
             swa: false,
             yarn: None,
+            rope_theta: None,
+            rope_freqs_offset: None,
+            head_gate: None,
         }
     }
 }
@@ -220,16 +236,25 @@ struct HexagonConvLayer {
     conv_w0_offset: usize,
     conv_w1_offset: usize,
     conv_w2_offset: usize,
-    /// Interleaved `[3, C]` short-conv taps (oldest-first) for SsmConv dispatch.
+    /// Interleaved `[3, C]` short-conv taps (oldest-first) for SsmConv dispatch. Any other
+    /// `d_conv` (`lfm3`'s 7) holds `[d_conv, C]` taps here.
     conv_ssm_offset: usize,
-    /// Recurrent short-conv state, channel-interleaved `[C, 2]` (slot t
-    /// at `state + c*8 + t*4`, oldest-first) in one allocation. The DSP's
-    /// transposed-CONCAT worker fetches its s0 side as 2-float pairs at
-    /// 8-byte stride, so this layout is what the fast prepend path reads
-    /// natively; dense row-major state cannot feed that worker.
+    /// Recurrent short-conv state: one channel-major `[C, d_conv - 1]` slab (slot t of
+    /// channel c at `state + (c * (d_conv - 1) + t) * 4`, oldest-first) in one allocation.
+    /// For the 3-tap `lfm2` conv that is `[C, 2]` at an 8-byte channel stride, which the
+    /// DSP's transposed-CONCAT worker reads natively as 2-float pairs; every other width
+    /// copies the slab back with `conv_state_writeback`.
     state_offset: usize,
     ffn_norm_offset: usize,
     ffn: HexagonFfn,
+    /// Short-conv kernel width (taps). 3 for `lfm2`, whose conv state and update
+    /// run the fixed-width sequence above; any other width takes the generic one.
+    d_conv: usize,
+    /// RMSNorm weight applied to the conv block's output before its residual add
+    /// (`lfm3`'s sandwich norm).
+    post_norm_offset: Option<usize>,
+    /// RMSNorm weight applied to the FFN output before its residual add (`lfm3`).
+    ffn_post_norm_offset: Option<usize>,
 }
 
 enum HexagonLayer {
@@ -256,8 +281,10 @@ struct DenseSemantics {
     /// `1 / logits_scaling`, applied on the host to the returned logits (positive,
     /// so the on-DSP argmax is unaffected).
     logit_scale: Option<f32>,
-    /// Llama-3 `rope_freqs.weight` factors (`head_dim / 2`), used by the host
-    /// RoPE route: the DSP rope kernel params carry no frequency factors.
+    /// `rope_freqs.weight` factors (`head_dim / 2`), used by the host RoPE route
+    /// (Llama-3 NORM rotation, and `lfm3`'s global layers under `CERA_HEXAGON_CPU_ROPE`).
+    /// The default DSP route passes `lfm3`'s factors through
+    /// [`HexagonAttentionLayer::rope_freqs_offset`] instead.
     rope_freqs: Option<Vec<f32>>,
     /// Olmo 2/3 ordering: no block pre-norm; the block output is normed instead.
     post_norm: bool,
@@ -387,7 +414,8 @@ struct HexagonKnobs {
     dump_act: bool,
     /// `CERA_HEXAGON_ADPF_TARGET_MS`: ADPF target duration (default 10 ms).
     adpf_target_nanos: i64,
-    /// `CERA_HEXAGON_SSM_CONV` (default on): fused SsmConv op for short conv.
+    /// `CERA_HEXAGON_SSM_CONV` (default on): fused SsmConv op for short conv. Only
+    /// the 3-tap kernel has a manual fallback; wider kernels (`lfm3`) ignore `=0`.
     use_ssm_conv: bool,
     /// `CERA_HEXAGON_HMX` (default on): HMX kernels for prefill.
     use_hmx: bool,
@@ -487,15 +515,30 @@ impl HexagonKnobs {
     }
 }
 
+/// Whether the per-head gate's padded `[rows, out_dim]` output fits the scratch it is written
+/// to: the `conv_t0` / `conv_t1` regions, which hold `hidden_size` f32 values per row (a bound
+/// against the wider `q_dim` would let a small-hidden model write past them).
+fn head_gate_fits_scratch(out_dim: usize, hidden_size: usize) -> bool {
+    out_dim <= hidden_size
+}
+
+/// Bytes of the short-conv state slab of one layer: `d_conv - 1` planes (two for LFM2's
+/// 3-tap kernel, six for LFM3's 7-tap one) of `hidden_size` f32 channels, each plane padded to
+/// 256 bytes. The planner reserves it and a sequence reset clears it, so both use this.
+fn conv_state_slab_bytes(hidden_size: usize, d_conv: usize) -> usize {
+    d_conv.saturating_sub(1) * align256(hidden_size * 4)
+}
+
 /// Bytes of KV and conv state the model will map, sized the way the real plan
 /// sizes them (`debug_assert`ed equal to it after planning).
 fn kv_state_bytes(config: &ModelConfig, kv_dtype: HtpDataType) -> usize {
     let mut est = KvPlanner::new(kv_dtype, config.max_seq_len);
+    let d_conv = config.conv_kernel_size.unwrap_or(3);
     for i in 0..config.n_layers {
         if config.block_types[i] == BlockType::Attention {
             est.attention(config.kv_heads_per_layer[i] * config.head_dim);
         } else {
-            est.conv(align256(config.hidden_size * 4));
+            est.conv_slots(align256(config.hidden_size * 4), d_conv.saturating_sub(1));
         }
     }
     est.total
@@ -884,6 +927,14 @@ const MAX_OPS_PER_FLUSH: usize = 24;
 const ENCODER_MAX_TENSORS_PER_FLUSH: usize = 32;
 
 pub const MAX_ALL_LOGITS_TOKENS: usize = 64;
+
+/// Widest short-conv kernel accepted. A conservative cap, not a capacity limit:
+/// `conv_x` is sized for `PREFILL_MAX_ROWS + 2` rows of `3 * hidden_size`, which
+/// holds the `m + d_conv - 1` rows of the widest chunk (and the decode view, a prefix
+/// of that region) for every width up to this cap. The DSP `SsmConv` kernel handles
+/// wider kernels, but widths beyond 9 have not been verified on the device, so raise
+/// the cap only after checking the `SsmConv` and `Concat` kernels at the new width.
+const MAX_CONV_TAPS: usize = 9;
 
 #[derive(Clone, Copy, Debug)]
 struct ScratchOffsets {
@@ -1634,9 +1685,54 @@ impl HexagonLfmModel {
         let max_kv_dim = max_kv_dim(&config, head_dim);
 
         check_conv_stage_slots(&config)?;
+        // `lfm3`: per-layer window / RoPE layout (shared with the CPU loader), the
+        // sandwich norms, the per-head attention gate and a wider short conv.
+        let is_lfm3 = config.architecture == "lfm3";
+        let lfm3 = if is_lfm3 {
+            crate::model::lfm2::LfmModel::validate_lfm3_tensor_shapes(&gguf, &config)
+                .map_err(|e| CeraError::Backend(format!("{e:#}")))?;
+            Some(
+                crate::model::lfm2::LfmModel::lfm3_layout(&gguf, &config)
+                    .map_err(|e| CeraError::Backend(format!("{e:#}")))?,
+            )
+        } else {
+            None
+        };
+        let d_conv = config.conv_kernel_size.unwrap_or(3);
+        if config.block_types.contains(&BlockType::GatedConv)
+            && !(2..=MAX_CONV_TAPS).contains(&d_conv)
+        {
+            return Err(CeraError::Backend(format!(
+                "Hexagon: short-conv kernel width {d_conv} is outside 2..={MAX_CONV_TAPS}, \
+                 which the activation scratch is sized for"
+            )));
+        }
+        if d_conv != 3 && !knobs.use_ssm_conv && config.block_types.contains(&BlockType::GatedConv)
+        {
+            hexagon_warn!(
+                "CERA_HEXAGON_SSM_CONV=0 is ignored: the {d_conv}-tap short conv has no manual \
+                 op chain, so it always uses SsmConv"
+            );
+        }
+        // A window as long as the context never masks anything on a causal model: run those
+        // layers dense. On a non-causal `lfm3` model (`d1-2B` / `d1-Omni-2B`), `so.mask` is
+        // filled with zeros (bidirectional) while SWA layers remain causal, so keep `swa_window`
+        // whenever `!config.is_causal` as well.
+        let swa_window = lfm3
+            .as_ref()
+            .and_then(|l| l.window)
+            .filter(|&w| w > 0 && (w < max_seq_len || !config.is_causal));
+        let layer_swa: Vec<bool> = (0..n_layers)
+            .map(|i| {
+                swa_window.is_some()
+                    && config.block_types[i] == BlockType::Attention
+                    && lfm3.as_ref().is_some_and(|l| l.swa_pattern[i])
+            })
+            .collect();
+        let has_swa = layer_swa.iter().any(|&b| b);
 
         // Allocate unified shared scratch buffer
-        let scratch_offsets = ScratchOffsets::new(
+        let mut scratch_offsets = ScratchOffsets::new(
             hidden_size,
             q_dim,
             max_kv_dim,
@@ -1646,11 +1742,19 @@ impl HexagonLfmModel {
             config.moe.as_ref(),
             None,
         );
+        if has_swa {
+            scratch_offsets = scratch_offsets.with_swa_mask(max_seq_len);
+        }
         let ModelBuffers {
             scratch_buf,
             mask_buf,
-            ..
-        } = ModelBuffers::alloc(driver, &scratch_offsets, (max_seq_len * 2).max(128), false)?;
+            mask_swa,
+        } = ModelBuffers::alloc(
+            driver,
+            &scratch_offsets,
+            (max_seq_len * 2).max(128),
+            has_swa,
+        )?;
 
         // Determine layer norms
         let mut has_attn_q_norm = Vec::with_capacity(n_layers);
@@ -1712,6 +1816,13 @@ impl HexagonLfmModel {
                 })
         };
 
+        // `lfm3`'s partial-rotary mask, shared by every global layer: planned once and
+        // handed to the DSP rope op as its frequency-factor source.
+        let lfm3_rope_freqs_offset = lfm3
+            .as_ref()
+            .and_then(|l| l.rope_freq_factors.as_ref())
+            .map(|f| plan.vector("rope_freqs.weight", f.len()));
+
         // Weights are planned in layer order (norms, projections, FFN); KV and
         // conv state offsets follow the same order in their own buffer.
         let mut layers = Vec::with_capacity(n_layers);
@@ -1731,9 +1842,57 @@ impl HexagonLfmModel {
                 let ffn_norm_offset = plan.vector(&format!("blk.{i}.ffn_norm.weight"), hidden_size);
                 let ffn = plan.ffn(i, hidden_size, intermediate_size, moe_dims(i), [None; 3])?;
                 let (k_offset, v_offset) = kv.attention(kv_dim);
+                // `lfm3`: optional post-attention / post-FFN norms, the per-head gate, and this
+                // layer's window and RoPE schedule.
+                let lfm3_attn = match lfm3.as_ref() {
+                    Some(layout) => {
+                        let post_attn_name = format!("blk.{i}.post_attention_norm.weight");
+                        let post_norm = gguf
+                            .tensors
+                            .contains_key(&post_attn_name)
+                            .then(|| plan.vector(&post_attn_name, hidden_size));
+                        let post_ffn_name = format!("blk.{i}.post_ffw_norm.weight");
+                        let ffn_post_norm = gguf
+                            .tensors
+                            .contains_key(&post_ffn_name)
+                            .then(|| plan.vector(&post_ffn_name, hidden_size));
+                        // Planned as `[hidden -> n_heads]`, run as `[hidden -> n_heads
+                        // padded to 32]`: the matmul works in 32-row tiles (the repack
+                        // zero-fills the extra rows) and an unpadded output would let the
+                        // HMX path write past a `n_heads`-wide row.
+                        let mut gate = plan.weight(
+                            &format!("blk.{i}.attn_gate.weight"),
+                            hidden_size,
+                            n_heads,
+                        )?;
+                        gate.out_dim = n_heads.next_multiple_of(32);
+                        if !head_gate_fits_scratch(gate.out_dim, hidden_size) {
+                            return Err(CeraError::Backend(format!(
+                                "blk.{i}.attn_gate.weight: {n_heads} heads (padded to {}) do not fit \
+                                 the gate scratch of {hidden_size} values per row",
+                                gate.out_dim
+                            )));
+                        }
+                        let sliding = layout.swa_pattern[i];
+                        Some((post_norm, ffn_post_norm, gate, sliding))
+                    }
+                    None => None,
+                };
                 layers.push(HexagonLayer::Attention(HexagonAttentionLayer {
                     attn_q_norm_offset,
                     attn_k_norm_offset,
+                    attn_post_norm_offset: lfm3_attn.and_then(|(post, ..)| post),
+                    ffn_post_norm_offset: lfm3_attn.and_then(|(_, post, ..)| post),
+                    head_gate: lfm3_attn.map(|(_, _, gate, _)| gate),
+                    swa: layer_swa[i],
+                    // sliding layers rotate the whole head with their own base; the
+                    // global layers keep the model base and mask with `rope_freqs`
+                    rope_theta: lfm3_attn
+                        .filter(|&(.., sliding)| sliding)
+                        .and(lfm3.as_ref().map(|l| l.theta_swa)),
+                    rope_freqs_offset: lfm3_attn
+                        .filter(|&(.., sliding)| !sliding)
+                        .and(lfm3_rope_freqs_offset),
                     ..HexagonAttentionLayer::plain(
                         attn_norm_offset,
                         [attn_q, attn_k, attn_v, attn_output],
@@ -1755,11 +1914,29 @@ impl HexagonLfmModel {
                     hidden_size,
                     hidden_size,
                 )?;
-                let ([conv_w0_offset, conv_w1_offset, conv_w2_offset], conv_ssm_offset) =
-                    plan.conv_taps(&format!("blk.{i}.shortconv.conv.weight"), hidden_size);
+                let ([conv_w0_offset, conv_w1_offset, conv_w2_offset], conv_ssm_offset) = plan
+                    .conv_taps(
+                        &format!("blk.{i}.shortconv.conv.weight"),
+                        hidden_size,
+                        d_conv,
+                    );
                 let ffn_norm_offset = plan.vector(&format!("blk.{i}.ffn_norm.weight"), hidden_size);
                 let ffn = plan.ffn(i, hidden_size, intermediate_size, moe_dims(i), [None; 3])?;
-                let state_offset = kv.conv(state_size);
+                let state_offset = kv.conv_slots(state_size, d_conv - 1);
+                let (post_norm_offset, ffn_post_norm_offset) = if is_lfm3 {
+                    let post_attn_name = format!("blk.{i}.post_attention_norm.weight");
+                    let post_ffn_name = format!("blk.{i}.post_ffw_norm.weight");
+                    (
+                        gguf.tensors
+                            .contains_key(&post_attn_name)
+                            .then(|| plan.vector(&post_attn_name, hidden_size)),
+                        gguf.tensors
+                            .contains_key(&post_ffn_name)
+                            .then(|| plan.vector(&post_ffn_name, hidden_size)),
+                    )
+                } else {
+                    (None, None)
+                };
                 layers.push(HexagonLayer::Conv(HexagonConvLayer {
                     attn_norm_offset,
                     in_proj,
@@ -1771,6 +1948,9 @@ impl HexagonLfmModel {
                     state_offset,
                     ffn_norm_offset,
                     ffn,
+                    d_conv,
+                    post_norm_offset,
+                    ffn_post_norm_offset,
                 }));
             }
         }
@@ -1842,7 +2022,12 @@ impl HexagonLfmModel {
                 mask_buf,
                 rope_type,
                 cpu_rope,
-                dense: DenseSemantics::default(),
+                dense: DenseSemantics {
+                    rope_freqs: lfm3.and_then(|l| l.rope_freq_factors),
+                    swa_window,
+                    mask_swa,
+                    ..DenseSemantics::default()
+                },
                 activation: FfnActivation::Swiglu,
                 attn_logit_softcapping: None,
                 final_logit_softcapping: None,
@@ -2195,8 +2380,9 @@ impl HexagonLfmModel {
             .attn_temp_scale
             .filter(|&(scale, floor)| scale > 0.0 && floor > 0 && max_seq_len > floor);
         let rope_freqs = src.rope_freqs().map(<[f32]>::to_vec);
-        // The DSP rope kernel carries neither YaRN nor frequency-factor inputs
-        // here. NORM RoPE uses the factors only without YaRN (CPU reference).
+        // The dense path does not route YaRN or Llama-3 frequency factors to the DSP
+        // rope kernel (it does accept factors: `lfm3` passes them). NORM RoPE uses
+        // the factors only without YaRN (CPU reference).
         let needs_host_rope = extras.layer_yarn.iter().any(Option::is_some)
             || (rope_type == RopeType::Norm && rope_freqs.is_some());
         if needs_host_rope {
@@ -2463,6 +2649,11 @@ impl HexagonLfmModel {
             }
         };
 
+        if !self.config.is_causal && start_pos > 0 {
+            return Err(CeraError::Backend(
+                "bidirectional prefill must run in one pass from start_pos == 0".to_string(),
+            ));
+        }
         if m > PREFILL_MAX_ROWS {
             return Err(CeraError::Backend(format!(
                 "prefill chunk size ({m}) exceeds maximum ({PREFILL_MAX_ROWS})"
@@ -2528,12 +2719,17 @@ impl HexagonLfmModel {
             for (i, slot) in pos_slice.iter_mut().enumerate() {
                 *slot = (start_pos + i) as i32;
             }
-            // Causal mask [kv_len, M]: query i attends slots <= start_pos + i.
+            // Causal mask [kv_len, M]: query i attends slots <= start_pos + i, or all slots
+            // on bidirectional LFM3 global attention layers (`d1-2B` / `d1-Omni-2B`).
             let mask = std::slice::from_raw_parts_mut(
                 scratch.as_mut_ptr().add(so.mask) as *mut u16,
                 kv_len * m,
             );
-            fill_prefill_mask(mask, start_pos, m, kv_len, None);
+            if !self.config.is_causal && self.config.architecture == "lfm3" {
+                mask.fill(0);
+            } else {
+                fill_prefill_mask(mask, start_pos, m, kv_len, None);
+            }
             // Sliding-window layers get their own windowed copy.
             if let Some(window) = self.dense.swa_window
                 && so.mask_swa != 0
@@ -3152,6 +3348,9 @@ impl HexagonLfmModel {
             return Ok(Vec::new());
         }
         if tokens.len() > 1 {
+            if !self.config.is_causal {
+                return self.try_forward_prefill_chunk(tokens, pos, state);
+            }
             self.prefill_head(tokens, pos, state)?;
             return self.try_forward(&tokens[tokens.len() - 1..], pos + tokens.len() - 1, state);
         }
@@ -3176,6 +3375,14 @@ impl HexagonLfmModel {
             return Ok(0);
         }
         if tokens.len() > 1 {
+            if !self.config.is_causal {
+                let logits = self.try_forward_prefill_chunk(tokens, pos, state)?;
+                return Ok(logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                    .map_or(0, |(idx, _)| idx as u32));
+            }
             self.prefill_head(tokens, pos, state)?;
             return self.try_forward_greedy(
                 &tokens[tokens.len() - 1..],
@@ -3438,14 +3645,20 @@ impl Model for HexagonLfmModel {
             record_first_fault(&self.decode_error, e);
             return vec![0.0f32; self.config.vocab_size];
         }
-        let (consumed, logits) = run_scratch_chunks_embeddings(
-            embeddings,
-            n_tokens,
-            hs,
-            start_pos,
-            state,
-            |chunk, pos, state| self.forward_prefill_chunk_from_embeddings(chunk, pos, state),
-        );
+        let (consumed, logits) = if !self.config.is_causal {
+            let logits = self.forward_prefill_chunk_from_embeddings(embeddings, start_pos, state);
+            let consumed = if logits.is_some() { n_tokens } else { 0 };
+            (consumed, logits)
+        } else {
+            run_scratch_chunks_embeddings(
+                embeddings,
+                n_tokens,
+                hs,
+                start_pos,
+                state,
+                |chunk, pos, state| self.forward_prefill_chunk_from_embeddings(chunk, pos, state),
+            )
+        };
         prefill_tail_logits(consumed, n_tokens, logits, self.config.vocab_size)
     }
 
@@ -3492,10 +3705,15 @@ impl Model for HexagonLfmModel {
     ) -> Vec<f32> {
         // The session path below recovers exact accounting through
         // `forward_prefill_chunked`.
-        let (consumed, logits) =
+        let (consumed, logits) = if !self.config.is_causal {
+            let logits = self.forward_prefill_chunk(tokens, start_pos, state);
+            let consumed = if logits.is_some() { tokens.len() } else { 0 };
+            (consumed, logits)
+        } else {
             run_scratch_chunks(tokens, start_pos, state, |chunk, pos, state| {
                 self.forward_prefill_chunk(chunk, pos, state)
-            });
+            })
+        };
         prefill_tail_logits(consumed, tokens.len(), logits, self.config.vocab_size)
     }
 
@@ -3507,6 +3725,13 @@ impl Model for HexagonLfmModel {
         ubatch: usize,
         cancel: &AtomicBool,
     ) -> (usize, Option<Vec<f32>>) {
+        if !self.config.is_causal {
+            return super::run_chunked_prefill(tokens, start_pos, 0, cancel, |chunk, pos| {
+                let logits = self.forward_prefill_chunk(chunk, pos, state);
+                let consumed = if logits.is_some() { chunk.len() } else { 0 };
+                (consumed, logits)
+            });
+        }
         // The shared loop (`model::run_chunked_prefill`): the fallible
         // per-chunk forward is a scratch-capacity `run_scratch_chunks` call.
         super::run_chunked_prefill(tokens, start_pos, ubatch, cancel, |chunk, pos| {
@@ -3527,13 +3752,17 @@ impl Model for HexagonLfmModel {
         }
         // Speculative verification batches `1 + k` tokens and `k` can be 64, so
         // split at the scratch capacity instead of panicking.
-        let result = chunked_all_logits(
-            tokens,
-            start_pos,
-            MAX_ALL_LOGITS_TOKENS,
-            self.config.vocab_size,
-            |chunk, chunk_start| self.try_forward_prefill_logits_all(chunk, chunk_start, state),
-        );
+        let result = if !self.config.is_causal {
+            self.try_forward_prefill_logits_all(tokens, start_pos, state)
+        } else {
+            chunked_all_logits(
+                tokens,
+                start_pos,
+                MAX_ALL_LOGITS_TOKENS,
+                self.config.vocab_size,
+                |chunk, chunk_start| self.try_forward_prefill_logits_all(chunk, chunk_start, state),
+            )
+        };
         match result {
             Ok(logits) => logits,
             Err(e) => {
@@ -3662,7 +3891,10 @@ impl Model for HexagonLfmModel {
         compression: &KvCompression,
         max_seq_len: usize,
     ) -> Result<(), CeraError> {
-        if !matches!(compression, KvCompression::None) {
+        // A request the model cannot serve (lfm3) resolves to the plain cache, and
+        // `Session::new` has already warned; refusing it here would let a session start
+        // and then never reset.
+        if !matches!(compression.resolved_for(&self.config), KvCompression::None) {
             return Err(CeraError::Backend(
                 "TurboQuant KV compression is not supported by the Hexagon backend".into(),
             ));
@@ -3697,6 +3929,9 @@ impl HexagonLfmModel {
         state: &InferenceState,
         len: usize,
     ) -> Result<(), crate::kv_cache::KvRewindError> {
+        if !self.config.is_causal {
+            return Err(crate::kv_cache::KvRewindError::NonCausal);
+        }
         if len > state.seq_len {
             return Err(crate::kv_cache::KvRewindError::OutOfBounds {
                 requested: len,
@@ -3782,7 +4017,10 @@ impl HexagonLfmModel {
                 HexagonLayer::Attention(_) => {}
                 // the slab the planner reserves: a `[C, 2]` plane pair, one plane padded to 256 bytes
                 HexagonLayer::Conv(conv) => {
-                    zero(conv.state_offset, 2 * align256(self.config.hidden_size * 4));
+                    zero(
+                        conv.state_offset,
+                        conv_state_slab_bytes(self.config.hidden_size, conv.d_conv),
+                    );
                 }
                 HexagonLayer::DeltaNet(dn) => {
                     zero(

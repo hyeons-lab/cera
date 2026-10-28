@@ -1,0 +1,4428 @@
+{
+  "prompt": "Entry 0: the quick fox number 3 crossed the wide river near town 0 and reported 0 birds.\nEntry 1: the slow fox number 10 crossed the narrow river near town 1 and reported 13 birds.\nEntry 2: the red fox number 17 crossed the frozen river near town 2 and reported 26 birds.\nEntry 3: the grey fox number 24 crossed the muddy river near town 3 and reported 39 birds.\nEntry 4: the tired fox number 31 crossed the clear river near town 4 and reported 52 birds.\nEntry 5: the loud fox number 38 crossed the deep river near town 5 and reported 65 birds.\nEntry 6: the calm fox number 45 crossed the shallow river near town 6 and reported 78 birds.\nEntry 7: the brave fox number 52 crossed the fast river near town 7 and reported 91 birds.\nEntry 8: the shy fox number 59 crossed the wide river near town 8 and reported 7 birds.\nEntry 9: the old fox number 66 crossed the narrow river near town 9 and reported 20 birds.\nEntry 10: the quick fox number 73 crossed the frozen river near town 10 and reported 33 birds.\nEntry 11: the slow fox number 80 crossed the muddy river near town 0 and reported 46 birds.\nEntry 12: the red fox number 87 crossed the clear river near town 1 and reported 59 birds.\nEntry 13: the grey fox number 94 crossed the deep river near town 2 and reported 72 birds.\nEntry 14: the tired fox number 101 crossed the shallow river near town 3 and reported 85 birds.\nEntry 15: the loud fox number 108 crossed the fast river near town 4 and reported 1 birds.\nEntry 16: the calm fox number 115 crossed the wide river near town 5 and reported 14 birds.\nEntry 17: the brave fox number 122 crossed the narrow river near town 6 and reported 27 birds.\nSummary of the entries above:",
+  "input_tokens": [
+    16075,
+    229,
+    24,
+    34,
+    278,
+    4104,
+    35886,
+    1579,
+    229,
+    27,
+    23828,
+    278,
+    5765,
+    7507,
+    3126,
+    4386,
+    229,
+    24,
+    309,
+    3967,
+    229,
+    24,
+    7962,
+    318,
+    16075,
+    229,
+    25,
+    34,
+    278,
+    5373,
+    35886,
+    1579,
+    229,
+    654,
+    23828,
+    278,
+    10396,
+    7507,
+    3126,
+    4386,
+    229,
+    25,
+    309,
+    3967,
+    229,
+    1031,
+    7962,
+    318,
+    16075,
+    229,
+    26,
+    34,
+    278,
+    2959,
+    35886,
+    1579,
+    229,
+    916,
+    23828,
+    278,
+    21858,
+    7507,
+    3126,
+    4386,
+    229,
+    26,
+    309,
+    3967,
+    229,
+    1616,
+    7962,
+    318,
+    16075,
+    229,
+    27,
+    34,
+    278,
+    22358,
+    35886,
+    1579,
+    229,
+    1325,
+    23828,
+    278,
+    295,
+    43088,
+    7507,
+    3126,
+    4386,
+    229,
+    27,
+    309,
+    3967,
+    229,
+    2687,
+    7962,
+    318,
+    16075,
+    229,
+    28,
+    34,
+    278,
+    22219,
+    35886,
+    1579,
+    229,
+    2498,
+    23828,
+    278,
+    3983,
+    7507,
+    3126,
+    4386,
+    229,
+    28,
+    309,
+    3967,
+    229,
+    6557,
+    7962,
+    318,
+    16075,
+    229,
+    29,
+    34,
+    278,
+    18977,
+    35886,
+    1579,
+    229,
+    2481,
+    23828,
+    278,
+    4708,
+    7507,
+    3126,
+    4386,
+    229,
+    29,
+    309,
+    3967,
+    229,
+    2257,
+    7962,
+    318,
+    16075,
+    229,
+    30,
+    34,
+    278,
+    18742,
+    35886,
+    1579,
+    229,
+    2136,
+    23828,
+    278,
+    22933,
+    7507,
+    3126,
+    4386,
+    229,
+    30,
+    309,
+    3967,
+    229,
+    2274,
+    7962,
+    318,
+    16075,
+    229,
+    31,
+    34,
+    278,
+    39040,
+    35886,
+    1579,
+    229,
+    6557,
+    23828,
+    278,
+    5071,
+    7507,
+    3126,
+    4386,
+    229,
+    31,
+    309,
+    3967,
+    229,
+    9505,
+    7962,
+    318,
+    16075,
+    229,
+    32,
+    34,
+    278,
+    47356,
+    35886,
+    1579,
+    229,
+    5098,
+    23828,
+    278,
+    5765,
+    7507,
+    3126,
+    4386,
+    229,
+    32,
+    309,
+    3967,
+    229,
+    31,
+    7962,
+    318,
+    16075,
+    229,
+    33,
+    34,
+    278,
+    2230,
+    35886,
+    1579,
+    229,
+    3088,
+    23828,
+    278,
+    10396,
+    7507,
+    3126,
+    4386,
+    229,
+    33,
+    309,
+    3967,
+    229,
+    397,
+    7962,
+    318,
+    16075,
+    229,
+    654,
+    34,
+    278,
+    4104,
+    35886,
+    1579,
+    229,
+    9125,
+    23828,
+    278,
+    21858,
+    7507,
+    3126,
+    4386,
+    229,
+    654,
+    309,
+    3967,
+    229,
+    2124,
+    7962,
+    318,
+    16075,
+    229,
+    1131,
+    34,
+    278,
+    5373,
+    35886,
+    1579,
+    229,
+    1845,
+    23828,
+    278,
+    295,
+    43088,
+    7507,
+    3126,
+    4386,
+    229,
+    24,
+    309,
+    3967,
+    229,
+    3694,
+    7962,
+    318,
+    16075,
+    229,
+    873,
+    34,
+    278,
+    2959,
+    35886,
+    1579,
+    229,
+    5042,
+    23828,
+    278,
+    3983,
+    7507,
+    3126,
+    4386,
+    229,
+    25,
+    309,
+    3967,
+    229,
+    5098,
+    7962,
+    318,
+    16075,
+    229,
+    1031,
+    34,
+    278,
+    22358,
+    35886,
+    1579,
+    229,
+    9787,
+    23828,
+    278,
+    4708,
+    7507,
+    3126,
+    4386,
+    229,
+    26,
+    309,
+    3967,
+    229,
+    7832,
+    7962,
+    318,
+    16075,
+    229,
+    1035,
+    34,
+    278,
+    22219,
+    35886,
+    1579,
+    229,
+    5267,
+    23828,
+    278,
+    22933,
+    7507,
+    3126,
+    4386,
+    229,
+    27,
+    309,
+    3967,
+    229,
+    3019,
+    7962,
+    318,
+    16075,
+    229,
+    885,
+    34,
+    278,
+    18977,
+    35886,
+    1579,
+    229,
+    9259,
+    23828,
+    278,
+    5071,
+    7507,
+    3126,
+    4386,
+    229,
+    28,
+    309,
+    3967,
+    229,
+    25,
+    7962,
+    318,
+    16075,
+    229,
+    942,
+    34,
+    278,
+    18742,
+    35886,
+    1579,
+    229,
+    10436,
+    23828,
+    278,
+    5765,
+    7507,
+    3126,
+    4386,
+    229,
+    29,
+    309,
+    3967,
+    229,
+    1035,
+    7962,
+    318,
+    16075,
+    229,
+    916,
+    34,
+    278,
+    39040,
+    35886,
+    1579,
+    229,
+    12178,
+    23828,
+    278,
+    10396,
+    7507,
+    3126,
+    4386,
+    229,
+    30,
+    309,
+    3967,
+    229,
+    1641,
+    7962,
+    318,
+    32173,
+    302,
+    278,
+    20647,
+    3036,
+    34
+  ],
+  "greedy_text": " There are 18 entries in total. The quickest crossing is by the loud",
+  "nodes": [
+    {
+      "name": "model.embed_tokens",
+      "op": "GET_ROWS",
+      "sum": 76.547043
+    },
+    {
+      "name": "cache_r_l0 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "node_5",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_7",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_5 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "norm-0",
+      "op": "RMS_NORM",
+      "sum": 2973.218018
+    },
+    {
+      "name": "model.layers.{}.operator_norm-0",
+      "op": "MUL",
+      "sum": 309.090546
+    },
+    {
+      "name": "model.layers.{}.operator_norm-0 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 309.090546
+    },
+    {
+      "name": "model.layers.{}.conv.in_proj-0",
+      "op": "MUL_MAT",
+      "sum": -5618.344727
+    },
+    {
+      "name": "node_17",
+      "op": "MUL",
+      "sum": -1277.590088
+    },
+    {
+      "name": "(transposed)",
+      "op": "TRANSPOSE",
+      "sum": -1277.743896
+    },
+    {
+      "name": "node_19",
+      "op": "CONCAT",
+      "sum": -1277.743896
+    },
+    {
+      "name": "cache_r_l1 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "node_26",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_27",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_26 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "model.layers.{}.conv.conv-0",
+      "op": "SSM_CONV",
+      "sum": -128.327911
+    },
+    {
+      "name": "node_33",
+      "op": "MUL",
+      "sum": -44.373909
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-0",
+      "op": "MUL_MAT",
+      "sum": -103.677193
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-0 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -103.677193
+    },
+    {
+      "name": "norm-0",
+      "op": "RMS_NORM",
+      "sum": -11844.298828
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-0",
+      "op": "MUL",
+      "sum": -206.103958
+    },
+    {
+      "name": "node_38",
+      "op": "ADD",
+      "sum": -129.562073
+    },
+    {
+      "name": "norm-0",
+      "op": "RMS_NORM",
+      "sum": -5670.906738
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-0",
+      "op": "MUL",
+      "sum": -408.579376
+    },
+    {
+      "name": "ffn_gate-0",
+      "op": "MUL_MAT",
+      "sum": -591277.125
+    },
+    {
+      "name": "ffn_up-0",
+      "op": "MUL_MAT",
+      "sum": 2313.261963
+    },
+    {
+      "name": "ffn_swiglu-0",
+      "op": "SWIGLU",
+      "sum": -221.574387
+    },
+    {
+      "name": "node_44",
+      "op": "MUL_MAT",
+      "sum": 2971.138184
+    },
+    {
+      "name": "norm-0",
+      "op": "RMS_NORM",
+      "sum": 17239.013672
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-0",
+      "op": "MUL",
+      "sum": -261.369507
+    },
+    {
+      "name": "l_out-0",
+      "op": "ADD",
+      "sum": -390.932068
+    },
+    {
+      "name": "norm-1",
+      "op": "RMS_NORM",
+      "sum": -21790.019531
+    },
+    {
+      "name": "model.layers.{}.operator_norm-1",
+      "op": "MUL",
+      "sum": -2977.75415
+    },
+    {
+      "name": "model.layers.{}.operator_norm-1 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -2977.75415
+    },
+    {
+      "name": "model.layers.{}.conv.in_proj-1",
+      "op": "MUL_MAT",
+      "sum": 13240.959961
+    },
+    {
+      "name": "node_54",
+      "op": "MUL",
+      "sum": 1779.027588
+    },
+    {
+      "name": "(transposed)",
+      "op": "TRANSPOSE",
+      "sum": 1779.041504
+    },
+    {
+      "name": "node_56",
+      "op": "CONCAT",
+      "sum": 1779.041504
+    },
+    {
+      "name": "model.layers.{}.conv.conv-1",
+      "op": "SSM_CONV",
+      "sum": -30.999157
+    },
+    {
+      "name": "node_62",
+      "op": "MUL",
+      "sum": 3.398364
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-1",
+      "op": "MUL_MAT",
+      "sum": 77.872101
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-1 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 77.872101
+    },
+    {
+      "name": "norm-1",
+      "op": "RMS_NORM",
+      "sum": 11328.822266
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-1",
+      "op": "MUL",
+      "sum": 123.160995
+    },
+    {
+      "name": "node_67",
+      "op": "ADD",
+      "sum": -267.766663
+    },
+    {
+      "name": "norm-1",
+      "op": "RMS_NORM",
+      "sum": -15797.631836
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-1",
+      "op": "MUL",
+      "sum": -6454.423828
+    },
+    {
+      "name": "ffn_gate-1",
+      "op": "MUL_MAT",
+      "sum": -1968409.875
+    },
+    {
+      "name": "ffn_up-1",
+      "op": "MUL_MAT",
+      "sum": -8832.587891
+    },
+    {
+      "name": "ffn_swiglu-1",
+      "op": "SWIGLU",
+      "sum": -893.866943
+    },
+    {
+      "name": "node_73",
+      "op": "MUL_MAT",
+      "sum": -1164.353027
+    },
+    {
+      "name": "norm-1",
+      "op": "RMS_NORM",
+      "sum": -1525.782959
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-1",
+      "op": "MUL",
+      "sum": -35.019665
+    },
+    {
+      "name": "l_out-1",
+      "op": "ADD",
+      "sum": -302.781616
+    },
+    {
+      "name": "norm-2",
+      "op": "RMS_NORM",
+      "sum": -16971.708984
+    },
+    {
+      "name": "model.layers.{}.operator_norm-2",
+      "op": "MUL",
+      "sum": -720.707642
+    },
+    {
+      "name": "Qcur-2",
+      "op": "MUL_MAT",
+      "sum": -442.180634
+    },
+    {
+      "name": "Qcur-2",
+      "op": "RESHAPE",
+      "sum": -442.180634
+    },
+    {
+      "name": "norm-2",
+      "op": "RMS_NORM",
+      "sum": -6279.583984
+    },
+    {
+      "name": "model.layers.{}.self_attn.q_layernorm-2",
+      "op": "MUL",
+      "sum": 2717.239258
+    },
+    {
+      "name": "node_83",
+      "op": "ROPE",
+      "sum": 38234.621094
+    },
+    {
+      "name": "Kcur-2",
+      "op": "MUL_MAT",
+      "sum": 730.586243
+    },
+    {
+      "name": "Kcur-2",
+      "op": "RESHAPE",
+      "sum": 730.586243
+    },
+    {
+      "name": "norm-2",
+      "op": "RMS_NORM",
+      "sum": 9965.518555
+    },
+    {
+      "name": "model.layers.{}.self_attn.k_layernorm-2",
+      "op": "MUL",
+      "sum": 13546.276367
+    },
+    {
+      "name": "node_88",
+      "op": "ROPE",
+      "sum": 14793.625
+    },
+    {
+      "name": "Vcur-2",
+      "op": "MUL_MAT",
+      "sum": 176.675781
+    },
+    {
+      "name": "Vcur-2",
+      "op": "RESHAPE",
+      "sum": 176.675781
+    },
+    {
+      "name": "node_101",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 192.571045
+    },
+    {
+      "name": "attn_out-2",
+      "op": "RESHAPE",
+      "sum": 192.571045
+    },
+    {
+      "name": "cache_r_l3 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "node_106",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_107",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_106 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "attn_out-2 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 192.571045
+    },
+    {
+      "name": "node_112",
+      "op": "MUL_MAT",
+      "sum": -1556.099854
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-2",
+      "op": "SIGMOID",
+      "sum": 3164.921143
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-2 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 3164.921143
+    },
+    {
+      "name": "node_115",
+      "op": "MUL",
+      "sum": 101.816109
+    },
+    {
+      "name": "(reshaped)",
+      "op": "RESHAPE",
+      "sum": 101.816109
+    },
+    {
+      "name": "model.layers.{}.self_attn.out_proj-2",
+      "op": "MUL_MAT",
+      "sum": -197.29982
+    },
+    {
+      "name": "norm-2",
+      "op": "RMS_NORM",
+      "sum": -11864.071289
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-2",
+      "op": "MUL",
+      "sum": -35.754566
+    },
+    {
+      "name": "node_120",
+      "op": "ADD",
+      "sum": -338.538757
+    },
+    {
+      "name": "norm-2",
+      "op": "RMS_NORM",
+      "sum": -19936.119141
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-2",
+      "op": "MUL",
+      "sum": -10421.713867
+    },
+    {
+      "name": "ffn_gate-2",
+      "op": "MUL_MAT",
+      "sum": -2619788.75
+    },
+    {
+      "name": "ffn_up-2",
+      "op": "MUL_MAT",
+      "sum": 4618.615723
+    },
+    {
+      "name": "ffn_swiglu-2",
+      "op": "SWIGLU",
+      "sum": -2010.281738
+    },
+    {
+      "name": "node_126",
+      "op": "MUL_MAT",
+      "sum": -5754.257812
+    },
+    {
+      "name": "norm-2",
+      "op": "RMS_NORM",
+      "sum": -19178.824219
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-2",
+      "op": "MUL",
+      "sum": -138.351807
+    },
+    {
+      "name": "l_out-2",
+      "op": "ADD",
+      "sum": -476.889404
+    },
+    {
+      "name": "norm-3",
+      "op": "RMS_NORM",
+      "sum": -26635.320312
+    },
+    {
+      "name": "model.layers.{}.operator_norm-3",
+      "op": "MUL",
+      "sum": -4377.643555
+    },
+    {
+      "name": "model.layers.{}.operator_norm-3 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -4377.643555
+    },
+    {
+      "name": "model.layers.{}.conv.in_proj-3",
+      "op": "MUL_MAT",
+      "sum": 5687.0
+    },
+    {
+      "name": "node_136",
+      "op": "MUL",
+      "sum": 1100.057373
+    },
+    {
+      "name": "(transposed)",
+      "op": "TRANSPOSE",
+      "sum": 1100.033447
+    },
+    {
+      "name": "node_138",
+      "op": "CONCAT",
+      "sum": 1100.033447
+    },
+    {
+      "name": "model.layers.{}.conv.conv-3",
+      "op": "SSM_CONV",
+      "sum": 74.687187
+    },
+    {
+      "name": "node_144",
+      "op": "MUL",
+      "sum": 34.382153
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-3",
+      "op": "MUL_MAT",
+      "sum": -51.723206
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-3 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -51.723206
+    },
+    {
+      "name": "norm-3",
+      "op": "RMS_NORM",
+      "sum": -10070.240234
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-3",
+      "op": "MUL",
+      "sum": 111.990585
+    },
+    {
+      "name": "node_149",
+      "op": "ADD",
+      "sum": -364.898193
+    },
+    {
+      "name": "norm-3",
+      "op": "RMS_NORM",
+      "sum": -22547.164062
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-3",
+      "op": "MUL",
+      "sum": -6088.781738
+    },
+    {
+      "name": "ffn_gate-3",
+      "op": "MUL_MAT",
+      "sum": -1058677.375
+    },
+    {
+      "name": "ffn_up-3",
+      "op": "MUL_MAT",
+      "sum": -1315.335815
+    },
+    {
+      "name": "ffn_swiglu-3",
+      "op": "SWIGLU",
+      "sum": -858.951233
+    },
+    {
+      "name": "node_155",
+      "op": "MUL_MAT",
+      "sum": 290.733276
+    },
+    {
+      "name": "norm-3",
+      "op": "RMS_NORM",
+      "sum": 2069.262207
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-3",
+      "op": "MUL",
+      "sum": -145.720627
+    },
+    {
+      "name": "l_out-3",
+      "op": "ADD",
+      "sum": -510.625732
+    },
+    {
+      "name": "norm-4",
+      "op": "RMS_NORM",
+      "sum": -27483.023438
+    },
+    {
+      "name": "model.layers.{}.operator_norm-4",
+      "op": "MUL",
+      "sum": -1702.123535
+    },
+    {
+      "name": "Qcur-4",
+      "op": "MUL_MAT",
+      "sum": 2624.589355
+    },
+    {
+      "name": "Qcur-4",
+      "op": "RESHAPE",
+      "sum": 2624.589355
+    },
+    {
+      "name": "norm-4",
+      "op": "RMS_NORM",
+      "sum": 29624.951172
+    },
+    {
+      "name": "model.layers.{}.self_attn.q_layernorm-4",
+      "op": "MUL",
+      "sum": 33460.238281
+    },
+    {
+      "name": "node_165",
+      "op": "ROPE",
+      "sum": 19336.431641
+    },
+    {
+      "name": "Kcur-4",
+      "op": "MUL_MAT",
+      "sum": -1348.535156
+    },
+    {
+      "name": "Kcur-4",
+      "op": "RESHAPE",
+      "sum": -1348.535156
+    },
+    {
+      "name": "norm-4",
+      "op": "RMS_NORM",
+      "sum": -16699.210938
+    },
+    {
+      "name": "model.layers.{}.self_attn.k_layernorm-4",
+      "op": "MUL",
+      "sum": -16641.679688
+    },
+    {
+      "name": "node_170",
+      "op": "ROPE",
+      "sum": -4980.780273
+    },
+    {
+      "name": "Vcur-4",
+      "op": "MUL_MAT",
+      "sum": -120.893326
+    },
+    {
+      "name": "Vcur-4",
+      "op": "RESHAPE",
+      "sum": -120.893326
+    },
+    {
+      "name": "node_183",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 453.281189
+    },
+    {
+      "name": "attn_out-4",
+      "op": "RESHAPE",
+      "sum": 453.281189
+    },
+    {
+      "name": "cache_r_l5 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "node_188",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_189",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_188 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "attn_out-4 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 453.281189
+    },
+    {
+      "name": "node_194",
+      "op": "MUL_MAT",
+      "sum": -561.855164
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-4",
+      "op": "SIGMOID",
+      "sum": 3385.082031
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-4 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 3385.082031
+    },
+    {
+      "name": "node_197",
+      "op": "MUL",
+      "sum": 167.723663
+    },
+    {
+      "name": "(reshaped)",
+      "op": "RESHAPE",
+      "sum": 167.723663
+    },
+    {
+      "name": "model.layers.{}.self_attn.out_proj-4",
+      "op": "MUL_MAT",
+      "sum": -648.921875
+    },
+    {
+      "name": "norm-4",
+      "op": "RMS_NORM",
+      "sum": -35947.261719
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-4",
+      "op": "MUL",
+      "sum": -36.560242
+    },
+    {
+      "name": "node_202",
+      "op": "ADD",
+      "sum": -547.165405
+    },
+    {
+      "name": "norm-4",
+      "op": "RMS_NORM",
+      "sum": -28598.623047
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-4",
+      "op": "MUL",
+      "sum": -10205.488281
+    },
+    {
+      "name": "ffn_gate-4",
+      "op": "MUL_MAT",
+      "sum": -1457236.5
+    },
+    {
+      "name": "ffn_up-4",
+      "op": "MUL_MAT",
+      "sum": -3461.534424
+    },
+    {
+      "name": "ffn_swiglu-4",
+      "op": "SWIGLU",
+      "sum": -971.930969
+    },
+    {
+      "name": "node_208",
+      "op": "MUL_MAT",
+      "sum": 4686.070801
+    },
+    {
+      "name": "norm-4",
+      "op": "RMS_NORM",
+      "sum": 20211.863281
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-4",
+      "op": "MUL",
+      "sum": -195.614426
+    },
+    {
+      "name": "l_out-4",
+      "op": "ADD",
+      "sum": -742.816833
+    },
+    {
+      "name": "norm-5",
+      "op": "RMS_NORM",
+      "sum": -34505.792969
+    },
+    {
+      "name": "model.layers.{}.operator_norm-5",
+      "op": "MUL",
+      "sum": -4966.932617
+    },
+    {
+      "name": "model.layers.{}.operator_norm-5 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -4966.932617
+    },
+    {
+      "name": "model.layers.{}.conv.in_proj-5",
+      "op": "MUL_MAT",
+      "sum": -1379.588745
+    },
+    {
+      "name": "node_218",
+      "op": "MUL",
+      "sum": 507.523743
+    },
+    {
+      "name": "(transposed)",
+      "op": "TRANSPOSE",
+      "sum": 507.522003
+    },
+    {
+      "name": "node_220",
+      "op": "CONCAT",
+      "sum": 507.522003
+    },
+    {
+      "name": "model.layers.{}.conv.conv-5",
+      "op": "SSM_CONV",
+      "sum": 126.10743
+    },
+    {
+      "name": "node_226",
+      "op": "MUL",
+      "sum": -19.817362
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-5",
+      "op": "MUL_MAT",
+      "sum": 7.734843
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-5 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 7.734843
+    },
+    {
+      "name": "norm-5",
+      "op": "RMS_NORM",
+      "sum": 1932.504028
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-5",
+      "op": "MUL",
+      "sum": 247.334412
+    },
+    {
+      "name": "node_231",
+      "op": "ADD",
+      "sum": -495.475006
+    },
+    {
+      "name": "norm-5",
+      "op": "RMS_NORM",
+      "sum": -26420.804688
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-5",
+      "op": "MUL",
+      "sum": -5695.548828
+    },
+    {
+      "name": "ffn_gate-5",
+      "op": "MUL_MAT",
+      "sum": -679079.5
+    },
+    {
+      "name": "ffn_up-5",
+      "op": "MUL_MAT",
+      "sum": 5149.556152
+    },
+    {
+      "name": "ffn_swiglu-5",
+      "op": "SWIGLU",
+      "sum": -1636.627686
+    },
+    {
+      "name": "node_237",
+      "op": "MUL_MAT",
+      "sum": 3329.702881
+    },
+    {
+      "name": "norm-5",
+      "op": "RMS_NORM",
+      "sum": 23142.357422
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-5",
+      "op": "MUL",
+      "sum": 122.582062
+    },
+    {
+      "name": "l_out-5",
+      "op": "ADD",
+      "sum": -372.895386
+    },
+    {
+      "name": "norm-6",
+      "op": "RMS_NORM",
+      "sum": -17432.929688
+    },
+    {
+      "name": "model.layers.{}.operator_norm-6",
+      "op": "MUL",
+      "sum": -732.746033
+    },
+    {
+      "name": "Qcur-6",
+      "op": "MUL_MAT",
+      "sum": -3397.291016
+    },
+    {
+      "name": "Qcur-6",
+      "op": "RESHAPE",
+      "sum": -3397.291016
+    },
+    {
+      "name": "norm-6",
+      "op": "RMS_NORM",
+      "sum": -35212.636719
+    },
+    {
+      "name": "model.layers.{}.self_attn.q_layernorm-6",
+      "op": "MUL",
+      "sum": -22438.126953
+    },
+    {
+      "name": "node_247",
+      "op": "ROPE",
+      "sum": -14070.243164
+    },
+    {
+      "name": "Kcur-6",
+      "op": "MUL_MAT",
+      "sum": 432.747009
+    },
+    {
+      "name": "Kcur-6",
+      "op": "RESHAPE",
+      "sum": 432.747009
+    },
+    {
+      "name": "norm-6",
+      "op": "RMS_NORM",
+      "sum": 4436.677734
+    },
+    {
+      "name": "model.layers.{}.self_attn.k_layernorm-6",
+      "op": "MUL",
+      "sum": 6581.851562
+    },
+    {
+      "name": "node_252",
+      "op": "ROPE",
+      "sum": 4803.22998
+    },
+    {
+      "name": "Vcur-6",
+      "op": "MUL_MAT",
+      "sum": -429.930267
+    },
+    {
+      "name": "Vcur-6",
+      "op": "RESHAPE",
+      "sum": -429.930267
+    },
+    {
+      "name": "node_265",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -565.77948
+    },
+    {
+      "name": "attn_out-6",
+      "op": "RESHAPE",
+      "sum": -565.77948
+    },
+    {
+      "name": "cache_r_l7 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "node_270",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_271",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_270 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "attn_out-6 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -565.77948
+    },
+    {
+      "name": "node_276",
+      "op": "MUL_MAT",
+      "sum": 575.366821
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-6",
+      "op": "SIGMOID",
+      "sum": 3655.774414
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-6 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 3655.774414
+    },
+    {
+      "name": "node_279",
+      "op": "MUL",
+      "sum": -416.131958
+    },
+    {
+      "name": "(reshaped)",
+      "op": "RESHAPE",
+      "sum": -416.131958
+    },
+    {
+      "name": "model.layers.{}.self_attn.out_proj-6",
+      "op": "MUL_MAT",
+      "sum": 430.933899
+    },
+    {
+      "name": "norm-6",
+      "op": "RMS_NORM",
+      "sum": 17344.814453
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-6",
+      "op": "MUL",
+      "sum": -60.735069
+    },
+    {
+      "name": "node_284",
+      "op": "ADD",
+      "sum": -433.620972
+    },
+    {
+      "name": "norm-6",
+      "op": "RMS_NORM",
+      "sum": -17861.244141
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-6",
+      "op": "MUL",
+      "sum": -3934.071289
+    },
+    {
+      "name": "ffn_gate-6",
+      "op": "MUL_MAT",
+      "sum": -491987.78125
+    },
+    {
+      "name": "ffn_up-6",
+      "op": "MUL_MAT",
+      "sum": -8195.358398
+    },
+    {
+      "name": "ffn_swiglu-6",
+      "op": "SWIGLU",
+      "sum": 527.18811
+    },
+    {
+      "name": "node_290",
+      "op": "MUL_MAT",
+      "sum": -380.52301
+    },
+    {
+      "name": "norm-6",
+      "op": "RMS_NORM",
+      "sum": -4775.445801
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-6",
+      "op": "MUL",
+      "sum": -527.932129
+    },
+    {
+      "name": "l_out-6",
+      "op": "ADD",
+      "sum": -961.544006
+    },
+    {
+      "name": "norm-7",
+      "op": "RMS_NORM",
+      "sum": -35258.226562
+    },
+    {
+      "name": "model.layers.{}.operator_norm-7",
+      "op": "MUL",
+      "sum": -5140.399414
+    },
+    {
+      "name": "model.layers.{}.operator_norm-7 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -5140.399414
+    },
+    {
+      "name": "model.layers.{}.conv.in_proj-7",
+      "op": "MUL_MAT",
+      "sum": -4941.548828
+    },
+    {
+      "name": "node_300",
+      "op": "MUL",
+      "sum": -780.830139
+    },
+    {
+      "name": "(transposed)",
+      "op": "TRANSPOSE",
+      "sum": -780.845642
+    },
+    {
+      "name": "node_302",
+      "op": "CONCAT",
+      "sum": -780.845642
+    },
+    {
+      "name": "model.layers.{}.conv.conv-7",
+      "op": "SSM_CONV",
+      "sum": 91.313034
+    },
+    {
+      "name": "node_308",
+      "op": "MUL",
+      "sum": -0.144649
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-7",
+      "op": "MUL_MAT",
+      "sum": -38.19595
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-7 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -38.19595
+    },
+    {
+      "name": "norm-7",
+      "op": "RMS_NORM",
+      "sum": -9322.4375
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-7",
+      "op": "MUL",
+      "sum": 278.34726
+    },
+    {
+      "name": "node_313",
+      "op": "ADD",
+      "sum": -683.197327
+    },
+    {
+      "name": "norm-7",
+      "op": "RMS_NORM",
+      "sum": -27747.808594
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-7",
+      "op": "MUL",
+      "sum": -5717.592773
+    },
+    {
+      "name": "ffn_gate-7",
+      "op": "MUL_MAT",
+      "sum": -358558.78125
+    },
+    {
+      "name": "ffn_up-7",
+      "op": "MUL_MAT",
+      "sum": 1691.15979
+    },
+    {
+      "name": "ffn_swiglu-7",
+      "op": "SWIGLU",
+      "sum": 5.933714
+    },
+    {
+      "name": "node_319",
+      "op": "MUL_MAT",
+      "sum": -1089.657715
+    },
+    {
+      "name": "norm-7",
+      "op": "RMS_NORM",
+      "sum": -15384.049805
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-7",
+      "op": "MUL",
+      "sum": -329.498993
+    },
+    {
+      "name": "l_out-7",
+      "op": "ADD",
+      "sum": -1012.711853
+    },
+    {
+      "name": "norm-8",
+      "op": "RMS_NORM",
+      "sum": -36662.652344
+    },
+    {
+      "name": "model.layers.{}.operator_norm-8",
+      "op": "MUL",
+      "sum": -2128.307861
+    },
+    {
+      "name": "Qcur-8",
+      "op": "MUL_MAT",
+      "sum": -1370.619263
+    },
+    {
+      "name": "Qcur-8",
+      "op": "RESHAPE",
+      "sum": -1370.619263
+    },
+    {
+      "name": "norm-8",
+      "op": "RMS_NORM",
+      "sum": -17226.300781
+    },
+    {
+      "name": "model.layers.{}.self_attn.q_layernorm-8",
+      "op": "MUL",
+      "sum": 7839.501465
+    },
+    {
+      "name": "node_329",
+      "op": "ROPE",
+      "sum": -12281.362305
+    },
+    {
+      "name": "Kcur-8",
+      "op": "MUL_MAT",
+      "sum": -164.657303
+    },
+    {
+      "name": "Kcur-8",
+      "op": "RESHAPE",
+      "sum": -164.657303
+    },
+    {
+      "name": "norm-8",
+      "op": "RMS_NORM",
+      "sum": -1701.956177
+    },
+    {
+      "name": "model.layers.{}.self_attn.k_layernorm-8",
+      "op": "MUL",
+      "sum": -4082.367432
+    },
+    {
+      "name": "node_334",
+      "op": "ROPE",
+      "sum": 6156.943848
+    },
+    {
+      "name": "Vcur-8",
+      "op": "MUL_MAT",
+      "sum": 17.298063
+    },
+    {
+      "name": "Vcur-8",
+      "op": "RESHAPE",
+      "sum": 17.298063
+    },
+    {
+      "name": "node_347",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 157.291641
+    },
+    {
+      "name": "attn_out-8",
+      "op": "RESHAPE",
+      "sum": 157.291641
+    },
+    {
+      "name": "cache_r_l9 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "node_352",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_353",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_352 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "attn_out-8 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 157.291641
+    },
+    {
+      "name": "node_358",
+      "op": "MUL_MAT",
+      "sum": -301.260071
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-8",
+      "op": "SIGMOID",
+      "sum": 3449.570801
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-8 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 3449.570801
+    },
+    {
+      "name": "node_361",
+      "op": "MUL",
+      "sum": 76.19516
+    },
+    {
+      "name": "(reshaped)",
+      "op": "RESHAPE",
+      "sum": 76.19516
+    },
+    {
+      "name": "model.layers.{}.self_attn.out_proj-8",
+      "op": "MUL_MAT",
+      "sum": -175.463257
+    },
+    {
+      "name": "norm-8",
+      "op": "RMS_NORM",
+      "sum": -9220.546875
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-8",
+      "op": "MUL",
+      "sum": 466.439941
+    },
+    {
+      "name": "node_366",
+      "op": "ADD",
+      "sum": -546.270813
+    },
+    {
+      "name": "norm-8",
+      "op": "RMS_NORM",
+      "sum": -19219.908203
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-8",
+      "op": "MUL",
+      "sum": -4753.838379
+    },
+    {
+      "name": "ffn_gate-8",
+      "op": "MUL_MAT",
+      "sum": -538460.875
+    },
+    {
+      "name": "ffn_up-8",
+      "op": "MUL_MAT",
+      "sum": -1433.941162
+    },
+    {
+      "name": "ffn_swiglu-8",
+      "op": "SWIGLU",
+      "sum": 1077.035889
+    },
+    {
+      "name": "node_372",
+      "op": "MUL_MAT",
+      "sum": -250.037857
+    },
+    {
+      "name": "norm-8",
+      "op": "RMS_NORM",
+      "sum": -2978.000488
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-8",
+      "op": "MUL",
+      "sum": -404.681824
+    },
+    {
+      "name": "l_out-8",
+      "op": "ADD",
+      "sum": -950.957397
+    },
+    {
+      "name": "norm-9",
+      "op": "RMS_NORM",
+      "sum": -28081.447266
+    },
+    {
+      "name": "model.layers.{}.operator_norm-9",
+      "op": "MUL",
+      "sum": -4355.421875
+    },
+    {
+      "name": "model.layers.{}.operator_norm-9 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -4355.421875
+    },
+    {
+      "name": "model.layers.{}.conv.in_proj-9",
+      "op": "MUL_MAT",
+      "sum": -643.727844
+    },
+    {
+      "name": "node_382",
+      "op": "MUL",
+      "sum": 1020.420105
+    },
+    {
+      "name": "(transposed)",
+      "op": "TRANSPOSE",
+      "sum": 1020.418762
+    },
+    {
+      "name": "node_384",
+      "op": "CONCAT",
+      "sum": 1020.418762
+    },
+    {
+      "name": "model.layers.{}.conv.conv-9",
+      "op": "SSM_CONV",
+      "sum": -51.908249
+    },
+    {
+      "name": "node_390",
+      "op": "MUL",
+      "sum": -3.394592
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-9",
+      "op": "MUL_MAT",
+      "sum": 10.227606
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-9 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 10.227606
+    },
+    {
+      "name": "norm-9",
+      "op": "RMS_NORM",
+      "sum": 2681.318359
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-9",
+      "op": "MUL",
+      "sum": 356.305389
+    },
+    {
+      "name": "node_395",
+      "op": "ADD",
+      "sum": -594.672485
+    },
+    {
+      "name": "norm-9",
+      "op": "RMS_NORM",
+      "sum": -19805.171875
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-9",
+      "op": "MUL",
+      "sum": -2964.564453
+    },
+    {
+      "name": "ffn_gate-9",
+      "op": "MUL_MAT",
+      "sum": -219876.9375
+    },
+    {
+      "name": "ffn_up-9",
+      "op": "MUL_MAT",
+      "sum": -1190.515503
+    },
+    {
+      "name": "ffn_swiglu-9",
+      "op": "SWIGLU",
+      "sum": 73.597961
+    },
+    {
+      "name": "node_401",
+      "op": "MUL_MAT",
+      "sum": -486.093903
+    },
+    {
+      "name": "norm-9",
+      "op": "RMS_NORM",
+      "sum": -13795.597656
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-9",
+      "op": "MUL",
+      "sum": -155.553345
+    },
+    {
+      "name": "l_out-9",
+      "op": "ADD",
+      "sum": -750.237488
+    },
+    {
+      "name": "norm-10",
+      "op": "RMS_NORM",
+      "sum": -23475.152344
+    },
+    {
+      "name": "model.layers.{}.operator_norm-10",
+      "op": "MUL",
+      "sum": -1603.185669
+    },
+    {
+      "name": "Qcur-10",
+      "op": "MUL_MAT",
+      "sum": -1677.646362
+    },
+    {
+      "name": "Qcur-10",
+      "op": "RESHAPE",
+      "sum": -1677.646362
+    },
+    {
+      "name": "norm-10",
+      "op": "RMS_NORM",
+      "sum": -19872.908203
+    },
+    {
+      "name": "model.layers.{}.self_attn.q_layernorm-10",
+      "op": "MUL",
+      "sum": -4513.502441
+    },
+    {
+      "name": "node_411",
+      "op": "ROPE",
+      "sum": -16609.326172
+    },
+    {
+      "name": "Kcur-10",
+      "op": "MUL_MAT",
+      "sum": 20.835846
+    },
+    {
+      "name": "Kcur-10",
+      "op": "RESHAPE",
+      "sum": 20.835846
+    },
+    {
+      "name": "norm-10",
+      "op": "RMS_NORM",
+      "sum": 196.521103
+    },
+    {
+      "name": "model.layers.{}.self_attn.k_layernorm-10",
+      "op": "MUL",
+      "sum": -1498.649048
+    },
+    {
+      "name": "node_416",
+      "op": "ROPE",
+      "sum": 367.615814
+    },
+    {
+      "name": "Vcur-10",
+      "op": "MUL_MAT",
+      "sum": 290.6539
+    },
+    {
+      "name": "Vcur-10",
+      "op": "RESHAPE",
+      "sum": 290.6539
+    },
+    {
+      "name": "node_429",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 1024.106079
+    },
+    {
+      "name": "attn_out-10",
+      "op": "RESHAPE",
+      "sum": 1024.106079
+    },
+    {
+      "name": "cache_r_l11 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "node_434",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_435",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_434 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "attn_out-10 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 1024.106079
+    },
+    {
+      "name": "node_440",
+      "op": "MUL_MAT",
+      "sum": 897.042542
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-10",
+      "op": "SIGMOID",
+      "sum": 3717.402344
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-10 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 3717.402344
+    },
+    {
+      "name": "node_443",
+      "op": "MUL",
+      "sum": 587.341309
+    },
+    {
+      "name": "(reshaped)",
+      "op": "RESHAPE",
+      "sum": 587.341309
+    },
+    {
+      "name": "model.layers.{}.self_attn.out_proj-10",
+      "op": "MUL_MAT",
+      "sum": -304.009125
+    },
+    {
+      "name": "norm-10",
+      "op": "RMS_NORM",
+      "sum": -9291.679688
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-10",
+      "op": "MUL",
+      "sum": 436.697784
+    },
+    {
+      "name": "node_448",
+      "op": "ADD",
+      "sum": -313.521454
+    },
+    {
+      "name": "norm-10",
+      "op": "RMS_NORM",
+      "sum": -8606.015625
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-10",
+      "op": "MUL",
+      "sum": -2543.368896
+    },
+    {
+      "name": "ffn_gate-10",
+      "op": "MUL_MAT",
+      "sum": -503725.28125
+    },
+    {
+      "name": "ffn_up-10",
+      "op": "MUL_MAT",
+      "sum": 5505.747559
+    },
+    {
+      "name": "ffn_swiglu-10",
+      "op": "SWIGLU",
+      "sum": -640.771545
+    },
+    {
+      "name": "node_454",
+      "op": "MUL_MAT",
+      "sum": -770.545227
+    },
+    {
+      "name": "norm-10",
+      "op": "RMS_NORM",
+      "sum": -12687.666992
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-10",
+      "op": "MUL",
+      "sum": -663.681458
+    },
+    {
+      "name": "l_out-10",
+      "op": "ADD",
+      "sum": -977.207275
+    },
+    {
+      "name": "norm-11",
+      "op": "RMS_NORM",
+      "sum": -20460.707031
+    },
+    {
+      "name": "model.layers.{}.operator_norm-11",
+      "op": "MUL",
+      "sum": -3730.562012
+    },
+    {
+      "name": "model.layers.{}.operator_norm-11 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -3730.562012
+    },
+    {
+      "name": "model.layers.{}.conv.in_proj-11",
+      "op": "MUL_MAT",
+      "sum": 1366.723267
+    },
+    {
+      "name": "node_464",
+      "op": "MUL",
+      "sum": 2055.917725
+    },
+    {
+      "name": "(transposed)",
+      "op": "TRANSPOSE",
+      "sum": 2055.875977
+    },
+    {
+      "name": "node_466",
+      "op": "CONCAT",
+      "sum": 2055.875977
+    },
+    {
+      "name": "model.layers.{}.conv.conv-11",
+      "op": "SSM_CONV",
+      "sum": -36.965698
+    },
+    {
+      "name": "node_472",
+      "op": "MUL",
+      "sum": 7.927548
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-11",
+      "op": "MUL_MAT",
+      "sum": -81.632362
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-11 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -81.632362
+    },
+    {
+      "name": "norm-11",
+      "op": "RMS_NORM",
+      "sum": -17142.859375
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-11",
+      "op": "MUL",
+      "sum": 417.702393
+    },
+    {
+      "name": "node_477",
+      "op": "ADD",
+      "sum": -559.507019
+    },
+    {
+      "name": "norm-11",
+      "op": "RMS_NORM",
+      "sum": -13725.979492
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-11",
+      "op": "MUL",
+      "sum": -3386.127686
+    },
+    {
+      "name": "ffn_gate-11",
+      "op": "MUL_MAT",
+      "sum": -458747.40625
+    },
+    {
+      "name": "ffn_up-11",
+      "op": "MUL_MAT",
+      "sum": 976.613647
+    },
+    {
+      "name": "ffn_swiglu-11",
+      "op": "SWIGLU",
+      "sum": -620.276367
+    },
+    {
+      "name": "node_483",
+      "op": "MUL_MAT",
+      "sum": 788.608154
+    },
+    {
+      "name": "norm-11",
+      "op": "RMS_NORM",
+      "sum": 12438.924805
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-11",
+      "op": "MUL",
+      "sum": -82.639694
+    },
+    {
+      "name": "l_out-11",
+      "op": "ADD",
+      "sum": -642.148376
+    },
+    {
+      "name": "norm-12",
+      "op": "RMS_NORM",
+      "sum": -14253.845703
+    },
+    {
+      "name": "model.layers.{}.operator_norm-12",
+      "op": "MUL",
+      "sum": -1190.340088
+    },
+    {
+      "name": "Qcur-12",
+      "op": "MUL_MAT",
+      "sum": -4173.426758
+    },
+    {
+      "name": "Qcur-12",
+      "op": "RESHAPE",
+      "sum": -4173.426758
+    },
+    {
+      "name": "norm-12",
+      "op": "RMS_NORM",
+      "sum": -41914.671875
+    },
+    {
+      "name": "model.layers.{}.self_attn.q_layernorm-12",
+      "op": "MUL",
+      "sum": -39059.109375
+    },
+    {
+      "name": "node_493",
+      "op": "ROPE",
+      "sum": 10200.169922
+    },
+    {
+      "name": "Kcur-12",
+      "op": "MUL_MAT",
+      "sum": 843.890869
+    },
+    {
+      "name": "Kcur-12",
+      "op": "RESHAPE",
+      "sum": 843.890869
+    },
+    {
+      "name": "norm-12",
+      "op": "RMS_NORM",
+      "sum": 7333.842773
+    },
+    {
+      "name": "model.layers.{}.self_attn.k_layernorm-12",
+      "op": "MUL",
+      "sum": 4242.694336
+    },
+    {
+      "name": "node_498",
+      "op": "ROPE",
+      "sum": -3013.808838
+    },
+    {
+      "name": "Vcur-12",
+      "op": "MUL_MAT",
+      "sum": -738.731567
+    },
+    {
+      "name": "Vcur-12",
+      "op": "RESHAPE",
+      "sum": -738.731567
+    },
+    {
+      "name": "node_511",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -3131.22168
+    },
+    {
+      "name": "attn_out-12",
+      "op": "RESHAPE",
+      "sum": -3131.22168
+    },
+    {
+      "name": "cache_r_l13 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "node_516",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_517",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_516 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "attn_out-12 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -3131.22168
+    },
+    {
+      "name": "node_522",
+      "op": "MUL_MAT",
+      "sum": 225.262024
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-12",
+      "op": "SIGMOID",
+      "sum": 3569.370117
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-12 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 3569.370117
+    },
+    {
+      "name": "node_525",
+      "op": "MUL",
+      "sum": -1706.84436
+    },
+    {
+      "name": "(reshaped)",
+      "op": "RESHAPE",
+      "sum": -1706.84436
+    },
+    {
+      "name": "model.layers.{}.self_attn.out_proj-12",
+      "op": "MUL_MAT",
+      "sum": -291.561371
+    },
+    {
+      "name": "norm-12",
+      "op": "RMS_NORM",
+      "sum": -10567.181641
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-12",
+      "op": "MUL",
+      "sum": 119.539558
+    },
+    {
+      "name": "node_530",
+      "op": "ADD",
+      "sum": -522.611633
+    },
+    {
+      "name": "norm-12",
+      "op": "RMS_NORM",
+      "sum": -10849.615234
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-12",
+      "op": "MUL",
+      "sum": -3076.650391
+    },
+    {
+      "name": "ffn_gate-12",
+      "op": "MUL_MAT",
+      "sum": -633509.8125
+    },
+    {
+      "name": "ffn_up-12",
+      "op": "MUL_MAT",
+      "sum": -5556.722656
+    },
+    {
+      "name": "ffn_swiglu-12",
+      "op": "SWIGLU",
+      "sum": -12.504285
+    },
+    {
+      "name": "node_536",
+      "op": "MUL_MAT",
+      "sum": -2146.734375
+    },
+    {
+      "name": "norm-12",
+      "op": "RMS_NORM",
+      "sum": -30034.140625
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-12",
+      "op": "MUL",
+      "sum": -723.968689
+    },
+    {
+      "name": "l_out-12",
+      "op": "ADD",
+      "sum": -1246.580566
+    },
+    {
+      "name": "norm-13",
+      "op": "RMS_NORM",
+      "sum": -20325.328125
+    },
+    {
+      "name": "model.layers.{}.operator_norm-13",
+      "op": "MUL",
+      "sum": -3757.564453
+    },
+    {
+      "name": "model.layers.{}.operator_norm-13 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -3757.564453
+    },
+    {
+      "name": "model.layers.{}.conv.in_proj-13",
+      "op": "MUL_MAT",
+      "sum": 7434.486816
+    },
+    {
+      "name": "node_546",
+      "op": "MUL",
+      "sum": 3123.03418
+    },
+    {
+      "name": "(transposed)",
+      "op": "TRANSPOSE",
+      "sum": 3123.021729
+    },
+    {
+      "name": "node_548",
+      "op": "CONCAT",
+      "sum": 3123.021729
+    },
+    {
+      "name": "model.layers.{}.conv.conv-13",
+      "op": "SSM_CONV",
+      "sum": 3.180891
+    },
+    {
+      "name": "node_554",
+      "op": "MUL",
+      "sum": -32.067467
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-13",
+      "op": "MUL_MAT",
+      "sum": 122.983231
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-13 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 122.983231
+    },
+    {
+      "name": "norm-13",
+      "op": "RMS_NORM",
+      "sum": 20318.773438
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-13",
+      "op": "MUL",
+      "sum": 847.666748
+    },
+    {
+      "name": "node_559",
+      "op": "ADD",
+      "sum": -398.925293
+    },
+    {
+      "name": "norm-13",
+      "op": "RMS_NORM",
+      "sum": -7613.03125
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-13",
+      "op": "MUL",
+      "sum": -1962.651001
+    },
+    {
+      "name": "ffn_gate-13",
+      "op": "MUL_MAT",
+      "sum": -422469.4375
+    },
+    {
+      "name": "ffn_up-13",
+      "op": "MUL_MAT",
+      "sum": -10547.080078
+    },
+    {
+      "name": "ffn_swiglu-13",
+      "op": "SWIGLU",
+      "sum": -126.525017
+    },
+    {
+      "name": "node_565",
+      "op": "MUL_MAT",
+      "sum": -951.438599
+    },
+    {
+      "name": "norm-13",
+      "op": "RMS_NORM",
+      "sum": -15587.34082
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-13",
+      "op": "MUL",
+      "sum": 175.207886
+    },
+    {
+      "name": "l_out-13",
+      "op": "ADD",
+      "sum": -223.712296
+    },
+    {
+      "name": "norm-14",
+      "op": "RMS_NORM",
+      "sum": -3854.153076
+    },
+    {
+      "name": "model.layers.{}.operator_norm-14",
+      "op": "MUL",
+      "sum": 175.513306
+    },
+    {
+      "name": "Qcur-14",
+      "op": "MUL_MAT",
+      "sum": 1399.795532
+    },
+    {
+      "name": "Qcur-14",
+      "op": "RESHAPE",
+      "sum": 1399.795532
+    },
+    {
+      "name": "norm-14",
+      "op": "RMS_NORM",
+      "sum": 16008.601562
+    },
+    {
+      "name": "model.layers.{}.self_attn.q_layernorm-14",
+      "op": "MUL",
+      "sum": 20120.554688
+    },
+    {
+      "name": "node_575",
+      "op": "ROPE",
+      "sum": 14337.581055
+    },
+    {
+      "name": "Kcur-14",
+      "op": "MUL_MAT",
+      "sum": 189.393051
+    },
+    {
+      "name": "Kcur-14",
+      "op": "RESHAPE",
+      "sum": 189.393051
+    },
+    {
+      "name": "norm-14",
+      "op": "RMS_NORM",
+      "sum": 2297.845947
+    },
+    {
+      "name": "model.layers.{}.self_attn.k_layernorm-14",
+      "op": "MUL",
+      "sum": 572.862305
+    },
+    {
+      "name": "node_580",
+      "op": "ROPE",
+      "sum": -4690.83252
+    },
+    {
+      "name": "Vcur-14",
+      "op": "MUL_MAT",
+      "sum": -133.496735
+    },
+    {
+      "name": "Vcur-14",
+      "op": "RESHAPE",
+      "sum": -133.496735
+    },
+    {
+      "name": "node_593",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -1672.949829
+    },
+    {
+      "name": "attn_out-14",
+      "op": "RESHAPE",
+      "sum": -1672.949829
+    },
+    {
+      "name": "cache_r_l15 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "node_598",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_599",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_598 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "attn_out-14 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -1672.949829
+    },
+    {
+      "name": "node_604",
+      "op": "MUL_MAT",
+      "sum": -1788.820312
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-14",
+      "op": "SIGMOID",
+      "sum": 3101.279785
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-14 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 3101.279785
+    },
+    {
+      "name": "node_607",
+      "op": "MUL",
+      "sum": -715.018005
+    },
+    {
+      "name": "(reshaped)",
+      "op": "RESHAPE",
+      "sum": -715.018005
+    },
+    {
+      "name": "model.layers.{}.self_attn.out_proj-14",
+      "op": "MUL_MAT",
+      "sum": -236.768112
+    },
+    {
+      "name": "norm-14",
+      "op": "RMS_NORM",
+      "sum": -12040.166992
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-14",
+      "op": "MUL",
+      "sum": -476.164368
+    },
+    {
+      "name": "node_612",
+      "op": "ADD",
+      "sum": -699.874146
+    },
+    {
+      "name": "norm-14",
+      "op": "RMS_NORM",
+      "sum": -8711.016602
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-14",
+      "op": "MUL",
+      "sum": -2061.317871
+    },
+    {
+      "name": "ffn_gate-14",
+      "op": "MUL_MAT",
+      "sum": -490654.0
+    },
+    {
+      "name": "ffn_up-14",
+      "op": "MUL_MAT",
+      "sum": 5433.62207
+    },
+    {
+      "name": "ffn_swiglu-14",
+      "op": "SWIGLU",
+      "sum": -627.696594
+    },
+    {
+      "name": "node_618",
+      "op": "MUL_MAT",
+      "sum": -722.508118
+    },
+    {
+      "name": "norm-14",
+      "op": "RMS_NORM",
+      "sum": -12024.272461
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-14",
+      "op": "MUL",
+      "sum": -207.315094
+    },
+    {
+      "name": "l_out-14",
+      "op": "ADD",
+      "sum": -907.1745
+    },
+    {
+      "name": "norm-15",
+      "op": "RMS_NORM",
+      "sum": -10508.894531
+    },
+    {
+      "name": "model.layers.{}.operator_norm-15",
+      "op": "MUL",
+      "sum": -1589.214722
+    },
+    {
+      "name": "model.layers.{}.operator_norm-15 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -1589.214722
+    },
+    {
+      "name": "model.layers.{}.conv.in_proj-15",
+      "op": "MUL_MAT",
+      "sum": -4112.735352
+    },
+    {
+      "name": "node_628",
+      "op": "MUL",
+      "sum": -817.111633
+    },
+    {
+      "name": "(transposed)",
+      "op": "TRANSPOSE",
+      "sum": -817.084595
+    },
+    {
+      "name": "node_630",
+      "op": "CONCAT",
+      "sum": -817.084595
+    },
+    {
+      "name": "model.layers.{}.conv.conv-15",
+      "op": "SSM_CONV",
+      "sum": 6.419877
+    },
+    {
+      "name": "node_636",
+      "op": "MUL",
+      "sum": -0.690626
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-15",
+      "op": "MUL_MAT",
+      "sum": -11.875496
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-15 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -11.875496
+    },
+    {
+      "name": "norm-15",
+      "op": "RMS_NORM",
+      "sum": -3034.006104
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-15",
+      "op": "MUL",
+      "sum": 635.923889
+    },
+    {
+      "name": "node_641",
+      "op": "ADD",
+      "sum": -271.253998
+    },
+    {
+      "name": "norm-15",
+      "op": "RMS_NORM",
+      "sum": -3342.608398
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-15",
+      "op": "MUL",
+      "sum": -8.84893
+    },
+    {
+      "name": "ffn_gate-15",
+      "op": "MUL_MAT",
+      "sum": -755433.5625
+    },
+    {
+      "name": "ffn_up-15",
+      "op": "MUL_MAT",
+      "sum": -5861.265625
+    },
+    {
+      "name": "ffn_swiglu-15",
+      "op": "SWIGLU",
+      "sum": -147.087616
+    },
+    {
+      "name": "node_647",
+      "op": "MUL_MAT",
+      "sum": -3486.113525
+    },
+    {
+      "name": "norm-15",
+      "op": "RMS_NORM",
+      "sum": -28280.242188
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-15",
+      "op": "MUL",
+      "sum": -38.486481
+    },
+    {
+      "name": "l_out-15",
+      "op": "ADD",
+      "sum": -309.742523
+    },
+    {
+      "name": "norm-16",
+      "op": "RMS_NORM",
+      "sum": -3766.212402
+    },
+    {
+      "name": "model.layers.{}.operator_norm-16",
+      "op": "MUL",
+      "sum": -1216.962769
+    },
+    {
+      "name": "Qcur-16",
+      "op": "MUL_MAT",
+      "sum": -2437.078125
+    },
+    {
+      "name": "Qcur-16",
+      "op": "RESHAPE",
+      "sum": -2437.078125
+    },
+    {
+      "name": "norm-16",
+      "op": "RMS_NORM",
+      "sum": -25901.550781
+    },
+    {
+      "name": "model.layers.{}.self_attn.q_layernorm-16",
+      "op": "MUL",
+      "sum": -28063.503906
+    },
+    {
+      "name": "node_657",
+      "op": "ROPE",
+      "sum": -5872.245605
+    },
+    {
+      "name": "Kcur-16",
+      "op": "MUL_MAT",
+      "sum": -249.561676
+    },
+    {
+      "name": "Kcur-16",
+      "op": "RESHAPE",
+      "sum": -249.561676
+    },
+    {
+      "name": "norm-16",
+      "op": "RMS_NORM",
+      "sum": -2975.402832
+    },
+    {
+      "name": "model.layers.{}.self_attn.k_layernorm-16",
+      "op": "MUL",
+      "sum": 5653.647461
+    },
+    {
+      "name": "node_662",
+      "op": "ROPE",
+      "sum": 2926.950439
+    },
+    {
+      "name": "Vcur-16",
+      "op": "MUL_MAT",
+      "sum": 57.153667
+    },
+    {
+      "name": "Vcur-16",
+      "op": "RESHAPE",
+      "sum": 57.153667
+    },
+    {
+      "name": "node_675",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -46.499119
+    },
+    {
+      "name": "attn_out-16",
+      "op": "RESHAPE",
+      "sum": -46.499119
+    },
+    {
+      "name": "cache_r_l17 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "node_680",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_681",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_680 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "attn_out-16 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -46.499119
+    },
+    {
+      "name": "node_686",
+      "op": "MUL_MAT",
+      "sum": -3555.23999
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-16",
+      "op": "SIGMOID",
+      "sum": 2742.203613
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-16 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 2742.203613
+    },
+    {
+      "name": "node_689",
+      "op": "MUL",
+      "sum": -172.141022
+    },
+    {
+      "name": "(reshaped)",
+      "op": "RESHAPE",
+      "sum": -172.141022
+    },
+    {
+      "name": "model.layers.{}.self_attn.out_proj-16",
+      "op": "MUL_MAT",
+      "sum": -219.08139
+    },
+    {
+      "name": "norm-16",
+      "op": "RMS_NORM",
+      "sum": -7368.268555
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-16",
+      "op": "MUL",
+      "sum": 30.798189
+    },
+    {
+      "name": "node_694",
+      "op": "ADD",
+      "sum": -278.944
+    },
+    {
+      "name": "norm-16",
+      "op": "RMS_NORM",
+      "sum": -3256.398926
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-16",
+      "op": "MUL",
+      "sum": 175.896759
+    },
+    {
+      "name": "ffn_gate-16",
+      "op": "MUL_MAT",
+      "sum": -391007.125
+    },
+    {
+      "name": "ffn_up-16",
+      "op": "MUL_MAT",
+      "sum": 2019.612793
+    },
+    {
+      "name": "ffn_swiglu-16",
+      "op": "SWIGLU",
+      "sum": -1148.454102
+    },
+    {
+      "name": "node_700",
+      "op": "MUL_MAT",
+      "sum": -2047.42688
+    },
+    {
+      "name": "norm-16",
+      "op": "RMS_NORM",
+      "sum": -25566.117188
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-16",
+      "op": "MUL",
+      "sum": -547.792358
+    },
+    {
+      "name": "l_out-16",
+      "op": "ADD",
+      "sum": -826.74054
+    },
+    {
+      "name": "norm-17",
+      "op": "RMS_NORM",
+      "sum": -8401.948242
+    },
+    {
+      "name": "model.layers.{}.operator_norm-17",
+      "op": "MUL",
+      "sum": -1078.940918
+    },
+    {
+      "name": "model.layers.{}.operator_norm-17 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -1078.940918
+    },
+    {
+      "name": "model.layers.{}.conv.in_proj-17",
+      "op": "MUL_MAT",
+      "sum": -2547.541992
+    },
+    {
+      "name": "node_710",
+      "op": "MUL",
+      "sum": -832.969727
+    },
+    {
+      "name": "(transposed)",
+      "op": "TRANSPOSE",
+      "sum": -832.931885
+    },
+    {
+      "name": "node_712",
+      "op": "CONCAT",
+      "sum": -832.931885
+    },
+    {
+      "name": "model.layers.{}.conv.conv-17",
+      "op": "SSM_CONV",
+      "sum": -68.640251
+    },
+    {
+      "name": "node_718",
+      "op": "MUL",
+      "sum": -18.548393
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-17",
+      "op": "MUL_MAT",
+      "sum": -24.12641
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-17 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -24.12641
+    },
+    {
+      "name": "norm-17",
+      "op": "RMS_NORM",
+      "sum": -5319.401367
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-17",
+      "op": "MUL",
+      "sum": 443.94809
+    },
+    {
+      "name": "node_723",
+      "op": "ADD",
+      "sum": -382.787262
+    },
+    {
+      "name": "norm-17",
+      "op": "RMS_NORM",
+      "sum": -4238.85791
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-17",
+      "op": "MUL",
+      "sum": 412.314972
+    },
+    {
+      "name": "ffn_gate-17",
+      "op": "MUL_MAT",
+      "sum": -384294.8125
+    },
+    {
+      "name": "ffn_up-17",
+      "op": "MUL_MAT",
+      "sum": 309.895721
+    },
+    {
+      "name": "ffn_swiglu-17",
+      "op": "SWIGLU",
+      "sum": -603.342834
+    },
+    {
+      "name": "node_729",
+      "op": "MUL_MAT",
+      "sum": 1450.223145
+    },
+    {
+      "name": "norm-17",
+      "op": "RMS_NORM",
+      "sum": 14879.272461
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-17",
+      "op": "MUL",
+      "sum": -41.863831
+    },
+    {
+      "name": "l_out-17",
+      "op": "ADD",
+      "sum": -424.658264
+    },
+    {
+      "name": "norm-18",
+      "op": "RMS_NORM",
+      "sum": -4739.638184
+    },
+    {
+      "name": "model.layers.{}.operator_norm-18",
+      "op": "MUL",
+      "sum": -8.401843
+    },
+    {
+      "name": "Qcur-18",
+      "op": "MUL_MAT",
+      "sum": 203.563675
+    },
+    {
+      "name": "Qcur-18",
+      "op": "RESHAPE",
+      "sum": 203.563675
+    },
+    {
+      "name": "norm-18",
+      "op": "RMS_NORM",
+      "sum": 2724.709717
+    },
+    {
+      "name": "model.layers.{}.self_attn.q_layernorm-18",
+      "op": "MUL",
+      "sum": -2164.040039
+    },
+    {
+      "name": "node_739",
+      "op": "ROPE",
+      "sum": -2840.415039
+    },
+    {
+      "name": "Kcur-18",
+      "op": "MUL_MAT",
+      "sum": -288.976227
+    },
+    {
+      "name": "Kcur-18",
+      "op": "RESHAPE",
+      "sum": -288.976227
+    },
+    {
+      "name": "norm-18",
+      "op": "RMS_NORM",
+      "sum": -7633.404785
+    },
+    {
+      "name": "model.layers.{}.self_attn.k_layernorm-18",
+      "op": "MUL",
+      "sum": 1913.012329
+    },
+    {
+      "name": "node_744",
+      "op": "ROPE",
+      "sum": 1987.211304
+    },
+    {
+      "name": "Vcur-18",
+      "op": "MUL_MAT",
+      "sum": 338.207458
+    },
+    {
+      "name": "Vcur-18",
+      "op": "RESHAPE",
+      "sum": 338.207458
+    },
+    {
+      "name": "node_757",
+      "op": "FLASH_ATTN_EXT",
+      "sum": -808.197327
+    },
+    {
+      "name": "attn_out-18",
+      "op": "RESHAPE",
+      "sum": -808.197327
+    },
+    {
+      "name": "cache_r_l19 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "node_762",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_763",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_762 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "attn_out-18 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -808.197327
+    },
+    {
+      "name": "node_768",
+      "op": "MUL_MAT",
+      "sum": -3005.013428
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-18",
+      "op": "SIGMOID",
+      "sum": 2799.226807
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-18 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 2799.226807
+    },
+    {
+      "name": "node_771",
+      "op": "MUL",
+      "sum": -283.627197
+    },
+    {
+      "name": "(reshaped)",
+      "op": "RESHAPE",
+      "sum": -283.627197
+    },
+    {
+      "name": "model.layers.{}.self_attn.out_proj-18",
+      "op": "MUL_MAT",
+      "sum": 541.431763
+    },
+    {
+      "name": "norm-18",
+      "op": "RMS_NORM",
+      "sum": 20155.216797
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-18",
+      "op": "MUL",
+      "sum": 381.94751
+    },
+    {
+      "name": "node_776",
+      "op": "ADD",
+      "sum": -42.698933
+    },
+    {
+      "name": "norm-18",
+      "op": "RMS_NORM",
+      "sum": -573.155762
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-18",
+      "op": "MUL",
+      "sum": 1375.618042
+    },
+    {
+      "name": "ffn_gate-18",
+      "op": "MUL_MAT",
+      "sum": -488739.75
+    },
+    {
+      "name": "ffn_up-18",
+      "op": "MUL_MAT",
+      "sum": -6341.974609
+    },
+    {
+      "name": "ffn_swiglu-18",
+      "op": "SWIGLU",
+      "sum": -1027.186646
+    },
+    {
+      "name": "node_782",
+      "op": "MUL_MAT",
+      "sum": -2213.900879
+    },
+    {
+      "name": "norm-18",
+      "op": "RMS_NORM",
+      "sum": -14679.020508
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-18",
+      "op": "MUL",
+      "sum": -151.022446
+    },
+    {
+      "name": "l_out-18",
+      "op": "ADD",
+      "sum": -193.719025
+    },
+    {
+      "name": "norm-19",
+      "op": "RMS_NORM",
+      "sum": -1870.526367
+    },
+    {
+      "name": "model.layers.{}.operator_norm-19",
+      "op": "MUL",
+      "sum": -263.283234
+    },
+    {
+      "name": "model.layers.{}.operator_norm-19 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -263.283234
+    },
+    {
+      "name": "model.layers.{}.conv.in_proj-19",
+      "op": "MUL_MAT",
+      "sum": 310.172394
+    },
+    {
+      "name": "node_792",
+      "op": "MUL",
+      "sum": 1608.30481
+    },
+    {
+      "name": "(transposed)",
+      "op": "TRANSPOSE",
+      "sum": 1608.27356
+    },
+    {
+      "name": "node_794",
+      "op": "CONCAT",
+      "sum": 1608.27356
+    },
+    {
+      "name": "model.layers.{}.conv.conv-19",
+      "op": "SSM_CONV",
+      "sum": -113.328117
+    },
+    {
+      "name": "node_800",
+      "op": "MUL",
+      "sum": -10.234453
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-19",
+      "op": "MUL_MAT",
+      "sum": -0.720099
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-19 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -0.720099
+    },
+    {
+      "name": "norm-19",
+      "op": "RMS_NORM",
+      "sum": -536.991455
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-19",
+      "op": "MUL",
+      "sum": 415.106506
+    },
+    {
+      "name": "node_805",
+      "op": "ADD",
+      "sum": 221.387772
+    },
+    {
+      "name": "norm-19",
+      "op": "RMS_NORM",
+      "sum": 1785.370728
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-19",
+      "op": "MUL",
+      "sum": 1678.739014
+    },
+    {
+      "name": "ffn_gate-19",
+      "op": "MUL_MAT",
+      "sum": -519939.90625
+    },
+    {
+      "name": "ffn_up-19",
+      "op": "MUL_MAT",
+      "sum": -9899.104492
+    },
+    {
+      "name": "ffn_swiglu-19",
+      "op": "SWIGLU",
+      "sum": -853.056458
+    },
+    {
+      "name": "node_811",
+      "op": "MUL_MAT",
+      "sum": -6351.947754
+    },
+    {
+      "name": "norm-19",
+      "op": "RMS_NORM",
+      "sum": -37998.378906
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-19",
+      "op": "MUL",
+      "sum": -2317.179443
+    },
+    {
+      "name": "l_out-19",
+      "op": "ADD",
+      "sum": -2095.797363
+    },
+    {
+      "name": "norm-20",
+      "op": "RMS_NORM",
+      "sum": -16867.925781
+    },
+    {
+      "name": "model.layers.{}.operator_norm-20",
+      "op": "MUL",
+      "sum": -1509.330688
+    },
+    {
+      "name": "Qcur-20",
+      "op": "MUL_MAT",
+      "sum": -709.286499
+    },
+    {
+      "name": "Qcur-20",
+      "op": "RESHAPE",
+      "sum": -709.286499
+    },
+    {
+      "name": "norm-20",
+      "op": "RMS_NORM",
+      "sum": -11955.348633
+    },
+    {
+      "name": "model.layers.{}.self_attn.q_layernorm-20",
+      "op": "MUL",
+      "sum": -1657.526978
+    },
+    {
+      "name": "node_821",
+      "op": "ROPE",
+      "sum": -3151.220703
+    },
+    {
+      "name": "Kcur-20",
+      "op": "MUL_MAT",
+      "sum": -255.650024
+    },
+    {
+      "name": "Kcur-20",
+      "op": "RESHAPE",
+      "sum": -255.650024
+    },
+    {
+      "name": "norm-20",
+      "op": "RMS_NORM",
+      "sum": -3167.284912
+    },
+    {
+      "name": "model.layers.{}.self_attn.k_layernorm-20",
+      "op": "MUL",
+      "sum": 2090.197998
+    },
+    {
+      "name": "node_826",
+      "op": "ROPE",
+      "sum": -841.506042
+    },
+    {
+      "name": "Vcur-20",
+      "op": "MUL_MAT",
+      "sum": 121.600281
+    },
+    {
+      "name": "Vcur-20",
+      "op": "RESHAPE",
+      "sum": 121.600281
+    },
+    {
+      "name": "node_839",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 593.701416
+    },
+    {
+      "name": "attn_out-20",
+      "op": "RESHAPE",
+      "sum": 593.701416
+    },
+    {
+      "name": "cache_r_l21 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "node_844",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_845",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_844 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "attn_out-20 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 593.701416
+    },
+    {
+      "name": "node_850",
+      "op": "MUL_MAT",
+      "sum": -6374.08252
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-20",
+      "op": "SIGMOID",
+      "sum": 2124.446533
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-20 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 2124.446533
+    },
+    {
+      "name": "node_853",
+      "op": "MUL",
+      "sum": 188.21167
+    },
+    {
+      "name": "(reshaped)",
+      "op": "RESHAPE",
+      "sum": 188.21167
+    },
+    {
+      "name": "model.layers.{}.self_attn.out_proj-20",
+      "op": "MUL_MAT",
+      "sum": -299.271027
+    },
+    {
+      "name": "norm-20",
+      "op": "RMS_NORM",
+      "sum": -18517.224609
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-20",
+      "op": "MUL",
+      "sum": 471.130463
+    },
+    {
+      "name": "node_858",
+      "op": "ADD",
+      "sum": -1624.668945
+    },
+    {
+      "name": "norm-20",
+      "op": "RMS_NORM",
+      "sum": -13750.229492
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-20",
+      "op": "MUL",
+      "sum": -1670.853394
+    },
+    {
+      "name": "ffn_gate-20",
+      "op": "MUL_MAT",
+      "sum": -181851.421875
+    },
+    {
+      "name": "ffn_up-20",
+      "op": "MUL_MAT",
+      "sum": -2311.440186
+    },
+    {
+      "name": "ffn_swiglu-20",
+      "op": "SWIGLU",
+      "sum": -626.176086
+    },
+    {
+      "name": "node_864",
+      "op": "MUL_MAT",
+      "sum": -733.690552
+    },
+    {
+      "name": "norm-20",
+      "op": "RMS_NORM",
+      "sum": -8614.014648
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-20",
+      "op": "MUL",
+      "sum": -1178.374268
+    },
+    {
+      "name": "l_out-20",
+      "op": "ADD",
+      "sum": -2803.040283
+    },
+    {
+      "name": "norm-21",
+      "op": "RMS_NORM",
+      "sum": -18582.904297
+    },
+    {
+      "name": "model.layers.{}.operator_norm-21",
+      "op": "MUL",
+      "sum": -1332.075195
+    },
+    {
+      "name": "model.layers.{}.operator_norm-21 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -1332.075195
+    },
+    {
+      "name": "model.layers.{}.conv.in_proj-21",
+      "op": "MUL_MAT",
+      "sum": -7319.09668
+    },
+    {
+      "name": "node_874",
+      "op": "MUL",
+      "sum": 673.409424
+    },
+    {
+      "name": "(transposed)",
+      "op": "TRANSPOSE",
+      "sum": 673.417664
+    },
+    {
+      "name": "node_876",
+      "op": "CONCAT",
+      "sum": 673.417664
+    },
+    {
+      "name": "model.layers.{}.conv.conv-21",
+      "op": "SSM_CONV",
+      "sum": 189.746094
+    },
+    {
+      "name": "node_882",
+      "op": "MUL",
+      "sum": -17.15818
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-21",
+      "op": "MUL_MAT",
+      "sum": 79.724937
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-21 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 79.724937
+    },
+    {
+      "name": "norm-21",
+      "op": "RMS_NORM",
+      "sum": 16608.177734
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-21",
+      "op": "MUL",
+      "sum": 1313.873291
+    },
+    {
+      "name": "node_887",
+      "op": "ADD",
+      "sum": -1489.171265
+    },
+    {
+      "name": "norm-21",
+      "op": "RMS_NORM",
+      "sum": -11333.583984
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-21",
+      "op": "MUL",
+      "sum": -1224.6521
+    },
+    {
+      "name": "ffn_gate-21",
+      "op": "MUL_MAT",
+      "sum": -149193.046875
+    },
+    {
+      "name": "ffn_up-21",
+      "op": "MUL_MAT",
+      "sum": 2332.801025
+    },
+    {
+      "name": "ffn_swiglu-21",
+      "op": "SWIGLU",
+      "sum": -701.010986
+    },
+    {
+      "name": "node_893",
+      "op": "MUL_MAT",
+      "sum": -258.610565
+    },
+    {
+      "name": "norm-21",
+      "op": "RMS_NORM",
+      "sum": -2236.926025
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-21",
+      "op": "MUL",
+      "sum": 578.318604
+    },
+    {
+      "name": "l_out-21",
+      "op": "ADD",
+      "sum": -910.858215
+    },
+    {
+      "name": "norm-22",
+      "op": "RMS_NORM",
+      "sum": -6175.354004
+    },
+    {
+      "name": "model.layers.{}.operator_norm-22",
+      "op": "MUL",
+      "sum": -637.626892
+    },
+    {
+      "name": "Qcur-22",
+      "op": "MUL_MAT",
+      "sum": 2281.918213
+    },
+    {
+      "name": "Qcur-22",
+      "op": "RESHAPE",
+      "sum": 2281.918213
+    },
+    {
+      "name": "norm-22",
+      "op": "RMS_NORM",
+      "sum": 34524.191406
+    },
+    {
+      "name": "model.layers.{}.self_attn.q_layernorm-22",
+      "op": "MUL",
+      "sum": -21971.0
+    },
+    {
+      "name": "node_903",
+      "op": "ROPE",
+      "sum": -26922.095703
+    },
+    {
+      "name": "Kcur-22",
+      "op": "MUL_MAT",
+      "sum": -21.225149
+    },
+    {
+      "name": "Kcur-22",
+      "op": "RESHAPE",
+      "sum": -21.225149
+    },
+    {
+      "name": "norm-22",
+      "op": "RMS_NORM",
+      "sum": -1016.109314
+    },
+    {
+      "name": "model.layers.{}.self_attn.k_layernorm-22",
+      "op": "MUL",
+      "sum": -5378.67334
+    },
+    {
+      "name": "node_908",
+      "op": "ROPE",
+      "sum": 4338.527832
+    },
+    {
+      "name": "Vcur-22",
+      "op": "MUL_MAT",
+      "sum": 81.156158
+    },
+    {
+      "name": "Vcur-22",
+      "op": "RESHAPE",
+      "sum": 81.156158
+    },
+    {
+      "name": "node_921",
+      "op": "FLASH_ATTN_EXT",
+      "sum": 103.405479
+    },
+    {
+      "name": "attn_out-22",
+      "op": "RESHAPE",
+      "sum": 103.405479
+    },
+    {
+      "name": "cache_r_l23 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "node_926",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_927",
+      "op": "GET_ROWS",
+      "sum": 0.0
+    },
+    {
+      "name": "node_926 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 0.0
+    },
+    {
+      "name": "attn_out-22 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 103.405479
+    },
+    {
+      "name": "node_932",
+      "op": "MUL_MAT",
+      "sum": -2337.36499
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-22",
+      "op": "SIGMOID",
+      "sum": 2970.240723
+    },
+    {
+      "name": "model.layers.{}.self_attn.gate-22 (reshaped)",
+      "op": "RESHAPE",
+      "sum": 2970.240723
+    },
+    {
+      "name": "node_935",
+      "op": "MUL",
+      "sum": 28.408623
+    },
+    {
+      "name": "(reshaped)",
+      "op": "RESHAPE",
+      "sum": 28.408623
+    },
+    {
+      "name": "model.layers.{}.self_attn.out_proj-22",
+      "op": "MUL_MAT",
+      "sum": 56.618816
+    },
+    {
+      "name": "norm-22",
+      "op": "RMS_NORM",
+      "sum": 5165.183594
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-22",
+      "op": "MUL",
+      "sum": -1425.089966
+    },
+    {
+      "name": "node_940",
+      "op": "ADD",
+      "sum": -2335.898926
+    },
+    {
+      "name": "norm-22",
+      "op": "RMS_NORM",
+      "sum": -12328.947266
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-22",
+      "op": "MUL",
+      "sum": -1099.502808
+    },
+    {
+      "name": "ffn_gate-22",
+      "op": "MUL_MAT",
+      "sum": -706871.0
+    },
+    {
+      "name": "ffn_up-22",
+      "op": "MUL_MAT",
+      "sum": -13385.335938
+    },
+    {
+      "name": "ffn_swiglu-22",
+      "op": "SWIGLU",
+      "sum": -591.610229
+    },
+    {
+      "name": "node_946",
+      "op": "MUL_MAT",
+      "sum": 12591.6875
+    },
+    {
+      "name": "norm-22",
+      "op": "RMS_NORM",
+      "sum": 25858.064453
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-22",
+      "op": "MUL",
+      "sum": 689.261353
+    },
+    {
+      "name": "l_out-22",
+      "op": "ADD",
+      "sum": -1646.700439
+    },
+    {
+      "name": "norm-23",
+      "op": "RMS_NORM",
+      "sum": -7742.129395
+    },
+    {
+      "name": "model.layers.{}.operator_norm-23",
+      "op": "MUL",
+      "sum": -1325.428467
+    },
+    {
+      "name": "model.layers.{}.operator_norm-23 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -1325.428467
+    },
+    {
+      "name": "model.layers.{}.conv.in_proj-23",
+      "op": "MUL_MAT",
+      "sum": 10101.391602
+    },
+    {
+      "name": "node_956",
+      "op": "MUL",
+      "sum": -3715.865967
+    },
+    {
+      "name": "(transposed)",
+      "op": "TRANSPOSE",
+      "sum": -3715.899658
+    },
+    {
+      "name": "node_958",
+      "op": "CONCAT",
+      "sum": -3715.899658
+    },
+    {
+      "name": "node_962",
+      "op": "GET_ROWS",
+      "sum": -19.555803
+    },
+    {
+      "name": "model.layers.{}.conv.conv-23",
+      "op": "SSM_CONV",
+      "sum": 84.710335
+    },
+    {
+      "name": "node_965",
+      "op": "MUL",
+      "sum": 13.068771
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-23",
+      "op": "MUL_MAT",
+      "sum": -20.330225
+    },
+    {
+      "name": "model.layers.{}.conv.out_proj-23 (reshaped)",
+      "op": "RESHAPE",
+      "sum": -20.330225
+    },
+    {
+      "name": "norm-23",
+      "op": "RMS_NORM",
+      "sum": -2500.998047
+    },
+    {
+      "name": "model.layers.{}.post_operator_norm-23",
+      "op": "MUL",
+      "sum": 981.345398
+    },
+    {
+      "name": "node_970",
+      "op": "GET_ROWS",
+      "sum": 4.258746
+    },
+    {
+      "name": "node_971",
+      "op": "ADD",
+      "sum": -15.297087
+    },
+    {
+      "name": "norm-23",
+      "op": "RMS_NORM",
+      "sum": -64.442177
+    },
+    {
+      "name": "model.layers.{}.ffn_norm-23",
+      "op": "MUL",
+      "sum": -27.606939
+    },
+    {
+      "name": "ffn_gate-23",
+      "op": "MUL_MAT",
+      "sum": -2221.435791
+    },
+    {
+      "name": "ffn_up-23",
+      "op": "MUL_MAT",
+      "sum": 133.115555
+    },
+    {
+      "name": "ffn_swiglu-23",
+      "op": "SWIGLU",
+      "sum": -31.162966
+    },
+    {
+      "name": "node_977",
+      "op": "MUL_MAT",
+      "sum": 24.20594
+    },
+    {
+      "name": "norm-23",
+      "op": "RMS_NORM",
+      "sum": 47.312737
+    },
+    {
+      "name": "model.layers.{}.post_ffn_norm-23",
+      "op": "MUL",
+      "sum": 3.670249
+    },
+    {
+      "name": "l_out-23",
+      "op": "ADD",
+      "sum": -11.626823
+    },
+    {
+      "name": "norm",
+      "op": "RMS_NORM",
+      "sum": -38.090149
+    },
+    {
+      "name": "result_norm",
+      "op": "MUL",
+      "sum": -40.342308
+    },
+    {
+      "name": "result_output",
+      "op": "MUL_MAT",
+      "sum": 201299.34375
+    }
+  ],
+  "logits": {
+    "n": 128000,
+    "mean": 1.5726707844815164,
+    "std": 2.5543613236215137,
+    "top": [
+      [
+        1978,
+        19.590946197509766
+      ],
+      [
+        912,
+        19.289897918701172
+      ],
+      [
+        440,
+        19.22652244567871
+      ],
+      [
+        229,
+        19.11570167541504
+      ],
+      [
+        278,
+        18.798595428466797
+      ],
+      [
+        469,
+        17.803300857543945
+      ],
+      [
+        529,
+        17.02592658996582
+      ],
+      [
+        21249,
+        16.945423126220703
+      ],
+      [
+        2925,
+        16.795019149780273
+      ],
+      [
+        7634,
+        16.760351181030273
+      ],
+      [
+        1275,
+        16.579742431640625
+      ],
+      [
+        1394,
+        16.293325424194336
+      ],
+      [
+        1389,
+        16.2744083404541
+      ],
+      [
+        45751,
+        16.22150230407715
+      ],
+      [
+        2329,
+        16.22105598449707
+      ],
+      [
+        2094,
+        16.169076919555664
+      ],
+      [
+        334,
+        16.067211151123047
+      ],
+      [
+        4104,
+        15.969744682312012
+      ],
+      [
+        5440,
+        15.889362335205078
+      ],
+      [
+        969,
+        15.818948745727539
+      ],
+      [
+        35886,
+        15.810691833496094
+      ],
+      [
+        522,
+        15.726330757141113
+      ],
+      [
+        267,
+        15.710649490356445
+      ],
+      [
+        54544,
+        15.681982040405273
+      ],
+      [
+        16196,
+        15.671027183532715
+      ],
+      [
+        358,
+        15.664689064025879
+      ],
+      [
+        33286,
+        15.63638973236084
+      ],
+      [
+        2304,
+        15.613429069519043
+      ],
+      [
+        296,
+        15.561361312866211
+      ],
+      [
+        8731,
+        15.39410400390625
+      ],
+      [
+        1017,
+        15.36808967590332
+      ],
+      [
+        487,
+        15.35414981842041
+      ]
+    ]
+  },
+  "logits_bf16": {
+    "n": 128000,
+    "mean": 1.5812929733580572,
+    "std": 2.5544483667514912,
+    "top": [
+      [
+        1978,
+        19.54831886291504
+      ],
+      [
+        912,
+        19.30914306640625
+      ],
+      [
+        440,
+        19.205514907836914
+      ],
+      [
+        229,
+        19.122785568237305
+      ],
+      [
+        278,
+        18.81108856201172
+      ],
+      [
+        469,
+        17.869413375854492
+      ],
+      [
+        21249,
+        17.07771110534668
+      ],
+      [
+        2925,
+        16.96269416809082
+      ],
+      [
+        529,
+        16.934940338134766
+      ],
+      [
+        7634,
+        16.70223045349121
+      ],
+      [
+        1275,
+        16.60653305053711
+      ],
+      [
+        1394,
+        16.342262268066406
+      ],
+      [
+        1389,
+        16.240018844604492
+      ],
+      [
+        2094,
+        16.19512939453125
+      ],
+      [
+        45751,
+        16.183162689208984
+      ],
+      [
+        2329,
+        16.098060607910156
+      ],
+      [
+        4104,
+        16.065101623535156
+      ],
+      [
+        334,
+        16.026182174682617
+      ],
+      [
+        522,
+        15.806352615356445
+      ],
+      [
+        5440,
+        15.789127349853516
+      ],
+      [
+        35886,
+        15.763154983520508
+      ],
+      [
+        267,
+        15.757100105285645
+      ],
+      [
+        33286,
+        15.683771133422852
+      ],
+      [
+        54544,
+        15.679765701293945
+      ],
+      [
+        16196,
+        15.66865348815918
+      ],
+      [
+        358,
+        15.662181854248047
+      ],
+      [
+        969,
+        15.641095161437988
+      ],
+      [
+        296,
+        15.522647857666016
+      ],
+      [
+        2304,
+        15.515681266784668
+      ],
+      [
+        612,
+        15.341344833374023
+      ],
+      [
+        1017,
+        15.315723419189453
+      ],
+      [
+        487,
+        15.305795669555664
+      ]
+    ]
+  }
+}

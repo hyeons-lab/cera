@@ -42,10 +42,14 @@ use crate::model::weights::MmapWeight;
 // ── GGUF metadata keys ────────────────────────────────────────────
 
 const KEY_HAS_VISION: &str = "clip.has_vision_encoder";
+const KEY_PROJ_TYPE: &str = "clip.projector_type";
+const KEY_VISION_PROJ_TYPE: &str = "clip.vision.projector_type";
 const KEY_N_LAYER: &str = "clip.vision.block_count";
 const KEY_N_EMBD: &str = "clip.vision.embedding_length";
 const KEY_N_FF: &str = "clip.vision.feed_forward_length";
 const KEY_N_HEAD: &str = "clip.vision.attention.head_count";
+const KEY_N_HEAD_KV: &str = "clip.vision.attention.head_count_kv";
+const KEY_ROPE_THETA: &str = "clip.vision.rope_theta";
 const KEY_LN_EPS: &str = "clip.vision.attention.layer_norm_epsilon";
 const KEY_IMAGE_SIZE: &str = "clip.vision.image_size";
 const KEY_PATCH_SIZE: &str = "clip.vision.patch_size";
@@ -54,83 +58,223 @@ const KEY_SCALE_FACTOR: &str = "clip.vision.projector.scale_factor";
 const KEY_IMAGE_MEAN: &str = "clip.vision.image_mean";
 const KEY_IMAGE_STD: &str = "clip.vision.image_std";
 
-/// Configuration for the LFM2-VL ViT vision encoder. Read from
-/// the `clip.vision.*` metadata block of the multimodal_projector
-/// GGUF.
+/// Default RoPE theta for LFM3 vision 2D M-RoPE when `clip.vision.rope_theta` is absent.
+const LFM3_DEFAULT_ROPE_THETA: f32 = 1_000_000.0;
+/// Most pixels a GGUF may ask the vision preprocessor to resize an image to (64 Mpx).
+const MAX_IMAGE_PIXELS: usize = 64 << 20;
+
+/// Where in the LFM3 projector the optional `mm.input_norm` applies, by its width.
+#[derive(Debug, PartialEq, Eq)]
+enum MmNormStage {
+    /// Over the encoder width, on the tokens before the spatial merge.
+    PreMerge,
+    /// Over the merged width (`n_embd * scale_factor^2`), after the merge.
+    PostMerge,
+}
+
+/// The one stage a norm of `len` entries applies at. With `scale_factor == 1` the merged width
+/// equals `n_embd`, and both stages would match: the norm must still run once.
+fn mm_norm_stage(len: usize, n_embd: usize, merged_dim: usize) -> Option<MmNormStage> {
+    if len == n_embd {
+        Some(MmNormStage::PreMerge)
+    } else if len == merged_dim {
+        Some(MmNormStage::PostMerge)
+    } else {
+        None
+    }
+}
+
+/// LayerNorm epsilon used by `mm.input_norm` in the LFM3 vision projector.
+const LFM3_MM_INPUT_NORM_EPS: f32 = 1e-6;
+
+/// Vision start boundary token emitted before projected image tokens for `lfm3o`.
+pub const VISION_START_TOKEN: &str = "<|vision_start|>";
+/// Vision end boundary token emitted after projected image tokens for `lfm3o`.
+pub const VISION_END_TOKEN: &str = "<|vision_end|>";
+
+/// Multimodal vision projector / encoder architecture type read from
+/// `clip.vision.projector_type` or `clip.projector_type`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum VisionProjectorType {
+    /// LFM2-VL ViT encoder + pixel-shuffle + 2-layer MLP projector (`"lfm2"`).
+    #[default]
+    Lfm2,
+    /// LFM3-VL hybrid conv + 2D M-RoPE GQA attention encoder (`"lfm3vl"`), without boundary tokens.
+    Lfm3Vl,
+    /// LFM3-Omni hybrid conv + 2D M-RoPE GQA attention encoder (`"lfm3o"`), with `<|vision_start|>` and `<|vision_end|>`.
+    Lfm3O,
+}
+
+impl VisionProjectorType {
+    /// Parse the GGUF projector type string (`"lfm2"`, `"lfm3vl"`, `"lfm3o"`).
+    pub fn from_gguf_str(s: &str) -> Result<Self> {
+        match s.trim() {
+            "" | "lfm2" => Ok(Self::Lfm2),
+            "lfm3vl" => Ok(Self::Lfm3Vl),
+            "lfm3o" => Ok(Self::Lfm3O),
+            other => anyhow::bail!("unsupported vision projector_type `{other}`"),
+        }
+    }
+
+    /// Canonical GGUF string identifier for this projector type.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Lfm2 => "lfm2",
+            Self::Lfm3Vl => "lfm3vl",
+            Self::Lfm3O => "lfm3o",
+        }
+    }
+
+    /// True for LFM3-VL (`lfm3vl`) and LFM3-Omni (`lfm3o`) vision encoders.
+    pub fn is_lfm3(&self) -> bool {
+        matches!(self, Self::Lfm3Vl | Self::Lfm3O)
+    }
+
+    /// True when the vision projector wraps image embeddings in `<|vision_start|>` and `<|vision_end|>`.
+    /// Only `lfm3o` enables boundary tokens; `lfm3vl` and `lfm2` do not.
+    pub fn has_boundary_tokens(&self) -> bool {
+        matches!(self, Self::Lfm3O)
+    }
+
+    /// Return `Some(("<|vision_start|>", "<|vision_end|>"))` when boundary tokens are enabled (`lfm3o`),
+    /// or `None` for `lfm3vl` and `lfm2`.
+    pub fn vision_boundary_tokens(&self) -> Option<(&'static str, &'static str)> {
+        if self.has_boundary_tokens() {
+            Some((VISION_START_TOKEN, VISION_END_TOKEN))
+        } else {
+            None
+        }
+    }
+
+    /// Format an image placeholder or token string with boundary tokens if enabled (`lfm3o`).
+    pub fn wrap_image_prompt(&self, inner: &str) -> String {
+        if let Some((start, end)) = self.vision_boundary_tokens() {
+            format!("{start}{inner}{end}")
+        } else {
+            inner.to_string()
+        }
+    }
+
+    /// Resolve the `(start_token_id, end_token_id)` pair via a vocabulary lookup closure
+    /// when boundary tokens are enabled for this projector type (`lfm3o`).
+    pub fn resolve_boundary_token_ids<F>(&self, mut lookup: F) -> Option<(u32, u32)>
+    where
+        F: FnMut(&str) -> Option<u32>,
+    {
+        let (start_str, end_str) = self.vision_boundary_tokens()?;
+        Some((lookup(start_str)?, lookup(end_str)?))
+    }
+}
+
+/// Configuration for the LFM2-VL / LFM3-VL / LFM3-Omni vision encoder. Read from
+/// the `clip.vision.*` metadata block of the multimodal_projector GGUF.
 #[derive(Debug, Clone)]
 pub struct VisionEncoderConfig {
-    /// Number of ViT transformer blocks.
+    /// Vision architecture / projector variant (`lfm2`, `lfm3vl`, or `lfm3o`).
+    pub projector_type: VisionProjectorType,
+    /// Number of ViT / hybrid encoder blocks.
     pub n_layer: usize,
     /// Encoder hidden dimension (`clip.vision.embedding_length`).
     pub n_embd: usize,
-    /// FFN intermediate dimension inside each ViT block.
+    /// FFN intermediate dimension inside each block.
     pub n_ff: usize,
-    /// Number of attention heads per block.
+    /// Number of query attention heads per attention block.
     pub n_head: usize,
-    /// LayerNorm epsilon. Read from
-    /// `clip.vision.attention.layer_norm_epsilon` — the metadata
-    /// key is named after attention but the value applies to
-    /// **every** norm in the encoder (per-block ln1 + ln2 + the
-    /// final post_ln), matching llama.cpp's `clip.cpp` which
-    /// uses the single key for all of them.
+    /// Number of key/value attention heads per attention block (`clip.vision.attention.head_count_kv`).
+    /// Defaults to `n_head` when absent.
+    pub n_head_kv: usize,
+    /// Base period theta for 2D M-RoPE in LFM3 vision attention blocks (`clip.vision.rope_theta`).
+    /// Defaults to `1_000_000.0` (`1e6`).
+    pub rope_theta: f32,
+    /// LayerNorm epsilon. Read from `clip.vision.attention.layer_norm_epsilon`.
     pub eps: f32,
-    /// Square input image side length in pixels (typically 256).
+    /// Square input image side length in pixels (typically 256 or 512).
     pub image_size: usize,
     /// Square patch side length in pixels (typically 16).
     pub patch_size: usize,
-    /// Number of patches in the **trained** position-grid:
-    /// `(image_size / patch_size)²`. This is the row count of the
-    /// `position_embd.weight` tensor — the size at which the model
-    /// was trained. The **runtime** patch count is `grid_w *
-    /// grid_h` after dynamic-resolution resize and is computed
-    /// per-call by the preprocessor; when those don't match the
-    /// trained grid, position embeddings are bilinearly
-    /// interpolated to the dynamic dims (mirrors llama.cpp's
-    /// `clip_graph::resize_position_embeddings`).
+    /// Number of patches in the trained position-grid: `(image_size / patch_size)^2`.
     pub n_trained_patches: usize,
-    /// Projector output dimension; matches the LLM's
-    /// `embedding_length` so projected image tokens drop straight
-    /// into the LFM2 stream.
+    /// Projector output dimension; matches the LLM's `embedding_length`.
     pub projection_dim: usize,
-    /// Pixel-shuffle pooling factor between the ViT output and the
-    /// projector input. `scale_factor=2` means a 16×16 patch grid
-    /// becomes 8×8 tokens with 4× channel inflation
-    /// (768 → 768·4 = 3072).
+    /// Spatial patch-merge / pixel-shuffle pooling factor between encoder output and projector input.
     pub scale_factor: usize,
-    /// Per-channel mean for image normalisation. RGB order, matches
-    /// CLIP family preprocessing conventions.
+    /// Per-channel mean for image normalisation (RGB order).
     pub image_mean: [f32; 3],
-    /// Per-channel std for image normalisation.
+    /// Per-channel std for image normalisation (RGB order).
     pub image_std: [f32; 3],
-    /// Lower bound on resized image area in pixels for the
-    /// dynamic-resolution preprocessor. Equal to
-    /// `n_tokens_min · (patch_size · scale_factor)²`. For LFM2-VL:
-    /// `64 · 32² = 65 536` (= 256² square baseline).
-    /// Source: llama.cpp's
-    /// `clip_model.h::set_limit_image_tokens(64, 256)` for
-    /// `PROJECTOR_TYPE_LFM2`. Hardcoded since no GGUF metadata
-    /// key surfaces it.
+    /// Lower bound on resized image area in pixels for dynamic-resolution preprocessing.
     pub image_min_pixels: usize,
-    /// Upper bound on resized image area in pixels.
-    /// `n_tokens_max · (patch_size · scale_factor)² = 256 · 32² =
-    /// 262 144` (= 512² square baseline) for LFM2-VL. Inputs above
-    /// this band are scaled down preserving aspect ratio.
+    /// Upper bound on resized image area in pixels for dynamic-resolution preprocessing.
     pub image_max_pixels: usize,
 }
 
+impl Default for VisionEncoderConfig {
+    fn default() -> Self {
+        Self {
+            projector_type: VisionProjectorType::Lfm2,
+            n_layer: 12,
+            n_embd: 768,
+            n_ff: 3072,
+            n_head: 12,
+            n_head_kv: 12,
+            rope_theta: LFM3_DEFAULT_ROPE_THETA,
+            eps: 1e-6,
+            image_size: 512,
+            patch_size: 16,
+            n_trained_patches: 1024,
+            projection_dim: 1024,
+            scale_factor: 2,
+            image_mean: [0.5, 0.5, 0.5],
+            image_std: [0.5, 0.5, 0.5],
+            image_min_pixels: 65_536,
+            image_max_pixels: 262_144,
+        }
+    }
+}
+
 impl VisionEncoderConfig {
+    /// True when the encoder uses the LFM3 hybrid vision architecture (`lfm3vl` or `lfm3o`).
+    pub fn is_lfm3(&self) -> bool {
+        self.projector_type.is_lfm3()
+    }
+
+    /// True when projected image embeddings are wrapped in `<|vision_start|>` and `<|vision_end|>` (`lfm3o`).
+    pub fn has_boundary_tokens(&self) -> bool {
+        self.projector_type.has_boundary_tokens()
+    }
+
+    /// Return `Some(("<|vision_start|>", "<|vision_end|>"))` when boundary tokens are enabled (`lfm3o`).
+    pub fn vision_boundary_tokens(&self) -> Option<(&'static str, &'static str)> {
+        self.projector_type.vision_boundary_tokens()
+    }
+
+    /// Wrap an image prompt segment with `<|vision_start|>` and `<|vision_end|>` if enabled (`lfm3o`).
+    pub fn wrap_image_prompt(&self, inner: &str) -> String {
+        self.projector_type.wrap_image_prompt(inner)
+    }
+
     /// Read the vision-encoder config from a multimodal_projector
-    /// GGUF's `clip.vision.*` metadata. Errors on any missing
-    /// required key — the LFM2.5-VL bundles all carry the full
-    /// set, so a missing key indicates a corrupt or
-    /// non-vision-encoder mmproj.
+    /// GGUF's `clip.vision.*` metadata.
     pub fn from_gguf(gguf: &Arc<GgufFile>) -> Result<Self> {
-        let has_vision = gguf.get_bool(KEY_HAS_VISION).unwrap_or(false);
+        let has_vision = match gguf.metadata.get(KEY_HAS_VISION) {
+            Some(crate::gguf::GgufValue::Bool(b)) => *b,
+            Some(other) => anyhow::bail!("invalid type for `{KEY_HAS_VISION}`: {other:?}"),
+            None => false,
+        };
         anyhow::ensure!(
             has_vision,
             "mmproj GGUF missing or false `{KEY_HAS_VISION}`; \
              not a vision encoder"
         );
+        let projector_type = if let Some(s) = match get_opt_str(gguf, KEY_VISION_PROJ_TYPE)? {
+            Some(s) => Some(s),
+            None => get_opt_str(gguf, KEY_PROJ_TYPE)?,
+        } {
+            VisionProjectorType::from_gguf_str(s)?
+        } else {
+            VisionProjectorType::Lfm2
+        };
+
         let n_layer = gguf
             .get_u32(KEY_N_LAYER)
             .with_context(|| format!("missing `{KEY_N_LAYER}`"))? as usize;
@@ -143,21 +287,48 @@ impl VisionEncoderConfig {
         let n_head = gguf
             .get_u32(KEY_N_HEAD)
             .with_context(|| format!("missing `{KEY_N_HEAD}`"))? as usize;
+        let n_head_kv = if let Some(v) = gguf.get_u32(KEY_N_HEAD_KV) {
+            v as usize
+        } else if let Some(arr) = gguf.get_i32_array(KEY_N_HEAD_KV) {
+            let v = arr.into_iter().find(|&x| x > 0).with_context(|| {
+                format!("`{KEY_N_HEAD_KV}` array contains no positive head count")
+            })?;
+            v as usize
+        } else if let Some(other) = gguf.metadata.get(KEY_N_HEAD_KV) {
+            anyhow::bail!("invalid type for `{KEY_N_HEAD_KV}`: {other:?}");
+        } else {
+            n_head
+        };
+        let rope_theta = get_opt_f32(gguf, KEY_ROPE_THETA)?.unwrap_or(LFM3_DEFAULT_ROPE_THETA);
         let eps = gguf
             .get_f32(KEY_LN_EPS)
             .with_context(|| format!("missing `{KEY_LN_EPS}`"))?;
-        let image_size =
-            gguf.get_u32(KEY_IMAGE_SIZE)
-                .with_context(|| format!("missing `{KEY_IMAGE_SIZE}`"))? as usize;
+        anyhow::ensure!(
+            eps.is_finite() && eps > 0.0,
+            "`{KEY_LN_EPS}` ({eps}) must be finite and > 0"
+        );
+        anyhow::ensure!(
+            rope_theta.is_finite() && rope_theta > 0.0,
+            "`{KEY_ROPE_THETA}` ({rope_theta}) must be finite and > 0"
+        );
         let patch_size =
             gguf.get_u32(KEY_PATCH_SIZE)
                 .with_context(|| format!("missing `{KEY_PATCH_SIZE}`"))? as usize;
+        let image_size = match get_opt_u32(gguf, KEY_IMAGE_SIZE)? {
+            Some(v) => v as usize,
+            None if projector_type.is_lfm3() => 512,
+            None => anyhow::bail!("missing `{KEY_IMAGE_SIZE}`"),
+        };
         anyhow::ensure!(
-            n_head > 0 && n_embd.is_multiple_of(n_head),
+            n_embd > 0 && n_head > 0 && n_embd.is_multiple_of(n_head),
             "n_embd ({n_embd}) must be a positive multiple of n_head ({n_head})"
         );
         anyhow::ensure!(
-            patch_size > 0 && image_size.is_multiple_of(patch_size),
+            n_head_kv > 0 && n_head.is_multiple_of(n_head_kv),
+            "n_head ({n_head}) must be a positive multiple of n_head_kv ({n_head_kv})"
+        );
+        anyhow::ensure!(
+            image_size > 0 && patch_size > 0 && image_size.is_multiple_of(patch_size),
             "image_size ({image_size}) must be a positive multiple of patch_size ({patch_size})"
         );
         let n_trained_patches = (image_size / patch_size).pow(2);
@@ -165,9 +336,14 @@ impl VisionEncoderConfig {
         let projection_dim =
             gguf.get_u32(KEY_PROJECTION_DIM)
                 .with_context(|| format!("missing `{KEY_PROJECTION_DIM}`"))? as usize;
-        let scale_factor =
-            gguf.get_u32(KEY_SCALE_FACTOR)
-                .with_context(|| format!("missing `{KEY_SCALE_FACTOR}`"))? as usize;
+        let scale_factor = match match get_opt_u32(gguf, KEY_SCALE_FACTOR)? {
+            Some(v) => Some(v),
+            None => get_opt_u32(gguf, "clip.vision.spatial_merge_size")?,
+        } {
+            Some(v) => v as usize,
+            None if projector_type.is_lfm3() => 2,
+            None => anyhow::bail!("missing `{KEY_SCALE_FACTOR}`"),
+        };
         anyhow::ensure!(
             scale_factor > 0,
             "scale_factor ({scale_factor}) must be > 0; a zero or missing value would \
@@ -176,21 +352,33 @@ impl VisionEncoderConfig {
         let image_mean = read_rgb_array(gguf, KEY_IMAGE_MEAN)?;
         let image_std = read_rgb_array(gguf, KEY_IMAGE_STD)?;
 
-        // LFM2-VL dynamic-resolution bounds, hardcoded per
-        // `clip_model.h::set_limit_image_tokens(64, 256)`. The
-        // `(min, max) = (64, 256) tokens` band converts to pixel
-        // bounds via `n_tokens · (patch_size · scale_factor)²`.
         let n_tokens_min: usize = 64;
         let n_tokens_max: usize = 256;
         let pixels_per_token = (patch_size * scale_factor).pow(2);
-        let image_min_pixels = n_tokens_min * pixels_per_token;
-        let image_max_pixels = n_tokens_max * pixels_per_token;
+        let image_min_pixels = get_opt_u32(gguf, "clip.vision.image_min_pixels")?
+            .map(|v| v as usize)
+            .unwrap_or(n_tokens_min * pixels_per_token);
+        let image_max_pixels = get_opt_u32(gguf, "clip.vision.image_max_pixels")?
+            .map(|v| v as usize)
+            .unwrap_or(n_tokens_max * pixels_per_token);
+        // they steer the resize target (and so an allocation): a range that is empty, inverted
+        // or larger than any real image is a corrupt file
+        anyhow::ensure!(
+            image_min_pixels > 0
+                && image_min_pixels <= image_max_pixels
+                && image_max_pixels <= MAX_IMAGE_PIXELS,
+            "clip.vision.image_min_pixels ({image_min_pixels}) and image_max_pixels \
+             ({image_max_pixels}) must satisfy 0 < min <= max <= {MAX_IMAGE_PIXELS}"
+        );
 
         Ok(Self {
+            projector_type,
             n_layer,
             n_embd,
             n_ff,
             n_head,
+            n_head_kv,
+            rope_theta,
             eps,
             image_size,
             patch_size,
@@ -205,21 +393,126 @@ impl VisionEncoderConfig {
     }
 }
 
+fn get_opt_u32(gguf: &GgufFile, key: &str) -> Result<Option<u32>> {
+    if let Some(v) = gguf.get_u32(key) {
+        Ok(Some(v))
+    } else if let Some(other) = gguf.metadata.get(key) {
+        anyhow::bail!("invalid type for `{key}`: {other:?}");
+    } else {
+        Ok(None)
+    }
+}
+
+fn get_opt_f32(gguf: &GgufFile, key: &str) -> Result<Option<f32>> {
+    if let Some(v) = gguf.get_f32(key) {
+        Ok(Some(v))
+    } else if let Some(other) = gguf.metadata.get(key) {
+        anyhow::bail!("invalid type for `{key}`: {other:?}");
+    } else {
+        Ok(None)
+    }
+}
+
+fn get_opt_str<'a>(gguf: &'a GgufFile, key: &str) -> Result<Option<&'a str>> {
+    if let Some(s) = gguf.get_str(key) {
+        Ok(Some(s))
+    } else if let Some(other) = gguf.metadata.get(key) {
+        anyhow::bail!("invalid type for `{key}`: {other:?}");
+    } else {
+        Ok(None)
+    }
+}
+
 /// Patch-embed Conv2D weights, pre-transposed at load time into
-/// row-major `[in_dim × n_embd]` where `in_dim = 3·patch_size²`.
-/// The conv-with-stride-equal-to-kernel-size collapses to a per-
-/// patch matmul; storing the kernel in `[in × out]` row-major
-/// matches the layout `cpu::matmul_f32(a, b, c, m, n, k)` reads
-/// for `B` (the function does standard `C = A · B`, NOT `A · B^T`),
-/// so the forward pass calls it directly with no per-image
-/// transpose.
+/// row-major `[in_dim x n_embd]` where `in_dim = 3 * patch_size^2`.
 #[derive(Clone)]
 pub struct PatchEmbedWeights {
-    /// Row-major `[in_dim × n_embd]` kernel ready for matmul. Built
+    /// Row-major `[in_dim x n_embd]` kernel ready for matmul. Built
     /// from `v.patch_embd.weight` once at load time.
     pub conv_w: Vec<f32>,
-    /// `v.patch_embd.bias` — `[n_embd]`.
+    /// `v.patch_embd.bias` (`[n_embd]`).
     pub conv_b: Vec<f32>,
+}
+
+/// Norm weights for LFM3 vision layers. Uses standard LayerNorm when `bias` is `Some`,
+/// and RMSNorm when `bias` is `None`.
+#[derive(Clone, Debug)]
+pub struct Lfm3NormWeights {
+    pub weight: Vec<f32>,
+    pub bias: Option<Vec<f32>>,
+}
+
+impl Lfm3NormWeights {
+    #[inline]
+    pub(crate) fn apply_row_inplace(&self, row: &mut [f32], eps: f32) {
+        if let Some(bias) = &self.bias {
+            crate::backend::cpu::layer_norm_inplace(row, &self.weight, bias, eps);
+        } else {
+            rms_norm_row_inplace(row, &self.weight, eps);
+        }
+    }
+}
+
+#[inline]
+fn rms_norm_row_inplace(row: &mut [f32], weight: &[f32], eps: f32) {
+    crate::backend::cpu::rmsnorm(row, weight, eps);
+}
+
+/// LFM3 gated 2D depthwise convolution sub-block weights.
+pub struct Lfm3ConvBlockWeights {
+    /// Input projection: either `[3 * n_embd, n_embd]` (double-gated `first, middle, third`)
+    /// or `[2 * n_embd, n_embd]` (single-gated `b, c`).
+    pub in_proj_w: MmapWeight,
+    pub in_proj_b: Option<Vec<f32>>,
+    /// Depthwise 2D spatial convolution weights stored in `[n_embd][kernel_size][kernel_size]`
+    /// row-major order (`c * K * K + ky * K + kx`).
+    pub depthwise_w: Vec<f32>,
+    pub depthwise_b: Option<Vec<f32>>,
+    pub kernel_size: usize,
+    pub out_proj_w: MmapWeight,
+    pub out_proj_b: Option<Vec<f32>>,
+}
+
+/// LFM3 2D M-RoPE grouped-query attention sub-block weights.
+pub struct Lfm3AttnBlockWeights {
+    pub q_w: MmapWeight,
+    pub q_b: Option<Vec<f32>>,
+    pub k_w: MmapWeight,
+    pub k_b: Option<Vec<f32>>,
+    pub v_w: MmapWeight,
+    pub v_b: Option<Vec<f32>>,
+    pub q_norm: Lfm3NormWeights,
+    pub k_norm: Lfm3NormWeights,
+    pub o_w: MmapWeight,
+    pub o_b: Option<Vec<f32>>,
+    pub n_head: usize,
+    pub n_head_kv: usize,
+    pub head_dim: usize,
+}
+
+/// Operator inside an LFM3 hybrid vision block (either spatial Conv2d or 2D M-RoPE GQA Attention).
+#[allow(clippy::large_enum_variant)]
+pub enum Lfm3BlockOp {
+    Conv(Lfm3ConvBlockWeights),
+    Attn(Lfm3AttnBlockWeights),
+}
+
+/// Feed-forward network inside an LFM3 hybrid vision block (SwiGLU when `gate_w` is `Some`, GELU otherwise).
+pub struct Lfm3FfnWeights {
+    pub gate_w: Option<MmapWeight>,
+    pub gate_b: Option<Vec<f32>>,
+    pub up_w: MmapWeight,
+    pub up_b: Option<Vec<f32>>,
+    pub down_w: MmapWeight,
+    pub down_b: Option<Vec<f32>>,
+}
+
+/// One LFM3 hybrid vision encoder block (`ln1 -> Conv/Attn + residual -> ln2 -> FFN + residual`).
+pub struct Lfm3VisionBlockWeights {
+    pub ln1: Lfm3NormWeights,
+    pub op: Lfm3BlockOp,
+    pub ln2: Lfm3NormWeights,
+    pub ffn: Lfm3FfnWeights,
 }
 
 /// One ViT block's weight set. Pre-norm self-attention + GELU MLP
@@ -244,10 +537,8 @@ pub struct VitBlockWeights {
     pub ffn_down_b: Vec<f32>,
 }
 
-/// 2-layer MLP projector that maps the pixel-shuffled ViT output
-/// into the LLM embedding dim. `mm.1` is `[n_embd·scale_factor² →
-/// projection_dim·2]`, GELU, `mm.2` is `[projection_dim·2 →
-/// projection_dim]` per llama.cpp's LFM2 projector layout.
+/// 2-layer MLP projector that maps the pixel-shuffled encoder output
+/// into the LLM embedding dim.
 #[derive(Clone)]
 pub struct ProjectorWeights {
     pub mm1_w: MmapWeight,
@@ -275,17 +566,22 @@ impl ProjectorWeights {
         if !q8.matmul(&self.mm1_w, &mut mid) {
             self.mm1_w.batched_matmul(pooled, &mut mid, n_tokens);
         }
+        let has_mm1_b = !self.mm1_b.is_empty();
         par_rows_n(&mut mid, mid_dim, |_, mid_row| {
-            crate::backend::cpu::add_inplace(mid_row, &self.mm1_b);
+            if has_mm1_b {
+                crate::backend::cpu::add_inplace(mid_row, &self.mm1_b);
+            }
             crate::backend::cpu::gelu_inplace(mid_row);
         });
         q8.quantize(&mid, mid_dim, n_tokens);
         if !q8.matmul(&self.mm2_w, &mut out) {
             self.mm2_w.batched_matmul(&mid, &mut out, n_tokens);
         }
-        par_rows_n(&mut out, out_dim, |_, out_row| {
-            crate::backend::cpu::add_inplace(out_row, &self.mm2_b);
-        });
+        if !self.mm2_b.is_empty() {
+            par_rows_n(&mut out, out_dim, |_, out_row| {
+                crate::backend::cpu::add_inplace(out_row, &self.mm2_b);
+            });
+        }
         out
     }
 }
@@ -334,94 +630,72 @@ pub struct VitStageDump {
 pub struct VisionEncoderWeights {
     pub config: VisionEncoderConfig,
     pub patch_embed: PatchEmbedWeights,
-    /// `v.position_embd.weight` — `[n_patches × n_embd]` flattened
-    /// row-major. Learnable absolute position embeddings; added
-    /// to the patch tokens before block 0. GGUF reports the
-    /// shape as `[n_embd, n_patches]` (innermost-first
-    /// convention); `to_f32_vec` returns the data row-major over
-    /// `[n_patches × n_embd]` so `position_embed[p * n_embd + i]`
-    /// indexes patch `p`'s embedding dim `i`.
+    /// Optional second temporal patch-embed kernel (`v.patch_embd.weight.1` or `v.patch_embd.1.weight`)
+    /// used by LFM3 vision models (`lfm3vl`, `lfm3o`) for 2-frame temporal patchification.
+    pub patch_embed_1: Option<PatchEmbedWeights>,
+    /// Optional post-patch-embedding norm (`v.embedding_norm.weight` / `.bias`) used by LFM3 vision models.
+    pub embedding_norm: Option<Lfm3NormWeights>,
+    /// `v.position_embd.weight` (`[n_patches x n_embd]` flattened row-major). Empty for LFM3 models
+    /// that use 2D M-RoPE instead of learned absolute position embeddings.
     pub position_embed: Vec<f32>,
     pub blocks: Vec<VitBlockWeights>,
+    /// Hybrid Conv2d / 2D M-RoPE GQA Attention encoder blocks for `lfm3vl` and `lfm3o`.
+    pub lfm3_blocks: Vec<Lfm3VisionBlockWeights>,
     pub post_ln_w: Vec<f32>,
     pub post_ln_b: Vec<f32>,
+    /// Optional projector input norm (`mm.input_norm.weight` / `.bias`) used by LFM3 vision models.
+    pub mm_input_norm: Option<Lfm3NormWeights>,
     pub projector: ProjectorWeights,
 }
 
 impl VisionEncoderWeights {
+    /// True when the vision encoder uses the LFM3 hybrid architecture (`lfm3vl` or `lfm3o`).
+    pub fn is_lfm3(&self) -> bool {
+        self.config.is_lfm3()
+    }
+
+    /// True when projected image embeddings are wrapped in `<|vision_start|>` and `<|vision_end|>` (`lfm3o`).
+    pub fn has_boundary_tokens(&self) -> bool {
+        self.config.has_boundary_tokens()
+    }
+
+    /// Return `Some(("<|vision_start|>", "<|vision_end|>"))` when boundary tokens are enabled (`lfm3o`).
+    pub fn vision_boundary_tokens(&self) -> Option<(&'static str, &'static str)> {
+        self.config.vision_boundary_tokens()
+    }
+
+    /// Wrap an image prompt segment with `<|vision_start|>` and `<|vision_end|>` if enabled (`lfm3o`).
+    pub fn wrap_image_prompt(&self, inner: &str) -> String {
+        self.config.wrap_image_prompt(inner)
+    }
+
+    /// Resolve the `(start_token_id, end_token_id)` pair via a vocabulary lookup closure
+    /// when boundary tokens are enabled (`lfm3o`).
+    pub fn resolve_boundary_token_ids<F>(&self, lookup: F) -> Option<(u32, u32)>
+    where
+        F: FnMut(&str) -> Option<u32>,
+    {
+        self.config
+            .projector_type
+            .resolve_boundary_token_ids(lookup)
+    }
+
     /// Load every vision-encoder tensor from a multimodal_projector
     /// GGUF without eagerly building CPU `smmla` repacks.
     pub(crate) fn from_gguf_unprepared(gguf: &Arc<GgufFile>) -> Result<Self> {
         let config = VisionEncoderConfig::from_gguf(gguf)?;
-
-        // Patch embed Conv2D kernel `[kw, kh, ic, oc]` in GGUF
-        // layout — `kw` innermost (stride 1), `oc` outermost
-        // (stride `kw·kh·ic`), matching the same convention
-        // `F32Weight::from_tensor` uses for 2D shapes (rightmost-
-        // in-shape is the outermost axis).
-        //
-        // The forward pass treats Conv2D-with-stride-equal-to-
-        // kernel-size as a per-patch GEMV against a
-        // `[n_embd × (3·patch_size²)]` matrix; transpose into
-        // that row-major layout once here so `encode_image`
-        // doesn't have to rebuild it on every call.
-        let patch_t = gguf
-            .get_tensor("v.patch_embd.weight")
-            .context("loading v.patch_embd.weight")?;
-        let patch_shape = patch_t.shape().to_vec();
-        anyhow::ensure!(
-            patch_shape.len() == 4
-                && patch_shape[0] == config.patch_size
-                && patch_shape[1] == config.patch_size
-                && patch_shape[2] == 3
-                && patch_shape[3] == config.n_embd,
-            "v.patch_embd.weight shape {patch_shape:?} != [patch_size={}, patch_size={}, 3, n_embd={}]",
-            config.patch_size,
-            config.patch_size,
-            config.n_embd,
-        );
-        let raw = patch_t.to_f32_vec();
-        let p = config.patch_size;
-        let in_dim = 3 * p * p;
-        let out_dim = config.n_embd;
-        // Row-major destination `[in_dim × out_dim]` where rows are
-        // input flat-index (`c*p² + kh*p + kw`) and cols are output
-        // channels (oc). This is the layout `cpu::matmul_f32` reads
-        // for its `B` argument when computing `C = A · B` standard
-        // (NOT `A · B^T` — the function name is plain `matmul_f32`,
-        // its docs/test confirm `c[i*n+j] = Σ_k a[i*k+k]·b[k*n+j]`).
-        // Building the kernel directly in this layout means the
-        // forward pass can call `matmul_f32(patches, conv_w, …)` with
-        // no per-image transpose. Source GGUF stride:
-        // `linear(kw, kh, c, oc) = kw + p·kh + p²·c + p²·3·oc`.
-        let mut conv_w = vec![0f32; in_dim * out_dim];
-        for oc in 0..out_dim {
-            for c in 0..3 {
-                for kh in 0..p {
-                    for kw in 0..p {
-                        let src = kw + p * kh + p * p * c + p * p * 3 * oc;
-                        let in_idx = c * p * p + kh * p + kw;
-                        conv_w[in_idx * out_dim + oc] = raw[src];
-                    }
-                }
-            }
+        if config.is_lfm3() {
+            return Self::from_gguf_lfm3_unprepared(gguf, config);
         }
-        let conv_b = load_vec_f32(gguf, "v.patch_embd.bias")?;
-        anyhow::ensure!(
-            conv_b.len() == config.n_embd,
-            "v.patch_embd.bias len ({}) != n_embd ({})",
-            conv_b.len(),
-            config.n_embd,
-        );
-        let patch_embed = PatchEmbedWeights { conv_w, conv_b };
 
-        // Position embedding `[n_trained_patches × n_embd]`. The
-        // tensor stores embeddings for the *trained* grid only;
-        // dynamic-resolution inputs interpolate this into a
-        // per-call dynamic grid via [`interpolate_pos_embed_2d`].
-        // MmapWeight would also work but treating it as a flat
-        // Vec<f32> keeps the indexing readable
-        // (`position_embed[p * n_embd + i]`).
+        let (patch_embed, _) = load_patch_embed_weights(
+            gguf,
+            "v.patch_embd.weight",
+            Some("v.patch_embd.bias"),
+            true,
+            &config,
+        )?;
+
         let pos_t = gguf
             .get_tensor("v.position_embd.weight")
             .context("loading v.position_embd.weight")?;
@@ -434,7 +708,7 @@ impl VisionEncoderWeights {
             config.n_embd,
             config.n_trained_patches,
         );
-        let position_embed = pos_t.to_f32_vec();
+        let position_embed = pos_t.try_to_f32_vec()?;
 
         // ── ViT blocks ──
         let mut blocks = Vec::with_capacity(config.n_layer);
@@ -454,16 +728,6 @@ impl VisionEncoderWeights {
         );
 
         // ── Projector (mm.1, mm.2) ──
-        // Shape relationships we encode:
-        //   mm.1: [intermediate_dim, n_embd * scale_factor²]
-        //   mm.2: [projection_dim,   intermediate_dim]
-        // The `intermediate_dim` is **derived from mm.1.weight.rows**
-        // rather than hardcoded as `projection_dim * 2`. The "× 2"
-        // is llama.cpp's LFM2 projector convention but isn't
-        // surfaced in any GGUF metadata key, so deriving from the
-        // actual tensor shape keeps the loader robust to a future
-        // LFM2-VL variant that picks a different intermediate
-        // width while still asserting the mm.1 → mm.2 size match.
         let mm1_w = wt_f32(gguf, "mm.1.weight")?;
         let mm1_b = load_vec_f32(gguf, "mm.1.bias")?;
         let mm2_w = wt_f32(gguf, "mm.2.weight")?;
@@ -472,7 +736,7 @@ impl VisionEncoderWeights {
         let intermediate_dim = mm1_w.rows;
         anyhow::ensure!(
             mm1_w.cols == mm1_in_dim,
-            "mm.1.weight cols ({}) != n_embd*sf² ({mm1_in_dim})",
+            "mm.1.weight cols ({}) != n_embd*sf^2 ({mm1_in_dim})",
             mm1_w.cols,
         );
         anyhow::ensure!(
@@ -482,8 +746,8 @@ impl VisionEncoderWeights {
         );
         anyhow::ensure!(
             mm2_w.cols == intermediate_dim,
-            "mm.2.weight cols ({}) != mm.1.weight.rows ({intermediate_dim}) — \
-             projector mm.1→mm.2 dimensions don't line up",
+            "mm.2.weight cols ({}) != mm.1.weight.rows ({intermediate_dim}); \
+             projector mm.1->mm.2 dimensions do not line up",
             mm2_w.cols,
         );
         anyhow::ensure!(
@@ -506,19 +770,204 @@ impl VisionEncoderWeights {
             mm2_b,
         };
 
-        let weights = Self {
+        Ok(Self {
             config,
             patch_embed,
+            patch_embed_1: None,
+            embedding_norm: None,
             position_embed,
             blocks,
+            lfm3_blocks: Vec::new(),
             post_ln_w,
             post_ln_b,
+            mm_input_norm: None,
             projector,
-        };
-        Ok(weights)
+        })
     }
 
-    /// Parse a LFM2-VL `mmproj` GGUF and pre-build the CPU `smmla` repacks.
+    fn from_gguf_lfm3_unprepared(
+        gguf: &Arc<GgufFile>,
+        config: VisionEncoderConfig,
+    ) -> Result<Self> {
+        let (patch_embed, inline_pe1) = load_patch_embed_weights(
+            gguf,
+            "v.patch_embd.weight",
+            Some("v.patch_embd.bias"),
+            false,
+            &config,
+        )?;
+        let patch_embed_1 = if inline_pe1.is_some() {
+            inline_pe1
+        } else if gguf.tensors.contains_key("v.patch_embd.weight.1") {
+            let (pe1, _) = load_patch_embed_weights(
+                gguf,
+                "v.patch_embd.weight.1",
+                Some("v.patch_embd.bias.1"),
+                false,
+                &config,
+            )?;
+            Some(pe1)
+        } else if gguf.tensors.contains_key("v.patch_embd.1.weight") {
+            let (pe1, _) = load_patch_embed_weights(
+                gguf,
+                "v.patch_embd.1.weight",
+                Some("v.patch_embd.1.bias"),
+                false,
+                &config,
+            )?;
+            Some(pe1)
+        } else {
+            None
+        };
+
+        let embedding_norm = load_optional_lfm3_norm(gguf, "v.embedding_norm", config.n_embd)?;
+
+        let position_embed = if gguf.tensors.contains_key("v.position_embd.weight") {
+            let pos_t = gguf
+                .get_tensor("v.position_embd.weight")
+                .context("loading v.position_embd.weight")?;
+            let pos_shape = pos_t.shape();
+            anyhow::ensure!(
+                pos_shape.len() == 2
+                    && pos_shape[0] == config.n_embd
+                    && pos_shape[1] == config.n_trained_patches,
+                "v.position_embd.weight shape {pos_shape:?} != [n_embd={}, n_trained_patches={}]",
+                config.n_embd,
+                config.n_trained_patches,
+            );
+            pos_t.try_to_f32_vec()?
+        } else {
+            Vec::new()
+        };
+
+        let mut lfm3_blocks = Vec::with_capacity(config.n_layer);
+        for il in 0..config.n_layer {
+            lfm3_blocks.push(load_lfm3_block(gguf, il, &config)?);
+        }
+
+        let post_ln_w = if gguf.tensors.contains_key("v.post_ln.weight") {
+            let w = load_vec_f32(gguf, "v.post_ln.weight")?;
+            anyhow::ensure!(
+                w.len() == config.n_embd,
+                "v.post_ln.weight len ({}) != n_embd ({})",
+                w.len(),
+                config.n_embd
+            );
+            w
+        } else {
+            Vec::new()
+        };
+        let post_ln_b = if gguf.tensors.contains_key("v.post_ln.bias") {
+            let b = load_vec_f32(gguf, "v.post_ln.bias")?;
+            anyhow::ensure!(
+                b.len() == config.n_embd,
+                "v.post_ln.bias len ({}) != n_embd ({})",
+                b.len(),
+                config.n_embd
+            );
+            b
+        } else {
+            Vec::new()
+        };
+
+        let mm1_in_dim = config.n_embd * config.scale_factor.pow(2);
+        let mm_input_norm = if gguf.tensors.contains_key("mm.input_norm.weight") {
+            let w = load_vec_f32(gguf, "mm.input_norm.weight")?;
+            anyhow::ensure!(
+                w.len() == config.n_embd || w.len() == mm1_in_dim,
+                "mm.input_norm.weight len ({}) must equal n_embd ({}) or n_embd*sf^2 ({mm1_in_dim})",
+                w.len(),
+                config.n_embd,
+            );
+            let bias = if gguf.tensors.contains_key("mm.input_norm.bias") {
+                let b = load_vec_f32(gguf, "mm.input_norm.bias")?;
+                anyhow::ensure!(
+                    b.len() == w.len(),
+                    "mm.input_norm.bias len ({}) != mm.input_norm.weight len ({})",
+                    b.len(),
+                    w.len(),
+                );
+                Some(b)
+            } else {
+                None
+            };
+            Some(Lfm3NormWeights { weight: w, bias })
+        } else {
+            None
+        };
+
+        let (mm0_w_name, mm0_b_name) = if gguf.tensors.contains_key("mm.0.weight") {
+            ("mm.0.weight", "mm.0.bias")
+        } else {
+            ("mm.1.weight", "mm.1.bias")
+        };
+        let mm1_w = wt_f32(gguf, mm0_w_name)?;
+        let intermediate_dim = mm1_w.rows;
+        anyhow::ensure!(
+            mm1_w.cols == mm1_in_dim,
+            "{mm0_w_name} cols ({}) != n_embd*sf^2 ({mm1_in_dim})",
+            mm1_w.cols,
+        );
+        let mm1_b = if gguf.tensors.contains_key(mm0_b_name) {
+            let b = load_vec_f32(gguf, mm0_b_name)?;
+            anyhow::ensure!(
+                b.len() == intermediate_dim,
+                "{mm0_b_name} len ({}) != {mm0_w_name}.rows ({intermediate_dim})",
+                b.len(),
+            );
+            b
+        } else {
+            vec![0.0; intermediate_dim]
+        };
+
+        let mm2_w = wt_f32(gguf, "mm.2.weight")?;
+        anyhow::ensure!(
+            mm2_w.cols == intermediate_dim,
+            "mm.2.weight cols ({}) != {mm0_w_name}.rows ({intermediate_dim})",
+            mm2_w.cols,
+        );
+        anyhow::ensure!(
+            mm2_w.rows == config.projection_dim,
+            "mm.2.weight rows ({}) != projection_dim ({})",
+            mm2_w.rows,
+            config.projection_dim,
+        );
+        let mm2_b = if gguf.tensors.contains_key("mm.2.bias") {
+            let b = load_vec_f32(gguf, "mm.2.bias")?;
+            anyhow::ensure!(
+                b.len() == config.projection_dim,
+                "mm.2.bias len ({}) != projection_dim ({})",
+                b.len(),
+                config.projection_dim,
+            );
+            b
+        } else {
+            vec![0.0; config.projection_dim]
+        };
+
+        let projector = ProjectorWeights {
+            mm1_w,
+            mm1_b,
+            mm2_w,
+            mm2_b,
+        };
+
+        Ok(Self {
+            config,
+            patch_embed,
+            patch_embed_1,
+            embedding_norm,
+            position_embed,
+            blocks: Vec::new(),
+            lfm3_blocks,
+            post_ln_w,
+            post_ln_b,
+            mm_input_norm,
+            projector,
+        })
+    }
+
+    /// Parse a `mmproj` GGUF and pre-build the CPU `smmla` repacks.
     pub fn from_gguf(gguf: &Arc<GgufFile>) -> Result<Self> {
         let weights = Self::from_gguf_unprepared(gguf)?;
         weights.prepare_int8();
@@ -538,29 +987,34 @@ impl VisionEncoderWeights {
                 let _ = w.smmla_repacked();
             }
         }
+        for b in &self.lfm3_blocks {
+            match &b.op {
+                Lfm3BlockOp::Conv(conv) => {
+                    let _ = conv.in_proj_w.smmla_repacked();
+                    let _ = conv.out_proj_w.smmla_repacked();
+                }
+                Lfm3BlockOp::Attn(attn) => {
+                    for w in [&attn.q_w, &attn.k_w, &attn.v_w, &attn.o_w] {
+                        let _ = w.smmla_repacked();
+                    }
+                }
+            }
+            if let Some(gw) = &b.ffn.gate_w {
+                let _ = gw.smmla_repacked();
+            }
+            let _ = b.ffn.up_w.smmla_repacked();
+            let _ = b.ffn.down_w.smmla_repacked();
+        }
         let _ = self.projector.mm1_w.smmla_repacked();
         let _ = self.projector.mm2_w.smmla_repacked();
     }
 
     /// Run the vision encoder + projector on a preprocessed image
     /// at the dynamic patch grid the preprocessor selected.
-    ///
-    /// `pixels` is `[3 × target_h × target_w]` f32 NCHW
-    /// (RGB, normalised via `image_mean` / `image_std`).
-    /// `(grid_w, grid_h)` are the patch-grid dimensions:
-    /// `target_w / patch_size` × `target_h / patch_size`. The
-    /// preprocessor returns these as part of `PreprocessedImage`.
-    ///
-    /// Output: `[n_image_tokens × projection_dim]` f32 where
-    /// `n_image_tokens = (grid_w / scale_factor) · (grid_h /
-    /// scale_factor)`. For a 1024×771 input on LFM2.5-VL-450M
-    /// (target 576×416 → grid 36×26): 18·13 = 234 image tokens
-    /// of 1024 dims each.
-    ///
-    /// Pipeline:
-    /// `pixels → patch_embed → +interpolated_pos_embed → 12 × ViT
-    /// block → post_ln → pixel-shuffle 2×2 → mm.1+GELU → mm.2`.
     pub fn encode_image(&self, pixels: &[f32], grid_w: usize, grid_h: usize) -> Result<Vec<f32>> {
+        if self.config.is_lfm3() {
+            return self.encode_lfm3_frames(pixels, None, grid_w, grid_h);
+        }
         let cfg = &self.config;
         anyhow::ensure!(grid_w > 0 && grid_h > 0, "grid dims must be > 0");
         anyhow::ensure!(
@@ -569,46 +1023,40 @@ impl VisionEncoderWeights {
         );
         anyhow::ensure!(
             grid_w.is_multiple_of(cfg.scale_factor) && grid_h.is_multiple_of(cfg.scale_factor),
-            "grid {grid_w}×{grid_h} not divisible by scale_factor ({})",
+            "grid {grid_w}x{grid_h} not divisible by scale_factor ({})",
             cfg.scale_factor,
         );
-        // Compute target image / patch counts with overflow checks —
-        // a malformed caller (or 32-bit target like wasm32 with a
-        // huge grid) shouldn't silently wrap and bypass the
-        // pixels.len() invariant below.
         let target_w = grid_w
             .checked_mul(cfg.patch_size)
-            .ok_or_else(|| anyhow::anyhow!("grid_w·patch_size overflow"))?;
+            .ok_or_else(|| anyhow::anyhow!("grid_w*patch_size overflow"))?;
         let target_h = grid_h
             .checked_mul(cfg.patch_size)
-            .ok_or_else(|| anyhow::anyhow!("grid_h·patch_size overflow"))?;
+            .ok_or_else(|| anyhow::anyhow!("grid_h*patch_size overflow"))?;
         let n_pix = target_w
             .checked_mul(target_h)
             .and_then(|x| x.checked_mul(3))
-            .ok_or_else(|| anyhow::anyhow!("3·target_w·target_h overflow"))?;
+            .ok_or_else(|| anyhow::anyhow!("3*target_w*target_h overflow"))?;
         anyhow::ensure!(
             pixels.len() == n_pix,
-            "encode_image: pixels.len() {} != 3·target_w·target_h ({n_pix})",
+            "encode_image: pixels.len() {} != 3*target_w*target_h ({n_pix})",
             pixels.len()
         );
         let n_patches = grid_w
             .checked_mul(grid_h)
-            .ok_or_else(|| anyhow::anyhow!("grid_w·grid_h overflow"))?;
+            .ok_or_else(|| anyhow::anyhow!("grid_w*grid_h overflow"))?;
         let mut prof = Prof::new();
-        // 1. Patch embed: [3, H, W] → [n_patches, n_embd]
+        // 1. Patch embed: [3, H, W] -> [n_patches, n_embd]
         let t = prof.start();
         let mut tokens = patch_embed_compute(pixels, &self.patch_embed, cfg, grid_w, grid_h);
         prof.stop("patch_embed", t);
-        // 2. Add position embeddings — interpolate from the trained
-        //    grid when the dynamic grid differs.
+        // 2. Add position embeddings.
         let pos = self.resolved_position_embed(grid_w, grid_h);
         debug_assert_eq!(pos.len(), n_patches * cfg.n_embd);
         for (t, p) in tokens.iter_mut().zip(pos.iter()) {
             *t += *p;
         }
 
-        // 3. 12 × ViT block. Allocate scratch sized to the dynamic
-        //    grid and reuse across blocks.
+        // 3. 12 x ViT block.
         let mut scratch = VitScratch::new(cfg, n_patches);
         for block in &self.blocks {
             self.vit_block_forward(&mut tokens, block, &mut scratch, n_patches, &mut prof);
@@ -620,9 +1068,7 @@ impl VisionEncoderWeights {
             crate::backend::cpu::layer_norm_inplace(row, &self.post_ln_w, &self.post_ln_b, cfg.eps);
         });
 
-        // 5. Pixel-shuffle scale_factor² over the dynamic grid →
-        //    `(grid_w/sf) · (grid_h/sf)` tokens with sf² channel
-        //    inflation.
+        // 5. Pixel-shuffle scale_factor^2 over the dynamic grid.
         let pooled = pixel_shuffle(&tokens, cfg, grid_w, grid_h);
         prof.stop("post_ln_shuffle", t);
 
@@ -632,6 +1078,139 @@ impl VisionEncoderWeights {
         prof.stop("projector", t);
         prof.report();
         Ok(out)
+    }
+
+    /// Encode a pair of consecutive video frames (`pixels_t0` and `pixels_t1`) using the LFM3
+    /// temporal patchifier (`v.patch_embd.weight` on `pixels_t0` plus `v.patch_embd.weight.1` on `pixels_t1`).
+    pub fn encode_video_frame_pair(
+        &self,
+        pixels_t0: &[f32],
+        pixels_t1: &[f32],
+        grid_w: usize,
+        grid_h: usize,
+    ) -> Result<Vec<f32>> {
+        anyhow::ensure!(
+            self.config.is_lfm3() && self.patch_embed_1.is_some(),
+            "encode_video_frame_pair needs an LFM3 encoder with a temporal patch kernel \
+             (`v.patch_embd.weight.1`); this one would drop the second frame"
+        );
+        self.encode_lfm3_frames(pixels_t0, Some(pixels_t1), grid_w, grid_h)
+    }
+
+    fn encode_lfm3_frames(
+        &self,
+        pixels_t0: &[f32],
+        pixels_t1: Option<&[f32]>,
+        grid_w: usize,
+        grid_h: usize,
+    ) -> Result<Vec<f32>> {
+        let cfg = &self.config;
+        anyhow::ensure!(grid_w > 0 && grid_h > 0, "grid dims must be > 0");
+        anyhow::ensure!(
+            cfg.scale_factor > 0,
+            "vision encoder config has scale_factor=0; refusing to divide by zero"
+        );
+        anyhow::ensure!(
+            grid_w.is_multiple_of(cfg.scale_factor) && grid_h.is_multiple_of(cfg.scale_factor),
+            "grid {grid_w}x{grid_h} not divisible by scale_factor ({})",
+            cfg.scale_factor,
+        );
+        let target_w = grid_w
+            .checked_mul(cfg.patch_size)
+            .ok_or_else(|| anyhow::anyhow!("grid_w*patch_size overflow"))?;
+        let target_h = grid_h
+            .checked_mul(cfg.patch_size)
+            .ok_or_else(|| anyhow::anyhow!("grid_h*patch_size overflow"))?;
+        let n_pix = target_w
+            .checked_mul(target_h)
+            .and_then(|x| x.checked_mul(3))
+            .ok_or_else(|| anyhow::anyhow!("3*target_w*target_h overflow"))?;
+        anyhow::ensure!(
+            pixels_t0.len() == n_pix,
+            "encode_image: pixels.len() {} != 3*target_w*target_h ({n_pix})",
+            pixels_t0.len()
+        );
+        if let Some(p1) = pixels_t1 {
+            anyhow::ensure!(
+                p1.len() == n_pix,
+                "encode_video_frame_pair: pixels_t1.len() {} != 3*target_w*target_h ({n_pix})",
+                p1.len()
+            );
+        }
+        let n_patches = grid_w
+            .checked_mul(grid_h)
+            .ok_or_else(|| anyhow::anyhow!("grid_w*grid_h overflow"))?;
+
+        // 1. Temporal patchifier: conv2d(t0, w0) + conv2d(t1_or_t0, w1) + bias.
+        let mut tokens = patch_embed_compute(pixels_t0, &self.patch_embed, cfg, grid_w, grid_h);
+        if let Some(pe1) = &self.patch_embed_1 {
+            let frame1 = pixels_t1.unwrap_or(pixels_t0);
+            let tokens_t1 = patch_embed_compute(frame1, pe1, cfg, grid_w, grid_h);
+            for (dst, &src) in tokens.iter_mut().zip(tokens_t1.iter()) {
+                *dst += src;
+            }
+        }
+
+        // 2. Post-patch embedding norm (if present) and optional position embedding.
+        if let Some(emb_norm) = &self.embedding_norm {
+            par_rows_n(&mut tokens, cfg.n_embd, |_, row| {
+                emb_norm.apply_row_inplace(row, cfg.eps);
+            });
+        }
+        if !self.position_embed.is_empty() {
+            let pos = self.resolved_position_embed(grid_w, grid_h);
+            for (t, p) in tokens.iter_mut().zip(pos.iter()) {
+                *t += *p;
+            }
+        }
+
+        // 3. Hybrid Conv2d / 2D M-RoPE GQA Attention blocks.
+        let mut scratch = VitScratch::new(cfg, n_patches);
+        for block in &self.lfm3_blocks {
+            self.lfm3_block_forward(&mut tokens, block, &mut scratch, grid_w, grid_h);
+        }
+
+        // 4. Optional post_ln and pre-merge mm.input_norm.
+        if !self.post_ln_w.is_empty() {
+            let has_post_b = !self.post_ln_b.is_empty();
+            par_rows_n(&mut tokens, cfg.n_embd, |_, row| {
+                if has_post_b {
+                    crate::backend::cpu::layer_norm_inplace(
+                        row,
+                        &self.post_ln_w,
+                        &self.post_ln_b,
+                        cfg.eps,
+                    );
+                } else {
+                    rms_norm_row_inplace(row, &self.post_ln_w, cfg.eps);
+                }
+            });
+        }
+        let merged_dim = cfg.n_embd * cfg.scale_factor * cfg.scale_factor;
+        let norm_stage = self
+            .mm_input_norm
+            .as_ref()
+            .and_then(|n| mm_norm_stage(n.weight.len(), cfg.n_embd, merged_dim));
+        if let Some(mm_norm) = &self.mm_input_norm
+            && norm_stage == Some(MmNormStage::PreMerge)
+        {
+            par_rows_n(&mut tokens, cfg.n_embd, |_, row| {
+                mm_norm.apply_row_inplace(row, LFM3_MM_INPUT_NORM_EPS);
+            });
+        }
+
+        // 5. 2x2 spatial patch merge (space-to-depth in row-major 2x2 order).
+        let mut pooled = pixel_shuffle(&tokens, cfg, grid_w, grid_h);
+        if let Some(mm_norm) = &self.mm_input_norm
+            && norm_stage == Some(MmNormStage::PostMerge)
+        {
+            par_rows_n(&mut pooled, merged_dim, |_, row| {
+                mm_norm.apply_row_inplace(row, LFM3_MM_INPUT_NORM_EPS);
+            });
+        }
+
+        // 6. 2-layer GELU MLP projector (mm.0 + GELU + mm.2).
+        Ok(self.projector_forward(&pooled, cfg))
     }
 
     /// The `[patches, n_embd]` tokens after patch embedding, the position
@@ -923,9 +1502,368 @@ impl VisionEncoderWeights {
         prof.stop("bias_res", t);
     }
 
-    /// Projector forward: pixel-shuffled `[64, 3072]` → `mm.1`
-    /// (3072 → 2048) + GELU → `mm.2` (2048 → 1024). Output:
-    /// `[64, 1024]` flattened.
+    fn lfm3_block_forward(
+        &self,
+        tokens: &mut [f32],
+        block: &Lfm3VisionBlockWeights,
+        scratch: &mut VitScratch,
+        grid_w: usize,
+        grid_h: usize,
+    ) {
+        let cfg = &self.config;
+        let n_embd = cfg.n_embd;
+        let n_tokens = grid_w * grid_h;
+
+        scratch.pre_norm[..n_tokens * n_embd].copy_from_slice(tokens);
+        par_rows_n(
+            &mut scratch.pre_norm[..n_tokens * n_embd],
+            n_embd,
+            |_, row| {
+                block.ln1.apply_row_inplace(row, cfg.eps);
+            },
+        );
+
+        match &block.op {
+            Lfm3BlockOp::Conv(conv) => {
+                self.lfm3_conv_forward(tokens, conv, scratch, grid_w, grid_h);
+            }
+            Lfm3BlockOp::Attn(attn) => {
+                self.lfm3_attn_forward(tokens, attn, scratch, grid_w, grid_h);
+            }
+        }
+
+        scratch.pre_norm[..n_tokens * n_embd].copy_from_slice(tokens);
+        par_rows_n(
+            &mut scratch.pre_norm[..n_tokens * n_embd],
+            n_embd,
+            |_, row| {
+                block.ln2.apply_row_inplace(row, cfg.eps);
+            },
+        );
+
+        self.lfm3_ffn_forward(tokens, &block.ffn, scratch, n_tokens);
+    }
+
+    fn lfm3_conv_forward(
+        &self,
+        tokens: &mut [f32],
+        conv: &Lfm3ConvBlockWeights,
+        scratch: &mut VitScratch,
+        grid_w: usize,
+        grid_h: usize,
+    ) {
+        let n_tokens = grid_w * grid_h;
+        let d = self.config.n_embd;
+        let proj_rows = conv.in_proj_w.rows;
+        let proj_len = n_tokens * proj_rows;
+        if scratch.conv_proj.len() < proj_len {
+            scratch.conv_proj.resize(proj_len, 0.0);
+        }
+
+        scratch
+            .q8
+            .quantize(&scratch.pre_norm[..n_tokens * d], d, n_tokens);
+        vit_linear(
+            &conv.in_proj_w,
+            &scratch.pre_norm[..n_tokens * d],
+            &mut scratch.conv_proj[..proj_len],
+            n_tokens,
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
+        );
+        if let Some(b) = &conv.in_proj_b {
+            par_rows_n(&mut scratch.conv_proj[..proj_len], proj_rows, |_, row| {
+                crate::backend::cpu::add_inplace(row, b);
+            });
+        }
+
+        if scratch.conv_gated.len() < n_tokens * d {
+            scratch.conv_gated.resize(n_tokens * d, 0.0);
+        }
+        if scratch.conv_out.len() < n_tokens * d {
+            scratch.conv_out.resize(n_tokens * d, 0.0);
+        }
+        {
+            let proj = &scratch.conv_proj[..proj_len];
+            let gated = &mut scratch.conv_gated[..n_tokens * d];
+            if proj_rows == 3 * d {
+                par_rows_n(gated, d, |t, dst| {
+                    let row = &proj[t * 3 * d..(t + 1) * 3 * d];
+                    let first = &row[0..d];
+                    let third = &row[2 * d..3 * d];
+                    for c in 0..d {
+                        dst[c] = first[c] * third[c];
+                    }
+                });
+            } else {
+                par_rows_n(gated, d, |t, dst| {
+                    let row = &proj[t * 2 * d..(t + 1) * 2 * d];
+                    let b_part = &row[0..d];
+                    let c_part = &row[d..2 * d];
+                    for c in 0..d {
+                        dst[c] = b_part[c] * c_part[c];
+                    }
+                });
+            }
+        }
+
+        depthwise_conv2d_same_into(
+            &scratch.conv_gated[..n_tokens * d],
+            &conv.depthwise_w,
+            conv.depthwise_b.as_deref(),
+            grid_w,
+            grid_h,
+            d,
+            conv.kernel_size,
+            &mut scratch.conv_out[..n_tokens * d],
+        );
+        if proj_rows == 3 * d {
+            let proj = &scratch.conv_proj[..proj_len];
+            let conv_out = &mut scratch.conv_out[..n_tokens * d];
+            par_rows_n(conv_out, d, |t, dst| {
+                let middle = &proj[t * 3 * d + d..t * 3 * d + 2 * d];
+                crate::backend::cpu::mul_inplace(dst, middle);
+            });
+        }
+
+        scratch
+            .q8
+            .quantize(&scratch.conv_out[..n_tokens * d], d, n_tokens);
+        vit_linear(
+            &conv.out_proj_w,
+            &scratch.conv_out[..n_tokens * d],
+            &mut scratch.attn_proj[..n_tokens * d],
+            n_tokens,
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
+        );
+        if let Some(b) = &conv.out_proj_b {
+            add_bias_residual(tokens, &mut scratch.attn_proj[..n_tokens * d], b, d);
+        } else {
+            crate::backend::cpu::add_inplace(tokens, &scratch.attn_proj[..n_tokens * d]);
+        }
+    }
+
+    fn lfm3_attn_forward(
+        &self,
+        tokens: &mut [f32],
+        attn: &Lfm3AttnBlockWeights,
+        scratch: &mut VitScratch,
+        grid_w: usize,
+        grid_h: usize,
+    ) {
+        let cfg = &self.config;
+        let n_tokens = grid_w * grid_h;
+        let d = cfg.n_embd;
+        let n_head = attn.n_head;
+        let n_head_kv = attn.n_head_kv;
+        let head_dim = attn.head_dim;
+        let kv_dim = n_head_kv * head_dim;
+        let scale = 1.0f32 / (head_dim as f32).sqrt();
+
+        scratch
+            .q8
+            .quantize(&scratch.pre_norm[..n_tokens * d], d, n_tokens);
+        vit_linear(
+            &attn.q_w,
+            &scratch.pre_norm[..n_tokens * d],
+            &mut scratch.q[..n_tokens * d],
+            n_tokens,
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
+        );
+        vit_linear(
+            &attn.k_w,
+            &scratch.pre_norm[..n_tokens * d],
+            &mut scratch.k[..n_tokens * kv_dim],
+            n_tokens,
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
+        );
+        vit_linear(
+            &attn.v_w,
+            &scratch.pre_norm[..n_tokens * d],
+            &mut scratch.v[..n_tokens * kv_dim],
+            n_tokens,
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
+        );
+
+        if let Some(qb) = &attn.q_b {
+            par_rows_n(&mut scratch.q[..n_tokens * d], d, |_, row| {
+                crate::backend::cpu::add_inplace(row, qb);
+            });
+        }
+        if let Some(kb) = &attn.k_b {
+            par_rows_n(&mut scratch.k[..n_tokens * kv_dim], kv_dim, |_, row| {
+                crate::backend::cpu::add_inplace(row, kb);
+            });
+        }
+        if let Some(vb) = &attn.v_b {
+            par_rows_n(&mut scratch.v[..n_tokens * kv_dim], kv_dim, |_, row| {
+                crate::backend::cpu::add_inplace(row, vb);
+            });
+        }
+
+        // Per-head (or per-row) QK norms.
+        let q_norm_stride = attn.q_norm.weight.len();
+        if q_norm_stride > 0 && (n_tokens * d).is_multiple_of(q_norm_stride) {
+            par_rows_n(&mut scratch.q[..n_tokens * d], q_norm_stride, |_, slice| {
+                attn.q_norm.apply_row_inplace(slice, cfg.eps);
+            });
+        }
+        let k_norm_stride = attn.k_norm.weight.len();
+        if k_norm_stride > 0 && (n_tokens * kv_dim).is_multiple_of(k_norm_stride) {
+            par_rows_n(
+                &mut scratch.k[..n_tokens * kv_dim],
+                k_norm_stride,
+                |_, slice| {
+                    attn.k_norm.apply_row_inplace(slice, cfg.eps);
+                },
+            );
+        }
+
+        // 2D Vision M-RoPE on Q and K (sharing the per-row/col sin_cos tables).
+        apply_2d_vision_mrope_qk(
+            &mut scratch.q[..n_tokens * d],
+            &mut scratch.k[..n_tokens * kv_dim],
+            grid_w,
+            grid_h,
+            n_head,
+            n_head_kv,
+            head_dim,
+            cfg.rope_theta,
+        );
+
+        // Expand KV heads in-place if GQA (n_head_kv < n_head) so vit_attention can run directly.
+        if n_head_kv < n_head {
+            let n_rep = n_head / n_head_kv;
+            for t in (0..n_tokens).rev() {
+                for h in (0..n_head).rev() {
+                    let kv_h = h / n_rep;
+                    let src_off = t * kv_dim + kv_h * head_dim;
+                    let dst_off = t * d + h * head_dim;
+                    if src_off != dst_off {
+                        scratch.k.copy_within(src_off..src_off + head_dim, dst_off);
+                        scratch.v.copy_within(src_off..src_off + head_dim, dst_off);
+                    }
+                }
+            }
+        }
+
+        vit_attention(
+            &scratch.q[..n_tokens * d],
+            &scratch.k[..n_tokens * d],
+            &scratch.v[..n_tokens * d],
+            &mut scratch.attn_out[..n_tokens * d],
+            &mut scratch.attn_heads,
+            &mut scratch.attn_kt,
+            n_tokens,
+            n_head,
+            head_dim,
+            scale,
+        );
+
+        scratch
+            .q8
+            .quantize(&scratch.attn_out[..n_tokens * d], d, n_tokens);
+        vit_linear(
+            &attn.o_w,
+            &scratch.attn_out[..n_tokens * d],
+            &mut scratch.attn_proj[..n_tokens * d],
+            n_tokens,
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
+        );
+        if let Some(ob) = &attn.o_b {
+            add_bias_residual(tokens, &mut scratch.attn_proj[..n_tokens * d], ob, d);
+        } else {
+            for (tok, &p) in tokens
+                .iter_mut()
+                .zip(scratch.attn_proj[..n_tokens * d].iter())
+            {
+                *tok += p;
+            }
+        }
+    }
+
+    fn lfm3_ffn_forward(
+        &self,
+        tokens: &mut [f32],
+        ffn: &Lfm3FfnWeights,
+        scratch: &mut VitScratch,
+        n_tokens: usize,
+    ) {
+        let d = self.config.n_embd;
+        let n_ff = ffn.up_w.rows;
+        if scratch.ffn_mid.len() < n_tokens * n_ff {
+            scratch.ffn_mid.resize(n_tokens * n_ff, 0.0);
+        }
+        scratch
+            .q8
+            .quantize(&scratch.pre_norm[..n_tokens * d], d, n_tokens);
+        vit_linear(
+            &ffn.up_w,
+            &scratch.pre_norm[..n_tokens * d],
+            &mut scratch.ffn_mid[..n_tokens * n_ff],
+            n_tokens,
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
+        );
+        if let Some(up_b) = &ffn.up_b {
+            par_rows_n(&mut scratch.ffn_mid[..n_tokens * n_ff], n_ff, |_, row| {
+                crate::backend::cpu::add_inplace(row, up_b);
+            });
+        }
+
+        if let Some(gate_w) = &ffn.gate_w {
+            if scratch.ffn_gate.len() < n_tokens * n_ff {
+                scratch.ffn_gate.resize(n_tokens * n_ff, 0.0);
+            }
+            vit_linear(
+                gate_w,
+                &scratch.pre_norm[..n_tokens * d],
+                &mut scratch.ffn_gate[..n_tokens * n_ff],
+                n_tokens,
+                &mut scratch.q8,
+                &mut scratch.dequant_scratch,
+            );
+            let gate_b = ffn.gate_b.as_deref();
+            let gate_slice = &mut scratch.ffn_gate[..n_tokens * n_ff];
+            let mid_slice = &mut scratch.ffn_mid[..n_tokens * n_ff];
+            if let Some(gb) = gate_b {
+                par_rows_n(gate_slice, n_ff, |_, g_row| {
+                    crate::backend::cpu::add_inplace(g_row, gb);
+                });
+            }
+            crate::backend::cpu::silu_mul_inplace(gate_slice, mid_slice);
+            mid_slice.copy_from_slice(gate_slice);
+        } else {
+            par_rows_n(&mut scratch.ffn_mid[..n_tokens * n_ff], n_ff, |_, row| {
+                crate::backend::cpu::gelu_inplace(row);
+            });
+        }
+
+        scratch
+            .q8
+            .quantize(&scratch.ffn_mid[..n_tokens * n_ff], n_ff, n_tokens);
+        vit_linear(
+            &ffn.down_w,
+            &scratch.ffn_mid[..n_tokens * n_ff],
+            &mut scratch.ffn_out[..n_tokens * d],
+            n_tokens,
+            &mut scratch.q8,
+            &mut scratch.dequant_scratch,
+        );
+        if let Some(down_b) = &ffn.down_b {
+            add_bias_residual(tokens, &mut scratch.ffn_out[..n_tokens * d], down_b, d);
+        } else {
+            crate::backend::cpu::add_inplace(tokens, &scratch.ffn_out[..n_tokens * d]);
+        }
+    }
+
+    /// Projector forward: pixel-shuffled `[64, 3072]` -> `mm.1` / `mm.0`
+    /// + GELU -> `mm.2`.
     fn projector_forward(&self, pooled: &[f32], cfg: &VisionEncoderConfig) -> Vec<f32> {
         self.projector.forward(pooled, cfg.projection_dim)
     }
@@ -980,7 +1918,7 @@ impl Prof {
 }
 
 /// Per-block scratch buffers for the ViT forward pass. Allocated
-/// once per `encode_image` and reused across all 12 blocks; sized
+/// once per `encode_image` and reused across all blocks; sized
 /// to the **dynamic** patch count picked by the preprocessor
 /// (`grid_w · grid_h`), not the trained-grid count.
 struct VitScratch {
@@ -997,10 +1935,13 @@ struct VitScratch {
     /// for `cpu::vit_attention_chunk_neon`; empty where that kernel is not used.
     attn_kt: Vec<f32>,
     attn_proj: Vec<f32>,
+    conv_proj: Vec<f32>,
+    conv_gated: Vec<f32>,
+    conv_out: Vec<f32>,
     ffn_mid: Vec<f32>,
+    ffn_gate: Vec<f32>,
     ffn_out: Vec<f32>,
-    /// Reusable row dequantization buffer sized to `max(n_embd, n_ff)`
-    /// to avoid per-matmul heap allocations across all blocks.
+    /// Reusable dequantization buffer to avoid per-matmul heap allocations across all blocks.
     dequant_scratch: Vec<f32>,
     /// Int8 activation buffers for the Q8_0 linears.
     q8: Q8Act,
@@ -1011,6 +1952,10 @@ impl VitScratch {
         let n_pe = n_tokens * cfg.n_embd;
         let n_pf = n_tokens * cfg.n_ff;
         let max_dim = cfg.n_embd.max(cfg.n_ff);
+        #[cfg(has_blas)]
+        let dequant_len = (3 * cfg.n_embd).max(cfg.n_ff).saturating_mul(max_dim);
+        #[cfg(not(has_blas))]
+        let dequant_len = max_dim;
         Self {
             pre_norm: vec![0.0; n_pe],
             q: vec![0.0; n_pe],
@@ -1020,9 +1965,13 @@ impl VitScratch {
             attn_heads: vec![0.0; attn_heads_len(n_tokens, cfg.n_head, cfg.n_embd / cfg.n_head)],
             attn_kt: vec![0.0; attn_kt_len(n_tokens, cfg.n_head, cfg.n_embd / cfg.n_head)],
             attn_proj: vec![0.0; n_pe],
+            conv_proj: vec![0.0; 3 * n_pe],
+            conv_gated: vec![0.0; n_pe],
+            conv_out: vec![0.0; n_pe],
             ffn_mid: vec![0.0; n_pf],
+            ffn_gate: vec![0.0; n_pf],
             ffn_out: vec![0.0; n_pe],
-            dequant_scratch: vec![0.0; max_dim],
+            dequant_scratch: vec![0.0; dequant_len],
             q8: Q8Act::new(cfg, n_tokens),
         }
     }
@@ -1051,7 +2000,7 @@ struct Q8Act {
 
 impl Q8Act {
     fn new(cfg: &VisionEncoderConfig, n_tokens: usize) -> Self {
-        Self::for_dims(&[cfg.n_embd, cfg.n_ff], n_tokens)
+        Self::for_dims(&[cfg.n_embd, cfg.n_ff, 3 * cfg.n_embd], n_tokens)
     }
 
     /// An int8 activation buffer for token rows of any of `dims` floats.
@@ -1724,8 +2673,8 @@ fn load_vit_block(
     // `n_head > 0` first to avoid the modulo's div-by-zero on a
     // corrupt mmproj reporting `n_head = 0`.
     anyhow::ensure!(
-        cfg.n_head > 0 && n_embd.is_multiple_of(cfg.n_head),
-        "n_embd ({n_embd}) not divisible by n_head ({})",
+        n_embd > 0 && cfg.n_head > 0 && n_embd.is_multiple_of(cfg.n_head),
+        "n_embd ({n_embd}) must be a positive multiple of n_head ({})",
         cfg.n_head,
     );
 
@@ -1768,22 +2717,610 @@ fn load_vec_f32(gguf: &Arc<GgufFile>, name: &str) -> Result<Vec<f32>> {
         "tensor {name} must be 1D, got rank {}",
         tensor.shape().len()
     );
-    Ok(tensor.to_f32_vec())
+    Ok(tensor.try_to_f32_vec()?)
+}
+
+/// Apply 2D Vision M-RoPE (`GGML_ROPE_TYPE_VISION`, `mrope_sections = [head_dim/4, head_dim/4, 0, 0]`,
+/// `indep_sects = true`) in-place on `q_or_k` (`[grid_h * grid_w, n_head * head_dim]`).
+///
+/// For each token at grid coordinate `(py, px)` (`py in 0..grid_h`, `px in 0..grid_w`) and each head:
+/// - `sect = head_dim / 4`, `half = head_dim / 2`.
+/// - `theta_scale = rope_theta.powf(-2.0 / (half as f32))`.
+/// - For `ic in 0..sect`: rotates `(head[ic], head[ic + half])` by `(py as f32) * theta_scale.powi(ic)`.
+/// - For `ic in sect..2*sect` (`k = ic - sect`): rotates `(head[ic], head[ic + half])` by
+///   `(px as f32) * theta_scale.powi(k)`.
+#[cfg(test)]
+pub(crate) fn apply_2d_vision_mrope(
+    q_or_k: &mut [f32],
+    grid_w: usize,
+    grid_h: usize,
+    n_head: usize,
+    head_dim: usize,
+    rope_theta: f32,
+) {
+    apply_2d_vision_mrope_qk(
+        q_or_k,
+        &mut [],
+        grid_w,
+        grid_h,
+        n_head,
+        0,
+        head_dim,
+        rope_theta,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_2d_vision_mrope_qk(
+    q: &mut [f32],
+    k: &mut [f32],
+    grid_w: usize,
+    grid_h: usize,
+    n_head_q: usize,
+    n_head_k: usize,
+    head_dim: usize,
+    rope_theta: f32,
+) {
+    let half = head_dim / 2;
+    let sect = head_dim / 4;
+    if half == 0 || sect == 0 || grid_w == 0 || grid_h == 0 || (n_head_q == 0 && n_head_k == 0) {
+        return;
+    }
+    let theta_scale = rope_theta.powf(-2.0f32 / (half as f32));
+
+    let mut inv_freq = vec![0.0f32; sect];
+    let mut cur = 1.0f32;
+    for freq in inv_freq.iter_mut() {
+        *freq = cur;
+        cur *= theta_scale;
+    }
+
+    let mut y_sincos = vec![(0.0f32, 1.0f32); grid_h * sect];
+    for py in 0..grid_h {
+        let py_f = py as f32;
+        let row = &mut y_sincos[py * sect..(py + 1) * sect];
+        for (ic, &freq) in inv_freq.iter().enumerate() {
+            row[ic] = (py_f * freq).sin_cos();
+        }
+    }
+    let mut x_sincos = vec![(0.0f32, 1.0f32); grid_w * sect];
+    for px in 0..grid_w {
+        let px_f = px as f32;
+        let row = &mut x_sincos[px * sect..(px + 1) * sect];
+        for (idx, &freq) in inv_freq.iter().enumerate() {
+            row[idx] = (px_f * freq).sin_cos();
+        }
+    }
+
+    let rotate = |buf: &mut [f32], n_head: usize| {
+        if n_head == 0 {
+            return;
+        }
+        let stride = n_head * head_dim;
+        debug_assert_eq!(buf.len(), grid_w * grid_h * stride);
+        par_rows_n(buf, stride, |tok_idx, tok_row| {
+            let py = tok_idx / grid_w;
+            let px = tok_idx % grid_w;
+            let y_sc = &y_sincos[py * sect..(py + 1) * sect];
+            let x_sc = &x_sincos[px * sect..(px + 1) * sect];
+            for h in 0..n_head {
+                let head = &mut tok_row[h * head_dim..(h + 1) * head_dim];
+                for (ic, &(sin_y, cos_y)) in y_sc.iter().enumerate() {
+                    let x0 = head[ic];
+                    let x1 = head[ic + half];
+                    head[ic] = x0 * cos_y - x1 * sin_y;
+                    head[ic + half] = x0 * sin_y + x1 * cos_y;
+                }
+                for (idx, &(sin_x, cos_x)) in x_sc.iter().enumerate() {
+                    let ic = sect + idx;
+                    let x0 = head[ic];
+                    let x1 = head[ic + half];
+                    head[ic] = x0 * cos_x - x1 * sin_x;
+                    head[ic + half] = x0 * sin_x + x1 * cos_x;
+                }
+            }
+        });
+    };
+    rotate(q, n_head_q);
+    rotate(k, n_head_k);
+}
+
+/// Depthwise 2D spatial convolution with `stride = 1` and `padding = kernel_size / 2` ("same" padding)
+/// over a token-major `[grid_h * grid_w, channels]` buffer, writing into `out`.
+/// `weight` is stored in `[channels][kernel_size][kernel_size]` order (`c * K * K + ky * K + kx`).
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn depthwise_conv2d_same_into(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    grid_w: usize,
+    grid_h: usize,
+    channels: usize,
+    kernel_size: usize,
+    out: &mut [f32],
+) {
+    let n_tokens = grid_w * grid_h;
+    let k2 = kernel_size * kernel_size;
+    debug_assert_eq!(input.len(), n_tokens * channels);
+    debug_assert_eq!(weight.len(), channels * k2);
+    debug_assert_eq!(out.len(), n_tokens * channels);
+    let pad = kernel_size / 2;
+
+    // Transpose weights from [channels, k2] to tap-major [k2, channels] for unit-stride SIMD loops.
+    let mut w_tap = vec![0.0f32; k2 * channels];
+    for c in 0..channels {
+        let src = &weight[c * k2..(c + 1) * k2];
+        for (k_off, &w_val) in src.iter().enumerate() {
+            w_tap[k_off * channels + c] = w_val;
+        }
+    }
+
+    par_rows_n(out, channels, |tok_idx, out_row| {
+        let y = tok_idx / grid_w;
+        let x = tok_idx % grid_w;
+        if let Some(b) = bias {
+            out_row.copy_from_slice(b);
+        } else {
+            out_row.fill(0.0);
+        }
+        for ky in 0..kernel_size {
+            let sy_isize = (y + ky) as isize - (pad as isize);
+            if sy_isize < 0 || (sy_isize as usize) >= grid_h {
+                continue;
+            }
+            let sy = sy_isize as usize;
+            for kx in 0..kernel_size {
+                let sx_isize = (x + kx) as isize - (pad as isize);
+                if sx_isize < 0 || (sx_isize as usize) >= grid_w {
+                    continue;
+                }
+                let sx = sx_isize as usize;
+                let in_row =
+                    &input[(sy * grid_w + sx) * channels..(sy * grid_w + sx + 1) * channels];
+                let k_off = ky * kernel_size + kx;
+                let w_row = &w_tap[k_off * channels..(k_off + 1) * channels];
+                for c in 0..channels {
+                    out_row[c] += in_row[c] * w_row[c];
+                }
+            }
+        }
+    });
+}
+
+/// Depthwise 2D spatial convolution with `stride = 1` and `padding = kernel_size / 2` ("same" padding)
+/// over a token-major `[grid_h * grid_w, channels]` buffer.
+/// `weight` is stored in `[channels][kernel_size][kernel_size]` order (`c * K * K + ky * K + kx`).
+#[cfg(test)]
+pub(crate) fn depthwise_conv2d_same(
+    input: &[f32],
+    weight: &[f32],
+    bias: Option<&[f32]>,
+    grid_w: usize,
+    grid_h: usize,
+    channels: usize,
+    kernel_size: usize,
+) -> Vec<f32> {
+    let mut out = vec![0.0f32; grid_w * grid_h * channels];
+    depthwise_conv2d_same_into(
+        input,
+        weight,
+        bias,
+        grid_w,
+        grid_h,
+        channels,
+        kernel_size,
+        &mut out,
+    );
+    out
+}
+
+/// Load a patch-embedding kernel from GGUF and transpose it into row-major `[3 * p^2, n_embd]`.
+/// Supports both 4D `[p, p, 3, n_embd]` and 5D temporal `[p, p, 2, 3, n_embd]` / `[p, p, 3, 2, n_embd]`.
+fn load_patch_embed_weights(
+    gguf: &Arc<GgufFile>,
+    weight_name: &str,
+    bias_name: Option<&str>,
+    require_bias: bool,
+    config: &VisionEncoderConfig,
+) -> Result<(PatchEmbedWeights, Option<PatchEmbedWeights>)> {
+    let patch_t = gguf
+        .get_tensor(weight_name)
+        .with_context(|| format!("loading {weight_name}"))?;
+    let patch_shape = patch_t.shape().to_vec();
+    let p = config.patch_size;
+    let in_dim = 3 * p * p;
+    let out_dim = config.n_embd;
+    let raw = patch_t.try_to_f32_vec()?;
+
+    let conv_b = match bias_name {
+        Some(b_name) if gguf.tensors.contains_key(b_name) => {
+            let b = load_vec_f32(gguf, b_name)?;
+            anyhow::ensure!(
+                b.len() == out_dim,
+                "{b_name} len ({}) != n_embd ({out_dim})",
+                b.len()
+            );
+            b
+        }
+        Some(b_name) if require_bias => {
+            return Err(anyhow::anyhow!("missing required `{b_name}`"));
+        }
+        _ => vec![0.0; out_dim],
+    };
+
+    if patch_shape.len() == 4 {
+        anyhow::ensure!(
+            patch_shape[0] == p
+                && patch_shape[1] == p
+                && patch_shape[2] == 3
+                && patch_shape[3] == out_dim,
+            "{weight_name} shape {patch_shape:?} != [patch_size={p}, patch_size={p}, 3, n_embd={out_dim}]"
+        );
+        let mut conv_w = vec![0f32; in_dim * out_dim];
+        for oc in 0..out_dim {
+            for c in 0..3 {
+                for kh in 0..p {
+                    for kw in 0..p {
+                        let src = kw + p * kh + p * p * c + p * p * 3 * oc;
+                        let in_idx = c * p * p + kh * p + kw;
+                        conv_w[in_idx * out_dim + oc] = raw[src];
+                    }
+                }
+            }
+        }
+        return Ok((PatchEmbedWeights { conv_w, conv_b }, None));
+    }
+
+    if patch_shape.len() == 5 {
+        // 5D temporal kernel: either [p, p, 2, 3, out_dim] or [p, p, 3, 2, out_dim].
+        let t_first = patch_shape[0] == p
+            && patch_shape[1] == p
+            && patch_shape[2] == 2
+            && patch_shape[3] == 3
+            && patch_shape[4] == out_dim;
+        let c_first = patch_shape[0] == p
+            && patch_shape[1] == p
+            && patch_shape[2] == 3
+            && patch_shape[3] == 2
+            && patch_shape[4] == out_dim;
+        anyhow::ensure!(
+            t_first || c_first,
+            "{weight_name} 5D shape {patch_shape:?} != [{p}, {p}, 2, 3, {out_dim}]"
+        );
+        let mut conv_w0 = vec![0f32; in_dim * out_dim];
+        let mut conv_w1 = vec![0f32; in_dim * out_dim];
+        for oc in 0..out_dim {
+            for c in 0..3 {
+                for t in 0..2 {
+                    for kh in 0..p {
+                        for kw in 0..p {
+                            let src = if t_first {
+                                kw + p * kh + p * p * t + p * p * 2 * c + p * p * 6 * oc
+                            } else {
+                                kw + p * kh + p * p * c + p * p * 3 * t + p * p * 6 * oc
+                            };
+                            let in_idx = c * p * p + kh * p + kw;
+                            if t == 0 {
+                                conv_w0[in_idx * out_dim + oc] = raw[src];
+                            } else {
+                                conv_w1[in_idx * out_dim + oc] = raw[src];
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        return Ok((
+            PatchEmbedWeights {
+                conv_w: conv_w0,
+                conv_b,
+            },
+            Some(PatchEmbedWeights {
+                conv_w: conv_w1,
+                conv_b: vec![0.0; out_dim],
+            }),
+        ));
+    }
+
+    anyhow::bail!(
+        "{weight_name} unexpected rank {} ({patch_shape:?})",
+        patch_shape.len()
+    )
+}
+
+fn load_optional_lfm3_norm(
+    gguf: &Arc<GgufFile>,
+    prefix: &str,
+    expected_len: usize,
+) -> Result<Option<Lfm3NormWeights>> {
+    let w_name = format!("{prefix}.weight");
+    if !gguf.tensors.contains_key(&w_name) {
+        return Ok(None);
+    }
+    Ok(Some(load_lfm3_norm(gguf, prefix, &[expected_len])?))
+}
+
+fn load_lfm3_norm(
+    gguf: &Arc<GgufFile>,
+    prefix: &str,
+    allowed_lens: &[usize],
+) -> Result<Lfm3NormWeights> {
+    let w_name = format!("{prefix}.weight");
+    let b_name = format!("{prefix}.bias");
+    let weight = load_vec_f32(gguf, &w_name)?;
+    anyhow::ensure!(
+        allowed_lens.contains(&weight.len()),
+        "{w_name} len ({}) not in allowed lengths {allowed_lens:?}",
+        weight.len()
+    );
+    let bias = if gguf.tensors.contains_key(&b_name) {
+        let b = load_vec_f32(gguf, &b_name)?;
+        anyhow::ensure!(
+            b.len() == weight.len(),
+            "{b_name} len ({}) != {w_name} len ({})",
+            b.len(),
+            weight.len()
+        );
+        Some(b)
+    } else {
+        None
+    };
+    Ok(Lfm3NormWeights { weight, bias })
+}
+
+fn load_optional_vec_f32(
+    gguf: &Arc<GgufFile>,
+    name: &str,
+    expected_len: usize,
+) -> Result<Option<Vec<f32>>> {
+    if !gguf.tensors.contains_key(name) {
+        return Ok(None);
+    }
+    let v = load_vec_f32(gguf, name)?;
+    anyhow::ensure!(
+        v.len() == expected_len,
+        "{name} len ({}) != expected ({expected_len})",
+        v.len()
+    );
+    Ok(Some(v))
+}
+
+fn load_lfm3_block(
+    gguf: &Arc<GgufFile>,
+    il: usize,
+    cfg: &VisionEncoderConfig,
+) -> Result<Lfm3VisionBlockWeights> {
+    let pfx = format!("v.blk.{il}");
+    let d = cfg.n_embd;
+    let ln1 = load_lfm3_norm(gguf, &format!("{pfx}.ln1"), &[d])?;
+    let ln2 = load_lfm3_norm(gguf, &format!("{pfx}.ln2"), &[d])?;
+
+    let conv_spatial_name = if gguf
+        .tensors
+        .contains_key(&format!("{pfx}.conv2d_spatial.weight"))
+    {
+        Some((
+            format!("{pfx}.conv2d_in_proj"),
+            format!("{pfx}.conv2d_spatial"),
+            format!("{pfx}.conv2d_out_proj"),
+        ))
+    } else if gguf
+        .tensors
+        .contains_key(&format!("{pfx}.conv.conv.weight"))
+    {
+        Some((
+            format!("{pfx}.conv.in_proj"),
+            format!("{pfx}.conv.conv"),
+            format!("{pfx}.conv.out_proj"),
+        ))
+    } else {
+        None
+    };
+
+    let op = if let Some((in_proj_pfx, spatial_pfx, out_proj_pfx)) = conv_spatial_name {
+        let in_proj_w = wt_f32(gguf, &format!("{in_proj_pfx}.weight"))?;
+        anyhow::ensure!(
+            in_proj_w.cols == d && (in_proj_w.rows == 3 * d || in_proj_w.rows == 2 * d),
+            "block {il} {in_proj_pfx}.weight shape ({}, {}) != (3*{d} or 2*{d}, {d})",
+            in_proj_w.rows,
+            in_proj_w.cols,
+        );
+        let in_proj_b =
+            load_optional_vec_f32(gguf, &format!("{in_proj_pfx}.bias"), in_proj_w.rows)?;
+
+        let dw_t = gguf
+            .get_tensor(&format!("{spatial_pfx}.weight"))
+            .with_context(|| format!("loading {spatial_pfx}.weight"))?;
+        let dw_shape = dw_t.shape().to_vec();
+        let kernel_size = match dw_shape.as_slice() {
+            [kw, kh, 1, oc] if kw == kh && *oc == d => *kw,
+            [kw, kh, oc] if kw == kh && *oc == d => *kw,
+            [k2, oc] if *oc == d => {
+                let k = (*k2 as f64).sqrt().round() as usize;
+                anyhow::ensure!(
+                    k * k == *k2,
+                    "block {il} {spatial_pfx}.weight non-square {k2}"
+                );
+                k
+            }
+            other => anyhow::bail!(
+                "block {il} {spatial_pfx}.weight unexpected shape {other:?} for n_embd={d}"
+            ),
+        };
+        anyhow::ensure!(
+            kernel_size > 0 && kernel_size % 2 == 1,
+            "block {il} {spatial_pfx}.weight kernel_size ({kernel_size}) must be odd and > 0"
+        );
+        let depthwise_w = dw_t.try_to_f32_vec()?;
+        anyhow::ensure!(
+            depthwise_w.len() == d * kernel_size * kernel_size,
+            "block {il} {spatial_pfx}.weight len ({}) != d*K^2 ({})",
+            depthwise_w.len(),
+            d * kernel_size * kernel_size
+        );
+        let depthwise_b = load_optional_vec_f32(gguf, &format!("{spatial_pfx}.bias"), d)?;
+
+        let out_proj_w = wt_f32(gguf, &format!("{out_proj_pfx}.weight"))?;
+        anyhow::ensure!(
+            out_proj_w.rows == d && out_proj_w.cols == d,
+            "block {il} {out_proj_pfx}.weight shape ({}, {}) != ({d}, {d})",
+            out_proj_w.rows,
+            out_proj_w.cols,
+        );
+        let out_proj_b = load_optional_vec_f32(gguf, &format!("{out_proj_pfx}.bias"), d)?;
+
+        Lfm3BlockOp::Conv(Lfm3ConvBlockWeights {
+            in_proj_w,
+            in_proj_b,
+            depthwise_w,
+            depthwise_b,
+            kernel_size,
+            out_proj_w,
+            out_proj_b,
+        })
+    } else if gguf.tensors.contains_key(&format!("{pfx}.attn_q.weight")) {
+        let head_dim = d / cfg.n_head;
+        let q_w = wt_f32(gguf, &format!("{pfx}.attn_q.weight"))?;
+        let k_w = wt_f32(gguf, &format!("{pfx}.attn_k.weight"))?;
+        let v_w = wt_f32(gguf, &format!("{pfx}.attn_v.weight"))?;
+        let o_w = wt_f32(gguf, &format!("{pfx}.attn_out.weight"))?;
+
+        anyhow::ensure!(
+            q_w.rows == d && q_w.cols == d,
+            "block {il} attn_q.weight shape ({}, {}) != ({d}, {d})",
+            q_w.rows,
+            q_w.cols,
+        );
+        anyhow::ensure!(
+            k_w.cols == d
+                && v_w.cols == d
+                && k_w.rows == v_w.rows
+                && k_w.rows > 0
+                && k_w.rows.is_multiple_of(head_dim),
+            "block {il} attn_k/v.weight shapes ({}, {}) / ({}, {}) invalid for d={d}, head_dim={head_dim}",
+            k_w.rows,
+            k_w.cols,
+            v_w.rows,
+            v_w.cols,
+        );
+        let n_head_kv = k_w.rows / head_dim;
+        anyhow::ensure!(
+            cfg.n_head.is_multiple_of(n_head_kv),
+            "block {il} n_head ({}) not divisible by n_head_kv ({n_head_kv})",
+            cfg.n_head,
+        );
+        anyhow::ensure!(
+            o_w.rows == d && o_w.cols == d,
+            "block {il} attn_out.weight shape ({}, {}) != ({d}, {d})",
+            o_w.rows,
+            o_w.cols,
+        );
+
+        let q_b = load_optional_vec_f32(gguf, &format!("{pfx}.attn_q.bias"), d)?;
+        let k_b = load_optional_vec_f32(gguf, &format!("{pfx}.attn_k.bias"), k_w.rows)?;
+        let v_b = load_optional_vec_f32(gguf, &format!("{pfx}.attn_v.bias"), v_w.rows)?;
+        let o_b = load_optional_vec_f32(gguf, &format!("{pfx}.attn_out.bias"), d)?;
+
+        let q_norm = load_lfm3_norm(gguf, &format!("{pfx}.attn_q_norm"), &[head_dim, d])?;
+        let k_norm = load_lfm3_norm(gguf, &format!("{pfx}.attn_k_norm"), &[head_dim, k_w.rows])?;
+
+        Lfm3BlockOp::Attn(Lfm3AttnBlockWeights {
+            q_w,
+            q_b,
+            k_w,
+            k_b,
+            v_w,
+            v_b,
+            q_norm,
+            k_norm,
+            o_w,
+            o_b,
+            n_head: cfg.n_head,
+            n_head_kv,
+            head_dim,
+        })
+    } else {
+        anyhow::bail!("LFM3 vision block {il} has neither conv2d_spatial.weight nor attn_q.weight");
+    };
+
+    let up_w = wt_f32(gguf, &format!("{pfx}.ffn_up.weight"))?;
+    let down_w = wt_f32(gguf, &format!("{pfx}.ffn_down.weight"))?;
+    let n_ff = up_w.rows;
+    // the int8 scratch is sized from `clip.vision.feed_forward_length`: a block of another
+    // width would load and then panic in `quantize_rows`
+    anyhow::ensure!(
+        n_ff == cfg.n_ff,
+        "block {il} ffn_up.weight has {n_ff} rows but clip.vision.feed_forward_length is {}",
+        cfg.n_ff
+    );
+    anyhow::ensure!(
+        up_w.cols == d && down_w.rows == d && down_w.cols == n_ff,
+        "block {il} FFN up/down shapes ({}, {}) / ({}, {}) mismatch for d={d}",
+        up_w.rows,
+        up_w.cols,
+        down_w.rows,
+        down_w.cols,
+    );
+    let up_b = load_optional_vec_f32(gguf, &format!("{pfx}.ffn_up.bias"), n_ff)?;
+    let down_b = load_optional_vec_f32(gguf, &format!("{pfx}.ffn_down.bias"), d)?;
+
+    let (gate_w, gate_b) = if gguf.tensors.contains_key(&format!("{pfx}.ffn_gate.weight")) {
+        let gw = wt_f32(gguf, &format!("{pfx}.ffn_gate.weight"))?;
+        anyhow::ensure!(
+            gw.rows == n_ff && gw.cols == d,
+            "block {il} ffn_gate.weight shape ({}, {}) != ({n_ff}, {d})",
+            gw.rows,
+            gw.cols,
+        );
+        let gb = load_optional_vec_f32(gguf, &format!("{pfx}.ffn_gate.bias"), n_ff)?;
+        (Some(gw), gb)
+    } else {
+        (None, None)
+    };
+
+    let ffn = Lfm3FfnWeights {
+        gate_w,
+        gate_b,
+        up_w,
+        up_b,
+        down_w,
+        down_b,
+    };
+
+    Ok(Lfm3VisionBlockWeights { ln1, op, ln2, ffn })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    #[test]
+    fn the_projector_input_norm_is_applied_at_exactly_one_stage() {
+        // scale_factor 1: the merged width equals n_embd, and the norm used to run twice
+        assert_eq!(
+            mm_norm_stage(16, 16, 16),
+            Some(MmNormStage::PreMerge),
+            "one stage when the widths coincide"
+        );
+        // scale_factor 2: a norm over the encoder width runs before the merge, one over the
+        // merged width after it, anything else is not applied
+        assert_eq!(mm_norm_stage(16, 16, 64), Some(MmNormStage::PreMerge));
+        assert_eq!(mm_norm_stage(64, 16, 64), Some(MmNormStage::PostMerge));
+        assert_eq!(mm_norm_stage(32, 16, 64), None);
+    }
+
     fn synth_cfg(grid: usize, n_embd: usize, scale_factor: usize) -> VisionEncoderConfig {
         let patch_size = 16;
         let image_size = grid * patch_size;
         let pixels_per_token = (patch_size * scale_factor).pow(2);
         VisionEncoderConfig {
+            projector_type: VisionProjectorType::Lfm2,
             n_layer: 1,
             n_embd,
             n_ff: n_embd * 4,
             n_head: 1,
+            n_head_kv: 1,
+            rope_theta: LFM3_DEFAULT_ROPE_THETA,
             eps: 1e-6,
             image_size,
             patch_size,
@@ -2329,5 +3866,323 @@ mod tests {
         assert_eq!(&pooled[8..12], &[4.0, 5.0, 10.0, 11.0]);
         // Output (1, 0): rows 2..4 cols 0..2: 12, 13, 18, 19.
         assert_eq!(&pooled[12..16], &[12.0, 13.0, 18.0, 19.0]);
+    }
+
+    #[test]
+    fn vision_projector_type_and_boundary_tokens() {
+        let lfm2 = VisionProjectorType::from_gguf_str("lfm2").unwrap();
+        let lfm3vl = VisionProjectorType::from_gguf_str("lfm3vl").unwrap();
+        let lfm3o = VisionProjectorType::from_gguf_str("lfm3o").unwrap();
+
+        assert!(!lfm2.is_lfm3());
+        assert!(lfm3vl.is_lfm3());
+        assert!(lfm3o.is_lfm3());
+
+        assert!(!lfm2.has_boundary_tokens());
+        assert!(!lfm3vl.has_boundary_tokens());
+        assert!(lfm3o.has_boundary_tokens());
+
+        assert_eq!(lfm3vl.vision_boundary_tokens(), None);
+        assert_eq!(
+            lfm3o.vision_boundary_tokens(),
+            Some((VISION_START_TOKEN, VISION_END_TOKEN))
+        );
+        assert_eq!(lfm3vl.wrap_image_prompt("<img/>"), "<img/>");
+        assert_eq!(
+            lfm3o.wrap_image_prompt("<img/>"),
+            "<|vision_start|><img/><|vision_end|>"
+        );
+        let ids = lfm3o.resolve_boundary_token_ids(|tok| match tok {
+            "<|vision_start|>" => Some(100),
+            "<|vision_end|>" => Some(101),
+            _ => None,
+        });
+        assert_eq!(ids, Some((100, 101)));
+        assert_eq!(lfm3vl.resolve_boundary_token_ids(|_| Some(1)), None);
+    }
+
+    #[test]
+    fn vision_mrope_2d_rotates_height_and_width_sections_independently() {
+        // 2x2 grid, 1 head, head_dim = 8 => half = 4, sect = 2.
+        // Indices [0, 1] pair with [4, 5] for height (py).
+        // Indices [2, 3] pair with [6, 7] for width (px), with frequency resetting at index 2.
+        let (grid_w, grid_h, n_head, head_dim) = (2usize, 2usize, 1usize, 8usize);
+        let rope_theta = 1_000_000.0f32;
+        let orig = lcg_vec(42, grid_w * grid_h * head_dim);
+        let mut rotated = orig.clone();
+        apply_2d_vision_mrope(&mut rotated, grid_w, grid_h, n_head, head_dim, rope_theta);
+
+        // At (py=0, px=0), angles are 0 so the vector is unchanged.
+        for d in 0..head_dim {
+            assert!((rotated[d] - orig[d]).abs() < 1e-6);
+        }
+
+        // At (py=0, px=1) (token 1), height section [0,1,4,5] has angle 0 (unchanged),
+        // while width section [2,3,6,7] is rotated by px=1.
+        let tok1 = &rotated[head_dim..2 * head_dim];
+        let orig1 = &orig[head_dim..2 * head_dim];
+        assert!((tok1[0] - orig1[0]).abs() < 1e-6);
+        assert!((tok1[1] - orig1[1]).abs() < 1e-6);
+        assert!((tok1[4] - orig1[4]).abs() < 1e-6);
+        assert!((tok1[5] - orig1[5]).abs() < 1e-6);
+        // ic=2 (k=0) has freq = 1.0, so angle_x = 1.0 rad.
+        let (sin1, cos1) = 1.0f32.sin_cos();
+        let want_x0 = orig1[2] * cos1 - orig1[6] * sin1;
+        let want_x1 = orig1[2] * sin1 + orig1[6] * cos1;
+        assert!((tok1[2] - want_x0).abs() < 1e-5);
+        assert!((tok1[6] - want_x1).abs() < 1e-5);
+
+        // Every token preserves its L2 norm under 2D M-RoPE rotation.
+        for t in 0..(grid_w * grid_h) {
+            let n0: f32 = orig[t * head_dim..(t + 1) * head_dim]
+                .iter()
+                .map(|x| x * x)
+                .sum();
+            let n1: f32 = rotated[t * head_dim..(t + 1) * head_dim]
+                .iter()
+                .map(|x| x * x)
+                .sum();
+            assert!((n0 - n1).abs() < 1e-4, "token {t} norm drift: {n0} vs {n1}");
+        }
+    }
+
+    #[test]
+    fn depthwise_conv2d_same_computes_spatial_3x3_per_channel() {
+        // 2x2 grid, 2 channels, 3x3 identity-center + neighbor kernel.
+        let (grid_w, grid_h, channels, k) = (2usize, 2usize, 2usize, 3usize);
+        // Channel 0 kernel: center (ky=1, kx=1) = 2.0, right (ky=1, kx=2) = 1.0.
+        // Channel 1 kernel: center (ky=1, kx=1) = 1.0, bottom (ky=2, kx=1) = 0.5.
+        let mut weight = vec![0.0f32; channels * k * k];
+        weight[4] = 2.0;
+        weight[5] = 1.0;
+        weight[9 + 4] = 1.0;
+        weight[9 + 7] = 0.5;
+        let bias = [0.25f32, -0.5f32];
+        // Input tokens at (0,0), (0,1), (1,0), (1,1):
+        let input = vec![
+            1.0, 10.0, // (0,0)
+            2.0, 20.0, // (0,1)
+            3.0, 30.0, // (1,0)
+            4.0, 40.0, // (1,1)
+        ];
+        let out = depthwise_conv2d_same(&input, &weight, Some(&bias), grid_w, grid_h, channels, k);
+        // At (0,0): ch0 = 0.25 + 2.0*1.0 + 1.0*2.0 = 4.25; ch1 = -0.5 + 1.0*10.0 + 0.5*30.0 = 24.5.
+        assert!((out[0] - 4.25).abs() < 1e-6);
+        assert!((out[1] - 24.5).abs() < 1e-6);
+    }
+
+    #[test]
+    fn lfm3_hybrid_encoder_forward_pass_end_to_end() {
+        let (grid_w, grid_h) = (2usize, 2usize);
+        let patch_size = 2usize;
+        let n_embd = 16usize;
+        let n_ff = 32usize;
+        let n_head = 2usize;
+        let n_head_kv = 1usize;
+        let head_dim = n_embd / n_head;
+        let scale_factor = 2usize;
+        let projection_dim = 12usize;
+
+        let cfg = VisionEncoderConfig {
+            projector_type: VisionProjectorType::Lfm3O,
+            n_layer: 2,
+            n_embd,
+            n_ff,
+            n_head,
+            n_head_kv,
+            rope_theta: LFM3_DEFAULT_ROPE_THETA,
+            eps: 1e-6,
+            image_size: 4,
+            patch_size,
+            n_trained_patches: 4,
+            projection_dim,
+            scale_factor,
+            image_mean: [0.5; 3],
+            image_std: [0.5; 3],
+            image_min_pixels: 16,
+            image_max_pixels: 16,
+        };
+
+        let in_dim = 3 * patch_size * patch_size;
+        let patch_embed = PatchEmbedWeights {
+            conv_w: lcg_vec(1, in_dim * n_embd),
+            conv_b: lcg_vec(2, n_embd),
+        };
+        let patch_embed_1 = Some(PatchEmbedWeights {
+            conv_w: lcg_vec(3, in_dim * n_embd),
+            conv_b: vec![0.0; n_embd],
+        });
+
+        let conv_block = Lfm3VisionBlockWeights {
+            ln1: Lfm3NormWeights {
+                weight: vec![1.0; n_embd],
+                bias: Some(vec![0.0; n_embd]),
+            },
+            op: Lfm3BlockOp::Conv(Lfm3ConvBlockWeights {
+                in_proj_w: MmapWeight::from_owned_f32(
+                    lcg_vec(4, 3 * n_embd * n_embd),
+                    3 * n_embd,
+                    n_embd,
+                ),
+                in_proj_b: Some(vec![0.0; 3 * n_embd]),
+                depthwise_w: lcg_vec(5, n_embd * 9),
+                depthwise_b: Some(vec![0.0; n_embd]),
+                kernel_size: 3,
+                out_proj_w: MmapWeight::from_owned_f32(lcg_vec(6, n_embd * n_embd), n_embd, n_embd),
+                out_proj_b: Some(vec![0.0; n_embd]),
+            }),
+            ln2: Lfm3NormWeights {
+                weight: vec![1.0; n_embd],
+                bias: None,
+            },
+            ffn: Lfm3FfnWeights {
+                gate_w: Some(MmapWeight::from_owned_f32(
+                    lcg_vec(7, n_ff * n_embd),
+                    n_ff,
+                    n_embd,
+                )),
+                gate_b: None,
+                up_w: MmapWeight::from_owned_f32(lcg_vec(8, n_ff * n_embd), n_ff, n_embd),
+                up_b: None,
+                down_w: MmapWeight::from_owned_f32(lcg_vec(9, n_embd * n_ff), n_embd, n_ff),
+                down_b: None,
+            },
+        };
+
+        let kv_dim = n_head_kv * head_dim;
+        let attn_block = Lfm3VisionBlockWeights {
+            ln1: Lfm3NormWeights {
+                weight: vec![1.0; n_embd],
+                bias: None,
+            },
+            op: Lfm3BlockOp::Attn(Lfm3AttnBlockWeights {
+                q_w: MmapWeight::from_owned_f32(lcg_vec(10, n_embd * n_embd), n_embd, n_embd),
+                q_b: None,
+                k_w: MmapWeight::from_owned_f32(lcg_vec(11, kv_dim * n_embd), kv_dim, n_embd),
+                k_b: None,
+                v_w: MmapWeight::from_owned_f32(lcg_vec(12, kv_dim * n_embd), kv_dim, n_embd),
+                v_b: None,
+                q_norm: Lfm3NormWeights {
+                    weight: vec![1.0; head_dim],
+                    bias: Some(vec![0.0; head_dim]),
+                },
+                k_norm: Lfm3NormWeights {
+                    weight: vec![1.0; head_dim],
+                    bias: Some(vec![0.0; head_dim]),
+                },
+                o_w: MmapWeight::from_owned_f32(lcg_vec(13, n_embd * n_embd), n_embd, n_embd),
+                o_b: None,
+                n_head,
+                n_head_kv,
+                head_dim,
+            }),
+            ln2: Lfm3NormWeights {
+                weight: vec![1.0; n_embd],
+                bias: Some(vec![0.0; n_embd]),
+            },
+            ffn: Lfm3FfnWeights {
+                gate_w: None,
+                gate_b: None,
+                up_w: MmapWeight::from_owned_f32(lcg_vec(14, n_ff * n_embd), n_ff, n_embd),
+                up_b: Some(vec![0.0; n_ff]),
+                down_w: MmapWeight::from_owned_f32(lcg_vec(15, n_embd * n_ff), n_embd, n_ff),
+                down_b: Some(vec![0.0; n_embd]),
+            },
+        };
+
+        let merged_dim = n_embd * scale_factor * scale_factor;
+        let weights = VisionEncoderWeights {
+            config: cfg,
+            patch_embed,
+            patch_embed_1,
+            embedding_norm: Some(Lfm3NormWeights {
+                weight: vec![1.0; n_embd],
+                bias: Some(vec![0.0; n_embd]),
+            }),
+            position_embed: Vec::new(),
+            blocks: Vec::new(),
+            lfm3_blocks: vec![conv_block, attn_block],
+            post_ln_w: Vec::new(),
+            post_ln_b: Vec::new(),
+            mm_input_norm: Some(Lfm3NormWeights {
+                weight: vec![1.0; n_embd],
+                bias: Some(vec![0.0; n_embd]),
+            }),
+            projector: ProjectorWeights {
+                mm1_w: MmapWeight::from_owned_f32(lcg_vec(16, 24 * merged_dim), 24, merged_dim),
+                mm1_b: vec![0.1; 24],
+                mm2_w: MmapWeight::from_owned_f32(
+                    lcg_vec(17, projection_dim * 24),
+                    projection_dim,
+                    24,
+                ),
+                mm2_b: vec![-0.05; projection_dim],
+            },
+        };
+
+        assert!(weights.is_lfm3());
+        assert!(weights.has_boundary_tokens());
+        let pixels = lcg_vec(99, 3 * (grid_w * patch_size) * (grid_h * patch_size));
+        let out = weights.encode_image(&pixels, grid_w, grid_h).unwrap();
+        // 2x2 grid merged by 2x2 => 1 token of `projection_dim` floats.
+        assert_eq!(out.len(), projection_dim);
+        assert!(out.iter().all(|v| v.is_finite()));
+
+        // Consecutive video frame pair equals `encode_image` when both frames are identical.
+        let out_pair = weights
+            .encode_video_frame_pair(&pixels, &pixels, grid_w, grid_h)
+            .unwrap();
+        assert_eq!(out, out_pair);
+
+        // Without the second patch kernel the pair would drop its second frame: refuse it.
+        let mut single_kernel = weights;
+        single_kernel.patch_embed_1 = None;
+        let err = single_kernel
+            .encode_video_frame_pair(&pixels, &pixels, grid_w, grid_h)
+            .unwrap_err();
+        assert!(err.to_string().contains("temporal patch kernel"), "{err}");
+    }
+
+    #[test]
+    fn vision_encoder_config_from_gguf_validates_bounds_types_and_kv_head_array() {
+        let base_builder = || {
+            crate::gguf::GgufBuilder::new()
+                .kv_str("general.architecture", "clip")
+                .kv_bool(KEY_HAS_VISION, true)
+                .kv_str(KEY_VISION_PROJ_TYPE, "lfm3o")
+                .kv_u32(KEY_N_LAYER, 2)
+                .kv_u32(KEY_N_EMBD, 16)
+                .kv_u32(KEY_N_FF, 32)
+                .kv_u32(KEY_N_HEAD, 4)
+                .kv_i32_array(KEY_N_HEAD_KV, vec![0, 2])
+                .kv_f32(KEY_LN_EPS, 1e-6)
+                .kv_u32(KEY_PATCH_SIZE, 2)
+                .kv_u32(KEY_IMAGE_SIZE, 4)
+                .kv_u32(KEY_PROJECTION_DIM, 12)
+                .kv_u32(KEY_SCALE_FACTOR, 2)
+                .kv_f32_array(KEY_IMAGE_MEAN, vec![0.5, 0.5, 0.5])
+                .kv_f32_array(KEY_IMAGE_STD, vec![0.5, 0.5, 0.5])
+        };
+
+        let parse = |b: crate::gguf::GgufBuilder| {
+            let gguf = Arc::new(GgufFile::from_bytes(Arc::from(b.build_bytes())).unwrap());
+            VisionEncoderConfig::from_gguf(&gguf)
+        };
+
+        let valid = parse(base_builder()).expect("valid config with i32 array head_count_kv");
+        assert_eq!(valid.n_head_kv, 2);
+        assert_eq!(valid.projector_type, VisionProjectorType::Lfm3O);
+
+        assert!(parse(base_builder().kv_u32(KEY_N_EMBD, 0)).is_err());
+        assert!(parse(base_builder().kv_u32(KEY_IMAGE_SIZE, 0)).is_err());
+        assert!(parse(base_builder().kv_f32(KEY_LN_EPS, 0.0)).is_err());
+        assert!(parse(base_builder().kv_f32(KEY_LN_EPS, -1e-5)).is_err());
+        assert!(parse(base_builder().kv_f32(KEY_LN_EPS, f32::NAN)).is_err());
+        assert!(parse(base_builder().kv_f32(KEY_ROPE_THETA, 0.0)).is_err());
+        assert!(parse(base_builder().kv_f32(KEY_ROPE_THETA, -100.0)).is_err());
+        assert!(parse(base_builder().kv_str(KEY_ROPE_THETA, "bad")).is_err());
+        assert!(parse(base_builder().kv_str(KEY_IMAGE_SIZE, "bad")).is_err());
+        assert!(parse(base_builder().kv_u32(KEY_VISION_PROJ_TYPE, 123)).is_err());
+        assert!(parse(base_builder().kv_i32_array(KEY_N_HEAD_KV, vec![0, 0])).is_err());
     }
 }

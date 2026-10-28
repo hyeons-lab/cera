@@ -94,9 +94,15 @@ inline void attention_prefill_impl(
 
     const uint n_q = min(QPT, n_queries - q_base);
     // Keys visible to the query at global row `row`; the loop bound is the widest of a block.
+    // When !bidir and prefix_rows > 0, prefix_rows carries the sliding-window size.
     const uint total_rows = start_pos + n_queries;
     const bool bidir = params.bidir != 0u;
     const uint prefix_rows = params.prefix_rows;
+    const uint first_row = start_pos + q_base;
+    const uint first_seq_len = first_row + 1u;
+    const uint min_pos_block = (!bidir && prefix_rows > 0u && first_seq_len > prefix_rows)
+                               ? (first_seq_len - prefix_rows)
+                               : 0u;
     const uint last_row = start_pos + q_base + n_q - 1u;
     const uint max_seq = bidir ? (last_row < prefix_rows ? prefix_rows : total_rows)
                                : start_pos + q_base + n_q;
@@ -105,11 +111,11 @@ inline void attention_prefill_impl(
     const uint n_sg = n_threads / 32u;
 
     // TG memory layout:
-    //   q_tg    : half  [QPT × hd]
-    //   kv_tile : half  [C_CHUNK × hd]            (K first, overwritten by V)
-    //   scores  : float [QPT × C_CHUNK]
-    //   out_tg  : float [QPT × hd]          (running softmax-weighted V sum)
-    //   state   : float [QPT × 2]           (per-query max, sum)
+    //   q_tg    : half  [QPT * hd]
+    //   kv_tile : half  [C_CHUNK * hd]            (K first, overwritten by V)
+    //   scores  : float [QPT * C_CHUNK]
+    //   out_tg  : float [QPT * hd]          (running softmax-weighted V sum)
+    //   state   : float [QPT * 2]           (per-query max, sum)
     //   rescales: float [QPT]
     threadgroup half*  q_tg     = (threadgroup half*)(shmem);
     threadgroup half*  kv_tile  = q_tg + QPT * hd;
@@ -137,7 +143,7 @@ inline void attention_prefill_impl(
     threadgroup_barrier(mem_flags::mem_threadgroup);
 
     // --- Outer chunk loop (online softmax) ---
-    for (uint c0 = 0; c0 < max_seq; c0 += C_CHUNK) {
+    for (uint c0 = (min_pos_block / C_CHUNK) * C_CHUNK; c0 < max_seq; c0 += C_CHUNK) {
         const uint c_end = min(c0 + C_CHUNK, max_seq);
         const uint c_len = c_end - c0;
 
@@ -177,14 +183,17 @@ inline void attention_prefill_impl(
         }
         threadgroup_barrier(mem_flags::mem_threadgroup);
 
-        // --- Scale + causal mask ---
+        // --- Scale + causal / sliding-window mask ---
         for (uint idx = tid; idx < n_q * c_len; idx += n_threads) {
             uint q = idx / c_len;
             uint t = idx % c_len;
             const uint row = start_pos + q_base + q;
             uint seq_len_q = bidir ? (row < prefix_rows ? prefix_rows : total_rows) : row + 1u;
+            uint min_pos_q = (!bidir && prefix_rows > 0u && seq_len_q > prefix_rows)
+                             ? (seq_len_q - prefix_rows)
+                             : 0u;
             float s = scores[q * C_CHUNK + t];
-            if (c0 + t >= seq_len_q) {
+            if (c0 + t < min_pos_q || c0 + t >= seq_len_q) {
                 s = -INFINITY;
             } else {
                 s = s * scale;
@@ -214,7 +223,7 @@ inline void attention_prefill_impl(
                     float prev_max = state[q * 2 + 0];
                     float new_max = max(prev_max, chunk_max);
                     float rescale = (prev_max > -INFINITY) ? exp(prev_max - new_max) : 0.0f;
-                    float e0 = (idx0 < c_len) ? exp(s0 - new_max) : 0.0f;
+                    float e0 = (idx0 < c_len && s0 > -INFINITY) ? exp(s0 - new_max) : 0.0f;
                     scores[q * 32 + idx0] = e0;
                     float chunk_sum = simd_sum(e0);
                     if (simd_lane == 0u) {
@@ -237,13 +246,13 @@ inline void attention_prefill_impl(
 
                     float e0 = 0.0f;
                     float e1 = 0.0f;
-                    if (idx0 < c_len) {
+                    if (idx0 < c_len && s0 > -INFINITY) {
                         e0 = exp(s0 - new_max);
                         scores[q * C_CHUNK + idx0] = e0;
                     } else {
                         scores[q * C_CHUNK + idx0] = 0.0f;
                     }
-                    if (idx1 < c_len) {
+                    if (idx1 < c_len && s1 > -INFINITY) {
                         e1 = exp(s1 - new_max);
                         scores[q * C_CHUNK + idx1] = e1;
                     } else {

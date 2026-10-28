@@ -289,6 +289,7 @@ CERA_FFI_LIB=../target/debug/libcera_ffi.dylib \
 
 Supported architectures match the engine: `lfm2`/`lfm2.5` (incl. vision, audio,
 and bidirectional decision models), `lfm2moe` (routed mixture-of-experts),
+`lfm3` (incl. vision, audio, omni, and routed MoE),
 `qwen2`/`qwen3`/`qwen35`, `llama` (incl. classic Mistral), `granite`,
 `minicpm`/`minicpm5`, `nanbeige`, `phi3`/`phi`, `mistral3`/`ministral3`,
 `gemma2`/`gemma4`, `olmo2`/`olmo3`, `bailingmoe3`, plus `Whisper` ASR,

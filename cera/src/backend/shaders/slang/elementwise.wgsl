@@ -57,3 +57,27 @@ fn silu_mul_inplace(@builtin(global_invocation_id) gid_3 : vec3<u32>)
     return;
 }
 
+@compute
+@workgroup_size(256, 1, 1)
+fn sigmoid_head_gate_inplace(@builtin(global_invocation_id) gid_4 : vec3<u32>)
+{
+    var i_4 : u32 = gid_4.x + gid_4.y * u32(16776960);
+    var p_0 : vec2<u32> = par_buf_0[i32(0)];
+    var _S1 : bool;
+    if(i_4 >= (p_0.x))
+    {
+        _S1 = true;
+    }
+    else
+    {
+        _S1 = (p_0.y) == u32(0);
+    }
+    if(_S1)
+    {
+        return;
+    }
+    var _S2 : u32 = i_4 / p_0.y;
+    a_buf_0[i_4] = a_buf_0[i_4] / (1.0f + exp(- clamp(b_buf_0[_S2], -80.0f, 80.0f)));
+    return;
+}
+

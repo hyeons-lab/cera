@@ -82,8 +82,11 @@ pub fn calc_size_preserved_ratio(
     min_pixels: usize,
     max_pixels: usize,
 ) -> (usize, usize) {
-    debug_assert!(align_size > 0);
-    debug_assert!(min_pixels <= max_pixels);
+    assert!(align_size > 0, "align_size must be strictly positive");
+    assert!(
+        min_pixels <= max_pixels,
+        "min_pixels cannot exceed max_pixels"
+    );
     // `area` divides into `beta` in the scale-up branch — guard
     // against `width == 0 || height == 0` (the `image` crate
     // rejects zero-pixel inputs upstream, but `calc_size_preserved_ratio`
@@ -117,6 +120,85 @@ pub fn calc_size_preserved_ratio(
         h_bar = ceil_by((height as f64) * beta);
     }
     (w_bar, h_bar)
+}
+
+/// Qwen2-VL / LFM3-VL `smart_resize` for still images: rounds `width` and `height` to the nearest
+/// multiple of `align_size` using round-half-to-even (`f64::round_ties_even`), then scales down
+/// (flooring to `align_size`) if the aligned area exceeds `max_pixels` or scales up (ceiling to
+/// `align_size`) if it falls below `min_pixels`. Both output dimensions are clamped to at least
+/// `align_size`.
+///
+/// Mirrors `mtmd_image_preprocessor_lfm3vl::smart_resize` in `tools/mtmd/mtmd-image.cpp`.
+pub fn smart_resize(
+    width: usize,
+    height: usize,
+    align_size: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+) -> (usize, usize) {
+    smart_resize_video(width, height, align_size, min_pixels, max_pixels, 1, 1)
+}
+
+/// Video-capable variant of [`smart_resize`] over `n_frames` frames with temporal merge factor
+/// `temporal_factor` (typically `2` for LFM3-VL video). When `n_frames == 1 && temporal_factor == 1`,
+/// behaves identically to still-image [`smart_resize`].
+pub fn smart_resize_video(
+    width: usize,
+    height: usize,
+    align_size: usize,
+    min_pixels: usize,
+    max_pixels: usize,
+    n_frames: usize,
+    temporal_factor: usize,
+) -> (usize, usize) {
+    assert!(align_size > 0, "align_size must be strictly positive");
+    assert!(
+        min_pixels <= max_pixels,
+        "min_pixels cannot exceed max_pixels"
+    );
+    if width == 0 || height == 0 || n_frames == 0 || temporal_factor == 0 {
+        return (align_size, align_size);
+    }
+
+    let f = align_size as f64;
+    let mut h = height as f64;
+    let mut w = width as f64;
+    if temporal_factor > 1 && (h < f || w < f) {
+        let scale = (f / h).max(f / w);
+        h = (h * scale).floor();
+        w = (w * scale).floor();
+    }
+
+    let t_rounded = (n_frames as f64 / temporal_factor as f64).round_ties_even();
+    let t_bar = if t_rounded <= 0.0 {
+        0usize
+    } else {
+        (t_rounded as usize).saturating_mul(temporal_factor)
+    };
+    let round_even = |x: f64| {
+        let r = (x / f).round_ties_even();
+        if r <= 0.0 {
+            0usize
+        } else {
+            (r as usize).saturating_mul(align_size)
+        }
+    };
+    let mut w_bar = round_even(w);
+    let mut h_bar = round_even(h);
+
+    let total_px = (n_frames as f64) * h * w;
+    let area_check = t_bar.saturating_mul(h_bar).saturating_mul(w_bar);
+    if area_check > max_pixels {
+        let beta = (total_px / max_pixels as f64).sqrt();
+        w_bar = align_size.saturating_mul(((w / beta / f).floor() as usize).max(1));
+        h_bar = align_size.saturating_mul(((h / beta / f).floor() as usize).max(1));
+    } else if area_check < min_pixels {
+        let beta = (min_pixels as f64 / total_px).sqrt();
+        w_bar = align_size.saturating_mul(((w * beta / f).ceil() as usize).max(1));
+        h_bar = align_size.saturating_mul(((h * beta / f).ceil() as usize).max(1));
+    }
+
+    (align_size.max(w_bar), align_size.max(h_bar))
 }
 
 /// Hard cap on a decoded image's width / height, applied as an
@@ -221,9 +303,9 @@ fn decode_rgb8(bytes: &[u8]) -> Result<(Vec<u8>, usize, usize), CeraError> {
 }
 
 /// The single-image resize target for a `w x h` source: llama.cpp's
-/// `calc_size_preserved_ratio` from the NATIVE dims, then the optional caller cap on the longest
-/// side. `align_size = patch_size · scale_factor` keeps both grid dims even so the 2x pixel
-/// shuffle works out.
+/// `calc_size_preserved_ratio` (for LFM2) or `smart_resize` (for LFM3-VL / LFM3-Omni) from the
+/// NATIVE dims, then the optional caller cap on the longest side.
+/// `align_size = patch_size · scale_factor` keeps both grid dims even so the 2x patch merge works out.
 fn single_target(
     w: usize,
     h: usize,
@@ -231,8 +313,11 @@ fn single_target(
     max_long_size: Option<u32>,
 ) -> (usize, usize) {
     let align = cfg.patch_size * cfg.scale_factor;
-    let (mut target_w, mut target_h) =
-        calc_size_preserved_ratio(w, h, align, cfg.image_min_pixels, cfg.image_max_pixels);
+    let (mut target_w, mut target_h) = if cfg.projector_type.is_lfm3() {
+        smart_resize(w, h, align, cfg.image_min_pixels, cfg.image_max_pixels)
+    } else {
+        calc_size_preserved_ratio(w, h, align, cfg.image_min_pixels, cfg.image_max_pixels)
+    };
 
     // Optional caller cap on the longest side of the encoded target.
     // Applied to the TARGET (not a pre-resize of the input) so the
@@ -434,8 +519,11 @@ const LFM2_MAX_PIXELS_TOLERANCE: f64 = 2.0;
 
 /// Whether the reference processor tiles a `w x h` image: its aligned area exceeds the
 /// single-image pixel budget times the 2.0 tolerance. Alignment rounds half to even (C's
-/// `nearbyint`), as llama.cpp's `should_tile` does.
+/// `nearbyint`), as llama.cpp's `should_tile` does. LFM3-VL and LFM3-Omni do not tile.
 pub fn lfm2_should_tile(w: usize, h: usize, cfg: &VisionEncoderConfig) -> bool {
+    if cfg.projector_type.is_lfm3() {
+        return false;
+    }
     let align_usize = cfg
         .patch_size
         .max(1)
@@ -1001,10 +1089,13 @@ mod tests {
 
     fn synth_cfg() -> VisionEncoderConfig {
         VisionEncoderConfig {
+            projector_type: crate::model::vision_encoder::VisionProjectorType::Lfm2,
             n_layer: 12,
             n_embd: 768,
             n_ff: 3072,
             n_head: 12,
+            n_head_kv: 12,
+            rope_theta: 1_000_000.0,
             eps: 1e-6,
             image_size: 4,
             patch_size: 2,
@@ -1015,9 +1106,9 @@ mod tests {
             // channel reorder shows up loudly in the assertions.
             image_mean: [0.5, 0.4, 0.3],
             image_std: [0.2, 0.25, 0.5],
-            // Bound the `synth_cfg` resize at exactly 4×4 = 16
+            // Bound the `synth_cfg` resize at exactly 4x4 = 16
             // pixels so the original lossless solid-red test
-            // continues to land at 4×4 deterministically.
+            // continues to land at 4x4 deterministically.
             image_min_pixels: 16,
             image_max_pixels: 16,
         }
@@ -1647,5 +1738,73 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn smart_resize_rounds_ties_to_even_and_clamps_pixel_budget() {
+        // With align_size=32, 48 / 32 = 1.5 -> round_ties_even(1.5) = 2.0 -> 64.
+        // 80 / 32 = 2.5 -> round_ties_even(2.5) = 2.0 -> 64.
+        // Compare with calc_size_preserved_ratio where 80 / 32 = 2.5 -> round() = 3 -> 96.
+        let (w1, h1) = smart_resize(48, 80, 32, 1024, 1_000_000);
+        assert_eq!((w1, h1), (64, 64));
+
+        // Upper pixel bound scaling: 2048x1024 = 2,097,152 px > 262,144 max_pixels.
+        let (w_max, h_max) = smart_resize(2048, 1024, 32, 65_536, 262_144);
+        assert!(w_max.is_multiple_of(32) && h_max.is_multiple_of(32));
+        assert!(w_max * h_max <= 262_144);
+        assert!(w_max > h_max);
+
+        // Lower pixel bound scaling: 64x64 = 4,096 px < 65,536 min_pixels.
+        let (w_min, h_min) = smart_resize(64, 64, 32, 65_536, 262_144);
+        assert_eq!((w_min, h_min), (256, 256));
+
+        // Zero / invalid dims clamp safely to align_size.
+        assert_eq!(smart_resize(0, 100, 32, 65_536, 262_144), (32, 32));
+    }
+
+    #[test]
+    fn smart_resize_video_pairs_temporal_frames() {
+        // 4 frames -> t_bar = 4 -> total budget [4 * min, 4 * max] matches single-frame [min, max].
+        let (vw, vh) = smart_resize_video(1280, 720, 32, 4 * 65_536, 4 * 262_144, 4, 2);
+        let (sw, sh) = smart_resize(1280, 720, 32, 65_536, 262_144);
+        assert_eq!((vw, vh), (sw, sh));
+    }
+
+    #[test]
+    fn lfm3_disables_tiling_and_uses_smart_resize() {
+        for proj in [
+            crate::model::vision_encoder::VisionProjectorType::Lfm3Vl,
+            crate::model::vision_encoder::VisionProjectorType::Lfm3O,
+        ] {
+            let cfg = VisionEncoderConfig {
+                projector_type: proj,
+                ..lfm2_cfg()
+            };
+            // 1024x771 tiles under LFM2, but must stay Single under LFM3-VL and LFM3-Omni.
+            let rgb = vec![128u8; 1024 * 771 * 3];
+            let layout = preprocess_layout_rgb8(&rgb, 1024, 771, &cfg, None).unwrap();
+            assert!(
+                matches!(layout, PreprocessedLayout::Single(_)),
+                "LFM3 projector {proj:?} must never tile"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(expected = "align_size must be strictly positive")]
+    fn smart_resize_video_rejects_zero_align_size() {
+        let _ = smart_resize_video(640, 480, 0, 1024, 262_144, 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "min_pixels cannot exceed max_pixels")]
+    fn smart_resize_video_rejects_inverted_pixel_bounds() {
+        let _ = smart_resize_video(640, 480, 32, 262_145, 262_144, 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "align_size must be strictly positive")]
+    fn calc_size_preserved_ratio_rejects_zero_align_size() {
+        let _ = calc_size_preserved_ratio(640, 480, 0, 1024, 262_144);
     }
 }

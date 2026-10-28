@@ -33,7 +33,8 @@ TOK_RE = re.compile(r"\bI\s+(\d+)\s*$")
 
 
 def run(cmd, env):
-    out = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    # `errors="replace"`: a randomly initialised test model emits arbitrary bytes.
+    out = subprocess.run(cmd, env=env, capture_output=True, text=True, errors="replace")
     # Fail fast: a non-zero exit (missing model, loader error, wrong binary)
     # would otherwise yield empty/partial fixtures and silently commit bad
     # goldens. Surface stdout+stderr so the cause is obvious.

@@ -995,7 +995,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=4096  # 4.00 MB; PR #528 fused multimodal segment ingestion and fast top-k sampler (4075 KB measured)
+          BUDGET_KB=4352  # 4.25 MB; PR #534 LFM3 text, MoE, VL, Audio, Omni, and XML tool support (4290 KB measured)
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           # Display rounds UP to KB, so a 2,621,441-byte file reads as
           # "2561 KB" rather than "2560 KB". That keeps the human-readable
@@ -1163,7 +1163,7 @@ jobs:
           PKG=cera-wasm/pkg-${{ matrix.target }}-mt
           WASM=$PKG/cera_wasm_bg.wasm
           SIZE_BYTES=$(wc -c < "$WASM")
-          BUDGET_KB=4264  # 4.16 MB; PR #528 fused multimodal segment ingestion and fast top-k sampler (4243 KB measured)
+          BUDGET_KB=4608  # 4.50 MB; PR #534 LFM3 text, MoE, VL, Audio, Omni, and XML tool support (4517 KB measured)
           BUDGET_BYTES=$((BUDGET_KB * 1024))
           SIZE_KB=$(( (SIZE_BYTES + 1023) / 1024 ))
           SUMMARY=${GITHUB_STEP_SUMMARY:-/dev/null}

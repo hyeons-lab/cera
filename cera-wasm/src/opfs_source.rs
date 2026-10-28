@@ -101,6 +101,9 @@ pub struct OpfsGpuWeightSource {
 impl OpfsGpuWeightSource {
     /// Create a new OPFS streaming weight source from an open [`OpfsSyncHandle`]
     /// and parsed header-only `GgufFile`.
+    ///
+    /// On any failure the exclusive handle is closed before the error is returned, so a
+    /// retry can open the file again instead of hitting `NoModificationAllowedError`.
     pub fn new(
         sync: OpfsSyncHandle,
         gguf: Arc<GgufFile>,
@@ -124,7 +127,7 @@ impl OpfsGpuWeightSource {
             .to_ascii_lowercase();
 
         let arch = match arch_str.as_str() {
-            "lfm2" | "lfm2moe" => {
+            "lfm2" | "lfm2moe" | "lfm3" => {
                 let lfm = LfmModel::from_gguf_no_repack_with_loader(
                     (*gguf).clone(),
                     context_size,
@@ -384,6 +387,26 @@ impl GpuWeightSource for OpfsGpuWeightSource {
 
     fn attn_output_ref(&self, layer: usize) -> Option<&WeightRef> {
         self.inner_source().attn_output_ref(layer)
+    }
+
+    fn attn_gate_ref(&self, layer: usize) -> Option<&WeightRef> {
+        self.inner_source().attn_gate_ref(layer)
+    }
+
+    fn layer_rope_theta(&self, layer: usize) -> f32 {
+        self.inner_source().layer_rope_theta(layer)
+    }
+
+    fn layer_has_rope_freqs(&self, layer: usize) -> bool {
+        self.inner_source().layer_has_rope_freqs(layer)
+    }
+
+    fn layer_sliding_window(&self, layer: usize) -> Option<usize> {
+        self.inner_source().layer_sliding_window(layer)
+    }
+
+    fn layer_is_non_causal(&self, layer: usize) -> bool {
+        self.inner_source().layer_is_non_causal(layer)
     }
 
     fn rope_type(&self) -> RopeType {

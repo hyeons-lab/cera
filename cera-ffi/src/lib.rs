@@ -778,6 +778,9 @@ pub enum ToolFormat {
     /// Hermes / Qwen: JSON `{"name":…,"arguments":{…}}` in
     /// `<tool_call>…</tool_call>`.
     Hermes,
+    /// LFM3: XML `<function=name><parameter=arg>val</parameter></function>` in
+    /// `<tool_call>…</tool_call>`.
+    Lfm3Xml,
 }
 
 impl From<ToolFormat> for cera::tools::ToolFormat {
@@ -785,6 +788,7 @@ impl From<ToolFormat> for cera::tools::ToolFormat {
         match f {
             ToolFormat::Lfm2Pythonic => cera::tools::ToolFormat::Lfm2Pythonic,
             ToolFormat::Hermes => cera::tools::ToolFormat::Hermes,
+            ToolFormat::Lfm3Xml => cera::tools::ToolFormat::Lfm3Xml,
         }
     }
 }
@@ -794,6 +798,7 @@ impl From<cera::tools::ToolFormat> for ToolFormat {
         match f {
             cera::tools::ToolFormat::Lfm2Pythonic => ToolFormat::Lfm2Pythonic,
             cera::tools::ToolFormat::Hermes => ToolFormat::Hermes,
+            cera::tools::ToolFormat::Lfm3Xml => ToolFormat::Lfm3Xml,
         }
     }
 }
@@ -809,6 +814,10 @@ pub struct ToolDef {
     /// JSON Schema object for the arguments, as a JSON string (e.g.
     /// `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
     pub parameters_json: String,
+    /// When `true` the tool is withheld from the initial prompt's tool list and only revealed
+    /// later through a `tool_reference`, while staying active for call parsing and grammars.
+    #[uniffi(default = false)]
+    pub defer_loading: bool,
 }
 
 impl TryFrom<ToolDef> for cera::tools::ToolDef {
@@ -846,6 +855,7 @@ impl TryFrom<ToolDef> for cera::tools::ToolDef {
             name: t.name,
             description: t.description,
             parameters,
+            defer_loading: t.defer_loading,
         })
     }
 }
@@ -878,6 +888,7 @@ impl From<cera::tools::ToolDef> for ToolDef {
             description: t.description,
             parameters_json: serde_json::to_string(&t.parameters)
                 .unwrap_or_else(|_| "{}".to_string()),
+            defer_loading: t.defer_loading,
         }
     }
 }
@@ -5563,6 +5574,7 @@ mod tests {
             name: "get_weather".into(),
             description: Some("weather".into()),
             parameters_json: r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.into(),
+            defer_loading: false,
         };
         let core: cera::tools::ToolDef = ffi.try_into().expect("valid schema");
         assert_eq!(core.name, "get_weather");
@@ -5573,6 +5585,7 @@ mod tests {
             name: "ping".into(),
             description: None,
             parameters_json: String::new(),
+            defer_loading: false,
         };
         let core: cera::tools::ToolDef = bare.try_into().unwrap();
         assert_eq!(core.parameters["type"], "object");
@@ -5582,9 +5595,27 @@ mod tests {
             name: "x".into(),
             description: None,
             parameters_json: "{not json".into(),
+            defer_loading: false,
         };
         let core: Result<cera::tools::ToolDef, _> = bad.try_into();
         assert!(core.is_err());
+    }
+
+    /// `defer_loading` must cross the boundary both ways: dropping it would list a tool the
+    /// caller meant to withhold from the prompt.
+    #[test]
+    fn tool_def_defer_loading_round_trips() {
+        for deferred in [false, true] {
+            let ffi = ToolDef {
+                name: "lookup".into(),
+                description: None,
+                parameters_json: String::new(),
+                defer_loading: deferred,
+            };
+            let core: cera::tools::ToolDef = ffi.try_into().unwrap();
+            assert_eq!(core.defer_loading, deferred);
+            assert_eq!(ToolDef::from(core).defer_loading, deferred);
+        }
     }
 
     #[test]
@@ -5596,6 +5627,7 @@ mod tests {
                 name: "f".into(),
                 description: None,
                 parameters_json: bad.into(),
+                defer_loading: false,
             };
             let r: Result<cera::tools::ToolDef, _> = d.try_into();
             assert!(r.is_err(), "parameters_json={bad:?} should be rejected");
@@ -5621,6 +5653,7 @@ mod tests {
             name: "get_weather".into(),
             description: None,
             parameters_json: r#"{"type":"object","properties":{"city":{"type":"string"}}}"#.into(),
+            defer_loading: false,
         }];
         let gbnf = tool_grammar(tools, ToolFormat::Lfm2Pythonic).expect("grammar");
         assert!(cera::grammar::Grammar::parse(&gbnf).is_ok());

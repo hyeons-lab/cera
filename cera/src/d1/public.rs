@@ -22,9 +22,19 @@ pub const OMNI_TYPE: &str = "lfm2-d1-omni";
 /// `lfm2.decision.type` of the public causal d1 model.
 pub const CAUSAL_TYPE: &str = "lfm2-d1";
 
+/// `lfm3.decision.type` of the public LFM3 d1 model (`d1-2B`).
+pub const LFM3_CAUSAL_TYPE: &str = "lfm3-d1";
+
+/// `lfm3.decision.type` of the public LFM3 d1-omni model (`d1-Omni-2B`).
+pub const LFM3_OMNI_TYPE: &str = "lfm3-d1-omni";
+
 const TYPE_KEY: &str = "lfm2.decision.type";
+const LFM3_TYPE_KEY: &str = "lfm3.decision.type";
 const BLOCK_COUNT_KEY: &str = "lfm2.decision.block_count";
 const TEMPERATURE_PREFIX: &str = "lfm2.decision.temperature.";
+const LFM3_TEMPERATURE_PREFIX: &str = "lfm3.decision.temperature.";
+const OPTION_CODE_SCHEME_KEY: &str = "lfm2.decision.option_code_scheme";
+const LFM3_OPTION_CODE_SCHEME_KEY: &str = "lfm3.decision.option_code_scheme";
 
 /// Longest prompt of the public d1-omni model, in tokens (llama.cpp's `D1OMNI_MAX_TOKENS`).
 pub(crate) const OMNI_MAX_LENGTH: usize = 16384;
@@ -33,21 +43,60 @@ pub(crate) const OMNI_IMAGE_TEXT_LENGTH: usize = 896;
 /// Room a speech request leaves its text (`D1OMNI_MAX_TOKENS_AUDIO`).
 pub(crate) const OMNI_AUDIO_TEXT_LENGTH: usize = 15360;
 
-/// The `lfm2.decision.type` of a public d1 file, `None` for any other file.
+/// The `lfm2.decision.type` or `lfm3.decision.type` of a public d1 file, `None` for any other file.
 pub fn decision_type(gguf: &GgufFile) -> Option<&str> {
     gguf.get_str(TYPE_KEY)
-        .filter(|t| matches!(*t, OMNI_TYPE | CAUSAL_TYPE))
+        .or_else(|| gguf.get_str(LFM3_TYPE_KEY))
+        .filter(|t| {
+            matches!(
+                *t,
+                OMNI_TYPE | CAUSAL_TYPE | LFM3_CAUSAL_TYPE | LFM3_OMNI_TYPE
+            )
+        })
 }
 
-/// Whether `gguf` is the public d1-omni model file.
+/// Whether `gguf` is any public d1 model file (`lfm2-d1`, `lfm2-d1-omni`, `lfm3-d1`, `lfm3-d1-omni`).
+pub fn is_public_d1(gguf: &GgufFile) -> bool {
+    decision_type(gguf).is_some()
+}
+
+/// Whether `gguf` is a public non-omni d1 model file (`lfm2-d1` or `lfm3-d1`).
+pub fn is_causal(gguf: &GgufFile) -> bool {
+    matches!(decision_type(gguf), Some(CAUSAL_TYPE | LFM3_CAUSAL_TYPE))
+}
+
+/// Whether `gguf` is a public d1-omni model file (`lfm2-d1-omni` or `lfm3-d1-omni`).
 pub fn is_omni(gguf: &GgufFile) -> bool {
-    decision_type(gguf) == Some(OMNI_TYPE)
+    matches!(decision_type(gguf), Some(OMNI_TYPE | LFM3_OMNI_TYPE))
+}
+
+/// Whether `gguf` is a public LFM3 d1 model file (`lfm3-d1` or `lfm3-d1-omni`).
+pub fn is_lfm3_d1(gguf: &GgufFile) -> bool {
+    matches!(decision_type(gguf), Some(LFM3_CAUSAL_TYPE | LFM3_OMNI_TYPE))
+}
+
+/// Whether `gguf` is a prompt-based public d1 model (`lfm2-d1`, `lfm3-d1`, or `lfm3-d1-omni`)
+/// that scores next-token logits from `tokenizer.chat_template.systemone`.
+pub fn is_prompt_d1(gguf: &GgufFile) -> bool {
+    matches!(
+        decision_type(gguf),
+        Some(CAUSAL_TYPE | LFM3_CAUSAL_TYPE | LFM3_OMNI_TYPE)
+    )
+}
+
+/// The option-code scheme (`prompt.py`'s `d1_codes`): 2 (`A`..`Z` then `AA`..`ZZ` past 26
+/// options) for `lfm3` decision models unless overridden, 1 (`00`..`99` past 26 options)
+/// otherwise.
+pub fn option_code_scheme(gguf: &GgufFile) -> u32 {
+    gguf.get_u32(LFM3_OPTION_CODE_SCHEME_KEY)
+        .or_else(|| gguf.get_u32(OPTION_CODE_SCHEME_KEY))
+        .unwrap_or(if is_lfm3_d1(gguf) { 2 } else { 1 })
 }
 
 /// How many blocks at the end of `{prefix}.block_count` are the d1 head's, not the trunk's:
-/// `lfm2.decision.block_count` for a public d1-omni file, 0 for everything else.
+/// `lfm2.decision.block_count` for a public `lfm2-d1-omni` file, 0 for everything else.
 pub(crate) fn stored_head_blocks(gguf: &GgufFile, prefix: &str) -> usize {
-    if prefix == "lfm2" && is_omni(gguf) {
+    if prefix == "lfm2" && decision_type(gguf) == Some(OMNI_TYPE) {
         gguf.get_u32(BLOCK_COUNT_KEY).unwrap_or(0) as usize
     } else {
         0
@@ -65,7 +114,9 @@ pub(crate) fn temperatures(gguf: &GgufFile) -> Result<HashMap<String, f32>> {
     gguf.metadata
         .iter()
         .filter_map(|(key, value)| {
-            let name = key.strip_prefix(TEMPERATURE_PREFIX)?;
+            let name = key
+                .strip_prefix(TEMPERATURE_PREFIX)
+                .or_else(|| key.strip_prefix(LFM3_TEMPERATURE_PREFIX))?;
             let value = match value {
                 crate::gguf::GgufValue::F32(v) => *v,
                 crate::gguf::GgufValue::F64(v) => *v as f32,
@@ -155,5 +206,45 @@ mod tests {
         assert_eq!(stored_head_blocks(&causal, "lfm2"), 0);
         assert_eq!(decision_type(&causal), Some(CAUSAL_TYPE));
         assert!(is_omni(&omni) && !is_omni(&causal));
+        assert!(is_causal(&causal) && !is_causal(&omni));
+        assert!(is_public_d1(&omni) && is_public_d1(&causal) && !is_public_d1(&plain));
+        assert!(!is_lfm3_d1(&omni) && !is_lfm3_d1(&causal));
+        assert_eq!(option_code_scheme(&causal), 1);
+    }
+
+    #[test]
+    fn lfm3_d1_and_d1_omni_keys_are_recognized() {
+        let lfm3_d1 = GgufBuilder::new()
+            .kv_str("lfm3.decision.type", LFM3_CAUSAL_TYPE)
+            .kv_f32("lfm3.decision.temperature.choice", 1.337)
+            .kv_f32("lfm3.decision.temperature.noul", 1.337)
+            .kv_f32("lfm3.decision.temperature.score", 1.337)
+            .build();
+        assert_eq!(decision_type(&lfm3_d1), Some(LFM3_CAUSAL_TYPE));
+        assert!(is_public_d1(&lfm3_d1));
+        assert!(is_causal(&lfm3_d1));
+        assert!(!is_omni(&lfm3_d1));
+        assert!(is_lfm3_d1(&lfm3_d1));
+        assert!(is_prompt_d1(&lfm3_d1));
+        assert_eq!(stored_head_blocks(&lfm3_d1, "lfm3"), 0);
+        assert_eq!(option_code_scheme(&lfm3_d1), 2);
+        let t = temperatures(&lfm3_d1).unwrap();
+        assert_eq!(t.len(), 3);
+        assert!((t["choice"] - 1.337).abs() < 1e-6);
+
+        let lfm3_omni = GgufBuilder::new()
+            .kv_str("lfm3.decision.type", LFM3_OMNI_TYPE)
+            .kv_f32("lfm3.decision.temperature.choice", 3.383)
+            .kv_u32("lfm3.decision.option_code_scheme", 1)
+            .build();
+        assert_eq!(decision_type(&lfm3_omni), Some(LFM3_OMNI_TYPE));
+        assert!(is_public_d1(&lfm3_omni));
+        assert!(!is_causal(&lfm3_omni));
+        assert!(is_omni(&lfm3_omni));
+        assert!(is_lfm3_d1(&lfm3_omni));
+        assert!(is_prompt_d1(&lfm3_omni));
+        assert_eq!(stored_head_blocks(&lfm3_omni, "lfm3"), 0);
+        assert_eq!(stored_head_blocks(&lfm3_omni, "lfm2"), 0);
+        assert_eq!(option_code_scheme(&lfm3_omni), 1);
     }
 }

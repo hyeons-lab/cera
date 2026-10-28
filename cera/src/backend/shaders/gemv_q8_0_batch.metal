@@ -66,29 +66,35 @@ kernel void gemv_q8_0_batch(
 
         #pragma unroll(CHPT)
         for (short ch = 0; ch < CHPT; ++ch) {
-            const device uchar * blk = row_ptr + blk_idx * Q8_BLOCK_BYTES;
-            float d = float(*(const device half*)blk);
-            const device int8_t * qs = (const device int8_t*)(blk + 2);
-            uint qoff = cch * 4;
-            lx[ch] = float4(
-                float(qs[qoff]) * d,
-                float(qs[qoff + 1]) * d,
-                float(qs[qoff + 2]) * d,
-                float(qs[qoff + 3]) * d
-            );
+            if (4 * (ich + ch * NXPSG) < (int)k) {
+                const device uchar * blk = row_ptr + blk_idx * Q8_BLOCK_BYTES;
+                float d = float(*(const device half*)blk);
+                const device int8_t * qs = (const device int8_t*)(blk + 2);
+                uint qoff = cch * 4;
+                lx[ch] = float4(
+                    float(qs[qoff]) * d,
+                    float(qs[qoff + 1]) * d,
+                    float(qs[qoff + 2]) * d,
+                    float(qs[qoff + 3]) * d
+                );
 
-            cch += NXPSG;
-            if (cch >= CHPB) {
-                blk_idx += cch / CHPB;
-                cch %= CHPB;
+                cch += NXPSG;
+                if (cch >= CHPB) {
+                    blk_idx += cch / CHPB;
+                    cch %= CHPB;
+                }
+            } else {
+                lx[ch] = float4(0.0f);
             }
         }
 
         #pragma unroll(CHPT)
         for (short ch = 0; ch < CHPT; ++ch) {
-            #pragma unroll(R1PTG)
-            for (short ir1 = 0; ir1 < R1PTG; ++ir1) {
-                sumf[ir1] += dot(lx[ch], y4[ir1][ch * NXPSG]);
+            if (4 * (ich + ch * NXPSG) < (int)k) {
+                #pragma unroll(R1PTG)
+                for (short ir1 = 0; ir1 < R1PTG; ++ir1) {
+                    sumf[ir1] += dot(lx[ch], y4[ir1][ch * NXPSG]);
+                }
             }
         }
 

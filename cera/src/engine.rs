@@ -351,6 +351,42 @@ pub struct CeraEngine {
     drafter: Option<Arc<dyn crate::spec::Drafter>>,
 }
 
+/// The backend a modality tower (vision or audio encoder) is built for: `var` when it is set to a
+/// backend label (`cpu`, `gpu`, `npu`, `hexagon`, `metal`, `auto`), else the engine's own `backend`.
+///
+/// The tower's output is a plain f32 embedding buffer, so it can run on a different processor from
+/// the LLM. On a Snapdragon with the LLM on the CPU the vision tower on the Hexagon NPU
+/// (`CERA_VISION_BACKEND=npu`) takes an image to the LLM in about 100 ms instead of about 340, which
+/// is how a `CPU` engine with an NPU-offloaded mmproj (llama.cpp's default arrangement on that
+/// phone) reaches a first token in about 230 ms rather than 470. An unusable label is ignored with
+/// a warning; a tower that cannot be built on the chosen backend falls back to the CPU encoder, as it
+/// always has.
+fn parse_encoder_backend(
+    var: &str,
+    raw: Option<&str>,
+    engine_backend: BackendPreference,
+) -> BackendPreference {
+    match raw.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(label) => match BackendPreference::parse_str(label) {
+            Ok(backend) => backend,
+            Err(e) => {
+                tracing::warn!(target: "cera::engine", "ignoring {var}={label}: {e}");
+                eprintln!("[cera] warning: ignoring {var}={label}: {e}");
+                engine_backend
+            }
+        },
+        None => engine_backend,
+    }
+}
+
+fn encoder_backend(var: &str, engine_backend: BackendPreference) -> BackendPreference {
+    if cfg!(test) {
+        return engine_backend;
+    }
+    let val = std::env::var(var).ok();
+    parse_encoder_backend(var, val.as_deref(), engine_backend)
+}
+
 /// Parse an optional audio sidecar, best-effort: bytes that do not parse (a
 /// truncated download, a body that is not a GGUF) lose audio output, not the
 /// whole load, and the reason is logged instead of vanishing.
@@ -363,6 +399,7 @@ fn parse_audio_sidecar(bytes: Arc<[u8]>, what: &str) -> Option<Arc<GgufFile>> {
                 error = %format!("{e:#}"),
                 "ignoring the {what} sidecar: it does not parse"
             );
+            eprintln!("[cera] warning: ignoring the {what} sidecar: {e:#}");
             None
         }
     }
@@ -474,10 +511,10 @@ impl CeraEngine {
             .filter(|_| mmproj_can_matter)
             .and_then(|bytes| parse_aux_gguf(bytes, "multimodal projector"));
 
-        let inference_type = resolve_parts_inference_type(
+        let inference_type = resolve_parts_inference_type_with_mmproj(
             parts.inference_type.clone(),
             gguf.get_str("general.architecture").unwrap_or(""),
-            mmproj.is_some(),
+            mmproj.as_deref(),
         );
         check_inference_type_supported(&inference_type)?;
 
@@ -796,13 +833,19 @@ impl CeraEngine {
         // An unavailable encoder cannot use the helper. In particular, text/VL
         // GPU byte loads must release their host staging bytes after upload.
         let primary_gguf = primary_gguf.filter(|_| audio_encoder.is_some());
-        let vision_encoder_gguf = aux.vision_mmproj.or_else(|| {
-            if path.is_some() {
-                try_load_vision_encoder_gguf(&manifest)
-            } else {
-                None
-            }
-        });
+        let vision_encoder_gguf = aux
+            .vision_mmproj
+            .or_else(|| {
+                if path.is_some() {
+                    try_load_vision_encoder_gguf(&manifest)
+                } else {
+                    None
+                }
+            })
+            .filter(|g| {
+                !matches!(manifest.inference_type, InferenceType::LlamaCppLfm2AudioV1)
+                    || g.get_bool("clip.has_vision_encoder") == Some(true)
+            });
         // Typed weights only when the raw mmproj loaded — we don't
         // re-attempt the open here. Failure to parse leaves the
         // typed slot unset (warned in `try_parse_vision_encoder`)
@@ -825,16 +868,22 @@ impl CeraEngine {
             (other, _) => other,
         };
         let gpu_vision_encoder = vision_encoder.as_ref().and_then(|w| {
-            crate::model::vision_encoder_gpu::build_gpu_vision_encoder(w, vision_backend)
+            crate::model::vision_encoder_gpu::build_gpu_vision_encoder(
+                w,
+                encoder_backend("CERA_VISION_BACKEND", vision_backend),
+            )
         });
         if gpu_vision_encoder.is_none()
             && let Some(ref w) = vision_encoder
         {
             w.prepare_int8();
         }
-        let gpu_audio_encoder = audio_encoder
-            .as_ref()
-            .and_then(|w| crate::model::audio_encoder_gpu::build_gpu_audio_encoder(w, cfg.backend));
+        let gpu_audio_encoder = audio_encoder.as_ref().and_then(|w| {
+            crate::model::audio_encoder_gpu::build_gpu_audio_encoder(
+                w,
+                encoder_backend("CERA_AUDIO_ENCODER_BACKEND", vision_backend),
+            )
+        });
         let (eager_audio_decoder, eager_detok_weights, eager_audio_accelerator) =
             if path.is_some() && aux.audio_decoder.is_none() {
                 try_load_audio_decoder_and_detok(&manifest, cfg.backend)
@@ -844,7 +893,7 @@ impl CeraEngine {
 
         let audio_decoder = eager_audio_decoder.filter(|dec| {
             let model_dim = model.config().hidden_size;
-            let vocoder_dim = dec.decoder_config.n_embd;
+            let vocoder_dim = dec.depth_linear_w.cols;
             if vocoder_dim != model_dim {
                 tracing::warn!(
                     "audio decoder embedding dimension ({vocoder_dim}) does not match model hidden size ({model_dim}); ignoring mismatched vocoder"
@@ -859,7 +908,7 @@ impl CeraEngine {
         } else {
             (None, None)
         };
-        Ok(Self {
+        let engine = Self {
             audio_profile: std::sync::OnceLock::new(),
             manifest,
             model,
@@ -877,8 +926,88 @@ impl CeraEngine {
             gpu_audio_encoder,
             audio_accelerator,
             drafter,
-        })
+        };
+        engine.warm_up();
+        Ok(engine)
     }
+
+    /// Run a short throwaway forward pass so the first turn does not pay for first use: the CPU
+    /// worker pools (thread spawn and pinning), the kernels' code pages, the lazily built per-layer
+    /// state and the allocator's first big buffers. Measured on a Snapdragon 8 Elite, a 32-token
+    /// prompt's first turn after a load took 31 to 50 ms against 19 ms for the next one (and 207 ms in
+    /// one run right after the binary was pushed, with its pages not in the page cache): a load is when
+    /// that cost is expected. Costs about 45 ms at load for a text model, plus one tiny image or clip
+    /// through the CPU towers of a vision or audio one.
+    ///
+    /// Runs only on models that own no live state (the CPU backend); the GPU and NPU backends warm
+    /// their own pipelines and a session lease must not be held across the load. It uses a private
+    /// state and calls the model directly, so it touches no session, no KV compression choice and no
+    /// prefix cache. The work runs on a thread of its own that exits afterwards, so the worker pools'
+    /// caller pin (held by one thread at a time) is free for the first real caller.
+    /// `CERA_WARMUP=0` turns it off. Best effort: every failure is ignored.
+    #[cfg(not(target_arch = "wasm32"))]
+    fn warm_up(&self) {
+        if crate::backend::cpu_features::env_disabled("CERA_WARMUP") {
+            return;
+        }
+        if !matches!(self.model.acquire_session(), Ok(None)) {
+            return;
+        }
+        let model = Arc::clone(&self.model);
+        // The CPU towers, when no accelerator took the job: the first image or clip would otherwise
+        // be the first run of their kernels. The GPU and NPU towers warm themselves.
+        let vision = self
+            .vision_encoder
+            .clone()
+            .filter(|_| self.gpu_vision_encoder.is_none());
+        let audio = self
+            .audio_encoder
+            .clone()
+            .filter(|_| self.gpu_audio_encoder.is_none());
+        let started = crate::time::Instant::now();
+        let run = move || {
+            if let Some(vision) = &vision {
+                let g = (4 * vision.config.scale_factor.max(1)).max(2);
+                let px = g * vision.config.patch_size.max(1);
+                let _ = vision.encode_image(&vec![0.0f32; 3 * px * px], g, g);
+            }
+            if let Some(audio) = &audio {
+                let _ = crate::model::audio_encoder::encode_audio_pcm(&vec![0.0f32; 8_000], audio);
+            }
+            let cfg = model.config();
+            if !model.supports_embedding_input() || cfg.vocab_size < 4 || cfg.max_seq_len < 24 {
+                return;
+            }
+            let n = 16usize;
+            let ids: Vec<u32> = (0..n as u32)
+                .map(|i| 1 + i % (cfg.vocab_size as u32 - 2))
+                .collect();
+            let Some(rows) = model.embed_token_rows(&ids) else {
+                return;
+            };
+            let Ok(mut state) = crate::kv_cache::InferenceState::for_prefill(cfg, n + 4) else {
+                return;
+            };
+            let _ = model.forward_prefill_from_embeddings(&rows, n, 0, &mut state);
+            for i in 0..2 {
+                let _ = model.forward(&ids[..1], n + i, &mut state);
+            }
+            let _ = model.take_decode_error();
+        };
+        // A panic in a throwaway pass must not take the load down with it.
+        let _ = std::thread::Builder::new()
+            .name("cera-warmup".into())
+            .spawn(run)
+            .map(|h| h.join());
+        tracing::debug!(
+            target: "cera::engine",
+            elapsed_ms = started.elapsed().as_millis() as u64,
+            "engine warm-up pass"
+        );
+    }
+
+    #[cfg(target_arch = "wasm32")]
+    fn warm_up(&self) {}
 
     /// Opens the primary GGUF at `primary` and delegates assembly to
     /// [`Self::from_gguf`] with `Some(primary)` so Metal/GPU backends
@@ -968,11 +1097,12 @@ impl CeraEngine {
     /// insertion point inside a rendered chat template. The first one the
     /// tokenizer actually defines is used. Shared by [`Self::transcribe`] and
     /// the CLI's audio chat path so the two never drift.
-    pub const AUDIO_MARKER_CANDIDATES: [&'static str; 4] = [
+    pub const AUDIO_MARKER_CANDIDATES: [&'static str; 5] = [
         "<|reserved_4|>",
         "<|reserved_5|>",
         "<|reserved_6|>",
         "<|reserved_7|>",
+        "<|audio_start|>",
     ];
 
     /// Find the unique index of `marker_id` in `tokens` (single pass, no
@@ -1041,10 +1171,17 @@ impl CeraEngine {
                 )
             })?;
 
+        let sys_prompt = if self.audio_encoder.as_ref().is_some_and(|e| e.is_lfm3a())
+            || self.model.config().architecture == "lfm3"
+        {
+            crate::session::Session::DEFAULT_ASR_SYSTEM_PROMPT_LFM3A
+        } else {
+            crate::session::Session::DEFAULT_ASR_SYSTEM_PROMPT_LFM2A
+        };
         let messages = [
             ChatMessage {
                 role: "system".to_string(),
-                content: "Perform ASR.".to_string(),
+                content: sys_prompt.to_string(),
             },
             ChatMessage {
                 role: "user".to_string(),
@@ -1092,12 +1229,22 @@ impl CeraEngine {
             }
             Err(error) => return Err(error),
         };
-        if split > 0 {
-            session.append_tokens(&toks[..split])?;
-        }
-        session.append_audio(pcm, sample_rate)?;
-        if split + 1 < toks.len() {
-            session.append_tokens(&toks[split + 1..])?;
+        let segments = [
+            crate::session::chat::IngestSegment::Tokens(&toks[..split]),
+            crate::session::chat::IngestSegment::Audio { pcm, sample_rate },
+            crate::session::chat::IngestSegment::Tokens(&toks[split + 1..]),
+        ];
+        match session.try_append_fused_audio(&segments) {
+            Some(res) => res?,
+            None => {
+                if split > 0 {
+                    session.append_tokens(&toks[..split])?;
+                }
+                session.append_audio(pcm, sample_rate)?;
+                if split + 1 < toks.len() {
+                    session.append_tokens(&toks[split + 1..])?;
+                }
+            }
         }
 
         struct CollectSink {
@@ -1202,7 +1349,18 @@ impl CeraEngine {
     /// want to gate UI / API surfaces on what the model supports
     /// without constructing a [`Session`].
     pub fn capabilities(&self) -> ModalityCapabilities {
-        ModalityCapabilities::from_inference_type(&self.manifest.inference_type)
+        let mut caps = ModalityCapabilities::from_inference_type(&self.manifest.inference_type);
+        if matches!(
+            self.manifest.inference_type,
+            InferenceType::LlamaCppLfm2AudioV1
+        ) && self.vision_encoder.is_some()
+        {
+            caps.image_in = true;
+        }
+        if self.audio_encoder.is_some() {
+            caps.audio_in = true;
+        }
+        caps
     }
 
     /// What this model needs to be told to speak: the system prompts, voices
@@ -1303,6 +1461,9 @@ impl CeraEngine {
         text: &str,
         lora: Option<Arc<crate::lora::LoraAdapterWeights>>,
     ) -> Result<Vec<crate::classifier::EntitySpan>, CeraError> {
+        // The same refusal `Session` applies: an adapter on a model that cannot run it would
+        // be silently ignored, or (a classifier adapter on lfm3) switch it to attention
+        // branches written for another architecture.
         if let Some(adapter) = lora.as_deref() {
             crate::session::ensure_adapter_runs(self.model.as_ref(), adapter)?;
         }
@@ -1918,10 +2079,13 @@ fn inference_type_defaults_shape(it: &InferenceType) -> DefaultsShape {
 /// `from_reader`, which already skip auto-attach by contract.
 #[cfg(feature = "mmap")]
 fn try_load_audio_encoder(manifest: &Manifest) -> Option<Arc<AudioEncoderWeights>> {
-    if !matches!(manifest.inference_type, InferenceType::LlamaCppLfm2AudioV1) {
+    let audio_extra = manifest.files.extras.get("audio_encoder");
+    if audio_extra.is_none()
+        && !matches!(manifest.inference_type, InferenceType::LlamaCppLfm2AudioV1)
+    {
         return None;
     }
-    let mmproj_path = manifest.files.multimodal_projector.as_ref()?;
+    let mmproj_path = audio_extra.or(manifest.files.multimodal_projector.as_ref())?;
     let path = Path::new(mmproj_path);
     let gguf = match GgufFile::open(path) {
         Ok(g) => Arc::new(g),
@@ -1998,6 +2162,11 @@ fn try_load_audio_decoder_and_detok(
     }
     let voc_path = manifest.files.audio_decoder.as_deref().map(Path::new);
     let tok_path = manifest.files.audio_tokenizer.as_deref().map(Path::new);
+    let mmproj_path = manifest
+        .files
+        .multimodal_projector
+        .as_deref()
+        .map(Path::new);
 
     let voc_gguf = voc_path.and_then(|p| match GgufFile::open_arc(p) {
         Ok(g) => Some(g),
@@ -2017,6 +2186,24 @@ fn try_load_audio_decoder_and_detok(
             None
         }
     });
+
+    let mmproj_gguf = if voc_gguf.is_none() {
+        mmproj_path
+            .and_then(|p| match GgufFile::open_arc(p) {
+                Ok(g) => Some(g),
+                Err(e) => {
+                    tracing::warn!(
+                        target: "cera::engine",
+                        "failed to open the multimodal projector `{}` for audio output: {e:#}",
+                        p.display()
+                    );
+                    None
+                }
+            })
+            .filter(|g| crate::model::audio_decoder::is_lfm3a_gen_gguf(g))
+    } else {
+        None
+    };
 
     // The llama.cpp release splits the detokenizer backbone into the tokenizer
     // sidecar; fold it into one vocoder so every backend loader sees the merged
@@ -2042,15 +2229,28 @@ fn try_load_audio_decoder_and_detok(
             })
             .ok()
             .map(Arc::new)
+    } else if let Some(ref mg) = mmproj_gguf {
+        crate::model::audio_decoder::AudioDecoderWeights::from_gguf(mg)
+            .map_err(|e| {
+                tracing::warn!(
+                    target: "cera::engine",
+                    error = %format!("{e:#}"),
+                    "audio decoder (depthformer) failed to load from the multimodal projector; \
+                     audio output is off"
+                );
+                e
+            })
+            .ok()
+            .map(Arc::new)
     } else {
         None
     };
 
-    // Vocoder first, then the audio tokenizer, for the reason spelled out on
-    // the other detokenizer load above: a tokenizer GGUF parses as a
-    // detokenizer through the fallback tensor names while carrying a different
-    // model's weights.
-    let detok = [voc_gguf.as_ref(), tok_gguf.as_ref()]
+    // Vocoder first, then the audio tokenizer, then an embedded mmproj, for the
+    // reason spelled out on the other detokenizer load above: a tokenizer GGUF
+    // parses as a detokenizer through the fallback tensor names while carrying
+    // a different model's weights.
+    let detok = [voc_gguf.as_ref(), tok_gguf.as_ref(), mmproj_gguf.as_ref()]
         .into_iter()
         .flatten()
         .find_map(|g| {
@@ -2062,6 +2262,7 @@ fn try_load_audio_decoder_and_detok(
     let acc = if dec.is_some() && detok.is_some() {
         voc_gguf
             .as_ref()
+            .or(mmproj_gguf.as_ref())
             .and_then(|g| crate::model::audio_decoder::build_audio_accelerator(g, backend))
     } else {
         None
@@ -2253,6 +2454,31 @@ fn open_for_inference_type(model_path: &Path) -> Result<GgufFile, CeraError> {
     })
 }
 
+fn is_audio_mmproj_gguf(gguf: &GgufFile) -> bool {
+    gguf.get_bool("clip.has_audio_encoder") == Some(true)
+        || gguf.tensors.contains_key("a.conv1d.0.weight")
+        || crate::model::audio_decoder::is_lfm3a_gen_gguf(gguf)
+}
+
+fn resolve_parts_inference_type_with_mmproj(
+    explicit: Option<InferenceType>,
+    arch: &str,
+    mmproj: Option<&GgufFile>,
+) -> InferenceType {
+    if let Some(it) = explicit {
+        return it;
+    }
+    let detected = inference_type_for_arch(arch);
+    match (&detected, mmproj) {
+        (InferenceType::LlamaCppTextToText, Some(g))
+            if arch == "lfm3" && is_audio_mmproj_gguf(g) =>
+        {
+            InferenceType::LlamaCppLfm2AudioV1
+        }
+        _ => resolve_parts_inference_type(None, arch, mmproj.is_some()),
+    }
+}
+
 /// Decide a [`ModelBytes`] bundle's inference type. See
 /// [`CeraEngine::from_parts`] for the reasoning, in particular why an mmproj
 /// upgrades a text detection to VL. Pure, so the policy is testable without a
@@ -2280,12 +2506,11 @@ fn resolve_parts_inference_type(
 /// Resolution retains the same `GgufFile` for assembly.
 fn inference_type_for_arch(arch: &str) -> InferenceType {
     match arch {
-        "lfm2" | "lfm2moe" | "llama" | "qwen2" | "qwen3" | "qwen35" | "qwen3_5" | "qwen3.5"
-        | "granite" | "gemma2" | "olmo2" | "olmo3" | "gemma4" | "gemma-4" | "gemma4-assistant"
-        | "gemma-4-assistant" | "minicpm" | "minicpm5" | "nanbeige" | "mistral3" | "ministral3"
-        | "phi3" | "phi" | "bailingmoe3" | "bailingmoe" | "bailingmoe2" => {
-            InferenceType::LlamaCppTextToText
-        }
+        "lfm2" | "lfm2moe" | "lfm3" | "llama" | "qwen2" | "qwen3" | "qwen35" | "qwen3_5"
+        | "qwen3.5" | "granite" | "gemma2" | "olmo2" | "olmo3" | "gemma4" | "gemma-4"
+        | "gemma4-assistant" | "gemma-4-assistant" | "minicpm" | "minicpm5" | "nanbeige"
+        | "mistral3" | "ministral3" | "phi3" | "phi" | "bailingmoe3" | "bailingmoe"
+        | "bailingmoe2" => InferenceType::LlamaCppTextToText,
         "lfm2vl" => InferenceType::LlamaCppImageToText,
         "lfm2-audio" => InferenceType::LlamaCppLfm2AudioV1,
         "bert" | "modernbert" => {
@@ -3024,5 +3249,52 @@ mod tests {
             inference_type_for_arch("modernbert"),
             InferenceType::Unknown(_)
         ));
+    }
+
+    #[test]
+    fn audio_mmproj_upgrades_lfm3_arch_to_audio_inference_type() {
+        let mut w_audio = crate::convert::writer::GgufWriter::new();
+        w_audio.add_bool("clip.has_audio_encoder", true);
+        let mut bytes_audio = Vec::new();
+        w_audio
+            .write_header_and_tensor_info(&mut bytes_audio)
+            .unwrap();
+        let audio_mmproj = GgufFile::from_bytes(bytes_audio.into()).unwrap();
+        assert_eq!(
+            resolve_parts_inference_type_with_mmproj(None, "lfm3", Some(&audio_mmproj)),
+            InferenceType::LlamaCppLfm2AudioV1
+        );
+
+        let mut w_vision = crate::convert::writer::GgufWriter::new();
+        w_vision.add_bool("clip.has_vision_encoder", true);
+        let mut bytes_vision = Vec::new();
+        w_vision
+            .write_header_and_tensor_info(&mut bytes_vision)
+            .unwrap();
+        let vision_mmproj = GgufFile::from_bytes(bytes_vision.into()).unwrap();
+        assert_eq!(
+            resolve_parts_inference_type_with_mmproj(None, "lfm3", Some(&vision_mmproj)),
+            InferenceType::LlamaCppImageToText
+        );
+    }
+
+    #[test]
+    fn parse_encoder_backend_handles_valid_empty_and_invalid_labels() {
+        assert_eq!(
+            parse_encoder_backend("CERA_VISION_BACKEND", Some("npu"), BackendPreference::Cpu),
+            BackendPreference::Npu
+        );
+        assert_eq!(
+            parse_encoder_backend("CERA_VISION_BACKEND", Some("  "), BackendPreference::Metal),
+            BackendPreference::Metal
+        );
+        assert_eq!(
+            parse_encoder_backend(
+                "CERA_VISION_BACKEND",
+                Some("not_a_backend"),
+                BackendPreference::Hexagon
+            ),
+            BackendPreference::Hexagon
+        );
     }
 }

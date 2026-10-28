@@ -1,0 +1,13 @@
+{
+  "model_file": "test_lfm3.gguf",
+  "llama_cpp_sha": "c38c8b905e2578311fc24df0dbf9bb05b6f3cb14",
+  "n_predict": 8,
+  "prompts": [
+    {
+      "prompt": "Helloworld12345",
+      "fixture": "helloworld12345.json",
+      "n_tokens": 15,
+      "n_nodes": 192
+    }
+  ]
+}

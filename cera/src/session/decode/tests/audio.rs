@@ -48,6 +48,7 @@ fn codebook() -> CodebookWeights {
 fn attach_end_vocoder(session: &mut Session, interleave: InterleaveCadence) -> Arc<EndAudio> {
     session.attach_vocoder(
         Arc::new(AudioDecoderWeights {
+            lfm3a_gen: false,
             depthformer_config: DepthformerConfig {
                 n_layer: 0,
                 n_embd: 2,
@@ -95,6 +96,7 @@ fn attach_end_vocoder(session: &mut Session, interleave: InterleaveCadence) -> A
             lin_w: weight(),
             lin_b: vec![0.0; 2],
             layers: vec![],
+            lfm3_fsq: None,
         }),
     );
     let backend = Arc::new(EndAudio::default());

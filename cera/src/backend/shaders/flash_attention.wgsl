@@ -66,14 +66,15 @@ fn flash_attention(
     let kv_dim = params[3];
     let seq_len = params[4];
     let scale = bitcast<f32>(params[5]);
+    let min_pos = params[6];
 
     let group_size = n_heads / n_kv_heads;
     let kv_head = head / group_size;
     let kv_h_offset = kv_head * head_dim;
     let q_offset = head * head_dim;
 
-    // seq_len == 0 would divide by st[1] == 0 → NaN. Write zeros and bail.
-    if seq_len == 0u {
+    // seq_len <= min_pos would divide by st[1] == 0 -> NaN. Write zeros and bail.
+    if seq_len <= min_pos {
         if tid < head_dim {
             out[q_offset + tid] = 0.0;
         }
@@ -91,7 +92,7 @@ fn flash_attention(
     }
     workgroupBarrier();
 
-    var base = 0u;
+    var base = min_pos;
     while base < seq_len {
         // ── score for timestep t = base + tid (one per thread) ──
         let t = base + tid;

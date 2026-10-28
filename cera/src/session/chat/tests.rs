@@ -1444,6 +1444,7 @@ fn chat_tool_registration_and_accessors() {
             },
             "required": ["expr"]
         }),
+        defer_loading: false,
     };
 
     chat.set_tools(vec![tool.clone()]);
@@ -1470,6 +1471,7 @@ fn chat_initial_render_with_tools_injects_tool_definitions() {
                 "city": { "type": "string" }
             }
         }),
+        defer_loading: false,
     };
     chat.set_tools(vec![tool]);
 
@@ -1507,6 +1509,7 @@ fn chat_tool_execution_loop_parses_call_and_ingests_response() {
                 "city": { "type": "string" }
             }
         }),
+        defer_loading: false,
     };
     chat.set_tools(vec![tool]);
 
@@ -1551,6 +1554,7 @@ fn chat_tool_validation_rules() {
         name: "test".into(),
         description: None,
         parameters: serde_json::json!({}),
+        defer_loading: false,
     }]);
     let err = chat
         .replace_messages(&[Message::tool("tool response")])
@@ -1570,6 +1574,7 @@ struct MockMultimodalExecution {
     audio: Vec<(Vec<f32>, u32)>,
     image_capable: bool,
     audio_capable: bool,
+    projector_type: crate::model::vision_encoder::VisionProjectorType,
 }
 
 impl Execution for MockMultimodalExecution {
@@ -1584,6 +1589,9 @@ impl Execution for MockMultimodalExecution {
     }
     fn image_input(&self) -> bool {
         self.image_capable
+    }
+    fn vision_projector_type(&self) -> crate::model::vision_encoder::VisionProjectorType {
+        self.projector_type
     }
     fn audio_input(&self) -> bool {
         self.audio_capable
@@ -1744,6 +1752,110 @@ fn chat_multimodal_image_ingestion_with_image_capable_execution() {
 }
 
 #[test]
+fn chat_multimodal_image_ingestion_respects_vision_projector_type() {
+    use crate::gguf::{GgufFile, GgufValue};
+    use crate::model::vision_encoder::VisionProjectorType;
+
+    // Lfm3Vl omits boundary tokens even when <|image_start|>/<|image_end|> exist in the vocab.
+    let profile = Profile::discover(fixtures::tokenizer()).unwrap();
+    let exec_vl = MockMultimodalExecution {
+        image_capable: true,
+        projector_type: VisionProjectorType::Lfm3Vl,
+        ..Default::default()
+    };
+    let mut chat_vl = Chat::new(exec_vl, profile, 0).ok().unwrap();
+    chat_vl
+        .ingest(&Message::user_with_image("Describe", vec![9, 8, 7]))
+        .unwrap();
+    let inner_vl = chat_vl.into_inner();
+    assert_eq!(inner_vl.images.len(), 1);
+    assert!(!inner_vl.tokens.contains(&2));
+    assert!(!inner_vl.tokens.contains(&3));
+    assert!(inner_vl.tokens.contains(&9999));
+
+    // Lfm3O with an Omni tokenizer (both <image> and <|image|> in vocab, <|image|> in
+    // chat_template, neither <|vision_start|> nor <|vision_end|>) selects <|image|> and
+    // ingests the image cleanly without boundary tokens.
+    let make_omni_tokenizer = |with_unpaired_vision_start: bool| -> Arc<BpeTokenizer> {
+        let mut bytes = b"GGUF".to_vec();
+        bytes.extend(3u32.to_le_bytes());
+        bytes.extend(0u64.to_le_bytes());
+        bytes.extend(0u64.to_le_bytes());
+        bytes.resize(32, 0);
+        let mut gguf = GgufFile::from_bytes(bytes.into()).unwrap();
+        let mut vocab = vec![
+            "<pad>".to_owned(),
+            "<|startoftext|>".into(),
+            "<image>".into(),   // id 2: legacy special token present in Omni vocab
+            "<|image|>".into(), // id 3: actual Omni image token in chat_template
+            "<|audio_start|>".into(), // id 4
+            "<|im_start|>".into(), // id 5
+            "<|im_end|>".into(), // id 6
+        ];
+        if with_unpaired_vision_start {
+            vocab.push("<|vision_start|>".into()); // id 7
+        }
+        let special_count = vocab.len();
+        vocab.push("Ġ".into());
+        vocab.push("Ċ".into());
+        vocab.extend((33u8..=126).map(|b| (b as char).to_string()));
+        let types = (0..vocab.len())
+            .map(|i| GgufValue::I32(if i < special_count { 3 } else { 1 }))
+            .collect();
+        let omni_template = "{{- bos_token -}}{%- for message in messages -%}{{- '<|im_start|>' + message['role'] + '\\n' -}}{%- if message['content'] is string -%}{{- message['content'] -}}{%- else -%}{%- for item in message['content'] -%}{%- if item['type'] == 'image' -%}{{- '<|image|>' -}}{%- elif item['type'] == 'text' -%}{{- item['text'] -}}{%- endif -%}{%- endfor -%}{%- endif -%}{{- '<|im_end|>\\n' -}}{%- endfor -%}{%- if add_generation_prompt -%}{{- '<|im_start|>assistant\\n' -}}{%- endif -%}";
+        gguf.metadata.insert(
+            "tokenizer.ggml.tokens".into(),
+            GgufValue::Array(vocab.into_iter().map(GgufValue::String).collect()),
+        );
+        gguf.metadata
+            .insert("tokenizer.ggml.token_type".into(), GgufValue::Array(types));
+        gguf.metadata
+            .insert("tokenizer.ggml.bos_token_id".into(), GgufValue::U32(1));
+        gguf.metadata
+            .insert("tokenizer.ggml.eos_token_id".into(), GgufValue::U32(6));
+        gguf.metadata.insert(
+            "tokenizer.chat_template".into(),
+            GgufValue::String(omni_template.into()),
+        );
+        Arc::new(BpeTokenizer::from_gguf(&gguf).unwrap())
+    };
+
+    let omni_profile = Profile::discover(make_omni_tokenizer(false)).unwrap();
+    assert_eq!(omni_profile.image_marker(), Some(3));
+    let exec_omni = MockMultimodalExecution {
+        image_capable: true,
+        projector_type: VisionProjectorType::Lfm3O,
+        ..Default::default()
+    };
+    let mut chat_omni = Chat::new(exec_omni, omni_profile, 0).ok().unwrap();
+    chat_omni
+        .ingest(&Message::user_with_image("Describe", vec![9, 8, 7]))
+        .unwrap();
+    let inner_omni = chat_omni.into_inner();
+    assert_eq!(inner_omni.images.len(), 1);
+    assert_eq!(inner_omni.images[0], vec![9, 8, 7]);
+    assert!(inner_omni.tokens.contains(&9999));
+    assert!(!inner_omni.tokens.contains(&2));
+    assert!(!inner_omni.tokens.contains(&3));
+
+    // Lfm3O with an unpaired <|vision_start|> (missing <|vision_end|>) is rejected.
+    let broken_profile = Profile::discover(make_omni_tokenizer(true)).unwrap();
+    let exec_broken = MockMultimodalExecution {
+        image_capable: true,
+        projector_type: VisionProjectorType::Lfm3O,
+        ..Default::default()
+    };
+    let mut chat_broken = Chat::new(exec_broken, broken_profile, 0).ok().unwrap();
+    let err = chat_broken
+        .ingest(&Message::user_with_image("Describe", vec![9, 8, 7]))
+        .unwrap_err();
+    assert!(matches!(
+        err.cause,
+        IngestCause::Validation(ValidationError::UnsupportedContent { .. })
+    ));
+}
+
+#[test]
 fn chat_multimodal_audio_ingestion_with_audio_capable_execution() {
     let profile = Profile::discover(fixtures::tokenizer()).unwrap();
     let exec = MockMultimodalExecution {
@@ -1875,6 +1987,7 @@ fn chat_checkpoint_roundtrip_persistence_and_continuation() {
             },
             "required": ["expr"]
         }),
+        defer_loading: false,
     }];
     chat.set_tools(tools.clone());
     chat.set_tool_format(ToolFormat::Hermes);
@@ -2180,5 +2293,78 @@ fn restore_resets_prefilled_think_to_false() {
     assert!(
         !chat.prefilled_think(),
         "checkpoint restore must fall back to stream parsing"
+    );
+}
+
+/// The image marker follows the chat template (and the vocabulary), never the text of a
+/// message: a user turn that merely mentions `<|image|>` must not flip a legacy `<image>`
+/// template onto the other marker.
+#[test]
+fn the_image_marker_is_chosen_by_the_template_not_by_message_text() {
+    // template names only `<image>`: `<image>` first even though the vocabulary has `<|image|>`
+    assert_eq!(
+        image_marker_candidates("{{ '<image>' }}", true),
+        ["<image>", "<|image|>"]
+    );
+    assert_eq!(
+        image_marker_candidates("{{ '<|image|>' }}", false),
+        ["<|image|>", "<image>"]
+    );
+    // a template that names neither follows the vocabulary
+    assert_eq!(
+        image_marker_candidates("plain", true),
+        ["<|image|>", "<image>"]
+    );
+    assert_eq!(
+        image_marker_candidates("plain", false),
+        ["<image>", "<|image|>"]
+    );
+}
+
+#[test]
+fn profile_render_handles_deferred_tools_and_continuation_tool_references() {
+    let profile = Profile::discover(fixtures::tokenizer()).unwrap();
+    let tools = vec![
+        ToolDef::new(
+            "search_tools",
+            Some("Search tools".into()),
+            serde_json::json!({"type": "object", "properties": {}}),
+        ),
+        ToolDef::new(
+            "secret_tool",
+            Some("Deferred tool".into()),
+            serde_json::json!({"type": "object", "properties": {"id": {"type": "string"}}}),
+        )
+        .with_defer_loading(true),
+    ];
+
+    let initial = profile
+        .render(&[Message::user("hi")], true, &tools)
+        .unwrap();
+    assert!(
+        initial.contains("search_tools"),
+        "visible tool must appear in initial render: {initial}"
+    );
+    assert!(
+        !initial.contains("secret_tool") && !initial.contains("defer_loading"),
+        "deferred tool must not leak into initial render: {initial}"
+    );
+
+    let cont = profile
+        .render(
+            &[Message::tool(
+                r#"[{"type":"tool_reference","name":"secret_tool"},{"type":"text","text":"ok"}]"#,
+            )],
+            false,
+            &tools,
+        )
+        .unwrap();
+    assert!(
+        cont.contains("<additional_tools>") && cont.contains("secret_tool"),
+        "continuation tool_reference must expand into <additional_tools>: {cont}"
+    );
+    assert!(
+        !cont.contains("List of tools:") && !cont.contains("defer_loading"),
+        "continuation turn must not re-inject system tool list or defer_loading: {cont}"
     );
 }

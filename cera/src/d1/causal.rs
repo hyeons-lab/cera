@@ -48,32 +48,39 @@ pub struct CausalD1 {
     image_start: u32,
     image_end: u32,
     temperatures: std::collections::HashMap<String, f32>,
+    option_code_scheme: u32,
+    is_omni: bool,
 }
 
-/// One step of a prompt: a text token or the rows of an image.
+/// One step of a prompt: a text token, the rows of an image, or a speech clip.
 #[derive(Debug, Clone, PartialEq)]
 enum Item {
     Token(u32),
     Image(usize),
+    Audio,
 }
 
 impl CausalD1 {
-    /// Read the template and the image delimiters.
+    /// Read the template and the media delimiters.
     ///
     /// # Errors
     ///
-    /// Fails when `gguf` is not a public causal d1 file, has no `systemone` template, or the
-    /// tokenizer lacks the image delimiters.
+    /// Fails when `gguf` is not a public prompt-based d1 file, has no `systemone` template, or
+    /// the tokenizer lacks the media delimiters.
     pub fn from_gguf(gguf: &crate::gguf::GgufFile, tokenizer: &BpeTokenizer) -> Result<Self> {
+        let decision_type = public::decision_type(gguf);
         ensure!(
-            public::decision_type(gguf) == Some(public::CAUSAL_TYPE),
-            "not a public d1 model (lfm2.decision.type is {:?})",
-            gguf.get_str("lfm2.decision.type")
+            public::is_prompt_d1(gguf),
+            "not a public d1 model (lfm2.decision.type is {:?}, lfm3.decision.type is {:?})",
+            gguf.get_str("lfm2.decision.type"),
+            gguf.get_str("lfm3.decision.type")
         );
-        ensure!(
-            crate::model::lfm2::gguf_is_causal(gguf, "lfm2"),
-            "a d1 model reads its answer from the next token and needs a causal trunk"
-        );
+        if decision_type == Some(public::CAUSAL_TYPE) {
+            ensure!(
+                crate::model::lfm2::gguf_is_causal(gguf, "lfm2"),
+                "a d1 model reads its answer from the next token and needs a causal trunk"
+            );
+        }
         let template = gguf
             .get_str("tokenizer.chat_template.systemone")
             .context("the model has no `systemone` template (tokenizer.chat_template.systemone)")?;
@@ -86,11 +93,21 @@ impl CausalD1 {
                 .special_token_id(name)
                 .with_context(|| format!("the tokenizer has no `{name}` token"))
         };
+        let (start_name, end_name) = if public::is_lfm3_d1(gguf)
+            && (tokenizer.special_token_id("<|vision_start|>").is_some()
+                || tokenizer.special_token_id("<|image_start|>").is_none())
+        {
+            ("<|vision_start|>", "<|vision_end|>")
+        } else {
+            ("<|image_start|>", "<|image_end|>")
+        };
         Ok(Self {
             env,
-            image_start: special("<|image_start|>")?,
-            image_end: special("<|image_end|>")?,
+            image_start: special(start_name)?,
+            image_end: special(end_name)?,
             temperatures: public::temperatures(gguf)?,
+            option_code_scheme: public::option_code_scheme(gguf),
+            is_omni: decision_type == Some(public::LFM3_OMNI_TYPE),
         })
     }
 
@@ -104,14 +121,20 @@ impl CausalD1 {
             .unwrap_or(1.0)
     }
 
+    /// Whether this model is an `lfm3-d1-omni` variant (supports both image and speech inputs).
+    pub fn is_omni(&self) -> bool {
+        self.is_omni
+    }
+
     /// Answer every question of `request`, stopping with [`Cancelled`] when `cancel` is set
     /// (read before each question).
     ///
     /// # Errors
     ///
-    /// Fails on a request with audio (the model has no speech input) or more than eight images,
-    /// on a question whose options cannot be labelled with single tokens, on images without a
-    /// vision tower in `session`, on a prompt over the session's context, or on a trunk failure.
+    /// Fails on a request with audio when the model has no speech input or with more than eight
+    /// images, on a question whose options cannot be labelled with single tokens, on media without
+    /// the corresponding tower in `session`, on a prompt over the session's context, or on a trunk
+    /// failure.
     pub fn answer(
         &self,
         session: &mut Session,
@@ -119,10 +142,18 @@ impl CausalD1 {
         request: &D1Request,
         cancel: &AtomicBool,
     ) -> Result<D1Response> {
-        ensure!(
-            request.audio.is_none(),
-            "this model has no speech input (d1-3B reads text and images)"
-        );
+        if self.is_omni {
+            ensure!(
+                request.images.is_empty() || request.audio.is_none(),
+                "{}",
+                D1Request::MEDIA_COMBO_ERR
+            );
+        } else {
+            ensure!(
+                request.audio.is_none(),
+                "this model has no speech input (d1-3B reads text and images)"
+            );
+        }
         ensure!(
             request.images.len() <= MAX_IMAGES,
             "too many images, the maximum is {MAX_IMAGES}"
@@ -131,6 +162,19 @@ impl CausalD1 {
         for (name, _) in &request.questions {
             ensure!(seen.insert(name), "duplicate question `{name}`");
         }
+        // each speech clip goes through the audio tower once, however many questions follow it
+        let audio = request
+            .audio
+            .as_deref()
+            .map(|wav| -> Result<(Vec<f32>, usize)> {
+                let (samples, sample_rate) =
+                    super::audio::decode_wav_capped(wav, super::audio::MAX_SECONDS)
+                        .context("audio")?;
+                session
+                    .encode_audio_rows(&samples, sample_rate)
+                    .context("audio")
+            })
+            .transpose()?;
         // each image goes through the vision tower once, however many questions follow it
         let images = request
             .images
@@ -146,14 +190,22 @@ impl CausalD1 {
             .questions
             .iter()
             .map(|(name, q)| {
-                self.prepare(tokenizer, &request.state, q, request.images.len())
-                    .with_context(|| format!("question `{name}`"))
+                self.prepare(
+                    tokenizer,
+                    &request.state,
+                    q,
+                    request.images.len(),
+                    audio.is_some(),
+                )
+                .with_context(|| format!("question `{name}`"))
             })
             .collect::<Result<Vec<_>>>()?;
 
         // the images and the state come first, so the questions share a prefix; one tail token
-        // at least stays per question, it is the position the answer is read at
-        let shared = if prepared.len() > 1 {
+        // at least stays per question, it is the position the answer is read at. A non-causal
+        // trunk (`lfm3-d1`, `lfm3-d1-omni`) reads the whole prompt both ways on its global
+        // attention layers, so its questions cannot share a causal prefix checkpoint.
+        let shared = if session.model().config().is_causal && prepared.len() > 1 {
             let first = &prepared[0].items;
             let common = prepared
                 .iter()
@@ -177,7 +229,12 @@ impl CausalD1 {
         let prefix_checkpoint = if shared > 0 && prepared.len() > 1 && session.checkpoint().is_ok()
         {
             ensure!(!cancel.load(Ordering::Relaxed), Cancelled);
-            feed(session, &prepared[0].items[..shared], &images)?;
+            feed(
+                session,
+                &prepared[0].items[..shared],
+                &images,
+                audio.as_ref(),
+            )?;
             Some(
                 session
                     .checkpoint()
@@ -208,7 +265,7 @@ impl CausalD1 {
                     0
                 }
             };
-            feed(session, &prompt.items[from..], &images)
+            feed(session, &prompt.items[from..], &images, audio.as_ref())
                 .with_context(|| format!("question `{name}`"))?;
             input_tokens = input_tokens.saturating_add(session.position() as usize);
             let logits = session
@@ -277,20 +334,30 @@ impl CausalD1 {
         state: &Json,
         q: &Question,
         n_images: usize,
+        has_audio: bool,
     ) -> Result<Prepared> {
-        let (options, groups) = options_and_groups(&|text| tokenizer.encode(text), q)?;
-        let rendered = self.render(q, state, &options, n_images)?;
+        let (options, groups) = options_and_groups_with_scheme(
+            &|text| tokenizer.encode(text),
+            q,
+            self.option_code_scheme,
+        )?;
+        let n_media = if has_audio { 1 } else { n_images };
+        let rendered = self.render(q, state, &options, n_media)?;
         let mut items = Vec::new();
         let pieces: Vec<&str> = rendered.split(MEDIA_MARKER).collect();
         ensure!(
-            pieces.len() == n_images + 1,
-            "the template placed {} images for {n_images}",
+            pieces.len() == n_media + 1,
+            "the template placed {} images for {n_media}",
             pieces.len() - 1
         );
         for (i, piece) in pieces.iter().enumerate() {
             if i > 0 {
                 items.push(Item::Token(self.image_start));
-                items.push(Item::Image(i - 1));
+                if has_audio {
+                    items.push(Item::Audio);
+                } else {
+                    items.push(Item::Image(i - 1));
+                }
                 items.push(Item::Token(self.image_end));
             }
             items.extend(tokenizer.encode(piece).into_iter().map(Item::Token));
@@ -309,8 +376,75 @@ struct Prepared {
     groups: Vec<Vec<u32>>,
 }
 
-/// Append `items` to the session: runs of tokens in one call, an image as its encoded rows.
-fn feed(session: &mut Session, items: &[Item], images: &[EncodedImage]) -> Result<()> {
+/// Append `items` to the session: when the segment contains an image or speech clip and the
+/// backend can hand out token embedding rows, splice all text and media rows into one
+/// `append_embeddings` call (required for non-causal trunks so bidirectional attention sees
+/// the full prompt in one pass, and faster on causal trunks by avoiding per-segment launches).
+fn feed(
+    session: &mut Session,
+    items: &[Item],
+    images: &[EncodedImage],
+    audio: Option<&(Vec<f32>, usize)>,
+) -> Result<()> {
+    let has_media = items
+        .iter()
+        .any(|item| matches!(item, Item::Image(_) | Item::Audio));
+    if has_media && session.model().supports_embedding_input() {
+        let hs = session.model().config().hidden_size;
+        let mut fused_rows = Vec::new();
+        let mut fused_tokens = 0usize;
+        let mut run = Vec::new();
+        let mut can_fuse = true;
+        for item in items {
+            match item {
+                Item::Token(t) => run.push(*t),
+                Item::Image(i) => {
+                    if !run.is_empty() {
+                        if let Some(rows) = session.model().embed_image_marker_rows(&run) {
+                            fused_rows.extend_from_slice(&rows);
+                            fused_tokens += run.len();
+                            run.clear();
+                        } else {
+                            can_fuse = false;
+                            break;
+                        }
+                    }
+                    let image = images.get(*i).context("the prompt names a missing image")?;
+                    fused_rows.extend_from_slice(image.rows());
+                    fused_tokens += image.n_tokens();
+                }
+                Item::Audio => {
+                    if !run.is_empty() {
+                        if let Some(rows) = session.model().embed_image_marker_rows(&run) {
+                            fused_rows.extend_from_slice(&rows);
+                            fused_tokens += run.len();
+                            run.clear();
+                        } else {
+                            can_fuse = false;
+                            break;
+                        }
+                    }
+                    let (rows, n_tokens) =
+                        audio.context("the prompt names a missing speech clip")?;
+                    fused_rows.extend_from_slice(rows);
+                    fused_tokens += *n_tokens;
+                }
+            }
+        }
+        if can_fuse && !run.is_empty() {
+            if let Some(rows) = session.model().embed_image_marker_rows(&run) {
+                fused_rows.extend_from_slice(&rows);
+                fused_tokens += run.len();
+            } else {
+                can_fuse = false;
+            }
+        }
+        if can_fuse && fused_tokens > 0 && fused_rows.len() == fused_tokens * hs {
+            session.append_embeddings(&fused_rows, fused_tokens)?;
+            return Ok(());
+        }
+    }
+
     let mut run: Vec<u32> = Vec::new();
     for item in items {
         match item {
@@ -324,6 +458,15 @@ fn feed(session: &mut Session, items: &[Item], images: &[EncodedImage]) -> Resul
                     .append_encoded_image(image)
                     .with_context(|| format!("images[{i}]"))?;
             }
+            Item::Audio => {
+                if !run.is_empty() {
+                    session.append_tokens(&std::mem::take(&mut run))?;
+                }
+                let (rows, n_tokens) = audio.context("the prompt names a missing speech clip")?;
+                session
+                    .append_embeddings(rows, *n_tokens)
+                    .context("audio")?;
+            }
         }
     }
     if !run.is_empty() {
@@ -334,9 +477,18 @@ fn feed(session: &mut Session, items: &[Item], images: &[EncodedImage]) -> Resul
 
 /// The template's `options` for a question (with the labels it shows) and, per option in the
 /// order the answer reads them, the label tokens that score it.
+#[cfg(test)]
 fn options_and_groups(
     encode: &dyn Fn(&str) -> Vec<u32>,
     q: &Question,
+) -> Result<(Vec<serde_json::Value>, Vec<Vec<u32>>)> {
+    options_and_groups_with_scheme(encode, q, 1)
+}
+
+fn options_and_groups_with_scheme(
+    encode: &dyn Fn(&str) -> Vec<u32>,
+    q: &Question,
+    scheme: u32,
 ) -> Result<(Vec<serde_json::Value>, Vec<Vec<u32>>)> {
     let value = |v: &Json| match v {
         Json::Null => serde_json::Value::Null,
@@ -395,7 +547,7 @@ fn options_and_groups(
         }
         QuestionType::Choice => {
             let keys: Vec<&str> = q.criteria.iter().map(|(k, _)| k.as_str()).collect();
-            let labelled = choice_labels(encode, &keys)?;
+            let labelled = choice_labels_with_scheme(encode, &keys, scheme)?;
             let options = q
                 .criteria
                 .iter()
@@ -412,10 +564,22 @@ fn options_and_groups(
     }
 }
 
-/// The code of each choice option and the tokens that score it.
+/// The code of each choice option and the tokens that score it (scheme 1).
+#[cfg(test)]
 fn choice_labels(
     encode: &dyn Fn(&str) -> Vec<u32>,
     keys: &[&str],
+) -> Result<Vec<(String, Vec<u32>)>> {
+    choice_labels_with_scheme(encode, keys, 1)
+}
+
+/// The code of each choice option and the tokens that score it under `scheme` (`prompt.py`'s
+/// `option_codes`): scheme 1 uses `00`..`99` past 26 options; scheme 2 uses `A`..`Z` then
+/// `AA`..`ZZ` past 26 options.
+fn choice_labels_with_scheme(
+    encode: &dyn Fn(&str) -> Vec<u32>,
+    keys: &[&str],
+    scheme: u32,
 ) -> Result<Vec<(String, Vec<u32>)>> {
     let n = keys.len();
     let letters = keys
@@ -424,8 +588,15 @@ fn choice_labels(
     let wanted = |i: usize| -> String {
         if letters {
             keys[i].to_string()
-        } else if n <= 26 {
+        } else if n <= 26 || (scheme == 2 && i < 26) {
             char::from(b'A' + i as u8).to_string()
+        } else if scheme == 2 && i < 26 + 26 * 26 {
+            let j = i - 26;
+            format!(
+                "{}{}",
+                char::from(b'A' + (j / 26) as u8),
+                char::from(b'A' + (j % 26) as u8)
+            )
         } else {
             format!("{i:02}")
         }
@@ -444,7 +615,7 @@ fn choice_labels(
         };
         if used.contains(&token) {
             return None;
-        }
+        };
         used.push(token);
         let spaced = match encode(&format!(" {code}"))[..] {
             [t] if t != token => Some(t),
@@ -481,6 +652,8 @@ mod tests {
             image_start: 1,
             image_end: 2,
             temperatures: std::collections::HashMap::new(),
+            option_code_scheme: 1,
+            is_omni: false,
         }
     }
 
@@ -674,5 +847,26 @@ mod tests {
         .unwrap();
         assert_eq!(groups, vec![vec!['0' as u32], vec!['1' as u32]]);
         assert_eq!(options[1]["key"], "1");
+    }
+
+    #[test]
+    fn scheme_two_uses_two_letter_codes_past_twenty_six_options() {
+        let encode_lfm3 = |text: &str| {
+            let mut chars = text.chars();
+            match (chars.next(), chars.next(), chars.next()) {
+                (Some(a), Some(b), None) if a.is_ascii_uppercase() && b.is_ascii_uppercase() => {
+                    vec![3000 + (a as u32 - 'A' as u32) * 26 + (b as u32 - 'A' as u32)]
+                }
+                _ => toy_encode(text),
+            }
+        };
+        let keys: Vec<String> = (0..28).map(|i| format!("key{i}")).collect();
+        let keys: Vec<&str> = keys.iter().map(String::as_str).collect();
+        let labelled = choice_labels_with_scheme(&encode_lfm3, &keys, 2).unwrap();
+        let labels: Vec<_> = labelled.iter().map(|(l, _)| l.as_str()).collect();
+        assert_eq!(labels[0], "A");
+        assert_eq!(labels[25], "Z");
+        assert_eq!(labels[26], "AA");
+        assert_eq!(labels[27], "AB");
     }
 }

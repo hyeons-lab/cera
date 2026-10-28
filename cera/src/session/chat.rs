@@ -20,7 +20,10 @@ use crate::model::Model;
 use crate::tokenizer::{
     BpeTokenizer, ChatMessage, apply_chat_template, apply_chat_template_with_tools,
 };
-use crate::tools::{ToolCall, ToolDef, ToolFormat, parse_tool_calls, tool_grammar};
+use crate::tools::{
+    ToolCall, ToolChatMessage, ToolDef, ToolFormat, format_tool_def, parse_tool_calls_with_tools,
+    tool_grammar,
+};
 
 /// ChatML chat template used by LFM2 models.
 pub const TEMPLATE: &str = "{{bos_token}}{% for message in messages %}{{'<|im_start|>' + message['role'] + '\n' + message['content'] + '<|im_end|>' + '\n'}}{% endfor %}{% if add_generation_prompt %}{{ '<|im_start|>assistant\n' }}{% endif %}";
@@ -370,6 +373,10 @@ pub trait Execution: std::fmt::Debug {
     fn image_input(&self) -> bool {
         false
     }
+    /// Vision projector variant controlling image boundary tokens during chat ingestion.
+    fn vision_projector_type(&self) -> crate::model::vision_encoder::VisionProjectorType {
+        crate::model::vision_encoder::VisionProjectorType::Lfm2
+    }
     /// Whether audio input is supported.
     fn audio_input(&self) -> bool {
         false
@@ -558,6 +565,20 @@ impl ProfileBuilder {
     }
 }
 
+/// The image marker spellings to try, preferred first: `<|image|>` or `<image>`. The chat
+/// template decides (a template that names one uses it); when it names neither, the vocabulary
+/// does. Never the text of a message, which can mention either.
+pub(crate) fn image_marker_candidates(
+    template: &str,
+    vocab_has_pipe_image: bool,
+) -> [&'static str; 2] {
+    if template.contains("<|image|>") || (!template.contains("<image>") && vocab_has_pipe_image) {
+        ["<|image|>", "<image>"]
+    } else {
+        ["<image>", "<|image|>"]
+    }
+}
+
 /// Chat rendering profile holding tokenizer and template rules.
 #[derive(Clone)]
 pub struct Profile {
@@ -568,8 +589,11 @@ pub struct Profile {
     turn_end: String,
     newline_tokens: Vec<u32>,
     image_marker: Option<u32>,
+    image_marker_name: &'static str,
     image_start: Option<u32>,
     image_end: Option<u32>,
+    vision_start: Option<u32>,
+    vision_end: Option<u32>,
     audio_marker: Option<(u32, &'static str)>,
 }
 
@@ -584,6 +608,8 @@ impl std::fmt::Debug for Profile {
             .field("image_marker", &self.image_marker)
             .field("image_start", &self.image_start)
             .field("image_end", &self.image_end)
+            .field("vision_start", &self.vision_start)
+            .field("vision_end", &self.vision_end)
             .field("audio_marker", &self.audio_marker)
             .finish()
     }
@@ -710,16 +736,24 @@ impl Profile {
         eos: u32,
     ) -> Result<Self, ValidationError> {
         let newline_tokens = tokenizer.encode("\n");
-        let image_marker = {
-            let probed = tokenizer.encode("<image>");
-            if probed.len() == 1 {
-                Some(probed[0])
-            } else {
-                None
-            }
+        let single_token = |s: &str| -> Option<u32> {
+            tokenizer.special_token_id(s).or_else(|| {
+                let probed = tokenizer.encode(s);
+                (probed.len() == 1).then(|| probed[0])
+            })
         };
+        let image_candidates = image_marker_candidates(
+            tokenizer.chat_template().unwrap_or(""),
+            tokenizer.special_token_id("<|image|>").is_some(),
+        );
+        let (image_marker, image_marker_name) = image_candidates
+            .into_iter()
+            .find_map(|name| single_token(name).map(|id| (Some(id), name)))
+            .unwrap_or((None, "<image>"));
         let image_start = tokenizer.special_token_id("<|image_start|>");
         let image_end = tokenizer.special_token_id("<|image_end|>");
+        let vision_start = tokenizer.special_token_id("<|vision_start|>");
+        let vision_end = tokenizer.special_token_id("<|vision_end|>");
         let audio_marker = crate::engine::CeraEngine::AUDIO_MARKER_CANDIDATES
             .into_iter()
             .find_map(|name| tokenizer.special_token_id(name).map(|id| (id, name)));
@@ -731,8 +765,11 @@ impl Profile {
             turn_end,
             newline_tokens,
             image_marker,
+            image_marker_name,
             image_start,
             image_end,
+            vision_start,
+            vision_end,
             audio_marker,
         })
     }
@@ -796,6 +833,38 @@ impl Profile {
         self.image_end
     }
 
+    /// Token ID for `<|vision_start|>` envelope if supported by tokenizer.
+    pub fn vision_start(&self) -> Option<u32> {
+        self.vision_start
+    }
+
+    /// Token ID for `<|vision_end|>` envelope if supported by tokenizer.
+    pub fn vision_end(&self) -> Option<u32> {
+        self.vision_end
+    }
+
+    /// Resolve image boundary token IDs (`(start, end)`) for a given vision projector variant.
+    pub(crate) fn image_boundary_tokens(
+        &self,
+        projector_type: crate::model::vision_encoder::VisionProjectorType,
+    ) -> Result<Option<(u32, u32)>, &'static str> {
+        use crate::model::vision_encoder::VisionProjectorType;
+        match projector_type {
+            VisionProjectorType::Lfm2 => match (self.image_start, self.image_end) {
+                (Some(s), Some(e)) => Ok(Some((s, e))),
+                (None, _) => Err("missing image start token in profile"),
+                (_, None) => Err("missing image end token in profile"),
+            },
+            VisionProjectorType::Lfm3Vl => Ok(None),
+            VisionProjectorType::Lfm3O => match (self.vision_start, self.vision_end) {
+                (Some(s), Some(e)) => Ok(Some((s, e))),
+                (None, None) => Ok(None),
+                (None, Some(_)) => Err("missing vision start token in profile"),
+                (Some(_), None) => Err("missing vision end token in profile"),
+            },
+        }
+    }
+
     /// Audio marker special token ID and candidate name if supported.
     pub fn audio_marker(&self) -> Option<(u32, &'static str)> {
         self.audio_marker
@@ -806,11 +875,27 @@ impl Profile {
         &self.tokenizer
     }
 
+    #[cfg(test)]
     fn render(
         &self,
         messages: &[Message],
         initial: bool,
         tools: &[ToolDef],
+    ) -> Result<String, ValidationError> {
+        self.render_with_vision_projector(
+            messages,
+            initial,
+            tools,
+            crate::model::vision_encoder::VisionProjectorType::Lfm2,
+        )
+    }
+
+    fn render_with_vision_projector(
+        &self,
+        messages: &[Message],
+        initial: bool,
+        tools: &[ToolDef],
+        vision_projector_type: crate::model::vision_encoder::VisionProjectorType,
     ) -> Result<String, ValidationError> {
         if messages.is_empty() {
             return Err(ValidationError::EmptyBatch);
@@ -878,15 +963,14 @@ impl Profile {
                             });
                         }
                         if self.image_marker.is_none()
-                            || self.image_start.is_none()
-                            || self.image_end.is_none()
+                            || self.image_boundary_tokens(vision_projector_type).is_err()
                         {
                             return Err(ValidationError::UnsupportedContent {
                                 message: index,
                                 part,
                             });
                         }
-                        text.push_str("<image>");
+                        text.push_str(self.image_marker_name);
                     }
                     ContentPart::Audio { .. } => {
                         if message.role != Role::User {
@@ -918,10 +1002,7 @@ impl Profile {
             if has_reserved {
                 return Err(ValidationError::ReservedMarker { message: index });
             }
-            serialized.push(ChatMessage {
-                role: role.into(),
-                content: text,
-            });
+            serialized.push(ToolChatMessage::text(role, text));
         }
         if messages
             .last()
@@ -936,29 +1017,33 @@ impl Profile {
             .chat_template()
             .is_some_and(|t| t.contains("tools"));
         if initial && !tools.is_empty() && !template_has_tools {
-            let tools_json = tools
+            let visible_tools: Vec<String> = tools
                 .iter()
-                .map(|t| serde_json::to_string(t).unwrap_or_default())
-                .collect::<Vec<_>>()
-                .join(", ");
-            let tool_block = format!("List of tools: [{tools_json}]");
-            if let Some(first) = serialized.first_mut()
-                && first.role == "system"
-            {
-                first.content.push('\n');
-                first.content.push_str(&tool_block);
-            } else {
-                serialized.insert(
-                    0,
-                    ChatMessage {
-                        role: "system".into(),
-                        content: tool_block,
-                    },
-                );
+                .filter(|t| !t.defer_loading)
+                .map(format_tool_def)
+                .collect();
+            if !visible_tools.is_empty() {
+                let tools_json = visible_tools.join(", ");
+                let tool_block = format!("List of tools: [{tools_json}]");
+                if let Some(first) = serialized.first_mut()
+                    && first.role == "system"
+                {
+                    first.content.push('\n');
+                    first.content.push_str(&tool_block);
+                } else {
+                    serialized.insert(0, ToolChatMessage::text("system", tool_block));
+                }
             }
         }
         let rendered = if initial && !tools.is_empty() {
             apply_chat_template_with_tools(&self.tokenizer, &serialized, tools, true)
+        } else if !tools.is_empty() {
+            let continuation_tools: Vec<ToolDef> = tools
+                .iter()
+                .cloned()
+                .map(|t| t.with_defer_loading(true))
+                .collect();
+            apply_chat_template_with_tools(&self.tokenizer, &serialized, &continuation_tools, true)
         } else {
             apply_chat_template(&self.tokenizer, &serialized, true)
         }
@@ -1241,7 +1326,13 @@ impl<E: Execution> Chat<E> {
 
         let before = self.position();
         let initial = replace || self.phase == SessionPhase::Idle;
-        let rendered = self.profile.render(messages, initial, &self.tools)?;
+        let vision_projector_type = self.execution.vision_projector_type();
+        let rendered = self.profile.render_with_vision_projector(
+            messages,
+            initial,
+            &self.tools,
+            vision_projector_type,
+        )?;
         let prefilled_think = prompt_prefills_think(&rendered);
         let mut tokens = Vec::with_capacity(
             rendered.len().saturating_div(2) + self.profile.newline_tokens.len() + 1,
@@ -1269,6 +1360,7 @@ impl<E: Execution> Chat<E> {
         // Build prefill segments:
         let img_start_arr;
         let img_end_arr;
+        let has_img_boundaries;
         let mut template_segments_opt = None;
         let mut audio_split_opt = None;
 
@@ -1276,14 +1368,19 @@ impl<E: Execution> Chat<E> {
             let image_marker_id = self.profile.image_marker.ok_or_else(|| {
                 ValidationError::Template("missing image marker token in profile".into())
             })?;
-            let img_start_id = self.profile.image_start.ok_or_else(|| {
-                ValidationError::Template("missing image start token in profile".into())
-            })?;
-            let img_end_id = self.profile.image_end.ok_or_else(|| {
-                ValidationError::Template("missing image end token in profile".into())
-            })?;
-            img_start_arr = [img_start_id];
-            img_end_arr = [img_end_id];
+            let boundary_ids = self
+                .profile
+                .image_boundary_tokens(vision_projector_type)
+                .map_err(|msg| ValidationError::Template(msg.into()))?;
+            if let Some((img_start_id, img_end_id)) = boundary_ids {
+                img_start_arr = [img_start_id];
+                img_end_arr = [img_end_id];
+                has_img_boundaries = true;
+            } else {
+                img_start_arr = [0];
+                img_end_arr = [0];
+                has_img_boundaries = false;
+            }
 
             let segs = crate::session::splice_image_markers(&tokens, image_marker_id);
             let marker_count = segs
@@ -1301,6 +1398,7 @@ impl<E: Execution> Chat<E> {
         } else if audio.is_some() {
             img_start_arr = [0];
             img_end_arr = [0];
+            has_img_boundaries = false;
             let (marker_id, marker_name) = self.profile.audio_marker.ok_or_else(|| {
                 ValidationError::Template("missing audio marker token in profile".into())
             })?;
@@ -1311,6 +1409,7 @@ impl<E: Execution> Chat<E> {
         } else {
             img_start_arr = [0];
             img_end_arr = [0];
+            has_img_boundaries = false;
         }
 
         let mut segments = Vec::new();
@@ -1322,9 +1421,13 @@ impl<E: Execution> Chat<E> {
                         segments.push(IngestSegment::Tokens(&tokens[start..end]));
                     }
                     crate::session::ChatTemplateSegment::Image => {
-                        segments.push(IngestSegment::Tokens(&img_start_arr));
+                        if has_img_boundaries {
+                            segments.push(IngestSegment::Tokens(&img_start_arr));
+                        }
                         segments.push(IngestSegment::Image(images[img_idx]));
-                        segments.push(IngestSegment::Tokens(&img_end_arr));
+                        if has_img_boundaries {
+                            segments.push(IngestSegment::Tokens(&img_end_arr));
+                        }
                         img_idx += 1;
                     }
                 }
@@ -1484,7 +1587,8 @@ impl<E: Execution> Chat<E> {
             .map_err(CompleteError::Validation)?;
         let summary = report.result.map_err(CompleteError::Execution)?;
         let text = self.profile.tokenizer.decode(&collector.0);
-        let tool_calls = parse_tool_calls(&text, self.tool_format).unwrap_or_default();
+        let tool_calls =
+            parse_tool_calls_with_tools(&text, self.tool_format, &self.tools).unwrap_or_default();
         Ok(TurnResult {
             text,
             tokens: collector.0,
@@ -1563,7 +1667,8 @@ impl<E: Execution> Chat<E> {
             .map_err(CompleteError::Validation)?;
         let summary = report.result.map_err(CompleteError::Execution)?;
         let full_text = self.profile.tokenizer.decode(&collector.tokens);
-        let tool_calls = parse_tool_calls(&full_text, self.tool_format).unwrap_or_default();
+        let tool_calls = parse_tool_calls_with_tools(&full_text, self.tool_format, &self.tools)
+            .unwrap_or_default();
         Ok(TurnResult {
             text: full_text,
             tokens: collector.tokens,
@@ -1752,6 +1857,13 @@ impl Execution for CoreExecution {
     fn image_input(&self) -> bool {
         self.session.capabilities.image_in
     }
+    fn vision_projector_type(&self) -> crate::model::vision_encoder::VisionProjectorType {
+        self.session
+            .vision_encoder
+            .as_ref()
+            .map(|ve| ve.config.projector_type)
+            .unwrap_or(crate::model::vision_encoder::VisionProjectorType::Lfm2)
+    }
     fn audio_input(&self) -> bool {
         self.session.capabilities.audio_in
     }
@@ -1773,6 +1885,9 @@ impl Execution for CoreExecution {
         self.session
             .with_ingest_recovery(|session| {
                 if let Some(res) = session.try_append_fused_segments(segments) {
+                    return res;
+                }
+                if let Some(res) = session.try_append_fused_audio(segments) {
                     return res;
                 }
                 for seg in segments {

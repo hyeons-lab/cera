@@ -38,14 +38,14 @@
 //   binding/buffer 4: params   (hs, kernel_size, d_conv, n_tokens, proj_stride,
 //                               out_stride)
 //
-// Constraints: kernel_size <= 4, d_conv <= 3, so `w_local[d_conv]` and
+// Constraints: kernel_size <= 8, d_conv <= 7, so `w_local[d_conv]` and
 // `rb[d_conv - 1]` cannot run off the fixed-size register arrays. That range is
 // enforced at load by `validate_conv_kernel_size` in `model/lfm2.rs`, which
-// rejects an out-of-range `lfm2.shortconv.l_cache` rather than letting this
+// rejects an out-of-range `shortconv.l_cache` rather than letting this
 // kernel receive params it cannot honor; the early-out below is the second line
-// of defence, not the only one. Shipped LFM2 GGUFs set `l_cache = 3`, giving
-// ks=3 and d_conv=2; 4 and 3 are the maxima the arrays are sized for, not the
-// usual values.
+// of defence, not the only one. Shipped LFM2 GGUFs set `l_cache = 3` (ks=3,
+// d_conv=2) or `4` (ks=4, d_conv=3), and LFM3 sets `l_cache = 7` (ks=7,
+// d_conv=6); 8 and 7 are the maxima the arrays are sized for.
 //
 // Every loop over `w_local` / `rb` is written as a literal-trip-count loop with
 // a predicated body (`for k in 0..3 { if (k < d_conv) ... }`) plus
@@ -79,14 +79,14 @@ void conv1d_fused_batch(uint3 gid : SV_DispatchThreadID) {
     if (ch >= hs) {
         return;
     }
-    // Static guard: `w_local` and `rb` are sized for LFM2's ks=4 / d_conv=3.
+    // Static guard: `w_local` and `rb` are sized for up to ks=8 / d_conv=7.
     // Bail before `w_local[d_conv]` or `rb[d_conv - 1u]` can run off the end.
-    if (ks > 4u || d_conv > 3u) {
+    if (ks > 8u || d_conv > 7u) {
         return;
     }
 
-    // Pre-load this channel's conv weights (at most 4) and rolling state (at
-    // most 3) once, so the per-token loop stays in thread-private state.
+    // Pre-load this channel's conv weights (at most 8) and rolling state (at
+    // most 7) once, so the per-token loop stays in thread-private state.
     // `k < ks` as well as `k <= d_conv`: the body reads taps 0..d_conv, and
     // ks == d_conv + 1 for every model that ships (each host derives
     // `d_conv = kernel_size - 1`), but a params buffer with a shorter weight row
@@ -98,16 +98,16 @@ void conv1d_fused_batch(uint3 gid : SV_DispatchThreadID) {
     // construction, so no fixture can reach either case (`CONV_SHAPES` cannot
     // express it, and the CPU references index `weight[ch * ks + d_conv]`), and
     // they are pinned by this comment rather than by a test.
-    float w_local[4] = { 0.0f, 0.0f, 0.0f, 0.0f };
+    float w_local[8] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
     [ForceUnroll]
-    for (uint k = 0u; k < 4u; ++k) {
+    for (uint k = 0u; k < 8u; ++k) {
         if (k <= d_conv && k < ks) {
             w_local[k] = w_buf[ch * ks + k];
         }
     }
-    float rb[3] = { 0.0f, 0.0f, 0.0f };
+    float rb[7] = { 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f, 0.0f };
     [ForceUnroll]
-    for (uint k = 0u; k < 3u; ++k) {
+    for (uint k = 0u; k < 7u; ++k) {
         if (k < d_conv) {
             rb[k] = rbuf[k * hs + ch];
         }
@@ -126,7 +126,7 @@ void conv1d_fused_batch(uint3 gid : SV_DispatchThreadID) {
 
         float sum = 0.0f;
         [ForceUnroll]
-        for (uint k = 0u; k < 3u; ++k) {
+        for (uint k = 0u; k < 7u; ++k) {
             if (k < d_conv) {
                 sum += rb[k] * w_local[k];
             }
@@ -141,7 +141,7 @@ void conv1d_fused_batch(uint3 gid : SV_DispatchThreadID) {
 
         // Roll the state left one slot and append bx, all in registers.
         [ForceUnroll]
-        for (uint k = 0u; k < 2u; ++k) {
+        for (uint k = 0u; k < 6u; ++k) {
             if (k + 1u < d_conv) {
                 rb[k] = rb[k + 1u];
             }
@@ -155,7 +155,7 @@ void conv1d_fused_batch(uint3 gid : SV_DispatchThreadID) {
 
     // Publish the final rolling state back to global memory.
     [ForceUnroll]
-    for (uint k = 0u; k < 3u; ++k) {
+    for (uint k = 0u; k < 7u; ++k) {
         if (k < d_conv) {
             rbuf[k * hs + ch] = rb[k];
         }

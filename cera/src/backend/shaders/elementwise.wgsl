@@ -48,3 +48,13 @@ fn silu_mul_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
     let clamped_g = clamp(g, -80.0, 80.0);
     a[i] = (clamped_g / (1.0 + exp(-clamped_g))) * b[i];
 }
+
+@compute @workgroup_size(256, 1, 1)
+fn sigmoid_head_gate_inplace(@builtin(global_invocation_id) gid: vec3<u32>) {
+    let i = gid.x + gid.y * (65535u * 256u);
+    let n = params.x;
+    let head_dim = params.y;
+    if i >= n || head_dim == 0u { return; }
+    let g = clamp(b[i / head_dim], -80.0, 80.0);
+    a[i] = a[i] / (1.0 + exp(-g));
+}

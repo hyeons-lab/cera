@@ -644,6 +644,9 @@ impl HexagonLfmModel {
         if self.config.is_causal {
             return Some("the model is causal");
         }
+        if self.config.architecture == "lfm3" {
+            return Some("lfm3 uses causal short-conv and per-head gated attention");
+        }
         if self.config.conv_kernel_size.unwrap_or(3) != 3 {
             return Some("the symmetric conv kernel has 3 taps");
         }
@@ -661,9 +664,16 @@ impl HexagonLfmModel {
         }
         let plain_layers = self.layers.iter().all(|l| match l {
             HexagonLayer::Attention(a) => {
-                !a.has_q_gate && !a.swa && matches!(a.ffn, HexagonFfn::Dense(_))
+                !a.has_q_gate
+                    && a.head_gate.is_none()
+                    && !a.swa
+                    && matches!(a.ffn, HexagonFfn::Dense(_))
             }
-            HexagonLayer::Conv(c) => matches!(c.ffn, HexagonFfn::Dense(_)),
+            HexagonLayer::Conv(c) => {
+                c.post_norm_offset.is_none()
+                    && c.ffn_post_norm_offset.is_none()
+                    && matches!(c.ffn, HexagonFfn::Dense(_))
+            }
             HexagonLayer::DeltaNet(_) => false,
         });
         if !plain_layers {

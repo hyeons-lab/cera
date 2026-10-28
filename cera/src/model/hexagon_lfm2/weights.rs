@@ -188,11 +188,13 @@ pub(super) enum CopyOp {
         name: String,
         weight: HexagonStackedWeight,
     },
-    /// Short-conv taps `[hidden, 3]`: three per-tap planes at `taps` (manual
-    /// decode chain) plus the GGUF layout verbatim at `ssm` (SsmConv).
+    /// Short-conv taps `[hidden, d_conv]`: for `d_conv == 3`, three per-tap planes
+    /// at `taps` (manual decode chain); always the GGUF layout verbatim at `ssm`
+    /// (SsmConv). Other widths have no manual chain, so `taps` is unused.
     ConvTaps {
         name: String,
         hidden_size: usize,
+        d_conv: usize,
         taps: [usize; 3],
         ssm: usize,
     },
@@ -263,18 +265,30 @@ impl<'a> WeightPlanner<'a> {
         offset
     }
 
-    /// Reserve the short-conv tap planes and SsmConv taps of layer `name`:
-    /// `(per-tap plane offsets, SsmConv offset)`.
-    pub(super) fn conv_taps(&mut self, name: &str, hidden_size: usize) -> ([usize; 3], usize) {
-        let taps = [
-            plan_offset(&mut self.total, hidden_size * 4),
-            plan_offset(&mut self.total, hidden_size * 4),
-            plan_offset(&mut self.total, hidden_size * 4),
-        ];
-        let ssm = plan_offset(&mut self.total, 3 * hidden_size * 4);
+    /// Reserve the short-conv taps of layer `name` (`d_conv` per channel):
+    /// `(per-tap plane offsets, SsmConv offset)`. The planes exist only for the
+    /// 3-tap manual decode chain; any other width plans just the SsmConv taps and
+    /// returns zeroed plane offsets.
+    pub(super) fn conv_taps(
+        &mut self,
+        name: &str,
+        hidden_size: usize,
+        d_conv: usize,
+    ) -> ([usize; 3], usize) {
+        let taps = if d_conv == 3 {
+            [
+                plan_offset(&mut self.total, hidden_size * 4),
+                plan_offset(&mut self.total, hidden_size * 4),
+                plan_offset(&mut self.total, hidden_size * 4),
+            ]
+        } else {
+            [0; 3]
+        };
+        let ssm = plan_offset(&mut self.total, d_conv * hidden_size * 4);
         self.copies.push(CopyOp::ConvTaps {
             name: name.to_string(),
             hidden_size,
+            d_conv,
             taps,
             ssm,
         });
@@ -519,11 +533,12 @@ impl KvPlanner {
         (k_offset, v_offset)
     }
 
-    /// One channel-interleaved `[C, 2]` short-conv state slab (see
-    /// `HexagonConvLayer::state_offset`); `state_size` is one `[C]` plane.
-    pub(super) fn conv(&mut self, state_size: usize) -> usize {
+    /// A channel-interleaved `[C, slots]` short-conv state slab (`slots = d_conv - 1`,
+    /// so `[C, 2]` for LFM2; see `HexagonConvLayer::state_offset`); `state_size` is
+    /// one `[C]` plane.
+    pub(super) fn conv_slots(&mut self, state_size: usize, slots: usize) -> usize {
         let offset = align256(self.total);
-        self.total = align256(offset + 2 * state_size);
+        self.total = align256(offset + slots * state_size);
         offset
     }
 
@@ -650,26 +665,30 @@ fn run_copies(
             CopyOp::ConvTaps {
                 name,
                 hidden_size,
+                d_conv,
                 taps,
                 ssm,
             } => {
-                let hidden_size = *hidden_size;
+                let (hidden_size, d_conv) = (*hidden_size, *d_conv);
                 let conv = src.vector(name)?;
-                let expected = hidden_size.checked_mul(3).ok_or_else(|| {
+                let expected = hidden_size.checked_mul(d_conv).ok_or_else(|| {
                     CeraError::Backend("hidden_size overflow calculating conv weight size".into())
                 })?;
                 if conv.len() != expected {
                     return Err(CeraError::Backend(format!(
-                        "{name} size {} != hidden_size * 3 ({hidden_size} * 3)",
+                        "{name} size {} != hidden_size * d_conv ({hidden_size} * {d_conv})",
                         conv.len()
                     )));
                 }
-                // Per-tap planes for the manual decode chain; the SsmConv
-                // taps use the GGUF `[3, C]` layout (already oldest-first
+                // Per-tap planes for the 3-tap manual decode chain; the SsmConv
+                // taps use the GGUF `[d_conv, C]` layout (already oldest-first
                 // per channel) verbatim.
-                for (tap, offset) in taps.iter().enumerate() {
-                    let plane: Vec<f32> = (0..hidden_size).map(|ch| conv[ch * 3 + tap]).collect();
-                    copy_f32_into(&plane, name, *offset, buf)?;
+                if d_conv == 3 {
+                    for (tap, offset) in taps.iter().enumerate() {
+                        let plane: Vec<f32> =
+                            (0..hidden_size).map(|ch| conv[ch * 3 + tap]).collect();
+                        copy_f32_into(&plane, name, *offset, buf)?;
+                    }
                 }
                 copy_f32_into(&conv, name, *ssm, buf)?;
             }
@@ -1834,26 +1853,59 @@ mod tests {
         assert!(planner.bias("b", Some(&[0.0; 8]), 8).unwrap().is_some());
     }
 
-    /// Conv taps whose size is not `hidden_size * 3` fail the copy pass.
+    /// Conv taps whose size is not `hidden_size * d_conv` fail the copy pass.
     #[test]
     fn conv_taps_size_is_validated() {
         let hs = 8;
-        let run = |len: usize| {
-            let src = OneVector(vec![1.0; len]);
-            let mut planner = WeightPlanner::new(&src);
-            planner.conv_taps("blk.0.shortconv.conv.weight", hs);
-            WeightCopy {
-                src: &src,
-                weights_total: planner.total,
-                kv_total: 256,
-                copies: &planner.copies,
-            }
-            .run(&crate::backend::hexagon::sys::fake::driver())
-            .map(|_| ())
-        };
-        let err = run(hs * 3 - 1).unwrap_err().to_string();
-        assert!(err.contains("blk.0.shortconv.conv.weight"), "{err}");
-        assert!(err.contains("hidden_size * 3"), "{err}");
-        run(hs * 3).unwrap();
+        for d_conv in [3usize, 7] {
+            let run = |len: usize| {
+                let src = OneVector(vec![1.0; len]);
+                let mut planner = WeightPlanner::new(&src);
+                planner.conv_taps("blk.0.shortconv.conv.weight", hs, d_conv);
+                WeightCopy {
+                    src: &src,
+                    weights_total: planner.total,
+                    kv_total: 256,
+                    copies: &planner.copies,
+                }
+                .run(&crate::backend::hexagon::sys::fake::driver())
+                .map(|_| ())
+            };
+            let err = run(hs * d_conv - 1).unwrap_err().to_string();
+            assert!(err.contains("blk.0.shortconv.conv.weight"), "{err}");
+            assert!(err.contains("hidden_size * d_conv"), "{err}");
+            run(hs * d_conv).unwrap();
+        }
+    }
+
+    /// The per-tap planes exist only for the 3-tap manual chain; every width plans the
+    /// SsmConv taps (`d_conv` floats per channel) and the state slab holds `d_conv - 1`
+    /// slots per channel.
+    #[test]
+    fn conv_taps_and_state_scale_with_the_kernel_width() {
+        let hs = 8;
+        let src = OneVector(Vec::new());
+        let mut planner = WeightPlanner::new(&src);
+
+        // 3 taps: three planes, then the SsmConv taps right after them
+        let (planes3, ssm3) = planner.conv_taps("a", hs, 3);
+        assert_eq!(planes3, [0, 256, 512]);
+        assert_eq!(ssm3, 768);
+        assert_eq!(planner.total, ssm3 + 3 * hs * 4);
+
+        // 7 taps: no planes, just the 7-wide SsmConv taps
+        let before = planner.total;
+        let (planes7, ssm7) = planner.conv_taps("b", hs, 7);
+        assert_eq!(planes7, [0; 3]);
+        assert_eq!(ssm7, align256(before));
+        assert_eq!(planner.total, ssm7 + 7 * hs * 4);
+
+        let mut kv = KvPlanner::new(HtpDataType::F16, 64);
+        let state = align256(hs * 4);
+        let first = kv.conv_slots(state, 2);
+        let second = kv.conv_slots(state, 6);
+        assert_eq!(first, 0);
+        assert_eq!(second, align256(2 * state));
+        assert_eq!(kv.total, align256(second + 6 * state));
     }
 }

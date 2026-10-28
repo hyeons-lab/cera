@@ -98,3 +98,15 @@ kernel void scale_f32(
     if (gid >= params.n) return;
     a[gid] = a[gid] * as_type<float>(params.scale_bits);
 }
+
+// Per-head sigmoid attention gate (LFM3): a[i] *= sigmoid(b[i / head_dim]).
+kernel void sigmoid_head_gate_inplace(
+    device float* a [[buffer(0)]],
+    const device float* b [[buffer(1)]],
+    constant Params& params [[buffer(2)]],
+    uint gid [[thread_position_in_grid]]
+) {
+    if (gid >= params.n || params._pad == 0u) return;
+    float g = clamp(b[gid / params._pad], -80.0f, 80.0f);
+    a[gid] = a[gid] / (1.0f + exp(-g));
+}

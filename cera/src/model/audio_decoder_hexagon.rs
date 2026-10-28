@@ -38,7 +38,7 @@ pub use crate::backend::hexagon::types::HexagonWeightDesc as HexagonDetokWeightD
 const DETOK_TILE: TokenTile = TokenTile::Whole;
 
 /// Offsets for one detokenizer layer in `weights_buf`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HexagonDetokLayerOffsets {
     pub is_conv: bool,
     pub op_norm_off: usize,
@@ -48,15 +48,16 @@ pub struct HexagonDetokLayerOffsets {
     pub ffn_w3: HexagonDetokWeightDesc,
     pub conv_in_proj: Option<HexagonDetokWeightDesc>,
     pub conv_out_proj: Option<HexagonDetokWeightDesc>,
-    pub conv_w0_off: Option<usize>,
-    pub conv_w1_off: Option<usize>,
-    pub conv_w2_off: Option<usize>,
+    pub conv_w_offs: Vec<usize>,
     pub wq: Option<HexagonDetokWeightDesc>,
     pub wk: Option<HexagonDetokWeightDesc>,
     pub wv: Option<HexagonDetokWeightDesc>,
     pub wo: Option<HexagonDetokWeightDesc>,
     pub q_norm_off: Option<usize>,
     pub k_norm_off: Option<usize>,
+    pub attn_post_norm_off: Option<usize>,
+    pub ffn_post_norm_off: Option<usize>,
+    pub attn_gate: Option<HexagonDetokWeightDesc>,
 }
 
 /// Weight buffer layout offsets across all detokenizer layers.
@@ -69,10 +70,49 @@ pub struct HexagonDetokWeightOffsets {
     pub total_bytes: usize,
 }
 
+/// The detokenizer's Q, K, V and attention-output scratch regions are `n_embd` values per token,
+/// so the attention widths must fit them; the loader accepts wider heads, which would make the
+/// DSP matmuls write into the neighbouring regions.
+fn detok_attention_dims_fit_scratch(
+    n_head: usize,
+    n_head_kv: usize,
+    head_dim: usize,
+    n_embd: usize,
+) -> Result<(), CeraError> {
+    if n_head * head_dim > n_embd || n_head_kv * head_dim > n_embd {
+        return Err(CeraError::Backend(format!(
+            "Hexagon detokenizer: attention width {n_head} heads / {n_head_kv} kv heads x {head_dim} \
+             exceeds n_embd {n_embd}, which the scratch is sized for"
+        )));
+    }
+    Ok(())
+}
+
+/// The gate is stored either per head (`n_head` rows, expanded when staged) or already per
+/// output channel (`expanded_rows`); any other row count cannot be staged.
+fn detok_attn_gate_rows_ok(
+    rows: usize,
+    n_head: usize,
+    expanded_rows: usize,
+) -> Result<(), CeraError> {
+    if rows != n_head && rows != expanded_rows {
+        return Err(CeraError::Backend(format!(
+            "Hexagon detokenizer: attn_gate has {rows} rows, expected {n_head} (per head) or \
+             {expanded_rows} (per channel)"
+        )));
+    }
+    Ok(())
+}
+
 impl HexagonDetokWeightOffsets {
     /// Compute memory layout and byte offsets for all detokenizer weights in shared rpcmem.
     pub fn plan(weights: &DetokenizerWeights) -> Result<Self, CeraError> {
         let mut cur_off = 0;
+        let allow_float_quant = weights.is_lfm3a_gen();
+        if weights.layers.iter().any(|l| l.wq.is_some()) {
+            let c = &weights.config;
+            detok_attention_dims_fit_scratch(c.n_head, c.n_head_kv, c.n_embd_head, c.n_embd)?;
+        }
 
         let plan_vec_f32 = |cur_off: &mut usize, len: usize| -> usize {
             let off = *cur_off;
@@ -80,32 +120,44 @@ impl HexagonDetokWeightOffsets {
             off
         };
 
+        let plan_linear_dims = |cur_off: &mut usize,
+                                rows: usize,
+                                cols: usize,
+                                dtype: DType|
+         -> Result<HexagonDetokWeightDesc, CeraError> {
+            let off = *cur_off;
+            let (fmt, sz) = match dtype {
+                DType::Q8_0 => {
+                    let sz = repacked_matrix_size_q8_0(cols, rows)?;
+                    (HexagonWeightFormat::RepackedQ8_0, sz)
+                }
+                DType::Q4_0 => {
+                    let sz = repacked_matrix_size_q4_0(cols, rows)?;
+                    (HexagonWeightFormat::RepackedQ4_0, sz)
+                }
+                DType::F32 | DType::F16 if allow_float_quant => {
+                    let sz = repacked_matrix_size_q8_0(cols, rows)?;
+                    (HexagonWeightFormat::RepackedQ8_0, sz)
+                }
+                other => {
+                    return Err(CeraError::Backend(format!(
+                        "Hexagon detokenizer linear weight requires Q8_0 or Q4_0, got {other:?}"
+                    )));
+                }
+            };
+            *cur_off += align128(sz);
+            Ok(HexagonDetokWeightDesc {
+                offset: off,
+                size_bytes: sz,
+                format: fmt,
+                rows,
+                cols,
+            })
+        };
+
         let plan_linear =
             |cur_off: &mut usize, w: &MmapWeight| -> Result<HexagonDetokWeightDesc, CeraError> {
-                let off = *cur_off;
-                let (fmt, sz) = match w.dtype {
-                    DType::Q8_0 => {
-                        let sz = repacked_matrix_size_q8_0(w.cols, w.rows)?;
-                        (HexagonWeightFormat::RepackedQ8_0, sz)
-                    }
-                    DType::Q4_0 => {
-                        let sz = repacked_matrix_size_q4_0(w.cols, w.rows)?;
-                        (HexagonWeightFormat::RepackedQ4_0, sz)
-                    }
-                    other => {
-                        return Err(CeraError::Backend(format!(
-                            "Hexagon detokenizer linear weight requires Q8_0 or Q4_0, got {other:?}"
-                        )));
-                    }
-                };
-                *cur_off += align128(sz);
-                Ok(HexagonDetokWeightDesc {
-                    offset: off,
-                    size_bytes: sz,
-                    format: fmt,
-                    rows: w.rows,
-                    cols: w.cols,
-                })
+                plan_linear_dims(cur_off, w.rows, w.cols, w.dtype)
             };
 
         let mut layers = Vec::with_capacity(weights.layers.len());
@@ -116,8 +168,16 @@ impl HexagonDetokWeightOffsets {
             let ffn_w1 = plan_linear(&mut cur_off, &lw.ffn_w1)?;
             let ffn_w2 = plan_linear(&mut cur_off, &lw.ffn_w2)?;
             let ffn_w3 = plan_linear(&mut cur_off, &lw.ffn_w3)?;
+            let attn_post_norm_off = lw
+                .attn_post_norm
+                .as_ref()
+                .map(|v| plan_vec_f32(&mut cur_off, v.len()));
+            let ffn_post_norm_off = lw
+                .ffn_post_norm
+                .as_ref()
+                .map(|v| plan_vec_f32(&mut cur_off, v.len()));
 
-            let (conv_in_proj, conv_out_proj, conv_w0_off, conv_w1_off, conv_w2_off) = if is_conv {
+            let (conv_in_proj, conv_out_proj, conv_w_offs) = if is_conv {
                 let in_proj = lw.conv_in_proj.as_ref().ok_or_else(|| {
                     CeraError::Backend("missing conv_in_proj in detok conv layer".into())
                 })?;
@@ -134,25 +194,32 @@ impl HexagonDetokWeightOffsets {
                         lw.operator_norm.len()
                     )));
                 }
-                if conv_w.len() != 3 * n_embd {
+                let d_conv = weights.config.d_conv;
+                if !(1..16).contains(&d_conv) {
                     return Err(CeraError::Backend(format!(
-                        "hexagon detokenizer requires 3-tap conv kernel (expected {} weights, got {})",
-                        3 * n_embd,
+                        "hexagon detokenizer d_conv ({d_conv}) must be in 1..16"
+                    )));
+                }
+                let kernel_size = d_conv + 1;
+                let expected_conv_w = kernel_size * n_embd;
+                if conv_w.len() != expected_conv_w {
+                    return Err(CeraError::Backend(format!(
+                        "hexagon detokenizer requires {kernel_size}-tap conv kernel (expected {expected_conv_w} weights, got {})",
                         conv_w.len()
                     )));
                 }
-                (
-                    Some(plan_linear(&mut cur_off, in_proj)?),
-                    Some(plan_linear(&mut cur_off, out_proj)?),
-                    Some(plan_vec_f32(&mut cur_off, n_embd)),
-                    Some(plan_vec_f32(&mut cur_off, n_embd)),
-                    Some(plan_vec_f32(&mut cur_off, n_embd)),
-                )
+                let in_proj_desc = plan_linear(&mut cur_off, in_proj)?;
+                let out_proj_desc = plan_linear(&mut cur_off, out_proj)?;
+                let mut w_offs = Vec::with_capacity(kernel_size);
+                for _ in 0..kernel_size {
+                    w_offs.push(plan_vec_f32(&mut cur_off, n_embd));
+                }
+                (Some(in_proj_desc), Some(out_proj_desc), w_offs)
             } else {
-                (None, None, None, None, None)
+                (None, None, Vec::new())
             };
 
-            let (wq, wk, wv, wo, q_norm_off, k_norm_off) = if !is_conv {
+            let (wq, wk, wv, wo, q_norm_off, k_norm_off, attn_gate) = if !is_conv {
                 let wq = lw.wq.as_ref().ok_or_else(|| {
                     CeraError::Backend("missing wq in detok attention layer".into())
                 })?;
@@ -171,6 +238,21 @@ impl HexagonDetokWeightOffsets {
                 let kn = lw.k_norm.as_ref().ok_or_else(|| {
                     CeraError::Backend("missing k_norm in detok attention layer".into())
                 })?;
+                let attn_gate_desc = if let Some(ag) = lw.attn_gate.as_ref() {
+                    let expanded_rows = weights.config.n_head * weights.config.n_embd_head;
+                    detok_attn_gate_rows_ok(ag.rows, weights.config.n_head, expanded_rows)?;
+                    // The gate is always expanded to one row per output channel and staged as
+                    // Q8_0 (below), whatever its stored dtype, so it is planned as Q8_0: a Q4_0
+                    // plan would reserve a smaller region than the Q8_0 repack writes.
+                    Some(plan_linear_dims(
+                        &mut cur_off,
+                        expanded_rows,
+                        ag.cols,
+                        DType::Q8_0,
+                    )?)
+                } else {
+                    None
+                };
                 (
                     Some(plan_linear(&mut cur_off, wq)?),
                     Some(plan_linear(&mut cur_off, wk)?),
@@ -178,9 +260,10 @@ impl HexagonDetokWeightOffsets {
                     Some(plan_linear(&mut cur_off, wo)?),
                     Some(plan_vec_f32(&mut cur_off, qn.len())),
                     Some(plan_vec_f32(&mut cur_off, kn.len())),
+                    attn_gate_desc,
                 )
             } else {
-                (None, None, None, None, None, None)
+                (None, None, None, None, None, None, None)
             };
 
             layers.push(HexagonDetokLayerOffsets {
@@ -192,15 +275,16 @@ impl HexagonDetokWeightOffsets {
                 ffn_w3,
                 conv_in_proj,
                 conv_out_proj,
-                conv_w0_off,
-                conv_w1_off,
-                conv_w2_off,
+                conv_w_offs,
                 wq,
                 wk,
                 wv,
                 wo,
                 q_norm_off,
                 k_norm_off,
+                attn_post_norm_off,
+                ffn_post_norm_off,
+                attn_gate,
             });
         }
 
@@ -233,16 +317,30 @@ impl HexagonDetokWeightOffsets {
                            w: &MmapWeight|
          -> Result<(), CeraError> {
             let dst_slice = &mut dst[desc.offset..desc.offset + desc.size_bytes];
-            match desc.format {
-                HexagonWeightFormat::RepackedQ8_0 => {
+            match (desc.format, w.dtype) {
+                (HexagonWeightFormat::RepackedQ8_0, DType::Q8_0) => {
                     repack_q8_0(w.data(), w.cols, w.rows, dst_slice).map_err(|e| {
                         CeraError::Backend(format!("detok repack Q8_0 failed: {e}"))
                     })?;
                 }
-                HexagonWeightFormat::RepackedQ4_0 => {
+                (HexagonWeightFormat::RepackedQ8_0, DType::F32 | DType::F16) => {
+                    let f32_buf = w.to_dense_f32();
+                    let q8_bytes =
+                        crate::backend::hexagon::quantize_f32_to_q8_0(&f32_buf, w.cols, w.rows)?;
+                    repack_q8_0(&q8_bytes, w.cols, w.rows, dst_slice).map_err(|e| {
+                        CeraError::Backend(format!("detok float->Q8_0 repack failed: {e}"))
+                    })?;
+                }
+                (HexagonWeightFormat::RepackedQ4_0, DType::Q4_0) => {
                     repack_q4_0(w.data(), w.cols, w.rows, dst_slice).map_err(|e| {
                         CeraError::Backend(format!("detok repack Q4_0 failed: {e}"))
                     })?;
+                }
+                (_, other) => {
+                    return Err(CeraError::Backend(format!(
+                        "unsupported detok linear staging combination: {:?} with {other:?}",
+                        desc.format
+                    )));
                 }
             }
             Ok(())
@@ -254,6 +352,13 @@ impl HexagonDetokWeightOffsets {
             copy_linear(slice, lo.ffn_w1, &lw.ffn_w1)?;
             copy_linear(slice, lo.ffn_w2, &lw.ffn_w2)?;
             copy_linear(slice, lo.ffn_w3, &lw.ffn_w3)?;
+            if let (Some(apn_off), Some(apn)) = (lo.attn_post_norm_off, lw.attn_post_norm.as_ref())
+            {
+                copy_vec_f32(slice, apn_off, apn);
+            }
+            if let (Some(fpn_off), Some(fpn)) = (lo.ffn_post_norm_off, lw.ffn_post_norm.as_ref()) {
+                copy_vec_f32(slice, fpn_off, fpn);
+            }
 
             if lo.is_conv {
                 if let (Some(cin_desc), Some(cin_w)) = (lo.conv_in_proj, lw.conv_in_proj.as_ref()) {
@@ -264,29 +369,24 @@ impl HexagonDetokWeightOffsets {
                 {
                     copy_linear(slice, cout_desc, cout_w)?;
                 }
-                if let (Some(w0_off), Some(cw)) = (lo.conv_w0_off, lw.conv_weight.as_ref()) {
+                if let Some(cw) = lw.conv_weight.as_ref()
+                    && !lo.conv_w_offs.is_empty()
+                {
                     let hs = lw.operator_norm.len();
-                    if cw.len() != 3 * hs {
+                    let kernel_size = lo.conv_w_offs.len();
+                    if cw.len() != kernel_size * hs {
                         return Err(CeraError::Backend(format!(
-                            "hexagon detokenizer requires 3-tap conv kernel matching operator_norm (expected {} weights, got {})",
-                            3 * hs,
+                            "hexagon detokenizer requires {kernel_size}-tap conv kernel matching operator_norm (expected {} weights, got {})",
+                            kernel_size * hs,
                             cw.len()
                         )));
                     }
-                    let mut w0 = vec![0.0f32; hs];
-                    let mut w1 = vec![0.0f32; hs];
-                    let mut w2 = vec![0.0f32; hs];
-                    for ch in 0..hs {
-                        w0[ch] = cw[ch * 3];
-                        w1[ch] = cw[ch * 3 + 1];
-                        w2[ch] = cw[ch * 3 + 2];
-                    }
-                    copy_vec_f32(slice, w0_off, &w0);
-                    if let Some(w1_off) = lo.conv_w1_off {
-                        copy_vec_f32(slice, w1_off, &w1);
-                    }
-                    if let Some(w2_off) = lo.conv_w2_off {
-                        copy_vec_f32(slice, w2_off, &w2);
+                    let mut tap = vec![0.0f32; hs];
+                    for (k, &w_off) in lo.conv_w_offs.iter().enumerate() {
+                        for ch in 0..hs {
+                            tap[ch] = cw[ch * kernel_size + k];
+                        }
+                        copy_vec_f32(slice, w_off, &tap);
                     }
                 }
             } else {
@@ -307,6 +407,34 @@ impl HexagonDetokWeightOffsets {
                 }
                 if let (Some(kn_off), Some(kn)) = (lo.k_norm_off, lw.k_norm.as_ref()) {
                     copy_vec_f32(slice, kn_off, kn);
+                }
+                if let (Some(ag_desc), Some(ag_w)) = (lo.attn_gate, lw.attn_gate.as_ref()) {
+                    let n_head = weights.config.n_head;
+                    let hd = weights.config.n_embd_head;
+                    let cols = ag_w.cols;
+                    let src_f32 = ag_w.to_dense_f32();
+                    let expanded_f32 = if ag_w.rows == n_head && ag_desc.rows == n_head * hd {
+                        let mut exp = vec![0.0f32; n_head * hd * cols];
+                        for h in 0..n_head {
+                            let row = &src_f32[h * cols..(h + 1) * cols];
+                            for d in 0..hd {
+                                let dst_r = h * hd + d;
+                                exp[dst_r * cols..(dst_r + 1) * cols].copy_from_slice(row);
+                            }
+                        }
+                        exp
+                    } else {
+                        src_f32
+                    };
+                    let q8_bytes = crate::backend::hexagon::quantize_f32_to_q8_0(
+                        &expanded_f32,
+                        cols,
+                        ag_desc.rows,
+                    )?;
+                    let dst_slice = &mut slice[ag_desc.offset..ag_desc.offset + ag_desc.size_bytes];
+                    repack_q8_0(&q8_bytes, cols, ag_desc.rows, dst_slice).map_err(|e| {
+                        CeraError::Backend(format!("detok attn_gate repack Q8_0 failed: {e}"))
+                    })?;
                 }
             }
         }
@@ -450,10 +578,9 @@ impl HexagonDepthformerWeightOffsets {
 }
 
 /// Offsets for recurrent rolling conv states in `state_buf`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct HexagonDetokConvStateOffset {
-    pub s0_off: usize,
-    pub s1_off: usize,
+    pub state_offs: Vec<usize>,
 }
 
 /// Offsets for sliding-window attention KV cache in `state_buf`.
@@ -484,14 +611,12 @@ impl HexagonDetokStateOffsets {
 
         for &is_conv in &cfg.layer_is_conv {
             if is_conv {
-                let s0 = cur_off;
-                cur_off += align128(n_embd * 4);
-                let s1 = cur_off;
-                cur_off += align128(n_embd * 4);
-                conv_states.push(Some(HexagonDetokConvStateOffset {
-                    s0_off: s0,
-                    s1_off: s1,
-                }));
+                let mut state_offs = Vec::with_capacity(cfg.d_conv);
+                for _ in 0..cfg.d_conv {
+                    state_offs.push(cur_off);
+                    cur_off += align128(n_embd * 4);
+                }
+                conv_states.push(Some(HexagonDetokConvStateOffset { state_offs }));
                 attn_states.push(None);
             } else {
                 let k_off = cur_off;
@@ -544,18 +669,15 @@ pub struct HexagonDetokScratchOffsets {
 impl HexagonDetokScratchOffsets {
     pub fn new(n_embd: usize, ffn_dim: usize, n_fft_bins: usize, max_seq_len: usize) -> Self {
         const MAX_AUDIO_TOKENS: usize = 16;
-        let n_head = 8;
-        let n_kv = 2;
-        let hd = (n_embd / n_head).max(1);
 
         let tokens_bytes = align128(MAX_AUDIO_TOKENS * n_embd * 4);
         let conv_bcx_bytes = align128(MAX_AUDIO_TOKENS * 3 * n_embd * 4);
-        let q_bytes = align128(MAX_AUDIO_TOKENS * (n_head * hd) * 4);
-        let kv_f32_bytes = align128(MAX_AUDIO_TOKENS * (n_kv * hd) * 4);
-        let kv_f16_bytes = align128(max_seq_len.max(64) * (n_kv * hd) * 2);
+        let q_bytes = align128(MAX_AUDIO_TOKENS * n_embd * 4);
+        let kv_f32_bytes = align128(MAX_AUDIO_TOKENS * n_embd * 4);
+        let kv_f16_bytes = align128(max_seq_len.max(64) * n_embd * 2);
         let pos_bytes = align128(MAX_AUDIO_TOKENS * 4);
         let ffn_mid_bytes = align128(MAX_AUDIO_TOKENS * ffn_dim * 4);
-        let spec_bytes = align128(MAX_AUDIO_TOKENS * (n_fft_bins * 2) * 4);
+        let spec_bytes = align128(MAX_AUDIO_TOKENS * (n_fft_bins * 2).next_multiple_of(32) * 4);
 
         let mut off = 0;
         let tokens_off = off;
@@ -1562,16 +1684,20 @@ impl HexagonAudioDecoder {
         weights_buf.flush_cpu_cache(0, offsets.total_bytes);
 
         let depthformer = if let Some(ad_weights) = audio_dec_weights {
-            match HexagonDepthformer::new(Arc::clone(&driver), ad_weights) {
-                Ok(df) => {
-                    tracing::info!("audio decoder: Hexagon NPU Depthformer initialized");
-                    Some(df)
-                }
-                Err(e) => {
-                    crate::backend::hexagon::hexagon_warn!(
-                        "audio decoder: Hexagon NPU Depthformer unavailable: {e:#}"
-                    );
-                    None
+            if ad_weights.is_lfm3a_gen() {
+                None
+            } else {
+                match HexagonDepthformer::new(Arc::clone(&driver), ad_weights) {
+                    Ok(df) => {
+                        tracing::info!("audio decoder: Hexagon NPU Depthformer initialized");
+                        Some(df)
+                    }
+                    Err(e) => {
+                        crate::backend::hexagon::hexagon_warn!(
+                            "audio decoder: Hexagon NPU Depthformer unavailable: {e:#}"
+                        );
+                        None
+                    }
                 }
             }
         } else {
@@ -2170,15 +2296,13 @@ impl HexagonAudioDecoder {
                 let conv_state = self.state_offsets.conv_states[il].as_ref().ok_or_else(|| {
                     CeraError::Backend(format!("missing conv state offset for layer {il}"))
                 })?;
-                let w0_off = lo.conv_w0_off.ok_or_else(|| {
-                    CeraError::Backend(format!("missing conv_w0_off for layer {il}"))
-                })?;
-                let w1_off = lo.conv_w1_off.ok_or_else(|| {
-                    CeraError::Backend(format!("missing conv_w1_off for layer {il}"))
-                })?;
-                let w2_off = lo.conv_w2_off.ok_or_else(|| {
-                    CeraError::Backend(format!("missing conv_w2_off for layer {il}"))
-                })?;
+                let d_conv = conv_state.state_offs.len();
+                if lo.conv_w_offs.len() != d_conv + 1 {
+                    return Err(CeraError::Backend(format!(
+                        "conv weight tap count ({}) does not match state tap count ({d_conv}) + 1 for layer {il}",
+                        lo.conv_w_offs.len()
+                    )));
+                }
                 let in_proj = lo.conv_in_proj.ok_or_else(|| {
                     CeraError::Backend(format!("missing conv_in_proj for layer {il}"))
                 })?;
@@ -2229,75 +2353,61 @@ impl HexagonAudioDecoder {
                         hs,
                     )?;
 
-                    // Rolling conv: conv_out = s0 * w0 + s1 * w1 + bx * w2
-                    Self::dispatch_mul(
-                        session,
-                        &state_buf_guard,
-                        conv_state.s0_off,
-                        &self.weights_buf,
-                        w0_off,
-                        &scratch_guard,
-                        so.conv_t0_off,
-                        hs,
-                    )?;
-                    Self::dispatch_mul(
-                        session,
-                        &state_buf_guard,
-                        conv_state.s1_off,
-                        &self.weights_buf,
-                        w1_off,
-                        &scratch_guard,
-                        so.conv_t1_off,
-                        hs,
-                    )?;
+                    // Rolling conv: conv_out = bx * w[d_conv] + sum_{k=0..d_conv} state[k] * w[k]
                     Self::dispatch_mul(
                         session,
                         &scratch_guard,
                         so.conv_bx_off,
                         &self.weights_buf,
-                        w2_off,
+                        lo.conv_w_offs[d_conv],
                         &scratch_guard,
                         so.conv_out_off,
                         hs,
                     )?;
-                    Self::dispatch_add(
-                        session,
-                        &scratch_guard,
-                        so.conv_t0_off,
-                        &scratch_guard,
-                        so.conv_t1_off,
-                        &scratch_guard,
-                        so.conv_t0_off,
-                        hs,
-                    )?;
-                    Self::dispatch_add(
-                        session,
-                        &scratch_guard,
-                        so.conv_t0_off,
-                        &scratch_guard,
-                        so.conv_out_off,
-                        &scratch_guard,
-                        so.conv_out_off,
-                        hs,
-                    )?;
+                    for k in 0..d_conv {
+                        Self::dispatch_mul(
+                            session,
+                            &state_buf_guard,
+                            conv_state.state_offs[k],
+                            &self.weights_buf,
+                            lo.conv_w_offs[k],
+                            &scratch_guard,
+                            so.conv_t0_off,
+                            hs,
+                        )?;
+                        Self::dispatch_add(
+                            session,
+                            &scratch_guard,
+                            so.conv_out_off,
+                            &scratch_guard,
+                            so.conv_t0_off,
+                            &scratch_guard,
+                            so.conv_out_off,
+                            hs,
+                        )?;
+                    }
 
-                    // Update rolling states: s0 = s1; s1 = bx
-                    Self::dispatch_cpy(
-                        session,
-                        &state_buf_guard,
-                        conv_state.s1_off,
-                        &state_buf_guard,
-                        conv_state.s0_off,
-                        hs * 4,
-                    )?;
-                    Self::dispatch_cpy(
-                        session,
-                        &scratch_guard,
-                        so.conv_bx_off,
-                        &state_buf_guard,
-                        conv_state.s1_off,
-                        hs * 4,
-                    )?;
+                    // Update rolling states: state[k] = state[k + 1], state[d_conv - 1] = bx
+                    for k in 0..d_conv.saturating_sub(1) {
+                        Self::dispatch_cpy(
+                            session,
+                            &state_buf_guard,
+                            conv_state.state_offs[k + 1],
+                            &state_buf_guard,
+                            conv_state.state_offs[k],
+                            hs * 4,
+                        )?;
+                    }
+                    if d_conv > 0 {
+                        Self::dispatch_cpy(
+                            session,
+                            &scratch_guard,
+                            so.conv_bx_off,
+                            &state_buf_guard,
+                            conv_state.state_offs[d_conv - 1],
+                            hs * 4,
+                        )?;
+                    }
 
                     // Gating: y = c * conv_out (c at offset hs * 4)
                     Self::dispatch_mul(
@@ -2324,6 +2434,21 @@ impl HexagonAudioDecoder {
                         1,
                         DETOK_TILE,
                     )?;
+
+                    if let Some(apn_off) = lo.attn_post_norm_off {
+                        Self::dispatch_rms_norm_mul(
+                            session,
+                            &scratch_guard,
+                            so.conv_out_off,
+                            &self.weights_buf,
+                            apn_off,
+                            &scratch_guard,
+                            so.conv_out_off,
+                            eps,
+                            hs,
+                            1,
+                        )?;
+                    }
 
                     // Residual add: tok[t] += conv_out
                     Self::dispatch_add(
@@ -2397,6 +2522,20 @@ impl HexagonAudioDecoder {
                         1,
                         DETOK_TILE,
                     )?;
+                    if let Some(fpn_off) = lo.ffn_post_norm_off {
+                        Self::dispatch_rms_norm_mul(
+                            session,
+                            &scratch_guard,
+                            so.ffn_out_off,
+                            &self.weights_buf,
+                            fpn_off,
+                            &scratch_guard,
+                            so.ffn_out_off,
+                            eps,
+                            hs,
+                            1,
+                        )?;
+                    }
                     Self::dispatch_add(
                         session,
                         &scratch_guard,
@@ -2537,77 +2676,181 @@ impl HexagonAudioDecoder {
                     2,
                 )?;
 
-                // 5. Write K and V into ring buffer
+                // 5-7. Ring-buffer KV update and FlashAttnExt.
+                // For lfm3a_gen with n_tokens > 1, attention is causal within the chunk,
+                // so we insert K_t / V_t and attend token by token.
                 let kv_bytes = (n_kv * hd) * 4;
-                for t in 0..n_tokens {
-                    let pos = n_past + t;
-                    let cache_pos = pos % swa_window_size;
-                    let k_src = so.k_off + t * kv_bytes;
-                    let v_src = so.v_off + t * kv_bytes;
-                    let k_dst = attn_state.k_cache_off + cache_pos * kv_bytes;
-                    let v_dst = attn_state.v_cache_off + cache_pos * kv_bytes;
-                    Self::dispatch_cpy(
+                let q_tok_bytes = (n_head * hd) * 4;
+                let scale = 1.0f32 / (hd as f32).sqrt();
+                if self.detok_weights.is_lfm3a_gen() && n_tokens > 1 {
+                    for t in 0..n_tokens {
+                        let pos = n_past + t;
+                        let cache_pos = pos % swa_window_size;
+                        let k_src = so.k_off + t * kv_bytes;
+                        let v_src = so.v_off + t * kv_bytes;
+                        let k_dst = attn_state.k_cache_off + cache_pos * kv_bytes;
+                        let v_dst = attn_state.v_cache_off + cache_pos * kv_bytes;
+                        Self::dispatch_cpy(
+                            session,
+                            &scratch_guard,
+                            k_src,
+                            &state_buf_guard,
+                            k_dst,
+                            kv_bytes,
+                        )?;
+                        Self::dispatch_cpy(
+                            session,
+                            &scratch_guard,
+                            v_src,
+                            &state_buf_guard,
+                            v_dst,
+                            kv_bytes,
+                        )?;
+                        let seq_len = (pos + 1).min(swa_window_size);
+                        dispatch::cpy_f32_to_f16(
+                            session,
+                            &state_buf_guard,
+                            attn_state.k_cache_off,
+                            &scratch_guard,
+                            so.k_f16_off,
+                            TokenShape {
+                                dim: n_kv * hd,
+                                n_tokens: seq_len,
+                            },
+                        )?;
+                        dispatch::cpy_f32_to_f16(
+                            session,
+                            &state_buf_guard,
+                            attn_state.v_cache_off,
+                            &scratch_guard,
+                            so.v_f16_off,
+                            TokenShape {
+                                dim: n_kv * hd,
+                                n_tokens: seq_len,
+                            },
+                        )?;
+                        Self::dispatch_self_attention(
+                            session,
+                            &scratch_guard,
+                            so.q_off + t * q_tok_bytes,
+                            &scratch_guard,
+                            so.k_f16_off,
+                            &scratch_guard,
+                            so.v_f16_off,
+                            &scratch_guard,
+                            so.attn_out_off + t * q_tok_bytes,
+                            hd,
+                            n_head,
+                            n_kv,
+                            1,
+                            seq_len,
+                            scale,
+                        )?;
+                    }
+                } else {
+                    for t in 0..n_tokens {
+                        let pos = n_past + t;
+                        let cache_pos = pos % swa_window_size;
+                        let k_src = so.k_off + t * kv_bytes;
+                        let v_src = so.v_off + t * kv_bytes;
+                        let k_dst = attn_state.k_cache_off + cache_pos * kv_bytes;
+                        let v_dst = attn_state.v_cache_off + cache_pos * kv_bytes;
+                        Self::dispatch_cpy(
+                            session,
+                            &scratch_guard,
+                            k_src,
+                            &state_buf_guard,
+                            k_dst,
+                            kv_bytes,
+                        )?;
+                        Self::dispatch_cpy(
+                            session,
+                            &scratch_guard,
+                            v_src,
+                            &state_buf_guard,
+                            v_dst,
+                            kv_bytes,
+                        )?;
+                    }
+
+                    let seq_len = (n_past + n_tokens).min(swa_window_size);
+                    dispatch::cpy_f32_to_f16(
                         session,
-                        &scratch_guard,
-                        k_src,
                         &state_buf_guard,
-                        k_dst,
-                        kv_bytes,
+                        attn_state.k_cache_off,
+                        &scratch_guard,
+                        so.k_f16_off,
+                        TokenShape {
+                            dim: n_kv * hd,
+                            n_tokens: seq_len,
+                        },
                     )?;
-                    Self::dispatch_cpy(
+                    dispatch::cpy_f32_to_f16(
+                        session,
+                        &state_buf_guard,
+                        attn_state.v_cache_off,
+                        &scratch_guard,
+                        so.v_f16_off,
+                        TokenShape {
+                            dim: n_kv * hd,
+                            n_tokens: seq_len,
+                        },
+                    )?;
+
+                    Self::dispatch_self_attention(
                         session,
                         &scratch_guard,
-                        v_src,
-                        &state_buf_guard,
-                        v_dst,
-                        kv_bytes,
+                        so.q_off,
+                        &scratch_guard,
+                        so.k_f16_off,
+                        &scratch_guard,
+                        so.v_f16_off,
+                        &scratch_guard,
+                        so.attn_out_off,
+                        hd,
+                        n_head,
+                        n_kv,
+                        n_tokens,
+                        seq_len,
+                        scale,
                     )?;
                 }
 
-                // 6. Sliding window length and F16 conversion
-                let seq_len = (n_past + n_tokens).min(swa_window_size);
-                dispatch::cpy_f32_to_f16(
-                    session,
-                    &state_buf_guard,
-                    attn_state.k_cache_off,
-                    &scratch_guard,
-                    so.k_f16_off,
-                    TokenShape {
-                        dim: n_kv * hd,
-                        n_tokens: seq_len,
-                    },
-                )?;
-                dispatch::cpy_f32_to_f16(
-                    session,
-                    &state_buf_guard,
-                    attn_state.v_cache_off,
-                    &scratch_guard,
-                    so.v_f16_off,
-                    TokenShape {
-                        dim: n_kv * hd,
-                        n_tokens: seq_len,
-                    },
-                )?;
-
-                // 7. FlashAttnExt
-                let scale = 1.0f32 / (hd as f32).sqrt();
-                Self::dispatch_self_attention(
-                    session,
-                    &scratch_guard,
-                    so.q_off,
-                    &scratch_guard,
-                    so.k_f16_off,
-                    &scratch_guard,
-                    so.v_f16_off,
-                    &scratch_guard,
-                    so.attn_out_off,
-                    hd,
-                    n_head,
-                    n_kv,
-                    n_tokens,
-                    seq_len,
-                    scale,
-                )?;
+                // 7b. Optional sigmoid attention gate (staged as [n_head * hd, hs])
+                if let Some(ag_desc) = lo.attn_gate {
+                    dispatch::linear_m(
+                        session,
+                        &scratch_guard,
+                        so.normed_off,
+                        &self.weights_buf,
+                        ag_desc,
+                        None,
+                        &scratch_guard,
+                        so.attn_proj_off,
+                        n_tokens,
+                        DETOK_TILE,
+                    )?;
+                    dispatch::sigmoid(
+                        session,
+                        &scratch_guard,
+                        so.attn_proj_off,
+                        TokenShape {
+                            dim: n_head * hd,
+                            n_tokens,
+                        },
+                        DETOK_TILE,
+                    )?;
+                    Self::dispatch_mul(
+                        session,
+                        &scratch_guard,
+                        so.attn_out_off,
+                        &scratch_guard,
+                        so.attn_proj_off,
+                        &scratch_guard,
+                        so.attn_out_off,
+                        n_tokens * n_head * hd,
+                    )?;
+                }
 
                 // 8. Out projection
                 dispatch::linear_m(
@@ -2622,6 +2865,21 @@ impl HexagonAudioDecoder {
                     n_tokens,
                     DETOK_TILE,
                 )?;
+
+                if let Some(apn_off) = lo.attn_post_norm_off {
+                    Self::dispatch_rms_norm_mul(
+                        session,
+                        &scratch_guard,
+                        so.attn_proj_off,
+                        &self.weights_buf,
+                        apn_off,
+                        &scratch_guard,
+                        so.attn_proj_off,
+                        eps,
+                        hs,
+                        n_tokens,
+                    )?;
+                }
 
                 // 9. Residual add
                 dispatch::add_residual(
@@ -2694,6 +2952,20 @@ impl HexagonAudioDecoder {
                     n_tokens,
                     DETOK_TILE,
                 )?;
+                if let Some(fpn_off) = lo.ffn_post_norm_off {
+                    Self::dispatch_rms_norm_mul(
+                        session,
+                        &scratch_guard,
+                        so.ffn_out_off,
+                        &self.weights_buf,
+                        fpn_off,
+                        &scratch_guard,
+                        so.ffn_out_off,
+                        eps,
+                        hs,
+                        n_tokens,
+                    )?;
+                }
                 dispatch::add_residual(
                     session,
                     &scratch_guard,
@@ -2738,7 +3010,7 @@ impl HexagonAudioDecoder {
         session.flush()?;
 
         // 8. Read back spectrogram frames
-        let spec_total_floats = n_tokens * spec_per_frame;
+        let spec_total_floats = self.weights_offsets.lin_w.rows * n_tokens;
         scratch_guard.invalidate_cpu_cache(so.spec_out_off, spec_total_floats * 4);
         let spec_bytes =
             &scratch_guard.as_slice()[so.spec_out_off..so.spec_out_off + spec_total_floats * 4];
@@ -2748,7 +3020,21 @@ impl HexagonAudioDecoder {
         // 9. Advance past token count
         state_guard.n_past += n_tokens;
 
-        Ok(result)
+        Ok(result[..expected_spec_len_for_tokens(
+            self.weights_offsets.lin_w.rows,
+            n_tokens,
+            spec_per_frame,
+        )]
+            .to_vec())
+    }
+}
+
+#[inline]
+fn expected_spec_len_for_tokens(lin_rows: usize, n_tokens: usize, spec_per_frame: usize) -> usize {
+    if lin_rows == 6 * spec_per_frame && n_tokens == 1 {
+        lin_rows
+    } else {
+        n_tokens * spec_per_frame
     }
 }
 
@@ -2773,15 +3059,24 @@ impl AudioAccelerator for HexagonAudioDecoder {
         let n_fft_bins = cpu_weights.config.n_fft / 2 + 1;
         let spec_per_frame = n_fft_bins * 2;
         let expected_spec_len = n_frames * spec_per_frame;
+        let n_tokens = if cpu_weights.lin_w.rows == expected_spec_len {
+            1
+        } else {
+            n_frames
+        };
 
-        // 1. Embed codes and upsample to 6 tokens on host CPU
+        // 1. Embed codes and upsample on host CPU when needed
         let tokens = {
             let emb = detok_embed_codes(cpu_weights, codes);
-            upsample(&emb, hs, n_frames)
+            if n_tokens > 1 {
+                upsample(&emb, hs, n_tokens)
+            } else {
+                emb
+            }
         };
 
         // 2. Dispatch forward pass to Hexagon NPU
-        match self.detokenize_to_spectrum_npu(&tokens, n_frames) {
+        match self.detokenize_to_spectrum_npu(&tokens, n_tokens) {
             Ok(spec) if spec.len() == expected_spec_len => spec,
             Err(e) => {
                 crate::backend::hexagon::hexagon_warn!(
@@ -2843,6 +3138,10 @@ impl AudioAccelerator for HexagonAudioDecoder {
 
     fn supports_depthformer(&self) -> bool {
         self.depthformer.is_some()
+    }
+
+    fn supports_lfm3a_gen_detokenizer(&self) -> bool {
+        true
     }
 
     fn depthformer_default_on(&self) -> bool {
@@ -2937,6 +3236,26 @@ mod tests {
             crate::backend::hexagon::dispatch::testing::layer_norm_op_count(DETOK_TILE),
             3
         );
+    }
+
+    #[test]
+    fn attention_wider_than_the_scratch_is_refused_at_plan_time() {
+        assert!(detok_attention_dims_fit_scratch(8, 2, 64, 512).is_ok());
+        assert!(
+            detok_attention_dims_fit_scratch(16, 2, 64, 512).is_err(),
+            "q wider than n_embd"
+        );
+        assert!(
+            detok_attention_dims_fit_scratch(2, 16, 64, 512).is_err(),
+            "kv wider than n_embd"
+        );
+    }
+
+    #[test]
+    fn a_gate_with_an_unstageable_row_count_is_refused() {
+        assert!(detok_attn_gate_rows_ok(8, 8, 512).is_ok());
+        assert!(detok_attn_gate_rows_ok(512, 8, 512).is_ok());
+        assert!(detok_attn_gate_rows_ok(100, 8, 512).is_err());
     }
 
     #[test]
@@ -3048,12 +3367,136 @@ mod tests {
                 wo: None,
                 q_norm: None,
                 k_norm: None,
+                attn_post_norm: None,
+                ffn_post_norm: None,
+                attn_gate: None,
             }],
+            lfm3_fsq: None,
         };
 
         let plan_res = HexagonDetokWeightOffsets::plan(&weights);
         let err = plan_res.unwrap_err().to_string();
         assert!(err.contains("requires Q8_0 or Q4_0"));
+    }
+
+    #[test]
+    fn test_hexagon_detok_weight_offsets_plan_supports_lfm3a_gen() {
+        let cfg = DetokenizerConfig {
+            n_layer: 2,
+            n_embd: 512,
+            n_head: 16,
+            n_head_kv: 8,
+            n_embd_head: 32,
+            ffn_dim: 1536,
+            d_conv: 6,
+            rms_norm_eps: 1e-5,
+            rope_freq_base: 10000.0,
+            swa_window_size: 30,
+            n_codes: 12,
+            n_fft: 1280,
+            hop_length: 320,
+            sample_rate: 24000,
+            layer_is_conv: vec![true, false],
+        };
+        use crate::model::audio_decoder::{DetokLayerWeights, Lfm3FsqWeights};
+        let weights = DetokenizerWeights {
+            config: cfg,
+            output_norm: vec![1.0f32; 512],
+            emb_weight: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+            lin_w: MmapWeight::from_owned_f32(vec![0.0f32; 7692 * 512], 7692, 512),
+            lin_b: vec![0.0f32; 7692],
+            layers: vec![
+                DetokLayerWeights {
+                    operator_norm: vec![1.0f32; 512],
+                    ffn_norm: vec![1.0f32; 512],
+                    ffn_w1: MmapWeight::from_owned_f32(vec![0.0f32; 1536 * 512], 1536, 512),
+                    ffn_w2: MmapWeight::from_owned_f32(vec![0.0f32; 512 * 1536], 512, 1536),
+                    ffn_w3: MmapWeight::from_owned_f32(vec![0.0f32; 1536 * 512], 1536, 512),
+                    conv_in_proj: Some(MmapWeight::from_owned_f32(
+                        vec![0.0f32; 1536 * 512],
+                        1536,
+                        512,
+                    )),
+                    conv_out_proj: Some(MmapWeight::from_owned_f32(
+                        vec![0.0f32; 512 * 512],
+                        512,
+                        512,
+                    )),
+                    conv_weight: Some(vec![0.0f32; 7 * 512]),
+                    wq: None,
+                    wk: None,
+                    wv: None,
+                    wo: None,
+                    q_norm: None,
+                    k_norm: None,
+                    attn_post_norm: Some(vec![1.0f32; 512]),
+                    ffn_post_norm: Some(vec![1.0f32; 512]),
+                    attn_gate: None,
+                },
+                DetokLayerWeights {
+                    operator_norm: vec![1.0f32; 512],
+                    ffn_norm: vec![1.0f32; 512],
+                    ffn_w1: MmapWeight::from_owned_f32(vec![0.0f32; 1536 * 512], 1536, 512),
+                    ffn_w2: MmapWeight::from_owned_f32(vec![0.0f32; 512 * 1536], 512, 1536),
+                    ffn_w3: MmapWeight::from_owned_f32(vec![0.0f32; 1536 * 512], 1536, 512),
+                    conv_in_proj: None,
+                    conv_out_proj: None,
+                    conv_weight: None,
+                    wq: Some(MmapWeight::from_owned_f32(
+                        vec![0.0f32; 512 * 512],
+                        512,
+                        512,
+                    )),
+                    wk: Some(MmapWeight::from_owned_f32(
+                        vec![0.0f32; 256 * 512],
+                        256,
+                        512,
+                    )),
+                    wv: Some(MmapWeight::from_owned_f32(
+                        vec![0.0f32; 256 * 512],
+                        256,
+                        512,
+                    )),
+                    wo: Some(MmapWeight::from_owned_f32(
+                        vec![0.0f32; 512 * 512],
+                        512,
+                        512,
+                    )),
+                    q_norm: Some(vec![1.0f32; 32]),
+                    k_norm: Some(vec![1.0f32; 32]),
+                    attn_post_norm: Some(vec![1.0f32; 512]),
+                    ffn_post_norm: Some(vec![1.0f32; 512]),
+                    attn_gate: Some(MmapWeight::from_owned_f32(vec![0.0f32; 16 * 512], 16, 512)),
+                },
+            ],
+            lfm3_fsq: Some(Lfm3FsqWeights {
+                fsq_codebook: vec![0.0; 256 * 4],
+                fsq_proj_dim: 512,
+                quant_first_out_w: vec![0.0; 512 * 4],
+                quant_first_out_b: vec![0.0; 512],
+                quant_rest_out_w: vec![0.0; 512 * 44],
+                quant_rest_out_b: vec![0.0; 512],
+                tfm_in_proj_w: MmapWeight::from_owned_f32(vec![0.0; 512 * 512], 512, 512),
+                tfm_in_proj_b: vec![0.0; 512],
+            }),
+        };
+
+        let plan = HexagonDetokWeightOffsets::plan(&weights).expect("plan lfm3a_gen detok");
+        assert_eq!(plan.layers.len(), 2);
+        assert_eq!(plan.layers[0].conv_w_offs.len(), 7);
+        assert!(plan.layers[0].attn_post_norm_off.is_some());
+        assert!(plan.layers[0].ffn_post_norm_off.is_some());
+        assert!(plan.layers[1].attn_gate.is_some());
+        assert_eq!(plan.layers[1].attn_gate.unwrap().rows, 512);
+        assert_eq!(plan.total_bytes % 128, 0);
+        let state_plan = HexagonDetokStateOffsets::plan(&weights.config);
+        assert_eq!(
+            state_plan.conv_states[0].as_ref().unwrap().state_offs.len(),
+            6
+        );
+        let mut buf = vec![0u8; plan.total_bytes];
+        plan.copy_to_slice(&mut buf, &weights)
+            .expect("stage 7-tap lfm3a_gen detok weights");
     }
 
     #[test]
@@ -3112,7 +3555,11 @@ mod tests {
                 wo: None,
                 q_norm: None,
                 k_norm: None,
+                attn_post_norm: None,
+                ffn_post_norm: None,
+                attn_gate: None,
             }],
+            lfm3_fsq: None,
         };
 
         let err = HexagonDetokWeightOffsets::plan(&weights)
@@ -3200,6 +3647,7 @@ mod tests {
             rms_norm_eps: 1e-5,
         };
         let weights = AudioDecoderWeights {
+            lfm3a_gen: false,
             depthformer_config: df_cfg,
             decoder_config: dec_cfg,
             depthformer_layers: vec![DepthformerLayerWeights {

@@ -1747,6 +1747,9 @@ class ToolDef {
     /// JSON Schema object for the arguments, as a JSON string (e.g.
     /// `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
     required this.parametersJson,
+    /// When `true` the tool is withheld from the initial prompt's tool list and only revealed
+    /// later through a `tool_reference`, while staying active for call parsing and grammars.
+    this.deferLoading = false,
   });
 
   final String name;
@@ -1754,12 +1757,16 @@ class ToolDef {
   /// JSON Schema object for the arguments, as a JSON string (e.g.
   /// `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
   final String parametersJson;
+  /// When `true` the tool is withheld from the initial prompt's tool list and only revealed
+  /// later through a `tool_reference`, while staying active for call parsing and grammars.
+  final bool deferLoading;
 
   Map<String, dynamic> toJson() {
     return {
       'name': this.name,
       'description': this.description,
       'parametersJson': this.parametersJson,
+      'deferLoading': this.deferLoading,
     };
   }
 
@@ -1768,6 +1775,7 @@ class ToolDef {
       name: json['name'] as String,
       description: json['description'] == null ? null : json['description'] as String,
       parametersJson: json['parametersJson'] as String,
+      deferLoading: json.containsKey('deferLoading') ? json['deferLoading'] as bool : false,
     );
   }
 
@@ -1775,26 +1783,28 @@ class ToolDef {
     String? name,
     Object? description = _sentinel,
     String? parametersJson,
+    bool? deferLoading,
   }) {
     return ToolDef(
       name: name ?? this.name,
       description: description == _sentinel ? this.description : description as String?,
       parametersJson: parametersJson ?? this.parametersJson,
+      deferLoading: deferLoading ?? this.deferLoading,
     );
   }
 
   @override
   String toString() {
-    return 'ToolDef(name: $name, description: $description, parametersJson: $parametersJson)';
+    return 'ToolDef(name: $name, description: $description, parametersJson: $parametersJson, deferLoading: $deferLoading)';
   }
 
   @override
   bool operator ==(Object other) =>
       identical(this, other) ||
-      other is ToolDef && name == other.name && description == other.description && parametersJson == other.parametersJson;
+      other is ToolDef && name == other.name && description == other.description && parametersJson == other.parametersJson && deferLoading == other.deferLoading;
 
   @override
-  int get hashCode => Object.hash(name, description, parametersJson);
+  int get hashCode => Object.hash(name, description, parametersJson, deferLoading);
 }
 
 /// One speaker an audio model understands. Mirrors [`cera::TtsVoice`].
@@ -3296,6 +3306,9 @@ enum ToolFormat {
   /// Hermes / Qwen: JSON `{"name":…,"arguments":{…}}` in
   /// `<tool_call>…</tool_call>`.
   hermes,
+  /// LFM3: XML `<function=name><parameter=arg>val</parameter></function>` in
+  /// `<tool_call>…</tool_call>`.
+  lfm3Xml,
 }
 
 /// An event emitted by the unified audio pipeline.
@@ -5107,6 +5120,7 @@ String _encodeToolFormat(ToolFormat value) {
   return switch (value) {
     ToolFormat.lfm2Pythonic => 'lfm2Pythonic',
     ToolFormat.hermes => 'hermes',
+    ToolFormat.lfm3Xml => 'lfm3Xml',
   };
 }
 
@@ -5114,6 +5128,7 @@ ToolFormat _decodeToolFormat(String raw) {
   return switch (raw) {
     'lfm2Pythonic' => ToolFormat.lfm2Pythonic,
     'hermes' => ToolFormat.hermes,
+    'lfm3Xml' => ToolFormat.lfm3Xml,
     _ => throw StateError('Unknown ToolFormat variant: $raw'),
   };
 }

@@ -1030,6 +1030,8 @@ pub enum ToolFormat {
     Lfm2Pythonic,
     /// Hermes / Qwen: JSON `{"name":…,"arguments":{…}}`.
     Hermes,
+    /// LFM3: XML `<function=name><parameter=arg>val</parameter></function>`.
+    Lfm3Xml,
 }
 
 impl From<ToolFormat> for cera::tools::ToolFormat {
@@ -1037,6 +1039,7 @@ impl From<ToolFormat> for cera::tools::ToolFormat {
         match f {
             ToolFormat::Lfm2Pythonic => cera::tools::ToolFormat::Lfm2Pythonic,
             ToolFormat::Hermes => cera::tools::ToolFormat::Hermes,
+            ToolFormat::Lfm3Xml => cera::tools::ToolFormat::Lfm3Xml,
         }
     }
 }
@@ -1046,6 +1049,7 @@ impl From<cera::tools::ToolFormat> for ToolFormat {
         match f {
             cera::tools::ToolFormat::Lfm2Pythonic => ToolFormat::Lfm2Pythonic,
             cera::tools::ToolFormat::Hermes => ToolFormat::Hermes,
+            cera::tools::ToolFormat::Lfm3Xml => ToolFormat::Lfm3Xml,
         }
     }
 }
@@ -3334,6 +3338,14 @@ mod webgpu {
                     "[cera-wasm] streaming model weights directly from OPFS to WebGPU for \"{bundle_id}\"..."
                 ));
                 let gguf = crate::bundle::read_gguf_header_from_sync_handle(sync.as_raw())?;
+                if let Some(arch) = gguf
+                    .architecture()
+                    .filter(|a| cera::model::gpu_refuses_architecture(a))
+                {
+                    return Err(JsError::new(&format!(
+                        "{arch} is not supported on the WebGPU backend; load it with the CPU engine"
+                    )));
+                }
                 let gguf_arc = Arc::new(gguf);
                 let tokenizer =
                     Arc::new(cera::tokenizer::BpeTokenizer::from_gguf(&gguf_arc).map_err(map_err)?);
@@ -3571,7 +3583,9 @@ mod webgpu {
             }
 
             if let (Some(dw), Some(tw)) = (decoder_weights.as_ref(), detok_weights.as_ref()) {
-                if let Some(detok_g) = voc_arc.as_ref().or(tok_arc.as_ref()) {
+                if let Some(detok_g) = voc_arc.as_ref().or(tok_arc.as_ref())
+                    && !cera::model::audio_decoder::is_lfm3a_gen_gguf(detok_g)
+                {
                     let ctx = self.model.ctx().clone();
                     let depthformer_g = voc_arc.as_ref();
                     match cera::model::wgpu_audio_decoder::WgpuAudioDecoder::from_ggufs_with_context(
@@ -3624,6 +3638,8 @@ mod webgpu {
             let llm_hidden = cera::model::Model::config(&self.model).hidden_size;
 
             let is_audio = cera::model::audio_encoder::is_audio_encoder_gguf(&proj_arc);
+            let has_vision =
+                !is_audio || proj_arc.get_bool("clip.has_vision_encoder") == Some(true);
 
             if is_audio {
                 let weights = cera::model::audio_encoder::AudioEncoderWeights::from_gguf(&proj_arc)
@@ -3644,8 +3660,15 @@ mod webgpu {
                 // Audio encoding on WebGPU falls back to the CPU encoder path.
                 self.gpu_audio_encoder = None;
                 self.audio_encoder = Some(weights);
-                Ok(())
-            } else {
+
+                if self.audio_decoder.is_none()
+                    && cera::model::audio_decoder::is_lfm3a_gen_gguf(&proj_arc)
+                {
+                    self.attach_audio_sidecars(Some(Arc::clone(&mmproj)), None)?;
+                }
+            }
+
+            if has_vision {
                 let weights =
                     cera::model::vision_encoder::VisionEncoderWeights::from_gguf(&proj_arc)
                         .map_err(|e| {
@@ -3668,8 +3691,8 @@ mod webgpu {
                         &weights,
                     );
                 self.vision_encoder = Some(weights);
-                Ok(())
             }
+            Ok(())
         }
 
         /// Parse draft model sidecar (e.g. DSpark) and attach it for speculative decoding,
@@ -4329,12 +4352,13 @@ mod webgpu {
                     .await
                     .map_err(map_err)?,
             };
+            let ctrl = cera::audio_engine::ModalityControlTokens::from_tokenizer(&self.tokenizer);
             console_info(&format!(
                 "[cera-wasm] Prefill finished (prompt_tokens={}, start_pos={}). First predicted token: {} (is_audio_start={})",
                 ids.len(),
                 pos,
                 next,
-                next == cera::audio_engine::TOKEN_AUDIO_START
+                next == ctrl.audio_start
             ));
             pos += 1;
 
@@ -4388,7 +4412,7 @@ mod webgpu {
             } else {
                 None
             };
-            let is_interleaved = has_audio_weights && on_audio.is_some();
+            let mut is_interleaved = has_audio_weights && on_audio.is_some();
 
             let mut time_llm_text_ms = 0.0;
             let mut time_llm_audio_ms = 0.0;
@@ -4426,7 +4450,7 @@ mod webgpu {
                     break;
                 }
 
-                if next == cera::audio_engine::TOKEN_AUDIO_START
+                if next == ctrl.audio_start
                     && let Some(ref mut dec) = decoder
                 {
                     console_info(&format!(
@@ -4487,6 +4511,23 @@ mod webgpu {
                                         "[cera-wasm] WebGpuSession vocoder emitted End code after {} frames",
                                         dec.audio_frames()
                                     ));
+                                    if let Some(eos_emb) = dec.eos_feedback_embedding()
+                                        && pos < max_seq_len
+                                    {
+                                        let t_eos0 = js_sys::Date::now();
+                                        let _ = self
+                                            .model
+                                            .forward_greedy_from_embedding_async(
+                                                &eos_emb,
+                                                pos,
+                                                &mut self.state,
+                                            )
+                                            .await
+                                            .map_err(map_err)?;
+                                        time_llm_audio_ms += js_sys::Date::now() - t_eos0;
+                                        llm_hidden_passes += 1;
+                                        pos += 1;
+                                    }
                                     break;
                                 }
                                 cera::audio_engine::FrameOutcome::Codes {
@@ -4542,8 +4583,18 @@ mod webgpu {
                     break;
                 }
 
-                if decoder.is_some() && next == cera::audio_engine::TOKEN_TEXT_END {
+                let is_mixed_start = decoder.is_some() && next == ctrl.mixed_start;
+                if is_mixed_start && !is_interleaved {
+                    is_interleaved = true;
+                    modality_budget = cadence.text;
+                }
+
+                if decoder.is_some() && next == ctrl.text_end {
                     text_done = true;
+                } else if is_mixed_start || (decoder.is_some() && next == ctrl.audio_end) {
+                    // Modality control tokens (`<|mixed_start|>`, `<|audio_end|>`)
+                    // advance the LLM state without emitting text or counting against
+                    // the text cadence budget.
                 } else {
                     text_tokens_count += 1;
                     pending.extend_from_slice(&self.tokenizer.decode_bytes(&[next]));
@@ -4558,9 +4609,8 @@ mod webgpu {
                         emit(on_token, piece);
                         pending.drain(..valid);
                     }
+                    modality_budget = modality_budget.saturating_sub(1);
                 }
-
-                modality_budget = modality_budget.saturating_sub(1);
 
                 if is_interleaved
                     && let Some(ref mut dec) = decoder
@@ -4603,6 +4653,39 @@ mod webgpu {
                                 )));
                             }
                             cera::audio_engine::FrameOutcome::End => {
+                                if let Some(eos_emb) = dec.eos_feedback_embedding() {
+                                    let t_trans0 = js_sys::Date::now();
+                                    next = match sampler.as_mut() {
+                                        Some(s) => {
+                                            let mut l = self
+                                                .model
+                                                .forward_logits_from_embedding_async(
+                                                    &eos_emb,
+                                                    pos,
+                                                    &mut self.state,
+                                                )
+                                                .await
+                                                .map_err(map_err)?;
+                                            s.sample(&mut l)
+                                        }
+                                        None => self
+                                            .model
+                                            .forward_greedy_from_embedding_async(
+                                                &eos_emb,
+                                                pos,
+                                                &mut self.state,
+                                            )
+                                            .await
+                                            .map_err(map_err)?,
+                                    };
+                                    time_llm_text_ms += js_sys::Date::now() - t_trans0;
+                                    pos += 1;
+                                    if !text_done {
+                                        token_history.push(next);
+                                        modality_budget = cadence.text;
+                                    }
+                                    break;
+                                }
                                 if text_done {
                                     break;
                                 }
@@ -4612,7 +4695,7 @@ mod webgpu {
                                         let mut l = self
                                             .model
                                             .forward_logits_async(
-                                                cera::audio_engine::TOKEN_TEXT_END,
+                                                ctrl.text_end,
                                                 pos,
                                                 &mut self.state,
                                             )
@@ -4622,11 +4705,7 @@ mod webgpu {
                                     }
                                     None => self
                                         .model
-                                        .forward_greedy_async(
-                                            cera::audio_engine::TOKEN_TEXT_END,
-                                            pos,
-                                            &mut self.state,
-                                        )
+                                        .forward_greedy_async(ctrl.text_end, pos, &mut self.state)
                                         .await
                                         .map_err(map_err)?,
                                 };
@@ -4716,7 +4795,11 @@ mod webgpu {
                         pos += 1;
                     }
 
-                    if text_done {
+                    if text_done
+                        || self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+                        || pos >= max_seq_len
+                        || dec.is_safety_limit_reached()
+                    {
                         break;
                     }
                     continue;

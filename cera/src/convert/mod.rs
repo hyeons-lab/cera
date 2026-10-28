@@ -6,14 +6,17 @@ mod cache;
 mod checkpoint;
 pub mod config;
 pub mod d1;
+pub mod mmproj;
 pub mod parity;
 #[cfg(feature = "std-fs")]
 pub mod pipeline;
 pub mod quantize;
 pub mod safetensors;
+pub mod tensor_map;
 pub mod tokenizer;
 pub mod writer;
 
+pub use mmproj::convert_mmproj;
 pub use parity::{
     GgufParityReport, InferenceParityResult, MetadataDiff, MetadataParityStatus,
     TensorComparisonSummary, TensorParityEntry, compare_gguf_metadata, compare_gguf_tensors,

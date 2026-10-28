@@ -53,13 +53,15 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
       'Download models from the catalog to run fast, offline on-device inference.';
   static const _kBrowseCatalogButton = 'Browse Catalog to Download';
   static const _kSearchHint =
-      'Filter models (e.g. VL, Audio, 1.2B, Thinking)...';
+      'Filter models (e.g. LFM3, Omni, VL, Audio, d1)...';
   static const _kBadgeActive = 'Active';
   static const _kBadgeDownloaded = 'Downloaded';
   static const _kBadgeDSpark = 'DSpark';
   static const _kBadgeDSparkSidecar = 'DSpark Sidecar';
   static const _kBadgeVision = 'Vision';
   static const _kBadgeAudio = 'Audio';
+  static const _kBadgeOmni = 'Omni';
+  static const _kBadgeDecision = 'Decision';
   static const _kBadgeMoe = 'MoE';
   static const _kBadgeThinking = 'Thinking';
   static const _kMonospaceFont = 'monospace';
@@ -68,9 +70,18 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
   static const _kStandardQuants = ['Q4_K_M', 'Q4_0', 'Q8_0', 'F16'];
   static const _kCompactQuants = ['Q4_K_M', 'Q8_0', 'F16'];
   static const _kAudioQuants = ['Q4_0', 'Q8_0', 'F16'];
+  static const _kTwoQuants = ['Q8_0', 'F16'];
   static const _kDSparkSupportedQuants = {'Q4_K_M', 'Q8_0', 'F16'};
 
   static const _kDefaultBundles = [
+    CeraBundle(name: 'LFM3-1.7B-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM3-VL-2B-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM3-Audio-2B-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'LFM3-Omni-2B-GGUF', quants: _kStandardQuants),
+    CeraBundle(name: 'd1-3B-GGUF', quants: _kCompactQuants),
+    CeraBundle(name: 'd1-2B-GGUF', quants: _kCompactQuants),
+    CeraBundle(name: 'd1-Omni-2B-GGUF', quants: _kTwoQuants),
+    CeraBundle(name: 'd1-omni-600M-GGUF', quants: _kTwoQuants),
     CeraBundle(name: 'LFM2.5-2.6B-GGUF', quants: _kStandardQuants),
     CeraBundle(name: 'LFM2.5-2.6B-Agent-GGUF', quants: _kStandardQuants),
     CeraBundle(name: 'LFM2.5-2.6B-Thinking-GGUF', quants: _kStandardQuants),
@@ -110,10 +121,8 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
 
     final map = {for (final b in live) b.name: b};
 
-    if (map.isEmpty) {
-      for (final b in _kDefaultBundles) {
-        map[b.name] = b;
-      }
+    for (final b in _kDefaultBundles) {
+      map.putIfAbsent(b.name, () => b);
     }
 
     final list = map.values.toList();
@@ -535,6 +544,8 @@ class _BundlePickerDialogState extends State<BundlePickerDialog> {
 
   static String? _modalityBadgeFor(String bundleName) {
     final lower = bundleName.toLowerCase();
+    if (lower.contains('-omni-')) return _kBadgeOmni;
+    if (lower.startsWith('d1-')) return _kBadgeDecision;
     if (lower.contains('-vl-')) return _kBadgeVision;
     if (lower.contains('-audio-')) return _kBadgeAudio;
     if (lower.contains('-8b-a1b')) return _kBadgeMoe;

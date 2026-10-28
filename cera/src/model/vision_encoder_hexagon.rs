@@ -19,7 +19,8 @@ use crate::backend::hexagon::{
 };
 use crate::model::vision_encoder::{
     PatchEmbedWeights, ProjectorWeights, VisionEncoderConfig, VisionEncoderWeights,
-    VitBlockWeights, VitStageDump, interpolate_pos_embed_2d, patch_embed_compute, pixel_shuffle,
+    VisionProjectorType, VitBlockWeights, VitStageDump, interpolate_pos_embed_2d,
+    patch_embed_compute, pixel_shuffle,
 };
 use crate::model::vision_encoder_gpu::{
     MAX_VIT_TOKENS, VisionGpuEncode, VitStack, VitStackActivation, VitStackSpec,
@@ -1871,6 +1872,9 @@ fn stack_weights(spec: &VitStackSpec) -> Result<VisionEncoderWeights> {
         image_std: [1.0; 3],
         image_min_pixels: 0,
         image_max_pixels: 0,
+        n_head_kv: spec.heads,
+        rope_theta: 10000.0,
+        projector_type: VisionProjectorType::Lfm2,
     };
     let blocks = spec
         .blocks
@@ -1904,10 +1908,14 @@ fn stack_weights(spec: &VitStackSpec) -> Result<VisionEncoderWeights> {
             conv_w: Vec::new(),
             conv_b: Vec::new(),
         },
+        patch_embed_1: None,
+        embedding_norm: None,
         position_embed: Vec::new(),
         blocks,
+        lfm3_blocks: Vec::new(),
         post_ln_w,
         post_ln_b,
+        mm_input_norm: None,
         projector: match &spec.projector {
             Some(p) => ProjectorWeights {
                 mm1_w: npu_weight(&p.mm1)?,
@@ -2027,11 +2035,13 @@ mod tests {
 
     #[test]
     fn test_try_hexagon_vision_encoder_returns_none_for_unloadable_weights() {
+        use crate::model::vision_encoder::VisionProjectorType;
         let cfg = VisionEncoderConfig {
             n_layer: 1,
             n_embd: 64,
             n_ff: 128,
             n_head: 2,
+            n_head_kv: 2,
             eps: 1e-5,
             image_size: 32,
             patch_size: 16,
@@ -2042,6 +2052,8 @@ mod tests {
             image_std: [0.5, 0.5, 0.5],
             image_min_pixels: 32 * 32,
             image_max_pixels: 32 * 32,
+            rope_theta: 10000.0,
+            projector_type: VisionProjectorType::Lfm2,
         };
         let weights = VisionEncoderWeights {
             config: cfg,
@@ -2050,6 +2062,7 @@ mod tests {
                 conv_b: vec![0.0f32; 64],
             },
             position_embed: vec![0.0f32; 4 * 64],
+            embedding_norm: None,
             blocks: vec![VitBlockWeights {
                 ln1_w: vec![1.0f32; 64],
                 ln1_b: vec![0.0f32; 64],
@@ -2068,8 +2081,11 @@ mod tests {
                 ffn_down_w: MmapWeight::from_owned_f32(vec![0.0f32; 64 * 128], 64, 128),
                 ffn_down_b: vec![0.0f32; 64],
             }],
+            lfm3_blocks: Vec::new(),
             post_ln_w: vec![1.0f32; 64],
             post_ln_b: vec![0.0f32; 64],
+            patch_embed_1: None,
+            mm_input_norm: None,
             projector: ProjectorWeights {
                 mm1_w: MmapWeight::from_owned_f32(vec![0.0f32; 64 * 256], 64, 256),
                 mm1_b: vec![0.0f32; 64],
@@ -2084,11 +2100,13 @@ mod tests {
 
     #[test]
     fn test_hexagon_vit_weight_offsets_plan_rejects_dense_f32() {
+        use crate::model::vision_encoder::VisionProjectorType;
         let cfg = VisionEncoderConfig {
             n_layer: 1,
             n_embd: 64,
             n_ff: 128,
             n_head: 2,
+            n_head_kv: 2,
             eps: 1e-5,
             image_size: 32,
             patch_size: 16,
@@ -2099,6 +2117,8 @@ mod tests {
             image_std: [0.5, 0.5, 0.5],
             image_min_pixels: 32 * 32,
             image_max_pixels: 32 * 32,
+            rope_theta: 10000.0,
+            projector_type: VisionProjectorType::Lfm2,
         };
         let weights = VisionEncoderWeights {
             config: cfg,
@@ -2107,6 +2127,7 @@ mod tests {
                 conv_b: vec![0.0f32; 64],
             },
             position_embed: vec![0.0f32; 4 * 64],
+            embedding_norm: None,
             blocks: vec![VitBlockWeights {
                 ln1_w: vec![1.0f32; 64],
                 ln1_b: vec![0.0f32; 64],
@@ -2125,8 +2146,11 @@ mod tests {
                 ffn_down_w: MmapWeight::from_owned_f32(vec![0.0f32; 64 * 128], 64, 128),
                 ffn_down_b: vec![0.0f32; 64],
             }],
+            lfm3_blocks: Vec::new(),
             post_ln_w: vec![1.0f32; 64],
             post_ln_b: vec![0.0f32; 64],
+            patch_embed_1: None,
+            mm_input_norm: None,
             projector: ProjectorWeights {
                 mm1_w: MmapWeight::from_owned_f32(vec![0.0f32; 64 * 256], 64, 256),
                 mm1_b: vec![0.0f32; 64],
@@ -2142,6 +2166,7 @@ mod tests {
 
     #[test]
     fn test_hexagon_vit_weight_offsets_plan_q8_0() {
+        use crate::model::vision_encoder::VisionProjectorType;
         let make_q8 = |rows: usize, cols: usize| -> MmapWeight {
             let n_blocks = (rows * cols) / 32;
             let bytes = vec![0u8; n_blocks * 34];
@@ -2153,6 +2178,7 @@ mod tests {
             n_embd: 64,
             n_ff: 128,
             n_head: 2,
+            n_head_kv: 2,
             eps: 1e-5,
             image_size: 32,
             patch_size: 16,
@@ -2163,6 +2189,8 @@ mod tests {
             image_std: [0.5, 0.5, 0.5],
             image_min_pixels: 32 * 32,
             image_max_pixels: 32 * 32,
+            rope_theta: 10000.0,
+            projector_type: VisionProjectorType::Lfm2,
         };
         let weights = VisionEncoderWeights {
             config: cfg,
@@ -2171,6 +2199,7 @@ mod tests {
                 conv_b: vec![0.0f32; 64],
             },
             position_embed: vec![0.0f32; 4 * 64],
+            embedding_norm: None,
             blocks: vec![VitBlockWeights {
                 ln1_w: vec![1.0f32; 64],
                 ln1_b: vec![0.0f32; 64],
@@ -2189,8 +2218,11 @@ mod tests {
                 ffn_down_w: make_q8(64, 128),
                 ffn_down_b: vec![0.0f32; 64],
             }],
+            lfm3_blocks: Vec::new(),
             post_ln_w: vec![1.0f32; 64],
             post_ln_b: vec![0.0f32; 64],
+            patch_embed_1: None,
+            mm_input_norm: None,
             projector: ProjectorWeights {
                 mm1_w: make_q8(64, 256),
                 mm1_b: vec![0.0f32; 64],
@@ -2300,11 +2332,13 @@ mod tests {
             MmapWeight::from_owned_bytes(vec![0u8; n_blocks * 34], DType::Q8_0, rows, cols)
         };
         // n_ff = 112 is not a multiple of 32, so ffn_down is F16 in the GGUF.
+        use crate::model::vision_encoder::VisionProjectorType;
         let cfg = VisionEncoderConfig {
             n_layer: 1,
             n_embd: 64,
             n_ff: 112,
             n_head: 2,
+            n_head_kv: 2,
             eps: 1e-5,
             image_size: 32,
             patch_size: 16,
@@ -2315,6 +2349,8 @@ mod tests {
             image_std: [0.5, 0.5, 0.5],
             image_min_pixels: 32 * 32,
             image_max_pixels: 32 * 32,
+            rope_theta: 10000.0,
+            projector_type: VisionProjectorType::Lfm2,
         };
         let mut weights = VisionEncoderWeights {
             config: cfg,
@@ -2323,6 +2359,7 @@ mod tests {
                 conv_b: vec![0.0f32; 64],
             },
             position_embed: vec![0.0f32; 4 * 64],
+            embedding_norm: None,
             blocks: vec![VitBlockWeights {
                 ln1_w: vec![1.0f32; 64],
                 ln1_b: vec![0.0f32; 64],
@@ -2346,8 +2383,11 @@ mod tests {
                 ),
                 ffn_down_b: vec![0.0f32; 64],
             }],
+            lfm3_blocks: Vec::new(),
             post_ln_w: vec![1.0f32; 64],
             post_ln_b: vec![0.0f32; 64],
+            patch_embed_1: None,
+            mm_input_norm: None,
             projector: ProjectorWeights {
                 mm1_w: make_q8(64, 256),
                 mm1_b: vec![0.0f32; 64],

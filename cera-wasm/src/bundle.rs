@@ -65,10 +65,9 @@ use std::pin::Pin;
 use std::sync::Arc;
 
 use crate::{console_info, console_warn};
-use cera::bundle::LeapBundleEntry;
 use cera::bundle::cache_key::{
     LEAP_BUNDLES_API_URL, cache_relative_segments, leap_bundles_manifest_url, parse_leap_bundles,
-    validate_path_segment,
+    supplement_known_bundles, validate_path_segment,
 };
 use js_sys::{Function, Reflect, Uint8Array};
 use sha2::{Digest, Sha256};
@@ -1291,24 +1290,7 @@ pub async fn list_leap_bundles() -> Result<JsValue, JsError> {
     .ok_or_else(|| JsError::new("the LeapBundles catalog was not text"))?;
 
     let mut entries = parse_leap_bundles(&body).map_err(|e| JsError::new(&e.to_string()))?;
-    let target_name = "LFM2.5-VL-3B-GGUF";
-    if let Err(pos) = entries.binary_search_by(|e| e.name.as_str().cmp(target_name)) {
-        entries.insert(
-            pos,
-            LeapBundleEntry {
-                name: target_name.to_string(),
-                quants: vec![
-                    "BF16".to_string(),
-                    "F16".to_string(),
-                    "Q4_0".to_string(),
-                    "Q4_K_M".to_string(),
-                    "Q5_K_M".to_string(),
-                    "Q6_K".to_string(),
-                    "Q8_0".to_string(),
-                ],
-            },
-        );
-    }
+    supplement_known_bundles(&mut entries);
     let out = js_sys::Array::new();
     for entry in entries {
         let obj = js_sys::Object::new();

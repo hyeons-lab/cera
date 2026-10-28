@@ -127,6 +127,7 @@ fn chat_checkpoint_roundtrip() {
             "type": "object",
             "properties": { "val": { "type": "number" } }
         }),
+        defer_loading: false,
     };
 
     let chat_checkpoint = ChatCheckpoint {

@@ -1,0 +1,37 @@
+{
+  "model_file": "LFM3-1.7B-Q8_0.gguf",
+  "llama_cpp_sha": "d7af1a0b39fc40925950552ab2338bfef8c38ea7",
+  "n_predict": 16,
+  "prompts": [
+    {
+      "prompt": "The capital of France is",
+      "fixture": "the-capital-of-france-is.json",
+      "n_tokens": 5,
+      "n_nodes": 742
+    },
+    {
+      "prompt": "def add(a, b):\n    return",
+      "fixture": "def-add-a-b-return.json",
+      "n_tokens": 8,
+      "n_nodes": 742
+    },
+    {
+      "prompt": "Hola, \u00bfc\u00f3mo est\u00e1s?",
+      "fixture": "hola-c-mo-est-s.json",
+      "n_tokens": 8,
+      "n_nodes": 742
+    },
+    {
+      "prompt": "1 + 2 + 3 =",
+      "fixture": "1-2-3.json",
+      "n_tokens": 8,
+      "n_nodes": 742
+    },
+    {
+      "prompt": "Entry 0: the quick fox number 3 crossed the wide river near town 0 and reported 0 birds.\nEntry 1: the slow fox number 10 crossed the narrow river near town 1 and reported 13 birds.\nEntry 2: the red fox number 17 crossed the frozen river near town 2 and reported 26 birds.\nEntry 3: the grey fox number 24 crossed the muddy river near town 3 and reported 39 birds.\nEntry 4: the tired fox number 31 crossed the clear river near town 4 and reported 52 birds.\nEntry 5: the loud fox number 38 crossed the deep river near town 5 and reported 65 birds.\nEntry 6: the calm fox number 45 crossed the shallow river near town 6 and reported 78 birds.\nEntry 7: the brave fox number 52 crossed the fast river near town 7 and reported 91 birds.\nEntry 8: the shy fox number 59 crossed the wide river near town 8 and reported 7 birds.\nEntry 9: the old fox number 66 crossed the narrow river near town 9 and reported 20 birds.\nEntry 10: the quick fox number 73 crossed the frozen river near town 10 and reported 33 birds.\nEntry 11: the slow fox number 80 crossed the muddy river near town 0 and reported 46 birds.\nEntry 12: the red fox number 87 crossed the clear river near town 1 and reported 59 birds.\nEntry 13: the grey fox number 94 crossed the deep river near town 2 and reported 72 birds.\nEntry 14: the tired fox number 101 crossed the shallow river near town 3 and reported 85 birds.\nEntry 15: the loud fox number 108 crossed the fast river near town 4 and reported 1 birds.\nEntry 16: the calm fox number 115 crossed the wide river near town 5 and reported 14 birds.\nEntry 17: the brave fox number 122 crossed the narrow river near town 6 and reported 27 birds.\nSummary of the entries above:",
+      "fixture": "entry-0-the-quick-fox-number-3-crossed-t.json",
+      "n_tokens": 440,
+      "n_nodes": 742
+    }
+  ]
+}

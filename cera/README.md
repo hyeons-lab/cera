@@ -31,7 +31,7 @@ cera = "0.7"
 - **Chat coordinator (`cera::session::chat`)**: `Session::into_chat()` transfers execution into `SessionChat`, with delta-only prefill and validated template profiles. Ingest another turn only from `TurnComplete`. Interrupted generation requires reset or replacement before a new user turn; zero-token/no-progress calls can preserve `PromptReady` for retry. Recovery can restore, reset or leave the session unusable. Legacy `Session::append_user_message` is deprecated in favor of this API.
 - **Language-Native Reactive Streaming**: Real-time token and text streaming via `SessionChat::stream_text` in Rust, `AsyncThrowingStream` in Swift, `Flow` in Kotlin, `Iterator[str]` in Python, and `Stream<String>` in Dart, with cancellation isolation across conversation turns.
 - **JSON Schema compiler (`cera::grammar::json_schema_to_gbnf`)**: Compiles a [documented subset](../docs/API_0_6.md#json-schema-constraints) with required/optional properties, bounded arrays, local refs and restricted `allOf` composition. Use `GenerateOpts::with_json_schema`; still check for truncated output and validate constraints outside the supported subset.
-- **First-Class Tool Calling**: Tool definition, schema validation, format detection (LFM2 Pythonic, Hermes/Qwen JSON), `chat.set_tools()`, and `chat.ingest_tool_response()`.
+- **First-Class Tool Calling**: Tool definition, schema validation, format detection (LFM2 Pythonic, LFM3 XML, Hermes/Qwen JSON), `chat.set_tools()`, and `chat.ingest_tool_response()`.
 - **Session checkpoints (`cera::session::checkpoint`)**: CPU Session/Chat snapshots (`CERASCHK` / `CERACHAT`) validate structural identity, KV geometry and compression including the TurboQuant seed. Native Metal/Hexagon/wgpu checkpoints are rejected; browser WebGPU has a separate snapshot path. Recreate pre-0.6.2 f16/TurboQuant checkpoints with old fingerprints. File persistence uses atomic rename.
 - **Unified Stateful Audio Pipeline (`cera::audio_pipeline::AudioPipeline`)**: Stateful streaming pipeline uniting Silero VAD v5, streaming hotword detection, Whisper speech-to-text transcription, and optional speaker diarization (`with_diarizer` for Sortformer or `with_diarizer_nemotron3` for Nemotron-3). Features pre-roll ring buffering, max utterance duration chunking that preserves active VAD hidden states across continuation segments, automatic transcription, and wait-free cancellation across FFI boundaries.
 - **Expanded Model Architectures**: Native support for Mamba-2 SSM and hybrid architectures, Gemma 2, Olmo 2, Gemma 4 (PLE and cross-layer KV sharing), Olmo 3 (sliding window and YaRN RoPE), MiniCPM, Nanbeige 4.2, Qwen 3.5 / Ornith 1.0, Ministral 3, Phi-3 / Phi-4-mini, and Ling 3.0 Tiny.
@@ -159,6 +159,7 @@ are listed below:
 |--------------|----------|
 | `lfm2` | Liquid LFM2 / LFM2.5 (the canonical LeapBundles family) |
 | `lfm2moe` | Liquid LFM2.5-8B-A1B (routed mixture-of-experts) |
+| `lfm3` | LFM3 / LFM3-MoE (CPU and Hexagon NPU; CPU prefill attention is per token; LoRA, TurboQuant and `n_keep` shift are not supported, and a TurboQuant request falls back to the uncompressed cache) |
 | `qwen2`, `qwen3` | Qwen2 / Qwen2.5 / Qwen3 |
 | `qwen35` | Qwen 3.5 / Ornith 1.0 (interleaved Gated Delta Net hybrid) |
 | `llama` | LLaMA 2/3, and classic Mistral 7B (ships as GGUF arch `llama`) |
@@ -176,12 +177,14 @@ the selected loader. An architecture outside that dispatch returns
 `unsupported architecture: <name>`; the table above is not exhaustive.
 
 **Modalities:** text-to-text is fully supported for every architecture above.
-**LFM2-Audio** (`lfm2-audio-v1`, text+audio in/out) also loads. **Vision (VL,
-image-to-text)** is wired up end-to-end: `CeraEngine` auto-attaches the vision
-mmproj encoder for VL bundles, and `Session::append_image` (or
-`append_chat_with_images`) runs image → ViT → projector → soft-token prefill.
-Verified against LFM2.5-VL-450M. The ViT encode runs on the GPU (native Metal or
-wgpu, selected by `BackendPreference`) with a CPU fallback.
+**LFM2-Audio** (`lfm2-audio-v1`) and **LFM3-Audio / LFM3-Omni** (`lfm3a` /
+`lfm3a_gen`, text+audio in/out) also load. **Vision (VL, image-to-text)** is
+wired up end-to-end for LFM2-VL, LFM3-VL, and LFM3-Omni (`lfm3vl`): `CeraEngine`
+auto-attaches the vision mmproj encoder for VL and Omni bundles, and
+`Session::append_image` (or `append_chat_with_images`) runs image → ViT →
+projector → soft-token prefill. Verified against LFM2.5-VL-450M and the public
+LFM3-VL-2B / LFM3-Omni-2B mmproj encoders. The ViT encode runs on the GPU
+(native Metal or wgpu, selected by `BackendPreference`) with a CPU fallback.
 
 ## Sharing a loaded GPU or NPU model
 
@@ -455,8 +458,8 @@ The CLI exposes speculative decoding knobs across `run`, `chat`, and `bench`
 ## Tool calling
 
 `cera::tools` renders tool schemas into the chat template and parses tool calls
-back out, format-aware: `ToolFormat::detect(arch)` picks Pythonic (LFM2) vs
-Hermes JSON (Qwen2.5/Qwen3) from the GGUF architecture.
+back out, format-aware: `ToolFormat::detect(arch)` picks Pythonic (LFM2),
+Hermes JSON (Qwen2.5/Qwen3) or XML (LFM3) from the GGUF architecture.
 
 Using `engine`, the mutable `session`, and `TokenCollector` from the raw-token
 quickstart, replace its prompt/generation block with the sequence below. It
@@ -523,7 +526,8 @@ Two backend gaps refuse loudly with `CeraError::LoraUnsupportedByBackend`
 rather than silently ignoring the adapter: `lfm2moe`'s routed-FFN targets (the
 router and the per-expert projections), which apply on CPU only; and the
 bert, qwen35, gemma4, and bailingmoe3 backends, which have no LoRA hooks at
-all (any adapter is refused on those).
+all (any adapter is refused on those). `lfm3` shares the LFM2 hooks but refuses
+adapters too, until one is validated against its sandwich norms and attention gate.
 
 ```rust
 use cera::lora::LoraAdapterWeights;

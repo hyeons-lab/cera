@@ -15485,6 +15485,11 @@ data class ToolDef(
      * `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
      */
     var `parametersJson`: kotlin.String,
+    /**
+     * When `true` the tool is withheld from the initial prompt's tool list and only revealed
+     * later through a `tool_reference`, while staying active for call parsing and grammars.
+     */
+    var `deferLoading`: kotlin.Boolean = false,
 ) {
     companion object
 }
@@ -15498,13 +15503,15 @@ public object FfiConverterTypeToolDef : FfiConverterRustBuffer<ToolDef> {
             FfiConverterString.read(buf),
             FfiConverterOptionalString.read(buf),
             FfiConverterString.read(buf),
+            FfiConverterBoolean.read(buf),
         )
 
     override fun allocationSize(value: ToolDef) =
         (
             FfiConverterString.allocationSize(value.`name`) +
                 FfiConverterOptionalString.allocationSize(value.`description`) +
-                FfiConverterString.allocationSize(value.`parametersJson`)
+                FfiConverterString.allocationSize(value.`parametersJson`) +
+                FfiConverterBoolean.allocationSize(value.`deferLoading`)
         )
 
     override fun write(
@@ -15514,6 +15521,7 @@ public object FfiConverterTypeToolDef : FfiConverterRustBuffer<ToolDef> {
         FfiConverterString.write(value.`name`, buf)
         FfiConverterOptionalString.write(value.`description`, buf)
         FfiConverterString.write(value.`parametersJson`, buf)
+        FfiConverterBoolean.write(value.`deferLoading`, buf)
     }
 }
 
@@ -18055,6 +18063,12 @@ enum class ToolFormat {
      * `<tool_call>…</tool_call>`.
      */
     HERMES,
+
+    /**
+     * LFM3: XML `<function=name><parameter=arg>val</parameter></function>` in
+     * `<tool_call>…</tool_call>`.
+     */
+    LFM3_XML,
 
     ;
 

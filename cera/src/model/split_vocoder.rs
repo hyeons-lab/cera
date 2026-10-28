@@ -61,7 +61,9 @@ const GLOBAL_TENSORS: &[(&str, &str)] = &[
 /// True when `vocoder` carries no detokenizer backbone of its own, i.e. it is
 /// the llama.cpp half of a split layout (or not a vocoder at all).
 pub fn is_split_vocoder(vocoder: &GgufFile) -> bool {
-    !vocoder.tensors.contains_key(MERGED_PROBE) && !vocoder.tensors.contains_key(SIDECAR_PROBE)
+    !vocoder.tensors.contains_key(MERGED_PROBE)
+        && !vocoder.tensors.contains_key(SIDECAR_PROBE)
+        && !crate::model::audio_decoder::is_lfm3a_gen_gguf(vocoder)
 }
 
 /// True when `sidecar` is a llama.cpp audio-tokenizer GGUF carrying the

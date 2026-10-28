@@ -68,6 +68,10 @@ impl EncodedImage {
     pub fn n_tokens(&self) -> usize {
         self.n_tokens
     }
+
+    pub(crate) fn rows(&self) -> &[f32] {
+        &self.rows
+    }
 }
 
 /// The phase times of the most recent image ingest on the calling thread.
@@ -242,7 +246,9 @@ pub struct GenerateOpts {
     /// llama.cpp's lazy grammar triggers: free text, then a constrained tool call
     /// only after the start marker appears. See [`crate::tools`].
     pub grammar_trigger_tokens: Vec<u32>,
-    /// Emit `on_text_tokens` at least every N tokens. `0` treats as 1.
+    /// Emit `on_text_tokens` at least every N tokens. `0` treats as 1. The first token of a call is
+    /// always delivered on its own, as soon as it is sampled, whatever N and `flush_every_ms` say,
+    /// so time to first token never waits for a batch.
     pub flush_every_tokens: u32,
     /// Emit `on_text_tokens` at least every N milliseconds. `0` disables time-based flushing.
     pub flush_every_ms: u32,
@@ -537,8 +543,9 @@ pub enum CeraError {
     /// model needs changing, only the backend it runs on. Two cases: a routed
     /// feed-forward delta (the router or the per-expert factors) on a GPU
     /// backend, which the CPU backend applies; and a backend with no LoRA
-    /// hooks at all (bert, qwen35, gemma4, bailingmoe3), where no backend
-    /// runs the adapter and retrying elsewhere is futile.
+    /// hooks at all (bert, qwen35, gemma4, bailingmoe3) or whose hooks are not
+    /// validated for the architecture (lfm3), where no backend runs the adapter
+    /// and retrying elsewhere is futile.
     #[error("LoRA adapter not supported by this backend: {0}")]
     LoraUnsupportedByBackend(String),
     /// A [`Session::set_lora_adapters`] stack is inconsistent with itself
@@ -651,6 +658,19 @@ pub(crate) enum ChatTemplateSegment {
     Image,
 }
 
+/// `logits` copied into `out` with each of `ids` set to negative infinity: the logits an audio
+/// turn samples from while the modality-control tokens are banned. `logits` itself stays as the
+/// model produced it, since it may be saved as the seed of a later `generate()`.
+fn ban_control_ids(logits: &[f32], ids: [u32; 4], out: &mut Vec<f32>) {
+    out.clear();
+    out.extend_from_slice(logits);
+    for id in ids {
+        if let Some(slot) = out.get_mut(id as usize) {
+            *slot = f32::NEG_INFINITY;
+        }
+    }
+}
+
 /// Walk a tokenized chat-template stream and produce a splice plan:
 /// for each contiguous run of non-marker tokens emit a
 /// [`ChatTemplateSegment::Text`] range; for each `<image>` token
@@ -703,7 +723,7 @@ struct ChatRows {
 fn splice_chat_rows(
     segments: &[ChatTemplateSegment],
     tokens: &[u32],
-    (img_start, img_end): (u32, u32),
+    boundary_ids: Option<(u32, u32)>,
     images: &[(Vec<f32>, usize)],
     embed: impl Fn(&[u32]) -> Option<Vec<f32>>,
 ) -> Option<ChatRows> {
@@ -724,11 +744,15 @@ fn splice_chat_rows(
         match *seg {
             ChatTemplateSegment::Text { start, end } => text(&tokens[start..end], &mut out)?,
             ChatTemplateSegment::Image => {
-                text(&[img_start], &mut out)?;
+                if let Some((img_start, _)) = boundary_ids {
+                    text(&[img_start], &mut out)?;
+                }
                 let (rows, n) = images.get(img_idx)?;
                 out.rows.extend_from_slice(rows);
                 out.n_rows += n;
-                text(&[img_end], &mut out)?;
+                if let Some((_, img_end)) = boundary_ids {
+                    text(&[img_end], &mut out)?;
+                }
                 img_idx += 1;
             }
         }
@@ -914,16 +938,19 @@ fn splice_tiled_rows(
     (rows, n_rows)
 }
 
-/// Validate that `model` can execute `adapter` (`supports_lora`, dimension match,
-/// and `supports_moe_lora` when routed-FFN deltas are present). Shared by
-/// [`Session`] and [`crate::CeraEngine::detect_pii_with_lora`].
+/// Refuse an adapter the model cannot run: a model without LoRA hooks (or whose hooks are
+/// not validated for its architecture, like lfm3) would install it and silently produce
+/// base-model output, or, for a classifier adapter, switch to attention branches written
+/// for another architecture. Capability comes first, then the dimensions, then the routed-FFN deltas. Every entry that
+/// attaches an adapter calls this: `Session` and `CeraEngine::detect_pii_with_lora`.
 pub(crate) fn ensure_adapter_runs(
     model: &dyn Model,
     adapter: &crate::lora::LoraAdapterWeights,
 ) -> Result<(), CeraError> {
     if !model.supports_lora() {
         return Err(CeraError::LoraUnsupportedByBackend(format!(
-            "model architecture '{}' has no LoRA apply hooks, so the adapter would be \
+            "model architecture '{}' does not run LoRA adapters (it has no LoRA apply \
+             hooks, or they are not validated for it), so the adapter would be \
              silently ignored; no backend runs it",
             model.config().architecture
         )));
@@ -931,6 +958,9 @@ pub(crate) fn ensure_adapter_runs(
     adapter
         .validate_dims(model.config())
         .map_err(|e| CeraError::LoraDimMismatch(e.to_string()))?;
+    // Routed-FFN deltas have no hook on the GPU backends. Both the router and the per-expert
+    // factors would upload without complaint and then never be applied, which is an adapter
+    // that quietly does part of its job, so refuse the whole thing here.
     if adapter.has_moe_deltas() && !model.supports_moe_lora() {
         return Err(CeraError::LoraUnsupportedByBackend(
             "the adapter carries mixture-of-experts deltas (router and/or per-expert \
@@ -979,20 +1009,6 @@ impl Session {
         if matches!(config.kv_compression, KvCompression::F16) && !model.f16_kv_supported() {
             config.kv_compression = KvCompression::None;
         }
-        if config.kv_compression.is_downgraded_for(model_cfg) {
-            tracing::warn!(
-                target: "cera::session",
-                architecture = model_cfg.architecture.as_str(),
-                head_dim = model_cfg.head_dim,
-                "TurboQuant KV compression was requested, but this model configuration \
-                 resolves it to the plain uncompressed cache (e.g. non-power-of-two head_dim)"
-            );
-            eprintln!(
-                "[cera::session] TurboQuant KV compression downgraded to plain uncompressed cache for architecture '{}' (head_dim: {})",
-                model_cfg.architecture.as_str(),
-                model_cfg.head_dim
-            );
-        }
         let max_seq_len = config
             .max_seq_len
             .map(|v| v as usize)
@@ -1023,13 +1039,27 @@ impl Session {
         // and it must precede the first forward pass either way.
         model.configure_kv_compression(&config.kv_compression)?;
 
+        // A request the model cannot serve (lfm3, or an incompatible `head_dim`) runs on the
+        // uncompressed cache; say so, since a phone that asked for compression to fit memory
+        // would otherwise run an f32 cache silently.
+        if config.kv_compression.is_downgraded_for(model_cfg) {
+            tracing::warn!(
+                target: "cera::session",
+                architecture = model_cfg.architecture.as_str(),
+                "TurboQuant KV compression is not supported by this model's attention layout \
+                 or head width; using the uncompressed cache"
+            );
+        }
+
         // Likewise, `n_keep > 0` + a TurboQuant-compressed KV cache is a
         // no-op because the overflow arm gates the shift out
         // (`can_shift`'s `cache_unshiftable`). f16 KV *is* shiftable now
         // (widen→rotate→narrow), so it no longer warns. Warn once for
         // TurboQuant so the user knows their n_keep is silently ignored on
-        // overflow.
-        if config.n_keep > 0 && matches!(config.kv_compression, KvCompression::TurboQuant { .. }) {
+        // overflow. Keyed on the mode the cache will really use, not the one
+        // requested: a downgraded request is not compressed.
+        let resolved_kv = config.kv_compression.resolved_for(model_cfg);
+        if config.n_keep > 0 && matches!(resolved_kv, KvCompression::TurboQuant { .. }) {
             tracing::warn!(
                 target: "cera::session",
                 n_keep = config.n_keep,
@@ -1052,7 +1082,8 @@ impl Session {
                 "n_keep configured but this backend doesn't support KV shift; \
                  overflow will still return ContextOverflow. CPU, wgpu and \
                  Metal all implement the shift for RoPE architectures, so the \
-                 usual cause is a TurboQuant-compressed cache."
+                 usual cause is a TurboQuant-compressed cache, or a per-layer \
+                 RoPE schedule (lfm3)."
             );
         }
 
@@ -1185,6 +1216,57 @@ impl Session {
     /// the LLM it was trained against.
     pub fn attach_audio_encoder(&mut self, encoder: Arc<AudioEncoderWeights>) {
         self.audio_encoder = Some(encoder);
+    }
+
+    /// Default ASR system prompt for LFM2-Audio (`lfm2a`).
+    pub const DEFAULT_ASR_SYSTEM_PROMPT_LFM2A: &'static str = "Perform ASR.";
+
+    /// Default ASR system prompt for LFM3-Audio (`lfm3a`).
+    pub const DEFAULT_ASR_SYSTEM_PROMPT_LFM3A: &'static str = "Perform ASR in English.";
+
+    /// Return the default ASR system prompt for the loaded audio encoder / model family:
+    /// `"Perform ASR in English."` for LFM3-Audio (`lfm3a`) and `"Perform ASR."` for LFM2-Audio.
+    pub fn default_asr_system_prompt(&self) -> &'static str {
+        if self.audio_encoder.as_ref().is_some_and(|e| e.is_lfm3a())
+            || self.model.config().architecture == "lfm3"
+        {
+            Self::DEFAULT_ASR_SYSTEM_PROMPT_LFM3A
+        } else {
+            Self::DEFAULT_ASR_SYSTEM_PROMPT_LFM2A
+        }
+    }
+
+    /// Load and attach audio encoder weights from a `mmproj` GGUF, and when the
+    /// same GGUF also bundles audio generation weights (`lfm3a_gen` single-file
+    /// `mmproj` layout with `clip.has_gen_audio_encoder` / `a.gen.*` tensors)
+    /// and no separate vocoder is attached yet, load and attach its
+    /// [`crate::model::audio_decoder::AudioDecoderWeights`] and
+    /// [`crate::model::audio_decoder::DetokenizerWeights`] as well.
+    pub fn attach_audio_mmproj(
+        &mut self,
+        mmproj: &Arc<crate::gguf::GgufFile>,
+    ) -> Result<(), CeraError> {
+        let encoder = AudioEncoderWeights::from_gguf(mmproj)
+            .map_err(|e| CeraError::Backend(format!("loading audio encoder from mmproj: {e:#}")))?;
+        let bundled_vocoder = if (self.audio_decoder.is_none() || self.detok_weights.is_none())
+            && crate::model::audio_decoder::is_lfm3a_gen_gguf(mmproj)
+        {
+            let dec = crate::model::audio_decoder::AudioDecoderWeights::from_gguf(mmproj).map_err(
+                |e| CeraError::Backend(format!("loading audio decoder from mmproj: {e:#}")),
+            )?;
+            let detok = crate::model::audio_decoder::DetokenizerWeights::from_gguf(mmproj)
+                .map_err(|e| {
+                    CeraError::Backend(format!("loading audio detokenizer from mmproj: {e:#}"))
+                })?;
+            Some((Arc::new(dec), Arc::new(detok)))
+        } else {
+            None
+        };
+        self.attach_audio_encoder(Arc::new(encoder));
+        if let Some((dec, detok)) = bundled_vocoder {
+            self.attach_vocoder(dec, detok);
+        }
+        Ok(())
     }
 
     /// Attach a cached GPU audio encoder. When present, [`Self::append_audio`]
@@ -1941,6 +2023,18 @@ impl Session {
     ///    mid-prefill surfaces as [`CeraError::Backend`], not
     ///    [`CeraError::Cancelled`]).
     pub fn append_audio(&mut self, samples: &[f32], sample_rate: u32) -> Result<(), CeraError> {
+        let (embeddings, n_frames) = self.encode_audio_rows(samples, sample_rate)?;
+        self.append_embeddings(&embeddings, n_frames)
+    }
+
+    /// Everything [`Self::append_audio`] does before the prefill: the checks, the resample and the
+    /// encoder (GPU where one is attached, else CPU). Returns the LLM-input rows
+    /// (`n_frames * hidden_size`) and the frame count, and touches no KV state.
+    pub(crate) fn encode_audio_rows(
+        &mut self,
+        samples: &[f32],
+        sample_rate: u32,
+    ) -> Result<(Vec<f32>, usize), CeraError> {
         self.ensure_usable()?;
         // Before validation like the other append entries: the CPU encode
         // below dispatches on the pools long before `append_embeddings`'s
@@ -2024,7 +2118,86 @@ impl Session {
             // the empty embedding buffer downstream.
             return Err(CeraError::EmptyInput);
         }
-        self.append_embeddings(&embeddings, n_frames)
+        Ok((embeddings, n_frames))
+    }
+
+    /// Fuse an ingest batch of `[Tokens.., Audio, Tokens..]` into one [`Self::append_embeddings`]:
+    /// the prompt's text before the audio, the encoded audio and the text after it become one
+    /// prefill forward instead of three. Each forward re-reads every weight and pays the backend's
+    /// fixed cost, which for a few dozen tokens is most of the time (a 47-token audio prompt on the
+    /// 1.5B model spent about 100 ms in three forwards on the CPU against about 77 ms in one, and
+    /// more on the GPU). Returns `None`, with the session untouched, when the batch is not that
+    /// shape or the backend cannot hand out token rows, so the caller falls back to the per-segment
+    /// route; `CERA_AUDIO_SPLIT_PREFILL` forces that route.
+    pub(crate) fn try_append_fused_audio(
+        &mut self,
+        segments: &[chat::IngestSegment<'_>],
+    ) -> Option<Result<(), CeraError>> {
+        if std::env::var_os("CERA_AUDIO_SPLIT_PREFILL").is_some()
+            || !self.capabilities.audio_in
+            || !self.model.supports_embedding_input()
+        {
+            return None;
+        }
+        let mut audio = None;
+        let mut n_audio = 0usize;
+        let mut total_text_tokens = 0usize;
+        for seg in segments {
+            match *seg {
+                chat::IngestSegment::Tokens(toks) => total_text_tokens += toks.len(),
+                chat::IngestSegment::Image(_) => return None,
+                chat::IngestSegment::Audio { pcm, sample_rate } => {
+                    n_audio += 1;
+                    audio = Some((pcm, sample_rate));
+                }
+            }
+        }
+        let (pcm, sample_rate) = audio?;
+        if n_audio != 1 || total_text_tokens == 0 {
+            return None;
+        }
+        // Embed the text first: if any token cannot be embedded, bail out before the encoder runs so
+        // the fallback does not encode the audio twice.
+        let mut text_rows: Vec<Vec<f32>> = Vec::new();
+        for seg in segments {
+            if let chat::IngestSegment::Tokens(toks) = *seg
+                && !toks.is_empty()
+            {
+                text_rows.push(self.model.embed_token_rows(toks)?);
+            }
+        }
+        let (audio_rows, n_audio_rows) = match self.encode_audio_rows(pcm, sample_rate) {
+            Ok(v) => v,
+            Err(e) => return Some(Err(e)),
+        };
+        let mut rows =
+            Vec::with_capacity(text_rows.iter().map(Vec::len).sum::<usize>() + audio_rows.len());
+        let mut n_rows = 0usize;
+        let mut text_ids = Vec::with_capacity(total_text_tokens);
+        let mut text_iter = text_rows.into_iter();
+        for seg in segments {
+            match *seg {
+                chat::IngestSegment::Tokens(toks) => {
+                    if !toks.is_empty() {
+                        let tok_rows = text_iter.next().expect("matched non-empty token segment");
+                        rows.extend_from_slice(&tok_rows);
+                        n_rows += toks.len();
+                        text_ids.extend_from_slice(toks);
+                    }
+                }
+                chat::IngestSegment::Audio { .. } => {
+                    rows.extend_from_slice(&audio_rows);
+                    n_rows += n_audio_rows;
+                }
+                chat::IngestSegment::Image(_) => unreachable!(),
+            }
+        }
+        if let Err(e) = self.append_embeddings(&rows, n_rows) {
+            return Some(Err(e));
+        }
+        // The text is what drafting looks up; the audio rows have no ids.
+        self.token_history.extend_from_slice(&text_ids);
+        Some(Ok(()))
     }
 
     /// Append raw token IDs, running a prefill pass from the current position
@@ -2127,11 +2300,17 @@ impl Session {
         // CLI `--ubatch-size 0` opt-out.
         let prefill_start = Instant::now();
         self.note_ingest_mutation(false);
+        let ubatch = if self.model.config().architecture == "lfm3" && !self.model.config().is_causal
+        {
+            0
+        } else {
+            self.config.ubatch_size as usize
+        };
         let (consumed, logits) = self.model.forward_prefill_chunked(
             tokens,
             self.current_pos,
             &mut self.state,
-            self.config.ubatch_size as usize,
+            ubatch,
             &self.cancel,
         );
         // Drain the sticky decode-error slot BEFORE advancing any session
@@ -2357,7 +2536,12 @@ impl Session {
         // and avoids leaving the session wedged on an entry-time
         // cancel. `ubatch == 0` means "no chunking" (one call
         // covering all frames), matching CLI `--ubatch-size 0`.
-        let ubatch = self.config.ubatch_size as usize;
+        let ubatch = if self.model.config().architecture == "lfm3" && !self.model.config().is_causal
+        {
+            0
+        } else {
+            self.config.ubatch_size as usize
+        };
         let chunk_size = if ubatch == 0 { n_tokens } else { ubatch };
         let mut last_logits: Option<Vec<f32>> = None;
         let mut ti = 0usize;
@@ -2959,40 +3143,66 @@ impl Session {
             crate::tokenizer::apply_chat_template(&self.tokenizer, messages, add_generation_prompt)
                 .map_err(|e| CeraError::Backend(format!("chat template render: {e:#}")))?;
 
-        // 2. Resolve `<image>` token id (probe once, error if not a
-        //    single token — that means the vocab doesn't actually
-        //    have `<image>` as a merged token, i.e. not a VL model).
-        let probed = self.tokenizer.encode("<image>");
-        if probed.len() != 1 {
-            return Err(CeraError::Backend(format!(
-                "tokenizer doesn't have `<image>` as a single token \
-                 (got {} tokens) — model isn't VL-shaped",
-                probed.len(),
-            )));
-        }
-        let image_marker_id = probed[0];
+        // 2. Resolve the `<|image|>` or `<image>` token id: the spelling follows the chat
+        //    template and the vocabulary, as the chat profile does (the rendered text also
+        //    holds the caller's messages, which may mention either). One that is not a single
+        //    token means the vocab has no merged image marker, i.e. this is not a VL model.
+        let candidates = crate::session::chat::image_marker_candidates(
+            self.tokenizer.chat_template().unwrap_or(""),
+            self.tokenizer.special_token_id("<|image|>").is_some(),
+        );
+        let image_marker_id = candidates
+            .into_iter()
+            .find_map(|name| {
+                let probed = self.tokenizer.encode(name);
+                (probed.len() == 1).then(|| probed[0])
+            })
+            .ok_or_else(|| {
+                CeraError::Backend(
+                    "tokenizer has neither `<|image|>` nor `<image>` as a single token \
+                     - model isn't VL-shaped"
+                        .into(),
+                )
+            })?;
 
-        // 3. Resolve special tokens for the image envelope.
-        let img_start = self
-            .tokenizer
-            .special_token_id("<|image_start|>")
-            .ok_or_else(|| {
-                CeraError::Backend(
-                    "tokenizer missing `<|image_start|>` special token — \
-                     model isn't VL-shaped"
-                        .into(),
-                )
-            })?;
-        let img_end = self
-            .tokenizer
-            .special_token_id("<|image_end|>")
-            .ok_or_else(|| {
-                CeraError::Backend(
-                    "tokenizer missing `<|image_end|>` special token — \
-                     model isn't VL-shaped"
-                        .into(),
-                )
-            })?;
+        // 3. Resolve special tokens for the image envelope based on the attached
+        //    vision projector type (`Lfm2`: `<|image_start|>`/`<|image_end|>`,
+        //    `Lfm3Vl`: none, `Lfm3O`: `<|vision_start|>`/`<|vision_end|>` when present).
+        let proj_type = self
+            .vision_encoder
+            .as_ref()
+            .map(|ve| ve.config.projector_type)
+            .unwrap_or(crate::model::vision_encoder::VisionProjectorType::Lfm2);
+        let boundary_ids: Option<(u32, u32)> = match proj_type {
+            crate::model::vision_encoder::VisionProjectorType::Lfm2 => {
+                let img_start = self
+                    .tokenizer
+                    .special_token_id("<|image_start|>")
+                    .ok_or_else(|| {
+                        CeraError::Backend(
+                            "tokenizer missing `<|image_start|>` special token - \
+                             model isn't VL-shaped"
+                                .into(),
+                        )
+                    })?;
+                let img_end = self
+                    .tokenizer
+                    .special_token_id("<|image_end|>")
+                    .ok_or_else(|| {
+                        CeraError::Backend(
+                            "tokenizer missing `<|image_end|>` special token - \
+                             model isn't VL-shaped"
+                                .into(),
+                        )
+                    })?;
+                Some((img_start, img_end))
+            }
+            crate::model::vision_encoder::VisionProjectorType::Lfm3Vl => None,
+            crate::model::vision_encoder::VisionProjectorType::Lfm3O => {
+                proj_type.resolve_boundary_token_ids(|tok| self.tokenizer.special_token_id(tok))
+            }
+        };
+        let boundary_overhead = if boundary_ids.is_some() { 2 } else { 0 };
 
         // 4. Tokenize the rendered text + walk for marker positions.
         //    Splice plan is computed eagerly so we can validate the
@@ -3017,25 +3227,33 @@ impl Session {
         //    rows (`CERA_VL_SPLIT_PREFILL` forces the per-segment route below): text, image
         //    and text are one batch instead of three forwards, each with a fixed cost. Every
         //    image is encoded before the session is touched, so a bad image leaves it as it was.
+        let probe_tok = boundary_ids
+            .map(|(s, _)| s)
+            .or_else(|| tokens.first().copied())
+            .unwrap_or(image_marker_id);
         let fused = std::env::var_os("CERA_VL_SPLIT_PREFILL").is_none()
             && self.model.supports_embedding_input()
-            && self.model.embed_token_rows(&[img_start]).is_some();
+            && self.model.embed_token_rows(&[probe_tok]).is_some();
         if fused {
-            // Rows already committed to this one prefill: the prompt's text (each `<image>` marker is
-            // replaced by `<|image_start|>`, the image's rows and `<|image_end|>`) plus the images
-            // encoded before this one. Each image is budgeted against that before its own tower pass,
-            // so an image that fits alone but not after the earlier ones is refused without running
-            // the tower for it (earlier images have already been encoded).
+            // Rows already committed to this one prefill: the prompt's text plus the images
+            // encoded before this one (and any boundary tokens when the architecture uses them).
+            // Each image is budgeted against that before its own tower pass, so an image that
+            // fits alone but not after the earlier ones is refused without running the tower
+            // for it (earlier images have already been encoded).
             let mut reserved = tokens.len().saturating_sub(images.len());
             let mut encoded = Vec::with_capacity(images.len());
             for image in images {
-                let rows = self.encode_image_rows(image, self.image_max_long_size, reserved + 2)?;
-                reserved += rows.1 + 2;
+                let rows = self.encode_image_rows(
+                    image,
+                    self.image_max_long_size,
+                    reserved + boundary_overhead,
+                )?;
+                reserved += rows.1 + boundary_overhead;
                 encoded.push(rows);
             }
             let model = Arc::clone(&self.model);
             if let Some(chat) =
-                splice_chat_rows(&segments, &tokens, (img_start, img_end), &encoded, |ids| {
+                splice_chat_rows(&segments, &tokens, boundary_ids, &encoded, |ids| {
                     model.embed_token_rows(ids)
                 })
             {
@@ -3071,16 +3289,22 @@ impl Session {
                     });
                 }
                 ChatTemplateSegment::Image => {
-                    let text_start = Instant::now();
-                    self.append_tokens(&[img_start])?;
-                    let start_ms = text_start.elapsed().as_secs_f64() * 1000.0;
+                    let mut start_ms = 0.0;
+                    if let Some((img_start, _)) = boundary_ids {
+                        let text_start = Instant::now();
+                        self.append_tokens(&[img_start])?;
+                        start_ms = text_start.elapsed().as_secs_f64() * 1000.0;
+                    }
                     self.append_image(images[img_idx])?;
-                    let text_start = Instant::now();
-                    self.append_tokens(&[img_end])?;
-                    let end_ms = text_start.elapsed().as_secs_f64() * 1000.0;
+                    let mut end_ms = 0.0;
+                    if let Some((_, img_end)) = boundary_ids {
+                        let text_start = Instant::now();
+                        self.append_tokens(&[img_end])?;
+                        end_ms = text_start.elapsed().as_secs_f64() * 1000.0;
+                    }
                     vl_timing_update(|t| {
                         t.text_prefill_ms += start_ms + end_ms;
-                        t.text_tokens += 2;
+                        t.text_tokens += boundary_overhead;
                     });
                     img_idx += 1;
                 }
@@ -3275,20 +3499,41 @@ impl Session {
                             )
                             })?;
 
-                    let user_content = match text_content {
-                        Some(text) => format!("{marker_name}\n{text}"),
-                        None => marker_name.to_string(),
-                    };
-
-                    let rendered = crate::tokenizer::apply_chat_template(
-                        &this.tokenizer,
-                        &[crate::tokenizer::ChatMessage {
+                    let messages = if this.current_pos == 0
+                        && this.audio_encoder.as_ref().is_some_and(|e| e.is_lfm3a())
+                    {
+                        let sys_content = match text_content {
+                            None | Some(Self::DEFAULT_ASR_SYSTEM_PROMPT_LFM2A) => {
+                                this.default_asr_system_prompt().to_string()
+                            }
+                            Some(text) => text.to_string(),
+                        };
+                        vec![
+                            crate::tokenizer::ChatMessage {
+                                role: "system".to_string(),
+                                content: sys_content,
+                            },
+                            crate::tokenizer::ChatMessage {
+                                role: "user".to_string(),
+                                content: marker_name.to_string(),
+                            },
+                        ]
+                    } else {
+                        let user_content = match text_content {
+                            Some(text) => format!("{marker_name}\n{text}"),
+                            None => marker_name.to_string(),
+                        };
+                        vec![crate::tokenizer::ChatMessage {
                             role: "user".to_string(),
                             content: user_content,
-                        }],
-                        true,
-                    )
-                    .map_err(|e| CeraError::Backend(format!("chat template render: {e:#}")))?;
+                        }]
+                    };
+
+                    let rendered =
+                        crate::tokenizer::apply_chat_template(&this.tokenizer, &messages, true)
+                            .map_err(|e| {
+                                CeraError::Backend(format!("chat template render: {e:#}"))
+                            })?;
 
                     let toks = this.tokenizer.encode(&rendered);
                     let split = crate::engine::CeraEngine::split_tokens_at_marker(
@@ -3297,6 +3542,17 @@ impl Session {
                         marker_name,
                     )?;
 
+                    let segments = [
+                        chat::IngestSegment::Tokens(&toks[..split]),
+                        chat::IngestSegment::Audio {
+                            pcm: &audio.pcm,
+                            sample_rate: audio.sample_rate,
+                        },
+                        chat::IngestSegment::Tokens(&toks[split + 1..]),
+                    ];
+                    if let Some(res) = this.try_append_fused_audio(&segments) {
+                        return res;
+                    }
                     if split > 0 {
                         this.append_tokens(&toks[..split])?;
                     }
@@ -3461,6 +3717,10 @@ impl Session {
         let mut pos = self.current_pos;
         let mut pending: Vec<u32> = Vec::with_capacity(opts.flush_every_tokens.max(1) as usize);
         let mut last_flush = Instant::now();
+        // The first token always goes straight to the sink: the count/time batching below is for
+        // the steady stream, and applying it to token one would hold time to first token for up
+        // to `flush_every_ms` (50 ms by default) after the prompt is already done.
+        let mut first_flushed = false;
 
         let flush_n = opts.flush_every_tokens.max(1) as usize;
         let flush_ms = opts.flush_every_ms;
@@ -3538,8 +3798,14 @@ impl Session {
         // switching kernels mid-loop would complicate the reproducibility-critical
         // decode body (see the RNG-step note below) for a path that is typically
         // short. Revisit if pre-trigger prose dominates a real workload.
+        let ctrl = crate::audio_engine::ModalityControlTokens::from_tokenizer(&self.tokenizer);
+        let has_mixed_start = self.tokenizer.special_token_id("<|mixed_start|>").is_some();
+        let ban_audio_control = has_mixed_start
+            && (opts.audio_mode == AudioOutputMode::TextOnly
+                || self.audio_decoder.is_none()
+                || self.detok_weights.is_none());
         let want_greedy = opts.temperature <= 0.0 || opts.top_k == 1;
-        let greedy = want_greedy && opts.grammar.is_none();
+        let greedy = want_greedy && opts.grammar.is_none() && !ban_audio_control;
 
         // Speculative-decoding fast path. Engages only on the plain greedy path
         // (implied by `greedy`, which already excludes grammar) with a dense
@@ -3665,16 +3931,22 @@ impl Session {
         let mut stopped_token = None;
         let mut used_audio = false;
         let mut began_step = false;
+        let mut logits_fresh = true;
         let mut decoder = if opts.audio_mode == AudioOutputMode::TextOnly {
             None
         } else if let (Some(dec), Some(detok)) = (&self.audio_decoder, &self.detok_weights) {
             let acc_ref = self.audio_accelerator.as_deref();
+            let (default_audio_temp, default_audio_top_k) = if dec.is_lfm3a_gen() {
+                (0.4, 0)
+            } else {
+                (0.7, 40)
+            };
             let mut out_dec = crate::audio_engine::AudioOutputDecoder::new(
                 dec,
                 detok,
                 acc_ref,
-                0.7,
-                40,
+                default_audio_temp,
+                default_audio_top_k,
                 self.config.gpu_depthformer,
             );
             let seed = opts
@@ -3693,14 +3965,15 @@ impl Session {
             .unwrap_or_default();
         // Only an interleaved turn forces the text -> audio switch. Every other
         // mode leaves the text budget unbounded, so the switch happens only when
-        // the model itself emits `<|audio_start|>`.
-        let text_budget = if opts.audio_mode == AudioOutputMode::Interleaved {
+        // the model itself emits `<|audio_start|>` (or `<|mixed_start|>` on LFM3).
+        let mut text_budget = if opts.audio_mode == AudioOutputMode::Interleaved {
             cadence.text
         } else {
             usize::MAX
         };
         let mut modality_budget = text_budget;
         let mut text_done = false;
+        let mut banned_logits: Vec<f32> = Vec::new();
 
         loop {
             if self.cancel.load(Ordering::Relaxed) {
@@ -3717,6 +3990,26 @@ impl Session {
             Self::resize_pools_for_cpuset();
 
             began_step = true;
+            // The ban applies to a copy: `logits` is saved as the seed of a later `generate()`
+            // without an append, and a stop right after this step would leave the control ids
+            // banned there (an audio turn could then never open with them).
+            if ban_audio_control {
+                ban_control_ids(
+                    &logits,
+                    [
+                        ctrl.audio_start,
+                        ctrl.audio_end,
+                        ctrl.text_end,
+                        ctrl.mixed_start,
+                    ],
+                    &mut banned_logits,
+                );
+            }
+            let step_logits: &mut Vec<f32> = if ban_audio_control {
+                &mut banned_logits
+            } else {
+                &mut logits
+            };
             let token = if greedy {
                 greedy_next
             } else if armed
@@ -3724,7 +4017,7 @@ impl Session {
                 && let Some(mask) = grammar_mask.as_ref()
             {
                 sample_scratch.clear();
-                sample_scratch.extend_from_slice(&logits);
+                sample_scratch.extend_from_slice(step_logits);
                 // Mask logits to grammar-allowed tokens (EOS only when complete).
                 let allowed =
                     mask.apply_with_stop_tokens(state, &mut sample_scratch, &opts.stop_tokens);
@@ -3738,10 +4031,10 @@ impl Session {
                     self.sampler.sample(&mut sample_scratch)
                 }
             } else if want_greedy {
-                crate::sampler::argmax(&logits)
+                crate::sampler::argmax(step_logits)
             } else {
                 self.sampler
-                    .sample_preserving(&mut logits, &mut sample_scratch)
+                    .sample_preserving(step_logits, &mut sample_scratch)
             };
 
             // A trigger token pending in the lazy pre-trigger phase must arm the
@@ -3811,16 +4104,22 @@ impl Session {
             // the current position, so the drafts are rejected and the round is
             // wasted. Output stays correct either way (`verify_draft` re-derives
             // every token), which is exactly why the gap would go unnoticed.
-            let is_audio_transition = decoder.is_some()
-                && (token == crate::audio_engine::TOKEN_TEXT_END
-                    || token == crate::audio_engine::TOKEN_AUDIO_START);
-            if is_audio_transition && token == crate::audio_engine::TOKEN_TEXT_END {
+            let is_audio_transition =
+                decoder.is_some() && (token == ctrl.text_end || token == ctrl.audio_start);
+            if is_audio_transition && token == ctrl.text_end {
                 text_done = true;
             }
+            if decoder.is_some() && token == ctrl.mixed_start {
+                text_budget = cadence.text;
+                modality_budget = cadence.text;
+            }
+            let is_audio_control = (decoder.is_some()
+                && (is_audio_transition || token == ctrl.audio_end || token == ctrl.mixed_start))
+                || (has_mixed_start && token == ctrl.mixed_start);
 
             let history_len = self.token_history.len();
             self.token_history.push(token);
-            if !is_audio_transition {
+            if !is_audio_control {
                 pending.push(token);
                 generated += 1;
                 modality_budget = modality_budget.saturating_sub(1);
@@ -3834,9 +4133,11 @@ impl Session {
                 if !pending.is_empty() {
                     sink.on_text_tokens(&pending);
                     pending.clear();
+                    first_flushed = true;
                 }
 
                 let mut emb = self.model.forward_embedding(&[token], pos, &mut self.state);
+                logits_fresh = false;
                 if let Err(e) = self.check_decode_error() {
                     return Err(Self::sync_frontier_on_err(
                         &mut self.current_pos,
@@ -3849,12 +4150,11 @@ impl Session {
                 }
                 pos += 1;
 
-                let mut audio_budget =
-                    if token == crate::audio_engine::TOKEN_AUDIO_START || text_done {
-                        usize::MAX
-                    } else {
-                        cadence.audio
-                    };
+                let mut audio_budget = if token == ctrl.audio_start || text_done {
+                    usize::MAX
+                } else {
+                    cadence.audio
+                };
                 loop {
                     if self.cancel.load(Ordering::Relaxed) {
                         finish = FinishReason::Cancelled;
@@ -3884,14 +4184,39 @@ impl Session {
                             ));
                         }
                         crate::audio_engine::FrameOutcome::End => {
+                            if let Some(eos_emb) = dec.eos_feedback_embedding() {
+                                let eos_logits = self.model.forward_from_embedding(
+                                    &eos_emb,
+                                    pos,
+                                    &mut self.state,
+                                );
+                                if let Err(e) = self.check_decode_error() {
+                                    return Err(Self::sync_frontier_on_err(
+                                        &mut self.current_pos,
+                                        &self.position_atomic,
+                                        &mut self.token_history,
+                                        pos,
+                                        history_len,
+                                        e,
+                                    ));
+                                }
+                                pos += 1;
+                                logits = eos_logits;
+                                logits_fresh = true;
+                                if is_audio_transition || text_done {
+                                    break;
+                                }
+                                if greedy {
+                                    greedy_next = crate::sampler::argmax(&logits);
+                                }
+                                modality_budget = text_budget;
+                                break;
+                            }
                             if is_audio_transition || text_done {
                                 break;
                             }
-                            let text_end_logits = self.model.forward(
-                                &[crate::audio_engine::TOKEN_TEXT_END],
-                                pos,
-                                &mut self.state,
-                            );
+                            let text_end_logits =
+                                self.model.forward(&[ctrl.text_end], pos, &mut self.state);
                             // `decode_frame` runs the vocoder, not the LLM: it
                             // takes no `Model` handle, so it cannot poison the
                             // slot between the `forward_embedding` check above
@@ -3914,6 +4239,7 @@ impl Session {
                                 greedy_next = crate::sampler::argmax(&text_end_logits);
                             }
                             logits = text_end_logits;
+                            logits_fresh = true;
                             pos += 1;
                             modality_budget = text_budget;
                             break;
@@ -3953,6 +4279,7 @@ impl Session {
                         if greedy {
                             greedy_next = crate::sampler::argmax(&logits);
                         }
+                        logits_fresh = true;
                         pos += 1;
                         modality_budget = text_budget;
                         break;
@@ -3961,6 +4288,7 @@ impl Session {
                     emb =
                         self.model
                             .forward_hidden_from_embedding(&audio_emb, pos, &mut self.state);
+                    logits_fresh = false;
                     if let Err(e) = self.check_decode_error() {
                         return Err(Self::sync_frontier_on_err(
                             &mut self.current_pos,
@@ -3975,7 +4303,7 @@ impl Session {
                     self.position_atomic.store(pos as u32, Ordering::Relaxed);
                 }
 
-                if is_audio_transition || text_done {
+                if is_audio_transition || text_done || dec.is_safety_limit_reached() {
                     if finish == FinishReason::MaxTokens {
                         finish = FinishReason::Stop;
                     }
@@ -3994,10 +4322,11 @@ impl Session {
             let should_flush_n = pending.len() >= flush_n;
             let should_flush_t =
                 flush_ms > 0 && last_flush.elapsed().as_millis() >= flush_ms as u128;
-            if should_flush_n || should_flush_t {
+            if should_flush_n || should_flush_t || (!first_flushed && !pending.is_empty()) {
                 sink.on_text_tokens(&pending);
                 pending.clear();
                 last_flush = Instant::now();
+                first_flushed = true;
             }
 
             if greedy {
@@ -4006,6 +4335,7 @@ impl Session {
                 // — that's fine, greedy mode never reads it after the
                 // initial argmax.
                 greedy_next = self.model.forward_greedy(&[token], pos, &mut self.state);
+                logits_fresh = false;
                 if let Err(e) = self.check_decode_error() {
                     return Err(Self::sync_frontier_on_err(
                         &mut self.current_pos,
@@ -4020,6 +4350,7 @@ impl Session {
                 // Stochastic: full forward. Logits stay pristine for the
                 // next iteration's sample and for chaining across calls.
                 logits = self.model.forward(&[token], pos, &mut self.state);
+                logits_fresh = true;
                 if let Err(e) = self.check_decode_error() {
                     return Err(Self::sync_frontier_on_err(
                         &mut self.current_pos,
@@ -4079,10 +4410,10 @@ impl Session {
         //   was already EOS). `logits` still holds the untouched prefill
         //   distribution; restoring it keeps the session usable for a
         //   retry without the caller having to re-prefill.
-        if greedy && generated > 0 {
-            self.last_logits = None;
-        } else {
+        if (!greedy || generated == 0) && logits_fresh {
             self.last_logits = Some(logits);
+        } else {
+            self.last_logits = None;
         }
 
         sink.on_done(finish.clone());
@@ -4147,6 +4478,8 @@ impl Session {
 
         let mut pending: Vec<u32> = Vec::with_capacity(flush_n);
         let mut last_flush = Instant::now();
+        // First token goes straight to the sink (see `generate_inner`).
+        let mut first_flushed = false;
         let mut generated: u32 = 0;
         let mut finish = FinishReason::MaxTokens;
         let mut stats = crate::spec::SpecStats::default();
@@ -4162,12 +4495,14 @@ impl Session {
                 pending.push(tok);
                 self.token_history.push(tok);
                 generated += 1;
-                let flush = pending.len() >= flush_n
+                let flush = !first_flushed
+                    || pending.len() >= flush_n
                     || (flush_ms > 0 && last_flush.elapsed().as_millis() >= flush_ms as u128);
                 if flush {
                     sink.on_text_tokens(&pending);
                     pending.clear();
                     last_flush = Instant::now();
+                    first_flushed = true;
                 }
             }};
         }
@@ -4487,7 +4822,149 @@ impl std::fmt::Debug for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The modality-control ban applies to a copy: the original logits can become the seed of
+    /// the next `generate()`, where the same ids must still be available.
+    #[test]
+    fn banning_control_ids_leaves_the_source_logits_alone() {
+        let logits = vec![0.5f32, 1.0, 1.5, 2.0, 2.5];
+        let mut banned = vec![9.0f32; 2]; // stale contents from an earlier step
+        ban_control_ids(&logits, [1, 3, 4, 99], &mut banned);
+        assert_eq!(
+            logits,
+            vec![0.5, 1.0, 1.5, 2.0, 2.5],
+            "the source was mutated"
+        );
+        assert_eq!(banned.len(), logits.len());
+        assert_eq!(banned[0], 0.5);
+        assert_eq!(banned[2], 1.5);
+        for id in [1, 3, 4] {
+            assert_eq!(banned[id], f32::NEG_INFINITY);
+        }
+    }
     use crate::manifest::InferenceType;
+
+    /// A TurboQuant request that resolves to the plain cache is reported; a request that is
+    /// honoured, and a request for no compression at all, are not.
+    #[test]
+    fn a_downgraded_turboquant_request_is_reported() {
+        let tq = KvCompression::turboquant(1);
+        let mut cfg = mock_config();
+        cfg.head_dim = 64;
+        cfg.architecture = "lfm2".into();
+        assert!(!tq.is_downgraded_for(&cfg));
+        cfg.architecture = "lfm3".into();
+        assert!(tq.is_downgraded_for(&cfg));
+        cfg.architecture = "lfm2".into();
+        cfg.head_dim = 24; // not a power of two
+        assert!(tq.is_downgraded_for(&cfg));
+        assert!(!KvCompression::None.is_downgraded_for(&cfg));
+    }
+
+    /// The adapter guard every attach path shares (`Session` and
+    /// `CeraEngine::detect_pii_with_lora`): a model that does not run LoRA refuses an adapter
+    /// instead of ignoring it, and a classifier adapter on such a model (lfm3) is the case
+    /// that would otherwise switch it to attention branches written for another architecture.
+    #[test]
+    fn an_adapter_is_refused_by_a_model_without_lora_hooks() {
+        let model = MockTestModel::new(mock_config());
+        assert!(!model.supports_lora());
+        let adapter = crate::lora::LoraAdapterWeights::new_classifier_for_testing(
+            vec![0.0; 2],
+            None,
+            vec!["class".into()],
+        );
+        let err = ensure_adapter_runs(&model, &adapter).unwrap_err();
+        match err {
+            CeraError::LoraUnsupportedByBackend(detail) => {
+                assert!(
+                    detail.contains("'mock'") && detail.contains("no backend runs it"),
+                    "{detail}"
+                );
+            }
+            other => panic!("expected LoraUnsupportedByBackend, got {other:?}"),
+        }
+    }
+
+    /// `Session::new` is where a downgraded TurboQuant request is reported (the model's
+    /// `configure_kv_compression` no longer errors for lfm3): one warning per session for
+    /// lfm3, none for a request the model serves or for no compression, and none from a
+    /// reset, which re-configures the same mode.
+    #[test]
+    fn session_new_warns_once_when_turboquant_is_downgraded() {
+        use crate::audio_profile::tests::warnings_of;
+        let new_session = |arch: &str, head_dim: usize, kv: KvCompression, n_keep: u32| {
+            let mut config = mock_config();
+            config.architecture = arch.into();
+            config.head_dim = head_dim;
+            let model = Arc::new(MockTestModel::new(config));
+            let tokenizer = Arc::new(BpeTokenizer::empty_for_test());
+            let session_config = SessionConfig {
+                kv_compression: kv,
+                n_keep,
+                ..SessionConfig::default()
+            };
+            Session::new(
+                model,
+                tokenizer,
+                ModalityCapabilities::text_only(),
+                session_config,
+            )
+            .unwrap()
+        };
+        let downgrades = |warnings: &[String]| {
+            warnings
+                .iter()
+                .filter(|w| w.contains("TurboQuant KV compression is not supported"))
+                .count()
+        };
+        let tq = KvCompression::turboquant(1);
+
+        let mut lfm3 = None;
+        let warned = warnings_of(|| lfm3 = Some(new_session("lfm3", 64, tq.clone(), 0)));
+        assert_eq!(downgrades(&warned), 1, "{warned:?}");
+        assert!(
+            warned.iter().any(|w| w.contains("lfm3")),
+            "the warning names the architecture: {warned:?}"
+        );
+        let warned = warnings_of(|| lfm3.as_mut().unwrap().reset().unwrap());
+        assert_eq!(
+            downgrades(&warned),
+            0,
+            "a reset must not warn again: {warned:?}"
+        );
+
+        let warned = warnings_of(|| drop(new_session("lfm2", 64, tq.clone(), 0)));
+        assert_eq!(downgrades(&warned), 0, "a servable request: {warned:?}");
+        let warned = warnings_of(|| drop(new_session("lfm3", 64, KvCompression::None, 0)));
+        assert_eq!(
+            downgrades(&warned),
+            0,
+            "no compression requested: {warned:?}"
+        );
+
+        // The n_keep warning keys on the mode the cache really uses: a downgraded request is
+        // not compressed, so an lfm3 session gets no "shifting compressed caches" warning, and a
+        // servable request still gets exactly one.
+        let n_keep_warnings = |warnings: &[String]| {
+            warnings
+                .iter()
+                .filter(|w| w.contains("n_keep configured alongside TurboQuant"))
+                .count()
+        };
+        let warned = warnings_of(|| drop(new_session("lfm3", 64, tq.clone(), 4)));
+        assert_eq!(
+            n_keep_warnings(&warned),
+            0,
+            "a downgraded request: {warned:?}"
+        );
+        let warned = warnings_of(|| drop(new_session("lfm2", 64, tq.clone(), 4)));
+        assert_eq!(
+            n_keep_warnings(&warned),
+            1,
+            "a compressed cache: {warned:?}"
+        );
+    }
 
     #[test]
     fn mean_pool_averages_rows_and_tolerates_zero_width() {
@@ -4694,6 +5171,76 @@ mod tests {
     }
 
     #[test]
+    fn fused_audio_prefill_declines_what_it_cannot_splice() {
+        use super::chat::IngestSegment;
+        let model = Arc::new(MockTestModel::new(mock_config()));
+        let mut session = Session::new(
+            model,
+            Arc::new(BpeTokenizer::empty_for_test()),
+            ModalityCapabilities {
+                audio_in: true,
+                ..ModalityCapabilities::text_only()
+            },
+            SessionConfig::default(),
+        )
+        .unwrap();
+        let pcm = [0.0f32; 160];
+        let audio = IngestSegment::Audio {
+            pcm: &pcm,
+            sample_rate: 16_000,
+        };
+        let toks = [1u32, 2, 3];
+        // The mock cannot hand out token rows: the caller must fall back, with nothing touched.
+        let out = session.try_append_fused_audio(&[
+            IngestSegment::Tokens(&toks),
+            audio.clone(),
+            IngestSegment::Tokens(&toks),
+        ]);
+        assert!(out.is_none());
+        // Audio without any text, two clips, and an image all keep the per-segment route.
+        assert!(
+            session
+                .try_append_fused_audio(std::slice::from_ref(&audio))
+                .is_none()
+        );
+        assert!(
+            session
+                .try_append_fused_audio(&[IngestSegment::Tokens(&toks), audio.clone(), audio])
+                .is_none()
+        );
+        assert!(
+            session
+                .try_append_fused_audio(&[IngestSegment::Tokens(&toks), IngestSegment::Image(&[1])])
+                .is_none()
+        );
+        assert_eq!(
+            session.position(),
+            0,
+            "a declined fusion must not touch the KV"
+        );
+    }
+
+    #[test]
+    fn first_token_skips_the_flush_batching() {
+        // Default opts batch the stream (16 tokens or 50 ms), but token one must not wait for
+        // either: it is the time to first token a streaming client sees.
+        let (_model, mut session) = poison_test_session();
+        session.append_tokens(&[1, 2, 3]).unwrap();
+        let mut sink = RecordingSink::default();
+        let opts = GenerateOpts {
+            temperature: 0.0,
+            max_tokens: 5,
+            ..GenerateOpts::default()
+        };
+        session.generate(&opts, &mut sink).unwrap();
+        assert_eq!(sink.tokens.len(), 5);
+        assert_eq!(
+            sink.flushes, 2,
+            "the first token is flushed alone, the rest batched"
+        );
+    }
+
+    #[test]
     fn generate_opts_default_batching() {
         let o = GenerateOpts::default();
         assert_eq!(o.flush_every_tokens, 16);
@@ -4741,7 +5288,7 @@ mod tests {
         let chat = splice_chat_rows(
             &segs,
             &tokens,
-            (1000, 1001),
+            Some((1000, 1001)),
             std::slice::from_ref(&image),
             embed,
         )
@@ -4755,6 +5302,14 @@ mod tests {
         assert_eq!(chat.rows.len(), chat.n_rows * HS);
         assert_eq!(chat.text_ids, vec![10, 11, 1000, 1001, 12, 13]);
 
+        // LFM3-VL (`boundary_ids == None`) splices image rows directly without boundary tokens.
+        let nobound =
+            splice_chat_rows(&segs, &tokens, None, std::slice::from_ref(&image), embed).unwrap();
+        let nobound_order: Vec<f32> = nobound.rows.chunks(HS).map(|r| r[0]).collect();
+        assert_eq!(nobound_order, vec![10.0, 11.0, 7.0, 8.0, 12.0, 13.0]);
+        assert_eq!(nobound.n_rows, 6);
+        assert_eq!(nobound.text_ids, vec![10, 11, 12, 13]);
+
         // Two images keep their own rows in marker order.
         let tokens2 = [10, 99, 11, 99, 12];
         let segs2 = splice_image_markers(&tokens2, 99);
@@ -4762,7 +5317,7 @@ mod tests {
         let two = splice_chat_rows(
             &segs2,
             &tokens2,
-            (1000, 1001),
+            Some((1000, 1001)),
             &[image.clone(), other],
             embed,
         )
@@ -4780,7 +5335,7 @@ mod tests {
             splice_chat_rows(
                 &segs,
                 &tokens,
-                (1000, 1001),
+                Some((1000, 1001)),
                 std::slice::from_ref(&image),
                 |_| None
             )
@@ -4791,13 +5346,13 @@ mod tests {
             splice_chat_rows(
                 &segs,
                 &tokens,
-                (1000, 1001),
+                Some((1000, 1001)),
                 std::slice::from_ref(&image),
                 refuse_img_start
             )
             .is_none()
         );
-        assert!(splice_chat_rows(&segs, &tokens, (1000, 1001), &[], embed).is_none());
+        assert!(splice_chat_rows(&segs, &tokens, Some((1000, 1001)), &[], embed).is_none());
     }
 
     /// Token stream with no `<image>` markers collapses to a single
@@ -5345,8 +5900,11 @@ mod tests {
         let mut sink = RecordingSink::default();
         let err = session.generate(&greedy_opts(4), &mut sink).unwrap_err();
         assert!(matches!(err, CeraError::Backend(ref s) if s == "injected decode fault"));
+        // The first token is delivered as soon as it is sampled (it comes from the prefill's
+        // logits, which are sound), so a fault in the next forward may follow it, but nothing
+        // after it.
         assert!(
-            sink.tokens.is_empty(),
+            sink.tokens.len() <= 1,
             "faulted generate emitted {:?}",
             sink.tokens
         );
@@ -5742,8 +6300,9 @@ mod tests {
         let mut sink = RecordingSink::default();
         let err = session.generate(&spec_opts(4, 2), &mut sink).unwrap_err();
         assert!(matches!(err, CeraError::Backend(ref s) if s == "injected verify fault"));
+        // The first token is delivered as soon as it is sampled, ahead of the verify batch.
         assert!(
-            sink.tokens.is_empty(),
+            sink.tokens.len() <= 1,
             "faulted spec generate emitted {:?}",
             sink.tokens
         );
@@ -5788,6 +6347,60 @@ mod tests {
         assert_eq!(session.current_pos, 3);
         assert_eq!(session.position(), 3);
         assert_eq!(session.token_history.len(), 3);
+    }
+
+    #[test]
+    fn default_asr_system_prompt_selects_lfm3a_vs_lfm2a() {
+        use crate::model::audio_encoder::{
+            AudioEncoderConfig, AudioEncoderWeights, AudioMlpAdapterWeights, ConvLayerWeights,
+            ConvStemWeights,
+        };
+        use crate::model::weights::MmapWeight;
+
+        let (_, mut session) = poison_test_session();
+        assert_eq!(session.default_asr_system_prompt(), "Perform ASR.");
+
+        let make_encoder = |stem_layers: usize| AudioEncoderWeights {
+            config: AudioEncoderConfig {
+                n_layer: 0,
+                n_embd: 4,
+                n_ff: 4,
+                n_head: 1,
+                eps: 1e-5,
+                n_mel_bins: 128,
+                llm_hidden_size: 4,
+            },
+            conv_stem: ConvStemWeights {
+                layers: (0..stem_layers)
+                    .map(|i| ConvLayerWeights {
+                        name: format!("c{i}"),
+                        weight: vec![0.0],
+                        bias: vec![0.0],
+                        shape: vec![1, 1, 1],
+                    })
+                    .collect(),
+                pre_encode_out_w: MmapWeight::from_owned_f32(vec![0.0; 16], 4, 4),
+                pre_encode_out_b: vec![0.0; 4],
+            },
+            layers: Vec::new(),
+            mlp_adapter: AudioMlpAdapterWeights {
+                norm_w: vec![1.0; 4],
+                norm_b: vec![0.0; 4],
+                up_w: MmapWeight::from_owned_f32(vec![0.0; 16], 4, 4),
+                up_b: vec![0.0; 4],
+                down_w: MmapWeight::from_owned_f32(vec![0.0; 16], 4, 4),
+                down_b: vec![0.0; 4],
+            },
+        };
+
+        session.audio_encoder = Some(Arc::new(make_encoder(5)));
+        assert_eq!(session.default_asr_system_prompt(), "Perform ASR.");
+
+        session.audio_encoder = Some(Arc::new(make_encoder(3)));
+        assert_eq!(
+            session.default_asr_system_prompt(),
+            "Perform ASR in English."
+        );
     }
 }
 

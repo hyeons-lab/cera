@@ -156,6 +156,39 @@ void main() {
   );
 
   testWidgets(
+    'bundle picker catalog includes LFM3 and d1 models and modality badges',
+    (WidgetTester tester) async {
+      await tester.pumpWidget(
+        const MaterialApp(home: Scaffold(body: BundlePickerDialog())),
+      );
+      await tester.pumpAndSettle();
+
+      await tester.tap(find.text('Catalog & Download'));
+      await tester.pumpAndSettle();
+
+      // Filter for LFM3 models
+      await tester.enterText(find.byType(TextField), 'LFM3');
+      await tester.pumpAndSettle();
+
+      expect(find.text('LFM3-1.7B'), findsOneWidget);
+      expect(find.text('LFM3-VL-2B'), findsOneWidget);
+      expect(find.text('LFM3-Audio-2B'), findsOneWidget);
+      expect(find.text('LFM3-Omni-2B'), findsOneWidget);
+      expect(find.text('Omni'), findsOneWidget);
+
+      // Filter for d1 models
+      await tester.enterText(find.byType(TextField), 'd1');
+      await tester.pumpAndSettle();
+
+      expect(find.text('d1-3B'), findsOneWidget);
+      expect(find.text('d1-2B'), findsOneWidget);
+      expect(find.text('d1-Omni-2B'), findsOneWidget);
+      expect(find.text('d1-omni-600M'), findsOneWidget);
+      expect(find.text('Decision'), findsWidgets);
+    },
+  );
+
+  testWidgets(
     'tts studio view initializes with clean default text without quant suffix',
     (WidgetTester tester) async {
       const bundle = BundleModelSource(
