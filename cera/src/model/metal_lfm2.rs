@@ -5066,7 +5066,7 @@ impl MetalLfmModel {
             n,
             self.state.max_seq_len
         );
-        if !cfg.is_causal {
+        if cfg.architecture == "lfm3" && !cfg.is_causal {
             assert_eq!(
                 start_pos, 0,
                 "bidirectional prefill must run in one pass from start_pos == 0"
@@ -5080,7 +5080,7 @@ impl MetalLfmModel {
         // over MAX_PREFILL_TOKENS route through `bidirectional_trunk`.
         let max_chunk = self.state.max_seq_len.min(MAX_PREFILL_TOKENS);
         if n > max_chunk {
-            if !cfg.is_causal {
+            if !cfg.is_causal && start_pos == 0 {
                 let mut emb = vec![0.0f32; n * hs];
                 self.embed_tokens(tokens, &mut emb);
                 return self.bidirectional_prefill_logits(&emb, n, state);
@@ -5138,7 +5138,7 @@ impl MetalLfmModel {
             n,
             self.state.max_seq_len
         );
-        if !cfg.is_causal {
+        if cfg.architecture == "lfm3" && !cfg.is_causal {
             assert_eq!(
                 start_pos, 0,
                 "bidirectional prefill must run in one pass from start_pos == 0"
@@ -5149,7 +5149,7 @@ impl MetalLfmModel {
         // populates `prefill_batch_buf` then runs the per-layer body.
         let max_chunk = self.state.max_seq_len.min(MAX_PREFILL_TOKENS);
         if n > max_chunk {
-            if !cfg.is_causal {
+            if !cfg.is_causal && start_pos == 0 {
                 return self.bidirectional_prefill_logits(embeddings, n, state);
             }
             let mut logits = Vec::new();

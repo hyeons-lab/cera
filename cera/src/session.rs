@@ -2300,10 +2300,11 @@ impl Session {
         // CLI `--ubatch-size 0` opt-out.
         let prefill_start = Instant::now();
         self.note_ingest_mutation(false);
-        let ubatch = if self.model.config().is_causal {
-            self.config.ubatch_size as usize
-        } else {
+        let ubatch = if self.model.config().architecture == "lfm3" && !self.model.config().is_causal
+        {
             0
+        } else {
+            self.config.ubatch_size as usize
         };
         let (consumed, logits) = self.model.forward_prefill_chunked(
             tokens,
@@ -2535,10 +2536,11 @@ impl Session {
         // and avoids leaving the session wedged on an entry-time
         // cancel. `ubatch == 0` means "no chunking" (one call
         // covering all frames), matching CLI `--ubatch-size 0`.
-        let ubatch = if self.model.config().is_causal {
-            self.config.ubatch_size as usize
-        } else {
+        let ubatch = if self.model.config().architecture == "lfm3" && !self.model.config().is_causal
+        {
             0
+        } else {
+            self.config.ubatch_size as usize
         };
         let chunk_size = if ubatch == 0 { n_tokens } else { ubatch };
         let mut last_logits: Option<Vec<f32>> = None;

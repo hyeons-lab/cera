@@ -6657,7 +6657,7 @@ impl GpuLfmModel {
             hidden_size
         );
 
-        if !self.config.is_causal {
+        if self.config.architecture == "lfm3" && !self.config.is_causal {
             assert_eq!(
                 start_pos, 0,
                 "bidirectional prefill must run in one pass from start_pos == 0"
@@ -10544,13 +10544,16 @@ impl GpuLfmModel {
         let hs = self.config.hidden_size;
         let chunk = self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS);
         if !self.config.is_causal {
-            assert_eq!(
-                state.seq_len, 0,
-                "bidirectional prefill must run in one pass from start_pos == 0"
-            );
-            if n_tokens > chunk
-                || !self.batched_prefill
-                || self.unbatchable_matmul_weight().is_some()
+            if self.config.architecture == "lfm3" {
+                assert_eq!(
+                    state.seq_len, 0,
+                    "bidirectional prefill must run in one pass from start_pos == 0"
+                );
+            }
+            if state.seq_len == 0
+                && (n_tokens > chunk
+                    || !self.batched_prefill
+                    || self.unbatchable_matmul_weight().is_some())
             {
                 return Some(self.bidirectional_prefill_logits_locked(
                     embeddings,
@@ -12461,12 +12464,16 @@ impl Model for GpuLfmModel {
         // state and KV cache writes carry across chunks naturally.
         let unbatchable = self.unbatchable_matmul_weight();
         if !tokens.is_empty() && !self.config.is_causal {
-            assert_eq!(
-                start_pos, 0,
-                "bidirectional prefill must run in one pass from start_pos == 0"
-            );
+            if self.config.architecture == "lfm3" {
+                assert_eq!(
+                    start_pos, 0,
+                    "bidirectional prefill must run in one pass from start_pos == 0"
+                );
+            }
             let chunk_size = self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS);
-            if tokens.len() > chunk_size || !self.batched_prefill || unbatchable.is_some() {
+            if start_pos == 0
+                && (tokens.len() > chunk_size || !self.batched_prefill || unbatchable.is_some())
+            {
                 let emb = self.embed_rows(tokens);
                 return self.bidirectional_prefill_logits_locked(
                     &emb,

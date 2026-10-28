@@ -6142,7 +6142,7 @@ impl LfmModel {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         let cfg = &self.config;
-        if !cfg.is_causal {
+        if self.lfm3.is_some() && !cfg.is_causal {
             assert_eq!(
                 start_pos, 0,
                 "bidirectional prefill must run in one pass from start_pos == 0"

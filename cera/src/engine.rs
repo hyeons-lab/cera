@@ -528,79 +528,73 @@ impl CeraEngine {
         //
         // A text type ignores the mmproj entirely, which is what makes the
         // documented opt-out ("text plus an ignored sidecar") mean something.
-        let (audio_decoder, detok_weights, audio_accelerator) =
-            if matches!(inference_type, InferenceType::LlamaCppLfm2AudioV1) {
-                let voc_arc = parts
-                    .audio_decoder
-                    .and_then(|b| parse_audio_sidecar(b, "audio decoder"));
-                let tok_arc = parts
-                    .audio_tokenizer
-                    .and_then(|b| parse_audio_sidecar(b, "audio tokenizer"));
+        let (audio_decoder, detok_weights, audio_accelerator) = {
+            let voc_arc = parts
+                .audio_decoder
+                .and_then(|b| parse_audio_sidecar(b, "audio decoder"));
+            let tok_arc = parts
+                .audio_tokenizer
+                .and_then(|b| parse_audio_sidecar(b, "audio tokenizer"));
 
-                let voc_arc = voc_arc
-                    .map(|vg| crate::model::split_vocoder::resolve_vocoder(vg, tok_arc.as_ref()));
-                let mmproj_gen = mmproj.as_ref().filter(|g| {
-                    voc_arc.is_none() && crate::model::audio_decoder::is_lfm3a_gen_gguf(g)
-                });
+            let voc_arc = voc_arc
+                .map(|vg| crate::model::split_vocoder::resolve_vocoder(vg, tok_arc.as_ref()));
 
-                let dec = if let Some(ref vg) = voc_arc {
-                    crate::model::audio_decoder::AudioDecoderWeights::from_gguf(vg)
+            let dec = if let Some(ref vg) = voc_arc {
+                crate::model::audio_decoder::AudioDecoderWeights::from_gguf(vg)
+                    .map_err(|e| {
+                        tracing::warn!("failed to parse audio decoder weights: {e:#}");
+                        e
+                    })
+                    .ok()
+                    .map(Arc::new)
+            } else if let Some(ref g) = mmproj {
+                crate::model::audio_decoder::AudioDecoderWeights::from_gguf(g)
+                    .ok()
+                    .map(Arc::new)
+            } else {
+                None
+            };
+
+            // The vocoder owns the detokenizer, so it is tried first, and each
+            // source is a real fallback rather than an `else if` arm: a
+            // present-but-unparseable file used to end the chain and leave the
+            // session with no detokenizer at all.
+            //
+            // Order matters beyond tidiness. `DetokenizerWeights::from_gguf`
+            // accepts fallback tensor names (`token_embd.weight`, `dense_2.*`,
+            // `token_embd_norm.weight`) so a combined GGUF still loads, and an
+            // audio *tokenizer* GGUF carries every one of them -- it is a whole
+            // separate `lfm2` model. Parsing it as a detokenizer therefore
+            // succeeds while silently substituting the wrong model's tensors:
+            // a 65536-row `token_embd.weight` stands in for the 16384-row
+            // `emb.emb.weight` code table (8 codebooks x 2048), so audio codes
+            // index a table that has nothing to do with them. The audio still
+            // sounds broadly like speech, which is what let it go unnoticed,
+            // but frames land wrong and some run an order of magnitude past
+            // [-1, 1].
+            let detok = [voc_arc.as_ref(), tok_arc.as_ref(), mmproj.as_ref()]
+                .into_iter()
+                .flatten()
+                .find_map(|g| {
+                    crate::model::audio_decoder::DetokenizerWeights::from_gguf(g)
                         .map_err(|e| {
-                            tracing::warn!("failed to parse audio decoder weights: {e:#}");
+                            tracing::warn!("failed to parse detokenizer weights: {e:#}");
                             e
                         })
                         .ok()
                         .map(Arc::new)
-                } else if let Some(g) = mmproj_gen {
-                    crate::model::audio_decoder::AudioDecoderWeights::from_gguf(g)
-                        .ok()
-                        .map(Arc::new)
-                } else {
-                    None
-                };
+                });
 
-                // The vocoder owns the detokenizer, so it is tried first, and each
-                // source is a real fallback rather than an `else if` arm: a
-                // present-but-unparseable file used to end the chain and leave the
-                // session with no detokenizer at all.
-                //
-                // Order matters beyond tidiness. `DetokenizerWeights::from_gguf`
-                // accepts fallback tensor names (`token_embd.weight`, `dense_2.*`,
-                // `token_embd_norm.weight`) so a combined GGUF still loads, and an
-                // audio *tokenizer* GGUF carries every one of them -- it is a whole
-                // separate `lfm2` model. Parsing it as a detokenizer therefore
-                // succeeds while silently substituting the wrong model's tensors:
-                // a 65536-row `token_embd.weight` stands in for the 16384-row
-                // `emb.emb.weight` code table (8 codebooks x 2048), so audio codes
-                // index a table that has nothing to do with them. The audio still
-                // sounds broadly like speech, which is what let it go unnoticed,
-                // but frames land wrong and some run an order of magnitude past
-                // [-1, 1].
-                let detok = [voc_arc.as_ref(), tok_arc.as_ref(), mmproj_gen]
-                    .into_iter()
-                    .flatten()
-                    .find_map(|g| {
-                        crate::model::audio_decoder::DetokenizerWeights::from_gguf(g)
-                            .map_err(|e| {
-                                tracing::warn!("failed to parse detokenizer weights: {e:#}");
-                                e
-                            })
-                            .ok()
-                            .map(Arc::new)
-                    });
-
-                let acc = if dec.is_some() && detok.is_some() {
-                    voc_arc.as_ref().or(mmproj_gen).and_then(|g| {
-                        crate::model::audio_decoder::build_audio_accelerator(g, cfg.backend)
-                    })
-                } else {
-                    None
-                };
-
-                (dec, detok, acc)
+            let acc = if dec.is_some() && detok.is_some() {
+                voc_arc.as_ref().or(mmproj.as_ref()).and_then(|g| {
+                    crate::model::audio_decoder::build_audio_accelerator(g, cfg.backend)
+                })
             } else {
-                (None, None, None)
+                None
             };
+
+            (dec, detok, acc)
+        };
 
         let mut aux = match (&inference_type, mmproj) {
             (InferenceType::LlamaCppImageToText, Some(g)) => AuxWeights {
