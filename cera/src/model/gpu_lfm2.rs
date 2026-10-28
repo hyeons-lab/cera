@@ -1463,10 +1463,23 @@ struct GpuLayerWeights {
     attn_q_bias: Option<wgpu::Buffer>,
     attn_k_bias: Option<wgpu::Buffer>,
     attn_v_bias: Option<wgpu::Buffer>,
+    // LFM3 sandwich norms and per-layer attention config / head gate
+    attn_post_norm: Option<wgpu::Buffer>,
+    ffn_post_norm: Option<wgpu::Buffer>,
+    attn_gate: Option<GpuWeight>,
+    rope_theta: f32,
+    has_freq_factors: bool,
+    sliding_window: Option<usize>,
+    is_non_causal: bool,
+    rope_params: Option<wgpu::Buffer>,
+    attn_params: Option<wgpu::Buffer>,
 
     // Cached bind groups for zero-allocation decode loop
     attn_norm_bg: Option<wgpu::BindGroup>,
     ffn_norm_bg: Option<wgpu::BindGroup>,
+    attn_post_norm_bg: Option<wgpu::BindGroup>,
+    ffn_post_norm_bg: Option<wgpu::BindGroup>,
+    attn_head_gate_bg: Option<wgpu::BindGroup>,
     rope_bg: Option<wgpu::BindGroup>,
     conv_fused_bg: Option<wgpu::BindGroup>,
     conv_add_bg: Option<wgpu::BindGroup>,
@@ -1844,6 +1857,7 @@ struct GpuPipelines {
     scale_f32: wgpu::ComputePipeline,
     mul_inplace: wgpu::ComputePipeline,
     silu_mul_inplace: wgpu::ComputePipeline,
+    sigmoid_head_gate_inplace: wgpu::ComputePipeline,
     ffn_swiglu_q4_0: wgpu::ComputePipeline,
     rmsnorm: wgpu::ComputePipeline,
     /// Out-of-place twin (`rmsnorm_out` entry): `dst = norm(src)`. Decode-only;
@@ -2179,8 +2193,10 @@ pub struct GpuLfmModel {
     /// in a second pass, the moved V) for one layer before it is copied back
     /// into the cache. Sized `[max_seq_len × max_kv_dim]` f32. See `shift_kv`.
     kv_shift_scratch: wgpu::Buffer,
-    attn_out_buf: wgpu::Buffer, // [hidden_size]
-    logits_buf: wgpu::Buffer,   // [vocab_size]
+    attn_out_buf: wgpu::Buffer,            // [q_dim]
+    attn_gate_buf: wgpu::Buffer,           // [n_heads]
+    head_gate_decode_params: wgpu::Buffer, // [q_dim, head_dim]
+    logits_buf: wgpu::Buffer,              // [vocab_size]
     /// `vocab_size * 4`-byte `MAP_READ` sink that `logits_buf` is copied into inside
     /// the decode step's single submission when full-logits readback (`TailArgmax::StageLogits`)
     /// is requested, avoiding a second encoder and submit in `forward_inner`.
@@ -2524,7 +2540,7 @@ impl GpuLfmModel {
                 }
                 Self::from_weight_source_with_ctx(&cpu_model, context_size, model_id, ctx)
             }
-            "lfm2" | "lfm2moe" => {
+            "lfm2" | "lfm2moe" | "lfm3" => {
                 // No CPU repacks: the GPU loader only resolves metadata from
                 // this model (see `with_repack_if`).
                 let cpu_model = super::lfm2::LfmModel::from_gguf_with_id_no_repack(
@@ -3179,6 +3195,21 @@ impl GpuLfmModel {
             let attn_q_bias = upload_opt_f32(src.attn_q_bias(i), &format!("l{i}.qb"));
             let attn_k_bias = upload_opt_f32(src.attn_k_bias(i), &format!("l{i}.kb"));
             let attn_v_bias = upload_opt_f32(src.attn_v_bias(i), &format!("l{i}.vb"));
+            let attn_post_norm =
+                upload_opt_f32(src.attn_post_norm_weight(i), &format!("l{i}.apon"));
+            let ffn_post_norm = upload_opt_f32(src.ffn_post_norm_weight(i), &format!("l{i}.fpon"));
+            let attn_gate = match src.attn_gate_ref(i) {
+                Some(wref) => Some(upload_weight(wref, &format!("l{i}.attn_gate"))?),
+                None => None,
+            };
+            let rope_theta = src.layer_rope_theta(i);
+            let layer_has_freq_factors = src.layer_has_rope_freqs(i);
+            let sliding_window = src.layer_sliding_window(i);
+            let is_non_causal = src.layer_is_non_causal(i);
+            let layer_rope_params =
+                (!is_conv).then(|| ctx.create_storage_rw(7 * 4, &format!("l{i}.rope_params")));
+            let layer_attn_params =
+                (!is_conv).then(|| ctx.create_storage_rw(8 * 4, &format!("l{i}.attn_params")));
 
             layers.push(GpuLayerWeights {
                 attn_norm,
@@ -3196,8 +3227,20 @@ impl GpuLfmModel {
                 attn_q_bias,
                 attn_k_bias,
                 attn_v_bias,
+                attn_post_norm,
+                ffn_post_norm,
+                attn_gate,
+                rope_theta,
+                has_freq_factors: layer_has_freq_factors,
+                sliding_window,
+                is_non_causal,
+                rope_params: layer_rope_params,
+                attn_params: layer_attn_params,
                 attn_norm_bg: None,
                 ffn_norm_bg: None,
+                attn_post_norm_bg: None,
+                ffn_post_norm_bg: None,
+                attn_head_gate_bg: None,
                 rope_bg: None,
                 conv_fused_bg: None,
                 conv_add_bg: None,
@@ -3245,6 +3288,11 @@ impl GpuLfmModel {
             "kv_shift_scratch",
         );
         let attn_out_buf = f(q_dim, "attn_out");
+        let attn_gate_buf = f(config.n_heads.max(1), "attn_gate");
+        let head_gate_decode_params = ctx.upload_storage(
+            bytemuck::cast_slice(&[q_dim as u32, head_dim as u32]),
+            "head_gate_decode_params",
+        );
         let logits_buf = f(config.vocab_size, "logits");
         let conv_proj_buf = f(3 * hs, "conv_proj");
         let conv_gate_buf = f(hs, "conv_gate");
@@ -3264,8 +3312,14 @@ impl GpuLfmModel {
         let prefill_batch_buf = f(hs * max_pref, "prefill_batch");
         let prefill_normed_buf = f(hs.max(q_dim) * max_pref, "prefill_normed");
         let prefill_proj_buf = f((3 * hs).max(q_dim) * max_pref, "prefill_proj");
-        let prefill_gate_buf = f(is.max(max_kv_dim).max(hs) * max_pref, "prefill_gate");
-        let prefill_up_buf = f(is.max(max_kv_dim).max(hs) * max_pref, "prefill_up");
+        let prefill_gate_buf = f(
+            is.max(max_kv_dim).max(hs).max(config.n_heads) * max_pref,
+            "prefill_gate",
+        );
+        let prefill_up_buf = f(
+            is.max(max_kv_dim).max(hs).max(config.n_heads) * max_pref,
+            "prefill_up",
+        );
         // Streaming-GEMM B16 scratch: [max_k × max_pref_padded] halfs. max_k
         // covers every Q4_0 matmul K (hs for most projections, `is` for FFN
         // down, q_dim for attention out). Only when the streaming path is on.
@@ -3358,6 +3412,7 @@ impl GpuLfmModel {
         let attn_params = ctx.create_storage_rw(8 * 4, "attn_params");
         let attn_split = head_dim == 64
             && config.n_heads.is_multiple_of(config.n_kv_heads.max(1))
+            && layers.iter().all(|lw| lw.sliding_window.is_none())
             && !crate::backend::cpu_features::env_disabled("CERA_GPU_ATTN_SPLIT");
         let attn_part = ctx.create_storage_rw(
             (config.n_heads * ATTN_SPLITS as usize * ATTN_PART_REC * 4) as u64,
@@ -3511,6 +3566,11 @@ impl GpuLfmModel {
                 shaders::ELEMENTWISE,
                 "silu_mul_inplace",
                 "silu_mul",
+            ),
+            sigmoid_head_gate_inplace: ctx.create_pipeline(
+                shaders::ELEMENTWISE,
+                "sigmoid_head_gate_inplace",
+                "sigmoid_head_gate",
             ),
             ffn_swiglu_q4_0: ctx.create_pipeline(
                 shaders::FFN_SWIGLU_Q4_0,
@@ -3848,6 +3908,8 @@ impl GpuLfmModel {
             v_buf,
             kv_shift_scratch,
             attn_out_buf,
+            attn_gate_buf,
+            head_gate_decode_params,
             logits_buf,
             logits_readback_buf,
             argmax_out_buf,
@@ -4602,6 +4664,52 @@ impl GpuLfmModel {
                     ],
                 });
 
+            let attn_post_norm_bg = self.layers[i].attn_post_norm.as_ref().map(|w| {
+                self.ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.rmsnorm.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.out_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: w.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: self.rmsnorm_hs_params.as_entire_binding(),
+                            },
+                        ],
+                    })
+            });
+
+            let ffn_post_norm_bg = self.layers[i].ffn_post_norm.as_ref().map(|w| {
+                self.ctx
+                    .device
+                    .create_bind_group(&wgpu::BindGroupDescriptor {
+                        label: None,
+                        layout: &self.pipelines.rmsnorm.get_bind_group_layout(0),
+                        entries: &[
+                            wgpu::BindGroupEntry {
+                                binding: 0,
+                                resource: self.out_buf.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 1,
+                                resource: w.as_entire_binding(),
+                            },
+                            wgpu::BindGroupEntry {
+                                binding: 2,
+                                resource: self.rmsnorm_hs_params.as_entire_binding(),
+                            },
+                        ],
+                    })
+            });
+
             let silu_bg = self
                 .ctx
                 .device
@@ -4710,6 +4818,10 @@ impl GpuLfmModel {
             };
 
             let (rope_bg, attn_out_add_bg) = if cfg.block_types[i] != BlockType::GatedConv {
+                let rope_p = self.layers[i]
+                    .rope_params
+                    .as_ref()
+                    .unwrap_or(&self.rope_params);
                 let bg_rope = self
                     .ctx
                     .device
@@ -4727,7 +4839,7 @@ impl GpuLfmModel {
                             },
                             wgpu::BindGroupEntry {
                                 binding: 2,
-                                resource: self.rope_params.as_entire_binding(),
+                                resource: rope_p.as_entire_binding(),
                             },
                             wgpu::BindGroupEntry {
                                 binding: 3,
@@ -4764,6 +4876,8 @@ impl GpuLfmModel {
             let layer = &mut self.layers[i];
             layer.attn_norm_bg = Some(attn_norm_bg);
             layer.ffn_norm_bg = Some(ffn_norm_bg);
+            layer.attn_post_norm_bg = attn_post_norm_bg;
+            layer.ffn_post_norm_bg = ffn_post_norm_bg;
             layer.silu_bg = Some(silu_bg);
             layer.ffn_add_bg = Some(ffn_add_bg);
             layer.conv_fused_bg = conv_fused_bg;
@@ -4905,9 +5019,42 @@ impl GpuLfmModel {
                     let bg = self.make_gemv_bg(w, &self.attn_out_buf, &self.out_buf);
                     self.layers[i].attn_output.as_mut().unwrap().cached_bg = Some(bg);
                 }
+                if let Some(ref w) = self.layers[i].attn_gate {
+                    let bg = self.make_gemv_bg(w, &self.normed_buf, &self.attn_gate_buf);
+                    self.layers[i].attn_gate.as_mut().unwrap().cached_bg = Some(bg);
+                    let gate_bg = self
+                        .ctx
+                        .device
+                        .create_bind_group(&wgpu::BindGroupDescriptor {
+                            label: Some("attn_head_gate"),
+                            layout: &self
+                                .pipelines
+                                .sigmoid_head_gate_inplace
+                                .get_bind_group_layout(0),
+                            entries: &[
+                                wgpu::BindGroupEntry {
+                                    binding: 0,
+                                    resource: self.attn_out_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 1,
+                                    resource: self.attn_gate_buf.as_entire_binding(),
+                                },
+                                wgpu::BindGroupEntry {
+                                    binding: 2,
+                                    resource: self.head_gate_decode_params.as_entire_binding(),
+                                },
+                            ],
+                        });
+                    self.layers[i].attn_head_gate_bg = Some(gate_bg);
+                }
 
                 if let Some(kv) = self.f16_kv().get(i).and_then(|opt| opt.as_ref()) {
                     let (k_cache, v_cache) = kv;
+                    let attn_p = self.layers[i]
+                        .attn_params
+                        .as_ref()
+                        .unwrap_or(&self.attn_params);
                     let attn_bg = self
                         .ctx
                         .device
@@ -4933,7 +5080,7 @@ impl GpuLfmModel {
                                 },
                                 wgpu::BindGroupEntry {
                                     binding: 4,
-                                    resource: self.attn_params.as_entire_binding(),
+                                    resource: attn_p.as_entire_binding(),
                                 },
                             ],
                         });
@@ -5814,10 +5961,25 @@ impl GpuLfmModel {
         let norm_bg = lw.ffn_norm_bg.as_ref().unwrap();
         if let GpuFfn::Moe(moe) = &lw.ffn {
             self.dispatch_into(pass, &self.pipelines.rmsnorm_out, norm_bg, (1, 1, 1));
-            let steps = self.moe_ffn_steps(moe, &self.ffn_input_buf, &self.hidden_buf, 1, true);
-            steps.iter().for_each(|s| {
-                self.dispatch_into(pass, s.pipeline, &s.bind_group, s.workgroups);
-            });
+            if let Some(ref post_norm_bg) = lw.ffn_post_norm_bg {
+                let steps = self.moe_ffn_steps(moe, &self.ffn_input_buf, &self.out_buf, 1, false);
+                steps.iter().for_each(|s| {
+                    self.dispatch_into(pass, s.pipeline, &s.bind_group, s.workgroups);
+                });
+                self.dispatch_into(pass, &self.pipelines.rmsnorm, post_norm_bg, (1, 1, 1));
+                let add_bg = lw.ffn_add_bg.as_ref().unwrap();
+                self.dispatch_into(
+                    pass,
+                    &self.pipelines.scaled_add_inplace,
+                    add_bg,
+                    (hs32.div_ceil(256), 1, 1),
+                );
+            } else {
+                let steps = self.moe_ffn_steps(moe, &self.ffn_input_buf, &self.hidden_buf, 1, true);
+                steps.iter().for_each(|s| {
+                    self.dispatch_into(pass, s.pipeline, &s.bind_group, s.workgroups);
+                });
+            }
             return;
         }
         let GpuFfn::Dense(dense) = &lw.ffn else {
@@ -5912,6 +6074,9 @@ impl GpuLfmModel {
         }
         // down GEMV
         self.dispatch_gemv_into(pass, &dense.down, down_bg);
+        if let Some(ref post_norm_bg) = lw.ffn_post_norm_bg {
+            self.dispatch_into(pass, &self.pipelines.rmsnorm, post_norm_bg, (1, 1, 1));
+        }
         // residual add
         self.dispatch_into(
             pass,
@@ -5937,6 +6102,17 @@ impl GpuLfmModel {
         self.dispatch_gemv_into(pass, pre.q_w, pre.q_bg);
         self.dispatch_gemv_into(pass, pre.k_w, pre.k_bg);
         self.dispatch_gemv_into(pass, pre.v_w, pre.v_bg);
+        if let Some(ref gate_w) = lw.attn_gate {
+            let gate_bg_tmp;
+            let gate_bg = match gate_w.cached_bg.as_ref() {
+                Some(b) => b,
+                None => {
+                    gate_bg_tmp = self.make_gemv_bg(gate_w, &self.normed_buf, &self.attn_gate_buf);
+                    &gate_bg_tmp
+                }
+            };
+            self.dispatch_gemv_into(pass, gate_w, gate_bg);
+        }
         // LoRA Q/K/V deltas on the raw projections (before bias/norm/rope).
         if let Some((t, (bg_a, bg_b))) = pre.q_lora.as_ref() {
             self.dispatch_lora_into(pass, t, bg_a, bg_b);
@@ -6000,16 +6176,30 @@ impl GpuLfmModel {
     /// Decode attn out_proj tail into an already-open pass: O GEMV, residual
     /// add, LoRA output delta. Shared by the merged `layer_attn` pass and the
     /// TurboQuant split (whose attention runs in its own encode passes).
+    #[allow(clippy::too_many_arguments)]
     fn encode_attn_out_into(
         &self,
         pass: &mut wgpu::ComputePass<'_>,
+        lw: &GpuLayerWeights,
         out_w: &GpuWeight,
         out_bg: &wgpu::BindGroup,
         add_bg: &wgpu::BindGroup,
         o_lora_bgs: &Option<(&WgpuLoraTarget, (wgpu::BindGroup, wgpu::BindGroup))>,
         hs32: u32,
+        q_dim: u32,
     ) {
+        if let Some(ref gate_bg) = lw.attn_head_gate_bg {
+            self.dispatch_into(
+                pass,
+                &self.pipelines.sigmoid_head_gate_inplace,
+                gate_bg,
+                (q_dim.div_ceil(256), 1, 1),
+            );
+        }
         self.dispatch_gemv_into(pass, out_w, out_bg);
+        if let Some(ref post_norm_bg) = lw.attn_post_norm_bg {
+            self.dispatch_into(pass, &self.pipelines.rmsnorm, post_norm_bg, (1, 1, 1));
+        }
         self.dispatch_into(
             pass,
             &self.pipelines.scaled_add_inplace,
@@ -6623,6 +6813,41 @@ impl GpuLfmModel {
         self.ctx
             .queue
             .write_buffer(&self.attn_params, 0, bytemuck::cast_slice(&attn_params));
+        let cur_seq = seq_len + 1;
+        for (i, lw) in self.layers.iter().enumerate() {
+            let layer_kv_heads = cfg.kv_heads_per_layer[i] as u32;
+            let layer_kv_dim = layer_kv_heads * head_dim;
+            if let Some(ref rp) = lw.rope_params {
+                let layer_rope: [u32; 7] = [
+                    pos as u32,
+                    n_heads,
+                    layer_kv_heads,
+                    head_dim,
+                    lw.rope_theta.to_bits(),
+                    self.rope_type as u32,
+                    u32::from(lw.has_freq_factors && self.has_freq_factors),
+                ];
+                self.ctx
+                    .queue
+                    .write_buffer(rp, 0, bytemuck::cast_slice(&layer_rope));
+            }
+            if let Some(ref ap) = lw.attn_params {
+                let min_pos = lw.sliding_window.map_or(0, |w| cur_seq.saturating_sub(w)) as u32;
+                let layer_attn: [u32; 8] = [
+                    n_heads,
+                    layer_kv_heads,
+                    head_dim,
+                    layer_kv_dim,
+                    cur_seq as u32,
+                    scale.to_bits(),
+                    min_pos,
+                    0,
+                ];
+                self.ctx
+                    .queue
+                    .write_buffer(ap, 0, bytemuck::cast_slice(&layer_attn));
+            }
+        }
         // `kv_append` slot for this token: row `seq_len` of every layer's
         // cache slab (kv_dim is uniform across attn layers — same value as
         // `attn_params[3]`). Offset in u32 words (2 halves each), count in
@@ -6821,6 +7046,9 @@ impl GpuLfmModel {
         if let Some((t, (bg_a, bg_b))) = &out_lora_bgs {
             self.dispatch_lora_into(pass, t, bg_a, bg_b);
         }
+        if let Some(ref post_norm_bg) = lw.attn_post_norm_bg {
+            self.dispatch_into(pass, &self.pipelines.rmsnorm, post_norm_bg, (1, 1, 1));
+        }
         self.dispatch_into(
             pass,
             &self.pipelines.add_inplace,
@@ -6932,6 +7160,7 @@ impl GpuLfmModel {
         let flash_bg_tmp;
         let flash_bg = if self.use_hs_scratch.load(Ordering::Relaxed) {
             let (k_buf, v_buf) = self.active_kv(i);
+            let attn_p = lw.attn_params.as_ref().unwrap_or(&self.attn_params);
             flash_bg_tmp = self
                 .ctx
                 .device
@@ -6957,7 +7186,7 @@ impl GpuLfmModel {
                         },
                         wgpu::BindGroupEntry {
                             binding: 4,
-                            resource: self.attn_params.as_entire_binding(),
+                            resource: attn_p.as_entire_binding(),
                         },
                     ],
                 });
@@ -7020,7 +7249,7 @@ impl GpuLfmModel {
                 (n_heads, 1, 1),
             );
         }
-        self.encode_attn_out_into(pass, out_w, out_bg, add_bg, &o_lora_bgs, hs32);
+        self.encode_attn_out_into(pass, lw, out_w, out_bg, add_bg, &o_lora_bgs, hs32, q_dim);
         if include_ffn {
             self.encode_ffn_decode_into(pass, lw, lora, i, hs32);
         }
@@ -7234,7 +7463,16 @@ impl GpuLfmModel {
                             "attn_post"
                         },
                     );
-                    self.encode_attn_out_into(&mut pass, out_w, out_bg, add_bg, &o_lora_bgs, hs32);
+                    self.encode_attn_out_into(
+                        &mut pass,
+                        lw,
+                        out_w,
+                        out_bg,
+                        add_bg,
+                        &o_lora_bgs,
+                        hs32,
+                        q_dim,
+                    );
                     if !profiling {
                         self.encode_ffn_decode_into(&mut pass, lw, lora, i, hs32);
                     }
@@ -7861,13 +8099,14 @@ impl GpuLfmModel {
                 GpuFfn::Dense(d) => (Some(&d.gate), Some(&d.up), Some(&d.down)),
                 GpuFfn::Moe(_) => (None, None, None),
             };
-            let weights: [(&'static str, Option<&GpuWeight>); 9] = [
+            let weights: [(&'static str, Option<&GpuWeight>); 10] = [
                 ("ffn_gate", gate),
                 ("ffn_up", up),
                 ("ffn_down", down),
                 ("attn_q", lw.attn_q.as_ref()),
                 ("attn_k", lw.attn_k.as_ref()),
                 ("attn_v", lw.attn_v.as_ref()),
+                ("attn_gate", lw.attn_gate.as_ref()),
                 ("attn_output", lw.attn_output.as_ref()),
                 ("conv_in_proj", lw.conv_in_proj.as_ref()),
                 ("conv_out_proj", lw.conv_out_proj.as_ref()),
@@ -7983,6 +8222,73 @@ impl GpuLfmModel {
             crate::backend::wgpu::kv_shift_workgroups(total),
             label,
         );
+    }
+
+    /// Encode `sigmoid_head_gate_inplace` across a batch of `n` tokens:
+    /// `attn_out[i] *= sigmoid(gate[i / head_dim])` for `i` in `0..total`
+    /// (`total = n * q_dim`).
+    fn encode_sigmoid_head_gate_batch<'a>(
+        &'a self,
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        attn_out: &wgpu::Buffer,
+        gate: &wgpu::Buffer,
+        total: u32,
+        head_dim: u32,
+    ) {
+        let params: [u32; 2] = [total, head_dim];
+        let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
+        let bg = self
+            .ctx
+            .device
+            .create_bind_group(&wgpu::BindGroupDescriptor {
+                label: None,
+                layout: &self
+                    .pipelines
+                    .sigmoid_head_gate_inplace
+                    .get_bind_group_layout(0),
+                entries: &[
+                    wgpu::BindGroupEntry {
+                        binding: 0,
+                        resource: attn_out.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 1,
+                        resource: gate.as_entire_binding(),
+                    },
+                    wgpu::BindGroupEntry {
+                        binding: 2,
+                        resource: p_buf.as_entire_binding(),
+                    },
+                ],
+            });
+        Self::push_prefill_dispatch(
+            cmds,
+            &self.pipelines.sigmoid_head_gate_inplace,
+            bg,
+            crate::backend::wgpu::kv_shift_workgroups(total),
+            "sigmoid_head_gate_batch",
+        );
+    }
+
+    /// Apply a sandwich post-norm (`attn_post_norm` or `ffn_post_norm`) to `buf`
+    /// via `scratch` (`n * hs` floats) and copy the normalized rows back into `buf`.
+    fn encode_post_norm_inplace_batch<'a>(
+        &'a self,
+        cmds: &mut Vec<PrefillCmd<'a>>,
+        buf: &'a wgpu::Buffer,
+        scratch: &'a wgpu::Buffer,
+        weight: &wgpu::Buffer,
+        n: u32,
+        hs: u32,
+    ) {
+        self.encode_rmsnorm_batch(cmds, buf, scratch, weight, n, hs);
+        cmds.push(PrefillCmd::Copy {
+            src: scratch,
+            src_off_floats: 0,
+            dst: buf,
+            dst_off_floats: 0,
+            len_floats: u64::from(n) * u64::from(hs),
+        });
     }
 
     /// Encode `add_rmsnorm_batch`: src[t,i] += residual[t,i]; dst[t,i] =
@@ -8929,6 +9235,8 @@ impl GpuLfmModel {
         head_dim: u32,
         q_stride: u32,
         k_stride: u32,
+        rope_theta: f32,
+        layer_has_freq_factors: bool,
     ) {
         // QK-norm (per-head rmsnorm before RoPE) only applies to archs that
         // carry per-head norm weights (Qwen3/LFM2). Dense transformers
@@ -8955,11 +9263,11 @@ impl GpuLfmModel {
             n_kv_heads,
             head_dim,
             self.config.rms_norm_eps.to_bits(),
-            self.config.rope_theta.to_bits(),
+            rope_theta.to_bits(),
             self.rope_type as u32,
             q_stride,
             k_stride,
-            self.has_freq_factors as u32,
+            u32::from(layer_has_freq_factors && self.has_freq_factors),
             has_qk_norm as u32,
         ];
         let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
@@ -9138,6 +9446,7 @@ impl GpuLfmModel {
         out_stride: u32,
         scale: f32,
         bidir_prefix: Option<u32>,
+        sliding_window: Option<usize>,
     ) {
         // No queries → nothing to dispatch (a 0-workgroup dispatch is a validation
         // error on some backends).
@@ -9186,12 +9495,20 @@ impl GpuLfmModel {
         // kernel) share each workgroup and each K/V tile stream; params[11] is the authoritative
         // chunk size edge workgroups mask against, params[7] the whole call's key rows for a
         // bidirectional pass.
-        let tiled = attention_prefill_tiled(
-            self.ctx.supports_flash_attention(),
-            head_dim,
-            q_stride,
-            out_stride,
-        );
+        //
+        // When a sliding window actively clips at least one query row in this chunk
+        // (`start_pos + n > w` on a causal layer), route to the generic `attention_prefill`
+        // shader, which reads the window from `params[13]` (reusing the `prefix_len` slot
+        // that is otherwise unused when `params[12] == 0`).
+        let window_clips =
+            bidir_prefix.is_none() && sliding_window.is_some_and(|w| (start_pos + n) as usize > w);
+        let tiled = !window_clips
+            && attention_prefill_tiled(
+                self.ctx.supports_flash_attention(),
+                head_dim,
+                q_stride,
+                out_stride,
+            );
         let f16_pipeline = self
             .pipelines
             .attention_prefill_hd64_f16
@@ -9239,7 +9556,7 @@ impl GpuLfmModel {
                 q_base,
                 n_sub,
                 u32::from(bidir_prefix.is_some()),
-                bidir_prefix.unwrap_or(0),
+                bidir_prefix.unwrap_or_else(|| sliding_window.unwrap_or(0) as u32),
             ];
             let p_buf = self.next_prefill_params(bytemuck::cast_slice(&params));
             let bg = self
@@ -9689,6 +10006,8 @@ impl GpuLfmModel {
                     head_dim,
                     q_dim,
                     kv_dim,
+                    lw.rope_theta,
+                    lw.has_freq_factors,
                 );
 
                 // Phase C: bulk-write K/V into the cache, then Phase D: batched
@@ -9755,6 +10074,23 @@ impl GpuLfmModel {
                         kv_chunk_floats,
                     );
 
+                    // LFM3 per-head attention gate: `prefill_normed_buf` still holds
+                    // `attn_norm(h)` until `encode_attention_prefill` overwrites it,
+                    // and `prefill_up_buf` is free once V has been appended to `v_cache`.
+                    if let Some(ref w_gate) = lw.attn_gate {
+                        self.encode_mul_mat_reg_tile(
+                            &mut cmds,
+                            w_gate,
+                            &self.prefill_normed_buf,
+                            &self.prefill_up_buf,
+                            n_u,
+                            hs_u,
+                            hs_u,
+                            n_heads,
+                            all_logits,
+                        );
+                    }
+
                     let max_seq_for_kv = (start_pos + n) as u32;
                     self.encode_attention_prefill(
                         &mut cmds,
@@ -9772,8 +10108,19 @@ impl GpuLfmModel {
                         q_dim,
                         q_dim,
                         attn_scale,
-                        None,
+                        if lw.is_non_causal { Some(0) } else { None },
+                        lw.sliding_window,
                     );
+
+                    if lw.attn_gate.is_some() {
+                        self.encode_sigmoid_head_gate_batch(
+                            &mut cmds,
+                            &self.prefill_normed_buf,
+                            &self.prefill_up_buf,
+                            n_u * q_dim,
+                            head_dim,
+                        );
+                    }
                 }
 
                 // Phase E: output projection (`q_dim → hs`) → prefill_gate_buf
@@ -9803,6 +10150,17 @@ impl GpuLfmModel {
                     &self.prefill_normed_buf,
                     &self.prefill_gate_buf,
                     n_u,
+                );
+            }
+
+            if let Some(ref post_norm) = lw.attn_post_norm {
+                self.encode_post_norm_inplace_batch(
+                    &mut cmds,
+                    &self.prefill_gate_buf,
+                    &self.prefill_normed_buf,
+                    post_norm,
+                    n_u,
+                    hs_u,
                 );
             }
 
@@ -9842,6 +10200,16 @@ impl GpuLfmModel {
                             s.bind_group,
                             s.workgroups,
                             "ffn_moe_batch",
+                        );
+                    }
+                    if let Some(ref post_norm) = lw.ffn_post_norm {
+                        self.encode_post_norm_inplace_batch(
+                            &mut cmds,
+                            &self.prefill_up_buf,
+                            &self.prefill_normed_buf,
+                            post_norm,
+                            n_u,
+                            hs_u,
                         );
                     }
                     self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("prefill_l{layer}"), n_u);
@@ -9944,6 +10312,16 @@ impl GpuLfmModel {
                 &self.prefill_up_buf,
                 n_u,
             );
+            if let Some(ref post_norm) = lw.ffn_post_norm {
+                self.encode_post_norm_inplace_batch(
+                    &mut cmds,
+                    &self.prefill_up_buf,
+                    &self.prefill_normed_buf,
+                    post_norm,
+                    n_u,
+                    hs_u,
+                );
+            }
             self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("prefill_l{layer}"), n_u);
         }
 
@@ -11084,7 +11462,14 @@ impl GpuLfmModel {
         let kv_scratch = &self.hs_scratch().kv;
         // The flash kernel reads K and V as f32 for the whole sequence, so they get buffers of
         // their own instead of the packed-f16 scratch caches the generic kernel reads.
-        let flash = self.flash_ready();
+        // LFM3 mixes global bidirectional layers with causal sliding-window layers, which the
+        // generic prefill kernel handles per layer.
+        let flash = self.flash_ready() && cfg.architecture != "lfm3";
+        let lfm3_conv_state = (cfg.architecture == "lfm3").then(|| {
+            let d_conv = cfg.conv_kernel_size.unwrap_or(3).saturating_sub(1).max(1);
+            self.ctx
+                .create_storage_rw((d_conv * hs * 4) as u64, "bidir.conv_state")
+        });
         let kv_dim_max = cfg
             .kv_heads_per_layer
             .iter()
@@ -11144,19 +11529,41 @@ impl GpuLfmModel {
                         3 * hs_u,
                         false,
                     );
-                    let elements = m_u as u64 * hs_u as u64;
-                    assert!(
-                        elements <= u32::MAX as u64,
-                        "bidir split over {elements} elements exceeds the u32 grid the shader assumes"
-                    );
-                    self.push_bidir_dispatch(
-                        &mut cmds,
-                        &self.pipelines.bidir_split,
-                        [&self.prefill_proj_buf, &buf_a, &buf_b],
-                        [m_u, hs_u, r0 as u32, 0],
-                        elements as u32,
-                        "bidir_split",
-                    );
+                    if let Some(ref conv_state) = lfm3_conv_state {
+                        if r0 == 0 {
+                            self.emit_prefill_cmds(
+                                &mut enc,
+                                &mut cmds,
+                                &format!("{label}a_pre"),
+                                m_u,
+                            );
+                            enc.clear_buffer(conv_state, 0, None);
+                        }
+                        self.encode_conv1d_fused_batch(
+                            &mut cmds,
+                            &self.prefill_proj_buf,
+                            conv_state,
+                            lw.conv_weight.as_ref().unwrap(),
+                            &self.prefill_normed_buf,
+                            m_u,
+                            hs_u,
+                        );
+                        cmds.push(copy_rows(&self.prefill_normed_buf, 0, &buf_b, r0, m, hs));
+                    } else {
+                        let elements = m_u as u64 * hs_u as u64;
+                        assert!(
+                            elements <= u32::MAX as u64,
+                            "bidir split over {elements} elements exceeds the u32 grid the shader assumes"
+                        );
+                        self.push_bidir_dispatch(
+                            &mut cmds,
+                            &self.pipelines.bidir_split,
+                            [&self.prefill_proj_buf, &buf_a, &buf_b],
+                            [m_u, hs_u, r0 as u32, 0],
+                            elements as u32,
+                            "bidir_split",
+                        );
+                    }
                 } else {
                     let n_heads = cfg.n_heads as u32;
                     let n_kv_heads = cfg.kv_heads_per_layer[layer] as u32;
@@ -11196,6 +11603,8 @@ impl GpuLfmModel {
                         head_dim as u32,
                         q_dim as u32,
                         kv_dim,
+                        lw.rope_theta,
+                        lw.has_freq_factors,
                     );
                     if let Some((k_big, v_big)) = &kv_big {
                         cmds.push(copy_rows(
@@ -11240,19 +11649,21 @@ impl GpuLfmModel {
 
             // Across rows.
             if conv {
-                let elements = n as u64 * hs as u64;
-                assert!(
-                    elements <= u32::MAX as u64,
-                    "bidir convolution over {elements} elements exceeds the u32 grid the shader assumes"
-                );
-                self.push_bidir_dispatch(
-                    &mut cmds,
-                    &self.pipelines.bidir_conv_centered,
-                    [&buf_a, lw.conv_weight.as_ref().unwrap(), &buf_b],
-                    [n as u32, hs_u, prefix as u32, 0],
-                    elements as u32,
-                    "bidir_conv_centered",
-                );
+                if lfm3_conv_state.is_none() {
+                    let elements = n as u64 * hs as u64;
+                    assert!(
+                        elements <= u32::MAX as u64,
+                        "bidir convolution over {elements} elements exceeds the u32 grid the shader assumes"
+                    );
+                    self.push_bidir_dispatch(
+                        &mut cmds,
+                        &self.pipelines.bidir_conv_centered,
+                        [&buf_a, lw.conv_weight.as_ref().unwrap(), &buf_b],
+                        [n as u32, hs_u, prefix as u32, 0],
+                        elements as u32,
+                        "bidir_conv_centered",
+                    );
+                }
             } else {
                 let n_kv_heads = cfg.kv_heads_per_layer[layer] as u32;
                 if let Some((k_big, v_big)) = &kv_big {
@@ -11289,7 +11700,12 @@ impl GpuLfmModel {
                         q_dim as u32,
                         q_dim as u32,
                         scale,
-                        Some(prefix as u32),
+                        if lw.is_non_causal {
+                            Some(prefix as u32)
+                        } else {
+                            None
+                        },
+                        lw.sliding_window,
                     );
                 }
             }
@@ -11299,6 +11715,35 @@ impl GpuLfmModel {
             for &(r0, m) in &chunks {
                 let m_u = m as u32;
                 cmds.push(copy_rows(&buf_b, r0, &self.prefill_normed_buf, 0, m, width));
+                if !conv && let Some(ref w_gate) = lw.attn_gate {
+                    cmds.push(copy_rows(&h_big, r0, &self.prefill_batch_buf, 0, m, hs));
+                    self.encode_rmsnorm_batch(
+                        &mut cmds,
+                        &self.prefill_batch_buf,
+                        &self.prefill_up_buf,
+                        &lw.attn_norm,
+                        m_u,
+                        hs_u,
+                    );
+                    self.encode_mul_mat_reg_tile(
+                        &mut cmds,
+                        w_gate,
+                        &self.prefill_up_buf,
+                        &self.prefill_gate_buf,
+                        m_u,
+                        hs_u,
+                        hs_u,
+                        cfg.n_heads as u32,
+                        false,
+                    );
+                    self.encode_sigmoid_head_gate_batch(
+                        &mut cmds,
+                        &self.prefill_normed_buf,
+                        &self.prefill_gate_buf,
+                        m_u * width as u32,
+                        head_dim as u32,
+                    );
+                }
                 self.encode_mul_mat_reg_tile(
                     &mut cmds,
                     if conv {
@@ -11314,6 +11759,16 @@ impl GpuLfmModel {
                     hs_u,
                     false,
                 );
+                if let Some(ref post_norm) = lw.attn_post_norm {
+                    self.encode_post_norm_inplace_batch(
+                        &mut cmds,
+                        &self.prefill_gate_buf,
+                        &self.prefill_normed_buf,
+                        post_norm,
+                        m_u,
+                        hs_u,
+                    );
+                }
                 cmds.push(copy_rows(&h_big, r0, &self.prefill_batch_buf, 0, m, hs));
                 self.encode_add_rmsnorm_batch(
                     &mut cmds,
@@ -11361,6 +11816,16 @@ impl GpuLfmModel {
                     hs_u,
                     false,
                 );
+                if let Some(ref post_norm) = lw.ffn_post_norm {
+                    self.encode_post_norm_inplace_batch(
+                        &mut cmds,
+                        &self.prefill_up_buf,
+                        &self.prefill_normed_buf,
+                        post_norm,
+                        m_u,
+                        hs_u,
+                    );
+                }
                 self.encode_scaled_add_inplace_batch(
                     &mut cmds,
                     &self.prefill_batch_buf,
@@ -11795,7 +12260,7 @@ impl Model for GpuLfmModel {
         self.gpu_state.seq_len.store(start_pos, Ordering::Relaxed);
 
         let full_tokens = tokens;
-        let cache_eligible = start_pos == 0 && !lora_active;
+        let cache_eligible = start_pos == 0 && !lora_active && self.config.is_causal;
         let mut start_pos = start_pos;
         let mut tokens = tokens;
 
@@ -11806,10 +12271,13 @@ impl Model for GpuLfmModel {
         // prefix cache is still bypassed with an adapter: cached KV is
         // base-model-only, so restoring it and adapting only the tail would
         // corrupt the result (and inserting adapter-modified KV would poison the
-        // cache for later base runs).
+        // cache for later base runs). Non-causal models (`lfm3-d1` / `lfm3-d1-omni`)
+        // also bypass the prefix cache: prefix KV cells attend to future tokens
+        // during prefill, so a snapshot from an earlier prompt is invalid for a
+        // different suffix.
         if start_pos == 0 {
-            // Cache lookup only for base-model prefills.
-            let hit = (!lora_active)
+            // Cache lookup only for causal base-model prefills.
+            let hit = cache_eligible
                 .then(|| {
                     self.prefix_cache
                         .lock()
@@ -12020,9 +12488,10 @@ impl Model for GpuLfmModel {
     }
 
     /// Dense-target hooks via `resolve_lora` (routed-FFN targets excluded, as
-    /// above).
+    /// above). LFM3 (`"lfm3"`) is excluded until LoRA hooks are wired for
+    /// `attn_gate` and post-norm sublayers.
     fn supports_lora(&self) -> bool {
-        true
+        self.config.architecture != "lfm3"
     }
 
     fn turboquant_supported(&self) -> bool {
@@ -12030,12 +12499,17 @@ impl Model for GpuLfmModel {
         // `head_dim` that is <= 128 and a multiple of 32. Reporting the real
         // capability here lets the CLI warn and fall back to f32 up front rather
         // than have `configure_kv_compression` silently ignore the request.
-        crate::model::gpu_turboquant::head_dim_supported(self.config.head_dim)
+        // LFM3 is excluded because the TurboQuant attention kernels do not
+        // implement per-layer sliding-window or bidirectional masks.
+        self.config.architecture != "lfm3"
+            && crate::model::gpu_turboquant::head_dim_supported(self.config.head_dim)
     }
 
     fn configure_kv_compression(&self, compression: &KvCompression) -> Result<(), CeraError> {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let want = TqMode::from_compression(compression, self.config.head_dim);
+        let want = (self.config.architecture != "lfm3")
+            .then(|| TqMode::from_compression(compression, self.config.head_dim))
+            .flatten();
 
         // Requests the compressed path can't serve fall back to f32 rather than
         // erroring, matching the CPU's silent fallback for a non-power-of-two
@@ -12126,7 +12600,9 @@ impl Model for GpuLfmModel {
         // by a RoPE delta, which needs the raw vectors, and TurboQuant only keeps
         // 2-bit rotated indices. Report `false` so `Session` warns accurately
         // instead of promising a shift the overflow path will refuse.
-        self.tq.get().is_none()
+        // LFM3 is also excluded because `encode_kv_shift_layers` uses model-global
+        // RoPE params rather than LFM3's per-layer local/global RoPE settings.
+        self.config.architecture != "lfm3" && self.tq.get().is_none()
     }
 
     fn shift_kv(&self, state: &mut InferenceState, n_keep: usize, shift: usize) {
@@ -13634,8 +14110,8 @@ mod tests {
         let elem_wgsl = include_str!("../backend/shaders/elementwise.wgsl");
         assert_eq!(
             elem_wgsl.matches("gid.x + gid.y * (65535u * 256u)").count(),
-            4,
-            "all 4 entry points in elementwise.wgsl must fold gid.y into the linear index for 2D dispatches"
+            5,
+            "all 5 entry points in elementwise.wgsl must fold gid.y into the linear index for 2D dispatches"
         );
         let err = super::check_dense_silu_fits(65536, 65536).expect_err("overflows u32::MAX");
         assert!(err.to_string().contains("u32 element cap"), "{err}");

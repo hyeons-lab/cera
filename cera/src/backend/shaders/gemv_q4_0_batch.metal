@@ -83,19 +83,25 @@ kernel void gemv_q4_0_batch(
 
         #pragma unroll(CHPT)
         for (short ch = 0; ch < CHPT; ++ch) {
-            dequantize_q4_0_t4(xq, cch, lx[ch]);
-            cch += NXPSG;
-            if (cch >= CHPB) {
-                xq  += cch / CHPB;
-                cch %= CHPB;
+            if (4 * (ich + ch * NXPSG) < (int)k) {
+                dequantize_q4_0_t4(xq, cch, lx[ch]);
+                cch += NXPSG;
+                if (cch >= CHPB) {
+                    xq  += cch / CHPB;
+                    cch %= CHPB;
+                }
+            } else {
+                lx[ch] = float4(0.0f);
             }
         }
 
         #pragma unroll(CHPT)
         for (short ch = 0; ch < CHPT; ++ch) {
-            #pragma unroll(R1PTG)
-            for (short ir1 = 0; ir1 < R1PTG; ++ir1) {
-                sumf[ir1] += dot(lx[ch], y4[ir1][ch * NXPSG]);
+            if (4 * (ich + ch * NXPSG) < (int)k) {
+                #pragma unroll(R1PTG)
+                for (short ir1 = 0; ir1 < R1PTG; ++ir1) {
+                    sumf[ir1] += dot(lx[ch], y4[ir1][ch * NXPSG]);
+                }
             }
         }
 

@@ -1,4 +1,4 @@
-// slang-entries: add_inplace scaled_add_inplace mul_inplace silu_mul_inplace
+// slang-entries: add_inplace scaled_add_inplace mul_inplace silu_mul_inplace sigmoid_head_gate_inplace
 //
 // Element-wise f32 operations, one Slang source for both GPU backends. Only the
 // four entry points whose WGSL and MSL twins are identical are migrated here:
@@ -66,4 +66,19 @@ void silu_mul_inplace(uint3 gid : SV_DispatchThreadID) {
     }
     float g = clamp(a_buf[i], -80.0f, 80.0f);
     a_buf[i] = (g / (1.0f + exp(-g))) * b_buf[i];
+}
+
+// Per-head sigmoid attention gate (LFM3): a[i] *= sigmoid(b[i / head_dim]),
+// where par_buf[0] = (n, head_dim) with n = n_tokens * n_heads * head_dim and
+// b has n_tokens * n_heads elements.
+[shader("compute")]
+[numthreads(256, 1, 1)]
+void sigmoid_head_gate_inplace(uint3 gid : SV_DispatchThreadID) {
+    uint i = gid.x + gid.y * (65535u * 256u);
+    uint2 p = par_buf[0];
+    if (i >= p.x || p.y == 0u) {
+        return;
+    }
+    float g = clamp(b_buf[i / p.y], -80.0f, 80.0f);
+    a_buf[i] = a_buf[i] / (1.0f + exp(-g));
 }

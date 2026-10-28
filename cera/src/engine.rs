@@ -2076,10 +2076,13 @@ fn inference_type_defaults_shape(it: &InferenceType) -> DefaultsShape {
 /// `from_reader`, which already skip auto-attach by contract.
 #[cfg(feature = "mmap")]
 fn try_load_audio_encoder(manifest: &Manifest) -> Option<Arc<AudioEncoderWeights>> {
-    if !matches!(manifest.inference_type, InferenceType::LlamaCppLfm2AudioV1) {
+    let audio_extra = manifest.files.extras.get("audio_encoder");
+    if audio_extra.is_none()
+        && !matches!(manifest.inference_type, InferenceType::LlamaCppLfm2AudioV1)
+    {
         return None;
     }
-    let mmproj_path = manifest.files.multimodal_projector.as_ref()?;
+    let mmproj_path = audio_extra.or(manifest.files.multimodal_projector.as_ref())?;
     let path = Path::new(mmproj_path);
     let gguf = match GgufFile::open(path) {
         Ok(g) => Arc::new(g),

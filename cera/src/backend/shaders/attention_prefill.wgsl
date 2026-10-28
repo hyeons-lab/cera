@@ -138,11 +138,11 @@ fn attention_prefill(
     // non-empty, which the host guarantees with n == 0 early-out).
     let q_read = select(q_base, q_global, q_live);
 
-    // Per-query causal window: attend over [0..pos_q]. Clamp against max_seq so a
-    // caller passing inconsistent params can only cause silent window truncation,
-    // never an OOB read of k_cache / v_cache.
+    // Per-query causal window: attend over [min_pos..seq_len). When bidir == 0
+    // and prefix_rows > 0, prefix_rows carries the sliding-window size.
     let pos_q = start_pos + q_read;
     let seq_len = key_window(pos_q, bidir, prefix_rows, total_rows, max_seq);
+    let min_pos = select(0u, seq_len - prefix_rows, bidir == 0u && prefix_rows > 0u && seq_len > prefix_rows);
 
     let group_size = n_heads / n_kv_heads;
     let kv_head = head / group_size;
@@ -180,13 +180,15 @@ fn attention_prefill(
     max_seq_all = max(max_seq_all, select(0u, key_window(start_pos + q_base + lbase + 6u, bidir, prefix_rows, total_rows, max_seq), lbase + 6u < n_sub));
     max_seq_all = max(max_seq_all, select(0u, key_window(start_pos + q_base + lbase + 7u, bidir, prefix_rows, total_rows, max_seq), lbase + 7u < n_sub));
 
-    var base = 0u;
+    let seq0 = key_window(start_pos + q_base + lbase, bidir, prefix_rows, total_rows, max_seq);
+    let min_pos_all = select(0u, seq0 - prefix_rows, bidir == 0u && prefix_rows > 0u && seq0 > prefix_rows);
+    var base = min_pos_all & ~(TILE - 1u);
     loop {
         if base >= max_seq_all { break; }
-        // ── score for timestep t = base + lane (one per lane, per query) ──
+        // score for timestep t = base + lane (one per lane, per query)
         let t = base + lane;
         var score = NEG_INF;
-        if t < seq_len {
+        if t >= min_pos && t < seq_len {
             var dot = 0.0;
             // k_base is even (kv_dim and kv_h_offset are multiples of the
             // even head_dim), so stepping dd by 2 walks whole u32 words.
@@ -200,7 +202,7 @@ fn attention_prefill(
         }
         tile_scores[q * TILE + lane] = score;
 
-        // ── tile max: 8 concurrent 32-wide tree reductions over `red` ──
+        // tile max: 8 concurrent 32-wide tree reductions over `red`
         red[tid] = score;
         workgroupBarrier();
         if lane < 16u { red[tid] = max(red[tid], red[tid + 16u]); }
@@ -219,7 +221,7 @@ fn attention_prefill(
         if lane == 0u {
             let nm = max(st[q * 4u], tmax);
             st[q * 4u + 2u] = nm;
-            st[q * 4u + 3u] = exp(st[q * 4u] - nm); // first tile: exp(-inf) = 0
+            st[q * 4u + 3u] = select(0.0, exp(st[q * 4u] - nm), st[q * 4u] > NEG_INF);
         }
         workgroupBarrier();
         let nm = st[q * 4u + 2u];
@@ -227,12 +229,12 @@ fn attention_prefill(
 
         // p = exp(score - nm); reuse tile_scores to hold the exponentials.
         var p = 0.0;
-        if t < seq_len {
+        if t >= min_pos && t < seq_len {
             p = exp(tile_scores[q * TILE + lane] - nm);
         }
         tile_scores[q * TILE + lane] = p;
 
-        // ── tile sum: 8 concurrent 32-wide tree reductions over `red` ──
+        // tile sum: 8 concurrent 32-wide tree reductions over `red`
         red[tid] = p;
         workgroupBarrier();
         if lane < 16u { red[tid] += red[tid + 16u]; }
@@ -257,7 +259,7 @@ fn attention_prefill(
             let vd_hi = (vd & 1u) == 1u;
             for (var jj = 0u; jj < TILE; jj += 1u) {
                 let tt = base + jj;
-                if tt < seq_len {
+                if tt >= min_pos && tt < seq_len {
                     let pair = unpack2x16float(v_cache[(tt * kv_dim + vd) >> 1u]);
                     a += tile_scores[q * TILE + jj] * select(pair.x, pair.y, vd_hi);
                 }

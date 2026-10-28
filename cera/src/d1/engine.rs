@@ -243,7 +243,7 @@ impl D1Engine {
         } = *files;
         let kind =
             public::decision_type(gguf).map_or_else(|| "converted".to_string(), str::to_string);
-        let is_causal = public::decision_type(gguf) == Some(public::CAUSAL_TYPE);
+        let is_causal = public::is_prompt_d1(gguf);
         let cfg = EngineConfig {
             context_size: if is_causal {
                 causal::CONTEXT_TOKENS
@@ -254,7 +254,29 @@ impl D1Engine {
             ..EngineConfig::default()
         };
         let (engine, model, report) = if is_causal {
-            // the mmproj goes to the engine, which attaches its vision tower to every session
+            // the mmproj goes to the engine, which attaches its vision/audio towers to every session
+            let is_audio_only_mmproj = mmproj.is_some_and(|g| {
+                crate::model::audio_encoder::is_audio_encoder_gguf(g)
+                    && g.get_bool("clip.has_vision_encoder") != Some(true)
+            });
+            let mut extras = std::collections::HashMap::new();
+            if public::decision_type(gguf) == Some(public::LFM3_OMNI_TYPE)
+                && !is_audio_only_mmproj
+                && let Some(dir) = mmproj_path.or(Some(model)).and_then(Path::parent)
+                && let Ok(entries) = std::fs::read_dir(dir)
+            {
+                for entry in entries.flatten() {
+                    let p = entry.path();
+                    if p.extension().and_then(|e| e.to_str()) == Some("gguf")
+                        && p.file_name()
+                            .and_then(|n| n.to_str())
+                            .is_some_and(|n| n.starts_with("audioproj"))
+                    {
+                        extras.insert("audio_encoder".to_string(), p);
+                        break;
+                    }
+                }
+            }
             let engine = match mmproj_path {
                 Some(path) => CeraEngine::from_files(
                     ModelFiles {
@@ -263,10 +285,27 @@ impl D1Engine {
                         audio_decoder: None,
                         audio_tokenizer: None,
                         draft_model: None,
-                        extras: std::collections::HashMap::new(),
+                        extras,
                         // an `lfm2` model with an mmproj is not taken for a vision model unless
                         // it is said to be one
-                        inference_type: Some(crate::manifest::InferenceType::LlamaCppImageToText),
+                        inference_type: Some(if is_audio_only_mmproj {
+                            crate::manifest::InferenceType::LlamaCppLfm2AudioV1
+                        } else {
+                            crate::manifest::InferenceType::LlamaCppImageToText
+                        }),
+                        chat_template: None,
+                    },
+                    cfg,
+                )?,
+                None if !extras.is_empty() => CeraEngine::from_files(
+                    ModelFiles {
+                        model: model.to_path_buf(),
+                        multimodal_projector: None,
+                        audio_decoder: None,
+                        audio_tokenizer: None,
+                        draft_model: None,
+                        extras,
+                        inference_type: Some(crate::manifest::InferenceType::LlamaCppTextToText),
                         chat_template: None,
                     },
                     cfg,
@@ -274,7 +313,18 @@ impl D1Engine {
                 None => CeraEngine::from_path(model, cfg)?,
             };
             let trunk = engine.backend_name();
-            let vision = mmproj_path.map(|_| engine.vision_backend_name().unwrap_or("cpu"));
+            let vision = if mmproj_path.is_some() && !is_audio_only_mmproj {
+                Some(engine.vision_backend_name().unwrap_or("cpu"))
+            } else {
+                None
+            };
+            let audio = engine.audio_encoder().map(|_| {
+                if engine.has_gpu_audio_encoder() {
+                    trunk
+                } else {
+                    "cpu"
+                }
+            });
             // a tower the accelerator did not take runs on the CPU: say so
             let mut note = note;
             if vision == Some("cpu") && trunk != "cpu" {
@@ -289,16 +339,16 @@ impl D1Engine {
             let report = BackendReport {
                 requested,
                 trunk,
-                // d1-3B has no head layers: its answer is read off the trunk's logits on the host
+                // prompt-based d1 models have no head layers: their answer is read off the trunk's logits on the host
                 head: "cpu (no head layers; the answer is read from the trunk's logits)",
                 vision,
-                audio: None,
+                audio,
                 note,
             };
             let causal_model = CausalD1::from_gguf(gguf, &engine.tokenizer_arc())?;
             let model = Model::Causal {
                 model: Box::new(causal_model),
-                images: mmproj_path.is_some(),
+                images: vision.is_some(),
             };
             (engine, model, report)
         } else {

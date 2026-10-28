@@ -118,3 +118,56 @@ struct KernelContext_0
     return;
 }
 
+
+#line 76
+[[kernel]] void sigmoid_head_gate_inplace(uint3 gid_4 [[thread_position_in_grid]], packed_uint2 device* par_buf_5 [[buffer(2)]], float device* a_buf_5 [[buffer(0)]], float device* b_buf_5 [[buffer(1)]])
+{
+
+#line 76
+    thread KernelContext_0 kernelContext_4;
+
+#line 76
+    (&kernelContext_4)->par_buf_0 = par_buf_5;
+
+#line 76
+    (&kernelContext_4)->a_buf_0 = a_buf_5;
+
+#line 76
+    (&kernelContext_4)->b_buf_0 = b_buf_5;
+    uint i_4 = gid_4.x + gid_4.y * 16776960U;
+
+#line 77
+    uint2 _S1 = uint2(*(par_buf_5+int(0))) ;
+
+#line 77
+    bool _S2;
+
+    if(i_4 >= (_S1.x))
+    {
+
+#line 79
+        _S2 = true;
+
+#line 79
+    }
+    else
+    {
+
+#line 79
+        _S2 = (_S1.y) == 0U;
+
+#line 79
+    }
+
+#line 79
+    if(_S2)
+    {
+
+#line 80
+        return;
+    }
+    uint _S3 = i_4 / _S1.y;
+    *((&kernelContext_4)->a_buf_0+i_4) = *((&kernelContext_4)->a_buf_0+i_4) / (1.0f + exp(- clamp((&kernelContext_4)->b_buf_0[_S3], -80.0f, 80.0f)));
+    return;
+}
+

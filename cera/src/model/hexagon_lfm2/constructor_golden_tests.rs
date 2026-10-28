@@ -2413,7 +2413,12 @@ fn lfm3_moe_edit(kv: &mut Vec<(String, KvValue)>, t: &mut Vec<Tensor>) {
                 && !x.name.starts_with(&format!("blk.{l}.ffn_up."))
                 && !x.name.starts_with(&format!("blk.{l}.ffn_down."))
         });
-        t.push(g.q4_0(&format!("blk.{l}.ffn_gate_inp.weight"), &[HS, n_expert]));
+        t.push(g.f32(
+            &format!("blk.{l}.ffn_gate_inp.weight"),
+            &[HS, n_expert],
+            0.1,
+            0.0,
+        ));
         t.push(g.f32(&format!("blk.{l}.exp_probs_b.bias"), &[n_expert], 0.05, 0.0));
         t.push(g.q4_0(
             &format!("blk.{l}.ffn_gate_exps.weight"),
@@ -2505,4 +2510,213 @@ fn a_sequence_reset_clears_every_history_plane_of_every_conv_layer() {
         assert_eq!(first_stale, None, "a conv history byte survived the reset");
     }
     assert!(conv_layers > 0);
+}
+
+#[test]
+fn lfm3_all_backends_match_cpu_prefill_and_decode() {
+    use crate::model::Model;
+    let tokens = [1u32, 3, 5, 7, 9, 11, 13, 15, 17, 19, 21, 23];
+    let decode_tokens = [25u32, 27];
+
+    let cpu = crate::model::lfm2::LfmModel::from_gguf(lfm3_gguf(), 64).unwrap();
+    let mut cpu_prefill_state = InferenceState::from_config(Model::config(&cpu)).unwrap();
+    let cpu_prefill = cpu.forward_prefill(&tokens, 0, &mut cpu_prefill_state);
+
+    let mut cpu_decode_state = InferenceState::from_config(Model::config(&cpu)).unwrap();
+    let mut cpu_decode = Vec::new();
+    for (pos, &tok) in tokens.iter().enumerate() {
+        cpu_decode = cpu.forward(&[tok], pos, &mut cpu_decode_state);
+    }
+    let prefill_vs_decode = cpu_prefill
+        .iter()
+        .zip(&cpu_decode)
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        prefill_vs_decode < 1e-4,
+        "CPU lfm3 prefill vs decode max_diff={prefill_vs_decode}"
+    );
+
+    let cpu_step1 = cpu.forward(&[decode_tokens[0]], tokens.len(), &mut cpu_prefill_state);
+    let cpu_step2 = cpu.forward(
+        &[decode_tokens[1]],
+        tokens.len() + 1,
+        &mut cpu_prefill_state,
+    );
+
+    let check_backend = |name: &str, got_prefill: &[f32], got_s1: &[f32], got_s2: &[f32]| {
+        for (stage, want, got) in [
+            ("prefill", cpu_prefill.as_slice(), got_prefill),
+            ("decode_1", cpu_step1.as_slice(), got_s1),
+            ("decode_2", cpu_step2.as_slice(), got_s2),
+        ] {
+            let dot: f32 = want.iter().zip(got).map(|(a, b)| a * b).sum();
+            let na: f32 = want.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = got.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let cos = dot / (na * nb);
+            let max_diff = want
+                .iter()
+                .zip(got)
+                .map(|(a, b)| (a - b).abs())
+                .fold(0.0f32, f32::max);
+            assert!(
+                cos > 0.998 && max_diff < 0.55,
+                "{name} {stage}: cosine={cos} max_diff={max_diff}"
+            );
+        }
+    };
+
+    let moe_tokens = [1u32, 3, 5, 7];
+    let cpu_moe =
+        crate::model::lfm2::LfmModel::from_gguf(lfm3_gguf_with(L3_TAPS, &lfm3_moe_edit), 64)
+            .unwrap();
+    let mut cpu_moe_state = InferenceState::from_config(Model::config(&cpu_moe)).unwrap();
+    let want_moe_prefill = cpu_moe.forward_prefill(&moe_tokens, 0, &mut cpu_moe_state);
+    let want_moe_decode = cpu_moe.forward(&[9], moe_tokens.len(), &mut cpu_moe_state);
+
+    #[cfg(feature = "gpu")]
+    if let Ok(gpu) = crate::model::gpu_lfm2::GpuLfmModel::from_gguf(lfm3_gguf(), 64) {
+        let mut s = InferenceState::from_config(Model::config(&gpu)).unwrap();
+        let p = gpu.forward_prefill(&tokens, 0, &mut s);
+        let d1 = gpu.forward(&[decode_tokens[0]], tokens.len(), &mut s);
+        let d2 = gpu.forward(&[decode_tokens[1]], tokens.len() + 1, &mut s);
+        check_backend("wgpu", &p, &d1, &d2);
+
+        let gpu_moe = crate::model::gpu_lfm2::GpuLfmModel::from_gguf(
+            lfm3_gguf_with(L3_TAPS, &lfm3_moe_edit),
+            64,
+        )
+        .unwrap();
+        let mut s = InferenceState::from_config(Model::config(&gpu_moe)).unwrap();
+        let got_p = gpu_moe.forward_prefill(&moe_tokens, 0, &mut s);
+        let got_d = gpu_moe.forward(&[9], moe_tokens.len(), &mut s);
+        for (stage, want, got) in [
+            (
+                "wgpu moe prefill",
+                want_moe_prefill.as_slice(),
+                got_p.as_slice(),
+            ),
+            (
+                "wgpu moe decode",
+                want_moe_decode.as_slice(),
+                got_d.as_slice(),
+            ),
+        ] {
+            let dot: f32 = want.iter().zip(got).map(|(a, b)| a * b).sum();
+            let na: f32 = want.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = got.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let cos = dot / (na * nb);
+            assert!(cos > 0.998, "{stage}: cosine={cos}");
+        }
+    }
+
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    if let Ok(metal) = crate::model::metal_lfm2::MetalLfmModel::from_gguf(lfm3_gguf(), None, 64) {
+        let mut s = InferenceState::from_config(Model::config(&metal)).unwrap();
+        let p = metal.forward_prefill(&tokens, 0, &mut s);
+        let d1 = metal.forward(&[decode_tokens[0]], tokens.len(), &mut s);
+        let d2 = metal.forward(&[decode_tokens[1]], tokens.len() + 1, &mut s);
+        check_backend("metal", &p, &d1, &d2);
+
+        let metal_moe = crate::model::metal_lfm2::MetalLfmModel::from_gguf(
+            lfm3_gguf_with(L3_TAPS, &lfm3_moe_edit),
+            None,
+            64,
+        )
+        .unwrap();
+        let mut s = InferenceState::from_config(Model::config(&metal_moe)).unwrap();
+        let got_p = metal_moe.forward_prefill(&moe_tokens, 0, &mut s);
+        let got_d = metal_moe.forward(&[9], moe_tokens.len(), &mut s);
+        for (stage, want, got) in [
+            (
+                "metal moe prefill",
+                want_moe_prefill.as_slice(),
+                got_p.as_slice(),
+            ),
+            (
+                "metal moe decode",
+                want_moe_decode.as_slice(),
+                got_d.as_slice(),
+            ),
+        ] {
+            let dot: f32 = want.iter().zip(got).map(|(a, b)| a * b).sum();
+            let na: f32 = want.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let nb: f32 = got.iter().map(|x| x * x).sum::<f32>().sqrt();
+            let cos = dot / (na * nb);
+            assert!(cos > 0.998, "{stage}: cosine={cos}");
+        }
+    }
+}
+
+#[test]
+fn lfm3_d1_all_backends_match_cpu() {
+    use crate::model::Model;
+    let make_d1 = || {
+        lfm3_gguf_with(L3_TAPS, &|kv, _| {
+            set_kv(kv, "lfm3.attention.causal", Some(KvValue::Raw(7, vec![0])));
+            set_kv(
+                kv,
+                "lfm3.decision.type",
+                Some(KvValue::Str("lfm3-d1".into())),
+            );
+        })
+    };
+
+    let tokens = [2u32, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24];
+    let cpu = crate::model::lfm2::LfmModel::from_gguf(make_d1(), 64).unwrap();
+    assert!(!Model::config(&cpu).is_causal);
+    assert!(cpu.layer_is_non_causal(1));
+    assert!(!cpu.layer_is_non_causal(3));
+
+    let mut cpu_state = InferenceState::from_config(Model::config(&cpu)).unwrap();
+    let cpu_logits = cpu.forward_prefill(&tokens, 0, &mut cpu_state);
+    let mut cpu_hs_state = InferenceState::for_prefill(Model::config(&cpu), tokens.len()).unwrap();
+    let cpu_hs = cpu.hidden_states(&tokens, &mut cpu_hs_state);
+
+    let mut tokens_alt = tokens;
+    tokens_alt[tokens.len() - 1] = 31;
+    let mut cpu_alt_state = InferenceState::for_prefill(Model::config(&cpu), tokens.len()).unwrap();
+    let cpu_hs_alt = cpu.hidden_states(&tokens_alt, &mut cpu_alt_state);
+    let row0_drift = cpu_hs[..HS]
+        .iter()
+        .zip(&cpu_hs_alt[..HS])
+        .map(|(a, b)| (a - b).abs())
+        .fold(0.0f32, f32::max);
+    assert!(
+        row0_drift > 1e-4,
+        "lfm3-d1 global attention must let the last token move row 0 (drift={row0_drift})"
+    );
+
+    let hex = HexagonLfmModel::from_gguf_on(backend(), make_d1(), 64).unwrap();
+    assert!(!hex.config.is_causal);
+    assert_eq!(hex.dense.swa_window, Some(L3_WINDOW));
+
+    let check_cosine = |label: &str, want: &[f32], got: &[f32]| {
+        assert_eq!(want.len(), got.len(), "{label} len");
+        let dot: f32 = want.iter().zip(got).map(|(a, b)| a * b).sum();
+        let na: f32 = want.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let nb: f32 = got.iter().map(|x| x * x).sum::<f32>().sqrt();
+        let cos = dot / (na * nb);
+        assert!(cos > 0.999, "{label}: cosine={cos}");
+    };
+
+    #[cfg(feature = "gpu")]
+    if let Ok(gpu) = crate::model::gpu_lfm2::GpuLfmModel::from_gguf(make_d1(), 64) {
+        let mut s = InferenceState::from_config(Model::config(&gpu)).unwrap();
+        let got_logits = gpu.forward_prefill(&tokens, 0, &mut s);
+        check_cosine("wgpu d1 prefill logits", &cpu_logits, &got_logits);
+        let mut hs_s = InferenceState::for_prefill(Model::config(&gpu), tokens.len()).unwrap();
+        let got_hs = gpu.hidden_states(&tokens, &mut hs_s);
+        check_cosine("wgpu d1 hidden_states", &cpu_hs, &got_hs);
+    }
+
+    #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
+    if let Ok(metal) = crate::model::metal_lfm2::MetalLfmModel::from_gguf(make_d1(), None, 64) {
+        let mut s = InferenceState::from_config(Model::config(&metal)).unwrap();
+        let got_logits = metal.forward_prefill(&tokens, 0, &mut s);
+        check_cosine("metal d1 prefill logits", &cpu_logits, &got_logits);
+        let mut hs_s = InferenceState::for_prefill(Model::config(&metal), tokens.len()).unwrap();
+        let got_hs = metal.hidden_states(&tokens, &mut hs_s);
+        check_cosine("metal d1 hidden_states", &cpu_hs, &got_hs);
+    }
 }

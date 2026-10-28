@@ -518,11 +518,28 @@ impl LfmModel {
             || (self.config.is_causal && !state.lora.as_ref().is_some_and(|l| l.is_classifier()))
     }
 
+    /// Whether `layer` uses bidirectional (non-causal) prefill attention.
+    /// For LFM2 `d1`, every attention layer is bidirectional when `!config.is_causal`.
+    /// For LFM3 `d1`, only global attention layers (`window.is_none()`) are bidirectional;
+    /// sliding-window attention layers remain causal with their configured window.
+    pub(crate) fn layer_is_non_causal(&self, layer: usize) -> bool {
+        if self.config.is_causal {
+            return false;
+        }
+        if let Some(lfm3) = &self.lfm3 {
+            return lfm3.layers[layer]
+                .attn
+                .as_ref()
+                .is_some_and(|a| a.window.is_none());
+        }
+        self.config.block_types[layer] == BlockType::Attention
+    }
+
     fn check_rewind_mode(
         &self,
         state: &InferenceState,
     ) -> Result<(), crate::kv_cache::KvRewindError> {
-        if !self.is_causal_for(state) {
+        if !self.is_causal_for(state) || !self.config.is_causal {
             return Err(crate::kv_cache::KvRewindError::NonCausal);
         }
         Ok(())
@@ -807,8 +824,15 @@ impl LfmModel {
         // non-causal lfm3 file would run them and return plausible, wrong output.
         if arch == "lfm3" {
             // Each cause is refused on its own, so the message names the one that fired.
+            // LFM3 d1 decision models (`lfm3.decision.type` = "lfm3-d1" | "lfm3-d1-omni")
+            // legitimately set `lfm3.attention.causal = false` to run bidirectional global
+            // attention while keeping ShortConv and SWA layers causal.
+            let is_lfm3_d1 = matches!(
+                gguf.get_str("lfm3.decision.type"),
+                Some("lfm3-d1" | "lfm3-d1-omni")
+            );
             ensure!(
-                is_causal,
+                is_causal || is_lfm3_d1,
                 "{prefix}: lfm3 supports causal language-model files only (this one is bidirectional)"
             );
             ensure!(
@@ -1353,11 +1377,18 @@ impl LfmModel {
         let hs = config.hidden_size;
         let ff = config.intermediate_size;
         let vector = |name: &str, expected: usize| -> Result<()> {
-            let len = gguf
-                .get_tensor(name)?
-                .try_to_f32_vec()
-                .with_context(|| format!("{name} cannot be read as f32"))?
-                .len();
+            let len = if gguf.mmap_data().is_empty() {
+                let info = gguf
+                    .tensors
+                    .get(name)
+                    .ok_or_else(|| anyhow::anyhow!("tensor not found: {name}"))?;
+                info.shape.iter().copied().product::<usize>()
+            } else {
+                gguf.get_tensor(name)?
+                    .try_to_f32_vec()
+                    .with_context(|| format!("{name} cannot be read as f32"))?
+                    .len()
+            };
             ensure!(
                 len == expected,
                 "{name} has {len} entries, expected {expected}"
@@ -3109,6 +3140,196 @@ impl LfmModel {
                 out,
                 &mut state.scratch.lora_tmp,
             );
+        }
+    }
+
+    /// Fallback multi-token bidirectional attention block for non-causal layers when
+    /// the batched GEMM path is unavailable (for example, F32/F16 weights in tests).
+    /// Appends K and V for all `n` tokens before computing attention so every token
+    /// attends across the full `[0..start_pos + n)` span.
+    fn forward_attn_block_bidir_batch(
+        &self,
+        layer: usize,
+        normed: &[f32],
+        start_pos: usize,
+        n: usize,
+        block_out: &mut [f32],
+        state: &mut InferenceState,
+    ) {
+        let refs = &self.layer_refs[layer];
+        let cfg = &self.config;
+        let hs = cfg.hidden_size;
+        let head_dim = cfg.head_dim;
+        let q_dim = cfg.n_heads * head_dim;
+        let n_kv_heads = cfg.kv_heads_per_layer[layer];
+        let kv_dim = n_kv_heads * head_dim;
+        let group_size = cfg.n_heads / n_kv_heads;
+        let scale = 1.0 / (head_dim as f32).sqrt();
+        let lora = state.lora.clone();
+        let lfm3_attn = self
+            .lfm3
+            .as_ref()
+            .and_then(|l| l.layers[layer].attn.as_ref());
+        let q_norm = self.attn_q_norm_weights[layer].as_ref().unwrap();
+        let k_norm = self.attn_k_norm_weights[layer].as_ref().unwrap();
+        let q_ref = refs.attn_q.as_ref().unwrap();
+        let k_ref = refs.attn_k.as_ref().unwrap();
+        let v_ref = refs.attn_v.as_ref().unwrap();
+        let out_ref = refs.attn_output.as_ref().unwrap();
+
+        let mut q_all = vec![0.0f32; n * q_dim];
+        let mut gate_all = if lfm3_attn.is_some() {
+            vec![0.0f32; n * cfg.n_heads]
+        } else {
+            Vec::new()
+        };
+
+        for j in 0..n {
+            let hidden = &normed[j * hs..(j + 1) * hs];
+            let q = &mut q_all[j * q_dim..(j + 1) * q_dim];
+            let k = &mut state.scratch.k[..kv_dim];
+            let v = &mut state.scratch.v[..kv_dim];
+            self.gemv(q_ref, hidden, q);
+            self.gemv(k_ref, hidden, k);
+            self.gemv(v_ref, hidden, v);
+            if let Some(lora) = &lora {
+                crate::lora::apply_attn_qkv(
+                    lora,
+                    layer,
+                    hidden,
+                    q,
+                    k,
+                    v,
+                    &mut state.scratch.lora_tmp,
+                );
+            }
+            if let Some(a) = lfm3_attn {
+                let gate = &mut gate_all[j * cfg.n_heads..(j + 1) * cfg.n_heads];
+                self.gemv(&a.gate, hidden, gate);
+                cpu::sigmoid_inplace(gate);
+            }
+            for h in 0..cfg.n_heads {
+                cpu::rmsnorm(
+                    &mut q[h * head_dim..(h + 1) * head_dim],
+                    q_norm,
+                    cfg.rms_norm_eps,
+                );
+            }
+            for h in 0..n_kv_heads {
+                cpu::rmsnorm(
+                    &mut k[h * head_dim..(h + 1) * head_dim],
+                    k_norm,
+                    cfg.rms_norm_eps,
+                );
+            }
+            match lfm3_attn {
+                Some(a) => cpu::rope_neox_freq_factors(
+                    q,
+                    k,
+                    start_pos + j,
+                    (cfg.n_heads, n_kv_heads),
+                    head_dim,
+                    a.rope_theta,
+                    a.rope_freq_factors.as_deref(),
+                ),
+                None => cpu::rope(
+                    q,
+                    k,
+                    start_pos + j,
+                    cfg.n_heads,
+                    n_kv_heads,
+                    head_dim,
+                    cfg.rope_theta,
+                ),
+            }
+            if let LayerState::Attention {
+                key_cache,
+                value_cache,
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            } = &mut state.layers[layer]
+            {
+                if state.kv_f16 {
+                    key_cache_f16.extend(k.iter().map(|&x| crate::quant::f32_to_f16(x)));
+                    value_cache_f16.extend(v.iter().map(|&x| crate::quant::f32_to_f16(x)));
+                } else {
+                    key_cache.extend_from_slice(k);
+                    value_cache.extend_from_slice(v);
+                }
+            }
+        }
+
+        let (k_cache_vec, v_cache_vec);
+        let (k_cache, v_cache) = match &state.layers[layer] {
+            LayerState::Attention {
+                key_cache,
+                value_cache,
+                key_cache_f16,
+                value_cache_f16,
+                ..
+            } => {
+                if state.kv_f16 {
+                    k_cache_vec = key_cache_f16
+                        .iter()
+                        .map(|&b| crate::quant::f16_to_f32(b))
+                        .collect::<Vec<_>>();
+                    v_cache_vec = value_cache_f16
+                        .iter()
+                        .map(|&b| crate::quant::f16_to_f32(b))
+                        .collect::<Vec<_>>();
+                    (k_cache_vec.as_slice(), v_cache_vec.as_slice())
+                } else {
+                    (key_cache.as_slice(), value_cache.as_slice())
+                }
+            }
+            _ => unreachable!(),
+        };
+        let seq_len = (start_pos + n).min(k_cache.len() / kv_dim);
+        for j in 0..n {
+            let q = &q_all[j * q_dim..(j + 1) * q_dim];
+            let attn_out = &mut state.scratch.attn_out[..q_dim];
+            let scores = &mut state.scratch.scores;
+            scores.resize(seq_len, 0.0);
+            for h in 0..cfg.n_heads {
+                let kv_h = h / group_size;
+                let q_head = &q[h * head_dim..(h + 1) * head_dim];
+                let kv_h_offset = kv_h * head_dim;
+                cpu::attn_scores(
+                    q_head,
+                    k_cache,
+                    scores,
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    scale,
+                    seq_len,
+                );
+                cpu::softmax_inplace(scores);
+                cpu::attn_values(
+                    scores,
+                    v_cache,
+                    &mut attn_out[h * head_dim..(h + 1) * head_dim],
+                    kv_dim,
+                    kv_h_offset,
+                    head_dim,
+                    seq_len,
+                );
+            }
+            if lfm3_attn.is_some() {
+                let gate = &gate_all[j * cfg.n_heads..(j + 1) * cfg.n_heads];
+                attn_out
+                    .chunks_exact_mut(head_dim)
+                    .zip(gate)
+                    .for_each(|(head, &g)| head.iter_mut().for_each(|x| *x *= g));
+            }
+            let out_row = &mut block_out[j * hs..(j + 1) * hs];
+            self.gemv(out_ref, attn_out, out_row);
+            if let Some(lora) = &lora
+                && let Some(t) = lora.get(layer, crate::lora::LoraTarget::AttnOutput)
+            {
+                crate::lora::apply_decode(t, attn_out, out_row, &mut state.scratch.lora_tmp);
+            }
         }
     }
     /// Run all layers + output norm on a hidden state vector. Shared by
@@ -5033,7 +5254,8 @@ impl LfmModel {
                             );
                             let q_ref = &q_col[..hs * n];
 
-                            let is_causal = self.is_causal_for(state);
+                            let is_causal =
+                                self.is_causal_for(state) && !self.layer_is_non_causal(layer);
                             if !cpu::flash_attention_prefill_items(
                                 q_ref, k_cache, v_cache, flash_buf, n_heads, group_size, n, kv_dim,
                                 head_dim, scale, start_pos, is_causal, max_active,
@@ -5227,7 +5449,8 @@ impl LfmModel {
                             state.scratch.scores.clear();
                             state.scratch.scores.reserve((start_pos + n) * group_size);
                             for j in 0..n {
-                                let is_causal = self.is_causal_for(state);
+                                let is_causal =
+                                    self.is_causal_for(state) && !self.layer_is_non_causal(layer);
                                 let seq_len = if is_causal {
                                     (start_pos + j + 1).min(k_cache.len() / kv_dim)
                                 } else {
@@ -5360,18 +5583,24 @@ impl LfmModel {
                 // always lands here, and would otherwise read as free in the profile.
                 let t_fallback = profile_prefill.then(Instant::now);
                 block_out.fill(0.0);
-                for j in 0..n {
-                    col.copy_from_slice(&normed[j * hs..(j + 1) * hs]);
-                    #[cfg(target_arch = "aarch64")]
-                    Self::quantize_to_scratch(col, state);
+                if !is_conv && self.layer_is_non_causal(layer) && n > 1 {
+                    self.forward_attn_block_bidir_batch(
+                        layer, normed, start_pos, n, block_out, state,
+                    );
+                } else {
+                    for j in 0..n {
+                        col.copy_from_slice(&normed[j * hs..(j + 1) * hs]);
+                        #[cfg(target_arch = "aarch64")]
+                        Self::quantize_to_scratch(col, state);
 
-                    if is_conv {
-                        self.forward_conv_block(layer, col, start_pos + j, state);
-                    } else {
-                        self.forward_attn_block(layer, col, start_pos + j, state);
+                        if is_conv {
+                            self.forward_conv_block(layer, col, start_pos + j, state);
+                        } else {
+                            self.forward_attn_block(layer, col, start_pos + j, state);
+                        }
+
+                        block_out[j * hs..(j + 1) * hs].copy_from_slice(&state.scratch.out[..hs]);
                     }
-
-                    block_out[j * hs..(j + 1) * hs].copy_from_slice(&state.scratch.out[..hs]);
                 }
                 if let Some(t) = t_fallback {
                     if is_conv {
@@ -6205,7 +6434,7 @@ impl Model for LfmModel {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
 
-        let is_causal = self.is_causal_for(state);
+        let is_causal = self.is_causal_for(state) && self.config.is_causal;
         if !is_causal {
             let n = tokens.len();
             let mut hidden = vec![0.0f32; n * hs];
@@ -6225,7 +6454,8 @@ impl Model for LfmModel {
             // F16 and F32 projections cannot take the batched path, and the per-token path
             // that would take them is causal: run the trunk in plain f32 instead, handing
             // it the embedded rows rather than embedding them a second time
-            if state.lora.is_none() && self.bidirectional_needs_float_path() {
+            if self.lfm3.is_none() && state.lora.is_none() && self.bidirectional_needs_float_path()
+            {
                 return self.hidden_states_float_bidirectional(hidden);
             }
             self.prefill_layers_loop(&mut hidden, n, 0, state);
@@ -6874,7 +7104,21 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LfmModel {
         None
     }
     fn rope_freqs(&self) -> Option<&[f32]> {
-        None
+        self.lfm3.as_ref().and_then(|l| {
+            l.layers
+                .iter()
+                .find_map(|ly| ly.attn.as_ref()?.rope_freq_factors.as_deref())
+        })
+    }
+    fn attn_post_norm_weight(&self, layer: usize) -> Option<&[f32]> {
+        self.lfm3
+            .as_ref()
+            .and_then(|l| l.layers[layer].post_operator_norm.as_deref())
+    }
+    fn ffn_post_norm_weight(&self, layer: usize) -> Option<&[f32]> {
+        self.lfm3
+            .as_ref()
+            .and_then(|l| l.layers[layer].post_ffn_norm.as_deref())
     }
 
     fn weight_bytes(&self, wref: &WeightRef) -> Result<std::borrow::Cow<'_, [u8]>> {
@@ -6887,7 +7131,8 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LfmModel {
     }
 
     fn output_ref(&self) -> Option<&WeightRef> {
-        None
+        (self.config.architecture == "lfm3" && self.gguf.tensors.contains_key("output.weight"))
+            .then_some(&self.logits_ref)
     }
     fn ffn_gate_ref(&self, layer: usize) -> Result<&WeightRef> {
         Ok(&self.layer_refs[layer].ffn.dense()?.gate)
@@ -6922,6 +7167,36 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LfmModel {
     fn attn_output_ref(&self, layer: usize) -> Option<&WeightRef> {
         self.layer_refs[layer].attn_output.as_ref()
     }
+    fn attn_gate_ref(&self, layer: usize) -> Option<&WeightRef> {
+        self.lfm3
+            .as_ref()
+            .and_then(|l| l.layers[layer].attn.as_ref().map(|a| &a.gate))
+    }
+    fn layer_rope_theta(&self, layer: usize) -> f32 {
+        self.lfm3
+            .as_ref()
+            .and_then(|l| l.layers[layer].attn.as_ref().map(|a| a.rope_theta))
+            .unwrap_or(self.config.rope_theta)
+    }
+    fn layer_has_rope_freqs(&self, layer: usize) -> bool {
+        self.lfm3
+            .as_ref()
+            .and_then(|l| {
+                l.layers[layer]
+                    .attn
+                    .as_ref()
+                    .map(|a| a.rope_freq_factors.is_some())
+            })
+            .unwrap_or(false)
+    }
+    fn layer_sliding_window(&self, layer: usize) -> Option<usize> {
+        self.lfm3
+            .as_ref()
+            .and_then(|l| l.layers[layer].attn.as_ref().and_then(|a| a.window))
+    }
+    fn layer_is_non_causal(&self, layer: usize) -> bool {
+        LfmModel::layer_is_non_causal(self, layer)
+    }
 
     fn gpu_unsupported_reason(&self) -> Option<String> {
         if !self.config.is_causal
@@ -6930,6 +7205,13 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LfmModel {
             return Some(format!(
                 "the GPU backends run {} with causal attention only, and this model is bidirectional (CPU only)",
                 self.config.architecture
+            ));
+        }
+        if let Some(k) = self.config.conv_kernel_size
+            && k > 8
+        {
+            return Some(format!(
+                "the GPU backends support shortconv.l_cache in 2..=8, got {k}"
             ));
         }
         None

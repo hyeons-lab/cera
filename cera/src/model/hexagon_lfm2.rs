@@ -1714,11 +1714,14 @@ impl HexagonLfmModel {
                  op chain, so it always uses SsmConv"
             );
         }
-        // A window as long as the context never masks anything: run those layers dense.
+        // A window as long as the context never masks anything on a causal model: run those
+        // layers dense. On a non-causal `lfm3` model (`d1-2B` / `d1-Omni-2B`), `so.mask` is
+        // filled with zeros (bidirectional) while SWA layers remain causal, so keep `swa_window`
+        // whenever `!config.is_causal` as well.
         let swa_window = lfm3
             .as_ref()
             .and_then(|l| l.window)
-            .filter(|&w| w > 0 && w < max_seq_len);
+            .filter(|&w| w > 0 && (w < max_seq_len || !config.is_causal));
         let layer_swa: Vec<bool> = (0..n_layers)
             .map(|i| {
                 swa_window.is_some()
@@ -2711,12 +2714,17 @@ impl HexagonLfmModel {
             for (i, slot) in pos_slice.iter_mut().enumerate() {
                 *slot = (start_pos + i) as i32;
             }
-            // Causal mask [kv_len, M]: query i attends slots <= start_pos + i.
+            // Causal mask [kv_len, M]: query i attends slots <= start_pos + i, or all slots
+            // on bidirectional LFM3 global attention layers (`d1-2B` / `d1-Omni-2B`).
             let mask = std::slice::from_raw_parts_mut(
                 scratch.as_mut_ptr().add(so.mask) as *mut u16,
                 kv_len * m,
             );
-            fill_prefill_mask(mask, start_pos, m, kv_len, None);
+            if !self.config.is_causal && self.config.architecture == "lfm3" {
+                mask.fill(0);
+            } else {
+                fill_prefill_mask(mask, start_pos, m, kv_len, None);
+            }
             // Sliding-window layers get their own windowed copy.
             if let Some(window) = self.dense.swa_window
                 && so.mask_swa != 0

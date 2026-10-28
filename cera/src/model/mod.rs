@@ -1312,7 +1312,7 @@ pub fn load_model_gpu(
         // `GpuWeightSource::moe_refs`, so the only difference here is that the
         // arch string is admitted. The expert kernels are Q4_0-only and reject
         // anything else at load with a named error.
-        "lfm2" | "lfm2moe" => Ok(Box::new(gpu_lfm2::GpuLfmModel::from_gguf_with_id(
+        "lfm2" | "lfm2moe" | "lfm3" => Ok(Box::new(gpu_lfm2::GpuLfmModel::from_gguf_with_id(
             gguf,
             context_size,
             model_id,
@@ -1352,7 +1352,7 @@ pub fn load_model_metal(
         // Both GPU backends dispatch the same three routing / expert kernels,
         // each generated from its own Slang source; see `load_model_gpu` above
         // for the wgpu half.
-        "lfm2" | "lfm2moe" => Ok(Box::new(metal_lfm2::MetalLfmModel::from_gguf(
+        "lfm2" | "lfm2moe" | "lfm3" => Ok(Box::new(metal_lfm2::MetalLfmModel::from_gguf(
             gguf,
             path,
             context_size,
@@ -1448,21 +1448,15 @@ fn _assert_arc_dyn_model_is_send_sync() {
 }
 
 /// Whether the GPU backends refuse an architecture that parses through the shared LFM2
-/// parser: `lfm3`, whose sandwich norms, attention gate, sliding windows and wide conv no GPU
-/// graph implements. This answers only that question (it says nothing about architectures
-/// the GPU loaders reject on their own); it is the one rule behind `ensure_gpu_supported_arch`
-/// and the browser's early refusal of an lfm3 bundle in `cera-wasm`.
+/// parser. With `lfm3` supported on both wgpu and Metal, all shared-parser architectures
+/// (`lfm2`, `lfm2moe`, `lfm3`) are accepted.
 #[doc(hidden)]
 pub fn gpu_refuses_architecture(architecture: &str) -> bool {
-    architecture == "lfm3"
+    let _ = architecture;
+    false
 }
 
-/// The GPU backends run `lfm2` and `lfm2moe` only. `lfm3` parses through the shared LFM2
-/// config (the CPU and Hexagon paths run it), but the GPU graphs know nothing of its
-/// sandwich norms, attention gate, sliding windows or wide conv, so they would load it
-/// and produce garbage. Every GPU weight-source loader calls this first; `load_model_gpu`
-/// and `load_model_metal` also refuse it, through their generic "unsupported architecture"
-/// arm.
+/// Check that `architecture` is supported by the shared LFM GPU/Metal loaders.
 #[cfg(any(feature = "gpu", feature = "metal"))]
 pub(crate) fn ensure_gpu_supported_arch(architecture: &str) -> anyhow::Result<()> {
     anyhow::ensure!(
@@ -1496,24 +1490,18 @@ mod tests {
     use std::sync::atomic::AtomicBool;
 
     /// The architecture rule shared by the native GPU loaders and the browser's early
-    /// refusal; it needs no GPU feature, so it runs in every CI leg.
+    /// check; it needs no GPU feature, so it runs in every CI leg.
     #[test]
-    fn only_lfm3_is_refused_by_the_gpu_arch_rule() {
-        assert!(super::gpu_refuses_architecture("lfm3"));
-        for arch in ["lfm2", "lfm2moe", "llama", "qwen3", "granite"] {
+    fn lfm3_is_accepted_by_the_gpu_arch_rule() {
+        for arch in ["lfm2", "lfm2moe", "lfm3", "llama", "qwen3", "granite"] {
             assert!(!super::gpu_refuses_architecture(arch), "{arch}");
         }
     }
 
     #[cfg(any(feature = "gpu", feature = "metal"))]
     #[test]
-    fn gpu_arch_gate_refuses_lfm3() {
-        let err = super::ensure_gpu_supported_arch("lfm3").unwrap_err();
-        assert!(
-            err.to_string().contains("not supported on the GPU"),
-            "{err}"
-        );
-        for arch in ["lfm2", "lfm2moe", "llama", "qwen3"] {
+    fn gpu_arch_gate_accepts_lfm3() {
+        for arch in ["lfm2", "lfm2moe", "lfm3", "llama", "qwen3"] {
             super::ensure_gpu_supported_arch(arch).unwrap();
         }
     }

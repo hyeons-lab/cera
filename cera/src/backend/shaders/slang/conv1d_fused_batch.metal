@@ -55,7 +55,7 @@ struct KernelContext_0
 
 
 
-    if(ks_0 > 4U)
+    if(ks_0 > 8U)
     {
 
 #line 84
@@ -67,7 +67,7 @@ struct KernelContext_0
     {
 
 #line 84
-        _S4 = d_conv_0 > 3U;
+        _S4 = d_conv_0 > 7U;
 
 #line 84
     }
@@ -81,7 +81,7 @@ struct KernelContext_0
     }
 
 #line 101
-    thread array<float, int(4)> w_local_0;
+    thread array<float, int(8)> w_local_0;
 
 #line 101
     w_local_0[int(0)] = 0.0f;
@@ -94,6 +94,18 @@ struct KernelContext_0
 
 #line 101
     w_local_0[int(3)] = 0.0f;
+
+#line 101
+    w_local_0[int(4)] = 0.0f;
+
+#line 101
+    w_local_0[int(5)] = 0.0f;
+
+#line 101
+    w_local_0[int(6)] = 0.0f;
+
+#line 101
+    w_local_0[int(7)] = 0.0f;
 
 
     if(0U <= d_conv_0)
@@ -207,9 +219,121 @@ struct KernelContext_0
 #line 104
     }
 
+#line 104
+    if(4U <= d_conv_0)
+    {
+
+#line 104
+        _S4 = 4U < ks_0;
+
+#line 104
+    }
+    else
+    {
+
+#line 104
+        _S4 = false;
+
+#line 104
+    }
+
+#line 104
+    if(_S4)
+    {
+
+#line 105
+        w_local_0[4U] = (&kernelContext_0)->w_buf_0[ch_0 * ks_0 + 4U];
+
+#line 104
+    }
+
+#line 104
+    if(5U <= d_conv_0)
+    {
+
+#line 104
+        _S4 = 5U < ks_0;
+
+#line 104
+    }
+    else
+    {
+
+#line 104
+        _S4 = false;
+
+#line 104
+    }
+
+#line 104
+    if(_S4)
+    {
+
+#line 105
+        w_local_0[5U] = (&kernelContext_0)->w_buf_0[ch_0 * ks_0 + 5U];
+
+#line 104
+    }
+
+#line 104
+    if(6U <= d_conv_0)
+    {
+
+#line 104
+        _S4 = 6U < ks_0;
+
+#line 104
+    }
+    else
+    {
+
+#line 104
+        _S4 = false;
+
+#line 104
+    }
+
+#line 104
+    if(_S4)
+    {
+
+#line 105
+        w_local_0[6U] = (&kernelContext_0)->w_buf_0[ch_0 * ks_0 + 6U];
+
+#line 104
+    }
+
+#line 104
+    if(7U <= d_conv_0)
+    {
+
+#line 104
+        _S4 = 7U < ks_0;
+
+#line 104
+    }
+    else
+    {
+
+#line 104
+        _S4 = false;
+
+#line 104
+    }
+
+#line 104
+    if(_S4)
+    {
+
+#line 105
+        w_local_0[7U] = (&kernelContext_0)->w_buf_0[ch_0 * ks_0 + 7U];
+
+#line 104
+    }
 
 
-    thread array<float, int(3)> rb_0;
+
+    thread array<float, int(7)> rb_0;
 
 #line 108
     rb_0[int(0)] = 0.0f;
@@ -219,6 +343,18 @@ struct KernelContext_0
 
 #line 108
     rb_0[int(2)] = 0.0f;
+
+#line 108
+    rb_0[int(3)] = 0.0f;
+
+#line 108
+    rb_0[int(4)] = 0.0f;
+
+#line 108
+    rb_0[int(5)] = 0.0f;
+
+#line 108
+    rb_0[int(6)] = 0.0f;
 
 
     bool _S5 = 0U < d_conv_0;
@@ -255,6 +391,58 @@ struct KernelContext_0
 
 #line 112
         rb_0[2U] = *((&kernelContext_0)->rbuf_0+(2U * hs_0 + ch_0));
+
+#line 111
+    }
+
+#line 111
+    bool _S8 = 3U < d_conv_0;
+
+#line 111
+    if(_S8)
+    {
+
+#line 112
+        rb_0[3U] = *((&kernelContext_0)->rbuf_0+(3U * hs_0 + ch_0));
+
+#line 111
+    }
+
+#line 111
+    bool _S9 = 4U < d_conv_0;
+
+#line 111
+    if(_S9)
+    {
+
+#line 112
+        rb_0[4U] = *((&kernelContext_0)->rbuf_0+(4U * hs_0 + ch_0));
+
+#line 111
+    }
+
+#line 111
+    bool _S10 = 5U < d_conv_0;
+
+#line 111
+    if(_S10)
+    {
+
+#line 112
+        rb_0[5U] = *((&kernelContext_0)->rbuf_0+(5U * hs_0 + ch_0));
+
+#line 111
+    }
+
+#line 111
+    bool _S11 = 6U < d_conv_0;
+
+#line 111
+    if(_S11)
+    {
+
+#line 112
+        rb_0[6U] = *((&kernelContext_0)->rbuf_0+(6U * hs_0 + ch_0));
 
 #line 111
     }
@@ -344,8 +532,84 @@ struct KernelContext_0
 #line 130
         }
 
+#line 129
+        float sum_3;
+        if(_S8)
+        {
+
+#line 130
+            sum_3 = sum_2 + rb_0[3U] * w_local_0[3U];
+
+#line 130
+        }
+        else
+        {
+
+#line 130
+            sum_3 = sum_2;
+
+#line 130
+        }
+
+#line 129
+        float sum_4;
+        if(_S9)
+        {
+
+#line 130
+            sum_4 = sum_3 + rb_0[4U] * w_local_0[4U];
+
+#line 130
+        }
+        else
+        {
+
+#line 130
+            sum_4 = sum_3;
+
+#line 130
+        }
+
+#line 129
+        float sum_5;
+        if(_S10)
+        {
+
+#line 130
+            sum_5 = sum_4 + rb_0[5U] * w_local_0[5U];
+
+#line 130
+        }
+        else
+        {
+
+#line 130
+            sum_5 = sum_4;
+
+#line 130
+        }
+
+#line 129
+        float sum_6;
+        if(_S11)
+        {
+
+#line 130
+            sum_6 = sum_5 + rb_0[6U] * w_local_0[6U];
+
+#line 130
+        }
+        else
+        {
+
+#line 130
+            sum_6 = sum_5;
+
+#line 130
+        }
+
 #line 140
-        float sum_3 = sum_2 + bx_0 * w_local_0[d_conv_0];
+        float sum_7 = sum_6 + bx_0 * w_local_0[d_conv_0];
 
 #line 145
         if(_S6)
@@ -367,6 +631,46 @@ struct KernelContext_0
 #line 145
         }
 
+#line 145
+        if(_S8)
+        {
+
+#line 146
+            rb_0[2U] = rb_0[3U];
+
+#line 145
+        }
+
+#line 145
+        if(_S9)
+        {
+
+#line 146
+            rb_0[3U] = rb_0[4U];
+
+#line 145
+        }
+
+#line 145
+        if(_S10)
+        {
+
+#line 146
+            rb_0[4U] = rb_0[5U];
+
+#line 145
+        }
+
+#line 145
+        if(_S11)
+        {
+
+#line 146
+            rb_0[5U] = rb_0[6U];
+
+#line 145
+        }
+
 
 
         if(d_conv_0 > 0U)
@@ -380,7 +684,7 @@ struct KernelContext_0
 
 
 
-        *((&kernelContext_0)->out_buf_0+(t_0 * _S3 + ch_0)) = c_val_0 * sum_3;
+        *((&kernelContext_0)->out_buf_0+(t_0 * _S3 + ch_0)) = c_val_0 * sum_7;
 
 #line 116
         t_0 = t_0 + 1U;
@@ -414,6 +718,46 @@ struct KernelContext_0
 
 #line 160
         *((&kernelContext_0)->rbuf_0+(2U * hs_0 + ch_0)) = rb_0[2U];
+
+#line 159
+    }
+
+#line 159
+    if(_S8)
+    {
+
+#line 160
+        *((&kernelContext_0)->rbuf_0+(3U * hs_0 + ch_0)) = rb_0[3U];
+
+#line 159
+    }
+
+#line 159
+    if(_S9)
+    {
+
+#line 160
+        *((&kernelContext_0)->rbuf_0+(4U * hs_0 + ch_0)) = rb_0[4U];
+
+#line 159
+    }
+
+#line 159
+    if(_S10)
+    {
+
+#line 160
+        *((&kernelContext_0)->rbuf_0+(5U * hs_0 + ch_0)) = rb_0[5U];
+
+#line 159
+    }
+
+#line 159
+    if(_S11)
+    {
+
+#line 160
+        *((&kernelContext_0)->rbuf_0+(6U * hs_0 + ch_0)) = rb_0[6U];
 
 #line 159
     }
