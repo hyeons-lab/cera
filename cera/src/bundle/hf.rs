@@ -381,7 +381,6 @@ pub fn classify_repo_siblings(siblings: &[HfSibling]) -> HfRepoContents {
 
 fn is_vision_mmproj(file: &str) -> bool {
     !is_audio_decoder(file)
-        && !file.contains("audio")
         && (file.starts_with("mmproj")
             || file.contains("-mmproj")
             || file.contains("_mmproj")
@@ -690,11 +689,16 @@ pub fn resolve_hf_manifest(
     }
 
     // Audio matching
+    let repo_lower = spec.repo.to_ascii_lowercase();
     let is_audio_pipeline = info.pipeline_tag.as_deref() == Some("automatic-speech-recognition")
+        || info.pipeline_tag.as_deref() == Some("audio-text-to-text")
         || info
             .tags
             .iter()
-            .any(|t| t.contains("audio") || t == "lfm2-audio")
+            .any(|t| t.contains("audio") || t == "lfm2-audio" || t == "lfm3-audio")
+        || repo_lower.contains("-audio-")
+        || repo_lower.contains("lfm3-omni")
+        || (repo_lower.contains("d1-omni") && !repo_lower.contains("600m"))
         || !contents.audio_decoders.is_empty()
         || !contents.vocoder_ggufs.is_empty();
 

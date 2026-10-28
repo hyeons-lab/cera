@@ -4395,7 +4395,7 @@ impl Session {
         //   was already EOS). `logits` still holds the untouched prefill
         //   distribution; restoring it keeps the session usable for a
         //   retry without the caller having to re-prefill.
-        if logits_fresh {
+        if (!greedy || generated == 0) && logits_fresh {
             self.last_logits = Some(logits);
         } else {
             self.last_logits = None;

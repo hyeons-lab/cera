@@ -2957,21 +2957,6 @@ mod webgpu {
         }
     }
 
-    /// Why the direct OPFS-to-WebGPU load did not produce a session: `Unavailable` (no sync
-    /// access handle, a read failure, ...) falls back to the in-memory load, while `Refused`
-    /// is known from the GGUF header and would fail the same way after that load has read
-    /// the whole model, so it is returned as is.
-    enum OpfsAttempt {
-        Unavailable(JsError),
-        Refused(JsError),
-    }
-
-    impl From<JsError> for OpfsAttempt {
-        fn from(e: JsError) -> Self {
-            Self::Unavailable(e)
-        }
-    }
-
     /// GPU-accelerated LFM2 session for the browser. Holds a WebGPU-resident
     /// model + KV/conv state and streams decoded token text to a JS callback.
     #[wasm_bindgen]
@@ -3651,6 +3636,8 @@ mod webgpu {
             let llm_hidden = cera::model::Model::config(&self.model).hidden_size;
 
             let is_audio = cera::model::audio_encoder::is_audio_encoder_gguf(&proj_arc);
+            let has_vision =
+                !is_audio || proj_arc.get_bool("clip.has_vision_encoder") == Some(true);
 
             if is_audio {
                 let weights = cera::model::audio_encoder::AudioEncoderWeights::from_gguf(&proj_arc)
@@ -3671,8 +3658,15 @@ mod webgpu {
                 // Audio encoding on WebGPU falls back to the CPU encoder path.
                 self.gpu_audio_encoder = None;
                 self.audio_encoder = Some(weights);
-                Ok(())
-            } else {
+
+                if self.audio_decoder.is_none()
+                    && cera::model::audio_decoder::is_lfm3a_gen_gguf(&proj_arc)
+                {
+                    self.attach_audio_sidecars(Some(Arc::clone(&mmproj)), None)?;
+                }
+            }
+
+            if has_vision {
                 let weights =
                     cera::model::vision_encoder::VisionEncoderWeights::from_gguf(&proj_arc)
                         .map_err(|e| {
@@ -3695,8 +3689,8 @@ mod webgpu {
                         &weights,
                     );
                 self.vision_encoder = Some(weights);
-                Ok(())
             }
+            Ok(())
         }
 
         /// Parse draft model sidecar (e.g. DSpark) and attach it for speculative decoding,

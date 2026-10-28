@@ -49,12 +49,55 @@ Future<Map<String, int>> probeBundleFileSizes(
     } catch (_) {}
 
     if (fileUrls.isEmpty) {
-      if (bundleName.contains('VL-3B')) {
-        final String mmprojQuant;
+      final cleanId = bundleName.startsWith('LiquidAI/')
+          ? bundleName.substring('LiquidAI/'.length)
+          : bundleName;
+      final mmprojQuant = (cleanQuant == 'BF16' || cleanQuant == 'F16')
+          ? cleanQuant
+          : 'Q8_0';
+      if (cleanId == 'LFM3-1.7B-GGUF') {
+        final modelQuant = (cleanQuant == 'Q4_0' || cleanQuant == 'QAD-Q4_0')
+            ? 'QAD-Q4_0'
+            : cleanQuant;
+        fileUrls.add(
+          'https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/'
+          'LFM3-1.7B-$modelQuant.gguf',
+        );
+      } else if (cleanId == 'LFM3-VL-2B-GGUF') {
+        final modelQuant = (cleanQuant == 'Q4_0' || cleanQuant == 'QAD-Q4_0')
+            ? 'QAD-Q4_0'
+            : cleanQuant;
+        fileUrls.add(
+          'https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF/resolve/main/'
+          'LFM3-VL-2B-$modelQuant.gguf',
+        );
+        fileUrls.add(
+          'https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF/resolve/main/'
+          'mmproj-LFM3-VL-2B-$mmprojQuant.gguf',
+        );
+      } else if (const {
+        'LFM3-Audio-2B-GGUF',
+        'LFM3-Omni-2B-GGUF',
+        'd1-3B-GGUF',
+        'd1-2B-GGUF',
+        'd1-Omni-2B-GGUF',
+        'd1-omni-600M-GGUF',
+      }.contains(cleanId)) {
+        final stem = cleanId.substring(0, cleanId.length - '-GGUF'.length);
+        fileUrls.add(
+          'https://huggingface.co/LiquidAI/$cleanId/resolve/main/'
+          '$stem-$cleanQuant.gguf',
+        );
+        fileUrls.add(
+          'https://huggingface.co/LiquidAI/$cleanId/resolve/main/'
+          'mmproj-$stem-$mmprojQuant.gguf',
+        );
+      } else if (bundleName.contains('VL-3B')) {
+        final String vl3bMmprojQuant;
         if (cleanQuant == 'F16' || cleanQuant == 'BF16') {
-          mmprojQuant = 'F16';
+          vl3bMmprojQuant = 'F16';
         } else {
-          mmprojQuant = 'Q8_0';
+          vl3bMmprojQuant = 'Q8_0';
         }
         fileUrls.add(
           'https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/'
@@ -62,9 +105,10 @@ Future<Map<String, int>> probeBundleFileSizes(
         );
         fileUrls.add(
           'https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/'
-          'mmproj-LFM2.5-VL-3B-$mmprojQuant.gguf',
+          'mmproj-LFM2.5-VL-3B-$vl3bMmprojQuant.gguf',
         );
-      } else if (bundleName.contains('Audio')) {
+      } else if (bundleName.contains('Audio-1.5B') ||
+          cleanId == 'LFM2.5-Audio-1.5B-GGUF') {
         final String sidecarQuant;
         if (cleanQuant == 'F16' || cleanQuant == 'BF16') {
           sidecarQuant = 'F16';

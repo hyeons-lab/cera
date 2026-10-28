@@ -2007,12 +2007,12 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let shard = dir.path().join("model.safetensors");
         fs::write(&shard, [0u8; 16]).unwrap();
-        // the span comes from the shard's own header: 2^50 bytes would abort on allocation
+        // the span comes from the shard's own header: usize::MAX bytes would abort on allocation
         let src = SourceRef {
             file_idx: 0,
             dtype: "F32".into(),
             data_start: 8,
-            data_end: 1 << 50,
+            data_end: usize::MAX,
         };
         let (mut idx, mut file, mut raw, mut out) = (usize::MAX, None, Vec::new(), Vec::new());
         let err = read_local_source_f32(&src, &[shard], &mut idx, &mut file, &mut raw, &mut out)

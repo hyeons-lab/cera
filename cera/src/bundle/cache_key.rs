@@ -28,44 +28,224 @@ use std::collections::{BTreeMap, BTreeSet, HashMap};
 use crate::manifest::{GenerationDefaults, InferenceType, Manifest, ManifestFiles};
 use crate::session::CeraError;
 
-/// Return a pre-configured [`Manifest`] for known models (such as `LFM2.5-VL-3B-GGUF`)
-/// whose individual manifests have not yet landed in `LiquidAI/LeapBundles`.
+/// Return a pre-configured [`Manifest`] for known models (such as `LFM2.5-VL-3B-GGUF`,
+/// `LFM3-*`, and `d1-*`) whose individual manifests have not yet landed in
+/// `LiquidAI/LeapBundles`.
 pub fn known_bundle_manifest(bundle_id: &str, quant: &str) -> Option<Manifest> {
     let clean_id = bundle_id.strip_prefix("LiquidAI/").unwrap_or(bundle_id);
     let clean_quant = quant.split(['+', ' ']).next().unwrap_or(quant).trim();
-    if clean_id == "LFM2.5-VL-3B-GGUF" {
-        let mmproj = if clean_quant == "F16" || clean_quant == "BF16" {
-            "https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/mmproj-LFM2.5-VL-3B-F16.gguf"
-        } else {
-            "https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/mmproj-LFM2.5-VL-3B-Q8_0.gguf"
-        };
-        let model = format!(
-            "https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/LFM2.5-VL-3B-{clean_quant}.gguf"
-        );
-        Some(Manifest {
-            inference_type: InferenceType::LlamaCppImageToText,
-            schema_version: "1.0.0".to_string(),
-            files: ManifestFiles {
-                model,
-                multimodal_projector: Some(mmproj.to_string()),
-                audio_decoder: None,
-                audio_tokenizer: None,
-                draft_model: None,
-                extras: HashMap::new(),
-            },
-            chat_template: None,
-            generation_defaults: GenerationDefaults::Text {
-                temperature: Some(0.1),
-                min_p: Some(0.15),
-                top_p: None,
-                top_k: None,
-                repetition_penalty: Some(1.05),
-            },
-            raw: serde_json::Value::Null,
-        })
-    } else {
-        None
+    validate_path_segment("quant", clean_quant).ok()?;
+
+    let mmproj_quant_for = |q: &str| match q {
+        "BF16" => "BF16",
+        "F16" => "F16",
+        _ => "Q8_0",
+    };
+
+    match clean_id {
+        "LFM2.5-VL-3B-GGUF" => {
+            let mmproj = if clean_quant == "F16" || clean_quant == "BF16" {
+                "https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/mmproj-LFM2.5-VL-3B-F16.gguf"
+            } else {
+                "https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/mmproj-LFM2.5-VL-3B-Q8_0.gguf"
+            };
+            let model = format!(
+                "https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/LFM2.5-VL-3B-{clean_quant}.gguf"
+            );
+            Some(Manifest {
+                inference_type: InferenceType::LlamaCppImageToText,
+                schema_version: "1.0.0".to_string(),
+                files: ManifestFiles {
+                    model,
+                    multimodal_projector: Some(mmproj.to_string()),
+                    audio_decoder: None,
+                    audio_tokenizer: None,
+                    draft_model: None,
+                    extras: HashMap::new(),
+                },
+                chat_template: None,
+                generation_defaults: GenerationDefaults::Text {
+                    temperature: Some(0.1),
+                    min_p: Some(0.15),
+                    top_p: None,
+                    top_k: None,
+                    repetition_penalty: Some(1.05),
+                },
+                raw: serde_json::Value::Null,
+            })
+        }
+        "LFM3-1.7B-GGUF" => {
+            let model_quant = match clean_quant {
+                "Q4_0" | "QAD-Q4_0" => "QAD-Q4_0",
+                other => other,
+            };
+            let model = format!(
+                "https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-{model_quant}.gguf"
+            );
+            Some(Manifest {
+                inference_type: InferenceType::LlamaCppTextToText,
+                schema_version: "1.0.0".to_string(),
+                files: ManifestFiles {
+                    model,
+                    multimodal_projector: None,
+                    audio_decoder: None,
+                    audio_tokenizer: None,
+                    draft_model: None,
+                    extras: HashMap::new(),
+                },
+                chat_template: None,
+                generation_defaults: GenerationDefaults::Text {
+                    temperature: Some(0.1),
+                    min_p: None,
+                    top_p: None,
+                    top_k: Some(50),
+                    repetition_penalty: Some(1.1),
+                },
+                raw: serde_json::Value::Null,
+            })
+        }
+        "LFM3-VL-2B-GGUF" => {
+            let model_quant = match clean_quant {
+                "Q4_0" | "QAD-Q4_0" => "QAD-Q4_0",
+                other => other,
+            };
+            let mmproj_quant = mmproj_quant_for(clean_quant);
+            let model = format!(
+                "https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF/resolve/main/LFM3-VL-2B-{model_quant}.gguf"
+            );
+            let mmproj = format!(
+                "https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF/resolve/main/mmproj-LFM3-VL-2B-{mmproj_quant}.gguf"
+            );
+            Some(Manifest {
+                inference_type: InferenceType::LlamaCppImageToText,
+                schema_version: "1.0.0".to_string(),
+                files: ManifestFiles {
+                    model,
+                    multimodal_projector: Some(mmproj),
+                    audio_decoder: None,
+                    audio_tokenizer: None,
+                    draft_model: None,
+                    extras: HashMap::new(),
+                },
+                chat_template: None,
+                generation_defaults: GenerationDefaults::Text {
+                    temperature: Some(0.1),
+                    min_p: None,
+                    top_p: None,
+                    top_k: Some(50),
+                    repetition_penalty: Some(1.1),
+                },
+                raw: serde_json::Value::Null,
+            })
+        }
+        "LFM3-Audio-2B-GGUF" | "LFM3-Omni-2B-GGUF" | "d1-Omni-2B-GGUF" => {
+            let stem = clean_id.strip_suffix("-GGUF").unwrap_or(clean_id);
+            let mmproj_quant = mmproj_quant_for(clean_quant);
+            let model = format!(
+                "https://huggingface.co/LiquidAI/{clean_id}/resolve/main/{stem}-{clean_quant}.gguf"
+            );
+            let mmproj = format!(
+                "https://huggingface.co/LiquidAI/{clean_id}/resolve/main/mmproj-{stem}-{mmproj_quant}.gguf"
+            );
+            Some(Manifest {
+                inference_type: InferenceType::LlamaCppLfm2AudioV1,
+                schema_version: "1.0.0".to_string(),
+                files: ManifestFiles {
+                    model,
+                    multimodal_projector: Some(mmproj),
+                    audio_decoder: None,
+                    audio_tokenizer: None,
+                    draft_model: None,
+                    extras: HashMap::new(),
+                },
+                chat_template: None,
+                generation_defaults: GenerationDefaults::Audio {
+                    number_of_decoding_threads: None,
+                    audio_temperature: Some(0.8),
+                    audio_top_k: Some(64),
+                    temperature: Some(0.7),
+                    min_p: None,
+                    top_p: None,
+                    top_k: Some(50),
+                    repetition_penalty: Some(1.1),
+                },
+                raw: serde_json::Value::Null,
+            })
+        }
+        "d1-3B-GGUF" | "d1-2B-GGUF" | "d1-omni-600M-GGUF" => {
+            let stem = clean_id.strip_suffix("-GGUF").unwrap_or(clean_id);
+            let mmproj_quant = mmproj_quant_for(clean_quant);
+            let model = format!(
+                "https://huggingface.co/LiquidAI/{clean_id}/resolve/main/{stem}-{clean_quant}.gguf"
+            );
+            let mmproj = format!(
+                "https://huggingface.co/LiquidAI/{clean_id}/resolve/main/mmproj-{stem}-{mmproj_quant}.gguf"
+            );
+            Some(Manifest {
+                inference_type: InferenceType::LlamaCppImageToText,
+                schema_version: "1.0.0".to_string(),
+                files: ManifestFiles {
+                    model,
+                    multimodal_projector: Some(mmproj),
+                    audio_decoder: None,
+                    audio_tokenizer: None,
+                    draft_model: None,
+                    extras: HashMap::new(),
+                },
+                chat_template: None,
+                generation_defaults: GenerationDefaults::Text {
+                    temperature: Some(0.1),
+                    min_p: None,
+                    top_p: None,
+                    top_k: Some(50),
+                    repetition_penalty: Some(1.1),
+                },
+                raw: serde_json::Value::Null,
+            })
+        }
+        _ => None,
     }
+}
+
+/// Append known published LiquidAI GGUF bundles whose per-quant `.json`
+/// manifests have not yet landed in `LiquidAI/LeapBundles`, preserving
+/// ascending `name` order.
+pub fn supplement_known_bundles(entries: &mut Vec<LeapBundleEntry>) {
+    const KNOWN_BUNDLES: &[(&str, &[&str])] = &[
+        (
+            "LFM2.5-VL-3B-GGUF",
+            &["BF16", "F16", "Q4_0", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"],
+        ),
+        (
+            "LFM3-1.7B-GGUF",
+            &["BF16", "F16", "Q4_0", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"],
+        ),
+        (
+            "LFM3-VL-2B-GGUF",
+            &["BF16", "F16", "Q4_0", "Q4_K_M", "Q5_K_M", "Q6_K", "Q8_0"],
+        ),
+        (
+            "LFM3-Audio-2B-GGUF",
+            &["BF16", "F16", "Q4_0", "Q4_K_M", "Q8_0"],
+        ),
+        (
+            "LFM3-Omni-2B-GGUF",
+            &["BF16", "F16", "Q4_0", "Q4_K_M", "Q8_0"],
+        ),
+        ("d1-3B-GGUF", &["BF16", "F16", "Q4_K_M", "Q8_0"]),
+        ("d1-2B-GGUF", &["BF16", "F16", "Q4_K_M", "Q8_0"]),
+        ("d1-Omni-2B-GGUF", &["BF16", "F16", "Q8_0"]),
+        ("d1-omni-600M-GGUF", &["BF16", "F16", "Q8_0"]),
+    ];
+    for &(name, quants) in KNOWN_BUNDLES {
+        if !entries.iter().any(|e| e.name == name) {
+            entries.push(LeapBundleEntry {
+                name: name.to_string(),
+                quants: quants.iter().map(|&q| q.to_string()).collect(),
+            });
+        }
+    }
+    entries.sort_by(|a, b| a.name.cmp(&b.name));
 }
 
 /// HuggingFace model-info endpoint for the LeapBundles repo. The
@@ -599,5 +779,116 @@ mod tests {
         // The invalid quant `Q 0` got filtered, leaving the one
         // good `Q4_0` quant.
         assert_eq!(entries[0].quants, vec!["Q4_0"]);
+    }
+
+    #[test]
+    fn known_bundle_manifest_resolves_lfm3_and_d1_bundles() {
+        let lfm3_text = known_bundle_manifest("LiquidAI/LFM3-1.7B-GGUF", "Q4_0").unwrap();
+        assert_eq!(lfm3_text.inference_type, InferenceType::LlamaCppTextToText);
+        assert!(lfm3_text.files.model.ends_with("LFM3-1.7B-QAD-Q4_0.gguf"));
+        assert!(lfm3_text.files.multimodal_projector.is_none());
+
+        let lfm3_vl = known_bundle_manifest("LFM3-VL-2B-GGUF", "Q4_0").unwrap();
+        assert_eq!(lfm3_vl.inference_type, InferenceType::LlamaCppImageToText);
+        assert!(lfm3_vl.files.model.ends_with("LFM3-VL-2B-QAD-Q4_0.gguf"));
+        assert!(
+            lfm3_vl
+                .files
+                .multimodal_projector
+                .as_deref()
+                .unwrap()
+                .ends_with("mmproj-LFM3-VL-2B-Q8_0.gguf")
+        );
+
+        let lfm3_audio = known_bundle_manifest("LFM3-Audio-2B-GGUF", "Q4_K_M").unwrap();
+        assert_eq!(
+            lfm3_audio.inference_type,
+            InferenceType::LlamaCppLfm2AudioV1
+        );
+        assert!(
+            lfm3_audio
+                .files
+                .model
+                .ends_with("LFM3-Audio-2B-Q4_K_M.gguf")
+        );
+        assert!(
+            lfm3_audio
+                .files
+                .multimodal_projector
+                .as_deref()
+                .unwrap()
+                .ends_with("mmproj-LFM3-Audio-2B-Q8_0.gguf")
+        );
+
+        let lfm3_omni = known_bundle_manifest("LFM3-Omni-2B-GGUF", "F16").unwrap();
+        assert_eq!(lfm3_omni.inference_type, InferenceType::LlamaCppLfm2AudioV1);
+        assert!(lfm3_omni.files.model.ends_with("LFM3-Omni-2B-F16.gguf"));
+        assert!(
+            lfm3_omni
+                .files
+                .multimodal_projector
+                .as_deref()
+                .unwrap()
+                .ends_with("mmproj-LFM3-Omni-2B-F16.gguf")
+        );
+
+        let d1_3b = known_bundle_manifest("d1-3B-GGUF", "Q4_K_M").unwrap();
+        assert_eq!(d1_3b.inference_type, InferenceType::LlamaCppImageToText);
+        assert!(d1_3b.files.model.ends_with("d1-3B-Q4_K_M.gguf"));
+        assert!(
+            d1_3b
+                .files
+                .multimodal_projector
+                .as_deref()
+                .unwrap()
+                .ends_with("mmproj-d1-3B-Q8_0.gguf")
+        );
+
+        let d1_omni = known_bundle_manifest("d1-Omni-2B-GGUF", "BF16").unwrap();
+        assert_eq!(d1_omni.inference_type, InferenceType::LlamaCppLfm2AudioV1);
+        assert!(d1_omni.files.model.ends_with("d1-Omni-2B-BF16.gguf"));
+        assert!(
+            d1_omni
+                .files
+                .multimodal_projector
+                .as_deref()
+                .unwrap()
+                .ends_with("mmproj-d1-Omni-2B-BF16.gguf")
+        );
+
+        let d1_600m = known_bundle_manifest("d1-omni-600M-GGUF", "Q8_0").unwrap();
+        assert_eq!(d1_600m.inference_type, InferenceType::LlamaCppImageToText);
+        assert!(d1_600m.files.model.ends_with("d1-omni-600M-Q8_0.gguf"));
+        assert!(
+            d1_600m
+                .files
+                .multimodal_projector
+                .as_deref()
+                .unwrap()
+                .ends_with("mmproj-d1-omni-600M-Q8_0.gguf")
+        );
+
+        assert!(known_bundle_manifest("LFM3-1.7B-GGUF", "../bad").is_none());
+    }
+
+    #[test]
+    fn supplement_known_bundles_adds_lfm3_and_d1_without_duplicates() {
+        let mut entries = vec![LeapBundleEntry {
+            name: "LFM2-1.2B-GGUF".to_string(),
+            quants: vec!["Q4_0".to_string()],
+        }];
+        supplement_known_bundles(&mut entries);
+        assert!(entries.iter().any(|e| e.name == "LFM3-1.7B-GGUF"));
+        assert!(entries.iter().any(|e| e.name == "LFM3-VL-2B-GGUF"));
+        assert!(entries.iter().any(|e| e.name == "LFM3-Audio-2B-GGUF"));
+        assert!(entries.iter().any(|e| e.name == "LFM3-Omni-2B-GGUF"));
+        assert!(entries.iter().any(|e| e.name == "d1-3B-GGUF"));
+        assert!(entries.iter().any(|e| e.name == "d1-2B-GGUF"));
+        assert!(entries.iter().any(|e| e.name == "d1-Omni-2B-GGUF"));
+        assert!(entries.iter().any(|e| e.name == "d1-omni-600M-GGUF"));
+
+        let count_once = entries.len();
+        supplement_known_bundles(&mut entries);
+        assert_eq!(entries.len(), count_once);
     }
 }

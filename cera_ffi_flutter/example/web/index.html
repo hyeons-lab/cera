@@ -285,11 +285,24 @@
             }
           }
         } else {
-          if (bundleName.includes('VL-3B')) {
-            const mmprojQuant = (cleanQuant === 'F16' || cleanQuant === 'BF16') ? 'F16' : 'Q8_0';
+          const cleanId = bundleName.startsWith('LiquidAI/') ? bundleName.slice('LiquidAI/'.length) : bundleName;
+          const mmprojQuant = (cleanQuant === 'BF16' || cleanQuant === 'F16') ? cleanQuant : 'Q8_0';
+          if (cleanId === 'LFM3-1.7B-GGUF') {
+            const modelQuant = (cleanQuant === 'Q4_0' || cleanQuant === 'QAD-Q4_0') ? 'QAD-Q4_0' : cleanQuant;
+            urls.push(`https://huggingface.co/LiquidAI/LFM3-1.7B-GGUF/resolve/main/LFM3-1.7B-${modelQuant}.gguf`);
+          } else if (cleanId === 'LFM3-VL-2B-GGUF') {
+            const modelQuant = (cleanQuant === 'Q4_0' || cleanQuant === 'QAD-Q4_0') ? 'QAD-Q4_0' : cleanQuant;
+            urls.push(`https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF/resolve/main/LFM3-VL-2B-${modelQuant}.gguf`);
+            urls.push(`https://huggingface.co/LiquidAI/LFM3-VL-2B-GGUF/resolve/main/mmproj-LFM3-VL-2B-${mmprojQuant}.gguf`);
+          } else if (['LFM3-Audio-2B-GGUF', 'LFM3-Omni-2B-GGUF', 'd1-3B-GGUF', 'd1-2B-GGUF', 'd1-Omni-2B-GGUF', 'd1-omni-600M-GGUF'].includes(cleanId)) {
+            const stem = cleanId.slice(0, -'-GGUF'.length);
+            urls.push(`https://huggingface.co/LiquidAI/${cleanId}/resolve/main/${stem}-${cleanQuant}.gguf`);
+            urls.push(`https://huggingface.co/LiquidAI/${cleanId}/resolve/main/mmproj-${stem}-${mmprojQuant}.gguf`);
+          } else if (bundleName.includes('VL-3B')) {
+            const vl3bMmprojQuant = (cleanQuant === 'F16' || cleanQuant === 'BF16') ? 'F16' : 'Q8_0';
             urls.push(`https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/LFM2.5-VL-3B-${cleanQuant}.gguf`);
-            urls.push(`https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/mmproj-LFM2.5-VL-3B-${mmprojQuant}.gguf`);
-          } else if (bundleName.includes('Audio')) {
+            urls.push(`https://huggingface.co/LiquidAI/LFM2.5-VL-3B-GGUF/resolve/main/mmproj-LFM2.5-VL-3B-${vl3bMmprojQuant}.gguf`);
+          } else if (bundleName.includes('Audio-1.5B') || cleanId === 'LFM2.5-Audio-1.5B-GGUF') {
             const sidecarQuant = (cleanQuant === 'F16' || cleanQuant === 'BF16') ? 'F16' : (cleanQuant === 'Q8_0' ? 'Q8_0' : 'Q4_0');
             urls.push(`https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF/resolve/main/LFM2.5-Audio-1.5B-${cleanQuant}.gguf`);
             urls.push(`https://huggingface.co/LiquidAI/LFM2.5-Audio-1.5B-GGUF/resolve/main/mmproj-LFM2.5-Audio-1.5B-${sidecarQuant}.gguf`);
