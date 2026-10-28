@@ -4288,7 +4288,7 @@ impl Session {
                     self.position_atomic.store(pos as u32, Ordering::Relaxed);
                 }
 
-                if is_audio_transition || text_done {
+                if is_audio_transition || text_done || dec.is_safety_limit_reached() {
                     if finish == FinishReason::MaxTokens {
                         finish = FinishReason::Stop;
                     }

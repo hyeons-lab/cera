@@ -383,7 +383,7 @@ public mmproj's vision linears and its speech pointwise convolutions) are rounde
 when they are staged on the DSP, so those parts differ from the CPU by Q8_0 rounding (worst
 logit-probability difference 0.003 against the phone CPU on the test image). A part the NPU
 cannot take (the DSP address space is full, a missing op) stays on the CPU, and `report()`
-names it with a note; an explicit NPU request does not hide that either. asked for. d1-3B is the engine's ordinary causal LFM2-VL graph on each backend, with its own
+names it with a note; an explicit NPU request does not hide that either. d1-3B is the engine's ordinary causal LFM2-VL graph on each backend, with its own
 vision tower. A GPU session cannot be checkpointed, so on Metal, wgpu and the NPU every question
 of a d1-3B request prefills its prompt again (the images are encoded once per request); on the CPU
 the shared prefix is prefilled once.

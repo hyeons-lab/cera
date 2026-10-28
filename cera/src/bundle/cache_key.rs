@@ -138,7 +138,7 @@ pub fn known_bundle_manifest(bundle_id: &str, quant: &str) -> Option<Manifest> {
                 raw: serde_json::Value::Null,
             })
         }
-        "LFM3-Audio-2B-GGUF" | "LFM3-Omni-2B-GGUF" | "d1-Omni-2B-GGUF" => {
+        "LFM3-Audio-2B-GGUF" | "LFM3-Omni-2B-GGUF" => {
             let stem = clean_id.strip_suffix("-GGUF").unwrap_or(clean_id);
             let mmproj_quant = mmproj_quant_for(clean_quant);
             let model = format!(
@@ -172,7 +172,7 @@ pub fn known_bundle_manifest(bundle_id: &str, quant: &str) -> Option<Manifest> {
                 raw: serde_json::Value::Null,
             })
         }
-        "d1-3B-GGUF" | "d1-2B-GGUF" | "d1-omni-600M-GGUF" => {
+        "d1-3B-GGUF" | "d1-2B-GGUF" | "d1-Omni-2B-GGUF" | "d1-omni-600M-GGUF" => {
             let stem = clean_id.strip_suffix("-GGUF").unwrap_or(clean_id);
             let mmproj_quant = mmproj_quant_for(clean_quant);
             let model = format!(
@@ -845,7 +845,7 @@ mod tests {
         );
 
         let d1_omni = known_bundle_manifest("d1-Omni-2B-GGUF", "BF16").unwrap();
-        assert_eq!(d1_omni.inference_type, InferenceType::LlamaCppLfm2AudioV1);
+        assert_eq!(d1_omni.inference_type, InferenceType::LlamaCppImageToText);
         assert!(d1_omni.files.model.ends_with("d1-Omni-2B-BF16.gguf"));
         assert!(
             d1_omni

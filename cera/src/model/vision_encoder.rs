@@ -256,16 +256,20 @@ impl VisionEncoderConfig {
     /// Read the vision-encoder config from a multimodal_projector
     /// GGUF's `clip.vision.*` metadata.
     pub fn from_gguf(gguf: &Arc<GgufFile>) -> Result<Self> {
-        let has_vision = gguf.get_bool(KEY_HAS_VISION).unwrap_or(false);
+        let has_vision = match gguf.metadata.get(KEY_HAS_VISION) {
+            Some(crate::gguf::GgufValue::Bool(b)) => *b,
+            Some(other) => anyhow::bail!("invalid type for `{KEY_HAS_VISION}`: {other:?}"),
+            None => false,
+        };
         anyhow::ensure!(
             has_vision,
             "mmproj GGUF missing or false `{KEY_HAS_VISION}`; \
              not a vision encoder"
         );
-        let projector_type = if let Some(s) = gguf
-            .get_str(KEY_VISION_PROJ_TYPE)
-            .or_else(|| gguf.get_str(KEY_PROJ_TYPE))
-        {
+        let projector_type = if let Some(s) = match get_opt_str(gguf, KEY_VISION_PROJ_TYPE)? {
+            Some(s) => Some(s),
+            None => get_opt_str(gguf, KEY_PROJ_TYPE)?,
+        } {
             VisionProjectorType::from_gguf_str(s)?
         } else {
             VisionProjectorType::Lfm2
@@ -283,26 +287,40 @@ impl VisionEncoderConfig {
         let n_head = gguf
             .get_u32(KEY_N_HEAD)
             .with_context(|| format!("missing `{KEY_N_HEAD}`"))? as usize;
-        let n_head_kv = gguf
-            .get_u32(KEY_N_HEAD_KV)
-            .map(|v| v as usize)
-            .unwrap_or(n_head);
-        let rope_theta = gguf
-            .get_f32(KEY_ROPE_THETA)
-            .unwrap_or(LFM3_DEFAULT_ROPE_THETA);
+        let n_head_kv = if let Some(v) = gguf.get_u32(KEY_N_HEAD_KV) {
+            v as usize
+        } else if let Some(arr) = gguf.get_i32_array(KEY_N_HEAD_KV) {
+            let v = arr.into_iter().find(|&x| x > 0).with_context(|| {
+                format!("`{KEY_N_HEAD_KV}` array contains no positive head count")
+            })?;
+            v as usize
+        } else if let Some(other) = gguf.metadata.get(KEY_N_HEAD_KV) {
+            anyhow::bail!("invalid type for `{KEY_N_HEAD_KV}`: {other:?}");
+        } else {
+            n_head
+        };
+        let rope_theta = get_opt_f32(gguf, KEY_ROPE_THETA)?.unwrap_or(LFM3_DEFAULT_ROPE_THETA);
         let eps = gguf
             .get_f32(KEY_LN_EPS)
             .with_context(|| format!("missing `{KEY_LN_EPS}`"))?;
+        anyhow::ensure!(
+            eps.is_finite() && eps > 0.0,
+            "`{KEY_LN_EPS}` ({eps}) must be finite and > 0"
+        );
+        anyhow::ensure!(
+            rope_theta.is_finite() && rope_theta > 0.0,
+            "`{KEY_ROPE_THETA}` ({rope_theta}) must be finite and > 0"
+        );
         let patch_size =
             gguf.get_u32(KEY_PATCH_SIZE)
                 .with_context(|| format!("missing `{KEY_PATCH_SIZE}`"))? as usize;
-        let image_size = match gguf.get_u32(KEY_IMAGE_SIZE) {
+        let image_size = match get_opt_u32(gguf, KEY_IMAGE_SIZE)? {
             Some(v) => v as usize,
             None if projector_type.is_lfm3() => 512,
             None => anyhow::bail!("missing `{KEY_IMAGE_SIZE}`"),
         };
         anyhow::ensure!(
-            n_head > 0 && n_embd.is_multiple_of(n_head),
+            n_embd > 0 && n_head > 0 && n_embd.is_multiple_of(n_head),
             "n_embd ({n_embd}) must be a positive multiple of n_head ({n_head})"
         );
         anyhow::ensure!(
@@ -310,7 +328,7 @@ impl VisionEncoderConfig {
             "n_head ({n_head}) must be a positive multiple of n_head_kv ({n_head_kv})"
         );
         anyhow::ensure!(
-            patch_size > 0 && image_size.is_multiple_of(patch_size),
+            image_size > 0 && patch_size > 0 && image_size.is_multiple_of(patch_size),
             "image_size ({image_size}) must be a positive multiple of patch_size ({patch_size})"
         );
         let n_trained_patches = (image_size / patch_size).pow(2);
@@ -318,10 +336,10 @@ impl VisionEncoderConfig {
         let projection_dim =
             gguf.get_u32(KEY_PROJECTION_DIM)
                 .with_context(|| format!("missing `{KEY_PROJECTION_DIM}`"))? as usize;
-        let scale_factor = match gguf
-            .get_u32(KEY_SCALE_FACTOR)
-            .or_else(|| gguf.get_u32("clip.vision.spatial_merge_size"))
-        {
+        let scale_factor = match match get_opt_u32(gguf, KEY_SCALE_FACTOR)? {
+            Some(v) => Some(v),
+            None => get_opt_u32(gguf, "clip.vision.spatial_merge_size")?,
+        } {
             Some(v) => v as usize,
             None if projector_type.is_lfm3() => 2,
             None => anyhow::bail!("missing `{KEY_SCALE_FACTOR}`"),
@@ -337,12 +355,10 @@ impl VisionEncoderConfig {
         let n_tokens_min: usize = 64;
         let n_tokens_max: usize = 256;
         let pixels_per_token = (patch_size * scale_factor).pow(2);
-        let image_min_pixels = gguf
-            .get_u32("clip.vision.image_min_pixels")
+        let image_min_pixels = get_opt_u32(gguf, "clip.vision.image_min_pixels")?
             .map(|v| v as usize)
             .unwrap_or(n_tokens_min * pixels_per_token);
-        let image_max_pixels = gguf
-            .get_u32("clip.vision.image_max_pixels")
+        let image_max_pixels = get_opt_u32(gguf, "clip.vision.image_max_pixels")?
             .map(|v| v as usize)
             .unwrap_or(n_tokens_max * pixels_per_token);
         // they steer the resize target (and so an allocation): a range that is empty, inverted
@@ -374,6 +390,36 @@ impl VisionEncoderConfig {
             image_min_pixels,
             image_max_pixels,
         })
+    }
+}
+
+fn get_opt_u32(gguf: &GgufFile, key: &str) -> Result<Option<u32>> {
+    if let Some(v) = gguf.get_u32(key) {
+        Ok(Some(v))
+    } else if let Some(other) = gguf.metadata.get(key) {
+        anyhow::bail!("invalid type for `{key}`: {other:?}");
+    } else {
+        Ok(None)
+    }
+}
+
+fn get_opt_f32(gguf: &GgufFile, key: &str) -> Result<Option<f32>> {
+    if let Some(v) = gguf.get_f32(key) {
+        Ok(Some(v))
+    } else if let Some(other) = gguf.metadata.get(key) {
+        anyhow::bail!("invalid type for `{key}`: {other:?}");
+    } else {
+        Ok(None)
+    }
+}
+
+fn get_opt_str<'a>(gguf: &'a GgufFile, key: &str) -> Result<Option<&'a str>> {
+    if let Some(s) = gguf.get_str(key) {
+        Ok(Some(s))
+    } else if let Some(other) = gguf.metadata.get(key) {
+        anyhow::bail!("invalid type for `{key}`: {other:?}");
+    } else {
+        Ok(None)
     }
 }
 
@@ -1677,19 +1723,13 @@ impl VisionEncoderWeights {
             );
         }
 
-        // 2D Vision M-RoPE on Q and K.
-        apply_2d_vision_mrope(
+        // 2D Vision M-RoPE on Q and K (sharing the per-row/col sin_cos tables).
+        apply_2d_vision_mrope_qk(
             &mut scratch.q[..n_tokens * d],
-            grid_w,
-            grid_h,
-            n_head,
-            head_dim,
-            cfg.rope_theta,
-        );
-        apply_2d_vision_mrope(
             &mut scratch.k[..n_tokens * kv_dim],
             grid_w,
             grid_h,
+            n_head,
             n_head_kv,
             head_dim,
             cfg.rope_theta,
@@ -2633,8 +2673,8 @@ fn load_vit_block(
     // `n_head > 0` first to avoid the modulo's div-by-zero on a
     // corrupt mmproj reporting `n_head = 0`.
     anyhow::ensure!(
-        cfg.n_head > 0 && n_embd.is_multiple_of(cfg.n_head),
-        "n_embd ({n_embd}) not divisible by n_head ({})",
+        n_embd > 0 && cfg.n_head > 0 && n_embd.is_multiple_of(cfg.n_head),
+        "n_embd ({n_embd}) must be a positive multiple of n_head ({})",
         cfg.n_head,
     );
 
@@ -2689,6 +2729,7 @@ fn load_vec_f32(gguf: &Arc<GgufFile>, name: &str) -> Result<Vec<f32>> {
 /// - For `ic in 0..sect`: rotates `(head[ic], head[ic + half])` by `(py as f32) * theta_scale.powi(ic)`.
 /// - For `ic in sect..2*sect` (`k = ic - sect`): rotates `(head[ic], head[ic + half])` by
 ///   `(px as f32) * theta_scale.powi(k)`.
+#[cfg(test)]
 pub(crate) fn apply_2d_vision_mrope(
     q_or_k: &mut [f32],
     grid_w: usize,
@@ -2697,13 +2738,34 @@ pub(crate) fn apply_2d_vision_mrope(
     head_dim: usize,
     rope_theta: f32,
 ) {
+    apply_2d_vision_mrope_qk(
+        q_or_k,
+        &mut [],
+        grid_w,
+        grid_h,
+        n_head,
+        0,
+        head_dim,
+        rope_theta,
+    );
+}
+
+#[allow(clippy::too_many_arguments)]
+pub(crate) fn apply_2d_vision_mrope_qk(
+    q: &mut [f32],
+    k: &mut [f32],
+    grid_w: usize,
+    grid_h: usize,
+    n_head_q: usize,
+    n_head_k: usize,
+    head_dim: usize,
+    rope_theta: f32,
+) {
     let half = head_dim / 2;
     let sect = head_dim / 4;
-    if half == 0 || sect == 0 || grid_w == 0 || grid_h == 0 || n_head == 0 {
+    if half == 0 || sect == 0 || grid_w == 0 || grid_h == 0 || (n_head_q == 0 && n_head_k == 0) {
         return;
     }
-    let stride = n_head * head_dim;
-    debug_assert_eq!(q_or_k.len(), grid_w * grid_h * stride);
     let theta_scale = rope_theta.powf(-2.0f32 / (half as f32));
 
     let mut inv_freq = vec![0.0f32; sect];
@@ -2725,33 +2787,42 @@ pub(crate) fn apply_2d_vision_mrope(
     for px in 0..grid_w {
         let px_f = px as f32;
         let row = &mut x_sincos[px * sect..(px + 1) * sect];
-        for (k, &freq) in inv_freq.iter().enumerate() {
-            row[k] = (px_f * freq).sin_cos();
+        for (idx, &freq) in inv_freq.iter().enumerate() {
+            row[idx] = (px_f * freq).sin_cos();
         }
     }
 
-    par_rows_n(q_or_k, stride, |tok_idx, tok_row| {
-        let py = tok_idx / grid_w;
-        let px = tok_idx % grid_w;
-        let y_sc = &y_sincos[py * sect..(py + 1) * sect];
-        let x_sc = &x_sincos[px * sect..(px + 1) * sect];
-        for h in 0..n_head {
-            let head = &mut tok_row[h * head_dim..(h + 1) * head_dim];
-            for (ic, &(sin_y, cos_y)) in y_sc.iter().enumerate() {
-                let x0 = head[ic];
-                let x1 = head[ic + half];
-                head[ic] = x0 * cos_y - x1 * sin_y;
-                head[ic + half] = x0 * sin_y + x1 * cos_y;
-            }
-            for (k, &(sin_x, cos_x)) in x_sc.iter().enumerate() {
-                let ic = sect + k;
-                let x0 = head[ic];
-                let x1 = head[ic + half];
-                head[ic] = x0 * cos_x - x1 * sin_x;
-                head[ic + half] = x0 * sin_x + x1 * cos_x;
-            }
+    let rotate = |buf: &mut [f32], n_head: usize| {
+        if n_head == 0 {
+            return;
         }
-    });
+        let stride = n_head * head_dim;
+        debug_assert_eq!(buf.len(), grid_w * grid_h * stride);
+        par_rows_n(buf, stride, |tok_idx, tok_row| {
+            let py = tok_idx / grid_w;
+            let px = tok_idx % grid_w;
+            let y_sc = &y_sincos[py * sect..(py + 1) * sect];
+            let x_sc = &x_sincos[px * sect..(px + 1) * sect];
+            for h in 0..n_head {
+                let head = &mut tok_row[h * head_dim..(h + 1) * head_dim];
+                for (ic, &(sin_y, cos_y)) in y_sc.iter().enumerate() {
+                    let x0 = head[ic];
+                    let x1 = head[ic + half];
+                    head[ic] = x0 * cos_y - x1 * sin_y;
+                    head[ic + half] = x0 * sin_y + x1 * cos_y;
+                }
+                for (idx, &(sin_x, cos_x)) in x_sc.iter().enumerate() {
+                    let ic = sect + idx;
+                    let x0 = head[ic];
+                    let x1 = head[ic + half];
+                    head[ic] = x0 * cos_x - x1 * sin_x;
+                    head[ic + half] = x0 * sin_x + x1 * cos_x;
+                }
+            }
+        });
+    };
+    rotate(q, n_head_q);
+    rotate(k, n_head_k);
 }
 
 /// Depthwise 2D spatial convolution with `stride = 1` and `padding = kernel_size / 2` ("same" padding)
@@ -4070,5 +4141,48 @@ mod tests {
             .encode_video_frame_pair(&pixels, &pixels, grid_w, grid_h)
             .unwrap_err();
         assert!(err.to_string().contains("temporal patch kernel"), "{err}");
+    }
+
+    #[test]
+    fn vision_encoder_config_from_gguf_validates_bounds_types_and_kv_head_array() {
+        let base_builder = || {
+            crate::gguf::GgufBuilder::new()
+                .kv_str("general.architecture", "clip")
+                .kv_bool(KEY_HAS_VISION, true)
+                .kv_str(KEY_VISION_PROJ_TYPE, "lfm3o")
+                .kv_u32(KEY_N_LAYER, 2)
+                .kv_u32(KEY_N_EMBD, 16)
+                .kv_u32(KEY_N_FF, 32)
+                .kv_u32(KEY_N_HEAD, 4)
+                .kv_i32_array(KEY_N_HEAD_KV, vec![0, 2])
+                .kv_f32(KEY_LN_EPS, 1e-6)
+                .kv_u32(KEY_PATCH_SIZE, 2)
+                .kv_u32(KEY_IMAGE_SIZE, 4)
+                .kv_u32(KEY_PROJECTION_DIM, 12)
+                .kv_u32(KEY_SCALE_FACTOR, 2)
+                .kv_f32_array(KEY_IMAGE_MEAN, vec![0.5, 0.5, 0.5])
+                .kv_f32_array(KEY_IMAGE_STD, vec![0.5, 0.5, 0.5])
+        };
+
+        let parse = |b: crate::gguf::GgufBuilder| {
+            let gguf = Arc::new(GgufFile::from_bytes(Arc::from(b.build_bytes())).unwrap());
+            VisionEncoderConfig::from_gguf(&gguf)
+        };
+
+        let valid = parse(base_builder()).expect("valid config with i32 array head_count_kv");
+        assert_eq!(valid.n_head_kv, 2);
+        assert_eq!(valid.projector_type, VisionProjectorType::Lfm3O);
+
+        assert!(parse(base_builder().kv_u32(KEY_N_EMBD, 0)).is_err());
+        assert!(parse(base_builder().kv_u32(KEY_IMAGE_SIZE, 0)).is_err());
+        assert!(parse(base_builder().kv_f32(KEY_LN_EPS, 0.0)).is_err());
+        assert!(parse(base_builder().kv_f32(KEY_LN_EPS, -1e-5)).is_err());
+        assert!(parse(base_builder().kv_f32(KEY_LN_EPS, f32::NAN)).is_err());
+        assert!(parse(base_builder().kv_f32(KEY_ROPE_THETA, 0.0)).is_err());
+        assert!(parse(base_builder().kv_f32(KEY_ROPE_THETA, -100.0)).is_err());
+        assert!(parse(base_builder().kv_str(KEY_ROPE_THETA, "bad")).is_err());
+        assert!(parse(base_builder().kv_str(KEY_IMAGE_SIZE, "bad")).is_err());
+        assert!(parse(base_builder().kv_u32(KEY_VISION_PROJ_TYPE, 123)).is_err());
+        assert!(parse(base_builder().kv_i32_array(KEY_N_HEAD_KV, vec![0, 0])).is_err());
     }
 }

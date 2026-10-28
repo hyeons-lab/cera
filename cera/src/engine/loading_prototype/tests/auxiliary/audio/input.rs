@@ -7,6 +7,7 @@ fn pcm() -> Vec<f32> {
 fn check(engine: CeraEngine, capability: bool, hidden: Option<usize>) {
     assert_eq!(engine.capabilities().audio_in, capability);
     assert_eq!(engine.capabilities().audio_out, capability);
+    assert!(!capability || engine.vision_encoder_gguf().is_none());
     assert_eq!(
         engine.audio_encoder().map(|w| w.config.llm_hidden_size),
         hidden

@@ -638,6 +638,7 @@ impl HfModelConfig {
         // fall back to `moe_intermediate_size`.
         if self.intermediate_size.is_none()
             && self.gguf_architecture() == "lfm3"
+            && self.hparam("num_dense_layers").and_then(Value::as_u64) == Some(0)
             && let Some(moe_ff) = self
                 .hparam("moe_intermediate_size")
                 .and_then(Value::as_u64)

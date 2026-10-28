@@ -595,19 +595,21 @@ impl AudioDecoderWeights {
             .or_else(|| gguf.get_u32("clip.audio_gen.code.attention.head_count"))
             .or_else(|| gguf.get_u32("clip.audio_gen.head_count"))
             .unwrap_or(8) as usize;
-        let mut n_head_kv = gguf
-            .get_u32("clip.gen.audio.attention.head_count_kv")
-            .or_else(|| gguf.get_u32("clip.audio_gen.code.attention.head_count_kv"))
-            .or_else(|| gguf.get_u32("clip.audio_gen.head_count_kv"))
-            .unwrap_or(2) as usize;
-        anyhow::ensure!(
-            n_embd > 0 && n_head > 0 && n_head_kv > 0,
-            "lfm3a_gen n_embd ({n_embd}), n_head ({n_head}), and n_head_kv ({n_head_kv}) must be > 0"
-        );
-        anyhow::ensure!(
-            n_embd.is_multiple_of(n_head) && n_head.is_multiple_of(n_head_kv),
-            "lfm3a_gen n_embd ({n_embd}) must be divisible by n_head ({n_head}) and n_head divisible by n_head_kv ({n_head_kv})"
-        );
+        let mut n_head_kv = [
+            "clip.gen.audio.attention.head_count_kv",
+            "clip.audio_gen.code.attention.head_count_kv",
+            "clip.audio_gen.head_count_kv",
+        ]
+        .into_iter()
+        .find_map(|k| {
+            gguf.get_u32(k).map(|v| v as usize).or_else(|| {
+                gguf.get_i32_array(k)
+                    .and_then(|arr| arr.into_iter().find(|&v| v > 0))
+                    .map(|v| v as usize)
+            })
+        })
+        .unwrap_or(2);
+        anyhow::ensure!(n_embd > 0, "lfm3a_gen n_embd ({n_embd}) must be > 0");
         anyhow::ensure!(
             depth_linear_w.cols > 0
                 && (depth_linear_w.rows == n_embd || depth_linear_w.rows == n_codebook * n_embd),
@@ -622,7 +624,7 @@ impl AudioDecoderWeights {
             depth_linear_w.rows
         );
 
-        let mut n_embd_head = n_embd / n_head;
+        let mut n_embd_head = 0usize;
         let mut ffn_dim = gguf
             .get_u32("clip.gen.audio.feed_forward_length")
             .or_else(|| gguf.get_u32("clip.audio_gen.code.feed_forward_length"))
@@ -897,6 +899,25 @@ impl AudioDecoderWeights {
                 });
             }
         }
+
+        if !seen_attn_block {
+            anyhow::ensure!(
+                n_head > 0
+                    && n_head_kv > 0
+                    && n_embd.is_multiple_of(n_head)
+                    && n_head.is_multiple_of(n_head_kv),
+                "lfm3a_gen n_embd ({n_embd}) must be divisible by n_head ({n_head}) and n_head divisible by n_head_kv ({n_head_kv})"
+            );
+            n_embd_head = n_embd / n_head;
+        }
+        anyhow::ensure!(
+            n_head > 0
+                && n_head_kv > 0
+                && n_embd_head > 0
+                && n_embd == n_head * n_embd_head
+                && n_head.is_multiple_of(n_head_kv),
+            "lfm3a_gen invalid attention dimensions: n_embd={n_embd}, n_head={n_head}, n_head_kv={n_head_kv}, head_dim={n_embd_head}"
+        );
 
         let mut depth_embeddings = Vec::with_capacity(n_codebook);
         let mut shared_output_norm = Vec::new();
@@ -3310,145 +3331,6 @@ pub fn upsample(input: &[f32], n_embd: usize, n_up: usize) -> Vec<f32> {
     output
 }
 
-#[allow(dead_code)]
-/// Process one token through a conv block (gated short conv).
-fn detok_conv_block(
-    lw: &DetokLayerWeights,
-    conv_buf: &mut [f32],
-    cur: &[f32],
-    n_embd: usize,
-    d_conv: usize,
-) -> Vec<f32> {
-    let (Some(in_proj), Some(conv_w), Some(out_proj)) =
-        (&lw.conv_in_proj, &lw.conv_weight, &lw.conv_out_proj)
-    else {
-        return cur.to_vec();
-    };
-    // in_proj -> [b, c, x] chunks.
-    let chunk_size = n_embd;
-    let mut bcx = vec![0.0; 3 * chunk_size];
-    in_proj.gemv(cur, &mut bcx);
-
-    let b = &bcx[..chunk_size];
-    let c = &bcx[chunk_size..2 * chunk_size];
-    let x = &bcx[2 * chunk_size..];
-
-    // bx = b * x
-    let bx: Vec<f32> = b.iter().zip(x).map(|(bi, xi)| bi * xi).collect();
-
-    // conv1d with rolling buffer: concat [conv_buf, bx], convolve, update buf.
-    let kernel_size = d_conv + 1;
-    let mut conv_out = vec![0.0; chunk_size];
-    for ch in 0..chunk_size {
-        let mut sum = 0.0;
-        for k in 0..d_conv {
-            sum += conv_buf[k * n_embd + ch] * conv_w[ch * kernel_size + k];
-        }
-        sum += bx[ch] * conv_w[ch * kernel_size + d_conv];
-        conv_out[ch] = sum;
-    }
-
-    // Update rolling buffer: shift left, append bx.
-    if d_conv > 1 {
-        let row_size = n_embd;
-        for k in 0..d_conv - 1 {
-            let src = (k + 1) * row_size;
-            let dst = k * row_size;
-            conv_buf.copy_within(src..src + row_size, dst);
-        }
-    }
-    if d_conv > 0 {
-        conv_buf[(d_conv - 1) * n_embd..d_conv * n_embd].copy_from_slice(&bx);
-    }
-
-    // y = c * conv_out
-    let y: Vec<f32> = c.iter().zip(&conv_out).map(|(ci, co)| ci * co).collect();
-
-    // out_proj
-    let mut out = vec![0.0; n_embd];
-    out_proj.gemv(&y, &mut out);
-    out
-}
-
-#[allow(dead_code)]
-/// Process one token through an attention block.
-fn detok_attn_block(
-    lw: &DetokLayerWeights,
-    kv: &mut (Vec<f32>, Vec<f32>),
-    cur: &[f32],
-    pos: usize,
-    cfg: &DetokenizerConfig,
-) -> Vec<f32> {
-    let (Some(wq), Some(wk), Some(wv), Some(wo)) = (&lw.wq, &lw.wk, &lw.wv, &lw.wo) else {
-        return cur.to_vec();
-    };
-    let n_embd = cfg.n_embd;
-    let n_head = cfg.n_head;
-    let n_kv = cfg.n_head_kv;
-    let hd = cfg.n_embd_head;
-
-    let mut q = vec![0.0; n_head * hd];
-    let mut k = vec![0.0; n_kv * hd];
-    let mut v = vec![0.0; n_kv * hd];
-    wq.gemv(cur, &mut q);
-    wk.gemv(cur, &mut k);
-    wv.gemv(cur, &mut v);
-
-    // Per-head norm + RoPE.
-    if let (Some(q_norm), Some(k_norm)) = (&lw.q_norm, &lw.k_norm) {
-        for h in 0..n_head {
-            cpu::rmsnorm(&mut q[h * hd..(h + 1) * hd], q_norm, cfg.rms_norm_eps);
-            apply_rope_neox(&mut q[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
-        }
-        for h in 0..n_kv {
-            cpu::rmsnorm(&mut k[h * hd..(h + 1) * hd], k_norm, cfg.rms_norm_eps);
-            apply_rope_neox(&mut k[h * hd..(h + 1) * hd], pos, hd, cfg.rope_freq_base);
-        }
-    }
-
-    // Write to KV cache (ring buffer for SWA).
-    let (k_cache, v_cache) = kv;
-    let kv_stride = n_kv * hd;
-    let write_pos = pos % cfg.swa_window_size;
-    k_cache[write_pos * kv_stride..(write_pos + 1) * kv_stride].copy_from_slice(&k);
-    v_cache[write_pos * kv_stride..(write_pos + 1) * kv_stride].copy_from_slice(&v);
-
-    // Attention with sliding window.
-    let kv_start = (pos + 1).saturating_sub(cfg.swa_window_size);
-    let kv_len = pos + 1 - kv_start;
-    let group_size = n_head / n_kv;
-    let scale = 1.0 / (hd as f32).sqrt();
-    let mut attn_out = vec![0.0; n_head * hd];
-
-    for h in 0..n_head {
-        let kv_h = h / group_size;
-        let q_head = &q[h * hd..(h + 1) * hd];
-        let mut scores = vec![0.0f32; kv_len];
-        for t in 0..kv_len {
-            let cache_pos = (kv_start + t) % cfg.swa_window_size;
-            let k_off = cache_pos * kv_stride + kv_h * hd;
-            let k_t = &k_cache[k_off..k_off + hd];
-            scores[t] = q_head.iter().zip(k_t).map(|(a, b)| a * b).sum::<f32>() * scale;
-        }
-        cpu::softmax_inplace(&mut scores);
-
-        let out = &mut attn_out[h * hd..(h + 1) * hd];
-        for t in 0..kv_len {
-            let cache_pos = (kv_start + t) % cfg.swa_window_size;
-            let v_off = cache_pos * kv_stride + kv_h * hd;
-            let v_t = &v_cache[v_off..v_off + hd];
-            let s = scores[t];
-            for d in 0..hd {
-                out[d] += s * v_t[d];
-            }
-        }
-    }
-
-    let mut proj = vec![0.0; n_embd];
-    wo.gemv(&attn_out, &mut proj);
-    proj
-}
-
 /// Run the detokenizer: codes -> spectrogram frames (before ISTFT).
 ///
 /// Returns raw spectrogram data as [n_frames x n_fft_bins x 2] (log_abs, angle).
@@ -4940,5 +4822,118 @@ mod tests {
         assert_eq!(det.config.n_embd, detok_embd);
         assert_eq!(det.config.d_conv, 6);
         assert_eq!(det.lfm3_fsq.as_ref().unwrap().fsq_codebook.len(), 2016 * 4);
+
+        // Also verify `from_gguf_lfm3a_gen` when `head_count` is omitted and `head_count_kv`
+        // is stored as a per-layer I32 array with `n_embd = 4` (not divisible by the default 8):
+        // attention dimensions `(n_head = 2, n_head_kv = 1, n_embd_head = 2)` are derived from
+        // the attention tensors in the block loop.
+        let small_embd = 4usize;
+        let small_ffn = 8usize;
+        let small_bytes = crate::gguf::GgufBuilder::new()
+            .kv_str("general.architecture", "clip")
+            .kv_bool("clip.has_audio_encoder", true)
+            .kv_bool("clip.has_gen_audio_encoder", true)
+            .kv_str("clip.gen.audio.projector_type", "lfm3a_gen")
+            .kv_u32("clip.gen.audio.block_count", 1)
+            .kv_u32("clip.gen.audio.embedding_length", small_embd as u32)
+            .kv_u32("clip.gen.audio.feed_forward_length", small_ffn as u32)
+            .kv_i32_array("clip.audio_gen.code.attention.head_count_kv", vec![0, 1])
+            .kv_f32("clip.gen.audio.attention.layer_norm_epsilon", 1e-5)
+            .kv_u32("clip.gen.audio.projection_dim", llm_dim as u32)
+            .tensor_f32(
+                "a.gen.code.proj_in.weight",
+                &[llm_dim, n_cb * small_embd],
+                &vec![0.01; n_cb * small_embd * llm_dim],
+            )
+            .tensor_f32(
+                "a.gen.code.proj_in.bias",
+                &[n_cb * small_embd],
+                &vec![0.0; n_cb * small_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.embd.weight",
+                &[small_embd, n_vocab, n_cb],
+                &vec![0.01; n_cb * n_vocab * small_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.head_norm.weight",
+                &[small_embd, n_cb],
+                &vec![1.0; n_cb * small_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.mask_embd",
+                &[small_embd],
+                &vec![0.2; small_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.output_norm.weight",
+                &[small_embd],
+                &vec![1.0; small_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.out_embd.weight",
+                &[llm_dim, n_cb * n_vocab],
+                &vec![0.01; n_cb * n_vocab * llm_dim],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.ln1.weight",
+                &[small_embd],
+                &vec![1.0; small_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.ln2.weight",
+                &[small_embd],
+                &vec![1.0; small_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.attn_q.weight",
+                &[small_embd, small_embd],
+                &vec![0.01; small_embd * small_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.attn_k.weight",
+                &[small_embd, 2],
+                &vec![0.01; 2 * small_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.attn_v.weight",
+                &[small_embd, 2],
+                &vec![0.01; 2 * small_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.attn_out.weight",
+                &[small_embd, small_embd],
+                &vec![0.01; small_embd * small_embd],
+            )
+            .tensor_f32("a.gen.code.blk.0.attn_q_norm.weight", &[2], &[1.0; 2])
+            .tensor_f32("a.gen.code.blk.0.attn_k_norm.weight", &[2], &[1.0; 2])
+            .tensor_f32(
+                "a.gen.code.blk.0.attn_gate.weight",
+                &[small_embd, 2],
+                &vec![0.01; 2 * small_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.ffn_gate.weight",
+                &[small_embd, small_ffn],
+                &vec![0.01; small_ffn * small_embd],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.ffn_down.weight",
+                &[small_ffn, small_embd],
+                &vec![0.01; small_embd * small_ffn],
+            )
+            .tensor_f32(
+                "a.gen.code.blk.0.ffn_up.weight",
+                &[small_embd, small_ffn],
+                &vec![0.01; small_ffn * small_embd],
+            )
+            .build_bytes();
+        let small_gguf = Arc::new(GgufFile::from_bytes(Arc::from(small_bytes)).unwrap());
+        let small_dec = AudioDecoderWeights::from_gguf(&small_gguf)
+            .expect("load lfm3a_gen decoder with tensor-derived head count");
+        assert_eq!(small_dec.depthformer_config.n_embd, small_embd);
+        assert_eq!(small_dec.depthformer_config.n_head, 2);
+        assert_eq!(small_dec.depthformer_config.n_head_kv, 1);
+        assert_eq!(small_dec.depthformer_config.n_embd_head, 2);
     }
 }

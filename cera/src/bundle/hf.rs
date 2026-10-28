@@ -690,17 +690,37 @@ pub fn resolve_hf_manifest(
 
     // Audio matching
     let repo_lower = spec.repo.to_ascii_lowercase();
-    let is_audio_pipeline = info.pipeline_tag.as_deref() == Some("automatic-speech-recognition")
-        || info.pipeline_tag.as_deref() == Some("audio-text-to-text")
-        || info
-            .tags
-            .iter()
-            .any(|t| t.contains("audio") || t == "lfm2-audio" || t == "lfm3-audio")
-        || repo_lower.contains("-audio-")
-        || repo_lower.contains("lfm3-omni")
-        || (repo_lower.contains("d1-omni") && !repo_lower.contains("600m"))
-        || !contents.audio_decoders.is_empty()
-        || !contents.vocoder_ggufs.is_empty();
+    let primary_lower = primary_entry.rfilename.to_ascii_lowercase();
+    let mmproj_lower = multimodal_projector
+        .as_deref()
+        .map(str::to_ascii_lowercase)
+        .unwrap_or_default();
+    let is_d1_omni = [
+        repo_lower.as_str(),
+        primary_lower.as_str(),
+        mmproj_lower.as_str(),
+    ]
+    .iter()
+    .any(|s| s.contains("d1-omni"));
+    let has_audio_or_omni_stem = |s: &str| {
+        !s.contains("d1-omni")
+            && (s.contains("-audio-")
+                || s.ends_with("-audio")
+                || s.contains("lfm3-omni")
+                || s.ends_with("-omni"))
+    };
+    let is_audio_pipeline = !is_d1_omni
+        && (info.pipeline_tag.as_deref() == Some("automatic-speech-recognition")
+            || info.pipeline_tag.as_deref() == Some("audio-text-to-text")
+            || info
+                .tags
+                .iter()
+                .any(|t| t.contains("audio") || t == "lfm2-audio" || t == "lfm3-audio")
+            || has_audio_or_omni_stem(&repo_lower)
+            || has_audio_or_omni_stem(&primary_lower)
+            || has_audio_or_omni_stem(&mmproj_lower)
+            || !contents.audio_decoders.is_empty()
+            || !contents.vocoder_ggufs.is_empty());
 
     let mut extras = HashMap::new();
 
@@ -1596,6 +1616,85 @@ mod tests {
         assert_eq!(
             manifest.files.model,
             "https://huggingface.co/LiquidAI/LFM2.5-2.6B-GGUF/resolve/main/LFM2.5-2.6B-DSpark-Q4_K_M.gguf"
+        );
+    }
+
+    #[test]
+    fn resolve_hf_manifest_classifies_custom_slug_lfm3_audio_and_omni_as_audio_pipeline() {
+        // 1. Custom repo slug ending in `-audio` with untagged metadata
+        let siblings_slug = vec![
+            HfSibling {
+                rfilename: "model-Q4_0.gguf".into(),
+                size: Some(1_000_000),
+            },
+            HfSibling {
+                rfilename: "mmproj-model-Q8_0.gguf".into(),
+                size: Some(500_000),
+            },
+        ];
+        let spec_slug = HfSpec::parse("custom/my-lfm3-audio").unwrap();
+        let info_slug = HfModelInfo {
+            id: "custom/my-lfm3-audio".into(),
+            siblings: siblings_slug,
+            tags: Vec::new(),
+            pipeline_tag: None,
+            config: None,
+        };
+        let manifest_slug = resolve_hf_manifest(&spec_slug, &info_slug, None, None).unwrap();
+        assert_eq!(
+            manifest_slug.inference_type,
+            InferenceType::LlamaCppLfm2AudioV1
+        );
+        assert!(manifest_slug.files.multimodal_projector.is_some());
+
+        // 2. Custom repo slug with LFM3-Audio-2B GGUF filenames and untagged metadata
+        let siblings_file = vec![
+            HfSibling {
+                rfilename: "LFM3-Audio-2B-Q4_0.gguf".into(),
+                size: Some(1_000_000),
+            },
+            HfSibling {
+                rfilename: "mmproj-LFM3-Audio-2B-Q8_0.gguf".into(),
+                size: Some(500_000),
+            },
+        ];
+        let spec_file = HfSpec::parse("custom/untagged-mirror").unwrap();
+        let info_file = HfModelInfo {
+            id: "custom/untagged-mirror".into(),
+            siblings: siblings_file,
+            tags: Vec::new(),
+            pipeline_tag: None,
+            config: None,
+        };
+        let manifest_file = resolve_hf_manifest(&spec_file, &info_file, None, None).unwrap();
+        assert_eq!(
+            manifest_file.inference_type,
+            InferenceType::LlamaCppLfm2AudioV1
+        );
+
+        // 3. d1-omni-600M remains ImageToText (audio-in + vision, no audio-out)
+        let siblings_d1 = vec![
+            HfSibling {
+                rfilename: "d1-omni-600M-Q4_0.gguf".into(),
+                size: Some(1_000_000),
+            },
+            HfSibling {
+                rfilename: "mmproj-d1-omni-600M-Q8_0.gguf".into(),
+                size: Some(500_000),
+            },
+        ];
+        let spec_d1 = HfSpec::parse("LiquidAI/d1-omni-600M-GGUF").unwrap();
+        let info_d1 = HfModelInfo {
+            id: "LiquidAI/d1-omni-600M-GGUF".into(),
+            siblings: siblings_d1,
+            tags: Vec::new(),
+            pipeline_tag: None,
+            config: None,
+        };
+        let manifest_d1 = resolve_hf_manifest(&spec_d1, &info_d1, None, None).unwrap();
+        assert_eq!(
+            manifest_d1.inference_type,
+            InferenceType::LlamaCppImageToText
         );
     }
 }

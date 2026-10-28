@@ -1141,7 +1141,7 @@ pub fn generate_audio(
                 // Run audio loop with this embedding.
                 loop {
                     if pos >= model_config.max_seq_len || decoder.is_safety_limit_reached() {
-                        break;
+                        break 'outer;
                     }
                     let outcome = decoder.decode_frame(&emb);
                     let audio_emb = match outcome {
@@ -1188,7 +1188,7 @@ pub fn generate_audio(
                     modality_budget = modality_budget.saturating_sub(1);
 
                     if generated >= config.max_tokens || pos >= model_config.max_seq_len {
-                        break;
+                        break 'outer;
                     }
                     if modality_budget == 0 && !text_done {
                         // Switch back to text. The reference transitions by

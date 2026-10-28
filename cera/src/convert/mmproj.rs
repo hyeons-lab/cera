@@ -1121,34 +1121,21 @@ pub fn apply_lfm3_audio_mmproj_metadata(
         writer.add_u32("clip.audio.detokenizer.rope.dimension_count", d_head_dim);
         writer.add_u32("clip.audio.detokenizer.n_fft", d_n_fft);
         writer.add_u32("clip.audio.detokenizer.hop_length", d_hop);
-        if let Some(rates) = detok_value(raw_dcfg, "upsample_rates").and_then(Value::as_array) {
-            let arr = rates
-                .iter()
-                .filter_map(Value::as_i64)
-                .map(|v| {
-                    i32::try_from(v).map_err(|_| {
-                        CeraError::Backend(format!(
-                            "mmproj detokenizer `upsample_rates` entry ({v}) does not fit in i32"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<i32>, CeraError>>()?;
+        let rates_arr = parse_positive_detok_i32_array(raw_dcfg, "upsample_rates")?;
+        let kernels_arr = parse_positive_detok_i32_array(raw_dcfg, "upsample_kernel_sizes")?;
+        if let (Some(r), Some(k)) = (&rates_arr, &kernels_arr)
+            && r.len() != k.len()
+        {
+            return Err(CeraError::Backend(format!(
+                "mmproj detokenizer `upsample_rates` len ({}) != `upsample_kernel_sizes` len ({})",
+                r.len(),
+                k.len()
+            )));
+        }
+        if let Some(arr) = rates_arr {
             writer.add_i32_array("clip.audio.detokenizer.upsample_rates", arr);
         }
-        if let Some(kernels) =
-            detok_value(raw_dcfg, "upsample_kernel_sizes").and_then(Value::as_array)
-        {
-            let arr = kernels
-                .iter()
-                .filter_map(Value::as_i64)
-                .map(|v| {
-                    i32::try_from(v).map_err(|_| {
-                        CeraError::Backend(format!(
-                            "mmproj detokenizer `upsample_kernel_sizes` entry ({v}) does not fit in i32"
-                        ))
-                    })
-                })
-                .collect::<Result<Vec<i32>, CeraError>>()?;
+        if let Some(arr) = kernels_arr {
             writer.add_i32_array("clip.audio.detokenizer.upsample_kernels", arr);
         }
     }
@@ -1163,18 +1150,50 @@ fn detok_value<'a>(cfg: &'a Value, key: &str) -> Option<&'a Value> {
         .or_else(|| cfg.get(key))
 }
 
+/// Parse an optional detokenizer integer array (`upsample_rates` or `upsample_kernel_sizes`),
+/// requiring every element to be a positive `i32` (`>= 1`).
+fn parse_positive_detok_i32_array(cfg: &Value, key: &str) -> Result<Option<Vec<i32>>, CeraError> {
+    let Some(val) = detok_value(cfg, key) else {
+        return Ok(None);
+    };
+    if val.is_null() {
+        return Ok(None);
+    }
+    let Some(arr) = val.as_array() else {
+        return Err(CeraError::Backend(format!(
+            "mmproj detokenizer `{key}` must be an array, got {val}"
+        )));
+    };
+    let mut out = Vec::with_capacity(arr.len());
+    for (idx, elem) in arr.iter().enumerate() {
+        let Some(v) = elem.as_i64() else {
+            return Err(CeraError::Backend(format!(
+                "mmproj detokenizer `{key}[{idx}]` ({elem}) must be an integer"
+            )));
+        };
+        let v_i32 = i32::try_from(v).ok().filter(|&x| x > 0).ok_or_else(|| {
+            CeraError::Backend(format!(
+                "mmproj detokenizer `{key}[{idx}]` ({v}) must be in 1..={}",
+                i32::MAX
+            ))
+        })?;
+        out.push(v_i32);
+    }
+    Ok(Some(out))
+}
+
 /// The detokenizer's `upsample_kernel_sizes` (causal kernels the folded convs are sliced to).
-fn detok_upsample_kernels(detok_cfg: Option<&Value>) -> Vec<usize> {
-    detok_cfg
-        .and_then(|c| detok_value(c, "upsample_kernel_sizes"))
-        .and_then(Value::as_array)
-        .map(|arr| {
-            arr.iter()
-                .filter_map(Value::as_u64)
-                .filter_map(|v| usize::try_from(v).ok())
-                .collect()
-        })
-        .unwrap_or_default()
+fn detok_upsample_kernels(detok_cfg: Option<&Value>) -> Result<Vec<usize>, CeraError> {
+    let Some(cfg) = detok_cfg else {
+        return Ok(Vec::new());
+    };
+    Ok(
+        parse_positive_detok_i32_array(cfg, "upsample_kernel_sizes")?
+            .unwrap_or_default()
+            .into_iter()
+            .map(|v| v as usize)
+            .collect(),
+    )
 }
 
 /// Most entries a config-defined FSQ table may have (65,536): the runtime's own table has 256.
@@ -1616,7 +1635,7 @@ pub fn build_lfm3_audio_mmproj_tensors(
     }
 
     // Fold WeightNorm pairs and slice causal kernels for detokenizer convs
-    let upsample_kernels = detok_upsample_kernels(detok_cfg);
+    let upsample_kernels = detok_upsample_kernels(detok_cfg)?;
 
     let has_detok_weights = !weight_norms.is_empty()
         || out
@@ -2364,9 +2383,9 @@ mod tests {
     fn upsample_kernels_are_read_from_the_nested_model_object_too() {
         let top = json!({"upsample_kernel_sizes": [4, 4]});
         let nested = json!({"model": {"upsample_kernel_sizes": [8, 2]}});
-        assert_eq!(detok_upsample_kernels(Some(&top)), vec![4, 4]);
-        assert_eq!(detok_upsample_kernels(Some(&nested)), vec![8, 2]);
-        assert!(detok_upsample_kernels(None).is_empty());
+        assert_eq!(detok_upsample_kernels(Some(&top)).unwrap(), vec![4, 4]);
+        assert_eq!(detok_upsample_kernels(Some(&nested)).unwrap(), vec![8, 2]);
+        assert!(detok_upsample_kernels(None).unwrap().is_empty());
     }
 
     #[test]
@@ -3510,5 +3529,24 @@ mod tests {
             "vision_config": { "patch_size": 16, "num_channels": 0 }
         });
         assert!(build_lfm3_vl_mmproj_tensors(&zero_chan_cfg, &raw).is_err());
+
+        for bad_detok in [
+            serde_json::json!({ "upsample_kernel_sizes": [0, 16] }),
+            serde_json::json!({ "upsample_kernel_sizes": [-4, 16] }),
+            serde_json::json!({ "upsample_kernel_sizes": ["bad", 16] }),
+            serde_json::json!({ "upsample_kernel_sizes": 16 }),
+        ] {
+            assert!(
+                detok_upsample_kernels(Some(&bad_detok)).is_err(),
+                "expected error for {bad_detok}"
+            );
+        }
+        assert_eq!(
+            detok_upsample_kernels(Some(&serde_json::json!({
+                "model": { "upsample_kernel_sizes": [16, 10, 8] }
+            })))
+            .unwrap(),
+            vec![16, 10, 8]
+        );
     }
 }

@@ -833,13 +833,19 @@ impl CeraEngine {
         // An unavailable encoder cannot use the helper. In particular, text/VL
         // GPU byte loads must release their host staging bytes after upload.
         let primary_gguf = primary_gguf.filter(|_| audio_encoder.is_some());
-        let vision_encoder_gguf = aux.vision_mmproj.or_else(|| {
-            if path.is_some() {
-                try_load_vision_encoder_gguf(&manifest)
-            } else {
-                None
-            }
-        });
+        let vision_encoder_gguf = aux
+            .vision_mmproj
+            .or_else(|| {
+                if path.is_some() {
+                    try_load_vision_encoder_gguf(&manifest)
+                } else {
+                    None
+                }
+            })
+            .filter(|g| {
+                !matches!(manifest.inference_type, InferenceType::LlamaCppLfm2AudioV1)
+                    || g.get_bool("clip.has_vision_encoder") == Some(true)
+            });
         // Typed weights only when the raw mmproj loaded — we don't
         // re-attempt the open here. Failure to parse leaves the
         // typed slot unset (warned in `try_parse_vision_encoder`)
@@ -848,10 +854,6 @@ impl CeraEngine {
         let vl_mmproj_path = manifest.files.multimodal_projector.as_deref();
         let vision_encoder = vision_encoder_gguf
             .as_ref()
-            .filter(|g| {
-                !matches!(manifest.inference_type, InferenceType::LlamaCppLfm2AudioV1)
-                    || g.get_bool("clip.has_vision_encoder") == Some(true)
-            })
             .and_then(|g| try_parse_vision_encoder(g, vl_mmproj_path));
         // Build a cached GPU vision encoder when the backend selects one and a
         // device is available. Uploading the mmproj to the GPU here (once)

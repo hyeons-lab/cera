@@ -1686,19 +1686,29 @@ const MASK_CLOSE: char = '\u{E001}';
 /// `<|tool_call_start|>...<|tool_call_end|>`) with `MASK_OPEN index MASK_CLOSE` and return the
 /// masked text with the sections it hid. A parameter value may contain `<think>` text (code,
 /// documentation), which must not be read as the model's reasoning.
-fn mask_tool_calls(text: &str) -> (String, Vec<String>) {
+fn mask_tool_calls(text: &str) -> (std::borrow::Cow<'_, str>, Vec<String>) {
     const SECTIONS: [(&str, &str); 2] = [
         ("<tool_call>", "</tool_call>"),
         ("<|tool_call_start|>", "<|tool_call_end|>"),
     ];
+    let first = SECTIONS
+        .iter()
+        .filter_map(|(open, close)| text.find(open).map(|at| (at, *open, *close)))
+        .min_by_key(|(at, _, _)| *at);
+    if first.is_none() {
+        return (std::borrow::Cow::Borrowed(text), Vec::new());
+    }
     let mut masked = String::with_capacity(text.len());
     let mut bodies = Vec::new();
     let mut rest = text;
+    let mut pending = first;
     loop {
-        let next = SECTIONS
-            .iter()
-            .filter_map(|(open, close)| rest.find(open).map(|at| (at, *open, *close)))
-            .min_by_key(|(at, _, _)| *at);
+        let next = pending.take().or_else(|| {
+            SECTIONS
+                .iter()
+                .filter_map(|(open, close)| rest.find(open).map(|at| (at, *open, *close)))
+                .min_by_key(|(at, _, _)| *at)
+        });
         let Some((at, open, close)) = next else {
             masked.push_str(rest);
             break;
@@ -1735,11 +1745,14 @@ fn mask_tool_calls(text: &str) -> (String, Vec<String>) {
         bodies.push(rest[at..end].to_string());
         rest = &rest[end..];
     }
-    (masked, bodies)
+    (std::borrow::Cow::Owned(masked), bodies)
 }
 
 /// Undo [`mask_tool_calls`] on `text`.
 fn unmask_tool_calls(text: &str, bodies: &[String]) -> String {
+    if bodies.is_empty() {
+        return text.to_string();
+    }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
     while let Some(open) = rest.find(MASK_OPEN) {
@@ -1832,8 +1845,7 @@ fn extract_thinking_masked(text: &str) -> (Option<String>, String) {
 }
 
 fn parse_lfm3_xml(text: &str, tools: &[ToolDef]) -> Result<Vec<ToolCall>> {
-    let (_, after_think) = extract_thinking(text);
-    let (_, calls) = split_and_parse_lfm3(&after_think, tools)?;
+    let (_, calls) = split_and_parse_lfm3(text, tools)?;
     Ok(calls)
 }
 
@@ -3003,5 +3015,19 @@ mod tests {
         assert!(parsed.defer_loading);
         let v_deferred = serde_json::to_value(&parsed).unwrap();
         assert_eq!(v_deferred["defer_loading"], true);
+    }
+
+    #[test]
+    fn lfm3_xml_tool_call_survives_literal_closing_think_tag_in_trailing_prose() {
+        let tools = [weather()];
+        let raw = "<think>\nplanning\n</think>\n<tool_call>\n<function=get_weather>\n<parameter=city>\nParis\n</parameter>\n</function>\n</tool_call>\nTrailing prose mentioning </think> literally.";
+        let calls = parse_tool_calls_with_tools(raw, ToolFormat::Lfm3Xml, &tools).unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].name, "get_weather");
+        assert_eq!(calls[0].arguments["city"], "Paris");
+
+        let parsed = parse_output_with_tools(raw, ToolFormat::Lfm3Xml, &tools).unwrap();
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("planning"));
+        assert_eq!(parsed.tool_calls, calls);
     }
 }

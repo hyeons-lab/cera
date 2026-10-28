@@ -82,8 +82,11 @@ pub fn calc_size_preserved_ratio(
     min_pixels: usize,
     max_pixels: usize,
 ) -> (usize, usize) {
-    debug_assert!(align_size > 0);
-    debug_assert!(min_pixels <= max_pixels);
+    assert!(align_size > 0, "align_size must be strictly positive");
+    assert!(
+        min_pixels <= max_pixels,
+        "min_pixels cannot exceed max_pixels"
+    );
     // `area` divides into `beta` in the scale-up branch — guard
     // against `width == 0 || height == 0` (the `image` crate
     // rejects zero-pixel inputs upstream, but `calc_size_preserved_ratio`
@@ -148,9 +151,11 @@ pub fn smart_resize_video(
     n_frames: usize,
     temporal_factor: usize,
 ) -> (usize, usize) {
-    debug_assert!(align_size > 0);
-    debug_assert!(min_pixels <= max_pixels);
-    let align_size = align_size.max(1);
+    assert!(align_size > 0, "align_size must be strictly positive");
+    assert!(
+        min_pixels <= max_pixels,
+        "min_pixels cannot exceed max_pixels"
+    );
     if width == 0 || height == 0 || n_frames == 0 || temporal_factor == 0 {
         return (align_size, align_size);
     }
@@ -1783,5 +1788,23 @@ mod tests {
                 "LFM3 projector {proj:?} must never tile"
             );
         }
+    }
+
+    #[test]
+    #[should_panic(expected = "align_size must be strictly positive")]
+    fn smart_resize_video_rejects_zero_align_size() {
+        let _ = smart_resize_video(640, 480, 0, 1024, 262_144, 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "min_pixels cannot exceed max_pixels")]
+    fn smart_resize_video_rejects_inverted_pixel_bounds() {
+        let _ = smart_resize_video(640, 480, 32, 262_145, 262_144, 1, 1);
+    }
+
+    #[test]
+    #[should_panic(expected = "align_size must be strictly positive")]
+    fn calc_size_preserved_ratio_rejects_zero_align_size() {
+        let _ = calc_size_preserved_ratio(640, 480, 0, 1024, 262_144);
     }
 }

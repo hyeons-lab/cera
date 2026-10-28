@@ -3583,7 +3583,9 @@ mod webgpu {
             }
 
             if let (Some(dw), Some(tw)) = (decoder_weights.as_ref(), detok_weights.as_ref()) {
-                if let Some(detok_g) = voc_arc.as_ref().or(tok_arc.as_ref()) {
+                if let Some(detok_g) = voc_arc.as_ref().or(tok_arc.as_ref())
+                    && !cera::model::audio_decoder::is_lfm3a_gen_gguf(detok_g)
+                {
                     let ctx = self.model.ctx().clone();
                     let depthformer_g = voc_arc.as_ref();
                     match cera::model::wgpu_audio_decoder::WgpuAudioDecoder::from_ggufs_with_context(
@@ -4737,7 +4739,11 @@ mod webgpu {
                         pos += 1;
                     }
 
-                    if text_done {
+                    if text_done
+                        || self.cancel.load(std::sync::atomic::Ordering::Relaxed)
+                        || pos >= max_seq_len
+                        || dec.is_safety_limit_reached()
+                    {
                         break;
                     }
                     continue;

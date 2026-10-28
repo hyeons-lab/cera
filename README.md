@@ -22,7 +22,7 @@ or in the browser, from a single dependency-free core.
 - **Structured output.** Constrain generation to a GBNF grammar, or one flag
   for grammar-constrained JSON (check for incomplete output on token limits).
 - **Tool calling.** Give the model a set of tool schemas and parse the calls it
-  makes back out: format-aware (LFM2 Pythonic, Hermes/Qwen JSON), with an
+  makes back out: format-aware (LFM2 Pythonic, LFM3 XML, Hermes/Qwen JSON), with
   optional grammar constraints on tool-call syntax.
   From the CLI and every binding.
 - **LoRA adapters & embeddings.** Load LoRA adapters at runtime (GGUF or PEFT
@@ -90,12 +90,14 @@ rather than half-applied.
 ### Modalities
 
 - **Text → text**: every supported architecture.
-- **Vision (image → text)**: LFM2-VL models. `CeraEngine` auto-attaches the
-  vision encoder; `Session::append_image` runs image → ViT → projector → prefill.
-  The ViT encoder runs on the GPU (Metal or wgpu) with a CPU fallback. Verified
-  against LFM2.5-VL-450M.
-- **Audio (in / out)**: LFM2-Audio (`lfm2-audio-v1`): feed PCM audio in, and
-  (with a vocoder) decode audio out.
+- **Vision (image → text)**: LFM2-VL, LFM3-VL, and LFM3-Omni models. `CeraEngine`
+  auto-attaches the vision encoder; `Session::append_image` runs image → ViT →
+  projector → prefill. The ViT encoder runs on the GPU (Metal or wgpu) with a
+  CPU fallback. Verified against LFM2.5-VL-450M and the public LFM3-VL-2B /
+  LFM3-Omni-2B mmproj encoders.
+- **Audio (in / out)**: LFM2-Audio (`lfm2-audio-v1`), LFM3-Audio, and LFM3-Omni
+  (`lfm3a` / `lfm3a_gen`): feed PCM audio in, and (with a vocoder / FSQ-ISTFT
+  detokenizer) decode audio out.
 - **Wake word & ASR**: Pure-Rust streaming Keyword Spotting (`cera::hotword`), Silero VAD v5 (`cera::vad`), and OpenAI Whisper speech-to-text (`cera::model::whisper`).
 
 ## Platforms & backends
@@ -220,7 +222,9 @@ Give the model a set of tools (OpenAI "function" schemas) and get the calls it
 makes back out as structured data. Cera renders the tools into the model's chat
 template and parses tool calls from the reply, **format-aware**, since the wire
 format isn't interchangeable: LFM2/LFM2.5 emit **Pythonic** calls
-(`[get_weather(city="Paris")]`) while Hermes-style Qwen2.5/Qwen3 emit **JSON**
+(`[get_weather(city="Paris")]`), LFM3 emits **XML** calls
+(`<tool_call><function=get_weather><parameter=city>Paris</parameter></function></tool_call>`),
+and Hermes-style Qwen2.5/Qwen3 emit **JSON**
 (`<tool_call>{"name": …, "arguments": {…}}</tool_call>`). The format is detected
 from the GGUF architecture.
 
