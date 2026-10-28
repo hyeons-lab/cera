@@ -138,6 +138,9 @@ impl Plan {
                     0.25, 1.0, 1.0, 32.0, 1.0, 16, 0.1,
                 )
             }),
+            rope_theta: None,
+            rope_freqs_offset: None,
+            head_gate: None,
         })
     }
 
@@ -163,6 +166,9 @@ impl Plan {
             state_offset,
             ffn_norm_offset,
             ffn,
+            d_conv: 3,
+            post_norm_offset: None,
+            ffn_post_norm_offset: None,
         })
     }
 
@@ -729,7 +735,7 @@ fn step_mode_flushes_each_op_group_and_completes() {
 
 /// Serialize a staged (template) batch the way `op_capture` serializes a
 /// flushed one, by loading it into the session and recording that.
-fn staged_text(model: &HexagonLfmModel, staged: &StagedBatch) -> String {
+pub(super) fn staged_text(model: &HexagonLfmModel, staged: &StagedBatch) -> String {
     use crate::backend::hexagon::{HtpBufDesc, HtpOpDesc, HtpTensor};
     fn read_all<T: Copy>(bytes: &[u8], n: usize) -> Vec<T> {
         (0..n)

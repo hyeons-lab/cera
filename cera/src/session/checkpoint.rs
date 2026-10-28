@@ -230,6 +230,7 @@ impl ChatCheckpoint {
         let format_byte = match self.tool_format {
             ToolFormat::Lfm2Pythonic => 0u8,
             ToolFormat::Hermes => 1u8,
+            ToolFormat::Lfm3Xml => 2u8,
         };
         writer.write_u8(format_byte);
 
@@ -284,6 +285,7 @@ impl ChatCheckpoint {
         let tool_format = match format_byte {
             0 => ToolFormat::Lfm2Pythonic,
             1 => ToolFormat::Hermes,
+            2 => ToolFormat::Lfm3Xml,
             other => {
                 return Err(CeraError::Format(format!(
                     "unknown tool format code {other} in chat checkpoint"

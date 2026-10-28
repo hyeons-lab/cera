@@ -1077,7 +1077,8 @@ pub trait Model: Send + Sync {
     /// backends) return `true`. Backends without them (bert, qwen35,
     /// gemma4, bailingmoe3) restate `false` at their own definitions rather
     /// than inheriting this one, so whoever adds the hooks reads the reason
-    /// where the work is.
+    /// where the work is. `lfm3` shares the LFM2 hooks but returns `false` until
+    /// an adapter is validated against its sandwich norms and attention gate.
     fn supports_lora(&self) -> bool {
         false
     }
@@ -1114,11 +1115,13 @@ pub trait Model: Send + Sync {
     /// different modes need two model instances. Re-configuring the same mode
     /// (as `Session::reset` does) is a no-op.
     ///
-    /// A request the backend can't serve — a single-sided TurboQuant debug mode,
-    /// or an incompatible `head_dim` — is NOT an error: the backend logs a
-    /// warning and stays on its uncompressed KV (f32 on wgpu, f16 on native
-    /// Metal), matching the CPU's silent fallback for a non-power-of-two
-    /// `head_dim`.
+    /// A request the backend can't serve (a single-sided TurboQuant debug mode,
+    /// or an incompatible `head_dim`, or an architecture it cannot mask on the
+    /// compressed read such as `lfm3`) is NOT an error: the backend stays on its
+    /// uncompressed KV (f32 on wgpu, f16 on native Metal), matching the CPU's
+    /// fallback for a non-power-of-two `head_dim`. `Session::new` logs the
+    /// requests `resolved_for` downgrades (a head width that is not a power of two, `lfm3`;
+    /// see `KvCompression::is_downgraded_for`); the GPU backends also log their own limits.
     fn configure_kv_compression(
         &self,
         _compression: &crate::kv_cache::KvCompression,
@@ -1194,7 +1197,9 @@ pub fn load_model(
     let model: Box<dyn Model> =
         match arch.as_str() {
             // `lfm2moe` shares this loader: same graph, experts in the FFN slot.
-            "lfm2" | "lfm2moe" => Box::new(lfm2::LfmModel::from_gguf_with_id(
+            // `lfm3` shares it too: the same conv and attention blocks with sandwich
+            // norms, a gated attention output, and per-layer sliding-window RoPE.
+            "lfm2" | "lfm2moe" | "lfm3" => Box::new(lfm2::LfmModel::from_gguf_with_id(
                 gguf,
                 context_size,
                 model_id,
@@ -1404,12 +1409,10 @@ fn load_model_hexagon_impl(
     let encoder_trunk = arch == "lfm2" && is_encoder_trunk(&gguf);
     reject_bidirectional_lfm2(&gguf, &arch, "Hexagon NPU", encoder_trunk)?;
     match arch.as_str() {
-        "lfm2" | "lfm2moe" if auto => Ok(Box::new(hexagon_lfm2::HexagonLfmModel::from_gguf_auto(
-            gguf,
-            path,
-            context_size,
-        )?)),
-        "lfm2" | "lfm2moe" => Ok(Box::new(hexagon_lfm2::HexagonLfmModel::from_gguf(
+        "lfm2" | "lfm2moe" | "lfm3" if auto => Ok(Box::new(
+            hexagon_lfm2::HexagonLfmModel::from_gguf_auto(gguf, path, context_size)?,
+        )),
+        "lfm2" | "lfm2moe" | "lfm3" => Ok(Box::new(hexagon_lfm2::HexagonLfmModel::from_gguf(
             gguf,
             path,
             context_size,
@@ -1428,7 +1431,7 @@ fn load_model_hexagon_impl(
             hexagon_lfm2::HexagonLfmModel::from_qwen35(gguf, path, context_size)?,
         )),
         other => bail!(
-            "unsupported architecture for Hexagon NPU: {other} (Hexagon backend currently supports LFM2, LFM2-MoE, Tier 1/2 dense architectures, and Qwen 3.5 hybrid)"
+            "unsupported architecture for Hexagon NPU: {other} (Hexagon backend currently supports LFM2, LFM2-MoE, LFM3, Tier 1/2 dense architectures, and Qwen 3.5 hybrid)"
         ),
     }
 }
@@ -1442,6 +1445,31 @@ fn load_model_hexagon_impl(
 fn _assert_arc_dyn_model_is_send_sync() {
     fn assert_send_sync<T: Send + Sync>() {}
     assert_send_sync::<std::sync::Arc<dyn Model>>();
+}
+
+/// Whether the GPU backends refuse an architecture that parses through the shared LFM2
+/// parser: `lfm3`, whose sandwich norms, attention gate, sliding windows and wide conv no GPU
+/// graph implements. This answers only that question (it says nothing about architectures
+/// the GPU loaders reject on their own); it is the one rule behind `ensure_gpu_supported_arch`
+/// and the browser's early refusal of an lfm3 bundle in `cera-wasm`.
+#[doc(hidden)]
+pub fn gpu_refuses_architecture(architecture: &str) -> bool {
+    architecture == "lfm3"
+}
+
+/// The GPU backends run `lfm2` and `lfm2moe` only. `lfm3` parses through the shared LFM2
+/// config (the CPU and Hexagon paths run it), but the GPU graphs know nothing of its
+/// sandwich norms, attention gate, sliding windows or wide conv, so they would load it
+/// and produce garbage. Every GPU weight-source loader calls this first; `load_model_gpu`
+/// and `load_model_metal` also refuse it, through their generic "unsupported architecture"
+/// arm.
+#[cfg(any(feature = "gpu", feature = "metal"))]
+pub(crate) fn ensure_gpu_supported_arch(architecture: &str) -> anyhow::Result<()> {
+    anyhow::ensure!(
+        !gpu_refuses_architecture(architecture),
+        "{architecture} is not supported on the GPU backends (CPU and Hexagon only)"
+    );
+    Ok(())
 }
 
 // Only models whose live execution cache is entirely in InferenceState may use
@@ -1466,6 +1494,29 @@ mod tests {
     use crate::CeraError;
     use std::sync::Mutex;
     use std::sync::atomic::AtomicBool;
+
+    /// The architecture rule shared by the native GPU loaders and the browser's early
+    /// refusal; it needs no GPU feature, so it runs in every CI leg.
+    #[test]
+    fn only_lfm3_is_refused_by_the_gpu_arch_rule() {
+        assert!(super::gpu_refuses_architecture("lfm3"));
+        for arch in ["lfm2", "lfm2moe", "llama", "qwen3", "granite"] {
+            assert!(!super::gpu_refuses_architecture(arch), "{arch}");
+        }
+    }
+
+    #[cfg(any(feature = "gpu", feature = "metal"))]
+    #[test]
+    fn gpu_arch_gate_refuses_lfm3() {
+        let err = super::ensure_gpu_supported_arch("lfm3").unwrap_err();
+        assert!(
+            err.to_string().contains("not supported on the GPU"),
+            "{err}"
+        );
+        for arch in ["lfm2", "lfm2moe", "llama", "qwen3"] {
+            super::ensure_gpu_supported_arch(arch).unwrap();
+        }
+    }
 
     #[test]
     fn sticky_slot_keeps_first_fault() {

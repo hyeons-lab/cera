@@ -39,6 +39,7 @@ families are listed below; tensor layouts and quantization must also match the l
 |--------------|--------|------------|
 | `lfm2` | Liquid **LFM2 / LFM2.5** (the canonical LeapBundles family) | text, vision, audio |
 | `lfm2moe` | Liquid **LFM2.5-8B-A1B** (routed mixture-of-experts) | text |
+| `lfm3` | **LFM3 / LFM3-MoE** (LFM2 hybrid with optional sandwich norms, gated attention, sliding-window layers, and routed experts); CPU and Hexagon NPU (the NPU path is verified on a Samsung S25 Ultra at the scope in `docs/HEXAGON_NPU.md`) | text, vision, audio |
 | `llama` | **LLaMA 2 / 3**, and classic **Mistral 7B** (ships as GGUF arch `llama`) | text |
 | `qwen2`, `qwen3` | **Qwen2 / Qwen2.5 / Qwen3** | text |
 | `qwen35` | **Qwen 3.5 / Ornith 1.0** (interleaved Gated Delta Net hybrid) | text |
@@ -58,16 +59,24 @@ Metal and wgpu support `lfm2`, `lfm2moe`, `llama`, `qwen2`, `qwen3`, `granite`,
 (YaRN is folded into the rope kernel's frequency table; attention temperature
 scaling is not implemented on GPU, so those models are limited to the context
 below its floor, the original context length, and warn when that caps a longer
-request). Qualcomm Hexagon NPU supports `lfm2`, `lfm2moe`, the dense families
+request). Qualcomm Hexagon NPU supports `lfm2`, `lfm2moe`, `lfm3`, the dense families
 (`llama`, `qwen2`, `qwen3`, `granite`, `gemma2`, `olmo2`/`olmo3`, `mistral3`,
 `phi3` and others listed in `docs/HEXAGON_NPU.md`) and `qwen35`
-(`HexagonLfmModel`); those paths are host-tested and still need device validation.
+(`HexagonLfmModel`). `lfm2`, `lfm3`, `qwen35` and the Llama, Qwen2 and Qwen3 models in
+`docs/HEXAGON_NPU.md` are verified on a Samsung S25 Ultra at the scope given there;
+the other listed paths (`lfm2moe` on a model that fits, `gemma2`, `granite`, `olmo`,
+`mistral3`, `phi3` and so on) are host-tested and still need device validation.
 The listed `bailingmoe3` family uses CPU; requesting an unsupported GPU or NPU
 backend explicitly returns an error. Auto selection can fall back to CPU.
 The LFM2 and supported dense-transformer paths use batched-GEMM prefill,
 including on CPU, with tiled flash attention for long prompts where supported.
 
-`lfm2moe`'s routed feed-forward block is the one exception to that
+`lfm3`'s attention is an exception on CPU: prefill runs it per token, because it
+carries a per-head gate, a sliding window and per-layer RoPE that the batched
+attention loop does not handle (about a quarter of a 512-token prefill on the 1.7B, measured on an Apple CPU);
+its conv and feed-forward blocks are batched.
+
+`lfm2moe`'s routed feed-forward block is the other exception to that
 batched-GEMM sentence, and it is deliberate: each token picks its own 4-of-32
 experts, so an expert's weights are re-read once per routed token rather than
 once per prompt. (The GPU backends still issue one dispatch per projection for
@@ -360,8 +369,11 @@ three write the same `TQK1`/`TQV1` blob format. Two GPU-specific restrictions:
 `head_dim` must be a power of two ≤ 128 and a multiple of 32 (every supported
 model is 64 or 128), and only the both-sides mode (`tq3`) is available; the
 single-sided debug modes `tq3-keys` / `tq3-values` fall back to the backend's
-uncompressed KV there (f32 on wgpu, f16 on Metal) with a warning. `--n-keep`
-context shift is not supported with any TurboQuant mode on any backend.
+uncompressed KV there (f32 on wgpu, f16 on Metal) with a warning. `lfm3` runs on CPU and
+Hexagon only, and its sliding-window layers are not masked on the compressed read, so
+there a TurboQuant request falls back to the uncompressed cache (the session logs a
+warning through `tracing`; the CLI prints it). `--n-keep` context shift is not
+supported with any TurboQuant mode on any backend.
 
 See `cera/src/turboquant.rs` for the algorithm (PolarQuant + QJL).
 

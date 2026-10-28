@@ -9,6 +9,7 @@ use std::collections::HashMap;
 mod fixture;
 mod integrity;
 mod lfm2;
+mod lfm3;
 mod recovery;
 mod upstream;
 

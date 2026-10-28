@@ -2586,6 +2586,7 @@ impl GpuLfmModel {
         context_size: usize,
         model_id: String,
     ) -> Result<Self> {
+        super::ensure_gpu_supported_arch(&src.config().architecture)?;
         if let Some(why) = src.gpu_unsupported_reason() {
             anyhow::bail!("{why}");
         }
@@ -2622,6 +2623,7 @@ impl GpuLfmModel {
         model_id: String,
         ctx: GpuContext,
     ) -> Result<Self> {
+        super::ensure_gpu_supported_arch(&src.config().architecture)?;
         if let Some(why) = src.gpu_unsupported_reason() {
             anyhow::bail!("{why}");
         }

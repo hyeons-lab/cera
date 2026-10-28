@@ -101,6 +101,9 @@ pub struct OpfsGpuWeightSource {
 impl OpfsGpuWeightSource {
     /// Create a new OPFS streaming weight source from an open [`OpfsSyncHandle`]
     /// and parsed header-only `GgufFile`.
+    ///
+    /// On any failure the exclusive handle is closed before the error is returned, so a
+    /// retry can open the file again instead of hitting `NoModificationAllowedError`.
     pub fn new(
         sync: OpfsSyncHandle,
         gguf: Arc<GgufFile>,

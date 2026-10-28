@@ -203,6 +203,110 @@ pub struct LayerWeightRefs {
     pub qkv_repacked: std::sync::Arc<std::sync::OnceLock<Option<FusedAttnProjections>>>,
 }
 
+/// Upper bound on attention heads for `lfm3`, so the per-head gate lives on the
+/// stack in the decode path. The checkpoint has 16.
+pub(crate) const MAX_LFM3_HEADS: usize = 128;
+
+/// A `u32` metadata value that must be present as exactly that type or absent: `get_u32`
+/// reads another integer type (llama.cpp's reader accepts any) as absent, which would let a
+/// mistyped head width, value width or rotary width pass as the default.
+fn lfm3_u32(gguf: &GgufFile, key: &str) -> Result<Option<u32>> {
+    match gguf.metadata.get(key) {
+        None => Ok(None),
+        Some(crate::gguf::GgufValue::U32(v)) => Ok(Some(*v)),
+        Some(_) => bail!("{key} must be stored as a u32"),
+    }
+}
+
+/// The `f32` twin of [`lfm3_u32`]: a mistyped rope base must fail, not read as its default.
+fn lfm3_f32(gguf: &GgufFile, key: &str) -> Result<Option<f32>> {
+    match gguf.metadata.get(key) {
+        None => Ok(None),
+        Some(crate::gguf::GgufValue::F32(v)) => Ok(Some(*v)),
+        Some(_) => bail!("{key} must be stored as an f32"),
+    }
+}
+
+/// A `bool` metadata value that must be present as exactly that type or absent: `get_bool`
+/// reads another type as absent, which would let a mistyped flag load as its default.
+fn lfm3_bool(gguf: &GgufFile, key: &str) -> Result<Option<bool>> {
+    match gguf.metadata.get(key) {
+        None => Ok(None),
+        Some(crate::gguf::GgufValue::Bool(v)) => Ok(Some(*v)),
+        Some(_) => bail!("{key} must be stored as a bool"),
+    }
+}
+
+/// `acc + a * b` as decode's short-conv accumulates it: fused on aarch64 (the NEON
+/// kernel uses `vfmaq_f32`), a separate multiply and add elsewhere (the scalar loop).
+/// The multi-tap prefill conv uses it so both paths round alike.
+// Its callers (the multi-tap batched prefill) are compiled only where a batched GEMM
+// exists: aarch64, x86_64 or BLAS.
+#[cfg_attr(
+    not(any(target_arch = "aarch64", target_arch = "x86_64", has_blas)),
+    allow(dead_code)
+)]
+#[inline(always)]
+fn conv_mac(acc: f32, a: f32, b: f32) -> f32 {
+    #[cfg(target_arch = "aarch64")]
+    {
+        a.mul_add(b, acc)
+    }
+    #[cfg(not(target_arch = "aarch64"))]
+    {
+        acc + a * b
+    }
+}
+
+/// What `lfm3` adds to the LFM2 graph, per layer.
+///
+/// Every layer may carry sandwich norms (an RMSNorm over the conv or attention
+/// output, and another over the FFN output, each applied before its residual
+/// add when `use_sandwich_norm` is enabled). Attention layers also carry a
+/// per-head sigmoid gate on the attention output, a sliding window (or none,
+/// for global layers), and their own RoPE schedule.
+#[derive(Debug)]
+struct Lfm3Layer {
+    post_operator_norm: Option<Vec<f32>>,
+    post_ffn_norm: Option<Vec<f32>>,
+    attn: Option<Lfm3Attn>,
+}
+
+#[derive(Debug)]
+struct Lfm3Attn {
+    /// `[n_heads, hidden_size]` projection of the normed block input; its
+    /// sigmoid scales each head's attention output.
+    gate: WeightRef,
+    /// Keys visible to a query, itself included. `None` on a global layer.
+    window: Option<usize>,
+    /// Frequency base for this layer: `rope.freq_base_swa` on a sliding-window
+    /// layer, `rope.freq_base` on a global one.
+    rope_theta: f32,
+    /// `rope_freqs.weight` for a global layer (partial rotary: the unrotated
+    /// pairs carry a huge factor). Sliding-window layers rotate the whole head.
+    rope_freq_factors: Option<Vec<f32>>,
+}
+
+/// Which `lfm3` layers slide and how each rotates, read from the GGUF metadata.
+#[derive(Debug)]
+pub(crate) struct Lfm3Layout {
+    /// Per layer: sliding-window attention (`true`) or global (`false`).
+    pub(crate) swa_pattern: Vec<bool>,
+    /// Keys visible to a query on a sliding layer, itself included.
+    pub(crate) window: Option<usize>,
+    /// RoPE base of the sliding layers (`rope.freq_base_swa`).
+    pub(crate) theta_swa: f32,
+    /// `rope_freqs.weight`: the partial-rotary mask of the global layers
+    /// (the unrotated pairs carry a huge factor). `None` with no global layer.
+    pub(crate) rope_freq_factors: Option<Vec<f32>>,
+}
+
+/// The `lfm3` architecture's deltas over `lfm2`. `None` on every other arch.
+#[derive(Debug)]
+struct Lfm3Extras {
+    layers: Vec<Lfm3Layer>,
+}
+
 // ── LFM Model ──────────────────────────────────────────────────────────────
 
 /// The CPU model of the LFM family: `lfm2`, the routed `lfm2moe`, and any later
@@ -226,7 +330,13 @@ pub struct LfmModel {
     conv_weights_transposed: Vec<Option<Vec<f32>>>,
     // Pre-resolved quantized weight refs
     embd_ref: WeightRef,
+    /// The logit projection: for `lfm3`, `output.weight` when the file carries one
+    /// (a checkpoint converted with an explicit `lm_head` does, even when it equals
+    /// the embedding); otherwise the tied embedding.
+    logits_ref: WeightRef,
     layer_refs: Vec<LayerWeightRefs>,
+    /// `Some` only for the `lfm3` architecture.
+    lfm3: Option<Lfm3Extras>,
     /// Caller namespace, typically a GGUF path. Cold use also binds it to the
     /// loaded bytes; CPU and KV-format prefixes separate incompatible snapshots.
     /// An empty ID disables the cold tier while keeping the private warm cache.
@@ -329,7 +439,7 @@ fn describe_cache_tag(tag: &str) -> String {
     }
 }
 
-/// Range-check `lfm2.shortconv.l_cache` at the point it enters from GGUF
+/// Range-check `{arch}.shortconv.l_cache` at the point it enters from GGUF
 /// metadata, so every downstream consumer can trust it.
 ///
 /// The GPU short-conv kernels stage a channel's weights and rolling state in
@@ -341,12 +451,21 @@ fn describe_cache_tag(tag: &str) -> String {
 /// lower bound only. Checking the range once here means a bad value is a load
 /// failure with a clear message, and the kernels can index on the invariant.
 ///
+/// `max` is [`GPU_CONV_KERNEL_MAX`] for `lfm2` / `lfm2moe`, whose files the GPU
+/// loaders also read through this parser. `lfm3` uses [`CPU_CONV_KERNEL_MAX`]:
+/// its checkpoint has `l_cache = 7`, the CPU conv loops are generic in the tap
+/// count, and the GPU loaders refuse the arch before they get here.
+///
 /// Every shipped LFM2 GGUF sets `l_cache = 3`.
-fn validate_conv_kernel_size(v: Option<usize>) -> anyhow::Result<Option<usize>> {
+fn validate_conv_kernel_size(
+    arch: &str,
+    v: Option<usize>,
+    max: usize,
+) -> anyhow::Result<Option<usize>> {
     if let Some(k) = v {
         anyhow::ensure!(
-            (2..=4).contains(&k),
-            "lfm2.shortconv.l_cache must be in 2..=4, got {k}"
+            (2..=max).contains(&k),
+            "{arch}.shortconv.l_cache must be in 2..={max}, got {k}"
         );
     }
     Ok(v)
@@ -370,12 +489,40 @@ pub(crate) fn gguf_is_causal(gguf: &GgufFile, prefix: &str) -> bool {
     }
 }
 
+/// Widest short-conv kernel the GPU kernels' fixed registers hold.
+const GPU_CONV_KERNEL_MAX: usize = 4;
+
+/// Widest short-conv kernel the CPU path accepts (a sanity bound, not a limit of
+/// the loops).
+pub(crate) const CPU_CONV_KERNEL_MAX: usize = 16;
+
 impl LfmModel {
+    /// Record a node's sum for the llama.cpp parity oracle, as llama.cpp's
+    /// `llama-eval-callback` names it (`<name>-<layer>`). A no-op unless a dump
+    /// is active, so the name is only formatted for the oracle tests. The names keep
+    /// llama.cpp's literal `{}` placeholder (`model.layers.{}.post_ffn_norm`).
+    #[inline]
+    fn dump_node(name: &str, layer: usize, data: &[f32]) {
+        if transformer::oracle_dump::is_active() {
+            transformer::oracle_dump::record(&format!("{name}-{layer}"), data);
+        }
+    }
+
+    /// Whether this call attends causally. The encoder and classifier branches (selected by a
+    /// non-causal file or a classifier adapter on the state) are written for LFM2: three conv
+    /// taps and none of lfm3's sandwich norms, gate, windows or rope factors. `lfm3` is always
+    /// causal whatever the state holds, because `InferenceState.lora` is a public field that
+    /// a direct caller can set past every entry guard; the loader refuses non-causal files.
+    fn is_causal_for(&self, state: &InferenceState) -> bool {
+        self.lfm3.is_some()
+            || (self.config.is_causal && !state.lora.as_ref().is_some_and(|l| l.is_classifier()))
+    }
+
     fn check_rewind_mode(
         &self,
         state: &InferenceState,
     ) -> Result<(), crate::kv_cache::KvRewindError> {
-        if !self.config.is_causal || state.lora.as_ref().is_some_and(|l| l.is_classifier()) {
+        if !self.is_causal_for(state) {
             return Err(crate::kv_cache::KvRewindError::NonCausal);
         }
         Ok(())
@@ -408,7 +555,7 @@ impl LfmModel {
         Self::from_gguf_with_id(gguf, context_size, String::new())
     }
 
-    /// Parse the [`ModelConfig`] for an LFM2 / LFM2MoE GGUF file from its header metadata.
+    /// Parse the [`ModelConfig`] for an LFM2 / LFM2MoE / LFM3 GGUF file from its header metadata.
     pub fn parse_config(gguf: &GgufFile, context_size: usize) -> Result<ModelConfig> {
         ensure!(context_size > 0, "context_size must be > 0");
         let arch = gguf
@@ -416,7 +563,7 @@ impl LfmModel {
             .unwrap_or("lfm2")
             .to_string();
         ensure!(
-            arch == "lfm2" || arch == "lfm2moe",
+            matches!(arch.as_str(), "lfm2" | "lfm2moe" | "lfm3"),
             "LfmModel: unsupported architecture {arch}"
         );
         let prefix = arch.as_str();
@@ -453,22 +600,54 @@ impl LfmModel {
             .get_u32(&format!("{prefix}.attention.head_count"))
             .with_context(|| format!("missing {prefix}.attention.head_count"))?
             as usize;
-        let vocab_size =
+        let vocab_size = if arch == "lfm3" {
+            match lfm3_u32(gguf, &format!("{prefix}.vocab_size"))? {
+                Some(v) => v as usize,
+                None => {
+                    let info = gguf
+                        .tensors
+                        .get("token_embd.weight")
+                        .context("missing token_embd.weight (cannot derive lfm3 vocab_size)")?;
+                    ensure!(
+                        info.shape.len() == 2 && info.shape[1] > 0,
+                        "token_embd.weight has unexpected shape {:?}",
+                        info.shape
+                    );
+                    info.shape[1]
+                }
+            }
+        } else {
             gguf.get_u32(&format!("{prefix}.vocab_size"))
-                .with_context(|| format!("missing {prefix}.vocab_size"))? as usize;
+                .with_context(|| format!("missing {prefix}.vocab_size"))? as usize
+        };
+        ensure!(vocab_size > 0, "{prefix}.vocab_size must be > 0");
         let gguf_max_seq_len = gguf
             .get_u32(&format!("{prefix}.context_length"))
             .unwrap_or(128000) as usize;
         let max_seq_len = context_size.min(gguf_max_seq_len);
-        let rope_theta = gguf
-            .get_f32(&format!("{prefix}.rope.freq_base"))
-            .unwrap_or(1_000_000.0);
-        let rms_norm_eps = gguf
-            .get_f32(&format!("{prefix}.attention.layer_norm_rms_epsilon"))
-            .unwrap_or(1e-5);
+        let rope_theta_key = format!("{prefix}.rope.freq_base");
+        let rope_theta = if arch == "lfm3" {
+            lfm3_f32(gguf, &rope_theta_key)?
+        } else {
+            gguf.get_f32(&rope_theta_key)
+        }
+        .unwrap_or(1_000_000.0);
+        let eps_key = format!("{prefix}.attention.layer_norm_rms_epsilon");
+        let rms_norm_eps = if arch == "lfm3" {
+            lfm3_f32(gguf, &eps_key)?
+        } else {
+            gguf.get_f32(&eps_key)
+        }
+        .unwrap_or(1e-5);
         let conv_kernel_size = validate_conv_kernel_size(
+            prefix,
             gguf.get_u32(&format!("{prefix}.shortconv.l_cache"))
                 .map(|v| v as usize),
+            if arch == "lfm3" {
+                CPU_CONV_KERNEL_MAX
+            } else {
+                GPU_CONV_KERNEL_MAX
+            },
         )?;
 
         let kv_heads_array = gguf
@@ -501,6 +680,46 @@ impl LfmModel {
 
         let n_kv_heads = kv_heads_per_layer.iter().copied().max().unwrap_or(0);
 
+        // LFM2 derives the head width from the hidden size. `lfm3` states it via
+        // `attention.key_length`, which may decouple `head_dim * n_heads` from `hidden_size`.
+        ensure!(
+            n_heads > 0,
+            "{prefix}: attention.head_count must be positive"
+        );
+        let head_dim = if arch == "lfm3" {
+            ensure!(
+                n_heads <= MAX_LFM3_HEADS,
+                "{prefix}: head_count ({n_heads}) exceeds the supported {MAX_LFM3_HEADS}"
+            );
+            let key_len = lfm3_u32(gguf, &format!("{prefix}.attention.key_length"))?
+                .map_or(hidden_size / n_heads, |v| v as usize);
+            ensure!(
+                key_len > 0
+                    && key_len.is_multiple_of(2)
+                    && key_len
+                        .checked_mul(n_heads)
+                        .is_some_and(|q_dim| q_dim.is_multiple_of(32)),
+                "{prefix}: attention.key_length ({key_len}) must be even and \
+                 key_length * head_count ({n_heads}) must be a multiple of 32"
+            );
+            // the attention weights are sized by one head width for q, k, v and o
+            ensure!(
+                lfm3_u32(gguf, &format!("{prefix}.attention.value_length"))?
+                    .is_none_or(|v| v as usize == key_len),
+                "{prefix}: attention.value_length must equal attention.key_length ({key_len})"
+            );
+            let n_rot = lfm3_u32(gguf, &format!("{prefix}.rope.dimension_count"))?
+                .map_or(key_len, |v| v as usize);
+            ensure!(
+                n_rot == key_len,
+                "{prefix}: rope.dimension_count ({n_rot}) must equal attention.key_length \
+                 ({key_len}); partial rotary is expressed through rope_freqs.weight"
+            );
+            key_len
+        } else {
+            hidden_size / n_heads
+        };
+
         let moe_layers: Vec<bool> = (0..n_layers)
             .map(|i| {
                 gguf.tensors
@@ -509,6 +728,36 @@ impl LfmModel {
             .collect();
 
         let moe = if moe_layers.iter().any(|&is_moe| is_moe) {
+            if arch == "lfm3" {
+                if let Some(n_dense_lead) =
+                    lfm3_u32(gguf, &format!("{prefix}.leading_dense_block_count"))?
+                {
+                    let n_dense_lead = n_dense_lead as usize;
+                    ensure!(
+                        n_dense_lead <= n_layers,
+                        "{prefix}.leading_dense_block_count ({n_dense_lead}) exceeds block_count ({n_layers})"
+                    );
+                    for (i, &is_moe) in moe_layers.iter().enumerate() {
+                        let expected_moe = i >= n_dense_lead;
+                        ensure!(
+                            is_moe == expected_moe,
+                            "layer {i}: expected is_moe={expected_moe} from leading_dense_block_count={n_dense_lead}, found {is_moe}"
+                        );
+                    }
+                }
+                if let Some(scale) = lfm3_f32(gguf, &format!("{prefix}.expert_weights_scale"))? {
+                    ensure!(
+                        scale.is_finite() && (scale - 1.0).abs() <= 1e-6,
+                        "{prefix}.expert_weights_scale ({scale}) is not supported (only 1.0)"
+                    );
+                }
+                if let Some(norm) = lfm3_bool(gguf, &format!("{prefix}.expert_weights_norm"))? {
+                    ensure!(
+                        norm,
+                        "{prefix}.expert_weights_norm=false is not supported (only true)"
+                    );
+                }
+            }
             let gating_func = gguf
                 .get_u32(&format!("{prefix}.expert_gating_func"))
                 .with_context(|| format!("missing {prefix}.expert_gating_func"))?;
@@ -553,6 +802,43 @@ impl LfmModel {
         };
 
         let is_causal = gguf_is_causal(gguf, prefix);
+        // The bidirectional (encoder / classifier) branches are written for LFM2: they take
+        // three conv taps and know nothing of lfm3's sandwich norms, gate or windows, so a
+        // non-causal lfm3 file would run them and return plausible, wrong output.
+        if arch == "lfm3" {
+            // Each cause is refused on its own, so the message names the one that fired.
+            ensure!(
+                is_causal,
+                "{prefix}: lfm3 supports causal language-model files only (this one is bidirectional)"
+            );
+            ensure!(
+                !gguf.tensors.contains_key("classifier.weight"),
+                "{prefix}: lfm3 supports causal language-model files only (this one carries \
+                 classifier.weight)"
+            );
+            // A causal key stored as a non-bool type reads as absent above, so check the raw
+            // metadata too.
+            for key in ["is_causal", "attention.causal"] {
+                ensure!(
+                    !matches!(
+                        gguf.metadata.get(&format!("{prefix}.{key}")),
+                        Some(v) if !matches!(v, crate::gguf::GgufValue::Bool(_))
+                    ),
+                    "{prefix}.{key} must be stored as a bool"
+                );
+            }
+            // `is_causal` wins over `attention.causal` above; a file that states both and
+            // disagrees is ambiguous (llama.cpp reads only `attention.causal`), so refuse it.
+            if let (Some(own), Some(llama)) = (
+                gguf.get_bool(&format!("{prefix}.is_causal")),
+                gguf.get_bool(&format!("{prefix}.attention.causal")),
+            ) {
+                ensure!(
+                    own == llama,
+                    "{prefix}: is_causal and attention.causal disagree"
+                );
+            }
+        }
 
         let class_labels: Vec<String> = gguf
             .get_string_array("token_classifier.labels")
@@ -566,7 +852,7 @@ impl LfmModel {
             intermediate_size,
             n_heads,
             n_kv_heads,
-            head_dim: hidden_size / n_heads,
+            head_dim,
             vocab_size,
             max_seq_len,
             rope_theta,
@@ -784,8 +1070,16 @@ impl LfmModel {
         let head_dim = config.head_dim;
         let block_types = config.block_types.clone();
 
-        // Pre-extract small F32 weights
-        let output_norm_name = if gguf.tensors.contains_key("token_embd_norm.weight")
+        if config.architecture == "lfm3" {
+            Self::validate_lfm3_tensor_shapes(&gguf, &config)?;
+        }
+
+        // Pre-extract small F32 weights. The final norm is stored as
+        // `token_embd_norm` by LFM2 (its HF name is `embedding_norm`) but as
+        // `output_norm` by `lfm3`.
+        let output_norm_name = if config.architecture == "lfm3" {
+            "output_norm.weight"
+        } else if gguf.tensors.contains_key("token_embd_norm.weight")
             || !gguf.tensors.contains_key("output_norm.weight")
         {
             "token_embd_norm.weight"
@@ -891,6 +1185,21 @@ impl LfmModel {
             embd_ref.m,
             config.vocab_size
         );
+        // Only `lfm3` reads `output.weight`: LFM2 files are tied, and the GPU loaders
+        // take the embedding as the logit weight, so honouring it here for lfm2 could
+        // make CPU and GPU disagree on a file that carried one.
+        let logits_ref =
+            if config.architecture == "lfm3" && gguf.tensors.contains_key("output.weight") {
+                // its shape against `token_embd.weight` is checked by `validate_lfm3_tensor_shapes`
+                Self::resolve_weight(&gguf, "output.weight")?
+            } else {
+                embd_ref.clone()
+            };
+        let lfm3 = if config.architecture == "lfm3" {
+            Some(Self::load_lfm3_extras(&gguf, &config)?)
+        } else {
+            None
+        };
 
         let prefix_cache = Mutex::new(KvPrefixCache::for_model(
             crate::kv_cache::KvCacheConfig::default(),
@@ -945,7 +1254,9 @@ impl LfmModel {
             conv_weights,
             conv_weights_transposed,
             embd_ref,
+            logits_ref,
             layer_refs,
+            lfm3,
             model_id,
             #[cfg(feature = "disk-cache")]
             persistent_id: std::sync::OnceLock::new(),
@@ -954,6 +1265,248 @@ impl LfmModel {
             classifier_weight,
             classifier_bias,
         })
+    }
+
+    /// The per-layer attention layout of an `lfm3` GGUF, as llama.cpp reads it:
+    /// `sliding_window_pattern` is a bool array, `rope.freq_base_swa` applies to the
+    /// `true` layers, and the partial-rotary mask is the `rope_freqs.weight` tensor
+    /// shared by every global attention layer. Shared by the CPU and NPU loaders so
+    /// they cannot disagree about which layer slides or which base it rotates with.
+    pub(crate) fn lfm3_layout(gguf: &GgufFile, config: &ModelConfig) -> Result<Lfm3Layout> {
+        let n_layers = config.n_layers;
+        // A stated window with no readable per-layer pattern would otherwise run every
+        // layer as global attention: plausible text, wrong. llama.cpp treats an absent
+        // pattern as "no window", so the pattern is only optional when no window is set.
+        let swa_pattern = match gguf.get_bool_array("lfm3.attention.sliding_window_pattern") {
+            Some(pattern) => pattern,
+            None => {
+                ensure!(
+                    lfm3_u32(gguf, "lfm3.attention.sliding_window")?.is_none(),
+                    "lfm3.attention.sliding_window is set but \
+                     lfm3.attention.sliding_window_pattern is missing or not a bool array"
+                );
+                vec![false; n_layers]
+            }
+        };
+        ensure!(
+            swa_pattern.len() >= n_layers,
+            "lfm3.attention.sliding_window_pattern has {} entries, block_count is {n_layers}",
+            swa_pattern.len()
+        );
+        let window = if swa_pattern.iter().take(n_layers).any(|&swa| swa) {
+            let w = lfm3_u32(gguf, "lfm3.attention.sliding_window")?
+                .context("missing lfm3.attention.sliding_window")? as usize;
+            ensure!(w > 0, "lfm3.attention.sliding_window must be > 0");
+            Some(w)
+        } else {
+            None
+        };
+        ensure!(
+            config.rope_theta.is_finite() && config.rope_theta > 1.0,
+            "lfm3.rope.freq_base must be finite and > 1"
+        );
+        let theta_swa = lfm3_f32(gguf, "lfm3.rope.freq_base_swa")?.unwrap_or(10_000.0);
+        ensure!(
+            theta_swa.is_finite() && theta_swa > 1.0,
+            "lfm3.rope.freq_base_swa must be finite and > 1"
+        );
+
+        let global_layers =
+            (0..n_layers).any(|i| config.block_types[i] == BlockType::Attention && !swa_pattern[i]);
+        let rope_freq_factors = if global_layers {
+            let ff = gguf
+                .get_tensor("rope_freqs.weight")
+                .context("lfm3 global attention layers need rope_freqs.weight")?
+                .try_to_f32_vec()
+                .context("rope_freqs.weight cannot be read as f32")?;
+            ensure!(
+                ff.len() == config.head_dim / 2,
+                "rope_freqs.weight has {} entries, expected {}",
+                ff.len(),
+                config.head_dim / 2
+            );
+            ensure!(
+                ff.iter().all(|f| f.is_finite() && *f >= 1e-9),
+                "rope_freqs.weight holds a non-finite factor or one below 1e-9 (position / factor \
+                 would overflow); an F16 table overflows the 1e30 mask factor to infinity, so \
+                 store it as F32"
+            );
+            Some(ff)
+        } else {
+            None
+        };
+        Ok(Lfm3Layout {
+            swa_pattern,
+            window,
+            theta_swa,
+            rope_freq_factors,
+        })
+    }
+
+    /// Checks every lfm3 tensor whose size the graph assumes against the validated config
+    /// (embedding, norms, FFN, conv projections, attention, the optional untied head).
+    /// Shared by the CPU and Hexagon loaders (the NPU constructor sizes its planes from
+    /// "at least" lengths and would otherwise read a short norm or a wide projection on the
+    /// device with no error). A short norm makes `cpu::rmsnorm` return early (plausible,
+    /// wrong logits); a wide projection or a long norm panics in the first forward.
+    pub(crate) fn validate_lfm3_tensor_shapes(gguf: &GgufFile, config: &ModelConfig) -> Result<()> {
+        let hs = config.hidden_size;
+        let ff = config.intermediate_size;
+        let vector = |name: &str, expected: usize| -> Result<()> {
+            let len = gguf
+                .get_tensor(name)?
+                .try_to_f32_vec()
+                .with_context(|| format!("{name} cannot be read as f32"))?
+                .len();
+            ensure!(
+                len == expected,
+                "{name} has {len} entries, expected {expected}"
+            );
+            Ok(())
+        };
+        let matrix = |name: String, rows: usize, cols: usize| -> Result<()> {
+            let w = Self::resolve_weight(gguf, &name)?;
+            ensure!(
+                w.m == rows && w.k == cols,
+                "{name} is {}x{}, expected {rows}x{cols}",
+                w.m,
+                w.k
+            );
+            Ok(())
+        };
+        matrix("token_embd.weight".into(), config.vocab_size, hs)?;
+        vector("output_norm.weight", hs)?;
+        for i in 0..config.n_layers {
+            for name in ["attn_norm", "ffn_norm"] {
+                vector(&format!("blk.{i}.{name}.weight"), hs)?;
+            }
+            let post_attn_name = format!("blk.{i}.post_attention_norm.weight");
+            let post_ffn_name = format!("blk.{i}.post_ffw_norm.weight");
+            let has_post_attn = gguf.tensors.contains_key(&post_attn_name);
+            let has_post_ffn = gguf.tensors.contains_key(&post_ffn_name);
+            ensure!(
+                has_post_attn == has_post_ffn,
+                "layer {i}: post_attention_norm.weight and post_ffw_norm.weight must both be present or both absent"
+            );
+            if has_post_attn {
+                vector(&post_attn_name, hs)?;
+                vector(&post_ffn_name, hs)?;
+            }
+            let is_moe = config
+                .moe
+                .as_ref()
+                .and_then(|m| m.is_moe_layer.get(i).copied())
+                .unwrap_or(false);
+            if is_moe {
+                let moe = config.moe.as_ref().unwrap();
+                matrix(format!("blk.{i}.ffn_gate_inp.weight"), moe.n_expert, hs)?;
+                vector(&format!("blk.{i}.exp_probs_b.bias"), moe.n_expert)?;
+                for (name, rows, cols) in [
+                    ("ffn_gate_exps", moe.expert_ff_len, hs),
+                    ("ffn_up_exps", moe.expert_ff_len, hs),
+                    ("ffn_down_exps", hs, moe.expert_ff_len),
+                ] {
+                    let full_name = format!("blk.{i}.{name}.weight");
+                    for e in 0..moe.n_expert {
+                        let w = Self::resolve_expert_weight(gguf, &full_name, e)?;
+                        ensure!(
+                            w.m == rows && w.k == cols,
+                            "{full_name} expert {e} is {}x{}, expected {rows}x{cols}",
+                            w.m,
+                            w.k
+                        );
+                    }
+                }
+            } else {
+                for (name, rows, cols) in [
+                    ("ffn_gate", ff, hs),
+                    ("ffn_up", ff, hs),
+                    ("ffn_down", hs, ff),
+                ] {
+                    matrix(format!("blk.{i}.{name}.weight"), rows, cols)?;
+                }
+            }
+            if config.block_types[i] != BlockType::Attention {
+                for (name, rows) in [("in_proj", 3 * hs), ("out_proj", hs)] {
+                    matrix(format!("blk.{i}.shortconv.{name}.weight"), rows, hs)?;
+                }
+                continue;
+            }
+            for name in ["attn_q_norm", "attn_k_norm"] {
+                vector(&format!("blk.{i}.{name}.weight"), config.head_dim)?;
+            }
+            let q_dim = config.n_heads * config.head_dim;
+            let kv_dim = config.kv_heads_per_layer[i] * config.head_dim;
+            // q, k, v and o are sized by the one head width validated at load
+            for (name, rows, cols) in [
+                ("attn_gate", config.n_heads, hs),
+                ("attn_q", q_dim, hs),
+                ("attn_k", kv_dim, hs),
+                ("attn_v", kv_dim, hs),
+                ("attn_output", hs, q_dim),
+            ] {
+                matrix(format!("blk.{i}.{name}.weight"), rows, cols)?;
+            }
+        }
+        if gguf.tensors.contains_key("output.weight") {
+            let output = Self::resolve_weight(gguf, "output.weight")?;
+            let embd = Self::resolve_weight(gguf, "token_embd.weight")?;
+            ensure!(
+                output.m == embd.m && output.k == embd.k,
+                "output.weight is {}x{} but token_embd.weight is {}x{}",
+                output.m,
+                output.k,
+                embd.m,
+                embd.k
+            );
+        }
+        Ok(())
+    }
+
+    /// Load what `lfm3` adds to the LFM2 graph (see [`Lfm3Extras`]).
+    fn load_lfm3_extras(gguf: &GgufFile, config: &ModelConfig) -> Result<Lfm3Extras> {
+        let n_layers = config.n_layers;
+        let Lfm3Layout {
+            swa_pattern,
+            window,
+            theta_swa,
+            rope_freq_factors,
+        } = Self::lfm3_layout(gguf, config)?;
+
+        let opt_norm = |name: String| -> Result<Option<Vec<f32>>> {
+            gguf.tensors
+                .contains_key(&name)
+                .then(|| {
+                    gguf.get_tensor(&name)?
+                        .try_to_f32_vec()
+                        .with_context(|| format!("{name} cannot be read as f32"))
+                })
+                .transpose()
+        };
+
+        let layers = (0..n_layers)
+            .map(|i| {
+                let attn = (config.block_types[i] == BlockType::Attention)
+                    .then(|| -> Result<Lfm3Attn> {
+                        let gate =
+                            Self::resolve_weight(gguf, &format!("blk.{i}.attn_gate.weight"))?;
+                        let is_swa = swa_pattern[i];
+                        Ok(Lfm3Attn {
+                            gate,
+                            window: window.filter(|_| is_swa),
+                            rope_theta: if is_swa { theta_swa } else { config.rope_theta },
+                            rope_freq_factors: rope_freq_factors.clone().filter(|_| !is_swa),
+                        })
+                    })
+                    .transpose()?;
+                Ok(Lfm3Layer {
+                    post_operator_norm: opt_norm(format!("blk.{i}.post_attention_norm.weight"))?,
+                    post_ffn_norm: opt_norm(format!("blk.{i}.post_ffw_norm.weight"))?,
+                    attn,
+                })
+            })
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Lfm3Extras { layers })
     }
 
     /// Resolve a tensor name to a pre-computed byte range in the mmap.
@@ -2029,7 +2582,8 @@ impl LfmModel {
     ) {
         let refs = &self.layer_refs[layer];
         let cfg = &self.config;
-        let head_dim = cfg.hidden_size / cfg.n_heads;
+        let head_dim = cfg.head_dim;
+        let q_dim = cfg.n_heads * head_dim;
         let n_kv_heads = cfg.kv_heads_per_layer[layer];
         let kv_dim = n_kv_heads * head_dim;
 
@@ -2038,7 +2592,7 @@ impl LfmModel {
         let lora = state.lora.clone();
 
         // Q, K, V projections using pre-quantized hidden state
-        let q = &mut state.scratch.q[..cfg.hidden_size];
+        let q = &mut state.scratch.q[..q_dim];
         let k = &mut state.scratch.k[..kv_dim];
         let v = &mut state.scratch.v[..kv_dim];
 
@@ -2051,7 +2605,7 @@ impl LfmModel {
             let valid_dims = q_ref.k == cfg.hidden_size
                 && k_ref.k == cfg.hidden_size
                 && v_ref.k == cfg.hidden_size
-                && q_ref.m == cfg.hidden_size
+                && q_ref.m == q_dim
                 && k_ref.m == kv_dim
                 && v_ref.m == kv_dim;
             if valid_dims
@@ -2071,7 +2625,7 @@ impl LfmModel {
                         q,
                         k,
                         v,
-                        cfg.hidden_size,
+                        q_dim,
                         kv_dim,
                         kv_dim,
                         cfg.hidden_size,
@@ -2089,7 +2643,7 @@ impl LfmModel {
                         q,
                         k,
                         v,
-                        cfg.hidden_size,
+                        q_dim,
                         kv_dim,
                         kv_dim,
                         cfg.hidden_size,
@@ -2112,7 +2666,7 @@ impl LfmModel {
                     q,
                     k,
                     v,
-                    cfg.hidden_size,
+                    q_dim,
                     kv_dim,
                     kv_dim,
                     cfg.hidden_size,
@@ -2134,7 +2688,7 @@ impl LfmModel {
                     q,
                     k,
                     v,
-                    cfg.hidden_size,
+                    q_dim,
                     kv_dim,
                     kv_dim,
                     cfg.hidden_size,
@@ -2172,7 +2726,7 @@ impl LfmModel {
                         q,
                         k,
                         v,
-                        cfg.hidden_size,
+                        q_dim,
                         kv_dim,
                         kv_dim,
                         cfg.hidden_size,
@@ -2219,6 +2773,30 @@ impl LfmModel {
             crate::lora::apply_attn_qkv(lora, layer, hidden, q, k, v, &mut state.scratch.lora_tmp);
         }
 
+        // `lfm3`: per-head sigmoid gate, from the same normed input as Q/K/V, that
+        // scales the attention output before the output projection.
+        let lfm3_attn = self
+            .lfm3
+            .as_ref()
+            .and_then(|l| l.layers[layer].attn.as_ref());
+        let mut gate_buf = [0.0f32; MAX_LFM3_HEADS];
+        let gate = lfm3_attn.map(|a| {
+            let gate = &mut gate_buf[..cfg.n_heads];
+            #[cfg(target_arch = "aarch64")]
+            self.gemv_preq(
+                &a.gate,
+                hidden,
+                &state.scratch.q8_scales,
+                &state.scratch.q8_quants,
+                gate,
+            );
+            #[cfg(not(target_arch = "aarch64"))]
+            self.gemv(&a.gate, hidden, gate);
+            cpu::sigmoid_inplace(gate);
+            Self::dump_node("model.layers.{}.self_attn.gate", layer, gate);
+            &*gate
+        });
+
         // Per-head QK norm (RMSnorm each head slice with shared weights)
         let q_norm = self.attn_q_norm_weights[layer].as_ref().unwrap();
         let k_norm = self.attn_k_norm_weights[layer].as_ref().unwrap();
@@ -2237,8 +2815,19 @@ impl LfmModel {
             );
         }
 
-        // RoPE
-        cpu::rope(q, k, pos, cfg.n_heads, n_kv_heads, head_dim, cfg.rope_theta);
+        // RoPE. `lfm3` carries its own base and partial-rotary mask per layer.
+        match lfm3_attn {
+            Some(a) => cpu::rope_neox_freq_factors(
+                q,
+                k,
+                pos,
+                (cfg.n_heads, n_kv_heads),
+                head_dim,
+                a.rope_theta,
+                a.rope_freq_factors.as_deref(),
+            ),
+            None => cpu::rope(q, k, pos, cfg.n_heads, n_kv_heads, head_dim, cfg.rope_theta),
+        }
 
         // Grab per-model TurboQuant state once (None when disabled)
         // TurboQuant rotation state lives on InferenceState now (since PR #12
@@ -2357,8 +2946,8 @@ impl LfmModel {
             } else {
                 k_cache.len() / kv_dim
             };
-            let attn_out = &mut state.scratch.attn_out[..cfg.hidden_size];
-            let q = &state.scratch.q[..cfg.hidden_size];
+            let attn_out = &mut state.scratch.attn_out[..q_dim];
+            let q = &state.scratch.q[..q_dim];
 
             if use_tq_keys || use_tq_values {
                 // GQA batched path — one score buffer per group, shared
@@ -2468,7 +3057,7 @@ impl LfmModel {
                         scale,
                         seq_len,
                         attn_logit_softcapping: None,
-                        sliding_window: None,
+                        sliding_window: lfm3_attn.and_then(|a| a.window),
                     },
                     attn_out,
                     &mut state.scratch.scores,
@@ -2476,17 +3065,25 @@ impl LfmModel {
             }
         }
 
+        // `lfm3`: scale each head's output by its gate.
+        if let Some(gate) = gate {
+            state.scratch.attn_out[..q_dim]
+                .chunks_exact_mut(head_dim)
+                .zip(gate)
+                .for_each(|(head, &g)| head.iter_mut().for_each(|x| *x *= g));
+        }
+
         // Output projection
         #[cfg(target_arch = "aarch64")]
         {
             transformer::quantize_to_scratch_bufs(
-                &state.scratch.attn_out[..cfg.hidden_size],
+                &state.scratch.attn_out[..q_dim],
                 &mut state.scratch.q8_scales,
                 &mut state.scratch.q8_quants,
             );
             self.gemv_preq(
                 refs.attn_output.as_ref().unwrap(),
-                &state.scratch.attn_out[..cfg.hidden_size],
+                &state.scratch.attn_out[..q_dim],
                 &state.scratch.q8_scales,
                 &state.scratch.q8_quants,
                 &mut state.scratch.out[..cfg.hidden_size],
@@ -2497,7 +3094,7 @@ impl LfmModel {
             let out = &mut state.scratch.out[..cfg.hidden_size];
             self.gemv(
                 refs.attn_output.as_ref().unwrap(),
-                &state.scratch.attn_out[..cfg.hidden_size],
+                &state.scratch.attn_out[..q_dim],
                 out,
             );
         }
@@ -2508,7 +3105,7 @@ impl LfmModel {
             let out = &mut state.scratch.out[..cfg.hidden_size];
             crate::lora::apply_decode(
                 t,
-                &state.scratch.attn_out[..cfg.hidden_size],
+                &state.scratch.attn_out[..q_dim],
                 out,
                 &mut state.scratch.lora_tmp,
             );
@@ -2521,6 +3118,7 @@ impl LfmModel {
         let hs = cfg.hidden_size;
         // Decode has started: a large prefill working set is dead weight now.
         state.prefill_scratch.release_if_large();
+        let lfm3 = self.lfm3.as_ref();
         // Reuse pre-allocated scratch from InferenceState instead of allocating
         // fresh Vecs on every call. Take them out of `state.scratch` to avoid
         // borrow-checker conflicts with the mutable `state` passed to
@@ -2546,6 +3144,8 @@ impl LfmModel {
             } else {
                 None
             };
+            state.scratch.q8_scales.resize(nb, 0.0);
+            state.scratch.q8_quants.resize(hs, 0);
             cpu::rmsnorm_and_quantize_q8_0(
                 hidden,
                 &self.attn_norm_weights[i],
@@ -2556,6 +3156,9 @@ impl LfmModel {
             );
             if let Some(t) = t0 {
                 t_norm += t.elapsed();
+            }
+            if lfm3.is_some() {
+                Self::dump_node("model.layers.{}.operator_norm", i, &normed);
             }
 
             let t1 = if profile {
@@ -2575,6 +3178,14 @@ impl LfmModel {
                 }
             }
 
+            if let Some(norm_w) = lfm3.and_then(|l| l.layers[i].post_operator_norm.as_ref()) {
+                cpu::rmsnorm(&mut state.scratch.out[..hs], norm_w, cfg.rms_norm_eps);
+                Self::dump_node(
+                    "model.layers.{}.post_operator_norm",
+                    i,
+                    &state.scratch.out[..hs],
+                );
+            }
             cpu::add_inplace(hidden, &state.scratch.out[..hs]);
 
             let t2 = if profile {
@@ -2582,6 +3193,8 @@ impl LfmModel {
             } else {
                 None
             };
+            state.scratch.q8_scales.resize(nb, 0.0);
+            state.scratch.q8_quants.resize(hs, 0);
             cpu::rmsnorm_and_quantize_q8_0(
                 hidden,
                 &self.ffn_norm_weights[i],
@@ -2624,7 +3237,14 @@ impl LfmModel {
                 t_ffn += t.elapsed();
             }
 
+            if let Some(norm_w) = lfm3.and_then(|l| l.layers[i].post_ffn_norm.as_ref()) {
+                cpu::rmsnorm(&mut state.scratch.out[..hs], norm_w, cfg.rms_norm_eps);
+                Self::dump_node("model.layers.{}.post_ffn_norm", i, &state.scratch.out[..hs]);
+            }
             cpu::add_inplace(hidden, &state.scratch.out[..cfg.hidden_size]);
+            if lfm3.is_some() {
+                Self::dump_node("l_out", i, hidden);
+            }
         }
 
         if profile {
@@ -2638,6 +3258,9 @@ impl LfmModel {
         }
 
         cpu::rmsnorm(hidden, &self.output_norm_weight, cfg.rms_norm_eps);
+        if lfm3.is_some() && transformer::oracle_dump::is_active() {
+            transformer::oracle_dump::record("result_norm", hidden);
+        }
         #[cfg(target_arch = "aarch64")]
         Self::quantize_to_scratch(hidden, state);
         state.seq_len += 1;
@@ -2751,6 +3374,10 @@ impl LfmModel {
             kv_widen_k,
             kv_widen_v,
         } = &mut scratch;
+        #[allow(unused_variables)]
+        let bq_scales = &mut bq_scales[..n * hs.div_ceil(32)];
+        #[allow(unused_variables)]
+        let bq_quants = &mut bq_quants[..n * hs];
         #[cfg(any(target_arch = "aarch64", target_arch = "x86_64", has_blas))]
         let is = cfg.intermediate_size;
 
@@ -2894,8 +3521,7 @@ impl LfmModel {
                         let (conv_w0, rest_w) = conv_wt.split_at(hs);
                         let (conv_w1, conv_w2) = rest_w.split_at(hs);
 
-                        let is_causal = cfg.is_causal
-                            && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
+                        let is_causal = self.is_causal_for(state);
 
                         if !is_causal {
                             // Reuse pre-allocated ffn_input as scratch for bx_all;
@@ -3054,6 +3680,47 @@ impl LfmModel {
                                     }
                                 }
                             }
+                        } else if kernel_size != 3 {
+                            // Any other tap count (`lfm3` has 7): the loops below are written
+                            // for exactly three taps, so walk the taps. Same summation order and
+                            // rounding as the decode kernel (buffered taps oldest first, then the
+                            // new bx; see `conv_mac`).
+                            for j in 0..n {
+                                let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
+                                let (b_slice, c_slice, x_slice) =
+                                    (&proj[..hs], &proj[hs..2 * hs], &proj[2 * hs..3 * hs]);
+
+                                let LayerState::Conv { buffer, history } = &mut state.layers[layer]
+                                else {
+                                    panic!("expected Conv state for layer {layer}");
+                                };
+                                let out_in = &mut out_proj_input[j * hs..(j + 1) * hs];
+                                let bx = &mut state.scratch.conv_scratch[..hs];
+
+                                bx.iter_mut()
+                                    .zip(b_slice.iter().zip(x_slice))
+                                    .for_each(|(o, (&b, &x))| *o = b * x);
+                                out_in
+                                    .iter_mut()
+                                    .zip(buffer[..hs].iter().zip(&conv_wt[..hs]))
+                                    .for_each(|(o, (&s, &w))| *o = s * w);
+                                (1..d_conv).for_each(|t| {
+                                    out_in
+                                        .iter_mut()
+                                        .zip(buffer[t * hs..(t + 1) * hs].iter())
+                                        .zip(&conv_wt[t * hs..(t + 1) * hs])
+                                        .for_each(|((o, &s), &w)| *o = conv_mac(*o, s, w));
+                                });
+                                out_in
+                                    .iter_mut()
+                                    .zip(bx.iter().zip(&conv_wt[d_conv * hs..(d_conv + 1) * hs]))
+                                    .zip(c_slice)
+                                    .for_each(|((o, (&b, &w)), &c)| *o = c * conv_mac(*o, b, w));
+
+                                buffer.copy_within(hs.., 0);
+                                buffer[(d_conv - 1) * hs..d_conv * hs].copy_from_slice(bx);
+                                history.push(start_pos + j + 1, buffer);
+                            }
                         } else {
                             for j in 0..n {
                                 let proj = &proj_mat[j * 3 * hs..(j + 1) * 3 * hs];
@@ -3196,9 +3863,13 @@ impl LfmModel {
                     let attn_k_ref = refs.attn_k.as_ref().unwrap();
                     let attn_v_ref = refs.attn_v.as_ref().unwrap();
                     let attn_output_ref = refs.attn_output.as_ref().unwrap();
-                    // Require ALL four projections to be batchable — a mixed-dtype
-                    // attention block would leave later matrices silently uncomputed
-                    // in the batched path and produce wrong outputs.
+                    let lfm3_attn = self
+                        .lfm3
+                        .as_ref()
+                        .and_then(|l| l.layers[layer].attn.as_ref());
+                    // Require ALL projections (including LFM3's per-head gate when present)
+                    // to be batchable. A mixed-dtype attention block would leave later matrices
+                    // silently uncomputed in the batched path and produce wrong outputs.
                     let blas_ok = [
                         ("attn_q", attn_q_ref),
                         ("attn_k", attn_k_ref),
@@ -3210,12 +3881,24 @@ impl LfmModel {
                         if transformer::batched_gemm_supports(w.dtype, w.k) {
                             ok
                         } else {
-                            transformer::warn_unbatchable(name, w.dtype);
+                            if self.lfm3.is_none() {
+                                transformer::warn_unbatchable(name, w.dtype);
+                            }
                             false
                         }
                     });
-                    if blas_ok {
-                        let head_dim = hs / cfg.n_heads;
+                    let gate_ok = lfm3_attn
+                        .is_none_or(|a| transformer::batched_gemm_supports(a.gate.dtype, a.gate.k));
+                    let dims_ok = cfg.n_heads * cfg.head_dim == hs;
+                    let tq_sliding_ok =
+                        lfm3_attn.and_then(|a| a.window).is_none() || state.tq_config.is_none();
+                    if blas_ok
+                        && gate_ok
+                        && dims_ok
+                        && tq_sliding_ok
+                        && !transformer::oracle_dump::is_active()
+                    {
+                        let head_dim = cfg.head_dim;
                         let n_kv_heads = cfg.kv_heads_per_layer[layer];
                         let kv_dim = n_kv_heads * head_dim;
 
@@ -3259,6 +3942,20 @@ impl LfmModel {
                                     .copy_from_slice(&row[hs..hs + kv_dim]);
                                 v_mat[j * kv_dim..(j + 1) * kv_dim]
                                     .copy_from_slice(&row[hs + kv_dim..qkv_dim]);
+                            }
+                            if let Some(a) = lfm3_attn {
+                                let gate_buf = &mut ffn_input[..n * cfg.n_heads];
+                                transformer::try_blas_prefill_gemm_rowmajor(
+                                    &self.gguf,
+                                    &a.gate,
+                                    normed,
+                                    gate_buf,
+                                    n,
+                                    cfg.n_heads,
+                                    hs,
+                                    &mut state.scratch.dequant_weight_scratch,
+                                );
+                                cpu::sigmoid_inplace(gate_buf);
                             }
                             if profile_prefill {
                                 t_attn_qkv += t_qkv.elapsed();
@@ -3991,6 +4688,20 @@ impl LfmModel {
                                     hs,
                                 );
                             }
+                            if let Some(a) = lfm3_attn {
+                                let gate_buf = &mut ffn_input[..n * cfg.n_heads];
+                                transformer::gemm_preq_rowmajor(
+                                    &self.gguf,
+                                    &a.gate,
+                                    bq_scales,
+                                    bq_quants,
+                                    gate_buf,
+                                    n,
+                                    cfg.n_heads,
+                                    hs,
+                                );
+                                cpu::sigmoid_inplace(gate_buf);
+                            }
                             if profile_prefill {
                                 t_attn_qkv += t_qkv.elapsed();
                             }
@@ -4107,6 +4818,10 @@ impl LfmModel {
                             let k_ptr = k_mat.as_mut_ptr() as usize;
                             let n_heads = cfg.n_heads;
                             let rope_theta = cfg.rope_theta;
+                            let lfm3_rope_theta = lfm3_attn.map(|a| a.rope_theta);
+                            let lfm3_freq_factors_ptr = lfm3_attn
+                                .and_then(|a| a.rope_freq_factors.as_deref())
+                                .map(|s| (s.as_ptr() as usize, s.len()));
                             let eps = cfg.rms_norm_eps;
                             let max_active = cpu::prefill_threads_for_tokens(n);
                             cpu::par_rows_n_active(
@@ -4138,7 +4853,24 @@ impl LfmModel {
                                             eps,
                                         );
                                     }
-                                    cpu::rope(q, k, pos, n_heads, n_kv_heads, head_dim, rope_theta);
+                                    if let Some(theta) = lfm3_rope_theta {
+                                        let factors = lfm3_freq_factors_ptr.map(|(ptr, len)| {
+                                            core::slice::from_raw_parts(ptr as *const f32, len)
+                                        });
+                                        cpu::rope_neox_freq_factors(
+                                            q,
+                                            k,
+                                            pos,
+                                            (n_heads, n_kv_heads),
+                                            head_dim,
+                                            theta,
+                                            factors,
+                                        );
+                                    } else {
+                                        cpu::rope(
+                                            q, k, pos, n_heads, n_kv_heads, head_dim, rope_theta,
+                                        );
+                                    }
                                 },
                             );
                         } else {
@@ -4160,15 +4892,26 @@ impl LfmModel {
                                         cfg.rms_norm_eps,
                                     );
                                 }
-                                cpu::rope(
-                                    q,
-                                    k,
-                                    pos,
-                                    cfg.n_heads,
-                                    n_kv_heads,
-                                    head_dim,
-                                    cfg.rope_theta,
-                                );
+                                match lfm3_attn {
+                                    Some(a) => cpu::rope_neox_freq_factors(
+                                        q,
+                                        k,
+                                        pos,
+                                        (cfg.n_heads, n_kv_heads),
+                                        head_dim,
+                                        a.rope_theta,
+                                        a.rope_freq_factors.as_deref(),
+                                    ),
+                                    None => cpu::rope(
+                                        q,
+                                        k,
+                                        pos,
+                                        cfg.n_heads,
+                                        n_kv_heads,
+                                        head_dim,
+                                        cfg.rope_theta,
+                                    ),
+                                }
                             }
                         }
 
@@ -4240,8 +4983,11 @@ impl LfmModel {
                                 _ => false,
                             };
 
+                        let sliding_window = lfm3_attn.and_then(|a| a.window);
                         const FLASH_ATTN_THRESHOLD: usize = 16;
-                        let use_flash = !use_tq && n >= FLASH_ATTN_THRESHOLD;
+                        let use_flash = !use_tq
+                            && n >= FLASH_ATTN_THRESHOLD
+                            && sliding_window.is_none_or(|w| start_pos + n <= w);
 
                         if use_f16
                             && let LayerState::Attention {
@@ -4287,8 +5033,7 @@ impl LfmModel {
                             );
                             let q_ref = &q_col[..hs * n];
 
-                            let is_causal = cfg.is_causal
-                                && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
+                            let is_causal = self.is_causal_for(state);
                             if !cpu::flash_attention_prefill_items(
                                 q_ref, k_cache, v_cache, flash_buf, n_heads, group_size, n, kv_dim,
                                 head_dim, scale, start_pos, is_causal, max_active,
@@ -4482,41 +5227,59 @@ impl LfmModel {
                             state.scratch.scores.clear();
                             state.scratch.scores.reserve((start_pos + n) * group_size);
                             for j in 0..n {
-                                let is_causal = cfg.is_causal
-                                    && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
+                                let is_causal = self.is_causal_for(state);
                                 let seq_len = if is_causal {
                                     (start_pos + j + 1).min(k_cache.len() / kv_dim)
                                 } else {
                                     (start_pos + n).min(k_cache.len() / kv_dim)
                                 };
+                                let win_start =
+                                    sliding_window.map_or(0, |w| seq_len.saturating_sub(w));
+                                let win_len = seq_len - win_start;
+                                let k_win = &k_cache[win_start * kv_dim..seq_len * kv_dim];
+                                let v_win = &v_cache[win_start * kv_dim..seq_len * kv_dim];
                                 let q = &q_mat[j * hs..(j + 1) * hs];
                                 let attn_out = &mut out_proj_input[j * hs..(j + 1) * hs];
                                 let scores = &mut state.scratch.scores;
-                                scores.resize(seq_len, 0.0);
+                                scores.resize(win_len, 0.0);
                                 for h in 0..cfg.n_heads {
                                     let kv_h = h / group_size;
                                     let q_head = &q[h * head_dim..(h + 1) * head_dim];
                                     let kv_h_offset = kv_h * head_dim;
                                     cpu::attn_scores(
                                         q_head,
-                                        k_cache,
+                                        k_win,
                                         scores,
                                         kv_dim,
                                         kv_h_offset,
                                         head_dim,
                                         scale,
-                                        seq_len,
+                                        win_len,
                                     );
                                     cpu::softmax_inplace(scores);
                                     cpu::attn_values(
                                         scores,
-                                        v_cache,
+                                        v_win,
                                         &mut attn_out[h * head_dim..(h + 1) * head_dim],
                                         kv_dim,
                                         kv_h_offset,
                                         head_dim,
-                                        seq_len,
+                                        win_len,
                                     );
+                                }
+                            }
+                        }
+
+                        // `lfm3`: scale each head's output by its sigmoid gate before output projection.
+                        if lfm3_attn.is_some() {
+                            let gate_buf = &ffn_input[..n * cfg.n_heads];
+                            for j in 0..n {
+                                let tok_out = &mut out_proj_input[j * hs..(j + 1) * hs];
+                                let tok_gate = &gate_buf[j * cfg.n_heads..(j + 1) * cfg.n_heads];
+                                for (head, &g) in tok_out.chunks_exact_mut(head_dim).zip(tok_gate) {
+                                    for x in head {
+                                        *x *= g;
+                                    }
                                 }
                             }
                         }
@@ -4592,6 +5355,10 @@ impl LfmModel {
             #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", has_blas)))]
             let need_block_fallback = true;
             if need_block_fallback {
+                // The whole per-token block (projections and attention) is timed as one
+                // lump under the conv-core or attention-scores column: `lfm3` attention
+                // always lands here, and would otherwise read as free in the profile.
+                let t_fallback = profile_prefill.then(Instant::now);
                 block_out.fill(0.0);
                 for j in 0..n {
                     col.copy_from_slice(&normed[j * hs..(j + 1) * hs]);
@@ -4605,6 +5372,13 @@ impl LfmModel {
                     }
 
                     block_out[j * hs..(j + 1) * hs].copy_from_slice(&state.scratch.out[..hs]);
+                }
+                if let Some(t) = t_fallback {
+                    if is_conv {
+                        t_conv_core += t.elapsed();
+                    } else {
+                        t_attn_scores += t.elapsed();
+                    }
                 }
             }
 
@@ -4626,6 +5400,17 @@ impl LfmModel {
                     &format!("layer {layer} ({block_kind}) block-out"),
                     block_out,
                 );
+            }
+
+            // `lfm3` sandwich norm: the block output is normalized before the residual add.
+            if let Some(norm_w) = self
+                .lfm3
+                .as_ref()
+                .and_then(|l3| l3.layers[layer].post_operator_norm.as_ref())
+            {
+                block_out[..n * hs]
+                    .chunks_exact_mut(hs)
+                    .for_each(|row| cpu::rmsnorm(row, norm_w, cfg.rms_norm_eps));
             }
 
             let t_res1 = Instant::now();
@@ -5030,6 +5815,16 @@ impl LfmModel {
             if debug_hidden {
                 log_rms(&format!("layer {layer} ffn-out"), ffn_out);
             }
+            // `lfm3` sandwich norm on the FFN output, before its residual add.
+            if let Some(norm_w) = self
+                .lfm3
+                .as_ref()
+                .and_then(|l3| l3.layers[layer].post_ffn_norm.as_ref())
+            {
+                ffn_out[..n * hs]
+                    .chunks_exact_mut(hs)
+                    .for_each(|row| cpu::rmsnorm(row, norm_w, cfg.rms_norm_eps));
+            }
             let t_res2 = Instant::now();
             // Second residual: hidden += ffn_out
             #[cfg(target_arch = "aarch64")]
@@ -5106,7 +5901,7 @@ impl LfmModel {
         {
             Self::quantize_to_scratch(&last_hidden, state);
             self.gemv_preq(
-                &self.embd_ref,
+                &self.logits_ref,
                 &last_hidden,
                 &state.scratch.q8_scales,
                 &state.scratch.q8_quants,
@@ -5114,7 +5909,7 @@ impl LfmModel {
             );
         }
         #[cfg(not(target_arch = "aarch64"))]
-        self.gemv(&self.embd_ref, &last_hidden, &mut logits);
+        self.gemv(&self.logits_ref, &last_hidden, &mut logits);
 
         logits
     }
@@ -5129,7 +5924,7 @@ impl LfmModel {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let vocab = cfg.vocab_size;
-        if !transformer::batched_gemm_supports(self.embd_ref.dtype, hs) {
+        if !transformer::batched_gemm_supports(self.logits_ref.dtype, hs) {
             return None;
         }
 
@@ -5137,11 +5932,11 @@ impl LfmModel {
         let mut b_quants = vec![0i8; n * hs];
         transformer::quantize_rows(normed_hidden, hs, n, &mut b_scales, &mut b_quants);
 
-        let rows = self.embd_ref.m;
+        let rows = self.logits_ref.m;
         let mut out = vec![0.0f32; rows * n];
         if !transformer::gemm_preq(
             &self.gguf,
-            &self.embd_ref,
+            &self.logits_ref,
             &b_scales,
             &b_quants,
             &mut out,
@@ -5190,7 +5985,7 @@ impl LfmModel {
             {
                 Self::quantize_to_scratch(tok_h, state);
                 self.gemv_preq(
-                    &self.embd_ref,
+                    &self.logits_ref,
                     tok_h,
                     &state.scratch.q8_scales,
                     &state.scratch.q8_quants,
@@ -5198,7 +5993,7 @@ impl LfmModel {
                 );
             }
             #[cfg(not(target_arch = "aarch64"))]
-            self.gemv(&self.embd_ref, tok_h, tok_l);
+            self.gemv(&self.logits_ref, tok_h, tok_l);
         }
         all_logits
     }
@@ -5385,8 +6180,10 @@ impl Model for LfmModel {
     }
 
     /// Dense-target LoRA hooks in the attention, FFN, and gated-conv blocks.
+    /// Not `lfm3`: its sandwich norms and attention gate sit between the hooked
+    /// projections, and no adapter has been validated against them.
     fn supports_lora(&self) -> bool {
-        true
+        self.lfm3.is_none()
     }
 
     fn f16_kv_supported(&self) -> bool {
@@ -5408,7 +6205,7 @@ impl Model for LfmModel {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
 
-        let is_causal = cfg.is_causal && !state.lora.as_ref().is_some_and(|l| l.is_classifier());
+        let is_causal = self.is_causal_for(state);
         if !is_causal {
             let n = tokens.len();
             let mut hidden = vec![0.0f32; n * hs];
@@ -5567,15 +6364,18 @@ impl Model for LfmModel {
             &mut hidden_heap[..]
         };
         self.dequantize_row_into(&self.embd_ref, token_id, hidden);
+        if self.lfm3.is_some() && transformer::oracle_dump::is_active() {
+            transformer::oracle_dump::record("model.embed_tokens", hidden);
+        }
         self.run_layers(hidden, pos, state);
 
-        // 2. Output projection (tied embeddings)
+        // 2. Output projection (the tied embedding, or an lfm3 file's output.weight)
         if state.scratch.logits.len() < cfg.vocab_size {
             state.scratch.logits.resize(cfg.vocab_size, 0.0);
         }
         #[cfg(target_arch = "aarch64")]
         self.gemv_preq(
-            &self.embd_ref,
+            &self.logits_ref,
             hidden,
             &state.scratch.q8_scales,
             &state.scratch.q8_quants,
@@ -5583,10 +6383,16 @@ impl Model for LfmModel {
         );
         #[cfg(not(target_arch = "aarch64"))]
         self.gemv(
-            &self.embd_ref,
+            &self.logits_ref,
             hidden,
             &mut state.scratch.logits[..cfg.vocab_size],
         );
+        if self.lfm3.is_some() && transformer::oracle_dump::is_active() {
+            transformer::oracle_dump::record(
+                "result_output",
+                &state.scratch.logits[..cfg.vocab_size],
+            );
+        }
 
         state.scratch.logits[..cfg.vocab_size].to_vec()
     }
@@ -5644,12 +6450,12 @@ impl Model for LfmModel {
         self.run_layers(hidden, pos, state);
 
         #[cfg(target_arch = "aarch64")]
-        if self.embd_ref.dtype == DType::Q6K && self.config.scalars.logit > 0.0 {
+        if self.logits_ref.dtype == DType::Q6K && self.config.scalars.logit > 0.0 {
             let profile = Self::profile_decode_enabled();
             let t_lm = std::time::Instant::now();
             let res = transformer::gemv_preq_argmax(
                 &self.gguf,
-                &self.embd_ref,
+                &self.logits_ref,
                 hidden,
                 &state.scratch.q8_scales,
                 &state.scratch.q8_quants,
@@ -5668,7 +6474,7 @@ impl Model for LfmModel {
         }
         #[cfg(target_arch = "aarch64")]
         self.gemv_preq(
-            &self.embd_ref,
+            &self.logits_ref,
             hidden,
             &state.scratch.q8_scales,
             &state.scratch.q8_quants,
@@ -5676,7 +6482,7 @@ impl Model for LfmModel {
         );
         #[cfg(not(target_arch = "aarch64"))]
         self.gemv(
-            &self.embd_ref,
+            &self.logits_ref,
             hidden,
             &mut state.scratch.logits[..cfg.vocab_size],
         );
@@ -5699,13 +6505,13 @@ impl Model for LfmModel {
         let pos = state.seq_len;
         self.run_layers(&mut hidden, pos, state);
 
-        // Output projection (tied embeddings)
+        // Output projection (the tied embedding, or an lfm3 file's output.weight)
         let mut logits = vec![0.0f32; cfg.vocab_size];
         #[cfg(target_arch = "aarch64")]
         {
             Self::quantize_to_scratch(&hidden, state);
             self.gemv_preq(
-                &self.embd_ref,
+                &self.logits_ref,
                 &hidden,
                 &state.scratch.q8_scales,
                 &state.scratch.q8_quants,
@@ -5713,7 +6519,7 @@ impl Model for LfmModel {
             );
         }
         #[cfg(not(target_arch = "aarch64"))]
-        self.gemv(&self.embd_ref, &hidden, &mut logits);
+        self.gemv(&self.logits_ref, &hidden, &mut logits);
 
         logits
     }
@@ -5898,6 +6704,8 @@ impl Model for LfmModel {
         &self,
         compression: &KvCompression,
     ) -> Result<(), crate::CeraError> {
+        // A request the model cannot serve (lfm3, or an incompatible `head_dim`) resolves to the
+        // uncompressed cache here, and `Session::new` warns about it, so this stays a no-op.
         let resolved = compression.resolved_for(&self.config).cache_tag();
 
         // Cache lock outside, tag lock inside, so the tag and the cache's namespace
@@ -5988,16 +6796,18 @@ impl Model for LfmModel {
         &self.config
     }
 
+    /// Not `lfm3`: the TurboQuant attention read has no sliding-window mask.
     fn turboquant_supported(&self) -> bool {
-        let head_dim = self.config.hidden_size / self.config.n_heads;
-        head_dim.is_power_of_two()
+        crate::kv_cache::turboquant_capable(&self.config)
     }
 
     fn supports_kv_shift(&self) -> bool {
         // CPU LFM2 implements shift with RoPE re-rotation. The wgpu and
         // Metal overrides mirror this with a GPU-side shift shader, and
-        // report `false` only while a TurboQuant cache is active.
-        true
+        // report `false` only while a TurboQuant cache is active. `lfm3` rotates
+        // each layer on its own base and mask, which the single-schedule
+        // re-rotation in `shift_kv` does not know.
+        self.lfm3.is_none()
     }
 
     fn shift_kv(&self, state: &mut crate::kv_cache::InferenceState, n_keep: usize, shift: usize) {
@@ -6134,19 +6944,23 @@ impl crate::model::gpu_weight_source::GpuWeightSource for LfmModel {
 
 #[cfg(test)]
 mod conv_kernel_size_tests {
-    use super::validate_conv_kernel_size;
+    use super::{CPU_CONV_KERNEL_MAX, GPU_CONV_KERNEL_MAX, validate_conv_kernel_size};
+
+    fn lfm2(v: Option<usize>) -> anyhow::Result<Option<usize>> {
+        validate_conv_kernel_size("lfm2", v, GPU_CONV_KERNEL_MAX)
+    }
 
     #[test]
     fn accepts_the_shipped_value_and_absence() {
-        assert_eq!(validate_conv_kernel_size(Some(3)).unwrap(), Some(3));
+        assert_eq!(lfm2(Some(3)).unwrap(), Some(3));
         // Absent metadata falls back to 3 downstream, so it stays None here.
-        assert_eq!(validate_conv_kernel_size(None).unwrap(), None);
+        assert_eq!(lfm2(None).unwrap(), None);
     }
 
     #[test]
     fn accepts_the_register_array_bounds() {
         for k in [2usize, 4] {
-            assert_eq!(validate_conv_kernel_size(Some(k)).unwrap(), Some(k));
+            assert_eq!(lfm2(Some(k)).unwrap(), Some(k));
         }
     }
 
@@ -6156,11 +6970,21 @@ mod conv_kernel_size_tests {
         // the batched kernel's fixed-size `w_local` / `rb` registers, which used
         // to make it silently skip the dispatch and emit wrong prefill logits.
         for k in [0usize, 1, 5, 64, usize::MAX] {
-            let err = validate_conv_kernel_size(Some(k)).unwrap_err().to_string();
+            let err = lfm2(Some(k)).unwrap_err().to_string();
             assert!(
                 err.contains("l_cache must be in 2..=4"),
                 "unexpected error for k={k}: {err}"
             );
+        }
+    }
+
+    #[test]
+    fn lfm3_takes_its_wider_kernel_but_not_an_unbounded_one() {
+        let lfm3 = |k| validate_conv_kernel_size("lfm3", k, CPU_CONV_KERNEL_MAX);
+        assert_eq!(lfm3(Some(7)).unwrap(), Some(7));
+        for k in [0usize, 1, CPU_CONV_KERNEL_MAX + 1] {
+            let err = lfm3(Some(k)).unwrap_err().to_string();
+            assert!(err.starts_with("lfm3.shortconv.l_cache"), "{err}");
         }
     }
 }

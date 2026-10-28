@@ -32,7 +32,8 @@ impl ConversionRequest {
             // cached conversion once, whatever its architecture
             // 4: block quantization types need whole blocks per row, so conversions with
             // rows that end mid-block (Whisper tiny/base) are rebuilt
-            version: 4,
+            // 5: lfm3 repos were converted as lfm2 before; rebuild cached conversions
+            version: 5,
             owner: spec.owner.clone(),
             repo: spec.repo.clone(),
             revision: spec.revision.clone(),

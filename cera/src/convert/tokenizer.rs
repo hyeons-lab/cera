@@ -32,6 +32,8 @@ pub struct VocabOptions<'a> {
     pub llama_cpp_layout: bool,
     /// The model's `vocab_size`.
     pub pad_to: Option<usize>,
+    /// `add_bos_token` regardless of what the tokenizer says (only with `llama_cpp_layout`).
+    pub force_add_bos: Option<bool>,
     /// `tokenizer_config.json`: the BOS/EOS token names and its `add_*_token` overrides.
     pub tokenizer_config: Option<&'a serde_json::Value>,
 }
@@ -360,6 +362,7 @@ impl HfTokenizerJson {
             };
             add_bos = explicit("add_bos_token").or(add_bos);
             add_eos = explicit("add_eos_token").or(add_eos);
+            add_bos = options.force_add_bos.or(add_bos);
             if let Some(v) = add_bos {
                 writer.add_bool("tokenizer.ggml.add_bos_token", v);
             }
@@ -438,6 +441,7 @@ mod tests {
         let options = VocabOptions {
             llama_cpp_layout: true,
             pad_to: None,
+            force_add_bos: None,
             tokenizer_config: Some(&config),
         };
         // BOS A EOS
@@ -474,6 +478,7 @@ mod tests {
         let options = VocabOptions {
             llama_cpp_layout: true,
             pad_to: None,
+            force_add_bos: None,
             tokenizer_config: Some(&config),
         };
         tok.apply_to_gguf_writer_with(&mut writer, None, &options);

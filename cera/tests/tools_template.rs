@@ -40,6 +40,7 @@ fn weather_tool() -> ToolDef {
             "properties": { "city": { "type": "string", "description": "City name" } },
             "required": ["city"]
         }),
+        defer_loading: false,
     }
 }
 

@@ -1046,6 +1046,7 @@ fn chat_session_tool_registration_and_accessors() {
         name: "get_weather".into(),
         description: Some("Get weather for a given city".into()),
         parameters_json: r#"{"type": "object", "properties": {"city": {"type": "string"}}}"#.into(),
+        defer_loading: false,
     };
 
     chat.set_tools(vec![tool]).expect("set_tools succeeds");
@@ -1071,6 +1072,7 @@ fn chat_session_tool_execution_flow() {
         name: "calculator".into(),
         description: Some("Calculate mathematical expression".into()),
         parameters_json: r#"{"type": "object", "properties": {"expr": {"type": "string"}}}"#.into(),
+        defer_loading: false,
     };
     chat.set_tools(vec![tool]).expect("set_tools succeeds");
 
@@ -1130,6 +1132,7 @@ fn chat_session_checkpoint_export_import_and_file_persistence() {
         name: "math".into(),
         description: Some("evaluate math".into()),
         parameters_json: r#"{"type":"object"}"#.into(),
+        defer_loading: false,
     };
     chat.set_tools(vec![tool]).expect("set_tools succeeds");
     chat.set_tool_format(ToolFormat::Hermes)
@@ -1234,6 +1237,7 @@ fn tool_def_try_from_validates_parameters_json() {
         name: "test_empty".to_string(),
         description: None,
         parameters_json: "".to_string(),
+        defer_loading: false,
     };
     let core_empty: cera::tools::ToolDef = empty_tool.try_into().unwrap();
     assert_eq!(core_empty.name, "test_empty");
@@ -1245,6 +1249,7 @@ fn tool_def_try_from_validates_parameters_json() {
         description: Some("valid tool".to_string()),
         parameters_json: r#"{"type":"object","properties":{"location":{"type":"string"}}}"#
             .to_string(),
+        defer_loading: false,
     };
     let core_valid: cera::tools::ToolDef = valid_tool.try_into().unwrap();
     assert_eq!(core_valid.name, "test_valid");
@@ -1255,6 +1260,7 @@ fn tool_def_try_from_validates_parameters_json() {
         name: "test_invalid_json".to_string(),
         description: None,
         parameters_json: "{not_valid_json}".to_string(),
+        defer_loading: false,
     };
     let err = cera::tools::ToolDef::try_from(invalid_json_tool).unwrap_err();
     assert!(matches!(err, FfiError::Backend { .. }));
@@ -1264,6 +1270,7 @@ fn tool_def_try_from_validates_parameters_json() {
         name: "test_scalar".to_string(),
         description: None,
         parameters_json: "42".to_string(),
+        defer_loading: false,
     };
     let err = cera::tools::ToolDef::try_from(scalar_tool).unwrap_err();
     assert!(matches!(err, FfiError::Backend { .. }));
@@ -1273,6 +1280,7 @@ fn tool_def_try_from_validates_parameters_json() {
         name: "test_array".to_string(),
         description: None,
         parameters_json: "[]".to_string(),
+        defer_loading: false,
     };
     let err = cera::tools::ToolDef::try_from(array_tool).unwrap_err();
     assert!(matches!(err, FfiError::Backend { .. }));

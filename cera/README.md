@@ -159,6 +159,7 @@ are listed below:
 |--------------|----------|
 | `lfm2` | Liquid LFM2 / LFM2.5 (the canonical LeapBundles family) |
 | `lfm2moe` | Liquid LFM2.5-8B-A1B (routed mixture-of-experts) |
+| `lfm3` | LFM3 / LFM3-MoE (CPU and Hexagon NPU; CPU prefill attention is per token; LoRA, TurboQuant and `n_keep` shift are not supported, and a TurboQuant request falls back to the uncompressed cache) |
 | `qwen2`, `qwen3` | Qwen2 / Qwen2.5 / Qwen3 |
 | `qwen35` | Qwen 3.5 / Ornith 1.0 (interleaved Gated Delta Net hybrid) |
 | `llama` | LLaMA 2/3, and classic Mistral 7B (ships as GGUF arch `llama`) |
@@ -455,8 +456,8 @@ The CLI exposes speculative decoding knobs across `run`, `chat`, and `bench`
 ## Tool calling
 
 `cera::tools` renders tool schemas into the chat template and parses tool calls
-back out, format-aware: `ToolFormat::detect(arch)` picks Pythonic (LFM2) vs
-Hermes JSON (Qwen2.5/Qwen3) from the GGUF architecture.
+back out, format-aware: `ToolFormat::detect(arch)` picks Pythonic (LFM2),
+Hermes JSON (Qwen2.5/Qwen3) or XML (LFM3) from the GGUF architecture.
 
 Using `engine`, the mutable `session`, and `TokenCollector` from the raw-token
 quickstart, replace its prompt/generation block with the sequence below. It
@@ -523,7 +524,8 @@ Two backend gaps refuse loudly with `CeraError::LoraUnsupportedByBackend`
 rather than silently ignoring the adapter: `lfm2moe`'s routed-FFN targets (the
 router and the per-expert projections), which apply on CPU only; and the
 bert, qwen35, gemma4, and bailingmoe3 backends, which have no LoRA hooks at
-all (any adapter is refused on those).
+all (any adapter is refused on those). `lfm3` shares the LFM2 hooks but refuses
+adapters too, until one is validated against its sandwich norms and attention gate.
 
 ```rust
 use cera::lora::LoraAdapterWeights;

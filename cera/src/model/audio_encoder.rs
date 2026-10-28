@@ -48,8 +48,8 @@ pub fn is_audio_encoder_gguf(gguf: &GgufFile) -> bool {
         || gguf.metadata.contains_key("clip.has_audio_encoder")
         || gguf.metadata.contains_key("audio.block_count")
         || gguf
-            .get_tensor("audio_model.encoder.layers.0.attn.q.weight")
-            .is_ok()
+            .tensors
+            .contains_key("audio_model.encoder.layers.0.attn.q.weight")
 }
 
 // ── Audio preprocessing constants (hardcoded by llama.cpp's LFM2A
@@ -251,23 +251,48 @@ pub struct ConformerLayerWeights {
     pub ffn_down_1_b: Vec<f32>,
 
     // ── Final block norm ──────────────────────────────────────────
-    /// `a.blk.{il}.ln2.{weight,bias}` — final layer norm.
+    /// `a.blk.{il}.ln2.{weight,bias}`: final layer norm.
     pub ln2_w: Vec<f32>,
     pub ln2_b: Vec<f32>,
+
+    /// LFM3A hybrid ShortConv / Attention block extras (`None` for LFM2A Conformer blocks).
+    pub lfm3a: Option<Lfm3aLayerExtras>,
+}
+
+/// LFM3A-specific weights and metadata for a single hybrid ShortConv or Attention block.
+pub struct Lfm3aLayerExtras {
+    /// `a.blk.{il}.attn_q_norm.weight` (per-head RMSNorm weight, length `d_head`).
+    pub q_norm_w: Vec<f32>,
+    /// `a.blk.{il}.attn_k_norm.weight` (per-head RMSNorm weight, length `d_head`).
+    pub k_norm_w: Vec<f32>,
+    /// Optional `a.blk.{il}.attn_gate.weight` (`[n_head, n_embd]` or `[n_embd, n_embd]`).
+    pub attn_gate_w: Option<MmapWeight>,
+    /// Optional `a.blk.{il}.attn_post_norm.weight` / `post_attention_norm.weight`.
+    pub attn_post_norm_w: Vec<f32>,
+    /// Optional `a.blk.{il}.ffn_post_norm.weight` / `post_ffw_norm.weight`.
+    pub ffn_post_norm_w: Vec<f32>,
+    /// Optional post-trunk RMSNorm (`a.post_ln.weight` / `a.output_norm.weight`), stored on layer 0.
+    pub post_ln_w: Vec<f32>,
+    /// RoPE frequency base (`clip.audio.rope.freq_base`).
+    pub rope_theta: f32,
+    /// Number of KV heads (`clip.audio.attention.head_count_kv`).
+    pub n_head_kv: usize,
+    /// Sliding window attention size (`clip.audio.window_size` / `clip.audio.attention.sliding_window`).
+    pub sliding_window: usize,
 }
 
 /// 2-layer MLP adapter projecting encoder output to LLM hidden dim.
 /// llama.cpp loads this under `mm.a.mlp.{0,1,3}.{weight,bias}` (note
-/// the gap at index 2 — a GELU activation between layers 1 and 3
+/// the gap at index 2: a GELU activation between layers 1 and 3
 /// carries no parameters).
 pub struct AudioMlpAdapterWeights {
-    /// `mm.a.mlp.0.{weight,bias}` — input layer norm of the adapter.
+    /// `mm.a.mlp.0.{weight,bias}`: input layer norm of the adapter.
     pub norm_w: Vec<f32>,
     pub norm_b: Vec<f32>,
-    /// `mm.a.mlp.1.{weight,bias}` — `[n_embd → n_ff_adapter]`.
+    /// `mm.a.mlp.1.{weight,bias}`: `[n_embd -> n_ff_adapter]`.
     pub up_w: MmapWeight,
     pub up_b: Vec<f32>,
-    /// `mm.a.mlp.3.{weight,bias}` — `[n_ff_adapter → llm_hidden_size]`.
+    /// `mm.a.mlp.3.{weight,bias}`: `[n_ff_adapter -> llm_hidden_size]`.
     pub down_w: MmapWeight,
     pub down_b: Vec<f32>,
 }
@@ -301,12 +326,32 @@ impl AudioEncoderWeights {
             adapter: Some(&self.mlp_adapter),
         }
     }
+
+    /// Returns `true` when this encoder uses the LFM3A hybrid ShortConv + Attention architecture
+    /// rather than the LFM2A Conformer architecture.
+    pub fn is_lfm3a(&self) -> bool {
+        if let Some(first) = self.layers.first() {
+            first.lfm3a.is_some()
+        } else {
+            self.conv_stem.layers.len() == 3
+        }
+    }
+}
+
+/// Returns `true` when a GGUF file carries an `lfm3a` audio encoder.
+pub fn is_lfm3a_gguf(gguf: &GgufFile) -> bool {
+    matches!(
+        gguf.get_str("clip.audio.projector_type")
+            .or_else(|| gguf.get_str("clip.projector_type")),
+        Some("lfm3a")
+    ) || (!gguf.tensors.contains_key("a.blk.0.pos_bias_u")
+        && gguf.tensors.contains_key("a.blk.0.ffn_gate.weight"))
 }
 
 impl AudioEncoderWeights {
     /// Load every encoder tensor from a multimodal_projector GGUF.
-    /// Errors if any required tensor or metadata key is missing —
-    /// no silent defaults. Per-tensor `with_context` makes the first
+    /// Errors if any required tensor or metadata key is missing.
+    /// Per-tensor `with_context` makes the first
     /// missing name visible at the top of the error chain. Also errors
     /// on zero or mismatched widths and a non-positive-finite epsilon.
     ///
@@ -319,9 +364,12 @@ impl AudioEncoderWeights {
     /// read only to detect tensor/metadata disagreement and emit
     /// a warn-level log; the actual `n_ff` is always derived from
     /// the loaded `ffn_up.weight` shape (the metadata key is stale
-    /// on the real LFM2.5-Audio-1.5B mmproj GGUF — claims 512 while
+    /// on the real LFM2.5-Audio-1.5B mmproj GGUF, claiming 512 while
     /// the tensor is `[512, 2048]`).
     pub fn from_gguf(gguf: &Arc<GgufFile>) -> Result<Self> {
+        if is_lfm3a_gguf(gguf) {
+            return load_lfm3a_encoder(gguf);
+        }
         // ── Config from metadata ──
         let n_layer = gguf
             .get_u32(KEY_N_LAYER)
@@ -360,7 +408,7 @@ impl AudioEncoderWeights {
         // Read it if present only to warn on disagreement.
         let metadata_n_ff = gguf.get_u32(KEY_N_FF).map(|v| v as usize);
 
-        // ── Conv stem (positional indices 0/2/3/5/6 — 1/4/7 are
+        // ── Conv stem (positional indices 0/2/3/5/6; 1/4/7 are
         //    parameter-free ReLU activations) ──
         let stem_indices = [0u32, 2, 3, 5, 6];
         let mut stem_layers = Vec::with_capacity(stem_indices.len());
@@ -389,7 +437,7 @@ impl AudioEncoderWeights {
         // (same "tensor is the source of truth" pattern as
         // `llm_hidden_size` below). Validate every per-block FFN
         // tensor against the derived `n_ff` and the metadata
-        // `n_embd` — release-fatal so corrupted / mismatched
+        // `n_embd` so corrupted or mismatched
         // blocks are caught at load time instead of producing
         // a misleading panic deep inside `conformer_ffn_forward`.
         anyhow::ensure!(
@@ -447,7 +495,7 @@ impl AudioEncoderWeights {
             // Pre-FFN LayerNorm weights (n_embd-wide, both FFN-1
             // and FFN-2 paths). Shape errors here would manifest
             // as a silent zip-truncation in `add_inplace` during
-            // the forward pass — fail loudly at load instead.
+            // the forward pass; fail loudly at load instead.
             anyhow::ensure!(
                 layer.ffn_norm_w.len() == n_embd && layer.ffn_norm_b.len() == n_embd,
                 "block {il} ffn_norm w/b lens ({}, {}) != n_embd ({n_embd})",
@@ -485,7 +533,7 @@ impl AudioEncoderWeights {
         };
 
         // The adapter's down-projection rows match the LLM hidden
-        // size — the authoritative source for `llm_hidden_size`.
+        // size, which is the authoritative source for `llm_hidden_size`.
         let llm_hidden_size = mlp_adapter.down_w.rows;
 
         let config = AudioEncoderConfig {
@@ -507,6 +555,669 @@ impl AudioEncoderWeights {
     }
 }
 
+/// A `u32` metadata value that is absent or exactly that type: another type is an error
+/// naming the key, not a silent fall back to the default (a corrupt file would load as a
+/// different graph).
+fn typed_u32(gguf: &GgufFile, key: &str) -> Result<Option<u32>> {
+    match gguf.metadata.get(key) {
+        None => Ok(None),
+        Some(crate::gguf::GgufValue::U32(v)) => Ok(Some(*v)),
+        Some(_) => anyhow::bail!("{key} must be stored as a u32"),
+    }
+}
+
+/// [`typed_u32`] for `f32`.
+fn typed_f32(gguf: &GgufFile, key: &str) -> Result<Option<f32>> {
+    match gguf.metadata.get(key) {
+        None => Ok(None),
+        Some(crate::gguf::GgufValue::F32(v)) => Ok(Some(*v)),
+        Some(_) => anyhow::bail!("{key} must be stored as an f32"),
+    }
+}
+
+/// A stem conv layer's tensors must be as large as its shape says: the forward's conv2d only
+/// debug-asserts it, so a short weight or bias would panic at inference in a release build.
+fn check_stem_layer_extent(layer: &ConvLayerWeights) -> Result<()> {
+    anyhow::ensure!(
+        layer.shape.len() == 4,
+        "{}: expected a 4D weight shape, got {:?}",
+        layer.name,
+        layer.shape
+    );
+    let expected = layer
+        .shape
+        .iter()
+        .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+        .with_context(|| format!("{}: shape {:?} overflows", layer.name, layer.shape))?;
+    anyhow::ensure!(
+        layer.weight.len() == expected,
+        "{}: {} weights for shape {:?} ({expected} expected)",
+        layer.name,
+        layer.weight.len(),
+        layer.shape
+    );
+    anyhow::ensure!(
+        layer.bias.len() == layer.shape[3],
+        "{}: bias has {} entries, expected {} (output channels)",
+        layer.name,
+        layer.bias.len(),
+        layer.shape[3]
+    );
+    Ok(())
+}
+
+/// `(channels, frequency bins)` after the LFM3A conv stem, from its layers' weight shapes
+/// `[kw, kh, in_per_group, out]`. The frequency axis is convolved by `kh` and the time axis
+/// by `kw` (`conv_stem_forward_lfm3a`), so this follows `kh`; the 5-layer stem alternates
+/// full and depthwise convolutions, the 3-layer one is stride 2 throughout.
+fn lfm3a_stem_geometry(layer_shapes: &[&[usize]], n_mel_bins: usize) -> Result<(usize, usize)> {
+    let mut cur_ch = 1usize;
+    let mut cur_f = n_mel_bins;
+    for (pos, shape) in layer_shapes.iter().enumerate() {
+        anyhow::ensure!(
+            shape.len() == 4,
+            "lfm3a conv stem layer {pos}: expected 4D weight shape, got {shape:?}"
+        );
+        let (kh, in_per_group, out_ch) = (shape[1], shape[2], shape[3]);
+        anyhow::ensure!(
+            shape.iter().all(|&d| d > 0),
+            "lfm3a conv stem layer {pos}: non-positive shape {shape:?}"
+        );
+        let (groups, stride, pad) = if layer_shapes.len() == 5 {
+            let modes: [(usize, usize, usize); 5] = [
+                (1, 2, 1),
+                (cur_ch, 2, 1),
+                (1, 1, 0),
+                (cur_ch, 2, 1),
+                (1, 1, 0),
+            ];
+            modes[pos]
+        } else {
+            let groups = if in_per_group == 1 && cur_ch > 1 {
+                cur_ch
+            } else {
+                1
+            };
+            (groups, 2, 1)
+        };
+        anyhow::ensure!(
+            in_per_group * groups == cur_ch,
+            "lfm3a conv stem layer {pos}: in_per_group ({in_per_group}) * groups ({groups}) != cur_ch ({cur_ch})"
+        );
+        let padded_f = cur_f + 2 * pad;
+        anyhow::ensure!(
+            padded_f >= kh,
+            "lfm3a conv stem layer {pos}: frequency kernel kh ({kh}) > padded mel width ({padded_f})"
+        );
+        cur_f = (padded_f - kh) / stride + 1;
+        cur_ch = out_ch;
+    }
+    Ok((cur_ch, cur_f))
+}
+
+/// The KV head count stored as `clip.audio.attention.head_count_kv`: a scalar (unsigned or
+/// signed) or a per-layer array, where the first positive entry is the count. `None` when the
+/// key is absent or holds no positive count.
+fn kv_heads_from_metadata(value: Option<&crate::gguf::GgufValue>) -> Option<usize> {
+    use crate::gguf::GgufValue;
+    match value? {
+        GgufValue::U32(v) if *v > 0 => Some(*v as usize),
+        GgufValue::I32(v) if *v > 0 => Some(*v as usize),
+        GgufValue::Array(items) => items.iter().find_map(|item| match item {
+            GgufValue::U32(v) if *v > 0 => Some(*v as usize),
+            GgufValue::I32(v) if *v > 0 => Some(*v as usize),
+            _ => None,
+        }),
+        _ => None,
+    }
+}
+
+/// Load an `lfm3a` hybrid ShortConv + Attention audio encoder from GGUF.
+///
+/// Packs `lfm3a` tensors into the existing `AudioEncoderWeights` / `ConformerLayerWeights`
+/// structs (with `lfm3a` populated and `ln1_b` left empty so `AudioEncoderWeights::is_lfm3a()`
+/// is `true` and GPU/Hexagon Conformer backends decline cleanly).
+fn load_lfm3a_encoder(gguf: &Arc<GgufFile>) -> Result<AudioEncoderWeights> {
+    let n_layer = gguf
+        .get_u32(KEY_N_LAYER)
+        .with_context(|| format!("missing `{KEY_N_LAYER}`"))? as usize;
+    let n_embd = gguf
+        .get_u32(KEY_N_EMBD)
+        .with_context(|| format!("missing `{KEY_N_EMBD}`"))? as usize;
+    let n_head = gguf
+        .get_u32(KEY_N_HEAD)
+        .with_context(|| format!("missing `{KEY_N_HEAD}`"))? as usize;
+    anyhow::ensure!(n_layer >= 1, "the audio encoder must have at least 1 layer");
+    anyhow::ensure!(n_head >= 1, "the audio encoder has no heads");
+    anyhow::ensure!(n_embd >= 1, "the audio encoder has no width");
+    anyhow::ensure!(
+        n_embd.is_multiple_of(n_head),
+        "{n_head} heads do not divide {n_embd}"
+    );
+    // present-but-mistyped metadata is a corrupt file, not a request for the default
+    if let Some(v) = gguf.metadata.get("clip.audio.attention.head_count_kv") {
+        anyhow::ensure!(
+            matches!(
+                v,
+                crate::gguf::GgufValue::U32(_)
+                    | crate::gguf::GgufValue::I32(_)
+                    | crate::gguf::GgufValue::Array(_)
+            ),
+            "clip.audio.attention.head_count_kv must be stored as an integer or an array of them"
+        );
+    }
+    let n_head_kv = kv_heads_from_metadata(gguf.metadata.get("clip.audio.attention.head_count_kv"))
+        .unwrap_or(n_head);
+    anyhow::ensure!(
+        n_head_kv >= 1 && n_head.is_multiple_of(n_head_kv),
+        "invalid head_count_kv ({n_head_kv}) for head_count ({n_head})"
+    );
+    let d_head = n_embd / n_head;
+    let n_embd_kv = n_head_kv * d_head;
+
+    let eps = typed_f32(gguf, KEY_LN_EPS)?.unwrap_or(1e-5);
+    anyhow::ensure!(
+        eps.is_finite() && eps > 0.0,
+        "the audio encoder epsilon ({eps}) is not positive and finite"
+    );
+    let n_mel_bins = typed_u32(gguf, KEY_N_MEL_BINS)?.map_or(128, |v| v as usize);
+    anyhow::ensure!(n_mel_bins >= 1, "the audio encoder has no mel bins");
+
+    let rope_theta = typed_f32(gguf, "clip.audio.rope.freq_base")?.unwrap_or(1_000_000.0);
+    anyhow::ensure!(
+        rope_theta.is_finite() && rope_theta > 0.0,
+        "the audio encoder rope base ({rope_theta}) is not positive and finite"
+    );
+    let sliding_window = match typed_u32(gguf, "clip.audio.window_size")? {
+        Some(v) => Some(v),
+        None => typed_u32(gguf, "clip.audio.attention.sliding_window")?,
+    }
+    .map_or(150, |v| v as usize);
+
+    // Conv stem: support both the 5-layer depthwise-separable stem
+    // (`a.conv1d.{0,2,3,5,6}`) and the 3-layer stride-2 stem (`a.conv1d.{0,1,2}`).
+    let stem_indices: &[u32] = if gguf.tensors.contains_key("a.conv1d.5.weight") {
+        &[0, 2, 3, 5, 6]
+    } else {
+        &[0, 1, 2]
+    };
+    let mut stem_layers = Vec::with_capacity(stem_indices.len());
+    for &idx in stem_indices {
+        let layer = load_conv_layer(gguf, idx)?;
+        check_stem_layer_extent(&layer)?;
+        stem_layers.push(layer);
+    }
+    let stem_shapes: Vec<&[usize]> = stem_layers.iter().map(|l| l.shape.as_slice()).collect();
+    let (cur_ch, cur_f) = lfm3a_stem_geometry(&stem_shapes, n_mel_bins)?;
+    let expected_pre_encode_cols = cur_ch * cur_f;
+
+    let (pre_encode_out_w, pre_encode_out_b) =
+        if gguf.tensors.contains_key("a.pre_encode.out.weight") {
+            let w = MmapWeight::from_gguf(gguf, "a.pre_encode.out.weight")
+                .context("loading a.pre_encode.out.weight")?;
+            let b = load_optional_vec_f32(gguf, &["a.pre_encode.out.bias".to_string()])?;
+            let b = if b.is_empty() { vec![0.0; w.rows] } else { b };
+            (w, b)
+        } else {
+            let w = MmapWeight::from_gguf(gguf, "a.conv1d.3.weight")
+                .context("loading a.conv1d.3.weight")?;
+            let b = load_optional_vec_f32(gguf, &["a.conv1d.3.bias".to_string()])?;
+            let b = if b.is_empty() { vec![0.0; w.rows] } else { b };
+            (w, b)
+        };
+    anyhow::ensure!(
+        pre_encode_out_w.rows == n_embd
+            && pre_encode_out_w.cols == expected_pre_encode_cols
+            && pre_encode_out_b.len() == n_embd,
+        "lfm3a pre_encode_out shape ({}, {}) / bias len ({}) mismatch expected ({n_embd}, {expected_pre_encode_cols})",
+        pre_encode_out_w.rows,
+        pre_encode_out_w.cols,
+        pre_encode_out_b.len()
+    );
+    let conv_stem = ConvStemWeights {
+        layers: stem_layers,
+        pre_encode_out_w,
+        pre_encode_out_b,
+    };
+
+    let mut layers = Vec::new();
+    for il in 0..n_layer {
+        layers.push(load_lfm3a_block(
+            gguf,
+            il,
+            n_embd,
+            n_head,
+            n_head_kv,
+            n_embd_kv,
+            d_head,
+            rope_theta,
+            sliding_window,
+        )?);
+    }
+
+    let n_ff = layers[0].ffn_up_w.rows;
+    anyhow::ensure!(n_ff > 0, "lfm3a block 0 ffn_up rows must be > 0");
+    for (il, layer) in layers.iter().enumerate() {
+        anyhow::ensure!(
+            layer.ffn_up_w.rows == n_ff && layer.ffn_up_w.cols == n_embd,
+            "lfm3a block {il} ffn_up shape ({}, {}) != ({n_ff}, {n_embd})",
+            layer.ffn_up_w.rows,
+            layer.ffn_up_w.cols
+        );
+        anyhow::ensure!(
+            layer.ffn_up_1_w.rows == n_ff && layer.ffn_up_1_w.cols == n_embd,
+            "lfm3a block {il} ffn_gate shape ({}, {}) != ({n_ff}, {n_embd})",
+            layer.ffn_up_1_w.rows,
+            layer.ffn_up_1_w.cols
+        );
+        anyhow::ensure!(
+            layer.ffn_down_w.rows == n_embd && layer.ffn_down_w.cols == n_ff,
+            "lfm3a block {il} ffn_down shape ({}, {}) != ({n_embd}, {n_ff})",
+            layer.ffn_down_w.rows,
+            layer.ffn_down_w.cols
+        );
+    }
+
+    // Store post-trunk RMSNorm (`a.post_ln.weight` or `a.output_norm.weight`) in
+    // `layers[0].lfm3a.post_ln_w`.
+    let post_ln = load_optional_vec_f32(
+        gguf,
+        &[
+            "a.post_ln.weight".to_string(),
+            "a.output_norm.weight".to_string(),
+        ],
+    )?;
+    if !post_ln.is_empty() {
+        anyhow::ensure!(
+            post_ln.len() == n_embd,
+            "a.post_ln.weight len ({}) != n_embd ({n_embd})",
+            post_ln.len()
+        );
+        if let Some(extras) = layers[0].lfm3a.as_mut() {
+            extras.post_ln_w = post_ln;
+        }
+    }
+
+    let (down_w_name, down_b_name) = if gguf.tensors.contains_key("mm.a.mlp.3.weight") {
+        ("mm.a.mlp.3.weight", "mm.a.mlp.3.bias")
+    } else {
+        ("mm.a.mlp.2.weight", "mm.a.mlp.2.bias")
+    };
+    let mlp_adapter = AudioMlpAdapterWeights {
+        norm_w: load_vec_f32(gguf, "mm.a.mlp.0.weight")?,
+        norm_b: load_vec_f32(gguf, "mm.a.mlp.0.bias")?,
+        up_w: MmapWeight::from_gguf(gguf, "mm.a.mlp.1.weight")
+            .context("loading mm.a.mlp.1.weight")?,
+        up_b: load_vec_f32(gguf, "mm.a.mlp.1.bias")?,
+        down_w: MmapWeight::from_gguf(gguf, down_w_name)
+            .with_context(|| format!("loading {down_w_name}"))?,
+        down_b: load_vec_f32(gguf, down_b_name)?,
+    };
+    let mlp_hidden = mlp_adapter.up_w.rows;
+    let llm_hidden_size = mlp_adapter.down_w.rows;
+    anyhow::ensure!(
+        mlp_adapter.norm_w.len() == n_embd
+            && mlp_adapter.norm_b.len() == n_embd
+            && mlp_hidden > 0
+            && mlp_adapter.up_w.cols == n_embd
+            && mlp_adapter.up_b.len() == mlp_hidden
+            && llm_hidden_size > 0
+            && mlp_adapter.down_w.cols == mlp_hidden
+            && mlp_adapter.down_b.len() == llm_hidden_size,
+        "lfm3a mlp_adapter shapes invalid for n_embd={n_embd}"
+    );
+
+    let config = AudioEncoderConfig {
+        n_layer,
+        n_embd,
+        n_ff,
+        n_head,
+        eps,
+        n_mel_bins,
+        llm_hidden_size,
+    };
+
+    Ok(AudioEncoderWeights {
+        config,
+        conv_stem,
+        layers,
+        mlp_adapter,
+    })
+}
+
+/// Load one hybrid ShortConv or Attention block for `lfm3a`.
+#[allow(clippy::too_many_arguments)]
+fn load_lfm3a_block(
+    gguf: &Arc<GgufFile>,
+    il: usize,
+    n_embd: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    n_embd_kv: usize,
+    d_head: usize,
+    rope_theta: f32,
+    sliding_window: usize,
+) -> Result<ConformerLayerWeights> {
+    let pfx = format!("a.blk.{il}");
+    let dummy_wt = || MmapWeight::from_owned_f32(Vec::new(), 0, 0);
+
+    let ln1_w = load_vec_f32(gguf, &format!("{pfx}.ln1.weight"))
+        .or_else(|_| load_vec_f32(gguf, &format!("{pfx}.attn_norm.weight")))
+        .with_context(|| format!("loading {pfx}.ln1.weight"))?;
+    anyhow::ensure!(
+        ln1_w.len() == n_embd,
+        "lfm3a block {il} ln1.weight len ({}) != n_embd ({n_embd})",
+        ln1_w.len()
+    );
+
+    let attn_post_norm_w = load_optional_vec_f32(
+        gguf,
+        &[
+            format!("{pfx}.attn_post_norm.weight"),
+            format!("{pfx}.post_attention_norm.weight"),
+        ],
+    )?;
+    if !attn_post_norm_w.is_empty() {
+        anyhow::ensure!(
+            attn_post_norm_w.len() == n_embd,
+            "lfm3a block {il} attn_post_norm.weight len ({}) != n_embd ({n_embd})",
+            attn_post_norm_w.len()
+        );
+    }
+
+    let ln2_w = load_vec_f32(gguf, &format!("{pfx}.ln2.weight"))
+        .or_else(|_| load_vec_f32(gguf, &format!("{pfx}.ffn_norm.weight")))
+        .with_context(|| format!("loading {pfx}.ln2.weight"))?;
+    anyhow::ensure!(
+        ln2_w.len() == n_embd,
+        "lfm3a block {il} ln2.weight len ({}) != n_embd ({n_embd})",
+        ln2_w.len()
+    );
+
+    let ffn_post_norm_w = load_optional_vec_f32(
+        gguf,
+        &[
+            format!("{pfx}.ffn_post_norm.weight"),
+            format!("{pfx}.post_ffw_norm.weight"),
+        ],
+    )?;
+    if !ffn_post_norm_w.is_empty() {
+        anyhow::ensure!(
+            ffn_post_norm_w.len() == n_embd,
+            "lfm3a block {il} ffn_post_norm.weight len ({}) != n_embd ({n_embd})",
+            ffn_post_norm_w.len()
+        );
+    }
+
+    let ffn_up_1_w = MmapWeight::from_gguf(gguf, &format!("{pfx}.ffn_gate.weight"))
+        .with_context(|| format!("loading {pfx}.ffn_gate.weight"))?;
+    let ffn_up_w = MmapWeight::from_gguf(gguf, &format!("{pfx}.ffn_up.weight"))
+        .with_context(|| format!("loading {pfx}.ffn_up.weight"))?;
+    let ffn_down_w = MmapWeight::from_gguf(gguf, &format!("{pfx}.ffn_down.weight"))
+        .with_context(|| format!("loading {pfx}.ffn_down.weight"))?;
+
+    let is_shortconv = gguf.tensors.contains_key(&format!("{pfx}.conv_dw.weight"))
+        || gguf
+            .tensors
+            .contains_key(&format!("{pfx}.shortconv.conv.weight"));
+
+    if is_shortconv {
+        let conv_dw_t = gguf
+            .get_tensor(&format!("{pfx}.conv_dw.weight"))
+            .or_else(|_| gguf.get_tensor(&format!("{pfx}.shortconv.conv.weight")))
+            .with_context(|| format!("loading {pfx}.conv_dw.weight"))?;
+        let conv_dw_shape = conv_dw_t.shape().to_vec();
+        let conv_dw_w = conv_dw_t.try_to_f32_vec()?;
+        let conv_dw_b = load_optional_vec_f32(
+            gguf,
+            &[
+                format!("{pfx}.conv_dw.bias"),
+                format!("{pfx}.shortconv.conv.bias"),
+            ],
+        )?;
+        anyhow::ensure!(
+            (conv_dw_shape.len() == 2 || conv_dw_shape.len() == 3)
+                && conv_dw_shape[0] > 0
+                && conv_dw_w.len() == conv_dw_shape[0] * n_embd
+                && (conv_dw_b.is_empty() || conv_dw_b.len() == n_embd),
+            "lfm3a block {il} conv_dw shape {:?} / len ({}) / bias len ({}) invalid for n_embd={n_embd}",
+            conv_dw_shape,
+            conv_dw_w.len(),
+            conv_dw_b.len()
+        );
+
+        let conv_pw1_w = MmapWeight::from_gguf(gguf, &format!("{pfx}.conv_pw1.weight"))
+            .or_else(|_| MmapWeight::from_gguf(gguf, &format!("{pfx}.shortconv.in_proj.weight")))
+            .with_context(|| format!("loading {pfx}.conv_pw1.weight"))?;
+        let conv_pw1_b = load_optional_vec_f32(
+            gguf,
+            &[
+                format!("{pfx}.conv_pw1.bias"),
+                format!("{pfx}.shortconv.in_proj.bias"),
+            ],
+        )?;
+
+        let conv_pw2_w = MmapWeight::from_gguf(gguf, &format!("{pfx}.conv_pw2.weight"))
+            .or_else(|_| MmapWeight::from_gguf(gguf, &format!("{pfx}.shortconv.out_proj.weight")))
+            .with_context(|| format!("loading {pfx}.conv_pw2.weight"))?;
+        let conv_pw2_b = load_optional_vec_f32(
+            gguf,
+            &[
+                format!("{pfx}.conv_pw2.bias"),
+                format!("{pfx}.shortconv.out_proj.bias"),
+            ],
+        )?;
+
+        anyhow::ensure!(
+            conv_pw1_w.rows == 3 * n_embd
+                && conv_pw1_w.cols == n_embd
+                && (conv_pw1_b.is_empty() || conv_pw1_b.len() == 3 * n_embd),
+            "lfm3a block {il} conv_pw1 shape ({}, {}) / bias len ({}) != ({}, {n_embd})",
+            conv_pw1_w.rows,
+            conv_pw1_w.cols,
+            conv_pw1_b.len(),
+            3 * n_embd
+        );
+        anyhow::ensure!(
+            conv_pw2_w.rows == n_embd
+                && conv_pw2_w.cols == n_embd
+                && (conv_pw2_b.is_empty() || conv_pw2_b.len() == n_embd),
+            "lfm3a block {il} conv_pw2 shape ({}, {}) / bias len ({}) != ({n_embd}, {n_embd})",
+            conv_pw2_w.rows,
+            conv_pw2_w.cols,
+            conv_pw2_b.len()
+        );
+
+        Ok(ConformerLayerWeights {
+            ffn_norm_w: Vec::new(),
+            ffn_norm_b: Vec::new(),
+            ffn_up_w,
+            ffn_up_b: Vec::new(),
+            ffn_down_w,
+            ffn_down_b: Vec::new(),
+            ln1_w,
+            ln1_b: Vec::new(),
+            attn_q_w: dummy_wt(),
+            attn_q_b: Vec::new(),
+            attn_k_w: dummy_wt(),
+            attn_k_b: Vec::new(),
+            attn_v_w: dummy_wt(),
+            attn_v_b: Vec::new(),
+            attn_o_w: dummy_wt(),
+            attn_o_b: Vec::new(),
+            pos_bias_u: Vec::new(),
+            pos_bias_v: Vec::new(),
+            linear_pos_w: dummy_wt(),
+            norm_conv_w: Vec::new(),
+            norm_conv_b: Vec::new(),
+            conv_pw1_w,
+            conv_pw1_b,
+            conv_dw_w,
+            conv_dw_b,
+            conv_dw_shape,
+            conv_norm_w: Vec::new(),
+            conv_norm_b: Vec::new(),
+            conv_pw2_w,
+            conv_pw2_b,
+            ffn_norm_1_w: Vec::new(),
+            ffn_norm_1_b: Vec::new(),
+            ffn_up_1_w,
+            ffn_up_1_b: Vec::new(),
+            ffn_down_1_w: dummy_wt(),
+            ffn_down_1_b: Vec::new(),
+            ln2_w,
+            ln2_b: Vec::new(),
+            lfm3a: Some(Lfm3aLayerExtras {
+                q_norm_w: Vec::new(),
+                k_norm_w: Vec::new(),
+                attn_gate_w: None,
+                attn_post_norm_w,
+                ffn_post_norm_w,
+                post_ln_w: Vec::new(),
+                rope_theta,
+                n_head_kv,
+                sliding_window,
+            }),
+        })
+    } else {
+        let attn_q_w = MmapWeight::from_gguf(gguf, &format!("{pfx}.attn_q.weight"))
+            .with_context(|| format!("loading {pfx}.attn_q.weight"))?;
+        let attn_q_b = load_optional_vec_f32(gguf, &[format!("{pfx}.attn_q.bias")])?;
+        let attn_k_w = MmapWeight::from_gguf(gguf, &format!("{pfx}.attn_k.weight"))
+            .with_context(|| format!("loading {pfx}.attn_k.weight"))?;
+        let attn_k_b = load_optional_vec_f32(gguf, &[format!("{pfx}.attn_k.bias")])?;
+        let attn_v_w = MmapWeight::from_gguf(gguf, &format!("{pfx}.attn_v.weight"))
+            .with_context(|| format!("loading {pfx}.attn_v.weight"))?;
+        let attn_v_b = load_optional_vec_f32(gguf, &[format!("{pfx}.attn_v.bias")])?;
+        let attn_o_w = MmapWeight::from_gguf(gguf, &format!("{pfx}.attn_out.weight"))
+            .or_else(|_| MmapWeight::from_gguf(gguf, &format!("{pfx}.attn_output.weight")))
+            .with_context(|| format!("loading {pfx}.attn_out.weight"))?;
+        let attn_o_b = load_optional_vec_f32(
+            gguf,
+            &[
+                format!("{pfx}.attn_out.bias"),
+                format!("{pfx}.attn_output.bias"),
+            ],
+        )?;
+        let q_norm_w = load_vec_f32(gguf, &format!("{pfx}.attn_q_norm.weight"))
+            .with_context(|| format!("loading {pfx}.attn_q_norm.weight"))?;
+        let k_norm_w = load_vec_f32(gguf, &format!("{pfx}.attn_k_norm.weight"))
+            .with_context(|| format!("loading {pfx}.attn_k_norm.weight"))?;
+        let attn_gate_w = if gguf
+            .tensors
+            .contains_key(&format!("{pfx}.attn_gate.weight"))
+        {
+            let gw = MmapWeight::from_gguf(gguf, &format!("{pfx}.attn_gate.weight"))
+                .with_context(|| format!("loading {pfx}.attn_gate.weight"))?;
+            anyhow::ensure!(
+                gw.cols == n_embd && (gw.rows == n_head || gw.rows == n_head * d_head),
+                "lfm3a block {il} attn_gate.weight shape ({}, {}) != ({n_head} or {}, {n_embd})",
+                gw.rows,
+                gw.cols,
+                n_head * d_head,
+            );
+            Some(gw)
+        } else {
+            None
+        };
+
+        anyhow::ensure!(
+            attn_q_w.rows == n_embd && attn_q_w.cols == n_embd,
+            "lfm3a block {il} attn_q shape ({}, {}) != ({n_embd}, {n_embd})",
+            attn_q_w.rows,
+            attn_q_w.cols
+        );
+        anyhow::ensure!(
+            attn_k_w.rows == n_embd_kv && attn_k_w.cols == n_embd,
+            "lfm3a block {il} attn_k shape ({}, {}) != ({n_embd_kv}, {n_embd})",
+            attn_k_w.rows,
+            attn_k_w.cols
+        );
+        anyhow::ensure!(
+            attn_v_w.rows == n_embd_kv && attn_v_w.cols == n_embd,
+            "lfm3a block {il} attn_v shape ({}, {}) != ({n_embd_kv}, {n_embd})",
+            attn_v_w.rows,
+            attn_v_w.cols
+        );
+        anyhow::ensure!(
+            attn_o_w.rows == n_embd && attn_o_w.cols == n_embd,
+            "lfm3a block {il} attn_out shape ({}, {}) != ({n_embd}, {n_embd})",
+            attn_o_w.rows,
+            attn_o_w.cols
+        );
+        anyhow::ensure!(
+            q_norm_w.len() == d_head && k_norm_w.len() == d_head,
+            "lfm3a block {il} q/k norm len ({}, {}) != d_head ({d_head})",
+            q_norm_w.len(),
+            k_norm_w.len()
+        );
+        for (b_name, b_vec, expected_len) in [
+            ("attn_q.bias", &attn_q_b, n_embd),
+            ("attn_k.bias", &attn_k_b, n_embd_kv),
+            ("attn_v.bias", &attn_v_b, n_embd_kv),
+            ("attn_out.bias", &attn_o_b, n_embd),
+        ] {
+            anyhow::ensure!(
+                b_vec.is_empty() || b_vec.len() == expected_len,
+                "lfm3a block {il} {b_name} len ({}) != expected ({expected_len})",
+                b_vec.len()
+            );
+        }
+
+        Ok(ConformerLayerWeights {
+            ffn_norm_w: Vec::new(),
+            ffn_norm_b: Vec::new(),
+            ffn_up_w,
+            ffn_up_b: Vec::new(),
+            ffn_down_w,
+            ffn_down_b: Vec::new(),
+            ln1_w,
+            ln1_b: Vec::new(),
+            attn_q_w,
+            attn_q_b,
+            attn_k_w,
+            attn_k_b,
+            attn_v_w,
+            attn_v_b,
+            attn_o_w,
+            attn_o_b,
+            pos_bias_u: Vec::new(),
+            pos_bias_v: Vec::new(),
+            linear_pos_w: dummy_wt(),
+            norm_conv_w: Vec::new(),
+            norm_conv_b: Vec::new(),
+            conv_pw1_w: dummy_wt(),
+            conv_pw1_b: Vec::new(),
+            conv_dw_w: Vec::new(),
+            conv_dw_b: Vec::new(),
+            conv_dw_shape: Vec::new(),
+            conv_norm_w: Vec::new(),
+            conv_norm_b: Vec::new(),
+            conv_pw2_w: dummy_wt(),
+            conv_pw2_b: Vec::new(),
+            ffn_norm_1_w: Vec::new(),
+            ffn_norm_1_b: Vec::new(),
+            ffn_up_1_w,
+            ffn_up_1_b: Vec::new(),
+            ffn_down_1_w: dummy_wt(),
+            ffn_down_1_b: Vec::new(),
+            ln2_w,
+            ln2_b: Vec::new(),
+            lfm3a: Some(Lfm3aLayerExtras {
+                q_norm_w,
+                k_norm_w,
+                attn_gate_w,
+                attn_post_norm_w,
+                ffn_post_norm_w,
+                post_ln_w: Vec::new(),
+                rope_theta,
+                n_head_kv,
+                sliding_window,
+            }),
+        })
+    }
+}
+
 /// Load one conv1d stem layer at the given positional index. Stem
 /// uses `a.conv1d.{idx}.weight` / `.bias` per llama.cpp's naming.
 pub(crate) fn load_conv_layer(gguf: &Arc<GgufFile>, idx: u32) -> Result<ConvLayerWeights> {
@@ -521,8 +1232,8 @@ pub(crate) fn load_conv_layer(gguf: &Arc<GgufFile>, idx: u32) -> Result<ConvLaye
     Ok(ConvLayerWeights {
         name: weight_name,
         shape: weight_t.shape().to_vec(),
-        weight: weight_t.to_f32_vec(),
-        bias: bias_t.to_f32_vec(),
+        weight: weight_t.try_to_f32_vec()?,
+        bias: bias_t.try_to_f32_vec()?,
     })
 }
 
@@ -533,7 +1244,7 @@ pub(crate) fn load_conformer_block(
 ) -> Result<ConformerLayerWeights> {
     let pfx = format!("a.blk.{il}");
 
-    // Helpers — keep the per-tensor lines short.
+    // Helpers to keep the per-tensor lines short.
     let wt_f32 = |name: &str| -> Result<MmapWeight> {
         MmapWeight::from_gguf(gguf, name).with_context(|| format!("loading {name}"))
     };
@@ -543,7 +1254,7 @@ pub(crate) fn load_conformer_block(
         .get_tensor(&format!("{pfx}.conv_dw.weight"))
         .with_context(|| format!("loading {pfx}.conv_dw.weight"))?;
     let conv_dw_shape = conv_dw_w_t.shape().to_vec();
-    let conv_dw_w = conv_dw_w_t.to_f32_vec();
+    let conv_dw_w = conv_dw_w_t.try_to_f32_vec()?;
     let conv_dw_b = vec_f32(&format!("{pfx}.conv_dw.bias"))?;
 
     Ok(ConformerLayerWeights {
@@ -590,6 +1301,7 @@ pub(crate) fn load_conformer_block(
         // Final norm
         ln2_w: vec_f32(&format!("{pfx}.ln2.weight"))?,
         ln2_b: vec_f32(&format!("{pfx}.ln2.bias"))?,
+        lfm3a: None,
     })
 }
 
@@ -598,7 +1310,19 @@ pub(crate) fn load_vec_f32(gguf: &Arc<GgufFile>, name: &str) -> Result<Vec<f32>>
     let tensor = gguf
         .get_tensor(name)
         .with_context(|| format!("loading {name}"))?;
-    Ok(tensor.to_f32_vec())
+    tensor
+        .try_to_f32_vec()
+        .with_context(|| format!("{name} cannot be read as f32"))
+}
+
+/// The first of `names` that exists in the file, as f32, or an empty vector when none does.
+/// A tensor that exists but cannot be read is an error, never "absent": treating it as absent
+/// would run the encoder without a norm or bias the file declares.
+pub(crate) fn load_optional_vec_f32(gguf: &Arc<GgufFile>, names: &[String]) -> Result<Vec<f32>> {
+    match names.iter().find(|n| gguf.tensors.contains_key(*n)) {
+        Some(name) => load_vec_f32(gguf, name),
+        None => Ok(Vec::new()),
+    }
 }
 
 // ── Relative positional embeddings ─────────────────────────────────
@@ -1618,6 +2342,10 @@ pub fn audio_encoder_forward(
     n_frames: usize,
     weights: &AudioEncoderWeights,
 ) -> (Vec<f32>, usize) {
+    if weights.is_lfm3a() {
+        return audio_encoder_forward_lfm3a(mel, n_frames, weights);
+    }
+
     let cfg = &weights.config;
     let n_embd = cfg.n_embd;
     let n_ff = cfg.n_ff;
@@ -1635,7 +2363,7 @@ pub fn audio_encoder_forward(
     // Stage 2: relative-position embedding (built once per chunk).
     let pos_emb = relative_pos_emb(t_out);
 
-    // Pre-allocate FFN scratch — same shape every block, reused
+    // Pre-allocate FFN scratch: same shape every block, reused
     // across all 2 * n_layer FFN calls.
     let mut scratch_pre_norm = vec![0.0f32; n_embd];
     let mut scratch_ff = vec![0.0f32; n_ff];
@@ -1666,7 +2394,7 @@ pub fn audio_encoder_forward(
         );
     }
 
-    // Stage 4: MLP adapter — per-timestep LN + 2-layer MLP with
+    // Stage 4: MLP adapter: per-timestep LN + 2-layer MLP with
     // GELU. Projects from `n_embd` to `llm_hidden_size`. No
     // residual. Reuses `scratch_pre_norm` for the LN output.
     let n_ff_adapter = weights.mlp_adapter.up_w.rows;
@@ -1741,9 +2469,562 @@ pub fn audio_encoder_forward(
     (encoder_out, t_out)
 }
 
-/// Convenience entry point: PCM samples → per-frame embeddings in
+/// Run the LFM3A conv2d subsampling stem on a single mel-spectrogram chunk.
+///
+/// Supports both:
+/// - the 5-layer depthwise-separable stem (`a.conv1d.{0,2,3,5,6}` with SiLU after
+///   positions 0, 2, 4), and
+/// - the 3-layer stride-2 stem (`a.conv1d.{0,1,2}` with SiLU after every layer).
+///
+/// Followed by `(channel, time, freq) -> (time, channel * freq)` permutation and linear
+/// projection (`a.pre_encode.out` or `a.conv1d.3`) to `n_embd`.
+pub fn conv_stem_forward_lfm3a(
+    mel: &[f32],
+    n_frames: usize,
+    weights: &ConvStemWeights,
+    config: &AudioEncoderConfig,
+) -> (Vec<f32>, usize) {
+    let n_mel_bins = config.n_mel_bins;
+    let n_embd = config.n_embd;
+
+    assert_eq!(
+        mel.len(),
+        n_frames * n_mel_bins,
+        "conv_stem_forward_lfm3a: mel.len() = {} != n_frames * n_mel_bins = {} * {}",
+        mel.len(),
+        n_frames,
+        n_mel_bins,
+    );
+    let n_stem = weights.layers.len();
+    assert!(
+        n_stem == 5 || n_stem == 3,
+        "conv_stem_forward_lfm3a: expected 5 or 3 stem conv layers; got {n_stem}",
+    );
+
+    if n_frames == 0 {
+        return (Vec::new(), 0);
+    }
+
+    // Transpose time-major `[n_frames, n_mel_bins]` into `[n_mel_bins, n_frames]`
+    // so `cur_h = n_mel_bins` (frequency) and `cur_w = n_frames` (time), matching
+    // PyTorch `[batch, 1, n_mel, n_frames]` and `lfm3a.cpp` (`ne0 = n_frames`,
+    // `ne1 = n_mel` passed without pre-transposing into `ggml_conv_2d`).
+    let mut cur_data = vec![0.0f32; n_mel_bins * n_frames];
+    for t in 0..n_frames {
+        let src_row = &mel[t * n_mel_bins..(t + 1) * n_mel_bins];
+        for (m, &val) in src_row.iter().enumerate() {
+            cur_data[m * n_frames + t] = val;
+        }
+    }
+    let mut cur_ch: usize = 1;
+    let mut cur_h: usize = n_mel_bins;
+    let mut cur_w: usize = n_frames;
+
+    for (pos, layer) in weights.layers.iter().enumerate() {
+        assert_eq!(
+            layer.shape.len(),
+            4,
+            "lfm3a conv stem layer {pos}: expected 4-dim weight shape, got {:?}",
+            layer.shape
+        );
+        let kw = layer.shape[0];
+        let kh = layer.shape[1];
+        let in_per_group = layer.shape[2];
+        let out_ch = layer.shape[3];
+
+        let (groups, stride, pad, apply_silu) = if n_stem == 5 {
+            let modes: [(usize, usize, usize, bool); 5] = [
+                (1, 2, 1, true),
+                (cur_ch, 2, 1, false),
+                (1, 1, 0, true),
+                (cur_ch, 2, 1, false),
+                (1, 1, 0, true),
+            ];
+            modes[pos]
+        } else {
+            let groups = if in_per_group == 1 && cur_ch > 1 {
+                cur_ch
+            } else {
+                1
+            };
+            (groups, 2, 1, true)
+        };
+
+        assert_eq!(
+            in_per_group * groups,
+            cur_ch,
+            "lfm3a conv stem layer {pos}: in_per_group ({in_per_group}) * groups ({groups}) != cur_ch ({cur_ch})"
+        );
+
+        let two_pad = pad
+            .checked_mul(2)
+            .expect("conv_stem_forward_lfm3a: 2 * pad overflowed usize");
+        let padded_h = cur_h
+            .checked_add(two_pad)
+            .expect("conv_stem_forward_lfm3a: cur_h + 2 * pad overflowed usize");
+        let padded_w = cur_w
+            .checked_add(two_pad)
+            .expect("conv_stem_forward_lfm3a: cur_w + 2 * pad overflowed usize");
+        assert!(
+            padded_h >= kh && padded_w >= kw,
+            "lfm3a conv stem layer {pos}: kernel ({kh}x{kw}) > padded ({padded_h}x{padded_w})"
+        );
+        let new_h = (padded_h - kh) / stride + 1;
+        let new_w = (padded_w - kw) / stride + 1;
+        let next_len = out_ch
+            .checked_mul(new_h)
+            .and_then(|v| v.checked_mul(new_w))
+            .expect("conv_stem_forward_lfm3a: out_ch * new_h * new_w overflowed usize");
+        let mut next = vec![0.0f32; next_len];
+        crate::backend::cpu::conv2d(
+            &cur_data,
+            &layer.weight,
+            Some(&layer.bias),
+            &mut next,
+            cur_ch,
+            out_ch,
+            cur_h,
+            cur_w,
+            kh,
+            kw,
+            stride,
+            stride,
+            pad,
+            pad,
+            groups,
+        );
+        if apply_silu {
+            crate::backend::cpu::silu_inplace(&mut next);
+        }
+
+        cur_data = next;
+        cur_ch = out_ch;
+        cur_h = new_h;
+        cur_w = new_w;
+    }
+
+    let f_out = cur_h;
+    let t_out = cur_w;
+    let plane = cur_ch * f_out;
+    assert_eq!(weights.pre_encode_out_w.cols, plane);
+    assert_eq!(weights.pre_encode_out_w.rows, n_embd);
+    assert_eq!(weights.pre_encode_out_b.len(), n_embd);
+
+    let mut flat_seq = vec![0.0f32; t_out * plane];
+    for ti in 0..t_out {
+        let dst_row = &mut flat_seq[ti * plane..(ti + 1) * plane];
+        for (k, dst) in dst_row.iter_mut().enumerate() {
+            *dst = cur_data[k * t_out + ti];
+        }
+    }
+    let mut encoder_in = vec![0.0f32; t_out * n_embd];
+    weights
+        .pre_encode_out_w
+        .batched_matmul(&flat_seq, &mut encoder_in, t_out);
+    if !weights.pre_encode_out_b.is_empty() {
+        for ti in 0..t_out {
+            crate::backend::cpu::add_inplace(
+                &mut encoder_in[ti * n_embd..(ti + 1) * n_embd],
+                &weights.pre_encode_out_b,
+            );
+        }
+    }
+
+    (encoder_in, t_out)
+}
+
+/// Apply Neox-style rotary position embedding in place to a single head vector of length `d_head`.
+fn apply_rope_neox_head(head: &mut [f32], pos: usize, rope_theta: f32) {
+    let d_head = head.len();
+    let half = d_head / 2;
+    if half == 0 {
+        return;
+    }
+    let base = rope_theta as f64;
+    let pos_f = pos as f64;
+    let inv_freq_step = base.powf(-2.0 / d_head as f64);
+    let mut inv_freq = 1.0f64;
+    for i in 0..half {
+        let freq = pos_f * inv_freq;
+        let (sin, cos) = (freq as f32).sin_cos();
+        let x0 = head[i];
+        let x1 = head[i + half];
+        head[i] = x0 * cos - x1 * sin;
+        head[i + half] = x0 * sin + x1 * cos;
+        inv_freq *= inv_freq_step;
+    }
+}
+
+/// Run one LFM3A hybrid block (either ShortConv or sliding-window Attention, followed by SwiGLU FFN)
+/// in place on a `[t, n_embd]` time-major sequence.
+#[allow(clippy::too_many_arguments)]
+pub fn lfm3a_block_forward(
+    x: &mut [f32],
+    layer: &ConformerLayerWeights,
+    n_embd: usize,
+    n_ff: usize,
+    n_head: usize,
+    n_head_kv: usize,
+    t: usize,
+    eps: f32,
+    rope_theta: f32,
+    sliding_window: usize,
+) {
+    if t == 0 {
+        return;
+    }
+    // `load_lfm3a_encoder` fills the extras of every layer; the Conformer fields of an LFM3A
+    // layer are placeholders, so nothing here may read them.
+    let extras = layer
+        .lfm3a
+        .as_ref()
+        .expect("lfm3a_block_forward: the layer has no Lfm3aLayerExtras");
+    let attn_post_norm_w = extras.attn_post_norm_w.as_slice();
+    let ffn_post_norm_w = extras.ffn_post_norm_w.as_slice();
+
+    let mut norm_mat = x[..t * n_embd].to_vec();
+    for ti in 0..t {
+        crate::backend::cpu::rmsnorm(
+            &mut norm_mat[ti * n_embd..(ti + 1) * n_embd],
+            &layer.ln1_w,
+            eps,
+        );
+    }
+
+    let is_shortconv = !layer.conv_dw_w.is_empty();
+    if is_shortconv {
+        let dw_rank = layer.conv_dw_shape.len();
+        assert!(
+            dw_rank == 2 || dw_rank == 3,
+            "lfm3a_block_forward: expected 2- or 3-dim conv_dw shape, got {:?}",
+            layer.conv_dw_shape
+        );
+        let kernel_size = layer.conv_dw_shape[0];
+        assert!(kernel_size > 0, "lfm3a ShortConv kernel_size must be > 0");
+        assert_eq!(kernel_size * n_embd, layer.conv_dw_w.len());
+
+        let pad_left = kernel_size - 1;
+        let t_padded = t + pad_left;
+        let mut bcx_mat = vec![0.0f32; t * 3 * n_embd];
+        layer.conv_pw1_w.batched_matmul(&norm_mat, &mut bcx_mat, t);
+        if !layer.conv_pw1_b.is_empty() {
+            for ti in 0..t {
+                crate::backend::cpu::add_inplace(
+                    &mut bcx_mat[ti * 3 * n_embd..(ti + 1) * 3 * n_embd],
+                    &layer.conv_pw1_b,
+                );
+            }
+        }
+
+        let mut padded_bx = vec![0.0f32; n_embd * t_padded];
+        let mut c_gate = vec![0.0f32; t * n_embd];
+        for ti in 0..t {
+            let bcx = &bcx_mat[ti * 3 * n_embd..(ti + 1) * 3 * n_embd];
+            let (b_part, rest) = bcx.split_at(n_embd);
+            let (c_part, x_part) = rest.split_at(n_embd);
+            c_gate[ti * n_embd..(ti + 1) * n_embd].copy_from_slice(c_part);
+            for ch in 0..n_embd {
+                padded_bx[ch * t_padded + pad_left + ti] = b_part[ch] * x_part[ch];
+            }
+        }
+
+        let mut conv_out = vec![0.0f32; n_embd * t];
+        let dw_bias = if layer.conv_dw_b.is_empty() {
+            None
+        } else {
+            Some(layer.conv_dw_b.as_slice())
+        };
+        let t_out = crate::backend::cpu::conv1d(
+            &padded_bx,
+            &layer.conv_dw_w,
+            dw_bias,
+            &mut conv_out,
+            n_embd,
+            n_embd,
+            t_padded,
+            kernel_size,
+            1,
+            0,
+            n_embd,
+        );
+        debug_assert_eq!(t_out, t);
+
+        for ti in 0..t {
+            let c_row = &c_gate[ti * n_embd..(ti + 1) * n_embd];
+            let y_in = &mut norm_mat[ti * n_embd..(ti + 1) * n_embd];
+            for ch in 0..n_embd {
+                y_in[ch] = conv_out[ch * t + ti] * c_row[ch];
+            }
+        }
+        let mut y_out = vec![0.0f32; t * n_embd];
+        layer.conv_pw2_w.batched_matmul(&norm_mat, &mut y_out, t);
+        for ti in 0..t {
+            let out_row = &mut y_out[ti * n_embd..(ti + 1) * n_embd];
+            if !layer.conv_pw2_b.is_empty() {
+                crate::backend::cpu::add_inplace(out_row, &layer.conv_pw2_b);
+            }
+            if !attn_post_norm_w.is_empty() {
+                crate::backend::cpu::rmsnorm(out_row, attn_post_norm_w, eps);
+            }
+        }
+        crate::backend::cpu::add_inplace(&mut x[..t * n_embd], &y_out);
+    } else {
+        let d_head = n_embd / n_head;
+        let n_embd_kv = n_head_kv * d_head;
+        let n_rep = n_head / n_head_kv;
+        let q_norm_w = extras.q_norm_w.as_slice();
+        let k_norm_w = extras.k_norm_w.as_slice();
+        let gate_w = extras.attn_gate_w.as_ref();
+        let gate_rows = gate_w.map(|gw| gw.rows).unwrap_or(0);
+        if let Some(gw) = gate_w {
+            assert!(
+                gw.cols == n_embd && (gw.rows == n_head || gw.rows == n_head * d_head),
+                "lfm3a_block_forward: invalid attn_gate shape ({}, {}) for n_head={n_head}, n_embd={n_embd}",
+                gw.rows,
+                gw.cols
+            );
+        }
+
+        let mut q_proj = vec![0.0f32; t * n_embd];
+        let mut k_proj = vec![0.0f32; t * n_embd_kv];
+        let mut v_proj = vec![0.0f32; t * n_embd_kv];
+        layer.attn_q_w.batched_matmul(&norm_mat, &mut q_proj, t);
+        layer.attn_k_w.batched_matmul(&norm_mat, &mut k_proj, t);
+        layer.attn_v_w.batched_matmul(&norm_mat, &mut v_proj, t);
+        let mut gate_proj = if let Some(gw) = gate_w {
+            let mut g = vec![0.0f32; t * gate_rows];
+            gw.batched_matmul(&norm_mat, &mut g, t);
+            g
+        } else {
+            Vec::new()
+        };
+
+        for ti in 0..t {
+            let q_row = &mut q_proj[ti * n_embd..(ti + 1) * n_embd];
+            if !layer.attn_q_b.is_empty() {
+                crate::backend::cpu::add_inplace(q_row, &layer.attn_q_b);
+            }
+            let k_row = &mut k_proj[ti * n_embd_kv..(ti + 1) * n_embd_kv];
+            if !layer.attn_k_b.is_empty() {
+                crate::backend::cpu::add_inplace(k_row, &layer.attn_k_b);
+            }
+            let v_row = &mut v_proj[ti * n_embd_kv..(ti + 1) * n_embd_kv];
+            if !layer.attn_v_b.is_empty() {
+                crate::backend::cpu::add_inplace(v_row, &layer.attn_v_b);
+            }
+            for h in 0..n_head {
+                let q_head = &mut q_row[h * d_head..(h + 1) * d_head];
+                crate::backend::cpu::rmsnorm(q_head, q_norm_w, eps);
+                apply_rope_neox_head(q_head, ti, rope_theta);
+            }
+            for h_kv in 0..n_head_kv {
+                let k_head = &mut k_row[h_kv * d_head..(h_kv + 1) * d_head];
+                crate::backend::cpu::rmsnorm(k_head, k_norm_w, eps);
+                apply_rope_neox_head(k_head, ti, rope_theta);
+            }
+        }
+
+        let scale = 1.0f64 / (d_head as f64).sqrt();
+        let mut attn_v = vec![0.0f32; t * n_embd];
+        let mut scores = vec![0.0f32; t];
+        let mut acc = vec![0.0f64; d_head];
+
+        for h in 0..n_head {
+            let h_kv = h / n_rep;
+            for q in 0..t {
+                let k_start = if sliding_window > 0 {
+                    q.saturating_sub(sliding_window - 1)
+                } else {
+                    0
+                };
+                let k_end = q + 1;
+                let q_head = &q_proj[q * n_embd + h * d_head..q * n_embd + (h + 1) * d_head];
+                let score_slice = &mut scores[..k_end - k_start];
+                for (idx, k) in (k_start..k_end).enumerate() {
+                    let k_head =
+                        &k_proj[k * n_embd_kv + h_kv * d_head..k * n_embd_kv + (h_kv + 1) * d_head];
+                    let mut dot = 0.0f64;
+                    for d in 0..d_head {
+                        dot += q_head[d] as f64 * k_head[d] as f64;
+                    }
+                    score_slice[idx] = (dot * scale) as f32;
+                }
+                crate::backend::cpu::softmax_inplace(score_slice);
+
+                acc.fill(0.0);
+                for (idx, k) in (k_start..k_end).enumerate() {
+                    let w = score_slice[idx] as f64;
+                    let v_head =
+                        &v_proj[k * n_embd_kv + h_kv * d_head..k * n_embd_kv + (h_kv + 1) * d_head];
+                    for d in 0..d_head {
+                        acc[d] += w * v_head[d] as f64;
+                    }
+                }
+                let out_head = &mut attn_v[q * n_embd + h * d_head..q * n_embd + (h + 1) * d_head];
+                for d in 0..d_head {
+                    out_head[d] = acc[d] as f32;
+                }
+            }
+        }
+
+        if gate_rows == n_head {
+            for ti in 0..t {
+                let g_row = &gate_proj[ti * n_head..(ti + 1) * n_head];
+                for h in 0..n_head {
+                    let sig = 1.0f32 / (1.0f32 + (-g_row[h]).exp());
+                    let out_head =
+                        &mut attn_v[ti * n_embd + h * d_head..ti * n_embd + (h + 1) * d_head];
+                    for v in out_head.iter_mut() {
+                        *v *= sig;
+                    }
+                }
+            }
+        } else if gate_rows == n_head * d_head {
+            crate::backend::cpu::sigmoid_inplace(&mut gate_proj);
+            crate::backend::cpu::mul_inplace(&mut attn_v, &gate_proj);
+        }
+
+        let mut out_mat = vec![0.0f32; t * n_embd];
+        layer.attn_o_w.batched_matmul(&attn_v, &mut out_mat, t);
+        for ti in 0..t {
+            let out_row = &mut out_mat[ti * n_embd..(ti + 1) * n_embd];
+            if !layer.attn_o_b.is_empty() {
+                crate::backend::cpu::add_inplace(out_row, &layer.attn_o_b);
+            }
+            if !attn_post_norm_w.is_empty() {
+                crate::backend::cpu::rmsnorm(out_row, attn_post_norm_w, eps);
+            }
+        }
+        crate::backend::cpu::add_inplace(&mut x[..t * n_embd], &out_mat);
+    }
+
+    // SwiGLU FFN: x += post_norm?(ffn_down(silu(ffn_gate(rms_norm(x))) * ffn_up(rms_norm(x))))
+    norm_mat.copy_from_slice(&x[..t * n_embd]);
+    for ti in 0..t {
+        crate::backend::cpu::rmsnorm(
+            &mut norm_mat[ti * n_embd..(ti + 1) * n_embd],
+            &layer.ln2_w,
+            eps,
+        );
+    }
+    let mut gate_mat = vec![0.0f32; t * n_ff];
+    let mut up_mat = vec![0.0f32; t * n_ff];
+    let mut down_mat = vec![0.0f32; t * n_embd];
+    layer.ffn_up_1_w.batched_matmul(&norm_mat, &mut gate_mat, t);
+    layer.ffn_up_w.batched_matmul(&norm_mat, &mut up_mat, t);
+    crate::backend::cpu::silu_mul_inplace(&mut gate_mat, &up_mat);
+    layer.ffn_down_w.batched_matmul(&gate_mat, &mut down_mat, t);
+    if !ffn_post_norm_w.is_empty() {
+        for ti in 0..t {
+            crate::backend::cpu::rmsnorm(
+                &mut down_mat[ti * n_embd..(ti + 1) * n_embd],
+                ffn_post_norm_w,
+                eps,
+            );
+        }
+    }
+    crate::backend::cpu::add_inplace(&mut x[..t * n_embd], &down_mat);
+}
+
+/// Run the full LFM3A hybrid audio encoder on a single mel-spectrogram chunk.
+pub fn audio_encoder_forward_lfm3a(
+    mel: &[f32],
+    n_frames: usize,
+    weights: &AudioEncoderWeights,
+) -> (Vec<f32>, usize) {
+    let cfg = &weights.config;
+    let n_embd = cfg.n_embd;
+    let n_ff = cfg.n_ff;
+    let n_head = cfg.n_head;
+    let n_layer = cfg.n_layer;
+    let eps = cfg.eps;
+    let llm_hidden_size = cfg.llm_hidden_size;
+
+    let (mut x, t_out) = conv_stem_forward_lfm3a(mel, n_frames, &weights.conv_stem, cfg);
+    if t_out == 0 {
+        return (Vec::new(), 0);
+    }
+
+    assert_eq!(
+        weights.layers.len(),
+        n_layer,
+        "audio_encoder_forward_lfm3a: config.n_layer ({}) != weights.layers.len() ({})",
+        n_layer,
+        weights.layers.len()
+    );
+
+    let first_extras = weights
+        .layers
+        .first()
+        .and_then(|l| l.lfm3a.as_ref())
+        .expect("audio_encoder_forward_lfm3a: the layers have no Lfm3aLayerExtras");
+    let rope_theta = first_extras.rope_theta;
+    let n_head_kv = first_extras.n_head_kv.max(1);
+    let sliding_window = first_extras.sliding_window;
+
+    for il in 0..n_layer {
+        lfm3a_block_forward(
+            &mut x,
+            &weights.layers[il],
+            n_embd,
+            n_ff,
+            n_head,
+            n_head_kv,
+            t_out,
+            eps,
+            rope_theta,
+            sliding_window,
+        );
+    }
+
+    let post_ln_w = Some(first_extras.post_ln_w.as_slice()).filter(|w| !w.is_empty());
+    if let Some(post_ln_w) = post_ln_w {
+        for ti in 0..t_out {
+            let row = &mut x[ti * n_embd..(ti + 1) * n_embd];
+            crate::backend::cpu::rmsnorm(row, post_ln_w, eps);
+        }
+    }
+
+    let n_ff_adapter = weights.mlp_adapter.up_w.rows;
+    let total_out_len = t_out
+        .checked_mul(llm_hidden_size)
+        .expect("audio_encoder_forward_lfm3a: t_out * llm_hidden_size overflowed usize");
+
+    for ti in 0..t_out {
+        crate::backend::cpu::layer_norm_inplace(
+            &mut x[ti * n_embd..(ti + 1) * n_embd],
+            &weights.mlp_adapter.norm_w,
+            &weights.mlp_adapter.norm_b,
+            1e-5,
+        );
+    }
+    let mut adapter_mid = vec![0.0f32; t_out * n_ff_adapter];
+    weights
+        .mlp_adapter
+        .up_w
+        .batched_matmul(&x, &mut adapter_mid, t_out);
+    for ti in 0..t_out {
+        let mid_row = &mut adapter_mid[ti * n_ff_adapter..(ti + 1) * n_ff_adapter];
+        crate::backend::cpu::add_inplace(mid_row, &weights.mlp_adapter.up_b);
+        crate::backend::cpu::gelu_erf_inplace(mid_row);
+    }
+    let mut encoder_out = vec![0.0f32; total_out_len];
+    weights
+        .mlp_adapter
+        .down_w
+        .batched_matmul(&adapter_mid, &mut encoder_out, t_out);
+    for ti in 0..t_out {
+        let out_row = &mut encoder_out[ti * llm_hidden_size..(ti + 1) * llm_hidden_size];
+        crate::backend::cpu::add_inplace(out_row, &weights.mlp_adapter.down_b);
+    }
+
+    (encoder_out, t_out)
+}
+
+/// Convenience entry point: PCM samples -> per-frame embeddings in
 /// the LLM's hidden dimension. Wires
-/// [`crate::model::audio_preprocessor::log_mel_spectrogram`] into
+/// [`crate::model::audio_preprocessor::log_mel_spectrogram`] (or
+/// [`crate::model::audio_preprocessor::log_mel_spectrogram_lfm3a`] for `lfm3a` models) into
 /// [`audio_encoder_forward`] using the `n_mel_bins` value the
 /// encoder was loaded with.
 ///
@@ -1751,16 +3032,14 @@ pub fn audio_encoder_forward(
 /// `[-1, 1]`. Empty input returns `(vec![], 0)`.
 ///
 /// Returns `(encoder_out, t_out)` where `encoder_out` is a flat
-/// `[t_out × llm_hidden_size]` row-major buffer ready for soft-
+/// `[t_out x llm_hidden_size]` row-major buffer ready for soft-
 /// token injection into an LLM session.
-///
-/// This is a thin glue helper — callers that need to drive the
-/// preprocessor and encoder separately (e.g. for feature caching,
-/// chunked streaming, or to swap in a different mel preprocessor)
-/// can call those two stages directly.
 pub fn encode_audio_pcm(pcm: &[f32], weights: &AudioEncoderWeights) -> (Vec<f32>, usize) {
-    let (mel, n_frames) =
-        crate::model::audio_preprocessor::log_mel_spectrogram(pcm, weights.config.n_mel_bins);
+    let (mel, n_frames) = if weights.is_lfm3a() {
+        crate::model::audio_preprocessor::log_mel_spectrogram_lfm3a(pcm, weights.config.n_mel_bins)
+    } else {
+        crate::model::audio_preprocessor::log_mel_spectrogram(pcm, weights.config.n_mel_bins)
+    };
     if n_frames == 0 {
         return (Vec::new(), 0);
     }
@@ -1770,6 +3049,206 @@ pub fn encode_audio_pcm(pcm: &[f32], weights: &AudioEncoderWeights) -> (Vec<f32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn kv_heads_are_read_from_every_stored_shape() {
+        use crate::gguf::GgufValue as V;
+        assert_eq!(kv_heads_from_metadata(None), None);
+        assert_eq!(kv_heads_from_metadata(Some(&V::U32(8))), Some(8));
+        // a signed scalar is a count too, not "absent"
+        assert_eq!(kv_heads_from_metadata(Some(&V::I32(4))), Some(4));
+        assert_eq!(
+            kv_heads_from_metadata(Some(&V::Array(vec![V::I32(0), V::I32(2), V::I32(0)]))),
+            Some(2)
+        );
+        assert_eq!(
+            kv_heads_from_metadata(Some(&V::Array(vec![V::U32(0)]))),
+            None
+        );
+        assert_eq!(kv_heads_from_metadata(Some(&V::I32(0))), None);
+        assert_eq!(kv_heads_from_metadata(Some(&V::I32(-3))), None);
+    }
+
+    /// Deterministic, non-uniform values in roughly [-0.5, 0.5).
+    fn varied(seed: u32, n: usize) -> Vec<f32> {
+        let mut state = seed.wrapping_mul(2654435761).wrapping_add(12345);
+        (0..n)
+            .map(|_| {
+                state = state.wrapping_mul(1664525).wrapping_add(1013904223);
+                ((state >> 8) as f32 / (1u32 << 24) as f32) - 0.5
+            })
+            .collect()
+    }
+
+    /// One attention layer run over `t` rows of varied input; `sliding_window` steers the mask.
+    fn run_attn_block(rows: &[f32], t: usize, sliding_window: usize) -> Vec<f32> {
+        let dims = (8usize, 16usize, 2usize, 1usize);
+        let seed = std::cell::Cell::new(0u32);
+        let layer = lfm3a_test_attn_block(
+            &|n| {
+                seed.set(seed.get() + 1);
+                varied(seed.get(), n)
+            },
+            dims,
+            sliding_window,
+        );
+        let mut x = rows.to_vec();
+        lfm3a_block_forward(
+            &mut x,
+            &layer,
+            dims.0,
+            dims.1,
+            dims.2,
+            dims.3,
+            t,
+            1e-5,
+            10000.0,
+            sliding_window,
+        );
+        x
+    }
+
+    /// With uniform 0.1 weights the attention output equals `v` whatever the scores, so a
+    /// broken mask, window or RoPE would pass. Varied weights make them observable: the
+    /// attention is causal, a finite window hides old rows, and with a wide window the same
+    /// perturbation does reach the last row (the control that keeps this from passing vacuously).
+    #[test]
+    fn lfm3a_attention_is_causal_and_windowed() {
+        let (n_embd, t) = (8usize, 8usize);
+        let base = varied(777, t * n_embd);
+        let differs = |a: &[f32], b: &[f32]| a.iter().zip(b).any(|(x, y)| (x - y).abs() > 1e-6);
+
+        // perturb the LAST row: earlier rows are unchanged (causal), the last one moves
+        let mut late = base.clone();
+        for v in &mut late[(t - 1) * n_embd..] {
+            *v += 0.75;
+        }
+        let a = run_attn_block(&base, t, 150);
+        let b = run_attn_block(&late, t, 150);
+        assert!(
+            !differs(&a[..(t - 1) * n_embd], &b[..(t - 1) * n_embd]),
+            "a later row leaked backwards"
+        );
+        assert!(
+            differs(&a[(t - 1) * n_embd..], &b[(t - 1) * n_embd..]),
+            "the last row ignores its own input"
+        );
+
+        // perturb the FIRST row: a wide window carries it to the last row, a window of 2 does not
+        let mut early = base.clone();
+        for v in &mut early[..n_embd] {
+            *v += 0.75;
+        }
+        let wide_a = run_attn_block(&base, t, 150);
+        let wide_b = run_attn_block(&early, t, 150);
+        assert!(
+            differs(&wide_a[(t - 1) * n_embd..], &wide_b[(t - 1) * n_embd..]),
+            "control: the first row should reach the last one through a wide window"
+        );
+        let narrow_a = run_attn_block(&base, t, 2);
+        let narrow_b = run_attn_block(&early, t, 2);
+        assert!(
+            !differs(&narrow_a[(t - 1) * n_embd..], &narrow_b[(t - 1) * n_embd..]),
+            "a window of 2 should hide the first row from the last"
+        );
+    }
+
+    /// A GGUF with an f32 vector `present` and an i32 vector `broken` (a type with no f32
+    /// reader), both of two entries.
+    fn optional_tensor_gguf() -> Arc<GgufFile> {
+        let mut w = crate::convert::writer::GgufWriter::new();
+        w.add_tensor("present", vec![2], 0, 8);
+        w.add_tensor("broken", vec![2], 26, 8);
+        let mut bytes = Vec::new();
+        w.write_header_and_tensor_info(&mut bytes).unwrap();
+        // one call per tensor: each is padded to the file's alignment
+        let present: Vec<u8> = [1.5f32, 2.5].iter().flat_map(|v| v.to_le_bytes()).collect();
+        w.write_tensor_data(&mut bytes, &present).unwrap();
+        w.write_tensor_data(&mut bytes, &[0u8; 8]).unwrap();
+        Arc::new(GgufFile::from_bytes(Arc::from(bytes)).unwrap())
+    }
+
+    #[test]
+    fn an_optional_tensor_that_exists_but_cannot_be_read_is_an_error() {
+        let gguf = optional_tensor_gguf();
+        let names = |n: &[&str]| n.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        // absent: empty; present: its values; the first alias that exists wins
+        assert!(
+            load_optional_vec_f32(&gguf, &names(&["nope"]))
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            load_optional_vec_f32(&gguf, &names(&["nope", "present"])).unwrap(),
+            vec![1.5, 2.5]
+        );
+        // present but unreadable: not "absent"
+        let err = load_optional_vec_f32(&gguf, &names(&["broken"])).unwrap_err();
+        assert!(
+            format!("{err:#}").contains("broken cannot be read as f32"),
+            "{err:#}"
+        );
+    }
+
+    fn stem_layer(shape: [usize; 4]) -> ConvLayerWeights {
+        let n: usize = shape.iter().product();
+        ConvLayerWeights {
+            name: "a.conv1d.test.weight".into(),
+            weight: vec![0.0; n],
+            bias: vec![0.0; shape[3]],
+            shape: shape.to_vec(),
+        }
+    }
+
+    /// The loader sizes `pre_encode_out` from the stem's geometry and the forward then
+    /// asserts it: a non-square kernel (here 3 wide in time, 1 tall in frequency) made
+    /// the loader convolve the frequency axis with the time kernel, so a valid file
+    /// failed the forward's assertion.
+    #[test]
+    fn stem_geometry_follows_the_forward_for_non_square_kernels() {
+        // shape = [kw, kh, in_per_group, out]: time kernel kw, frequency kernel kh
+        let layers = vec![
+            stem_layer([3, 1, 1, 2]),
+            stem_layer([3, 1, 1, 2]),
+            stem_layer([3, 1, 2, 2]),
+        ];
+        let (n_mel_bins, n_embd, n_frames) = (16usize, 4usize, 12usize);
+        let shapes: Vec<&[usize]> = layers.iter().map(|l| l.shape.as_slice()).collect();
+        let (ch, freq) = lfm3a_stem_geometry(&shapes, n_mel_bins).unwrap();
+        let plane = ch * freq;
+        let stem = ConvStemWeights {
+            layers,
+            pre_encode_out_w: MmapWeight::from_owned_f32(vec![0.0; n_embd * plane], n_embd, plane),
+            pre_encode_out_b: vec![0.0; n_embd],
+        };
+        let cfg = AudioEncoderConfig {
+            n_layer: 0,
+            n_embd,
+            n_ff: 0,
+            n_head: 0,
+            eps: 1e-5,
+            n_mel_bins,
+            llm_hidden_size: 0,
+        };
+        let mel = vec![0.1f32; n_frames * n_mel_bins];
+        let (out, t_out) = conv_stem_forward_lfm3a(&mel, n_frames, &stem, &cfg);
+        assert!(t_out > 0);
+        assert_eq!(out.len(), t_out * n_embd);
+    }
+
+    #[test]
+    fn stem_layer_extents_must_match_their_shape() {
+        assert!(check_stem_layer_extent(&stem_layer([3, 3, 1, 4])).is_ok());
+        let mut short_weight = stem_layer([3, 3, 1, 4]);
+        short_weight.weight.pop();
+        assert!(check_stem_layer_extent(&short_weight).is_err());
+        let mut long_bias = stem_layer([3, 3, 1, 4]);
+        long_bias.bias.push(0.0);
+        assert!(check_stem_layer_extent(&long_bias).is_err());
+        let mut flat = stem_layer([3, 3, 1, 4]);
+        flat.shape = vec![36];
+        assert!(check_stem_layer_extent(&flat).is_err());
+    }
     use crate::gguf::GgufFile;
     use std::sync::Arc;
 
@@ -1797,7 +3276,7 @@ mod tests {
             Err(e) => {
                 let msg = format!("{e:#}");
                 // First missing key is `clip.audio.block_count` per
-                // load order — the contextful error should mention it.
+                // load order: the contextful error should mention it.
                 assert!(
                     msg.contains("clip.audio.block_count"),
                     "expected missing-key error, got: {msg}"
@@ -2625,13 +4104,14 @@ mod tests {
             // ln_2
             ln2_w: vec![1.0; n_embd],
             ln2_b: vec![0.0; n_embd],
+            lfm3a: None,
         }
     }
 
     /// End-to-end smoke test wiring conv stem + 1 Conformer block
     /// + MLP adapter. Verifies the orchestration runs without
     ///   panicking and produces finite output of the expected shape
-    ///   `[t_out × llm_hidden_size]`. Per-piece correctness is
+    ///   `[t_out x llm_hidden_size]`. Per-piece correctness is
     ///   covered by the dedicated tests above; this catches wiring
     ///   bugs (mismatched scratch sizes, missing residual, wrong
     ///   loop bounds) in the orchestration layer.
@@ -2647,7 +4127,7 @@ mod tests {
         let n_ff_adapter = 8;
         let expected_t_out = 3; // same as conv_stem smoke test dims
 
-        // Conv stem: zero kernels + identity 1×1s + identity
+        // Conv stem: zero kernels + identity 1x1s + identity
         // pre_encode_out (so the Conformer block sees a
         // hand-traceable input).
         let out_ch = n_embd; // stem out channels = encoder n_embd
@@ -2684,7 +4164,7 @@ mod tests {
             pre_encode_out_b: vec![0.0; n_embd],
         };
 
-        // MLP adapter — small but real: norm + 2-layer MLP with
+        // MLP adapter: small but real: norm + 2-layer MLP with
         // GELU. Use mostly-identity weights so the output isn't
         // zeroed out.
         let mut adapter_up = vec![0.0f32; n_ff_adapter * n_embd];
@@ -2888,9 +4368,9 @@ mod tests {
 
     /// End-to-end smoke for the `encode_audio_pcm` glue helper.
     /// 0.5 seconds of a 1 kHz sine wave through the full pipeline
-    /// (mel preprocessor → conv stem → 1 Conformer block → MLP
+    /// (mel preprocessor -> conv stem -> 1 Conformer block -> MLP
     /// adapter) should produce a finite, properly-shaped output
-    /// `[t_out × llm_hidden_size]`. Catches mismatches between
+    /// `[t_out x llm_hidden_size]`. Catches mismatches between
     /// the preprocessor's `n_mel_bins` output and the encoder's
     /// `config.n_mel_bins` expectation.
     #[test]
@@ -3040,5 +4520,196 @@ mod tests {
         let (out, t_out) = encode_audio_pcm(&[], &weights);
         assert_eq!(t_out, 0);
         assert!(out.is_empty());
+    }
+
+    /// An LFM3A attention layer whose weights come from `fill(len)`.
+    fn lfm3a_test_attn_block(
+        fill: &dyn Fn(usize) -> Vec<f32>,
+        (n_embd, n_ff, n_head, n_head_kv): (usize, usize, usize, usize),
+        sliding_window: usize,
+    ) -> ConformerLayerWeights {
+        let d_head = n_embd / n_head;
+        let n_embd_kv = n_head_kv * d_head;
+        ConformerLayerWeights {
+            ffn_norm_w: Vec::new(),
+            ffn_norm_b: Vec::new(),
+            ffn_up_w: MmapWeight::from_owned_f32(fill(n_ff * n_embd), n_ff, n_embd),
+            ffn_up_b: Vec::new(),
+            ffn_down_w: MmapWeight::from_owned_f32(fill(n_embd * n_ff), n_embd, n_ff),
+            ffn_down_b: Vec::new(),
+            ln1_w: vec![1.0; n_embd],
+            ln1_b: Vec::new(),
+            attn_q_w: MmapWeight::from_owned_f32(fill(n_embd * n_embd), n_embd, n_embd),
+            attn_q_b: Vec::new(),
+            attn_k_w: MmapWeight::from_owned_f32(fill(n_embd_kv * n_embd), n_embd_kv, n_embd),
+            attn_k_b: Vec::new(),
+            attn_v_w: MmapWeight::from_owned_f32(fill(n_embd_kv * n_embd), n_embd_kv, n_embd),
+            attn_v_b: Vec::new(),
+            attn_o_w: MmapWeight::from_owned_f32(fill(n_embd * n_embd), n_embd, n_embd),
+            attn_o_b: Vec::new(),
+            pos_bias_u: Vec::new(),
+            pos_bias_v: Vec::new(),
+            linear_pos_w: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+            norm_conv_w: Vec::new(),
+            norm_conv_b: Vec::new(),
+            conv_pw1_w: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+            conv_pw1_b: Vec::new(),
+            conv_dw_w: Vec::new(),
+            conv_dw_b: Vec::new(),
+            conv_dw_shape: Vec::new(),
+            conv_norm_w: Vec::new(),
+            conv_norm_b: Vec::new(),
+            conv_pw2_w: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+            conv_pw2_b: Vec::new(),
+            ffn_norm_1_w: Vec::new(),
+            ffn_norm_1_b: Vec::new(),
+            ffn_up_1_w: MmapWeight::from_owned_f32(fill(n_ff * n_embd), n_ff, n_embd),
+            ffn_up_1_b: Vec::new(),
+            ffn_down_1_w: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
+            ffn_down_1_b: Vec::new(),
+            ln2_w: vec![1.0; n_embd],
+            ln2_b: Vec::new(),
+            lfm3a: Some(Lfm3aLayerExtras {
+                q_norm_w: vec![1.0; d_head],
+                k_norm_w: vec![1.0; d_head],
+                attn_gate_w: Some(MmapWeight::from_owned_f32(
+                    fill(n_head * n_embd),
+                    n_head,
+                    n_embd,
+                )),
+                attn_post_norm_w: vec![1.0; n_embd],
+                ffn_post_norm_w: vec![1.0; n_embd],
+                post_ln_w: Vec::new(),
+                rope_theta: 1_000_000.0,
+                n_head_kv,
+                sliding_window,
+            }),
+        }
+    }
+
+    #[test]
+    fn encode_audio_pcm_lfm3a_hybrid_shortconv_and_attention_smoke() {
+        let n_embd = 4;
+        let n_ff = 8;
+        let n_head = 2;
+        let n_head_kv = 1;
+        let n_mel_bins = 16;
+        let llm_hidden_size = 6;
+        let n_ff_adapter = 8;
+        let dummy_wt = || MmapWeight::from_owned_f32(Vec::new(), 0, 0);
+
+        let conv_stem = ConvStemWeights {
+            layers: vec![
+                zero_kernel_layer("a.conv1d.0.weight", 3, 3, 1, n_embd, vec![0.1; n_embd]),
+                zero_kernel_layer("a.conv1d.1.weight", 3, 3, n_embd, n_embd, vec![0.1; n_embd]),
+                zero_kernel_layer("a.conv1d.2.weight", 3, 3, n_embd, n_embd, vec![0.1; n_embd]),
+            ],
+            pre_encode_out_w: MmapWeight::from_owned_f32(
+                vec![0.05; n_embd * (n_embd * 2)],
+                n_embd,
+                n_embd * 2,
+            ),
+            pre_encode_out_b: vec![0.0; n_embd],
+        };
+
+        let shortconv_block = ConformerLayerWeights {
+            ffn_norm_w: Vec::new(),
+            ffn_norm_b: Vec::new(),
+            ffn_up_w: MmapWeight::from_owned_f32(vec![0.1; n_ff * n_embd], n_ff, n_embd),
+            ffn_up_b: Vec::new(),
+            ffn_down_w: MmapWeight::from_owned_f32(vec![0.1; n_embd * n_ff], n_embd, n_ff),
+            ffn_down_b: Vec::new(),
+            ln1_w: vec![1.0; n_embd],
+            ln1_b: Vec::new(),
+            attn_q_w: dummy_wt(),
+            attn_q_b: Vec::new(),
+            attn_k_w: dummy_wt(),
+            attn_k_b: Vec::new(),
+            attn_v_w: dummy_wt(),
+            attn_v_b: Vec::new(),
+            attn_o_w: dummy_wt(),
+            attn_o_b: Vec::new(),
+            pos_bias_u: Vec::new(),
+            pos_bias_v: Vec::new(),
+            linear_pos_w: dummy_wt(),
+            norm_conv_w: Vec::new(),
+            norm_conv_b: Vec::new(),
+            conv_pw1_w: MmapWeight::from_owned_f32(
+                vec![0.1; 3 * n_embd * n_embd],
+                3 * n_embd,
+                n_embd,
+            ),
+            conv_pw1_b: Vec::new(),
+            conv_dw_w: vec![0.2; 3 * n_embd],
+            conv_dw_b: Vec::new(),
+            conv_dw_shape: vec![3, n_embd],
+            conv_norm_w: Vec::new(),
+            conv_norm_b: Vec::new(),
+            conv_pw2_w: MmapWeight::from_owned_f32(vec![0.1; n_embd * n_embd], n_embd, n_embd),
+            conv_pw2_b: Vec::new(),
+            ffn_norm_1_w: Vec::new(),
+            ffn_norm_1_b: Vec::new(),
+            ffn_up_1_w: MmapWeight::from_owned_f32(vec![0.1; n_ff * n_embd], n_ff, n_embd),
+            ffn_up_1_b: Vec::new(),
+            ffn_down_1_w: dummy_wt(),
+            ffn_down_1_b: Vec::new(),
+            ln2_w: vec![1.0; n_embd],
+            ln2_b: Vec::new(),
+            lfm3a: Some(Lfm3aLayerExtras {
+                q_norm_w: Vec::new(),
+                k_norm_w: Vec::new(),
+                attn_gate_w: None,
+                attn_post_norm_w: vec![1.0; n_embd],
+                ffn_post_norm_w: vec![1.0; n_embd],
+                post_ln_w: vec![1.0; n_embd],
+                rope_theta: 1_000_000.0,
+                n_head_kv,
+                sliding_window: 150,
+            }),
+        };
+
+        let attn_block =
+            lfm3a_test_attn_block(&|n| vec![0.1; n], (n_embd, n_ff, n_head, n_head_kv), 150);
+
+        let mlp_adapter = AudioMlpAdapterWeights {
+            norm_w: vec![1.0; n_embd],
+            norm_b: vec![0.0; n_embd],
+            up_w: MmapWeight::from_owned_f32(
+                vec![0.1; n_ff_adapter * n_embd],
+                n_ff_adapter,
+                n_embd,
+            ),
+            up_b: vec![0.0; n_ff_adapter],
+            down_w: MmapWeight::from_owned_f32(
+                vec![0.1; llm_hidden_size * n_ff_adapter],
+                llm_hidden_size,
+                n_ff_adapter,
+            ),
+            down_b: vec![0.0; llm_hidden_size],
+        };
+
+        let weights = AudioEncoderWeights {
+            config: AudioEncoderConfig {
+                n_layer: 2,
+                n_embd,
+                n_ff,
+                n_head,
+                eps: 1e-5,
+                n_mel_bins,
+                llm_hidden_size,
+            },
+            conv_stem,
+            layers: vec![shortconv_block, attn_block],
+            mlp_adapter,
+        };
+        assert!(weights.is_lfm3a());
+
+        let pcm: Vec<f32> = (0..1600)
+            .map(|i| (2.0 * std::f32::consts::PI * 440.0 * i as f32 / SAMPLE_RATE as f32).sin())
+            .collect();
+        let (out, t_out) = encode_audio_pcm(&pcm, &weights);
+        assert!(t_out > 0);
+        assert_eq!(out.len(), t_out * llm_hidden_size);
+        assert!(out.iter().all(|v| v.is_finite()));
     }
 }

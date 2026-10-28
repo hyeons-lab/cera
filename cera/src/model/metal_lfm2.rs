@@ -699,6 +699,7 @@ impl MetalLfmModel {
         path: Option<&std::path::Path>,
         context_size: usize,
     ) -> Result<Self> {
+        super::ensure_gpu_supported_arch(&src.config().architecture)?;
         if let Some(why) = src.gpu_unsupported_reason() {
             anyhow::bail!("{why}");
         }

@@ -27,8 +27,10 @@ use crate::convert::d1;
 use crate::convert::quantize::{QuantStrategy, TargetQuant, quantize_tensor_data_with_strategy};
 use crate::convert::safetensors::{
     SafeTensorsHeader, decode_safetensor_to_f32_into, gguf_tensor_dims,
-    translate_hf_to_gguf_tensor_name_with_arch,
 };
+use crate::convert::tensor_map::{TensorAction, classify_tensor, stack_expert_tensors};
+#[cfg(test)]
+use crate::convert::tensor_map::{split_lfm3_vl_gate_up, split_lfm3_vl_qkv};
 use crate::convert::tokenizer::{HfTokenizerJson, VocabOptions};
 use crate::convert::writer::GgufWriter;
 #[cfg(feature = "remote")]
@@ -216,6 +218,7 @@ fn vocab_options<'a>(
     VocabOptions {
         llama_cpp_layout: config.uses_llama_cpp_vocab_layout(),
         pad_to: config.vocab_size,
+        force_add_bos: config.forced_add_bos_token(),
         tokenizer_config,
     }
 }
@@ -378,11 +381,7 @@ pub fn stream_quantize_hf_repo(
         .iter()
         .filter(|s| {
             let lower = s.rfilename.to_ascii_lowercase();
-            lower.ends_with(".safetensors")
-                && !lower.contains("mmproj")
-                && !lower.contains("visual")
-                && !lower.contains("audio_decoder")
-                && !lower.contains("vocoder")
+            lower.ends_with(".safetensors") && !is_auxiliary_shard(&lower)
         })
         .map(|s| s.rfilename.clone())
         .collect();
@@ -439,68 +438,19 @@ pub fn stream_quantize_hf_repo(
         &vocab_options(&config, tokenizer_config.as_ref()),
     );
 
-    // Register all tensors in GGUF writer
-    struct PendingTensor {
-        shard_idx: usize,
-        gguf_name: String,
-        dtype: String,
-        data_start: usize,
-        data_end: usize,
-        ggml_type: u32,
-        expected_elements: usize,
-    }
-
-    let mut pending_tensors = Vec::new();
-
     let arch = config.gguf_architecture();
-    for (shard_idx, (_file_name, header)) in shard_headers.iter().enumerate() {
-        for (tensor_name, tensor_info) in &header.tensors {
-            let gguf_name = translate_hf_to_gguf_tensor_name_with_arch(tensor_name, arch);
-            let num_elements: usize = tensor_info
-                .shape
-                .iter()
-                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-                .ok_or_else(|| {
-                    CeraError::Backend(format!("tensor shape overflow for `{tensor_name}`"))
-                })?;
-            let ggml_type = opts.target_quant.select_ggml_type_with_overrides(
-                &gguf_name,
-                tensor_info.shape.len(),
-                num_elements,
-                tensor_info.shape.last().copied().unwrap_or(1),
-                &opts.tensor_overrides,
-            );
-            let out_bytes = TargetQuant::compute_tensor_bytes(ggml_type, num_elements);
-
-            // In GGUF, dimensions are column-major (reversed shape: [cols, rows])
-            let dims = gguf_tensor_dims(&gguf_name, &tensor_info.shape);
-
-            writer.add_tensor(&gguf_name, dims, ggml_type, out_bytes);
-
-            let data_start = header
-                .header_size_bytes
-                .checked_add(tensor_info.data_offsets.0)
-                .ok_or_else(|| {
-                    CeraError::Backend(format!("tensor offset start overflow for `{tensor_name}`"))
-                })?;
-            let data_end = header
-                .header_size_bytes
-                .checked_add(tensor_info.data_offsets.1)
-                .ok_or_else(|| {
-                    CeraError::Backend(format!("tensor offset end overflow for `{tensor_name}`"))
-                })?;
-
-            pending_tensors.push(PendingTensor {
-                shard_idx,
-                gguf_name,
-                dtype: tensor_info.dtype.clone(),
-                data_start,
-                data_end,
-                ggml_type,
-                expected_elements: num_elements,
-            });
-        }
-    }
+    let pending_tensors = plan_pending_tensors(
+        shard_headers
+            .iter()
+            .enumerate()
+            .map(|(idx, (_, header))| (idx, header)),
+        &config,
+        arch,
+        false,
+        opts.target_quant,
+        &opts.tensor_overrides,
+        &mut writer,
+    )?;
 
     let total_tensors = pending_tensors.len();
 
@@ -609,9 +559,11 @@ pub fn stream_quantize_hf_repo(
         .map(|(name, _)| pinned_spec.file_download_url(name))
         .collect();
 
+    let expected_experts = expected_expert_count(&config);
     let mut quant_buf = Vec::new();
     let mut f32_data = Vec::new();
     let mut raw_tensor_bytes = Vec::new();
+    let mut last_split_source: Option<(SourceRef, Vec<f32>)> = None;
 
     for (i, pt) in pending_tensors.iter().enumerate().skip(start_tensor_idx) {
         if let Some(ref cancel) = opts.cancel
@@ -621,7 +573,7 @@ pub fn stream_quantize_hf_repo(
             return Err(CeraError::Cancelled);
         }
 
-        let tensor_url = &shard_download_urls[pt.shard_idx];
+        let tensor_url = &shard_download_urls[pt.action.primary_file_idx()];
 
         if let Some(p) = &opts.progress {
             p.on_progress(
@@ -631,22 +583,22 @@ pub fn stream_quantize_hf_repo(
             );
         }
 
-        // Fetch raw tensor bytes over HTTP Range with automatic retry and exponential backoff
-        if pt.data_start < pt.data_end {
-            fetch_hf_file_range_into(
-                &client,
-                tensor_url,
-                pt.data_start,
-                pt.data_end - 1,
-                opts.auth_token.as_deref(),
-                &mut raw_tensor_bytes,
-            )?;
-        } else {
-            raw_tensor_bytes.clear();
-        }
-
-        // Decode BF16/F16/F32 to f32
-        decode_safetensor_to_f32_into(&raw_tensor_bytes, &pt.dtype, &mut f32_data)?;
+        materialize_pending_tensor_f32(
+            pt,
+            expected_experts,
+            &mut last_split_source,
+            &mut f32_data,
+            |src, out| {
+                fetch_remote_source_f32(
+                    src,
+                    &client,
+                    &shard_download_urls,
+                    opts.auth_token.as_deref(),
+                    &mut raw_tensor_bytes,
+                    out,
+                )
+            },
+        )?;
         let num_elements = f32_data.len();
         if num_elements != pt.expected_elements {
             return Err(CeraError::Backend(format!(
@@ -655,36 +607,16 @@ pub fn stream_quantize_hf_repo(
             )));
         }
 
-        // Hugging Face Gemma and Gemma 2 checkpoints store RMSNorm weights as an offset
-        // from 1.0: `x * (1.0 + weight)` (see Hugging Face transformers modeling_gemma.py
-        // and modeling_gemma2.py). Standard GGUF runtime RMSNorm executes standard `x * weight`
-        // without runtime offset addition. Therefore, standard GGUF converters
-        // (including upstream llama.cpp conversion/gemma.py:67) fold the +1.0 offset
-        // directly into the exported tensor weights during conversion so real checkpoints
-        // produce correct activations at inference.
-        if (arch == "gemma" || arch == "gemma2") && pt.gguf_name.ends_with("norm.weight") {
-            for v in f32_data.iter_mut() {
-                *v += 1.0;
-            }
-        }
-
-        if matches!(arch, "qwen35" | "qwen3_5" | "qwen3.5")
-            && (pt.gguf_name.ends_with(".ssm_a") || pt.gguf_name.ends_with(".ssm_a.weight"))
-        {
-            transform_qwen35_ssm_a_inplace(&mut f32_data);
-        }
-
-        if matches!(arch, "bailingmoe3" | "bailingmoe" | "bailingmoe2")
-            && (pt.gguf_name.ends_with(".ssm_a") || pt.gguf_name.ends_with(".ssm_a.weight"))
-        {
-            transform_bailingmoe_ssm_a_inplace(&mut f32_data);
-        }
+        apply_arch_tensor_transforms(arch, &pt.gguf_name, &mut f32_data);
 
         // Quantize to target GGML type
         let target_size = TargetQuant::compute_tensor_bytes(pt.ggml_type, num_elements);
         quant_buf.resize(target_size, 0);
 
         quantize_tensor_data_with_strategy(&f32_data, pt.ggml_type, opts.strategy, &mut quant_buf)?;
+        if matches!(pt.action, LocalSourceAction::StackExperts { .. }) {
+            f32_data = Vec::new();
+        }
 
         // Write to GGUF with alignment padding
         let written = writer.write_tensor_data(&mut buf_writer, &quant_buf)?;
@@ -890,6 +822,764 @@ fn fold_stats_checked(
     ))
 }
 
+/// Where a tensor's bytes sit in the checkpoint.
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceRef {
+    file_idx: usize,
+    dtype: String,
+    data_start: usize,
+    data_end: usize,
+}
+
+/// Deferred source action for materializing a planned GGUF tensor on demand during the write pass.
+#[derive(Clone, Debug)]
+enum LocalSourceAction {
+    /// Read and decode a single tensor directly from a shard.
+    Direct(SourceRef),
+    /// Values for a tensor generated from the config instead of read from a shard.
+    Generated(Vec<f32>),
+    /// A tensor derived from several sources (a folded batch norm): the half it holds
+    /// and the weight, bias, running mean and running variance it is computed from.
+    Fold {
+        kind: d1::Fold,
+        sources: Vec<SourceRef>,
+    },
+    /// A row slice (`attn_q`, `attn_k`, or `attn_v`) of a fused LFM3-VL `self_attn.qkv.weight` tensor.
+    SplitVlQkvSlice {
+        source: SourceRef,
+        block_idx: usize,
+        shape: Vec<usize>,
+        out_offset_elems: usize,
+        out_len_elems: usize,
+    },
+    /// A row half (`ffn_gate` or `ffn_up`) of a fused LFM3-VL `feed_forward.gate_up.weight` tensor.
+    SplitVlGateUpSlice {
+        source: SourceRef,
+        block_idx: usize,
+        shape: Vec<usize>,
+        is_up: bool,
+    },
+    /// Per-expert 2D tensors stacked in ascending `expert_idx` order into a 3D `[n_experts, rows, cols]` tensor.
+    StackExperts {
+        experts: Vec<(usize, SourceRef)>,
+        rows: usize,
+        cols: usize,
+    },
+}
+
+impl LocalSourceAction {
+    #[cfg(feature = "remote")]
+    fn primary_file_idx(&self) -> usize {
+        match self {
+            Self::Direct(src)
+            | Self::SplitVlQkvSlice { source: src, .. }
+            | Self::SplitVlGateUpSlice { source: src, .. } => src.file_idx,
+            Self::Generated(_) => 0,
+            Self::Fold { sources, .. } => sources.first().map_or(0, |s| s.file_idx),
+            Self::StackExperts { experts, .. } => experts.first().map_or(0, |(_, s)| s.file_idx),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct LocalPendingTensor {
+    expected_elements: usize,
+    ggml_type: u32,
+    gguf_name: String,
+    action: LocalSourceAction,
+}
+
+type PlannedSlice = (String, Vec<usize>, usize, LocalSourceAction);
+
+fn expected_expert_count(config: &HfModelConfig) -> Option<usize> {
+    config.expert_count()
+}
+
+fn plan_split_lfm3_vl_qkv(
+    shape: &[usize],
+    block_idx: usize,
+    config: &HfModelConfig,
+    source: SourceRef,
+) -> Result<[PlannedSlice; 3], CeraError> {
+    if shape.len() != 2 {
+        return Err(CeraError::Backend(format!(
+            "blk.{block_idx} fused qkv.weight must be 2D, got {shape:?}"
+        )));
+    }
+    let n_head = config.num_attention_heads.unwrap_or(0);
+    let n_head_kv = config
+        .num_key_value_heads
+        .or(config.num_attention_heads)
+        .unwrap_or(0);
+    let head_dim = config.lfm3_head_dim().unwrap_or(0);
+    let (total_rows, cols) = (shape[0], shape[1]);
+    let Some((q_rows, kv_rows, expected_rows)) =
+        crate::convert::tensor_map::lfm3_vl_qkv_rows(n_head, n_head_kv, head_dim)
+    else {
+        return Err(CeraError::Backend(format!(
+            "blk.{block_idx} fused qkv.weight: {n_head} heads and {n_head_kv} kv heads of \
+             width {head_dim} overflow the row count"
+        )));
+    };
+    if total_rows != expected_rows {
+        return Err(CeraError::Backend(format!(
+            "blk.{block_idx} fused qkv.weight shape {shape:?} does not match \
+             q_rows={q_rows} + 2*kv_rows={kv_rows}"
+        )));
+    }
+    let _total_elems = total_rows.checked_mul(cols).ok_or_else(|| {
+        CeraError::Backend(format!("blk.{block_idx} fused qkv.weight shape overflow"))
+    })?;
+    let q_elems = q_rows * cols;
+    let kv_elems = kv_rows * cols;
+    let full_shape = shape.to_vec();
+    Ok([
+        (
+            format!("blk.{block_idx}.attn_q.weight"),
+            vec![q_rows, cols],
+            q_elems,
+            LocalSourceAction::SplitVlQkvSlice {
+                source: source.clone(),
+                block_idx,
+                shape: full_shape.clone(),
+                out_offset_elems: 0,
+                out_len_elems: q_elems,
+            },
+        ),
+        (
+            format!("blk.{block_idx}.attn_k.weight"),
+            vec![kv_rows, cols],
+            kv_elems,
+            LocalSourceAction::SplitVlQkvSlice {
+                source: source.clone(),
+                block_idx,
+                shape: full_shape.clone(),
+                out_offset_elems: q_elems,
+                out_len_elems: kv_elems,
+            },
+        ),
+        (
+            format!("blk.{block_idx}.attn_v.weight"),
+            vec![kv_rows, cols],
+            kv_elems,
+            LocalSourceAction::SplitVlQkvSlice {
+                source,
+                block_idx,
+                shape: full_shape,
+                out_offset_elems: q_elems + kv_elems,
+                out_len_elems: kv_elems,
+            },
+        ),
+    ])
+}
+
+fn plan_split_lfm3_vl_gate_up(
+    shape: &[usize],
+    block_idx: usize,
+    source: SourceRef,
+) -> Result<[PlannedSlice; 2], CeraError> {
+    if shape.len() != 2 || !shape[0].is_multiple_of(2) {
+        return Err(CeraError::Backend(format!(
+            "blk.{block_idx} fused gate_up.weight must have even 2D rows, got {shape:?}"
+        )));
+    }
+    let (total_rows, cols) = (shape[0], shape[1]);
+    let total_elems = total_rows.checked_mul(cols).ok_or_else(|| {
+        CeraError::Backend(format!(
+            "blk.{block_idx} fused gate_up.weight shape overflow"
+        ))
+    })?;
+    let half_rows = total_rows / 2;
+    let half_elems = total_elems / 2;
+    let full_shape = shape.to_vec();
+    Ok([
+        (
+            format!("blk.{block_idx}.ffn_gate.weight"),
+            vec![half_rows, cols],
+            half_elems,
+            LocalSourceAction::SplitVlGateUpSlice {
+                source: source.clone(),
+                block_idx,
+                shape: full_shape.clone(),
+                is_up: false,
+            },
+        ),
+        (
+            format!("blk.{block_idx}.ffn_up.weight"),
+            vec![half_rows, cols],
+            half_elems,
+            LocalSourceAction::SplitVlGateUpSlice {
+                source,
+                block_idx,
+                shape: full_shape,
+                is_up: true,
+            },
+        ),
+    ])
+}
+
+fn plan_stacked_experts(
+    mut experts: Vec<(usize, Vec<usize>, SourceRef)>,
+    expected_experts: Option<usize>,
+    gguf_name: &str,
+) -> Result<(Vec<usize>, usize, LocalSourceAction), CeraError> {
+    if experts.is_empty() {
+        return Err(CeraError::Backend(format!(
+            "no expert tensors found for `{gguf_name}`"
+        )));
+    }
+    experts.sort_by_key(|(idx, _, _)| *idx);
+    if let Some(expected) = expected_experts
+        && experts.len() != expected
+    {
+        return Err(CeraError::Backend(format!(
+            "`{gguf_name}` has {} expert tensors, expected {expected}",
+            experts.len()
+        )));
+    }
+    let first_shape = &experts[0].1;
+    if first_shape.len() != 2 {
+        return Err(CeraError::Backend(format!(
+            "`{gguf_name}` expert 0 has shape {first_shape:?}; expected 2D [rows, cols]"
+        )));
+    }
+    let (rows, cols) = (first_shape[0], first_shape[1]);
+    let slice_len = rows
+        .checked_mul(cols)
+        .ok_or_else(|| CeraError::Backend(format!("`{gguf_name}` expert dimensions overflow")))?;
+    let total_len = slice_len.checked_mul(experts.len()).ok_or_else(|| {
+        CeraError::Backend(format!("`{gguf_name}` stacked expert buffer size overflow"))
+    })?;
+    let mut ordered_sources = Vec::with_capacity(experts.len());
+    for (expected_idx, (idx, shape, src)) in experts.into_iter().enumerate() {
+        if idx != expected_idx {
+            return Err(CeraError::Backend(format!(
+                "`{gguf_name}` missing expert {expected_idx} (found expert {idx})"
+            )));
+        }
+        if shape.as_slice() != [rows, cols] {
+            return Err(CeraError::Backend(format!(
+                "`{gguf_name}` expert {idx} shape {shape:?} does not match [{rows}, {cols}]"
+            )));
+        }
+        ordered_sources.push((idx, src));
+    }
+    let stacked_shape = vec![ordered_sources.len(), rows, cols];
+    Ok((
+        stacked_shape,
+        total_len,
+        LocalSourceAction::StackExperts {
+            experts: ordered_sources,
+            rows,
+            cols,
+        },
+    ))
+}
+
+fn plan_pending_tensors<'a>(
+    shard_headers: impl IntoIterator<Item = (usize, &'a SafeTensorsHeader)>,
+    config: &HfModelConfig,
+    arch: &str,
+    is_d1: bool,
+    quant: TargetQuant,
+    overrides: &[(String, TargetQuant)],
+    writer: &mut GgufWriter,
+) -> Result<Vec<LocalPendingTensor>, CeraError> {
+    let mut pending_tensors = Vec::new();
+    // the batch-norm statistics of the d1 conformer, by layer, folded after the scan
+    let mut batch_norms: std::collections::BTreeMap<
+        usize,
+        std::collections::BTreeMap<d1::BatchNormStat, (SourceRef, usize)>,
+    > = std::collections::BTreeMap::new();
+    // per-expert tensors of an LFM3-MoE checkpoint, grouped by (block_idx, gguf_name) and stacked after the scan
+    type ExpertSliceEntry = (usize, Vec<usize>, SourceRef);
+    let mut stacked_experts: std::collections::BTreeMap<(usize, String), Vec<ExpertSliceEntry>> =
+        std::collections::BTreeMap::new();
+
+    for (file_idx, header) in shard_headers {
+        for (raw_name, tensor_info) in &header.tensors {
+            if config.skips_tensor(raw_name) {
+                continue;
+            }
+            let data_start = header
+                .header_size_bytes
+                .checked_add(tensor_info.data_offsets.0)
+                .ok_or_else(|| {
+                    CeraError::Backend(format!("tensor offset start overflow for `{raw_name}`"))
+                })?;
+            let data_end = header
+                .header_size_bytes
+                .checked_add(tensor_info.data_offsets.1)
+                .ok_or_else(|| {
+                    CeraError::Backend(format!("tensor offset end overflow for `{raw_name}`"))
+                })?;
+            let source = SourceRef {
+                file_idx,
+                dtype: tensor_info.dtype.clone(),
+                data_start,
+                data_end,
+            };
+
+            if !is_d1 {
+                match classify_tensor(raw_name, arch) {
+                    TensorAction::Skip => continue,
+                    TensorAction::StackExpert {
+                        block_idx,
+                        expert_idx,
+                        gguf_name,
+                    } => {
+                        stacked_experts
+                            .entry((block_idx, gguf_name))
+                            .or_default()
+                            .push((expert_idx, tensor_info.shape.clone(), source));
+                        continue;
+                    }
+                    TensorAction::SplitVlQkv { block_idx } => {
+                        for (gguf_name, slice_shape, n_elems, action) in
+                            plan_split_lfm3_vl_qkv(&tensor_info.shape, block_idx, config, source)?
+                        {
+                            let ggml_type = quant.select_ggml_type_with_overrides(
+                                &gguf_name,
+                                slice_shape.len(),
+                                n_elems,
+                                slice_shape.last().copied().unwrap_or(1),
+                                overrides,
+                            );
+                            let dims = gguf_tensor_dims(&gguf_name, &slice_shape);
+                            writer.add_tensor(
+                                &gguf_name,
+                                dims,
+                                ggml_type,
+                                TargetQuant::compute_tensor_bytes(ggml_type, n_elems),
+                            );
+                            pending_tensors.push(LocalPendingTensor {
+                                expected_elements: n_elems,
+                                ggml_type,
+                                gguf_name,
+                                action,
+                            });
+                        }
+                        continue;
+                    }
+                    TensorAction::SplitVlGateUp { block_idx } => {
+                        for (gguf_name, slice_shape, n_elems, action) in
+                            plan_split_lfm3_vl_gate_up(&tensor_info.shape, block_idx, source)?
+                        {
+                            let ggml_type = quant.select_ggml_type_with_overrides(
+                                &gguf_name,
+                                slice_shape.len(),
+                                n_elems,
+                                slice_shape.last().copied().unwrap_or(1),
+                                overrides,
+                            );
+                            let dims = gguf_tensor_dims(&gguf_name, &slice_shape);
+                            writer.add_tensor(
+                                &gguf_name,
+                                dims,
+                                ggml_type,
+                                TargetQuant::compute_tensor_bytes(ggml_type, n_elems),
+                            );
+                            pending_tensors.push(LocalPendingTensor {
+                                expected_elements: n_elems,
+                                ggml_type,
+                                gguf_name,
+                                action,
+                            });
+                        }
+                        continue;
+                    }
+                    TensorAction::Map(gguf_name) => {
+                        let num_elements: usize = tensor_info
+                            .shape
+                            .iter()
+                            .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                            .ok_or_else(|| {
+                                CeraError::Backend(format!(
+                                    "tensor shape overflow for `{raw_name}`"
+                                ))
+                            })?;
+                        let ggml_type = quant.select_ggml_type_with_overrides(
+                            &gguf_name,
+                            tensor_info.shape.len(),
+                            num_elements,
+                            tensor_info.shape.last().copied().unwrap_or(1),
+                            overrides,
+                        );
+                        let dims = gguf_tensor_dims(&gguf_name, &tensor_info.shape);
+                        let out_bytes = TargetQuant::compute_tensor_bytes(ggml_type, num_elements);
+                        writer.add_tensor(&gguf_name, dims, ggml_type, out_bytes);
+                        pending_tensors.push(LocalPendingTensor {
+                            expected_elements: num_elements,
+                            ggml_type,
+                            gguf_name,
+                            action: LocalSourceAction::Direct(source),
+                        });
+                        continue;
+                    }
+                }
+            }
+
+            let num_elements: usize = tensor_info
+                .shape
+                .iter()
+                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
+                .ok_or_else(|| {
+                    CeraError::Backend(format!("tensor shape overflow for `{raw_name}`"))
+                })?;
+            let (gguf_name, batch_norm) = match d1::tensor_plan(raw_name) {
+                d1::TensorPlan::Skip => continue,
+                d1::TensorPlan::Name(name) => (name, None),
+                d1::TensorPlan::BatchNorm { layer, stat } => (String::new(), Some((layer, stat))),
+            };
+            if let Some((layer, stat)) = batch_norm {
+                batch_norms
+                    .entry(layer)
+                    .or_default()
+                    .insert(stat, (source, num_elements));
+                continue;
+            }
+            let ggml_type = if d1::keeps_f32(&gguf_name) {
+                crate::convert::writer::GGML_TYPE_F32
+            } else {
+                quant.select_ggml_type_with_overrides(
+                    &gguf_name,
+                    tensor_info.shape.len(),
+                    num_elements,
+                    tensor_info.shape.last().copied().unwrap_or(1),
+                    overrides,
+                )
+            };
+
+            let dims = d1::tensor_dims(&gguf_name, &tensor_info.shape);
+            let out_bytes = TargetQuant::compute_tensor_bytes(ggml_type, num_elements);
+
+            writer.add_tensor(&gguf_name, dims, ggml_type, out_bytes);
+
+            pending_tensors.push(LocalPendingTensor {
+                expected_elements: num_elements,
+                ggml_type,
+                gguf_name,
+                action: LocalSourceAction::Direct(source),
+            });
+        }
+    }
+
+    let expected_experts = expected_expert_count(config);
+    for ((_block_idx, gguf_name), expert_refs) in stacked_experts {
+        let (stacked_shape, n_elems, action) =
+            plan_stacked_experts(expert_refs, expected_experts, &gguf_name)?;
+        let ggml_type = quant.select_ggml_type_with_overrides(
+            &gguf_name,
+            stacked_shape.len(),
+            n_elems,
+            stacked_shape.last().copied().unwrap_or(1),
+            overrides,
+        );
+        let dims = gguf_tensor_dims(&gguf_name, &stacked_shape);
+        writer.add_tensor(
+            &gguf_name,
+            dims,
+            ggml_type,
+            TargetQuant::compute_tensor_bytes(ggml_type, n_elems),
+        );
+        pending_tensors.push(LocalPendingTensor {
+            expected_elements: n_elems,
+            ggml_type,
+            gguf_name,
+            action,
+        });
+    }
+
+    // each conformer layer's batch norm becomes a scale and a shift
+    for (layer, stats) in &batch_norms {
+        use d1::BatchNormStat::{Bias, Mean, Var, Weight};
+        let mut sources = Vec::with_capacity(4);
+        let mut elements = None;
+        for stat in [Weight, Bias, Mean, Var] {
+            let (source, n) = stats.get(&stat).ok_or_else(|| {
+                CeraError::Backend(format!(
+                    "d1-omni conformer layer {layer} has no batch-norm {stat:?} tensor"
+                ))
+            })?;
+            if *elements.get_or_insert(*n) != *n {
+                return Err(CeraError::Backend(format!(
+                    "d1-omni conformer layer {layer}: the batch-norm tensors differ in length"
+                )));
+            }
+            sources.push(source.clone());
+        }
+        let n = elements.unwrap_or(0);
+        for (name, kind) in [("weight", d1::Fold::Scale), ("bias", d1::Fold::Shift)] {
+            let gguf_name = format!("a.blk.{layer}.conv_norm.{name}");
+            let ggml_type = crate::convert::writer::GGML_TYPE_F32;
+            writer.add_tensor(
+                &gguf_name,
+                vec![n as u64],
+                ggml_type,
+                TargetQuant::compute_tensor_bytes(ggml_type, n),
+            );
+            pending_tensors.push(LocalPendingTensor {
+                expected_elements: n,
+                ggml_type,
+                gguf_name,
+                action: LocalSourceAction::Fold {
+                    kind,
+                    sources: sources.clone(),
+                },
+            });
+        }
+    }
+
+    for generated in config.generated_tensors() {
+        let num_elements = generated.data.len();
+        let row_len = generated.dims.first().copied().unwrap_or(1) as usize;
+        let ggml_type = quant.select_ggml_type_with_overrides(
+            &generated.name,
+            generated.dims.len(),
+            num_elements,
+            row_len,
+            overrides,
+        );
+        writer.add_tensor(
+            &generated.name,
+            generated.dims,
+            ggml_type,
+            TargetQuant::compute_tensor_bytes(ggml_type, num_elements),
+        );
+        pending_tensors.push(LocalPendingTensor {
+            expected_elements: num_elements,
+            ggml_type,
+            gguf_name: generated.name,
+            action: LocalSourceAction::Generated(generated.data),
+        });
+    }
+
+    Ok(pending_tensors)
+}
+
+fn materialize_pending_tensor_f32<F>(
+    pt: &LocalPendingTensor,
+    expected_experts: Option<usize>,
+    last_split_source: &mut Option<(SourceRef, Vec<f32>)>,
+    f32_data: &mut Vec<f32>,
+    mut read_source: F,
+) -> Result<(), CeraError>
+where
+    F: FnMut(&SourceRef, &mut Vec<f32>) -> Result<(), CeraError>,
+{
+    if !matches!(
+        pt.action,
+        LocalSourceAction::SplitVlQkvSlice { .. } | LocalSourceAction::SplitVlGateUpSlice { .. }
+    ) {
+        *last_split_source = None;
+    }
+
+    match &pt.action {
+        LocalSourceAction::Direct(src) => {
+            read_source(src, f32_data)?;
+        }
+        LocalSourceAction::Generated(values) => {
+            // a tensor the checkpoint does not store but the GGUF needs
+            f32_data.clear();
+            f32_data.extend_from_slice(values);
+        }
+        LocalSourceAction::Fold { kind, sources } => {
+            // a folded batch norm: read its weight, bias, running mean and running variance
+            let mut stats: Vec<Vec<f32>> = Vec::with_capacity(sources.len());
+            for src in sources {
+                let mut values = Vec::new();
+                read_source(src, &mut values)?;
+                stats.push(values);
+            }
+            // a corrupt shard fails here with the span lengths, not inside the fold with
+            // an index panic
+            *f32_data = fold_stats_checked(*kind, &stats, &pt.gguf_name)?;
+        }
+        LocalSourceAction::SplitVlQkvSlice {
+            source,
+            block_idx,
+            shape,
+            out_offset_elems,
+            out_len_elems,
+        } => {
+            let needs_load = last_split_source
+                .as_ref()
+                .is_none_or(|(cached_src, _)| cached_src != source);
+            if needs_load {
+                let mut decoded = Vec::new();
+                read_source(source, &mut decoded)?;
+                *last_split_source = Some((source.clone(), decoded));
+            }
+            let decoded = &last_split_source.as_ref().unwrap().1;
+            let expected_len = shape[0].saturating_mul(shape[1]);
+            let end_elems = out_offset_elems.saturating_add(*out_len_elems);
+            if decoded.len() != expected_len || end_elems > decoded.len() {
+                return Err(CeraError::Backend(format!(
+                    "blk.{block_idx} fused qkv.weight element count mismatch: expected {expected_len}, got {}",
+                    decoded.len()
+                )));
+            }
+            f32_data.clear();
+            f32_data.extend_from_slice(&decoded[*out_offset_elems..end_elems]);
+            if end_elems >= decoded.len() {
+                *last_split_source = None;
+            }
+        }
+        LocalSourceAction::SplitVlGateUpSlice {
+            source,
+            block_idx,
+            shape,
+            is_up,
+        } => {
+            let needs_load = last_split_source
+                .as_ref()
+                .is_none_or(|(cached_src, _)| cached_src != source);
+            if needs_load {
+                let mut decoded = Vec::new();
+                read_source(source, &mut decoded)?;
+                *last_split_source = Some((source.clone(), decoded));
+            }
+            let decoded = &last_split_source.as_ref().unwrap().1;
+            let expected_len = shape[0].saturating_mul(shape[1]);
+            if decoded.len() != expected_len {
+                return Err(CeraError::Backend(format!(
+                    "blk.{block_idx} fused gate_up.weight element count mismatch: expected {expected_len}, got {}",
+                    decoded.len()
+                )));
+            }
+            let half_elems = expected_len / 2;
+            let slice = if *is_up {
+                &decoded[half_elems..]
+            } else {
+                &decoded[..half_elems]
+            };
+            f32_data.clear();
+            f32_data.extend_from_slice(slice);
+            if *is_up {
+                *last_split_source = None;
+            }
+        }
+        LocalSourceAction::StackExperts {
+            experts,
+            rows,
+            cols,
+        } => {
+            let mut decoded_experts = Vec::with_capacity(experts.len());
+            for (exp_idx, src) in experts {
+                let mut values = Vec::new();
+                read_source(src, &mut values)?;
+                decoded_experts.push((*exp_idx, vec![*rows, *cols], values));
+            }
+            let (_, stacked_data) =
+                stack_expert_tensors(&mut decoded_experts, expected_experts, &pt.gguf_name)?;
+            *f32_data = stacked_data;
+        }
+    }
+
+    Ok(())
+}
+
+fn apply_arch_tensor_transforms(arch: &str, gguf_name: &str, f32_data: &mut [f32]) {
+    // Hugging Face Gemma and Gemma 2 checkpoints store RMSNorm weights as an offset
+    // from 1.0: `x * (1.0 + weight)` (see Hugging Face transformers modeling_gemma.py
+    // and modeling_gemma2.py). Standard GGUF runtime RMSNorm executes standard `x * weight`
+    // without runtime offset addition. Therefore, standard GGUF converters
+    // (including upstream llama.cpp conversion/gemma.py:67) fold the +1.0 offset
+    // directly into the exported tensor weights during conversion so real checkpoints
+    // produce correct activations at inference.
+    if (arch == "gemma" || arch == "gemma2") && gguf_name.ends_with("norm.weight") {
+        for v in f32_data.iter_mut() {
+            *v += 1.0;
+        }
+    }
+
+    if matches!(arch, "qwen35" | "qwen3_5" | "qwen3.5")
+        && (gguf_name.ends_with(".ssm_a") || gguf_name.ends_with(".ssm_a.weight"))
+    {
+        transform_qwen35_ssm_a_inplace(f32_data);
+    }
+
+    if matches!(arch, "bailingmoe3" | "bailingmoe" | "bailingmoe2")
+        && (gguf_name.ends_with(".ssm_a") || gguf_name.ends_with(".ssm_a.weight"))
+    {
+        transform_bailingmoe_ssm_a_inplace(f32_data);
+    }
+}
+
+fn read_local_source_f32(
+    src: &SourceRef,
+    safetensors_files: &[PathBuf],
+    current_file_idx: &mut usize,
+    current_file: &mut Option<File>,
+    raw_bytes: &mut Vec<u8>,
+    f32_out: &mut Vec<f32>,
+) -> Result<(), CeraError> {
+    if src.file_idx != *current_file_idx {
+        let f = File::open(&safetensors_files[src.file_idx]).map_err(|e| {
+            CeraError::Backend(format!(
+                "failed to open `{}`: {e}",
+                safetensors_files[src.file_idx].display()
+            ))
+        })?;
+        *current_file = Some(f);
+        *current_file_idx = src.file_idx;
+    }
+
+    let file = current_file
+        .as_mut()
+        .ok_or_else(|| CeraError::Backend("no active safetensors shard file".into()))?;
+
+    // The span comes from the shard's own header: bound it by the file before sizing a
+    // buffer from it, or a crafted header allocates (and zero-fills) gigabytes.
+    let file_len = file
+        .metadata()
+        .map_err(|e| CeraError::Backend(format!("failed to stat safetensors shard: {e}")))?
+        .len();
+    if src.data_end < src.data_start || src.data_end as u64 > file_len {
+        return Err(CeraError::Backend(format!(
+            "tensor data range {}..{} extends past the end of its {file_len}-byte shard",
+            src.data_start, src.data_end
+        )));
+    }
+    let byte_len = src.data_end - src.data_start;
+    file.seek(SeekFrom::Start(src.data_start as u64))
+        .map_err(|e| CeraError::Backend(format!("failed to seek in safetensors shard: {e}")))?;
+
+    raw_bytes.resize(byte_len, 0);
+    file.read_exact(raw_bytes).map_err(|e| {
+        CeraError::Backend(format!(
+            "failed to read tensor data from safetensors shard: {e}"
+        ))
+    })?;
+
+    decode_safetensor_to_f32_into(raw_bytes, &src.dtype, f32_out)
+}
+
+#[cfg(feature = "remote")]
+fn fetch_remote_source_f32(
+    src: &SourceRef,
+    client: &reqwest::blocking::Client,
+    shard_download_urls: &[String],
+    auth_token: Option<&str>,
+    raw_bytes: &mut Vec<u8>,
+    f32_out: &mut Vec<f32>,
+) -> Result<(), CeraError> {
+    let tensor_url = &shard_download_urls[src.file_idx];
+    if src.data_start < src.data_end {
+        fetch_hf_file_range_into(
+            client,
+            tensor_url,
+            src.data_start,
+            src.data_end - 1,
+            auth_token,
+            raw_bytes,
+        )?;
+    } else {
+        raw_bytes.clear();
+    }
+    decode_safetensor_to_f32_into(raw_bytes, &src.dtype, f32_out)
+}
+
 /// Quantize a local SafeTensors directory or file to GGUF with explicit strategy and per-tensor overrides.
 ///
 /// # Errors
@@ -988,11 +1678,7 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
                 .and_then(|n| n.to_str())
                 .unwrap_or("")
                 .to_ascii_lowercase();
-            let is_auxiliary = filename_lower.contains("mmproj")
-                || filename_lower.contains("visual")
-                || filename_lower.contains("audio_decoder")
-                || filename_lower.contains("vocoder");
-            if is_safetensors && !is_auxiliary {
+            if is_safetensors && !is_auxiliary_shard(&filename_lower) {
                 safetensors_files.push(p);
             }
         }
@@ -1006,163 +1692,24 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
         )));
     }
 
-    /// Where a tensor's bytes sit in the checkpoint.
-    #[derive(Clone)]
-    struct SourceRef {
-        file_idx: usize,
-        dtype: String,
-        data_start: usize,
-        data_end: usize,
-    }
-
-    struct LocalPendingTensor {
-        file_idx: usize,
-        expected_elements: usize,
-        dtype: String,
-        data_start: usize,
-        data_end: usize,
-        ggml_type: u32,
-        gguf_name: String,
-        /// A tensor derived from several sources (a folded batch norm): the half it holds
-        /// and the weight, bias, running mean and running variance it is computed from.
-        fold: Option<(d1::Fold, Vec<SourceRef>)>,
-    }
-
-    let mut pending_tensors = Vec::new();
-    // the batch-norm statistics of the d1 conformer, by layer, folded after the scan
-    let mut batch_norms: std::collections::BTreeMap<
-        usize,
-        std::collections::BTreeMap<d1::BatchNormStat, (SourceRef, usize)>,
-    > = std::collections::BTreeMap::new();
-
-    for (file_idx, file_path) in safetensors_files.iter().enumerate() {
+    let mut shard_headers = Vec::with_capacity(safetensors_files.len());
+    for file_path in &safetensors_files {
         let mut file = File::open(file_path).map_err(|e| {
             CeraError::Backend(format!("failed to open `{}`: {e}", file_path.display()))
         })?;
         let header = SafeTensorsHeader::parse_from_reader(&mut file)?;
-        for (raw_name, tensor_info) in &header.tensors {
-            let plan = if is_d1 {
-                d1::tensor_plan(raw_name)
-            } else {
-                d1::TensorPlan::Name(translate_hf_to_gguf_tensor_name_with_arch(raw_name, &arch))
-            };
-            let num_elements: usize = tensor_info
-                .shape
-                .iter()
-                .try_fold(1usize, |acc, &d| acc.checked_mul(d))
-                .ok_or_else(|| {
-                    CeraError::Backend(format!("tensor shape overflow for `{raw_name}`"))
-                })?;
-            let (gguf_name, batch_norm) = match plan {
-                d1::TensorPlan::Skip => continue,
-                d1::TensorPlan::Name(name) => (name, None),
-                d1::TensorPlan::BatchNorm { layer, stat } => (String::new(), Some((layer, stat))),
-            };
-            if let Some((layer, stat)) = batch_norm {
-                let bound = |off: usize| {
-                    header.header_size_bytes.checked_add(off).ok_or_else(|| {
-                        CeraError::Backend(format!("tensor offset overflow for `{raw_name}`"))
-                    })
-                };
-                let source = SourceRef {
-                    file_idx,
-                    dtype: tensor_info.dtype.clone(),
-                    data_start: bound(tensor_info.data_offsets.0)?,
-                    data_end: bound(tensor_info.data_offsets.1)?,
-                };
-                batch_norms
-                    .entry(layer)
-                    .or_default()
-                    .insert(stat, (source, num_elements));
-                continue;
-            }
-            let ggml_type = if is_d1 && d1::keeps_f32(&gguf_name) {
-                crate::convert::writer::GGML_TYPE_F32
-            } else {
-                quant.select_ggml_type_with_overrides(
-                    &gguf_name,
-                    tensor_info.shape.len(),
-                    num_elements,
-                    tensor_info.shape.last().copied().unwrap_or(1),
-                    overrides,
-                )
-            };
-
-            let dims = if is_d1 {
-                d1::tensor_dims(&gguf_name, &tensor_info.shape)
-            } else {
-                gguf_tensor_dims(&gguf_name, &tensor_info.shape)
-            };
-            let out_bytes = TargetQuant::compute_tensor_bytes(ggml_type, num_elements);
-
-            writer.add_tensor(&gguf_name, dims, ggml_type, out_bytes);
-
-            let data_start = header
-                .header_size_bytes
-                .checked_add(tensor_info.data_offsets.0)
-                .ok_or_else(|| {
-                    CeraError::Backend(format!("tensor offset start overflow for `{raw_name}`"))
-                })?;
-            let data_end = header
-                .header_size_bytes
-                .checked_add(tensor_info.data_offsets.1)
-                .ok_or_else(|| {
-                    CeraError::Backend(format!("tensor offset end overflow for `{raw_name}`"))
-                })?;
-
-            pending_tensors.push(LocalPendingTensor {
-                file_idx,
-                expected_elements: num_elements,
-                dtype: tensor_info.dtype.clone(),
-                data_start,
-                data_end,
-                ggml_type,
-                gguf_name,
-                fold: None,
-            });
-        }
+        shard_headers.push(header);
     }
 
-    // each conformer layer's batch norm becomes a scale and a shift
-    for (layer, stats) in &batch_norms {
-        use d1::BatchNormStat::{Bias, Mean, Var, Weight};
-        let mut sources = Vec::with_capacity(4);
-        let mut elements = None;
-        for stat in [Weight, Bias, Mean, Var] {
-            let (source, n) = stats.get(&stat).ok_or_else(|| {
-                CeraError::Backend(format!(
-                    "d1-omni conformer layer {layer} has no batch-norm {stat:?} tensor"
-                ))
-            })?;
-            if *elements.get_or_insert(*n) != *n {
-                return Err(CeraError::Backend(format!(
-                    "d1-omni conformer layer {layer}: the batch-norm tensors differ in length"
-                )));
-            }
-            sources.push(source.clone());
-        }
-        let n = elements.unwrap_or(0);
-        for (name, kind) in [("weight", d1::Fold::Scale), ("bias", d1::Fold::Shift)] {
-            let gguf_name = format!("a.blk.{layer}.conv_norm.{name}");
-            let ggml_type = crate::convert::writer::GGML_TYPE_F32;
-            writer.add_tensor(
-                &gguf_name,
-                vec![n as u64],
-                ggml_type,
-                TargetQuant::compute_tensor_bytes(ggml_type, n),
-            );
-            pending_tensors.push(LocalPendingTensor {
-                file_idx: sources[0].file_idx,
-                expected_elements: n,
-                dtype: sources[0].dtype.clone(),
-                data_start: sources[0].data_start,
-                data_end: sources[0].data_end,
-                ggml_type,
-                gguf_name,
-                fold: Some((kind, sources.clone())),
-            });
-        }
-    }
+    let pending_tensors = plan_pending_tensors(
+        shard_headers.iter().enumerate(),
+        &config,
+        &arch,
+        is_d1,
+        quant,
+        overrides,
+        &mut writer,
+    )?;
 
     let tmp_out = output_gguf_path.with_extension(unique_temp_suffix());
     let tmp_guard = TempFileGuard::new(tmp_out.clone());
@@ -1173,68 +1720,31 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
     let mut buf_writer = BufWriter::with_capacity(1024 * 1024 * 4, out_file);
     writer.write_header_and_tensor_info(&mut buf_writer)?;
 
+    let expected_experts = expected_expert_count(&config);
     let mut quant_buf = Vec::new();
     let mut f32_data = Vec::new();
     let mut raw_bytes = Vec::new();
     let mut current_file_idx = usize::MAX;
     let mut current_file: Option<File> = None;
+    let mut last_split_source: Option<(SourceRef, Vec<f32>)> = None;
 
     for pt in pending_tensors {
-        if pt.file_idx != current_file_idx {
-            let f = File::open(&safetensors_files[pt.file_idx]).map_err(|e| {
-                CeraError::Backend(format!(
-                    "failed to open `{}`: {e}",
-                    safetensors_files[pt.file_idx].display()
-                ))
-            })?;
-            current_file = Some(f);
-            current_file_idx = pt.file_idx;
-        }
-
-        if let Some((kind, sources)) = &pt.fold {
-            // a folded batch norm: read its weight, bias, running mean and running variance
-            let mut stats: Vec<Vec<f32>> = Vec::with_capacity(sources.len());
-            for src in sources {
-                let mut shard = File::open(&safetensors_files[src.file_idx]).map_err(|e| {
-                    CeraError::Backend(format!(
-                        "failed to open `{}`: {e}",
-                        safetensors_files[src.file_idx].display()
-                    ))
-                })?;
-                shard
-                    .seek(SeekFrom::Start(src.data_start as u64))
-                    .map_err(|e| CeraError::Backend(format!("failed to seek in shard: {e}")))?;
-                let mut bytes = vec![0u8; src.data_end.saturating_sub(src.data_start)];
-                shard.read_exact(&mut bytes).map_err(|e| {
-                    CeraError::Backend(format!("failed to read a batch-norm statistic: {e}"))
-                })?;
-                let mut values = Vec::new();
-                decode_safetensor_to_f32_into(&bytes, &src.dtype, &mut values)?;
-                stats.push(values);
-            }
-            // a corrupt shard fails here with the span lengths, not inside the fold with
-            // an index panic
-            f32_data = fold_stats_checked(*kind, &stats, &pt.gguf_name)?;
-        } else {
-            let file = current_file
-                .as_mut()
-                .ok_or_else(|| CeraError::Backend("no active safetensors shard file".into()))?;
-
-            let byte_len = pt.data_end.saturating_sub(pt.data_start);
-            file.seek(SeekFrom::Start(pt.data_start as u64))
-                .map_err(|e| {
-                    CeraError::Backend(format!("failed to seek in safetensors shard: {e}"))
-                })?;
-
-            raw_bytes.resize(byte_len, 0);
-            file.read_exact(&mut raw_bytes).map_err(|e| {
-                CeraError::Backend(format!(
-                    "failed to read tensor data from safetensors shard: {e}"
-                ))
-            })?;
-
-            decode_safetensor_to_f32_into(&raw_bytes, &pt.dtype, &mut f32_data)?;
-        }
+        materialize_pending_tensor_f32(
+            &pt,
+            expected_experts,
+            &mut last_split_source,
+            &mut f32_data,
+            |src, out| {
+                read_local_source_f32(
+                    src,
+                    &safetensors_files,
+                    &mut current_file_idx,
+                    &mut current_file,
+                    &mut raw_bytes,
+                    out,
+                )
+            },
+        )?;
         let num_elements = f32_data.len();
         if num_elements != pt.expected_elements {
             return Err(CeraError::Backend(format!(
@@ -1243,35 +1753,15 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
             )));
         }
 
-        // Hugging Face Gemma and Gemma 2 checkpoints store RMSNorm weights as an offset
-        // from 1.0: `x * (1.0 + weight)` (see Hugging Face transformers modeling_gemma.py
-        // and modeling_gemma2.py). Standard GGUF runtime RMSNorm executes standard `x * weight`
-        // without runtime offset addition. Therefore, standard GGUF converters
-        // (including upstream llama.cpp conversion/gemma.py:67) fold the +1.0 offset
-        // directly into the exported tensor weights during conversion so real checkpoints
-        // produce correct activations at inference.
-        if (arch == "gemma" || arch == "gemma2") && pt.gguf_name.ends_with("norm.weight") {
-            for v in f32_data.iter_mut() {
-                *v += 1.0;
-            }
-        }
-
-        if matches!(arch.as_str(), "qwen35" | "qwen3_5" | "qwen3.5")
-            && (pt.gguf_name.ends_with(".ssm_a") || pt.gguf_name.ends_with(".ssm_a.weight"))
-        {
-            transform_qwen35_ssm_a_inplace(&mut f32_data);
-        }
-
-        if matches!(arch.as_str(), "bailingmoe3" | "bailingmoe" | "bailingmoe2")
-            && (pt.gguf_name.ends_with(".ssm_a") || pt.gguf_name.ends_with(".ssm_a.weight"))
-        {
-            transform_bailingmoe_ssm_a_inplace(&mut f32_data);
-        }
+        apply_arch_tensor_transforms(&arch, &pt.gguf_name, &mut f32_data);
 
         let target_size = TargetQuant::compute_tensor_bytes(pt.ggml_type, num_elements);
         quant_buf.resize(target_size, 0);
 
         quantize_tensor_data_with_strategy(&f32_data, pt.ggml_type, strategy, &mut quant_buf)?;
+        if matches!(pt.action, LocalSourceAction::StackExperts { .. }) {
+            f32_data = Vec::new();
+        }
         writer.write_tensor_data(&mut buf_writer, &quant_buf)?;
     }
 
@@ -1298,6 +1788,10 @@ pub fn quantize_safetensors_to_gguf_with_strategy(
 const MAX_RETRIES: u32 = 5;
 #[cfg(feature = "remote")]
 const BASE_RETRY_DELAY_MS: u64 = 1000;
+
+/// Most a remote range fetch reserves up front (256 MiB); larger tensors grow as bytes arrive.
+#[cfg(feature = "remote")]
+const REMOTE_RESERVE_CAP: usize = 256 << 20;
 
 #[cfg(feature = "remote")]
 fn is_retryable_status(status: reqwest::StatusCode) -> bool {
@@ -1404,7 +1898,9 @@ fn fetch_hf_file_range_into(
                 let status = resp.status();
                 if status == reqwest::StatusCode::PARTIAL_CONTENT {
                     let expected_range_len = end.saturating_sub(start) + 1;
-                    out.reserve(expected_range_len);
+                    // the range comes from the shard's own header: reserve a bounded head start
+                    // and let `read_to_end` grow with the bytes that really arrive
+                    out.reserve(expected_range_len.min(REMOTE_RESERVE_CAP));
                     let mut reader =
                         std::io::Read::take(&mut resp, (expected_range_len + 1) as u64);
                     match std::io::Read::read_to_end(&mut reader, out) {
@@ -1487,9 +1983,103 @@ fn fetch_hf_file_range(
     Ok(buf)
 }
 
+/// Whether a lower-cased checkpoint file belongs to a side model (projector, vision tower,
+/// audio decoder or detokenizer, vocoder), not the language model being converted. The
+/// local and the streaming converter filter shards with this one rule.
+pub(crate) fn is_auxiliary_shard(lower: &str) -> bool {
+    [
+        "mmproj",
+        "visual",
+        "audio_decoder",
+        "detokenizer",
+        "vocoder",
+    ]
+    .iter()
+    .any(|marker| lower.contains(marker))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_source_span_past_the_end_of_its_shard_is_refused_before_allocating() {
+        let dir = tempfile::tempdir().unwrap();
+        let shard = dir.path().join("model.safetensors");
+        fs::write(&shard, [0u8; 16]).unwrap();
+        // the span comes from the shard's own header: 2^50 bytes would abort on allocation
+        let src = SourceRef {
+            file_idx: 0,
+            dtype: "F32".into(),
+            data_start: 8,
+            data_end: 1 << 50,
+        };
+        let (mut idx, mut file, mut raw, mut out) = (usize::MAX, None, Vec::new(), Vec::new());
+        let err = read_local_source_f32(&src, &[shard], &mut idx, &mut file, &mut raw, &mut out)
+            .unwrap_err();
+        assert!(err.to_string().contains("past the end"), "{err}");
+    }
+
+    #[test]
+    fn qkv_plan_refuses_head_counts_whose_rows_overflow() {
+        let config = HfModelConfig::from_json_str(
+            r#"{"num_attention_heads": 2, "head_dim": 64,
+                "num_key_value_heads": 9223372036854775808, "hidden_size": 128}"#,
+        )
+        .unwrap();
+        let source = SourceRef {
+            file_idx: 0,
+            dtype: "F32".into(),
+            data_start: 0,
+            data_end: 0,
+        };
+        let err = plan_split_lfm3_vl_qkv(&[128, 4], 0, &config, source).unwrap_err();
+        assert!(err.to_string().contains("fused qkv"), "{err}");
+    }
+
+    #[test]
+    fn expert_count_follows_the_metadata_writer_lookup() {
+        let count =
+            |json: &str| expected_expert_count(&HfModelConfig::from_json_str(json).unwrap());
+        // a null top-level key falls through to `text_config`, as the writer's lookup does
+        assert_eq!(
+            count(r#"{"num_experts": null, "text_config": {"num_experts": 4}}"#),
+            Some(4)
+        );
+        // `num_experts` anywhere beats `n_routed_experts` at the top level
+        assert_eq!(
+            count(r#"{"n_routed_experts": 4, "text_config": {"num_experts": 8}}"#),
+            Some(8)
+        );
+        assert_eq!(
+            count(r#"{"num_experts": 8, "n_routed_experts": 4}"#),
+            Some(8)
+        );
+        // zero experts means a dense model: there is no count to enforce
+        assert_eq!(count(r#"{"num_experts": 0}"#), None);
+        assert_eq!(count(r#"{"hidden_size": 8}"#), None);
+    }
+
+    /// Side-model files (the LFM3 audio bundle ships a `detokenizer` next to its language
+    /// model) are not shards of the model being converted. The converters' call sites are
+    /// pinned by the detokenizer sibling in the lfm3 local and streaming fixtures; the
+    /// full-path cases here are the forms only the streaming converter sees.
+    #[test]
+    fn side_model_files_are_not_language_model_shards() {
+        use super::is_auxiliary_shard;
+        for aux in [
+            "mmproj-model.safetensors",
+            "vision/visual.safetensors",
+            "audio_decoder/model.safetensors",
+            "detokenizer/model.safetensors",
+            "vocoder-model.safetensors",
+        ] {
+            assert!(is_auxiliary_shard(aux), "{aux}");
+        }
+        for shard in ["model.safetensors", "model-00001-of-00002.safetensors"] {
+            assert!(!is_auxiliary_shard(shard), "{shard}");
+        }
+    }
 
     #[test]
     fn a_template_file_is_absent_only_when_it_is_not_there() {
@@ -1678,5 +2268,205 @@ mod tests {
             err.to_string().contains("blk.0.ffn"),
             "unexpected message: {err}"
         );
+    }
+
+    #[test]
+    fn lazy_assembly_matches_eager_for_vl_splits_and_stacked_experts() {
+        let config = HfModelConfig::from_json_str(
+            &serde_json::json!({
+                "model_type": "lfm3",
+                "hidden_size": 8,
+                "num_hidden_layers": 2,
+                "num_attention_heads": 4,
+                "num_key_value_heads": 1,
+                "head_dim": 2,
+                "intermediate_size": 3,
+                "vocab_size": 16,
+                "max_position_embeddings": 128,
+                "rms_norm_eps": 1e-5,
+                "rope_theta": 10000.0,
+                "num_experts": 2,
+            })
+            .to_string(),
+        )
+        .unwrap();
+
+        let qkv_data: Vec<f32> = (0..48).map(|v| v as f32 + 0.25).collect();
+        let gate_up_data: Vec<f32> = (0..24).map(|v| (v as f32) * 1.5).collect();
+        let exp0_w1: Vec<f32> = (1..=8).map(|v| v as f32).collect();
+        let exp1_w1: Vec<f32> = (101..=108).map(|v| v as f32).collect();
+        let exp0_w2: Vec<f32> = (201..=208).map(|v| v as f32).collect();
+        let exp1_w2: Vec<f32> = (301..=308).map(|v| v as f32).collect();
+        let exp0_w3: Vec<f32> = (401..=408).map(|v| v as f32).collect();
+        let exp1_w3: Vec<f32> = (501..=508).map(|v| v as f32).collect();
+        let vision_skip: Vec<f32> = vec![9.0; 16];
+
+        let raw_entries: Vec<(&str, Vec<usize>, &[f32])> = vec![
+            (
+                "vision_tower.encoder.layers.0.weight",
+                vec![4, 4],
+                &vision_skip,
+            ),
+            (
+                "language_model.layers.0.self_attn.qkv.weight",
+                vec![12, 4],
+                &qkv_data,
+            ),
+            (
+                "language_model.layers.0.feed_forward.gate_up.weight",
+                vec![6, 4],
+                &gate_up_data,
+            ),
+            (
+                "model.layers.1.feed_forward.experts.1.w1.weight",
+                vec![2, 4],
+                &exp1_w1,
+            ),
+            (
+                "model.layers.1.feed_forward.experts.0.w1.weight",
+                vec![2, 4],
+                &exp0_w1,
+            ),
+            (
+                "model.layers.1.feed_forward.experts.0.w2.weight",
+                vec![4, 2],
+                &exp0_w2,
+            ),
+            (
+                "model.layers.1.feed_forward.experts.1.w2.weight",
+                vec![4, 2],
+                &exp1_w2,
+            ),
+            (
+                "model.layers.1.feed_forward.experts.0.w3.weight",
+                vec![2, 4],
+                &exp0_w3,
+            ),
+            (
+                "model.layers.1.feed_forward.experts.1.w3.weight",
+                vec![2, 4],
+                &exp1_w3,
+            ),
+        ];
+
+        let mut header_map = serde_json::Map::new();
+        let mut payload_bytes = Vec::new();
+        for (name, shape, values) in &raw_entries {
+            let start = payload_bytes.len();
+            for v in *values {
+                payload_bytes.extend_from_slice(&v.to_le_bytes());
+            }
+            let end = payload_bytes.len();
+            header_map.insert(
+                (*name).to_string(),
+                serde_json::json!({
+                    "dtype": "F32",
+                    "shape": shape,
+                    "data_offsets": [start, end],
+                }),
+            );
+        }
+        let header_json = serde_json::Value::Object(header_map).to_string();
+        let header_size = 8 + header_json.len();
+        let header = SafeTensorsHeader::parse_from_json_str(&header_json, header_size).unwrap();
+
+        let mut shard_bytes = Vec::with_capacity(header_size + payload_bytes.len());
+        shard_bytes.extend_from_slice(&(header_json.len() as u64).to_le_bytes());
+        shard_bytes.extend_from_slice(header_json.as_bytes());
+        shard_bytes.extend_from_slice(&payload_bytes);
+
+        let mut writer = GgufWriter::new();
+        // Header planning must succeed from metadata alone before reading any tensor bytes.
+        let planned = plan_pending_tensors(
+            [(0usize, &header)],
+            &config,
+            "lfm3",
+            false,
+            TargetQuant::F32,
+            &[],
+            &mut writer,
+        )
+        .unwrap();
+
+        assert!(
+            !planned.iter().any(|pt| pt.gguf_name.contains("vision")),
+            "multimodal tensor should be skipped"
+        );
+
+        let mut read_counts = std::collections::BTreeMap::<(usize, usize), usize>::new();
+        let mut last_split_source = None;
+        let mut materialized = std::collections::BTreeMap::<String, Vec<f32>>::new();
+        for pt in &planned {
+            let mut f32_data = Vec::new();
+            materialize_pending_tensor_f32(
+                pt,
+                expected_expert_count(&config),
+                &mut last_split_source,
+                &mut f32_data,
+                |src, out| {
+                    *read_counts
+                        .entry((src.data_start, src.data_end))
+                        .or_insert(0) += 1;
+                    decode_safetensor_to_f32_into(
+                        &shard_bytes[src.data_start..src.data_end],
+                        &src.dtype,
+                        out,
+                    )
+                },
+            )
+            .unwrap();
+            assert_eq!(f32_data.len(), pt.expected_elements, "{}", pt.gguf_name);
+            if pt.gguf_name == "blk.0.attn_v.weight" || pt.gguf_name == "blk.0.ffn_up.weight" {
+                assert!(
+                    last_split_source.is_none(),
+                    "split cache should be dropped after final slice of {}",
+                    pt.gguf_name
+                );
+            }
+            materialized.insert(pt.gguf_name.clone(), f32_data);
+        }
+
+        // Each source span in the shard should be decoded only once across the entire pass.
+        for (&span, &count) in &read_counts {
+            assert_eq!(count, 1, "source span {span:?} was decoded {count} times");
+        }
+
+        let eager_qkv = split_lfm3_vl_qkv(&qkv_data, &[12, 4], 0, 4, 1, 2).unwrap();
+        for (name, shape, data) in eager_qkv {
+            assert_eq!(materialized.get(&name), Some(&data), "{name}");
+            let info = writer.tensors().iter().find(|t| t.name == name).unwrap();
+            assert_eq!(info.dims, gguf_tensor_dims(&name, &shape));
+        }
+
+        let eager_gu = split_lfm3_vl_gate_up(&gate_up_data, &[6, 4], 0).unwrap();
+        for (name, shape, data) in eager_gu {
+            assert_eq!(materialized.get(&name), Some(&data), "{name}");
+            let info = writer.tensors().iter().find(|t| t.name == name).unwrap();
+            assert_eq!(info.dims, gguf_tensor_dims(&name, &shape));
+        }
+
+        for (gguf_name, exp_shape, e0, e1) in [
+            ("blk.1.ffn_gate_exps.weight", vec![2, 4], &exp0_w1, &exp1_w1),
+            ("blk.1.ffn_down_exps.weight", vec![4, 2], &exp0_w2, &exp1_w2),
+            ("blk.1.ffn_up_exps.weight", vec![2, 4], &exp0_w3, &exp1_w3),
+        ] {
+            let mut raw = vec![
+                (1, exp_shape.clone(), e1.clone()),
+                (0, exp_shape.clone(), e0.clone()),
+            ];
+            let (expected_shape, expected_data) =
+                stack_expert_tensors(&mut raw, Some(2), gguf_name).unwrap();
+            assert_eq!(
+                materialized.get(gguf_name),
+                Some(&expected_data),
+                "{gguf_name}"
+            );
+            let info = writer
+                .tensors()
+                .iter()
+                .find(|t| t.name == gguf_name)
+                .unwrap();
+            assert_eq!(info.dims, gguf_tensor_dims(gguf_name, &expected_shape));
+        }
     }
 }

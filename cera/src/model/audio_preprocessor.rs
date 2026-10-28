@@ -516,6 +516,123 @@ pub(crate) fn log_mel_with_tables(
     )
 }
 
+/// FFT size for the LFM3A audio preprocessor (400 samples = 25 ms at 16 kHz).
+pub const N_FFT_LFM3A: usize = 400;
+
+/// Periodic Hann window length for the LFM3A audio preprocessor.
+pub const WINDOW_LEN_LFM3A: usize = 400;
+
+/// Frame hop length for the LFM3A audio preprocessor (160 samples = 10 ms at 16 kHz).
+pub const HOP_LEN_LFM3A: usize = 160;
+
+/// Number of unique FFT bins for a 400-point real-input transform (`400 / 2 + 1 = 201`).
+pub const N_FFT_BINS_LFM3A: usize = N_FFT_LFM3A / 2 + 1;
+
+/// Floor applied before `log10` in the LFM3A mel frontend.
+pub const LOG_MEL_FLOOR_LFM3A: f32 = 1e-12;
+
+/// Number of STFT frames [`log_mel_spectrogram_lfm3a`] will produce for `n_samples`
+/// input samples, without computing the spectrogram.
+///
+/// Matches the uncentered right-padded LFM3A STFT (`mtmd_audio_preprocessor_lfm3a`):
+/// if `n_samples <= 400`, pad to `400` (`1` frame); otherwise right-pad to the
+/// next hop boundary above `400`:
+/// `n_padded = n_samples + (160 - (n_samples - 400) % 160) % 160`,
+/// `n_frames = (n_padded - 400) / 160 + 1`.
+pub fn n_frames_for_lfm3a(n_samples: usize) -> usize {
+    if n_samples == 0 {
+        return 0;
+    }
+    let win = WINDOW_LEN_LFM3A;
+    let hop = HOP_LEN_LFM3A;
+    let n_padded = if n_samples > win {
+        let rem = (n_samples - win) % hop;
+        let pad = (hop - rem) % hop;
+        let Some(v) = n_samples.checked_add(pad) else {
+            return 0;
+        };
+        v
+    } else {
+        win
+    };
+    (n_padded - win) / hop + 1
+}
+
+/// Compute the LFM3A log-mel spectrogram of a mono PCM chunk sampled at
+/// `SAMPLE_RATE` (16 kHz). Output is row-major `[n_frames, n_mel_bins]`
+/// (time-major outer, freq inner).
+///
+/// Returns `(mel, n_frames)`. Empty input yields `(vec![], 0)`.
+///
+/// Pipeline:
+/// - Uncentered STFT (`center = false`), no pre-emphasis.
+/// - Right-pad to `400` if `n_samples <= 400`, or to the next multiple of `160`
+///   above `400` (`n_samples + (160 - (n_samples - 400) % 160) % 160`).
+/// - Periodic Hann window of length 400 (`build_hann_window(400)`).
+/// - 400-point FFT -> power spectrum `|X[k]|^2` for `k in 0..201`.
+/// - Slaney mel filterbank (`build_mel_filterbank(n_mel_bins, 400, 16000)`).
+/// - Base-10 log with `1e-12` floor followed by fixed affine normalization:
+///   `(mel.max(1e-12).log10() + 4.0) / 4.0`.
+pub fn log_mel_spectrogram_lfm3a(pcm: &[f32], n_mel_bins: usize) -> (Vec<f32>, usize) {
+    if pcm.is_empty() || n_mel_bins == 0 {
+        return (Vec::new(), 0);
+    }
+    let n_frames = n_frames_for_lfm3a(pcm.len());
+    if n_frames == 0 {
+        return (Vec::new(), 0);
+    }
+
+    let win = WINDOW_LEN_LFM3A;
+    let hop = HOP_LEN_LFM3A;
+    let n_padded = if pcm.len() > win {
+        let rem = (pcm.len() - win) % hop;
+        pcm.len() + (hop - rem) % hop
+    } else {
+        win
+    };
+    let mut samples = vec![0.0f32; n_padded];
+    samples[..pcm.len()].copy_from_slice(pcm);
+
+    let hann = build_hann_window(WINDOW_LEN_LFM3A);
+    let filters = build_mel_filterbank(n_mel_bins, N_FFT_LFM3A, SAMPLE_RATE as usize);
+
+    let mut planner = FftPlanner::<f32>::new();
+    let fft = planner.plan_fft_forward(N_FFT_LFM3A);
+    let mut fft_buf = vec![Complex32::new(0.0, 0.0); N_FFT_LFM3A];
+    let mut power_spec = vec![0.0f64; N_FFT_BINS_LFM3A];
+    let mut mel_time_major = vec![0.0f32; n_frames * n_mel_bins];
+
+    for ti in 0..n_frames {
+        let offset = ti * HOP_LEN_LFM3A;
+        let frame_samples = &samples[offset..offset + N_FFT_LFM3A];
+        for (fb, (&h, &s)) in fft_buf.iter_mut().zip(hann.iter().zip(frame_samples)) {
+            *fb = Complex32::new(h * s, 0.0);
+        }
+        fft.process(&mut fft_buf);
+
+        for (p, c) in power_spec
+            .iter_mut()
+            .zip(fft_buf.iter().take(N_FFT_BINS_LFM3A))
+        {
+            *p = c.re as f64 * c.re as f64 + c.im as f64 * c.im as f64;
+        }
+
+        let dst = &mut mel_time_major[ti * n_mel_bins..(ti + 1) * n_mel_bins];
+        for (mi, o) in dst.iter_mut().enumerate() {
+            let frow = &filters[mi * N_FFT_BINS_LFM3A..(mi + 1) * N_FFT_BINS_LFM3A];
+            let sum: f64 = power_spec
+                .iter()
+                .zip(frow)
+                .map(|(&p, &f)| p * f as f64)
+                .sum();
+            let clamped = (sum as f32).max(LOG_MEL_FLOOR_LFM3A);
+            *o = (clamped.log10() + 4.0) / 4.0;
+        }
+    }
+
+    (mel_time_major, n_frames)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -656,7 +773,7 @@ mod tests {
         let w = build_padded_hann_window();
         assert_eq!(w.len(), N_FFT);
         let lo = (N_FFT - WINDOW_LEN) / 2;
-        // Symmetric window: the peak straddles N_FFT/2 - 1 and N_FFT/2.
+        // Symmetric window: the peak straddling N_FFT/2 - 1 and N_FFT/2.
         assert!(
             (w[N_FFT / 2] - 1.0).abs() < 1e-4,
             "peak should land at N_FFT/2, got {}",
@@ -762,5 +879,47 @@ mod tests {
         let (mel, n_frames) = log_mel_spectrogram(&[], 80);
         assert_eq!(n_frames, 0);
         assert!(mel.is_empty());
+    }
+
+    /// LFM3A frame count matches `log_mel_spectrogram_lfm3a` across short, exact, and multi-hop inputs.
+    #[test]
+    fn n_frames_for_lfm3a_matches_spectrogram() {
+        assert_eq!(n_frames_for_lfm3a(0), 0);
+        assert_eq!(n_frames_for_lfm3a(1), 1);
+        assert_eq!(n_frames_for_lfm3a(159), 1);
+        assert_eq!(n_frames_for_lfm3a(400), 1);
+        assert_eq!(n_frames_for_lfm3a(401), 2);
+        assert_eq!(n_frames_for_lfm3a(560), 2);
+        assert_eq!(n_frames_for_lfm3a(16000), 99);
+
+        for n in [0usize, 1, 159, 160, 400, 401, 560, 1600, 16000] {
+            let pcm = vec![0.05f32; n];
+            let (mel, actual) = log_mel_spectrogram_lfm3a(&pcm, 128);
+            assert_eq!(n_frames_for_lfm3a(n), actual);
+            assert_eq!(mel.len(), actual * 128);
+        }
+    }
+
+    /// Silence in LFM3A mel frontend clamps at `1e-12`, producing `(log10(1e-12) + 4.0) / 4.0 = -2.0`.
+    #[test]
+    fn log_mel_spectrogram_lfm3a_silence_floor_and_sine_smoke() {
+        let silence = vec![0.0f32; 1600];
+        let (mel_zero, n_frames) = log_mel_spectrogram_lfm3a(&silence, 128);
+        assert_eq!(n_frames, 9);
+        assert_eq!(mel_zero.len(), 9 * 128);
+        for &v in &mel_zero {
+            assert!(
+                (v - (-2.0)).abs() < 1e-5,
+                "expected -2.0 on silence, got {v}"
+            );
+        }
+
+        let pcm: Vec<f32> = (0..1600)
+            .map(|i| (2.0 * std::f32::consts::PI * 1000.0 * i as f32 / SAMPLE_RATE as f32).sin())
+            .collect();
+        let (mel, nf) = log_mel_spectrogram_lfm3a(&pcm, 128);
+        assert_eq!(nf, 9);
+        assert!(mel.iter().all(|v| v.is_finite()));
+        assert!(mel.iter().any(|&v| v > -2.0));
     }
 }

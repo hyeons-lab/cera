@@ -10106,6 +10106,11 @@ public struct ToolDef: Equatable, Hashable {
      * `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
      */
     public var parametersJson: String
+    /**
+     * When `true` the tool is withheld from the initial prompt's tool list and only revealed
+     * later through a `tool_reference`, while staying active for call parsing and grammars.
+     */
+    public var deferLoading: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -10113,10 +10118,15 @@ public struct ToolDef: Equatable, Hashable {
         /**
          * JSON Schema object for the arguments, as a JSON string (e.g.
          * `{"type":"object","properties":{…},"required":[…]}`). Empty → none.
-         */parametersJson: String) {
+         */parametersJson: String, 
+        /**
+         * When `true` the tool is withheld from the initial prompt's tool list and only revealed
+         * later through a `tool_reference`, while staying active for call parsing and grammars.
+         */deferLoading: Bool = false) {
         self.name = name
         self.description = description
         self.parametersJson = parametersJson
+        self.deferLoading = deferLoading
     }
 
     
@@ -10137,7 +10147,8 @@ public struct FfiConverterTypeToolDef: FfiConverterRustBuffer {
             try ToolDef(
                 name: FfiConverterString.read(from: &buf), 
                 description: FfiConverterOptionString.read(from: &buf), 
-                parametersJson: FfiConverterString.read(from: &buf)
+                parametersJson: FfiConverterString.read(from: &buf), 
+                deferLoading: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -10145,6 +10156,7 @@ public struct FfiConverterTypeToolDef: FfiConverterRustBuffer {
         FfiConverterString.write(value.name, into: &buf)
         FfiConverterOptionString.write(value.description, into: &buf)
         FfiConverterString.write(value.parametersJson, into: &buf)
+        FfiConverterBool.write(value.deferLoading, into: &buf)
     }
 }
 
@@ -12494,6 +12506,11 @@ public enum ToolFormat: Equatable, Hashable {
      * `<tool_call>…</tool_call>`.
      */
     case hermes
+    /**
+     * LFM3: XML `<function=name><parameter=arg>val</parameter></function>` in
+     * `<tool_call>…</tool_call>`.
+     */
+    case lfm3Xml
 
 
 
@@ -12519,6 +12536,8 @@ public struct FfiConverterTypeToolFormat: FfiConverterRustBuffer {
         
         case 2: return .hermes
         
+        case 3: return .lfm3Xml
+        
         default: throw UniffiInternalError.unexpectedEnumCase
         }
     }
@@ -12533,6 +12552,10 @@ public struct FfiConverterTypeToolFormat: FfiConverterRustBuffer {
         
         case .hermes:
             writeInt(&buf, Int32(2))
+        
+        
+        case .lfm3Xml:
+            writeInt(&buf, Int32(3))
         
         }
     }

@@ -208,6 +208,77 @@ impl HexagonLfmModel {
         Ok(())
     }
 
+    /// `dst[i, :] = a[i, :] * scalars[i]` over `n_rows` contiguous rows of `dim`
+    /// elements: the DSP's per-row scalar worker (`src1 = [1, n_rows]`, contiguous,
+    /// staged in VTCM). `dst` may be `a`. This is `lfm3`'s per-head attention gate
+    /// when `a` is the attention output viewed as one row per `(token, head)`.
+    pub(super) fn dispatch_mul_per_row_scalar(
+        session: &mut HexagonQueueSession,
+        a_buf: &RpcmemBuffer,
+        a_offset: usize,
+        scalars_buf: &RpcmemBuffer,
+        scalars_offset: usize,
+        dst_buf: &RpcmemBuffer,
+        dst_offset: usize,
+        dim: usize,
+        n_rows: usize,
+    ) -> Result<(), CeraError> {
+        // Sized first: a refusal then registers no tensor.
+        let kparams = build_binary_scalar_dma_kernel_params(
+            dim,
+            n_rows,
+            4,
+            8 * 1024 * 1024,
+            session.dsp_threads(),
+        )
+        .ok_or_else(|| {
+            CeraError::Backend(format!(
+                "dispatch_mul_per_row_scalar: a {dim}-wide row with a {n_rows}-entry table does \
+                 not fit VTCM"
+            ))
+        })?;
+        let bytes = dim * n_rows * 4;
+        let row = (dim * 4) as u32;
+        let a_ti = session.add_tensor(
+            a_buf,
+            a_offset,
+            bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            [dim as u32, n_rows as u32, 1, 1],
+            [4, row, bytes as u32, bytes as u32],
+        )?;
+        let scalar_bytes = n_rows * 4;
+        let b_ti = session.add_tensor(
+            scalars_buf,
+            scalars_offset,
+            scalar_bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            [1, n_rows as u32, 1, 1],
+            [4, 4, scalar_bytes as u32, scalar_bytes as u32],
+        )?;
+        let dst_ti = session.add_tensor(
+            dst_buf,
+            dst_offset,
+            bytes,
+            HTP_TENSOR_COMPUTE,
+            HtpDataType::F32 as u32,
+            [dim as u32, n_rows as u32, 1, 1],
+            [4, row, bytes as u32, bytes as u32],
+        )?;
+        Self::enqueue_labeled(
+            session,
+            "dispatch_mul_per_row_scalar",
+            HtpOpCode::Mul as u32,
+            &[a_ti, b_ti],
+            &[dst_ti],
+            [0i32; 16],
+            kparams,
+        )?;
+        Ok(())
+    }
+
     /// Dim-0 CONCAT of two 2D f32 tensors:
     /// `[s0_rows, dim] + [s1_rows, dim] -> [s0_rows + s1_rows, dim]`.
     /// `params[0]` is the concat dim; kparams are zero, and `enqueue_op` fills them from the
@@ -1643,6 +1714,21 @@ impl HexagonLfmModel {
         Ok(())
     }
 
+    /// The optional third RoPE source: `n` F32 frequency factors (each rotated pair's
+    /// angle is divided by its factor) in the weights buffer. Returns the tensor index
+    /// (unused when there are no factors, which returns the `(0, 0)` sentinel) and the
+    /// factor count the kernel params must carry.
+    fn rope_freq_factors_tensor(
+        session: &mut HexagonQueueSession,
+        freq_factors: Option<(&RpcmemBuffer, usize, usize)>,
+    ) -> Result<(u16, usize), CeraError> {
+        let Some((buf, offset, n)) = freq_factors else {
+            return Ok((0, 0));
+        };
+        let ti = Self::add_f32_vec(session, buf, offset, n, HTP_TENSOR_WEIGHT)?;
+        Ok((ti, n))
+    }
+
     pub(super) fn dispatch_rope(
         session: &mut HexagonQueueSession,
         act: &RpcmemBuffer,
@@ -1654,6 +1740,7 @@ impl HexagonLfmModel {
         max_seq_len: usize,
         rope_theta: f32,
         mode: u32,
+        freq_factors: Option<(&RpcmemBuffer, usize, usize)>,
     ) -> Result<(), CeraError> {
         let total_bytes = head_dim * n_heads * 4;
         let act_ti = session.add_tensor(
@@ -1683,12 +1770,16 @@ impl HexagonLfmModel {
         // Dims are [head_dim, n_heads, 1]: heads are dim 1, tokens dim 2.
         let nrows = n_heads;
         let n_threads = session.dsp_threads().min(nrows as u32).max(1);
-        let kparams = build_rope_kernel_params(head_dim, nrows, n_heads, 1, n_threads);
+        let (ff_ti, n_ff) = Self::rope_freq_factors_tensor(session, freq_factors)?;
+        let kparams = build_rope_kernel_params_with_freq_factors(
+            head_dim, nrows, n_heads, 1, n_threads, n_ff,
+        );
+        let srcs = [act_ti, pos_ti, ff_ti];
         Self::enqueue_labeled(
             session,
             "dispatch_rope",
             HtpOpCode::Rope as u32,
-            &[act_ti, pos_ti],
+            &srcs[..2 + usize::from(n_ff > 0)],
             &[act_ti],
             params,
             kparams,
@@ -1711,6 +1802,7 @@ impl HexagonLfmModel {
         max_seq_len: usize,
         rope_theta: f32,
         mode: u32,
+        freq_factors: Option<(&RpcmemBuffer, usize, usize)>,
     ) -> Result<(), CeraError> {
         let q_dim = head_dim * n_heads;
         let total_bytes = q_dim * n_tokens * 4;
@@ -1745,12 +1837,16 @@ impl HexagonLfmModel {
         let params = build_rope_params(head_dim, mode, max_seq_len as u32, rope_theta, 1.0);
         let nrows = n_heads * n_tokens;
         let n_threads = session.dsp_threads().min(nrows as u32).max(1);
-        let kparams = build_rope_kernel_params(head_dim, nrows, n_heads, n_tokens, n_threads);
+        let (ff_ti, n_ff) = Self::rope_freq_factors_tensor(session, freq_factors)?;
+        let kparams = build_rope_kernel_params_with_freq_factors(
+            head_dim, nrows, n_heads, n_tokens, n_threads, n_ff,
+        );
+        let srcs = [act_ti, pos_ti, ff_ti];
         Self::enqueue_labeled(
             session,
             "dispatch_rope_m",
             HtpOpCode::Rope as u32,
-            &[act_ti, pos_ti],
+            &srcs[..2 + usize::from(n_ff > 0)],
             &[act_ti],
             params,
             kparams,

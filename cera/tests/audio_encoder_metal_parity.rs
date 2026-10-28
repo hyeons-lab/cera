@@ -293,6 +293,7 @@ fn to_f32_encoder(w: &AudioEncoderWeights) -> AudioEncoderWeights {
                 ffn_down_1_b: b.ffn_down_1_b.clone(),
                 ln2_w: b.ln2_w.clone(),
                 ln2_b: b.ln2_b.clone(),
+                lfm3a: None,
             })
             .collect(),
         mlp_adapter: AudioMlpAdapterWeights {

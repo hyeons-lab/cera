@@ -76,6 +76,14 @@ pub fn oracle_fixture(rel: &str) -> Option<std::path::PathBuf> {
     p.exists().then_some(p)
 }
 
+/// Whether `CERA_REQUIRE_MODEL` asks for coverage: set and non-empty, the one reading every
+/// suite shares (an empty value counts as unset).
+pub fn require_model() -> bool {
+    !std::env::var("CERA_REQUIRE_MODEL")
+        .unwrap_or_default()
+        .is_empty()
+}
+
 /// Resolve `fixture` under [`models_dir`], or skip the calling test.
 ///
 /// A missing fixture skips with a loud `eprintln` carrying the suite's
@@ -138,9 +146,7 @@ pub fn fixture_or_skip(fixture: &str, tag: &str) -> Option<std::path::PathBuf> {
         return Some(p);
     }
     assert!(
-        std::env::var("CERA_REQUIRE_MODEL")
-            .unwrap_or_default()
-            .is_empty(),
+        !require_model(),
         "CERA_REQUIRE_MODEL is set but {fixture} is absent at {}",
         p.display()
     );

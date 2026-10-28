@@ -305,7 +305,7 @@ are sampled; a later `setGrammar` replaces any grammar set by a prior call.
 Render a set of tools into the prompt, generate, then parse the calls back out.
 The wire format is per-model-family; detect it from the GGUF architecture
 (`detectToolFormat`) or pick one explicitly (`ToolFormat.Lfm2Pythonic` for
-LFM2/LFM2.5, `ToolFormat.Hermes` for Qwen2.5/Qwen3). Tools cross the JS boundary
+LFM2/LFM2.5, `ToolFormat.Hermes` for Qwen2.5/Qwen3, `ToolFormat.Lfm3Xml` for LFM3). Tools cross the JS boundary
 as a JSON string; `parseToolCalls` returns a JSON string you `JSON.parse`.
 
 ```js
@@ -335,7 +335,8 @@ opts.maxTokens = 128;
 // The start marker differs by format; it must be a special token in the model's
 // vocab for the trigger to fire (LFM2's is; Hermes markers usually aren't, so
 // this stays unconstrained there; validate the generated output).
-const startMarker = format === ToolFormat.Hermes ? '<tool_call>' : '<|tool_call_start|>';
+const startMarker = (format === ToolFormat.Hermes || format === ToolFormat.Lfm3Xml)
+  ? '<tool_call>' : '<|tool_call_start|>';
 const trigger = tok.specialTokenId(startMarker);
 if (trigger != null) {
   opts.setGrammar(toolGrammar(tools, format));   // separate tool-grammar subset

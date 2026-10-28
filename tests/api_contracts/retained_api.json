@@ -9,7 +9,7 @@
       "owner": "CeraEngine",
       "retained_home": "Rust core; retain existing engine and raw helpers",
       "expected": {
-        "AUDIO_MARKER_CANDIDATES": "pub const AUDIO_MARKER_CANDIDATES: [&'static str; 4]",
+        "AUDIO_MARKER_CANDIDATES": "pub const AUDIO_MARKER_CANDIDATES: [&'static str; 5]",
         "audio_encoder": "pub fn audio_encoder(&self) -> Option<&Arc<AudioEncoderWeights>>",
         "audio_profile": "pub fn audio_profile(&self) -> crate::audio_profile::AudioProfile",
         "backend_name": "pub fn backend_name(&self) -> &'static str",
@@ -409,7 +409,7 @@
       "kind": "record",
       "owner": "ToolDef",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
-      "expected": "pub struct ToolDef { pub name: String, pub description: Option<String>, pub parameters_json: String, }"
+      "expected": "pub struct ToolDef { pub name: String, pub description: Option<String>, pub parameters_json: String, #[uniffi(default = false)] pub defer_loading: bool, }"
     },
     {
       "source": "cera-ffi/src/lib.rs",
@@ -563,7 +563,7 @@
       "kind": "record",
       "owner": "ToolFormat",
       "retained_home": "Existing UniFFI Swift/Kotlin/Python/Dart API",
-      "expected": "pub enum ToolFormat { Lfm2Pythonic, Hermes, }"
+      "expected": "pub enum ToolFormat { Lfm2Pythonic, Hermes, Lfm3Xml, }"
     },
     {
       "source": "cera-ffi/src/lib.rs",
@@ -860,7 +860,7 @@
       "kind": "record",
       "owner": "ToolFormat",
       "retained_home": "Existing wasm-bindgen API; WebGpu types retain wgpu gate",
-      "expected": "pub enum ToolFormat { Lfm2Pythonic, Hermes, }"
+      "expected": "pub enum ToolFormat { Lfm2Pythonic, Hermes, Lfm3Xml, }"
     },
     {
       "source": "cera-wasm/src/lib.rs",

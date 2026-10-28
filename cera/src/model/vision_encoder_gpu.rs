@@ -2898,44 +2898,72 @@ fn try_wgpu_stack(_spec: &VitStackSpec, _need_flash: bool) -> Option<std::sync::
     None
 }
 
+/// An accelerator that can host a vision encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum VisionEncoderAccel {
+    Wgpu,
+    Hexagon,
+    Metal,
+}
+
+/// The accelerators to try for a vision encoder, in order. The LFM3 ViT (conv-gated blocks,
+/// temporal patch embedding, `lfm3_blocks`) has no accelerated implementation: the Hexagon
+/// encoder iterates `weights.blocks`, which is empty for it, so it would run zero blocks and
+/// return wrong embeddings with no error. It stays on the CPU.
+fn vision_encoder_candidates(
+    is_lfm3: bool,
+    backend: crate::engine::BackendPreference,
+) -> &'static [VisionEncoderAccel] {
+    use crate::engine::BackendPreference as BP;
+    use VisionEncoderAccel::{Hexagon, Metal, Wgpu};
+    if is_lfm3 {
+        return &[];
+    }
+    match backend {
+        BP::Cpu => &[],
+        // Hexagon is the only NPU with a vision encoder today; `Npu` takes the
+        // same path and gains other vendors here as they grow one.
+        BP::Hexagon | BP::Npu => &[Hexagon],
+        BP::Metal => &[Metal],
+        BP::Gpu => &[Wgpu],
+        BP::Auto => &[Metal, Hexagon, Wgpu],
+    }
+}
+
+#[cfg(feature = "hexagon")]
+fn try_hexagon_vision_encoder_for(
+    weights: &VisionEncoderWeights,
+) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    crate::model::vision_encoder_hexagon::try_hexagon_vision_encoder(weights)
+}
+
+#[cfg(not(feature = "hexagon"))]
+fn try_hexagon_vision_encoder_for(
+    _weights: &VisionEncoderWeights,
+) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    None
+}
+
 /// Build a cached GPU vision encoder for `weights`, honoring `backend`.
-/// Returns `None` for `Cpu`, when the chosen backend's feature isn't compiled,
+/// Returns `None` for `Cpu`, for an LFM3 encoder (CPU only, see `vision_encoder_candidates`),
+/// when the chosen backend's feature isn't compiled,
 /// when the device/context can't be created, or (wgpu, native only) when the blank-image warm-up
 /// encode fails: the caller then falls back to the CPU encoder. `Auto` prefers Metal, then Hexagon, then wgpu.
 pub fn build_gpu_vision_encoder(
     weights: &VisionEncoderWeights,
     backend: crate::engine::BackendPreference,
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
-    use crate::engine::BackendPreference as BP;
-    match backend {
-        BP::Cpu => None,
-        // Hexagon is the only NPU with a vision encoder today; `Npu` takes the
-        // same path and gains other vendors here as they grow one.
-        BP::Hexagon | BP::Npu => {
-            #[cfg(feature = "hexagon")]
-            {
-                crate::model::vision_encoder_hexagon::try_hexagon_vision_encoder(weights)
-            }
-            #[cfg(not(feature = "hexagon"))]
-            {
-                None
-            }
-        }
-        BP::Metal => try_metal_vision_encoder(weights),
-        BP::Gpu => try_wgpu_vision_encoder(weights),
-        BP::Auto => try_metal_vision_encoder(weights)
-            .or_else(|| {
-                #[cfg(feature = "hexagon")]
-                {
-                    crate::model::vision_encoder_hexagon::try_hexagon_vision_encoder(weights)
-                }
-                #[cfg(not(feature = "hexagon"))]
-                {
-                    None
-                }
-            })
-            .or_else(|| try_wgpu_vision_encoder(weights)),
+    let is_lfm3 = weights.config.projector_type.is_lfm3();
+    if is_lfm3 && !matches!(backend, crate::engine::BackendPreference::Cpu) {
+        tracing::debug!("vision encoder: lfm3 has no accelerated encoder; using the CPU encoder");
     }
+    vision_encoder_candidates(is_lfm3, backend)
+        .iter()
+        .find_map(|accel| match accel {
+            VisionEncoderAccel::Wgpu => try_wgpu_vision_encoder(weights),
+            VisionEncoderAccel::Hexagon => try_hexagon_vision_encoder_for(weights),
+            VisionEncoderAccel::Metal => try_metal_vision_encoder(weights),
+        })
 }
 
 #[cfg(feature = "gpu")]
@@ -2943,6 +2971,9 @@ pub fn build_wgpu_vision_encoder_with_context(
     ctx: crate::backend::wgpu::GpuContext,
     weights: &VisionEncoderWeights,
 ) -> Option<std::sync::Arc<dyn VisionGpuEncode>> {
+    if weights.config.projector_type.is_lfm3() {
+        return None;
+    }
     let ops = WgpuVitOps::new(ctx).ok()?;
     let gpu_w = GpuVitWeights::build(&ops, weights);
     let encoder = WgpuVisionEncoder {
@@ -3052,6 +3083,30 @@ fn try_metal_vision_encoder(
 ))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lfm3_vision_encoder_is_never_routed_to_an_accelerator() {
+        use crate::engine::BackendPreference as BP;
+        for backend in [BP::Cpu, BP::Gpu, BP::Hexagon, BP::Npu, BP::Metal, BP::Auto] {
+            assert!(
+                vision_encoder_candidates(true, backend).is_empty(),
+                "lfm3 was routed under {backend:?}"
+            );
+        }
+        assert_eq!(
+            vision_encoder_candidates(false, BP::Auto),
+            &[
+                VisionEncoderAccel::Metal,
+                VisionEncoderAccel::Hexagon,
+                VisionEncoderAccel::Wgpu
+            ]
+        );
+        assert_eq!(
+            vision_encoder_candidates(false, BP::Hexagon),
+            &[VisionEncoderAccel::Hexagon]
+        );
+        assert!(vision_encoder_candidates(false, BP::Cpu).is_empty());
+    }
 
     #[cfg(feature = "gpu")]
     use crate::backend::wgpu::{gpu_or_skip, require_flash_or_skip};
@@ -3207,6 +3262,7 @@ mod tests {
             image_std: [0.5, 0.5, 0.5],
             image_min_pixels: ppt,
             image_max_pixels: ppt * n_trained_patches,
+            ..Default::default()
         };
 
         let blocks = (0..n_layer)
@@ -3238,10 +3294,14 @@ mod tests {
                 conv_w: rnd(in_dim * n_embd, 50),
                 conv_b: rnd(n_embd, 51),
             },
+            patch_embed_1: None,
+            embedding_norm: None,
             position_embed: rnd(n_trained_patches * n_embd, 52),
             blocks,
+            lfm3_blocks: Vec::new(),
             post_ln_w: rnd(n_embd, 53),
             post_ln_b: rnd(n_embd, 54),
+            mm_input_norm: None,
             projector: ProjectorWeights {
                 mm1_w: lin(intermediate, n_embd * scale_factor * scale_factor, 55),
                 mm1_b: rnd(intermediate, 56),

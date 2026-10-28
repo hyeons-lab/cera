@@ -127,6 +127,11 @@ fn deltanet_conv_dim(ssm: &crate::model::SsmConfig) -> Result<usize, CeraError> 
 /// implement the both-sides mode: a single-sided (debug) request, or a
 /// `head_dim` their kernels can't handle, warns and falls back to the backend's
 /// uncompressed KV (f32 on wgpu, f16 on Metal).
+///
+/// An `lfm3` model (its sliding-window layers are not masked on the compressed
+/// read) and any `head_dim` that is not a power of two resolve to the plain cache
+/// on every backend; `Session::new` logs the downgrade (see
+/// [`KvCompression::is_downgraded_for`]).
 #[derive(Clone, Debug, Default)]
 pub enum KvCompression {
     /// No compression — the backend's uncompressed KV: f32 on CPU and wgpu,
@@ -150,6 +155,16 @@ pub enum KvCompression {
     /// `seed` drives the per-layer randomized Hadamard rotations — the same
     /// seed reproduces the same rotations deterministically.
     TurboQuant { seed: u64, keys: bool, values: bool },
+}
+
+/// Whether a state built from `config` can hold a TurboQuant cache: the Walsh-Hadamard
+/// transform needs a power-of-two `head_dim`, and `lfm3` is excluded because its
+/// sliding-window layers are not masked on the compressed read path (a compressed cache
+/// would attend outside the window and return plausible, wrong text). The allocator and
+/// [`KvCompression::resolved_for`] both ask this, so no entry point can build a
+/// compressed state for a model that cannot read one.
+pub(crate) fn turboquant_capable(config: &ModelConfig) -> bool {
+    config.head_dim.is_power_of_two() && config.architecture != "lfm3"
 }
 
 impl KvCompression {
@@ -181,13 +196,14 @@ impl KvCompression {
     /// The mode a state built from `config` will *actually* use.
     ///
     /// `from_config_capped` silently downgrades TurboQuant to plain f32 when
-    /// `head_dim` isn't a power of two (the Walsh-Hadamard transform needs it), so
+    /// `head_dim` isn't a power of two (the Walsh-Hadamard transform needs it) or the
+    /// architecture is `lfm3` (see `turboquant_capable`), so
     /// anything deriving identity from the mode — the prefix-cache tag especially —
     /// has to ask what was resolved, not what was requested. Keeping that rule here
     /// beside the allocator that applies it stops the two from drifting.
     pub fn resolved_for(&self, config: &ModelConfig) -> Self {
         let (keys, values) = self.flags();
-        if (keys || values) && !config.head_dim.is_power_of_two() {
+        if (keys || values) && !turboquant_capable(config) {
             Self::None
         } else {
             self.clone()
@@ -548,7 +564,7 @@ impl PrefillScratch {
         Self::resize_f32(&mut self.out_col, hs);
         Self::resize_f32(&mut self.proj_mat, proj_rows * n);
         Self::resize_f32(&mut self.out_proj_input, max_act_dim * n);
-        Self::resize_f32(&mut self.q_mat, q_dim * n);
+        Self::resize_f32(&mut self.q_mat, max_act_dim * n);
         Self::resize_f32(&mut self.k_mat, max_kv_dim * n);
         Self::resize_f32(&mut self.v_mat, max_kv_dim * n);
         Self::resize_f32(&mut self.bq_scales, n * nb_hs);
@@ -560,7 +576,7 @@ impl PrefillScratch {
         Self::resize_f32(&mut self.dq_scales, n * nb_is);
         Self::resize_i8(&mut self.dq_quants, n * is);
         Self::resize_f32(&mut self.flash_out, max_act_dim * n);
-        Self::resize_f32(&mut self.q_col, q_dim * n);
+        Self::resize_f32(&mut self.q_col, max_act_dim * n);
         self.kv_widen_k.clear();
         self.kv_widen_v.clear();
     }
@@ -882,9 +898,10 @@ impl InferenceState {
         // (half the bytes). Independent of the TurboQuant `compress_*` axis.
         let use_f16 = compression.is_f16();
 
-        // TurboQuant requires power-of-2 head_dim for the Walsh-Hadamard Transform.
+        // TurboQuant needs a power-of-2 head_dim for the Walsh-Hadamard Transform, and an
+        // architecture whose attention read it can serve (see `turboquant_capable`).
         // If the requirement isn't met, silently fall back to uncompressed f32.
-        let tq_enabled = (compress_keys || compress_values) && head_dim.is_power_of_two();
+        let tq_enabled = (compress_keys || compress_values) && turboquant_capable(config);
         let (compress_keys, compress_values) = if tq_enabled {
             (compress_keys, compress_values)
         } else {
@@ -1129,8 +1146,16 @@ impl InferenceState {
                 k: zeroed_f32(max_kv_dim)?,
                 v: zeroed_f32(max_kv_dim)?,
                 attn_out: zeroed_f32(q_dim)?,
-                gate: zeroed_f32(config.intermediate_size)?,
-                up: zeroed_f32(config.intermediate_size)?,
+                gate: zeroed_f32(
+                    config
+                        .intermediate_size
+                        .max(config.moe.as_ref().map_or(0, |m| m.expert_ff_len)),
+                )?,
+                up: zeroed_f32(
+                    config
+                        .intermediate_size
+                        .max(config.moe.as_ref().map_or(0, |m| m.expert_ff_len)),
+                )?,
                 out: zeroed_f32(config.hidden_size)?,
                 scores: Vec::new(),    // grows with seq_len during inference
                 q8_scales: Vec::new(), // resized per GEMV input dimension (max of hidden/intermediate)
@@ -2537,6 +2562,60 @@ mod cache_tag_tests {
         assert_eq!(scratch.dq_quants.len(), is * n);
         assert_eq!(scratch.dq_scales.len(), is.div_ceil(32) * n);
     }
+
+    /// The other side of each `max` in the sizing: a hidden size above q_dim, a layer with more
+    /// KV heads than `n_kv_heads`, and an expert width below the dense FFN width.
+    #[test]
+    fn prefill_scratch_ensure_takes_the_widest_of_each_dimension() {
+        use super::PrefillScratch;
+        use crate::model::{ModelConfig, MoeConfig, ScalarMultipliers};
+
+        let cfg = ModelConfig {
+            architecture: "lfm3".to_string(),
+            n_layers: 2,
+            hidden_size: 512, // above q_dim (2 * 64 = 128)
+            intermediate_size: 1024,
+            n_heads: 2,
+            n_kv_heads: 1,
+            head_dim: 64,
+            vocab_size: 256,
+            max_seq_len: 64,
+            rms_norm_eps: 1e-5,
+            rope_theta: 10_000.0,
+            block_types: Vec::new(),
+            kv_heads_per_layer: vec![1, 4], // a layer wider than n_kv_heads
+            conv_kernel_size: None,
+            scalars: ScalarMultipliers::default(),
+            moe: Some(MoeConfig {
+                n_expert: 4,
+                n_expert_used: 2,
+                expert_ff_len: 256, // below intermediate_size
+                is_moe_layer: vec![false, true],
+            }),
+            ssm: None,
+            is_causal: true,
+            class_labels: Vec::new(),
+        };
+        let n = 5;
+        let mut scratch = PrefillScratch::default();
+        scratch.ensure(n, &cfg);
+
+        let q_dim = 2 * 64;
+        let max_act_dim = 512; // hidden_size, not q_dim
+        let max_kv_dim = 4 * 64; // the widest layer
+        let is = 1024; // the dense width, not the expert's
+        assert_eq!(scratch.q_mat.len(), max_act_dim * n);
+        assert_eq!(scratch.q_col.len(), max_act_dim * n);
+        assert_eq!(scratch.out_proj_input.len(), max_act_dim * n);
+        assert_eq!(scratch.k_mat.len(), max_kv_dim * n);
+        assert_eq!(scratch.v_mat.len(), max_kv_dim * n);
+        assert_eq!(
+            scratch.proj_mat.len(),
+            (3 * 512).max(q_dim + 2 * max_kv_dim) * n
+        );
+        assert_eq!(scratch.gate_mat.len(), is * n);
+        assert_eq!(scratch.dq_quants.len(), is * n);
+    }
 }
 
 // ── KV Prefix Cache ─────────────────────────────────────────────────────
@@ -3629,6 +3708,52 @@ mod tests {
             is_causal: true,
             class_labels: Vec::new(),
         }
+    }
+
+    /// `lfm3` is never TurboQuant-capable (its sliding-window layers are not masked on the
+    /// compressed read), whatever its `head_dim`; the request resolves to the plain cache
+    /// and the allocator builds no compressed buffers, so no entry point (a model's
+    /// `configure_kv_compression`, `Session`, or a direct state build) can disagree. A
+    /// power-of-two `lfm2` stays capable, and a non-power-of-two one is not.
+    #[test]
+    fn turboquant_is_not_offered_to_lfm3_or_odd_head_dims() {
+        let tq = KvCompression::turboquant(1);
+        let compressed = |cfg: &ModelConfig| -> bool {
+            InferenceState::from_config_with_compression(cfg, &tq)
+                .unwrap()
+                .layers
+                .iter()
+                .any(|l| {
+                    matches!(
+                        l,
+                        LayerState::Attention {
+                            compressed_keys: Some(_),
+                            ..
+                        } | LayerState::Attention {
+                            compressed_values: Some(_),
+                            ..
+                        }
+                    )
+                })
+        };
+
+        let mut cfg = tiny_config(2, 256); // head_dim 64
+        assert!(turboquant_capable(&cfg));
+        assert_eq!(tq.resolved_for(&cfg).cache_tag(), tq.cache_tag());
+        assert!(compressed(&cfg));
+
+        cfg.architecture = "lfm3".into();
+        assert!(!turboquant_capable(&cfg));
+        assert_eq!(tq.resolved_for(&cfg).cache_tag(), "");
+        assert_ne!(tq.cache_tag(), "");
+        assert!(
+            !compressed(&cfg),
+            "an lfm3 state must hold no TurboQuant cache"
+        );
+
+        let odd = tiny_config(2, 96); // head_dim 24, not a power of two
+        assert!(!turboquant_capable(&odd));
+        assert!(!compressed(&odd));
     }
 
     #[test]

@@ -175,10 +175,19 @@ pub fn translate_hf_to_gguf_tensor_name(hf_name: &str) -> String {
 
 /// Translate Hugging Face standard tensor names to standard GGUF tensor names for a specific architecture.
 pub fn translate_hf_to_gguf_tensor_name_with_arch(hf_name: &str, arch: &str) -> String {
+    // Strip optional multimodal language-model prefixes (`model.language_model.`, `language_model.`, `lfm.`)
+    let hf_name = hf_name
+        .strip_prefix("model.language_model.")
+        .or_else(|| hf_name.strip_prefix("language_model."))
+        .unwrap_or(hf_name);
+    let hf_name = match arch {
+        "lfm3" => hf_name.strip_prefix("lfm.").unwrap_or(hf_name),
+        _ => hf_name,
+    };
     // Direct global mappings
     if hf_name == "model.embed_tokens.weight"
         || hf_name == "lfm2.embed_tokens.weight"
-        || (arch == "lfm2" && hf_name == "embed_tokens.weight")
+        || (matches!(arch, "lfm2" | "lfm3") && hf_name == "embed_tokens.weight")
         || hf_name == "transformer.wte.weight"
         || hf_name == "embeddings.word_embeddings.weight"
     {
@@ -194,6 +203,15 @@ pub fn translate_hf_to_gguf_tensor_name_with_arch(hf_name: &str, arch: &str) -> 
             ))
     {
         return "token_embd_norm.weight".to_string();
+    }
+    // `lfm3` applies the same tensor as its final norm, and names it that way
+    if arch == "lfm3"
+        && matches!(
+            hf_name,
+            "model.embedding_norm.weight" | "embedding_norm.weight" | "norm.weight"
+        )
+    {
+        return "output_norm.weight".to_string();
     }
     if hf_name == "model.norm.weight"
         || hf_name == "lfm2.norm.weight"
@@ -270,6 +288,40 @@ pub fn translate_hf_to_gguf_tensor_name_with_arch(hf_name: &str, arch: &str) -> 
         .or_else(|| hf_name.strip_prefix("transformer.h."))
         .or_else(|| hf_name.strip_prefix("layers."));
     if let Some((layer_idx, sub_name)) = layer_rest.and_then(|r| r.split_once('.')) {
+        // the sandwich norms, attention gate, and MoE tensors of `lfm3`
+        if arch == "lfm3" {
+            let suffix = match sub_name {
+                "post_operator_norm.weight" => Some("post_attention_norm.weight"),
+                "post_ffn_norm.weight" => Some("post_ffw_norm.weight"),
+                "self_attn.gate_proj.weight" | "attention.gate_proj.weight" => {
+                    Some("attn_gate.weight")
+                }
+                "conv.conv" => Some("shortconv.conv.weight"),
+                "feed_forward.gate.weight" | "mlp.gate.weight" | "mlp.router.weight" => {
+                    Some("ffn_gate_inp.weight")
+                }
+                "feed_forward.expert_bias"
+                | "feed_forward.expert_bias.bias"
+                | "mlp.expert_bias"
+                | "mlp.expert_bias.bias" => Some("exp_probs_b.bias"),
+                "feed_forward.experts.w1.weight"
+                | "mlp.experts.w1.weight"
+                | "feed_forward.experts.gate_proj.weight"
+                | "mlp.experts.gate_proj.weight" => Some("ffn_gate_exps.weight"),
+                "feed_forward.experts.w2.weight"
+                | "mlp.experts.w2.weight"
+                | "feed_forward.experts.down_proj.weight"
+                | "mlp.experts.down_proj.weight" => Some("ffn_down_exps.weight"),
+                "feed_forward.experts.w3.weight"
+                | "mlp.experts.w3.weight"
+                | "feed_forward.experts.up_proj.weight"
+                | "mlp.experts.up_proj.weight" => Some("ffn_up_exps.weight"),
+                _ => None,
+            };
+            if let Some(suffix) = suffix {
+                return format!("blk.{layer_idx}.{suffix}");
+            }
+        }
         let gguf_suffix = match sub_name {
             "self_attn.q_proj.weight" | "attention.q_proj.weight" => "attn_q.weight",
             "self_attn.q_proj.bias" | "attention.q_proj.bias" => "attn_q.bias",
@@ -654,5 +706,52 @@ mod tests {
             translate_hf_to_gguf_tensor_name("model.decoder.layer_norm.weight"),
             "decoder.ln_post.weight"
         );
+    }
+
+    #[test]
+    fn lfm3_moe_and_vl_tensor_name_translation() {
+        for (hf, want) in [
+            (
+                "language_model.model.embed_tokens.weight",
+                "token_embd.weight",
+            ),
+            ("language_model.embed_tokens.weight", "token_embd.weight"),
+            (
+                "model.language_model.embed_tokens.weight",
+                "token_embd.weight",
+            ),
+            ("language_model.embedding_norm.weight", "output_norm.weight"),
+            ("language_model.lm_head.weight", "output.weight"),
+            (
+                "language_model.layers.0.conv.conv",
+                "blk.0.shortconv.conv.weight",
+            ),
+            (
+                "model.layers.2.feed_forward.gate.weight",
+                "blk.2.ffn_gate_inp.weight",
+            ),
+            (
+                "model.layers.2.feed_forward.expert_bias",
+                "blk.2.exp_probs_b.bias",
+            ),
+            (
+                "model.layers.2.feed_forward.experts.w1.weight",
+                "blk.2.ffn_gate_exps.weight",
+            ),
+            (
+                "model.layers.2.feed_forward.experts.w2.weight",
+                "blk.2.ffn_down_exps.weight",
+            ),
+            (
+                "model.layers.2.feed_forward.experts.w3.weight",
+                "blk.2.ffn_up_exps.weight",
+            ),
+        ] {
+            assert_eq!(
+                translate_hf_to_gguf_tensor_name_with_arch(hf, "lfm3"),
+                want,
+                "{hf}"
+            );
+        }
     }
 }

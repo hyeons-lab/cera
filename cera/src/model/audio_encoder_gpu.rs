@@ -2443,28 +2443,58 @@ fn try_wgpu_audio_encoder(
     None
 }
 
+/// An accelerator that can host an audio encoder.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AudioEncoderAccel {
+    Wgpu,
+    Hexagon,
+    Metal,
+}
+
+/// The accelerators to try for an audio encoder, in order. The LFM3A encoder (hybrid short
+/// conv and attention, RMS norms) has no accelerated implementation: the Hexagon, Metal and
+/// wgpu encoders all stage the LFM2A Conformer layout, so sending it to one would bring a
+/// device up and then reject the weights (or run the wrong graph). It stays on the CPU.
+fn audio_encoder_candidates(
+    is_lfm3a: bool,
+    backend: crate::engine::BackendPreference,
+) -> &'static [AudioEncoderAccel] {
+    use crate::engine::BackendPreference as BP;
+    use AudioEncoderAccel::{Hexagon, Metal, Wgpu};
+    if is_lfm3a {
+        return &[];
+    }
+    match backend {
+        BP::Cpu => &[],
+        BP::Gpu => &[Wgpu],
+        // Hexagon is the only NPU with an audio encoder today; `Npu` takes the
+        // same path and gains other vendors here as they grow one.
+        BP::Hexagon | BP::Npu => &[Hexagon],
+        BP::Metal => &[Metal],
+        // Metal first, then the NPU, then wgpu (the order the rest of `auto` uses).
+        BP::Auto => &[Metal, Hexagon, Wgpu],
+    }
+}
+
 /// Build a cached GPU audio encoder for `weights`, honoring `backend`.
 ///
-/// Returns `None` for `Cpu`, when the chosen backend's feature isn't compiled,
+/// Returns `None` for `Cpu`, for the LFM3A encoder (CPU only, see
+/// `audio_encoder_candidates`), when the chosen backend's feature isn't compiled,
 /// or when the device/context can't be created. The caller then uses the CPU
 /// encoder. `Auto` prefers Metal, then the NPU, then wgpu.
 pub fn build_gpu_audio_encoder(
     weights: &std::sync::Arc<AudioEncoderWeights>,
     backend: crate::engine::BackendPreference,
 ) -> Option<std::sync::Arc<dyn AudioGpuEncode>> {
-    use crate::engine::BackendPreference as BP;
-    match backend {
-        BP::Cpu => None,
-        BP::Gpu => try_wgpu_audio_encoder(weights),
-        // Hexagon is the only NPU with an audio encoder today; `Npu` takes the
-        // same path and gains other vendors here as they grow one.
-        BP::Hexagon | BP::Npu => try_hexagon_audio_encoder(weights),
-        BP::Metal => try_metal_audio_encoder(weights),
-        // Metal first, then the NPU, then wgpu (the order the rest of `auto` uses).
-        BP::Auto => try_metal_audio_encoder(weights)
-            .or_else(|| try_hexagon_audio_encoder(weights))
-            .or_else(|| try_wgpu_audio_encoder(weights)),
+    let candidates = audio_encoder_candidates(weights.is_lfm3a(), backend);
+    if weights.is_lfm3a() && !matches!(backend, crate::engine::BackendPreference::Cpu) {
+        tracing::debug!("audio encoder: lfm3a has no accelerated encoder; using the CPU encoder");
     }
+    candidates.iter().find_map(|accel| match accel {
+        AudioEncoderAccel::Wgpu => try_wgpu_audio_encoder(weights),
+        AudioEncoderAccel::Hexagon => try_hexagon_audio_encoder(weights),
+        AudioEncoderAccel::Metal => try_metal_audio_encoder(weights),
+    })
 }
 
 #[cfg(feature = "hexagon")]
@@ -2529,6 +2559,31 @@ fn try_metal_audio_encoder(
 #[cfg(all(test, feature = "gpu"))]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lfm3a_encoder_is_never_routed_to_an_accelerator() {
+        use crate::engine::BackendPreference as BP;
+        for backend in [BP::Cpu, BP::Gpu, BP::Hexagon, BP::Npu, BP::Metal, BP::Auto] {
+            assert!(
+                audio_encoder_candidates(true, backend).is_empty(),
+                "lfm3a was routed under {backend:?}"
+            );
+        }
+        // the LFM2A routes are unchanged
+        assert_eq!(
+            audio_encoder_candidates(false, BP::Auto),
+            &[
+                AudioEncoderAccel::Metal,
+                AudioEncoderAccel::Hexagon,
+                AudioEncoderAccel::Wgpu
+            ]
+        );
+        assert_eq!(
+            audio_encoder_candidates(false, BP::Npu),
+            &[AudioEncoderAccel::Hexagon]
+        );
+        assert!(audio_encoder_candidates(false, BP::Cpu).is_empty());
+    }
 
     /// `conv_spec_runnable` admits what fits one dispatch and what the channel splitter can
     /// bind, and refuses a per-channel plane past `MAX_FLAT / 64`, which would round the
@@ -2764,6 +2819,7 @@ mod tests {
             ffn_down_1_b: vec![0.0; n_embd],
             ln2_w: vec![1.0; n_embd],
             ln2_b: vec![0.0; n_embd],
+            lfm3a: None,
         };
         AudioEncoderWeights {
             config: AudioEncoderConfig {

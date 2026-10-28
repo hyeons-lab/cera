@@ -73,6 +73,7 @@ fn model_emits_parseable_tool_call() {
             "properties": { "city": { "type": "string", "description": "City name" } },
             "required": ["city"]
         }),
+        defer_loading: false,
     }];
     let messages = vec![ChatMessage {
         role: "user".into(),
@@ -154,6 +155,7 @@ fn constrained_tool_call_with_lazy_trigger() {
             },
             "required": ["city"]
         }),
+        defer_loading: false,
     }];
     let messages = vec![ChatMessage {
         role: "user".into(),

@@ -8,7 +8,8 @@ use crate::kv_cache::{InferenceState, KvCompression};
 use crate::model::Model;
 use crate::model::audio_decoder::{
     AudioAccelerator, AudioDecoderWeights, DepthformerState, DetokenizerState, DetokenizerWeights,
-    detokenize_to_spectrum, embed_audio_token, istft_to_pcm, sample_audio_frame,
+    detokenize_to_spectrum, embed_audio_codes, embed_audio_token, istft_to_pcm, sample_audio_frame,
+    sample_frame,
 };
 use crate::sampler::{Sampler, SamplerConfig};
 use crate::time::{Duration, Instant};
@@ -52,10 +53,66 @@ pub struct AudioGenerateResult {
 
 /// Special token IDs for modality control.
 pub const TOKEN_AUDIO_START: u32 = 128;
+pub const TOKEN_AUDIO_END: u32 = 129;
 pub const TOKEN_TEXT_END: u32 = 130;
+pub const TOKEN_MIXED_START: u32 = 131;
 pub const AUDIO_END_CODE: i32 = 2048;
+pub const LFM3A_AUDIO_END_CODE: i32 = 256;
+
+/// The end-of-speech code of an `lfm3a_gen` decoder with `n_vocab` entries: the sampler's own
+/// mask/EOS id, the last one. (`LFM3A_AUDIO_END_CODE` is that id for the 257-entry vocabulary.)
+fn lfm3a_eos_code(n_vocab: usize) -> i32 {
+    i32::try_from(n_vocab.saturating_sub(1)).unwrap_or(i32::MAX)
+}
+
+/// Whether `code0` ends an `lfm3a_gen` audio span.
+fn lfm3a_is_end_code(n_vocab: usize, code0: i32) -> bool {
+    code0 == lfm3a_eos_code(n_vocab)
+}
 pub const DEFAULT_INTERLEAVED_TEXT_BUDGET: usize = 6;
 pub const DEFAULT_INTERLEAVED_AUDIO_BUDGET: usize = 12;
+
+/// Modality control token IDs resolved dynamically from the tokenizer vocabulary,
+/// falling back to the standard LFM2/LFM3 token IDs (`128..=131`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ModalityControlTokens {
+    pub audio_start: u32,
+    pub audio_end: u32,
+    pub text_end: u32,
+    pub mixed_start: u32,
+}
+
+impl Default for ModalityControlTokens {
+    fn default() -> Self {
+        Self {
+            audio_start: TOKEN_AUDIO_START,
+            audio_end: TOKEN_AUDIO_END,
+            text_end: TOKEN_TEXT_END,
+            mixed_start: TOKEN_MIXED_START,
+        }
+    }
+}
+
+impl ModalityControlTokens {
+    /// Resolve `<|audio_start|>`, `<|audio_end|>`, `<|text_end|>`, and `<|mixed_start|>`
+    /// dynamically from `tokenizer`, falling back to `128, 129, 130, 131` when absent.
+    pub fn from_tokenizer(tokenizer: &BpeTokenizer) -> Self {
+        Self {
+            audio_start: tokenizer
+                .token_to_id("<|audio_start|>")
+                .unwrap_or(TOKEN_AUDIO_START),
+            audio_end: tokenizer
+                .token_to_id("<|audio_end|>")
+                .unwrap_or(TOKEN_AUDIO_END),
+            text_end: tokenizer
+                .token_to_id("<|text_end|>")
+                .unwrap_or(TOKEN_TEXT_END),
+            mixed_start: tokenizer
+                .token_to_id("<|mixed_start|>")
+                .unwrap_or(TOKEN_MIXED_START),
+        }
+    }
+}
 
 /// How many text tokens and audio frames an interleaved turn alternates
 /// between. A vocoder GGUF may declare its own cadence
@@ -84,7 +141,10 @@ impl InterleaveCadence {
     /// default; a zero (which would spin the interleave loop) is rejected with
     /// a warning and also keeps the default.
     pub fn from_gguf(gguf: &crate::gguf::GgufFile) -> Self {
-        let read = |key: &str, default: usize| match gguf.get_u32(key) {
+        let read = |key: &str, alt_key: &str, default: usize| match gguf
+            .get_u32(key)
+            .or_else(|| gguf.get_u32(alt_key))
+        {
             Some(0) => {
                 tracing::warn!(
                     target: "cera::audio",
@@ -98,8 +158,16 @@ impl InterleaveCadence {
         };
         let d = Self::default();
         Self {
-            text: read("interleaved_n_text", d.text),
-            audio: read("interleaved_n_audio", d.audio),
+            text: read(
+                "interleaved_n_text",
+                "clip.audio_gen.interleaved_n_text",
+                d.text,
+            ),
+            audio: read(
+                "interleaved_n_audio",
+                "clip.audio_gen.interleaved_n_audio",
+                d.audio,
+            ),
         }
     }
 }
@@ -263,6 +331,8 @@ pub struct AudioOutputDecoder<'a> {
     streaming: bool,
     /// Buffered sampled codes across frames (used when `streaming == false`).
     all_codes: Vec<i32>,
+    /// Full codebook indices from the most recently decoded frame (8 for LFM2A, 12 for LFM3A).
+    last_codes: Vec<i32>,
     /// Unified silence and loop safety watchdog.
     pub watchdog: AudioSilenceWatchdog,
 }
@@ -284,6 +354,11 @@ impl<'a> AudioOutputDecoder<'a> {
     /// Total audio samples streamed so far in this session.
     pub fn streamed_samples(&self) -> usize {
         self.streamed_samples
+    }
+
+    /// Full codebook indices of the most recently decoded frame (8 for LFM2A, 12 for LFM3A).
+    pub fn last_frame_codes(&self) -> &[i32] {
+        &self.last_codes
     }
 
     /// Sample rate of the vocoder in Hz (typically 24000).
@@ -330,6 +405,29 @@ impl<'a> AudioOutputDecoder<'a> {
         self.watchdog.is_safety_limit_reached()
     }
 
+    #[inline]
+    fn is_end_code(&self, code0: i32) -> bool {
+        if self.weights.is_lfm3a_gen() {
+            lfm3a_is_end_code(self.weights.decoder_config.n_vocab, code0)
+        } else {
+            code0 == AUDIO_END_CODE
+        }
+    }
+
+    /// For `lfm3a_gen` (LFM3-Audio / LFM3-Omni), return the summed codebook feedback embedding
+    /// for the end-of-speech frame `[eos_code; n_codebook]`, which closes an `audio_out` span
+    /// in the LLM context so the backbone predicts `<|im_end|>`. Returns `None` for `lfm2a`.
+    pub fn eos_feedback_embedding(&self) -> Option<Vec<f32>> {
+        if self.weights.is_lfm3a_gen() {
+            let eos = lfm3a_eos_code(self.weights.decoder_config.n_vocab);
+            let n_cb = self.weights.decoder_config.n_codebook.max(1);
+            let eos_codes = vec![eos; n_cb];
+            Some(embed_audio_codes(self.weights, &eos_codes))
+        } else {
+            None
+        }
+    }
+
     /// Seed the internal Depthformer PRNG for deterministic audio codebook sampling.
     pub fn seed_rng(&mut self, seed: u64) {
         self.df_state.seed_rng(seed);
@@ -347,20 +445,26 @@ impl<'a> AudioOutputDecoder<'a> {
         gpu_depthformer: bool,
     ) -> Self {
         let initial_seed = crate::model::audio_decoder::non_zero_rng_seed(rand::random::<u64>());
-        let active_accelerator = match accelerator {
-            Some(a) if a.try_acquire_session() => {
-                a.reset_detokenizer();
-                a.reset_depthformer();
-                a.seed_rng(initial_seed);
-                Some(a)
+        let active_accelerator = if (weights.is_lfm3a_gen() || detok_weights.is_lfm3a_gen())
+            && !accelerator.is_some_and(|a| a.supports_lfm3a_gen_detokenizer())
+        {
+            None
+        } else {
+            match accelerator {
+                Some(a) if a.try_acquire_session() => {
+                    a.reset_detokenizer();
+                    a.reset_depthformer();
+                    a.seed_rng(initial_seed);
+                    Some(a)
+                }
+                Some(_) => {
+                    tracing::warn!(
+                        "Audio accelerator busy with another session, falling back to CPU detokenization"
+                    );
+                    None
+                }
+                None => None,
             }
-            Some(_) => {
-                tracing::warn!(
-                    "Audio accelerator busy with another session, falling back to CPU detokenization"
-                );
-                None
-            }
-            None => None,
         };
         let mut df_state = DepthformerState::new(&weights.depthformer_config);
         df_state.seed_rng(initial_seed);
@@ -383,15 +487,17 @@ impl<'a> AudioOutputDecoder<'a> {
             time_detokenizer: Duration::ZERO,
             audio_temperature,
             audio_top_k,
-            use_accelerated_df: active_accelerator.is_some_and(|a| {
-                crate::model::audio_decoder::accelerated_depthformer_enabled(
-                    a.supports_depthformer(),
-                    a.depthformer_default_on(),
-                    gpu_depthformer,
-                )
-            }),
+            use_accelerated_df: !weights.is_lfm3a_gen()
+                && active_accelerator.is_some_and(|a| {
+                    crate::model::audio_decoder::accelerated_depthformer_enabled(
+                        a.supports_depthformer(),
+                        a.depthformer_default_on(),
+                        gpu_depthformer,
+                    )
+                }),
             streaming: true,
             all_codes: Vec::new(),
+            last_codes: Vec::new(),
             watchdog: AudioSilenceWatchdog::new(),
         }
     }
@@ -414,6 +520,77 @@ impl<'a> AudioOutputDecoder<'a> {
     /// this frame on (the audio_start token embedding on the first
     /// frame, or the prior frame's feedback embedding afterward).
     pub fn decode_frame(&mut self, embed: &[f32]) -> FrameOutcome {
+        if self.weights.is_lfm3a_gen() {
+            let t0 = Instant::now();
+            let codes_vec = sample_frame(
+                self.weights,
+                &mut self.df_state,
+                embed,
+                self.audio_temperature,
+                self.audio_top_k,
+            );
+            self.time_depthformer += t0.elapsed();
+
+            if codes_vec
+                .first()
+                .copied()
+                .is_some_and(|c| self.is_end_code(c))
+            {
+                self.last_codes.clone_from(&codes_vec);
+                return FrameOutcome::End;
+            }
+
+            self.audio_frames += 1;
+            self.last_codes.clone_from(&codes_vec);
+            let mut codes = [0i32; 8];
+            for (dst, &src) in codes.iter_mut().zip(codes_vec.iter()) {
+                *dst = src;
+            }
+            let audio_embedding = embed_audio_codes(self.weights, &codes_vec);
+
+            if !self.streaming {
+                self.all_codes.extend_from_slice(&codes_vec);
+                return FrameOutcome::Codes {
+                    audio_embedding,
+                    pcm: vec![],
+                    codes,
+                };
+            }
+
+            let t1 = Instant::now();
+            let spectrum = if let Some(a) = self.accelerator {
+                let _ = a.take_audio_error();
+                let spectrum = a.detokenize_to_spectrum(self.detok_weights, &codes_vec);
+                if a.take_audio_error().is_some() {
+                    detokenize_to_spectrum(
+                        self.detok_weights,
+                        self.weights,
+                        &mut self.detok_state,
+                        &codes_vec,
+                    )
+                } else {
+                    spectrum
+                }
+            } else {
+                detokenize_to_spectrum(
+                    self.detok_weights,
+                    self.weights,
+                    &mut self.detok_state,
+                    &codes_vec,
+                )
+            };
+            self.time_detokenizer += t1.elapsed();
+
+            let pcm = self.streamer.feed_frames(&spectrum);
+            self.streamed_samples += pcm.len();
+
+            return FrameOutcome::Codes {
+                audio_embedding,
+                pcm,
+                codes,
+            };
+        }
+
         let t0 = Instant::now();
         let codes = match (self.use_accelerated_df, self.accelerator) {
             (true, Some(a)) => {
@@ -449,6 +626,8 @@ impl<'a> AudioOutputDecoder<'a> {
         }
 
         self.audio_frames += 1;
+        self.last_codes.clear();
+        self.last_codes.extend_from_slice(&codes);
         let audio_embedding = embed_audio_token(self.weights, &codes);
 
         if !self.streaming {
@@ -498,6 +677,9 @@ impl<'a> AudioOutputDecoder<'a> {
 
     /// Async version of [`Self::decode_frame`] for WebGPU / browser wasm.
     pub async fn decode_frame_async(&mut self, embed: &[f32]) -> anyhow::Result<FrameOutcome> {
+        if self.weights.is_lfm3a_gen() {
+            return Ok(self.decode_frame(embed));
+        }
         let t0 = Instant::now();
         let codes = match (self.use_accelerated_df, self.accelerator) {
             (true, Some(a)) => {
@@ -519,6 +701,8 @@ impl<'a> AudioOutputDecoder<'a> {
         }
 
         self.audio_frames += 1;
+        self.last_codes.clear();
+        self.last_codes.extend_from_slice(&codes);
         let audio_embedding = embed_audio_token(self.weights, &codes);
 
         if !self.streaming {
@@ -588,6 +772,8 @@ impl<'a> AudioOutputDecoder<'a> {
         }
 
         self.audio_frames += 1;
+        self.last_codes.clear();
+        self.last_codes.extend_from_slice(&codes);
         let audio_embedding = embed_audio_token(self.weights, &codes);
 
         if !self.streaming {
@@ -649,7 +835,12 @@ impl<'a> AudioOutputDecoder<'a> {
 
         if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
             let t1 = Instant::now();
-            let chunks = self.all_codes.chunks_exact(8);
+            let frame_codebooks = if self.weights.is_lfm3a_gen() {
+                self.weights.decoder_config.n_codebook.max(1)
+            } else {
+                8
+            };
+            let chunks = self.all_codes.chunks_exact(frame_codebooks);
             let remainder = chunks.remainder();
             for codes in chunks {
                 let spectrum = if let Some(a) = self.accelerator {
@@ -679,8 +870,9 @@ impl<'a> AudioOutputDecoder<'a> {
             }
             if !remainder.is_empty() {
                 tracing::warn!(
-                    "AudioOutputDecoder: discarding {} trailing unaligned audio codes (expected multiple of 8)",
-                    remainder.len()
+                    "AudioOutputDecoder: discarding {} trailing unaligned audio codes (expected multiple of {})",
+                    remainder.len(),
+                    frame_codebooks
                 );
             }
             self.time_detokenizer += t1.elapsed();
@@ -733,7 +925,12 @@ impl<'a> AudioOutputDecoder<'a> {
 
         if !self.all_codes.is_empty() && self.all_spectrum.is_empty() {
             let t1 = Instant::now();
-            let chunks = self.all_codes.chunks_exact(8);
+            let frame_codebooks = if self.weights.is_lfm3a_gen() {
+                self.weights.decoder_config.n_codebook.max(1)
+            } else {
+                8
+            };
+            let chunks = self.all_codes.chunks_exact(frame_codebooks);
             let remainder = chunks.remainder();
             for codes in chunks {
                 let spectrum = if let Some(a) = self.accelerator {
@@ -751,8 +948,9 @@ impl<'a> AudioOutputDecoder<'a> {
             }
             if !remainder.is_empty() {
                 tracing::warn!(
-                    "AudioOutputDecoder: discarding {} trailing unaligned audio codes (expected multiple of 8)",
-                    remainder.len()
+                    "AudioOutputDecoder: discarding {} trailing unaligned audio codes (expected multiple of {})",
+                    remainder.len(),
+                    frame_codebooks
                 );
             }
             self.time_detokenizer += t1.elapsed();
@@ -814,6 +1012,7 @@ pub fn generate_audio(
     // attempt's own faults may fail it at the checks below.
     let _ = model.take_decode_error();
 
+    let ctrl = ModalityControlTokens::from_tokenizer(tokenizer);
     let model_config = model.config();
     let mut state = InferenceState::from_config(model_config)?;
     // A fresh state starts at position 0, but backends that keep KV or
@@ -864,9 +1063,11 @@ pub fn generate_audio(
 
     // Interleaved mode counters.
     let cadence = decoder_weights.interleave;
-    let mut modality_budget = match config.mode {
-        AudioMode::Interleaved => cadence.text, // start with the vocoder's text budget
-        AudioMode::Sequential => usize::MAX,
+    let mut interleaved = matches!(config.mode, AudioMode::Interleaved);
+    let mut modality_budget = if interleaved {
+        cadence.text // start with the vocoder's text budget
+    } else {
+        usize::MAX
     };
     let mut text_done = false;
 
@@ -883,22 +1084,36 @@ pub fn generate_audio(
                 break;
             }
 
+            if next_token == ctrl.mixed_start {
+                interleaved = true;
+                modality_budget = cadence.text;
+                logits = model.forward(&[next_token], pos, &mut state);
+                check_audio_decode_error(model)?;
+                next_token = sampler.sample(&mut logits);
+                pos += 1;
+                continue;
+            }
+
             // Sequential mode: switch on audio_start token.
-            if next_token == TOKEN_AUDIO_START {
+            if next_token == ctrl.audio_start {
                 modality = Modality::Audio;
-                modality_budget = match config.mode {
-                    AudioMode::Interleaved => cadence.audio,
-                    AudioMode::Sequential => usize::MAX,
+                modality_budget = if interleaved {
+                    cadence.audio
+                } else {
+                    usize::MAX
                 };
                 continue;
             }
 
-            if next_token == TOKEN_TEXT_END {
+            if next_token == ctrl.text_end {
                 text_done = true;
             }
 
-            // Emit text token.
-            if next_token != TOKEN_TEXT_END {
+            // Emit text token (excluding modality control markers).
+            if next_token != ctrl.text_end
+                && next_token != ctrl.audio_end
+                && next_token != ctrl.mixed_start
+            {
                 let piece = tokenizer.decode(&[next_token]);
                 text_callback(&piece);
                 text_tokens += 1;
@@ -915,8 +1130,7 @@ pub fn generate_audio(
             // When budget hits 0, use forward_embedding on this token to
             // extract the audio embedding. This matches the reference which
             // extracts from the decode of the LAST text token.
-            if matches!(config.mode, AudioMode::Interleaved) && (modality_budget == 0 || text_done)
-            {
+            if interleaved && (modality_budget == 0 || text_done) {
                 let mut emb = model.forward_embedding(&[next_token], pos, &mut state);
                 check_audio_decode_error(model)?;
                 pos += 1;
@@ -937,10 +1151,20 @@ pub fn generate_audio(
                             return Err(crate::CeraError::Backend(detail).into());
                         }
                         FrameOutcome::End => {
+                            if let Some(eos_emb) = decoder.eos_feedback_embedding() {
+                                logits = model.forward_from_embedding(&eos_emb, pos, &mut state);
+                                check_audio_decode_error(model)?;
+                                pos += 1;
+                                if text_done {
+                                    break;
+                                }
+                                next_token = sampler.sample(&mut logits);
+                                break;
+                            }
                             if text_done {
                                 break;
                             }
-                            logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
+                            logits = model.forward(&[ctrl.text_end], pos, &mut state);
                             check_audio_decode_error(model)?;
                             next_token = sampler.sample(&mut logits);
                             pos += 1;
@@ -1017,29 +1241,36 @@ pub fn generate_audio(
                     FrameOutcome::Fault(detail) => {
                         return Err(crate::CeraError::Backend(detail).into());
                     }
-                    FrameOutcome::End => match config.mode {
-                        AudioMode::Sequential => {
+                    FrameOutcome::End => {
+                        if !interleaved {
                             // Sequential TTS: audio is the final output.
-                            // Returning to text + forwarding TEXT_END +
-                            // resampling produces runaway garbage tokens (the
-                            // model has nothing useful left to say) until
-                            // max_tokens caps. Exit cleanly.
+                            // On `lfm3a_gen`, record the EOS frame embedding in the LLM
+                            // state before exiting cleanly.
+                            if let Some(eos_emb) = decoder.eos_feedback_embedding()
+                                && pos < model_config.max_seq_len
+                            {
+                                let _ = model.forward_from_embedding(&eos_emb, pos, &mut state);
+                                check_audio_decode_error(model)?;
+                            }
                             break 'outer;
-                        }
-                        AudioMode::Interleaved => {
+                        } else {
                             // Interleaved: transition back to text. Trailing
                             // silence detection and safety frame limits bound
                             // runaway cycles.
                             modality = Modality::Text;
                             text_done = true;
                             modality_budget = cadence.text;
-                            logits = model.forward(&[TOKEN_TEXT_END], pos, &mut state);
+                            if let Some(eos_emb) = decoder.eos_feedback_embedding() {
+                                logits = model.forward_from_embedding(&eos_emb, pos, &mut state);
+                            } else {
+                                logits = model.forward(&[ctrl.text_end], pos, &mut state);
+                            }
                             check_audio_decode_error(model)?;
                             next_token = sampler.sample(&mut logits);
                             pos += 1;
                             break;
                         }
-                    },
+                    }
                     FrameOutcome::Codes {
                         audio_embedding,
                         pcm,
@@ -1049,9 +1280,7 @@ pub fn generate_audio(
                         if !pcm.is_empty() {
                             audio_callback(&pcm, decoder.sample_rate());
                         }
-                        if (matches!(config.mode, AudioMode::Sequential) || text_done)
-                            && decoder.is_silence_terminated()
-                        {
+                        if (!interleaved || text_done) && decoder.is_silence_terminated() {
                             break 'outer;
                         }
                         audio_embedding
@@ -1062,10 +1291,7 @@ pub fn generate_audio(
                 if generated >= config.max_tokens || pos >= model_config.max_seq_len {
                     break;
                 }
-                if matches!(config.mode, AudioMode::Interleaved)
-                    && modality_budget == 0
-                    && !text_done
-                {
+                if interleaved && modality_budget == 0 && !text_done {
                     modality = Modality::Text;
                     modality_budget = cadence.text;
                     logits = model.forward_from_embedding(&audio_emb, pos, &mut state);
@@ -1075,7 +1301,7 @@ pub fn generate_audio(
                     break;
                 }
 
-                // Feed codes back as embedding → next hidden state.
+                // Feed codes back as embedding -> next hidden state.
                 emb = model.forward_hidden_from_embedding(&audio_emb, pos, &mut state);
                 check_audio_decode_error(model)?;
                 pos += 1;
@@ -1099,6 +1325,28 @@ pub fn generate_audio(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The end-of-speech code is the sampler's own mask/EOS id, `n_vocab - 1`. A fixed 256
+    /// ended turns early on a larger vocabulary (256 is a real code there) and named a row
+    /// past the table on a smaller one.
+    #[test]
+    fn lfm3a_end_code_is_the_last_vocabulary_id() {
+        assert_eq!(lfm3a_eos_code(257), 256);
+        assert_eq!(lfm3a_eos_code(2049), 2048);
+        assert_eq!(lfm3a_eos_code(100), 99);
+        assert!(lfm3a_is_end_code(257, 256));
+        assert!(!lfm3a_is_end_code(257, 255));
+        assert!(lfm3a_is_end_code(2049, 2048));
+        assert!(
+            !lfm3a_is_end_code(2049, 256),
+            "256 is an ordinary code in a 2049 vocabulary"
+        );
+        assert!(lfm3a_is_end_code(100, 99));
+        assert!(
+            !lfm3a_is_end_code(100, 256),
+            "256 is outside a 100-entry vocabulary"
+        );
+    }
 
     #[test]
     fn test_audio_silence_watchdog_initial_state() {
@@ -1491,6 +1739,7 @@ mod tests {
         };
         use crate::model::weights::MmapWeight;
         let dec = AudioDecoderWeights {
+            lfm3a_gen: false,
             depthformer_config: DepthformerConfig {
                 n_layer: 0,
                 n_embd: 4,
@@ -1542,6 +1791,7 @@ mod tests {
             lin_w: MmapWeight::from_owned_f32(Vec::new(), 0, 0),
             lin_b: Vec::new(),
             layers: Vec::new(),
+            lfm3_fsq: None,
         };
         (dec, detok)
     }
@@ -1665,5 +1915,27 @@ mod tests {
             InterleaveCadence::from_gguf(&g),
             InterleaveCadence::default()
         );
+    }
+
+    #[test]
+    fn interleave_cadence_reads_clip_audio_gen_keys() {
+        let g = cadence_gguf(&[
+            ("clip.audio_gen.interleaved_n_text", 6),
+            ("clip.audio_gen.interleaved_n_audio", 12),
+        ]);
+        assert_eq!(
+            InterleaveCadence::from_gguf(&g),
+            InterleaveCadence { text: 6, audio: 12 }
+        );
+    }
+
+    #[test]
+    fn modality_control_tokens_fallback_to_standard_ids() {
+        let tok = BpeTokenizer::empty_for_test();
+        let ctrl = ModalityControlTokens::from_tokenizer(&tok);
+        assert_eq!(ctrl.audio_start, 128);
+        assert_eq!(ctrl.audio_end, 129);
+        assert_eq!(ctrl.text_end, 130);
+        assert_eq!(ctrl.mixed_start, 131);
     }
 }

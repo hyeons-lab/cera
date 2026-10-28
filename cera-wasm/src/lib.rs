@@ -1030,6 +1030,8 @@ pub enum ToolFormat {
     Lfm2Pythonic,
     /// Hermes / Qwen: JSON `{"name":…,"arguments":{…}}`.
     Hermes,
+    /// LFM3: XML `<function=name><parameter=arg>val</parameter></function>`.
+    Lfm3Xml,
 }
 
 impl From<ToolFormat> for cera::tools::ToolFormat {
@@ -1037,6 +1039,7 @@ impl From<ToolFormat> for cera::tools::ToolFormat {
         match f {
             ToolFormat::Lfm2Pythonic => cera::tools::ToolFormat::Lfm2Pythonic,
             ToolFormat::Hermes => cera::tools::ToolFormat::Hermes,
+            ToolFormat::Lfm3Xml => cera::tools::ToolFormat::Lfm3Xml,
         }
     }
 }
@@ -1046,6 +1049,7 @@ impl From<cera::tools::ToolFormat> for ToolFormat {
         match f {
             cera::tools::ToolFormat::Lfm2Pythonic => ToolFormat::Lfm2Pythonic,
             cera::tools::ToolFormat::Hermes => ToolFormat::Hermes,
+            cera::tools::ToolFormat::Lfm3Xml => ToolFormat::Lfm3Xml,
         }
     }
 }
@@ -2953,6 +2957,21 @@ mod webgpu {
         }
     }
 
+    /// Why the direct OPFS-to-WebGPU load did not produce a session: `Unavailable` (no sync
+    /// access handle, a read failure, ...) falls back to the in-memory load, while `Refused`
+    /// is known from the GGUF header and would fail the same way after that load has read
+    /// the whole model, so it is returned as is.
+    enum OpfsAttempt {
+        Unavailable(JsError),
+        Refused(JsError),
+    }
+
+    impl From<JsError> for OpfsAttempt {
+        fn from(e: JsError) -> Self {
+            Self::Unavailable(e)
+        }
+    }
+
     /// GPU-accelerated LFM2 session for the browser. Holds a WebGPU-resident
     /// model + KV/conv state and streams decoded token text to a JS callback.
     #[wasm_bindgen]
@@ -3334,6 +3353,14 @@ mod webgpu {
                     "[cera-wasm] streaming model weights directly from OPFS to WebGPU for \"{bundle_id}\"..."
                 ));
                 let gguf = crate::bundle::read_gguf_header_from_sync_handle(sync.as_raw())?;
+                if let Some(arch) = gguf
+                    .architecture()
+                    .filter(|a| cera::model::gpu_refuses_architecture(a))
+                {
+                    return Err(JsError::new(&format!(
+                        "{arch} is not supported on the WebGPU backend; load it with the CPU engine"
+                    )));
+                }
                 let gguf_arc = Arc::new(gguf);
                 let tokenizer =
                     Arc::new(cera::tokenizer::BpeTokenizer::from_gguf(&gguf_arc).map_err(map_err)?);

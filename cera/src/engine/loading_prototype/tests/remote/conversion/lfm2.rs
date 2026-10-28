@@ -52,16 +52,26 @@ fn hf_config(model_type: &str) -> serde_json::Value {
 }
 
 fn routes(model_type: &str) -> HashMap<String, Response> {
-    let mut routes = fixture::routes(REPO, "main", &[("model.safetensors".into(), shard())], true);
-    let prefix = format!("/fixture/{REPO}/resolve/{}/", fixture::commit("main"));
+    routes_with(
+        REPO,
+        vec![("model.safetensors".into(), shard())],
+        hf_config(model_type),
+    )
+}
+
+/// The fixture repo `repo` serving `files` (name and bytes) and `config` with the tokenizer,
+/// tokenizer config and chat template the LFM converters read (shared with the lfm3 tests).
+pub(super) fn routes_with(
+    repo: &str,
+    files: Vec<(String, Vec<u8>)>,
+    config: serde_json::Value,
+) -> HashMap<String, Response> {
+    let mut routes = fixture::routes(repo, "main", &files, true);
+    let prefix = format!("/fixture/{repo}/resolve/{}/", fixture::commit("main"));
     let replace = |routes: &mut HashMap<String, Response>, name: &str, body: String| {
         routes.insert(format!("{prefix}{name}"), Response::bytes(body));
     };
-    replace(
-        &mut routes,
-        "config.json",
-        hf_config(model_type).to_string(),
-    );
+    replace(&mut routes, "config.json", config.to_string());
     replace(
         &mut routes,
         "tokenizer.json",
@@ -86,7 +96,7 @@ fn routes(model_type: &str) -> HashMap<String, Response> {
     routes
 }
 
-fn options(cfg: &LoadConfig, progress: Arc<dyn DownloadProgress>) -> QuantizeOptions {
+pub(super) fn options(cfg: &LoadConfig, progress: Arc<dyn DownloadProgress>) -> QuantizeOptions {
     QuantizeOptions {
         target_quant: TargetQuant::F32,
         cache_dir: cfg.bundle_repo.as_ref().unwrap().store_dir().into(),

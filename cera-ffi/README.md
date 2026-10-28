@@ -882,7 +882,7 @@ messages without going through `Session::append_text`. Useful for:
 | `engine.hasChatTemplate()` → `Bool` | Check before render. |
 | `engine.applyChatTemplate(messages, addGenerationPrompt)` → `String` | Render template. |
 | `engine.applyChatTemplateWithTools(messages, tools, addGenerationPrompt)` → `String` | Render the template with a `tools` array so a tool-trained model emits its tool-definition block. Empty `tools` == `applyChatTemplate`. |
-| `engine.toolFormat()` → `ToolFormat?` | Tool-call format auto-detected from the model's architecture (`lfm2Pythonic` / `hermes`), or `null` if unknown. |
+| `engine.toolFormat()` → `ToolFormat?` | Tool-call format auto-detected from the model's architecture (`lfm2Pythonic` / `hermes` / `lfm3Xml`), or `null` if unknown. |
 | `engine.toolCallStartToken(format)` → `u32?` | Vocab id of `format`'s start marker (e.g. <code>&lt;|tool_call_start|&gt;</code>), for `GenerateOpts.grammarTriggerTokens` (lazy constrained tool calls). `null` if absent. |
 | `detectToolFormat(architecture)` → `ToolFormat?` | Free function: format for a GGUF architecture string. |
 | `toolGrammar(tools, format)` → `String` | Free function: GBNF that constrains output to a valid call for `tools`. Pair with `grammarTriggerTokens` for lazy constraint. |

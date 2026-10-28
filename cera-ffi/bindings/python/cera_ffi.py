@@ -8596,22 +8596,25 @@ class ToolDef:
     (`parameters_json`) since UniFFI has no arbitrary-JSON type. An empty
     `parameters_json` means "no parameters".
 """
-    def __init__(self, *, name:str, description:typing.Optional[str], parameters_json:str):
+    def __init__(self, *, name:str, description:typing.Optional[str], parameters_json:str, defer_loading:bool = False):
         self.name = name
         self.description = description
         self.parameters_json = parameters_json
+        self.defer_loading = defer_loading
         
         
 
     
     def __str__(self):
-        return "ToolDef(name={}, description={}, parameters_json={})".format(self.name, self.description, self.parameters_json)
+        return "ToolDef(name={}, description={}, parameters_json={}, defer_loading={})".format(self.name, self.description, self.parameters_json, self.defer_loading)
     def __eq__(self, other):
         if self.name != other.name:
             return False
         if self.description != other.description:
             return False
         if self.parameters_json != other.parameters_json:
+            return False
+        if self.defer_loading != other.defer_loading:
             return False
         return True
 
@@ -8622,6 +8625,7 @@ class _UniffiFfiConverterTypeToolDef(_UniffiConverterRustBuffer):
             name=_UniffiFfiConverterString.read(buf),
             description=_UniffiFfiConverterOptionalString.read(buf),
             parameters_json=_UniffiFfiConverterString.read(buf),
+            defer_loading=_UniffiFfiConverterBoolean.read(buf),
         )
 
     @staticmethod
@@ -8629,12 +8633,14 @@ class _UniffiFfiConverterTypeToolDef(_UniffiConverterRustBuffer):
         _UniffiFfiConverterString.check_lower(value.name)
         _UniffiFfiConverterOptionalString.check_lower(value.description)
         _UniffiFfiConverterString.check_lower(value.parameters_json)
+        _UniffiFfiConverterBoolean.check_lower(value.defer_loading)
 
     @staticmethod
     def write(value, buf):
         _UniffiFfiConverterString.write(value.name, buf)
         _UniffiFfiConverterOptionalString.write(value.description, buf)
         _UniffiFfiConverterString.write(value.parameters_json, buf)
+        _UniffiFfiConverterBoolean.write(value.defer_loading, buf)
 
 class _UniffiFfiConverterSequenceTypeToolCall(_UniffiConverterRustBuffer):
     @classmethod
@@ -10151,6 +10157,12 @@ class ToolFormat(enum.Enum):
     `<tool_call>…</tool_call>`.
 """
     
+    LFM3_XML = 2
+    """
+    LFM3: XML `<function=name><parameter=arg>val</parameter></function>` in
+    `<tool_call>…</tool_call>`.
+"""
+    
 
 
 class _UniffiFfiConverterTypeToolFormat(_UniffiConverterRustBuffer):
@@ -10161,6 +10173,8 @@ class _UniffiFfiConverterTypeToolFormat(_UniffiConverterRustBuffer):
             return ToolFormat.LFM2_PYTHONIC
         if variant == 2:
             return ToolFormat.HERMES
+        if variant == 3:
+            return ToolFormat.LFM3_XML
         raise InternalError("Raw enum value doesn't match any cases")
 
     @staticmethod
@@ -10168,6 +10182,8 @@ class _UniffiFfiConverterTypeToolFormat(_UniffiConverterRustBuffer):
         if value == ToolFormat.LFM2_PYTHONIC:
             return
         if value == ToolFormat.HERMES:
+            return
+        if value == ToolFormat.LFM3_XML:
             return
         raise ValueError(value)
 
@@ -10177,6 +10193,8 @@ class _UniffiFfiConverterTypeToolFormat(_UniffiConverterRustBuffer):
             buf.write_i32(1)
         if value == ToolFormat.HERMES:
             buf.write_i32(2)
+        if value == ToolFormat.LFM3_XML:
+            buf.write_i32(3)
 
 
 
