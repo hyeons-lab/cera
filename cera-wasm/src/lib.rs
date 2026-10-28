@@ -4583,7 +4583,7 @@ mod webgpu {
                     break;
                 }
 
-                let is_mixed_start = decoder.is_some() && ctrl.mixed_start == Some(next);
+                let is_mixed_start = decoder.is_some() && next == ctrl.mixed_start;
                 if is_mixed_start && !is_interleaved {
                     is_interleaved = true;
                     modality_budget = cadence.text;
@@ -4591,7 +4591,7 @@ mod webgpu {
 
                 if decoder.is_some() && next == ctrl.text_end {
                     text_done = true;
-                } else if is_mixed_start || (decoder.is_some() && ctrl.audio_end == Some(next)) {
+                } else if is_mixed_start || (decoder.is_some() && next == ctrl.audio_end) {
                     // Modality control tokens (`<|mixed_start|>`, `<|audio_end|>`)
                     // advance the LLM state without emitting text or counting against
                     // the text cadence budget.

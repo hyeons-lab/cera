@@ -2603,6 +2603,9 @@ impl GpuLfmModel {
         model_id: String,
     ) -> Result<Self> {
         super::ensure_gpu_supported_arch(&src.config().architecture)?;
+        if src.config().architecture == "lfm3" {
+            super::lfm2::LfmModel::validate_lfm3_tensor_shapes(src.gguf(), src.config())?;
+        }
         if let Some(why) = src.gpu_unsupported_reason() {
             anyhow::bail!("{why}");
         }
@@ -2640,6 +2643,9 @@ impl GpuLfmModel {
         ctx: GpuContext,
     ) -> Result<Self> {
         super::ensure_gpu_supported_arch(&src.config().architecture)?;
+        if src.config().architecture == "lfm3" {
+            super::lfm2::LfmModel::validate_lfm3_tensor_shapes(src.gguf(), src.config())?;
+        }
         if let Some(why) = src.gpu_unsupported_reason() {
             anyhow::bail!("{why}");
         }
@@ -6651,6 +6657,13 @@ impl GpuLfmModel {
             hidden_size
         );
 
+        if !self.config.is_causal {
+            assert_eq!(
+                start_pos, 0,
+                "bidirectional prefill must run in one pass from start_pos == 0"
+            );
+        }
+
         // Same fresh-prefill reset as the token path and the Metal twin: at
         // position zero the GPU-resident counter and the conv rolling buffers
         // still hold whatever a previous generate() left, and the embeddings
@@ -10528,11 +10541,29 @@ impl GpuLfmModel {
         compute_logits: bool,
         download_logits: bool,
     ) -> Option<Vec<f32>> {
+        let hs = self.config.hidden_size;
+        let chunk = self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS);
+        if !self.config.is_causal {
+            assert_eq!(
+                state.seq_len, 0,
+                "bidirectional prefill must run in one pass from start_pos == 0"
+            );
+            if n_tokens > chunk
+                || !self.batched_prefill
+                || self.unbatchable_matmul_weight().is_some()
+            {
+                return Some(self.bidirectional_prefill_logits_locked(
+                    embeddings,
+                    n_tokens,
+                    state,
+                    compute_logits,
+                    download_logits,
+                ));
+            }
+        }
         if !self.batched_prefill || self.unbatchable_matmul_weight().is_some() {
             return None;
         }
-        let hs = self.config.hidden_size;
-        let chunk = self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS);
         let host_prof = std::env::var("CERA_GPU_HOST_PROFILE").as_deref() == Ok("1");
         let mut done = 0usize;
         while done < n_tokens {
@@ -10569,6 +10600,47 @@ impl GpuLfmModel {
         } else {
             Vec::new()
         })
+    }
+
+    pub(crate) fn bidirectional_prefill_logits_locked(
+        &self,
+        embeddings: &[f32],
+        n_tokens: usize,
+        state: &mut InferenceState,
+        compute_logits: bool,
+        download_logits: bool,
+    ) -> Vec<f32> {
+        let _ = self.bidirectional_trunk_into(embeddings, 0, true);
+        self.gpu_state.seq_len.store(n_tokens, Ordering::Relaxed);
+        state.seq_len = n_tokens;
+        if !compute_logits {
+            return Vec::new();
+        }
+        let mut enc = self.new_encoder();
+        let scale_bg = self
+            .logit_scale_params
+            .as_ref()
+            .map(|params| self.logit_scale_bg(params));
+        {
+            let mut pass = self.ctx.begin_pass(&mut enc, "bidir_tail");
+            self.encode_lm_head_into(&mut pass, &self.hidden_buf, &self.logits_buf);
+            if let Some(scale_bg) = scale_bg.as_ref() {
+                self.dispatch_into(
+                    &mut pass,
+                    &self.pipelines.scale_f32,
+                    scale_bg,
+                    ((self.config.vocab_size as u32).div_ceil(256), 1, 1),
+                );
+            }
+        }
+        self.submit_and_wait(enc);
+        self.ctx.finish_profiler();
+        if download_logits {
+            self.ctx
+                .download_f32(&self.logits_buf, self.config.vocab_size)
+        } else {
+            Vec::new()
+        }
     }
 
     /// Async (wasm/WebGPU) batched prefill step returning all logits rows `[n x vocab_size]`,
@@ -11430,6 +11502,15 @@ impl GpuLfmModel {
     /// sequence; what looks across rows (attention, the convolution) is one dispatch over all
     /// of them. K and V go to the scratch caches `hidden_states` already owns.
     fn bidirectional_trunk(&self, embeddings: &[f32], prefix: usize) -> Vec<f32> {
+        self.bidirectional_trunk_into(embeddings, prefix, false)
+    }
+
+    fn bidirectional_trunk_into(
+        &self,
+        embeddings: &[f32],
+        prefix: usize,
+        use_gen_state: bool,
+    ) -> Vec<f32> {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let n = embeddings.len() / hs;
@@ -11459,17 +11540,18 @@ impl GpuLfmModel {
         self.ctx
             .queue
             .write_buffer(&h_big, 0, bytemuck::cast_slice(embeddings));
-        let kv_scratch = &self.hs_scratch().kv;
+        let (kv_scratch, conv_scratch) = if use_gen_state {
+            (self.f16_kv(), &self.gpu_state.conv_buffers)
+        } else {
+            let hs_scratch = self.hs_scratch();
+            (&hs_scratch.kv, &hs_scratch.conv)
+        };
         // The flash kernel reads K and V as f32 for the whole sequence, so they get buffers of
         // their own instead of the packed-f16 scratch caches the generic kernel reads.
         // LFM3 mixes global bidirectional layers with causal sliding-window layers, which the
         // generic prefill kernel handles per layer.
-        let flash = self.flash_ready() && cfg.architecture != "lfm3";
-        let lfm3_conv_state = (cfg.architecture == "lfm3").then(|| {
-            let d_conv = cfg.conv_kernel_size.unwrap_or(3).saturating_sub(1).max(1);
-            self.ctx
-                .create_storage_rw((d_conv * hs * 4) as u64, "bidir.conv_state")
-        });
+        let flash = self.flash_ready() && cfg.architecture != "lfm3" && !use_gen_state;
+        let is_lfm3 = cfg.architecture == "lfm3";
         let kv_dim_max = cfg
             .kv_heads_per_layer
             .iter()
@@ -11529,7 +11611,10 @@ impl GpuLfmModel {
                         3 * hs_u,
                         false,
                     );
-                    if let Some(ref conv_state) = lfm3_conv_state {
+                    if is_lfm3 {
+                        let conv_state = conv_scratch[layer]
+                            .as_ref()
+                            .expect("conv layer has conv state");
                         if r0 == 0 {
                             self.emit_prefill_cmds(
                                 &mut enc,
@@ -11649,7 +11734,7 @@ impl GpuLfmModel {
 
             // Across rows.
             if conv {
-                if lfm3_conv_state.is_none() {
+                if !is_lfm3 {
                     let elements = n as u64 * hs as u64;
                     assert!(
                         elements <= u32::MAX as u64,
@@ -11838,6 +11923,21 @@ impl GpuLfmModel {
                 self.emit_prefill_cmds(&mut enc, &mut cmds, &format!("{label}b"), m_u);
                 self.flush_submit(&mut enc, split);
             }
+        }
+
+        if use_gen_state {
+            cmds.push(copy_rows(&h_big, n - 1, &self.prefill_batch_buf, 0, 1, hs));
+            self.encode_rmsnorm_batch(
+                &mut cmds,
+                &self.prefill_batch_buf,
+                &self.hidden_buf,
+                &self.output_norm,
+                1,
+                hs_u,
+            );
+            self.emit_prefill_cmds(&mut enc, &mut cmds, "bidir_out_last", 1);
+            self.submit_and_wait(enc);
+            return Vec::new();
         }
 
         // Output norm, gathered into `buf_a` ([n, hs]).
@@ -12036,10 +12136,12 @@ impl Model for GpuLfmModel {
         self.supports_hidden_states()
     }
 
-    /// Only a bidirectional model reads a media prefix this way, and only a dense one:
-    /// the bidirectional trunk has no routed-FFN path.
+    /// Only a bidirectional ColBERT/ColVision model reads a media prefix this way, and only a
+    /// dense one: LFM3 decision models interleave media rows in prompt order and the
+    /// bidirectional trunk has no routed-FFN path.
     fn supports_media_prefix(&self) -> bool {
         !self.config.is_causal
+            && self.config.architecture != "lfm3"
             && self
                 .layers
                 .iter()
@@ -12358,6 +12460,23 @@ impl Model for GpuLfmModel {
         // bounded. Each chunk advances `start_pos`; conv rolling
         // state and KV cache writes carry across chunks naturally.
         let unbatchable = self.unbatchable_matmul_weight();
+        if !tokens.is_empty() && !self.config.is_causal {
+            assert_eq!(
+                start_pos, 0,
+                "bidirectional prefill must run in one pass from start_pos == 0"
+            );
+            let chunk_size = self.gpu_state.max_seq_len.min(MAX_PREFILL_TOKENS);
+            if tokens.len() > chunk_size || !self.batched_prefill || unbatchable.is_some() {
+                let emb = self.embed_rows(tokens);
+                return self.bidirectional_prefill_logits_locked(
+                    &emb,
+                    tokens.len(),
+                    state,
+                    true,
+                    true,
+                );
+            }
+        }
         if let Some((layer, name, dtype)) = unbatchable
             && !tokens.is_empty()
             && self.batched_prefill
@@ -12495,26 +12614,25 @@ impl Model for GpuLfmModel {
     }
 
     fn turboquant_supported(&self) -> bool {
-        // Gated on `head_dim`: the compressed kernels need a power-of-two
+        // Gated on `turboquant_capable` (excludes LFM3, whose SWA and
+        // bidirectional layers are not masked in the compressed attention
+        // kernels) plus `head_dim`: the compressed kernels need a power-of-two
         // `head_dim` that is <= 128 and a multiple of 32. Reporting the real
         // capability here lets the CLI warn and fall back to f32 up front rather
         // than have `configure_kv_compression` silently ignore the request.
-        // LFM3 is excluded because the TurboQuant attention kernels do not
-        // implement per-layer sliding-window or bidirectional masks.
-        self.config.architecture != "lfm3"
+        crate::kv_cache::turboquant_capable(&self.config)
             && crate::model::gpu_turboquant::head_dim_supported(self.config.head_dim)
     }
 
     fn configure_kv_compression(&self, compression: &KvCompression) -> Result<(), CeraError> {
         let _guard = self.infer_lock.lock().unwrap_or_else(|e| e.into_inner());
-        let want = (self.config.architecture != "lfm3")
-            .then(|| TqMode::from_compression(compression, self.config.head_dim))
-            .flatten();
+        let resolved = compression.resolved_for(&self.config);
+        let want = TqMode::from_compression(&resolved, self.config.head_dim);
 
         // Requests the compressed path can't serve fall back to f32 rather than
         // erroring, matching the CPU's silent fallback for a non-power-of-two
         // head_dim. Warn so a silently-downgraded request is visible.
-        if want.is_none() && matches!(compression, KvCompression::TurboQuant { .. }) {
+        if want.is_none() && matches!(resolved, KvCompression::TurboQuant { .. }) {
             tracing::warn!(
                 target: "cera::gpu",
                 head_dim = self.config.head_dim,

@@ -120,8 +120,13 @@ const WARMUP_REQUEST: &str = r#"{"state": "The parcel arrived on Monday.", "ques
 enum Model {
     /// A public d1-omni model or a cera-converted file.
     Omni(Box<D1Model>),
-    /// A public causal d1 model; `images` is whether an mmproj attached its vision tower.
-    Causal { model: Box<CausalD1>, images: bool },
+    /// A public prompt-based d1 model; `images` and `audio` report whether an mmproj
+    /// attached its vision or speech tower.
+    Causal {
+        model: Box<CausalD1>,
+        images: bool,
+        audio: bool,
+    },
 }
 
 /// Whether an `Auto` load of an image-capable d1-3B must leave wgpu: on Android a phone GPU
@@ -262,19 +267,22 @@ impl D1Engine {
             let mut extras = std::collections::HashMap::new();
             if public::decision_type(gguf) == Some(public::LFM3_OMNI_TYPE)
                 && !is_audio_only_mmproj
-                && let Some(dir) = mmproj_path.or(Some(model)).and_then(Path::parent)
+                && let Some(dir) = mmproj_path.and_then(Path::parent)
                 && let Ok(entries) = std::fs::read_dir(dir)
             {
-                for entry in entries.flatten() {
-                    let p = entry.path();
-                    if p.extension().and_then(|e| e.to_str()) == Some("gguf")
-                        && p.file_name()
-                            .and_then(|n| n.to_str())
-                            .is_some_and(|n| n.starts_with("audioproj"))
-                    {
-                        extras.insert("audio_encoder".to_string(), p);
-                        break;
-                    }
+                let mut candidates: Vec<std::path::PathBuf> = entries
+                    .flatten()
+                    .map(|e| e.path())
+                    .filter(|p| {
+                        p.extension().and_then(|e| e.to_str()) == Some("gguf")
+                            && p.file_name()
+                                .and_then(|n| n.to_str())
+                                .is_some_and(|n| n.starts_with("audioproj"))
+                    })
+                    .collect();
+                candidates.sort();
+                if let Some(p) = candidates.into_iter().next() {
+                    extras.insert("audio_encoder".to_string(), p);
                 }
             }
             let engine = match mmproj_path {
@@ -293,19 +301,6 @@ impl D1Engine {
                         } else {
                             crate::manifest::InferenceType::LlamaCppImageToText
                         }),
-                        chat_template: None,
-                    },
-                    cfg,
-                )?,
-                None if !extras.is_empty() => CeraEngine::from_files(
-                    ModelFiles {
-                        model: model.to_path_buf(),
-                        multimodal_projector: None,
-                        audio_decoder: None,
-                        audio_tokenizer: None,
-                        draft_model: None,
-                        extras,
-                        inference_type: Some(crate::manifest::InferenceType::LlamaCppTextToText),
                         chat_template: None,
                     },
                     cfg,
@@ -349,6 +344,7 @@ impl D1Engine {
             let model = Model::Causal {
                 model: Box::new(causal_model),
                 images: vision.is_some(),
+                audio: audio.is_some(),
             };
             (engine, model, report)
         } else {
@@ -440,7 +436,7 @@ impl D1Engine {
     pub fn supports_audio(&self) -> bool {
         match &self.model {
             Model::Omni(model) => model.supports_audio(),
-            Model::Causal { .. } => false,
+            Model::Causal { audio, .. } => *audio,
         }
     }
 
@@ -481,11 +477,21 @@ impl D1Engine {
             Model::Omni(model) => {
                 model.answer_cancellable(&mut session, &tokenizer, request, cancel)
             }
-            Model::Causal { model, images } => {
+            Model::Causal {
+                model,
+                images,
+                audio,
+            } => {
                 ensure!(
                     *images || request.images.is_empty(),
                     "this model has no vision tower (load its mmproj)"
                 );
+                if model.is_omni() {
+                    ensure!(
+                        *audio || request.audio.is_none(),
+                        "this model has no speech tower (load its mmproj)"
+                    );
+                }
                 model.answer(&mut session, &tokenizer, request, cancel)
             }
         }

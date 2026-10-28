@@ -121,6 +121,11 @@ impl CausalD1 {
             .unwrap_or(1.0)
     }
 
+    /// Whether this model is an `lfm3-d1-omni` variant (supports both image and speech inputs).
+    pub fn is_omni(&self) -> bool {
+        self.is_omni
+    }
+
     /// Answer every question of `request`, stopping with [`Cancelled`] when `cancel` is set
     /// (read before each question).
     ///
@@ -157,11 +162,17 @@ impl CausalD1 {
         for (name, _) in &request.questions {
             ensure!(seen.insert(name), "duplicate question `{name}`");
         }
+        // each speech clip goes through the audio tower once, however many questions follow it
         let audio = request
             .audio
             .as_deref()
-            .map(|wav| {
-                super::audio::decode_wav_capped(wav, super::audio::MAX_SECONDS).context("audio")
+            .map(|wav| -> Result<(Vec<f32>, usize)> {
+                let (samples, sample_rate) =
+                    super::audio::decode_wav_capped(wav, super::audio::MAX_SECONDS)
+                        .context("audio")?;
+                session
+                    .encode_audio_rows(&samples, sample_rate)
+                    .context("audio")
             })
             .transpose()?;
         // each image goes through the vision tower once, however many questions follow it
@@ -365,14 +376,75 @@ struct Prepared {
     groups: Vec<Vec<u32>>,
 }
 
-/// Append `items` to the session: runs of tokens in one call, an image as its encoded rows,
-/// or a speech clip through the audio encoder.
+/// Append `items` to the session: when the segment contains an image or speech clip and the
+/// backend can hand out token embedding rows, splice all text and media rows into one
+/// `append_embeddings` call (required for non-causal trunks so bidirectional attention sees
+/// the full prompt in one pass, and faster on causal trunks by avoiding per-segment launches).
 fn feed(
     session: &mut Session,
     items: &[Item],
     images: &[EncodedImage],
-    audio: Option<&(Vec<f32>, u32)>,
+    audio: Option<&(Vec<f32>, usize)>,
 ) -> Result<()> {
+    let has_media = items
+        .iter()
+        .any(|item| matches!(item, Item::Image(_) | Item::Audio));
+    if has_media && session.model().supports_embedding_input() {
+        let hs = session.model().config().hidden_size;
+        let mut fused_rows = Vec::new();
+        let mut fused_tokens = 0usize;
+        let mut run = Vec::new();
+        let mut can_fuse = true;
+        for item in items {
+            match item {
+                Item::Token(t) => run.push(*t),
+                Item::Image(i) => {
+                    if !run.is_empty() {
+                        if let Some(rows) = session.model().embed_image_marker_rows(&run) {
+                            fused_rows.extend_from_slice(&rows);
+                            fused_tokens += run.len();
+                            run.clear();
+                        } else {
+                            can_fuse = false;
+                            break;
+                        }
+                    }
+                    let image = images.get(*i).context("the prompt names a missing image")?;
+                    fused_rows.extend_from_slice(image.rows());
+                    fused_tokens += image.n_tokens();
+                }
+                Item::Audio => {
+                    if !run.is_empty() {
+                        if let Some(rows) = session.model().embed_image_marker_rows(&run) {
+                            fused_rows.extend_from_slice(&rows);
+                            fused_tokens += run.len();
+                            run.clear();
+                        } else {
+                            can_fuse = false;
+                            break;
+                        }
+                    }
+                    let (rows, n_tokens) =
+                        audio.context("the prompt names a missing speech clip")?;
+                    fused_rows.extend_from_slice(rows);
+                    fused_tokens += *n_tokens;
+                }
+            }
+        }
+        if can_fuse && !run.is_empty() {
+            if let Some(rows) = session.model().embed_image_marker_rows(&run) {
+                fused_rows.extend_from_slice(&rows);
+                fused_tokens += run.len();
+            } else {
+                can_fuse = false;
+            }
+        }
+        if can_fuse && fused_tokens > 0 && fused_rows.len() == fused_tokens * hs {
+            session.append_embeddings(&fused_rows, fused_tokens)?;
+            return Ok(());
+        }
+    }
+
     let mut run: Vec<u32> = Vec::new();
     for item in items {
         match item {
@@ -390,10 +462,9 @@ fn feed(
                 if !run.is_empty() {
                     session.append_tokens(&std::mem::take(&mut run))?;
                 }
-                let (samples, sample_rate) =
-                    audio.context("the prompt names a missing speech clip")?;
+                let (rows, n_tokens) = audio.context("the prompt names a missing speech clip")?;
                 session
-                    .append_audio(samples, *sample_rate)
+                    .append_embeddings(rows, *n_tokens)
                     .context("audio")?;
             }
         }

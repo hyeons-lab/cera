@@ -4097,10 +4097,12 @@ impl Model for MetalLfmModel {
         self.supports_hidden_states()
     }
 
-    /// Only a bidirectional model reads a media prefix this way, and only a dense one:
-    /// the bidirectional trunk has no routed-FFN path.
+    /// Only a bidirectional ColBERT/ColVision model reads a media prefix this way, and only a
+    /// dense one: LFM3 decision models interleave media rows in prompt order and the
+    /// bidirectional trunk has no routed-FFN path.
     fn supports_media_prefix(&self) -> bool {
         !self.config.is_causal
+            && self.config.architecture != "lfm3"
             && self
                 .layers
                 .iter()
@@ -4292,6 +4294,14 @@ impl Model for MetalLfmModel {
         true
     }
 
+    fn embed_token_rows(&self, tokens: &[u32]) -> Option<Vec<f32>> {
+        if self.config.is_causal {
+            None
+        } else {
+            self.embed_image_marker_rows(tokens)
+        }
+    }
+
     /// The marker rows of a tiled image: a dequantized row of the embedding table per token, which
     /// is what this backend's token prefill stages. Only this hook is offered, not
     /// `embed_token_rows`: the tiled image needs just these rows, and handing out the token rows too
@@ -4430,7 +4440,7 @@ impl Model for MetalLfmModel {
         // Requests the compressed path can't serve fall back to f16 rather than
         // erroring, matching the CPU's silent fallback for a non-power-of-two
         // head_dim. Warn so a silently-downgraded request is visible.
-        if want.is_none() && matches!(compression, KvCompression::TurboQuant { .. }) {
+        if want.is_none() && matches!(resolved, KvCompression::TurboQuant { .. }) {
             tracing::warn!(
                 target: "cera::metal",
                 head_dim = self.config.head_dim,
@@ -4544,11 +4554,12 @@ impl Model for MetalLfmModel {
         // doesn't carry KV history from a previous generation. The CPU-side
         // InferenceState is already fresh when callers invoke generate() again,
         // but the Metal model holds its own seq_len counter and GPU KV buffers.
+        let cache_eligible = start_pos == 0 && !lora_active && self.config.is_causal;
         if start_pos == 0 {
             self.state.seq_len.store(0, Ordering::Relaxed);
 
-            // Cache lookup: only for fresh, base-model prefills.
-            let hit = (!lora_active)
+            // Cache lookup: only for fresh, causal base-model prefills.
+            let hit = cache_eligible
                 .then(|| {
                     self.prefix_cache
                         .lock()
@@ -4590,8 +4601,9 @@ impl Model for MetalLfmModel {
         }
 
         let logits = self.forward_prefill_inner(tokens, start_pos, state);
-        // Only cache base-model KV — an adapted run's KV must never be reused.
-        if start_pos == 0 && !lora_active {
+        // Only cache causal base-model KV: an adapted or bidirectional run's KV
+        // must never be reused for a different suffix.
+        if cache_eligible {
             self.maybe_snapshot_prefix_locked(tokens);
         }
         logits
@@ -5054,12 +5066,25 @@ impl MetalLfmModel {
             n,
             self.state.max_seq_len
         );
+        if !cfg.is_causal {
+            assert_eq!(
+                start_pos, 0,
+                "bidirectional prefill must run in one pass from start_pos == 0"
+            );
+        }
 
         // Chunked prefill: process in MAX_PREFILL_TOKENS-sized chunks, each using
         // the GEMM path. This keeps memory constant while avoiding the 14× slower
-        // sequential fallback for prompts > MAX_PREFILL_TOKENS.
+        // sequential fallback for prompts > MAX_PREFILL_TOKENS. Non-causal models
+        // cannot split bidirectional attention across sequential chunks, so prompts
+        // over MAX_PREFILL_TOKENS route through `bidirectional_trunk`.
         let max_chunk = self.state.max_seq_len.min(MAX_PREFILL_TOKENS);
         if n > max_chunk {
+            if !cfg.is_causal {
+                let mut emb = vec![0.0f32; n * hs];
+                self.embed_tokens(tokens, &mut emb);
+                return self.bidirectional_prefill_logits(&emb, n, state);
+            }
             let mut logits = Vec::new();
             let mut pos = start_pos;
             let mut remaining = tokens;
@@ -5113,11 +5138,20 @@ impl MetalLfmModel {
             n,
             self.state.max_seq_len
         );
+        if !cfg.is_causal {
+            assert_eq!(
+                start_pos, 0,
+                "bidirectional prefill must run in one pass from start_pos == 0"
+            );
+        }
 
         // Chunked prefill: same shape as the token path. Each chunk
         // populates `prefill_batch_buf` then runs the per-layer body.
         let max_chunk = self.state.max_seq_len.min(MAX_PREFILL_TOKENS);
         if n > max_chunk {
+            if !cfg.is_causal {
+                return self.bidirectional_prefill_logits(embeddings, n, state);
+            }
             let mut logits = Vec::new();
             let mut pos = start_pos;
             let mut remaining = embeddings;
@@ -5143,6 +5177,19 @@ impl MetalLfmModel {
         }
 
         self.prefill_layers_and_logits(n, start_pos, state)
+    }
+
+    pub(crate) fn bidirectional_prefill_logits(
+        &self,
+        embeddings: &[f32],
+        n: usize,
+        state: &mut InferenceState,
+    ) -> Vec<f32> {
+        let vocab = self.config.vocab_size;
+        let _ = self.bidirectional_trunk_into(embeddings, 0, true);
+        self.state.seq_len.store(n, Ordering::Relaxed);
+        state.seq_len = n;
+        self.ctx.read_f32(&self.logits_buf, vocab)
     }
 
     pub(crate) fn forward_prefill_logits_all_inner(
@@ -6065,6 +6112,15 @@ impl MetalLfmModel {
     /// chunks (its intermediate is the widest tensor); everything else is one dispatch over
     /// all rows.
     fn bidirectional_trunk(&self, embeddings: &[f32], prefix: usize) -> Vec<f32> {
+        self.bidirectional_trunk_into(embeddings, prefix, false)
+    }
+
+    fn bidirectional_trunk_into(
+        &self,
+        embeddings: &[f32],
+        prefix: usize,
+        use_gen_state: bool,
+    ) -> Vec<f32> {
         let cfg = &self.config;
         let hs = cfg.hidden_size;
         let n = embeddings.len() / hs;
@@ -6111,9 +6167,12 @@ impl MetalLfmModel {
                 embeddings.len(),
             );
         }
-        let hs_scratch = self.hs_scratch();
-        let kv_scratch = &hs_scratch.kv;
-        let conv_scratch = &hs_scratch.conv;
+        let (kv_scratch, conv_scratch) = if use_gen_state {
+            (self.f16_kv(), &self.state.conv_buffers)
+        } else {
+            let hs_scratch = self.hs_scratch();
+            (&hs_scratch.kv, &hs_scratch.conv)
+        };
         if cfg.architecture == "lfm3" {
             for buf in conv_scratch.iter().flatten() {
                 let len = buf.length() as usize / 4;
@@ -6407,6 +6466,23 @@ impl MetalLfmModel {
             (n * hs) as u32,
             self.scalars.residual,
         );
+        if use_gen_state {
+            self.encode_rmsnorm_batch(
+                enc,
+                &h_buf,
+                ((n - 1) * hs * 4) as u64,
+                &self.normed_buf,
+                0,
+                &self.output_norm,
+                1,
+                hs as u32,
+                hs as u32,
+            );
+            self.encode_gemv_output(enc, &self.normed_buf, &self.logits_buf);
+            enc.end_encoding();
+            self.ctx.commit_and_wait(cb, "bidirectional_prefill_logits");
+            return Vec::new();
+        }
         self.encode_rmsnorm_batch(
             enc,
             &h_buf,

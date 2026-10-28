@@ -2573,6 +2573,9 @@ fn lfm3_all_backends_match_cpu_prefill_and_decode() {
     let mut cpu_moe_state = InferenceState::from_config(Model::config(&cpu_moe)).unwrap();
     let want_moe_prefill = cpu_moe.forward_prefill(&moe_tokens, 0, &mut cpu_moe_state);
     let want_moe_decode = cpu_moe.forward(&[9], moe_tokens.len(), &mut cpu_moe_state);
+    check_backend("cpu", &cpu_prefill, &cpu_step1, &cpu_step2);
+    assert_eq!(want_moe_prefill.len(), VOCAB);
+    assert_eq!(want_moe_decode.len(), VOCAB);
 
     #[cfg(feature = "gpu")]
     if let Ok(gpu) = crate::model::gpu_lfm2::GpuLfmModel::from_gguf(lfm3_gguf(), 64) {
@@ -2653,6 +2656,7 @@ fn lfm3_d1_all_backends_match_cpu() {
     use crate::model::Model;
     let make_d1 = || {
         lfm3_gguf_with(L3_TAPS, &|kv, _| {
+            set_kv(kv, "lfm3.context_length", Some(KvValue::U32(544)));
             set_kv(kv, "lfm3.attention.causal", Some(KvValue::Raw(7, vec![0])));
             set_kv(
                 kv,
@@ -2663,13 +2667,16 @@ fn lfm3_d1_all_backends_match_cpu() {
     };
 
     let tokens = [2u32, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24];
-    let cpu = crate::model::lfm2::LfmModel::from_gguf(make_d1(), 64).unwrap();
+    let cpu = crate::model::lfm2::LfmModel::from_gguf(make_d1(), 544).unwrap();
     assert!(!Model::config(&cpu).is_causal);
+    assert!(!cpu.supports_media_prefix());
     assert!(cpu.layer_is_non_causal(1));
     assert!(!cpu.layer_is_non_causal(3));
 
     let mut cpu_state = InferenceState::from_config(Model::config(&cpu)).unwrap();
     let cpu_logits = cpu.forward_prefill(&tokens, 0, &mut cpu_state);
+    let cpu_decode = cpu.forward(&[2], tokens.len(), &mut cpu_state);
+    assert_eq!(cpu.warm_cache_usage(), Some((0, 0)));
     let mut cpu_hs_state = InferenceState::for_prefill(Model::config(&cpu), tokens.len()).unwrap();
     let cpu_hs = cpu.hidden_states(&tokens, &mut cpu_hs_state);
 
@@ -2687,9 +2694,50 @@ fn lfm3_d1_all_backends_match_cpu() {
         "lfm3-d1 global attention must let the last token move row 0 (drift={row0_drift})"
     );
 
-    let hex = HexagonLfmModel::from_gguf_on(backend(), make_d1(), 64).unwrap();
+    let hex = HexagonLfmModel::from_gguf_on(backend(), make_d1(), 544).unwrap();
     assert!(!hex.config.is_causal);
+    assert!(!hex.supports_media_prefix());
+    assert!(!hex.supports_bidirectional_encode());
     assert_eq!(hex.dense.swa_window, Some(L3_WINDOW));
+    let mut hex_state = InferenceState::from_config(Model::config(&hex)).unwrap();
+    assert_eq!(
+        hex.check_kv_rewind(&hex_state, 0),
+        Err(crate::kv_cache::KvRewindError::NonCausal)
+    );
+    let mut hex_no_swa = HexagonLfmModel::from_gguf_on(
+        backend(),
+        lfm3_gguf_with(3, &|kv, _| {
+            set_kv(kv, "lfm3.attention.causal", Some(KvValue::Raw(7, vec![0])));
+            set_kv(
+                kv,
+                "lfm3.decision.type",
+                Some(KvValue::Str("lfm3-d1".into())),
+            );
+        }),
+        64,
+    )
+    .unwrap();
+    hex_no_swa.dense.swa_window = None;
+    hex_no_swa.dense.mask_swa = None;
+    for l in &mut hex_no_swa.layers {
+        if let HexagonLayer::Attention(a) = l {
+            a.swa = false;
+        }
+    }
+    assert!(!hex_no_swa.supports_bidirectional_encode());
+    assert!(!hex_no_swa.supports_media_prefix());
+    assert_eq!(
+        hex_no_swa.check_kv_rewind(&hex_state, 0),
+        Err(crate::kv_cache::KvRewindError::NonCausal)
+    );
+    let start_pos_err = hex
+        .try_forward_prefill_chunk(&tokens, 1, &mut hex_state)
+        .unwrap_err();
+    assert!(
+        start_pos_err.to_string().contains("start_pos == 0"),
+        "expected start_pos == 0 error, got: {start_pos_err}"
+    );
+    assert_eq!(hex_state.seq_len, 0);
 
     let check_cosine = |label: &str, want: &[f32], got: &[f32]| {
         assert_eq!(want.len(), got.len(), "{label} len");
@@ -2700,23 +2748,116 @@ fn lfm3_d1_all_backends_match_cpu() {
         assert!(cos > 0.999, "{label}: cosine={cos}");
     };
 
+    let mut long_tokens: Vec<u32> = vec![2; 516];
+    long_tokens.extend_from_slice(&[25, 27, 29, 31]);
+    let hex_long_logits = hex.forward_prefill(&long_tokens, 0, &mut hex_state);
+    assert!(hex_long_logits.iter().all(|&x| x == 0.0));
+    let hex_long_err = hex.take_decode_error().expect("long_tokens must fail fast");
+    assert!(
+        hex_long_err.to_string().contains("exceeds maximum"),
+        "expected exceeds maximum error, got: {hex_long_err}"
+    );
+    assert_eq!(hex_state.seq_len, 0);
+    let mut cpu_long_state = InferenceState::from_config(Model::config(&cpu)).unwrap();
+    let cpu_long_logits = cpu.forward_prefill(&long_tokens, 0, &mut cpu_long_state);
+    let cpu_long_decode = cpu.forward(&[2], long_tokens.len(), &mut cpu_long_state);
+    check_cosine("cpu d1 prefill self", &cpu_logits, &cpu_logits);
+    check_cosine("cpu d1 decode self", &cpu_decode, &cpu_decode);
+    check_cosine(
+        "cpu d1 long prefill self",
+        &cpu_long_logits,
+        &cpu_long_logits,
+    );
+    check_cosine(
+        "cpu d1 long decode self",
+        &cpu_long_decode,
+        &cpu_long_decode,
+    );
+
     #[cfg(feature = "gpu")]
-    if let Ok(gpu) = crate::model::gpu_lfm2::GpuLfmModel::from_gguf(make_d1(), 64) {
+    if let Ok(gpu) = crate::model::gpu_lfm2::GpuLfmModel::from_gguf(make_d1(), 544) {
+        assert!(!gpu.supports_media_prefix());
         let mut s = InferenceState::from_config(Model::config(&gpu)).unwrap();
         let got_logits = gpu.forward_prefill(&tokens, 0, &mut s);
+        assert_eq!(gpu.warm_cache_usage(), Some((0, 0)));
         check_cosine("wgpu d1 prefill logits", &cpu_logits, &got_logits);
         let mut hs_s = InferenceState::for_prefill(Model::config(&gpu), tokens.len()).unwrap();
         let got_hs = gpu.hidden_states(&tokens, &mut hs_s);
         check_cosine("wgpu d1 hidden_states", &cpu_hs, &got_hs);
+
+        let emb = gpu.embed_token_rows(&tokens).unwrap();
+        let mut bidir_s = InferenceState::from_config(Model::config(&gpu)).unwrap();
+        let got_bidir_logits =
+            gpu.bidirectional_prefill_logits_locked(&emb, tokens.len(), &mut bidir_s, true, true);
+        check_cosine(
+            "wgpu d1 bidirectional_prefill_logits",
+            &cpu_logits,
+            &got_bidir_logits,
+        );
+        let got_bidir_decode = gpu.forward(&[2], tokens.len(), &mut bidir_s);
+        check_cosine(
+            "wgpu d1 bidirectional_prefill_logits decode",
+            &cpu_decode,
+            &got_bidir_decode,
+        );
+
+        let mut long_s = InferenceState::from_config(Model::config(&gpu)).unwrap();
+        let got_long_logits = gpu.forward_prefill(&long_tokens, 0, &mut long_s);
+        check_cosine(
+            "wgpu d1 long prefill logits",
+            &cpu_long_logits,
+            &got_long_logits,
+        );
+        let got_long_decode = gpu.forward(&[2], long_tokens.len(), &mut long_s);
+        check_cosine(
+            "wgpu d1 long decode logits",
+            &cpu_long_decode,
+            &got_long_decode,
+        );
     }
 
     #[cfg(all(feature = "metal", any(target_os = "macos", target_os = "ios")))]
-    if let Ok(metal) = crate::model::metal_lfm2::MetalLfmModel::from_gguf(make_d1(), None, 64) {
+    if let Ok(metal) = crate::model::metal_lfm2::MetalLfmModel::from_gguf(make_d1(), None, 544) {
+        assert!(!metal.supports_media_prefix());
+        assert_eq!(
+            metal.embed_token_rows(&tokens),
+            cpu.embed_token_rows(&tokens)
+        );
         let mut s = InferenceState::from_config(Model::config(&metal)).unwrap();
         let got_logits = metal.forward_prefill(&tokens, 0, &mut s);
+        assert_eq!(metal.warm_cache_usage(), Some((0, 0)));
         check_cosine("metal d1 prefill logits", &cpu_logits, &got_logits);
         let mut hs_s = InferenceState::for_prefill(Model::config(&metal), tokens.len()).unwrap();
         let got_hs = metal.hidden_states(&tokens, &mut hs_s);
         check_cosine("metal d1 hidden_states", &cpu_hs, &got_hs);
+
+        let emb = metal.embed_token_rows(&tokens).unwrap();
+        let mut bidir_s = InferenceState::from_config(Model::config(&metal)).unwrap();
+        let got_bidir_logits = metal.bidirectional_prefill_logits(&emb, tokens.len(), &mut bidir_s);
+        check_cosine(
+            "metal d1 bidirectional_prefill_logits",
+            &cpu_logits,
+            &got_bidir_logits,
+        );
+        let got_bidir_decode = metal.forward(&[2], tokens.len(), &mut bidir_s);
+        check_cosine(
+            "metal d1 bidirectional_prefill_logits decode",
+            &cpu_decode,
+            &got_bidir_decode,
+        );
+
+        let mut long_s = InferenceState::from_config(Model::config(&metal)).unwrap();
+        let got_long_logits = metal.forward_prefill(&long_tokens, 0, &mut long_s);
+        check_cosine(
+            "metal d1 long prefill logits",
+            &cpu_long_logits,
+            &got_long_logits,
+        );
+        let got_long_decode = metal.forward(&[2], long_tokens.len(), &mut long_s);
+        check_cosine(
+            "metal d1 long decode logits",
+            &cpu_long_decode,
+            &got_long_decode,
+        );
     }
 }

@@ -508,11 +508,12 @@ impl LfmModel {
         }
     }
 
-    /// Whether this call attends causally. The encoder and classifier branches (selected by a
-    /// non-causal file or a classifier adapter on the state) are written for LFM2: three conv
-    /// taps and none of lfm3's sandwich norms, gate, windows or rope factors. `lfm3` is always
-    /// causal whatever the state holds, because `InferenceState.lora` is a public field that
-    /// a direct caller can set past every entry guard; the loader refuses non-causal files.
+    /// Whether this call skips the LFM2-only `float_trunk` / bidirectional-RoPE branch.
+    /// That branch is written for LFM2 (three centred conv taps and none of `lfm3`'s
+    /// sandwich norms, attention gate, sliding windows, or partial-rotary factors).
+    /// `lfm3` always returns `true` here so it stays on the `lfm3`-aware layer loop,
+    /// where non-causal `lfm3` (`!config.is_causal`) dispatches bidirectional global
+    /// attention per layer via [`Self::layer_is_non_causal`].
     fn is_causal_for(&self, state: &InferenceState) -> bool {
         self.lfm3.is_some()
             || (self.config.is_causal && !state.lora.as_ref().is_some_and(|l| l.is_classifier()))
@@ -1220,7 +1221,11 @@ impl LfmModel {
                 embd_ref.clone()
             };
         let lfm3 = if config.architecture == "lfm3" {
-            Some(Self::load_lfm3_extras(&gguf, &config)?)
+            Some(Self::load_lfm3_extras_with_loader(
+                &gguf,
+                &config,
+                &mut load_f32,
+            )?)
         } else {
             None
         };
@@ -1296,7 +1301,20 @@ impl LfmModel {
     /// `true` layers, and the partial-rotary mask is the `rope_freqs.weight` tensor
     /// shared by every global attention layer. Shared by the CPU and NPU loaders so
     /// they cannot disagree about which layer slides or which base it rotates with.
+    #[cfg(feature = "hexagon")]
     pub(crate) fn lfm3_layout(gguf: &GgufFile, config: &ModelConfig) -> Result<Lfm3Layout> {
+        Self::lfm3_layout_with_loader(gguf, config, |g, name| {
+            g.get_tensor(name)?
+                .try_to_f32_vec()
+                .with_context(|| format!("{name} cannot be read as f32"))
+        })
+    }
+
+    fn lfm3_layout_with_loader(
+        gguf: &GgufFile,
+        config: &ModelConfig,
+        mut load_f32: impl FnMut(&GgufFile, &str) -> Result<Vec<f32>>,
+    ) -> Result<Lfm3Layout> {
         let n_layers = config.n_layers;
         // A stated window with no readable per-layer pattern would otherwise run every
         // layer as global attention: plausible text, wrong. llama.cpp treats an absent
@@ -1338,11 +1356,8 @@ impl LfmModel {
         let global_layers =
             (0..n_layers).any(|i| config.block_types[i] == BlockType::Attention && !swa_pattern[i]);
         let rope_freq_factors = if global_layers {
-            let ff = gguf
-                .get_tensor("rope_freqs.weight")
-                .context("lfm3 global attention layers need rope_freqs.weight")?
-                .try_to_f32_vec()
-                .context("rope_freqs.weight cannot be read as f32")?;
+            let ff = load_f32(gguf, "rope_freqs.weight")
+                .context("lfm3 global attention layers need rope_freqs.weight")?;
             ensure!(
                 ff.len() == config.head_dim / 2,
                 "rope_freqs.weight has {} entries, expected {}",
@@ -1495,22 +1510,32 @@ impl LfmModel {
     }
 
     /// Load what `lfm3` adds to the LFM2 graph (see [`Lfm3Extras`]).
-    fn load_lfm3_extras(gguf: &GgufFile, config: &ModelConfig) -> Result<Lfm3Extras> {
+    fn load_lfm3_extras_with_loader(
+        gguf: &GgufFile,
+        config: &ModelConfig,
+        mut load_f32: impl FnMut(&GgufFile, &str) -> Result<Vec<f32>>,
+    ) -> Result<Lfm3Extras> {
         let n_layers = config.n_layers;
+        let hs = config.hidden_size;
         let Lfm3Layout {
             swa_pattern,
             window,
             theta_swa,
             rope_freq_factors,
-        } = Self::lfm3_layout(gguf, config)?;
+        } = Self::lfm3_layout_with_loader(gguf, config, &mut load_f32)?;
 
-        let opt_norm = |name: String| -> Result<Option<Vec<f32>>> {
+        let mut opt_norm = |name: String| -> Result<Option<Vec<f32>>> {
             gguf.tensors
                 .contains_key(&name)
                 .then(|| {
-                    gguf.get_tensor(&name)?
-                        .try_to_f32_vec()
-                        .with_context(|| format!("{name} cannot be read as f32"))
+                    let v = load_f32(gguf, &name)
+                        .with_context(|| format!("{name} cannot be read as f32"))?;
+                    ensure!(
+                        v.len() == hs,
+                        "{name} has {} entries, expected {hs}",
+                        v.len()
+                    );
+                    Ok(v)
                 })
                 .transpose()
         };
@@ -5578,9 +5603,9 @@ impl LfmModel {
             #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64", has_blas)))]
             let need_block_fallback = true;
             if need_block_fallback {
-                // The whole per-token block (projections and attention) is timed as one
-                // lump under the conv-core or attention-scores column: `lfm3` attention
-                // always lands here, and would otherwise read as free in the profile.
+                // The whole fallback block (projections and attention/conv) is timed as one
+                // lump under the conv-core or attention-scores column so layers that decline
+                // batched GEMM do not read as free in the profile.
                 let t_fallback = profile_prefill.then(Instant::now);
                 block_out.fill(0.0);
                 if !is_conv && self.layer_is_non_causal(layer) && n > 1 {
@@ -6117,6 +6142,12 @@ impl LfmModel {
         state: &mut InferenceState,
     ) -> Vec<f32> {
         let cfg = &self.config;
+        if !cfg.is_causal {
+            assert_eq!(
+                start_pos, 0,
+                "bidirectional prefill must run in one pass from start_pos == 0"
+            );
+        }
         let hs = cfg.hidden_size;
         self.prefill_layers_loop(&mut hidden, n, start_pos, state);
 
@@ -6354,9 +6385,9 @@ impl Model for LfmModel {
         true
     }
 
-    /// Only a bidirectional model reads a media prefix this way.
+    /// Only a bidirectional LFM2 model reads a media prefix via `float_trunk`.
     fn supports_media_prefix(&self) -> bool {
-        !self.config.is_causal
+        !self.config.is_causal && self.lfm3.is_none()
     }
 
     /// The CPU extractor branches on the config: full-context prefill for a
@@ -6373,8 +6404,8 @@ impl Model for LfmModel {
     ) -> Vec<f32> {
         let hs = self.config.hidden_size;
         assert!(
-            !self.config.is_causal,
-            "hidden_states_with_prefix needs a bidirectional model"
+            !self.config.is_causal && self.lfm3.is_none(),
+            "hidden_states_with_prefix needs a bidirectional LFM2 model"
         );
         assert!(
             prefix.len().is_multiple_of(hs),
@@ -6804,7 +6835,10 @@ impl Model for LfmModel {
         // key doesn't include the adapter — caching it would let a later base-model
         // (or different-adapter) prefill restore adapted KV. Skip both the lookup
         // and the insert while LoRA is attached.
-        let cache_eligible = start_pos == 0 && state.lora.is_none();
+        let cache_eligible = start_pos == 0
+            && self.config.is_causal
+            && self.is_causal_for(state)
+            && state.lora.is_none();
 
         if cache_eligible {
             let hit = self
@@ -6896,6 +6930,12 @@ impl Model for LfmModel {
         let tag = self.kv_cache_tag.lock().unwrap_or_else(|e| e.into_inner());
         let id = Self::namespace_for(tag.as_deref().unwrap_or(""), model_id);
         *cache = KvPrefixCache::for_model(config, &self.config, &self.model_id, &id);
+    }
+
+    #[cfg(test)]
+    fn warm_cache_usage(&self) -> Option<(usize, u64)> {
+        let cache = self.prefix_cache.lock().unwrap_or_else(|e| e.into_inner());
+        Some((cache.warm_count(), cache.warm_bytes()))
     }
 
     fn clear_warm_cache(&self) {

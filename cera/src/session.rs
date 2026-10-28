@@ -68,6 +68,10 @@ impl EncodedImage {
     pub fn n_tokens(&self) -> usize {
         self.n_tokens
     }
+
+    pub(crate) fn rows(&self) -> &[f32] {
+        &self.rows
+    }
 }
 
 /// The phase times of the most recent image ingest on the calling thread.
@@ -2026,7 +2030,7 @@ impl Session {
     /// Everything [`Self::append_audio`] does before the prefill: the checks, the resample and the
     /// encoder (GPU where one is attached, else CPU). Returns the LLM-input rows
     /// (`n_frames * hidden_size`) and the frame count, and touches no KV state.
-    fn encode_audio_rows(
+    pub(crate) fn encode_audio_rows(
         &mut self,
         samples: &[f32],
         sample_rate: u32,
@@ -2296,11 +2300,16 @@ impl Session {
         // CLI `--ubatch-size 0` opt-out.
         let prefill_start = Instant::now();
         self.note_ingest_mutation(false);
+        let ubatch = if self.model.config().is_causal {
+            self.config.ubatch_size as usize
+        } else {
+            0
+        };
         let (consumed, logits) = self.model.forward_prefill_chunked(
             tokens,
             self.current_pos,
             &mut self.state,
-            self.config.ubatch_size as usize,
+            ubatch,
             &self.cancel,
         );
         // Drain the sticky decode-error slot BEFORE advancing any session
@@ -2526,7 +2535,11 @@ impl Session {
         // and avoids leaving the session wedged on an entry-time
         // cancel. `ubatch == 0` means "no chunking" (one call
         // covering all frames), matching CLI `--ubatch-size 0`.
-        let ubatch = self.config.ubatch_size as usize;
+        let ubatch = if self.model.config().is_causal {
+            self.config.ubatch_size as usize
+        } else {
+            0
+        };
         let chunk_size = if ubatch == 0 { n_tokens } else { ubatch };
         let mut last_logits: Option<Vec<f32>> = None;
         let mut ti = 0usize;

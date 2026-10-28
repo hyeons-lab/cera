@@ -2649,6 +2649,11 @@ impl HexagonLfmModel {
             }
         };
 
+        if !self.config.is_causal && start_pos > 0 {
+            return Err(CeraError::Backend(
+                "bidirectional prefill must run in one pass from start_pos == 0".to_string(),
+            ));
+        }
         if m > PREFILL_MAX_ROWS {
             return Err(CeraError::Backend(format!(
                 "prefill chunk size ({m}) exceeds maximum ({PREFILL_MAX_ROWS})"
@@ -3343,6 +3348,9 @@ impl HexagonLfmModel {
             return Ok(Vec::new());
         }
         if tokens.len() > 1 {
+            if !self.config.is_causal {
+                return self.try_forward_prefill_chunk(tokens, pos, state);
+            }
             self.prefill_head(tokens, pos, state)?;
             return self.try_forward(&tokens[tokens.len() - 1..], pos + tokens.len() - 1, state);
         }
@@ -3367,6 +3375,14 @@ impl HexagonLfmModel {
             return Ok(0);
         }
         if tokens.len() > 1 {
+            if !self.config.is_causal {
+                let logits = self.try_forward_prefill_chunk(tokens, pos, state)?;
+                return Ok(logits
+                    .iter()
+                    .enumerate()
+                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
+                    .map_or(0, |(idx, _)| idx as u32));
+            }
             self.prefill_head(tokens, pos, state)?;
             return self.try_forward_greedy(
                 &tokens[tokens.len() - 1..],
@@ -3629,14 +3645,20 @@ impl Model for HexagonLfmModel {
             record_first_fault(&self.decode_error, e);
             return vec![0.0f32; self.config.vocab_size];
         }
-        let (consumed, logits) = run_scratch_chunks_embeddings(
-            embeddings,
-            n_tokens,
-            hs,
-            start_pos,
-            state,
-            |chunk, pos, state| self.forward_prefill_chunk_from_embeddings(chunk, pos, state),
-        );
+        let (consumed, logits) = if !self.config.is_causal {
+            let logits = self.forward_prefill_chunk_from_embeddings(embeddings, start_pos, state);
+            let consumed = if logits.is_some() { n_tokens } else { 0 };
+            (consumed, logits)
+        } else {
+            run_scratch_chunks_embeddings(
+                embeddings,
+                n_tokens,
+                hs,
+                start_pos,
+                state,
+                |chunk, pos, state| self.forward_prefill_chunk_from_embeddings(chunk, pos, state),
+            )
+        };
         prefill_tail_logits(consumed, n_tokens, logits, self.config.vocab_size)
     }
 
@@ -3683,10 +3705,15 @@ impl Model for HexagonLfmModel {
     ) -> Vec<f32> {
         // The session path below recovers exact accounting through
         // `forward_prefill_chunked`.
-        let (consumed, logits) =
+        let (consumed, logits) = if !self.config.is_causal {
+            let logits = self.forward_prefill_chunk(tokens, start_pos, state);
+            let consumed = if logits.is_some() { tokens.len() } else { 0 };
+            (consumed, logits)
+        } else {
             run_scratch_chunks(tokens, start_pos, state, |chunk, pos, state| {
                 self.forward_prefill_chunk(chunk, pos, state)
-            });
+            })
+        };
         prefill_tail_logits(consumed, tokens.len(), logits, self.config.vocab_size)
     }
 
@@ -3698,6 +3725,13 @@ impl Model for HexagonLfmModel {
         ubatch: usize,
         cancel: &AtomicBool,
     ) -> (usize, Option<Vec<f32>>) {
+        if !self.config.is_causal {
+            return super::run_chunked_prefill(tokens, start_pos, 0, cancel, |chunk, pos| {
+                let logits = self.forward_prefill_chunk(chunk, pos, state);
+                let consumed = if logits.is_some() { chunk.len() } else { 0 };
+                (consumed, logits)
+            });
+        }
         // The shared loop (`model::run_chunked_prefill`): the fallible
         // per-chunk forward is a scratch-capacity `run_scratch_chunks` call.
         super::run_chunked_prefill(tokens, start_pos, ubatch, cancel, |chunk, pos| {
@@ -3718,13 +3752,17 @@ impl Model for HexagonLfmModel {
         }
         // Speculative verification batches `1 + k` tokens and `k` can be 64, so
         // split at the scratch capacity instead of panicking.
-        let result = chunked_all_logits(
-            tokens,
-            start_pos,
-            MAX_ALL_LOGITS_TOKENS,
-            self.config.vocab_size,
-            |chunk, chunk_start| self.try_forward_prefill_logits_all(chunk, chunk_start, state),
-        );
+        let result = if !self.config.is_causal {
+            self.try_forward_prefill_logits_all(tokens, start_pos, state)
+        } else {
+            chunked_all_logits(
+                tokens,
+                start_pos,
+                MAX_ALL_LOGITS_TOKENS,
+                self.config.vocab_size,
+                |chunk, chunk_start| self.try_forward_prefill_logits_all(chunk, chunk_start, state),
+            )
+        };
         match result {
             Ok(logits) => logits,
             Err(e) => {
@@ -3891,6 +3929,9 @@ impl HexagonLfmModel {
         state: &InferenceState,
         len: usize,
     ) -> Result<(), crate::kv_cache::KvRewindError> {
+        if !self.config.is_causal {
+            return Err(crate::kv_cache::KvRewindError::NonCausal);
+        }
         if len > state.seq_len {
             return Err(crate::kv_cache::KvRewindError::OutOfBounds {
                 requested: len,

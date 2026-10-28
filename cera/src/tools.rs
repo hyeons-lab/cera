@@ -244,7 +244,46 @@ impl serde::Serialize for ToolChatMessage {
         let mut map = serializer.serialize_map(None)?;
         map.serialize_entry("role", &self.role)?;
 
-        if !self.content_parts.is_empty() {
+        let has_additional = self.role == "tool"
+            && self
+                .additional_tools
+                .as_ref()
+                .is_some_and(|t| !t.is_empty());
+        if has_additional {
+            let mut combined: Vec<ToolContentPart> = if !self.content_parts.is_empty() {
+                let mut v = Vec::with_capacity(self.content_parts.len() + 1);
+                if !self.content.is_empty() {
+                    v.push(ToolContentPart::Text {
+                        text: self.content.clone(),
+                    });
+                }
+                v.extend(self.content_parts.iter().cloned());
+                v
+            } else if let Some(parts) = lenient_tool_content_parts(&self.content) {
+                parts
+            } else if !self.content.is_empty() {
+                vec![ToolContentPart::Text {
+                    text: self.content.clone(),
+                }]
+            } else {
+                Vec::new()
+            };
+            if let Some(ref at) = self.additional_tools {
+                for tool in at {
+                    if !combined.iter().any(|p| {
+                        matches!(
+                            p,
+                            ToolContentPart::ToolReference { name } if name == &tool.name
+                        )
+                    }) {
+                        combined.push(ToolContentPart::ToolReference {
+                            name: tool.name.clone(),
+                        });
+                    }
+                }
+            }
+            map.serialize_entry("content", &combined)?;
+        } else if !self.content_parts.is_empty() {
             if self.content.is_empty() {
                 map.serialize_entry("content", &self.content_parts)?;
             } else {

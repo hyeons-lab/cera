@@ -964,12 +964,36 @@ pub fn apply_chat_template_with_tools<M: serde::Serialize>(
     // `defer_loading` entries from the initial `<tools>` block itself. For any other template
     // (one that merely knows `tool_reference` parts included) the deferred tools are filtered
     // out here and `tool_reference` parts are expanded up front.
+    let mut msgs_val =
+        serde_json::to_value(messages).context("serializing chat messages for template")?;
+
+    // Collect any per-message `additional_tools` into an extended lookup table (marked
+    // `defer_loading = true` when not already in `tools`, so they are excluded from the
+    // initial `<tools>` header and only revealed at the `tool_reference` site).
+    let mut all_tools: std::borrow::Cow<'_, [crate::tools::ToolDef]> =
+        std::borrow::Cow::Borrowed(tools);
+    if let Some(arr) = msgs_val.as_array() {
+        for msg in arr {
+            if let Some(at_val) = msg.get("additional_tools")
+                && let Ok(extra) =
+                    serde_json::from_value::<Vec<crate::tools::ToolDef>>(at_val.clone())
+            {
+                for mut def in extra {
+                    if !all_tools.iter().any(|t| t.name == def.name) {
+                        def.defer_loading = true;
+                        all_tools.to_mut().push(def);
+                    }
+                }
+            }
+        }
+    }
+
     let template_handles_deferred = template_str.contains("defer_loading");
     let visible_tools: Vec<&crate::tools::ToolDef>;
     let tools_for_ctx: Vec<&crate::tools::ToolDef> = if template_handles_deferred {
-        tools.iter().collect()
+        all_tools.iter().collect()
     } else {
-        visible_tools = tools.iter().filter(|t| !t.defer_loading).collect();
+        visible_tools = all_tools.iter().filter(|t| !t.defer_loading).collect();
         visible_tools
     };
 
@@ -977,8 +1001,26 @@ pub fn apply_chat_template_with_tools<M: serde::Serialize>(
         serde_json::to_value(&tools_for_ctx).context("serializing tools for template")?;
 
     if template_handles_deferred && template_str.contains("tool_reference") {
+        // Normalize string-serialized `tool_reference` JSON in `role == "tool"` messages
+        // (such as from `ChatMessage`) so the template's structured `content` loop runs.
+        if let Some(arr) = msgs_val.as_array_mut() {
+            for msg in arr {
+                let Some(obj) = msg.as_object_mut() else {
+                    continue;
+                };
+                if obj.get("role").and_then(|r| r.as_str()) != Some("tool") {
+                    continue;
+                }
+                if let Some(serde_json::Value::String(s)) = obj.get("content")
+                    && let Some(parts) = crate::tools::lenient_tool_content_parts(s)
+                    && let Ok(parts_val) = serde_json::to_value(&parts)
+                {
+                    obj.insert("content".to_string(), parts_val);
+                }
+            }
+        }
         let ctx = minijinja::context! {
-            messages => minijinja::value::Serde(messages),
+            messages => minijinja::value::Serde(&msgs_val),
             tools => minijinja::value::Serde(&tools_val),
             bos_token => bos_token,
             eos_token => eos_token,
@@ -986,9 +1028,7 @@ pub fn apply_chat_template_with_tools<M: serde::Serialize>(
         };
         tmpl.render(ctx).context("rendering chat template")
     } else {
-        let mut msgs_val =
-            serde_json::to_value(messages).context("serializing chat messages for template")?;
-        expand_tool_references_in_messages(&mut msgs_val, tools)?;
+        expand_tool_references_in_messages(&mut msgs_val, &all_tools)?;
         let ctx = minijinja::context! {
             messages => minijinja::value::Serde(&msgs_val),
             tools => minijinja::value::Serde(&tools_val),
@@ -2519,6 +2559,83 @@ mod tests {
         assert!(
             format!("{err:#}").contains("tool_reference could not be resolved"),
             "unexpected error: {err:#}"
+        );
+    }
+
+    #[test]
+    fn test_lfm3_chat_template_expands_string_tool_reference_and_additional_tools() {
+        use crate::tools::{ToolChatMessage, ToolDef};
+
+        let mut tok = make_gpt2_style_tokenizer();
+        tok.chat_template = Some(LFM3_CHAT_TEMPLATE.to_string());
+
+        let search_tool = ToolDef::new(
+            "search_tools",
+            Some("Search available tools".to_string()),
+            serde_json::json!({"type": "object"}),
+        );
+        let weather_tool = ToolDef::new(
+            "get_weather",
+            Some("Get weather for a city".to_string()),
+            serde_json::json!({
+                "type": "object",
+                "properties": {"city": {"type": "string"}}
+            }),
+        )
+        .with_defer_loading(true);
+
+        // 1. Plain `ChatMessage` (as passed by `CeraEngine::apply_chat_template_with_tools`
+        //    in `cera-ffi` and `Tokenizer::apply_chat_template_with_tools` in `cera-wasm`)
+        //    with JSON-serialized `tool_reference` content.
+        let chat_messages = vec![
+            ChatMessage {
+                role: "user".to_string(),
+                content: "Weather in Paris?".to_string(),
+            },
+            ChatMessage {
+                role: "tool".to_string(),
+                content: r#"[{"type":"tool_reference","tool_name":"get_weather"},{"type":"text","text":"found get_weather"}]"#.to_string(),
+            },
+        ];
+        let rendered_chat = apply_chat_template_with_tools(
+            &tok,
+            &chat_messages,
+            &[search_tool.clone(), weather_tool.clone()],
+            true,
+        )
+        .expect("ChatMessage tool_reference should render cleanly on LFM3 template");
+        assert!(
+            rendered_chat
+                .contains("<additional_tools>\n{\"description\": \"Get weather for a city\""),
+            "rendered_chat:\n{rendered_chat}"
+        );
+        assert!(
+            rendered_chat.contains(
+                "</additional_tools>\n<tool_response>\nfound get_weather\n</tool_response>"
+            ),
+            "rendered_chat:\n{rendered_chat}"
+        );
+
+        // 2. `ToolChatMessage::with_additional_tools` supplies the deferred tool definition
+        //    directly on the tool message without requiring it in `tools`.
+        let tool_messages = vec![
+            ToolChatMessage::text("user", "Weather in Paris?"),
+            ToolChatMessage::tool_result("found get_weather", Some("search_tools".to_string()))
+                .with_additional_tools(vec![weather_tool]),
+        ];
+        let rendered_with_additional =
+            apply_chat_template_with_tools(&tok, &tool_messages, &[search_tool], true)
+                .expect("with_additional_tools should render cleanly on LFM3 template");
+        assert!(
+            rendered_with_additional
+                .contains("<additional_tools>\n{\"description\": \"Get weather for a city\""),
+            "rendered_with_additional:\n{rendered_with_additional}"
+        );
+        assert!(
+            rendered_with_additional.contains(
+                "</additional_tools>\n<tool_response>\nfound get_weather\n</tool_response>"
+            ),
+            "rendered_with_additional:\n{rendered_with_additional}"
         );
     }
 }
