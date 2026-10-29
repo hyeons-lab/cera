@@ -1994,7 +1994,18 @@ fn extract_thinking_masked(text: &str, mask_open: Option<char>) -> (Option<Strin
             None => {
                 // a thought that never closes ends where a tool call begins: the call is
                 // the model's answer, not part of the reasoning
-                let (thinking, tail) = match mask_open.and_then(|m| after.find(m)) {
+                // with no mask character free the calls are not masked, so the raw section
+                // openers stand in for the mask
+                let call_at = mask_open.and_then(|m| after.find(m)).or_else(|| {
+                    if mask_open.is_some() {
+                        return None;
+                    }
+                    ["<tool_call>", "<|tool_call_start|>"]
+                        .iter()
+                        .filter_map(|open| after.find(open))
+                        .min()
+                });
+                let (thinking, tail) = match call_at {
                     Some(call_at) => after.split_at(call_at),
                     None => (after, ""),
                 };
@@ -3890,6 +3901,37 @@ mod tests {
     /// With every private-use character in the text there is no safe placeholder: nothing is
     /// masked, so forged placeholders cannot restore a call twice. With only the first range
     /// used, the placeholders come from another range.
+    /// With every private-use character in the text nothing is masked, but a thought that never
+    /// closes must still end where a call begins: the call is the answer, not more reasoning.
+    #[test]
+    fn an_unclosed_think_does_not_swallow_a_call_when_no_mask_character_is_free() {
+        let range = |lo: u32, hi: u32| (lo..=hi).filter_map(char::from_u32).collect::<String>();
+        let used = format!(
+            "{}{}{}",
+            range(0xE000, 0xF8FF),
+            range(0xF_0000, 0xF_FFFD),
+            range(0x10_0000, 0x10_FFFD)
+        );
+        let hermes =
+            r#"<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>"#;
+        let lfm2 = "<|tool_call_start|>[get_weather(city=\"Paris\")]<|tool_call_end|>";
+        for (format, call) in [
+            (ToolFormat::Hermes, hermes),
+            (ToolFormat::Lfm2Pythonic, lfm2),
+        ] {
+            let text = format!("{used}<think>plan {call}");
+            assert!(Marks::for_text(&text).is_none());
+            let parsed = parse_output(&text, format).unwrap();
+            assert_eq!(parsed.tool_calls.len(), 1, "{format:?}");
+            assert_eq!(parsed.tool_calls[0].name, "get_weather", "{format:?}");
+            assert_eq!(
+                parsed.reasoning_content.as_deref(),
+                Some("plan"),
+                "{format:?}"
+            );
+        }
+    }
+
     #[test]
     fn exhausting_the_private_use_characters_never_duplicates_a_call() {
         let call =
