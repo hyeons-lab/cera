@@ -1587,8 +1587,7 @@ impl<E: Execution> Chat<E> {
             .map_err(CompleteError::Validation)?;
         let summary = report.result.map_err(CompleteError::Execution)?;
         let text = self.profile.tokenizer.decode(&collector.0);
-        let tool_calls =
-            parse_tool_calls_with_tools(&text, self.tool_format, &self.tools).unwrap_or_default();
+        let tool_calls = parsed_tool_calls(&text, self.tool_format, &self.tools);
         Ok(TurnResult {
             text,
             tokens: collector.0,
@@ -1667,8 +1666,7 @@ impl<E: Execution> Chat<E> {
             .map_err(CompleteError::Validation)?;
         let summary = report.result.map_err(CompleteError::Execution)?;
         let full_text = self.profile.tokenizer.decode(&collector.tokens);
-        let tool_calls = parse_tool_calls_with_tools(&full_text, self.tool_format, &self.tools)
-            .unwrap_or_default();
+        let tool_calls = parsed_tool_calls(&full_text, self.tool_format, &self.tools);
         Ok(TurnResult {
             text: full_text,
             tokens: collector.tokens,
@@ -2013,6 +2011,23 @@ mod contract_tests;
 #[cfg(test)]
 #[path = "../../tests/api_chat/fixtures.rs"]
 mod fixtures;
+
+/// The tool calls in a finished turn. A call section the parser cannot read is not a turn that
+/// failed: the text stands and there are no calls, but the reason is logged, so a model whose
+/// calls keep coming back empty can be told apart from one that made none.
+fn parsed_tool_calls(text: &str, format: ToolFormat, tools: &[ToolDef]) -> Vec<ToolCall> {
+    match parse_tool_calls_with_tools(text, format, tools) {
+        Ok(calls) => calls,
+        Err(e) => {
+            tracing::warn!(
+                target: "cera::tools",
+                error = %e,
+                "the turn contains a tool call section that could not be parsed; returning no tool calls"
+            );
+            Vec::new()
+        }
+    }
+}
 
 #[cfg(test)]
 mod tests;

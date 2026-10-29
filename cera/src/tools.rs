@@ -1203,18 +1203,22 @@ fn lfm3_text_rule(name: &str, terminator: &str) -> String {
     out
 }
 
-fn lfm3_enum_literal(v: &Value, typed_string: bool) -> Option<String> {
+fn lfm3_enum_literal(v: &Value, schema: &Value) -> Option<String> {
     match v {
-        // Read back by `parse_lfm3_param_value`: a `string` parameter keeps the text as
-        // written; an untyped one is parsed as JSON first, so a variant such as `true` or `3`
-        // must be quoted to stay a string, and any other variant is plain text.
-        Value::String(s) => Some(
-            if typed_string || serde_json::from_str::<Value>(s).is_err() {
+        // Spelled so that `parse_lfm3_param_value` reads it back as exactly this string: as
+        // written when it does (a `string` parameter, or text that is not another allowed type),
+        // quoted when the quotes are what make it a string (`true`, `3`, `null` under an untyped
+        // or union schema).
+        Value::String(s) => {
+            let reads_back =
+                |text: &str| parse_lfm3_param_value(text, Some(schema)) == Value::String(s.clone());
+            let quoted = serde_json::to_string(s).unwrap_or_default();
+            Some(if reads_back(s) || !reads_back(&quoted) {
                 gbnf_lit(s)
             } else {
                 json_str_gbnf(s)
-            },
-        ),
+            })
+        }
         Value::Bool(b) => Some(gbnf_lit(if *b { "true" } else { "false" })),
         Value::Number(n) => Some(gbnf_lit(&n.to_string())),
         Value::Null => Some(gbnf_lit("null")),
@@ -1226,10 +1230,9 @@ fn lfm3_value_for_schema(schema: &Value) -> String {
     if let Some(Value::Array(variants)) = schema.get("enum")
         && !variants.is_empty()
     {
-        let typed_string = schema.get("type").and_then(|t| t.as_str()) == Some("string");
         let lits: Vec<Option<String>> = variants
             .iter()
-            .map(|v| lfm3_enum_literal(v, typed_string))
+            .map(|v| lfm3_enum_literal(v, schema))
             .collect();
         if lits.iter().all(Option::is_some) {
             let joined = lits.into_iter().flatten().collect::<Vec<_>>().join(" | ");
@@ -1705,6 +1708,14 @@ impl<'a> PyParser<'a> {
 
 // ── LFM3 XML parser ─────────────────────────────────────────────────────────
 
+/// The text of a parameter value between the `\n` the template writes after `<parameter=NAME>` and
+/// the `\n` it writes before `</parameter>`. Only those two characters are delimiters: a value
+/// that itself starts or ends with `\r` keeps it.
+fn strip_value_delimiters(s: &str) -> &str {
+    let s = s.strip_prefix('\n').unwrap_or(s);
+    s.strip_suffix('\n').unwrap_or(s)
+}
+
 /// Strip at most one leading newline (`\r\n` or `\n`) and at most one trailing
 /// newline (`\r\n` or `\n`) from `s`.
 fn strip_one_newline(s: &str) -> &str {
@@ -1717,15 +1728,33 @@ fn strip_one_newline(s: &str) -> &str {
         .unwrap_or(s)
 }
 
-/// Private-use markers that stand for a tool-call body while thinking is extracted.
-const MASK_OPEN: char = '\u{E000}';
-const MASK_CLOSE: char = '\u{E001}';
+/// The two private-use characters that stand for a tool-call body while thinking is extracted.
+/// They are chosen so that neither occurs in the text being masked: model output that contains
+/// such a character could otherwise name a hidden call and have its body restored twice.
+#[derive(Clone, Copy)]
+struct Marks {
+    open: char,
+    close: char,
+}
+
+impl Marks {
+    fn for_text(text: &str) -> Self {
+        let mut free = ('\u{E000}'..='\u{F8FF}').filter(|c| !text.contains(*c));
+        // a text cannot contain every private-use character; the fallback only keeps the
+        // function total
+        Marks {
+            open: free.next().unwrap_or('\u{E000}'),
+            close: free.next().unwrap_or('\u{E001}'),
+        }
+    }
+}
 
 /// Replace each tool-call section (`<tool_call>...</tool_call>`, or LFM2's
 /// `<|tool_call_start|>...<|tool_call_end|>`) with `MASK_OPEN index MASK_CLOSE` and return the
 /// masked text with the sections it hid. A parameter value may contain `<think>` text (code,
 /// documentation), which must not be read as the model's reasoning.
-fn mask_tool_calls(text: &str) -> (std::borrow::Cow<'_, str>, Vec<String>) {
+fn mask_tool_calls(text: &str) -> (std::borrow::Cow<'_, str>, Vec<String>, Marks) {
+    let marks = Marks::for_text(text);
     const SECTIONS: [(&str, &str); 2] = [
         ("<tool_call>", "</tool_call>"),
         ("<|tool_call_start|>", "<|tool_call_end|>"),
@@ -1735,7 +1764,7 @@ fn mask_tool_calls(text: &str) -> (std::borrow::Cow<'_, str>, Vec<String>) {
         .filter_map(|(open, close)| text.find(open).map(|at| (at, *open, *close)))
         .min_by_key(|(at, _, _)| *at);
     if first.is_none() {
-        return (std::borrow::Cow::Borrowed(text), Vec::new());
+        return (std::borrow::Cow::Borrowed(text), Vec::new(), marks);
     }
     let mut masked = String::with_capacity(text.len());
     let mut bodies = Vec::new();
@@ -1754,7 +1783,13 @@ fn mask_tool_calls(text: &str) -> (std::borrow::Cow<'_, str>, Vec<String>) {
         };
         masked.push_str(&rest[..at]);
         let body_start = at + open.len();
-        let close_pos = rest[body_start..].find(close);
+        // a `<tool_call>` ends at its structural close, as the parser reads it; a value may hold
+        // the tag
+        let close_pos = if open == "<tool_call>" {
+            find_structural_close(&rest[body_start..], close)
+        } else {
+            rest[body_start..].find(close)
+        };
         let is_bare_in_think = match close_pos {
             None => rest[body_start..].contains("</think>"),
             Some(c) => {
@@ -1778,26 +1813,26 @@ fn mask_tool_calls(text: &str) -> (std::borrow::Cow<'_, str>, Vec<String>) {
         }
         // an unclosed section runs to the end of the text
         let end = close_pos.map_or(rest.len(), |c| body_start + c + close.len());
-        masked.push(MASK_OPEN);
+        masked.push(marks.open);
         masked.push_str(&bodies.len().to_string());
-        masked.push(MASK_CLOSE);
+        masked.push(marks.close);
         bodies.push(rest[at..end].to_string());
         rest = &rest[end..];
     }
-    (std::borrow::Cow::Owned(masked), bodies)
+    (std::borrow::Cow::Owned(masked), bodies, marks)
 }
 
 /// Undo [`mask_tool_calls`] on `text`.
-fn unmask_tool_calls(text: &str, bodies: &[String]) -> String {
+fn unmask_tool_calls(text: &str, bodies: &[String], marks: Marks) -> String {
     if bodies.is_empty() {
         return text.to_string();
     }
     let mut out = String::with_capacity(text.len());
     let mut rest = text;
-    while let Some(open) = rest.find(MASK_OPEN) {
+    while let Some(open) = rest.find(marks.open) {
         out.push_str(&rest[..open]);
-        let after = &rest[open + MASK_OPEN.len_utf8()..];
-        let Some(close) = after.find(MASK_CLOSE) else {
+        let after = &rest[open + marks.open.len_utf8()..];
+        let Some(close) = after.find(marks.close) else {
             out.push_str(&rest[open..]);
             return out;
         };
@@ -1807,10 +1842,11 @@ fn unmask_tool_calls(text: &str, bodies: &[String]) -> String {
             .and_then(|i| bodies.get(i))
         {
             Some(body) => out.push_str(body),
-            None => out
-                .push_str(&rest[open..open + MASK_OPEN.len_utf8() + close + MASK_CLOSE.len_utf8()]),
+            None => out.push_str(
+                &rest[open..open + marks.open.len_utf8() + close + marks.close.len_utf8()],
+            ),
         }
-        rest = &after[close + MASK_CLOSE.len_utf8()..];
+        rest = &after[close + marks.close.len_utf8()..];
     }
     out.push_str(rest);
     out
@@ -1819,16 +1855,16 @@ fn unmask_tool_calls(text: &str, bodies: &[String]) -> String {
 /// Extract `<think>...</think>` blocks (or a leading `...</think>` when the
 /// prompt already opened `<think>`), returning `(reasoning_content, rest)`.
 fn extract_thinking(text: &str) -> (Option<String>, String) {
-    let (masked, bodies) = mask_tool_calls(text);
-    let (reasoning, rest) = extract_thinking_masked(&masked);
+    let (masked, bodies, marks) = mask_tool_calls(text);
+    let (reasoning, rest) = extract_thinking_masked(&masked, marks.open);
     (
-        reasoning.map(|r| unmask_tool_calls(&r, &bodies)),
-        unmask_tool_calls(&rest, &bodies),
+        reasoning.map(|r| unmask_tool_calls(&r, &bodies, marks)),
+        unmask_tool_calls(&rest, &bodies, marks),
     )
 }
 
 /// The body of [`extract_thinking`], over text whose tool-call sections are masked.
-fn extract_thinking_masked(text: &str) -> (Option<String>, String) {
+fn extract_thinking_masked(text: &str, mask_open: char) -> (Option<String>, String) {
     let mut reasoning_parts: Vec<String> = Vec::new();
     let mut remaining = String::new();
     let mut rest = text;
@@ -1860,7 +1896,7 @@ fn extract_thinking_masked(text: &str) -> (Option<String>, String) {
             None => {
                 // a thought that never closes ends where a tool call begins: the call is
                 // the model's answer, not part of the reasoning
-                let (thinking, tail) = match after.find(MASK_OPEN) {
+                let (thinking, tail) = match after.find(mask_open) {
                     Some(call_at) => after.split_at(call_at),
                     None => (after, ""),
                 };
@@ -1888,6 +1924,31 @@ fn parse_lfm3_xml(text: &str, tools: &[ToolDef]) -> Result<Vec<ToolCall>> {
     Ok(calls)
 }
 
+/// The byte offset of the first `close` tag in `s` that is not inside a `<parameter=...>` value.
+/// A value ends only at its first `</parameter>` (what the grammar enforces), so it may hold
+/// `</function>` or `</tool_call>`; those are skipped over, not taken for the end of the call.
+/// An unterminated value hides everything after it, so the search then finds nothing.
+fn find_structural_close(s: &str, close: &str) -> Option<usize> {
+    const PARAM: &str = "<parameter=";
+    const PARAM_END: &str = "</parameter>";
+    let mut i = 0;
+    while i < s.len() {
+        let rest = &s[i..];
+        if rest.starts_with(close) {
+            return Some(i);
+        }
+        if rest.starts_with(PARAM) {
+            let value_from = rest.find('>').map_or(rest.len(), |gt| gt + 1);
+            // skip to just past this value's own end tag; no end tag hides the rest
+            let end = rest[value_from..].find(PARAM_END)?;
+            i += value_from + end + PARAM_END.len();
+            continue;
+        }
+        i += rest.chars().next().map_or(1, char::len_utf8);
+    }
+    None
+}
+
 fn split_and_parse_lfm3(text: &str, tools: &[ToolDef]) -> Result<(String, Vec<ToolCall>)> {
     let mut calls = Vec::new();
     let mut content_parts = Vec::new();
@@ -1901,7 +1962,7 @@ fn split_and_parse_lfm3(text: &str, tools: &[ToolDef]) -> Result<(String, Vec<To
             content_parts.push(before.trim());
         }
         let after = &rest[start + "<tool_call>".len()..];
-        let (tc_body, next_rest) = match after.find("</tool_call>") {
+        let (tc_body, next_rest) = match find_structural_close(after, "</tool_call>") {
             Some(end) => (&after[..end], &after[end + "</tool_call>".len()..]),
             None => (after, ""),
         };
@@ -1944,7 +2005,7 @@ fn parse_lfm3_functions(body: &str, tools: &[ToolDef], calls: &mut Vec<ToolCall>
             bail!("empty function name in <function=> tag");
         }
         let after_fn_open = &after_prefix[gt_pos + 1..];
-        let (fn_body, next_rest) = match after_fn_open.find("</function>") {
+        let (fn_body, next_rest) = match find_structural_close(after_fn_open, "</function>") {
             Some(end) => (
                 &after_fn_open[..end],
                 &after_fn_open[end + "</function>".len()..],
@@ -2006,7 +2067,7 @@ fn parse_lfm3_parameters(
             ),
             None => bail!("missing </parameter> for '{param_name}' in call to '{fn_name}'"),
         };
-        let val_str = strip_one_newline(raw_val);
+        let val_str = strip_value_delimiters(raw_val);
         let prop_schema = tool_def
             .and_then(|t| t.parameters.get("properties"))
             .and_then(|p| p.get(param_name));
@@ -2018,16 +2079,57 @@ fn parse_lfm3_parameters(
 }
 
 fn parse_lfm3_param_value(val_str: &str, prop_schema: Option<&Value>) -> Value {
-    let schema_ty = prop_schema
-        .and_then(|s| s.get("type"))
-        .and_then(|t| t.as_str());
-    if schema_ty == Some("string") {
+    let allowed = prop_schema.map(schema_value_types).unwrap_or_default();
+    if allowed.is_empty() {
+        // no type information: the text is JSON when it parses as JSON, else a string
+        return serde_json::from_str::<Value>(val_str)
+            .unwrap_or_else(|_| Value::String(val_str.to_string()));
+    }
+    let parsed = serde_json::from_str::<Value>(val_str).ok();
+    if let Some(v) = parsed.filter(|v| json_value_fits_types(v, &allowed)) {
+        match v {
+            // a union that includes `string` can quote a variant that would otherwise read as
+            // another type (`"7"`, `"null"`): the quoted form is the string without its quotes.
+            // A string-only schema keeps its text exactly as written.
+            Value::String(unquoted) if allowed.len() > 1 => return Value::String(unquoted),
+            Value::String(_) => {}
+            other => return other,
+        }
+    }
+    if allowed.contains(&"string") {
         return Value::String(val_str.to_string());
     }
-    match serde_json::from_str::<Value>(val_str) {
-        Ok(v) => v,
-        Err(_) => Value::String(val_str.to_string()),
+    serde_json::from_str::<Value>(val_str).unwrap_or_else(|_| Value::String(val_str.to_string()))
+}
+
+/// The JSON types a property schema allows: its `type` (a name or a list) and the types of its
+/// `anyOf` / `oneOf` branches. Empty when the schema says nothing about the type.
+fn schema_value_types(schema: &Value) -> Vec<&str> {
+    let mut out = Vec::new();
+    match schema.get("type") {
+        Some(Value::String(t)) => out.push(t.as_str()),
+        Some(Value::Array(ts)) => out.extend(ts.iter().filter_map(Value::as_str)),
+        _ => {}
     }
+    for key in ["anyOf", "oneOf"] {
+        if let Some(branches) = schema.get(key).and_then(Value::as_array) {
+            for b in branches {
+                out.extend(schema_value_types(b));
+            }
+        }
+    }
+    out
+}
+
+/// Whether `v` is a value of one of the JSON schema `types` (an integer also fits `number`).
+fn json_value_fits_types(v: &Value, types: &[&str]) -> bool {
+    types.iter().any(|t| match (*t, v) {
+        ("null", Value::Null) | ("boolean", Value::Bool(_)) | ("string", Value::String(_)) => true,
+        ("array", Value::Array(_)) | ("object", Value::Object(_)) => true,
+        ("integer", Value::Number(n)) => n.is_i64() || n.is_u64(),
+        ("number", Value::Number(_)) => true,
+        _ => false,
+    })
 }
 
 fn split_and_parse_lfm2(text: &str) -> Result<(String, Vec<ToolCall>)> {
@@ -2137,6 +2239,216 @@ mod tests {
         let (reasoning, rest) = extract_thinking(&format!("<think>plan {call}"));
         assert_eq!(reasoning.as_deref(), Some("plan"));
         assert_eq!(rest, call);
+    }
+
+    /// The placeholders that hide a call while thinking is extracted are private-use characters;
+    /// model text that contains them must not be able to name a hidden call, or the call would be
+    /// parsed (and executed) twice.
+    /// The grammar ends a string value only at `</parameter>`, so a value may hold `</function>`
+    /// or `</tool_call>` (documentation, XML, a quoted call). The parser must read back what the
+    /// grammar let the model write, not split the call at the first closing tag it meets.
+    /// The template puts one `\n` before and after a value, so only those are delimiters: a value
+    /// that itself ends in `\r` (or starts with one) keeps it.
+    #[test]
+    fn a_value_keeps_its_own_carriage_returns() {
+        let tool = ToolDef::new(
+            "f",
+            None,
+            serde_json::json!({"type": "object", "properties": {"v": {"type": "string"}}}),
+        );
+        for value in ["x\r", "\rx", "\r", "a\r\n", "x\r\ny"] {
+            let text = format!(
+                "<tool_call>\n<function=f>\n<parameter=v>\n{value}\n</parameter>\n</function>\n</tool_call>"
+            );
+            let calls = parse_tool_calls_with_tools(
+                &text,
+                ToolFormat::Lfm3Xml,
+                std::slice::from_ref(&tool),
+            )
+            .unwrap();
+            assert_eq!(
+                calls[0].arguments["v"],
+                serde_json::json!(value),
+                "{value:?}"
+            );
+        }
+    }
+
+    /// A parameter that can be a string and something else is read as the something else only
+    /// when the text is a valid value of that type; otherwise it is the string, never a number or
+    /// boolean the schema does not allow.
+    #[test]
+    fn union_typed_parameters_keep_strings_unless_another_allowed_type_fits() {
+        let call = |schema: serde_json::Value, text: &str| {
+            let tool = ToolDef::new(
+                "f",
+                None,
+                serde_json::json!({"type": "object", "properties": {"v": schema}}),
+            );
+            let body = format!(
+                "<tool_call>\n<function=f>\n<parameter=v>\n{text}\n</parameter>\n</function>\n</tool_call>"
+            );
+            parse_tool_calls_with_tools(&body, ToolFormat::Lfm3Xml, &[tool]).unwrap()[0]
+                .arguments["v"]
+                .clone()
+        };
+        use serde_json::json;
+        let nullable = json!({"type": ["string", "null"]});
+        assert_eq!(call(nullable.clone(), "12345"), json!("12345"));
+        assert_eq!(call(nullable.clone(), "true"), json!("true"));
+        assert_eq!(call(nullable.clone(), "null"), json!(null));
+        assert_eq!(call(nullable, "hello"), json!("hello"));
+        let any_of = json!({"anyOf": [{"type": "string"}, {"type": "integer"}]});
+        assert_eq!(call(any_of.clone(), "42"), json!(42));
+        assert_eq!(call(any_of.clone(), "4.5"), json!("4.5"));
+        assert_eq!(call(any_of, "word"), json!("word"));
+        // a plain string still never coerces, and a plain integer still parses
+        assert_eq!(call(json!({"type": "string"}), "null"), json!("null"));
+        assert_eq!(call(json!({"type": "integer"}), "7"), json!(7));
+    }
+
+    /// Thinking is extracted around the calls, so the masker has to end a call where the parser does:
+    /// at the structural `</tool_call>`, not at one inside a value. Otherwise the text after it in
+    /// the value would be searched for `<think>` blocks and stripped out of the argument.
+    #[test]
+    fn think_text_after_a_closing_tag_inside_a_value_stays_in_the_value() {
+        let tool = ToolDef::new(
+            "f",
+            None,
+            serde_json::json!({"type": "object", "properties": {"v": {"type": "string"}}}),
+        );
+        let value = "x </tool_call> <think>keep me</think> tail";
+        let text = format!(
+            "<tool_call>\n<function=f>\n<parameter=v>\n{value}\n</parameter>\n</function>\n</tool_call>"
+        );
+        let calls =
+            parse_tool_calls_with_tools(&text, ToolFormat::Lfm3Xml, std::slice::from_ref(&tool))
+                .unwrap();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(calls[0].arguments["v"], serde_json::json!(value));
+        let (reasoning, rest) = extract_thinking(&text);
+        assert_eq!(reasoning, None, "the <think> in the value is not reasoning");
+        assert!(rest.contains("<think>keep me</think>"), "{rest:?}");
+    }
+
+    /// A union that includes `string` plus an `enum`: whichever form the grammar writer picks for
+    /// a variant must read back as that exact string.
+    #[test]
+    fn union_typed_string_enums_round_trip_through_the_grammar_writer_and_the_parser() {
+        let schema =
+            serde_json::json!({"type": ["string", "null"], "enum": ["a", "7", "null", "true"]});
+        let tool = ToolDef::new(
+            "f",
+            None,
+            serde_json::json!({"type": "object", "properties": {"v": schema}}),
+        );
+        let g = compile(&generate_gbnf(std::slice::from_ref(&tool), ToolFormat::Lfm3Xml).unwrap());
+        for variant in ["a", "7", "null", "true"] {
+            // the writer accepts some spelling of the variant, and the parser reads it back
+            let spellings = [variant.to_string(), format!("\"{variant}\"")];
+            let mut accepted = false;
+            for spelling in &spellings {
+                let text = format!(
+                    "<tool_call>\n<function=f>\n<parameter=v>\n{spelling}\n</parameter>\n</function>\n</tool_call>"
+                );
+                if accepts_complete(&g, text.as_bytes()) {
+                    accepted = true;
+                    let calls = parse_tool_calls_with_tools(
+                        &text,
+                        ToolFormat::Lfm3Xml,
+                        std::slice::from_ref(&tool),
+                    )
+                    .unwrap();
+                    assert_eq!(
+                        calls[0].arguments["v"],
+                        serde_json::json!(variant),
+                        "{spelling} (variant {variant})"
+                    );
+                }
+            }
+            assert!(accepted, "the grammar accepts no spelling of {variant}");
+        }
+    }
+
+    #[test]
+    fn a_call_with_very_many_parameters_does_not_recurse() {
+        let mut body = String::from("<tool_call>\n<function=f>\n");
+        for i in 0..20_000 {
+            body.push_str(&format!("<parameter=p{i}>\nv\n</parameter>\n"));
+        }
+        body.push_str("</function>\n</tool_call>");
+        let calls = parse_tool_calls_with_tools(&body, ToolFormat::Lfm3Xml, &[]).unwrap();
+        assert_eq!(calls[0].arguments.as_object().unwrap().len(), 20_000);
+    }
+
+    #[test]
+    fn a_value_may_contain_the_closing_tags_of_the_enclosing_elements() {
+        let tool = ToolDef::new(
+            "note",
+            None,
+            serde_json::json!({"type": "object", "properties": {
+                "text": {"type": "string"}, "tag": {"type": "string"}}}),
+        );
+        for value in [
+            "see </function> for details",
+            "a </tool_call> b",
+            "</function></tool_call>",
+            "<function=x><parameter=y>z",
+            "line one\n</function>\nline two",
+        ] {
+            let text = format!(
+                "<tool_call>\n<function=note>\n<parameter=text>\n{value}\n</parameter>\n\
+                 <parameter=tag>\nkeep\n</parameter>\n</function>\n</tool_call>"
+            );
+            let calls = parse_tool_calls_with_tools(
+                &text,
+                ToolFormat::Lfm3Xml,
+                std::slice::from_ref(&tool),
+            )
+            .unwrap_or_else(|e| panic!("{value:?}: {e}"));
+            assert_eq!(calls.len(), 1, "{value:?}");
+            assert_eq!(
+                calls[0].arguments["text"],
+                serde_json::json!(value),
+                "{value:?}"
+            );
+            assert_eq!(calls[0].arguments["tag"], "keep", "{value:?}");
+        }
+        // two calls, the first with a closing tag in its value, still read as two calls
+        let two = "<tool_call>\n<function=note>\n<parameter=text>\na </tool_call> b\n</parameter>\n</function>\n</tool_call>\n\
+                   <tool_call>\n<function=note>\n<parameter=text>\nsecond\n</parameter>\n</function>\n</tool_call>";
+        let calls = parse_tool_calls_with_tools(two, ToolFormat::Lfm3Xml, &[tool]).unwrap();
+        assert_eq!(calls.len(), 2);
+        assert_eq!(calls[0].arguments["text"], "a </tool_call> b");
+        assert_eq!(calls[1].arguments["text"], "second");
+    }
+
+    #[test]
+    fn text_that_forges_a_call_placeholder_does_not_duplicate_the_call() {
+        let call =
+            r#"<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>"#;
+        for forged in [
+            "\u{E000}0\u{E001}",
+            "\u{E000}0",
+            "0\u{E001}",
+            "\u{E000}\u{E001}",
+        ] {
+            for text in [
+                format!("{forged}{call}"),
+                format!("{call}{forged}"),
+                format!("<think>{forged}</think>{call}"),
+                format!("{forged} {call} {forged}"),
+            ] {
+                let calls = parse_tool_calls_with_tools(&text, ToolFormat::Hermes, &[]).unwrap();
+                assert_eq!(calls.len(), 1, "{text:?}");
+                let (_, rest) = extract_thinking(&text);
+                assert_eq!(
+                    rest.matches("get_weather").count(),
+                    1,
+                    "{text:?} -> {rest:?}"
+                );
+            }
+        }
     }
 
     #[test]
