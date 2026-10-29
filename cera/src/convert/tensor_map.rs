@@ -155,7 +155,6 @@ pub fn stack_expert_tensors(
     let total_len = slice_len.checked_mul(experts.len()).ok_or_else(|| {
         CeraError::Backend(format!("`{gguf_name}` stacked expert buffer size overflow"))
     })?;
-    let mut stacked = Vec::with_capacity(total_len);
     for (expected_idx, (idx, shape, data)) in experts.iter().enumerate() {
         if *idx != expected_idx {
             return Err(CeraError::Backend(format!(
@@ -173,6 +172,10 @@ pub fn stack_expert_tensors(
                 data.len()
             )));
         }
+    }
+    // every expert's declared shape now matches its real data, so `total_len` is real memory
+    let mut stacked = Vec::with_capacity(total_len);
+    for (_, _, data) in experts.iter() {
         stacked.extend_from_slice(data);
     }
     Ok((vec![experts.len(), rows, cols], stacked))
@@ -287,6 +290,20 @@ pub fn split_lfm3_vl_gate_up(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The header shape sizes the stacked buffer, so it must be checked against the real data
+    /// before anything is allocated: a crafted shard used to abort in `Vec::with_capacity`.
+    #[test]
+    fn a_huge_declared_expert_shape_is_an_error_not_an_allocation() {
+        let huge = vec![1usize << 30, 1usize << 30];
+        let mut experts = vec![
+            (0usize, huge.clone(), vec![0.0f32; 4]),
+            (1usize, huge, vec![0.0f32; 4]),
+        ];
+        let err = stack_expert_tensors(&mut experts, Some(2), "blk.0.ffn_gate_exps.weight")
+            .expect_err("a shape that disagrees with its data was accepted");
+        assert!(err.to_string().contains("elements"), "{err}");
+    }
 
     #[test]
     fn qkv_split_refuses_head_counts_whose_rows_overflow() {

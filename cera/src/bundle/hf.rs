@@ -653,6 +653,7 @@ pub fn resolve_hf_manifest(
 
     // 2. Modality Aux Pairing
     let mut multimodal_projector = None;
+    let mut multimodal_projector_file: Option<String> = None;
     let mut audio_decoder = None;
     let mut audio_tokenizer = None;
     let mut draft_model = None;
@@ -686,12 +687,20 @@ pub fn resolve_hf_manifest(
             .unwrap_or(&contents.mmproj_ggufs[0]);
 
         multimodal_projector = Some(spec.file_download_url(&mmproj_chosen.rfilename));
+        multimodal_projector_file = Some(mmproj_chosen.rfilename.clone());
     }
 
     // Audio matching
-    let repo_lower = spec.repo.to_ascii_lowercase();
+    // Names only: the owner, the revision and the rest of the download URL are not part of what a
+    // model is called, and `-audio-` in one of them says nothing about the model.
+    let repo_lower = spec
+        .repo
+        .rsplit('/')
+        .next()
+        .unwrap_or(&spec.repo)
+        .to_ascii_lowercase();
     let primary_lower = primary_entry.rfilename.to_ascii_lowercase();
-    let mmproj_lower = multimodal_projector
+    let mmproj_lower = multimodal_projector_file
         .as_deref()
         .map(str::to_ascii_lowercase)
         .unwrap_or_default();
@@ -1696,5 +1705,42 @@ mod tests {
             manifest_d1.inference_type,
             InferenceType::LlamaCppImageToText
         );
+    }
+
+    /// The audio check looks at names, not at the download URL: an owner, a repository path or a
+    /// revision that happens to contain `-audio-` must not turn a vision repository into an audio
+    /// pipeline.
+    #[test]
+    fn an_owner_or_revision_containing_audio_does_not_make_a_vision_repo_audio() {
+        let siblings = vec![
+            HfSibling {
+                rfilename: "vision-model-Q4_0.gguf".into(),
+                size: Some(1_000_000),
+            },
+            HfSibling {
+                rfilename: "mmproj-vision-model-Q8_0.gguf".into(),
+                size: Some(500_000),
+            },
+        ];
+        for slug in [
+            "acme-audio-labs/vision-model",
+            "acme-omni/vision-model",
+            "acme/vision-model@feature-audio-branch",
+        ] {
+            let spec = HfSpec::parse(slug).unwrap();
+            let info = HfModelInfo {
+                id: spec.repo.clone(),
+                siblings: siblings.clone(),
+                tags: Vec::new(),
+                pipeline_tag: None,
+                config: None,
+            };
+            let manifest = resolve_hf_manifest(&spec, &info, None, None).unwrap();
+            assert_eq!(
+                manifest.inference_type,
+                InferenceType::LlamaCppImageToText,
+                "{slug}"
+            );
+        }
     }
 }

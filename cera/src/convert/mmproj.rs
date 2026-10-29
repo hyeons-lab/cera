@@ -39,6 +39,13 @@ impl MmprojTensor {
 
 /// Validate that `shape` product does not overflow `usize` and equals `data.len()`.
 fn validate_tensor_buffer(name: &str, shape: &[usize], data: &[f32]) -> Result<(), CeraError> {
+    // a zero extent makes the product 0 whatever the other extents are, so `[2^60, 0]` matches
+    // an empty buffer and then drives loops over the huge extent
+    if shape.contains(&0) {
+        return Err(CeraError::Backend(format!(
+            "`{name}` has a zero extent in its shape {shape:?}"
+        )));
+    }
     let expected = shape
         .iter()
         .try_fold(1usize, |acc, &d| acc.checked_mul(d))
@@ -1815,22 +1822,21 @@ fn concat_indexed_tensors(
     Ok((out_shape, combined))
 }
 
-/// A config number as `u32`: absent (or not a number) gives `None`, and a number that does not
-/// fit is an error naming the key, not a wrapped width written into the GGUF.
+/// A config number as `u32`: absent (or null) gives `None`; a value of another type, or a number
+/// that does not fit, is an error naming the key, not a default or a wrapped width written into
+/// the GGUF.
 fn narrowed_opt(key: &str, v: Option<&Value>) -> Result<Option<u32>, CeraError> {
-    if let Some(i) = v.and_then(Value::as_i64)
-        && i < 0
-    {
-        return Err(CeraError::Backend(format!(
-            "mmproj config `{key}` ({i}) does not fit in u32"
-        )));
-    }
-    match v.and_then(Value::as_u64) {
-        None => Ok(None),
-        Some(n) => u32::try_from(n).map(Some).map_err(|_| {
-            CeraError::Backend(format!("mmproj config `{key}` ({n}) does not fit in u32"))
-        }),
-    }
+    let n = match v {
+        None | Some(Value::Null) => return Ok(None),
+        Some(x) => x.as_u64().ok_or_else(|| {
+            CeraError::Backend(format!(
+                "mmproj config `{key}` must be a non-negative integer, got {x}"
+            ))
+        })?,
+    };
+    u32::try_from(n)
+        .map(Some)
+        .map_err(|_| CeraError::Backend(format!("mmproj config `{key}` ({n}) does not fit in u32")))
 }
 
 /// [`narrowed_opt`] with a default for an absent key.
@@ -1964,6 +1970,10 @@ fn load_safetensors_file(path: &Path, keep: &dyn Fn(&str) -> bool) -> Result<Ten
         .map_err(|e| CeraError::Backend(format!("failed to stat `{}`: {e}", path.display())))?
         .len();
     let mut out = BTreeMap::new();
+    // SafeTensors spans are disjoint, so the kept tensors cannot claim more bytes than the file
+    // holds; aliasing spans would otherwise decode into memory far larger than a small file
+    let mut claimed: u64 = 0;
+    let data_len = file_len.saturating_sub(header.header_size_bytes as u64);
     for (name, info) in header.tensors.iter().filter(|(name, _)| keep(name)) {
         let start = header
             .header_size_bytes
@@ -1983,6 +1993,13 @@ fn load_safetensors_file(path: &Path, keep: &dyn Fn(&str) -> bool) -> Result<Ten
         if end as u64 > file_len {
             return Err(CeraError::Backend(format!(
                 "`{name}` data range {start}..{end} extends past the end of its {file_len}-byte file"
+            )));
+        }
+        claimed = claimed.saturating_add((end - start) as u64);
+        if claimed > data_len {
+            return Err(CeraError::Backend(format!(
+                "the tensor data ranges in `{}` overlap: at `{name}` they claim {claimed} bytes of a {data_len}-byte data region",
+                path.display()
             )));
         }
         file.seek(SeekFrom::Start(start as u64))
@@ -2138,6 +2155,46 @@ mod tests {
 
     /// A width that does not fit `u32` used to wrap (`as u32`) into a plausible small number in
     /// the written GGUF; it is refused with the key named.
+    /// A zero extent next to a huge one multiplies to 0, so it matched an empty buffer and then
+    /// drove loops over the huge extent (`[2^60, 0]` ran for years).
+    /// A present config number of the wrong type used to read as absent, so the default was
+    /// written into the file instead of the converter saying the config is malformed.
+    #[test]
+    fn a_mistyped_config_number_is_an_error_not_the_default() {
+        use serde_json::json;
+        assert_eq!(narrowed_opt("k", None).unwrap(), None);
+        assert_eq!(narrowed_opt("k", Some(&json!(null))).unwrap(), None);
+        assert_eq!(narrowed_opt("k", Some(&json!(7))).unwrap(), Some(7));
+        for bad in [
+            json!("7"),
+            json!(1.5),
+            json!(-1),
+            json!(true),
+            json!([7]),
+            json!({}),
+        ] {
+            let err = narrowed_opt("k", Some(&bad)).expect_err(&format!("{bad} was accepted"));
+            assert!(err.to_string().contains("`k`"), "{bad}: {err}");
+        }
+        assert_eq!(narrowed("k", Some(&json!(null)), 9).unwrap(), 9);
+        assert!(narrowed("k", Some(&json!("x")), 9).is_err());
+    }
+
+    #[test]
+    fn a_shape_with_a_zero_extent_is_refused() {
+        for shape in [
+            vec![1usize << 60, 0],
+            vec![3, 0],
+            vec![0],
+            vec![0, 1 << 40, 7],
+        ] {
+            let err = validate_tensor_buffer("t", &shape, &[])
+                .expect_err(&format!("{shape:?} was accepted"));
+            assert!(err.to_string().contains("zero"), "{shape:?}: {err}");
+        }
+        assert!(validate_tensor_buffer("t", &[2, 3], &[0.0; 6]).is_ok());
+    }
+
     #[test]
     fn an_audio_config_number_that_does_not_fit_u32_is_refused() {
         let too_big = serde_json::json!(u64::from(u32::MAX) + 7);
@@ -2354,6 +2411,28 @@ mod tests {
         let err = write_mmproj_gguf(&out, &mut writer, &dup, TargetQuant::F32).unwrap_err();
         assert!(err.to_string().contains("a.x"), "{err}");
         assert!(!out.exists(), "nothing is written for a refused set");
+    }
+
+    /// Each tensor's span is bounded by the file length, but spans may overlap: many tensors naming
+    /// the same bytes would decode into memory far larger than the file. SafeTensors spans are
+    /// disjoint, so their total can never exceed the file.
+    #[test]
+    fn tensors_that_alias_the_same_bytes_are_refused() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("model.safetensors");
+        let mut entries = Vec::new();
+        for i in 0..50 {
+            entries.push(format!(
+                r#""vision_tower.t{i}.weight":{{"dtype":"F32","shape":[16],"data_offsets":[0,64]}}"#
+            ));
+        }
+        let header = format!("{{{}}}", entries.join(","));
+        let mut bytes = (header.len() as u64).to_le_bytes().to_vec();
+        bytes.extend_from_slice(header.as_bytes());
+        bytes.extend_from_slice(&[0u8; 64]);
+        std::fs::write(&path, bytes).unwrap();
+        let err = load_safetensors_file(&path, &|_| true).unwrap_err();
+        assert!(err.to_string().contains("overlap"), "{err}");
     }
 
     #[test]

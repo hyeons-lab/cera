@@ -335,6 +335,23 @@ impl HfModelConfig {
     /// is honoured) and `conv_bias`. Ignoring any of them would write a file that loads
     /// and produces plausible, wrong text.
     fn lfm3_unhonoured_member(&self) -> Option<String> {
+        // The shared layout reader accepts any `*attention` type (llama.cpp treats every non-conv
+        // layer as attention), but lfm3 only knows two: anything else would be written as a global
+        // layer with the wrong window and RoPE.
+        if let Some(types) = self.hparam("layer_types").and_then(Value::as_array) {
+            for (i, t) in types.iter().enumerate() {
+                if let Some(t) = t.as_str()
+                    && t != "conv"
+                    && t != "sliding_attention"
+                    && t != "full_attention"
+                {
+                    return Some(format!(
+                        "`layer_types[{i}]` is `{t}`; lfm3 supports `conv`, `sliding_attention` and \
+                         `full_attention`"
+                    ));
+                }
+            }
+        }
         if self.hparam("conv_bias").and_then(Value::as_bool) == Some(true) {
             return Some("`conv_bias` is true; lfm3 short convolutions here have no bias".into());
         }
@@ -2873,6 +2890,31 @@ mod tests {
     }
 
     /// Members the converter does not honour are refused rather than dropped.
+    #[test]
+    fn lfm3_unknown_attention_layer_types_are_refused() {
+        let mut cfg = valid_lfm3();
+        let first_attention = cfg["layer_types"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .position(|t| t != "conv")
+            .expect("the base config has an attention layer");
+        for kind in ["chunked_attention", "local_attention", "attention"] {
+            cfg["layer_types"][first_attention] = json!(kind);
+            let err = refusal_of(cfg.clone()).unwrap_or_default();
+            assert!(
+                err.contains(kind) && err.contains("layer_types"),
+                "{kind}: {err}"
+            );
+        }
+        // a sliding layer needs its window
+        cfg["sliding_window"] = json!(128);
+        for kind in ["sliding_attention", "full_attention"] {
+            cfg["layer_types"][first_attention] = json!(kind);
+            assert_eq!(refusal_of(cfg.clone()), None, "{kind}");
+        }
+    }
+
     #[test]
     fn lfm3_unhonoured_members_are_refused() {
         let params = |v: serde_json::Value| {

@@ -891,6 +891,53 @@ struct LocalPendingTensor {
 
 type PlannedSlice = (String, Vec<usize>, usize, LocalSourceAction);
 
+/// Whether the stacked expert groups found in a checkpoint are complete: every MoE block that has
+/// one of `ffn_gate_exps`, `ffn_up_exps`, `ffn_down_exps` has all three, a config that declares
+/// experts has some, and a config that declares none has none. Anything else converts to a file
+/// the loader refuses (or, worse, mis-reads), so it is refused here with the block named.
+fn check_expert_groups_complete<'a>(
+    groups: impl Iterator<Item = (usize, &'a str)>,
+    expected_experts: Option<usize>,
+    is_moe_arch: bool,
+) -> Result<(), CeraError> {
+    const KINDS: [&str; 3] = [
+        "ffn_gate_exps.weight",
+        "ffn_up_exps.weight",
+        "ffn_down_exps.weight",
+    ];
+    let mut blocks: std::collections::BTreeMap<usize, [bool; 3]> =
+        std::collections::BTreeMap::new();
+    for (block, name) in groups {
+        let seen = blocks.entry(block).or_default();
+        if let Some(k) = KINDS.iter().position(|kind| name.ends_with(kind)) {
+            seen[k] = true;
+        }
+    }
+    let declared = expected_experts.is_some_and(|n| n > 0);
+    if declared && is_moe_arch && blocks.is_empty() {
+        return Err(CeraError::Backend(format!(
+            "the config declares {} experts but the checkpoint holds no per-expert tensors \
+             (fused expert tensors are not supported)",
+            expected_experts.unwrap_or(0)
+        )));
+    }
+    if !declared && is_moe_arch && !blocks.is_empty() {
+        return Err(CeraError::Backend(
+            "the checkpoint holds per-expert tensors but the config declares no expert count"
+                .into(),
+        ));
+    }
+    for (block, seen) in &blocks {
+        if let Some(missing) = seen.iter().position(|s| !s) {
+            return Err(CeraError::Backend(format!(
+                "block {block} has stacked experts but no `{}` group",
+                KINDS[missing]
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn expected_expert_count(config: &HfModelConfig) -> Option<usize> {
     config.expert_count()
 }
@@ -1265,6 +1312,13 @@ fn plan_pending_tensors<'a>(
     }
 
     let expected_experts = expected_expert_count(config);
+    check_expert_groups_complete(
+        stacked_experts
+            .keys()
+            .map(|(block, name)| (*block, name.as_str())),
+        expected_experts,
+        arch.starts_with("lfm3"),
+    )?;
     for ((_block_idx, gguf_name), expert_refs) in stacked_experts {
         let (stacked_shape, n_elems, action) =
             plan_stacked_experts(expert_refs, expected_experts, &gguf_name)?;
@@ -1464,10 +1518,22 @@ where
             rows,
             cols,
         } => {
+            let slice_len = rows.checked_mul(*cols).ok_or_else(|| {
+                CeraError::Backend(format!("`{}` expert dimensions overflow", pt.gguf_name))
+            })?;
             let mut decoded_experts = Vec::with_capacity(experts.len());
             for (exp_idx, src) in experts {
                 let mut values = Vec::new();
                 read_source(src, &mut values)?;
+                // check each expert as it is read: spans that alias one large range would
+                // otherwise all be held decoded before the first length check
+                if values.len() != slice_len {
+                    return Err(CeraError::Backend(format!(
+                        "`{}` expert {exp_idx} decoded to {} elements, expected {slice_len} ([{rows}, {cols}])",
+                        pt.gguf_name,
+                        values.len()
+                    )));
+                }
                 decoded_experts.push((*exp_idx, vec![*rows, *cols], values));
             }
             let (_, stacked_data) =
@@ -2001,6 +2067,71 @@ pub(crate) fn is_auxiliary_shard(lower: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Every expert's decoded length is checked as it is read, not after all of them are: experts
+    /// whose byte spans alias the same large range would otherwise be held in memory at once, one
+    /// full decode per expert, before the first length check ran.
+    #[test]
+    fn a_stacked_expert_that_decodes_to_the_wrong_length_stops_the_read_at_once() {
+        let src = SourceRef {
+            file_idx: 0,
+            dtype: "F32".into(),
+            data_start: 0,
+            data_end: 0,
+        };
+        let pt = LocalPendingTensor {
+            expected_elements: 3 * 2 * 2,
+            ggml_type: crate::convert::writer::GGML_TYPE_F32,
+            gguf_name: "blk.0.ffn_gate_exps.weight".into(),
+            action: LocalSourceAction::StackExperts {
+                experts: (0..3).map(|i| (i, src.clone())).collect(),
+                rows: 2,
+                cols: 2,
+            },
+        };
+        let mut reads = 0usize;
+        let mut out = Vec::new();
+        let err = materialize_pending_tensor_f32(&pt, Some(3), &mut None, &mut out, |_, v| {
+            reads += 1;
+            v.clear();
+            v.extend(std::iter::repeat_n(0.0f32, 1000)); // an alias of a large range
+            Ok(())
+        })
+        .expect_err("a wrong-sized expert was accepted");
+        assert!(err.to_string().contains("expert 0"), "{err}");
+        assert_eq!(
+            reads, 1,
+            "the remaining experts were read after the first mismatch"
+        );
+    }
+
+    #[test]
+    fn expert_groups_must_be_complete_per_block_and_match_the_config() {
+        let g = |b: usize, n: &'static str| (b, n);
+        let all = |b: usize| {
+            vec![
+                g(b, "blk.1.ffn_gate_exps.weight"),
+                g(b, "blk.1.ffn_up_exps.weight"),
+                g(b, "blk.1.ffn_down_exps.weight"),
+            ]
+        };
+        // complete, in two blocks
+        let ok: Vec<_> = all(1).into_iter().chain(all(2)).collect();
+        assert!(check_expert_groups_complete(ok.iter().copied(), Some(4), true).is_ok());
+        // a dense model with no expert count and no expert tensors
+        assert!(check_expert_groups_complete(std::iter::empty(), None, true).is_ok());
+        assert!(check_expert_groups_complete(std::iter::empty(), Some(0), true).is_ok());
+        // experts declared, none found (fused expert tensors)
+        let err = check_expert_groups_complete(std::iter::empty(), Some(4), true).unwrap_err();
+        assert!(err.to_string().contains("no per-expert tensors"), "{err}");
+        // a block missing the down group
+        let partial: Vec<_> = all(1).into_iter().take(2).collect();
+        let err = check_expert_groups_complete(partial.iter().copied(), Some(4), true).unwrap_err();
+        assert!(err.to_string().contains("ffn_down_exps"), "{err}");
+        // per-expert tensors but no expert count
+        let err = check_expert_groups_complete(all(1).into_iter(), None, true).unwrap_err();
+        assert!(err.to_string().contains("no expert count"), "{err}");
+    }
 
     #[test]
     fn a_source_span_past_the_end_of_its_shard_is_refused_before_allocating() {
