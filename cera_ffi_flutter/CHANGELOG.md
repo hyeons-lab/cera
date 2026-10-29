@@ -1,5 +1,10 @@
 # Changelog
 
+## 0.7.3
+
+- Include the `cera_ffi` 0.7.3 fixes: stricter LFM3 converter and mmproj validation, LFM3 tool-call parsing fixes and LFM3 runtime edge-case fixes.
+- Align platform manifests and the dependency on `cera_ffi` at 0.7.3.
+
 ## 0.7.2
 
 - Include the `cera_ffi` 0.7.2 additions: public `d1-omni-600M` and `d1-3B` decision models on CPU, Metal, wgpu and the Hexagon NPU, deterministic seeded audio sampling, and a BLAS batched-matmul fast path.

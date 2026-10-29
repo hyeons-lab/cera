@@ -1,5 +1,12 @@
 # Changelog
 
+## 0.7.3
+
+- Harden the LFM3 GGUF and safetensors converters and the mmproj loaders: zero-extent shapes, incomplete expert groups, truncated per-expert data, oversized tensor spans and inconsistent audio stem or attention geometry are refused with an error instead of panicking or allocating.
+- Fix tool-call parsing and masking for LFM3: closing tags inside argument values, lone `\r` after value delimiters, union-typed parameters and enum literals now round-trip through the parser.
+- Fix LFM3 runtime edge cases: Hexagon greedy fallback uses the shared argmax, `<|mixed_start|>` counts as a generated token, audio input is only accepted for omni models, and prompts for causal d1 models escape embedded JSON strings and the media marker.
+- Align package and native artifact versions at 0.7.3.
+
 ## 0.7.2
 
 - Run the public `d1-omni-600M` and `d1-3B` decision models directly from their GGUFs (no conversion step) on CPU, Metal, wgpu and the Hexagon NPU, through `D1Engine`, the `DecisionEngine` FFI object and the Kotlin `DecisionClient`. Converted `d1.*` files keep working.
