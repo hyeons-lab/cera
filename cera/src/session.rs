@@ -2200,6 +2200,20 @@ impl Session {
         Some(Ok(()))
     }
 
+    /// A non-causal LFM3 model reads its whole prompt in one pass from position 0: every backend
+    /// asserts `start_pos == 0` (the Hexagon one returns an error). Refuse a second append here, as
+    /// a typed error, instead of letting a backend panic.
+    fn ensure_single_pass_prefill(&self) -> Result<(), CeraError> {
+        if second_prefill_unsupported(self.model.config(), self.current_pos) {
+            return Err(CeraError::Backend(
+                "this bidirectional lfm3 model reads its whole prompt in one pass from position 0; \
+                 append the complete prompt in a single call, or reset the session first"
+                    .to_string(),
+            ));
+        }
+        Ok(())
+    }
+
     /// Append raw token IDs, running a prefill pass from the current position
     /// over just the new tail.
     ///
@@ -2235,6 +2249,7 @@ impl Session {
     ///   ```
     pub fn append_tokens(&mut self, tokens: &[u32]) -> Result<(), CeraError> {
         self.ensure_usable()?;
+        self.ensure_single_pass_prefill()?;
         Self::resize_pools_for_cpuset();
         self.discard_stale_decode_error();
         if tokens.is_empty() {
@@ -2467,6 +2482,7 @@ impl Session {
         n_tokens: usize,
     ) -> Result<(), CeraError> {
         self.ensure_usable()?;
+        self.ensure_single_pass_prefill()?;
         Self::resize_pools_for_cpuset();
         self.discard_stale_decode_error();
         if n_tokens == 0 {
@@ -3198,9 +3214,10 @@ impl Session {
                 Some((img_start, img_end))
             }
             crate::model::vision_encoder::VisionProjectorType::Lfm3Vl => None,
-            crate::model::vision_encoder::VisionProjectorType::Lfm3O => {
-                proj_type.resolve_boundary_token_ids(|tok| self.tokenizer.special_token_id(tok))
-            }
+            crate::model::vision_encoder::VisionProjectorType::Lfm3O => lfm3o_boundary_ids(
+                self.tokenizer.special_token_id("<|vision_start|>"),
+                self.tokenizer.special_token_id("<|vision_end|>"),
+            )?,
         };
         let boundary_overhead = if boundary_ids.is_some() { 2 } else { 0 };
 
@@ -4819,9 +4836,64 @@ impl std::fmt::Debug for Session {
 // Tests
 // ---------------------------------------------------------------------------
 
+/// Whether appending to a session already at `current_pos` would be a second prefill pass of a
+/// non-causal LFM3 model, which no backend supports.
+fn second_prefill_unsupported(config: &crate::model::ModelConfig, current_pos: usize) -> bool {
+    !config.is_causal && config.architecture == "lfm3" && current_pos > 0
+}
+
+/// The `<|vision_start|>` / `<|vision_end|>` envelope of an LFM3-Omni image: both, or neither.
+/// One without the other is a broken vocabulary, the same refusal `Chat` makes.
+fn lfm3o_boundary_ids(
+    start: Option<u32>,
+    end: Option<u32>,
+) -> Result<Option<(u32, u32)>, CeraError> {
+    match (start, end) {
+        (Some(s), Some(e)) => Ok(Some((s, e))),
+        (None, None) => Ok(None),
+        (None, Some(_)) => Err(CeraError::Backend(
+            "tokenizer has `<|vision_end|>` but no `<|vision_start|>` special token".into(),
+        )),
+        (Some(_), None) => Err(CeraError::Backend(
+            "tokenizer has `<|vision_start|>` but no `<|vision_end|>` special token".into(),
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_lfm3o_image_envelope_is_both_tokens_or_neither() {
+        assert_eq!(lfm3o_boundary_ids(Some(7), Some(8)).unwrap(), Some((7, 8)));
+        assert_eq!(lfm3o_boundary_ids(None, None).unwrap(), None);
+        for (s, e) in [(Some(7), None), (None, Some(8))] {
+            let err = lfm3o_boundary_ids(s, e).unwrap_err().to_string();
+            assert!(err.contains("vision_"), "{err}");
+        }
+    }
+
+    /// Only a non-causal LFM3 model past position 0 refuses another append; every other model, and
+    /// the first append of that one, goes through.
+    #[test]
+    fn a_second_prefill_of_a_non_causal_lfm3_model_is_refused() {
+        let mut cfg = mock_config();
+        for (arch, causal, pos, refused) in [
+            ("lfm3", false, 5, true),
+            ("lfm3", false, 0, false),
+            ("lfm3", true, 5, false),
+            ("lfm2", false, 5, false),
+        ] {
+            cfg.architecture = arch.to_string();
+            cfg.is_causal = causal;
+            assert_eq!(
+                second_prefill_unsupported(&cfg, pos),
+                refused,
+                "{arch} causal={causal} pos={pos}"
+            );
+        }
+    }
 
     /// The modality-control ban applies to a copy: the original logits can become the seed of
     /// the next `generate()`, where the same ids must still be available.

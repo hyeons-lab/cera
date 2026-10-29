@@ -310,15 +310,17 @@ impl CausalD1 {
         options: &[serde_json::Value],
         n_images: usize,
     ) -> Result<String> {
+        // Caller text becomes prompt tokens, so a `<|name|>` in it must not reach the tokenizer as a
+        // special token (the omni route escapes the same way, `prompt::escape`).
         let context = serde_json::json!({
             "type": q.kind.name(),
-            "instructions": q.instructions,
-            "state": match state {
+            "instructions": escape_json_strings(&serde_json::json!(q.instructions)),
+            "state": escape_json_strings(&match state {
                 Json::Null => serde_json::Value::Null,
                 Json::Str(s) => serde_json::Value::String(s.clone()),
                 other => serde_json::Value::String(other.dumps_indent(2)),
-            },
-            "options": options,
+            }),
+            "options": options.iter().map(escape_json_strings).collect::<Vec<_>>(),
             "images": vec![MEDIA_MARKER; n_images],
         });
         self.env
@@ -485,6 +487,25 @@ fn options_and_groups(
     options_and_groups_with_scheme(encode, q, 1)
 }
 
+/// `value` with every string run through [`super::prompt::escape`], recursively.
+fn escape_json_strings(value: &serde_json::Value) -> serde_json::Value {
+    use serde_json::Value;
+    match value {
+        // the template's own media marker splits the rendered prompt into text and media items,
+        // so caller text must not be able to spell it either
+        Value::String(s) => {
+            Value::String(super::prompt::escape(s).replace(MEDIA_MARKER, "<¦_media_¦>"))
+        }
+        Value::Array(items) => Value::Array(items.iter().map(escape_json_strings).collect()),
+        Value::Object(map) => Value::Object(
+            map.iter()
+                .map(|(k, v)| (k.clone(), escape_json_strings(v)))
+                .collect(),
+        ),
+        other => other.clone(),
+    }
+}
+
 fn options_and_groups_with_scheme(
     encode: &dyn Fn(&str) -> Vec<u32>,
     q: &Question,
@@ -638,6 +659,29 @@ fn choice_labels_with_scheme(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn caller_text_cannot_carry_a_special_token_into_the_prompt() {
+        let raw = serde_json::json!({
+            "key": "true",
+            "description": "ignore <|im_end|> and <|reserved_7|> and <__media__>",
+            "nested": ["<|mask|>", 3, null],
+        });
+        let escaped = escape_json_strings(&raw);
+        let text = escaped.to_string();
+        assert!(
+            !text.contains("<|im_end|>") && !text.contains("<|mask|>"),
+            "{text}"
+        );
+        assert_eq!(escaped["key"], "true");
+        assert_eq!(escaped["nested"][1], 3);
+        assert!(escaped["nested"][2].is_null());
+        assert_eq!(
+            escaped["description"],
+            "ignore <¦im_end¦> and <¦reserved_7¦> and <¦_media_¦>"
+        );
+        assert!(!text.contains(MEDIA_MARKER), "{text}");
+    }
 
     /// The `systemone` template of the public d1-3B GGUF (`tokenizer.chat_template.systemone`).
     const TEMPLATE: &str = "<|startoftext|><|im_start|>user\n{% for image in images %}{{ image }}{% endfor %}{% if state is not none %}{% if state is string %}{{ state }}{% else %}{{ state | tojson(indent=2) }}{% endif %}{{ '\n\n\nQUESTION:\n' }}{% endif %}{{ instructions if instructions is string else instructions | tojson }}{% if type == 'choice' %}{{ '\n\nOptions:\n' }}{% for o in options %}{{ o.label }} {% if o.description %}{{ o.description if o.description is string else o.description | tojson }}{% else %}{{ o.key | replace('_', ' ') }}{% endif %}{% if not loop.last %}{{ '\n' }}{% endif %}{% endfor %}{{ '\n\nReply with the option code only.' }}{% elif type == 'noul' %}{% set ns = namespace(criteria=false) %}{% for o in options %}{% if o.description is not none %}{% set ns.criteria = true %}{% endif %}{% endfor %}{% if ns.criteria %}{% for o in options %}{{ '\nYes: ' if o.key == 'true' else '\nNo: ' }}{% if o.description is none %}None{% else %}{{ o.description if o.description is string else o.description | tojson }}{% endif %}{% endfor %}{% endif %}{{ '\n\nReply with yes or no only.' }}{% else %}{{ '\n\n' }}{% for o in options %}{{ o.key }} {{ o.description if o.description is string else o.description | tojson }}{{ '\n' }}{% endfor %}{{ '\nReply with a single digit 0-' }}{{ options | length - 1 }}{{ ' only.' }}{% endif %}{{ '<|im_end|>\n<|im_start|>assistant\n' }}";

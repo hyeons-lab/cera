@@ -413,10 +413,23 @@ impl AudioEncoderWeights {
         let stem_indices = [0u32, 2, 3, 5, 6];
         let mut stem_layers = Vec::with_capacity(stem_indices.len());
         for idx in stem_indices {
-            stem_layers.push(load_conv_layer(gguf, idx)?);
+            let layer = load_conv_layer(gguf, idx)?;
+            check_stem_layer_extent(&layer)?;
+            stem_layers.push(layer);
         }
+        // the same five-layer stem the lfm3a loader checks: the shapes must chain from the mel
+        // bins to the width `pre_encode.out` reads, or the forward asserts on the first clip
+        let stem_shapes: Vec<&[usize]> = stem_layers.iter().map(|l| l.shape.as_slice()).collect();
+        let (stem_ch, stem_f) = lfm3a_stem_geometry(&stem_shapes, n_mel_bins)?;
         let pre_encode_out_w = MmapWeight::from_gguf(gguf, "a.pre_encode.out.weight")
             .context("loading a.pre_encode.out.weight")?;
+        anyhow::ensure!(
+            pre_encode_out_w.cols == stem_ch * stem_f,
+            "a.pre_encode.out.weight has {} columns but the conv stem produces {stem_ch} channels \
+             x {stem_f} frequency bins = {}",
+            pre_encode_out_w.cols,
+            stem_ch * stem_f
+        );
         let pre_encode_out_b = load_vec_f32(gguf, "a.pre_encode.out.bias")?;
 
         let conv_stem = ConvStemWeights {
@@ -640,6 +653,10 @@ fn lfm3a_stem_geometry(layer_shapes: &[&[usize]], n_mel_bins: usize) -> Result<(
             };
             (groups, 2, 1)
         };
+        anyhow::ensure!(
+            out_ch % groups == 0,
+            "lfm3a conv stem layer {pos}: out channels ({out_ch}) not divisible by groups ({groups})"
+        );
         anyhow::ensure!(
             in_per_group * groups == cur_ch,
             "lfm3a conv stem layer {pos}: in_per_group ({in_per_group}) * groups ({groups}) != cur_ch ({cur_ch})"
@@ -3049,6 +3066,40 @@ pub fn encode_audio_pcm(pcm: &[f32], weights: &AudioEncoderWeights) -> (Vec<f32>
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The real LFM2.5-Audio mmproj, when it is on this machine: its five-layer stem must pass the
+    /// geometry check the legacy loader now applies (128 mel bins -> 256 channels x 16 bins =
+    /// the 4096 columns of `pre_encode.out`). Skips quietly without the file.
+    #[test]
+    fn the_real_legacy_audio_stem_passes_the_geometry_check() {
+        let Some(dir) = std::env::var_os("CERA_ORACLE_MODELS_DIR") else {
+            return;
+        };
+        let path = std::path::Path::new(&dir)
+            .join("LFM2.5-Audio-1.5B-Q4_0/mmproj-LFM2.5-Audio-1.5B-Q4_0.gguf");
+        if !path.exists() {
+            eprintln!("SKIP (absent): {}", path.display());
+            return;
+        }
+        let gguf = std::sync::Arc::new(crate::gguf::GgufFile::open(&path).unwrap());
+        let weights = AudioEncoderWeights::from_gguf(&gguf)
+            .unwrap_or_else(|e| panic!("the real legacy audio encoder is refused: {e:#}"));
+        assert_eq!(weights.conv_stem.layers.len(), 5);
+        assert_eq!(weights.conv_stem.pre_encode_out_w.cols, 256 * 16);
+    }
+
+    /// A grouped conv needs `out % groups == 0`; the conv kernel only debug-asserts it, so a file
+    /// with an uneven stem used to load and then read past the weights in a release build.
+    #[test]
+    fn a_stem_layer_whose_outputs_do_not_divide_into_groups_is_refused() {
+        // 3-layer stem: layer 1 is depthwise (in_per_group 1 over 8 channels, so 8 groups)
+        let ok: [&[usize]; 3] = [&[3, 3, 1, 8], &[3, 3, 1, 16], &[1, 1, 16, 16]];
+        // layer 1 with 12 outputs over 8 groups does not divide
+        let bad: [&[usize]; 3] = [&[3, 3, 1, 8], &[3, 3, 1, 12], &[1, 1, 12, 16]];
+        assert!(lfm3a_stem_geometry(&ok, 32).is_ok());
+        let err = lfm3a_stem_geometry(&bad, 32).unwrap_err().to_string();
+        assert!(err.contains("groups"), "{err}");
+    }
 
     #[test]
     fn kv_heads_are_read_from_every_stored_shape() {

@@ -267,23 +267,9 @@ impl D1Engine {
             let mut extras = std::collections::HashMap::new();
             if public::decision_type(gguf) == Some(public::LFM3_OMNI_TYPE)
                 && !is_audio_only_mmproj
-                && let Some(dir) = mmproj_path.and_then(Path::parent)
-                && let Ok(entries) = std::fs::read_dir(dir)
+                && let Some(p) = mmproj_path.and_then(sibling_audio_projector)
             {
-                let mut candidates: Vec<std::path::PathBuf> = entries
-                    .flatten()
-                    .map(|e| e.path())
-                    .filter(|p| {
-                        p.extension().and_then(|e| e.to_str()) == Some("gguf")
-                            && p.file_name()
-                                .and_then(|n| n.to_str())
-                                .is_some_and(|n| n.starts_with("audioproj"))
-                    })
-                    .collect();
-                candidates.sort();
-                if let Some(p) = candidates.into_iter().next() {
-                    extras.insert("audio_encoder".to_string(), p);
-                }
+                extras.insert("audio_encoder".to_string(), p);
             }
             let engine = match mmproj_path {
                 Some(path) => CeraEngine::from_files(
@@ -320,6 +306,9 @@ impl D1Engine {
                     "cpu"
                 }
             });
+            // only an omni model answers speech; `answer` rejects audio for the others, so a speech
+            // tower next to a non-omni file is neither reported nor counted as support
+            let audio = audio.filter(|_| public::is_omni(gguf));
             // a tower the accelerator did not take runs on the CPU: say so
             let mut note = note;
             if vision == Some("cpu") && trunk != "cpu" {
@@ -523,9 +512,74 @@ impl D1Engine {
     }
 }
 
+/// The directory a path's file sits in. A bare relative file name has the empty path as its
+/// parent, which `read_dir` rejects: it means the current directory.
+fn containing_dir(path: &Path) -> &Path {
+    match path.parent() {
+        Some(d) if !d.as_os_str().is_empty() => d,
+        _ => Path::new("."),
+    }
+}
+
+/// The `audioproj*.gguf` that sits next to an LFM3 d1-omni `mmproj` file, the speech tower the
+/// vision `mmproj` does not carry. The first one by name wins. A bare relative `mmproj` path has
+/// an empty parent, which is the current directory, not an unreadable one.
+fn sibling_audio_projector(mmproj: &Path) -> Option<std::path::PathBuf> {
+    let dir = containing_dir(mmproj);
+    let mut candidates: Vec<std::path::PathBuf> = std::fs::read_dir(dir)
+        .ok()?
+        .flatten()
+        .map(|e| e.path())
+        .filter(|p| {
+            p.extension().and_then(|e| e.to_str()) == Some("gguf")
+                && p.file_name()
+                    .and_then(|n| n.to_str())
+                    .is_some_and(|n| n.starts_with("audioproj"))
+        })
+        .collect();
+    candidates.sort();
+    candidates.into_iter().next()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn the_audio_projector_is_found_next_to_the_mmproj_by_name() {
+        let dir = tempfile::tempdir().unwrap();
+        for f in [
+            "mmproj-x.gguf",
+            "audioproj-b.gguf",
+            "audioproj-a.gguf",
+            "other.gguf",
+            "audioproj-c.bin",
+        ] {
+            std::fs::write(dir.path().join(f), b"x").unwrap();
+        }
+        let found = sibling_audio_projector(&dir.path().join("mmproj-x.gguf")).unwrap();
+        assert_eq!(
+            found.file_name().unwrap(),
+            "audioproj-a.gguf",
+            "first by name"
+        );
+        let empty = tempfile::tempdir().unwrap();
+        assert!(sibling_audio_projector(&empty.path().join("mmproj-x.gguf")).is_none());
+    }
+
+    /// A bare relative path has the empty path as its parent, which `read_dir` rejects: it means
+    /// the current directory (the test crate's own directory holds no `audioproj*.gguf`, so the
+    /// lookup finds nothing, but it must look rather than fail).
+    #[test]
+    fn a_bare_relative_mmproj_path_looks_in_the_current_directory() {
+        assert!(sibling_audio_projector(Path::new("mmproj-none.gguf")).is_none());
+        assert_eq!(containing_dir(Path::new("mmproj.gguf")), Path::new("."));
+        assert_eq!(
+            containing_dir(Path::new("a/b/mmproj.gguf")),
+            Path::new("a/b")
+        );
+        assert_eq!(containing_dir(Path::new("/mmproj.gguf")), Path::new("/"));
+    }
 
     #[test]
     fn towers_follow_the_trunk() {

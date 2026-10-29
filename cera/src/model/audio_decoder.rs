@@ -353,6 +353,11 @@ impl AudioDecoderWeights {
         let n_layer = gguf
             .get_u32("depthformer_n_layer")
             .context("missing depthformer_n_layer")? as usize;
+        // sizes a `Vec::with_capacity` below: bound it like the lfm3a loaders bound theirs
+        anyhow::ensure!(
+            (1..=256).contains(&n_layer),
+            "depthformer_n_layer ({n_layer}) must be in 1..=256"
+        );
         let n_embd = gguf
             .get_u32("depthformer_n_embd")
             .context("missing depthformer_n_embd")? as usize;
@@ -362,14 +367,21 @@ impl AudioDecoderWeights {
         let qkv = MmapWeight::from_gguf(gguf, "depthformer.layers.0.operator.qkv_proj.weight")?;
         let q_norm_w =
             gguf.get_tensor("depthformer.layers.0.operator.attention.q_layernorm.weight")?;
-        let n_embd_head = q_norm_w.shape()[0]; // head_dim from q_norm shape
+        // head_dim from q_norm shape
+        let n_embd_head = q_norm_w
+            .shape()
+            .first()
+            .copied()
+            .filter(|&d| d > 0)
+            .context("depthformer q_layernorm has no usable shape")?;
         let qkv_out = qkv.rows; // (n_head + 2*n_head_kv) * head_dim
         let n_head = 32; // hardcoded per decoder.cpp config
         let n_head_kv = 8;
-        assert_eq!(
-            qkv_out,
-            (n_head + 2 * n_head_kv) * n_embd_head,
-            "qkv_proj shape mismatch"
+        anyhow::ensure!(
+            qkv_out == (n_head + 2 * n_head_kv) * n_embd_head,
+            "depthformer qkv_proj has {qkv_out} rows, expected {} for {n_head} heads and \
+             {n_head_kv} kv heads of width {n_embd_head}",
+            (n_head + 2 * n_head_kv) * n_embd_head
         );
 
         // FFN dim from w1 shape.
@@ -975,9 +987,16 @@ impl AudioDecoderWeights {
                 None
             };
             let cb_elems = n_vocab * n_embd;
+            // exactly the table, not at least: a vocab or width that disagrees with the tensor
+            // (the published file stores `[n_embd, n_vocab, n_codebook]`) would otherwise shift
+            // every codebook's slice and the mask row without an error
             anyhow::ensure!(
-                tok_all.len() >= n_codebook * cb_elems && out_all.len() >= n_codebook * cb_elems,
-                "a.gen.code.tok_embd / out_proj smaller than {n_codebook} * {n_vocab} * {n_embd}"
+                tok_all.len() == n_codebook * cb_elems && out_all.len() == n_codebook * cb_elems,
+                "a.gen.code.tok_embd / out_proj hold {} / {} values, expected {n_codebook} * \
+                 {n_vocab} * {n_embd} = {}",
+                tok_all.len(),
+                out_all.len(),
+                n_codebook * cb_elems
             );
             for j in 0..n_codebook {
                 let mut slice_tok = tok_all[j * cb_elems..(j + 1) * cb_elems].to_vec();
@@ -2198,7 +2217,8 @@ impl DetokenizerWeights {
             "lfm.layers.2.self_attn.q_layernorm.weight",
             "blk.2.attn_q_norm.weight",
         )?;
-        let n_embd_head = q_norm_w.shape()[0];
+        // an empty shape is the corrupt case the guard below names; indexing it would panic first
+        let n_embd_head = q_norm_w.shape().first().copied().unwrap_or(0);
         // Guard against a corrupt vocoder GGUF reporting an empty
         // q_layernorm shape; both `n_head` and `n_head_kv` are
         // derived from this dim and would div-by-zero panic
@@ -3919,6 +3939,25 @@ impl IstftStreamer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The legacy loader sizes a `Vec::with_capacity` from `depthformer_n_layer`, so an absurd
+    /// file value must be an error, not an allocation.
+    #[test]
+    fn the_legacy_decoder_loader_bounds_its_layer_count() {
+        for bad in [0u32, 1 << 30] {
+            let gguf = crate::gguf::GgufBuilder::new()
+                .kv_u32("depthformer_n_layer", bad)
+                .kv_u32("depthformer_n_embd", 8)
+                .build();
+            let err = AudioDecoderWeights::from_gguf(&std::sync::Arc::new(gguf))
+                .err()
+                .unwrap_or_else(|| panic!("n_layer {bad} was accepted"));
+            assert!(
+                err.to_string().contains("depthformer_n_layer"),
+                "{bad}: {err}"
+            );
+        }
+    }
 
     /// A GGUF holding just a tensor named `name` (one f32).
     fn gguf_with_tensor(name: &str) -> Arc<GgufFile> {

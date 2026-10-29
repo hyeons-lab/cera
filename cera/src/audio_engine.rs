@@ -1087,6 +1087,9 @@ pub fn generate_audio(
             if next_token == ctrl.mixed_start {
                 interleaved = true;
                 modality_budget = cadence.text;
+                // a sampled token like any other: without it a run of this token is bounded
+                // only by `max_seq_len`, not by `max_tokens`
+                generated += 1;
                 logits = model.forward(&[next_token], pos, &mut state);
                 check_audio_decode_error(model)?;
                 next_token = sampler.sample(&mut logits);

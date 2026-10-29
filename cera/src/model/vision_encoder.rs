@@ -3085,6 +3085,23 @@ fn load_optional_vec_f32(
     Ok(Some(v))
 }
 
+/// The per-head width of an LFM3 vision attention block: `d / n_head`, which must divide evenly
+/// and be a multiple of 4 (the 2D M-RoPE rotates half the head per axis in pairs; any other
+/// width rotates fewer dimensions than the head has and silently skews the positions).
+fn lfm3_attention_head_dim(il: usize, d: usize, n_head: usize) -> Result<usize> {
+    anyhow::ensure!(n_head > 0, "block {il}: n_head must be positive");
+    anyhow::ensure!(
+        d.is_multiple_of(n_head),
+        "block {il}: embedding width {d} is not a multiple of n_head {n_head}"
+    );
+    let head_dim = d / n_head;
+    anyhow::ensure!(
+        head_dim > 0 && head_dim.is_multiple_of(4),
+        "block {il}: head_dim {head_dim} must be a positive multiple of 4 for 2D M-RoPE"
+    );
+    Ok(head_dim)
+}
+
 fn load_lfm3_block(
     gguf: &Arc<GgufFile>,
     il: usize,
@@ -3179,7 +3196,7 @@ fn load_lfm3_block(
             out_proj_b,
         })
     } else if gguf.tensors.contains_key(&format!("{pfx}.attn_q.weight")) {
-        let head_dim = d / cfg.n_head;
+        let head_dim = lfm3_attention_head_dim(il, d, cfg.n_head)?;
         let q_w = wt_f32(gguf, &format!("{pfx}.attn_q.weight"))?;
         let k_w = wt_f32(gguf, &format!("{pfx}.attn_k.weight"))?;
         let v_w = wt_f32(gguf, &format!("{pfx}.attn_v.weight"))?;
@@ -3293,6 +3310,18 @@ fn load_lfm3_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn lfm3_attention_head_dim_must_suit_2d_rope() {
+        assert_eq!(lfm3_attention_head_dim(0, 128, 2).unwrap(), 64);
+        assert_eq!(lfm3_attention_head_dim(0, 64, 16).unwrap(), 4);
+        for (d, n_head) in [(130, 2), (100, 3), (66, 2), (6, 2), (64, 0)] {
+            assert!(
+                lfm3_attention_head_dim(0, d, n_head).is_err(),
+                "d={d} n_head={n_head} was accepted"
+            );
+        }
+    }
 
     #[test]
     fn the_projector_input_norm_is_applied_at_exactly_one_stage() {

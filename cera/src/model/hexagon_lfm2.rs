@@ -3377,11 +3377,8 @@ impl HexagonLfmModel {
         if tokens.len() > 1 {
             if !self.config.is_causal {
                 let logits = self.try_forward_prefill_chunk(tokens, pos, state)?;
-                return Ok(logits
-                    .iter()
-                    .enumerate()
-                    .max_by(|(_, a), (_, b)| a.total_cmp(b))
-                    .map_or(0, |(idx, _)| idx as u32));
+                // the same pick as every other backend: first index on a tie, NaN never wins
+                return Ok(crate::sampler::argmax(&logits));
             }
             self.prefill_head(tokens, pos, state)?;
             return self.try_forward_greedy(
