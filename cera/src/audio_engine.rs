@@ -1090,6 +1090,9 @@ pub fn generate_audio(
                 // a sampled token like any other: without it a run of this token is bounded
                 // only by `max_seq_len`, not by `max_tokens`
                 generated += 1;
+                if generated >= config.max_tokens {
+                    break;
+                }
                 logits = model.forward(&[next_token], pos, &mut state);
                 check_audio_decode_error(model)?;
                 next_token = sampler.sample(&mut logits);
@@ -1326,7 +1329,7 @@ pub fn generate_audio(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
 
     /// The end-of-speech code is the sampler's own mask/EOS id, `n_vocab - 1`. A fixed 256
@@ -1670,10 +1673,13 @@ mod tests {
         logits: Option<Vec<f32>>,
         /// How many times `generate_audio` asked for a checked KV reset.
         resets: std::sync::atomic::AtomicUsize,
+        forwards: std::sync::atomic::AtomicUsize,
     }
 
     impl Model for ScriptedPrefillModel {
         fn forward(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> Vec<f32> {
+            self.forwards
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
             state.seq_len += tokens.len();
             vec![0.0; self.config.vocab_size]
         }
@@ -1728,6 +1734,7 @@ mod tests {
             consumed,
             logits,
             resets: std::sync::atomic::AtomicUsize::new(0),
+            forwards: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -1736,7 +1743,7 @@ mod tests {
     /// `AudioOutputDecoder::new` must construct (it reads configs only).
     /// `n_fft`/`hop_length` are nonzero because `IstftStreamer::new`
     /// plans a real FFT.
-    fn empty_vocoder_weights() -> (AudioDecoderWeights, DetokenizerWeights) {
+    pub(crate) fn empty_vocoder_weights() -> (AudioDecoderWeights, DetokenizerWeights) {
         use crate::model::audio_decoder::{
             CodebookWeights, DecoderConfig, DepthformerConfig, DetokenizerConfig,
         };
@@ -1808,6 +1815,33 @@ mod tests {
             mode: AudioMode::Sequential,
             gpu_depthformer: false,
         }
+    }
+
+    #[test]
+    fn mixed_start_at_the_token_limit_does_not_forward_again() {
+        let mut logits = vec![-1.0; 132];
+        logits[TOKEN_MIXED_START as usize] = 1.0;
+        let mut model = scripted_model(1, Some(logits));
+        model.config.vocab_size = 132;
+        let (dec_w, detok_w) = empty_vocoder_weights();
+        let tokenizer =
+            BpeTokenizer::from_vocab((0..132).map(|n| n.to_string().into_bytes()).collect());
+        let mut config = audio_test_config();
+        config.max_tokens = 1;
+        config.sampler.temperature = 0.0;
+        generate_audio(
+            &model,
+            &dec_w,
+            &detok_w,
+            &tokenizer,
+            &[1],
+            &config,
+            None,
+            |_| {},
+            |_, _| {},
+        )
+        .unwrap();
+        assert_eq!(model.forwards.load(std::sync::atomic::Ordering::SeqCst), 0);
     }
 
     #[test]

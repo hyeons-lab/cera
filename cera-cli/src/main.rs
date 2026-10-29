@@ -4104,6 +4104,9 @@ fn main() -> Result<()> {
 
             // Build token sequence.
             let mut tokens = Vec::new();
+            // whether the tool prompt ends inside an opened reasoning block, so the reply text
+            // starts in reasoning (the parser needs it to tell a cut-off draft from a call)
+            let mut reply_starts_in_think = false;
             if !tool_defs.is_empty() {
                 // Tool calling: render the chat template with a `tools` array so
                 // the model's tool-definition block appears. `--system` is
@@ -4127,6 +4130,7 @@ fn main() -> Result<()> {
                     tool_defs.len(),
                     formatted.len()
                 );
+                reply_starts_in_think = cera::session::chat::prompt_prefills_think(&formatted);
                 tokens = tokenizer.encode(&formatted);
             } else if system.is_some() || vocoder.is_some() {
                 // Use chat template when --system or --vocoder is set.
@@ -4473,8 +4477,13 @@ fn main() -> Result<()> {
                 // The human summary goes to stderr. `writeln!` (not `println!`)
                 // so a closed pipe surfaces as an ignored error, not a panic.
                 if let (Some(fmt), Some(text)) = (tool_format, reply_text) {
-                    let calls = cera::tools::parse_tool_calls_with_tools(&text, fmt, &tool_defs)
-                        .context("parsing tool calls from model reply")?;
+                    let calls = cera::tools::parse_tool_calls_in_context(
+                        &text,
+                        fmt,
+                        &tool_defs,
+                        reply_starts_in_think,
+                    )
+                    .context("parsing tool calls from model reply")?;
                     if calls.is_empty() {
                         eprintln!("--- (no tool calls in reply)");
                     } else {

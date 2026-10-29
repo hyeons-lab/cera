@@ -183,6 +183,32 @@ impl GgufWriter {
             .insert(key.into(), MetadataValue::BoolArray(val));
     }
 
+    /// [`Self::add_tensor`] for a size that comes from an untrusted shape: refuses a tensor whose
+    /// aligned offset plus size no longer fits the `u64` offset space, instead of wrapping the
+    /// running offset and writing a header that points at the wrong bytes.
+    pub fn try_add_tensor(
+        &mut self,
+        name: impl Into<String>,
+        dims: Vec<u64>,
+        ggml_type: u32,
+        size_bytes: usize,
+    ) -> Result<&TensorMeta, CeraError> {
+        let name = name.into();
+        let align = self.alignment as u64;
+        let end = self
+            .current_data_offset
+            .checked_next_multiple_of(align)
+            .and_then(|offset| offset.checked_add(size_bytes as u64));
+        if end.is_none() {
+            return Err(CeraError::Backend(format!(
+                "tensor `{name}` ({size_bytes} bytes) does not fit in a GGUF data region of \
+                 {} bytes",
+                self.current_data_offset
+            )));
+        }
+        Ok(self.add_tensor(name, dims, ggml_type, size_bytes))
+    }
+
     /// Register a tensor and compute its aligned data offset.
     ///
     /// `dims` should be in GGUF order (reverse of PyTorch: [cols, rows, ...]).
@@ -422,6 +448,31 @@ fn write_metadata_value<W: Write>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// The running data offset is a `u64`: a tensor that no longer fits is refused by name, not
+    /// wrapped into an offset that points at other tensors' bytes.
+    #[test]
+    fn a_tensor_that_overflows_the_data_offset_is_refused() {
+        let mut writer = GgufWriter::new();
+        writer
+            .try_add_tensor("a", vec![1], GGML_TYPE_F32, 1024)
+            .unwrap();
+        // a data region already 8 bytes short of the end of the `u64` offset space (a size that
+        // large is not reachable on a 32-bit target, so the offset is driven instead)
+        writer.current_data_offset = u64::MAX - 8;
+        let err = writer
+            .try_add_tensor("huge", vec![1], GGML_TYPE_F32, 64)
+            .map(|_| ())
+            .unwrap_err();
+        assert!(err.to_string().contains("huge"), "{err}");
+        // the refused tensor was not registered
+        assert_eq!(writer.tensors().len(), 1);
+        // and with room left, a tensor is accepted again
+        writer.current_data_offset = 0;
+        writer
+            .try_add_tensor("b", vec![1], GGML_TYPE_F32, 8)
+            .unwrap();
+    }
     use crate::gguf::GgufFile;
 
     #[test]

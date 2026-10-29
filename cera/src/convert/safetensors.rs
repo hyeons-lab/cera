@@ -20,6 +20,28 @@ pub struct SafeTensorsHeader {
     pub tensors: BTreeMap<String, SafeTensorInfo>,
 }
 
+/// Refuse byte spans that overlap. SafeTensors tensors occupy disjoint ranges, so spans that share
+/// bytes come from a malformed or hostile file, and decoding each would copy one small range into
+/// many buffers. Each span is `(start, end, label)` in one file; empty spans hold no bytes and are
+/// ignored. `what` names the file for the message.
+pub(crate) fn check_disjoint_spans(
+    mut spans: Vec<(usize, usize, String)>,
+    what: &str,
+) -> Result<(), CeraError> {
+    spans.retain(|&(start, end, _)| start < end);
+    spans.sort_by_key(|&(start, end, _)| (start, end));
+    for pair in spans.windows(2) {
+        let ((_, prev_end, prev), (start, _, label)) = (&pair[0], &pair[1]);
+        if *start < *prev_end {
+            return Err(CeraError::Backend(format!(
+                "the tensor data ranges in {what} overlap: {prev} ends at byte {prev_end} but \
+                 {label} starts at byte {start}"
+            )));
+        }
+    }
+    Ok(())
+}
+
 impl SafeTensorsHeader {
     /// Parse the header from the start of a SafeTensors file/buffer.
     ///

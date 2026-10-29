@@ -196,7 +196,8 @@ impl WgpuAudioDecoder {
             "lfm.layers.2.self_attn.q_layernorm.weight",
             "blk.2.attn_q_norm.weight",
         )?;
-        let head_dim = q_norm_t.shape()[0];
+        // an empty shape is the corrupt case the guard below names; indexing it would panic first
+        let head_dim = q_norm_t.shape().first().copied().unwrap_or(0);
         // `n_head` and `n_kv` below both divide by this, so a corrupt vocoder
         // GGUF reporting an empty q_layernorm shape would be a div-by-zero
         // panic. Same wording as the CPU loader's check in `audio_decoder.rs`,
@@ -1442,6 +1443,11 @@ impl WgpuDepthformer {
         let n_layer = gguf
             .get_u32("depthformer_n_layer")
             .context("missing depthformer_n_layer")? as usize;
+        // sizes per-layer allocations below: bound it like the CPU loader does
+        anyhow::ensure!(
+            (1..=256).contains(&n_layer),
+            "depthformer_n_layer ({n_layer}) must be in 1..=256"
+        );
         let n_embd = gguf
             .get_u32("depthformer_n_embd")
             .context("missing depthformer_n_embd")? as usize;
@@ -1451,9 +1457,19 @@ impl WgpuDepthformer {
             gguf,
             "depthformer.layers.0.operator.qkv_proj.weight",
         )?;
+        anyhow::ensure!(
+            n_embd > 0 && qkv.cols == n_embd,
+            "depthformer_n_embd ({n_embd}) disagrees with qkv_proj ({} columns)",
+            qkv.cols
+        );
         let q_norm_w =
             gguf.get_tensor("depthformer.layers.0.operator.attention.q_layernorm.weight")?;
-        let n_embd_head = q_norm_w.shape()[0];
+        let n_embd_head = q_norm_w
+            .shape()
+            .first()
+            .copied()
+            .filter(|&d| d > 0)
+            .context("depthformer q_layernorm has no usable shape")?;
         let qkv_out = qkv.rows;
         let n_head = 32;
         let n_head_kv = 8;
@@ -1467,6 +1483,11 @@ impl WgpuDepthformer {
             "depthformer.layers.0.feed_forward.w1.weight",
         )?;
         let ffn_dim = w1_0.rows;
+        anyhow::ensure!(
+            w1_0.cols == n_embd,
+            "depthformer_n_embd ({n_embd}) disagrees with w1 ({} columns)",
+            w1_0.cols
+        );
 
         let df_cfg = DepthformerConfig {
             n_layer,
@@ -1531,8 +1552,10 @@ impl WgpuDepthformer {
         let ffn_act_buf = alloc(ffn_dim, "df_ffn_act");
         let dl_t = gguf.get_tensor("depth_linear.weight")?;
         let dl_f32 = dl_t.to_f32_vec();
-        let dl_cols = dl_t.shape()[0]; // e.g. 2048 (n_embd_llm)
-        let dl_rows = dl_t.shape()[1]; // e.g. 8 * 1024
+        // e.g. 2048 (n_embd_llm) columns by 8 * 1024 rows
+        let &[dl_cols, dl_rows] = dl_t.shape() else {
+            anyhow::bail!("depth_linear.weight must be 2-D, got {:?}", dl_t.shape());
+        };
         let n_embd_d = dl_rows / dec_cfg.n_codebook;
 
         let embedding_in_buf = alloc(dl_cols, "df_embedding_in");

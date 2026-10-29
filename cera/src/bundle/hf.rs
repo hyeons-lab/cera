@@ -699,10 +699,16 @@ pub fn resolve_hf_manifest(
         .next()
         .unwrap_or(&spec.repo)
         .to_ascii_lowercase();
-    let primary_lower = primary_entry.rfilename.to_ascii_lowercase();
+    let filename_lower = |name: &str| {
+        name.rsplit(['/', '\\'])
+            .next()
+            .unwrap_or(name)
+            .to_ascii_lowercase()
+    };
+    let primary_lower = filename_lower(&primary_entry.rfilename);
     let mmproj_lower = multimodal_projector_file
         .as_deref()
-        .map(str::to_ascii_lowercase)
+        .map(filename_lower)
         .unwrap_or_default();
     let is_d1_omni = [
         repo_lower.as_str(),
@@ -1742,5 +1748,28 @@ mod tests {
                 "{slug}"
             );
         }
+    }
+
+    #[test]
+    fn an_audio_named_directory_does_not_make_a_vision_repo_audio() {
+        let spec = HfSpec::parse("acme/vision-model").unwrap();
+        let info = HfModelInfo {
+            id: spec.repo.clone(),
+            siblings: vec![
+                HfSibling {
+                    rfilename: "archive-audio-build/vision-model-Q4_0.gguf".into(),
+                    size: Some(1_000_000),
+                },
+                HfSibling {
+                    rfilename: "archive-audio-build/mmproj-vision-model-Q8_0.gguf".into(),
+                    size: Some(500_000),
+                },
+            ],
+            tags: Vec::new(),
+            pipeline_tag: None,
+            config: None,
+        };
+        let manifest = resolve_hf_manifest(&spec, &info, None, None).unwrap();
+        assert_eq!(manifest.inference_type, InferenceType::LlamaCppImageToText);
     }
 }

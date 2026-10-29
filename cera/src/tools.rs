@@ -502,9 +502,22 @@ pub fn parse_tool_calls_with_tools(
     format: ToolFormat,
     tools: &[ToolDef],
 ) -> Result<Vec<ToolCall>> {
+    parse_tool_calls_in_context(text, format, tools, false)
+}
+
+/// [`parse_tool_calls_with_tools`] for text generated after a prompt that already opened the
+/// reasoning block (`think_prefilled`): the text then starts inside reasoning, which is how a
+/// turn that closes its `</think>` without ever opening one is told apart from a tool call whose
+/// parameter value happens to hold the tag.
+pub fn parse_tool_calls_in_context(
+    text: &str,
+    format: ToolFormat,
+    tools: &[ToolDef],
+    think_prefilled: bool,
+) -> Result<Vec<ToolCall>> {
     // The same view of the text as `parse_output`: a call quoted inside the model's reasoning
     // is not a call, whichever format is asked for.
-    let (_, after_think) = extract_thinking(text);
+    let (_, after_think) = extract_thinking(text, format, think_prefilled);
     match format {
         ToolFormat::Lfm2Pythonic => parse_lfm2_pythonic(&after_think),
         ToolFormat::Lfm3Xml => parse_lfm3_xml(&after_think, tools),
@@ -525,7 +538,18 @@ pub fn parse_output_with_tools(
     format: ToolFormat,
     tools: &[ToolDef],
 ) -> Result<ParsedOutput> {
-    let (reasoning_content, after_think) = extract_thinking(text);
+    parse_output_in_context(text, format, tools, false)
+}
+
+/// [`parse_output_with_tools`] with the reasoning block already open when the text starts (see
+/// [`parse_tool_calls_in_context`]).
+pub fn parse_output_in_context(
+    text: &str,
+    format: ToolFormat,
+    tools: &[ToolDef],
+    think_prefilled: bool,
+) -> Result<ParsedOutput> {
+    let (reasoning_content, after_think) = extract_thinking(text, format, think_prefilled);
     let (content, tool_calls) = match format {
         ToolFormat::Lfm2Pythonic => split_and_parse_lfm2(&after_think)?,
         ToolFormat::Lfm3Xml => split_and_parse_lfm3(&after_think, tools)?,
@@ -1709,11 +1733,15 @@ impl<'a> PyParser<'a> {
 // ── LFM3 XML parser ─────────────────────────────────────────────────────────
 
 /// The text of a parameter value between the `\n` the template writes after `<parameter=NAME>` and
-/// the `\n` it writes before `</parameter>`. Only those two characters are delimiters: a value
-/// that itself starts or ends with `\r` keeps it.
+/// the `\n` it writes before `</parameter>`; a value framed with `\r\n` on both sides is read the
+/// same way. A lone `\r` is part of the value, so one that starts or ends it is kept.
 fn strip_value_delimiters(s: &str) -> &str {
-    let s = s.strip_prefix('\n').unwrap_or(s);
-    s.strip_suffix('\n').unwrap_or(s)
+    if let Some(s) = s.strip_prefix("\r\n") {
+        s.strip_suffix("\r\n").unwrap_or(s)
+    } else {
+        let s = s.strip_prefix('\n').unwrap_or(s);
+        s.strip_suffix('\n').unwrap_or(s)
+    }
 }
 
 /// Strip at most one leading newline (`\r\n` or `\n`) and at most one trailing
@@ -1738,23 +1766,44 @@ struct Marks {
 }
 
 impl Marks {
-    fn for_text(text: &str) -> Self {
-        let mut free = ('\u{E000}'..='\u{F8FF}').filter(|c| !text.contains(*c));
-        // a text cannot contain every private-use character; the fallback only keeps the
-        // function total
-        Marks {
-            open: free.next().unwrap_or('\u{E000}'),
-            close: free.next().unwrap_or('\u{E001}'),
-        }
+    /// Two private-use characters absent from `text`, or `None` when it uses every one of them
+    /// (all three private-use ranges, about 137,000 characters): masking is then skipped rather
+    /// than falling back to a character the text already holds.
+    fn for_text(text: &str) -> Option<Self> {
+        const RANGES: [(u32, u32); 3] = [
+            (0xE000, 0xF8FF),
+            (0xF_0000, 0xF_FFFD),
+            (0x10_0000, 0x10_FFFD),
+        ];
+        let in_ranges = |c: &char| {
+            RANGES
+                .iter()
+                .any(|&(lo, hi)| (lo..=hi).contains(&(*c as u32)))
+        };
+        let used: std::collections::HashSet<char> = text.chars().filter(in_ranges).collect();
+        let mut free = RANGES
+            .iter()
+            .flat_map(|&(lo, hi)| (lo..=hi).filter_map(char::from_u32))
+            .filter(|c| !used.contains(c));
+        Some(Marks {
+            open: free.next()?,
+            close: free.next()?,
+        })
     }
 }
 
 /// Replace each tool-call section (`<tool_call>...</tool_call>`, or LFM2's
 /// `<|tool_call_start|>...<|tool_call_end|>`) with `MASK_OPEN index MASK_CLOSE` and return the
 /// masked text with the sections it hid. A parameter value may contain `<think>` text (code,
-/// documentation), which must not be read as the model's reasoning.
-fn mask_tool_calls(text: &str) -> (std::borrow::Cow<'_, str>, Vec<String>, Marks) {
-    let marks = Marks::for_text(text);
+/// documentation), which must not be read as the model's reasoning. The `Lfm3Xml` format reads a
+/// call as the parser does, so a parameter value may hold `</tool_call>`, `</think>`, or another
+/// `<tool_call>`; the other formats end a call at its first closing tag. With no mask characters
+/// free in `text`, or no call in it, nothing is masked and the marks come back `None`.
+fn mask_tool_calls(
+    text: &str,
+    format: ToolFormat,
+    think_prefilled: bool,
+) -> (std::borrow::Cow<'_, str>, Vec<String>, Option<Marks>) {
     const SECTIONS: [(&str, &str); 2] = [
         ("<tool_call>", "</tool_call>"),
         ("<|tool_call_start|>", "<|tool_call_end|>"),
@@ -1763,9 +1812,10 @@ fn mask_tool_calls(text: &str) -> (std::borrow::Cow<'_, str>, Vec<String>, Marks
         .iter()
         .filter_map(|(open, close)| text.find(open).map(|at| (at, *open, *close)))
         .min_by_key(|(at, _, _)| *at);
-    if first.is_none() {
-        return (std::borrow::Cow::Borrowed(text), Vec::new(), marks);
-    }
+    let marks = match (first, Marks::for_text(text)) {
+        (Some(_), Some(marks)) => marks,
+        _ => return (std::borrow::Cow::Borrowed(text), Vec::new(), None),
+    };
     let mut masked = String::with_capacity(text.len());
     let mut bodies = Vec::new();
     let mut rest = text;
@@ -1783,26 +1833,67 @@ fn mask_tool_calls(text: &str) -> (std::borrow::Cow<'_, str>, Vec<String>, Marks
         };
         masked.push_str(&rest[..at]);
         let body_start = at + open.len();
-        // a `<tool_call>` ends at its structural close, as the parser reads it; a value may hold
-        // the tag
-        let close_pos = if open == "<tool_call>" {
-            find_structural_close(&rest[body_start..], close)
-        } else {
-            rest[body_start..].find(close)
+        // an LFM3 `<tool_call>` ends at its structural close, as the parser reads it; a value
+        // may hold the tag, and the markers the heuristic below looks for
+        let find = |s: &str, needle: &str, in_function: bool| {
+            if open == "<tool_call>" && format == ToolFormat::Lfm3Xml {
+                find_outside_values(s, needle, in_function)
+            } else {
+                s.find(needle)
+            }
+        };
+        let close_pos = find(&rest[body_start..], close, false);
+        // whether the reasoning block is open where this section starts: an explicit `<think>`
+        // after the last `</think>`, or, with no think tag yet, a prompt that opened it. Only an
+        // opener inside open reasoning can be a mention rather than a call.
+        let reasoning_open = match (masked.rfind("<think>"), masked.rfind("</think>")) {
+            (Some(opened), Some(closed)) => opened > closed,
+            (Some(_), None) => true,
+            (None, Some(_)) => false,
+            (None, None) => think_prefilled,
+        };
+        let lfm3_call = open == "<tool_call>" && format == ToolFormat::Lfm3Xml;
+        // a draft skeleton that leaves its first value open: the value runs on to the real call's
+        // own `</parameter>`, hiding the `</think>` that ends the draft. The first `</think>`
+        // decides, since a grammar-shaped call after a later one is also after the first.
+        let draft_then_call = |text: &str| {
+            text.find("</think>")
+                .is_some_and(|at| has_grammar_call(&text[at + "</think>".len()..]))
         };
         let is_bare_in_think = match close_pos {
+            None if lfm3_call => {
+                // an unclosed call: a `</think>` outside every value ends reasoning, and so does
+                // one in a value that never closes (a draft cut off mid-value) or one that a
+                // real call after it closes (a draft followed by a real call) while reasoning
+                // is open; one inside a finished value is the value's text
+                let tail = &rest[body_start..];
+                let scan = scan_outside_values(tail, "</think>", false);
+                scan.found.is_some()
+                    || (reasoning_open
+                        && (scan
+                            .open_value
+                            .is_some_and(|from| tail[from..].contains("</think>"))
+                            || draft_then_call(tail)))
+            }
             None => rest[body_start..].contains("</think>"),
             Some(c) => {
                 let interior = &rest[body_start..body_start + c];
-                if let Some(tc) = interior.find("</think>") {
+                if let Some(tc) = find(interior, "</think>", false) {
                     let before_tc = &interior[..tc];
                     let after_tc = &interior[tc + "</think>".len()..];
-                    after_tc.contains(open)
+                    find(after_tc, open, ends_inside_function(before_tc)).is_some()
                         || !(before_tc.contains("<function=")
                             || before_tc.contains('{')
                             || before_tc.contains('['))
                 } else {
-                    false
+                    // a draft skeleton that leaves its first value open makes the scan above read
+                    // everything up to the real call's `</parameter>` as that value, hiding the
+                    // `</think>` that ends the draft; one followed by a call written the way the
+                    // grammar writes it (`<tool_call>` then `<function=NAME>` and a line break) is
+                    // the end of reasoning, but only while reasoning is open: outside it the same
+                    // text is a parameter value, and promoting what it holds would run text the
+                    // model only copied.
+                    lfm3_call && reasoning_open && draft_then_call(interior)
                 }
             }
         };
@@ -1819,7 +1910,7 @@ fn mask_tool_calls(text: &str) -> (std::borrow::Cow<'_, str>, Vec<String>, Marks
         bodies.push(rest[at..end].to_string());
         rest = &rest[end..];
     }
-    (std::borrow::Cow::Owned(masked), bodies, marks)
+    (std::borrow::Cow::Owned(masked), bodies, Some(marks))
 }
 
 /// Undo [`mask_tool_calls`] on `text`.
@@ -1854,17 +1945,24 @@ fn unmask_tool_calls(text: &str, bodies: &[String], marks: Marks) -> String {
 
 /// Extract `<think>...</think>` blocks (or a leading `...</think>` when the
 /// prompt already opened `<think>`), returning `(reasoning_content, rest)`.
-fn extract_thinking(text: &str) -> (Option<String>, String) {
-    let (masked, bodies, marks) = mask_tool_calls(text);
-    let (reasoning, rest) = extract_thinking_masked(&masked, marks.open);
-    (
-        reasoning.map(|r| unmask_tool_calls(&r, &bodies, marks)),
-        unmask_tool_calls(&rest, &bodies, marks),
-    )
+fn extract_thinking(
+    text: &str,
+    format: ToolFormat,
+    think_prefilled: bool,
+) -> (Option<String>, String) {
+    let (masked, bodies, marks) = mask_tool_calls(text, format, think_prefilled);
+    let (reasoning, rest) = extract_thinking_masked(&masked, marks.map(|m| m.open));
+    match marks {
+        Some(marks) => (
+            reasoning.map(|r| unmask_tool_calls(&r, &bodies, marks)),
+            unmask_tool_calls(&rest, &bodies, marks),
+        ),
+        None => (reasoning, rest),
+    }
 }
 
 /// The body of [`extract_thinking`], over text whose tool-call sections are masked.
-fn extract_thinking_masked(text: &str, mask_open: char) -> (Option<String>, String) {
+fn extract_thinking_masked(text: &str, mask_open: Option<char>) -> (Option<String>, String) {
     let mut reasoning_parts: Vec<String> = Vec::new();
     let mut remaining = String::new();
     let mut rest = text;
@@ -1896,7 +1994,7 @@ fn extract_thinking_masked(text: &str, mask_open: char) -> (Option<String>, Stri
             None => {
                 // a thought that never closes ends where a tool call begins: the call is
                 // the model's answer, not part of the reasoning
-                let (thinking, tail) = match after.find(mask_open) {
+                let (thinking, tail) = match mask_open.and_then(|m| after.find(m)) {
                     Some(call_at) => after.split_at(call_at),
                     None => (after, ""),
                 };
@@ -1924,29 +2022,88 @@ fn parse_lfm3_xml(text: &str, tools: &[ToolDef]) -> Result<Vec<ToolCall>> {
     Ok(calls)
 }
 
-/// The byte offset of the first `close` tag in `s` that is not inside a `<parameter=...>` value.
-/// A value ends only at its first `</parameter>` (what the grammar enforces), so it may hold
-/// `</function>` or `</tool_call>`; those are skipped over, not taken for the end of the call.
-/// An unterminated value hides everything after it, so the search then finds nothing.
-fn find_structural_close(s: &str, close: &str) -> Option<usize> {
+/// The byte offset of the first `needle` in `s` that is not inside a `<parameter=...>` value.
+/// See [`scan_outside_values`]; an unterminated value hides everything after it, so the search
+/// then finds nothing.
+fn find_outside_values(s: &str, needle: &str, in_function: bool) -> Option<usize> {
+    scan_outside_values(s, needle, in_function).found
+}
+
+/// What [`scan_outside_values`] saw.
+struct ValueScan {
+    /// The byte offset of the first `needle` outside every value.
+    found: Option<usize>,
+    /// Where the value that never closed starts (just past its opening tag), when the scan
+    /// stopped inside one.
+    open_value: Option<usize>,
+}
+
+/// Scan `s` for `needle`, outside the `<parameter=...>` values. A value ends only at its first
+/// `</parameter>` (what the grammar enforces), so it may hold `</function>`, `</tool_call>`, or
+/// `</think>`; those are skipped over, not taken for structure. A `<parameter=` opens a value only
+/// inside a `<function=...>` body, and both tags count only when the newline the template and
+/// grammar always write follows them: `in_function` says whether `s` starts inside a body, and the
+/// scan tracks it from there, so prose that mentions the tags (a reasoning block sketching the
+/// format) hides nothing. A value with no end tag hides everything after it (`open_value` says
+/// where it began). `s` must start outside a value.
+fn scan_outside_values(s: &str, needle: &str, mut in_function: bool) -> ValueScan {
+    const FUNCTION: &str = "<function=";
+    const FUNCTION_END: &str = "</function>";
     const PARAM: &str = "<parameter=";
     const PARAM_END: &str = "</parameter>";
     let mut i = 0;
     while i < s.len() {
         let rest = &s[i..];
-        if rest.starts_with(close) {
-            return Some(i);
+        if rest.starts_with(needle) {
+            return ValueScan {
+                found: Some(i),
+                open_value: None,
+            };
         }
-        if rest.starts_with(PARAM) {
+        if rest.starts_with(FUNCTION) {
+            in_function = in_function || tag_then_newline(rest);
+        } else if rest.starts_with(FUNCTION_END) {
+            in_function = false;
+        } else if in_function && rest.starts_with(PARAM) && tag_then_newline(rest) {
             let value_from = rest.find('>').map_or(rest.len(), |gt| gt + 1);
-            // skip to just past this value's own end tag; no end tag hides the rest
-            let end = rest[value_from..].find(PARAM_END)?;
+            // skip to just past this value's own end tag
+            let Some(end) = rest[value_from..].find(PARAM_END) else {
+                return ValueScan {
+                    found: None,
+                    open_value: Some(i + value_from),
+                };
+            };
             i += value_from + end + PARAM_END.len();
             continue;
         }
         i += rest.chars().next().map_or(1, char::len_utf8);
     }
-    None
+    ValueScan {
+        found: None,
+        open_value: None,
+    }
+}
+
+/// Whether `s` holds a call written the way the grammar writes it: `<tool_call>`, then
+/// `<function=NAME>` and a line break. Text before it (an answer between `</think>` and the call)
+/// does not matter.
+fn has_grammar_call(s: &str) -> bool {
+    s.match_indices("<tool_call>").any(|(i, tag)| {
+        let call = s[i + tag.len()..].trim_start();
+        call.starts_with("<function=") && tag_then_newline(call)
+    })
+}
+
+/// Whether the opening tag at the start of `rest` is followed by a line break, as the template and
+/// the grammar write every `<function=NAME>` and `<parameter=NAME>`.
+fn tag_then_newline(rest: &str) -> bool {
+    rest.find('>')
+        .is_some_and(|gt| rest[gt + 1..].starts_with('\n') || rest[gt + 1..].starts_with("\r\n"))
+}
+
+/// Whether the end of `prefix` (which starts outside any value) is inside a `<function=...>` body.
+fn ends_inside_function(prefix: &str) -> bool {
+    prefix.rfind("<function=") > prefix.rfind("</function>")
 }
 
 fn split_and_parse_lfm3(text: &str, tools: &[ToolDef]) -> Result<(String, Vec<ToolCall>)> {
@@ -1962,7 +2119,7 @@ fn split_and_parse_lfm3(text: &str, tools: &[ToolDef]) -> Result<(String, Vec<To
             content_parts.push(before.trim());
         }
         let after = &rest[start + "<tool_call>".len()..];
-        let (tc_body, next_rest) = match find_structural_close(after, "</tool_call>") {
+        let (tc_body, next_rest) = match find_outside_values(after, "</tool_call>", false) {
             Some(end) => (&after[..end], &after[end + "</tool_call>".len()..]),
             None => (after, ""),
         };
@@ -2005,7 +2162,7 @@ fn parse_lfm3_functions(body: &str, tools: &[ToolDef], calls: &mut Vec<ToolCall>
             bail!("empty function name in <function=> tag");
         }
         let after_fn_open = &after_prefix[gt_pos + 1..];
-        let (fn_body, next_rest) = match find_structural_close(after_fn_open, "</function>") {
+        let (fn_body, next_rest) = match find_outside_values(after_fn_open, "</function>", true) {
             Some(end) => (
                 &after_fn_open[..end],
                 &after_fn_open[end + "</function>".len()..],
@@ -2079,7 +2236,7 @@ fn parse_lfm3_parameters(
 }
 
 fn parse_lfm3_param_value(val_str: &str, prop_schema: Option<&Value>) -> Value {
-    let allowed = prop_schema.map(schema_value_types).unwrap_or_default();
+    let allowed = prop_schema.and_then(schema_value_types).unwrap_or_default();
     if allowed.is_empty() {
         // no type information: the text is JSON when it parses as JSON, else a string
         return serde_json::from_str::<Value>(val_str)
@@ -2102,23 +2259,105 @@ fn parse_lfm3_param_value(val_str: &str, prop_schema: Option<&Value>) -> Value {
     serde_json::from_str::<Value>(val_str).unwrap_or_else(|_| Value::String(val_str.to_string()))
 }
 
-/// The JSON types a property schema allows: its `type` (a name or a list) and the types of its
-/// `anyOf` / `oneOf` branches. Empty when the schema says nothing about the type.
-fn schema_value_types(schema: &Value) -> Vec<&str> {
-    let mut out = Vec::new();
+/// The JSON types a property schema allows, or `None` when it does not restrict them (or the
+/// restriction cannot be read). A root `type`, `enum` / `const`, and every `allOf` member all apply, so they
+/// intersect with each other and with the `anyOf` / `oneOf` union; the branches of that union are
+/// alternatives, and one branch that says nothing about type leaves it unrestricted. A branch
+/// with no `type` but a `const` or `enum` allows the types of those values. An integer satisfies
+/// `number`. The result holds each type once.
+fn schema_value_types(schema: &Value) -> Option<Vec<&str>> {
+    let mut allowed: Option<Vec<&str>> = None;
     match schema.get("type") {
-        Some(Value::String(t)) => out.push(t.as_str()),
-        Some(Value::Array(ts)) => out.extend(ts.iter().filter_map(Value::as_str)),
+        Some(Value::String(t)) => allowed = intersect_types(allowed, Some(vec![t.as_str()])),
+        Some(Value::Array(ts)) => {
+            allowed = intersect_types(allowed, Some(dedup(ts.iter().filter_map(Value::as_str))));
+        }
         _ => {}
+    }
+    // a root `enum` / `const` bounds the types too, as it does inside a branch: a string enum with
+    // no `type` reads `7` as the string "7", not the number
+    if let Some(literal) = literal_value_types(schema) {
+        allowed = intersect_types(allowed, Some(literal));
+    }
+    if let Some(Value::Array(members)) = schema.get("allOf") {
+        for m in members {
+            allowed = intersect_types(allowed, schema_value_types(m));
+        }
     }
     for key in ["anyOf", "oneOf"] {
         if let Some(branches) = schema.get(key).and_then(Value::as_array) {
-            for b in branches {
-                out.extend(schema_value_types(b));
+            let union = branches
+                .iter()
+                .map(|b| schema_value_types(b).or_else(|| literal_value_types(b)))
+                .try_fold(Vec::new(), |mut acc, branch| {
+                    acc.extend(branch?);
+                    Some(acc)
+                })
+                .map(|all| dedup(all.into_iter()))
+                .filter(|u| !u.is_empty());
+            allowed = intersect_types(allowed, union);
+        }
+    }
+    allowed
+}
+
+/// The types both `have` and `also` allow (`None` is unrestricted); an integer is the narrower
+/// of `integer` and `number`.
+fn intersect_types<'a>(
+    have: Option<Vec<&'a str>>,
+    also: Option<Vec<&'a str>>,
+) -> Option<Vec<&'a str>> {
+    let (have, also) = match (have, also) {
+        (None, types) | (types, None) => return types,
+        (Some(have), Some(also)) => (have, also),
+    };
+    let mut both = Vec::new();
+    for &a in &have {
+        for &b in &also {
+            let narrowest = match (a, b) {
+                _ if a == b => Some(a),
+                ("integer", "number") | ("number", "integer") => Some("integer"),
+                _ => None,
+            };
+            if let Some(t) = narrowest.filter(|t| !both.contains(t)) {
+                both.push(t);
             }
         }
     }
+    Some(both)
+}
+
+/// The types of the values a schema's `const` or `enum` lists, when it has either.
+fn literal_value_types(schema: &Value) -> Option<Vec<&str>> {
+    if let Some(c) = schema.get("const") {
+        return Some(vec![json_type_name(c)]);
+    }
+    let vs = schema.get("enum")?.as_array()?;
+    Some(dedup(vs.iter().map(json_type_name))).filter(|t| !t.is_empty())
+}
+
+/// `types` without repeats, in first-seen order.
+fn dedup<'a>(types: impl Iterator<Item = &'a str>) -> Vec<&'a str> {
+    let mut out = Vec::new();
+    for t in types {
+        if !out.contains(&t) {
+            out.push(t);
+        }
+    }
     out
+}
+
+/// The schema type name of a JSON value (`integer` for a whole number).
+fn json_type_name(v: &Value) -> &'static str {
+    match v {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+        Value::Number(n) if n.is_i64() || n.is_u64() => "integer",
+        Value::Number(_) => "number",
+    }
 }
 
 /// Whether `v` is a value of one of the JSON schema `types` (an integer also fits `number`).
@@ -2221,7 +2460,8 @@ mod tests {
     fn think_tags_inside_a_tool_call_are_part_of_the_call() {
         // a parameter value may legitimately contain the literal tags (code, docs)
         let body = "<tool_call>\n<function=note>\n<parameter=text>\na <think>b</think> c\n</parameter>\n</function>\n</tool_call>";
-        let (reasoning, rest) = extract_thinking(&format!("hello {body} bye"));
+        let (reasoning, rest) =
+            extract_thinking(&format!("hello {body} bye"), ToolFormat::Lfm3Xml, false);
         assert_eq!(reasoning, None);
         assert_eq!(rest, format!("hello {body} bye"));
         let calls = parse_tool_calls(body, ToolFormat::Lfm3Xml).unwrap();
@@ -2236,7 +2476,8 @@ mod tests {
     #[test]
     fn an_unterminated_think_does_not_swallow_the_tool_call_after_it() {
         let call = "<tool_call>\n<function=f>\n</function>\n</tool_call>";
-        let (reasoning, rest) = extract_thinking(&format!("<think>plan {call}"));
+        let (reasoning, rest) =
+            extract_thinking(&format!("<think>plan {call}"), ToolFormat::Lfm3Xml, false);
         assert_eq!(reasoning.as_deref(), Some("plan"));
         assert_eq!(rest, call);
     }
@@ -2272,6 +2513,10 @@ mod tests {
                 "{value:?}"
             );
         }
+
+        let text = "<tool_call>\r\n<function=f>\r\n<parameter=v>\r\nhello\r\n</parameter>\r\n</function>\r\n</tool_call>";
+        let calls = parse_tool_calls_with_tools(text, ToolFormat::Lfm3Xml, &[tool]).unwrap();
+        assert_eq!(calls[0].arguments["v"], "hello");
     }
 
     /// A parameter that can be a string and something else is read as the something else only
@@ -2326,7 +2571,7 @@ mod tests {
                 .unwrap();
         assert_eq!(calls.len(), 1);
         assert_eq!(calls[0].arguments["v"], serde_json::json!(value));
-        let (reasoning, rest) = extract_thinking(&text);
+        let (reasoning, rest) = extract_thinking(&text, ToolFormat::Lfm3Xml, false);
         assert_eq!(reasoning, None, "the <think> in the value is not reasoning");
         assert!(rest.contains("<think>keep me</think>"), "{rest:?}");
     }
@@ -2441,7 +2686,7 @@ mod tests {
             ] {
                 let calls = parse_tool_calls_with_tools(&text, ToolFormat::Hermes, &[]).unwrap();
                 assert_eq!(calls.len(), 1, "{text:?}");
-                let (_, rest) = extract_thinking(&text);
+                let (_, rest) = extract_thinking(&text, ToolFormat::Hermes, false);
                 assert_eq!(
                     rest.matches("get_weather").count(),
                     1,
@@ -3166,10 +3411,9 @@ mod tests {
         );
     }
 
-    /// A string enum is emitted the way the parser reads it back: raw text for a `string`
-    /// parameter (the parser keeps the text as written, so a quoted form would become a value
-    /// with quotes in it, outside the enum), and quoted only for an untyped enum variant that
-    /// would otherwise parse as JSON (`true`, `3`).
+    /// A string enum is emitted the way the parser reads it back: raw text, typed or not (the
+    /// parser keeps the text as written, so a quoted form would become a value with quotes in it,
+    /// outside the enum).
     #[test]
     fn lfm3_xml_string_enums_are_emitted_as_the_parser_reads_them() {
         let tool = |schema: serde_json::Value| ToolDef {
@@ -3194,19 +3438,19 @@ mod tests {
         let parsed =
             parse_tool_calls_with_tools(&call("celsius"), ToolFormat::Lfm3Xml, &[typed]).unwrap();
         assert_eq!(parsed[0].arguments["v"], "celsius");
-        // untyped: a variant that reads as JSON must be quoted to stay a string
+        // untyped: its values are all strings, so it reads as a string enum: raw text, like the
+        // template writes string values
         let untyped = tool(serde_json::json!({"enum": ["true", "x"]}));
         let g =
             compile(&generate_gbnf(std::slice::from_ref(&untyped), ToolFormat::Lfm3Xml).unwrap());
         assert!(accepts_complete(&g, call("x").as_bytes()));
-        assert!(accepts_complete(&g, call("\"true\"").as_bytes()));
+        assert!(accepts_complete(&g, call("true").as_bytes()));
         assert!(
-            !accepts_complete(&g, call("true").as_bytes()),
-            "raw `true` reads back as a bool"
+            !accepts_complete(&g, call("\"true\"").as_bytes()),
+            "quoted form emitted"
         );
         let parsed =
-            parse_tool_calls_with_tools(&call("\"true\""), ToolFormat::Lfm3Xml, &[untyped])
-                .unwrap();
+            parse_tool_calls_with_tools(&call("true"), ToolFormat::Lfm3Xml, &[untyped]).unwrap();
         assert_eq!(parsed[0].arguments["v"], "true");
     }
 
@@ -3380,5 +3624,290 @@ mod tests {
         let parsed = parse_output_with_tools(raw, ToolFormat::Lfm3Xml, &tools).unwrap();
         assert_eq!(parsed.reasoning_content.as_deref(), Some("planning"));
         assert_eq!(parsed.tool_calls, calls);
+    }
+
+    /// A Lfm3Xml `<parameter=...>` scan must not apply to Hermes JSON: a literal `<parameter=x>`
+    /// inside a JSON string would otherwise hide the call's real close, and the `<think>` text in
+    /// a later argument would be read as reasoning.
+    #[test]
+    fn hermes_json_with_a_literal_parameter_marker_keeps_its_think_text() {
+        let text = r#"<tool_call>{"name": "f", "arguments": {"v": "<parameter=x>", "w": "<think>keep</think>"}}</tool_call><think>after</think>"#;
+        let parsed = parse_output(text, ToolFormat::Hermes).unwrap();
+        // the reasoning after the call is read as reasoning: a scanner that had lost the call's
+        // close would have masked everything to the end of the text
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("after"));
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].arguments["v"], "<parameter=x>");
+        assert_eq!(parsed.tool_calls[0].arguments["w"], "<think>keep</think>");
+    }
+
+    /// The bare-opener heuristic reads markers outside parameter values only: a value that holds
+    /// `</think>` followed by `<tool_call>` is still a value.
+    #[test]
+    fn think_and_call_markers_inside_a_value_are_not_structure() {
+        let value = "see </think> then <tool_call> <think>keep</think> end";
+        let text = format!(
+            "<tool_call>\n<function=f>\n<parameter=v>\n{value}\n</parameter>\n</function>\n</tool_call>"
+        );
+        let parsed = parse_output(&text, ToolFormat::Lfm3Xml).unwrap();
+        assert_eq!(parsed.reasoning_content, None);
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].arguments["v"], value);
+        // the same call written as a bare opener inside reasoning still ends the reasoning
+        let bare = format!("plan </think> {text}");
+        let parsed = parse_output(&bare, ToolFormat::Lfm3Xml).unwrap();
+        assert_eq!(parsed.reasoning_content.as_deref(), Some("plan"));
+        assert_eq!(parsed.tool_calls[0].arguments["v"], value);
+    }
+
+    /// A reasoning block that talks about the format (`<tool_call>`, `<parameter=x>`) before the
+    /// real call: the prose tag opens no value, so the block still ends at its `</think>` and the
+    /// real call after it parses.
+    #[test]
+    fn a_reasoning_block_that_mentions_the_call_tags_does_not_swallow_the_real_call() {
+        let call =
+            "<tool_call>\n<function=f>\n<parameter=v>\nx\n</parameter>\n</function>\n</tool_call>";
+        let reasoning = "use <tool_call> with <parameter=x> tags";
+        let text = format!("<think>{reasoning}</think>\n{call}");
+        let parsed = parse_output(&text, ToolFormat::Lfm3Xml).unwrap();
+        assert_eq!(parsed.reasoning_content.as_deref(), Some(reasoning));
+        assert_eq!(parsed.tool_calls.len(), 1);
+        assert_eq!(parsed.tool_calls[0].arguments["v"], "x");
+        // and a value that holds the tags still hides them inside a function body
+        let value = "a <parameter=y> </think> <tool_call> b";
+        let text = format!(
+            "<tool_call>\n<function=f>\n<parameter=v>\n{value}\n</parameter>\n</function>\n</tool_call>"
+        );
+        let parsed = parse_output(&text, ToolFormat::Lfm3Xml).unwrap();
+        assert_eq!(parsed.tool_calls[0].arguments["v"], value);
+    }
+
+    /// Text a call's parameter value merely holds is not reasoning and not a call: a value that
+    /// ends in `</think>` and a skeleton must not turn the outer call into reasoning and promote
+    /// the embedded one (that would run text the model only copied), unless the reasoning block is
+    /// really open there.
+    #[test]
+    fn a_value_holding_think_and_a_skeleton_is_not_promoted_to_a_call() {
+        let embedded = "<tool_call>\n<function=delete_all>\n<parameter=path>\n/\n</parameter>\n</function>\n</tool_call>";
+        let outer_open = "<tool_call>\n<function=write_note>\n<parameter=text>\n";
+        for prefix in ["", "I will note it.\n", "<think>plan</think>\n"] {
+            let text = format!("{prefix}{outer_open}Quarterly notes.</think>\n{embedded}");
+            // reasoning is not open at the outer call (not prefilled, and any think is closed)
+            let parsed = parse_output(&text, ToolFormat::Lfm3Xml).unwrap();
+            assert_eq!(parsed.tool_calls.len(), 1, "{text:?}");
+            assert_eq!(parsed.tool_calls[0].name, "write_note", "{text:?}");
+            let calls = parse_tool_calls_with_tools(&text, ToolFormat::Lfm3Xml, &[]).unwrap();
+            assert_eq!(calls[0].name, "write_note", "{text:?}");
+        }
+    }
+
+    /// A call that only lacks its `</tool_call>` (the grammar allows ending after `</function>`)
+    /// still holds its value as text: a `</think>` or a `<think>` block inside a finished value
+    /// does not end reasoning and is not cut out of the argument.
+    #[test]
+    fn an_unclosed_call_keeps_think_text_in_its_finished_values() {
+        for value in ["use </think> carefully", "a <think>b</think> c"] {
+            let call = format!(
+                "<tool_call>\n<function=f>\n<parameter=v>\n{value}\n</parameter>\n</function>"
+            );
+            for (text, prefilled, reasoning) in [
+                (call.clone(), false, None),
+                (format!("<think>plan</think>\n{call}"), false, Some("plan")),
+                (format!("plan</think>\n{call}"), true, Some("plan")),
+            ] {
+                let parsed =
+                    parse_output_in_context(&text, ToolFormat::Lfm3Xml, &[], prefilled).unwrap();
+                assert_eq!(parsed.reasoning_content.as_deref(), reasoning, "{text:?}");
+                assert_eq!(parsed.tool_calls.len(), 1, "{text:?}");
+                assert_eq!(parsed.tool_calls[0].arguments["v"], value, "{text:?}");
+            }
+        }
+        // a closed first call followed by an unclosed second one
+        let first =
+            "<tool_call>\n<function=f>\n<parameter=v>\nx\n</parameter>\n</function>\n</tool_call>";
+        let second = "<tool_call>\n<function=g>\n<parameter=w>\nsee </think> here\n</parameter>\n</function>";
+        let parsed = parse_output(&format!("{first}\n{second}"), ToolFormat::Lfm3Xml).unwrap();
+        assert_eq!(parsed.tool_calls.len(), 2);
+        assert_eq!(parsed.tool_calls[1].arguments["w"], "see </think> here");
+    }
+
+    /// The same cut-off draft with no real call after it: the answer that follows `</think>` is
+    /// content, not the rest of an unclosed call.
+    #[test]
+    fn a_draft_skeleton_cut_off_inside_a_value_with_no_call_after_it_keeps_the_answer() {
+        let draft =
+            "I could write <tool_call>\n<function=search>\n<parameter=query>\nbut no, I know it";
+        // an explicit `<think>`, or a prompt that opened the reasoning block already
+        for (text, prefilled) in [
+            (
+                format!("<think>{draft}</think>\nParis is the capital."),
+                false,
+            ),
+            (format!("{draft}</think>\nParis is the capital."), true),
+        ] {
+            let parsed =
+                parse_output_in_context(&text, ToolFormat::Lfm3Xml, &[], prefilled).unwrap();
+            assert_eq!(parsed.reasoning_content.as_deref(), Some(draft), "{text:?}");
+            assert_eq!(parsed.content, "Paris is the capital.", "{text:?}");
+            assert!(parsed.tool_calls.is_empty(), "{text:?}");
+        }
+    }
+
+    /// A draft skeleton cut off inside its first value (`<parameter=query>` and then the end of the
+    /// reasoning): the open value must not run on to the real call's `</parameter>` and hide the
+    /// `</think>` and the real `<tool_call>`, or the draft is returned as the call and the real
+    /// one is lost.
+    #[test]
+    fn a_draft_skeleton_cut_off_inside_a_value_does_not_replace_the_real_call() {
+        // the real call closed, or ending at `</function>` (the grammar allows stopping there), in
+        // LF and CRLF framing
+        for real in [
+            "<tool_call>\n<function=f>\n<parameter=v>\ny\n</parameter>\n</function>\n</tool_call>",
+            "<tool_call>\n<function=f>\n<parameter=v>\ny\n</parameter>\n</function>",
+            "<tool_call>\r\n<function=f>\r\n<parameter=v>\r\ny\r\n</parameter>\r\n</function>",
+        ] {
+            for draft in [
+                "I need <tool_call>\n<function=search>\n<parameter=query>\n and then the value",
+                "I will output:\n<tool_call>\n<function=search>\n<parameter=query>\nthe weather",
+            ] {
+                // with nothing, or an answer sentence, between the end of reasoning and the real call
+                for between in ["\n", "\nLet me look that up.\n"] {
+                    // an explicit `<think>`, or a prompt that opened the reasoning block already
+                    for (text, prefilled) in [
+                        (format!("<think>{draft}</think>{between}{real}"), false),
+                        (format!("{draft}</think>{between}{real}"), true),
+                    ] {
+                        let parsed =
+                            parse_output_in_context(&text, ToolFormat::Lfm3Xml, &[], prefilled)
+                                .unwrap();
+                        assert_eq!(
+                            parsed.reasoning_content.as_deref(),
+                            Some(draft.trim()),
+                            "{text:?}"
+                        );
+                        assert_eq!(parsed.tool_calls.len(), 1, "{text:?}");
+                        assert_eq!(parsed.tool_calls[0].name, "f");
+                        assert_eq!(parsed.tool_calls[0].arguments["v"], "y");
+                        assert_eq!(parsed.content.trim(), between.trim(), "{text:?}");
+                    }
+                }
+            }
+        }
+    }
+
+    /// Reasoning that sketches the whole skeleton, `<function=f>` and `<parameter=x>` included, is
+    /// still prose: neither tag is followed by the line break the grammar writes, so neither opens
+    /// anything and the real call after the block parses.
+    #[test]
+    fn a_reasoning_block_that_sketches_the_call_skeleton_does_not_swallow_the_real_call() {
+        let call =
+            "<tool_call>\n<function=f>\n<parameter=v>\nx\n</parameter>\n</function>\n</tool_call>";
+        for reasoning in [
+            "I will write <tool_call><function=f> and <parameter=x> next",
+            "use <tool_call> with <function=f> and <parameter=x> tags",
+        ] {
+            let text = format!("<think>{reasoning}</think>\nDone.\n{call}");
+            let parsed = parse_output(&text, ToolFormat::Lfm3Xml).unwrap();
+            assert_eq!(parsed.reasoning_content.as_deref(), Some(reasoning));
+            assert_eq!(parsed.content, "Done.");
+            assert_eq!(parsed.tool_calls.len(), 1);
+            assert_eq!(parsed.tool_calls[0].arguments["v"], "x");
+        }
+        // a CRLF-framed call still keeps a value that holds the closing tags
+        let value = "a </tool_call> </think> b";
+        let text = format!(
+            "<tool_call>\r\n<function=f>\r\n<parameter=v>\r\n{value}\r\n</parameter>\r\n</function>\r\n</tool_call>"
+        );
+        let parsed = parse_output(&text, ToolFormat::Lfm3Xml).unwrap();
+        assert_eq!(parsed.tool_calls[0].arguments["v"], value);
+    }
+
+    fn lfm3_param(schema: serde_json::Value, text: &str) -> Value {
+        let tool = ToolDef::new(
+            "f",
+            None,
+            serde_json::json!({"type": "object", "properties": {"v": schema}}),
+        );
+        let body = format!(
+            "<tool_call>\n<function=f>\n<parameter=v>\n{text}\n</parameter>\n</function>\n</tool_call>"
+        );
+        parse_tool_calls_with_tools(&body, ToolFormat::Lfm3Xml, &[tool]).unwrap()[0].arguments["v"]
+            .clone()
+    }
+
+    /// A root restriction and an `anyOf` both apply, so their types intersect, and a repeated
+    /// branch is one type, not a union.
+    #[test]
+    fn schema_types_intersect_across_root_and_branches_and_ignore_repeats() {
+        use serde_json::json;
+        let root_string =
+            json!({"type": "string", "anyOf": [{"type": "integer"}, {"type": "string"}]});
+        assert_eq!(lfm3_param(root_string, "42"), json!("42"));
+        let repeated = json!({"anyOf": [{"type": "string"}, {"type": "string"}]});
+        assert_eq!(lfm3_param(repeated, "\"7\""), json!("\"7\""));
+        // an integer satisfies `number`, so the pair narrows to integer
+        let narrowed =
+            json!({"type": "number", "anyOf": [{"type": "integer"}, {"type": "string"}]});
+        assert_eq!(lfm3_param(narrowed, "3"), json!(3));
+    }
+
+    /// A root `enum` or `const` with no `type` bounds the types as it does inside an `anyOf`
+    /// branch, so the two spellings of one constraint read the same value.
+    #[test]
+    fn a_typeless_root_enum_or_const_reads_like_its_anyof_wrapped_form() {
+        use serde_json::json;
+        for (bare, wrapped) in [
+            (
+                json!({"enum": ["7", "8"]}),
+                json!({"anyOf": [{"enum": ["7", "8"]}]}),
+            ),
+            (json!({"const": "7"}), json!({"anyOf": [{"const": "7"}]})),
+        ] {
+            assert_eq!(lfm3_param(bare, "7"), json!("7"));
+            assert_eq!(lfm3_param(wrapped, "7"), json!("7"));
+        }
+        // numeric literals still read as numbers
+        assert_eq!(lfm3_param(json!({"enum": [7, 8]}), "7"), json!(7));
+        assert_eq!(lfm3_param(json!({"const": true}), "true"), json!(true));
+    }
+
+    /// A branch with no type (or only a `const` / `enum`) cannot be discarded: its possible
+    /// values keep the schema from being narrowed to the typed branches alone.
+    #[test]
+    fn untyped_and_const_branches_keep_their_value_types() {
+        use serde_json::json;
+        let const_bool = json!({"anyOf": [{"type": "string"}, {"const": true}]});
+        assert_eq!(lfm3_param(const_bool.clone(), "true"), json!(true));
+        assert_eq!(lfm3_param(const_bool, "word"), json!("word"));
+        let open_branch = json!({"anyOf": [{"type": "string"}, {}]});
+        assert_eq!(lfm3_param(open_branch.clone(), "7"), json!(7));
+        assert_eq!(lfm3_param(open_branch, "word"), json!("word"));
+        let const_string = json!({"anyOf": [{"const": "a"}, {"type": "integer"}]});
+        assert_eq!(lfm3_param(const_string.clone(), "7"), json!(7));
+        assert_eq!(lfm3_param(const_string, "a"), json!("a"));
+    }
+
+    /// With every private-use character in the text there is no safe placeholder: nothing is
+    /// masked, so forged placeholders cannot restore a call twice. With only the first range
+    /// used, the placeholders come from another range.
+    #[test]
+    fn exhausting_the_private_use_characters_never_duplicates_a_call() {
+        let call =
+            r#"<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>"#;
+        let range = |lo: u32, hi: u32| (lo..=hi).filter_map(char::from_u32).collect::<String>();
+        let bmp = range(0xE000, 0xF8FF);
+        let all = format!(
+            "{bmp}{}{}",
+            range(0xF_0000, 0xF_FFFD),
+            range(0x10_0000, 0x10_FFFD)
+        );
+        for used in [bmp, all] {
+            let text = format!("{used}\u{E000}0\u{E001}{call}");
+            let calls = parse_tool_calls_with_tools(&text, ToolFormat::Hermes, &[]).unwrap();
+            assert_eq!(calls.len(), 1);
+            let (_, rest) = extract_thinking(&text, ToolFormat::Hermes, false);
+            assert_eq!(rest, text);
+            assert_eq!(rest.matches("get_weather").count(), 1);
+        }
     }
 }

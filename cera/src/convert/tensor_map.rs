@@ -295,7 +295,7 @@ mod tests {
     /// before anything is allocated: a crafted shard used to abort in `Vec::with_capacity`.
     #[test]
     fn a_huge_declared_expert_shape_is_an_error_not_an_allocation() {
-        let huge = vec![1usize << 30, 1usize << 30];
+        let huge = vec![usize::MAX / 4, 1];
         let mut experts = vec![
             (0usize, huge.clone(), vec![0.0f32; 4]),
             (1usize, huge, vec![0.0f32; 4]),

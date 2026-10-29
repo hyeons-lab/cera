@@ -909,6 +909,10 @@ pub fn detect_tool_format(architecture: String) -> Option<ToolFormat> {
 /// Returns an empty list when the reply contains no tool call (the model
 /// answered in prose). Errors only when a call section is present but
 /// unrecoverably malformed.
+// The text is read as a reply that starts outside a reasoning block (replies
+// from a chat session are parsed with the session's own context). This is a
+// plain comment, not a doc comment, because UniFFI copies doc comments into
+// the committed generated bindings.
 #[uniffi::export]
 pub fn parse_tool_calls(text: String, format: ToolFormat) -> Result<Vec<ToolCall>, FfiError> {
     cera::tools::parse_tool_calls(&text, format.into())

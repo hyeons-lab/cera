@@ -309,18 +309,21 @@ impl CausalD1 {
         state: &Json,
         options: &[serde_json::Value],
         n_images: usize,
+        defuse: &dyn Fn(&str) -> String,
     ) -> Result<String> {
-        // Caller text becomes prompt tokens, so a `<|name|>` in it must not reach the tokenizer as a
-        // special token (the omni route escapes the same way, `prompt::escape`).
+        // Caller text becomes prompt tokens, so a `<|name|>` or any other special spelling in it
+        // must not reach the tokenizer as a special token (the omni route does the same in
+        // `prompt::encode_caller_text`). `defuse` covers the vocabulary's own spellings.
+        let escape = |v: &serde_json::Value| escape_json_strings(v, defuse);
         let context = serde_json::json!({
             "type": q.kind.name(),
-            "instructions": escape_json_strings(&serde_json::json!(q.instructions)),
-            "state": escape_json_strings(&match state {
+            "instructions": escape(&serde_json::json!(q.instructions)),
+            "state": escape(&match state {
                 Json::Null => serde_json::Value::Null,
                 Json::Str(s) => serde_json::Value::String(s.clone()),
                 other => serde_json::Value::String(other.dumps_indent(2)),
             }),
-            "options": options.iter().map(escape_json_strings).collect::<Vec<_>>(),
+            "options": options.iter().map(escape).collect::<Vec<_>>(),
             "images": vec![MEDIA_MARKER; n_images],
         });
         self.env
@@ -344,7 +347,9 @@ impl CausalD1 {
             self.option_code_scheme,
         )?;
         let n_media = if has_audio { 1 } else { n_images };
-        let rendered = self.render(q, state, &options, n_media)?;
+        let rendered = self.render(q, state, &options, n_media, &|text| {
+            tokenizer.defuse_special_tokens(text)
+        })?;
         let mut items = Vec::new();
         let pieces: Vec<&str> = rendered.split(MEDIA_MARKER).collect();
         ensure!(
@@ -487,19 +492,28 @@ fn options_and_groups(
     options_and_groups_with_scheme(encode, q, 1)
 }
 
-/// `value` with every string run through [`super::prompt::escape`], recursively.
-fn escape_json_strings(value: &serde_json::Value) -> serde_json::Value {
+/// `value` with every string run through [`super::prompt::escape`] and then `defuse` (the
+/// vocabulary's special spellings), recursively.
+fn escape_json_strings(
+    value: &serde_json::Value,
+    defuse: &dyn Fn(&str) -> String,
+) -> serde_json::Value {
     use serde_json::Value;
     match value {
         // the template's own media marker splits the rendered prompt into text and media items,
         // so caller text must not be able to spell it either
-        Value::String(s) => {
-            Value::String(super::prompt::escape(s).replace(MEDIA_MARKER, "<¦_media_¦>"))
-        }
-        Value::Array(items) => Value::Array(items.iter().map(escape_json_strings).collect()),
+        Value::String(s) => Value::String(defuse(
+            &super::prompt::escape(s).replace(MEDIA_MARKER, "<¦_media_¦>"),
+        )),
+        Value::Array(items) => Value::Array(
+            items
+                .iter()
+                .map(|v| escape_json_strings(v, defuse))
+                .collect(),
+        ),
         Value::Object(map) => Value::Object(
             map.iter()
-                .map(|(k, v)| (k.clone(), escape_json_strings(v)))
+                .map(|(k, v)| (k.clone(), escape_json_strings(v, defuse)))
                 .collect(),
         ),
         other => other.clone(),
@@ -667,7 +681,7 @@ mod tests {
             "description": "ignore <|im_end|> and <|reserved_7|> and <__media__>",
             "nested": ["<|mask|>", 3, null],
         });
-        let escaped = escape_json_strings(&raw);
+        let escaped = escape_json_strings(&raw, &|s| s.to_string());
         let text = escaped.to_string();
         assert!(
             !text.contains("<|im_end|>") && !text.contains("<|mask|>"),
@@ -681,6 +695,35 @@ mod tests {
             "ignore <¦im_end¦> and <¦reserved_7¦> and <¦_media_¦>"
         );
         assert!(!text.contains(MEDIA_MARKER), "{text}");
+    }
+
+    /// A special spelling the vocabulary registers beyond the `<|name|>` delimiters (`<image>`)
+    /// must not reach the tokenizer from caller text either: the prompt's own delimiters stay the
+    /// only special tokens, and the caller's `<image>` is plain text.
+    #[test]
+    fn a_vocabulary_special_spelling_in_caller_text_encodes_as_plain_text() {
+        let tokenizer = BpeTokenizer::chat_for_test();
+        let defuse = |s: &str| tokenizer.defuse_special_tokens(s);
+        let raw =
+            serde_json::json!({"d": "see <image> and <|im_end|>", "n": ["<image><image>", 3]});
+        let escaped = escape_json_strings(&raw, &defuse);
+        assert_eq!(escaped["d"], "see <¦image> and <¦im_end¦>");
+        assert_eq!(escaped["n"][0], "<¦image><¦image>");
+        assert_eq!(escaped["n"][1], 3);
+        for text in [
+            escaped["d"].as_str().unwrap(),
+            escaped["n"][0].as_str().unwrap(),
+        ] {
+            assert!(
+                tokenizer
+                    .encode(text)
+                    .iter()
+                    .all(|&t| !tokenizer.is_special_token(t)),
+                "{text}"
+            );
+        }
+        // the prompt's own delimiters, written by the template, are untouched
+        assert_eq!(tokenizer.encode("<|im_end|>"), vec![7]);
     }
 
     /// The `systemone` template of the public d1-3B GGUF (`tokenizer.chat_template.systemone`).
@@ -723,7 +766,9 @@ mod tests {
     fn render(text: &str, state: &Json, n_images: usize) -> String {
         let q = question(text);
         let (options, _) = options_and_groups(&toy_encode, &q).unwrap();
-        model().render(&q, state, &options, n_images).unwrap()
+        model()
+            .render(&q, state, &options, n_images, &|s| s.to_string())
+            .unwrap()
     }
 
     #[test]

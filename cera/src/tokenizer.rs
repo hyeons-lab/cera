@@ -697,6 +697,30 @@ impl BpeTokenizer {
             .or_else(|| self.token_to_id.get(text.as_bytes()).copied())
     }
 
+    /// `text` with every registered delimiter-shaped special spelling defused, so that
+    /// [`Self::encode`] reads it as plain text: a `¦` goes after the spelling's first character
+    /// (`<image>` becomes `<¦image>`). Use it on text a caller supplies that is spliced into a
+    /// prompt whose own delimiters must stay the only special tokens. A spelling that starts with a
+    /// letter or digit is a word (some vocabularies register `python` as a control token) and is
+    /// left alone, so ordinary text encodes as the vocabulary encodes it. Spellings that overlap
+    /// are each defused.
+    pub fn defuse_special_tokens(&self, text: &str) -> String {
+        let mut out = String::with_capacity(text.len());
+        let mut rest = text;
+        while let Some(first) = rest.chars().next() {
+            out.push(first);
+            // one character at a time, so a spelling that starts inside another is still seen
+            // when the scan reaches it
+            if self.special_tokens.keys().any(|s| {
+                s.starts_with(|c: char| !c.is_alphanumeric()) && rest.starts_with(s.as_str())
+            }) {
+                out.push('¦');
+            }
+            rest = &rest[first.len_utf8()..];
+        }
+        out
+    }
+
     /// Check if a token ID is a special/control token.
     ///
     /// Interior LFM3 XML tool-call tags (`<function=`, `</function>`,
@@ -1409,6 +1433,39 @@ impl BpeTokenizer {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Defusing leaves no special spelling for `encode` to find, including spellings that overlap
+    /// (a defused `ab` must not leave the `bc` that starts inside it) and multi-byte first
+    /// characters.
+    #[test]
+    fn defusing_special_spellings_leaves_none_for_encode_to_find() {
+        let mut t = BpeTokenizer::empty_for_test();
+        for (text, id) in [
+            ("<x|", 100),
+            ("|y>", 101),
+            ("«x»", 102),
+            ("<image>", 103),
+            ("python", 104),
+        ] {
+            t.special_tokens.insert(text.to_string(), id);
+        }
+        for text in ["<x|y>", "a<x|y>b", "«x»«x»", "<image>ab", "plain"] {
+            let defused = t.defuse_special_tokens(text);
+            let found = t
+                .split_special_tokens(&defused)
+                .iter()
+                .any(|s| matches!(s, Segment::Special(..)));
+            assert!(!found, "{text:?} -> {defused:?}");
+        }
+        assert_eq!(t.defuse_special_tokens("see <image>"), "see <¦image>");
+        assert_eq!(t.defuse_special_tokens("plain"), "plain");
+        // a word registered as a special token (a d1 vocabulary has `python`) is not a delimiter:
+        // text containing it encodes as the vocabulary encodes it
+        assert_eq!(
+            t.defuse_special_tokens("is this python or pythonic"),
+            "is this python or pythonic"
+        );
+    }
 
     fn make_test_tokenizer() -> BpeTokenizer {
         // Build a minimal tokenizer for testing

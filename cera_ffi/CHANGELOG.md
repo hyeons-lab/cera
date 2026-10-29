@@ -5,6 +5,10 @@
 - Harden the LFM3 GGUF and safetensors converters and the mmproj loaders: zero-extent shapes, incomplete expert groups, truncated per-expert data, oversized tensor spans and inconsistent audio stem or attention geometry are refused with an error instead of panicking or allocating.
 - Fix tool-call parsing and masking for LFM3: closing tags inside argument values, lone `\r` after value delimiters, union-typed parameters and enum literals now round-trip through the parser.
 - Fix LFM3 runtime edge cases: Hexagon greedy fallback uses the shared argmax, `<|mixed_start|>` counts as a generated token, audio input is only accepted for omni models, and prompts for causal d1 models escape embedded JSON strings and the media marker.
+- Make the mmproj converter refuse a config the loaders would refuse (heads that do not divide the width, image sizes that are not a multiple of the patch, empty pixel bands, `image_mean`/`image_std` of the wrong length, audio encoders with no layers or mel bins) before any file is written; refuse mistyped, non-finite or non-positive float settings (`layer_norm_eps`, `rope_theta`, `image_mean`) and tensor sizes that overflow; and read a JSON `null` setting as unset, so it no longer hides a later spelling or the documented default.
+- Tighten the legacy audio decoder loaders: every depthformer layer, the depth projection and each codebook must match the declared widths, and `depthformer_n_embd` is tied to the weights, on the CPU and wgpu paths.
+- Make `<|audio_end|>` count toward `max_tokens` like `<|mixed_start|>`, so a model that keeps predicting either token stops at the limit.
+- A string enum with no `type` is now emitted and read as raw text, like a typed one. `cera::tools::parse_tool_calls_in_context` and `parse_output_in_context` take whether the prompt already opened the reasoning block; chat sessions and the `cera` CLI pass it.
 - Align package and native artifact versions at 0.7.3.
 
 ## 0.7.2

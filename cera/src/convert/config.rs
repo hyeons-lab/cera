@@ -326,6 +326,18 @@ impl HfModelConfig {
             .filter(|&v| v > 0)
     }
 
+    /// The number of leading dense (non-routed) blocks the metadata advertises
+    /// (`lfm3.leading_dense_block_count`): the first of `num_dense_layers` /
+    /// `first_k_dense_replace` / `leading_dense_block_count` present, when it is an integer. One
+    /// lookup for the writer and the completeness check.
+    pub(crate) fn leading_dense_blocks(&self) -> Option<usize> {
+        self.hparam("num_dense_layers")
+            .or_else(|| self.hparam("first_k_dense_replace"))
+            .or_else(|| self.hparam("leading_dense_block_count"))
+            .and_then(Value::as_u64)
+            .and_then(|v| usize::try_from(v).ok())
+    }
+
     /// The config keys the expert count is read from, in order.
     const LFM3_EXPERT_COUNT_KEYS: [&'static str; 2] = ["num_experts", "n_routed_experts"];
 
@@ -493,10 +505,7 @@ impl HfModelConfig {
             writer.add_u32("lfm3.expert_used_count", n_used);
         }
         if let Some(lead_dense) = self
-            .hparam("num_dense_layers")
-            .or_else(|| self.hparam("first_k_dense_replace"))
-            .or_else(|| self.hparam("leading_dense_block_count"))
-            .and_then(Value::as_u64)
+            .leading_dense_blocks()
             .and_then(|v| u32::try_from(v).ok())
         {
             writer.add_u32("lfm3.leading_dense_block_count", lead_dense);

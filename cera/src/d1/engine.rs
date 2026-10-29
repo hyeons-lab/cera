@@ -567,12 +567,28 @@ mod tests {
         assert!(sibling_audio_projector(&empty.path().join("mmproj-x.gguf")).is_none());
     }
 
-    /// A bare relative path has the empty path as its parent, which `read_dir` rejects: it means
-    /// the current directory (the test crate's own directory holds no `audioproj*.gguf`, so the
-    /// lookup finds nothing, but it must look rather than fail).
+    /// A bare relative path uses the current directory. Run the lookup in a child so the test
+    /// does not change the current directory of other tests in this process.
     #[test]
     fn a_bare_relative_mmproj_path_looks_in_the_current_directory() {
-        assert!(sibling_audio_projector(Path::new("mmproj-none.gguf")).is_none());
+        const CHILD: &str = "CERA_TEST_D1_RELATIVE_PROJECTOR_CHILD";
+        if std::env::var_os(CHILD).is_some() {
+            let found = sibling_audio_projector(Path::new("mmproj.gguf")).unwrap();
+            assert_eq!(found.file_name().unwrap(), "audioproj-test.gguf");
+            return;
+        }
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("audioproj-test.gguf"), b"test").unwrap();
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "d1::engine::tests::a_bare_relative_mmproj_path_looks_in_the_current_directory",
+            ])
+            .env(CHILD, "1")
+            .current_dir(dir.path())
+            .status()
+            .unwrap();
+        assert!(status.success());
         assert_eq!(containing_dir(Path::new("mmproj.gguf")), Path::new("."));
         assert_eq!(
             containing_dir(Path::new("a/b/mmproj.gguf")),

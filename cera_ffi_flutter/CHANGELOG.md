@@ -2,7 +2,7 @@
 
 ## 0.7.3
 
-- Include the `cera_ffi` 0.7.3 fixes: stricter LFM3 converter and mmproj validation, LFM3 tool-call parsing fixes and LFM3 runtime edge-case fixes.
+- Include the `cera_ffi` 0.7.3 fixes: stricter LFM3 converter and mmproj validation (including config values the loaders would refuse), stricter legacy audio decoder loading, LFM3 tool-call parsing fixes and LFM3 runtime edge-case fixes.
 - Align platform manifests and the dependency on `cera_ffi` at 0.7.3.
 
 ## 0.7.2

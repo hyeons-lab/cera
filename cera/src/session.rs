@@ -2249,7 +2249,6 @@ impl Session {
     ///   ```
     pub fn append_tokens(&mut self, tokens: &[u32]) -> Result<(), CeraError> {
         self.ensure_usable()?;
-        self.ensure_single_pass_prefill()?;
         Self::resize_pools_for_cpuset();
         self.discard_stale_decode_error();
         if tokens.is_empty() {
@@ -2262,6 +2261,7 @@ impl Session {
                 vocab_size: vocab_size as u32,
             });
         }
+        self.ensure_single_pass_prefill()?;
         // `n_keep` context shift (Phase 1.5): if the backend supports shift, the session was configured
         // with `n_keep > 0`, the cache is shiftable (not TurboQuant: compressed caches would corrupt on
         // the in-place RoPE delta; f16 shifts via widen→rotate→narrow), and the pinned prefix leaves
@@ -2482,7 +2482,6 @@ impl Session {
         n_tokens: usize,
     ) -> Result<(), CeraError> {
         self.ensure_usable()?;
-        self.ensure_single_pass_prefill()?;
         Self::resize_pools_for_cpuset();
         self.discard_stale_decode_error();
         if n_tokens == 0 {
@@ -2504,6 +2503,8 @@ impl Session {
                 embeddings.len()
             )));
         }
+
+        self.ensure_single_pass_prefill()?;
 
         self.ensure_rows_fit(n_tokens)?;
         let new_end = self.current_pos + n_tokens;
@@ -4140,6 +4141,12 @@ impl Session {
                 pending.push(token);
                 generated += 1;
                 modality_budget = modality_budget.saturating_sub(1);
+            } else if !is_audio_transition {
+                // a control token that emits no text (`<|mixed_start|>`, `<|audio_end|>`) is still a
+                // sampled token: without counting it a run of them is bounded only by the context,
+                // not by `max_tokens` (the standalone driver counts them through its common path).
+                // The transitions enter the audio block below, which has its own bound.
+                generated += 1;
             }
 
             if let Some(ref mut dec) = decoder
@@ -4844,6 +4851,7 @@ fn second_prefill_unsupported(config: &crate::model::ModelConfig, current_pos: u
 
 /// The `<|vision_start|>` / `<|vision_end|>` envelope of an LFM3-Omni image: both, or neither.
 /// One without the other is a broken vocabulary, the same refusal `Chat` makes.
+#[cfg(any(feature = "vl-preprocess", test))]
 fn lfm3o_boundary_ids(
     start: Option<u32>,
     end: Option<u32>,
@@ -4893,6 +4901,45 @@ mod tests {
                 "{arch} causal={causal} pos={pos}"
             );
         }
+    }
+
+    #[test]
+    fn second_prefill_preserves_input_errors_on_both_entry_points() {
+        let mut config = mock_config();
+        config.architecture = "lfm3".into();
+        config.is_causal = false;
+        config.hidden_size = 8;
+        let model = Arc::new(MockTestModel::new(config));
+        let tokenizer = Arc::new(BpeTokenizer::empty_for_test());
+        let mut session = Session::new(
+            model,
+            tokenizer,
+            ModalityCapabilities::text_only(),
+            SessionConfig::default(),
+        )
+        .unwrap();
+        session.append_tokens(&[1]).unwrap();
+        assert!(matches!(
+            session.append_tokens(&[]),
+            Err(CeraError::EmptyInput)
+        ));
+        assert!(matches!(
+            session.append_tokens(&[100]),
+            Err(CeraError::InvalidToken { .. })
+        ));
+        assert!(matches!(
+            session.append_embeddings(&[], 0),
+            Err(CeraError::EmptyInput)
+        ));
+        assert!(matches!(
+            session.append_tokens(&[2]),
+            Err(CeraError::Backend(_))
+        ));
+        assert!(matches!(
+            session.append_embeddings(&[0.0; 8], 1),
+            Err(CeraError::Backend(_))
+        ));
+        assert_eq!(session.position(), 1);
     }
 
     /// The modality-control ban applies to a copy: the original logits can become the seed of
@@ -5954,6 +6001,53 @@ mod tests {
         )
         .unwrap();
         (model, session)
+    }
+
+    /// Always predicts one token (a vocoder control token an audio model can emit).
+    struct RepeatTokenModel(crate::model::ModelConfig, u32);
+
+    impl Model for RepeatTokenModel {
+        fn config(&self) -> &crate::model::ModelConfig {
+            &self.0
+        }
+        fn forward(&self, tokens: &[u32], _pos: usize, state: &mut InferenceState) -> Vec<f32> {
+            state.seq_len += tokens.len();
+            let mut logits = vec![0.0; self.0.vocab_size];
+            logits[self.1 as usize] = 1.0;
+            logits
+        }
+    }
+
+    /// `<|mixed_start|>` and `<|audio_end|>` are control tokens that emit no text, but each is
+    /// still a sampled token: a model that keeps predicting one must stop at `max_tokens`, not run
+    /// to the context limit.
+    #[test]
+    fn a_run_of_text_free_control_tokens_stops_at_max_tokens() {
+        for token in [
+            crate::audio_engine::TOKEN_MIXED_START,
+            crate::audio_engine::TOKEN_AUDIO_END,
+        ] {
+            let mut config = mock_config();
+            config.vocab_size = 132;
+            config.max_seq_len = 64;
+            let mut session = Session::new(
+                Arc::new(RepeatTokenModel(config, token)),
+                Arc::new(BpeTokenizer::empty_for_test()),
+                ModalityCapabilities::text_only(),
+                SessionConfig::default(),
+            )
+            .unwrap();
+            let (decoder, detok) = crate::audio_engine::tests::empty_vocoder_weights();
+            session.attach_vocoder(Arc::new(decoder), Arc::new(detok));
+            session.append_tokens(&[1, 2, 3]).unwrap();
+            let mut sink = RecordingSink::default();
+            let summary = session.generate(&greedy_opts(3), &mut sink).unwrap();
+            assert_eq!(
+                summary.finish_reason,
+                FinishReason::MaxTokens,
+                "token {token}"
+            );
+        }
     }
 
     fn greedy_opts(max_tokens: u32) -> GenerateOpts {
