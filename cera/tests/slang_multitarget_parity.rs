@@ -31,6 +31,21 @@
 ///
 /// Max-shifted like the kernels are, so the comparison is not measuring a
 /// difference in numerical strategy that both sides intended.
+/// Largest absolute difference between `got` and `want`; NaN if either holds a NaN or infinity,
+/// so a `worst <= tol` gate cannot pass a kernel that wrote NaN (`f32::max` drops it). The lengths
+/// must match.
+fn max_abs_err(got: &[f32], want: &[f32]) -> f32 {
+    assert_eq!(got.len(), want.len(), "compared outputs differ in length");
+    let mut worst = 0.0f32;
+    for (a, b) in got.iter().zip(want) {
+        if !a.is_finite() || !b.is_finite() {
+            return f32::NAN;
+        }
+        worst = worst.max((a - b).abs());
+    }
+    worst
+}
+
 fn softmax_ref(x: &[f32]) -> Vec<f32> {
     let max = x.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
     let exp: Vec<f32> = x.iter().map(|v| (v - max).exp()).collect();
@@ -451,20 +466,21 @@ fn rmsnorm_ref(x: &[f32], weight: &[f32], eps: f32) -> Vec<f32> {
 //
 // Every conv test sweeps [`CONV_SHAPES`], which is what makes the predicated
 // `[ForceUnroll]` loops in `conv1d_fused_batch.slang` testable at all: at the
-// maximum shape (ks=4, d_conv=3) every predicate in those loops is
+// maximum shape (ks=8, d_conv=7) every predicate in those loops is
 // unconditionally true, so replacing them all with `true` would still pass. The
-// shape that actually ships is the smaller one.
+// shapes that actually ship are smaller: (3, 2) for LFM2 and (7, 6) for LFM3.
 // ---------------------------------------------------------------------------
 
 /// `(kernel_size, d_conv)` pairs every conv test sweeps.
 ///
 /// `(3, 2)` is the production shape: shipped LFM2 GGUFs set
 /// `lfm2.shortconv.l_cache = 3`, and the Metal and wgpu hosts both derive
-/// `kernel_size = l_cache`, `d_conv = kernel_size - 1`. `(4, 3)` is the maximum
-/// the `conv1d_fused_batch` register arrays are sized for, so it pins the
-/// boundary. `(2, 1)` degenerates the rolling buffer to a single slot, which is
-/// where an off-by-one in the shift loop shows up.
-const CONV_SHAPES: &[(usize, usize)] = &[(3, 2), (4, 3), (2, 1)];
+/// `kernel_size = l_cache`, `d_conv = kernel_size - 1`. `(7, 6)` is the LFM3 shape (its
+/// checkpoint has `l_cache = 7`), which uses taps and shift slots LFM2 never reaches. `(8, 7)` is
+/// the maximum the `conv1d_fused_batch` register arrays are sized for, so it pins the
+/// boundary. `(4, 3)` is the old maximum, kept. `(2, 1)` degenerates the rolling buffer to a
+/// single slot, which is where an off-by-one in the shift loop shows up.
+const CONV_SHAPES: &[(usize, usize)] = &[(3, 2), (4, 3), (2, 1), (7, 6), (8, 7)];
 
 /// Deterministic conv input, rolling-buffer state and per-channel weights.
 /// `weight` is `hs x ks` with the current-input tap at column `d_conv`.
@@ -2156,11 +2172,7 @@ mod wgsl {
         let spec = exp_polar_input(n_frames, bins);
         let got = run_exp_polar(&ctx, &spec, n_frames as u32, bins as u32);
         let want = exp_polar_ref(&spec, n_frames, bins);
-        let worst = got
-            .iter()
-            .zip(&want)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        let worst = max_abs_err(&got, &want);
         assert!(
             worst <= 1e-4,
             "wgsl exp_polar worst abs err {worst:.3e} > 1e-4"
@@ -2228,11 +2240,7 @@ mod wgsl {
         let hann = cera::model::audio_decoder::build_hann(n_fft);
         let got = run_overlap_add(&ctx, &td, &hann, n_frames as u32, n_fft as u32, hop as u32);
         let want = overlap_add_ref(&td, &hann, n_frames, n_fft, hop);
-        let worst = got
-            .iter()
-            .zip(&want)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        let worst = max_abs_err(&got, &want);
         assert!(
             worst <= 1e-3,
             "wgsl overlap_add worst abs err {worst:.3e} > 1e-3"
@@ -3628,11 +3636,7 @@ mod msl {
         let spec = exp_polar_input(n_frames, bins);
         let got = run_exp_polar(&ctx, &spec, n_frames as u32, bins as u32);
         let want = exp_polar_ref(&spec, n_frames, bins);
-        let worst = got
-            .iter()
-            .zip(&want)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        let worst = max_abs_err(&got, &want);
         assert!(
             worst <= 1e-4,
             "msl exp_polar worst abs err {worst:.3e} > 1e-4"
@@ -3691,11 +3695,7 @@ mod msl {
         let hann = cera::model::audio_decoder::build_hann(n_fft);
         let got = run_overlap_add(&ctx, &td, &hann, n_frames as u32, n_fft as u32, hop as u32);
         let want = overlap_add_ref(&td, &hann, n_frames, n_fft, hop);
-        let worst = got
-            .iter()
-            .zip(&want)
-            .map(|(a, b)| (a - b).abs())
-            .fold(0.0f32, f32::max);
+        let worst = max_abs_err(&got, &want);
         assert!(
             worst <= 1e-3,
             "msl overlap_add worst abs err {worst:.3e} > 1e-3"

@@ -10,6 +10,44 @@ use super::*;
 use crate::backend::hexagon::op_capture;
 use crate::gguf::{GgufBuilder, KvValue};
 
+/// Largest absolute difference between two rows, NaN when either holds a NaN or infinity and
+/// a panic when the lengths differ. `f32::max` would drop a NaN, so a `max_diff < tol` gate over
+/// a fold of it passes logits that are all NaN.
+fn max_abs_diff(a: &[f32], b: &[f32]) -> f32 {
+    assert_eq!(a.len(), b.len(), "compared rows differ in length");
+    let mut worst = 0.0f32;
+    for (x, y) in a.iter().zip(b) {
+        if !x.is_finite() || !y.is_finite() {
+            return f32::NAN;
+        }
+        worst = worst.max((x - y).abs());
+    }
+    worst
+}
+
+#[test]
+fn max_abs_diff_fails_every_gate_on_non_finite_rows() {
+    assert_eq!(max_abs_diff(&[1.0, 2.0], &[1.0, 2.5]), 0.5);
+    for (a, b) in [
+        (vec![f32::NAN, 1.0], vec![0.0, 1.0]),
+        (vec![0.0, 1.0], vec![0.0, f32::INFINITY]),
+        (vec![f32::NAN], vec![f32::NAN]),
+    ] {
+        let d = max_abs_diff(&a, &b);
+        // NaN is unordered: neither a `< tol` gate nor a `> floor` gate can pass it
+        assert!(d.partial_cmp(&0.0).is_none(), "{a:?} vs {b:?} gave {d}");
+    }
+    assert!(std::panic::catch_unwind(|| max_abs_diff(&[1.0], &[1.0, 2.0])).is_err());
+}
+
+/// Logits must be real numbers before they are compared with anything.
+fn assert_all_finite(label: &str, row: &[f32]) {
+    assert!(!row.is_empty(), "{label}: empty row");
+    if let Some(i) = row.iter().position(|v| !v.is_finite()) {
+        panic!("{label}: element {i} is {}", row[i]);
+    }
+}
+
 const HS: usize = 64;
 const INTER: usize = 128;
 const VOCAB: usize = 64;
@@ -2303,11 +2341,7 @@ fn lfm3_without_sandwich_norms_loads_and_matches_prefill_to_decode() {
     for (pos, &tok) in tokens.iter().enumerate() {
         decode_logits = cpu.forward(&[tok], pos, &mut s_decode);
     }
-    let max_diff = prefill_logits
-        .iter()
-        .zip(&decode_logits)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+    let max_diff = max_abs_diff(&prefill_logits, &decode_logits);
     assert!(max_diff < 1e-4, "max_diff={max_diff}");
 }
 
@@ -2384,11 +2418,7 @@ fn lfm3_with_decoupled_head_dim_loads_and_matches_prefill_to_decode() {
     for (pos, &tok) in tokens.iter().enumerate() {
         decode_logits = cpu.forward(&[tok], pos, &mut s_decode);
     }
-    let max_diff = prefill_logits
-        .iter()
-        .zip(&decode_logits)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+    let max_diff = max_abs_diff(&prefill_logits, &decode_logits);
     assert!(max_diff < 1e-4, "max_diff={max_diff}");
 }
 
@@ -2454,11 +2484,7 @@ fn lfm3_moe_loads_and_matches_prefill_to_decode() {
     for (pos, &tok) in tokens.iter().enumerate() {
         decode_logits = cpu.forward(&[tok], pos, &mut s_decode);
     }
-    let max_diff = prefill_logits
-        .iter()
-        .zip(&decode_logits)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+    let max_diff = max_abs_diff(&prefill_logits, &decode_logits);
     assert!(max_diff < 1e-4, "max_diff={max_diff}");
 }
 
@@ -2527,11 +2553,7 @@ fn lfm3_all_backends_match_cpu_prefill_and_decode() {
     for (pos, &tok) in tokens.iter().enumerate() {
         cpu_decode = cpu.forward(&[tok], pos, &mut cpu_decode_state);
     }
-    let prefill_vs_decode = cpu_prefill
-        .iter()
-        .zip(&cpu_decode)
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+    let prefill_vs_decode = max_abs_diff(&cpu_prefill, &cpu_decode);
     assert!(
         prefill_vs_decode < 1e-4,
         "CPU lfm3 prefill vs decode max_diff={prefill_vs_decode}"
@@ -2554,11 +2576,7 @@ fn lfm3_all_backends_match_cpu_prefill_and_decode() {
             let na: f32 = want.iter().map(|x| x * x).sum::<f32>().sqrt();
             let nb: f32 = got.iter().map(|x| x * x).sum::<f32>().sqrt();
             let cos = dot / (na * nb);
-            let max_diff = want
-                .iter()
-                .zip(got)
-                .map(|(a, b)| (a - b).abs())
-                .fold(0.0f32, f32::max);
+            let max_diff = max_abs_diff(want, got);
             assert!(
                 cos > 0.998 && max_diff < 0.55,
                 "{name} {stage}: cosine={cos} max_diff={max_diff}"
@@ -2684,11 +2702,7 @@ fn lfm3_d1_all_backends_match_cpu() {
     tokens_alt[tokens.len() - 1] = 31;
     let mut cpu_alt_state = InferenceState::for_prefill(Model::config(&cpu), tokens.len()).unwrap();
     let cpu_hs_alt = cpu.hidden_states(&tokens_alt, &mut cpu_alt_state);
-    let row0_drift = cpu_hs[..HS]
-        .iter()
-        .zip(&cpu_hs_alt[..HS])
-        .map(|(a, b)| (a - b).abs())
-        .fold(0.0f32, f32::max);
+    let row0_drift = max_abs_diff(&cpu_hs[..HS], &cpu_hs_alt[..HS]);
     assert!(
         row0_drift > 1e-4,
         "lfm3-d1 global attention must let the last token move row 0 (drift={row0_drift})"
@@ -2739,6 +2753,8 @@ fn lfm3_d1_all_backends_match_cpu() {
     );
     assert_eq!(hex_state.seq_len, 0);
 
+    // used by the wgpu and Metal arms below
+    #[cfg_attr(not(any(feature = "gpu", feature = "metal")), allow(unused_variables))]
     let check_cosine = |label: &str, want: &[f32], got: &[f32]| {
         assert_eq!(want.len(), got.len(), "{label} len");
         let dot: f32 = want.iter().zip(got).map(|(a, b)| a * b).sum();
@@ -2761,18 +2777,12 @@ fn lfm3_d1_all_backends_match_cpu() {
     let mut cpu_long_state = InferenceState::from_config(Model::config(&cpu)).unwrap();
     let cpu_long_logits = cpu.forward_prefill(&long_tokens, 0, &mut cpu_long_state);
     let cpu_long_decode = cpu.forward(&[2], long_tokens.len(), &mut cpu_long_state);
-    check_cosine("cpu d1 prefill self", &cpu_logits, &cpu_logits);
-    check_cosine("cpu d1 decode self", &cpu_decode, &cpu_decode);
-    check_cosine(
-        "cpu d1 long prefill self",
-        &cpu_long_logits,
-        &cpu_long_logits,
-    );
-    check_cosine(
-        "cpu d1 long decode self",
-        &cpu_long_decode,
-        &cpu_long_decode,
-    );
+    // A row compared with itself has cosine 1 whatever it holds; what the CPU reference must be
+    // before other backends are held to it is a row of real numbers.
+    assert_all_finite("cpu d1 prefill logits", &cpu_logits);
+    assert_all_finite("cpu d1 decode logits", &cpu_decode);
+    assert_all_finite("cpu d1 long prefill logits", &cpu_long_logits);
+    assert_all_finite("cpu d1 long decode logits", &cpu_long_decode);
 
     #[cfg(feature = "gpu")]
     if let Ok(gpu) = crate::model::gpu_lfm2::GpuLfmModel::from_gguf(make_d1(), 544) {

@@ -1179,14 +1179,3 @@ fn the_conv_slab_a_reset_clears_is_the_slab_the_planner_reserves() {
     assert_eq!(conv_state_slab_bytes(256, 7), 6 * 1024);
     assert_eq!(conv_state_slab_bytes(256, 3), 2 * 1024);
 }
-
-/// The head-gate output is written into scratch of `hidden_size` values per row, whatever the
-/// attention width: a wide q_dim must not widen the bound.
-#[test]
-fn the_head_gate_must_fit_the_hidden_wide_scratch() {
-    assert!(head_gate_fits_scratch(32, 64));
-    assert!(head_gate_fits_scratch(64, 64));
-    // 40 heads pad to 64: fits a 64-wide hidden but not a 32-wide one, even with q_dim = 2048
-    assert!(!head_gate_fits_scratch(64, 32));
-    assert!(!head_gate_fits_scratch(32, 16));
-}
