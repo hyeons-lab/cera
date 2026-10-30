@@ -123,6 +123,17 @@ type DspqueueReadFn = extern "C" fn(
     msg: *mut u8,
     timeout_us: u32,
 ) -> i32;
+/// [`DspqueueReadFn`] without the wait: an empty queue answers at once.
+type DspqueueReadNoblockFn = extern "C" fn(
+    queue: DspQueueHandle,
+    flags: *mut u32,
+    max_buffers: u32,
+    num_buffers: *mut u32,
+    buffers: *mut super::types::DspQueueBuffer,
+    max_msg_len: u32,
+    msg_len: *mut u32,
+    msg: *mut u8,
+) -> i32;
 
 /// Dynamically loaded FastRPC library handle and dispatch table.
 pub struct FastRpcDriver {
@@ -151,6 +162,10 @@ pub struct FastRpcDriver {
     dspqueue_export: DspqueueExportFn,
     dspqueue_write: DspqueueWriteFn,
     dspqueue_read: DspqueueReadFn,
+    /// `dspqueue_read_noblock`, which every polled read goes through when the
+    /// library exports it (see [`FastRpcDriver::read_dsp_queue_napping`]);
+    /// `None` when it does not, or under `CERA_HEXAGON_READ_NOBLOCK=0`.
+    dspqueue_read_noblock: Option<DspqueueReadNoblockFn>,
 
     /// Non-blocking completion polling (llama's `GGML_HEXAGON_OPPOLL`):
     /// `dspqueue_read` is issued with timeout 0 and retried on
@@ -169,6 +184,12 @@ pub struct FastRpcDriver {
 // FastRPC driver dispatch is thread-safe across function invocations.
 unsafe impl Send for FastRpcDriver {}
 unsafe impl Sync for FastRpcDriver {}
+
+/// Whether polled reads may use `dspqueue_read_noblock`: on unless
+/// `CERA_HEXAGON_READ_NOBLOCK` is `0`.
+fn read_noblock_wanted(var: Option<&str>) -> bool {
+    var != Some("0")
+}
 
 impl FastRpcDriver {
     /// Attempt to dynamically load `libcdsprpc.so` (or system driver on Linux/Android).
@@ -279,6 +300,13 @@ impl FastRpcDriver {
                     dspqueue_export: resolve!("dspqueue_export", DspqueueExportFn),
                     dspqueue_write: resolve!("dspqueue_write", DspqueueWriteFn),
                     dspqueue_read: resolve!("dspqueue_read", DspqueueReadFn),
+                    dspqueue_read_noblock: if read_noblock_wanted(
+                        std::env::var("CERA_HEXAGON_READ_NOBLOCK").ok().as_deref(),
+                    ) {
+                        resolve_opt!("dspqueue_read_noblock", DspqueueReadNoblockFn)
+                    } else {
+                        None
+                    },
                     mapped_bytes: std::sync::atomic::AtomicUsize::new(0),
                     oppoll: std::env::var("CERA_HEXAGON_OPPOLL")
                         .map(|v| v != "0")
@@ -728,17 +756,35 @@ impl FastRpcDriver {
                     "dspqueue_read: no DSP response after 30s ({spins} spins)"
                 )));
             }
-            let ret = (self.dspqueue_read)(
-                queue,
-                &mut flags,
-                buffers.len() as u32,
-                &mut n_bufs,
-                buffers.as_mut_ptr(),
-                msg.len() as u32,
-                &mut msg_len,
-                msg.as_mut_ptr(),
-                timeout,
-            );
+            // A polled read asks the no-block entry when the library has one. The
+            // vendor build behind a timed `dspqueue_read` logs an error line each
+            // time the wait expires (`wait_signal_locked` fails), and a spin
+            // expires it hundreds of thousands of times a second, which floods
+            // logcat and drops the app's own lines. The no-block entry never
+            // reaches the timed wait.
+            let ret = match self.dspqueue_read_noblock {
+                Some(read_noblock) if timeout == 0 => read_noblock(
+                    queue,
+                    &mut flags,
+                    buffers.len() as u32,
+                    &mut n_bufs,
+                    buffers.as_mut_ptr(),
+                    msg.len() as u32,
+                    &mut msg_len,
+                    msg.as_mut_ptr(),
+                ),
+                _ => (self.dspqueue_read)(
+                    queue,
+                    &mut flags,
+                    buffers.len() as u32,
+                    &mut n_bufs,
+                    buffers.as_mut_ptr(),
+                    msg.len() as u32,
+                    &mut msg_len,
+                    msg.as_mut_ptr(),
+                    timeout,
+                ),
+            };
             if ret == 0 {
                 return Ok(msg_len);
             }
@@ -836,8 +882,14 @@ pub(crate) mod fake {
         /// has not been told to release (`htp_iface_munmap`, method 5): the DSP's hold.
         pub munmap_needs_release: bool,
         released: std::collections::HashSet<i32>,
-        /// The timeout argument of every `dspqueue_read` (0 = polled read).
+        /// The wait of every read, timed or not (0 = polled: a `dspqueue_read` with timeout 0,
+        /// or a `dspqueue_read_noblock`).
         pub read_timeouts: Vec<u32>,
+        /// Reads that went through `dspqueue_read_noblock` (also counted in `read_timeouts`).
+        pub noblock_reads: usize,
+        /// Polled reads still to answer "no response yet" before the queue yields one. A timed
+        /// read waits for the response, so it never sees this.
+        pub empty_reads: u32,
         /// What the fake DSP answers the `ARCH_VER` query with (`None` = the call fails).
         pub dsp_arch_ver: Option<u32>,
         /// Skel file names `remote_handle64_open` was asked for, in order.
@@ -1018,9 +1070,38 @@ pub(crate) mod fake {
         msg: *mut u8,
         timeout: u32,
     ) -> i32 {
+        read_response(max_msg, msg_len, msg, timeout)
+    }
+    extern "C" fn q_read_noblock(
+        _q: DspQueueHandle,
+        _flags: *mut u32,
+        _max_bufs: u32,
+        _n_bufs: *mut u32,
+        _bufs: *mut super::super::types::DspQueueBuffer,
+        max_msg: u32,
+        msg_len: *mut u32,
+        msg: *mut u8,
+    ) -> i32 {
+        with(|s| s.noblock_reads += 1);
+        read_response(max_msg, msg_len, msg, 0)
+    }
+
+    /// What a read answers: an error, "not yet" while a polled read has `empty_reads` left, or
+    /// the oldest unanswered batch's response.
+    fn read_response(max_msg: u32, msg_len: *mut u32, msg: *mut u8, timeout: u32) -> i32 {
         with(|s| s.read_timeouts.push(timeout));
         if with(|s| s.fail_read) {
             return -1;
+        }
+        if timeout == 0
+            && with(|s| {
+                let empty = s.empty_reads > 0;
+                s.empty_reads = s.empty_reads.saturating_sub(1);
+                empty
+            })
+        {
+            // The still-processing code the real reads answer with.
+            return 0x0c;
         }
         let rsp = super::super::types::HtpOpBatchRsp {
             seq: with(|s| s.written.pop_front().unwrap_or(s.last_seq)),
@@ -1043,6 +1124,15 @@ pub(crate) mod fake {
 
     /// The fake driver with response polling (`CERA_HEXAGON_OPPOLL`) forced.
     pub(crate) fn driver_with_polling(oppoll: bool) -> Arc<FastRpcDriver> {
+        build(oppoll, true)
+    }
+
+    /// [`driver_with_polling`] on a library that exports no `dspqueue_read_noblock`.
+    pub(crate) fn driver_without_noblock(oppoll: bool) -> Arc<FastRpcDriver> {
+        build(oppoll, false)
+    }
+
+    fn build(oppoll: bool, noblock: bool) -> Arc<FastRpcDriver> {
         Arc::new(FastRpcDriver {
             #[cfg(unix)]
             handle: std::ptr::null_mut(),
@@ -1062,6 +1152,7 @@ pub(crate) mod fake {
             dspqueue_export: q_export,
             dspqueue_write: q_write,
             dspqueue_read: q_read,
+            dspqueue_read_noblock: noblock.then_some(q_read_noblock as DspqueueReadNoblockFn),
             oppoll,
             mapped_bytes: std::sync::atomic::AtomicUsize::new(0),
         })
@@ -1132,5 +1223,95 @@ mod tests {
         let driver = fake::driver();
         let _host_only = RpcmemBuffer::alloc(driver.clone(), 4096, false).unwrap();
         assert_eq!(driver.mapped_bytes(), 0);
+    }
+
+    /// One response read on `driver` the way a flush does, with `empty` polled reads answering
+    /// "no response yet" first.
+    fn read_one(driver: &FastRpcDriver, spin: bool, nap_us: u64, empty: u32) {
+        let mut bufs = [super::super::types::DspQueueBuffer::default(); 1];
+        let mut msg = [0u8; std::mem::size_of::<super::super::types::HtpOpBatchRsp>()];
+        fake::with(|s| s.empty_reads = empty);
+        driver
+            .read_dsp_queue_napping(0x10 as DspQueueHandle, &mut bufs, &mut msg, spin, nap_us)
+            .expect("the fake queue answers in the end");
+    }
+
+    /// The vendor library logs an error per expired timed read, so a polled wait must never
+    /// issue one: a spin asks the no-block entry every time.
+    #[test]
+    fn a_spinning_read_polls_through_the_no_block_entry() {
+        fake::reset();
+        let driver = fake::driver_with_polling(true);
+        read_one(&driver, true, 0, 3);
+        fake::with(|s| {
+            assert_eq!(s.noblock_reads, 4, "three empty polls and the answer");
+            assert_eq!(s.read_timeouts, [0; 4], "no timed read was issued");
+        });
+    }
+
+    /// A nap poll sleeps between attempts and gets the same treatment.
+    #[test]
+    fn a_nap_poll_goes_through_the_no_block_entry() {
+        fake::reset();
+        let driver = fake::driver_with_polling(false);
+        read_one(&driver, false, 1, 2);
+        fake::with(|s| {
+            assert_eq!(s.noblock_reads, 3);
+            assert_eq!(s.read_timeouts, [0; 3]);
+        });
+    }
+
+    /// A blocking wait is the timed read, whatever the library exports.
+    #[test]
+    fn a_blocking_read_keeps_the_timed_entry() {
+        fake::reset();
+        let driver = fake::driver_with_polling(false);
+        read_one(&driver, false, 0, 0);
+        fake::with(|s| {
+            assert_eq!(s.noblock_reads, 0);
+            assert_eq!(s.read_timeouts, [DSPQUEUE_TIMEOUT_US]);
+        });
+    }
+
+    /// A spin that outlasts its budget stops polling and blocks for the response, so a slow
+    /// batch does not hold a core (and the no-block entry is not used for the timed wait).
+    #[test]
+    fn a_spin_past_its_budget_falls_back_to_the_timed_read() {
+        fake::reset();
+        let driver = fake::driver_with_polling(true);
+        read_one(&driver, true, 0, 1_000_000);
+        fake::with(|s| {
+            assert_eq!(
+                s.read_timeouts.last(),
+                Some(&DSPQUEUE_TIMEOUT_US),
+                "the budget ran out and the read blocked"
+            );
+            assert!(s.noblock_reads > 0, "it polled first");
+            assert_eq!(
+                s.read_timeouts.len(),
+                s.noblock_reads + 1,
+                "every read before the last was a poll"
+            );
+        });
+    }
+
+    /// A library without the no-block entry polls the way it always did.
+    #[test]
+    fn a_library_without_the_no_block_entry_polls_with_a_zero_timeout() {
+        fake::reset();
+        let driver = fake::driver_without_noblock(true);
+        read_one(&driver, true, 0, 3);
+        fake::with(|s| {
+            assert_eq!(s.noblock_reads, 0);
+            assert_eq!(s.read_timeouts, [0; 4]);
+        });
+    }
+
+    #[test]
+    fn the_no_block_entry_is_on_unless_the_env_var_is_zero() {
+        assert!(read_noblock_wanted(None));
+        assert!(read_noblock_wanted(Some("1")));
+        assert!(read_noblock_wanted(Some("")));
+        assert!(!read_noblock_wanted(Some("0")));
     }
 }
